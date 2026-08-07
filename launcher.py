@@ -78,6 +78,7 @@ from ouroboros.platform_layer import (
     terminate_process_group_id,
     terminate_process_tree,
 )
+from ouroboros.secret_masking import looks_masked_secret
 from ouroboros.utils import atomic_write_json, utc_now_iso
 from ouroboros.server_runtime import apply_runtime_provider_defaults, has_startup_ready_provider
 
@@ -982,6 +983,10 @@ def _run_first_run_wizard() -> bool:
             import urllib.error
             base_url = str(data.get("baseUrl", "") or "").rstrip("/")
             api_key = str(data.get("apiKey", "") or "").strip()
+            # A display placeholder is not a credential: probing with "Bearer ***"
+            # reports an auth failure instead of the unauthenticated listing meant.
+            if looks_masked_secret(api_key):
+                api_key = ""
             if not base_url:
                 return {"error": "baseUrl is required"}
             try:

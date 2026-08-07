@@ -22,6 +22,13 @@ from ouroboros.config import (
     load_settings,
     save_settings,
 )
+from ouroboros.secret_masking import (
+    PASSWORD_CLASS_KEYS as _PASSWORD_CLASS_KEYS,
+    SECRET_SETTING_KEYS as _SECRET_SETTING_KEYS,
+    looks_masked_secret as _looks_masked_secret,
+    mask_password_class as _mask_password_class,
+    mask_secret_value as _mask_secret_value,
+)
 from ouroboros.gateway._helpers import json_error, json_exception, request_drive_root
 from ouroboros.onboarding_wizard import build_onboarding_html
 from ouroboros.platform_layer import is_container_env
@@ -41,18 +48,6 @@ from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso
 log = logging.getLogger(__name__)
 DEFAULT_PORT = int(os.environ.get("OUROBOROS_SERVER_PORT", "8765"))
 
-_SECRET_SETTING_KEYS = {
-    "OPENROUTER_API_KEY",
-    "OPENAI_API_KEY",
-    "OPENAI_COMPATIBLE_API_KEY",
-    "CLOUDRU_FOUNDATION_MODELS_API_KEY",
-    "GIGACHAT_CREDENTIALS",
-    "GIGACHAT_PASSWORD",
-    "ANTHROPIC_API_KEY",
-    "MINIMAX_API_KEY",
-    "GITHUB_TOKEN",
-    "OUROBOROS_NETWORK_PASSWORD",
-}
 _CUSTOM_SECRET_KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]{2,}$")
 
 def _get_lan_ip() -> str:
@@ -129,28 +124,6 @@ def _build_network_meta(bind_host: str, bind_port: int) -> dict:
         "recommended_url": recommended_url,
         "warning": warning,
     }
-
-
-# Password-class secrets are usually short human-chosen strings: an 8-char
-# prefix can BE most of the password. They mask to a constant placeholder;
-# long machine-generated API keys keep the recognizable 8-char prefix.
-_PASSWORD_CLASS_KEYS = {
-    "OUROBOROS_NETWORK_PASSWORD",
-    "GIGACHAT_PASSWORD",
-    "GIGACHAT_CREDENTIALS",
-}
-
-
-def _mask_password_class(value: Any) -> str:
-    return "***set***" if str(value or "").strip() else ""
-
-
-def _mask_secret_value(value: Any) -> str:
-    text = str(value or "")
-    return text[:8] + "..." if len(text) > 8 else "***"
-
-
-from ouroboros.mcp_client import looks_masked_secret as _looks_masked_secret
 
 
 def _mask_mcp_servers_payload(servers: Any) -> list:
@@ -302,7 +275,10 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             continue
         if key not in body:
             continue
-        if key in _SECRET_SETTING_KEYS and _looks_masked_secret(body[key]) and merged.get(key):
+        # A masked placeholder means "field untouched", never a new secret — and
+        # never a credential worth persisting even when nothing is stored yet.
+        # Clearing stays explicit: the UI sends "" for its Clear action.
+        if key in _SECRET_SETTING_KEYS and _looks_masked_secret(body[key]):
             continue
         merged[key] = body[key]
     for key, value in body.items():
@@ -313,7 +289,7 @@ def _merge_settings_payload(current: Dict[str, Any], body: Dict[str, Any]) -> Di
             continue
         if text_key.startswith("OUROBOROS_"):
             continue
-        if _looks_masked_secret(value) and merged.get(text_key):
+        if _looks_masked_secret(value):
             continue
         merged[text_key] = value
     return merged

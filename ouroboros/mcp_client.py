@@ -20,6 +20,9 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+# Re-exported so MCP callers and the Settings API share one mask contract.
+from ouroboros.secret_masking import looks_masked_secret as looks_masked_secret
+
 log = logging.getLogger(__name__)
 
 
@@ -303,11 +306,6 @@ def _mask_token(value: str) -> str:
     if not text:
         return ""
     return text[:4] + "..." if len(text) > 4 else "***"
-
-
-def looks_masked_secret(value: Any) -> bool:
-    text = str(value or "").strip()
-    return text in ("***", "***set***") or text.endswith("...")
 
 
 def _redact_error_text(text: Any, cfg: Optional[MCPServerConfig] = None) -> str:

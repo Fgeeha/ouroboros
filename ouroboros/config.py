@@ -17,6 +17,7 @@ from typing import Any, Optional, Sequence
 from ouroboros.platform_layer import pid_lock_acquire as _compat_pid_lock_acquire
 from ouroboros.platform_layer import pid_lock_release as _compat_pid_lock_release
 from ouroboros.provider_models import compute_direct_review_models_fallback, local_only_review_route_env, migrate_model_value, review_model_uses_local as review_model_uses_local
+from ouroboros.secret_masking import strip_masked_secrets
 from ouroboros.update_channels import UPDATE_SETTINGS_DEFAULTS, normalize_update_channel
 
 
@@ -1363,7 +1364,7 @@ def load_settings() -> dict:
             if key in loaded and settings.get(key) not in {None, ""}:
                 continue
             settings[key] = _coerce_setting_value(key, raw_env)
-        return settings
+        return strip_masked_secrets(settings)
     finally:
         _release_settings_lock(fd)
 

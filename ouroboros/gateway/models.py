@@ -14,6 +14,7 @@ from starlette.responses import JSONResponse
 from ouroboros.config import load_settings
 from ouroboros.gateway._helpers import json_error, json_exception
 from ouroboros.provider_models import resolve_minimax_base_url
+from ouroboros.secret_masking import looks_masked_secret
 
 log = logging.getLogger(__name__)
 
@@ -102,7 +103,11 @@ async def _fetch_openai_compatible_model_catalog(
     if not api_root:
         return []
 
-    headers = {"Authorization": f"Bearer {api_key}"} if str(api_key or "").strip() else None
+    # A display placeholder is not a credential: this catalog is also reachable
+    # with a client-supplied key (the onboarding proxy), and "Bearer ***" would
+    # be a confusing auth failure rather than the unauthenticated probe meant.
+    token = "" if looks_masked_secret(api_key) else str(api_key or "").strip()
+    headers = {"Authorization": f"Bearer {token}"} if token else None
     response = await client.get(
         f"{api_root}/models",
         headers=headers,

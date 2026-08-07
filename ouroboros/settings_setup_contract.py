@@ -13,6 +13,7 @@ from ouroboros.provider_models import (
     MINIMAX_REGION_ENDPOINTS,
     OPENAI_DIRECT_DEFAULTS,
 )
+from ouroboros.secret_masking import looks_masked_secret
 
 
 def _rows(keys: tuple[str, ...], specs: tuple[tuple[Any, ...], ...]) -> list[dict]:
@@ -308,6 +309,11 @@ def wizard_authors_safety_light() -> bool:
 
 def validate_setup_payload(data: dict, current_settings: dict) -> Tuple[dict, str | None]:
     keys = {field["settingKey"]: _string(data.get(field["settingKey"])) for field in _PROVIDER_FIELDS}
+    # A display placeholder means "field untouched", never a credential — the same
+    # contract the Settings merge enforces (see ouroboros.config.looks_masked_secret).
+    for setting_key, value in keys.items():
+        if looks_masked_secret(value):
+            keys[setting_key] = _string(current_settings.get(setting_key))
     local_source = _string(data.get("LOCAL_MODEL_SOURCE"))
     local_filename = _string(data.get("LOCAL_MODEL_FILENAME"))
     local_chat_format = _string(data.get("LOCAL_MODEL_CHAT_FORMAT"))
