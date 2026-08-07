@@ -1,6 +1,6 @@
 import { apiFetch, jsonPost } from './api_client.js';
 /** MCP settings cards; preserves masked auth tokens until the user edits them. */
-import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { escapeHtmlAttr as escapeHtml, looksMaskedSecret } from './utils.js';
 
 const TRANSPORTS = [
     { value: 'streamable_http', label: 'Streamable HTTP' },
@@ -13,11 +13,7 @@ let mcpStatusEnvelope = null;
 let mcpDirtyTokens = new Set();
 let onChangeCallback = null;
 
-function looksMasked(value) {
-    const text = String(value ?? '').trim();
-    if (!text) return false;
-    return text === '***' || text.endsWith('...');
-}
+const looksMasked = looksMaskedSecret;
 
 function emptyServer() {
     return {

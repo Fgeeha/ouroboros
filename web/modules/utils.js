@@ -21,6 +21,16 @@ export function escapeHtmlAttr(value) {
 
 export const escapeHtml = escapeHtmlText;
 
+/** Mirrors ouroboros.secret_masking.looks_masked_secret: display placeholder, not a secret.
+ *  Narrow on purpose — an all-asterisk run, the password-class marker, and the
+ *  "prefix..." truncation are the only shapes the server can send back. */
+export function looksMaskedSecret(value) {
+    const text = String(value ?? '').trim();
+    if (!text) return false;
+    if (text === '***set***' || text.endsWith('...')) return true;
+    return text.length >= 2 && /^\*+$/.test(text);
+}
+
 export function safeExternalUrl(value) {
     const text = String(value ?? '').trim();
     if (!text) return '#';

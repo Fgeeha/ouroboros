@@ -3214,3 +3214,105 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.skip(str(exc))
         raise
+
+
+@pytest.mark.ui_browser
+def test_ui_smoke_provider_secret_survives_a_masked_round_trip(direct_server_with_data):
+    """A plain re-save must not replace a stored provider key with its display mask.
+
+    The Settings page loads secrets masked, so "Save Settings" without touching the
+    field posts back whatever the mask is. When that mask is persisted, every
+    consumer sends it as an ``Authorization`` value and the provider rejects it
+    ("expected to start with 'sk-'"). This drives the real owner flow — type, save,
+    reload, re-save untouched, Clear, retype — and reads the persisted file for the
+    truth the UI deliberately cannot show. All keys here are fixtures.
+    """
+    pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
+    from playwright.sync_api import Error as PlaywrightError
+    from playwright.sync_api import sync_playwright
+
+    url = direct_server_with_data["url"]
+    data_dir = direct_server_with_data["data_dir"]
+    settings_path = data_dir / "settings.json"
+    first_key = "sk-ui-smoke-first-key"
+    second_key = "sk-ui-smoke-second-key"
+
+    def saved_key():
+        return json.loads(settings_path.read_text(encoding="utf-8")).get(
+            "OPENAI_COMPATIBLE_API_KEY", "<absent>"
+        )
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(headless=True)
+            page = browser.new_page(viewport={"width": 1400, "height": 1000})
+            try:
+                def open_settings_providers():
+                    page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                    page.wait_for_selector('[data-nav-page="settings"]', timeout=30_000)
+                    page.click('[data-nav-page="settings"]')
+                    page.click('[data-settings-tab="providers"]')
+                    # The OpenAI Compatible card ships collapsed; open its disclosure.
+                    page.wait_for_selector('[data-provider-card="compatible"]', timeout=30_000)
+                    page.evaluate(
+                        "() => { document.querySelector('[data-provider-card=\"compatible\"]').open = true; }"
+                    )
+                    field = page.locator("#s-openai-compatible-key")
+                    field.wait_for(state="visible", timeout=30_000)
+                    page.wait_for_function(
+                        "() => document.querySelector('#btn-save-settings')?.disabled === false",
+                        timeout=30_000,
+                    )
+                    field.scroll_into_view_if_needed()
+                    return field
+
+                def type_key(value):
+                    page.fill("#s-openai-compatible-key", value)
+                    page.dispatch_event("#s-openai-compatible-key", "input")
+                    page.dispatch_event("#s-openai-compatible-key", "change")
+
+                def save_and_wait():
+                    page.click("#btn-save-settings")
+                    page.wait_for_function(
+                        "() => (document.querySelector('#settings-status')?.textContent || '')"
+                        ".includes('Settings saved')",
+                        timeout=30_000,
+                    )
+
+                open_settings_providers()
+                type_key(first_key)
+                save_and_wait()
+                assert saved_key() == first_key
+
+                # A reload shows a mask, never the stored key — not even behind "Show".
+                field = open_settings_providers()
+                shown = field.input_value()
+                assert shown != first_key
+                assert first_key not in page.content()
+                assert shown.endswith("...") or set(shown) == {"*"} or shown == "***set***"
+                page.click('.secret-toggle[data-target="s-openai-compatible-key"]')
+                assert page.locator("#s-openai-compatible-key").get_attribute("type") == "text"
+                assert page.locator("#s-openai-compatible-key").input_value() == shown
+
+                # The regression: saving again without editing must keep the real key.
+                save_and_wait()
+                assert saved_key() == first_key
+
+                # Clear is the one explicit way to delete a stored secret.
+                open_settings_providers()
+                page.click('.secret-clear[data-target="s-openai-compatible-key"]')
+                assert page.locator("#s-openai-compatible-key").input_value() == ""
+                save_and_wait()
+                assert saved_key() == ""
+
+                # A genuinely new key still replaces whatever is stored.
+                open_settings_providers()
+                type_key(second_key)
+                save_and_wait()
+                assert saved_key() == second_key
+            finally:
+                browser.close()
+    except PlaywrightError as exc:
+        if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
+            pytest.skip(str(exc))
+        raise

@@ -4,7 +4,7 @@ import { bindLocalModelControls } from './settings_local_model.js';
 import { applyMcpSettings, collectMcpSettings, initMcpSettings } from './mcp_settings.js';
 import { SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
-import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
+import { escapeHtmlAttr as escapeHtml, formatDualVersion, looksMaskedSecret } from './utils.js';
 import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
 import { collectSafeFieldValues, renderSafeField, setInlineStatus } from './ui_helpers.js';
 
@@ -86,7 +86,14 @@ function resetSecretClearFlags(root) {
 function applySecretInputs(root, settings) {
     root.querySelectorAll('[data-secret-setting]').forEach((input) => {
         applyInputValue(input.id, settings[input.dataset.secretSetting]);
+        rememberLoadedSecret(input);
     });
+}
+
+/** Record what the server put in the field so a save can tell "untouched" from
+ *  "new secret". Anything still equal to this is the display mask, not a key. */
+function rememberLoadedSecret(input) {
+    if (input) input.dataset.loadedValue = input.value || '';
 }
 
 
@@ -94,6 +101,7 @@ function wireSecretRow(row) {
     const input = row.querySelector('.secret-input');
     const toggle = row.querySelector('[data-row-secret-toggle]');
     const clear = row.querySelector('[data-row-secret-clear]');
+    rememberLoadedSecret(input);
     if (input) input.addEventListener('input', () => { if (input.value.trim()) delete input.dataset.forceClear; });
     if (toggle && input) toggle.addEventListener('click', () => { input.type = input.type === 'password' ? 'text' : 'password'; toggle.textContent = input.type === 'password' ? 'Show' : 'Hide'; });
     if (clear && input) clear.addEventListener('click', () => { input.value = ''; input.type = 'password'; input.dataset.forceClear = '1'; if (toggle) toggle.textContent = 'Show'; markSettingsDirty(); });
@@ -263,7 +271,11 @@ function collectSecretValue(id, body) {
         return;
     }
     const value = input.value;
-    if (value && !value.includes('...')) body[settingKey] = value;
+    // Only an edited field carries a new secret. The loaded value is the server
+    // mask; re-sending it (or any mask shape) would ask the backend to store the
+    // placeholder as the credential. Clearing goes through forceClear above.
+    if (!value || value === input.dataset.loadedValue || looksMaskedSecret(value)) return;
+    body[settingKey] = value;
 }
 
 // Fallback picker pills mirror config defaults plus useful direct-provider ids.
@@ -718,7 +730,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             if (!/^[A-Z][A-Z0-9_]{2,}$/.test(key)) { if (error) { error.hidden = false; error.textContent = 'Use uppercase letters, numbers, and underscores.'; } return; }
             if (row.dataset.removeCustomSecret === '1' || valueInput?.dataset.forceClear === '1') { body[key] = ''; return; }
             const value = valueInput?.value || '';
-            if (value && !value.includes('...')) body[key] = value;
+            if (!value || value === valueInput?.dataset.loadedValue || looksMaskedSecret(value)) return;
+            body[key] = value;
         });
 
         return body;
