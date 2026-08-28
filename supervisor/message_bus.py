@@ -122,6 +122,83 @@ def refresh_budget_limit(new_limit: Optional[float]) -> None:
         pass
 
 
+# Per-task resolved thread cache (positive hits only: a running task has no
+# task_result row yet, so a cached 0 would pin the pre-terminal miss) and the
+# parsed queue snapshot keyed by its file stamp.
+_TASK_CHAT_CACHE: Dict[str, int] = {}
+_TASK_CHAT_CACHE_MAX = 512
+_QUEUE_SNAPSHOT_CHAT_CACHE: Tuple[Any, Dict[str, int]] = (None, {})
+
+
+def _queue_snapshot_chat_ids() -> Dict[str, int]:
+    """``{task_id: chat_id}`` for every PENDING/RUNNING task, from the queue
+    snapshot (the only durable source that has an in-flight task's thread
+    before its task_result row exists). Re-parsed only when the file changes."""
+    global _QUEUE_SNAPSHOT_CHAT_CACHE
+    if not DATA_DIR:
+        return {}
+    import json
+    import pathlib
+
+    snap = pathlib.Path(str(DATA_DIR)) / "state" / "queue_snapshot.json"
+    try:
+        st = snap.stat()
+        stamp: Any = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return {}
+    cached_stamp, cached_map = _QUEUE_SNAPSHOT_CHAT_CACHE
+    if cached_stamp == stamp:
+        return cached_map
+    chat_by_task: Dict[str, int] = {}
+    try:
+        data = json.loads(snap.read_text(encoding="utf-8"))
+        for bucket in ("running", "pending"):
+            for row in (data.get(bucket) or []):
+                if not isinstance(row, dict):
+                    continue
+                task = row.get("task") if isinstance(row.get("task"), dict) else row
+                tid = str(task.get("id") or row.get("id") or "")
+                chat = int(task.get("chat_id") or 0)
+                if tid and chat:
+                    chat_by_task[tid] = chat
+    except Exception:
+        log.debug("queue snapshot chat_id parse failed", exc_info=True)
+        return {}
+    _QUEUE_SNAPSHOT_CHAT_CACHE = (stamp, chat_by_task)
+    return chat_by_task
+
+
+def _log_event_task_chat_id(event: dict) -> int:
+    """Canonical thread for a log event that names a task but carries no
+    chat_id of its own. Lineage order (own -> root -> parent) matches the
+    gateway history classifier, so a subagent's frames land in its root's
+    Project panel. A2A virtual threads are never surfaced to the browser
+    fan-out; a lookup that resolves to one stays 0 (main), same as today."""
+    for key in ("task_id", "root_task_id", "parent_task_id"):
+        tid = str(event.get(key) or "").strip()
+        if not tid:
+            continue
+        cached = _TASK_CHAT_CACHE.get(tid)
+        if cached:
+            return cached
+        chat = _queue_snapshot_chat_ids().get(tid, 0)
+        if not chat:
+            try:
+                from ouroboros.task_results import load_task_result
+
+                chat = int((load_task_result(DATA_DIR, tid) or {}).get("chat_id") or 0)
+            except Exception:
+                chat = 0
+        if chat and is_a2a_chat_id(chat):
+            return 0
+        if chat:
+            if len(_TASK_CHAT_CACHE) >= _TASK_CHAT_CACHE_MAX:
+                _TASK_CHAT_CACHE.clear()
+            _TASK_CHAT_CACHE[tid] = chat
+            return chat
+    return 0
+
+
 class LocalChatBridge:
     """Local Queue-backed message bus."""
 
@@ -681,7 +758,17 @@ class LocalChatBridge:
             # Surface the event's chat_id top-level so the browser's per-thread
             # fan-out (isMyThread) can route the live card to its project panel
             # instead of the main chat. Events without a chat_id default to main.
-            frame = {"type": "log", "data": event, "chat_id": int(event.get("chat_id") or 0)}
+            chat_id = int(event.get("chat_id") or 0)
+            if not chat_id:
+                # llm_usage / llm_round / task_checkpoint (and the post-terminal
+                # task_cost_finalized) are appended without a chat_id even when
+                # their task is bound to a Project thread. Left at 0, the frame
+                # is adopted by Main, which mints a "Working…" card there —
+                # while the terminal task_done (which DOES carry the Project
+                # chat_id) fans out only to the Project panel, so the Main card
+                # spins forever. Resolve the task's canonical thread instead.
+                chat_id = _log_event_task_chat_id(event)
+            frame = {"type": "log", "data": event, "chat_id": chat_id}
             stamp_project_thread(DATA_DIR, frame)
             self._broadcast_fn(frame)
 

@@ -308,6 +308,69 @@ def test_push_log_broadcast_surfaces_chat_id(monkeypatch):
     assert logs[1]["chat_id"] == 0
 
 
+def _reset_task_chat_caches(monkeypatch):
+    monkeypatch.setattr(message_bus, "_TASK_CHAT_CACHE", {})
+    monkeypatch.setattr(message_bus, "_QUEUE_SNAPSHOT_CHAT_CACHE", (None, {}))
+
+
+def test_push_log_resolves_project_chat_for_chatless_task_events(monkeypatch, tmp_path):
+    """llm_usage/llm_round/task_checkpoint rows are appended WITHOUT a chat_id
+    even when their task is bound to a Project thread. Broadcast at chat_id 0,
+    Main adopts them and mints a "Working…" card that the terminal task_done
+    (fanned out only to the Project panel by its real chat_id) can never
+    finalize. The choke must resolve the task's canonical thread instead."""
+    import json
+
+    from ouroboros.projects_registry import create_project
+
+    project_chat = int(create_project(tmp_path, "volg-ai", name="Volg-ai")["chat_id"])
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    _reset_task_chat_caches(monkeypatch)
+    (tmp_path / "state").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "state" / "queue_snapshot.json").write_text(json.dumps({
+        "running": [{"task": {"id": "t-run", "chat_id": project_chat}}],
+        "pending": [],
+    }), encoding="utf-8")
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+
+    bridge.push_log({"type": "llm_usage", "task_id": "t-run"})
+    # Subagent frames carry only lineage ids — the root's thread must win.
+    bridge.push_log({"type": "llm_round", "task_id": "t-child", "root_task_id": "t-run"})
+    bridge.push_log({"type": "tool_call", "task_id": "t-unknown"})
+
+    logs = [f for f in frames if f.get("type") == "log"]
+    assert logs[0]["chat_id"] == project_chat and logs[0]["project_thread"] is True
+    assert logs[1]["chat_id"] == project_chat and logs[1]["project_thread"] is True
+    assert logs[2]["chat_id"] == 0 and "project_thread" not in logs[2]
+
+
+def test_push_log_resolves_project_chat_after_terminal_via_task_result(monkeypatch, tmp_path):
+    """task_cost_finalized arrives AFTER the task left the queue snapshot; the
+    stored task_result row is the remaining chat_id authority."""
+    import json
+
+    from ouroboros.projects_registry import create_project
+    from ouroboros.task_results import task_result_path
+
+    project_chat = int(create_project(tmp_path, "volg-ai", name="Volg-ai")["chat_id"])
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    _reset_task_chat_caches(monkeypatch)
+    result_path = task_result_path(tmp_path, "t-done1234567890")
+    result_path.write_text(json.dumps({
+        "task_id": "t-done1234567890", "status": "completed", "chat_id": project_chat,
+    }), encoding="utf-8")
+    bridge = _make_bridge(monkeypatch)
+    frames = []
+    bridge._broadcast_fn = frames.append
+
+    bridge.push_log({"type": "task_cost_finalized", "task_id": "t-done1234567890"})
+
+    logs = [f for f in frames if f.get("type") == "log"]
+    assert logs[0]["chat_id"] == project_chat and logs[0]["project_thread"] is True
+
+
 def test_budget_line_replays_unresolved_attempt_not_stale_state(monkeypatch, tmp_path):
     from ouroboros import usage_accounting as ua
     from supervisor import state as state_module
