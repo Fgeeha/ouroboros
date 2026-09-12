@@ -8,7 +8,7 @@ import {
     projectCollapsedActivity,
 } from '../modules/chat.js';
 import { summarizeChatLiveEvent } from '../modules/log_events.js';
-import { bindContentButton, plainActivityText, selectionInside, subagentIdentityTitle, subagentTwin } from '../modules/chat_activity.js';
+import { bindContentButton, isLiveLineExpandable, plainActivityText, selectionInside, subagentIdentityTitle, subagentTwin } from '../modules/chat_activity.js';
 
 test('named root card shows the latest activity headline under the coined title', () => {
     assert.equal(projectCollapsedActivity({
@@ -287,4 +287,27 @@ test('a content button toggles on click and keyboard, but not on a selecting dra
     handlers.keydown({ key: 'a', preventDefault: () => { prevented += 1; } });
     assert.deepEqual([clicks, activated, prevented], [2, 3, 2]);
     globalThis.getSelection = saved;
+});
+
+
+test('a reasoning-stamped progress frame is its own collapsed Thinking line', () => {
+    const reasoning = 'Weighing the two migration paths before touching the schema. '.repeat(6).trim();
+    const frame = { type: 'send_message', is_progress: true, task_id: 't1', ts: '2026-09-11T10:00:00Z', content: `💬 ${reasoning}` };
+    const view = summarizeChatLiveEvent({ ...frame, reasoning: true });
+    assert.equal(view.phase, 'thinking');
+    assert.equal(view.headline, 'Thinking');
+    assert.equal(view.fullBody, reasoning);
+    assert.ok(view.body.length < reasoning.length && view.body.endsWith('...'));
+    // The collapsed card summary keeps the last action; reasoning never promotes.
+    assert.equal(view.activityPreview, '');
+    assert.equal(view.human, false);
+    assert.equal(view.promote, false);
+    assert.equal(view.visible, true);
+    assert.equal(view.dedupeKey, `reasoning:2026-09-11T10:00:00Z:${reasoning}`);
+    assert.equal(isLiveLineExpandable(view), true);
+    // The same frame without the stamp renders exactly as before.
+    const plain = summarizeChatLiveEvent(frame);
+    assert.equal(plain.phase, 'working');
+    assert.equal(plain.human, true);
+    assert.equal(plain.headline, view.body);
 });

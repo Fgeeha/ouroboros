@@ -1886,7 +1886,7 @@ A registry of `config.SETTINGS_DEFAULTS` (exact defaults stay canonical in `conf
 | OUROBOROS_EFFORT_DEEP_SELF_REVIEW | high | Deep-self-review effort — the surface default; a saved `deep_review` row's own effort outranks it |
 | OUROBOROS_EFFORT_CONSCIOUSNESS | high | Consciousness effort |
 | OUROBOROS_RETURN_REASONING | true | Ask OpenRouter to return reasoning; direct/local request copies strip OpenRouter-only fields |
-| OUROBOROS_REASONING_SUMMARY | auto | Readable reasoning-summary rendering; presentation-only, never added to history or returned to providers |
+| OUROBOROS_REASONING_SUMMARY | auto | Readable reasoning-summary rendering; display-only — the stamped progress row is durable and replays through history (`_PROGRESS_META_FIELDS`), but reasoning never re-enters the prompt digest or is returned to providers |
 | OUROBOROS_TASK_IDLE_TIMEOUT_SEC | 900 | Idle timeout — requires absence of real task/subtree progress; the typed in-flight main-LLM row spares only this rail; a settled child result stamps parent progress, because delivery creates immediate integration work and must not coincide with idle termination |
 | OUROBOROS_TASK_ABS_CEILING_SEC | 21600 | Absolute task ceiling, activity-independent; deadline and budget stay separate hard axes |
 | OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC | 90 | Supervisor/direct-turn liveness watchdog — alerts and recommends `/restart` but never frees an in-process lock held by a genuinely wedged turn |

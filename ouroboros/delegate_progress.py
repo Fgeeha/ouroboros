@@ -17,7 +17,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Dict, List, Optional
 
 from ouroboros.config import DELEGATE_WAIT_CEILING_SEC
@@ -622,7 +622,17 @@ def emit(ctx: Any, run_id: str, advance: _Advance, *,
     try:
         observation = executor_observation(ctx, run_id, advance, detail, entry) if detail is not None else {}
         metadata = {"executor_observation": observation} if observation else {}
-        fn(live_line(run_id, advance), **metadata)
+        # The harness's `thinking` rows are the run's reasoning: they go out first as
+        # their own line stamped `progress_meta.reasoning`, so the chat card folds them
+        # into a collapsed "Thinking" entry; every other row keeps the untyped action
+        # line, which also carries the batch omission count and the actor observation.
+        thinking = [row for row in advance.events if row.get("textKind") == "thinking"]
+        actions = [row for row in advance.events if row.get("textKind") != "thinking"]
+        if thinking:
+            fn(live_line(run_id, replace(advance, events=thinking, events_omitted=0)),
+               meta={"reasoning": True}, **({} if actions or advance.events_omitted else metadata))
+        if actions or advance.events_omitted or not thinking:
+            fn(live_line(run_id, replace(advance, events=actions)), **metadata)
     except Exception:
         log.debug("delegated progress emit failed", exc_info=True)
 

@@ -9,7 +9,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 
-import { categorizeLogEvent, summarizeLogEvent } from '../modules/log_events.js';
+import { LOG_CATEGORIES, categorizeLogEvent, summarizeLogEvent } from '../modules/log_events.js';
 
 const logEventsSource = readFileSync(new URL('../modules/log_events.js', import.meta.url), 'utf8');
 
@@ -37,6 +37,9 @@ const TABLE = [
     ['clean tool result', { type: 'tool_call_finished', tool: 'read_file', is_error: false }, 'done', 'tools'],
     ['LLM usage', { type: 'llm_usage', model: 'm' }, 'usage', 'llm'],
     ['unknown quiet event', { type: 'future_scheduler_tick' }, 'info', 'system'],
+    // the agent's reasoning files under its own chip; an unstamped row stays a task update
+    ['reasoning progress row', { type: 'send_message', is_progress: true, reasoning: true, task_id: 't', content: '💬 weighing options' }, 'thinking', 'reasoning'],
+    ['plain progress row', { type: 'send_message', is_progress: true, task_id: 't', content: '💬 editing the file' }, 'progress', 'tasks'],
 ];
 
 test('Logs category is derived from the typed phase of the same projection', () => {
@@ -95,4 +98,30 @@ test('a delegated harness run is not labelled as a subagent in the fan-out row (
     assert.equal(subagents.headline, 'swarm fan-out: 3 subagent(s) requested');
     assert.equal(summarizeLogEvent({ type: 'swarm_fanout', task_ids: ['a', 'b'] }).headline,
         'swarm fan-out: 2 subagent(s) requested');
+});
+
+
+test('the reasoning chip exists and the row shows the reasoning text as its body', () => {
+    assert.ok(LOG_CATEGORIES.reasoning);
+    const view = summarizeLogEvent({ type: 'send_message', is_progress: true, reasoning: true, task_id: 't', content: '💬 weighing options' });
+    assert.equal(view.headline, 'Thinking');
+    assert.equal(view.body, 'weighing options');
+});
+
+test('a subagent reasoning frame keeps its subagent row: pills, tasks chip, no Thinking line', () => {
+    // The chat projection lets the subagent branch win over the reasoning stamp; Logs
+    // must agree, or the same frame loses its role/parent/root/model pills here.
+    const evt = {
+        type: 'send_message', is_progress: true, reasoning: true,
+        delegation_role: 'subagent', subagent_task_id: 'child', subagent_role: 'critic',
+        parent_task_id: 'root', root_task_id: 'root', model: 'sonnet',
+        content: '💬 weighing options',
+    };
+    const view = summarizeLogEvent(evt);
+    assert.notEqual(view.phase, 'thinking');
+    assert.notEqual(view.headline, 'Thinking');
+    for (const pill of ['task=child', 'role=critic', 'model=sonnet', 'parent=root', 'root=root']) {
+        assert.ok(view.meta.includes(pill), `missing pill ${pill}`);
+    }
+    assert.equal(categorizeLogEvent(evt, view), 'tasks');
 });
