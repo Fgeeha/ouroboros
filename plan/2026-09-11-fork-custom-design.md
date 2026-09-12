@@ -141,3 +141,23 @@ the chat becomes sluggish, scope the observer to the sidebar/settings roots.
 
 Tests: `web/tests/i18n.test.js` (dictionary application, exclusion selectors,
 pattern strings), UI preference key test.
+
+## Status, 2026-09-12
+
+All four features are merged into `fork/custom`, each on its own branch with a
+separate-context review recorded in
+`/tmp/.../scratchpad/{theme,reasoning,i18n}-scope-receipt.json`.
+
+Known gaps, deliberately left:
+
+- `web/modules/chat.js` is 13 bytes over the shrink-only size ratchet. The lane
+  blocks only in official-repository CI, which does not run on this fork. Pay it
+  back before proposing any of this upstream.
+- The Russian dictionary covers chrome (nav, tabs, buttons, headings, settings
+  labels) but not most long body copy, notably the Accounts panel and the
+  onboarding provider paragraphs. Untranslated strings stay English by design.
+- Light mode: Skills, Marketplace and Widgets keep about 20 `rgba(250,250,250,…)`
+  inks; those pages were tokenized but never screenshotted in light mode.
+- Four pre-existing test failures on Python 3.13 (`test_plan_spec`,
+  `test_rc_audit_fixture_suite`, two in `test_v7next_transplant`) and one in
+  `test_process_custody`, all proven on the base commit.
