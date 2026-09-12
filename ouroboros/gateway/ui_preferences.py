@@ -31,7 +31,11 @@ DEFAULT_UI_PREFERENCES: dict[str, Any] = {
     # unknown-key 400, a stored legacy key is ignored on read and dropped on
     # the next write (``project_seen_revision`` is the replacement).
     "project_seen_revision": {},
+    # Colour theme of both the SPA and the onboarding document; the desktop
+    # launcher reads the same file for its window background.
+    "theme": "dark",
 }
+_THEMES = frozenset({"dark", "light"})
 _KNOWN_KEYS = frozenset(DEFAULT_UI_PREFERENCES)
 _MAX_WIDGET_ORDER_ITEMS = 200
 _MAX_WIDGET_START_MODE_ITEMS = 200
@@ -140,6 +144,14 @@ def _normalize_preferences(
                 except (TypeError, ValueError):
                     raise ValueError("project_seen_revision values must be integers")
             prefs["project_seen_revision"] = cleaned
+    if "theme" in raw:
+        value = raw.get("theme")
+        # `value not in <frozenset>` alone raises TypeError on an unhashable
+        # JSON value ([] / {}), which escapes as a 500; the isinstance guard
+        # keeps every rejected theme a 400 like its neighbours.
+        if not isinstance(value, str) or value not in _THEMES:
+            raise ValueError(f"theme must be one of {sorted(_THEMES)}")
+        prefs["theme"] = value
     return prefs
 
 

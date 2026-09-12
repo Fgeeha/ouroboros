@@ -28,6 +28,7 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
             "sidebar_width": 0,
             "project_panel_width": 0,
             "project_seen_revision": {},
+            "theme": "dark",
         }
 
         create_project(tmp_path, "racer", name="Racer")
@@ -121,6 +122,19 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
         assert client.post("/api/ui/preferences", json={"widget_order": "bad"}).status_code == 400
         assert client.post("/api/ui/preferences", json={"project_seen_revision": {"racer": "bad"}}).status_code == 400
         assert client.post("/api/ui/preferences", json={"unknown": True}).status_code == 400
+
+        # Theme: only the two literal names; anything else is a 400, not a fallback.
+        # The list/dict cases are the unhashable ones: a bare `value not in
+        # <frozenset>` raises TypeError there and the endpoint answered 500.
+        light = client.post("/api/ui/preferences", json={"theme": "light"})
+        assert light.status_code == 200 and light.json()["theme"] == "light"
+        assert client.get("/api/ui/preferences").json()["theme"] == "light"
+        for bad in ("Light", "auto", "", None, 1, True, [], {}, ["light"], {"theme": "light"}):
+            rejected = client.post("/api/ui/preferences", json={"theme": bad})
+            assert rejected.status_code == 400, bad
+            assert "theme" in rejected.json()["error"]
+        assert client.get("/api/ui/preferences").json()["theme"] == "light"
+        assert client.post("/api/ui/preferences", json={"theme": "dark"}).json()["theme"] == "dark"
 
 
 def test_ui_preferences_concurrent_paint_acks_are_monotonic(tmp_path):

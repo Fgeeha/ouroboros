@@ -3,6 +3,7 @@
 import { createWS } from './modules/ws.js';
 import { apiFetch, fetchJson } from './modules/api_client.js';
 import { loadVersion, initMatrixRain } from './modules/utils.js';
+import { applyTheme } from './modules/theme.js';
 import { bindScrollFade } from './modules/scroll_fade.js';
 import { initChat, createChatInstance } from './modules/chat.js';
 import { createStateSnapshotSequencer } from './modules/chat_activity.js';
@@ -651,6 +652,9 @@ function setupResizablePanels(prefs) {
             }).catch(() => {});
         }, 400);
     };
+    // Server preference reconciles the pre-paint localStorage mirror; a failed
+    // fetch (prefs = {}) leaves whatever the head script already painted.
+    if (prefs && 'theme' in prefs) applyTheme(prefs.theme);
     if (Number(prefs?.sidebar_width) > 0) root.style.setProperty('--sidebar-width', `${prefs.sidebar_width}px`);
     if (Number(prefs?.project_panel_width) > 0) root.style.setProperty('--project-panel-width', `${prefs.project_panel_width}px`);
     const isMobile = () => window.matchMedia('(max-width: 980px)').matches;

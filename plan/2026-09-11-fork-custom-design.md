@@ -93,9 +93,19 @@ Tests: `tests/test_narration_display.py`, `tests/test_delegate_progress_text.py`
 
 ## 3. Light theme
 
-- `web/theme_light.css`: `html[data-theme="light"]` overrides of the `:root`
-  tokens only, plus `color-scheme: light`. Linked after `style.css`. The
-  onboarding page gets the same override block inlined (it cannot import).
+- Correction (implementation): the token palette lives in `web/ui.css`
+  (`:root`, then `.ouro-ui { color-scheme: dark }`), not in `style.css`, and
+  `tests/test_web_typography_static.py` parses the `<link>` tags of
+  `index.html` / `onboarding_template.html`: `web/ui.css` must stay the first
+  sheet and no other linked sheet may declare a custom property name that
+  `ui.css` declares. So there is no `theme_light.css` and no new `<link>`: the
+  light overrides are an `html[data-theme="light"]` block inside `web/ui.css`
+  (plus `html[data-theme="light"].ouro-ui { color-scheme: light; }`), and the
+  onboarding page inherits them by already linking `ui.css` (its page-local
+  `--bg/--panel/...` names get their own light block in `onboarding.css`).
+  Every new `:root` token needs a `var()` reader in a linked sheet or in
+  `web/modules/**/*.js` in the same change, and every `var(--x)` used must be
+  declared (both directions are tested).
 - Hardcoded colors outside `:root` that break in light mode are replaced by
   tokens screen by screen, verified with screenshots. Not a blind sweep of all
   330 literals; upstream-visible surfaces first: chat, sidebar, settings,

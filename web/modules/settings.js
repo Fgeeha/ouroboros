@@ -17,6 +17,7 @@ import { initHarnessAccounts } from './harness_accounts.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { PROVIDER_TEST_INPUTS, SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
+import { bindThemeSegments } from './theme.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
 import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
 import { claudexorStatus } from './claudexor_status_store.js';
@@ -380,6 +381,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const disposeSettingsTabs = bindSettingsTabs(page, { state });
     bindSecretInputs(page);
     bindEffortSegments(page);
+    bindThemeSegments(page);
     const disposeLocalModel = bindLocalModelControls({ state });
     // Best-effort About version from /api/health.
     apiFetch('/api/health')
