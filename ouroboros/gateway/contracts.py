@@ -125,6 +125,9 @@ class ChatOutbound(TypedDict):
     # completed/failed/cancelled/rejected_duplicate.
     task_terminal_status: NotRequired[str]
     ephemeral_decision: NotRequired[bool]
+    # A progress frame that carries the agent's display reasoning (its own
+    # collapsed "Thinking" timeline line), not narration of what it did.
+    reasoning: NotRequired[bool]
     task_incident: NotRequired[str]
     # A cancellation fault names the PHYSICAL task it could not settle when that
     # differs from the displayed (logical) task id.

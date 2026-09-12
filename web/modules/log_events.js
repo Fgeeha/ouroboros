@@ -17,6 +17,7 @@ export const LOG_CATEGORIES = {
     llm: { label: 'LLM', color: 'var(--accent)' },
     errors: { label: 'Errors', color: 'var(--red)' },
     tasks: { label: 'Tasks', color: 'var(--amber)' },
+    reasoning: { label: 'Reasoning', color: 'var(--accent)' },
     system: { label: 'System', color: 'var(--text-muted)' },
     consciousness: { label: 'Consciousness', color: 'var(--accent)' },
 };
@@ -31,6 +32,9 @@ const ERROR_LOG_PHASES = new Set(['error', 'timeout', 'lifecycle_error']);
 export function categorizeLogEvent(evt, view = summarizeLogEvent(evt)) {
     const t = evt.type || evt.event || '';
     if (evt.is_progress) {
+        // A reasoning-stamped row files under its own chip, read off the same
+        // projection that paints its `thinking` phase pill.
+        if (String(view?.phase || '') === 'thinking') return 'reasoning';
         return evt.task_id === 'bg-consciousness' ? 'consciousness' : 'tasks';
     }
     // Severity comes from the typed projection, never from the event name; the
@@ -563,6 +567,12 @@ export function summarizeLogEvent(evt) {
     const taskMeta = (...items) => [evt.task_id ? `task=${evt.task_id}` : '', ...items];
 
     if (evt.is_progress || t === 'send_message') {
+        if (evt.reasoning === true && !isSubagentEvent(evt)) {
+            return view('thinking', 'Thinking', {
+                body: shortText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240),
+                meta: taskMeta(),
+            });
+        }
         if (isSubagentEvent(evt)) {
             const sid = subagentId(evt);
             const event = String(evt.subagent_event || 'update').toLowerCase();
@@ -1066,6 +1076,22 @@ export function summarizeChatLiveEvent(evt) {
             chip: executorChip(evt),
             model: evt.model,
             dedupeKey: `subagent:${sid}:${label}:${status}:${progressText.full || resultText.full || errorText.full || ''}`,
+        });
+    }
+
+    if ((evt.is_progress || t === 'send_message') && evt.reasoning === true) {
+        // The agent's own reasoning: a collapsed "Thinking" timeline line (body =
+        // preview, fullBody = the whole text for the existing Expand toggle). It is
+        // neither human narration nor promoted, so the card headline, phase and the
+        // collapsed activity summary keep showing the last action.
+        return chatView({
+            phase: 'thinking',
+            headline: 'Thinking',
+            body: progressText.preview,
+            fullBody: progressText.full,
+            activityPreview: '',
+            visible: true,
+            dedupeKey: `reasoning:${evt.ts || ''}:${progressText.full}`,
         });
     }
 

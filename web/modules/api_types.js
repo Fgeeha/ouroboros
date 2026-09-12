@@ -244,6 +244,9 @@
  * @property {Object=} origin_message_ref
  *   Host-captured inbound identity for a correlated operation's terminal reply.
  * @property {boolean=} ephemeral_decision
+ * @property {boolean=} reasoning
+ *   A progress frame carrying the agent's display reasoning (rendered as its
+ *   own collapsed "Thinking" timeline line), not narration of what it did.
  * @property {string=} task_phase
  *   "finalizing" on a root's early final answer: post-task synthesis still
  *   runs, so the frame is not the task's terminal conclusion.

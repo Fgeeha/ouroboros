@@ -311,6 +311,8 @@ not move them into the migrated set in section 8.
   as its external executor. A child keeps one useful activity line visible;
   a root permits up to three. Empty activity reserves no band, and a duplicate
   title is not activity. Full narration and Reviews expand independently.
+  The agent's own reasoning is a collapsed `Thinking` timeline row (a
+  reasoning-stamped progress frame); it never becomes the summary line.
   The root keeps primary title ink at weight 500, children secondary ink at
   400. Nested frames preserve real ancestry; their opaque secondary surface
   avoids accumulating translucent white tints at greater depth.

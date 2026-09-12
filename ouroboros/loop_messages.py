@@ -235,15 +235,18 @@ def _visible_round_text(content: Any) -> str:
 def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_trace: Dict[str, Any]) -> None:
     """Emit redacted progress safely to users.
 
-    Visible text is retained in ``reasoning_notes``. Provider reasoning stays
-    display-only; the native message and transcript remain unchanged.
+    Provider reasoning goes first as its own progress message stamped
+    ``progress_meta.reasoning = True`` (the chat card renders it as a collapsed
+    "Thinking" line, so the timeline reads think -> say); it stays display-only
+    and is never appended to the transcript or ``reasoning_notes``. Visible text
+    follows on the untyped path and is retained in ``reasoning_notes``.
     """
+    if str(os.environ.get("OUROBOROS_REASONING_SUMMARY", "auto")).strip().lower() != "off":
+        display_reasoning = LLMClient.extract_display_reasoning(msg)
+        if display_reasoning:
+            emit_progress(sanitize_tool_result_for_log(display_reasoning), meta={"reasoning": True})
     visible_text = _visible_round_text(content)
     if visible_text:
         safe_text = sanitize_tool_result_for_log(visible_text)
         emit_progress(safe_text)
         llm_trace["reasoning_notes"].append(safe_text)
-    elif str(os.environ.get("OUROBOROS_REASONING_SUMMARY", "auto")).strip().lower() != "off":
-        display_reasoning = LLMClient.extract_display_reasoning(msg)
-        if display_reasoning:
-            emit_progress(sanitize_tool_result_for_log(display_reasoning))

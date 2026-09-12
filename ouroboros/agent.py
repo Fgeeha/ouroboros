@@ -1081,9 +1081,12 @@ class OuroborosAgent:
             self._current_task_type = None
 
     def _emit_progress(self, text: str, *, incident: Optional[Dict[str, str]] = None,
-                       executor_observation: Optional[Dict[str, Any]] = None) -> None:
+                       executor_observation: Optional[Dict[str, Any]] = None,
+                       meta: Optional[Dict[str, Any]] = None) -> None:
         """Owner-visible note; ``incident`` is the typed ``task_incident``/``toast_once``
-        pair the browser toasts once — an ephemeral turn's only visible wait surface."""
+        pair the browser toasts once — an ephemeral turn's only visible wait surface.
+        ``meta`` is merged into ``progress_meta`` verbatim (``{"reasoning": True}`` stamps
+        a display-reasoning line); the subagent lineage stamps still win over it."""
         self._last_progress_ts = time.time()
         if self._event_queue is None or self._current_chat_id is None:
             return
@@ -1098,6 +1101,7 @@ class OuroborosAgent:
             if bool(getattr(getattr(self.tools, "_ctx", None), "is_ephemeral_turn", False)):
                 progress_meta["ephemeral_decision"] = True
             progress_meta.update(incident or {})
+            progress_meta.update(meta or {})
             progress_meta.update(self._subagent_progress_meta("progress"))
             if executor_observation is not None:
                 from ouroboros.subagent_messages import executor_observation_meta
