@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
+import { setReasoningVisible } from '../modules/log_events.js';
 class ClassList {
     constructor(node) { this.node = node; this.names = new Set(); }
     add(...names) { names.forEach((name) => this.names.add(name)); this.sync(); }
@@ -1500,6 +1501,9 @@ function walkLines(node, out = []) {
     return out;
 }
 test('a reasoning-stamped progress frame renders as a collapsed Thinking line, live and from history', async () => {
+    // Reasoning rows are hidden by default (the `show_reasoning` preference);
+    // this test is the shown state, restored at the end.
+    setReasoningVisible(true);
     // Long enough that the preview body is shorter than fullBody (the line's Expand toggle).
     const reasoning = 'Weigh the two migration paths before touching the schema. '.repeat(6).trim();
     const rows = [
@@ -1544,6 +1548,7 @@ test('a reasoning-stamped progress frame renders as a collapsed Thinking line, l
         const replayed = walkLines(walkCard(messages, 'think-h'));
         assert.deepEqual(replayed.map((n) => n.classList.contains('thinking')), [true, false]);
     } finally {
+        setReasoningVisible(false);
         instance?.destroy();
         restoreDom(prior);
     }

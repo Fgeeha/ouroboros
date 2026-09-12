@@ -7,7 +7,7 @@ import {
     clearStickyCardState,
     projectCollapsedActivity,
 } from '../modules/chat.js';
-import { summarizeChatLiveEvent } from '../modules/log_events.js';
+import { setReasoningVisible, summarizeChatLiveEvent } from '../modules/log_events.js';
 import { bindContentButton, isLiveLineExpandable, plainActivityText, selectionInside, subagentIdentityTitle, subagentTwin } from '../modules/chat_activity.js';
 
 test('named root card shows the latest activity headline under the coined title', () => {
@@ -293,6 +293,8 @@ test('a content button toggles on click and keyboard, but not on a selecting dra
 test('a reasoning-stamped progress frame is its own collapsed Thinking line', () => {
     const reasoning = 'Weighing the two migration paths before touching the schema. '.repeat(6).trim();
     const frame = { type: 'send_message', is_progress: true, task_id: 't1', ts: '2026-09-11T10:00:00Z', content: `💬 ${reasoning}` };
+    // The display preference is off by default; this is the shown state.
+    setReasoningVisible(true);
     const view = summarizeChatLiveEvent({ ...frame, reasoning: true });
     assert.equal(view.phase, 'thinking');
     assert.equal(view.headline, 'Thinking');
@@ -310,4 +312,21 @@ test('a reasoning-stamped progress frame is its own collapsed Thinking line', ()
     assert.equal(plain.phase, 'working');
     assert.equal(plain.human, true);
     assert.equal(plain.headline, view.body);
+    setReasoningVisible(false);
+});
+
+test('reasoning hidden: the stamped frame renders no chat timeline line', () => {
+    setReasoningVisible(false);
+    const reasoning = 'Weighing the two migration paths before touching the schema.';
+    const frame = { type: 'send_message', is_progress: true, task_id: 't1', ts: '2026-09-11T10:00:00Z', content: `💬 ${reasoning}` };
+    const hidden = summarizeChatLiveEvent({ ...frame, reasoning: true });
+    assert.equal(hidden.visible, false);
+    // The body still travels, so flipping the preference on reveals the same row.
+    assert.equal(hidden.fullBody, reasoning);
+    // An unstamped frame on the same surface stays visible.
+    assert.equal(summarizeChatLiveEvent(frame).visible, true);
+    setReasoningVisible(true);
+    assert.equal(summarizeChatLiveEvent({ ...frame, reasoning: true }).visible, true);
+    setReasoningVisible(false);
+    assert.equal(summarizeChatLiveEvent({ ...frame, reasoning: true }).visible, false);
 });

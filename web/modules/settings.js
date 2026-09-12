@@ -25,6 +25,7 @@ import { createModelRolesEditor } from './model_roles.js';
 import { collectSafeFieldValues, renderSafeField, setInlineStatus, revealNewRow } from './ui_helpers.js';
 import { extensionActionStatus } from './extension_status_text.js';
 import { currentLanguage, setLanguage, storedLanguage } from './i18n.js';
+import { isReasoningVisible, REASONING_VISIBILITY_EVENT, setReasoningVisible } from './log_events.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
@@ -384,6 +385,24 @@ function bindLanguageSegments(page) {
     }));
 }
 
+/** Settings -> Behavior display toggle for the agent's reasoning rows. Like the
+    theme control it applies + persists on its own and must never touch the
+    settings draft, so its change event stops before the page-level dirty
+    listener sees it. */
+function bindReasoningToggle(page) {
+    const box = page.querySelector('#ui-show-reasoning');
+    if (!box) return;
+    const sync = () => { box.checked = isReasoningVisible(); };
+    box.addEventListener('change', (event) => {
+        event.stopPropagation();
+        const show = setReasoningVisible(box.checked);
+        apiClient.saveUiPreferences({ show_reasoning: show })
+            .catch(() => showToast('Reasoning display choice could not be saved.', 'error'));
+    });
+    window.addEventListener(REASONING_VISIBILITY_EVENT, sync);
+    sync();
+}
+
 export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const page = document.createElement('div');
     page.id = 'page-settings';
@@ -403,6 +422,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // draft: each applies on click and persists on its own, never marking the page dirty.
     bindThemeSegments(page);
     bindLanguageSegments(page);
+    bindReasoningToggle(page);
     const disposeLocalModel = bindLocalModelControls({ state });
     // Best-effort About version from /api/health.
     apiFetch('/api/health')

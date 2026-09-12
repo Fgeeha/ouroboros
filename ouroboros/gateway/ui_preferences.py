@@ -37,6 +37,11 @@ DEFAULT_UI_PREFERENCES: dict[str, Any] = {
     # Colour theme of both the SPA and the onboarding document; the desktop
     # launcher reads the same file for its window background.
     "theme": "dark",
+    # Display-only: whether the agent's reasoning rows are rendered in the chat
+    # timeline and the Logs tab. The backend keeps emitting and storing them
+    # either way (OUROBOROS_REASONING_SUMMARY is the separate backend switch),
+    # so turning this on reveals the recorded rows on history replay too.
+    "show_reasoning": False,
 }
 _THEMES = frozenset({"dark", "light"})
 _KNOWN_KEYS = frozenset(DEFAULT_UI_PREFERENCES)
@@ -127,6 +132,11 @@ def _normalize_preferences(
         if not isinstance(value, bool):
             raise ValueError("nested_subagents_expanded must be a boolean")
         prefs["nested_subagents_expanded"] = value
+    if "show_reasoning" in raw:
+        value = raw.get("show_reasoning")
+        if not isinstance(value, bool):
+            raise ValueError("show_reasoning must be a boolean")
+        prefs["show_reasoning"] = value
     if "language" in raw:
         value = raw.get("language")
         if value not in _LANGUAGES:
