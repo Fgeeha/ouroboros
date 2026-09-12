@@ -23,6 +23,7 @@ import { claudexorStatus } from './claudexor_status_store.js';
 import { createModelRolesEditor } from './model_roles.js';
 import { collectSafeFieldValues, renderSafeField, setInlineStatus, revealNewRow } from './ui_helpers.js';
 import { extensionActionStatus } from './extension_status_text.js';
+import { currentLanguage, setLanguage, storedLanguage } from './i18n.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
@@ -365,6 +366,23 @@ export async function confirmAndSendRestart({ openConfirmDialog: confirmDialog, 
     return result?.status === 'sent' ? 'sent' : 'not_connected';
 }
 
+function bindLanguageSegments(page) {
+    const buttons = Array.from(page.querySelectorAll('[data-language-group] [data-language-value]'));
+    const sync = (lang) => buttons.forEach((button) => {
+        const on = button.dataset.languageValue === lang;
+        button.classList.toggle('active', on);
+        button.setAttribute('aria-pressed', String(on));
+    });
+    sync(currentLanguage() || storedLanguage());
+    window.addEventListener('ouro:language-changed', (event) => sync(event.detail?.language || 'en'));
+    buttons.forEach((button) => button.addEventListener('click', async () => {
+        const lang = button.dataset.languageValue;
+        if (lang === currentLanguage()) return;
+        await setLanguage(lang);
+        apiClient.saveUiPreferences({ language: lang }).catch(() => showToast('Language choice could not be saved.', 'error'));
+    }));
+}
+
 export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const page = document.createElement('div');
     page.id = 'page-settings';
@@ -380,6 +398,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const disposeSettingsTabs = bindSettingsTabs(page, { state });
     bindSecretInputs(page);
     bindEffortSegments(page);
+    // Language is an owner-local UI preference, not part of the settings draft:
+    // it applies on click and persists on its own, so it never marks the page dirty.
+    bindLanguageSegments(page);
     const disposeLocalModel = bindLocalModelControls({ state });
     // Best-effort About version from /api/health.
     apiFetch('/api/health')

@@ -20,6 +20,7 @@ import { adoptSubagentRoster, applyReviewerSlotsDraft, collectReviewerSlots,
     destroyReviewerSlots, initReviewerSlots, renderReviewerSlotsSection } from './reviewer_slots.js';
 import { accountRows } from './claudexor_status_store.js';
 import { accountRowFacts } from './harness_accounts.js';
+import { setLanguage, storedLanguage } from './i18n.js';
 
 (() => {
         // The wizard is its own document inside the overlay iframe, so the SPA's
@@ -1487,6 +1488,9 @@ import { accountRowFacts } from './harness_accounts.js';
         syncCurrentStepActionState();
     }
 
+    // Onboarding predates /api/ui/preferences, so the browser's last choice is the
+    // only source; English is already the authored source, so it needs no overlay.
+    if (storedLanguage() !== 'en') setLanguage('ru');
     applyModelDefaults(false);
     window.addEventListener('pagehide', (event) => {
         if (event.persisted) return;
