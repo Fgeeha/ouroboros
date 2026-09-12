@@ -389,6 +389,18 @@ export function renderSettingsPage() {
 
                 <section class="settings-panel" data-settings-panel="behavior">
                     <div class="form-section">
+                        <h3>Appearance</h3>
+                        <div class="settings-section-copy">Applies immediately and is saved on its own; the Save button below does not affect it.</div>
+                        <div class="settings-effort-card">
+                            <label id="s-theme-label">Theme</label>
+                            <div class="ui-segment-group settings-effort-group" data-theme-group role="group" aria-labelledby="s-theme-label">
+                                <button type="button" class="ui-segment settings-effort-btn" data-theme-value="dark">Dark</button>
+                                <button type="button" class="ui-segment settings-effort-btn" data-theme-value="light">Light</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
                         <h3>Reasoning Effort</h3>
                         <div class="settings-section-copy">Controls how deeply the model thinks per task type. Higher effort = slower but more thorough.</div>
                         <div class="settings-effort-grid">
