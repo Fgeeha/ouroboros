@@ -87,6 +87,9 @@ Change:
   `summarizeLogEvent` mirrors the branch; a `reasoning` category chip is added
   to the Logs tab.
 - Rows without the stamp (old logs) render as today.
+- Display toggle: the `show_reasoning` UI preference (Settings -> Behavior ->
+  Appearance) defaults to `false`, so reasoning rows are hidden on both
+  surfaces until the owner turns them on; emission and storage are unchanged.
 
 Tests: `tests/test_narration_display.py`, `tests/test_delegate_progress_text.py`,
 `web/tests/collapsed_activity.test.js`, `web/tests/log_category.test.js`.

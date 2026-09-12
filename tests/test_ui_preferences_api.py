@@ -30,6 +30,7 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
             "project_panel_width": 0,
             "project_seen_revision": {},
             "theme": "dark",
+            "show_reasoning": False,
         }
 
         create_project(tmp_path, "racer", name="Racer")
@@ -136,6 +137,21 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
             assert "theme" in rejected.json()["error"]
         assert client.get("/api/ui/preferences").json()["theme"] == "light"
         assert client.post("/api/ui/preferences", json={"theme": "dark"}).json()["theme"] == "dark"
+
+        # Reasoning display: a strict boolean, hidden by default. Numbers (1/0)
+        # are not booleans here, and the unhashable [] / {} must answer 400 like
+        # every other rejected value, never a 500.
+        assert client.get("/api/ui/preferences").json()["show_reasoning"] is False
+        shown = client.post("/api/ui/preferences", json={"show_reasoning": True})
+        assert shown.status_code == 200 and shown.json()["show_reasoning"] is True
+        assert client.get("/api/ui/preferences").json()["show_reasoning"] is True
+        for bad in (1, 0, "true", "false", "", None, [], {}, [True], {"show_reasoning": True}):
+            rejected = client.post("/api/ui/preferences", json={"show_reasoning": bad})
+            assert rejected.status_code == 400, bad
+            assert "show_reasoning" in rejected.json()["error"]
+        assert client.get("/api/ui/preferences").json()["show_reasoning"] is True
+        hidden = client.post("/api/ui/preferences", json={"show_reasoning": False})
+        assert hidden.status_code == 200 and hidden.json()["show_reasoning"] is False
 
         # Language is a two-value enum; anything else is a 400, like every other key.
         language = client.post("/api/ui/preferences", json={"language": "ru"})

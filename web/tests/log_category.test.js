@@ -9,7 +9,13 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { readFileSync } from 'node:fs';
 
-import { LOG_CATEGORIES, categorizeLogEvent, summarizeLogEvent } from '../modules/log_events.js';
+import {
+    LOG_CATEGORIES,
+    categorizeLogEvent,
+    isReasoningVisible,
+    setReasoningVisible,
+    summarizeLogEvent,
+} from '../modules/log_events.js';
 
 const logEventsSource = readFileSync(new URL('../modules/log_events.js', import.meta.url), 'utf8');
 
@@ -101,11 +107,54 @@ test('a delegated harness run is not labelled as a subagent in the fan-out row (
 });
 
 
+const REASONING_ROW = { type: 'send_message', is_progress: true, reasoning: true, task_id: 't', content: '💬 weighing options' };
+
 test('the reasoning chip exists and the row shows the reasoning text as its body', () => {
     assert.ok(LOG_CATEGORIES.reasoning);
-    const view = summarizeLogEvent({ type: 'send_message', is_progress: true, reasoning: true, task_id: 't', content: '💬 weighing options' });
+    setReasoningVisible(true);
+    const view = summarizeLogEvent(REASONING_ROW);
     assert.equal(view.headline, 'Thinking');
     assert.equal(view.body, 'weighing options');
+    assert.notEqual(view.visible, false);
+    setReasoningVisible(false);
+});
+
+test('a freshly loaded module hides reasoning on both surfaces until the preference turns it on', async () => {
+    // Read the real module default (this file's other tests move the flag), so
+    // a default flipped to "shown" fails here.
+    const fresh = await import('../modules/log_events.js?default-state');
+    assert.equal(fresh.isReasoningVisible(), false);
+    assert.equal(fresh.summarizeLogEvent(REASONING_ROW).visible, false);
+    assert.equal(fresh.summarizeChatLiveEvent(REASONING_ROW).visible, false);
+    fresh.setReasoningVisible(true);
+    assert.notEqual(fresh.summarizeLogEvent(REASONING_ROW).visible, false);
+    assert.equal(fresh.summarizeChatLiveEvent(REASONING_ROW).visible, true);
+});
+
+test('reasoning hidden: the stamped Logs row declares itself invisible', () => {
+    setReasoningVisible(false);
+    assert.equal(isReasoningVisible(), false);
+    const hidden = summarizeLogEvent(REASONING_ROW);
+    assert.equal(hidden.visible, false, 'the Logs renderer drops a view with visible === false');
+    // The projection keeps its facts so the chip/phase stay consistent once shown.
+    assert.equal(hidden.phase, 'thinking');
+    assert.equal(categorizeLogEvent(REASONING_ROW, hidden), 'reasoning');
+    // An unstamped progress row is untouched by the preference.
+    const plain = summarizeLogEvent({ type: 'send_message', is_progress: true, task_id: 't', content: '💬 editing the file' });
+    assert.notEqual(plain.visible, false);
+    setReasoningVisible(true);
+    assert.notEqual(summarizeLogEvent(REASONING_ROW).visible, false);
+    setReasoningVisible(false);
+    assert.equal(summarizeLogEvent(REASONING_ROW).visible, false);
+});
+
+test('the Logs filter chip is offered only while reasoning is displayed', () => {
+    // logs.js::renderFilters skips the chip on this exact condition, so the
+    // owner is never handed a filter that can never match.
+    const logsSource = readFileSync(new URL('../modules/logs.js', import.meta.url), 'utf8');
+    assert.match(logsSource, /key === 'reasoning' && !isReasoningVisible\(\)/);
+    // ... and the renderer really drops an invisible projection.
+    assert.match(logsSource, /summarizeLogEvent\(evt\)\.visible === false/);
 });
 
 test('a subagent reasoning frame keeps its subagent row: pills, tasks chip, no Thinking line', () => {

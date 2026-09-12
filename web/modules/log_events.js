@@ -12,6 +12,33 @@ const REVIEW_LIFECYCLE_ERROR_STATUSES = new Set([
 
 export { formatReviewProjection } from './review_presentation.js';
 
+// Display-only gate for the agent's reasoning rows (UI preference
+// `show_reasoning`, default off). The backend keeps emitting and storing the
+// stamped frames either way, so turning it on reveals them on replay too.
+// Both reasoning branches below read it and answer with the file's existing
+// "not visible" contract (`visible: false`) instead of a new sentinel.
+let reasoningVisible = false;
+
+export const REASONING_VISIBILITY_EVENT = 'ouro:reasoning-visibility';
+
+export function isReasoningVisible() {
+    return reasoningVisible;
+}
+
+/** Single writer of the flag. It notifies like theme.js/applyTheme does, so a
+    control bound before the preference arrives (and the Logs filter chips) can
+    resync; outside a DOM (node tests) it is a plain assignment. */
+export function setReasoningVisible(value) {
+    reasoningVisible = value === true;
+    if (typeof window !== 'undefined' && typeof window.dispatchEvent === 'function'
+        && typeof CustomEvent === 'function') {
+        window.dispatchEvent(new CustomEvent(REASONING_VISIBILITY_EVENT, {
+            detail: { visible: reasoningVisible },
+        }));
+    }
+    return reasoningVisible;
+}
+
 export const LOG_CATEGORIES = {
     tools: { label: 'Tools', color: 'var(--blue)' },
     llm: { label: 'LLM', color: 'var(--accent)' },
@@ -568,10 +595,13 @@ export function summarizeLogEvent(evt) {
 
     if (evt.is_progress || t === 'send_message') {
         if (evt.reasoning === true && !isSubagentEvent(evt)) {
-            return view('thinking', 'Thinking', {
+            const thinking = view('thinking', 'Thinking', {
                 body: shortText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240),
                 meta: taskMeta(),
             });
+            // Hidden by default: the durable row stays in the log, it just
+            // renders no entry until the owner turns the display on.
+            return reasoningVisible ? thinking : { ...thinking, visible: false };
         }
         if (isSubagentEvent(evt)) {
             const sid = subagentId(evt);
@@ -1090,7 +1120,9 @@ export function summarizeChatLiveEvent(evt) {
             body: progressText.preview,
             fullBody: progressText.full,
             activityPreview: '',
-            visible: true,
+            // Hidden by default; the frame keeps its body so turning the
+            // display on renders the same line, live and on history replay.
+            visible: reasoningVisible,
             dedupeKey: `reasoning:${evt.ts || ''}:${progressText.full}`,
         });
     }
