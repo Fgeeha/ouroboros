@@ -34,6 +34,14 @@ prevents.
 
 - Code identifiers, comments, docstrings, commit messages, and user-facing
   product UI strings are English.
+- Fork divergence (`fork/custom`), recorded so the rule above is not read as
+  broken: product source strings stay English, and a localization never edits a
+  call site. A language ships as `web/i18n/<lang>.js` — a data file keyed by the
+  English source string, applied to the rendered DOM at runtime — so the Russian
+  text in `web/i18n/ru.js` is translation data, not a product UI string.
+  Separately, commit messages on fork branches are Russian by the repository
+  owner's standing policy; a change proposed upstream must have its commit
+  messages re-worded to English before the pull request is opened.
 - Follow PEP 8: modules and variables use `snake_case`, classes use
   `PascalCase`, constants use `UPPER_SNAKE_CASE`. Name the observable
   responsibility and authority, not the implementation fashion; prefer a clear

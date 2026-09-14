@@ -225,12 +225,11 @@ BAND_PATHS = {
     "web/modules/api_types.js": "The shared browser contract module now includes issue 265 publication-preflight types alongside the target settings and subagent contracts.",
     "web/modules/harness_accounts.js": None,
     "web/modules/log_events.js": None,
-    "web/modules/onboarding_wizard.js": "Shrank INTO the band: the Claude Runtime onboarding card and its /api/claude-code/* polling were deleted with the retired transport (owner-approved Q4); no new content was added.",
     "web/modules/review_presentation.js": "Review Checkpoint read-side grouping, lifecycle/verdict separation, and keyed disclosure reconciliation remain one pure adapter below the 1500-line band cap.",
     "web/modules/reviewer_slots.js": "Owner-approved 5A editor: per-row Direct model / Configured subagent source picker with read-only derived disclosure replaces the legacy Claude-SDK advisory input in the same module that owns reviewer-row editing.",
     "web/modules/settings.js": None,
+    "web/modules/settings_ui.js": "Entered the 1001-1500 band on fork/custom: the Behavior panel gained the Appearance/Theme segmented control, the interface Language selector and the show-reasoning display toggle. Markup only, no new logic; extract the Behavior panel markup into its own module before proposing any of it upstream.",
     "web/modules/skills.js": "One installed-skill page controller owns independently settling primary/optional reads and current-generation menu, identity and badge updates; domain lifecycle, cards, hub truth and shared interactions remain separate owners.",
-    "web/tests/chat_instance_dom.test.js": "Entered the band from 1000 lines with the alias-free subagent cost pin (stage-2 fix wave): that regression reproduces only through the real createChatInstance card path, and this file owns the DOM harness that drives it; split when the next createChatInstance face lands.",
     "web/tests/harness_login_cards.test.js": "Login-card suite grew past 1000 lines with the name-the-account face cases (agy pickup, issue #232); split when the next face lands.",
     "web/tests/review_presentation.test.js": "Review Checkpoint lifecycle and verdict reconciliation remain covered by one focused presentation suite.",
 }
@@ -246,5 +245,5 @@ BYTE_BASELINE_DEBT = {
 
 BYTE_DEBT = {
     "tests/test_devtools_benchmarks.py": 327840,
-    "web/modules/chat.js": 205865,
+    "web/modules/chat.js": 205862,
 }

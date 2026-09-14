@@ -56,7 +56,7 @@ lint: ## Lint Python: deterministic F-rule gate, matches the CI quick-test step
 lint-web: ## Lint web modules: ESLint no-undef gate (needs `make install`)
 	cd web && npm run lint:undef
 
-check: lint lint-web test-web test ## Run every lint and test lane
+check: lint lint-web test test-web ## Run every lint and test lane
 
 health: ## Print codebase complexity metrics (requires ouroboros importable)
 	uv run --locked python -c "from ouroboros.review import collect_sections, compute_complexity_metrics; \

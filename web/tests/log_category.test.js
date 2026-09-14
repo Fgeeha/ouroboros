@@ -14,6 +14,7 @@ import {
     categorizeLogEvent,
     isReasoningVisible,
     setReasoningVisible,
+    summarizeChatLiveEvent,
     summarizeLogEvent,
 } from '../modules/log_events.js';
 
@@ -157,15 +158,18 @@ test('the Logs filter chip is offered only while reasoning is displayed', () => 
     assert.match(logsSource, /summarizeLogEvent\(evt\)\.visible === false/);
 });
 
-test('a subagent reasoning frame keeps its subagent row: pills, tasks chip, no Thinking line', () => {
+const SUBAGENT_REASONING_ROW = {
+    type: 'send_message', is_progress: true, reasoning: true,
+    delegation_role: 'subagent', subagent_task_id: 'child', subagent_role: 'critic',
+    parent_task_id: 'root', root_task_id: 'root', model: 'sonnet',
+    content: '💬 weighing options',
+};
+
+test('reasoning shown: a subagent reasoning frame keeps its subagent row: pills, tasks chip, no Thinking line', () => {
     // The chat projection lets the subagent branch win over the reasoning stamp; Logs
     // must agree, or the same frame loses its role/parent/root/model pills here.
-    const evt = {
-        type: 'send_message', is_progress: true, reasoning: true,
-        delegation_role: 'subagent', subagent_task_id: 'child', subagent_role: 'critic',
-        parent_task_id: 'root', root_task_id: 'root', model: 'sonnet',
-        content: '💬 weighing options',
-    };
+    setReasoningVisible(true);
+    const evt = SUBAGENT_REASONING_ROW;
     const view = summarizeLogEvent(evt);
     assert.notEqual(view.phase, 'thinking');
     assert.notEqual(view.headline, 'Thinking');
@@ -173,4 +177,19 @@ test('a subagent reasoning frame keeps its subagent row: pills, tasks chip, no T
         assert.ok(view.meta.includes(pill), `missing pill ${pill}`);
     }
     assert.equal(categorizeLogEvent(evt, view), 'tasks');
+    // Chat keeps projecting the child's progress as its own visible card line.
+    assert.equal(summarizeChatLiveEvent(evt).visible, true);
+    setReasoningVisible(false);
+});
+
+test('reasoning hidden: a subagent reasoning frame renders no row on either surface', () => {
+    // The subagent lineage stamps ride along with the reasoning stamp, so the
+    // subagent branch must not smuggle the child's reasoning past the preference.
+    setReasoningVisible(false);
+    assert.equal(summarizeLogEvent(SUBAGENT_REASONING_ROW).visible, false);
+    assert.equal(summarizeChatLiveEvent(SUBAGENT_REASONING_ROW).visible, false);
+    // A subagent frame WITHOUT the reasoning stamp is untouched by the preference.
+    const { reasoning, ...plainChild } = SUBAGENT_REASONING_ROW;
+    assert.notEqual(summarizeLogEvent(plainChild).visible, false);
+    assert.equal(summarizeChatLiveEvent(plainChild).visible, true);
 });

@@ -28,6 +28,13 @@ history, new event types in the supervisor taxonomy.
 - Every feature prefers new files and single hook points over inline rewrites
   of upstream code, to keep merge surface small.
 - Commit messages: Russian, Conventional Commits, no tool trailers.
+- Scope: `CONTRIBUTING.md` section 2 asks for one coherent purpose per pull
+  request, and `fork/custom` deliberately breaks that rule — it is an
+  integration branch that accumulates several features at once. The rule is
+  honoured one level down: each feature has its own single-purpose
+  `fork/<feature>` branch and its own commit. Anything proposed upstream must
+  be split back out into one focused pull request per feature, never offered
+  as this branch's combined diff.
 
 ## Work roles
 
@@ -90,6 +97,19 @@ Change:
 - Display toggle: the `show_reasoning` UI preference (Settings -> Behavior ->
   Appearance) defaults to `false`, so reasoning rows are hidden on both
   surfaces until the owner turns them on; emission and storage are unchanged.
+  A subagent's frame carries the reasoning stamp together with its lineage
+  stamps, so both projections intercept it while the display is off; with the
+  display on it keeps collapsing into the child's card line instead of becoming
+  a separate Thinking row.
+- Known limitation of the toggle: only the Logs surface repaints on the change
+  (`logs.js` replays its recent history through the new setting). Chat rows
+  already on screen keep their old rendering until a page reload. The only chat
+  repaint seam, `createChatInstance().refreshHistory({revision})`, refetches
+  only for a NEWER revision and advances `lastLoadedHistoryRevision`, which
+  feeds the Project unread-acknowledgement bookkeeping; driving it with a
+  synthetic revision to force a cosmetic repaint would corrupt that, and a real
+  fix means growing `chat.js`, which is already over the size ratchet. The
+  limitation is stated to the owner in the settings copy next to the checkbox.
 
 Tests: `tests/test_narration_display.py`, `tests/test_delegate_progress_text.py`,
 `web/tests/collapsed_activity.test.js`, `web/tests/log_category.test.js`.
@@ -126,7 +146,21 @@ Playwright screenshot pair per themed screen as PR evidence.
 
 ## 4. Russian language
 
-Translation overlay, no call-site edits:
+Translation overlay, no product-string call-site edits — the overlay translates
+rendered DOM, so not one English string literal in an upstream module was
+touched. Two upstream modules did gain a one-line import each, because both sit
+outside the overlay's reach:
+
+- `web/modules/chat_activity.js` imports `monthNames`: chat timestamps are
+  rendered inside the subtree the overlay excludes (chat bodies must never be
+  rewritten), so the month names have to be read from the dictionary as data.
+- `web/modules/onboarding_wizard.js` imports `setLanguage`/`storedLanguage`: the
+  wizard is its own document inside the overlay iframe and predates
+  `/api/ui/preferences`, so nothing else would apply the stored language there.
+
+Both replace a `window` global that the first draft used, and both carry data,
+not translated text.
+
 
 - `web/modules/i18n.js`: `applyLanguage(lang)` walks text nodes and
   `placeholder`/`title`/`aria-label` attributes, replaces exact English source
@@ -153,9 +187,22 @@ separate-context review recorded in
 
 Known gaps, deliberately left:
 
-- `web/modules/chat.js` is 13 bytes over the shrink-only size ratchet. The lane
-  blocks only in official-repository CI, which does not run on this fork. Pay it
-  back before proposing any of this upstream.
+- Size ratchet, as of 2026-09-12: green. `validate_size_ratchet` reports zero
+  errors and `validate_size_ratchet_transition_against_base` against `eec71d53`
+  reports zero errors. The 13 bytes `chat.js` had spent on the `reasoning`
+  history key were paid back inside the same statement (the key list was
+  reflowed onto two lines), so the file is 205862 bytes — three below the base.
+  `ouroboros/size_ratchet_manifest.py` was regenerated with
+  `scripts/regenerate_size_ratchet.py`, which recorded the band rationale for
+  `web/modules/settings_ui.js` (1007 lines; it entered the 1001-1500 band with
+  the Appearance, Language and reasoning controls).
+- Still owed, though no gate reports it: `chat.js` remains above the
+  200 000-byte module cap as it was upstream, and two files crossed 1500 lines
+  and so silently left the band manifest — `web/modules/onboarding_wizard.js`
+  (1501) and `web/tests/chat_instance_dom.test.js` (1555, +66 from this branch).
+  Nothing between 1501 and the 1600-line hard cap is tracked, so the test file
+  has 45 lines of headroom before it turns the lane red; split it before adding
+  another DOM case.
 - The Russian dictionary covers chrome (nav, tabs, buttons, headings, settings
   labels) but not most long body copy, notably the Accounts panel and the
   onboarding provider paragraphs. Untranslated strings stay English by design.

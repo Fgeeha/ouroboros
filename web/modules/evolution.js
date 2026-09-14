@@ -308,8 +308,8 @@ export function initEvolution({ ws, state, mount }) {
                     y: {
                         type: 'linear',
                         position: 'left',
-                        title: { display: true, text: 'Lines of Code', color: '#60a5fa', font: { size: 11 } },
-                        ticks: { color: '#60a5fa', font: { size: 10 } },
+                        title: { display: true, text: 'Lines of Code', color: cssToken('--blue', '#60a5fa'), font: { size: 11 } },
+                        ticks: { color: cssToken('--blue', '#60a5fa'), font: { size: 10 } },
                         grid: { color: cssToken('--divider', '#1e293b') },
                     },
                     y1: {

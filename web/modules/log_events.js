@@ -594,13 +594,18 @@ export function summarizeLogEvent(evt) {
     const taskMeta = (...items) => [evt.task_id ? `task=${evt.task_id}` : '', ...items];
 
     if (evt.is_progress || t === 'send_message') {
-        if (evt.reasoning === true && !isSubagentEvent(evt)) {
+        if (evt.reasoning === true && (!isSubagentEvent(evt) || !reasoningVisible)) {
             const thinking = view('thinking', 'Thinking', {
                 body: shortText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240),
                 meta: taskMeta(),
             });
             // Hidden by default: the durable row stays in the log, it just
-            // renders no entry until the owner turns the display on.
+            // renders no entry until the owner turns the display on. A subagent's
+            // reasoning frame carries the lineage stamps as well, so while the
+            // display is off it is intercepted here too — otherwise the subagent
+            // branch below would render it as an ordinary row and escape the
+            // preference. With the display on it keeps falling through to that
+            // branch, where the child's work reads as one lineage-labelled row.
             return reasoningVisible ? thinking : { ...thinking, visible: false };
         }
         if (isSubagentEvent(evt)) {
@@ -1033,6 +1038,31 @@ export function summarizeChatLiveEvent(evt) {
         });
     }
 
+    if ((evt.is_progress || t === 'send_message') && evt.reasoning === true
+        && (!reasoningVisible || !isSubagentEvent(evt))) {
+        // The agent's own reasoning: a collapsed "Thinking" timeline line (body =
+        // preview, fullBody = the whole text for the existing Expand toggle). It is
+        // neither human narration nor promoted, so the card headline, phase and the
+        // collapsed activity summary keep showing the last action.
+        // A subagent's frame carries the reasoning stamp AND the lineage stamps, so
+        // this branch must run before the subagent branch below: while the display
+        // is off it claims the frame and renders nothing, and with the display on it
+        // hands the frame over, keeping the child's progress collapsed into its card
+        // line instead of a second Thinking row. `summarizeLogEvent` splits on the
+        // same condition.
+        return chatView({
+            phase: 'thinking',
+            headline: 'Thinking',
+            body: progressText.preview,
+            fullBody: progressText.full,
+            activityPreview: '',
+            // Hidden by default; the frame keeps its body so turning the
+            // display on renders the same line, live and on history replay.
+            visible: reasoningVisible,
+            dedupeKey: `reasoning:${evt.ts || ''}:${progressText.full}`,
+        });
+    }
+
     if ((evt.is_progress || t === 'send_message') && isSubagentEvent(evt)) {
         const sid = subagentId(evt);
         const rawEvent = String(evt.subagent_event || '').toLowerCase();
@@ -1106,24 +1136,6 @@ export function summarizeChatLiveEvent(evt) {
             chip: executorChip(evt),
             model: evt.model,
             dedupeKey: `subagent:${sid}:${label}:${status}:${progressText.full || resultText.full || errorText.full || ''}`,
-        });
-    }
-
-    if ((evt.is_progress || t === 'send_message') && evt.reasoning === true) {
-        // The agent's own reasoning: a collapsed "Thinking" timeline line (body =
-        // preview, fullBody = the whole text for the existing Expand toggle). It is
-        // neither human narration nor promoted, so the card headline, phase and the
-        // collapsed activity summary keep showing the last action.
-        return chatView({
-            phase: 'thinking',
-            headline: 'Thinking',
-            body: progressText.preview,
-            fullBody: progressText.full,
-            activityPreview: '',
-            // Hidden by default; the frame keeps its body so turning the
-            // display on renders the same line, live and on history replay.
-            visible: reasoningVisible,
-            dedupeKey: `reasoning:${evt.ts || ''}:${progressText.full}`,
         });
     }
 

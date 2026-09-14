@@ -398,7 +398,7 @@ export function renderSettingsPage() {
                                 <button type="button" class="ui-segment settings-effort-btn" data-theme-value="light">Light</button>
                             </div>
                         </div>
-                        <div class="settings-section-copy">The agent's reasoning is recorded either way; this only controls whether it is displayed.</div>
+                        <div class="settings-section-copy">The agent's reasoning is recorded either way; this only controls whether it is displayed. Logs repaint at once; chat rows already on screen change after a page reload.</div>
                         <label class="local-toggle ui-field ui-field-inline" title="Display only: reasoning stays in the durable log, so turning this on also reveals it in past conversations.">
                             <input type="checkbox" id="ui-show-reasoning" class="ui-checkbox" name="ui-show-reasoning">
                             Show the agent's reasoning in chat and logs
