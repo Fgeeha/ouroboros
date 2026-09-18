@@ -156,6 +156,32 @@ export function createHistoryResyncScheduler({
  * Equal timestamps preserve arrival order; timestamp-free nodes append.
  * (Moved verbatim from chat.js — that module sits at its byte ceiling.)
  */
+// A focused text control keeps its own caret; Chromium mirrors it into the
+// document Selection, so clearing and rebuilding document ranges around a
+// timeline move collapses that caret (a typed wait-picker draft lost its
+// selection on every reconnect). While such a control is focused, the document
+// ranges are that mirror: leave them alone and restore the control's caret.
+function textControlCaret(active) {
+    const tag = String(active?.tagName || active?.nodeName || '').toUpperCase();
+    if (tag !== 'INPUT' && tag !== 'TEXTAREA') return null;
+    try {
+        const { selectionStart, selectionEnd, selectionDirection } = active;
+        if (selectionStart == null || selectionEnd == null) return null;
+        return { selectionStart, selectionEnd, selectionDirection: selectionDirection || 'none' };
+    } catch {
+        return null; // input types without a caret (number, email, ...) throw on read
+    }
+}
+
+function restoreTextControlCaret(active, caret) {
+    if (!caret || typeof active?.setSelectionRange !== 'function') return;
+    try {
+        active.setSelectionRange(caret.selectionStart, caret.selectionEnd, caret.selectionDirection);
+    } catch {
+        // The control changed type or lost its value between capture and restore.
+    }
+}
+
 export function insertTimelineNode(messages, node, typing = null) {
     const rawNodeTs = node?.dataset?.ts;
     const nodeTs = rawNodeTs == null || rawNodeTs === '' ? NaN : Number(rawNodeTs);
@@ -176,7 +202,8 @@ export function insertTimelineNode(messages, node, typing = null) {
     if (node.parentNode === messages && node.nextElementSibling === target) return { before };
     const doc = messages.ownerDocument;
     const active = doc?.activeElement;
-    const selection = doc?.getSelection?.();
+    const caret = textControlCaret(active);
+    const selection = caret ? null : doc?.getSelection?.();
     const ranges = Array.from({ length: selection?.rangeCount || 0 }, (_, index) => {
         const range = selection.getRangeAt(index);
         return [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
@@ -184,6 +211,7 @@ export function insertTimelineNode(messages, node, typing = null) {
     if (target) messages.insertBefore(node, target);
     else messages.appendChild(node);
     if (active && node.contains?.(active) && doc.activeElement !== active) active.focus({ preventScroll: true });
+    if (caret) restoreTextControlCaret(active, caret);
     if (ranges.length && ranges.every(([start, , end]) => start.isConnected && end.isConnected)) {
         selection.removeAllRanges();
         for (const [start, startOffset, end, endOffset] of ranges) {
@@ -293,7 +321,8 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
             const prevTop = el.scrollTop;
             const byKey = new Map(Array.from(el.children).map((node) => [node.dataset.liveLineKey, node]));
             const active = el.ownerDocument?.activeElement;
-            const selection = el.ownerDocument?.getSelection?.();
+            const caret = textControlCaret(active);
+            const selection = caret ? null : el.ownerDocument?.getSelection?.();
             const ranges = Array.from({ length: selection?.rangeCount || 0 }, (_, index) => {
                 const range = selection.getRangeAt(index);
                 return [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
@@ -321,6 +350,7 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
             }
             if (moved) {
                 if (el.contains(active) && el.ownerDocument.activeElement !== active) active.focus({ preventScroll: true });
+                if (caret) restoreTextControlCaret(active, caret);
                 const intact = ranges.filter(([start, , end]) => start.isConnected && end.isConnected);
                 if (intact.length) {
                     selection.removeAllRanges();
@@ -387,7 +417,7 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 && !node.classList.contains('chat-load-older')
         );
         const messagesRect = messagesDiv.getBoundingClientRect();
-        const topNode = nodes.find((item) => {
+        let topNode = nodes.find((item) => {
             const rect = item.getBoundingClientRect();
             return rect.bottom > messagesRect.top && rect.top < messagesRect.bottom;
         }) || null;
@@ -436,6 +466,18 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 .filter(({ rect }) => rect.top <= messagesRect.top && rect.bottom > messagesRect.top)
                 .sort((a, b) => b.depth - a.depth);
             node = belowTop[0]?.node || crossing[0]?.node || topNode;
+            if (node === topNode && topNode.getBoundingClientRect().top < messagesRect.top) {
+                // The card's visible part holds nothing anchorable (a wait row, a
+                // block without work): keep the reader's view of what FOLLOWS the
+                // card. Pinning the card's own top, far above the viewport, would let
+                // the card's shrink or growth move the content the reader is on.
+                const following = nodes.find((item) => {
+                    if (item === topNode) return false;
+                    const rect = item.getBoundingClientRect();
+                    return rect.top >= messagesRect.top && rect.top < messagesRect.bottom;
+                });
+                if (following) { topNode = following; node = following; }
+            }
         }
 
         const cardChain = [];
@@ -551,7 +593,13 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
             fullBody: summary.fullBody || summary.body || it.fullBody || '',
             fullRef: summary.fullRef || it.fullRef || '',
             truncated: summary.truncated || it.truncated || false,
+            // A call's failure frame replaces its receipt start: the row is
+            // content again once it reports an error.
+            receipt: Boolean(summary.receipt),
             ts: ts || it.ts,
+            // Replay compares the child's current status with older pages.
+            // Its source time advances with the live status, not with narration.
+            ...(syntheticKey.startsWith('subagent-lifecycle:') && rawTs ? { sourceTs: rawTs } : {}),
         };
         if (Object.entries(patch).some(([key, value]) => it[key] !== value)) {
             Object.assign(it, patch);
@@ -591,6 +639,7 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
             fullBody: summary.fullBody || summary.body || '',
             fullRef: summary.fullRef || '',
             truncated: summary.truncated || false,
+            receipt: Boolean(summary.receipt),
             ts: ts || '',
             sourceTs: rawTs,
             count: 1,
@@ -600,4 +649,18 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
         timelineUpdate = 'append';
     }
     return { timelineUpdate, patchIndex };
+}
+
+/** The block's folded tool evidence row. Live frames and the host's metrics
+ * reach it through the same keyed in-place upsert, so neither route can mint a
+ * second row, and the row keeps the position and timestamp of its first frame.
+ */
+export function upsertToolFoldRow(record, view, ts, rawTs) {
+    const syntheticKey = `tools|${record.groupId}`;
+    // Stationary: the row keeps the place and the time of the first frame it
+    // counted, so a burst of calls never walks it down the timeline.
+    const first = !record.items.some((item) => item.dedupeKey === syntheticKey);
+    return updateLiveTimelineItem(record, view, {
+        ts: first ? ts : '', rawTs, syntheticKey, headline: view.headline, inPlaceByKey: true,
+    });
 }

@@ -170,6 +170,16 @@ def _intent_outcome_fields(intent: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(intent, dict):
         return {}
     fields = {"cancel_observation": dict(intent["observation"])} if isinstance(intent.get("observation"), dict) else {}
+    # Preserve the recorded cause after the active intent is removed. Actor
+    # evidence is independent of requested_by, which also drives parent decisions.
+    origin = {key: str(intent[key]) for key in (
+        "source", "requested_by", "scope", "reason", "requested_at", "request_id",
+    ) if intent.get(key)}
+    request_origin = (fields.get("cancel_observation") or {}).get("request_origin")
+    if isinstance(request_origin, dict):
+        origin["request_origin"] = dict(request_origin)
+    if origin:
+        fields["cancel_origin"] = origin
     if not intent.get("requested_by"):
         return fields
     fields["parent_decision"] = "cancelled"
@@ -254,9 +264,9 @@ def _register_owed_terminal_delivery(
                 settled_status=stored_status,
             )
         elif stored_status == STATUS_COMPLETED:
-            # GR6-5a: the disclosure rides the completed text too, and the
-            # owed registration and the publish half must build the SAME text
-            # (one delivery id) — both pass the identical list.
+            # The disclosure rides the completed answer's custody row, and the
+            # owed registration and the publish half must build the SAME rows
+            # (one delivery id each) — both pass the identical list.
             event = build_completed_result_event(
                 pathlib.Path(q.DRIVE_ROOT), task, task_id, stored,
                 unreconciled_runs=list(unreconciled_runs or []),

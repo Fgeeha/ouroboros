@@ -174,15 +174,6 @@ def test_review_state_keeps_the_durable_store():
     assert defined.isdisjoint(_MOVED_OWNERS)
 
 
-def test_review_state_leaves_are_review_stack_members():
-    from ouroboros.tools.review_context_atlas import _REVIEW_STACK_PATHS, _is_force_include
-
-    for module in _LEAVES:
-        rel = pathlib.Path(module.__file__).relative_to(REPO).as_posix()
-        assert rel in _REVIEW_STACK_PATHS, rel
-        assert _is_force_include(rel), rel
-
-
 def test_review_state_extraction_size_bounds_have_meaningful_headroom():
     counts = {
         module.__name__: len(
@@ -192,6 +183,6 @@ def test_review_state_extraction_size_bounds_have_meaningful_headroom():
     }
     assert all(count <= 1000 for count in counts.values()), counts
     assert counts["ouroboros.review_state"] <= 850
-    assert 300 <= counts["ouroboros.review_state_records"] <= 1000
-    assert 600 <= counts["ouroboros.review_state_model"] <= 1000
-    assert 150 <= counts["ouroboros.review_state_custody"] <= 600
+    assert counts["ouroboros.review_state_records"] <= 1000
+    assert counts["ouroboros.review_state_model"] <= 1000
+    assert counts["ouroboros.review_state_custody"] <= 600

@@ -13,6 +13,7 @@ import json
 import os
 import threading
 import time
+from typing import Any
 
 from ouroboros.server_process import DATA_DIR, log
 from ouroboros.utils import utc_now_iso
@@ -65,15 +66,140 @@ def _run_cancel_delivery_ref_sweep(drive_root: pathlib.Path) -> None:
             retry_pending_child_ref_promotions(drive_root)
         except Exception:
             log.debug("Pending child-ref promotion retry failed", exc_info=True)
+        try:
+            _reconcile_abandoned_usage(drive_root)
+        except Exception:
+            log.warning("Abandoned usage reconciliation failed", exc_info=True)
     finally:
         _CANCEL_INTENT_SWEEP_LOCK.release()
 
 
-def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconcile: list) -> None:
+def _reconcile_abandoned_usage(drive_root: pathlib.Path) -> None:
+    """Close unowned terminal-task attempts; price and remote custody stay separate."""
+    from ouroboros import usage_accounting as usage
+    from ouroboros.claudexor_daemon import read_owned_gateway
+    from ouroboros.gateways.claudexor import ClaudexorUnavailable
+    from ouroboros.llm_claudexor import recover_model_attempt
+    from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+    from ouroboros.task_results import load_task_result
+    from ouroboros.task_status import SETTLED_STATUSES
+    from ouroboros.transport_custody import ProviderNotDispatched, release_pre_dispatch_attempt
+    from ouroboros.usage_ledger import is_abandoned_settlement
+    from supervisor.events_task_done import _refresh_terminal_task_cost
+    from supervisor.queue import task_has_live_ownership
+
+    root = pathlib.Path(drive_root)
+    with usage._locked(root):
+        rows = list(usage._final_rows(usage._read_records_locked_cached(root)).values())
+    tasks, refresh = {}, set()
+    gateway, gateway_unavailable = None, False
+
+    def eligible_task(task_id):
+        if not task_id:
+            return False
+        if task_id not in tasks:
+            try:
+                task = load_task_result(root, task_id, strict=True) or {}
+                checkpoint = task.get("root_phase_checkpoint") or {}
+                tasks[task_id] = task if (
+                    task.get("status") in SETTLED_STATUSES
+                    and not task_has_live_ownership(task_id)
+                    and not post_task_synthesis_is_open(checkpoint.get("post_task_synthesis"))
+                ) else None
+            except Exception:
+                tasks[task_id] = None  # Unreadable ownership permits neither duty.
+        return tasks[task_id] is not None
+
+    def borrowed_gateway():
+        nonlocal gateway, gateway_unavailable
+        if gateway_unavailable:
+            raise ClaudexorUnavailable("daemon_unreachable", "Usage recovery deferred until the next maintenance pass")
+        if gateway is None:
+            try:
+                gateway = read_owned_gateway()
+            except Exception:
+                gateway_unavailable = True
+                raise
+        return gateway
+
+    try:
+        for row in rows:
+            kind = row.get("kind", "attempt")
+            if kind not in {"attempt", "usage_baseline_group"} or any(row.get(key) for key in usage.REVIEW_ATTRIBUTION_KEYS):
+                continue
+            task_id = str(row.get("task_id") or "")
+            # Settled/compacted attribution still owes projection after a failed write.
+            refresh.update(owner for owner in (task_id, str(row.get("root_task_id") or "")) if eligible_task(owner))
+            if not eligible_task(task_id):
+                continue
+            remote = row.get("provider") == "claudexor"
+            abandoned = is_abandoned_settlement(row)
+            if (kind != "attempt"
+                or (row.get("state") not in {"reserved", "dispatched", "unresolved"}
+                    and not (remote and abandoned))):
+                continue
+            reservation = usage.AttemptReservation(
+                str(row["attempt_id"]), root, str(row.get("model") or ""),
+                str(row.get("provider") or ""), row.get("reservation_upper_bound_usd"),
+                str(row.get("processing_preference") or ""), str(row.get("submitted_processing_mode") or ""),
+                row.get("processing_basis"),
+            )
+            try:
+                recovered = None
+                if remote and row.get("state") != "reserved":
+                    recovered = recover_model_attempt(root, row, gateway_factory=borrowed_gateway)
+                    if recovered is None:
+                        continue
+                disposition, reported, cost, final = recovered or ("abandoned", {}, None, False)
+                if disposition == "settled":
+                    usage.settle_attempt(reservation, reported, cost_usd=cost, cost_final=final)
+                elif disposition == "released":
+                    if not release_pre_dispatch_attempt(reservation, ProviderNotDispatched("recovered model operation never started")):
+                        continue
+                elif disposition == "abandoned":
+                    if abandoned:
+                        continue
+                    state = usage.terminalize_abandoned_attempt(reservation, reason="owner_task_terminal", expected_seq=row.get("seq"))
+                    if state not in {"settled", "released"}:
+                        continue
+                else:
+                    continue
+            except ClaudexorUnavailable as exc:
+                gateway_unavailable = gateway_unavailable or exc.code == "daemon_unreachable"
+                log.debug("Model usage custody deferred for %s: %s", row["attempt_id"], exc.code)
+            except Exception:
+                log.warning("Usage reconciliation deferred for %s", row["attempt_id"], exc_info=True)
+    finally:
+        if gateway is not None:
+            try:
+                gateway.close()
+            except Exception:
+                log.debug("Usage recovery gateway close failed", exc_info=True)
+    if not refresh:
+        return
+    try:
+        usage.ensure_legacy_imported(root)
+        # One post-transition indexed view avoids per-owner scans; failure retries next pass.
+        breakdown = usage.usage_breakdown(root)
+    except Exception:
+        log.warning("Reconciled usage projection unavailable", exc_info=True)
+        return
+    for task_id in sorted(refresh):
+        try:
+            _refresh_terminal_task_cost(root, task_id, breakdown=breakdown)
+        except Exception:
+            log.warning("Reconciled task cost refresh failed for %s", task_id, exc_info=True)
+
+
+def _periodic_supervisor_maintenance(
+    last_custody_reap: list, last_review_reconcile: list, *, on_orphans_healed: Any = None,
+) -> None:
     """Throttled periodic upkeep extracted from the supervisor loop: cancel-intent
     watchdog and pending child-ref promotion replay (every 20s), custody reap of
     orphaned task-scoped processes (every 600s) + review-job zombie reconcile
-    (every 300s). Each cadence gates itself via its own last-run marker."""
+    (every 300s). Each cadence gates itself via its own last-run marker.
+    ``on_orphans_healed(count)`` fires when the zombie reconcile terminalized
+    orphaned RUNNING task rows (the alarm clock wakes early for them)."""
     if time.time() - _LAST_CANCEL_INTENT_SWEEP[0] > 20 and _CANCEL_INTENT_SWEEP_LOCK.acquire(blocking=False):
         _LAST_CANCEL_INTENT_SWEEP[0] = time.time()
         try:
@@ -121,7 +247,7 @@ def _periodic_supervisor_maintenance(last_custody_reap: list, last_review_reconc
             log.debug("Periodic custody reap failed", exc_info=True)
     if time.time() - last_review_reconcile[0] > 300:
         last_review_reconcile[0] = time.time()
-        _periodic_zombie_reconcile()
+        _periodic_zombie_reconcile(on_orphans_healed=on_orphans_healed)
 
 
 def _retry_latched_daemon_start() -> None:
@@ -431,22 +557,6 @@ def _startup_prune_sweeps(*, preserve_task_sources: bool = False) -> None:
             })
     except Exception:
         log.debug("Agent media prune failed", exc_info=True)
-    try:
-        # CPL4-C23: acknowledged observations older than GC retention fold into
-        # an archive segment; unacknowledged rows are never pruned. Runs before
-        # Background Consciousness starts (it is created later in startup).
-        from ouroboros.consciousness import compact_acknowledged_observations
-
-        fold_report = compact_acknowledged_observations(DATA_DIR)
-        if fold_report.get("folded") or fold_report.get("skipped"):
-            append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
-                "ts": utc_now_iso(),
-                "type": "consciousness_observation_fold",
-                "report": fold_report,
-            })
-    except Exception:
-        log.debug("Observation fold failed", exc_info=True)
-
     if not preserve_task_sources:
         try:
             from ouroboros.observability import prune_observability_blobs
@@ -627,7 +737,7 @@ def _prune_delegated_snapshots() -> None:
         log.debug("Delegated execution snapshot prune failed", exc_info=True)
 
 
-def _periodic_zombie_reconcile() -> None:
+def _periodic_zombie_reconcile(*, on_orphans_healed: Any = None) -> None:
     """Heal zombie 'running' records on a supervisor cadence.
 
     A worker that died mid-review (crash / SIGKILL / manual stop) leaves
@@ -646,8 +756,10 @@ def _periodic_zombie_reconcile() -> None:
         from ouroboros.task_status import reconcile_orphaned_running_tasks
 
         expired_quizzes: list = []
-        reconcile_orphaned_running_tasks(DATA_DIR, expired_quizzes=expired_quizzes)
+        healed = reconcile_orphaned_running_tasks(DATA_DIR, expired_quizzes=expired_quizzes)
         _publish_expired_quiz_frames(expired_quizzes)
+        if healed and callable(on_orphans_healed):
+            on_orphans_healed(int(healed))
     except Exception:
         log.debug("Periodic orphaned running-task reconcile failed", exc_info=True)
     try:
@@ -766,8 +878,9 @@ def _recover_terminal_task_files(drive_root: pathlib.Path, protected: set[str]) 
         terminal_task_files_ready,
     )
     from ouroboros.observability import _has_pending_ref_promotion
-    from ouroboros.task_results import load_task_result, validate_task_id
-    from ouroboros.task_status import SETTLED_STATUSES
+    from ouroboros.cancel_intents import cancel_pending
+    from ouroboros.task_results import load_task_result, validate_task_id, write_task_result
+    from ouroboros.task_status import SETTLED_STATUSES, effective_task_result
 
     root = pathlib.Path(drive_root)
     report = {"recovered": [], "unresolved": [], "protected": sorted(protected), "errors": []}
@@ -802,6 +915,22 @@ def _recover_terminal_task_files(drive_root: pathlib.Path, protected: set[str]) 
                 if not ready:
                     source = load_task_result(child_root, task_id, strict=True) or {}
                     if source.get("status") not in SETTLED_STATUSES:
+                        if (current.get("status") == "scheduled" and source.get("status") == "running"
+                                and source.get("started_at") and not source.get("_is_direct_chat")
+                                and not cancel_pending(root, task_id, strict=True)):
+                            # Older split roots omitted their canonical start.
+                            # Rebind only when the existing queue/worker/direct
+                            # ownership rules already prove this child orphaned.
+                            observed = effective_task_result(root, {
+                                **current, "child_drive_root": str(child_root),
+                            }, materialize_artifacts=False)
+                            if observed.get("reason_code") == "orphaned_running_after_worker_restart":
+                                write_task_result(
+                                    root, task_id, "running", child_drive_root=str(child_root),
+                                    budget_drive_root=str(root), started_at=source["started_at"],
+                                    ts=source.get("ts") or source["started_at"],
+                                )
+                                report.setdefault("rebound", []).append(task_id)
                         if (pending or current.get("status") == "completed") and (
                             suffix or current.get("headless_child_drive_root") or current.get("child_drive_root")
                         ):

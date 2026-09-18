@@ -51,7 +51,6 @@ from ouroboros.context_health import (
 from ouroboros.context_health import (
     safe_read as safe_read,
 )
-from ouroboros.context_layout import architecture_context_section
 from ouroboros.contracts.task_contract import normalize_bool
 from ouroboros.memory import Memory, render_scratchpad_markdown
 from ouroboros.update_letter import official_update_projection  # contract: never raises
@@ -361,6 +360,14 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         runtime_mode = get_runtime_mode()
     except Exception:
         runtime_mode = os.environ.get("OUROBOROS_RUNTIME_MODE", "advanced")
+    if not bool(task.get("_is_direct_chat")):
+        # A root consciousness started carries a per-task mode cap (Act/Observe = light) that
+        # the dispatcher enforces: its Runtime block names the mode it actually runs in. The
+        # wake itself is a direct turn and keeps Main's block byte-identical (В31=B).
+        from ouroboros.consciousness_authority import effective_runtime_mode, is_consciousness_origin
+
+        if is_consciousness_origin(task.get("metadata")):
+            runtime_mode = effective_runtime_mode(str(runtime_mode or ""), task.get("metadata"))
     runtime_data = {
         "utc_now": utc_now_iso(),
         "repo_dir": str(env.repo_dir),
@@ -686,22 +693,6 @@ def build_knowledge_sections(
                 sections.append(f"## Project workpad ({pid})\n\n{workpad}")
         except Exception:
             log.debug("project journal/workpad context injection failed", exc_info=True)
-    return sections
-
-
-def build_governance_sections(env: Any, *, warn_large: bool = False, warn_label: str = "context") -> List[str]:
-    sections: List[str] = []
-    bible_text = safe_read(env.repo_path("BIBLE.md"))
-    if bible_text:
-        if warn_large and len(bible_text) > _LARGE_CONTEXT_SECTION_CHARS:
-            log.warning("%s: BIBLE.md is large (%d chars)", warn_label, len(bible_text))
-        sections.append("## BIBLE.md\n\n" + bible_text)
-    # ARCHITECTURE: full in max, navigation map in low (context_layout SSOT).
-    arch_section = architecture_context_section(env, context_mode=get_context_mode())
-    if arch_section:
-        sections.append(arch_section)
-    else:
-        log.warning("%s: docs/ARCHITECTURE.md not found or empty", warn_label)
     return sections
 
 

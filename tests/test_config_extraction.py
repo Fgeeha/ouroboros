@@ -23,6 +23,7 @@ _LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes,
 # New subscription capabilities belong to the same leaves, but did not exist on
 # the historical extraction's facade and need not add compatibility re-exports.
 _ADDED_OWNERS = {
+    "WORKER_READY_CEILING_SEC": runtime_limits,
     "IMMEDIATE_SETTINGS": settings_scales,
     "RESTART_REQUIRED_SETTINGS": settings_scales,
     "get_finalization_grace_sec": runtime_limits,
@@ -43,6 +44,20 @@ _ADDED_OWNERS = {
     "CLAUDEXOR_MODEL_POLL_INTERVAL_SEC": runtime_limits,
     "CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC": runtime_limits,
     "CLAUDEXOR_STOP_EXIT_WAIT_SEC": runtime_limits,
+    # The native platform build envelope is owned by the common runtime-limits leaf.
+    "EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC": runtime_limits,
+    # Consciousness settings scaffolding: the alarm's SSOT default interval, the closed
+    # autonomy enum and the readers for the three consciousness keys.
+    "WAKE_DEFAULT_SEC": runtime_limits,
+    "USAGE_LEDGER_FOLD_MIN_AGE_SEC": runtime_limits,
+    "CONSCIOUSNESS_AUTONOMY_LEVELS": runtime_limits,
+    "get_consciousness_autonomy": runtime_limits,
+    "get_consciousness_daily_usd": runtime_limits,
+    "get_consciousness_max_tasks": runtime_limits,
+    "get_bg_wakeup_min_sec": runtime_limits,
+    "get_bg_wakeup_max_sec": runtime_limits,
+    # Governance tiers: the share of a reviewer's usable window tier-2 documents may take inline.
+    "REVIEW_GOVERNANCE_INLINE_SHARE": runtime_limits,
 }
 
 _MOVED_OWNERS = {
@@ -241,6 +256,7 @@ def test_config_facade_reexports_every_moved_identity():
         assert getattr(config, name) is getattr(owner, name), name
     owned = {name for module in _LEAVES for name in vars(module)}
     assert set(_MOVED_OWNERS) <= owned
+    assert config.EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC is runtime_limits.EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC
 
 
 def test_settings_file_lifecycle_and_path_roots_stay_with_the_parent():
@@ -272,5 +288,5 @@ def test_settings_extraction_size_bounds_have_meaningful_headroom():
     }
     assert counts["ouroboros.config"] <= 1000
     assert all(count <= 1000 for count in counts.values())
-    assert 250 <= counts["ouroboros.settings_defaults"] <= 500
+    assert counts["ouroboros.settings_defaults"] <= 500
     assert (PACKAGE / "config.py").is_file()

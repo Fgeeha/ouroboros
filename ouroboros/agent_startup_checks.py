@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import pathlib
@@ -728,7 +729,6 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
 def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
     from ouroboros.context_budget import (
         EVENTS_LOG_WARN_BYTES,
-        BG_OBSERVATIONS_WARN_BYTES,
         PROGRESS_LOG_WARN_BYTES,
         SCHEDULED_TASKS_WARN_BYTES,
         SKILL_REVIEW_ROOT_TASKS_WARN_BYTES,
@@ -744,14 +744,6 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
         "supervisor rotation tick (rotate_chat_log_if_needed pattern)."
     )
     return (
-        (
-            "state/consciousness_observations.jsonl",
-            BG_OBSERVATIONS_WARN_BYTES,
-            "Background consciousness replays this append-only inbox on wake; "
-            "acknowledged rows past GC retention fold into an archive segment "
-            "at startup (unacknowledged rows never) — growth past this size "
-            "means a large unacknowledged backlog or a gap-blocked fold.",
-        ),
         (
             "state/usage_attempts.jsonl",
             USAGE_LEDGER_WARN_BYTES,
@@ -797,7 +789,7 @@ def hot_store_growth_notes(env: Any) -> list:
 
     Reused live by context.py::build_health_invariants (the
     check_stray_server_processes pattern). Deliberately NOT TTL-cached
-    (contrast context._STRAY_PROBE_CACHE): nine os.stat calls plus two shallow
+    (contrast context._STRAY_PROBE_CACHE): eight os.stat calls plus two shallow
     iterdir passes per task turn are orders of magnitude cheaper than the pgrep
     probe that cache exists for, and a stale reading would delay the signal."""
     from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
@@ -856,7 +848,9 @@ def hot_store_growth_notes(env: Any) -> list:
             "WARNING: HOT STORE GROWTH — the events chain (logs/events.jsonl + "
             f"archive/events_*.jsonl) totals {events_chain_size / 1_000_000:.1f} MB "
             f"(threshold {EVENTS_ARCHIVE_SCAN_WARN_BYTES // 1_000_000} MB). Custody "
-            "replay scans this chain on ownership questions. Investigate chain "
+            "replay scans this chain on ownership questions. Legacy segments retain "
+            "inline delegated request bodies; new start rows reference the observability "
+            "store, without shrinking existing history. Investigate chain "
             "indexing/compaction; archives are durable history and are never deleted."
         )
     from ouroboros.context_budget import RETAINED_EXECUTION_DRIVES_WARN_COUNT
@@ -1025,6 +1019,23 @@ def _record_pending_owner_report(campaign: Dict[str, Any], tx: Dict[str, Any]) -
     }
 
 
+def _native_restart_error(git_sha: str) -> str:
+    # The outer launcher verified the installed native inputs before spawning
+    # this core. Workers inherit that generation's fact, not a persisted PASS.
+    # No APK/signature subprocess runs under the campaign's state lock.
+    if not os.environ.get("OUROBOROS_EXTERNAL_HOST_UPDATE"):
+        return ""
+    try:
+        native = json.loads(os.environ.get("OUROBOROS_EXTERNAL_HOST_RESULT", "{}"))
+        if (native.get("status") == "verified" and native.get("source_commit") == git_sha
+                and all(isinstance(native.get(key), str) and len(native[key]) == 64
+                        for key in ("input_sha256", "apk_sha256", "signer_sha256"))):
+            return ""
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return "native_update_failed_or_unverified"
+
+
 def verify_restart(env: Any, git_sha: str) -> None:
     """Best-effort restart verification."""
     from supervisor import state as supervisor_state
@@ -1111,7 +1122,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
             or claim is not None
         )
         if not strict:
-            return ""
+            return _native_restart_error(git_sha)
         if require_claim and not isinstance(claim, dict):
             return "restart_claim_missing" if claim is None else "restart_claim_invalid"
         expected = {
@@ -1126,7 +1137,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
             return "restart_claim_mismatch"
         from supervisor.evolution_lifecycle import evolution_commit_receipt_error
 
-        return evolution_commit_receipt_error(tx, **expected)
+        return evolution_commit_receipt_error(tx, **expected) or _native_restart_error(git_sha)
 
     def _boot_reconcile_generation() -> str:
         from supervisor.evolution_lifecycle import current_evolution_boot_generation
@@ -1314,7 +1325,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
         except Exception:
             log.debug("Failed to reconcile dangling evolution transaction", exc_info=True)
 
-    mark_error: Dict[str, str] = {}
+    mark_error: Dict[str, str] = {"reason": _native_restart_error(git_sha)}
 
     def _mark_campaign_restart_verified(
         expected_sha: str, observed_sha: str, ok: bool, claim: Any = None,
@@ -1338,7 +1349,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
                     mark_error["durable"] = "1"
                     return False
                 mark_error["durable"] = "1"
-                return bool(ok)
+                return bool(ok and not mark_error.get("reason"))
             live_state = read_json_dict(env.drive_path("state") / "state.json") or {}
             if bool(live_state.get("evolution_owner_stopped")):
                 mark_error["reason"] = "owner_stopped"

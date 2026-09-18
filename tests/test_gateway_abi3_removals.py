@@ -1,7 +1,7 @@
 """ABI 7.0 (ABI-3): per-alias removal pins for the five gateway compat aliases.
 
-One test class per alias (F11 axes: declaration / producer / stored tolerance /
-migration surface), per docs/v7next/ABI3_GATEWAY_ALIAS_INVENTORY.md. These pins
+One test class per alias (declaration / producer / stored tolerance /
+migration surface), per docs/architecture/11-frozen-contracts-v1.md. These pins
 are the REMOVAL side; the read-tolerance side lives in
 tests/test_cost_projection.py and the endpoint behavior in
 tests/test_ui_preferences_api.py / tests/test_gateway_history.py.
@@ -186,7 +186,8 @@ class TestAliasProducerFanOutSweep:
         ("ouroboros/usage_accounting.py", "cost_usd", "record_unmetered_external_dispatch"): ("ledger unmetered dispatch row", 1),
         ("ouroboros/usage_accounting.py", "cost_usd", "record_subscription_session"): ("ledger subscription session row", 1),
         ("ouroboros/usage_accounting.py", "cost_usd", "terminalize_abandoned_attempt"): ("ledger settlement transition", 1),
-        ("ouroboros/usage_accounting.py", "cost_usd", "settle_attempt"): ("ledger settlement transition", 1),
+        ("ouroboros/usage_accounting.py", "cost_usd", "_settlement_fields"): ("ledger settlement fields shared by received and abandoned attempts", 1),
+        ("ouroboros/server_maintenance.py", "cost_usd", "_reconcile_abandoned_usage"): ("existing ledger settlement call for the original recovered model operation", 1),
         ("ouroboros/usage_accounting.py", "cost_usd", "_terminalize_failed_attempt"): ("ledger settlement transitions + settle call for a rejected stream whose usage frame was read", 3),
         ("ouroboros/usage_accounting.py", "cost_usd", "execute_physical_attempt"): ("ledger settlement call", 1),
         ("ouroboros/usage_accounting.py", "cost_usd", "execute_physical_attempt_async"): ("ledger settlement call", 1),
@@ -198,7 +199,6 @@ class TestAliasProducerFanOutSweep:
         ("ouroboros/loop_llm_call.py", "cost_usd", "call_llm_with_retry"): ("llm_round usage event rows", 2),
         ("ouroboros/post_task_synthesis.py", "cost_usd", "_run_chat_consolidation"): ("chat_block_consolidation event row", 1),
         ("ouroboros/post_task_synthesis.py", "cost_usd", "_run_reflection"): ("reflection generation gate args", 1),
-        ("ouroboros/consciousness.py", "cost_usd", "_think_scoped"): ("consciousness thought receipt row", 2),
         ("supervisor/events_evolution_done.py", "cost_usd", "_handle_evolution_task_done"): ("internal lifecycle/checkpoint call kwargs + supervisor.jsonl observability row", 3),
         # review/evidence receipt schemas (internal review plane)
         ("ouroboros/triad_review.py", "cost_usd", "to_dict"): ("triad review receipt serialization", 1),
@@ -216,8 +216,7 @@ class TestAliasProducerFanOutSweep:
         ("ouroboros/tools/preflight_review_run.py", "cost_usd", "_run_claude_advisory"): ("single advisory receipt cost reused by event projections", 1),
         ("ouroboros/tools/review_admission.py", "cost_usd", "triad_not_dispatched_records"): ("review admission receipt", 1),
         ("ouroboros/tools/review_helpers.py", "cost_usd", "build_scope_actor_record"): ("review usage receipt", 1),
-        ("ouroboros/tools/scope_review.py", "cost_usd", "_scope_oversize_result"): ("scope review receipt", 1),
-        ("ouroboros/tools/scope_review.py", "cost_usd", "run_scope_review"): ("scope review receipt", 6),
+        ("ouroboros/tools/scope_review.py", "cost_usd", "run_scope_review"): ("scope review receipt", 4),
         ("ouroboros/tools/parallel_review.py", "cost_usd", "_run_scope"): ("scope review receipt", 1),
         # evolution checkpoint plane (durable state files, never a gateway payload;
         # the campaign HISTORY row producer left this list in fix-round-3)

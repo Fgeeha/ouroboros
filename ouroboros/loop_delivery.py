@@ -77,6 +77,9 @@ _DELIVERY_HOLD_CONTROLS = frozenset({
     _SKILL_ACTION_HOLD_CONTROL,
     _CHILD_ABSORPTION_HOLD_CONTROL,
 })
+# Header of the host's own rendered control block; identifies the transcript's
+# control history the way ``acceptance_observation`` marks the observation rows.
+_DELIVERY_CONTROL_MARKER = "[DELIVERY_FINALIZATION_CONTROL]"
 
 
 def _swarm_handoff_attempt(ctx: Any) -> Dict[str, Any]:
@@ -596,26 +599,35 @@ def _merge_finalization_trace(
     return llm_trace
 
 
-def _delivery_control_prompt(candidate: DeliveryCandidate, *, keep_allowed: bool) -> str:
+def _delivery_control_prompt(candidate: DeliveryCandidate, *, keep_allowed: bool,
+                             pending_review_choice: bool = False) -> str:
     keep_line = (
         "keep is allowed because no answer-invalidating evidence changed."
         if keep_allowed
         else "keep is NOT allowed because owner/tool/child/verification evidence changed."
     )
     return (
-        "[DELIVERY_FINALIZATION_CONTROL]\n"
+        f"{_DELIVERY_CONTROL_MARKER}\n"
         f"A complete answer candidate (revision {candidate.revision}, sha256 "
         f"{candidate.content_sha256[:12]}) is retained by the loop; do not replace it with a "
         f"service notice. {keep_line}\n"
         "You may continue using tools whenever more work is needed. This instruction applies "
-        "only to your final response with no tool calls. When ready to finalize, return "
-        "exactly one JSON object and no other text:\n"
-        '{"delivery_control":"keep"}\n'
+        "only to your final response with no tool calls. "
+        + ("Return the complete revised user-facing answer as ordinary prose, not a status "
+           "note. Prose never requests pending_review:finish. "
+           "Optionally, return exactly one JSON object and no other text:\n"
+           if candidate.finalization_control.startswith("acceptance_feedback")
+           else "When ready to finalize, return exactly one JSON object and no other text:\n")
+        + '{"delivery_control":"keep"}\n'
         "or\n"
         '{"delivery_control":"replace","full_answer":"<the complete user-facing answer>"}'
         "\nEither form may include acceptance_subject with the latest observed "
         "owner_source_sha256, optional complete effective_criteria and material_tool_indices. "
         "Keep can retain answer text while explicitly changing its review subject."
+        + ('\nA paid acceptance panel on an earlier revision is still running. Either form may add '
+           '"pending_review":"wait" (the default: hold this answer until its verdict arrives) or '
+           '"pending_review":"finish" (deliver now; the verdict reaches you as advice when it settles).'
+           if pending_review_choice else "")
     )
 
 
@@ -645,29 +657,51 @@ def _arm_delivery_control(
     llm_trace: Dict[str, Any],
     *,
     control: str = "awaiting_control",
+    skip_if_unchanged: bool = False,
 ) -> None:
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if not isinstance(candidate, _loop().DeliveryCandidate):
         return
+    if control == "acceptance_feedback" and (
+        candidate.finalization_control in _DELIVERY_HOLD_CONTROLS
+        or candidate.finalization_control == "owner_revision_required"
+        or _delivery_replace_required(candidate)
+        or (getattr(tools._ctx, "_delivery_control_required", False)
+            and not candidate.finalization_control.startswith("acceptance_feedback"))
+    ):
+        return  # A pending panel never relaxes another gate's existing control.
     evidence_revision, evidence_fingerprint = _loop()._delivery_evidence_state(tools, ctx, llm_trace)
     candidate.finalization_control = control
-    candidate.repair_attempted = False
+    # The acceptance wake re-offers an EXISTING candidate's contract: its one
+    # malformed-control repair stays spent. Every other arm starts a new episode.
+    if not skip_if_unchanged:
+        candidate.repair_attempted = False
     tools._ctx._delivery_control_required = True
-    _loop()._append_or_merge_user_message(
-        ctx.messages,
-        _delivery_control_prompt(
-            candidate,
-            keep_allowed=_delivery_keep_allowed(
-                candidate, evidence_revision, evidence_fingerprint,
-            ),
-        ),
+    from ouroboros.acceptance_settlement import acceptance_choice_offered
+
+    control_prompt = _delivery_control_prompt(
+        candidate,
+        keep_allowed=_delivery_keep_allowed(candidate, evidence_revision, evidence_fingerprint),
+        pending_review_choice=bool(getattr(tools._ctx, "_task_acceptance_pending", "")
+                                   and acceptance_choice_offered()),
     )
+    # ``skip_if_unchanged`` is the repeated re-offer (every acceptance wake shows
+    # the keep contract): an unchanged candidate renders identical bytes, so the
+    # transcript's control history is not repeated, the way
+    # ``prepare_acceptance_observation`` skips an unchanged observation. Every
+    # other caller arms because something changed and always appends. ``slot``
+    # keeps an already-sent tail row byte-frozen rather than rewritten (#906).
+    latest = next((row for row in reversed(ctx.messages)
+                   if _DELIVERY_CONTROL_MARKER in str(row.get("content") or "")), None)
+    if not (skip_if_unchanged and latest is not None
+            and control_prompt in str(latest.get("content") or "")):
+        _loop()._append_or_merge_user_message(ctx.messages, control_prompt, slot=tools._ctx)
     candidate.control_episode_seen = True
     from ouroboros.loop_acceptance import capture_acceptance_observation, acceptance_observation_prompt
 
     observed = capture_acceptance_observation(tools._ctx, llm_trace, getattr(ctx, "incoming_messages", None))
     if prompt := acceptance_observation_prompt(tools._ctx, observed):
-        _loop()._append_or_merge_user_message(ctx.messages, prompt)
+        _loop()._append_or_merge_user_message(ctx.messages, prompt, slot=tools._ctx)
     _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
 
 
@@ -766,7 +800,9 @@ def _classify_parsed_delivery_control(
     if not isinstance(parsed, dict) or "delivery_control" not in parsed:
         return "none", "", exact_error
     selected = str(parsed.get("delivery_control") or "")
-    keys = set(parsed) - {"acceptance_subject"}
+    if "pending_review" in parsed and str(parsed.get("pending_review") or "").strip().lower() not in {"wait", "finish"}:
+        return "invalid", "", 'pending_review must be "wait" or "finish"'
+    keys = set(parsed) - {"acceptance_subject", "pending_review"}
     if selected == "keep" and keys == {"delivery_control"}:
         return "keep", "", ""
     if selected == "replace" and keys == {"delivery_control", "full_answer"}:
@@ -873,6 +909,15 @@ def _resolve_delivery_control(
     control_kind, replacement, error = _classify_parsed_delivery_control(
         parsed, duplicate_protocol_key, embedded_protocol,
     )
+    from ouroboros.observability import strip_protocol_fence
+
+    if (candidate.finalization_control.startswith("acceptance_feedback")
+            and raw and control_kind == "none"
+            and not strip_protocol_fence(raw).startswith("{")
+            and not _loop()._task_acceptance_owner_generation_changed(tools._ctx)):
+        tools._ctx._acceptance_pending_review_choice = "wait"
+        tools._ctx._delivery_control_required = False
+        return "fresh", _loop()._extract_plain_text_from_content(content)
     # ANY parsed object carrying the protocol key is control intent, whatever
     # the verb or placement — a mangled protocol attempt is never prose (raw
     # JSON leaked to chat); validity judged below.
@@ -922,6 +967,11 @@ def _resolve_delivery_control(
         applied, subject_error = apply_delivery_subject_decision(tools, ctx, llm_trace, parsed["acceptance_subject"])
         if not applied:
             control_kind, error = "invalid", subject_error
+    if control_kind in {"keep", "replace"} and isinstance(parsed, dict):
+        # Recorded on every control answer (the classifier already refused any
+        # other value), so an answer without the key always means "wait" rather
+        # than inheriting an earlier round's choice.
+        tools._ctx._acceptance_pending_review_choice = str(parsed.get("pending_review") or "wait").strip().lower()
     evidence_revision, evidence_fingerprint = _loop()._delivery_evidence_state(tools, ctx, llm_trace)
     valid = control_kind == "replace"
     if control_kind == "keep":
@@ -955,7 +1005,8 @@ def _resolve_delivery_control(
         candidate.repair_attempted = True
         candidate.finalization_control = (
             f"{candidate.finalization_control}_repair_requested"
-            if _loop()._delivery_replace_required(candidate)
+            if (_loop()._delivery_replace_required(candidate)
+                or candidate.finalization_control.startswith("acceptance_feedback"))
             else "repair_requested"
         )
         if raw:
@@ -1012,20 +1063,20 @@ def _no_tool_final_answer(
     incoming_messages: queue.Queue,
     owner_msg_seen: set,
     emit_progress: Callable[[str], None],
-    *, review_only: bool = False,
+    *, review_only: bool = False, explicit_candidate: bool = False,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
     """Run the no-tool finalization gates; ``None`` requests another model round."""
     messages = limit_ctx.messages
-    control_state, controlled_content = _loop()._resolve_delivery_control(
+    control_state, controlled_content = ("fresh", content) if explicit_candidate else _loop()._resolve_delivery_control(
         content, tools, limit_ctx, llm_trace,
     )
     if control_state == "retry":
         return None
     content = controlled_content
     _loop()._project_child_result_dispositions(limit_ctx, llm_trace)
-    if control_state == "fresh" and str(content or "").strip():
+    if control_state == "fresh" and (explicit_candidate or str(content or "").strip()):
         candidate = _loop()._replace_delivery_candidate(
-            tools, limit_ctx, llm_trace, str(content), control="candidate",
+            tools, limit_ctx, llm_trace, str(content or ""), control="candidate",
         )
         content = candidate.full_text
     else:
@@ -1280,6 +1331,12 @@ def _no_tool_final_answer(
                     admission_agent._accepting_owner_messages = True
             _loop()._arm_delivery_control(tools, limit_ctx, llm_trace, control="owner_revision_required")
             return None
+    if isinstance(getattr(tools._ctx, "_presence_completion", None), dict):
+        # Only this successful common exit accepts the requested outcome. Holds,
+        # owner controls and budget exits must not inherit an earlier silent/send.
+        tools._ctx._presence_completion_accepted = True
+        limit_ctx.accumulated_usage["presence_completion_outcome"] = tools._ctx._presence_completion["outcome"]
+        limit_ctx.accumulated_usage["terminal_origin"] = _loop().TERMINAL_ORIGIN_MODEL_FINAL
     return _loop()._handle_text_response(
         str(content or ""),
         llm_trace,

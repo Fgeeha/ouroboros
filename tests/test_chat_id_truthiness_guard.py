@@ -60,11 +60,6 @@ ALLOWED = {
         "chat_id means 'the event carried no chat' and the owner chat is the "
         "fallback address, not the hidden partition.",
     ),
-    ("supervisor/worker_promotion.py", "if chat_id:"): (
-        1,
-        "Same promote lane: the loud-fail notice needs a reader, and the hidden "
-        "partition has none.",
-    ),
     ("supervisor/worker_chat_lane.py", "if not chat_id:"): (
         1,
         "Auto-resume gate, where owner_chat_id 0 means 'no owner chat "
@@ -75,20 +70,6 @@ ALLOWED = {
         "lineage_chat_id() again: 0 means the run was never homed, and pushing "
         "an unhomed answer into a partition with no reader would add rows to the "
         "chat log a benchmark parses for its final answer.",
-    ),
-    ("supervisor/steering.py", "if notify and chat_id:"): (
-        1,
-        "A steer REFUSAL is a live notice to the person who asked, and a steer "
-        "event only ever arrives from a real chat. Same rule as the scheduled "
-        "toast: a live notice needs a reader, and the hidden partition has none.",
-    ),
-    ("supervisor/steering.py", "if not client_message_id and chat_id:"): (
-        1,
-        "Same refusal path, same rule.",
-    ),
-    ("supervisor/steering.py", "if chat_id:"): (
-        1,
-        "Same refusal path, same rule.",
     ),
 }
 

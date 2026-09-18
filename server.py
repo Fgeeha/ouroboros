@@ -65,6 +65,7 @@ from ouroboros.server_routing_context import (  # noqa: F401
     _scoped_task_metadata,
     _task_belongs_to_chat,
     _task_result_ground_truth,
+    main_lane_routing_metadata,
 )
 from ouroboros.server_owner_routing import (  # noqa: F401
     _owner_evolution_stop,
@@ -98,6 +99,7 @@ from ouroboros.server_maintenance import (  # noqa: F401
 from ouroboros.server_restart import (  # noqa: F401
     _live_running_task_ids,
     _managed_update_pending_kwargs,
+    _perform_owner_restart,
     _safe_restart_serialized,
     _shutdown_supervisor_event_bus,
     _shutdown_task_cleanup_args,
@@ -211,31 +213,45 @@ _supervisor_thread: Optional[threading.Thread] = None
 _consciousness: Any = None
 
 
+def _clock_of(iso_value: Any) -> str:
+    """``HH:MM`` in the server's local time for an ISO instant (``?`` when absent)."""
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    parsed = parse_deadline_ts(str(iso_value or ""))
+    return parsed.astimezone().strftime("%H:%M") if parsed is not None else "?"
+
+
 def _describe_bg_consciousness_state(requested_enabled: bool) -> dict:
+    """Project the alarm clock's snapshot into one honest status + detail line."""
     snapshot = _consciousness.status_snapshot() if _consciousness else {}
-    idle_reason = snapshot.get("last_idle_reason")
+    outcome = str(snapshot.get("last_wake_outcome") or "")
+    next_at = _clock_of(snapshot.get("next_wake_at"))
     if not requested_enabled:
         status, detail = "disabled", "Background consciousness is off."
-    elif not snapshot.get("running"):
-        status, detail = "stopped", "Enabled in state, but the background thread is not running."
-    elif snapshot.get("paused"):
-        status, detail = "paused", "Paused while another foreground task is active."
-    elif any(row.get("state") == "waiting" for row in snapshot.get("model_waits", {}).values()):
-        status, detail = "model_wait", "Model access wait; no worker slot held."
-    elif idle_reason == "thinking":
-        status, detail = "running", "Background consciousness is thinking now."
-    elif idle_reason == "budget_blocked":
-        status, detail = "budget_blocked", "Background consciousness hit its budget allocation and is waiting."
+    elif not snapshot:
+        status, detail = "stopped", "Enabled in state, but the alarm clock was not constructed (supervisor init failed)."
+    elif snapshot.get("live_wake_task_id"):
+        status, detail = "thinking", f"Wake-up {snapshot['live_wake_task_id']} is running as a Main turn."
+    elif outcome == "skipped:waiting_for_first_conversation":
+        status, detail = "waiting_for_first_conversation", "No owner chat is bound yet; the first conversation binds it."
+    elif outcome == "skipped:allowance_exhausted":
+        spent, daily = snapshot.get("spent_24h_usd"), snapshot.get("daily_usd")
+        status = "allowance_exhausted"
+        at_least = "at least " if int(snapshot.get("unknown_unmetered") or 0) > 0 else ""
+        degraded = "; ledger integrity degraded" if snapshot.get("integrity_degraded") else ""
+        detail = (f"Daily allowance spent ({at_least}${float(spent or 0):.2f} of ${float(daily or 0):.2f} in the last 24 h{degraded}); "
+                  f"next check at {_clock_of(snapshot.get('allowance_resets_at')) if snapshot.get('allowance_resets_at') else next_at}.")
+    elif outcome == "skipped:allowance_unknown":
+        status, detail = "allowance_unknown", f"The usage ledger could not be read ({snapshot.get('last_error') or 'unknown error'}); retry at {next_at}."
+    elif outcome.startswith("rejected:"):
+        status, detail = "wake_rejected", f"The last wake-up was refused ({outcome.split(':', 1)[1]}); next attempt at {next_at}."
+    elif outcome == "failed":
+        status, detail = "wake_failed", f"The last wake-up failed ({snapshot.get('last_error') or 'runner error'}); next attempt at {next_at}, backing off."
     else:
-        status, detail = "running", "Background consciousness is idle between wakeups."
-        wakeup = int(snapshot.get("next_wakeup_sec") or 0)
-        if wakeup > 0:
-            detail += f" Next wakeup in {wakeup}s."
-    if idle_reason == "error_backoff" and snapshot.get("last_error"):
-        status = "error_backoff"
-        detail = f"Waiting to retry after an internal error: {snapshot['last_error']}"
-
-    return {"enabled": requested_enabled, "status": status, "detail": detail, **snapshot}
+        status, detail = "sleeping", f"Sleeping until {next_at}."
+        if snapshot.get("pending_reason"):
+            detail += f" Early wake pending: {snapshot['pending_reason']}."
+    return {**snapshot, "enabled": requested_enabled, "status": status, "detail": detail}
 
 
 def _start_supervisor_if_needed(settings: dict) -> bool:
@@ -372,43 +388,10 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
         elif lowered.startswith("/restart"):
             reply("♻️ Restarting.", "")
-            ok, restart_msg = _safe_restart_serialized(
-                ctx.safe_restart,
-                reason="owner_restart",
-                unsynced_policy="rescue_and_reset",
-            )
+            ok, restart_msg = _perform_owner_restart(ctx, reply)
             if not ok:
                 reply(f"⚠️ Restart cancelled: {restart_msg}", "failed")
                 continue
-            state_dir = DATA_DIR / "state"
-            owner_restart_flag = state_dir / "owner_restart_no_resume.flag"
-            stable_skip_flag = state_dir / "panic_stop.flag"
-            try:
-                state_dir.mkdir(parents=True, exist_ok=True)
-                owner_restart_flag.write_text("owner_restart", encoding="utf-8")
-                # Pair owner flag with panic_stop for stable-build auto-resume compatibility.
-                stable_skip_flag.write_text("owner_restart_no_resume", encoding="utf-8")
-            except Exception:
-                owner_restart_flag.unlink(missing_ok=True)
-                stable_skip_flag.unlink(missing_ok=True)
-                log.warning("Failed to write owner restart no-resume flag", exc_info=True)
-                reply("⚠️ Restart cancelled: could not write restart state.", "failed")
-                continue
-            # Everything reversible is behind us (checkout landed, no-resume
-            # intent durable): from here the restart always follows, and every
-            # unconfirmed stop is a critical diagnostic, never a deferral.
-            stopped_task_ids = _stop_owned_work(ctx)
-            try:
-                # Say only what happened: with nothing owned the stop sentence
-                # named a task that was never running.
-                reply(
-                    "Stopping active task. New settings apply to the next message."
-                    if stopped_task_ids else "New settings apply to the next message.",
-                    "",
-                )
-            except Exception:
-                log.warning("Failed to send owner restart stop notice; continuing restart", exc_info=True)
-            _request_restart_exit(owner=True)
         elif lowered == "/review" or lowered.startswith("/review "):
             # Target the requesting chat so the ack and results return to the
             # external transport owner, not the default web owner_chat_id.
@@ -461,6 +444,9 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             # autonomous re-arm until the owner /evolve starts again. Set True on stop,
             # cleared (False) on turn_on — the only owner-authorized clear.
             st2["evolution_owner_stopped"] = (not turn_on)
+            # An owner's stop carries no agent source (absent = owner-placed, sticky against
+            # toggle_evolution); an owner's start drops a stale one with the flag.
+            st2.pop("evolution_stop_source", None)
             # Owner-initiated evolution must not inherit a stale post-task one-shot
             # autostop, which would disable the owner's campaign after one cycle.
             st2["post_task_autostop"] = False
@@ -482,8 +468,8 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                 ctx.save_state(_bg_s)
                 reply(f"🧠 {result}")
             else:
-                bg_status = "running" if ctx.consciousness.is_running else "stopped"
-                reply(f"🧠 Background consciousness: {bg_status}")
+                described = _describe_bg_consciousness_state(bool(ctx.load_state().get("bg_consciousness_enabled")))
+                reply(f"🧠 Background consciousness: {described['status']} — {described['detail']}")
         elif lowered.startswith("/status"):
             from supervisor.state import status_text
 
@@ -510,17 +496,13 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
 
 
 def _runtime_branch_defaults() -> tuple[str, str]:
-    branch_dev = "ouroboros"
-    branch_stable = "ouroboros-stable"
-    if not _LAUNCHER_MANAGED:
-        return branch_dev, branch_stable
-    try:
-        from supervisor import git_ops as git_ops_module
-        if hasattr(git_ops_module, "managed_branch_defaults"):
+    if _LAUNCHER_MANAGED:
+        try:
+            from supervisor import git_ops as git_ops_module
             return git_ops_module.managed_branch_defaults(REPO_DIR)
-    except Exception:
-        pass
-    return branch_dev, branch_stable
+        except Exception:
+            pass
+    return "ouroboros", "ouroboros-stable"
 
 
 def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
@@ -631,6 +613,7 @@ def _run_supervisor(settings: dict) -> None:
             persist_queue_snapshot, restore_pending_from_snapshot,
             cancel_task_by_id, queue_deep_self_review_task, sort_pending,
         )
+        from supervisor.direct_roots import publish_direct_roots
         from supervisor.workers import (
             init as workers_init, get_event_q, WORKERS, PENDING, RUNNING,
             spawn_workers, kill_workers, assign_tasks, ensure_workers_healthy,
@@ -707,9 +690,8 @@ def _run_supervisor(settings: dict) -> None:
                 return None
 
         _consciousness = BackgroundConsciousness(
-            drive_root=DATA_DIR, repo_dir=REPO_DIR,
-            event_queue=get_event_q(), owner_chat_id_fn=_get_owner_chat_id,
-        )
+            drive_root=DATA_DIR, repo_dir=REPO_DIR, owner_chat_id_fn=_get_owner_chat_id,
+            routing_metadata_fn=lambda cid: main_lane_routing_metadata(_event_ctx, cid))  # _event_ctx is built below
 
         _bg_st = load_state()
         if _bg_st.get("bg_consciousness_enabled"):
@@ -819,7 +801,10 @@ def _run_supervisor(settings: dict) -> None:
                 check_scheduled_tasks()
             except Exception:
                 log.warning("Scheduled task check failed", exc_info=True)
-            _periodic_supervisor_maintenance(_last_custody_reap, _last_review_job_reconcile)
+            _periodic_supervisor_maintenance(
+                _last_custody_reap, _last_review_job_reconcile,
+                on_orphans_healed=lambda count: _consciousness and _consciousness.notify(f"orphans_healed:{count}"),
+            )
             # Loop-tick restart drain (no sleep, events keep flowing): while
             # draining a deferred restart, skip starting new work the restart
             # deadline would immediately chop (evolution / pending project tasks).
@@ -836,6 +821,12 @@ def _run_supervisor(settings: dict) -> None:
             if _restart_requested.is_set():
                 break  # restart just triggered (drain done) — exit without assigning new work (bridge intake already ran early this iteration)
             persist_queue_snapshot(reason="main_loop")
+            publish_direct_roots(_event_ctx.DRIVE_ROOT)
+            if _consciousness is not None:
+                try:
+                    _consciousness.tick(time.time())
+                except Exception:
+                    log.warning("Consciousness alarm tick failed", exc_info=True)
 
             crash_count = 0
             time.sleep(0.5)
@@ -1122,6 +1113,36 @@ def _execute_panic_stop(consciousness, kill_workers_fn) -> None:
         bound_port=_actual_bound_port(),
     )
 
+def _startup_owner_command(command: str):
+    """Bind only process verbs while the normal command consumer is absent."""
+    if command not in {"/panic", "/restart"}:
+        return None
+
+    def execute():
+        # Onboarding may finish after HTTP admission. A newly live consumer
+        # owns the ordinary command rather than two concurrent control paths.
+        from supervisor.message_bus import try_get_bridge
+        bridge = try_get_bridge()
+        if _supervisor_thread and _supervisor_thread.is_alive() and bridge is not None:
+            bridge.ui_send(command, broadcast=False)
+            return
+        from supervisor import state, workers, git_ops
+        from types import SimpleNamespace
+        state.init(DATA_DIR)
+        if command == "/panic":
+            _execute_panic_stop(_consciousness, workers.kill_workers)
+            return
+        branch_dev, branch_stable = _runtime_branch_defaults()
+        git_ops.init(REPO_DIR, DATA_DIR, "", branch_dev, branch_stable)
+        context = SimpleNamespace(safe_restart=git_ops.safe_restart,
+                                  RUNNING=workers.RUNNING, kill_workers=workers.kill_workers)
+        ok, message = _perform_owner_restart(context)
+        if not ok:
+            log.error("Startup owner restart cancelled: %s", message)
+
+    return execute
+
+
 APP_START = time.time()
 
 
@@ -1266,7 +1287,6 @@ async def lifespan(app):
         init_global_event_bus().set_loop(_event_loop)
         init_global_supervisor(lifespan_drive_root)
         host_service_app = create_host_service_app(lifespan_drive_root)
-        host_service_app.state.get_background_model_wait = getattr(app.state, "get_background_model_wait", None)
         host_port = host_service_port()
         # Bind before starting the asyncio task: uvicorn's bind-error SystemExit
         # otherwise escapes run_forever and kills the main server. Keep that
@@ -1472,7 +1492,7 @@ app.app.state.app_start = APP_START  # type: ignore[attr-defined]
 app.app.state.supervisor_ready_event = _supervisor_ready  # type: ignore[attr-defined]
 app.app.state.get_supervisor_error = lambda: _supervisor_error  # type: ignore[attr-defined]
 app.app.state.describe_bg_consciousness_state = _describe_bg_consciousness_state  # type: ignore[attr-defined]
-app.app.state.get_background_model_wait = lambda: _consciousness.live_model_wait() if _consciousness else None
+app.app.state.startup_owner_command = _startup_owner_command
 app.app.state.request_restart = _request_restart_exit  # type: ignore[attr-defined]
 app.app.state.runtime_branch_defaults = _runtime_branch_defaults  # type: ignore[attr-defined]
 app.app.state.bind_host = _BIND_HOST  # type: ignore[attr-defined]

@@ -17,14 +17,18 @@ from typing import Any, Mapping, Optional
 from ouroboros.configured_subagents import (
     ConfiguredSubagent,
     ConfiguredSubagentsResolution,
+    SESSION_ACCESS_PROFILES,
+    SESSION_ACCESS_LOWERING,
     SOURCE_INVALID,
     SOURCE_LEGACY_MIGRATED,
     SOURCE_UNDECIDED,
     configured_subagents_fingerprint,
     resolve_configured_subagents,
 )
+from ouroboros.delegate_shared import delegate_payload
 from ouroboros.route_spec import route_spec_dict
 from ouroboros.settings_integrity import SETTINGS_ENV_LOCK, TaskSettingsSnapshot, runtime_setting
+from ouroboros.tools.tool_result import ToolResult, _replace_tool_result
 from ouroboros.utils import utc_now_iso
 
 
@@ -98,6 +102,7 @@ def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any
             "requested_effort": row.effort or "(not explicitly set)",
         }
         if session:
+            projected["mutating_access"] = row.access
             projected["requested_target"] = row.route.target_id
             if row.route.credential_profile_id:
                 projected["account_policy"] = "explicit profile pin"
@@ -279,6 +284,7 @@ def select_subagent_snapshot(
     legacy_executor: Any = None,
     legacy_model_lane_supplied: bool = False,
     legacy_executor_supplied: bool = False,
+    access: Optional[str] = None,
 ) -> tuple[dict[str, Any], bool]:
     """Resolve one row and return ``(immutable_snapshot, used_legacy_seam)``.
 
@@ -323,7 +329,7 @@ def select_subagent_snapshot(
         row = matches[0]
         used_legacy = True
 
-    return {
+    return validate_subagent_snapshot({
         "schema": 1,
         "selected_subagent_id": row.subagent_id,
         "config_fingerprint": configured_subagents_fingerprint(config),
@@ -335,27 +341,37 @@ def select_subagent_snapshot(
         "effort": row.effort,
         "processing_preference": resolve_processing_preference(
             override=row.processing_preference or None, settings=dict(settings)),
+        **({"access": row.access} if row.route.is_session else {}),
         "selected_at": utc_now_iso(),
-    }, used_legacy
+    }, access=access), used_legacy
 
 
-def validate_subagent_snapshot(raw: Any) -> dict[str, Any]:
-    """Validate the small durable execution subset without consulting settings."""
+def validate_subagent_snapshot(raw: Any, *, access: Optional[str] = None) -> dict[str, Any]:
+    """Validate captured intent and optionally lower it, never consult live settings."""
 
     snapshot = dict(raw) if isinstance(raw, dict) else {}
     route = snapshot.get("route") if isinstance(snapshot.get("route"), dict) else {}
     kind = str(route.get("kind") or "")
     target = str(route.get("target_id") or "").strip()
+    captured_access = snapshot.get("access", "workspace_write")
     if (
         int(snapshot.get("schema") or 0) != 1
         or not str(snapshot.get("selected_subagent_id") or "").strip()
         or not str(snapshot.get("config_fingerprint") or "").strip()
         or kind not in {"api_model", "agent_session"}
         or not target
+        or captured_access not in (*SESSION_ACCESS_PROFILES, "readonly")
+        or ("access" in snapshot and kind != "agent_session")
     ):
         raise SubagentSelectionError(
             "subagent_snapshot_invalid", "The task has no complete immutable subagent snapshot."
         )
+    if access is not None:
+        if kind != "agent_session" or access not in SESSION_ACCESS_LOWERING:
+            raise SubagentSelectionError(
+                "subagent_access_invalid", "access may only lower an agent_session to readonly or workspace_write.")
+        if access == "readonly" or captured_access == "full":
+            snapshot["access"] = access
     from ouroboros.model_slots import normalize_processing_preference
 
     try:
@@ -459,7 +475,8 @@ def resolve_configured_actor_dispatch(
         normalized = normalize_task_constraint(task.get("task_constraint"))
         surface = str(getattr(normalized, "surface", "") or "")
         shape = delegated_run_shape(
-            predicted_subagent_profile(write_surface=surface) == "acting_subagent"
+            predicted_subagent_profile(write_surface=surface) == "acting_subagent",
+            snapshot.get("access", "workspace_write"),
         )
         gateway = None
         try:
@@ -517,10 +534,6 @@ def resolve_configured_actor_dispatch(
     )
 
 
-def current_exact_start_selection() -> dict[str, Any]:
-    return dict(_EXACT_START_SELECTION.get() or {})
-
-
 def current_subagent_alternatives(exclude_id: str = "") -> list[dict[str, Any]]:
     """Project the current saved choices without ranking or probing them."""
 
@@ -543,6 +556,7 @@ def current_subagent_alternatives(exclude_id: str = "") -> list[dict[str, Any]]:
             "route_kind": row.route.kind,
             "target_id": row.route.target_id,
             "effort": row.effort,
+            **({"mutating_access": row.access} if row.route.is_session else {}),
             "availability": "check_at_dispatch",
         }
         for row in config.items
@@ -583,13 +597,13 @@ def prepare_delegate_start_actor(
     invocation_id: str,
     work_order_fingerprint: str,
     authority_fingerprint: str,
-) -> tuple[dict[str, Any], str]:
+) -> tuple[dict[str, Any], Optional["ToolResult"]]:
     """Resolve the exact actor/start fence without growing the transport facade."""
 
     from ouroboros import delegate_custody as custody
     from ouroboros.delegate_recovery import unsettled_start_ids
     from ouroboros.delegate_shared import _fail
-    selection = current_exact_start_selection()
+    selection = dict(_EXACT_START_SELECTION.get() or {})
     selected_snapshot = selection.get("snapshot")
     if recovering:
         if selected_snapshot:
@@ -608,7 +622,7 @@ def prepare_delegate_start_actor(
             "authority_fingerprint": str(
                 invocation.get("authority_fingerprint") or authority_fingerprint
             ),
-        }, ""
+        }, None
 
     if selected_snapshot is None:
         return {}, _fail(
@@ -645,16 +659,17 @@ def prepare_delegate_start_actor(
         )
     return {
         "route": route,
+        "access": snapshot.get("access", "workspace_write"),
         "selected_subagent_id": selected_id,
         "processing_preference": str(snapshot.get("processing_preference") or ""),
         "config_fingerprint": config_fingerprint,
         "work_order_fingerprint": work_order_fingerprint,
         "authority_fingerprint": authority_fingerprint,
         "compiled_work_order": bool(selection.get("compiled_work_order")),
-    }, ""
+    }, None
 
 
-def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) -> str:
+def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) -> "ToolResult":
     """Shared exact-start primitive for actor-first sessions and root-direct calls."""
 
     options = dict(spec or {})
@@ -728,14 +743,15 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
     ).strip()
     coordination_context = str(options.pop("_coordination_context", "") or "")
     work_order_source_request = options.pop("work_order_source_request", None)
+    access = options.pop("access", None)
     try:
         if str(options.get("retry_of") or "").strip() and (
-            selected_id or selected_snapshot is not None
+            selected_id or selected_snapshot is not None or access is not None
         ):
             raise SubagentSelectionError(
                 "retry_selector_conflict",
                 "retry_of replays its already-bound immutable route and cannot accept a new "
-                "subagent selector.",
+                "subagent selector or access choice.",
             )
         if selected_id and selected_snapshot is not None:
             raise SubagentSelectionError(
@@ -754,7 +770,7 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
                 subagent_id=selected_id,
             )
         if selected_snapshot is not None:
-            selected_snapshot = validate_subagent_snapshot(selected_snapshot)
+            selected_snapshot = validate_subagent_snapshot(selected_snapshot, access=access)
     except SubagentSelectionError as exc:
         from ouroboros.delegate_shared import _fail
 
@@ -786,10 +802,7 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
         # episode could mint a false zero-run receipt after a successful start
         # and nanny economics would miss real activity.
         _mark_actor_physical_start(ctx, result)
-        try:
-            payload = json.loads(result)
-        except (TypeError, ValueError):
-            return result
+        payload = delegate_payload(result)
         if isinstance(selected_snapshot, dict):
             payload["selected_subagent_id"] = str(
                 selected_snapshot.get("selected_subagent_id") or ""
@@ -799,7 +812,8 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
             )
         if isinstance(work_order_source_request, dict):
             payload["work_order_source_request"] = dict(work_order_source_request)
-        return json.dumps(payload, ensure_ascii=False, indent=2)
+        return _replace_tool_result(
+            result, text=json.dumps(payload, ensure_ascii=False, indent=2))
     except SubagentSelectionError as exc:
         from ouroboros.delegate_shared import _fail
 
@@ -808,7 +822,7 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
         _EXACT_START_SELECTION.reset(token)
 
 
-def _mark_actor_physical_start(ctx: Any, result: Any) -> None:
+def _mark_actor_physical_start(ctx: Any, result: "ToolResult") -> None:
     """Record a successful actor-first physical start on the private bootstrap fact.
 
     This is deliberately an internal projection, not a new lifecycle ABI.  The
@@ -819,21 +833,19 @@ def _mark_actor_physical_start(ctx: Any, result: Any) -> None:
     bootstrap = getattr(ctx, "_configured_actor_bootstrap", None)
     if not isinstance(bootstrap, dict):
         return
-    try:
-        payload = json.loads(result) if isinstance(result, str) else result
-    except (TypeError, ValueError, json.JSONDecodeError):
-        return
-    if not isinstance(payload, dict) or str(payload.get("status") or "") not in {
-        "started", "started_uncustodied",
-    }:
+    # The DOMAIN status, never the host class: a started run is `started` (or
+    # `started_uncustodied`), and a refusal that classified `ok` would otherwise
+    # mint a physical-start marker over a run that never began.
+    status = str(delegate_payload(result).get("status") or "")
+    if status not in {"started", "started_uncustodied"}:
         return
     bootstrap["physical_started"] = True
     bootstrap["exact_start_pending"] = False
-    bootstrap["physical_start_status"] = str(payload.get("status") or "")
+    bootstrap["physical_start_status"] = status
     ctx._nanny_physical_activity_seed = True
 
 
-def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, **params: Any) -> str:
+def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, **params: Any) -> "ToolResult":
     # Actor-first configured sessions bind every fresh start to the immutable
     # snapshot captured before the episode. The model supplies only an advisory
     # coordination appendix; the canonical work order remains host-owned.
@@ -901,6 +913,10 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
         # argument the replay cannot honor is refused typed, never silently
         # discarded (the fresh-start refusals, mirrored).
         expected_id = str(bootstrap.get("selected_subagent_id") or "")
+        if params.get("access") is not None:
+            _blocked("retry_selector_conflict")
+            return _fail("delegate_start", "retry_selector_conflict",
+                         "A retry replays its recorded access; omit access.")
         requested_id = str(params.get("subagent_id") or "").strip()
         if requested_id and requested_id != expected_id:
             _blocked("configured_actor_route_mismatch")
@@ -947,7 +963,6 @@ def delegate_start_entry(ctx: Any, prompt: str, _resolved_binding: Any = None, *
 __all__ = [
     "SubagentSelectionError",
     "apply_task_start_settings",
-    "current_exact_start_selection",
     "current_model_visible_subagent_catalog",
     "current_subagent_alternatives",
     "delegate_start_entry",

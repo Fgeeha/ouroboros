@@ -11,6 +11,7 @@ from hashlib import sha256
 import uuid
 
 from ouroboros import delegate_custody as custody
+from ouroboros.configured_subagents import SESSION_ACCESS_PROFILES
 from ouroboros.artifacts import stream_artifact_file
 from ouroboros.utils import atomic_write_json
 
@@ -41,8 +42,8 @@ def default_shaped_directory_options(strategy, scope_paths) -> bool:
     return strategy in (None, "direct") and not scope_paths
 
 
-def blocked_geometry_refusal(ctx, authority, selector_root, strategy, scope_paths) -> str:
-    """Typed pre-POST refusal for geometry this shape can never serve, else ``""``.
+def blocked_geometry_refusal(ctx, authority, selector_root, strategy, scope_paths):
+    """Typed pre-POST refusal for geometry this shape can never serve, else ``None``.
 
     A read-only child and a payload selector never open the ordinary-folder session,
     so a real geometry request is refused before the daemon call — the parent repairs
@@ -60,10 +61,10 @@ def blocked_geometry_refusal(ctx, authority, selector_root, strategy, scope_path
     ``directory_execution``'s geometry validation and because ``_delegate_start`` sits
     at the 300-line function cap on a shrink-only band path.
     """
-    if not (selector_root or getattr(authority, "access", "") != "workspace_write"):
-        return ""
+    if not (selector_root or getattr(authority, "access", "") not in SESSION_ACCESS_PROFILES):
+        return None
     if default_shaped_directory_options(strategy, scope_paths):
-        return ""
+        return None
     from ouroboros.delegate_evidence import record_start_blocked
     from ouroboros.delegate_shared import _fail
 

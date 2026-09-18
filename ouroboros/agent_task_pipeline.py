@@ -39,7 +39,7 @@ from ouroboros.outcomes import (
 from ouroboros.outcome_receipt_store import task_verification_receipts
 from ouroboros.contracts.task_contract import build_task_contract
 from ouroboros.subagents import envelope_from_task, substrate_result_fields
-from ouroboros.subagent_messages import subagent_message_meta
+from ouroboros.subagent_messages import initiator_meta, subagent_message_meta
 from ouroboros.utils import utc_now_iso, append_jsonl, truncate_review_artifact as _truncate_with_notice
 from ouroboros.utils import in_worker_process
 from ouroboros.llm_claudexor import propagate_model_error
@@ -383,13 +383,19 @@ def _run_global_backlog_promotion_only(
             "memory_actions": [],
         }
         _update_improvement_backlog(env, sanitized_entry)
+        from ouroboros.consciousness_authority import consciousness_origin_metadata
         from ouroboros.post_task_evolution import maybe_promote
 
         global_task = {
             "id": str(task.get("id") or ""),
             "type": str(task.get("type") or "task"),
             "source": "project_scoped_global_improvement",
-            "metadata": {"globalized_from_project_task": True},
+            # The origin survives the sanitized view: a campaign a consciousness tree
+            # promotes stays inside the consciousness limits.
+            "metadata": {"globalized_from_project_task": True, **consciousness_origin_metadata(task.get("metadata"))},
+            # The eligibility probe reads the contract (disabled_tools), so the
+            # globalized view keeps it: a level that may not evolve stays that way.
+            **({"task_contract": dict(task["task_contract"])} if isinstance(task.get("task_contract"), dict) else {}),
         }
         maybe_promote(env, global_task, sanitized_entry, llm)
     except Exception as error:
@@ -525,13 +531,21 @@ def emit_task_results(
     )
     outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
     execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
+    failed_or_forced = (
+        execution_status in {EXECUTION_FAILED, EXECUTION_INFRA_FAILED, EXECUTION_BEST_EFFORT}
+        or str(usage.get("execution_status") or usage.get("result_status") or "") in {EXECUTION_FAILED, EXECUTION_INFRA_FAILED}
+    )
+    if ctx is not None and failed_or_forced:
+        ctx._presence_completion_accepted = False
     reason_code = str(loop_outcome.get("reason_code") or "")
     _root_outbox = _is_root_post_task(task)   # durable outbox (no model call): pre-marker predicate
     if getattr(ctx, "_skip_post_task_synthesis", False):   # "Stop now": paid root predicates see it
         task["_skip_post_task_synthesis"] = True
     _presence = is_presence_task(task)
     _typed_routing_action = str(getattr(ctx, "_typed_routing_action_emitted", "") or "").strip()
-    _message_meta = subagent_message_meta(task, task_id=str(task.get("id") or ""))
+    # The final frame's durable identity: the child lineage and the turn's
+    # origin label (a wake-up's "consciousness"), so the chat row keeps both.
+    _message_meta = {**subagent_message_meta(task, task_id=str(task.get("id") or "")), **initiator_meta(task)}
     from ouroboros.post_task_synthesis import task_tool_metrics
     tool_metrics = task_tool_metrics(llm_trace)
     send_event = {
@@ -545,7 +559,10 @@ def emit_task_results(
         # on a nearby progress row that may age out independently.
         send_event["progress_meta"] = dict(_message_meta)
     send_event = prepare_terminal_send_event(env.drive_root, task, text, usage, send_event, presence=_presence)
-    pending_events.append(build_presence_result_event(task, text, ctx, provider_notice=terminal_notice_text(usage)) if _presence else send_event)
+    pending_events.append(build_presence_result_event(
+        task, text, ctx, provider_notice=terminal_notice_text(usage),
+        retain_scheduled_handoff=failed_or_forced,
+    ) if _presence else send_event)
     duration_sec = round(time.time() - start_time, 3)
     try:
         from supervisor.state import reconstruct_task_cost
@@ -686,6 +703,8 @@ def emit_task_results(
         post_usage = dict(usage or {})
         post_usage["outcome_axes"] = outcome_axes
         post_usage["reason_code"] = reason_code
+        if _typed_routing_action:
+            post_usage["typed_routing_action"] = _typed_routing_action
         from ouroboros.project_facts import resolve_project_id
 
         _project_scoped = bool(resolve_project_id(task))
@@ -734,10 +753,13 @@ def emit_task_results(
             except Exception:
                 log.debug("project journal finalization entries failed", exc_info=True)
             try:
+                _task_metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
                 pending_events.append({
                     "type": "project_digest",
                     "project_id": _pid,
                     "task_id": str(task.get("id") or ""),
+                    # The alarm clock must not re-arm on a tree consciousness started.
+                    "initiator": str(_task_metadata.get("initiator") or ""),
                     "objective": _objective,
                     "execution_status": _exec_status,
                     "objective_status": str((outcome_axes.get("objective") or {}).get("status") or "not_evaluated"),
@@ -798,6 +820,11 @@ def _dispatch_root_post_task(
         or bool(str(task.get("workspace_mode") or "").strip())
         or project_task
     )
+    if (is_presence_task(task) and task.get("_is_direct_chat")
+            and not in_worker_process() and not split_drive):
+        # The native adapter receives the durable result on return. Its request
+        # must not wait for synthesis; pooled/forked workers retain their custody.
+        blocking = False
     if blocking and event_queue is not None:
         # The CANONICAL data root — what the supervisor's boot/tick outbox
         # replay reads (§8-A2): the parent/budget root for split children, the

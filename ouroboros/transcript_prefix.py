@@ -85,6 +85,18 @@ def message_digest(message: Mapping[str, Any]) -> str:
     return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
 
 
+def unsent_in_previous_send(slot: Any, message: Any) -> bool:
+    """Whether the last observed send proves this message was absent.
+
+    Without an execution slot or a recorded send, absence is unknown and the
+    append helper must keep existing rows intact.
+    """
+    if not isinstance(message, Mapping):
+        return False
+    previous = getattr(slot, DIGEST_ATTR, None) if slot is not None else None
+    return isinstance(previous, list) and message_digest(message) not in previous
+
+
 def observe_send(
     slot: Any,
     messages: Sequence[Mapping[str, Any]],

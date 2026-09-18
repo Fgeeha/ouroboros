@@ -77,13 +77,17 @@ def _finished_with_warnings(task_done_event: Dict[str, Any]) -> bool:
 
 def _authoritative_terminal_cost(
     task_id: str, task: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any], drive_root: pathlib.Path,
+    *, breakdown: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
-    """Project one terminal task/root from the physical-attempt authority."""
+    """Project terminal cost; the optional breakdown belongs to drive_root only."""
     from ouroboros.cost_projection import honest_accounted_amount
     from supervisor.state import reconstruct_task_cost
 
     authority_root = pathlib.Path(task.get("budget_drive_root") or drive_root)
-    projection = reconstruct_task_cost(task_id, fields=True, drive_root=authority_root)
+    if breakdown is not None and authority_root.resolve() != pathlib.Path(drive_root).resolve():
+        breakdown = None  # A split/copyback task keeps its canonical monetary authority.
+    projection = reconstruct_task_cost(task_id, fields=True, drive_root=authority_root,
+                                       **({"breakdown": breakdown} if breakdown is not None else {}))
     from ouroboros.task_results import resolve_task_lineage
 
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
@@ -115,10 +119,15 @@ def _authoritative_terminal_cost(
         try:
             from ouroboros.usage_accounting import usage_breakdown
 
-            subtree = usage_breakdown(
-                authority_root,
-                root_task_id=str(lineage["root_task_id"] or task_id),
-            )
+            root_id = str(lineage["root_task_id"] or task_id)
+            if breakdown is None:
+                subtree = usage_breakdown(authority_root, root_task_id=root_id)
+            else:
+                from ouroboros._usage_rows import _breakdown_bucket, _with_integrity
+
+                subtree = breakdown["by_root"].get(root_id)
+                if subtree is None:
+                    subtree = _with_integrity(_breakdown_bucket(()), bool(breakdown.get("integrity_degraded")))
             subtree_final = bool(subtree.get("cost_final"))
             subtree_amount = honest_accounted_amount(subtree)
             projection.update({
@@ -167,6 +176,44 @@ def _authoritative_terminal_cost(
     # — it re-normalizes amounts and would strip any retired key a future
     # mutation leaked. This is deliberately the LAST statement.
     return with_cost_aliases(projection)
+
+
+def _refresh_terminal_task_cost(
+    drive_root: pathlib.Path, task_id: str, *, breakdown: Dict[str, Any] | None = None,
+) -> bool:
+    """Refresh bookkeeping only; a supplied breakdown is bound to drive_root."""
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    current = load_task_result(drive_root, task_id, strict=True) or {}
+    if current.get("status") not in SETTLED_STATUSES:
+        return False
+    checkpoint = current.get("root_phase_checkpoint") or {}
+    if post_task_synthesis_is_open(checkpoint.get("post_task_synthesis")):
+        return False
+    fields = _authoritative_terminal_cost(task_id, current, current, {}, drive_root, breakdown=breakdown)
+    if fields.get("cost_accounting_status") != "available" or all(current.get(key) == value for key, value in fields.items()):
+        return False
+
+    def project(latest, patch):
+        post = (latest.get("root_phase_checkpoint") or {}).get("post_task_synthesis")
+        if latest.get("status") not in SETTLED_STATUSES or post_task_synthesis_is_open(post):
+            raise ValueError("Cost refresh lost terminal task ownership")
+        return {**patch, "status": latest["status"]}
+
+    stored = write_task_result(
+        drive_root, task_id, current["status"], strict_existing_dict=True,
+        _field_projector=project, **fields,
+    )
+    event = {"type": "task_cost_finalized", "ts": utc_now_iso(), "task_id": task_id,
+             "root_task_id": str(stored.get("root_task_id") or task_id), **carry_cost_meta(stored)}
+    if append_jsonl(drive_root / "logs" / "events.jsonl", event):
+        from supervisor.message_bus import try_get_bridge
+        from supervisor.log_addressing import address_handler_push
+
+        bridge = try_get_bridge()
+        if bridge is not None:
+            bridge.push_log(address_handler_push(drive_root, event))
+    return True
 
 
 def _task_done_review_projection(
@@ -735,6 +782,32 @@ def _task_done_durable_fault(evt: Dict[str, Any], ctx: Any, task_id: Any) -> boo
         return True
 
 
+def _notify_consciousness_of_root_done(ctx: Any, task: Dict[str, Any], task_metadata: Any,
+                                       final_task_result: Any, task_done_event: Dict[str, Any]) -> None:
+    """A ROOT finishing (any outcome) is a reason for an early consciousness wake —
+    except the owner's own direct turn (В13: an owner message never wakes it, and
+    neither does that turn ending), a wake-up's own finish or a root consciousness
+    started (``metadata.initiator == "consciousness"``), or the chain would never sleep."""
+    metadata = task_metadata if isinstance(task_metadata, dict) else {}
+    if "subagent" in (str(task.get("delegation_role") or ""), str(metadata.get("delegation_role") or "")):
+        return  # the cancel path has already popped the RUNNING row; the event's metadata still says
+    if bool(task_done_event.get("_is_direct_chat")) or bool(task.get("_is_direct_chat")):
+        return
+    from ouroboros.consciousness_authority import is_consciousness_origin
+
+    result_metadata = final_task_result.get("metadata") if isinstance(final_task_result, dict) else None
+    if is_consciousness_origin(result_metadata) or is_consciousness_origin(task_metadata):
+        return
+    consciousness = getattr(ctx, "consciousness", None)
+    if consciousness is None:
+        return
+    try:
+        consciousness.notify(
+            f"task_finished:{task_done_event.get('task_id') or ''}:{task_done_event.get('status') or ''}")
+    except Exception:
+        log.debug("consciousness notify on task_done failed", exc_info=True)
+
+
 def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
     task_id = evt.get("task_id")
     wid = evt.get("worker_id")
@@ -865,6 +938,11 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
             default=HIDDEN_CHAT_ID,
         ),
         "status": str(final_task_result.get("status") or evt.get("status") or ""),
+        # The direct-turn fact rides the rebuilt terminal so the chat block keys
+        # its chrome on host truth: the worker frame carries it, the durable
+        # result carries it, and a reaper-delivered terminal reads the result.
+        "_is_direct_chat": bool(evt.get("_is_direct_chat") or (
+            isinstance(final_task_result, dict) and final_task_result.get("_is_direct_chat"))),
         "root_phase_checkpoint": final_task_result.get("root_phase_checkpoint") or {},
         "outcome_axes": outcome_axes,
         "reason_code": reason_code,
@@ -875,6 +953,8 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         task_done_event["typed_routing_action"] = str(evt.get("typed_routing_action") or "").strip()
     if isinstance(artifact_bundle, dict):
         task_done_event["artifact_bundle"] = artifact_bundle
+    if isinstance(final_task_result.get("cancel_origin"), dict):
+        task_done_event["cancel_origin"] = dict(final_task_result["cancel_origin"])
     review_status = final_task_result.get("review_status") if isinstance(final_task_result, dict) else None
     if not isinstance(review_status, dict):
         review_status = evt.get("review_status")
@@ -911,6 +991,7 @@ def _handle_task_done(evt: Dict[str, Any], ctx: Any) -> None:
         final_task_result=final_task_result,
         task_done_event=task_done_event,
     )
+    _notify_consciousness_of_root_done(ctx, task, task_metadata, final_task_result, task_done_event)
 
     # v6.91 tree-quiescence coop checkpoint: MUST run after the dispatch
     # bookkeeping above removed this terminal child from RUNNING, or the

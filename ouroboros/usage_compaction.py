@@ -1,6 +1,6 @@
-"""Seq-preserving compaction of the monetary usage ledger (CPL4-C6, owner 1A).
+"""Seq-preserving compaction of the monetary usage ledger.
 
-Design contract: docs/v7next/DESIGN_USAGE_COMPACTION.md. Terminal, non-review
+Design contract: docs/USAGE_COMPACTION.md. Terminal, non-review
 ``kind="attempt"`` chains fold into a stamped baseline block (one
 ``usage_baseline`` header + per-attribution ``usage_baseline_group`` rows);
 the raw pre-compaction bytes move verbatim into an append-only
@@ -39,7 +39,8 @@ import uuid
 from decimal import Decimal, DecimalException, InvalidOperation
 from typing import Any, Callable, Dict, Iterator, Optional, Tuple
 
-from ouroboros._usage_rows import _breakdown_bucket, _summary, _processing_summary, _merge_processing_summary
+from ouroboros._usage_rows import _breakdown_bucket, _summary, _processing_summary, _merge_processing_summary, row_ts_epoch
+from ouroboros.runtime_limits import USAGE_LEDGER_FOLD_MIN_AGE_SEC
 from ouroboros.usage_ledger import (
     ARCHIVE_SEGMENT_DIR_REL,
     LEDGER_REL,
@@ -53,16 +54,23 @@ from ouroboros.usage_ledger import (
     _read_records_locked,
     _validate_records,
     _write_bytes_atomic_fsync,
+    is_abandoned_settlement,
     valid_archive_rel,
 )
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 log = logging.getLogger(__name__)
 
-# States a folded attempt chain may terminate in. In-flight (reserved/
-# dispatched) finals keep their WHOLE chain in the live file.
-_FOLDABLE_FINAL_STATES = frozenset({"settled", "unresolved", "released"})
+# Unresolved and administratively abandoned attempts still accept a late
+# receipt, so their WHOLE chain stays live just like reserved/dispatched work.
+_FOLDABLE_FINAL_STATES = frozenset({"settled", "released"})
 _BASELINE_KINDS = frozenset({"usage_baseline", "usage_baseline_group"})
+# The fold's clock: an attempt whose final row is younger than
+# ``USAGE_LEDGER_FOLD_MIN_AGE_SEC`` stays unfolded so its ``ts`` remains the true
+# spend time the rolling consciousness allowance reads (a group row carries the
+# compaction instant instead). Module-level so a test can age a fixture by
+# moving the clock rather than weakening the money assertions.
+_fold_clock: Callable[[], float] = time.time
 _REVIEW_KEYS = ("review_skill", "review_wave_id", "review_slot_id")
 _TOKEN_SUM_FIELDS = (
     "prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens",
@@ -598,10 +606,20 @@ def _parse_ledger_lines(raw: bytes) -> Tuple[list, list]:
     return float_rows, decimal_rows
 
 
-def _foldable_attempt_ids(records: list) -> set:
+def _attempt_is_recent(row: Dict[str, Any], now_ts: float) -> bool:
+    """Whether a final attempt row is younger than the fold horizon (an absent or
+    unparseable ``ts`` cannot prove recency and folds as before)."""
+    ts = row_ts_epoch(row)
+    return ts is not None and now_ts - ts < USAGE_LEDGER_FOLD_MIN_AGE_SEC
+
+
+def _foldable_attempt_ids(records: list, *, now_ts: Optional[float] = None) -> set:
     """Attempt ids whose whole chain folds: terminal, plain ``attempt`` kind,
-    no review attribution — plus prior baseline group/header rows (re-folded)."""
+    no pending late receipt or review attribution, older than the fold horizon
+    (``now_ts`` defaults to ``_fold_clock()``) — plus prior baseline rows. Old
+    unresolved groups remain aggregates; they cannot recreate individual ids."""
     finals = _final_rows(records)
+    clock = _fold_clock() if now_ts is None else float(now_ts)
     foldable: set = set()
     for attempt_id, row in finals.items():
         kind = str(row.get("kind") or "attempt")
@@ -612,6 +630,10 @@ def _foldable_attempt_ids(records: list) -> set:
             continue
         if str(row.get("state") or "") not in _FOLDABLE_FINAL_STATES:
             continue
+        if is_abandoned_settlement(row):
+            continue
+        if _attempt_is_recent(row, clock):
+            continue  # the allowance window still needs this row's own ts
         if any(str(row.get(key) or "") for key in _REVIEW_KEYS):
             continue
         if isinstance(row.get("cost_usd"), bool) or isinstance(
@@ -981,7 +1003,7 @@ def maybe_compact_usage_ledger_locked(
     return False
 
 
-# --- History readers (CPL-5 reverse-sweep join surface; audits) --------------
+# --- History readers (model-send reverse-sweep join surface; audits) --------------
 
 
 def _live_baseline_header(root: pathlib.Path) -> Optional[Dict[str, Any]]:
@@ -995,7 +1017,7 @@ def _live_baseline_header(root: pathlib.Path) -> Optional[Dict[str, Any]]:
     tell those apart and does not try — the archive does, in the epoch anchor,
     which runs on a stamp-less file too. A row that cannot be read AT ALL is
     corruption and says so: reporting it as "not compacted" would hand the
-    CPL-5 sweep an empty archive and let it call a folded attempt an orphan
+    model-send reconciliation sweep an empty archive and let it call a folded attempt an orphan
     seal.
     """
     try:
@@ -1118,7 +1140,7 @@ def _load_segment(
                 break
             chunks.append(chunk)
         payload = b"".join(chunks)
-    except OSError as exc:  # the CPL-5 sweep maps typed corruption to UNKNOWN; a bare OSError escapes it
+    except OSError as exc:  # the model-send reconciliation sweep maps typed corruption to UNKNOWN; a bare OSError escapes it
         raise UsageLedgerCorrupt(f"usage archive segment unreadable: {path}") from exc
     finally:
         os.close(fd)
@@ -1248,7 +1270,7 @@ def archived_attempt_ids(root: pathlib.Path | str | None = None) -> frozenset:
     Segments are immutable, so per-segment reads and the union over a given
     chain are cached. An unreadable (or not-a-regular-file), hash-mismatched,
     mis-stepped, cyclic or out-anchored chain raises ``UsageLedgerCorrupt`` —
-    the CPL-5 reverse sweep must treat that as its existing UNKNOWN /
+    the model-send reverse sweep must treat that as its existing UNKNOWN /
     skip-pass state, never as evidence of an orphan."""
     root = pathlib.Path(_drive_root(root))
     live_header = _live_baseline_header(root)
@@ -1331,7 +1353,7 @@ def usage_attempt_recorded(
     """Membership of ``attempt_id`` in the live replay ∪ archived segments.
 
     The join primitive for per-attempt history questions on a compacted
-    ledger (CPL-5 reverse sweep: an id absent HERE — not merely absent from
+    ledger (model-send reverse sweep: an id absent HERE — not merely absent from
     the live replay — is what "no attempt row" means)."""
     attempt_id = str(attempt_id or "")
     if not attempt_id:

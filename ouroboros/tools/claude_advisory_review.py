@@ -30,13 +30,11 @@ from ouroboros.review_state import (
     _utc_now,
 )
 from ouroboros.config import get_review_enforcement as _get_review_enforcement
-from ouroboros.config import get_finalization_grace_sec
+from ouroboros.config import get_finalization_grace_sec  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
 from ouroboros.deadline_utils import (
-    dispatch_window_remaining_sec,
     owner_deadline_exhausted_for_context,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
 )
 from ouroboros.tools.review_helpers import (
-    build_advisory_changed_context,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
     build_skill_host_context,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
     build_blocking_findings_json_section,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
     load_checklist_section,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
@@ -106,8 +104,37 @@ def _mandatory_read_pointer(repo_dir: pathlib.Path, rel_path: str, section: str 
     bodies — ``plan_review_runtime`` and the DEVELOPMENT.md "Core Governance
     Artifacts" table are the precedent): the session reads the document itself
     with its own tools; that retrieval is disclosed by the delegated-route
-    telemetry and is non-certifying."""
-    path = (pathlib.Path(repo_dir) / rel_path).resolve(strict=False)
+    telemetry and is non-certifying.
+
+    A reference-book entrypoint enumerates its CHAPTER CLOSURE with each
+    chapter's size. The entrypoint is an orientation page and a membership
+    list, so a reviewer who read it and stopped would have read none of the
+    book while the pointer said "in full" — the closure makes what "in full"
+    covers explicit, and the sizes let a chunked reader plan."""
+    from ouroboros.reference_books import BOOK_ENTRYPOINTS, load_reference_book
+
+    root = pathlib.Path(repo_dir)
+    path = (root / rel_path).resolve(strict=False)
+    book_id = next((key for key, entry in BOOK_ENTRYPOINTS.items() if entry == rel_path), None)
+    if book_id is not None and not section:
+        try:
+            book = load_reference_book(root, book_id)
+        except (OSError, ValueError) as exc:
+            return (
+                f"MANDATORY FULL READ (agent_session route): {path} could not be assembled "
+                f"from its chapters ({exc}) — its coverage is UNKNOWN for this review."
+            )
+        if book.chapters:
+            closure = "\n".join(
+                f"  - {(root / chapter.source_path).resolve(strict=False)} ({len(chapter.raw):,} bytes)"
+                for chapter in book.chapters
+            )
+            return (
+                f"MANDATORY FULL READ (agent_session route — bodies not inlined): {path} is the "
+                "book's membership page, NOT the book. Read every chapter below in full with "
+                "your own file tools BEFORE reviewing; do not review from memory of this "
+                f"document.\n{closure}"
+            )
     target = f"the '## {section}' section of {path}" if section else str(path)
     return (
         f"MANDATORY FULL READ (agent_session route — body not inlined): read {target} "
@@ -153,15 +180,6 @@ def _advisory_native_model(slot=None) -> str:
     if configured:
         return _same_model_payable_spelling(configured)
     return _advisory_default_model()
-
-
-def _advisory_child_timeout(ctx: object) -> Optional[float]:
-    metadata = getattr(ctx, "task_metadata", {})
-    return dispatch_window_remaining_sec(
-        deadline_at=(metadata or {}).get("deadline_at") if isinstance(metadata, dict) else None,
-        deadline_ts=getattr(ctx, "deadline_ts", None),
-        reserve_sec=get_finalization_grace_sec(),
-    )
 
 
 def _run_advisory_native(
@@ -1418,11 +1436,25 @@ def _preflight_review_params() -> dict:
     }
 
 
+def _preflight_tool_timeout_sec() -> float:
+    """Finite settlement envelope, following the existing plan-review wrapper.
+
+    Tests precede the critic. Cover their resolved total plus the existing
+    task/transport envelope; do not create or replace the critic's own deadline.
+    """
+    from ouroboros.config import get_llm_transport_read_timeout_sec, get_task_abs_ceiling_sec
+    from ouroboros.preflight_runner import _resolve_preflight_timeout
+
+    grace = get_finalization_grace_sec()
+    review_envelope = max(get_task_abs_ceiling_sec(), get_llm_transport_read_timeout_sec() + grace)
+    return _resolve_preflight_timeout() + review_envelope + grace
+
+
 def get_tools() -> list:
     return [
         ToolEntry(
             name="preflight_review",
-            timeout_sec=1200,
+            timeout_sec=_preflight_tool_timeout_sec(),
             schema={
                 "name": "preflight_review",
                 "description": (
@@ -1442,7 +1474,7 @@ def get_tools() -> list:
         # parameters as the canonical entry so old calls keep their args.
         ToolEntry(
             name="advisory_review",
-            timeout_sec=1200,
+            timeout_sec=_preflight_tool_timeout_sec(),
             alias_for="preflight_review",
             schema={
                 "name": "advisory_review",

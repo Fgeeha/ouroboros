@@ -20,6 +20,7 @@ import {
     taskControlBusy,
 } from './task_control_menu.js';
 import { showToast } from './toast.js';
+import { allowanceLabel } from './utils.js';
 
 function esc(value) {
     return String(value ?? '').replace(/[&<>"']/g, (c) => (
@@ -55,7 +56,7 @@ export function initActivity({ mount, ws } = {}) {
         return { root, status, content, loaded: false };
     });
 
-    function renderQueue(queue) {
+    function renderQueue(queue, census) {
         if (!Array.isArray(queue?.running) || !Array.isArray(queue?.pending)) throw new Error('Queue unavailable');
         const { running, pending } = queue;
         // #322: the snapshot already carries the pause truth — a member's own
@@ -85,19 +86,55 @@ export function initActivity({ mount, ws } = {}) {
                 </div>
             </div>`;
         };
-        const parts = [...running.map((q) => row(q, 'running')), ...pending.map((q) => row(q, 'pending'))];
-        return parts.length ? parts.join('') : '<div class="activity-empty">Nothing running or queued.</div>';
+        // Queue facts keep their runtime/budget controls. The census adds only
+        // missing identities; queued direct turns can appear in both sources.
+        const known = new Set([...running, ...pending].map((q) => String(q.id || q.task?.id || '')));
+        const live = (Array.isArray(census?.active_chat_activities) ? census.active_chat_activities : [])
+            .filter((a) => a && !known.has(String(a.activity_id || '')));
+        const names = { direct_chat: 'Direct turn', managed_task: 'Managed task' };
+        const liveRow = (a) => {
+            const started = Number(a.started_at) || 0;
+            const elapsed = started > 0 ? ` · ${Math.max(0, Math.round(Date.now() / 1000 - started))}s` : '';
+            return `<div class="activity-row">
+                <div class="activity-row-main">
+                    <span class="activity-name">${esc(names[a.kind] || 'Live turn')}</span>
+                    <span class="activity-sub">${esc(a.phase || '')}${elapsed}</span>
+                </div>
+                <div class="activity-row-actions">
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${esc(a.activity_id || '')}">${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
+                </div>
+            </div>`;
+        };
+        const parts = [...running.map((q) => row(q, 'running')), ...pending.map((q) => row(q, 'pending')), ...live.map(liveRow)];
+        if (parts.length) return parts.join('');
+        return census?.active_chat_activities_complete === true
+            ? '<div class="activity-empty">Nothing running or queued.</div>'
+            : '<div class="activity-empty">Queue empty; live turns unknown.</div>';
+    }
+
+    function formatWhen(value) {
+        if (!value) return '';
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? '' : parsed.toLocaleString([], { hour: '2-digit', minute: '2-digit', month: 'short', day: 'numeric' });
     }
 
     function renderBg(stateData) {
         if (typeof stateData?.bg_consciousness_enabled !== 'boolean') throw new Error('Background state unavailable');
         const enabled = stateData.bg_consciousness_enabled;
         const bg = (stateData && stateData.bg_consciousness_state) || {};
-        const detail = esc(bg.detail || bg.last_idle_reason || (enabled ? 'running' : 'disabled'));
+        const detail = esc(bg.detail || (enabled ? 'enabled' : 'disabled'));
+        const facts = [
+            bg.level ? `autonomy ${esc(bg.level)}` : '',
+            enabled && bg.next_wake_at ? `next wake ${esc(formatWhen(bg.next_wake_at))}` : '',
+            bg.last_wake_at ? `last wake ${esc(formatWhen(bg.last_wake_at))}${bg.last_wake_outcome ? ` (${esc(bg.last_wake_outcome)})` : ''}` : '',
+            allowanceLabel(bg.spent_24h_usd, bg.daily_usd, bg.unknown_unmetered, bg.integrity_degraded)
+                ? `allowance ${esc(allowanceLabel(bg.spent_24h_usd, bg.daily_usd, bg.unknown_unmetered, bg.integrity_degraded))} (24 h)` : '',
+            Number.isFinite(Number(bg.max_tasks)) ? `tasks ${Number(bg.tasks_running || 0)}/${Number(bg.max_tasks)}` : '',
+        ].filter(Boolean).join(' · ');
         return `<div class="activity-row">
             <div class="activity-row-main">
                 <span class="activity-name">Background consciousness</span>
-                <span class="activity-sub">${enabled ? 'enabled' : 'disabled'}${detail ? ` · ${detail}` : ''}</span>
+                <span class="activity-sub">${enabled ? 'enabled' : 'disabled'}${detail ? ` · ${detail}` : ''}${facts ? ` · ${facts}` : ''}</span>
             </div>
             <div class="activity-row-actions">
                 <button type="button" class="btn btn-xs btn-default" data-act="bg-toggle" data-enabled="${enabled ? '1' : '0'}"${ws ? '' : ' disabled'}>${enabled ? 'Stop' : 'Start'}</button>
@@ -149,7 +186,8 @@ export function initActivity({ mount, ws } = {}) {
             getJson('/api/schedules'),
         ]);
         if (revision !== refreshRevision) return;
-        const renderers = [(data) => renderQueue(data?.queue), renderBg, renderSchedules];
+        const census = results[1].status === 'fulfilled' ? results[1].value : null;
+        const renderers = [(data) => renderQueue(data?.queue, census), renderBg, renderSchedules];
         sections.forEach((section, index) => {
             const { root, status, content } = section;
             root.removeAttribute('aria-busy');

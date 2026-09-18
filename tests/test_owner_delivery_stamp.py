@@ -123,3 +123,19 @@ def test_a_drain_with_no_owner_context_is_a_no_op(tmp_path):
     )
 
     _drain_incoming_messages([], queue.Queue(), tmp_path, "root", None, set(), owner_ctx=None)
+
+
+def test_the_delivery_fact_lives_for_one_drain(tmp_path):
+    """Delivery keys the current round's receipt, never its author's identity.
+    The next drain clears it so later task words cannot label an old owner row."""
+    from ouroboros.owner_mailbox import write_owner_message
+    from ouroboros.tools.control_routing import ISSUER_TASK, _routing_issuer
+
+    write_owner_message(tmp_path, "please also check the tests", task_id="root", msg_id="m-1", client_message_id="cm-1")
+    ctx = _drain(tmp_path, ctx=SimpleNamespace(task_id="root", task_metadata={}))
+    assert ctx.last_owner_delivery["client_message_id"] == "cm-1"
+    assert _routing_issuer(ctx)["kind"] == ISSUER_TASK
+
+    _drain(tmp_path, ctx=ctx)  # nothing new this round
+    assert ctx.last_owner_delivery is None
+    assert _routing_issuer(ctx)["kind"] == ISSUER_TASK

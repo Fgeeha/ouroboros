@@ -35,6 +35,7 @@ from typing import Any, Dict, List
 
 from ouroboros import delegate_custody as custody
 from ouroboros.config import NETWORK_WAIT_BACKOFF_START_SEC
+from ouroboros.delegate_shared import delegate_payload
 from ouroboros.delegate_supervision import (
     UnknownHoldUnreadable,
     _control_wakes,
@@ -110,17 +111,23 @@ def _leaf_probe_live(ctx: Any, run_id: str) -> bool:
 def _single_live_run(ctx: Any) -> str:
     """Return the run id iff custody holds EXACTLY one open run, no pending
     invocations, no open containment fault, a readable log, and the read-only
-    probe reads a positive non-terminal engine state."""
+    probe reads a positive non-terminal engine state.
+
+    The cardinality is over the task's OWN delegation: a run a review panel owns
+    is not a leaf this nanny may hold on, and it never makes the task's one real
+    leaf look like two (issue #1006)."""
     mine = str(getattr(ctx, "task_id", "") or "")
     try:
         root = custody.custody_root(ctx)
         if custody.custody_log_unreadable(root):
             return ""
-        open_rows = [row for row in custody.open_runs(root) if row.task_id == mine]
+        open_rows = [row for row in custody.open_runs(root)
+                     if row.task_id == mine and not row.review_owned]
         if len(open_rows) != 1:
             return ""
         if any(
             str(row.get("task_id") or "") == mine
+            and not custody.review_owned_source(row.get("source"))
             for row in custody.pending_invocations(root)
         ):
             return ""
@@ -330,12 +337,15 @@ def hold_step(
             NETWORK_WAIT_BACKOFF_START_SEC * (2.0 ** min(cycles - 1, 4)),
             _HOLD_BACKOFF_CAP_SEC,
         ))
-    raw = supervised_wait(ctx, run_id)
+    # The supervising wait answers with the family's NATIVE result; its own JSON
+    # payload is what the hold judges. A shape this cannot read leaves the payload
+    # empty, which fails the acknowledgement below into the honest no-resend
+    # terminal — never an escape that would let the cleanup cancel a healthy leaf.
+    wake = supervised_wait(ctx, run_id)
     try:
-        payload = json.loads(raw) if isinstance(raw, str) else {}
-    except (TypeError, ValueError):
+        payload = delegate_payload(wake)
+    except (AttributeError, TypeError, ValueError):
         payload = {}
-    payload = payload if isinstance(payload, dict) else {}
     # Controls re-checked at the SOURCE too: an oversized wake render may drop
     # the control event from the rendered list, so also read the DURABLE
     # unrendered pending-wake payload (covers finalize_now, which the

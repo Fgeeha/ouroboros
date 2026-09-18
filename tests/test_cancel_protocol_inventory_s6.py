@@ -77,18 +77,28 @@ TERMINAL_WRITERS = {
     ('ouroboros/mutation_attribution.py::record_terminal_mutation_candidates', 'status'): 'dynamic',
     ('ouroboros/post_task_checkpoint.py::set_root_post_task_checkpoint', 'str(existing.get("status") or task.get("status") or STATUS_COMPLETED)'): 'terminal',
     ('ouroboros/project_dialogue.py::_append_terminal_task_projection', 'status'): 'dynamic',
+    ('ouroboros/project_naming.py::spawn_turn_namer._work', 'status'): 'dynamic',
     ('ouroboros/project_dialogue.py::persist_continuation_narrative', 'requested_status'): 'dynamic',
-    ('ouroboros/project_naming.py::spawn_proactive_namer._work', 'status'): 'dynamic',
     # The locked field projector preserves the existing status, including a
     # terminal one; publishing review evidence never completes the task itself.
     ('ouroboros/review_projection.py::publish_acceptance_checkpoint', '"running"'): 'dynamic',
+    # Rebinds a proven legacy child start before existing orphan materialization;
+    # write_task_result still preserves any terminal status under its locked reducer.
+    ('ouroboros/server_maintenance.py::_recover_terminal_task_files', '"running"'): 'dynamic',
     ('ouroboros/task_status.py::reconcile_orphaned_running_tasks', 'eff_status'): 'dynamic',
     ('ouroboros/tools/control_delegation.py::record_depth_limit_refusal', 'STATUS_FAILED'): 'terminal',
     ('supervisor/cancel_publication.py::_finalize_cancel_intent_on_miss', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/events_project_routing.py::_persist_promote_rejection', 'STATUS_FAILED'): 'terminal',
+    # The promoter's force_plan transfer is a locked field projection like its
+    # review-evidence sibling above: it preserves the status it reads (possibly
+    # terminal) and only records where the planning obligation went.
+    ('supervisor/events_project_routing.py::_record_obligation_transfer', '"running"'): 'dynamic',
     ('supervisor/events_schedule_task.py::_reject_schedule_task', 'status'): 'dynamic',
     ('supervisor/events_task_done.py::_finish_task_done_dispatch', 'STATUS_FAILED'): 'terminal',
     ('supervisor/events_task_done.py::_resolve_lifecycle_fault', 'STATUS_FAILED'): 'terminal',
+    # Monetary refresh projects fields under the result lock and preserves its
+    # current terminal status; it cannot publish a lifecycle transition.
+    ('supervisor/events_task_done.py::_refresh_terminal_task_cost', 'current["status"]'): 'dynamic',
     ('supervisor/queue_snapshot.py::restore_pending_from_snapshot', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/task_admission.py::record_scheduled_admission', 'STATUS_FAILED'): 'terminal',
     ('supervisor/task_admission.py::terminalize_invalid_depth_restore', 'STATUS_FAILED'): 'terminal',
@@ -106,7 +116,6 @@ TERMINAL_WRITERS = {
     ('supervisor/worker_health.py::_recover_crashed_task_without_terminal', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/worker_health.py::_recover_crashed_task_without_terminal', 'STATUS_FAILED'): 'terminal',
     ('supervisor/worker_pool_lifecycle.py::_write_failure_result', 'final_status'): 'dynamic',
-    ('supervisor/worker_promotion.py::_fail_promoted_task_loudly', 'STATUS_FAILED'): 'terminal',
     ('supervisor/workers.py::_settle_cancelled_pending_row', 'status_cancelled'): 'dynamic',
     ('supervisor/workers.py::_terminalize_invalid_pending_depth', 'STATUS_FAILED'): 'terminal',
 }

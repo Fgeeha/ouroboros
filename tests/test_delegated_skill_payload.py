@@ -18,6 +18,7 @@ import subprocess
 import pytest
 
 from ouroboros import delegate_custody as custody
+from tests._governance_docs_shared import architecture_text
 from ouroboros.subagent_worktrees import (
     find_execution_snapshot,
     provision_payload_snapshot,
@@ -71,6 +72,7 @@ def _payload_ctx(tmp_path: pathlib.Path, monkeypatch):
                 "credential_profile_id": "",
             },
             "effort": "low",
+            "access": "workspace_write",
         }],
     }
     monkeypatch.setenv("OUROBOROS_SUBAGENTS", json.dumps(configured))
@@ -87,12 +89,13 @@ def _payload_ctx(tmp_path: pathlib.Path, monkeypatch):
 
 
 def _exact_payload_start(ctx, prompt: str, **params):
+    """The start's own JSON payload, read off the family's native result."""
     from ouroboros.subagent_runtime import exact_start
 
     return exact_start(ctx, prompt, {
         "snapshot": ctx._payload_subagent_snapshot,
         **params,
-    })
+    }).text
 
 
 class _StartStub:
@@ -110,11 +113,14 @@ class _StartStub:
     def agent_capabilities(self):
         return {"harnesses": [{
             "id": "some-route", "enabled": True, "status": "ok",
-            "accessProfilesSupported": ["readonly", "workspace_write"],
+            "accessProfilesSupported": ["readonly", "workspace_write", "full"],
         }]}
 
     def quota_snapshots(self):
         return []
+
+    def ensure_full_access(self, root):
+        self._seen["full_grant"] = root
 
     def find_project_id(self, root):
         return "prj-existing"
@@ -176,14 +182,16 @@ def _terminal_wait(ctx, monkeypatch, *, run_id="run-p1",
 # -- 1A: selector, authority, custody shape -------------------------------------
 
 
-def test_payload_start_provisions_standalone_snapshot_with_semantic_ref(tmp_path, monkeypatch):
+@pytest.mark.parametrize("access", ["workspace_write", "full"])
+def test_payload_start_provisions_standalone_snapshot_with_semantic_ref(tmp_path, monkeypatch, access):
     ctx = _payload_ctx(tmp_path, monkeypatch)
+    ctx._payload_subagent_snapshot["access"] = access
     skill = _seed_skill(tmp_path / "data")
     payload, seen = _start_payload_run(ctx, monkeypatch)
     assert payload["status"] == "started", payload
     request = seen["request"]
     # The mutating shape rides the exact binding, never a workspace derivation.
-    assert request["access"] == "workspace_write" and request["mode"] == "agent"
+    assert request["access"] == access and request["mode"] == "agent"
     assert request["execution"] == {"isolation": "live", "delegated": True}
     exec_root = pathlib.Path(str(request["scope"]["root"]))
     assert exec_root.resolve().is_relative_to((tmp_path / "snaps").resolve())
@@ -195,7 +203,7 @@ def test_payload_start_provisions_standalone_snapshot_with_semantic_ref(tmp_path
     # Durable custody carries the granted shape and the semantic reference.
     entry = custody.replay(tmp_path / "data")["run-p1"]
     assert entry.authority_source == "skill_payload"
-    assert entry.access == "workspace_write" and entry.isolation == "live"
+    assert entry.access == access and entry.isolation == "live"
     ref = entry.resource_ref
     assert ref["source"] == "external" and ref["skill_name"] == "alpha"
     assert ref["target_root"] == str(skill.resolve()) and ref["payload_hash"]
@@ -220,7 +228,7 @@ def test_selector_argument_shapes_refuse_typed(tmp_path, monkeypatch):
         (dict(root="skill_payload", bucket="external"), "payload_selector_incomplete"),
         (dict(bucket="external", skill_name="alpha"), "payload_selector_incomplete"),
     ):
-        out = json.loads(delegate._delegate_start(ctx, "x", **kwargs))
+        out = json.loads(delegate._delegate_start(ctx, "x", **kwargs).text)
         assert out["status"] == "refused" and out["reason"] == reason, out
 
 
@@ -309,7 +317,7 @@ def test_markerless_native_delegates_as_external_and_rebinds_by_marker(
         context="test",
     )
     assert rebound is None
-    assert "payload_target_unresolved" in refusal
+    assert "payload_target_unresolved" in refusal.text
     custody._CUSTODY.clear()
 
 
@@ -820,20 +828,23 @@ def test_child_git_config_diff_driver_does_not_execute_at_capture(tmp_path, monk
     custody._CUSTODY.clear()
 
 
-def test_payload_instructions_variant_is_payload_only(tmp_path, monkeypatch):
+@pytest.mark.parametrize("access", ["workspace_write", "full"])
+def test_payload_instructions_variant_is_payload_only(tmp_path, monkeypatch, access):
     """Gate fix 3: ordinary runs keep the blanket ban byte-identically; only a
     payload run gets the narrowed ban plus the explicit permission block."""
     from ouroboros.subagents import delegated_run_shape
     from ouroboros.tools.delegate import _HOST_INSTRUCTIONS, _host_instructions
 
     ordinary = _host_instructions(delegated_run_shape(False))
-    assert "runtime controls, skills, or memory" in ordinary
+    assert "do not touch the host's runtime controls, skills, or memory" in ordinary
     assert "PAYLOAD ASSIGNMENT" not in ordinary
-    payload = _host_instructions(delegated_run_shape(True), payload_skill="alpha")
+    mutating = _host_instructions(delegated_run_shape(True, access))
+    assert "do not touch the host's runtime controls, skills, or memory" in mutating
+    payload = _host_instructions(delegated_run_shape(True, access), payload_skill="alpha")
     assert "runtime controls, skills, or memory" not in payload
-    assert "runtime controls or memory" in payload
+    assert "do not touch the host's runtime controls or memory" in payload
     assert "PAYLOAD ASSIGNMENT" in payload and "'alpha'" in payload
-    assert "runtime controls, skills, or memory" in _HOST_INSTRUCTIONS  # source intact
+    assert "do not touch the host's runtime controls, skills, or memory" in _HOST_INSTRUCTIONS  # source intact
 
 
 def test_idempotent_already_applied_branch_runs_the_finalizer(tmp_path, monkeypatch):
@@ -1165,8 +1176,7 @@ def test_schema_and_docs_split_git_staging_from_payload_live_apply():
     decision = entry.schema["parameters"]["properties"]["decision"]["description"]
     assert "STAGED into your active root" in decision
     assert "applied LIVE into the non-Git payload" in decision
-    arch = (pathlib.Path(__file__).resolve().parents[1] / "docs" /
-            "ARCHITECTURE.md").read_text(encoding="utf-8")
+    arch = architecture_text()
     assert "staging substrate differs" in arch
     assert "A SKILL-PAYLOAD target captures through the payload adapter" in arch
     assert "QUEUES the extension reconcile request" in arch
@@ -1412,13 +1422,13 @@ def test_host_states_the_typed_access_profile_once_and_says_it_governs():
     work order duplicated and contradicted the profile the host had already
     derived, and the run died unable to reach its own read surface. The host
     renders ONE sentence from `DelegatedRunShape.access`, names it as the
-    governing text, and still appends the assignment last as context."""
+    native-mechanism text, while explicit task constraints still bind."""
     from ouroboros.delegate_start_instructions import access_instruction
     from ouroboros.subagents import delegated_run_shape
     from ouroboros.tools.delegate import _host_instructions
 
-    precedence = ("any access wording in the assignment text below is CONTEXT, "
-                  "not authority — this line governs.")
+    precedence = ("this line governs native process access, while explicit task "
+                  "constraints and the assigned edit target still bind.")
     readonly = _host_instructions(delegated_run_shape(False))
     assert "ACCESS: you may read and run read-only commands inside this root" in readonly
     assert readonly.count(precedence) == 1  # one sentence, never a paragraph
@@ -1427,6 +1437,11 @@ def test_host_states_the_typed_access_profile_once_and_says_it_governs():
     assert "ACCESS: you may edit inside this root" in acting
     assert acting.count(precedence) == 1
     assert "read and run read-only commands" not in acting
+    full = _host_instructions(delegated_run_shape(True, "full"))
+    assert full.count(precedence) == 1
+    assert "No filesystem sandbox is requested" in full
+    assert "do not write outside this root" not in full
+    assert "source edits delivered through the assigned root" in full
 
     assignment = "ASSIGNMENT\nRead-only, no edits or commands."
     with_assignment = _host_instructions(delegated_run_shape(False), assignment)

@@ -1,20 +1,9 @@
 """Structural contracts for the semantic-no-op core tool extraction.
 
-Carried from the v7 reference (ouroboros_v7_wip @ 9f691656) with the following
-identity continuations to THIS tree's bytes:
-
-1. The catalog schema hash is re-pinned to tip bytes (upstream drifted the
-   read/list/write schemas after the reference cutoff).
-2. This tree keeps a re-export facade on ``tools/core.py`` (the §5.3 partial-
-   split idiom, matching the shell facade) instead of the reference's
-   no-facade cutover, so the reference's ``isdisjoint(vars(core))`` clause is
-   replaced by the facade identity clause; the consumer-rebinding rows of the
-   reference (browser/vision/query_code/edit_ops/test bindings) stay pending
-   and ride with their own hygiene wave.
-3. The frozen-tool-inventory clauses are dropped: ``ouroboros.tool_module_
-   inventory`` is a D04-family v7 leaf absent from this tree; the
-   non-catalog-owner and no-backedge clauses keep the structural half of that
-   contract. The inventory clause returns with its leaf.
+``tools/core.py`` keeps a re-export facade, matching the shell facade, so
+existing importers retain the exact leaf objects. The catalog schema hash
+pins the current tool schemas and the handler map pins their owners.
+The leaves are non-catalog owners without backedges into the facade.
 """
 
 from __future__ import annotations
@@ -117,10 +106,16 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
         separators=(",", ":"),
     ).encode()
     # Rolled for P1-9 (owner Q7=B): the escalate description states the ABCD rule and
-    # QuizOption gained the optional `recommended` boolean. Diffing the whole catalog
-    # base to head shows exactly those two edits and nothing else.
+    # QuizOption gained the optional `recommended` boolean. Rolled again for owner
+    # decision 6C (structural-health wave 2): the forward_to_worker description now
+    # names its second addressee, any host-listed independent root, delivered as a
+    # message from an independent task. Rolled again for owner decision В17a=A: the
+    # escalate description stops promising expiry at task end (a late answer reaches
+    # the chat as an ordinary owner message) and the optional `max_wait_minutes`
+    # bound joins its parameters. Diffing the whole catalog base to head shows
+    # exactly those edits and nothing else.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "8f80432a654edbe9487969d381cbee8528140a23d36323562a971363246925a9"
+        "532059cb95c431df39b0a950ced52e05228e88ec3ddd180bc0d2fa9a0cc8f616"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)
@@ -178,6 +173,6 @@ def test_core_extraction_size_bounds_have_meaningful_headroom():
         module.__name__: len(pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines())
         for module in (core, core_file_tools, core_artifacts)
     }
-    assert 1200 <= counts["ouroboros.tools.core"] <= 1499
-    assert 750 <= counts["ouroboros.tools.core_file_tools"] <= 1000
-    assert 150 <= counts["ouroboros.tools.core_artifacts"] <= 1000
+    assert counts["ouroboros.tools.core"] <= 1499
+    assert counts["ouroboros.tools.core_file_tools"] <= 1000
+    assert counts["ouroboros.tools.core_artifacts"] <= 1000

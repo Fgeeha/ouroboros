@@ -24,6 +24,9 @@ CLAUDEXOR_MODEL_POLL_INTERVAL_SEC = 0.25
 CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC = 35.0
 # Physical exit observation after a clean operator-stop receipt, not a task deadline.
 CLAUDEXOR_STOP_EXIT_WAIT_SEC = 5.0
+# Phone-native source compilation exceeds ten minutes; one contained platform
+# preparation may run for an hour, independently of ordinary tool/harness calls.
+EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC = 3600.0
 
 
 EXTENSION_STREAM_CHUNK_BYTES = 64 * 1024
@@ -51,13 +54,15 @@ WS_RELAY_REFILL_PER_SEC = 1.0
 # detector counts dead workers (up to ~60s to init: spawn + pip); workers.py binds it as `_SPAWN_GRACE_SEC`, the extension import-staging sweep reads it too.
 WORKER_SPAWN_GRACE_SEC = 90.0
 # Readiness window for ONE spawned/respawned slot: unassignable until the child's own `worker_ready` row lands; alive
-# but silent past this = torn down and replaced. Sized to the spawn grace (the pool's existing init budget): a warm
-# forkserver child boots in ~3-4s (G13 mock lane: 3.5-4.9s startup, 2.5-3.2s respawn), a cold 4-vCPU CI runner well under 60s (its 21-scenario mock lane runs in ~80s), and the E2E
-# scenarios wait 240s per task, so a wedged child is a fast, named failure. A contract distinct from process liveness
+# but silent past this = torn down and replaced. A child's own entry progress permits one longer window for
+# expensive extension loading; an empty mock install does not establish production startup latency.
+# Readiness is a contract distinct from process liveness
 # (`proc.is_alive`, worker_health.py) and from the task idle rail (queue_timeouts.py): a deadlocked child is alive.
 WORKER_READY_WINDOW_SEC = 90.0
 # Consecutive readiness failures of one slot before it is parked and reported (three strikes, like the crash-storm fence).
 WORKER_READY_MAX_ATTEMPTS = 3
+# One extension for a child that wrote its own entry progress, measured from birth, never from the last poll.
+WORKER_READY_CEILING_SEC = 300.0
 
 
 def _clamped_number_setting(key: str, *, low, high=float("inf"), cast=float):
@@ -212,6 +217,15 @@ def get_post_task_evolution_budget_usd() -> float:
     return _clamped_number_setting("OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD", low=0.0)
 
 
+# Share of a reviewer's USABLE window that CHANGE-CLASS governance may occupy
+# inline (`tools/governance_context.py` tiers 2 and 3 together): the handbook
+# chapters the change activates and, for a packet row, the architecture sections
+# that name a touched file. The rest of both books arrives as navigation the
+# reviewer reads on demand, so a 272K-token governance corpus can never crowd
+# out the change itself. Structural, not a settings key.
+REVIEW_GOVERNANCE_INLINE_SHARE = 0.20
+
+
 # Per-root active-child ceiling (v6.82: 50->500) and absolute host-visible nesting ceiling, used by supervisor gates and ARCHITECTURE §7.
 MAX_ACTIVE_SUBAGENTS_HARD_CAP, MAX_SUBAGENT_DEPTH_HARD_CAP = 500, 10
 
@@ -253,6 +267,61 @@ def get_delegate_wait_sec() -> int:
     wait holds, returns its advances, and bounds the nanny's mailbox absence."""
     return _clamped_number_setting(
         "OUROBOROS_DELEGATE_WAIT_SEC", low=1, high=get_delegate_wait_max_sec(), cast=int)
+
+
+# Consciousness wake-ups. The interval between wakes is the MODEL's choice (``set_next_wakeup``),
+# clamped to [``get_bg_wakeup_min_sec``, ``get_bg_wakeup_max_sec``]; WAKE_DEFAULT_SEC is the interval
+# used when it has chosen none — 55 minutes, just under the default ``OUROBOROS_PROMPT_CACHE_TTL``
+# of 1 h, so the shared prefix is still warm on TTL-metered routes when the next wake lands. SSOT
+# for the alarm; ``consciousness.py`` adopts these readers in P2.
+WAKE_DEFAULT_SEC = 3300
+CONSCIOUSNESS_AUTONOMY_LEVELS = ("observe", "act", "full")
+# The usage ledger keeps every attempt younger than this UNFOLDED (``usage_compaction``
+# ``_foldable_attempt_ids``): a folded group row is stamped with the compaction instant,
+# so only unfolded rows keep the true spend time the rolling consciousness allowance
+# (``consciousness_allowance``, a 24 h window) reads. Twice the window, so a root that
+# spent inside the window is still attributable when the window closes.
+USAGE_LEDGER_FOLD_MIN_AGE_SEC = 48 * 3600
+
+
+def get_consciousness_autonomy() -> str:
+    """What a consciousness wake may do: ``observe`` | ``act`` | ``full``. A closed enum read the
+    ``resolve_effort`` way — an unknown value is a typo, not a new level, and falls back to the
+    shipped default rather than widening or silently disabling what consciousness may do."""
+    value = str(runtime_setting("OUROBOROS_CONSCIOUSNESS_AUTONOMY", "") or "").strip().lower()
+    if value in CONSCIOUSNESS_AUTONOMY_LEVELS:
+        return value
+    return str(SETTINGS_DEFAULTS["OUROBOROS_CONSCIOUSNESS_AUTONOMY"])
+
+
+def get_consciousness_daily_usd() -> float:
+    """Rolling-24h USD ceiling on consciousness spend — its wakes plus the tasks they start.
+    ``0`` is a real owner choice, not unset: consciousness may not spend at all."""
+    return _clamped_number_setting("OUROBOROS_CONSCIOUSNESS_DAILY_USD", low=0.0)
+
+
+def get_consciousness_max_tasks() -> int:
+    """How many consciousness-started tasks may run at once; ``0`` = never start tasks (the explicit
+    zero of ``get_max_subagent_depth``). The hard max is a sanity ceiling — the real bounds are the
+    daily allowance and the worker pool, not this number."""
+    return _bounded_positive_int_setting(
+        "OUROBOROS_CONSCIOUSNESS_MAX_TASKS",
+        default=int(SETTINGS_DEFAULTS["OUROBOROS_CONSCIOUSNESS_MAX_TASKS"]),
+        hard_max=32,
+        min_value=0,
+    )
+
+
+def get_bg_wakeup_min_sec() -> int:
+    """Lower bound of the wake-up interval, floored at 60s so a typo cannot busy-wake the tick."""
+    return _clamped_number_setting("OUROBOROS_BG_WAKEUP_MIN", low=60, cast=int)
+
+
+def get_bg_wakeup_max_sec() -> int:
+    """Upper bound of the wake-up interval; never below the lower bound, so an inverted pair
+    collapses to a fixed interval instead of an empty range."""
+    return _clamped_number_setting(
+        "OUROBOROS_BG_WAKEUP_MAX", low=get_bg_wakeup_min_sec(), cast=int)
 
 
 def get_search_code_wall_sec() -> float:

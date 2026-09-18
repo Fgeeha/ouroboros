@@ -542,40 +542,68 @@ def _session_subject_section(subject: Optional[ManagedReviewSubject]) -> str:
 
 def build_triad_session_task(*, goal_section: str, scope_section: str,
                              checklist_section: str, rebuttal_section: str,
-                             review_history_section: str, dev_guide_text: str,
-                             architecture_text: str,
+                             review_history_section: str, dev_guide_text: str = "",
+                             architecture_text: str = "",
+                             governance_repo_dir: Optional[Any] = None,
+                             governance: Optional[Any] = None,
                              subject: Optional[ManagedReviewSubject] = None) -> str:
     """The commit-triad task in SESSION delivery (5.2/5.3): the SAME preamble,
     calibration, checklist and goal/scope/history the api pack carries — but no
     assembled evidence. The subject is a pointer (the session takes the staged
     diff itself) — except for a managed resolution, whose authoritative delta
-    artifact is inlined — and the governance docs arrive as navigation maps (5.7)."""
-    from ouroboros.context_layout import generate_doc_nav_map
+    artifact is inlined. Governance uses the same inline rules and navigation
+    tiers as the other review deliveries."""
+    from ouroboros.context_layout import book_navigation, generate_doc_nav_map
+    from ouroboros.reference_books import BOOK_ENTRYPOINTS, load_reference_book
     from ouroboros.tools.review_helpers import (
         CRITICAL_FINDING_CALIBRATION,
         REPO_ANTI_PATTERN_LOCK_GUARD,
         REVIEW_PREAMBLE,
     )
 
-    nav_maps = [
-        generate_doc_nav_map(text, title=title, rel_path=rel)
-        for title, rel, text in (
-            ("DEVELOPMENT.md", "docs/DEVELOPMENT.md", dev_guide_text),
-            ("ARCHITECTURE.md", "docs/ARCHITECTURE.md", architecture_text),
-        )
-        if str(text or "").strip()
-    ]
+    if governance is None and governance_repo_dir is not None:
+        from ouroboros.tools.governance_context import governance_context
+
+        governance = governance_context(
+            governance_repo_dir, surface="triad", delivery="retrieving",
+            checklist_section_text=checklist_section)
+    # Historical callers without a repository can supply standalone book texts.
+    # Live callers hand in the shared governance context, including tier 1.
+    # The supplied texts are the COMPOSED books, so mapping them against the
+    # entrypoint path would hand the session offsets into a file that holds a
+    # membership list. With a governance root the map is built from the book and
+    # addresses each physical chapter; without one (a synthetic or historical
+    # input) the supplied text is mapped as the single source it is.
+    nav_maps: list[str] = []
+    for book_id, rel, title, text in (
+        ("development", BOOK_ENTRYPOINTS["development"], "DEVELOPMENT.md", dev_guide_text),
+        ("architecture", BOOK_ENTRYPOINTS["architecture"], "ARCHITECTURE.md", architecture_text),
+    ):
+        if governance is not None:
+            break
+        if not str(text or "").strip():
+            continue
+        if governance_repo_dir is not None:
+            try:
+                nav_maps.append(book_navigation(load_reference_book(governance_repo_dir, book_id)))
+                continue
+            except (OSError, ValueError):
+                pass  # Fall back to the supplied text rather than drop the doc.
+        nav_maps.append(generate_doc_nav_map(text, title=title, rel_path=rel))
     return "\n\n".join(part for part in [
         REVIEW_PREAMBLE,
         CRITICAL_FINDING_CALIBRATION,
         REPO_ANTI_PATTERN_LOCK_GUARD,
         checklist_section,
+        governance.stable_inline if governance is not None else "",
+        governance.selected_inline if governance is not None else "",
+        governance.navigation if governance is not None else "",
         goal_section,
         scope_section,
         rebuttal_section,
         review_history_section,
         _session_subject_section(subject),
-        "## Governance context (navigation maps)\n"
+        "" if governance is not None else "## Governance context (navigation maps)\n"
         "Read BIBLE.md and docs/DESIGN.md in full from the repository root "
         "(DESIGN.md is short). The maps below index "
         "the other governance docs by line range; the paths are relative to the "

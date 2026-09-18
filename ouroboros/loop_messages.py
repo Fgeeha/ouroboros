@@ -67,9 +67,11 @@ def _extract_plain_text_from_content(content: Any) -> str:
     return str(content) if content is not None else ""
 
 
-def _append_or_merge_user_message(messages: List[Dict[str, Any]], text: str) -> None:
-    """Append a user message without creating consecutive user turns."""
-    _append_or_merge_user_content(messages, text)
+def _append_or_merge_user_message(
+    messages: List[Dict[str, Any]], text: str, *, slot: Any = None,
+) -> None:
+    """Append a user message, merging only when its tail is known unsent."""
+    _append_or_merge_user_content(messages, text, slot=slot)
 
 
 def _evict_stale_image_blocks(messages: List[Dict[str, Any]], *, incoming: int = 0) -> None:
@@ -110,8 +112,17 @@ def _evict_stale_image_blocks(messages: List[Dict[str, Any]], *, incoming: int =
         content[b_idx] = {"type": "text", "text": placeholder}
 
 
-def _append_or_merge_user_content(messages: List[Dict[str, Any]], content: Any) -> None:
-    """Append user content without flattening multipart blocks."""
+def _append_or_merge_user_content(
+    messages: List[Dict[str, Any]], content: Any, *, slot: Any = None,
+) -> None:
+    """Append user content without flattening multipart blocks.
+
+    ``slot`` is the execution slot the send observer parks the previous send's
+    digests on (the loop's ToolContext). Merge only when that recorded send
+    proves the tail absent; an unknown or sent tail stays intact.
+    """
+    from ouroboros.transcript_prefix import unsent_in_previous_send
+
     if isinstance(content, list):
         incoming_images = sum(
             1 for b in content
@@ -119,9 +130,8 @@ def _append_or_merge_user_content(messages: List[Dict[str, Any]], content: Any) 
         )
         if incoming_images:
             _evict_stale_image_blocks(messages, incoming=incoming_images)
-    if messages and messages[-1].get("acceptance_observation"):
-        # A sent observation row is byte-frozen: merging into it would rewrite an
-        # already-sent message and break byte-prefix prompt caching (issue #906).
+    if not (messages and unsent_in_previous_send(slot, messages[-1])):
+        # Unknown or sent content stays intact, including slot-less producers.
         messages.append({"role": "user", "content": content})
         return
     if messages and messages[-1].get("role") == "user":
@@ -363,13 +373,17 @@ def _emit_round_progress(content: Any, msg: Dict[str, Any], emit_progress, llm_t
     "Thinking" line, so the timeline reads think -> say); it stays display-only
     and is never appended to the transcript or ``reasoning_notes``. Visible text
     follows on the untyped path and is retained in ``reasoning_notes``.
+
+    Both emissions are the turn's OWN speech, so both carry ``narration=True``:
+    this function is the single producer of model narration, and the card takes
+    its title and collapsed activity line from that voice alone.
     """
     if str(runtime_setting("OUROBOROS_REASONING_SUMMARY", "auto")).strip().lower() != "off":
         display_reasoning = LLMClient.extract_display_reasoning(msg)
         if display_reasoning:
-            emit_progress(sanitize_tool_result_for_log(display_reasoning), meta={"reasoning": True})
+            emit_progress(sanitize_tool_result_for_log(display_reasoning), meta={"reasoning": True}, narration=True)
     visible_text = _visible_round_text(content)
     if visible_text:
         safe_text = sanitize_tool_result_for_log(visible_text)
-        emit_progress(safe_text)
+        emit_progress(safe_text, narration=True)
         llm_trace["reasoning_notes"].append(safe_text)

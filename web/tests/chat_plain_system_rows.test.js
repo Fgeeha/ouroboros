@@ -249,7 +249,7 @@ const PLAIN_ROW = {
     role: 'system',
     system_type: 'project_completion_summary',
     markdown: false,
-    content: 'Launch › Ship · Completed\nPlain excerpt line.',
+    content: 'Launch › Ship · Completed\nOpen the Project for details.',
     project_id: 'launch',
     project_name: 'Launch',
     ts: '2026-08-31T00:00:00Z',
@@ -267,7 +267,7 @@ test('plain project row renders escaped text with Open Project and no markdown m
         // Escaped plain text: the raw newline survives (pre-wrap), so the row
         // did NOT pass through the markdown renderer (whose no-parser fallback
         // rewrites \n to <br>) and produced no heading elements.
-        assert.match(bubble.innerHTML, /Launch › Ship · Completed\nPlain excerpt line\./);
+        assert.match(bubble.innerHTML, /Launch › Ship · Completed\nOpen the Project for details\./);
         assert.doesNotMatch(bubble.innerHTML, /<br>|<h1|<h2|md-h1|md-h2/);
         // Bug report #9: no enhancement pass — Mermaid/Chart/KaTeX/code-copy
         // only ever activate behind enhanceChatMarkdown's enhanced stamp.
@@ -384,6 +384,141 @@ test('system row without a markdown flag renders plain (cancel_receipt class)', 
         assert.match(bubble.innerHTML, /Task cancelled\. Preserved below\.\n## Heading \*\*bold\*\* `code`/);
         assert.doesNotMatch(bubble.innerHTML, /<br>|<h2|md-h2|<strong/);
         assert.equal(bubble.getAttribute('data-chat-markdown-enhanced'), '');
+    } finally {
+        instance?.destroy();
+        restoreDom(prior);
+    }
+});
+
+// Host-refusal placement: an owner-initiated refusal is ONE typed
+// system row bound to the target task's id, with plain `<title> · <cause>`
+// text — `task_not_started` for a confirmed refusal («Not started: …») and
+// `task_start_unconfirmed` when the host cannot tell («Not confirmed: …»).
+// A typed keyed row is neither a terminal fact nor a plain untyped final, so it
+// renders as an ordinary plain system bubble and mints/finishes no live card —
+// live or on replay. Admission and steering get the same assertions.
+const ORIGIN_ADDRESSED_NOTICE_ROWS = [
+    {
+        chat_id: 2,
+        role: 'system',
+        system_type: 'task_not_started',
+        task_id: 'abc123',
+        content: 'Аудит · Not started: the working folder can\'t be used',
+        ts: '2026-09-16T00:00:04Z',
+    },
+    {
+        chat_id: 2,
+        role: 'system',
+        system_type: 'task_start_unconfirmed',
+        task_id: 'def456',
+        content: 'Аудит · Not confirmed: the task may or may not have started',
+        ts: '2026-09-16T00:00:05Z',
+    },
+    {
+        chat_id: 2,
+        role: 'system',
+        system_type: 'steer_not_delivered',
+        task_id: 'ghi789',
+        content: 'Аудит · Not delivered: the task is in another chat',
+        ts: '2026-09-18T00:00:06Z',
+    },
+];
+
+function findCard(node, taskId) {
+    if (node?.dataset?.taskId === taskId && node.classList?.contains('chat-live-card')) return node;
+    for (const child of node?.children || []) {
+        const hit = findCard(child, taskId);
+        if (hit) return hit;
+    }
+    return null;
+}
+
+function liveCards() {
+    const messages = globalThis.document.byId.get('chat-messages');
+    return messages.children.filter((node) => node.classList.contains('chat-live-card'));
+}
+
+for (const noticeRow of ORIGIN_ADDRESSED_NOTICE_ROWS) {
+    test(`${noticeRow.system_type} renders as a plain system bubble and mints no card, live and after reload`, async () => {
+        const expectedText = new RegExp(noticeRow.content.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'));
+        let liveHtml = '';
+        {
+            const { prior, mount } = installDom();
+            let instance;
+            try {
+                const made = makeInstance(mount);
+                instance = made.instance;
+                made.handlers.get('chat')(noticeRow);
+                const bubble = findBubble('system');
+                assert.ok(bubble, 'the notice row rendered a system bubble');
+                assert.match(bubble.innerHTML, /📋 System/);
+                assert.match(bubble.innerHTML, expectedText);
+                assert.doesNotMatch(bubble.innerHTML, /<br>|<h1|<h2|md-h1|md-h2|<strong/);
+                assert.equal(bubble.getAttribute('data-chat-markdown-enhanced'), '');
+                assert.equal(bubble.dataset.taskId, noticeRow.task_id, 'the row keeps its target identity');
+                const messages = globalThis.document.byId.get('chat-messages');
+                assert.equal(findCard(messages, noticeRow.task_id), null, 'a refusal mints no live card');
+                assert.equal(liveCards().length, 0);
+                liveHtml = bubble.innerHTML;
+            } finally {
+                instance?.destroy();
+                restoreDom(prior);
+            }
+        }
+        const historyRow = {
+            text: noticeRow.content,
+            role: 'system',
+            ts: noticeRow.ts,
+            is_progress: false,
+            system_type: noticeRow.system_type,
+            task_id: noticeRow.task_id,
+            markdown: false,
+        };
+        const { prior, mount } = installDom(async (url) => {
+            if (String(url).startsWith('/api/chat/history')) {
+                return { ok: true, json: async () => ({ messages: [historyRow] }) };
+            }
+            return { ok: true, json: async () => ({ active_direct_turns: [] }) };
+        });
+        let instance;
+        try {
+            ({ instance } = makeInstance(mount));
+            await settle();
+            await settle();
+            const bubble = findBubble('system');
+            assert.ok(bubble, 'history replay rendered the notice row');
+            assert.equal(bubble.innerHTML, liveHtml,
+                'live DOM and reload DOM are byte-identical for the notice row');
+            const messages = globalThis.document.byId.get('chat-messages');
+            assert.equal(findCard(messages, noticeRow.task_id), null,
+                'replay does not mint a card for the refusal');
+            assert.equal(liveCards().length, 0);
+        } finally {
+            instance?.destroy();
+            restoreDom(prior);
+        }
+    });
+}
+
+test('a refused steer leaves the running target card open', () => {
+    const { prior, mount } = installDom();
+    let instance;
+    try {
+        const made = makeInstance(mount);
+        instance = made.instance;
+        const notice = ORIGIN_ADDRESSED_NOTICE_ROWS.find((row) => row.system_type === 'steer_not_delivered');
+        made.handlers.get('chat')({
+            chat_id: 2, role: 'assistant', is_progress: true, content: 'Reviewing the change',
+            ts: '2026-09-18T00:00:01Z', task_id: notice.task_id, cancelable: true,
+        });
+        const messages = globalThis.document.byId.get('chat-messages');
+        const card = findCard(messages, notice.task_id);
+        assert.ok(card, 'the target already has a live card');
+        assert.equal(card.dataset.finished, '0');
+        made.handlers.get('chat')(notice);
+        assert.equal(card.dataset.finished, '0', 'a refused message is no terminal task fact');
+        assert.equal(liveCards().length, 1);
+        assert.match(findBubble('system').innerHTML, /📋 System/);
     } finally {
         instance?.destroy();
         restoreDom(prior);

@@ -1,6 +1,5 @@
-# Production domain manifest — module -> domain, 1:1, for every runtime module
-# (plan §7.1, CPL-1). The Ф0 report-only stage lived at scripts/v7next_domains.toml;
-# this file is its production successor and the SSOT the domain gates read.
+# Production domain manifest — module -> domain, 1:1, for every runtime module.
+# This is the SSOT the domain gates read.
 #
 # Structure:
 #   - [domains] / [modules] / [classification] are HUMAN sections: the domain
@@ -71,6 +70,7 @@ D20 = "Presence"
 "ouroboros/_usage_response.py" = "D16"
 "ouroboros/_usage_rows.py" = "D16"
 "ouroboros/_usage_rows_memo.py" = "D16"
+"ouroboros/acceptance_settlement.py" = "D01"
 "ouroboros/agent.py" = "D01"
 "ouroboros/agent_dispatch.py" = "D01"
 "ouroboros/agent_startup_checks.py" = "D01"
@@ -101,6 +101,9 @@ D20 = "Presence"
 "ouroboros/settings_scales.py" = "D12"
 "ouroboros/configured_subagents.py" = "D07"
 "ouroboros/consciousness.py" = "D15"
+"ouroboros/consciousness_allowance.py" = "D15"
+"ouroboros/consciousness_authority.py" = "D15"
+"ouroboros/consciousness_wake.py" = "D15"
 "ouroboros/consolidator.py" = "D15"
 "ouroboros/knowledge.py" = "D15"
 "ouroboros/markdown_source.py" = "D18"
@@ -275,6 +278,7 @@ D20 = "Presence"
 "ouroboros/owner_hurry.py" = "D09"
 "ouroboros/owner_quiz.py" = "D09"  # F6 sync (#Q-2b): owner quiz cards, structural expiry with the authoring task
 "ouroboros/owner_mailbox.py" = "D01"
+"ouroboros/peer_roster.py" = "D01"  # the worker-side roster note beside the mailbox that renders its messages
 "ouroboros/owner_wait.py" = "D01"
 "ouroboros/packaged_cli.py" = "D18"
 "ouroboros/packaged_cli_install.py" = "D18"
@@ -289,6 +293,7 @@ D20 = "Presence"
 "ouroboros/presence_bindings.py" = "D20"
 "ouroboros/presence_capabilities.py" = "D20"
 "ouroboros/presence_context.py" = "D20"
+"ouroboros/presence_delivery.py" = "D20"
 "ouroboros/presence_profile.py" = "D20"
 "ouroboros/presence_runner.py" = "D20"
 "ouroboros/presence_runtime.py" = "D20"
@@ -323,6 +328,7 @@ D20 = "Presence"
 "ouroboros/review_evidence_sections.py" = "D06"
 "ouroboros/review_evidence_refs.py" = "D06"
 "ouroboros/review_execution.py" = "D06"
+"ouroboros/review_session_reads.py" = "D06"
 "ouroboros/review_execution_projection.py" = "D06"
 "ouroboros/review_native_episode.py" = "D06"
 "ouroboros/review_owner_custody.py" = "D06"
@@ -480,6 +486,7 @@ D20 = "Presence"
 "ouroboros/tools/review_multi_model.py" = "D06"
 "ouroboros/tools/review_admission.py" = "D06"
 "ouroboros/tools/review_binary_context.py" = "D06"
+"ouroboros/tools/governance_context.py" = "D06"
 "ouroboros/tools/review_context_atlas.py" = "D06"
 "ouroboros/tools/review_helpers.py" = "D06"
 "ouroboros/tools/review_file_pack.py" = "D06"
@@ -489,8 +496,7 @@ D20 = "Presence"
 "ouroboros/tools/review_subject.py" = "D06"
 "ouroboros/tools/review_synthesis.py" = "D06"
 "ouroboros/tools/scope_review.py" = "D06"
-"ouroboros/tools/scope_review_budget.py" = "D06"
-"ouroboros/tools/scope_review_pack.py" = "D06"
+"ouroboros/tools/scope_required_sources.py" = "D06"
 "ouroboros/tools/scope_review_contract.py" = "D06"
 "ouroboros/tools/scope_review_session.py" = "D06"
 "ouroboros/tools/scope_window.py" = "D06"
@@ -566,6 +572,7 @@ D20 = "Presence"
 "supervisor/owner_stop.py" = "D09"
 "supervisor/queue.py" = "D08"
 "supervisor/queue_snapshot.py" = "D08"
+"supervisor/direct_roots.py" = "D08"  # the main loop's off-lock fragment, written beside the snapshot
 "supervisor/queue_timeouts.py" = "D08"
 "supervisor/task_model_wait.py" = "D08"
 "supervisor/queue_schedules.py" = "D08"
@@ -575,6 +582,7 @@ D20 = "Presence"
 "supervisor/steering.py" = "D09"
 "supervisor/subagent_task_truth.py" = "D08"
 "supervisor/task_admission.py" = "D08"
+"supervisor/plan_obligation.py" = "D08"  # the promoter half of the admission transaction that stamps force_plan
 "supervisor/task_dispatch.py" = "D08"
 "supervisor/task_lifecycle.py" = "D09"
 "supervisor/task_reaper.py" = "D09"
@@ -611,19 +619,10 @@ D20 = "Presence"
 "supervisor/telemetry_events.py" = "D08"
 
 [classification]
-# The 80 new-upstream module placements this campaign derived rode here as
-# `proposed` (owner review pending) until owner batch №9 №10=A (2026-09-01)
-# accepted them as the 7.0 base; nine of them (the Presence family) had been
-# approved earlier under 4.2=A. The assignment itself lives in [modules] and
-# is unchanged by the acceptance — what is gone is the review marker, so
-# docs/DOMAIN_MAP.md no longer stars any row. A future placement that is
-# genuinely undecided goes back on this list rather than into [modules]
-# silently.
+# Module placements needing owner review are listed here and starred in
+# docs/DOMAIN_MAP.md. Accepted assignments remain in [modules]; an undecided
+# placement belongs on this list rather than being silently accepted.
 proposed = []
-
-# The Ф0 [split_pending]/[split_pending_leaves] sections are retired: every row
-# was resolved during F2 (dispositions recorded in docs/v7next/LEDGER_CORRECTIONS.md,
-# owner decisions 2026-08-31).
 
 # --- BEGIN GENERATED (python scripts/check_domains.py --write) ---
 # Factual dependency data of the live tree, pinned as baseline data.
@@ -684,7 +683,6 @@ allowed = [
   "D05->D19",
   "D06->D01",
   "D06->D02",
-  "D06->D03",
   "D06->D04",
   "D06->D07",
   "D06->D09",
@@ -704,6 +702,7 @@ allowed = [
   "D07->D08",
   "D07->D12",
   "D07->D13",
+  "D07->D15",
   "D07->D16",
   "D07->D17",
   "D07->D18",
@@ -777,10 +776,8 @@ allowed = [
   "D14->D18",
   "D14->D19",
   "D15->D01",
-  "D15->D02",
   "D15->D03",
   "D15->D04",
-  "D15->D09",
   "D15->D12",
   "D15->D16",
   "D15->D18",
@@ -836,11 +833,13 @@ lazy_only = [
   "D04->D10",
   "D04->D12",
   "D04->D14",
+  "D04->D15",
   "D04->D20",
   "D05->D06",
   "D05->D07",
   "D05->D14",
   "D05->D20",
+  "D06->D03",
   "D06->D05",
   "D06->D08",
   "D06->D15",
@@ -848,7 +847,6 @@ lazy_only = [
   "D07->D10",
   "D07->D11",
   "D07->D14",
-  "D07->D15",
   "D07->D20",
   "D08->D02",
   "D08->D10",
@@ -882,11 +880,14 @@ lazy_only = [
   "D14->D08",
   "D14->D17",
   "D14->D20",
+  "D15->D02",
   "D15->D05",
   "D15->D06",
   "D15->D07",
   "D15->D08",
+  "D15->D09",
   "D15->D10",
+  "D15->D13",
   "D15->D17",
   "D16->D01",
   "D16->D03",
@@ -913,6 +914,7 @@ lazy_only = [
   "D19->D20",
   "D20->D01",
   "D20->D07",
+  "D20->D08",
   "D20->D11",
   "D20->D12",
 ]

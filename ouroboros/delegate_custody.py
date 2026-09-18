@@ -194,6 +194,13 @@ class RunCustody:
     patch_apply_pending: bool = False
     patch_apply_key: str = ""  # Existing apply intent's engine idempotency key.
 
+    @property
+    def review_owned(self) -> bool:
+        """A run a REVIEW surface registered is owned by its panel, not by this
+        task's delegation lifecycle: the panel bounds it, and the task's own
+        terminal is never a verdict about its reviewer (issue #1006)."""
+        return review_owned_source(self.source)
+
 
 # Process-local MEMOIZATION of the rows above — never the authority. A miss falls
 # through to the durable scan, which is why a restart no longer loses custody.
@@ -358,6 +365,7 @@ from ouroboros.delegate_registration_policy import (
     STARTED_FIRST_WINS_FACTS as _STARTED_FIRST_WINS_FACTS,
     STARTED_PROGRESS_FLAGS as _STARTED_PROGRESS_FLAGS,
     STARTED_STR_FIELDS as _STARTED_STR_FIELDS,
+    review_owned_source,
 )
 
 from ouroboros.delegate_source_coverage import (
@@ -703,6 +711,8 @@ def invocation_record(drive_root: Any, invocation_id: str, *,
     and isolation facts are likewise replayed rather than re-derived.
     ``rows`` reuses a caller's single event snapshot, as the other replay views do.
     """
+    from ouroboros.delegate_pending import request_body
+
     target = str(invocation_id or "").strip()
     if not target:
         return None
@@ -718,7 +728,7 @@ def invocation_record(drive_root: Any, invocation_id: str, *,
                 "surface": str(row.get("surface") or ""),
                 "slot_id": str(row.get("slot_id") or ""),
                 "operation_id": str(row.get("operation_id") or ""),
-                "request": row.get("request") if isinstance(row.get("request"), dict) else None,
+                "request": request_body(drive_root, row),
                 "route": str(row.get("route") or ""),
                 "project_id": str(row.get("project_id") or ""),
                 "project_owned": bool(row.get("project_owned")),
@@ -766,7 +776,22 @@ def record_start_requested(drive_root: Any, **payload: Any) -> bool:
     Returns whether the row LANDED; the caller must not POST when it did not —
     a run whose request row never reached disk is live, mutating and unfindable
     if the worker dies before ``record_started``.
+
+    The full replay envelope goes to raw CAS before its event reference. Use
+    ``write_blob``, never a redacted ``persist_call`` projection: request values
+    must retain the engine's canonical JSON digest on an idempotent retry.
     """
+    body = payload.get("request")
+    if isinstance(body, dict) and body:
+        from ouroboros.observability import write_blob
+
+        try:
+            ref = write_blob(pathlib.Path(drive_root), body, kind="json")
+        except Exception:
+            log.warning("delegate custody request body could not be stored", exc_info=True)
+            return False
+        payload = {key: value for key, value in payload.items() if key != "request"}
+        payload.update(request_ref=ref, prompt_chars=len(str(body.get("prompt") or "")))
     return emit(drive_root, START_REQUESTED, payload)
 
 
@@ -985,6 +1010,9 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 "task_id": custody.task_id,
                 "root_task_id": custody.root_task_id, "parent_task_id": custody.parent_task_id,
                 "route": custody.route_id,
+                # The OWNER kind rides the terminal too: after rotation this may be
+                # the only surviving row (issue #1006; replay stays first-wins).
+                "source": custody.source, "category": custody.category,
                 # Route above remains custody authority. Fresh observations
                 # may differ from a replayed historical ledger row's model;
                 # they never rewrite that row, ownership, bounds or spend.
@@ -1332,6 +1360,7 @@ __all__ = [
     "release_task_runs",
     "reconcile_task_runs",
     "retire_project",
+    "review_owned_source",
     "run_timing",
     "settle_run",
     "settled_output_unread",

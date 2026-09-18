@@ -5,6 +5,17 @@ touching the transcript or the round-trip-sensitive metadata."""
 from ouroboros.llm import LLMClient
 
 
+def _recorder(sink):
+    """A progress sink shaped like the real emitter: ``_emit_round_progress``
+    names the round's voice with ``narration=True``, so a bare ``list.append``
+    would only prove the fake's signature."""
+    def emit(text, **meta):
+        sink.append(text)
+        emit.meta.append(meta)
+    emit.meta = []
+    return emit
+
+
 def test_flat_reasoning_string():
     assert LLMClient.extract_display_reasoning({"reasoning": "  thinking about X  "}) == "thinking about X"
 
@@ -81,11 +92,15 @@ def test_round_progress_redacts_secret_shaped_model_text_before_trace_and_emit()
     progress = []
     trace = {"reasoning_notes": []}
 
-    _emit_round_progress(visible, {}, progress.append, trace)
+    emit = _recorder(progress)
+    _emit_round_progress(visible, {}, emit, trace)
 
     assert candidate not in progress[0]
     assert candidate not in trace["reasoning_notes"][0]
     assert "***REDACTED***" in progress[0]
+    # The round's own text is the turn's voice, so the card may take its title
+    # from it; a redaction never demotes the line to a host note.
+    assert emit.meta == [{"narration": True}]
 
 
 def test_final_text_response_redacts_before_delivery_and_trace():
@@ -117,7 +132,7 @@ def test_round_and_final_prose_redact_all_observability_secret_classes():
         trace = {"reasoning_notes": []}
         content = f"Credential evidence: {candidate}"
 
-        _emit_round_progress(content, {}, progress.append, trace)
+        _emit_round_progress(content, {}, _recorder(progress), trace)
         delivered, _, final_trace = _handle_text_response(content, {"reasoning_notes": []}, {})
 
         assert candidate not in progress[0]
@@ -128,7 +143,7 @@ def test_round_and_final_prose_redact_all_observability_secret_classes():
     ordinary = "Edited tool.py and completed a fresh review."
     progress = []
     trace = {"reasoning_notes": []}
-    _emit_round_progress(ordinary, {}, progress.append, trace)
+    _emit_round_progress(ordinary, {}, _recorder(progress), trace)
     delivered, _, final_trace = _handle_text_response(ordinary, {"reasoning_notes": []}, {})
     assert progress == [ordinary]
     assert trace["reasoning_notes"] == [ordinary]
@@ -178,8 +193,8 @@ def test_round_progress_emits_reasoning_stamped_before_visible_text(monkeypatch)
 
     # think -> say: reasoning goes out first, stamped, even though visible text exists.
     assert calls == [
-        ("weigh the two options", {"meta": {"reasoning": True}}),
-        ("the answer", {}),
+        ("weigh the two options", {"meta": {"reasoning": True}, "narration": True}),
+        ("the answer", {"narration": True}),
     ]
     # reasoning is display-only: only the visible text reaches the trace.
     assert trace["reasoning_notes"] == ["the answer"]
@@ -194,7 +209,7 @@ def test_round_progress_reasoning_off_emits_only_visible_text(monkeypatch):
 
     _emit_round_progress("the answer", msg, _recording_emitter(calls), {"reasoning_notes": []})
 
-    assert calls == [("the answer", {})]
+    assert calls == [("the answer", {"narration": True})]
 
 
 def test_history_replays_the_reasoning_stamp_on_a_stored_progress_row(tmp_path):

@@ -1,10 +1,10 @@
 """Typed task/loop outcome helpers.
 
 Lifecycle, execution health, artifacts, review, and objective evaluation are
-separate axes.  Objective success is never inferred from final text or the
-absence of tool errors; only LLM-first task acceptance review can establish
-success, while typed runtime evidence may conservatively degrade an otherwise
-``not_evaluated`` objective.
+separate axes. Tool errors remain evidence without degrading a delivered answer.
+Only LLM-first task acceptance review can establish objective success; neither
+final text nor absent tool errors can. Typed runtime evidence may conservatively
+degrade an otherwise ``not_evaluated`` objective.
 """
 
 from __future__ import annotations
@@ -127,7 +127,6 @@ REASON_PROVIDER_FAILURE = "provider_failure"
 REASON_TASK_EXCEPTION = "task_exception"
 REASON_DEEP_SELF_REVIEW_UNAVAILABLE = "deep_self_review_unavailable"
 REASON_DEEP_SELF_REVIEW_ERROR = "deep_self_review_error"
-REASON_DEEP_SELF_REVIEW_PACK_UNFIT = "deep_self_review_pack_unfit"
 REASON_TOOL_FAILURE = "tool_failure"
 REASON_DELIVERY_CONTROL_DEGRADED = "delivery_control_degraded"
 REASON_CHILD_RESULTS_DEFERRED = "child_results_deferred"
@@ -203,7 +202,7 @@ ACCEPTANCE_DECISION_STATUSES = (
     ACCEPTANCE_ACCEPTED, ACCEPTANCE_REVISION_REQUESTED, ACCEPTANCE_FINALIZED_UNACCEPTED,
 )
 
-# When cosmetic residual errors exist but no acceptance review ran, the
+# When unresolved or cosmetic errors exist but no acceptance review ran, the
 # execution axis is OK yet "did it actually work?" was never judged: surface a
 # structural warning so a default-`auto` overclaim isn't displayed as clean.
 WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW = "residual_tool_errors_without_review"
@@ -871,6 +870,12 @@ def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in axes.items():
         if key not in normalized:
             normalized[key] = value
+    # Delivery/deferred-work states are not acceptance. Keep the warning when
+    # normalization restores their objective to not_evaluated.
+    if normalized["objective"].get("status") == OBJECTIVE_NOT_EVALUATED and (
+        normalized["execution"].get("unresolved_tool_errors") or normalized["execution"].get("cosmetic_tool_errors")
+    ):
+        _merge_objective_warning(normalized["objective"], WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW)
     return normalized
 
 
@@ -941,7 +946,6 @@ _INFRA_TEXT_PREFIXES = (
     ("❌ Deep self-review unavailable:", "runtime", REASON_DEEP_SELF_REVIEW_UNAVAILABLE),
     ("⚠️ Deep self-review error:", "runtime", REASON_DEEP_SELF_REVIEW_ERROR),
     ("❌ Deep self-review failed:", "runtime", REASON_DEEP_SELF_REVIEW_ERROR),
-    ("❌ Deep self-review pack unfit:", "runtime", REASON_DEEP_SELF_REVIEW_PACK_UNFIT),
 )
 
 
@@ -1096,7 +1100,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         execution_status = EXECUTION_FAILED
         reason_code = usage_reason or REASON_EMPTY_FINAL_TEXT
         failure = {"kind": "agent", "reason_code": reason_code}
-    elif not text.strip():
+    elif not text.strip() and usage.get("presence_completion_outcome") not in {"silent", "tool_delivered"}:
         execution_status = EXECUTION_FAILED
         reason_code = REASON_EMPTY_FINAL_TEXT
         failure = {"kind": "agent", "reason_code": reason_code}
@@ -1125,14 +1129,6 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "kind": "verification",
             "reason_code": reason_code,
             "verification_failures": verification_failures[:20],
-        }
-    elif tool_errors:
-        execution_status = EXECUTION_DEGRADED
-        reason_code = usage_reason or REASON_TOOL_FAILURE
-        failure = {
-            "kind": "tool",
-            "reason_code": reason_code,
-            "tool_errors": tool_errors[:20],
         }
     # A skipped-or-bypassed eligible panel is not a verdict, but cannot remain clean;
     # preserve stronger classifications and degrade only the false-green remainder.
@@ -1212,14 +1208,14 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         })
     # Mutation attribution is evidence for the reviewing panels (attached to the
     # failure-evidence projection below), deliberately never a structural veto.
-    # T4 honest residual: cosmetic shell errors no longer degrade execution, so
+    # Tool-call errors alone do not degrade a delivered answer's execution, so
     # when the objective was never judged (default "auto" with no self-call ->
     # objective not_evaluated) a real overclaim could read as clean. Surface a
     # structural warning (not a failure) so the UI escalates it. Gating on the
     # objective being genuinely unjudged is the honest condition: a review that
     # ran (any verdict) already judged it. No review is auto-run, no env knob, no
     # content inference (Bible P5).
-    if cosmetic_tool_errors and objective.get("status") == OBJECTIVE_NOT_EVALUATED:
+    if (cosmetic_tool_errors or tool_errors) and objective.get("status") == OBJECTIVE_NOT_EVALUATED:
         _merge_objective_warning(objective, WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW)
     final_answer_payload = (
         extract_final_answer(text)
@@ -1254,6 +1250,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "cosmetic_tool_errors": cosmetic_tool_errors[:20],
             "ignored_tool_errors": ignored_tool_errors[:20],
             "policy_denials": policy_denials[:20],
+            "unresolved_tool_errors": tool_errors[:20],
             **({"mutation_attribution": mutation_attribution} if mutation_attribution else {}),
         },
         "artifacts": {"status": "not_applicable"},

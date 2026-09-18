@@ -287,13 +287,23 @@ def test_task_done_live_summary_distinguishes_typed_failure():
     assert "headline: presentation.headline" in source
 
 
-def test_chat_warning_task_summaries_force_visible_cards():
+def test_no_severity_keyed_visibility_writer_survives_restart_paths():
+    """A warn/error/cancelled task keeps its block WITHOUT any writer forcing it.
+
+    Card presence used to be a sticky flag written from two places for exactly
+    this case: the live terminal frame (`summary.terminal && summary.phase ===
+    'warn'`) and the history replay's `needsVisibleTerminal` branch. Two
+    writers for one fact is how a cancelled root could come back from a reload
+    as Done, so both are gone and the ONE predicate decides from the record's
+    own facts. The predicate's clauses are pinned in the static contract
+    fixture, and the BEHAVIOUR (a zero-tool failed turn keeps its block live
+    and after a reload, a done one does not) in
+    `web/tests/chat_activity_block.test.js`; this guards only that no
+    severity-keyed visibility writer comes back on either restart path.
+    """
     source = _read("web/modules/chat.js")
-    assert "summary.terminal && summary.phase === 'warn'" in source
-    assert (
-        "const needsVisibleTerminal = severity === 'error' || severity === 'warn'"
-        " || severity === 'cancelled';"
-    ) in source
+    assert "needsVisibleTerminal" not in source
+    assert "summary.phase === 'warn'" not in source
 
 
 def test_chat_scrolls_to_bottom_after_first_history_load():
@@ -319,7 +329,13 @@ def test_chat_scrolls_to_bottom_after_first_history_load():
         "The anchors factory must receive the live-card registry it reads"
     assert "liveCardRecords.get(entry.taskId)" in anchor_source, \
         "A rebuilt live card whose earliest timestamp changed needs canonical task lookup"
-    assert "reorderExisting: anchorMovedEarlier" in source, \
+    # One reanchor owner: a card is re-sorted only when its own anchor actually
+    # moved earlier (or its history position did), never on every mutation.
+    assert "const movedEarlier = stampNodeTimestamp(record.root, rawTs, { anchor: true });" in source, \
+        "The reanchor owner must read the node's own anchor move"
+    assert "if (!movedEarlier && !positionChanged) return false;" in source, \
+        "An unmoved anchor must not re-sort a mounted card"
+    assert "ensureLiveCardVisible(record, { reorderExisting: true });" in source, \
         "A mounted task card must be re-sorted if a later event lowers its anchor"
     assert "record._anchorOrderDirty = true;" in source
     assert "reorderDirtyCardIfNeeded(rec);" in source, \
@@ -357,8 +373,13 @@ def test_restart_watchdog_waits_for_uvicorn_exit():
     assert "_uvicorn_exited.set()" in source
 
 
-def test_owner_restart_copy_is_explicit_about_stopped_task():
-    source = _read("server.py")
+def test_owner_restart_copy_is_explicit_about_stopped_task(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import server
+
+    from ouroboros import server_restart
+
+    source = _read("ouroboros/server_restart.py")
     assert "Stopping active task. New settings apply to the next message." in source
     assert "owner_restart_no_resume.flag" in source
     assert "owner_restart_no_resume" in source
@@ -367,12 +388,38 @@ def test_owner_restart_copy_is_explicit_about_stopped_task():
     assert "stable_skip_flag.unlink(missing_ok=True)" in source
     # Checkout gate first (a refusal leaves the server intact), then the durable
     # no-resume intent, then the owned-work stop, then the owner's stop notice.
-    owner_restart = source.split('elif lowered.startswith("/restart"):', 1)[1].split(
+    owner_restart = _read("server.py").split('elif lowered.startswith("/restart"):', 1)[1].split(
         'elif lowered == "/review"', 1
     )[0]
-    notice = owner_restart.index("Stopping active task. New settings apply to the next message.")
-    assert (owner_restart.index("_safe_restart_serialized(") < owner_restart.index("owner_restart_no_resume.flag")
-            < owner_restart.index("_stop_owned_work(ctx)") < notice)
+    assert "_perform_owner_restart(ctx, reply)" in owner_restart
+    flags = tmp_path / "state"
+    calls = []
+    ctx = SimpleNamespace(safe_restart=object())
+
+    def checked(function, **kwargs):
+        assert function is ctx.safe_restart and not flags.exists()
+        assert kwargs == {"reason": "owner_restart", "unsynced_policy": "rescue_and_reset"}
+        calls.append("checked")
+        return True, "ok"
+
+    def stopped(actual):
+        assert actual is ctx
+        assert (flags / "owner_restart_no_resume.flag").read_text(encoding="utf-8") == "owner_restart"
+        assert (flags / "panic_stop.flag").read_text(encoding="utf-8") == "owner_restart_no_resume"
+        calls.append("stopped")
+        return ["active-task"]
+
+    def notice(text, _suffix):
+        assert calls == ["checked", "stopped"]
+        assert text == "Stopping active task. New settings apply to the next message."
+        calls.append("notice")
+
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(server_restart, "_safe_restart_serialized", checked)
+    monkeypatch.setattr(server_restart, "_stop_owned_work", stopped)
+    monkeypatch.setattr(server_restart, "_request_restart_exit", lambda owner: calls.append(("exit", owner)))
+    assert server._perform_owner_restart(ctx, notice) == (True, "")
+    assert calls == ["checked", "stopped", "notice", ("exit", True)]
     stop = _read("ouroboros/server_restart.py").split("def _stop_owned_work", 1)[1]
     assert (stop.index("request_cancel(") < stop.index("ctx.kill_workers(")
             < stop.index("reconcile_orphaned_runs(") < stop.index("stop_outcome()"))
@@ -466,7 +513,7 @@ def test_owner_restart_proceeds_when_worker_shutdown_fails(tmp_path, monkeypatch
     monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
     monkeypatch.setattr(config, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(server, "_request_restart_exit", lambda owner=False: exits.append(owner))
+    monkeypatch.setattr(server_restart, "_request_restart_exit", lambda owner=False: exits.append(owner))
 
     server._process_bridge_updates(Bridge(), 0, Ctx())
 
@@ -565,8 +612,10 @@ def test_only_an_owner_restart_asks_for_the_runtime_mode_to_be_re_read(tmp_path,
 
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
+    from ouroboros import server_restart
+    monkeypatch.setattr(server_restart, "DATA_DIR", tmp_path)
     # The owned-work stop has its own suite; this pin is about the owner flag alone.
-    monkeypatch.setattr(server, "_stop_owned_work", lambda ctx: None)
+    monkeypatch.setattr(server_restart, "_stop_owned_work", lambda ctx: None)
 
     server._owner_restart_requested.clear()
     server._restart_requested.clear()

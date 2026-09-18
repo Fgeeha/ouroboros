@@ -13,6 +13,7 @@ from pathlib import Path
 from devtools.benchmarks.common import launcher_audit
 from ouroboros.configured_subagents import parse_configured_subagents
 from ouroboros.reviewer_slot_config import parse_reviewer_slots
+from tests._governance_docs_shared import architecture_text
 
 REPO = Path(__file__).resolve().parents[1]
 PROFILE = REPO / "devtools" / "benchmarks" / "cybergym" / "settings_base.json"
@@ -68,12 +69,13 @@ def test_profile_records_safe_runtime_and_budget_defaults():
     settings = _settings()
     assert settings["OUROBOROS_MAX_SUBAGENT_DEPTH"] == 0
     assert settings["OUROBOROS_MAX_WORKERS"] > 1
-    assert settings["OUROBOROS_TASK_ABS_CEILING_SEC"] == 14_400
-    assert settings["TOTAL_BUDGET"] == 3_500.0
+    assert settings["OUROBOROS_MAX_ROUNDS"] == 600
+    assert settings["OUROBOROS_TASK_ABS_CEILING_SEC"] == 10_800
+    assert settings["TOTAL_BUDGET"] == 3_000.0
     assert settings["OUROBOROS_RUNTIME_MODE"] == "pro"
     assert settings["OUROBOROS_SAFETY_MODE"] == "off"
     assert settings["OUROBOROS_CONTEXT_MODE"] == "max"
-    assert settings["OUROBOROS_TASK_REVIEW_MODE"] == "required"
+    assert settings["OUROBOROS_TASK_REVIEW_MODE"] == "off"
     assert settings["OUROBOROS_REVIEW_ENFORCEMENT"] == "advisory"
     assert settings["OUROBOROS_REVIEW_MAX_CYCLES"] == "2"
     for key in (
@@ -130,19 +132,19 @@ def test_template_does_not_carry_credentials_or_local_routes():
     assert settings["LOCAL_MODEL_FILENAME"] == ""
 
 
-def test_cybergym_is_registered_and_structural_test_lists_are_synchronized():
+def test_cybergym_is_registered_and_passes_the_shared_structural_audit():
     relative = "cybergym/run_cybergym.py"
+    path = REPO / "devtools" / "benchmarks" / relative
     assert relative in launcher_audit.MIGRATED_LAUNCHERS
-    structural = (REPO / "tests" / "test_devtools_benchmarks.py").read_text(encoding="utf-8")
-    assert '"devtools/benchmarks/cybergym/run_cybergym.py"' in structural
-    assert 'bench / "cybergym" / "run_cybergym.py"' in structural
+    assert path in launcher_audit.launcher_paths()
+    assert launcher_audit.audit_launcher(path) == []
 
 
 def test_benchmark_inventory_points_to_cybergym_docs():
     common_readme = (REPO / "devtools" / "benchmarks" / "README.md").read_text(
         encoding="utf-8"
     )
-    architecture = (REPO / "docs" / "ARCHITECTURE.md").read_text(encoding="utf-8")
+    architecture = architecture_text(REPO)
     assert "cybergym/" in common_readme
     assert "devtools/benchmarks/cybergym/" in architecture
 
@@ -178,9 +180,9 @@ def test_cybergym_docs_pin_the_owner_approved_contract():
         "schedule_subagent",
         "delegate_start",
         "claude_code_edit",
-        "OUROBOROS_TASK_ABS_CEILING_SEC=14400",
-        "USD 3,500",
-        "eight hours",
+        "OUROBOROS_TASK_ABS_CEILING_SEC=10800",
+        "USD 3,000",
+        "three hours",
         "admit_benchmark_run",
         "finalize_run_manifest",
         "append-only",

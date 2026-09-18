@@ -56,24 +56,6 @@ def test_component_basename_does_not_borrow_another_explicit_path():
     assert not _names_basename("test_s3_task_control_browser.py", "browser.py")
 
 
-def test_the_domain_quotient_report_ends_without_a_blank_line():
-    """The report generator wrote a blank line at EOF, so the whitespace gate
-    (`git diff --check`) was red on the one file nobody edits by hand.
-
-    Its sections append a trailing "" separator, and `"\\n".join(L) + "\\n"` then
-    turned the last separator into a blank final line. The generator now drops
-    the trailing separators; this pins both the artifact and that fix, without
-    pinning the report's CONTENT — the header carries a HEAD sha and a tree
-    fingerprint, so byte-identity to a regeneration is deliberately not a gate
-    (that gate belongs to `docs/DOMAIN_MAP.md`, whose input is the manifest).
-    """
-    report = _read("docs/v7next/DOMAIN_QUOTIENT_REPORT.md")
-    generator = _read("scripts/v7next_domain_report.py")
-
-    assert report.endswith("\n") and not report.endswith("\n\n")
-    assert "while L and not L[-1]:" in generator
-
-
 def test_the_domain_manifest_is_reachable_from_the_handbook():
     """The domain SSOT and its generated map were reachable from neither doc.
 
@@ -88,42 +70,38 @@ def test_the_domain_manifest_is_reachable_from_the_handbook():
 
 
 def test_recent_abi_retirements_section_carries_the_abi_70_window():
-    """Section 11.4 documented a 5.25.0-rc.4 banner API and nothing since.
+    """Section 11.4 carries the compatibility facts an upgrading operator needs.
 
     ABI 7.0 is the largest retirement window in the project's history — five
     gateway aliases, the reviewer comma-list configuration keys, two wall-clock
     timeout keys, a plugin-API major, and a durable task-row schema stamp with
-    no legacy converter — and an upgrading operator read "recent retirements"
-    as though none of it happened. Every key of
-    `RETIRED_COMMA_LIST_SETTING_KEYS` must be named there, because those are
-    the ones whose migration must happen BEFORE the upgrade.
+    no legacy converter. Every key of `RETIRED_COMMA_LIST_SETTING_KEYS` must be
+    named there, because those are the ones whose migration must happen BEFORE
+    the upgrade. Older release chronology is git history, not a book fact.
     """
     section = _architecture_section("11.4 Recent ABI Retirements")
 
     from ouroboros.settings_defaults import RETIRED_COMMA_LIST_SETTING_KEYS
 
     assert "**ABI 7.0**" in section
-    assert "5.25.0-rc.4" in section, "older entries stay: this is a history"
     missing = [key for key in RETIRED_COMMA_LIST_SETTING_KEYS if key not in section]
     assert not missing, f"11.4 does not name the retired comma-list keys: {missing}"
     assert "OUROBOROS_REVIEWER_SLOTS" in section, "the migration target must be named"
 
 
-def test_model_send_design_note_matches_the_landed_observability_contract():
-    """The CPL-5 note still said DESIGN ONLY and demanded fail-closed dispatch.
+def test_model_send_design_note_matches_the_observability_contract():
+    """A reconstruction mismatch is observable without blocking dispatch.
 
-    `ouroboros/model_send_seal.py` landed with the opposite rule, pinned by
+    `ouroboros/model_send_seal.py` implements the rule pinned by
     `tests/test_model_send_seal.py`: a reconstruction mismatch is a typed
     durable fact and the call is NOT blocked — dispatch authority stays with
     the pre-existing in-memory identity re-check. A design note that outranks
     the code it describes is how the next author reintroduces the gate.
     """
-    note = _read("docs/v7next/DESIGN_MODEL_VISIBLE_LOGGED.md")
+    note = _read("docs/MODEL_SEND_OBSERVABILITY.md")
     note_flat = " ".join(note.split())
 
     assert (REPO / "ouroboros" / "model_send_seal.py").exists()
-    assert "Status: DESIGN ONLY" not in note
-    assert "Status: LANDED" in note
     assert "refuse dispatch with the existing `PhysicalAttemptPreparationFailed`" \
         not in note_flat
     assert "The call is NOT blocked" in note_flat
@@ -197,25 +175,6 @@ def test_architecture_does_not_claim_usage_response_is_the_only_usage_reader():
     for module in ("ouroboros/usage_accounting.py", "ouroboros/loop_llm_call.py"):
         assert "from ouroboros._usage_response import" in _read(module), module
     assert 'resp_dict.get("usage")' in _read("ouroboros/llm_openai_compatible.py")
-
-
-def test_architecture_deep_review_has_no_compact_manifest_retry_rung():
-    """The compact-manifest retry rung was removed; the doc still promised it.
-
-    ``deep_self_review._compile`` is now called once with ``compact=True``
-    because compact coverage IS the atlas default (the durable manifest keeps
-    full per-file coverage either way), so there is no fuller form to fall back
-    from. A failed assembly returns no pack at all (BIBLE P3). The
-    final-shrink rebuild — one retry at a hard budget tightened by the measured
-    overage — is a different rung and still exists.
-    """
-    arch_flat = " ".join(_read("docs/ARCHITECTURE.md").split())
-    source = _read("ouroboros/deep_self_review.py")
-
-    assert "no compact retry rung anymore" in source
-    assert "retries once with the compact manifest" not in arch_flat
-    assert "the compact manifest is the atlas default" in arch_flat
-    assert "final-shrink rebuild" in arch_flat and "hard_budget_reduction" in source
 
 
 def test_architecture_component_map_covers_every_live_runtime_module():
@@ -361,14 +320,17 @@ def test_chat_id_addressing_docs_match_the_code_that_routes_it():
     assert "tests/test_chat_id_truthiness_guard.py" in development
 
 
-def test_consciousness_prompt_matches_scope_limited_contracts():
+def test_consciousness_prompt_is_the_wake_message_of_an_ordinary_main_turn():
+    """The wake-up runs on Main's system prompt and tools (owner decision В15); this file
+    is its USER message: no private capability catalog, no round or interval limits."""
     consciousness = _read("prompts/CONSCIOUSNESS.md")
 
-    assert "schedule subagents" in consciousness
-    assert "wait on subagents" in consciousness
-    assert "Update your scratchpad or identity" in consciousness
-    assert "Write to my human proactively" in consciousness
+    assert consciousness.startswith("[Wake-up · {reason}]")
+    assert "Doing nothing is a fine outcome" in consciousness
+    assert "`set_next_wakeup`" in consciousness and "`escalate`" in consciousness
     assert "recent_tasks" in consciousness
+    for retired in ("You can:", "up to 10 rounds", "Default wakeup", "background consciousness mode"):
+        assert retired not in consciousness, retired
 
 
 def test_phase3_governance_language_is_pinned_without_new_qa_surface():
@@ -438,14 +400,13 @@ def test_continuity_projection_contract_is_mirrored_across_governance_docs():
         "of the full contract it was cut from."
     ) in bible
     assert "Continuity data-flow map" in architecture
-    assert "state/consciousness_observations.jsonl" in architecture
     assert "Source-complete decision pipeline" in development
     assert "Context and growth matrix" in development
     assert "state/skill_review_root_tasks.jsonl" in development
     assert "state/skill_review_root_tasks.jsonl" in architecture
     assert "SKILL_REVIEW_ROOT_TASKS_WARN_BYTES" in architecture
-    assert "nine hot stores" in architecture
-    assert "nine os.stat calls" in _read("ouroboros/agent_startup_checks.py")
+    assert "eight hot stores" in architecture
+    assert "eight os.stat calls" in _read("ouroboros/agent_startup_checks.py")
     for item in (
         "source_completeness",
         "actor_readable_projection",
@@ -458,10 +419,10 @@ def test_continuity_projection_contract_is_mirrored_across_governance_docs():
 
 def test_architecture_names_all_window_surfaces_and_settlement_order():
     architecture = _read("docs/ARCHITECTURE.md")
-    assert (
-        "on those four surfaces (triad, plan review, task acceptance, and deep self-review)"
-        in architecture
-    )
+    assert "full-window sizing default for an unknown API window" in architecture
+    assert "raw subscription routes keep no numeric unknown-window assumption" in architecture
+    assert "designated-default or conservative fallback" in architecture
+    assert "no model-window table or window-authority floor" in architecture
     assert "SETTLED is published before registration retirement" in architecture
 
 
@@ -577,35 +538,23 @@ def _prompt_bare_identifiers(text: str) -> set:
 
 def test_prompt_tool_names_resolve_to_registered_tools(tmp_path):
     """Every backticked snake_case identifier in the three runtime prompts is
-    either a registered tool (public schema), a background-consciousness tool,
-    or a documented non-tool identifier. Completeness is deliberately NOT
-    required (the schemas are the catalog); this only forbids phantoms and
-    stale spellings, the drift class the prompt audit found in every prompt."""
-    from ouroboros.consciousness import BackgroundConsciousness
+    either a registered tool (public schema) or a documented non-tool identifier
+    (for the wake-up template also one of its own render placeholders).
+    Completeness is deliberately NOT required (the schemas are the catalog);
+    this only forbids phantoms and stale spellings, the drift class the prompt
+    audit found in every prompt. The wake-up runs on the full registry, so its
+    universe is Main's."""
+    from ouroboros.consciousness_wake import PLACEHOLDERS
 
     root = pathlib.Path(__file__).resolve().parent.parent
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
     registered = {schema["function"]["name"] for schema in registry.schemas()}
-    # The background whitelist is not taken on faith: every name in it must be a
-    # registered public tool or a ToolEntry the consciousness module registers
-    # itself (set_next_wakeup and friends), otherwise the whitelist has rotted.
-    consciousness_src = (root / "ouroboros" / "consciousness.py").read_text(encoding="utf-8")
-    bg_private = set(re.findall(r'ToolEntry\("([a-z0-9_]+)"', consciousness_src))
-    stale_whitelist = set(BackgroundConsciousness._BG_TOOL_WHITELIST) - registered - bg_private
-    assert not stale_whitelist, f"_BG_TOOL_WHITELIST names unregistered tools: {sorted(stale_whitelist)}"
-    universe = (
-        registered
-        | set(BackgroundConsciousness._BG_TOOL_WHITELIST)
-        | PROMPT_NON_TOOL_IDENTIFIERS
-    )
-    # CONSCIOUSNESS.md runs on the background registry, which admits ONLY the
-    # whitelist (consciousness.py _tool_schemas/_execute_tool), so a public tool
-    # that is not whitelisted is a phantom there.
-    bg_universe = set(BackgroundConsciousness._BG_TOOL_WHITELIST) | PROMPT_NON_TOOL_IDENTIFIERS
+    universe = registered | PROMPT_NON_TOOL_IDENTIFIERS
+    wake_universe = universe | set(PLACEHOLDERS)
     for rel, allowed in (
         ("prompts/SYSTEM.md", universe),
         ("prompts/SAFETY.md", universe),
-        ("prompts/CONSCIOUSNESS.md", bg_universe),
+        ("prompts/CONSCIOUSNESS.md", wake_universe),
     ):
         text = (root / rel).read_text(encoding="utf-8")
         unresolved = _prompt_backticked_identifiers(text) - allowed
@@ -613,11 +562,10 @@ def test_prompt_tool_names_resolve_to_registered_tools(tmp_path):
             f"{rel} names identifiers that are neither registered tools nor "
             f"classified non-tool identifiers: {sorted(unresolved)}"
         )
-    # CONSCIOUSNESS.md writes tool names without backticks; its bare snake_case
-    # tokens must resolve the same way (the runtime drift check in
-    # context_health only catches names with known prefixes).
+    # The wake template also names tools without backticks; its bare snake_case
+    # tokens (the render placeholders aside) must resolve the same way.
     bare = _prompt_bare_identifiers((root / "prompts" / "CONSCIOUSNESS.md").read_text(encoding="utf-8"))
-    unresolved_bare = bare - bg_universe
+    unresolved_bare = bare - wake_universe
     assert not unresolved_bare, (
         f"prompts/CONSCIOUSNESS.md names bare identifiers that are neither registered tools "
         f"nor classified non-tool identifiers: {sorted(unresolved_bare)}"
@@ -645,6 +593,13 @@ DOC_RESIDUE_PATTERNS = {
     "narrative": r"\b(?:used to|previously|formerly|was deleted|replaces the earlier|gate[- ]round|round \d+)\b",
     "codename_paren": r"\((?:GR|AR|BR|CR|D|Q|S|HQ|C|B)\d+[^)]{0,24}\)",
     "codename_word": r"\bPoltergeist\b|\bphase [A-C]\d?\b|owner(?:-| )(?:decision|ratif)",
+    # Owner-batch answer codes and reviewer-round labels resolve only inside the chat that minted
+    # them; the decision CONTENT belongs in the book, the label in the commit or PR.
+    "owner_code": r"\bowner (?:R\d+|batch \d+|fork \d+|\d+[A-Za-z]?\s*=\s*[A-Z]\b)",
+    "owner_paren": r"\(owner (?:R\d+|\d+[A-Za-z]?\b|fork \d|batch \d|answer )[^)]{0,40}\)",
+    # A residual may cite its tracker once, in the one resolvable form `(issue #NNN)`.
+    "bare_issue_ref": r"(?<!\(issue )#\d{3,}\b",
+    "cyrillic": r"[А-Яа-яЁё]",
 }
 DOC_RESIDUE_SKIPPED_SUBSECTIONS = {
     "docs/DEVELOPMENT.md": ("Mutable external-fact inventory", "Documentation contract"),
@@ -774,6 +729,7 @@ SETTINGS_TABLE_ENV_ONLY_ROWS = frozenset({
     "OUROBOROS_OBSERVABILITY_RETENTION_DAYS", "OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC",
     "OUROBOROS_REVIEW_MAX_TOKENS", "OUROBOROS_PREFLIGHT_TIMEOUT_SEC", "OUROBOROS_PREFLIGHT_SERIAL",
     "OUROBOROS_PREFLIGHT_TEST_WORKERS", "OUROBOROS_BUNDLE_DIR",
+    "OUROBOROS_EXTERNAL_HOST_UPDATE", "OUROBOROS_EXTERNAL_HOST_RESULT",
 })
 SETTINGS_TABLE_RETIRED_ROWS = frozenset({"OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"})
 

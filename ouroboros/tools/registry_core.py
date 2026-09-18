@@ -43,17 +43,12 @@ from ouroboros.tool_capabilities import (
 )
 from ouroboros.tool_access import (
     active_tool_profile,
-    build_resolved_resource_binding,
     canonical_repo_relative_path,
     decide_tool_access,
     light_cognitive_or_root_redirect,
-    _path_is_relative_to_casefold,
     shell_cwd_block_message,
-    resource_root_path,
-    user_files_path_block_reason,
     workspace_mode_block_reason,
 )
-from ouroboros.tools.deliverables_shell import lexical_user_files_block_reason
 from ouroboros.tools.tool_catalog import (
     DuplicateToolNameError as _DuplicateToolNameError,
     ToolCatalog as _ToolCatalog,
@@ -67,6 +62,7 @@ from ouroboros.tools.tool_resolution import (
     _binding_set_targets_system_repo,
     _build_builtin_target_binding,
     _target_binding_operation,
+    _user_files_binding_reaches_repo,
     active_repo_dir_for,
     system_repo_dir_for,
 )
@@ -422,59 +418,6 @@ class ToolRegistry:
             and str(getattr(tc, "surface", "") or "") == "self_worktree"
         )
 
-    def _deliverables_shell_target_allowed(
-        self,
-        candidate: pathlib.Path,
-        *,
-        lexical_candidate: pathlib.Path | None = None,
-    ) -> bool:
-        """Return whether a top-level user-files shell may write this target.
-
-        The workspace shell guard owns the process-root boundary.  This narrow
-        exception reuses the user-files policy and the configured Deliverables
-        root for the one existing top-level profile that already has
-        ``user_files:shell``.  Delegated children never inherit the carve-out.
-        """
-        if self._is_acting_subagent() or self._is_local_readonly_subagent():
-            return False
-        profile = active_tool_profile(self._ctx)
-        if not decide_tool_access(
-            profile=profile,
-            root="user_files",
-            operation="shell",
-        ).allow:
-            return False
-        try:
-            if lexical_user_files_block_reason(lexical_candidate or candidate):
-                return False
-            target = pathlib.Path(candidate).resolve(strict=False)
-            deliverables = resource_root_path(self._ctx, "deliverables")
-            # Validate the configured container itself before admitting a child.
-            # A root that contains a protected repo/data drive is not a genuine
-            # sibling; checking only the final file would otherwise turn its
-            # harmless-looking sibling paths into a broad parent escape.
-            if user_files_path_block_reason(self._ctx, deliverables):
-                return False
-            if not (
-                target.is_relative_to(deliverables)
-                or _path_is_relative_to_casefold(target, deliverables)
-            ):
-                return False
-            try:
-                deliverable_binding = build_resolved_resource_binding(
-                    self._ctx,
-                    root="user_files",
-                    operation="shell",
-                    path=str(target),
-                )
-            except (OSError, TypeError, ValueError, RuntimeError):
-                return False
-            if not _presence_binding_allowed(self._ctx, deliverable_binding):
-                return False
-            return not user_files_path_block_reason(self._ctx, target)
-        except (OSError, TypeError, ValueError, RuntimeError):
-            return False
-
     def _acting_tool_grants(self) -> set | None:
         from ouroboros.config import get_runtime_mode
 
@@ -521,7 +464,8 @@ class ToolRegistry:
     def available_tools(self) -> List[str]:
         acting_subagent = self._is_acting_subagent()
         local_readonly_subagent = self._is_local_readonly_subagent()
-        disabled = _disabled_tools(self._ctx)
+        # A consciousness-origin task keeps its full schema set (dispatch-only policy, В31=B).
+        disabled = frozenset() if registry_guards.disabled_tools_dispatch_only(self._ctx) else _disabled_tools(self._ctx)
         return [
             e.name
             for e in self._entries.values()
@@ -683,7 +627,9 @@ class ToolRegistry:
         acting_subagent = self._is_acting_subagent()
         acting_grants = self._acting_tool_grants() if acting_subagent else set()
         local_readonly_subagent = self._is_local_readonly_subagent()
-        disabled_tools = _disabled_tools(self._ctx)
+        # Dispatch-only policy (В31=B): a consciousness-origin task is filtered by nothing here and
+        # records no disabled_by_contract omission, so its prefix matches an owner turn's exactly.
+        disabled_tools = frozenset() if registry_guards.disabled_tools_dispatch_only(self._ctx) else _disabled_tools(self._ctx)
         # Rebuild from the load-time facts, never from empty: a rebuilt schema
         # list must not erase module_load_failed omissions (H3, capinv-447).
         self._capability_omissions = [dict(item) for item in self._module_load_omissions]
@@ -855,7 +801,7 @@ class ToolRegistry:
         # reason instead of "not found" (2026-08-10 amendments). Deeper extension/
         # MCP policy reasons (grants, network) would need new plumbing — disclosed
         # residual, not built.
-        if requested in _disabled_tools(self._ctx):
+        if requested in _disabled_tools(self._ctx) and not registry_guards.disabled_tools_dispatch_only(self._ctx):
             return "disabled by this task's contract (disabled_tools)"
         if not _presence_tool_allowed(self._ctx, requested):
             return "outside this presence task's positive capability ceiling"
@@ -883,7 +829,7 @@ class ToolRegistry:
         local_readonly_subagent = self._is_local_readonly_subagent()
         # Declarative tool policy applies across ALL discovery sources (built-in, extension, MCP),
         # so enable_tools/discovery can never surface a disabled name — consistent with schemas()/execute().
-        if requested in _disabled_tools(self._ctx):
+        if requested in _disabled_tools(self._ctx) and not registry_guards.disabled_tools_dispatch_only(self._ctx):
             return None
         if not _presence_tool_allowed(self._ctx, requested):
             return None
@@ -1202,6 +1148,12 @@ class ToolRegistry:
             _runtime_mode = _get_runtime_mode()
         except Exception:
             _runtime_mode = "advanced"
+        # A task's own mode cap (metadata.runtime_mode_cap — a consciousness wake-up at
+        # Act/Observe, В21=A) can only NARROW the install mode: every light gate below
+        # (repo mutation, protected writes, start_service, the shell write block) reads
+        # the stricter of the two through this one local; get_runtime_mode() is unchanged.
+        from ouroboros.consciousness_authority import effective_runtime_mode as _effective_runtime_mode
+        _runtime_mode = _effective_runtime_mode(_runtime_mode, getattr(self._ctx, "task_metadata", None))
         if is_mcp:
             return extension_dispatch._dispatch_mcp_tool_result(self._ctx, name, args)
         if entry is None:
@@ -1226,8 +1178,13 @@ class ToolRegistry:
         if name in _SYSTEM_INTRINSIC_REPO_MUTATION_TOOLS:
             light_targets_system = True
         elif resolved_binding is not None:
+            # The light gate reads the RESOLVED target, not the root label,
+            # exactly as it does for direct shell writes: a cyber_pro install
+            # resolves user_files to the whole host, so a repository path
+            # reached under THAT root is still Ouroboros self-modification.
             light_targets_system = (
                 _binding_set_is_light_restricted(self._ctx, resolved_binding) or acting_self_worktree
+                or _user_files_binding_reaches_repo(self._ctx, resolved_binding)
             )
         else:
             light_targets_system = not workspace_mode or acting_self_worktree

@@ -205,6 +205,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     })),
     "supervisor/git_ops_reset.py": ("supervisor/git_ops.py", "_go", frozenset({
         "BRANCH_DEV", "BRANCH_STABLE", "DRIVE_ROOT", "REPO_DIR",
+        "_git_network_bounded",
         "_admission_gate_for_unsynced_tree",
         "_clear_bootstrap_pin_marker", "_clear_update_intent",
         "_collect_repo_sync_state", "_compute_ref_ahead_count",
@@ -241,7 +242,8 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "cancel_and_verify", "close_absent_run", "daemon_says_absent", "emit",
         "is_terminal", "open_runs", "output_disposition", "pending_invocations",
         "record_containment_fault", "record_settled_unread", "record_started",
-        "replay", "retire_settled_registrations", "settle_run", "summary_of",
+        "replay", "retire_settled_registrations", "review_owned_source",
+        "settle_run", "summary_of",
     })),
     "ouroboros/tools/delegate_payload_patch.py": ("ouroboros/tools/delegate_integration.py", "_di", frozenset({
         "_rebind_payload_reference", "_resolved", "payload_content_hash",
@@ -317,7 +319,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_undispositioned_children",
     })),
     "ouroboros/loop_delivery.py": ("ouroboros/loop.py", "_loop", frozenset({
-        "DeliveryCandidate", "_LoopExitContext",
+        "DeliveryCandidate", "TERMINAL_ORIGIN_MODEL_FINAL", "_LoopExitContext",
         "_append_or_merge_user_message", "_arm_delivery_control", "_begin_task_acceptance_fence",
         "_child_disposition_state", "_current_delivery_candidate",
         "_compute_subagent_handoff", "_delivery_evidence_state",
@@ -430,27 +432,12 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     "ouroboros/tools/review_prompt_text.py": ("ouroboros/tools/review_helpers.py", "_rh", frozenset({
         "sanitize_tool_result_for_log",
     })),
-    "ouroboros/tools/scope_review_pack.py": ("ouroboros/tools/scope_review.py", "_sr", frozenset({
-        "BINARY_EXTENSIONS", "CRITICAL_FINDING_CALIBRATION", "ReviewContextAtlasRequest",
-        "StagedDiffUnavailable", "_SCOPE_FAILCLOSED_WINDOW", "_SCOPE_MODEL_CONTEXT_WINDOW",
-        "_SENSITIVE_EXTENSIONS", "_SENSITIVE_NAMES", "_TouchedContextStatus",
-        "_compute_touched_status", "_effective_scope_input_limit", "_get_scope_model",
-        "_load_canonical_context_docs", "_scope_window", "_shared_build_rebuttal_section",
-        "_shared_review_history_section", "atlas_assembly_failed",
-        "atlas_assembly_failure_reason", "atlas_hard_budget_overflowed",
-        "atlas_required_beyond_diff", "atlas_unassembled_required", "build_goal_section",
-        "build_scope_review_prompt", "build_scope_section", "build_touched_file_pack",
-        "capture_staged_diff", "compile_review_context_atlas", "estimate_tokens",
-        "load_checklist_section", "parse_git_name_status", "run_cmd",
-        "staged_path_is_binary",
-    })),
-    # F2.3b D06 lane rows (advisory re-derive on the native-episode form; the
-    # scope budget re-derive after PR #383). Same-leaf members that tests
-    # monkeypatch on the facades are declared too, so the patch points keep
-    # binding through the handle.
+    # F2.3b D06 lane rows (advisory re-derive on the native-episode form).
+    # Same-leaf members that tests monkeypatch on the facades are declared too,
+    # so the patch points keep binding through the handle.
     "ouroboros/tools/preflight_review_prompt.py": ("ouroboros/tools/claude_advisory_review.py", "_car", frozenset({
         "CRITICAL_FINDING_CALIBRATION", "_build_blocking_history_section",
-        "_get_changed_file_list", "_get_staged_diff", "_mandatory_read_pointer",
+        "_get_changed_file_list", "_get_staged_diff",
         "build_blocking_findings_json_section", "build_goal_section",
         "build_scope_section", "build_skill_host_context", "load_checklist_section",
         "load_governance_doc", "load_state", "make_repo_key",
@@ -463,13 +450,10 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_mandatory_read_corpus_chars", "_maybe_overflow_skip", "_predispatch_size_skip", "_persist_preflight_record",
         "_run_advisory_delegated",
         "_run_advisory_native", "_syntax_preflight_staged_py_files",
-        "advisory_gate_unavailability_reason", "build_advisory_changed_context",
+        "advisory_gate_unavailability_reason",
         "emit_review_event", "emit_review_usage", "empty_array_is_verified_clean",
         "extract_json_array", "get_finalization_grace_sec",
         "owner_deadline_exhausted_for_context",
-    })),
-    "ouroboros/tools/scope_review_budget.py": ("ouroboros/tools/scope_review.py", "_sr", frozenset({
-        "_effective_scope_input_limit", "_get_scope_model", "_scope_window",
     })),
     "ouroboros/loop_round_limits.py": ("ouroboros/loop.py", "_loop", frozenset({
         "DeliveryCandidate", "_append_or_merge_user_content",

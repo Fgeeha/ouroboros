@@ -1,9 +1,7 @@
 """Host-owned pre-dispatch guards: capability/resource, managed-update and skill-payload constraints.
 
-Every span is extracted VERBATIM from the parent's tip bytes by
-scripts/v7next_transplant.py (D18/D33 module-handle split, proof-checked);
-the parent re-exports every moved name, so historical imports and
-monkeypatch targets keep working unchanged.
+The facade re-exports these definitions so existing imports and monkeypatch
+targets retain the same bindings.
 """
 
 from __future__ import annotations
@@ -34,7 +32,7 @@ def _registry():
     The parent owns the rebindable module state and the members tests
     monkeypatch there; reading them through the module at each call keeps
     one binding, where a from-import would freeze the value this leaf saw
-    at import time (the owner-approved D18/D33 mechanical exception).
+    at import time.
     """
     from ouroboros.tools import registry
 
@@ -305,6 +303,14 @@ def _disabled_tools(ctx: Any) -> frozenset:
     (e.g. the agent's web_search/browser/VLM tools for a faithful benchmark)
     WITHOUT setting web/network=false — so shell network egress (git/pip) stays
     available. Withholding web tools does not withhold unrelated network tools.
+
+    Enforced twice — the schema filters in ``registry_core`` hide the names and
+    ``_capability_resource_guard_result`` refuses them at dispatch — EXCEPT for a
+    consciousness-origin task (``disabled_tools_dispatch_only``): its list is
+    enforced at dispatch only, so a wake-up's tool schemas and its capability
+    manifest are byte-identical to an owner turn's and the provider prompt cache
+    prefix is shared (owner decision В31=B). The model then sees tools it may not
+    call and gets the typed refusal instead; the wake message names the level.
     """
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     contract = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
@@ -321,7 +327,7 @@ def _disabled_tools(ctx: Any) -> frozenset:
     # too (harmless: nothing registers it), so old contracts round-trip as-is.
     if "claude_code_edit" in names:
         names.add("delegate_start")
-    # Q1 rename compatibility: contracts that withheld `advisory_review` keep
+    # Rename compatibility: contracts that withheld `advisory_review` keep
     # withholding the SAME organ under its new name, and vice versa (a new
     # contract naming only the new spelling must also silence the alias).
     if "advisory_review" in names:
@@ -329,6 +335,13 @@ def _disabled_tools(ctx: Any) -> frozenset:
     if "preflight_review" in names:
         names.add("advisory_review")
     return frozenset(names)
+
+
+def disabled_tools_dispatch_only(ctx: Any) -> bool:
+    """Whether ``disabled_tools`` binds at dispatch only (a consciousness-origin task)."""
+    from ouroboros.consciousness_authority import is_consciousness_origin
+
+    return is_consciousness_origin(getattr(ctx, "task_metadata", None))
 
 
 _GITHUB_TOKEN_TOOLS = frozenset({
@@ -582,15 +595,6 @@ def _executor_backend_candidate_path(ctx: Any, candidate: str) -> pathlib.Path |
         return None
 
 
-def _workspace_write_block_runtime_result(path_text: Any = "", spelled: Any = "") -> ToolResult:
-    """Typed carrier of the Guard-B runtime-path denial (same bytes in text)."""
-    return ToolResult(
-        status="blocked",
-        code="WORKSPACE_BLOCKED",
-        text=_workspace_write_block_runtime_message(path_text, spelled),
-    )
-
-
 def _workspace_write_block_outside_root_result(
     path_text: Any = "", work_dir: Any = "", spelled: Any = "",
 ) -> ToolResult:
@@ -667,6 +671,19 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
         self._ctx, operation="shell", process_cwd=str(work_dir))
     roots = list(dict.fromkeys([(selected.root, selected.base_path, selected.source, selected.skill_name),
                                *_process_root_candidates(self._ctx, "shell")]))
+    system_repo = pathlib.Path(getattr(self._ctx, "system_repo_dir", None) or self._ctx.repo_dir)
+
+    def _refuse_write(target: pathlib.Path, token: str) -> ToolResult:
+        if self._is_acting_subagent():
+            return _workspace_write_block_outside_root_result(target.resolve(strict=False), work_dir, token)
+        light_internal = runtime_mode == "light" and any(
+            path_is_relative_to(target, root) for root in _git_protected_roots(self))
+        code = "LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_BLOCKED"
+        prefix = "LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_SHELL_BLOCKED"
+        return ToolResult(status="blocked", code=code, text=(
+            f"⚠️ {prefix}: explicit write target {target} is outside the resources this task may write. "
+            f"Selected process root: {work_dir}. The process was not started."))
+
     for (argv, targets, _inline, _unknown), cwd in zip(rows, _registry().sequential_effective_cwds(rows, work_dir)):
         for command, destination, source in directory_destination_pairs(argv):
             directory = _command_path(self._ctx, cwd, destination)
@@ -679,6 +696,12 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
             target = _command_path(self._ctx, cwd, token)
             if target is None:
                 continue
+            # The light gate is root-independent: ``runtime_mode`` here is the
+            # EFFECTIVE mode (the install mode capped per task), and a cyber_pro
+            # install resolves user_files to the whole host, which would admit a
+            # repository target under that name for a light-capped task.
+            if runtime_mode == "light" and path_is_relative_to(target, system_repo):
+                return _refuse_write(target, token)
             for root, base, source, skill in roots:
                 if not decide_tool_access(profile=selected.profile, root=root, operation="write").allow:
                     continue
@@ -707,15 +730,7 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
                 except (OSError, ValueError, RuntimeError):
                     continue
             else:
-                if self._is_acting_subagent():
-                    return _workspace_write_block_outside_root_result(target.resolve(strict=False), work_dir, token)
-                light_internal = runtime_mode == "light" and any(
-                    path_is_relative_to(target, root) for root in _git_protected_roots(self))
-                code = "LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_BLOCKED"
-                prefix = "LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_SHELL_BLOCKED"
-                return ToolResult(status="blocked", code=code, text=(
-                    f"⚠️ {prefix}: explicit write target {target} is outside the resources this task may write. "
-                    f"Selected process root: {work_dir}. The process was not started."))
+                return _refuse_write(target, token)
     return None
 
 
@@ -767,7 +782,7 @@ def _shell_git_and_runtime_block(
     """Direct-git-via-shell policy + the external-workspace runtime/secret read
     guard. External workspaces AND the default (non-workspace) lane get full
     task-local git through ONE target-aware resolver — only the Ouroboros
-    runtime is protected (Q4=A unwind, 2026-08-08) — while raw non-git shell
+    runtime is protected — while raw non-git shell
     in external workspaces still cannot read the runtime/secrets;
     self_worktree keeps the strict read-only git policy."""
     if not _registry().shell_argv(raw_cmd):
@@ -840,7 +855,7 @@ def _shell_git_and_runtime_block(
                 ),
             )
         return None
-    # DEFAULT (non-workspace) lane. Q4=A (owner 2026-08-08): mutating git
+    # DEFAULT (non-workspace) lane: mutating git
     # is free EVERYWHERE outside the Ouroboros runtime. The argv-text
     # blanket is replaced by the SAME target-aware resolver the external
     # lane runs since v6.27: read-only git allowed even at a runtime

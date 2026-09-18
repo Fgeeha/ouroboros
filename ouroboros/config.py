@@ -94,9 +94,9 @@ from ouroboros.review_model_routes import (
     resolved_review_model_target,  # noqa: F401
 )
 from ouroboros.runtime_limits import (
-    WORKER_SPAWN_GRACE_SEC,  # noqa: F401
+    EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC, WORKER_SPAWN_GRACE_SEC,  # noqa: F401
     WORKER_READY_WINDOW_SEC,  # noqa: F401
-    WORKER_READY_MAX_ATTEMPTS,  # noqa: F401
+    WORKER_READY_MAX_ATTEMPTS, WORKER_READY_CEILING_SEC,  # noqa: F401
     EXTENSION_STREAM_CHUNK_BYTES,  # noqa: F401
     EXTENSION_CHILD_CLEANUP_GRACE_SEC,  # noqa: F401
     NESTED_SETTLEMENT_MARGIN_SEC,  # noqa: F401
@@ -116,12 +116,18 @@ from ouroboros.runtime_limits import (
     DELEGATE_WAIT_WINDOW_MAX_SEC,  # noqa: F401
     MAX_ACTIVE_SUBAGENTS_HARD_CAP,  # noqa: F401
     MAX_SUBAGENT_DEPTH_HARD_CAP,  # noqa: F401
+    WAKE_DEFAULT_SEC, USAGE_LEDGER_FOLD_MIN_AGE_SEC,  # noqa: F401
     _bounded_positive_int_setting,  # noqa: F401
     _clamped_number_setting,  # noqa: F401
     get_acceptance_reserve_pct,  # noqa: F401
     get_acceptance_review_est_sec,  # noqa: F401
+    get_bg_wakeup_max_sec,  # noqa: F401
+    get_bg_wakeup_min_sec,  # noqa: F401
     get_claudexor_harness_install_timeout_sec,  # noqa: F401
     get_claudexor_quota_refresh_timeout_sec,  # noqa: F401
+    get_consciousness_autonomy,  # noqa: F401
+    get_consciousness_daily_usd,  # noqa: F401
+    get_consciousness_max_tasks,  # noqa: F401
     get_delegate_wait_max_sec,  # noqa: F401
     get_delegate_wait_sec,  # noqa: F401
     get_finalization_grace_sec,  # noqa: F401
@@ -190,8 +196,8 @@ from ouroboros.settings_integrity import (  # noqa: E402, F401 — public config
 RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 AGENT_SERVER_PORT = 8765
-# --- Usage-ledger compaction policy (CPL4-C6, owner sanction 1A) -------------
-# docs/v7next/DESIGN_USAGE_COMPACTION.md. Constants, not env knobs. Compact the
+# --- Usage-ledger compaction policy -----------------------------------------
+# docs/USAGE_COMPACTION.md. Constants, not env knobs. Compact the
 # monetary ledger once its byte size reaches ~0.2s-per-cold-replay scale, well
 # under the measured 20MB degradation point (USAGE_LEDGER_WARN_BYTES in
 # context_budget.py), which stays as the broken-compaction regression tripwire.

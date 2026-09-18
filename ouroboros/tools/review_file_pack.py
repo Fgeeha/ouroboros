@@ -1,18 +1,19 @@
-"""Reviewable file classification and the packs read from the working tree.
+"""Reviewable file classification and the touched-file pack read from the tree.
 
 Owns what counts as sensitive, binary, oversized or vendored, the porcelain and
-name-status parsers that name the changed paths, and the three packs built from
-them: touched files (post-change), their HEAD or payload snapshots, and the
-filtered full-repository pack. Content is redacted and fenced by the prompt-text
-owner before it is returned. Extracted from ouroboros/tools/review_helpers.py
-(v7 D06 split, re-cut on the v7next tip); review_helpers.py re-exports every
-name. ``format_prompt_code_block`` is read inside f-strings, which the
-call-time handle cannot carry — it stays import-bound to its prompt-text owner.
+name-status parsers that name the changed paths, the tracked-path listing the
+repository index walks, and the post-change pack of the touched files the commit
+triad packet carries — with the disclosed exclusion classes (span-only release
+carriers, prefix-duplicated governance docs). Content is redacted and fenced by
+the prompt-text owner before it is returned. Extracted from
+ouroboros/tools/review_helpers.py (v7 D06 split, re-cut on the v7next tip);
+review_helpers.py re-exports every name. ``format_prompt_code_block`` is read
+inside f-strings, which the call-time handle cannot carry — it stays
+import-bound to its prompt-text owner.
 """
 
 from __future__ import annotations
 
-import os
 import subprocess
 from pathlib import Path
 
@@ -430,52 +431,38 @@ def triad_pack_exclusions(
       copy already inlined in this same prompt's governance prefix
       (``prefix_texts``: path -> the prefix's text) — pure duplication.
 
+    A reference-book entrypoint's prefix copy is the COMPOSED book, so a
+    touched CHAPTER is duplicated exactly when its current bytes already sit
+    in that composition — the same byte-identity fact, asked of a member
+    instead of a whole file. Without this the split would have withheld
+    nothing and inlined every touched chapter twice.
+
     A carrier edited outside its spans, a prefix doc whose bytes differ from
     the prefix copy and a managed subject (the caller skips this helper: its
     reviewed delta is M0→staged, not HEAD→staged) all keep the full text."""
+    from ouroboros.reference_books import book_entrypoint_for, book_path_role
+
     carriers = span_only_release_carriers(repo_dir, paths)
     duplicated: list[str] = []
     for rel in paths:
-        prefix_text = prefix_texts.get(rel) or ""
-        if not prefix_text or rel in carriers:
+        if rel in carriers:
+            continue
+        member_of = book_entrypoint_for(rel) if book_path_role(rel) == "chapter" else ""
+        prefix_text = prefix_texts.get(rel) or (prefix_texts.get(member_of) or "" if member_of else "")
+        if not prefix_text:
             continue
         try:
-            if (repo_dir / rel).read_text(encoding="utf-8") == prefix_text:
-                duplicated.append(rel)
+            current = (repo_dir / rel).read_bytes().decode("utf-8")
         except Exception:
             continue
+        # Duplication is a fact about TEXT: the prefix copy of a plain document
+        # came through a newline-translating read while a composed book keeps
+        # its sources' exact bytes, so on a CRLF checkout the two sides differ
+        # only in newline style. Compare with newlines normalized on both sides.
+        current, prefix_text = current.replace("\r\n", "\n"), prefix_text.replace("\r\n", "\n")
+        if current == prefix_text or (member_of and current and current in prefix_text):
+            duplicated.append(rel)
     return set(carriers) | set(duplicated), pack_exclusion_note(carriers, duplicated)
-
-
-def build_advisory_changed_context(
-    repo_dir: Path,
-    *,
-    changed_files_text: str,
-    paths: list[str] | None = None,
-    exclude_paths: set[str] | None = None,
-) -> tuple[list[str], str, list[str]]:
-    """Resolve changed paths and build advisory touched-file context."""
-    resolved_paths = (
-        list(paths)
-        if paths is not None
-        else parse_changed_paths_from_porcelain(changed_files_text)
-    )
-    filtered_paths = [
-        p for p in resolved_paths
-        if p not in (exclude_paths or set())
-    ]
-    # The advisory reviews the LIVE tree (staged + unstaged), so its carrier cut
-    # compares HEAD with the working-tree text this pack reads — the same
-    # predicate and the same disclosure as the commit triad and the scope pack.
-    # The native episode keeps read_file for a withheld carrier's full text.
-    carriers = span_only_release_carriers(repo_dir, filtered_paths, worktree=True)
-    touched_pack, omitted = build_touched_file_pack(
-        repo_dir, filtered_paths, exclude_paths=set(carriers))
-    if carriers:
-        touched_pack += "\n\n" + pack_exclusion_note(carriers)
-    if not touched_pack.strip():
-        touched_pack = "(no touched files)"
-    return resolved_paths, touched_pack, omitted
 
 
 def _is_probably_binary(path: Path) -> bool:
@@ -520,7 +507,7 @@ def list_git_tracked_paths(repo_dir: Path) -> list[str]:
     if result.returncode != 0:
         err = result.stderr.strip()[:200] if result.stderr else "unknown error"
         raise RuntimeError(
-            f"build_full_repo_pack: git ls-files failed (exit {result.returncode}): {err}"
+            f"list_git_tracked_paths: git ls-files failed (exit {result.returncode}): {err}"
         )
     return result.stdout.splitlines()
 
@@ -611,106 +598,3 @@ def iter_repo_pack_entries(
         entries.append((rel, content, lang, note))
 
     return entries, omitted
-
-
-def build_full_repo_pack(
-    repo_dir: Path,
-    exclude_paths: set[str] | None = None,
-) -> tuple[str, list[str]]:
-    """Build a filtered full-repo text pack; callers handle size limits."""
-    entries, omitted = iter_repo_pack_entries(repo_dir, exclude_paths=exclude_paths)
-    parts = [
-        f"### {rel}\n{note}```{lang}\n{content}\n```\n\n"
-        for rel, content, lang, note in entries
-    ]
-
-    return "".join(parts), omitted
-
-
-def build_head_snapshot_section(
-    repo_dir: Path, paths: list[str], *, current_snapshots: dict[str, Path] | None = None,
-) -> tuple[str, frozenset[str]]:
-    """Build prompt text with HEAD or explicit current snapshots of touched files.
-
-    ``included_paths`` names only FULL snapshots; omission markers must never
-    become Atlas ``already_included`` claims (BIBLE P3 / XG-1R.4).
-    """
-    if not paths:
-        return "(no touched files)", frozenset()
-    current_by_label = {str(k).strip(): Path(v) for k, v in (current_snapshots or {}).items()}
-    parts: list[str] = []
-    included: set[str] = set()
-    def append_bytes(rel: str, raw: bytes, source: str) -> None:
-        if len(raw) > _FILE_SIZE_LIMIT:
-            parts.append(
-                f"### {rel}\n\n*({source} omitted — {len(raw):,} bytes exceeds "
-                f"{_FILE_SIZE_LIMIT:,} byte limit)*\n"
-            )
-        elif _raw_bytes_binary(raw[:_BINARY_SNIFF_BYTES]):
-            parts.append(f"### {rel}\n\n*({source} omitted — binary content detected)*\n")
-        else:
-            lang = Path(rel).suffix.lstrip(".")
-            note = f"*{source}*\n\n" if source != "HEAD snapshot" else ""
-            content = raw.decode("utf-8", errors="replace")
-            parts.append(f"### {rel}\n\n{note}{format_prompt_code_block(content, lang)}\n")
-            included.add(rel)
-
-    for rel in paths:
-        fp_rel = Path(rel)
-        suffix = fp_rel.suffix.lower()
-        current_path = current_by_label.get(str(rel).strip())
-        source = "Current skill-payload snapshot (data plane, not Git HEAD)" if current_path else "HEAD snapshot"
-        fname_lower = fp_rel.name.lower()
-        if suffix in _SENSITIVE_EXTENSIONS or fname_lower in _SENSITIVE_NAMES:
-            parts.append(f"### {rel}\n\n*({source} omitted — sensitive file)*\n")
-            continue
-        if suffix in BINARY_EXTENSIONS:
-            parts.append(f"### {rel}\n\n*({source} omitted — binary file ({suffix}))*\n")
-            continue
-        try:
-            if current_path is not None:
-                if not current_path.is_file():
-                    parts.append(
-                        f"### {rel}\n\n*(Current skill-payload snapshot unavailable — "
-                        "file does not exist or is not a regular file)*\n"
-                    )
-                else:
-                    append_bytes(rel, current_path.read_bytes(), source)
-                continue
-            result = subprocess.run(
-                ["git", "show", f"HEAD:{rel}"],
-                cwd=repo_dir,
-                capture_output=True,
-                timeout=10,
-                env={**os.environ, "LC_ALL": "C", "LANG": "C", "LANGUAGE": "C"},
-            )
-            if result.returncode == 0 and result.stdout:
-                append_bytes(rel, result.stdout, source)
-                continue
-            if result.returncode != 0:
-                raw_stderr = result.stderr or b""
-                stderr_str = (
-                    raw_stderr.decode("utf-8", errors="replace")
-                    if isinstance(raw_stderr, (bytes, bytearray))
-                    else str(raw_stderr)
-                )
-                stderr_lower = stderr_str.lower()
-                is_new_file = (
-                    "does not exist" in stderr_lower
-                    or "exists on disk" in stderr_lower
-                    or "path not in" in stderr_lower
-                    or "not in 'head'" in stderr_lower
-                )
-                if is_new_file:
-                    parts.append(f"### {rel}\n\n*(File is new — no HEAD snapshot)*\n")
-                else:
-                    short_err = stderr_str.strip()[:200]
-                    parts.append(f"### {rel}\n\n*(HEAD snapshot error — git exited {result.returncode}: {short_err})*\n")
-            elif not result.stdout:
-                parts.append(f"### {rel}\n\n*(HEAD snapshot was empty)*\n")
-        except subprocess.TimeoutExpired:
-            parts.append(f"### {rel}\n\n*(HEAD snapshot timeout)*\n")
-        except Exception as exc:
-            parts.append(f"### {rel}\n\n*(HEAD snapshot error: {exc})*\n")
-
-    return "\n".join(parts), frozenset(included)

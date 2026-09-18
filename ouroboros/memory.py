@@ -99,8 +99,11 @@ def _chat_history_filter(filters: Mapping[str, str], search: str):
     def matches(entry: Mapping[str, Any]) -> bool:
         if is_a2a_chat_id(entry.get("chat_id")):
             return False
-        if search_lower and search_lower not in str(entry.get("text", "")).lower():
-            return False
+        if search_lower:
+            from ouroboros.dialogue_provenance import dialogue_text
+
+            if search_lower not in dialogue_text(entry).lower():
+                return False
         transport = entry.get("transport") if isinstance(entry.get("transport"), Mapping) else {}
         if any(value and str(transport.get(key) or "") != value for key, value in exact_transport.items()):
             return False
@@ -335,27 +338,6 @@ class Memory:
             log.debug("Failed to write scratchpad size to journal", exc_info=True)
 
         return new_block
-
-    def regenerate_scratchpad_md(self) -> None:
-        bp = self.scratchpad_blocks_path()
-        bp.parent.mkdir(parents=True, exist_ok=True)
-        fd = None
-        try:
-            fd = os.open(str(bp) + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
-            _lock_ex(fd)
-            try:
-                blocks = self._read_scratchpad_blocks_unlocked(bp)
-            except Exception:
-                log.debug("Failed to load scratchpad blocks for regeneration", exc_info=True)
-                blocks = []
-            self._write_scratchpad_markdown(blocks)
-        finally:
-            if fd is not None:
-                try:
-                    _unlock(fd)
-                    os.close(fd)
-                except OSError:
-                    pass
 
     def mutate_scratchpad_blocks(self, mutator: Any) -> List[Dict[str, Any]]:
         """Mutate block source and regenerate its markdown under one sidecar lock."""
@@ -945,14 +927,25 @@ class Memory:
 
     @staticmethod
     def _format_chat_line(e: Dict[str, Any], *, compact: bool) -> str:
+        from ouroboros.dialogue_provenance import dialogue_text
+
         dir_raw = str(e.get("direction", "")).lower()
         ts_full = str(e.get("ts", ""))
         ts = (ts_full[11:16] if len(ts_full) >= 16 else "") if compact else ts_full[:16]
-        raw_text = str(e.get("text", ""))
+        raw_text = dialogue_text(e)
         if dir_raw in ("out", "outgoing"):
+            from ouroboros.dialogue_provenance import dialogue_provenance
+
+            provenance = dialogue_provenance(e) if e.get("transport") else ""
+            if provenance:
+                raw_text = f"[{provenance}] {raw_text}"
             return f"→ {ts} {raw_text}" if compact else f"→ [{ts}] {raw_text}"
         if dir_raw == "system":
             entry_type = str(e.get("type", "")).strip() or "system"
+            if isinstance(e.get("transport"), dict) and e["transport"].get("delivery"):
+                from ouroboros.dialogue_provenance import dialogue_provenance
+
+                raw_text = f"[{dialogue_provenance(e)}] {raw_text}"
             return f"📋 {ts} [{entry_type}] {raw_text}" if compact else f"📋 [{ts}] [{entry_type}] {raw_text}"
         from ouroboros.dialogue_provenance import dialogue_author
 
