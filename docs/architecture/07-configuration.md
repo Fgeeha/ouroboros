@@ -166,7 +166,7 @@ A registry of `config.SETTINGS_DEFAULTS` (exact defaults canonical in `settings_
 | OUROBOROS_HUB_CATALOG_URL | `https://raw.githubusercontent.com/razzant/OuroborosHub/main/catalog.json` | OuroborosHub catalog URL (automatic fetch limited to catalog JSON; installs verify SHA-256) |
 | OUROBOROS_CLAWHUB_REGISTRY_URL | `https://clawhub.ai/api/v1` | ClawHub registry URL |
 | OUROBOROS_PROMPT_CACHE_TTL | 1h | Prompt-cache tier default/5m/1h for cache markers on compatible Anthropic-family wire payloads; the final send boundary legalizes ordering, so prompt builders own no provider TTL policy; `review_helpers.cached_prompt_blocks` and `usage_accounting._reservation_cost` also consult it; usage records the applied tier |
-| OUROBOROS_EFFORT_TASK | medium | Task reasoning effort (none/minimal/low/medium/high/xhigh/max/ultra; Settings hides `minimal`); adaptation is exact-route, success-confirmed, disclosed in `request_wire` |
+| OUROBOROS_EFFORT_TASK | medium | Task reasoning effort (none/minimal/low/medium/high/xhigh/max/ultra; Settings hides `minimal`); adaptation is exact-route, success-confirmed, disclosed in `request_wire`. Also the depth of post-task synthesis on the Light route (reflection, its Pattern Register update, episodic summary), which has no level of its own |
 | OUROBOROS_EFFORT_EVOLUTION | high | Evolution effort |
 | OUROBOROS_EFFORT_REVIEW | high | Review effort; reaches plan review as every row's default rung unless the envelope declares `reviewer_effort` |
 | OUROBOROS_EFFORT_SCOPE_REVIEW | high | Scope-review effort |

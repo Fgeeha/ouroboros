@@ -569,7 +569,7 @@ def run_llm_loop(
                 _inject_round_checkpoints(
                     round_idx=round_idx, max_rounds=MAX_ROUNDS, messages=messages, accumulated_usage=accumulated_usage,
                     emit_progress=emit_progress, tools=tools, event_queue=event_queue, task_id=task_id,
-                    drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling)
+                    drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling, llm_trace=llm_trace)
 
                 messages, _compaction_usage = _run_round_compaction(
                     messages,

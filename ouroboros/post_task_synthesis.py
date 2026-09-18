@@ -105,8 +105,48 @@ def capture_task_inputs(ctx: Any, task: dict, drive_root: Any, receipts: list) -
 
 
 
-def build_trace_summary(llm_trace: dict) -> str:
-    """Return a compact human-readable summary of tool calls and agent notes."""
+def _trace_round(tc: dict) -> int | None:
+    """Ordinal of the model round that issued this call (``…:round:<n>``); None when unrecorded."""
+    tail = str(tc.get("round_id") or "").rpartition(":round:")[2]
+    return int(tail) if tail.isdigit() else None
+
+
+def _trace_row_failed(tc: dict) -> bool:
+    return bool(tc.get("is_error")) or str(tc.get("status") or "ok").strip() not in ("", "ok")
+
+
+def _fold_identical_calls(tool_calls: list) -> list[tuple[int, dict, int, int | None, int | None]]:
+    """Run-length fold of consecutive IDENTICAL calls: (first index, row, count, first round, last round).
+
+    Identity is equality of tool, arguments, recorded status and delivered result — arithmetic,
+    not vocabulary — so a refusal returned as a plain string, a sleep loop and a blind poll
+    fold exactly like a typed error. Nothing is dropped: the count stays on the row.
+    """
+    folded: list[list] = []
+    previous = None
+    for index, tc in enumerate(tool_calls):
+        key = (tc.get("tool"), json.dumps(tc.get("args"), sort_keys=True, default=str, ensure_ascii=False),
+               str(tc.get("status") or ""), bool(tc.get("is_error")), str(tc.get("result") or ""))
+        if folded and key == previous:
+            folded[-1][2] += 1
+            folded[-1][4] = _trace_round(tc)
+        else:
+            folded.append([index, tc, 1, _trace_round(tc), _trace_round(tc)])
+        previous = key
+    return [tuple(item) for item in folded]
+
+
+def build_trace_summary(llm_trace: dict, *, all_calls: bool = False) -> str:
+    """Return a human-readable summary of tool calls and agent notes.
+
+    The default is the BOUNDED PREVIEW that is stored and shown (task card, parents,
+    children): two arguments per call, a positional window past thirty calls, a total
+    cut. ``all_calls=True`` is the post-task reflection's listing: every call in order
+    with every argument, identical consecutive calls folded into one ``×N`` row, the
+    first line of a failed or repeated call's result, no window and no total cut — a
+    decider must not adjudicate less of a call than the actor saw; its prompt is fitted
+    by the consolidation seam. Values stay width-bounded, with a disclosed omission.
+    """
     if llm_trace.get("loop_evidence_unavailable"):
         return "## Tool trace (call count unknown)\nThe failed loop supplied no verified execution trace."
     tool_calls = llm_trace.get("tool_calls", []) or []
@@ -135,24 +175,35 @@ def build_trace_summary(llm_trace: dict) -> str:
         _breakdown_bits.append(f"{_cosmetic} cosmetic")
     if _ignored:
         _breakdown_bits.append(f"{_ignored} ignored")
+    if all_calls:
+        # One arithmetic fact the rows cannot show at a glance: rounds in which NO call returned ok.
+        rounds: dict[int, bool] = {}
+        for tc in tool_calls:
+            number = _trace_round(tc)
+            if number is not None:
+                rounds[number] = rounds.get(number, True) and _trace_row_failed(tc)
+        if any(rounds.values()):
+            _breakdown_bits.append(f"{sum(rounds.values())} of {len(rounds)} rounds had only non-ok results")
 
     lines: list[str] = [f"## Tool trace ({n} calls, {', '.join(_breakdown_bits)})"]
 
     if not tool_calls:
         lines.append("No tool calls.")
     else:
-        def _fmt_call(idx: int, tc: dict) -> str:
+        from ouroboros.observability import redact_projection
+
+        def _fmt_call(first: int, tc: dict, count: int, round_a: int | None, round_b: int | None) -> str:
             name = tc.get("tool", "unknown")
             args = tc.get("args", {})
             if isinstance(args, dict):
                 parts = []
                 arg_items = list(args.items())
-                for k, v in arg_items[:2]:
+                for k, v in (arg_items if all_calls else arg_items[:2]):
                     v_str = str(v)
                     if len(v_str) > 200:
                         v_str = _truncate_with_notice(v_str, 200).replace("\n", " ")
                     parts.append(f"{k}={v_str!r}")
-                if len(arg_items) > 2:
+                if not all_calls and len(arg_items) > 2:
                     parts.append(f"⚠️ OMISSION NOTE: {len(arg_items) - 2} more args omitted")
                 args_str = ", ".join(parts)
             else:
@@ -169,16 +220,27 @@ def build_trace_summary(llm_trace: dict) -> str:
                 facts.append(f"signal={tc.get('signal')}")
             fact_suffix = f" [{', '.join(facts)}]" if facts else ""
             suffix = " → ERROR" if tc.get("is_error") else ""
-            return f"{idx}. {name}({args_str}){fact_suffix}{suffix}"
+            index = f"{first + 1}" if count == 1 else f"{first + 1}–{first + count}"
+            if count > 1:
+                span = "" if round_a is None else f", rounds {round_a}–{round_b}" if round_b != round_a else f", round {round_a}"
+                suffix += f" ×{count} identical{span}"
+            if all_calls and (count > 1 or _trace_row_failed(tc)):
+                # The answer is what a later reader needs to tell a refusal from progress.
+                head = str(redact_projection(str(tc.get("result") or "")).value).strip().splitlines()[:1]
+                if head:
+                    suffix += " ← " + _truncate_with_notice(head[0], 200)
+            return f"{index}. {name}({args_str}){fact_suffix}{suffix}"
 
-        if n > 30:
+        if all_calls:
+            shown = [_fmt_call(*row) for row in _fold_identical_calls(tool_calls)]
+        elif n > 30:
             shown = (
-                [_fmt_call(i + 1, tool_calls[i]) for i in range(15)]
+                [_fmt_call(i, tool_calls[i], 1, None, None) for i in range(15)]
                 + [f"⚠️ OMISSION NOTE: {n - 30} middle tool calls omitted from trace summary."]
-                + [_fmt_call(n - 14 + i, tool_calls[n - 15 + i]) for i in range(15)]
+                + [_fmt_call(n - 15 + i, tool_calls[n - 15 + i], 1, None, None) for i in range(15)]
             )
         else:
-            shown = [_fmt_call(i + 1, tool_calls[i]) for i in range(n)]
+            shown = [_fmt_call(i, tool_calls[i], 1, None, None) for i in range(n)]
         lines.extend(shown)
 
     if notes:
@@ -186,7 +248,7 @@ def build_trace_summary(llm_trace: dict) -> str:
         lines.extend(f"- {note}" for note in notes)
 
     summary = "\n".join(lines)
-    if len(summary) > 4000:
+    if not all_calls and len(summary) > 4000:
         summary = _truncate_with_notice(summary, 4000)
     return summary
 
@@ -382,7 +444,8 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
     try:
         from ouroboros.project_dialogue import append_authored_task_summary, completion_status_label, outcome_phase
         from ouroboros.projects_registry import project_thread_note_for_task
-        from ouroboros.consolidator import CONSOLIDATION_REASONING_EFFORT, _consolidation_route
+        from ouroboros.consolidator import _consolidation_route
+        from ouroboros.settings_scales import resolve_effort
         task_id = str(task.get("id") or "unknown")
         canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent)
         summary_id = f"task-narrative:{task_id}"
@@ -455,7 +518,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                                    call_type="task_summary", messages=[{"role": "user", "content": prompt}],
                                    model=summary_model,
                                    model_role="light",
-                                   reasoning_effort=CONSOLIDATION_REASONING_EFFORT,
+                                   reasoning_effort=resolve_effort("task"),  # the owner's Task / Chat level: one SSOT, no literal
                                    max_tokens=16384,
                                    use_local=summary_use_local)
             summary_text = (msg.get("content") or "").strip()
@@ -596,7 +659,7 @@ def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
             cost_usd=synthesis_cost,
             child_failure_classes=child_classes,
         ):
-            trace_summary = build_trace_summary(llm_trace)
+            trace_summary = build_trace_summary(llm_trace, all_calls=True)
             try:
                 reflection_usage = dict(usage)
                 # Reflection's legacy durable cost_usd field now records this

@@ -220,10 +220,16 @@ def should_generate_reflection(
     return False
 
 
+def _synthesis_effort() -> str:
+    """Post-task synthesis thinks at the owner's Task / Chat level (settings SSOT), never a literal."""
+    from ouroboros.settings_scales import resolve_effort
+
+    return resolve_effort("task")
+
+
 def _collect_error_details(llm_trace: Dict[str, Any], cap: int = 3000) -> str:
-    """Extract error tool results from the trace, up to *cap* chars."""
-    parts: List[str] = []
-    total = 0
+    """Extract error tool results from the trace, up to *cap* chars; identical ones once, counted."""
+    snippets: Dict[str, int] = {}
     tool_calls = llm_trace.get("tool_calls") or []
 
     for tc in tool_calls:
@@ -249,8 +255,16 @@ def _collect_error_details(llm_trace: Dict[str, Any], cap: int = 3000) -> str:
 
         safe_result = redact_projection(result_str).value
         # Pre-cap each snippet so one oversized error cannot monopolize the whole
-        # budget and hide later distinct errors (breadth over depth).
+        # budget and hide later distinct errors (breadth over depth). The same
+        # refusal repeated ten times is ONE entry with its count, not ten copies.
         snippet = _truncate_with_notice(f"[{tool_name}{fact_prefix}]: {safe_result}", 1000)
+        snippets[snippet] = snippets.get(snippet, 0) + 1
+
+    parts: List[str] = []
+    total = 0
+    for snippet, count in snippets.items():
+        if count > 1:
+            snippet = f"(×{count} identical) {snippet}"
         if total + len(snippet) > cap:
             remaining = cap - total
             if remaining > 50:
@@ -396,6 +410,36 @@ def task_inputs_prompt_section(review_evidence: Any) -> str:
         + json.dumps(inputs, ensure_ascii=False, indent=2) + "\n\n"
     )
 
+def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -> str:
+    """Retain the per-call record as the actor saw it and name its reader; optional reading.
+
+    The listing above it bounds values and shows only the first line of a failed or
+    repeated call's result, so the omission needs a source the same reader can open.
+    Redacted like every other reflection-visible result. Never a required source: a
+    reflection that does not open it is still complete for what its prompt shows.
+    """
+    tool_calls = [tc for tc in (llm_trace.get("tool_calls") or []) if isinstance(tc, dict)]
+    if not tool_calls:
+        return ""
+    try:
+        from ouroboros.consolidator import retain_memory_source
+        from ouroboros.observability import redact_projection
+
+        record = "\n\n".join(
+            f"### {index}. {tc.get('tool', 'unknown')} [status={tc.get('status') or ''}"
+            f"{', round_id=' + str(tc.get('round_id')) if tc.get('round_id') else ''}]\n"
+            f"args: {json.dumps(tc.get('args'), ensure_ascii=False, default=str)}\n"
+            f"result:\n{tc.get('result') or ''}"
+            for index, tc in enumerate(tool_calls, 1))
+        safe = str(redact_projection(record).value)
+        ref = retain_memory_source(knowledge_context, "task_trace_verbatim", safe.encode("utf-8"))
+        return ("\n\nComplete per-call record (every argument and each result as the actor saw it; optional "
+                f"reading, {len(safe)} chars): read_file " + json.dumps(ref["read"]["arguments"], ensure_ascii=False))
+    except Exception:
+        log.debug("Verbatim trace record unavailable for reflection", exc_info=True)
+        return ""
+
+
 def generate_reflection(
     task: Dict[str, Any],
     llm_trace: Dict[str, Any],
@@ -438,9 +482,19 @@ def generate_reflection(
     else:
         prompt_template = _REFLECTION_PROMPT_NONTRIVIAL_FULL
 
+    if knowledge_context is None:
+        from ouroboros.config import DATA_DIR
+        from ouroboros.tools.registry import ToolContext
+
+        root = pathlib.Path(task.get("budget_drive_root") or task.get("drive_root") or DATA_DIR)
+        knowledge_context = ToolContext(repo_dir=root, drive_root=root,
+            project_id=str(task.get("project_id") or ""),
+            task_id=str(task.get("id") or task.get("task_id") or "reflection"))
     prompt = prompt_template.format(
         goal=str(task.get("text") or "(no goal text)"),
-        trace_summary=_truncate_with_notice(trace_summary, 2000),
+        # The listing arrives whole: this call's prompt is fitted by the consolidation seam,
+        # so a literal cut here only hid the calls the lesson is about.
+        trace_summary=trace_summary + _verbatim_trace_pointer(knowledge_context, llm_trace),
         task_inputs=task_inputs_prompt_section(review_evidence),
         tool_usage=_tool_usage_profile(llm_trace),
         error_details=error_details,
@@ -452,20 +506,14 @@ def generate_reflection(
 
     try:
         from ouroboros.consolidator import KnowledgeReadContext, KNOWLEDGE_MAINTENANCE_PROMPT, _call_consolidation_llm
-        from ouroboros.tools.registry import ToolContext
 
-        if knowledge_context is None:
-            from ouroboros.config import DATA_DIR
-            root = pathlib.Path(task.get("budget_drive_root") or task.get("drive_root") or DATA_DIR)
-            knowledge_context = ToolContext(repo_dir=root, drive_root=root,
-                project_id=str(task.get("project_id") or ""),
-                task_id=str(task.get("id") or task.get("task_id") or "reflection"))
         knowledge = KnowledgeReadContext(knowledge_context, "task_reflection")
         from ouroboros.consolidator import retain_memory_source
         complete_prompt = KNOWLEDGE_MAINTENANCE_PROMPT + prompt
         source_ref = retain_memory_source(knowledge_context, "task_input_reflection", complete_prompt.encode("utf-8"))
         raw_reflection_text, refl_usage = _call_consolidation_llm(
-            llm_client, complete_prompt, "Task reflection", knowledge=knowledge, source_ref=source_ref)
+            llm_client, complete_prompt, "Task reflection", knowledge=knowledge, source_ref=source_ref,
+            reasoning_effort=_synthesis_effort())
         raw_reflection_text = raw_reflection_text.strip()
         memory_operation_errors = refl_usage.get("_consolidation_errors") or []
         if not raw_reflection_text and memory_operation_errors:
@@ -794,7 +842,7 @@ def _update_patterns(drive_root: pathlib.Path, entry: Dict[str, Any]) -> None:
         model_role="light",
         messages=[{"role": "user", "content": prompt}],
         model=light_model,
-        reasoning_effort="low",
+        reasoning_effort=_synthesis_effort(),
         max_tokens=16384,
     )
     # Pattern update also runs outside the tool-event loop.

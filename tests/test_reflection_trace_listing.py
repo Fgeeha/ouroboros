@@ -1,0 +1,198 @@
+"""The post-task reflection must see what the actor saw; the stored preview must not change.
+
+A task whose model sent the same refused call ten times produced a reflection that never
+saw the refusal: the summary showed two arguments per call, no result text, a positional
+window, and was cut twice (4000 then 2000 characters). These tests pin the reflection's
+all-calls listing, the unchanged stored preview, and the settings-resolved effort.
+"""
+import json
+import pathlib
+
+import pytest
+
+from ouroboros import reflection
+from ouroboros.post_task_synthesis import build_trace_summary
+
+REFUSAL = "⚠️ QUIZ_WAIT_BOUND_INVALID: max_wait_minutes applies only to wait_for_answer=true.\nsecond line"
+
+
+def _refused(round_number: int) -> dict:
+    return {"tool": "escalate", "tool_call_id": f"call-{round_number}",
+            "args": {"question": "Which theme?", "options": ["Light", "Dark"], "assumption": "Light",
+                     "wait_for_answer": False, "max_wait_minutes": 0},
+            "result": REFUSAL, "is_error": True, "status": "argument_error",
+            "round_id": f"exec_x:round:{round_number}"}
+
+
+def _ok(tool: str, round_number: int, **args) -> dict:
+    return {"tool": tool, "tool_call_id": f"ok-{round_number}", "args": args, "result": f"{tool} fine",
+            "is_error": False, "status": "ok", "round_id": f"exec_x:round:{round_number}"}
+
+
+def _streak_trace() -> dict:
+    calls = [_ok("read_file", 1, path="a.md", start_line=1, end_line=9)]
+    calls += [_refused(number) for number in range(2, 12)]
+    calls += [_ok("send_user_message", 12, text="DONE")]
+    return {"tool_calls": calls, "reasoning_notes": ["a note"]}
+
+
+def test_the_reflection_listing_shows_the_field_the_answer_and_the_repetition():
+    listing = build_trace_summary(_streak_trace(), all_calls=True)
+    # every argument, so the offending fifth one is visible
+    assert "max_wait_minutes='0'" in listing and "wait_for_answer='False'" in listing
+    # ten identical refused calls are ONE row that keeps its count and its rounds
+    assert listing.count("escalate(") == 1
+    assert "2–11. escalate(" in listing and "×10 identical, rounds 2–11" in listing
+    # the answer's first line, never its tail
+    assert "← ⚠️ QUIZ_WAIT_BOUND_INVALID: max_wait_minutes applies only" in listing and "second line" not in listing
+    # one arithmetic fact, no label
+    assert "10 of 12 rounds had only non-ok results" in listing.splitlines()[0]
+    assert "OMISSION NOTE" not in listing and "- a note" in listing
+
+
+def test_the_stored_preview_is_byte_identical_to_what_it_always_was():
+    trace = _streak_trace()
+    preview = build_trace_summary(trace)
+    assert preview.splitlines()[0] == "## Tool trace (12 calls, 10 errors)"
+    assert preview.count("escalate(") == 10 and "×" not in preview and "←" not in preview
+    assert "⚠️ OMISSION NOTE: 3 more args omitted" in preview
+    assert preview.splitlines()[1] == (
+        "1. read_file(path='a.md', start_line='1', ⚠️ OMISSION NOTE: 1 more args omitted) [status=ok]")
+    long_trace = {"tool_calls": [_ok("read_file", number, path=f"f{number}") for number in range(1, 41)]}
+    preview = build_trace_summary(long_trace)
+    assert "⚠️ OMISSION NOTE: 10 middle tool calls omitted from trace summary." in preview
+    assert "15. read_file(path='f15')" in preview and "16. read_file" not in preview and "26. read_file(path='f26')" in preview
+
+
+def test_the_listing_has_no_window_and_no_total_cut_and_redacts_results():
+    calls = [_ok("read_file", number, path=f"file-{number}.md", note="x" * 150) for number in range(1, 201)]
+    secret = {**_refused(201), "result": "ERROR: OPENROUTER_API_KEY=sk-or-v1-" + "a" * 40 + " rejected"}
+    listing = build_trace_summary({"tool_calls": calls + [secret]}, all_calls=True)
+    assert len(listing) > 4000 and "middle tool calls omitted" not in listing
+    assert "100. read_file(path='file-100.md'" in listing and "201. escalate(" in listing
+    assert "sk-or-v1-" + "a" * 40 not in listing
+
+
+def test_only_byte_identical_neighbours_fold():
+    varied = [_refused(2), {**_refused(3), "args": {**_refused(3)["args"], "question": "Which one?"}}, _refused(4)]
+    listing = build_trace_summary({"tool_calls": varied}, all_calls=True)
+    assert listing.count("escalate(") == 3 and "×" not in listing
+    # a bare-string refusal recorded ok still folds, and a repeated ok call shows what it answered
+    bare = [{**_ok("schedule_subagent", number, objective="x"), "result": "⚠️ subagent_access_invalid: nope"}
+            for number in (5, 6, 7)]
+    listing = build_trace_summary({"tool_calls": bare}, all_calls=True)
+    assert "×3 identical, rounds 5–7 ← ⚠️ subagent_access_invalid: nope" in listing
+
+
+def test_identical_error_details_are_one_entry_with_its_count():
+    trace = _streak_trace()
+    trace["tool_calls"].append({"tool": "run_command", "is_error": True, "status": "error", "exit_code": 2,
+                                "result": "make: *** [test] Error 2"})
+    details = reflection._collect_error_details(trace)
+    assert details.count("QUIZ_WAIT_BOUND_INVALID") == 1 and "(×10 identical) [escalate" in details
+    assert "[run_command (status=error, exit_code=2)]: make:" in details and "identical) [run_command" not in details
+
+
+@pytest.fixture
+def captured_calls(monkeypatch):
+    calls = []
+
+    def fake_chat(*_args, **kwargs):
+        calls.append(kwargs)
+        if kwargs.get("call_type") == "pattern_register_update":
+            return ({"content": reflection._PATTERNS_HEADER + "| refusal loop | 1 | cause | fix | open |\n"}, {})
+        return ({"content": "The bound was refused ten times.\nMEMORY_ACTIONS_JSON: []\nBACKLOG_CANDIDATES_JSON: []"}, {})
+
+    monkeypatch.setattr("ouroboros.config.get_light_model", lambda: "light")
+    monkeypatch.setattr("ouroboros.llm.LLMClient", lambda: object())
+    monkeypatch.setattr("ouroboros.llm_observability.chat_observed", fake_chat)
+    return calls
+
+
+def test_the_reflection_prompt_carries_the_whole_listing_and_an_optional_verbatim_record(tmp_path, captured_calls):
+    trace = _streak_trace()
+    listing = build_trace_summary(trace, all_calls=True) + "\n" + "\n".join(f"pad line {n}" for n in range(400))
+    assert len(listing) > 4000
+    entry = reflection.generate_reflection(
+        {"id": "task-streak", "text": "Ask the owner", "drive_root": str(tmp_path)},
+        trace, listing, object(), {"rounds": 12, "cost": 0.0})
+    assert entry["reflection"].startswith("The bound was refused")
+    prompt = next(call for call in captured_calls if call.get("call_type") != "pattern_register_update")["messages"][0]["content"]
+    assert "×10 identical, rounds 2–11" in prompt and "pad line 399" in prompt  # no second cut
+    assert "truncated at 2000 chars" not in prompt
+    # the verbatim record is named with the reader the reflection already holds, and is really there
+    marker = "Complete per-call record (every argument and each result as the actor saw it; optional reading"
+    assert marker in prompt
+    arguments = json.loads(prompt[prompt.index(marker):].split("read_file ", 1)[1].splitlines()[0])
+    assert arguments["root"] == "runtime_data"
+    record = (pathlib.Path(tmp_path) / arguments["path"]).read_text(encoding="utf-8")
+    assert record.count("### ") == 12 and "second line" in record and '"max_wait_minutes": 0' in record
+    assert "round_id=exec_x:round:11" in record
+
+
+@pytest.mark.parametrize("level", ["medium", "high"])
+def test_post_task_synthesis_thinks_at_the_owners_task_level_not_a_literal(tmp_path, monkeypatch, captured_calls, level):
+    monkeypatch.setenv("OUROBOROS_EFFORT_TASK", level)
+    monkeypatch.setattr("ouroboros.settings_scales.runtime_setting",
+                        lambda key, default=None: level if key == "OUROBOROS_EFFORT_TASK" else default)
+    entry = reflection.generate_reflection(
+        {"id": "task-effort", "text": "Ask the owner", "drive_root": str(tmp_path)},
+        _streak_trace(), "trace", object(), {"rounds": 12, "cost": 0.0})
+    reflection.append_reflection(tmp_path, entry)
+    efforts = {call.get("call_type"): call.get("reasoning_effort") for call in captured_calls}
+    assert efforts.get("task_reflection") == level
+    assert efforts.get("pattern_register_update") == level
+
+
+def test_memory_maintenance_keeps_its_own_depth(monkeypatch):
+    """Only post-task synthesis moved to the Task / Chat level; consolidation of large memory
+    inputs keeps the helper's default until its own owner decision."""
+    import inspect
+
+    from ouroboros import consolidator
+
+    assert inspect.signature(consolidator._call_consolidation_llm).parameters["reasoning_effort"].default == "low"
+    assert not hasattr(consolidator, "CONSOLIDATION_REASONING_EFFORT")
+
+
+def test_the_trace_row_carries_the_round_that_issued_the_call(tmp_path):
+    from ouroboros.loop_tool_execution import _execute_single_tool, process_tool_results
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "note.md").write_text("hello", encoding="utf-8")
+    registry = ToolRegistry(repo_dir=repo, drive_root=tmp_path)
+    ctx = ToolContext(repo_dir=repo, drive_root=tmp_path, task_id="t-round")
+    registry.set_context(ctx)
+    ctx._current_llm_call_meta = {"execution_id": "exec_r", "round_id": "exec_r:round:7", "llm_call_id": "llm_1"}
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    good = {"id": "c-good", "function": {"name": "read_file", "arguments": json.dumps({"path": "note.md"})}}
+    malformed = {"id": "c-bad", "function": {"name": "read_file", "arguments": "{not json"}}
+    results = [_execute_single_tool(registry, call, logs, "t-round") for call in (good, malformed)]
+    llm_trace = {"tool_calls": []}
+    process_tool_results(results, [], llm_trace, emit_progress=lambda _m, *, incident=None: None, tools=registry)
+    assert [row["round_id"] for row in llm_trace["tool_calls"]] == ["exec_r:round:7", "exec_r:round:7"]
+    assert llm_trace["tool_calls"][1]["is_error"] is True
+
+
+def test_the_self_check_lists_outcomes_and_a_failed_answer():
+    from ouroboros.loop_nudges import _build_recent_tool_trace
+
+    messages = [
+        {"role": "assistant", "tool_calls": [
+            {"id": "c1", "function": {"name": "escalate", "arguments": '{"question":"q","max_wait_minutes":0}'}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": REFUSAL},
+        {"role": "assistant", "tool_calls": [{"id": "c2", "function": {"name": "read_file", "arguments": '{"path":"a"}'}}]},
+    ]
+    trace = {"tool_calls": [
+        {"tool_call_id": "c1", "status": "argument_error", "is_error": True, "result": REFUSAL},
+        {"tool_call_id": "c2", "status": "ok", "is_error": False, "result": "file body"}]}
+    rendered = _build_recent_tool_trace(messages, llm_trace=trace)
+    assert ('1. escalate({"question":"q","max_wait_minutes":0}) [argument_error] ← '
+            "⚠️ QUIZ_WAIT_BOUND_INVALID: max_wait_minutes applies only") in rendered
+    assert '2. read_file({"path":"a"}) [ok]' in rendered and "file body" not in rendered and "second line" not in rendered
+    # without a trace the list is exactly what it was
+    assert _build_recent_tool_trace(messages) == (
+        'Recent tool calls (oldest first):\n  1. escalate({"question":"q","max_wait_minutes":0})\n  2. read_file({"path":"a"})')
