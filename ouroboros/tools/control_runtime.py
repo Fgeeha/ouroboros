@@ -9,6 +9,8 @@ switch the model or reasoning effort for the next round.
 
 from __future__ import annotations
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import logging
 import os
 from hashlib import sha256
@@ -21,6 +23,7 @@ log = logging.getLogger(__name__)
 
 
 from pathlib import Path
+from ouroboros.config import runtime_setting
 
 
 def _evolution_restart_block_reason(ctx: ToolContext) -> str:
@@ -183,21 +186,22 @@ def _chat_history(
 
 def _update_scratchpad(ctx: ToolContext, content: str) -> str:
     """LLM-driven scratchpad update — appends a timestamped block (Constitution P5: LLM-first)."""
-    if str(getattr(ctx, "project_id", "") or "").strip():
-        # Project-scoped tasks have no per-project scratchpad and must never write
-        # the canonical scratchpad (outbound isolation). Persist project facts via
-        # knowledge_write instead (routed to the per-project store).
-        return ("OK: scratchpad is not used for project-scoped tasks (no per-project "
-                "scratchpad). Persist durable project facts with knowledge_write.")
     if not content or not isinstance(content, str) or len(content.strip()) < 10:
         return (
-            "⚠️ REJECTED: content is empty or too short "
+            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ REJECTED: content is empty or too short "
             f"(got {type(content).__name__}, len={len(content) if isinstance(content, str) else 'N/A'}). "
             "Scratchpad must have meaningful content (10+ chars). "
-            "This likely means the tool call was malformed — check your arguments."
+            "This likely means the tool call was malformed — check your arguments.")))
         )
     from ouroboros.memory import Memory
-    mem = Memory(drive_root=ctx.drive_root)
+    from ouroboros.tool_access import canonical_data_root
+
+    # One working memory, every room (P1): the scratchpad is the same file in
+    # the main chat, in a project room, and in an external conversation, so a
+    # project-scoped turn writes it like any other turn. The root follows the
+    # same precedence as _chat_history, so a forked execution drive still
+    # remembers into the canonical root the next context reads.
+    mem = Memory(drive_root=canonical_data_root(ctx))
     mem.ensure_files()
     try:
         block = mem.append_scratchpad_block(
@@ -211,7 +215,7 @@ def _update_scratchpad(ctx: ToolContext, content: str) -> str:
         )
     except RuntimeError as exc:
         if "LEGACY_SCRATCHPAD_REQUIRES_MANUAL_UPGRADE" in str(exc):
-            return f"⚠️ {exc}"
+            return _publish_tool_result(ctx, ToolResult(status="unavailable", code="LEGACY_UNAVAILABLE", text=(f"⚠️ {exc}")))
         raise
     return f"OK: scratchpad block appended ({len(content)} chars, ts={block.get('ts', '?')[:16]})"
 
@@ -220,9 +224,9 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
     """Send a separate owner reply without completing the ongoing task."""
     chat_id = getattr(ctx, "current_chat_id", None)
     if chat_id is None or chat_id == "":  # 0 is a real hidden session, not absence
-        return "⚠️ No active chat — cannot send proactive message."
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("⚠️ No active chat — cannot send proactive message.")))
     if not text or not text.strip():
-        return "⚠️ Empty message."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ Empty message.")))
 
     from ouroboros.tools.owner_delivery import deliver_owner_event
     from ouroboros.utils import append_jsonl
@@ -253,24 +257,26 @@ def _send_user_message(ctx: ToolContext, text: str, reason: str = "") -> str:
 
 def _update_identity(ctx: ToolContext, content: str) -> str:
     """Update identity manifest (who you are, who you want to become)."""
-    if str(getattr(ctx, "project_id", "") or "").strip():
-        # Identity is global and continuous (P1); it is never modified from a
-        # project-scoped task. There is no per-project identity.
-        return ("OK: identity is global and is never modified from a project-scoped "
-                "task (identity stays continuous across projects — P1).")
     if not content or not isinstance(content, str) or len(content.strip()) < 50:
         return (
-            "⚠️ REJECTED: content is empty or too short "
+            _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ REJECTED: content is empty or too short "
             f"(got {type(content).__name__}, len={len(content) if isinstance(content, str) else 'N/A'}). "
             "Identity must be a substantial text (50+ chars). "
-            "This likely means the tool call was malformed — check your arguments."
+            "This likely means the tool call was malformed — check your arguments.")))
         )
     from ouroboros.memory import Memory
-    mem = Memory(drive_root=ctx.drive_root)
+    from ouroboros.tool_access import canonical_data_root
+
+    # One identity, every room (P1): who I am does not change with the room I
+    # am speaking in, so a project room or an external conversation revises the
+    # same continuous file. The root follows the same precedence as
+    # _chat_history, so a forked execution drive still writes the identity the
+    # canonical root reads back.
+    mem = Memory(drive_root=canonical_data_root(ctx))
     mem.ensure_files()
 
     old_content = ""
-    path = ctx.drive_root / "memory" / "identity.md"
+    path = mem.identity_path()
     if path.exists():
         try:
             old_content = path.read_text(encoding="utf-8")
@@ -353,21 +359,20 @@ def _switch_model(ctx: ToolContext, model: str = "", effort: str = "") -> str:
     # so a same-call model switch is not half-applied behind a rejected tier.
     requested_effort = str(effort or "").strip().lower()
     if requested_effort and requested_effort not in EFFORT_SCALE:
-        return f"⚠️ Unknown effort: {effort}. Valid: {', '.join(EFFORT_SCALE)}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Unknown effort: {effort}. Valid: {', '.join(EFFORT_SCALE)}")))
 
     if model:
         if model not in available:
-            return f"⚠️ Unknown model: {model}. Available: {', '.join(available)}"
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=(f"⚠️ Unknown model: {model}. Available: {', '.join(available)}")))
 
-        import os
         use_local = False
-        if model == os.environ.get("OUROBOROS_MODEL") and os.environ.get("USE_LOCAL_MAIN", "").lower() in ("true", "1"):
+        if model == runtime_setting("OUROBOROS_MODEL") and runtime_setting("USE_LOCAL_MAIN", "").lower() in ("true", "1"):
             use_local = True
-        elif model == os.environ.get("OUROBOROS_MODEL_LIGHT") and os.environ.get("USE_LOCAL_LIGHT", "").lower() in ("true", "1"):
+        elif model == runtime_setting("OUROBOROS_MODEL_LIGHT") and runtime_setting("USE_LOCAL_LIGHT", "").lower() in ("true", "1"):
             use_local = True
         else:
             from ouroboros.config import get_fallback_models
-            if model in get_fallback_models() and os.environ.get("USE_LOCAL_FALLBACK", "").lower() in ("true", "1"):
+            if model in get_fallback_models() and runtime_setting("USE_LOCAL_FALLBACK", "").lower() in ("true", "1"):
                 use_local = True
 
         ctx.active_model_override = model

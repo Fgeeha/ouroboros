@@ -10,7 +10,6 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import quote
 
 from ouroboros.artifacts import store_chat_media_bytes
-from ouroboros.cost_projection import carry_cost_meta
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.event_bus import CHAT_DOCUMENT, CHAT_LINKS, CHAT_OUTBOUND, CHAT_PHOTO, CHAT_QUIZ, CHAT_TYPING, CHAT_VIDEO, publish_event
 from supervisor.state import append_jsonl, load_state
@@ -561,6 +560,8 @@ class LocalChatBridge:
         action: str,
         target: str = "",
         target_label: str = "",
+        project_id: str = "",
+        project_chat_id: int = 0,
         status: str = "accepted",
         options: Optional[List[Dict[str, Any]]] = None,
         attachment_manifest: Optional[List[Dict[str, Any]]] = None,
@@ -586,6 +587,8 @@ class LocalChatBridge:
         }
         if str(target_label or ""):
             payload["target_label"] = str(target_label)
+        if project_id and int(project_chat_id) > 0:
+            payload.update(project_id=str(project_id), project_chat_id=int(project_chat_id))
         if str(routing_token or ""):
             # #198: the picker card's click identity; presentation-only frames
             # without it stay text lines.
@@ -643,10 +646,13 @@ class LocalChatBridge:
     ) -> bool:
         """Send typing indicator to UI/event subscribers.
 
-        ``kind`` is stamped only for registry-tracked direct/ephemeral turns
-        (``direct_chat``/``ephemeral_decision``); queued managed tasks emit
-        typing without it, so the client knows the /api/state snapshot has no
-        deletion authority over their entries.
+        ``kind`` is stamped only for registry-tracked direct turns
+        (``direct_chat``); RUNNING queue roots are stamped ``managed_task`` at
+        the event handler, and children and untracked tasks stay empty. The
+        stamp is kept for wire compatibility only (no in-repo client reads it)
+        and grants nothing: the web header never admits a typing frame into its
+        live-activity set, into which only the /api/state census inserts. Telegram's
+        native typing consumer ignores ``kind`` entirely.
         """
         if is_a2a_chat_id(chat_id):
             return True
@@ -1012,6 +1018,30 @@ class LocalChatBridge:
             },
         )
         _advance_project_visible_revision(chat_id)
+        if wait_for_answer and self._broadcast_fn and msg.get("project_thread"):
+            try:
+                from ouroboros.owner_quiz import quiz_states
+                from ouroboros.project_dialogue import project_question_pointer
+                from ouroboros.projects_registry import list_reserved_projects
+
+                project = next((row for row in list_reserved_projects(DATA_DIR)
+                                if row.get("chat_id") == int(chat_id)), None)
+                pointer = project_question_pointer(msg, quiz_states(DATA_DIR, task_id).get(qid), project)
+                if pointer:
+                    self._broadcast_fn({
+                        "type": "chat", "role": pointer["role"], "content": pointer["text"],
+                        "ts": pointer["ts"], "system_type": pointer["system_type"],
+                        "task_id": pointer["task_id"], "quiz_id": pointer["quiz_id"],
+                        "quiz_state": pointer["quiz_state"], "project_id": pointer["project_id"],
+                        "project_name": pointer["project_name"], "project_chat_id": pointer["project_chat_id"],
+                        "chat_id": pointer["chat_id"], "is_progress": False, "markdown": False,
+                        "owner_wait_state": pointer.get("owner_wait_state", ""),
+                        "source_status": pointer.get("source_status", ""),
+                    })
+            except Exception:
+                # The question is already delivered. History/activity reads heal
+                # this derived view without another quiz or paid execution.
+                log.debug("Project question pointer broadcast failed", exc_info=True)
         return True, "ok"
 
     def send_quiz_state(
@@ -1282,13 +1312,6 @@ def log_chat(
                     record[key] = meta[key]
         if "task_terminal_status" in meta:
             record["task_terminal_status"] = str(meta.get("task_terminal_status") or "")
-        if meta.get("ephemeral_decision"):
-            # A transient turn has no task_result: its final chat row carries
-            # the same outcome/accounting facts as the live terminal frame.
-            for key in ("ephemeral_decision", "outcome_axes", "reason_code"):
-                if key in meta:
-                    record[key] = meta[key]
-            record.update(carry_cost_meta(meta))
         if isinstance(meta.get("origin_message_ref"), dict):
             record["origin_message_ref"] = dict(meta["origin_message_ref"])
         if filename:

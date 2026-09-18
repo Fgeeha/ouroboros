@@ -1,198 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
-import { setReasoningVisible } from '../modules/log_events.js';
-class ClassList {
-    constructor(node) { this.node = node; this.names = new Set(); }
-    add(...names) { names.forEach((name) => this.names.add(name)); this.sync(); }
-    remove(...names) { names.forEach((name) => this.names.delete(name)); this.sync(); }
-    contains(name) { return this.names.has(name); }
-    toggle(name, force) {
-        const enabled = force === undefined ? !this.names.has(name) : Boolean(force);
-        if (enabled) this.names.add(name); else this.names.delete(name);
-        this.sync();
-        return enabled;
-    }
-    sync() { this.node._className = [...this.names].join(' '); }
-    from(value) { this.names = new Set(String(value || '').split(/\s+/).filter(Boolean)); this.sync(); }
-}
-class ElementStub {
-    constructor(tag = 'div', doc = null) {
-        this.tagName = tag.toUpperCase();
-        this.ownerDocument = doc;
-        this.dataset = {};
-        const styleValues = new Map();
-        this.style = { setProperty: (name, value) => styleValues.set(name, String(value)),
-            getPropertyValue: (name) => styleValues.get(name) || '' };
-        this.attributes = new Map();
-        this.children = [];
-        this.listeners = new Map();
-        this.classList = new ClassList(this);
-        this._className = '';
-        this._innerHTML = '';
-        this._textContent = '';
-        this.value = '';
-        this.hidden = false;
-        this.disabled = false;
-        // Detached until mounted under the connected mount (insertBefore /
-        // innerHTML propagate): a stub that reports every fresh node as
-        // connected hides the history-rebuild card path, whose pass 2 mounts a
-        // replayed root card only when `!rec.root.isConnected`.
-        this.isConnected = false;
-        this.offsetParent = {};
-        this.offsetHeight = 0;
-        this.scrollTop = 0;
-        this.scrollHeight = 0;
-        this.clientHeight = 400;
-    }
-    set className(value) { this.classList.from(value); }
-    get className() { return this._className; }
-    set textContent(value) {
-        this._textContent = String(value ?? '');
-        this._innerHTML = this._textContent
-            .replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;');
-    }
-    get textContent() { return this._textContent; }
-    set innerHTML(value) {
-        this._innerHTML = String(value || '');
-        if (!this.ownerDocument) return;
-        this.children = [];
-        for (const match of this._innerHTML.matchAll(/<([a-z0-9-]+)([^>]*)>/gi)) {
-            const node = new ElementStub(match[1], this.ownerDocument);
-            const attrs = match[2];
-            const idMatch = attrs.match(/\sid="([^"]+)"/i);
-            if (idMatch) node.id = idMatch[1];
-            const classMatch = match[0].match(/\sclass="([^"]*)"/i);
-            if (classMatch) node.className = classMatch[1];
-            for (const data of attrs.matchAll(/\sdata-([a-z0-9-]+)(?:="([^"]*)")?/gi)) {
-                const key = data[1].replace(/-([a-z])/g, (_all, char) => char.toUpperCase());
-                node.dataset[key] = data[2] ?? '';
-            }
-            node.parentNode = this;
-            node.parentElement = this;
-            node.isConnected = this.isConnected;
-            this.children.push(node);
-            if (node.id) this.ownerDocument.byId.set(node.id, node);
-        }
-    }
-    get innerHTML() { return this._innerHTML; }
-    addEventListener(type, fn) {
-        if (!this.listeners.has(type)) this.listeners.set(type, []);
-        this.listeners.get(type).push(fn);
-    }
-    removeEventListener() {}
-    setAttribute(name, value) { this.attributes.set(name, String(value)); }
-    getAttribute(name) { return this.attributes.get(name) || ''; }
-    removeAttribute(name) { this.attributes.delete(name); }
-    get firstElementChild() { return this.children[0] || null; }
-    appendChild(node) { return this.insertBefore(node, null); }
-    append(...nodes) { nodes.forEach((node) => this.appendChild(node)); }
-    prepend(node) { return this.insertBefore(node, this.children[0] || null); }
-    insertAdjacentElement(_position, node) { const list = this.parentNode?.children || []; return this.parentNode?.insertBefore(node, list[list.indexOf(this) + 1] || null); }
-    insertBefore(node, before) {
-        if (node?.isDocumentFragment) {
-            for (const child of [...node.children]) this.insertBefore(child, before);
-            return node;
-        }
-        node.parentNode?.removeChild?.(node);
-        const index = before ? this.children.indexOf(before) : -1;
-        if (index >= 0) this.children.splice(index, 0, node); else this.children.push(node);
-        node.parentNode = this;
-        node.parentElement = this;
-        const connect = (el, value) => { el.isConnected = value; for (const child of el.children || []) connect(child, value); };
-        connect(node, this.isConnected);
-        this.scrollHeight = this.children.length * 20;
-        return node;
-    }
-    removeChild(node) {
-        const index = this.children.indexOf(node);
-        if (index >= 0) this.children.splice(index, 1);
-        node.parentNode = null;
-        node.parentElement = null;
-    }
-    remove() { this.parentNode?.removeChild?.(this); this.isConnected = false; }
-    replaceChildren(...nodes) { this.children = []; nodes.forEach((node) => this.appendChild(node)); }
-    contains(node) {
-        if (node === this) return true;
-        return this.children.some((child) => child.contains(node));
-    }
-    querySelector(selector) {
-        const id = selector.match(/^\[id="([^"]+)"\]$/)?.[1];
-        if (id) return this.ownerDocument?.byId.get(id) || null;
-        const data = selector.match(/^\[data-([a-z0-9-]+)\]$/i)?.[1];
-        if (data) {
-            const key = data.replace(/-([a-z])/g, (_all, char) => char.toUpperCase());
-            return this.children.find((child) => Object.hasOwn(child.dataset, key)) || null;
-        }
-        if (selector === '.typing-bubble') return this.children.find((child) => child.classList.contains('typing-bubble')) || null;
-        if (selector.startsWith('.')) {
-            const className = selector.slice(1).split(/[ :>\[]/)[0];
-            return this.children.find((child) => child.classList.contains(className)) || null;
-        }
-        return null;
-    }
-    querySelectorAll(selector) {
-        if (selector === '[id]') return this.children.filter((child) => child.id);
-        const data = selector.match(/^\[data-([a-z0-9-]+)\]$/i)?.[1];
-        if (data) {
-            const key = data.replace(/-([a-z])/g, (_all, char) => char.toUpperCase());
-            return this.children.filter((child) => Object.hasOwn(child.dataset, key));
-        }
-        if (selector.startsWith('.')) {
-            const className = selector.slice(1).split(/[ :>\[]/)[0];
-            return this.children.filter((child) => child.classList.contains(className));
-        }
-        return [];
-    }
-    closest(selector) {
-        if (selector === '.page.active' && this.classList.contains('page') && this.classList.contains('active')) return this;
-        return this.parentElement?.closest?.(selector) || null;
-    }
-    getBoundingClientRect() { return { top: 0, bottom: 20, left: 0, right: 100, width: 100, height: 20 }; }
-    getClientRects() { return [this.getBoundingClientRect()]; }
-    focus() { if (this.ownerDocument) this.ownerDocument.activeElement = this; } click() {}
-}
-function installDom(fetchImpl = async () => ({ ok: true, json: async () => ({ active_direct_turns: [] }) })) {
-    const prior = {
-        document: globalThis.document, window: globalThis.window,
-        sessionStorage: globalThis.sessionStorage, fetch: globalThis.fetch,
-        ResizeObserver: globalThis.ResizeObserver,
-        requestAnimationFrame: globalThis.requestAnimationFrame,
-    };
-    const document = {
-        byId: new Map(), hidden: false, activeElement: null,
-        createElement(tag) { return new ElementStub(tag, document); },
-        createDocumentFragment() {
-            const fragment = new ElementStub('#document-fragment', document);
-            fragment.isDocumentFragment = true;
-            return fragment;
-        },
-        getElementById(id) { return document.byId.get(id) || null; },
-        addEventListener() {}, removeEventListener() {},
-    };
-    const mount = new ElementStub('div', document);
-    mount.isConnected = true;
-    document.byId.set('content', mount);
-    const storage = new Map();
-    globalThis.document = document;
-    globalThis.window = {
-        document, location: { href: 'http://local/' }, history: { replaceState() {} },
-        addEventListener() {}, removeEventListener() {}, dispatchEvent() {},
-        getSelection: () => null, innerHeight: 800, CSS: { escape: (value) => value },
-    };
-    globalThis.sessionStorage = {
-        getItem: (key) => storage.get(key) || null,
-        setItem: (key, value) => storage.set(key, String(value)),
-        removeItem: (key) => storage.delete(key),
-    };
-    globalThis.fetch = fetchImpl;
-    globalThis.ResizeObserver = class { observe() {} disconnect() {} };
-    globalThis.requestAnimationFrame = (fn) => { fn(); return 1; };
-    return { prior, mount };
-}
-function restoreDom(prior) {
-    Object.assign(globalThis, prior);
-}
+import { installDom, restoreDom, walkCard } from './chat_dom_fixture.js';
+
+// A typing frame no longer writes the client live-set: liveness is a projection
+// of the /api/state census. A PARTIAL census listing is the census-shaped
+// equivalent of the old typing-frame write — it inserts the activity and
+// concludes nothing else.
+let censusGeneration = 0;
+const listActivity = (instance, activityId, chatId, phase = 'working', kind = 'managed_task') =>
+    instance.hydrateStateSnapshot({
+        active_chat_activities: [{ activity_id: activityId, chat_id: chatId, kind, phase }],
+        active_chat_activities_complete: false,
+        supervisor_ready: true,
+    }, Infinity, ++censusGeneration);
 test('createChatInstance renders a real assistant bubble without senderLabel shadowing', () => {
     const { prior, mount } = installDom();
     const handlers = new Map();
@@ -310,10 +131,8 @@ test('first task-bound review hydrates a progress-created owner once and reconci
             asPanel: true,
         });
         await new Promise((resolve) => setTimeout(resolve, 0));
-        handlers.get('typing')({
-            chat_id: 2, activity_id: 'root-review', task_id: 'root-review',
-            kind: 'managed_task', phase: 'working',
-        });
+        // Liveness comes from the /api/state census, never from a typing frame.
+        listActivity(instance, 'root-review', 2);
         handlers.get('chat')({
             chat_id: 2, role: 'system', is_progress: true,
             task_id: 'root-review', content: 'Owner work is already visible',
@@ -423,17 +242,14 @@ test('first task-bound review hydrates a progress-created owner once and reconci
             (node) => node.dataset.taskId === 'root-deferred',
         );
         assert.ok(rebuiltDeferredCard, 'reconnect rebuilt the durable review owner');
-        assert.notEqual(rebuiltDeferredCard, oldDeferredCard, 'the old card generation was replaced');
-        handlers.get('typing')({
-            chat_id: 2, activity_id: 'root-deferred', task_id: 'root-deferred',
-            kind: 'managed_task', phase: 'working',
-        });
+        assert.equal(rebuiltDeferredCard, oldDeferredCard, 'reconnect preserves the reading card');
+        listActivity(instance, 'root-deferred', 2);
         messages.scrollHeight = 1000; messages.clientHeight = 400; messages.scrollTop = 500;
         messages.listeners.get('scroll')[0]();
         resolveDeferredDetail();
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.equal(calls.filter((url) => url.startsWith('/api/tasks/root-deferred')).length, 1,
-            'typing during the detail read did not trigger a second GET');
+            'a census listing during the detail read did not trigger a second GET');
         const deferredCard = messages.children.find((node) => node.dataset.taskId === 'root-deferred');
         assert.equal(deferredCard?.dataset.finished, '0');
         assert.equal(deferredCard?.querySelector('.chat-live-phase')?.textContent, 'Finalizing…',
@@ -442,10 +258,7 @@ test('first task-bound review hydrates a progress-created owner once and reconci
         assert.equal(jump.getAttribute('aria-label'), 'New activity — scroll to latest message');
         messages.scrollTop = 600;
         messages.listeners.get('scroll')[0]();
-        handlers.get('typing')({
-            chat_id: 2, activity_id: 'root-terminal-active', task_id: 'root-terminal-active',
-            kind: 'managed_task', phase: 'working',
-        });
+        listActivity(instance, 'root-terminal-active', 2);
         handlers.get('chat')({
             chat_id: 2,
             role: 'system',
@@ -621,10 +434,7 @@ test('review-only reconnect anchors stay inert until task truth arrives', async 
         assert.equal(terminalWsCard.dataset.finished, '1');
         assert.equal(terminalWsCard.querySelector('[data-live-phase]')?.textContent, 'Done');
         const anchoredCard = card('review-root');
-        handlers.get('typing')({
-            chat_id: 2, activity_id: 'review-root', task_id: 'review-root',
-            kind: 'managed_task', phase: 'working',
-        });
+        listActivity(instance, 'review-root', 2);
         assert.equal(card('review-root'), anchoredCard, 'task activity promotes the same card');
         assert.equal(anchoredCard.querySelector('[data-live-phase]')?.hidden, false);
         assert.equal(anchoredCard.querySelector('[data-live-phase]')?.textContent, 'Working');
@@ -695,10 +505,10 @@ test('Plan invalidation applies terminal task detail to its review-created owner
         await new Promise((resolve) => setTimeout(resolve, 0));
         const rebuiltCard = messages.children.find((node) => node.dataset.taskId === 'root-terminal');
         assert.ok(rebuiltCard, 'the same durable revision reattached after a full reconnect rebuild');
-        assert.notEqual(rebuiltCard, card);
+        assert.equal(rebuiltCard, card, 'reconnect keeps the same review owner node');
         assert.equal(rebuiltCard.querySelector('[data-live-review-summary]')?.textContent, 'Reviews 1');
-        assert.equal(detailCalls.length, 2,
-            'the applied-revision receipt reset for the new card generation');
+        assert.equal(detailCalls.length, 1,
+            'the retained card keeps the applied revision without another detail read');
     } finally {
         instance?.destroy();
         restoreDom(prior);
@@ -1181,15 +991,6 @@ test('a stopped direct turn replays its persisted terminal word, never a blanket
 // final row (no progress/lifecycle rows, no task_terminal_status on subagent
 // finals), its grandchildren by task_summary rows.
 // ---------------------------------------------------------------------------
-function walkCard(node, taskId) {
-    if (node?.dataset?.taskId === taskId && node.classList?.contains('chat-live-card')) return node;
-    for (const child of node?.children || []) {
-        const hit = walkCard(child, taskId);
-        if (hit) return hit;
-    }
-    return null;
-}
-
 test('history rebuild keeps a lineage-known branch nested, never appended top-level (#636)', async () => {
     const rows = [
         { chat_id: 2, role: 'user', content: 'run the tree', text: 'run the tree', ts: '2026-09-06T14:00:00Z' },
@@ -1272,10 +1073,9 @@ test('history rebuild keeps a lineage-known branch nested, never appended top-le
 });
 
 // ---------------------------------------------------------------------------
-// #691: a decision (ephemeral) turn's tool work shows on the ordinary live card,
-// concludes truthfully, merges its accounting, and claims no task authority.
+// Direct-turn tool work, typed conclusions and accounting keep the ordinary card.
 // ---------------------------------------------------------------------------
-test('an ephemeral decision turn renders its tool work on a card without task authority (#691)', async () => {
+test('a direct turn renders tool work and needs host authority for Cancel', async () => {
     const { prior, mount } = installDom(async () => ({ ok: true, json: async () => ({ active_direct_turns: [] }) }));
     const handlers = new Map();
     const ws = {
@@ -1296,7 +1096,7 @@ test('an ephemeral decision turn renders its tool work on a card without task au
         });
         const messages = globalThis.document.byId.get('chat-messages');
         handlers.get('log')({ chat_id: 1, data: {
-            type: 'task_started', task_id: 'eph-1', ephemeral_decision: true, ts: '2026-09-05T10:00:00Z',
+            type: 'task_started', task_id: 'eph-1', ts: '2026-09-05T10:00:00Z',
         } });
         assert.equal(walkCard(messages, 'eph-1'), null, 'a plain start mints no card');
         handlers.get('log')({ chat_id: 1, data: {
@@ -1304,10 +1104,10 @@ test('an ephemeral decision turn renders its tool work on a card without task au
         } });
         const card = walkCard(messages, 'eph-1');
         assert.ok(card, 'real tool work reveals the ordinary live card');
-        assert.equal(card.querySelector('[data-turn-into-project]'), null, 'no task claim: no Convert');
+        assert.ok(card.querySelector('[data-turn-into-project]'), 'ordinary Main work can become a project');
         assert.equal(card.querySelector('[data-cancel-run]'), null, 'no host cancelable marker: no Cancel');
         handlers.get('chat')({
-            chat_id: 1, role: 'assistant', is_progress: true, ephemeral_decision: true,
+            chat_id: 1, role: 'assistant', is_progress: true,
             content: 'Comparing the reset windows…', ts: '2026-09-05T10:00:02Z', task_id: 'eph-1',
         });
         assert.equal(card.dataset.finished, '0');
@@ -1325,20 +1125,20 @@ test('an ephemeral decision turn renders its tool work on a card without task au
             && n.classList.contains('assistant') && !n.classList.contains('progress')
             && /resets on Monday/.test(n.innerHTML));
         assert.equal(receipts.length, 1);
-        // The blank-status ephemeral task_done carries the accounting facts; it
+        // The typed task_done carries the accounting facts; it
         // must merge them without reopening the finished card.
         handlers.get('log')({ chat_id: 1, data: {
-            type: 'task_done', task_id: 'eph-1', status: '', ephemeral_decision: true,
+            type: 'task_done', task_id: 'eph-1', status: 'completed',
             ts: '2026-09-05T10:22:01Z', outcome_axes: { execution: { status: 'degraded' } },
             reason_code: 'tool_failure', accounted_upper_bound_usd: 2.700732,
             cost_accounting_status: 'available', cost_final: true,
         } });
         assert.equal(card.dataset.finished, '1');
         assert.match(card.querySelector('[data-live-meta]').innerHTML, /\$2\.70/);
-        assert.equal(card.querySelector('[data-turn-into-project]'), null);
-        // An ephemeral turn WITHOUT tool work or progress stays a plain answer.
+        assert.ok(card.querySelector('[data-turn-into-project]'));
+        // A direct turn without tool work or progress stays a plain answer.
         handlers.get('log')({ chat_id: 1, data: {
-            type: 'task_started', task_id: 'eph-2', ephemeral_decision: true, ts: '2026-09-05T11:00:00Z',
+            type: 'task_started', task_id: 'eph-2', ts: '2026-09-05T11:00:00Z',
         } });
         handlers.get('chat')({
             chat_id: 1, role: 'assistant', content: 'Just a short answer.',
@@ -1352,17 +1152,17 @@ test('an ephemeral decision turn renders its tool work on a card without task au
 });
 
 for (const [execution, phase] of [['ok', 'done'], ['degraded', 'warn'], ['failed', 'error'], ['infra_failed', 'error']]) {
-test(`history replay of an ephemeral turn preserves ${execution} (#691)`, async () => {
+test(`history replay of a direct turn preserves ${execution}`, async () => {
     const rows = [
         { chat_id: 1, role: 'user', content: 'compare the reset windows', text: 'compare the reset windows',
           ts: '2026-09-05T10:00:00Z' },
-        { chat_id: 1, role: 'assistant', is_progress: true, ephemeral_decision: true,
+        { chat_id: 1, role: 'assistant', is_progress: true,
           content: 'Reading the account snapshots…', ts: '2026-09-05T10:00:02Z', task_id: 'eph-h' },
-        { chat_id: 1, role: 'assistant', is_progress: true, ephemeral_decision: true,
+        { chat_id: 1, role: 'assistant', is_progress: true,
           content: 'Comparing the reset windows…', ts: '2026-09-05T10:05:00Z', task_id: 'eph-h' },
         { chat_id: 1, role: 'assistant', content: 'The earliest window resets on Monday.',
           text: 'The earliest window resets on Monday.', ts: '2026-09-05T10:22:00Z', task_id: 'eph-h',
-          task_terminal_status: 'completed', ephemeral_decision: true,
+          task_terminal_status: 'completed',
           outcome_axes: { execution: { status: execution } }, reason_code: execution === 'ok' ? 'final_message' : 'tool_failure',
           accounted_upper_bound_usd: execution === 'ok' ? 0.75 : null,
           cost_final: execution === 'ok', unknown_unmetered: execution === 'ok' ? 0 : 1, cost_accounting_status: 'available' },
@@ -1397,7 +1197,7 @@ test(`history replay of an ephemeral turn preserves ${execution} (#691)`, async 
         assert.equal(card.querySelector('[data-live-phase]').dataset.phase, phase);
         assert.doesNotMatch(card.querySelector('[data-live-meta]').innerHTML, /\$0(?:\.00)?(?:\s|<|$)/);
         if (execution === 'ok') assert.match(card.querySelector('[data-live-meta]').innerHTML, /\$0\.75/);
-        assert.equal(card.querySelector('[data-turn-into-project]'), null);
+        assert.ok(card.querySelector('[data-turn-into-project]'));
         assert.equal(card.querySelector('[data-cancel-run]'), null);
         assert.equal(messages.children.filter((n) => /resets on Monday/.test(n.innerHTML)).length, 1);
     } finally {
@@ -1490,66 +1290,104 @@ test('a terminal root settles its still-open child card from the child result (#
     }
 });
 
-// ---------------------------------------------------------------------------
-// Visible reasoning: a `reasoning: true` progress frame (live or replayed)
-// reaches the card as its own collapsed "Thinking" line; the stamp is forwarded
-// by updateLiveCardFromProgressMessage, so an unstamped frame stays a working line.
-// ---------------------------------------------------------------------------
-function walkLines(node, out = []) {
-    if (node?.classList?.contains('chat-live-line')) out.push(node);
-    for (const child of node?.children || []) walkLines(child, out);
-    return out;
-}
-test('a reasoning-stamped progress frame renders as a collapsed Thinking line, live and from history', async () => {
-    // Reasoning rows are hidden by default (the `show_reasoning` preference);
-    // this test is the shown state, restored at the end.
-    setReasoningVisible(true);
-    // Long enough that the preview body is shorter than fullBody (the line's Expand toggle).
-    const reasoning = 'Weigh the two migration paths before touching the schema. '.repeat(6).trim();
-    const rows = [
-        { chat_id: 2, role: 'system', is_progress: true, reasoning: true, task_id: 'think-h',
-          content: `💬 ${reasoning}`, ts: '2026-09-11T10:00:00Z' },
-        { chat_id: 2, role: 'system', is_progress: true, task_id: 'think-h',
-          content: '💬 editing the schema', ts: '2026-09-11T10:00:01Z' },
-    ];
-    const { prior, mount } = installDom(async (url) => {
-        if (String(url).startsWith('/api/chat/history')) {
-            return { ok: true, json: async () => ({ messages: rows, window: { complete: true } }) };
-        }
-        return { ok: true, json: async () => ({ active_direct_turns: [] }) };
+// Routing activity has one completion note regardless of delivery order.
+for (const order of ['final-first', 'done-first', 'cold']) {
+    test(`routing activity retains counts/model and one completion note: ${order}`, async () => {
+        const final = { chat_id: 1, role: 'assistant', text: 'Routed to the project.',
+            content: 'Routed to the project.', task_id: 'routing-facts', ts: '2026-09-09T10:00:00Z',
+            task_terminal_status: 'completed', tool_calls: 2, rounds: 2,
+            reason_code: 'final_message', outcome_axes: { execution: { status: 'ok' } },
+            model_execution: { source: 'usable_solve_response', requested_model: 'provider/model-a',
+                used_model: 'provider/model-b', reported_model: 'model-b-provider', provider: 'provider', used_local: false } };
+        const done = { ...final, type: 'task_done', status: 'completed', ts: '2026-09-09T10:00:01Z' };
+        const { prior, mount } = installDom(async (url) => ({ ok: true, json: async () =>
+            String(url).startsWith('/api/chat/history') ? { messages: order === 'cold' ? [{ ...final, system_type: 'task_summary' }] : [] }
+                : { active_direct_turns: [] } }));
+        const handlers = new Map();
+        const ws = { on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
+            isConnected: () => true, send() {} };
+        let instance;
+        try {
+            instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+                updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+                    isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
+            if (order === 'cold') await instance.refreshHistory({ revision: 1 });
+            else {
+                handlers.get('log')({ chat_id: 1, data: { type: 'tool_call_started', task_id: 'routing-facts',
+                    tool: 'route_to_project', ts: '2026-09-09T09:59:59Z' } });
+                if (order === 'final-first') handlers.get('chat')(final);
+                handlers.get('log')({ chat_id: 1, data: done });
+                handlers.get('chat')(final);
+            }
+            const card = walkCard(globalThis.document.byId.get('chat-messages'), 'routing-facts');
+            assert.ok(card);
+            assert.equal(card.dataset.finished, '1');
+            assert.equal(card.querySelector('[data-live-title]').textContent, 'Task activity');
+            assert.match(card.querySelector('[data-live-meta]').innerHTML, /2 tool calls/);
+            assert.match(card.querySelector('[data-live-meta]').innerHTML, /model-b/);
+            if (card.dataset.expanded !== '1') card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+            const nodes = (node) => [node, ...node.children.flatMap(nodes)];
+            const notes = nodes(card).filter((n) => n.classList.contains('chat-live-line') && n.classList.contains('done'));
+            assert.equal(notes.length, 1);
+            assert.doesNotMatch(card.innerHTML, /Reason: final_message/);
+            handlers.get('log')({ chat_id: 1, data: { type: 'task_cost_finalized', task_id: 'routing-facts',
+                accounted_upper_bound_usd: 1, cost_final: true, cost_accounting_status: 'available' } });
+            assert.match(card.querySelector('[data-live-meta]').innerHTML, /model-b/);
+        } finally { instance?.destroy(); restoreDom(prior); }
     });
-    const handlers = new Map();
-    const ws = {
-        on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
-        isConnected: () => true, send() {},
-    };
-    let generation = 0;
-    const stateSnapshots = {
-        begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
-        isCurrent: () => true, apply() {},
-    };
+}
+
+for (const source of ['missing', 'failed-read']) {
+    test(`only a complete fresh snapshot and proven missing result make history inert: ${source}`, async () => {
+        const { prior, mount } = installDom(async (url) => String(url).startsWith('/api/tasks/')
+            ? { ok: false, status: source === 'missing' ? 404 : 503, json: async () => ({ error: source }) }
+            : { ok: true, json: async () => ({ active_direct_turns: [] }) });
+        const handlers = new Map();
+        const ws = { on(type, fn) { handlers.set(type, fn); return () => handlers.delete(type); },
+            isConnected: () => true, send() {} };
+        let instance;
+        try {
+            instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+                updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+                    isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
+            listActivity(instance, 'old-root', 1);
+            handlers.get('chat')({ chat_id: 1, task_id: 'old-root', role: 'assistant', is_progress: true,
+                content: 'Inspecting the old source', ts: '2026-09-09T09:00:00Z' });
+            const card = walkCard(globalThis.document.byId.get('chat-messages'), 'old-root');
+            instance.hydrateStateSnapshot({ active_chat_activities: [], supervisor_ready: true,
+                active_chat_activities_complete: false }, Infinity, 1);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            assert.equal(card.querySelector('[data-live-phase]').hidden, false);
+            instance.hydrateStateSnapshot({ active_chat_activities: [], supervisor_ready: true,
+                active_chat_activities_complete: true }, Infinity, 2);
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            assert.equal(card.querySelector('[data-live-phase]').hidden, source === 'missing');
+            assert.equal(card.dataset.finished, '0', 'unavailable is not a fabricated lifecycle outcome');
+            if (source === 'missing') assert.match(card.querySelector('[data-live-meta]').innerHTML, /Outcome unavailable/);
+            listActivity(instance, 'old-root', 1);
+            assert.equal(card.querySelector('[data-live-phase]').hidden, false, 'fresh live evidence restores activity');
+        } finally { instance?.destroy(); restoreDom(prior); }
+    });
+}
+
+
+test('native terminal replay retains the actual narration as title', async () => {
+    const rows = [
+        { task_id: 'native-title', is_progress: true, text: '💬 still working', ts: '2026-09-09T08:00:00Z', task_terminal_status: 'completed' },
+        { task_id: 'native-title', role: 'assistant', text: 'The report is ready.', ts: '2026-09-09T08:01:00Z' },
+        { task_id: 'native-title', role: 'system', system_type: 'task_summary', text: 'Done.', ts: '2026-09-09T08:02:00Z',
+          tool_calls: 1, rounds: 2, outcome_final: true, outcome_phase: 'done', outcome_axes: { execution: { status: 'ok' } } },
+    ];
+    const { prior, mount } = installDom(async (url) => ({ ok: true, json: async () =>
+        String(url).startsWith('/api/chat/history') ? { messages: rows } : { active_direct_turns: [] } }));
+    const ws = { on() { return () => {}; }, isConnected: () => true, send() {} };
     let instance;
     try {
-        instance = createChatInstance({
-            ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-            updateUnreadBadge() {}, stateSnapshots, chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true,
-        });
-        const messages = globalThis.document.byId.get('chat-messages');
-        // A collapsed card defers its timeline DOM; expand through the summary button.
-        const expand = (card) => card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
-        for (const row of rows) handlers.get('chat')({ ...row, task_id: 'think-l' });
-        expand(walkCard(messages, 'think-l'));
-        const live = walkLines(walkCard(messages, 'think-l'));
-        assert.deepEqual(live.map((n) => n.classList.contains('thinking')), [true, false]);
-        assert.ok(live[0].classList.contains('expandable'), 'the reasoning line is collapsible');
-        assert.equal(live[1].classList.contains('working'), true);
+        instance = createChatInstance({ ws, state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
+            updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+                isCurrent: () => true, apply() {} }, chatId: 1, idPrefix: 'chat', mountEl: mount });
         await instance.refreshHistory({ revision: 1 });
-        expand(walkCard(messages, 'think-h'));
-        const replayed = walkLines(walkCard(messages, 'think-h'));
-        assert.deepEqual(replayed.map((n) => n.classList.contains('thinking')), [true, false]);
-    } finally {
-        setReasoningVisible(false);
-        instance?.destroy();
-        restoreDom(prior);
-    }
+        const card = walkCard(globalThis.document.byId.get('chat-messages'), 'native-title');
+        assert.equal(card.querySelector('[data-live-title]').textContent, 'still working');
+    } finally { instance?.destroy(); restoreDom(prior); }
 });

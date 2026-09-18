@@ -15,7 +15,6 @@ import uuid
 from pathlib import Path
 from typing import Any, Dict
 
-from ouroboros.tool_policy import swarm_router_turn
 from ouroboros.tools.control_events import (
     _PROMOTE_CONFIRM_TIMEOUT_SEC,
     _emit_and_wait_for_routing,
@@ -59,6 +58,37 @@ def _attach_origin_from_metadata(ctx: ToolContext, evt: Dict[str, Any]) -> None:
             evt["source_text"] = text
     elif metadata.get("origin_suppressed"):
         evt["origin_suppressed"] = True
+
+
+def _inherited_project_scope(ctx: ToolContext) -> str:
+    """The project a promote with NO explicit target should land in.
+
+    Order: (1) the promoting task's own DURABLE binding — the one truth about a
+    task's project, which a "Turn into project" conversion writes without ever
+    reaching the live worker's ``ctx.project_id``; (2) the project the OWNER
+    MESSAGE this turn came from already has, so a root promoted out of an
+    already-converted message joins it instead of appearing in Main as a second
+    convertible unit; (3) the in-memory scope copy, unchanged behaviour.
+
+    Both durable reads fail OPEN exactly like ``project_facts._bound_project_id``
+    (one DEBUG line, then the copy): this runs on a routing decision the owner is
+    waiting for, and an unreadable store must not stop the work. Explicit
+    ``project_id``/``project_name`` never reach here — they stay the model's
+    ceiling (BIBLE P13)."""
+    metadata = getattr(ctx, "task_metadata", None)
+    metadata = metadata if isinstance(metadata, dict) else {}
+    try:
+        from ouroboros.config import DATA_DIR
+        from ouroboros.projects_registry import project_id_for_origin, project_id_for_task
+
+        inherited = str(project_id_for_task(DATA_DIR, str(getattr(ctx, "task_id", "") or "")) or "")
+        if not inherited:
+            inherited = str(project_id_for_origin(DATA_DIR, metadata.get("origin_message_ref")) or "")
+        if inherited:
+            return inherited
+    except Exception:
+        log.debug("promote: durable project scope lookup failed", exc_info=True)
+    return str(getattr(ctx, "project_id", "") or "")
 
 
 def _attach_predecessor_authority_from_metadata(
@@ -115,23 +145,6 @@ def _attach_client_surface(ctx: ToolContext, evt: Dict[str, Any]) -> None:
         evt["client_surface"] = dict(fact)
 
 
-def _attach_swarm_intent(ctx: ToolContext, evt: Dict[str, Any]) -> None:
-    """Carry host-attested Swarm intent into the admitted managed root."""
-
-    if not swarm_router_turn(ctx):
-        return
-    metadata = getattr(ctx, "task_metadata", {})
-    evt["force_plan"] = True
-    evt["force_plan_source"] = str(
-        metadata.get("force_plan_source") or "operator"
-    ).strip() or "operator"
-
-
-def _cached_swarm_handoff(ctx: ToolContext) -> str:
-    attempt = getattr(ctx, "_swarm_handoff_attempt", None)
-    return str(attempt.get("response") or "") if swarm_router_turn(ctx) and isinstance(attempt, dict) else ""
-
-
 def _finish_swarm_handoff(
     ctx: ToolContext,
     evt: Dict[str, Any],
@@ -140,11 +153,11 @@ def _finish_swarm_handoff(
     status: str,
     reason: str = "",
 ) -> str:
-    """Latch one immutable admission attempt; repeated calls emit nothing."""
+    """Preserve the first Presence admission receipt for its terminal consumers."""
 
     metadata = getattr(ctx, "task_metadata", {})
     presence_turn = isinstance(metadata, dict) and bool(metadata.get("presence"))
-    if (swarm_router_turn(ctx) or presence_turn) and not isinstance(
+    if presence_turn and not isinstance(
         getattr(ctx, "_swarm_handoff_attempt", None), dict
     ):
         ctx._swarm_handoff_attempt = {
@@ -189,42 +202,11 @@ def _promote_chat_to_task(
     goal = str(objective or "").strip()
     if not goal:
         return "⚠️ TOOL_ARG_ERROR (promote_chat_to_task): objective is required"
-    cached = _cached_swarm_handoff(ctx)
-    if cached:
-        return cached
     from ouroboros.project_facts import (
         explicit_project_id_ok,
         project_id_from_display_name,
         sanitize_project_id,
     )
-
-    scope_override_note = ""
-    if swarm_router_turn(ctx):
-        # The model chooses admission; the host-owned room chooses scope — but
-        # room scope wins only on a GENUINE conflict (room already bound to a
-        # project). In a projectless room an explicitly passed project_name OR
-        # project_id is INHERITED (Q9-A): silently clearing them made the
-        # saga's first root run projectless, so its work landed in an
-        # off-registry tree that no later task could see.
-        room_pid = str(getattr(ctx, "project_id", "") or "")
-        if room_pid:
-            explicit = str(project_name or "").strip() or str(project_id or "").strip()
-            explicit_pid = (
-                project_id_from_display_name(project_name)
-                if str(project_name or "").strip()
-                else sanitize_project_id(project_id or "")
-            )
-            if explicit and explicit_pid != room_pid:
-                # An explicit owner input lost to the room binding — disclose
-                # it in the response, never drop silently (the silent drop was
-                # the saga defect).
-                scope_override_note = (
-                    f" Explicit project {explicit!r} was ignored: this room is "
-                    f"bound to project {room_pid!r}."
-                )
-            project_id = room_pid
-            project_name = ""
-        workspace_root = workspace = source = ""
 
     display_name = str(project_name or "").strip()
     pid = ""
@@ -245,7 +227,9 @@ def _promote_chat_to_task(
         # No explicit arg: inherit the CURRENT project scope so a project-chat
         # task that promotes follow-up work stays in its own project (the model
         # still chose to promote — scope is contextual, never a keyword gate).
-        pid = sanitize_project_id(getattr(ctx, "project_id", "") or "")
+        # The durable binding of this task, then of the owner message it came
+        # from, outrank the in-memory copy; see _inherited_project_scope.
+        pid = sanitize_project_id(_inherited_project_scope(ctx))
     try:
         current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
@@ -317,7 +301,6 @@ def _promote_chat_to_task(
             "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (promote_chat_to_task): "
             + predecessor_error
         )
-    _attach_swarm_intent(ctx, evt)
     _attach_client_surface(ctx, evt)
     mode, confirmation = _emit_and_wait_for_routing(ctx, evt)
     if display_name:
@@ -336,7 +319,7 @@ def _promote_chat_to_task(
             f"OK: task {tid}{scope_note} accepted and durably scheduled ({mode}).{source_confirmation} "
             "The task now runs independently, and follow-up chat can steer it. "
             "Use wait_task/get_task_result if its result "
-            "is needed in this conversation." + scope_override_note
+            "is needed in this conversation."
         )
         return _finish_swarm_handoff(ctx, evt, response, status="scheduled")
     if confirmation_status in {"rejected", "needs_manual_target"}:
@@ -425,14 +408,6 @@ def _route_to_project(
     msg = str(message or "")
     if not msg.strip():
         return "⚠️ TOOL_ARG_ERROR (route_to_project): message is required"
-    cached = _cached_swarm_handoff(ctx)
-    if cached:
-        return cached
-    if swarm_router_turn(ctx) and str(getattr(ctx, "project_id", "") or "").strip():
-        return (
-            "⚠️ SWARM_PROJECT_SCOPE_OWNED: this Project-room Swarm must create its new "
-            "root with promote_chat_to_task in the current Project."
-        )
     try:
         current_chat_id = int(getattr(ctx, "current_chat_id", None) or 0)
     except (TypeError, ValueError):
@@ -536,7 +511,6 @@ def _route_to_project(
     }
     _attach_origin_from_metadata(ctx, evt)
     evt.update(predecessor_event)
-    _attach_swarm_intent(ctx, evt)
     _attach_client_surface(ctx, evt)
     mode, receipt = _emit_and_wait_for_routing(ctx, evt)
     name = str(proj.get("name") or pid)
@@ -566,26 +540,58 @@ def _route_to_project(
     )
 
 
+def _origin_already_routed(ctx: ToolContext, client_message_id: str) -> bool:
+    """Whether this turn has ALREADY carried its origin message somewhere.
+
+    The FIRST routing act of a turn is the one that relays the owner's exact
+    ingress bytes.  Once that act landed, the turn's later words are its own —
+    a pacing note, a hand-off, an answer to something it learned since — and
+    replaying the origin over them delivers a stale message nobody wrote
+    (#896).  Read from the durable annotation receipts: a LANDED
+    promote/route/steer receipt on the origin message.  A refused or
+    unconfirmed act carried nothing, so the owner's message is still unrouted
+    and the next act still relays it.
+    """
+    message_id = str(client_message_id or "").strip()
+    if not message_id:
+        return False
+    try:
+        from ouroboros.project_dialogue import latest_chat_annotations
+
+        root = Path(str(getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
+        row = latest_chat_annotations(root).get(message_id) or {}
+    except Exception:
+        log.debug("Origin routing-receipt lookup failed", exc_info=True)
+        return False
+    return (
+        str(row.get("action") or "") in {"promote_chat_to_task", "route_to_project", "steer_task"}
+        and str(row.get("status") or "") in {"scheduled", "delivered"}
+    )
+
+
 def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
     """Deliver a follow-up to a host-listed RUNNING/PENDING owner root.
 
     Project rooms are limited to ``current_chat.addressable_root_tasks``; Main
     may also choose a Project-bound root from ``main_routing_manifest.root_tasks``.
 
-    When the chat is busy, a new message runs as a short-lived decision turn that
-    sees the running tasks of the current chat as structural context and picks the
-    one to steer. This verb just transports the message to that task's owner-mailbox
+    A conversation sees the running tasks as structural context and chooses
+    which one to steer. This verb transports the message to that task's owner-mailbox
     (the running task drains it at its next safe checkpoint). LLM-first (BIBLE P5):
     the code never decides which task a message belongs to — it only validates the
     transport (task exists, same chat, idempotent delivery) and the supervisor
     performs the mailbox write on the task's active drive. When unsure which task
     (or none) fits, spawn a fresh task with ``promote_chat_to_task`` instead.
+
+    On the turn's FIRST routing act, while it is still acting on the message
+    that started it, the host delivers that owner message's exact ingress bytes
+    instead of any paraphrase. Afterwards — once the turn has already routed
+    that message, or a later owner message has actually reached it — the message
+    given here is delivered verbatim, so relay the owner's words rather than a
+    summary of them. Delivery stays confirmable either way: a steer that belongs
+    to no owner message earns its receipt under its own id, and no owner message
+    in the chat is labelled with the agent's act.
     """
-    if swarm_router_turn(ctx):
-        return (
-            "⚠️ SWARM_NEW_ROOT_REQUIRED: explicit Swarm cannot steer an existing task; "
-            "use promote_chat_to_task or, from Main, route_to_project."
-        )
     target = str(task_id or "").strip()
     msg = str(message or "").strip()
     if not target:
@@ -600,23 +606,56 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
     except (TypeError, ValueError):
         current_chat_id = 0
     _md = getattr(ctx, "task_metadata", None)
-    # The model chooses the target, but the host transports the exact owner
-    # bytes captured at ingress.  A model-authored paraphrase must not replace
-    # the owner's steering text.  Non-owner/internal calls have no origin text
-    # and retain the explicit tool argument.
-    if isinstance(_md, dict) and isinstance(_md.get("origin_message_text"), str):
+    _md = _md if isinstance(_md, dict) else {}
+    client_message_id = str(_md.get("client_message_id") or "").strip()
+    # The model chooses the target, and the host transports the exact owner
+    # bytes captured at ingress on the turn's FIRST routing act while it is
+    # still acting on the message it was started with: a model-authored
+    # paraphrase must not replace the owner's own steering text.  Two typed
+    # facts end that window, and after either one the turn is RELAYING its own
+    # words rather than paraphrasing the owner's — a later owner message the
+    # turn actually DRAINED from its mailbox (``ctx.last_owner_delivery``,
+    # stamped at the loop's drain seam), or its origin message already carried
+    # somewhere by a landed routing receipt.  A message merely WRITTEN to the
+    # mailbox has not reached the turn and ends nothing: the write-time counter
+    # this used to read closed the window against a turn that was still acting
+    # on its own origin, and took the steer's receipt with it.  Replaying the
+    # origin past either real point re-sent a twenty-minute-old message and
+    # silently dropped what the turn actually had to say (#896).  So the model's
+    # text stands, and the receipt follows the owner message actually relayed —
+    # the drained entry's own client id — or, for an agent-authored steer that
+    # belongs to no owner message, the steer's OWN synthetic id: never again an
+    # origin message this turn has already routed.  The receipt channel is keyed
+    # by message id only because that is how `routing_wait` polls it, so silence
+    # there would report a successful delivery as STEER_UNCONFIRMED and invite
+    # the model to retry a message that landed.  Nothing in any chat carries a
+    # synthetic id, so no owner message is labelled by the agent's own act.
+    # Non-owner/internal calls have no origin text and retain the explicit
+    # tool argument.
+    from ouroboros.project_dialogue import AGENT_RECEIPT_ID_PREFIX
+
+    routing_token = uuid.uuid4().hex
+    agent_authored_receipt_id = f"{AGENT_RECEIPT_ID_PREFIX}{routing_token}"
+    delivery = getattr(ctx, "last_owner_delivery", None)
+    if isinstance(delivery, dict) and delivery:
+        # The turn is relaying its own words after a later owner message reached it.
+        client_message_id = (
+            str(delivery.get("client_message_id") or "").strip() or agent_authored_receipt_id
+        )
+    elif _origin_already_routed(ctx, client_message_id):
+        client_message_id = agent_authored_receipt_id
+    elif isinstance(_md.get("origin_message_text"), str):
         exact_owner_text = str(_md.get("origin_message_text") or "")
         if exact_owner_text.strip():
             msg = exact_owner_text
-    client_message_id = str((_md.get("client_message_id") if isinstance(_md, dict) else "") or "").strip()
     routing_contract = (
         _md.get("routing_contract")
-        if isinstance(_md, dict) and isinstance(_md.get("routing_contract"), dict)
+        if isinstance(_md.get("routing_contract"), dict)
         else {}
     )
     evt: Dict[str, Any] = {
         "type": "steer_task",
-        "routing_token": uuid.uuid4().hex,
+        "routing_token": routing_token,
         "target_task_id": target,
         "message": msg,
         "chat_id": current_chat_id,
@@ -625,8 +664,7 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
         # flag is derived from host metadata (not a model argument), allowing the
         # supervisor to validate that exact documented addressability.
         "allow_global_root": routing_contract.get("source_lane") == "main",
-        "attachment_uploads": list(_md.get("chat_attachment_uploads") or [])
-        if isinstance(_md, dict) else [],
+        "attachment_uploads": list(_md.get("chat_attachment_uploads") or []),
         "ts": utc_now_iso(),
     }
     _attach_client_surface(ctx, evt)

@@ -268,10 +268,16 @@ def test_identical_in_flight_plan_reconciles_same_paid_cycle_at_cap(
 def test_in_flight_plan_without_process_custody_refuses_duplicate_dispatch(
     harness, monkeypatch,
 ):
+    import ouroboros.review_substrate as review_substrate
+    real_substrate = review_substrate.run_review_request
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
     calls = []
 
     def substrate(request, *, slots, drive_root, llm, usage_ctx=None):
+        if request.reconcile_only:
+            no_send = SimpleNamespace(chat=lambda **kw: pytest.fail("missing CAS cannot dispatch"))
+            return real_substrate(request, slots=slots, drive_root=drive_root,
+                                  llm=no_send, usage_ctx=usage_ctx)
         calls.append(request.retry_key)
         return SimpleNamespace(actors=[{
             "slot_id": slot.slot_id, "model": slot.model, "status": "error",
@@ -280,15 +286,14 @@ def test_in_flight_plan_without_process_custody_refuses_duplicate_dispatch(
             "operation_state": "in_flight", "late_result_pending": True,
         } for slot in slots])
 
-    import ouroboros.review_substrate as review_substrate
-
     monkeypatch.setattr(review_substrate, "run_review_request", substrate)
     ctx = harness.make_ctx()
     _call(ctx)
     second = _call(ctx)
 
     assert len(calls) == 1
-    assert "process-local custody is unavailable" in second
+    assert _control(second) == {"outcome": "DEGRADED", "closed": False}
+    assert all(row["operation_state"] == "custody_lost" for row in _state(harness)["waves"][-1]["actors"])
     assert _state(harness)["cycles_paid"] == 1
 
 
@@ -574,10 +579,7 @@ def test_hold_on_self_opened_plan_under_blocking_and_advisory_disclosure(harness
     advisory = force_plan_decision(ctx, {}, enforcement="advisory")
     assert advisory["allow"] is True and advisory["status"] == "advisory_open"
     assert "advisory enforcement" in plan_review_disclosure(advisory)
-    # An ephemeral turn never holds; a real rail always releases.
-    ctx.is_ephemeral_turn = True
-    assert force_plan_decision(ctx, {}, enforcement="blocking")["status"] == "not_required"
-    ctx.is_ephemeral_turn = False
+    # A real rail releases the hold while preserving the open-review disclosure.
     railed = force_plan_decision(ctx, {}, hard_rail="round_limit", enforcement="blocking")
     assert railed["allow"] is True and railed["status"] == "rail_degraded"
 

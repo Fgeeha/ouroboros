@@ -36,48 +36,71 @@ HOST_NARRATION = "host_narration"
 
 def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
     try:
-        # Membership, not truthiness: absence skips the indicator, an explicit
-        # id — the hidden partition included — is a destination.
-        chat_id = notification_chat_route(evt.get("chat_id"))
         task_id = str(evt.get("task_id") or "")
         phase = str(evt.get("phase") or "thinking")
         client_msg_id = ""
         kind = ""
+        task_row: Dict[str, Any] = {}
+        if task_id:
+            # One read of the RUNNING row: it carries both the lineage the
+            # project binding is resolved by and the root check the kind stamp
+            # needs.
+            try:
+                running = getattr(ctx, "RUNNING", None)
+                meta = running.get(task_id) if isinstance(running, dict) else None
+                row = meta.get("task") if isinstance(meta, dict) else None
+                if isinstance(row, dict):
+                    task_row = row
+            except Exception:
+                log.debug("RUNNING row read failed for %s", task_id, exc_info=True)
+        # Membership, not truthiness: absence skips the indicator, an explicit
+        # id — the hidden partition included — is a destination. The binding is
+        # resolved AT EMISSION and OUTRANKS the origin chat, because a task
+        # bound to a project after admission keeps the chat it was born in on
+        # its row (same order as _handle_task_heartbeat and task_done).
+        chat_id = notification_chat_route(
+            _bound_project_chat_id(
+                ctx, task_id, task_row.get("parent_task_id"), task_row.get("root_task_id")
+            )
+            or None,
+            evt.get("chat_id"),
+        )
         if task_id:
             try:
                 from supervisor.active_activity import get_direct_activity_registry
                 # A registry hit identifies a direct/ephemeral turn; queued
                 # managed tasks also emit typing_start but are not tracked here,
-                # so their frames go out without a kind stamp.
+                # so their frames go out without a kind stamp. The stamp is
+                # kept for wire compatibility only: no in-repo client reads a
+                # typing frame's kind, and it carries no authority over any
+                # client-side set.
                 entry = get_direct_activity_registry().get(task_id)
                 if entry:
                     client_msg_id = entry.client_message_id
                     kind = entry.kind
             except Exception:
                 pass
-        if not kind and task_id:
-            # A RUNNING queue ROOT is stamped "managed_task" so the client can
-            # reconcile its entry against the /api/state activity snapshot
-            # (which lists queue roots). Subagent typing keeps the legacy
-            # no-kind exemption: no snapshot source enumerates children.
+        if not kind and task_row:
+            # A RUNNING queue ROOT is stamped "managed_task" like the /api/state
+            # activity census names it (that census lists queue roots). The stamp
+            # is kept for wire compatibility only: no in-repo client reads it, and
+            # the web header never admits a typing frame into its live-activity
+            # set, so an empty kind is not an exemption from anything. The census still
+            # does not enumerate children by design — their own task cards do.
             try:
-                running = getattr(ctx, "RUNNING", None)
-                meta = running.get(task_id) if isinstance(running, dict) else None
-                task_row = meta.get("task") if isinstance(meta, dict) else None
-                if isinstance(task_row, dict):
-                    from ouroboros.task_results import resolve_task_lineage
+                from ouroboros.task_results import resolve_task_lineage
 
-                    lineage = resolve_task_lineage(
-                        task_id,
-                        metadata=task_row.get("metadata"),
-                        root_task_id=task_row.get("root_task_id"),
-                        parent_task_id=task_row.get("parent_task_id"),
-                        delegation_role=task_row.get("delegation_role"),
-                        original_task_id=task_row.get("original_task_id"),
-                        timeout_retry_from=task_row.get("timeout_retry_from"),
-                    )
-                    if lineage["is_root_task"]:
-                        kind = "managed_task"
+                lineage = resolve_task_lineage(
+                    task_id,
+                    metadata=task_row.get("metadata"),
+                    root_task_id=task_row.get("root_task_id"),
+                    parent_task_id=task_row.get("parent_task_id"),
+                    delegation_role=task_row.get("delegation_role"),
+                    original_task_id=task_row.get("original_task_id"),
+                    timeout_retry_from=task_row.get("timeout_retry_from"),
+                )
+                if lineage["is_root_task"]:
+                    kind = "managed_task"
             except Exception:
                 log.debug("managed typing kind resolution failed for %s", task_id, exc_info=True)
         if chat_id is not None:
@@ -254,6 +277,10 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         if delivery_id:
             _DELIVERED_MESSAGE_IDS.append(delivery_id)
             _register_delivered(ctx, delivery_id)
+            if system_type == "cancel_receipt":
+                from supervisor.terminal_delivery import record_cancel_receipt_delivery
+
+                record_cancel_receipt_delivery(ctx.DRIVE_ROOT, task_id, delivery_id, chat_id)
     except Exception as e:
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",

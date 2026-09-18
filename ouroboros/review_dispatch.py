@@ -27,7 +27,7 @@ import logging
 import math
 import pathlib
 import threading
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Dict, Iterator
 
 log = logging.getLogger(__name__)
 _BOUND_API_PAID_STAMP: contextvars.ContextVar[Any] = contextvars.ContextVar(
@@ -141,6 +141,39 @@ def claim_task_acceptance_dispatch(
     return claim_task_acceptance_review_cycle(
         drive_root, root_task_id, binding, claimed_by_task_id=task_id,
     )
+
+
+def collect_task_acceptance_run(run: dict, *, drive_root: Any, usage_ctx: Any) -> Any:
+    """Collect the recorded operation at zero new dispatch, using its exact inputs.
+
+    The existing host review record owns the request and roster; custody owns live
+    workers and complete producer artifacts. No new configuration or evidence is
+    sampled here, and missing custody cannot turn collection into a new send.
+    """
+    import copy
+    import time
+    from ouroboros.review_custody import _freeze_roster_rows
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+
+    request = ReviewRequest(**copy.deepcopy(run["request"]))
+    if request.surface != "task_acceptance" or not request.retry_key:
+        raise ValueError("recorded acceptance operation identity is missing")
+    slots = [ReviewSlot(**{**row, "route": ReviewRouteKind(row["route"])})
+             for row in copy.deepcopy(run.get("slot_roster") or [])]
+    if not slots:
+        raise ValueError("recorded acceptance roster is unavailable")
+    request.reconcile_only, request.drain_deadline = True, time.monotonic()
+    previous = getattr(usage_ctx, "_review_frozen_rows", None)
+    usage_ctx._review_frozen_rows = {
+        **(previous or {}),
+        "task_acceptance": _freeze_roster_rows(usage_ctx, "task_acceptance", run.get("actors")),
+    }
+    try:
+        return run_review_request(request, slots=slots, drive_root=pathlib.Path(drive_root),
+                                  usage_ctx=usage_ctx)
+    finally:
+        usage_ctx._review_frozen_rows = previous
 
 
 def task_acceptance_preclaim_refusal(ctx: Any) -> Any:
@@ -334,3 +367,88 @@ def stamp_review_paid_on_dispatch(ctx: Any) -> None:
     invoke_review_paid_stamp(
         getattr(ctx, "_review_paid_stamp", None) if ctx is not None else None
     )
+
+
+def review_operation_binding(request: Any, slot: Any, operation_id: str) -> dict:
+    """Bind one physical result to its existing task, material and panel owners."""
+    from ouroboros.review_custody import _attempt_key
+
+    return {
+        **dict(getattr(request, "reconciliation_identity", {}) or {}),
+        "task_id": str(getattr(request, "task_id", "") or ""),
+        "surface": str(getattr(request, "surface", "") or ""),
+        "slot_id": str(getattr(slot, "slot_id", "") or ""),
+        "operation_id": str(operation_id or ""),
+        "request_key": _attempt_key(request, slot),
+    }
+
+
+def review_reconciliation_identity(request: Any, slots: list, *, root_task_id: str, contract: Any = "") -> dict:
+    """Reuse the caller's material/cycle identity and the exact configured roster."""
+    import hashlib
+    import json
+    from dataclasses import asdict, is_dataclass
+    from ouroboros.review_execution import review_output_contract
+
+    def digest(value):
+        return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False,
+                                         default=str).encode("utf-8")).hexdigest()
+
+    supplied = dict(getattr(request, "reconciliation_identity", None) or {})
+    roster = []
+    for slot in slots:
+        values = asdict(slot) if is_dataclass(slot) else dict(getattr(slot, "__dict__", {}) or {})
+        roster.append({k: v for k, v in values.items()
+                       if k not in {"timeout_sec", "transport_timeout_sec"}
+                       and (k != "processing_preference" or v)})
+    retry_key = getattr(request, "retry_key", None)
+    return {
+        "subject_hash": digest(retry_key or {
+            "subject": getattr(request, "subject", ""), "goal": getattr(request, "goal", ""),
+            "scope": getattr(request, "scope", ""), "evidence": getattr(request, "evidence", ""),
+            "evidence_refs": getattr(request, "evidence_refs", []), "messages": getattr(request, "messages", []),
+            "slot_messages": getattr(request, "slot_messages", []),
+        }),
+        "review_contract": str(contract or digest({
+            "rendered": review_output_contract(request) if hasattr(request, "policy") else "",
+            "policy": getattr(request, "policy", ""),
+        })),
+        "roster_hash": digest(roster), "epoch": str(retry_key or ""),
+        **supplied,
+        "root_task_id": str(root_task_id), "task_attempt": getattr(request, "task_attempt", None),
+    }
+
+
+def retrieving_acceptance_packet(evidence: Dict[str, Any]) -> Dict[str, Any]:
+    """The packet a NATIVE row receives (R4/R15): the same host-attested exhibits
+    WITHOUT the freely degradable tail the api ladder spends first — the
+    tool-trajectory rows and artifact previews — because that row reads those
+    sources itself at the pointers. Every section key survives, so an
+    `evidence_ref` naming it still resolves against the FULL dict (the ref
+    authority never changes), and the omission is manifested like every other."""
+    packet = dict(evidence)
+    manifest_present = "omissions_manifest" in packet
+    manifest = packet.get("omissions_manifest")
+    # A sequence is a manifest; anything else present (None, a dict, a string) is
+    # malformed and is normalized to an empty list — never carried as-is, never its keys.
+    omissions = list(manifest) if isinstance(manifest, (list, tuple)) else []
+    trajectory = packet.get("tool_trajectory")
+    if isinstance(trajectory, list) and trajectory:
+        packet["tool_trajectory"] = [{
+            "retrieve": "tool-trajectory rows withheld from this delivery; read the trajectory log at the pointer",
+            "calls": len(trajectory),
+        }]
+        omissions.append({"section": "tool_trajectory", "omitted": len(trajectory), "reason": "retrieving_delivery"})
+    artifacts = packet.get("artifacts")
+    if isinstance(artifacts, list):
+        rows = [
+            {k: v for k, v in row.items() if k != "preview"} if isinstance(row, dict) and row.get("preview") else row
+            for row in artifacts
+        ]
+        stripped = sum(1 for before, after in zip(artifacts, rows) if before is not after)
+        if stripped:
+            packet["artifacts"] = rows
+            omissions.append({"section": "artifact_previews", "omitted": stripped, "reason": "retrieving_delivery"})
+    if omissions or (manifest_present and not isinstance(manifest, list)):
+        packet["omissions_manifest"] = omissions  # normalized whenever present and not a list; an absent key stays absent
+    return packet

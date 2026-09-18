@@ -54,6 +54,7 @@ from ouroboros.utils import (
     truncate_for_log,
     utc_now_iso,
 )
+from ouroboros.config import runtime_setting
 
 _OBSERVATIONS_REL = pathlib.Path("state") / "consciousness_observations.jsonl"
 _OBSERVATION_SOURCE_REF = (
@@ -715,10 +716,17 @@ class BackgroundConsciousness:
 
     def _think(self) -> bool:
         """Bind each wakeup to the global ledger and its background sub-budget."""
+        from ouroboros.llm_claudexor import ModelTurnState
         from ouroboros.usage_accounting import UsageScope, usage_scope
 
         total_budget = resolve_total_budget_usd()
         root_limit = total_budget * (self._bg_budget_pct / 100.0) if total_budget else None
+        # One wake is one logical turn AND one cache identity: the existing
+        # per-wake owner id names both, so the awareness loop's rounds share a
+        # prefix with each other and with nothing else.
+        wake_id = uuid.uuid4().hex
+        self._wake_cache_affinity = wake_id
+        self._model_turn_state = ModelTurnState()
 
         with usage_scope(UsageScope(
             drive_root=self._drive_root,
@@ -729,7 +737,7 @@ class BackgroundConsciousness:
             global_limit_usd=total_budget,
             root_limit_usd=root_limit,
         )), task_model_wait_scope(
-            task={"id": "bg-consciousness", "model_wait_owner_id": uuid.uuid4().hex,
+            task={"id": "bg-consciousness", "model_wait_owner_id": wake_id,
                   "chat_id": getattr(self, "_owner_chat_id_fn", lambda: None)()},
             drive_root=self._drive_root, event_queue=getattr(self, "_event_queue", None), worker_slot_held=False,
             row_mutator=lambda key, transform: mutate_live_wait(wait, key, transform),
@@ -742,6 +750,8 @@ class BackgroundConsciousness:
                     return self._think_scoped()
             finally:
                 self._model_wait = None
+                self._model_turn_state = None
+                self._wake_cache_affinity = ""
 
     def _prepare_model_call(self, kwargs: dict) -> dict:
         """Keep the same call through foreground pause, then recheck its route."""
@@ -777,7 +787,7 @@ class BackgroundConsciousness:
         model = self._model
 
         tools = self._tool_schemas()
-        _use_local_consciousness = os.environ.get("USE_LOCAL_CONSCIOUSNESS", "").lower() in ("true", "1")
+        _use_local_consciousness = runtime_setting("USE_LOCAL_CONSCIOUSNESS", "").lower() in ("true", "1")
         effort = resolve_effort("consciousness")
         total_cost = 0.0
         cost_final = True
@@ -820,6 +830,8 @@ class BackgroundConsciousness:
                     reasoning_effort=effort,
                     max_tokens=65536,
                     use_local=_use_local_consciousness,
+                    cache_affinity=getattr(self, "_wake_cache_affinity", ""),
+                    model_turn_state=getattr(self, "_model_turn_state", None),
                 )
                 route = usage.get("model_role_route") or {}
                 model, _use_local_consciousness = route.get("model", model), route.get("use_local", _use_local_consciousness)
@@ -1308,13 +1320,15 @@ class BackgroundConsciousness:
 
         timeout_sec = _get_tool_timeout(self._registry, fn_name, args)
         result = None
+        result_meta: Dict[str, Any] = {}
         error = None
         timed_out = False
 
         def _run_tool():
-            nonlocal result, error
+            nonlocal result, result_meta, error
             try:
-                result = self._registry.execute(fn_name, args)
+                produced = self._registry.execute_result(fn_name, args)
+                result, result_meta = produced.text, dict(produced.meta)
             except Exception as e:
                 error = e
 
@@ -1379,9 +1393,18 @@ class BackgroundConsciousness:
             if path is not None:
                 try:
                     raw = path.read_bytes()
-                    current = raw.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
-                    if str(result) == current and result_str == current:
-                        self._identity_source_reads[topic] = hashlib.sha256(raw).hexdigest()
+                    current = raw.decode("utf-8")
+                    ref = result_meta.get("knowledge_source") or {}
+                    start = result_meta.get("knowledge_body_start")
+                    size = result_meta.get("knowledge_body_chars")
+                    revision = hashlib.sha256(raw).hexdigest()
+                    if (result_meta.get("knowledge_source_complete") is True
+                            and type(start) is int and type(size) is int and start >= 0 and size == len(current)
+                            and ref.get("revision") == revision
+                            and pathlib.Path(ref.get("path", "")).resolve() == path.resolve()
+                            and len(result_str) >= start + size
+                            and result_str[start:start + size] == current):
+                        self._identity_source_reads[topic] = revision
                 except Exception:
                     pass
 

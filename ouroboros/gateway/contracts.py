@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
 
+from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
 from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetTab, WidgetsResponse
 from ouroboros.gateway.decision_contracts import DecisionRequest, DecisionResponse  # noqa: F401 -- public re-exports
 
@@ -128,6 +129,15 @@ class ChatOutbound(TypedDict):
     # A progress frame that carries the agent's display reasoning (its own
     # collapsed "Thinking" timeline line), not narration of what it did.
     reasoning: NotRequired[bool]
+    tool_calls: NotRequired[int]
+    rounds: NotRequired[int]
+    suggested_name: NotRequired[str]
+    model_execution: NotRequired[Dict[str, Any]]
+    quiz_id: NotRequired[str]
+    quiz_state: NotRequired[str]
+    project_chat_id: NotRequired[int]
+    source_status: NotRequired[str]
+    owner_wait_state: NotRequired[str]
     task_incident: NotRequired[str]
     # A cancellation fault names the PHYSICAL task it could not settle when that
     # differs from the displayed (logical) task id.
@@ -358,6 +368,7 @@ class QuizOption(TypedDict):
 
     label: str
     detail: NotRequired[str]
+    recommended: NotRequired[bool]
 
 
 class QuizOutbound(TypedDict):
@@ -422,9 +433,9 @@ class TypingOutbound(TypedDict):
     activity_id: NotRequired[str]
     client_message_id: NotRequired[str]
     phase: NotRequired[str]
-    # Stamped only for direct-registry-tracked turns ("direct_chat" /
-    # "ephemeral_decision"); queued managed tasks emit typing without it, so the
-    # client exempts their entries from /api/state snapshot deletion authority.
+    # Stamped for a registry-tracked turn ("direct_chat") or a RUNNING queue
+    # root ("managed_task"); empty for children. No in-repo client reads it
+    # (wire compatibility): only the census inserts into the header live-set.
     kind: NotRequired[str]
 
 
@@ -482,6 +493,8 @@ class MessageAnnotationOutbound(TypedDict):
     chat_id: NotRequired[int]
     target: NotRequired[str]
     target_label: NotRequired[str]
+    project_id: NotRequired[str]
+    project_chat_id: NotRequired[int]
     options: NotRequired[List[Dict[str, Any]]]
     attachment_manifest: NotRequired[List[AttachmentManifestEntry]]
     # #198: the exact refusal-attempt identity — the picker card composes its
@@ -552,6 +565,11 @@ class UpdateApplyErrorResponse(TypedDict):
     stash_note: NotRequired[str]
     estimated_wave_usd: NotRequired[Optional[float]]
     remaining_usd: NotRequired[Optional[float]]
+
+
+class UpdateProgressChangedOutbound(TypedDict):
+    """Invalidation only; never proof that boot finalization completed."""
+    type: Literal["update_progress_changed"]
 
 
 class UpdateStatusReadyOutbound(TypedDict):
@@ -706,6 +724,8 @@ class ActiveChatActivity(ActiveDirectTurn):
     both; managed rows carry an empty ``client_message_id``.
     """
 
+    required_question: NotRequired[Dict[str, Any]]
+
 
 class StateResponse(TypedDict):
     """Shape of ``GET /api/state`` (happy path)."""
@@ -753,6 +773,7 @@ class StateResponse(TypedDict):
     # tasks). Additive beside active_direct_turns, which stays unchanged for
     # compatibility; new clients hydrate from this field.
     active_chat_activities: NotRequired[List[ActiveChatActivity]]
+    active_chat_activities_complete: NotRequired[bool]
 
 
 class SettingsNetworkMeta(TypedDict):
@@ -779,12 +800,30 @@ class AvailableSubagentsSettingsMeta(TypedDict, total=False):
     candidate: Optional[Dict[str, Any]]
 
 
+class SettingsPolicyAxis(TypedDict, total=False):
+    """Configured/effective owner policy values shown by Settings."""
+
+    configured: str
+    effective: str
+    restart_required: bool
+    pending: bool
+    applies: Literal["restart", "next_task"]
+
+
+class SettingsPolicyState(TypedDict):
+    access: SettingsPolicyAxis
+    supervisor: SettingsPolicyAxis
+    review: SettingsPolicyAxis
+    running_task_snapshot: bool
+
+
 class SettingsMeta(SettingsNetworkMeta, total=False):
     """Complete ``GET /api/settings`` ``_meta`` block."""
 
     custom_secret_keys: list[str]
     setup_contract: Dict[str, Any]
     available_subagents: AvailableSubagentsSettingsMeta
+    policy_state: SettingsPolicyState
 
 
 class SettingsSaveResponse(TypedDict, total=False):
@@ -991,13 +1030,6 @@ class FileBrowserListResponse(TypedDict, total=False):
     root: str
     path: str
     entries: list[Dict[str, Any]]
-    error: str
-
-
-class ChatHistoryResponse(TypedDict, total=False):
-    messages: list[Dict[str, Any]]
-    has_more: bool
-    next_before_ts: str
     error: str
 
 
@@ -1453,6 +1485,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
     "projects_changed",
     "task_named",
     "update_status_ready",
+    "update_progress_changed",
 )
 
 
@@ -1486,6 +1519,7 @@ __all__ = [
     "UpdateApplySuccessResponse",
     "UpdateApplyErrorResponse",
     "UpdateStatusReadyOutbound",
+    "UpdateProgressChangedOutbound",
     "ProjectCreateRequest",
     "ProjectEntry",
     "ProjectDeleteResponse",
@@ -1501,6 +1535,8 @@ __all__ = [
     "EvolutionStateSnapshot",
     "SettingsNetworkMeta",
     "AvailableSubagentsSettingsMeta",
+    "SettingsPolicyAxis",
+    "SettingsPolicyState",
     "SettingsMeta",
     "SettingsSaveResponse",
     "OwnerRuntimeModeResponse",

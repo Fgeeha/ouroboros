@@ -31,6 +31,7 @@
  * @property {Array<number>} project_chat_ids  // complete (uncapped) project chat_ids — WS fan-out isolation SSOT (v6.32.0)
  * @property {Object<string, {project_id: string, chat_id: number}>} task_bindings  // bound task -> its project: suppress the stray "turn into project" button (v6.33.0 P2) + render a pointer that opens the project panel (v6.33.0 F4)
  * @property {ActiveDirectTurn[]=} active_direct_turns  // active direct/ephemeral chat turns snapshot
+ * @property {boolean=} active_chat_activities_complete
  * @property {ActiveChatActivity[]=} active_chat_activities  // combined snapshot: direct/ephemeral turns + root managed queue tasks
  */
 
@@ -49,13 +50,14 @@
 
 /**
  * @typedef {Object} ActiveChatActivity
+ * @property {Object=} required_question  // read-only pointer to the current required Project quiz
  * @property {Object.<string,Object>=} model_waits
  * @property {number=} task_attempt
  * @property {string} activity_id
  * @property {number} chat_id
  * @property {string} project_id
  * @property {string} client_message_id  // empty for managed queue rows
- * @property {string} kind  // direct_chat | ephemeral_decision | managed_task
+ * @property {string} kind  // direct_chat | managed_task — presentational label; membership in this census, not kind, decides liveness
  * @property {string} phase  // managed rows: queued | working | finalizing
  * @property {number} started_at
  */
@@ -129,6 +131,15 @@
  * @property {string[]=} custom_secret_keys
  * @property {Object=} setup_contract
  * @property {AvailableSubagentsSettingsMeta=} available_subagents
+ * @property {SettingsPolicyState=} policy_state
+ */
+
+/**
+ * @typedef {Object} SettingsPolicyState
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,restart_required:boolean,applies:string}} access
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,pending:boolean,applies:string,active_task_snapshot:boolean}} supervisor
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,pending:boolean,applies:string,active_task_snapshot:boolean}} review
+ * @property {boolean} running_task_snapshot
  */
 
 /**
@@ -234,6 +245,11 @@
 
 /**
  * @typedef {Object} ChatOutbound
+ * @property {string=} quiz_id
+ * @property {string=} quiz_state
+ * @property {number=} project_chat_id
+ * @property {string=} source_status
+ * @property {string=} owner_wait_state
  * @property {"chat"} type
  * @property {"user"|"assistant"|"system"} role
  * @property {string} content
@@ -247,6 +263,10 @@
  * @property {boolean=} reasoning
  *   A progress frame carrying the agent's display reasoning (rendered as its
  *   own collapsed "Thinking" timeline line), not narration of what it did.
+ * @property {number=} tool_calls
+ * @property {number=} rounds
+ * @property {string=} suggested_name
+ * @property {Object=} model_execution
  * @property {string=} task_phase
  *   "finalizing" on a root's early final answer: post-task synthesis still
  *   runs, so the frame is not the task's terminal conclusion.
@@ -382,7 +402,7 @@
  * @property {string=} activity_id
  * @property {string=} client_message_id
  * @property {string=} phase
- * @property {string=} kind  // stamped only for direct-registry-tracked turns; absent for queued managed tasks (snapshot has no deletion authority over them)
+ * @property {string=} kind  // direct_chat | managed_task, empty for children and untracked tasks; kept for wire compatibility, no in-repo client reads it. A typing frame is a submission receipt, never liveness: only the /api/state census inserts into the header live-set
  */
 
 /**
@@ -450,6 +470,7 @@
  * @typedef {Object} QuizOption
  * @property {string} label
  * @property {string=} detail
+ * @property {boolean=} recommended
  */
 
 /**
@@ -580,6 +601,8 @@
  * @property {string} action
  * @property {string=} target
  * @property {string=} target_label
+ * @property {string=} project_id
+ * @property {number=} project_chat_id
  * @property {string} status
  * @property {Array<Object>=} options
  * @property {AttachmentManifestEntry[]=} attachment_manifest
@@ -610,6 +633,8 @@
  * @typedef {Object} TaskOutcomeHistoryFields
  * @property {"working"|"done"|"warn"|"error"|"cancelled"=} outcome_phase  // canonical display phase; "working" is not terminal
  * @property {boolean=} outcome_final  // true only after the canonical task outcome settles; false marks a pre-finalization narrative
+ * @property {{status: string, phase: string, ts: string, provenance: string, model_execution?: Object}=} historical_terminal
+ * @property {Object=} model_execution
  */
 
 /**
@@ -748,7 +773,9 @@
  * @property {string=} payload_root
  * @property {string=} review_status
  * @property {boolean=} review_stale
- * @property {{status: string, stale: boolean, executable_review: boolean, blocking_reason: string, review_enforcement: string, summary: string, preflight_failed: (boolean|undefined), preflight_failed_stale: (boolean|undefined)}=} review_gate
+ * @property {{status: string, stale: boolean, executable_review: boolean, blocking_reason: string, review_enforcement: string, summary: string, author_accepted: (boolean|undefined), reviewed_content_hash: (string|undefined), author_disposition: (Object|undefined), preflight_failed: (boolean|undefined), preflight_failed_stale: (boolean|undefined)}=} review_gate
+ * @property {string=} reviewed_content_hash
+ * @property {Object=} author_disposition
  * @property {boolean=} executable_review
  * @property {string=} review_profile
  * @property {boolean=} official_hub_verified
@@ -1320,6 +1347,25 @@
  */
 
 /**
+ * Process-local execution observation on /api/update/status; not recovery authority.
+ * @typedef {Object} UpdateProgress
+ * @property {string} operation_id
+ * @property {string} generation
+ * @property {string} stage
+ * @property {string} started_at
+ * @property {string} stage_started_at
+ * @property {boolean} active
+ * @property {string} result
+ * @property {string} error
+ * @property {boolean} restart_required
+ */
+
+/**
+ * @typedef {Object} UpdateProgressChangedOutbound
+ * @property {'update_progress_changed'} type
+ */
+
+/**
  * @typedef {Object} UpdateStatusReadyOutbound
  * @property {'update_status_ready'} type
  * @property {boolean} available
@@ -1354,3 +1400,23 @@ export const MAX_QUIZ_OPTIONS = 6;
 // the card must not offer to send one.
 export const MAX_DECISION_COMMENT = 2000;
 export const GATEWAY_CONTRACT_VERSION = '7.0.0';
+
+/**
+ * @typedef {Object} ChatHistoryPosition
+ * @property {'chat'|'progress'} source
+ * @property {number} offset Physical byte offset in the retained source chain.
+ *
+ * @typedef {Object} ChatHistoryResponse
+ * @property {Array<Object>} messages Rows and hidden typed quiz/terminal replay evidence.
+ * @property {boolean} has_more Older bytes remain or a disclosed source gap prevents establishing EOF.
+ * @property {string|null} next_cursor Opaque room-bound older continuation.
+ * @property {string|null} page_cursor Replays a frozen page; null for an unavailable source boundary.
+ * @property {{complete:boolean,truncated_by:Array<string>}} window Whole-history coverage.
+ * @property {string} [next_before_ts] Legacy field retained for compatibility.
+ * @property {string} [error]
+ * @property {string} [reason_code]
+ *
+ * Physical messages and folded review attempts may additionally carry
+ * history_id:string and history_position:ChatHistoryPosition. They identify
+ * stored source records, never current task or review authority.
+ */

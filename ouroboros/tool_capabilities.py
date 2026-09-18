@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+
 # The delegation_role value background consciousness stamps on its shared tool
 # context before every tool call. Owner-delivery gating keys on it, so both
 # sides import this one name instead of repeating the literal.
@@ -9,6 +11,17 @@ BACKGROUND_DELEGATION_ROLE: str = "background"
 
 OWNER_DELIVERY_TOOL_NAMES: frozenset[str] = frozenset({
     "send_user_message", "send_photo", "send_video", "send_file", "send_links",
+})
+
+# One class: an actor's own memory. Reading and revising what I know about my
+# work and about the people I talk with is a cognitive capability of this mind,
+# not an authority over settings, delivery, or anything outside it. Every room
+# carries it — the main chat, a project room, and an admitted presence
+# conversation, whose ceiling compiles this set in
+# ouroboros/presence_authority.py::build_presence_capability_ceiling.
+COGNITIVE_MEMORY_TOOL_NAMES: frozenset[str] = frozenset({
+    "knowledge_read", "knowledge_write", "knowledge_list",
+    "update_scratchpad", "update_identity", "chat_history",
 })
 
 CORE_TOOL_NAMES: frozenset[str] = frozenset({
@@ -39,9 +52,8 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     # set today, this makes the coupling explicit).
     "list_projects", "route_to_project", "promote_chat_to_task", "steer_task",
     "ensure_project_scope",
-    "update_scratchpad", "update_identity",
-    "chat_history", "recent_tasks",
-    "knowledge_read", "knowledge_write", "knowledge_list",
+    *COGNITIVE_MEMORY_TOOL_NAMES,
+    "recent_tasks",
     "web_search",
     "browse_page", "browser_action", "analyze_screenshot", "view_image",
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
@@ -129,6 +141,24 @@ ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
     "list_available_tools",
 })
+
+def schema_selection_tools_for_context(ctx: object) -> frozenset[str]:
+    """Existing Nano view controls select schemas without granting capabilities."""
+    from ouroboros.config import get_context_mode
+
+    mode = str(getattr(ctx, "active_context_mode", "") or get_context_mode())
+    return META_TOOL_NAMES | {"compact_context"} if mode == "nano" else frozenset()
+
+
+def acting_tool_names_for_context(ctx: object, registered_names: Iterable[str]) -> frozenset[str]:
+    """Project the actual catalog; inherited acting labels do not veto Cyber."""
+    from ouroboros.config import get_runtime_mode
+    from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+
+    if mode_has_unrestricted_agency(get_runtime_mode()):
+        return frozenset(registered_names)
+    return ACTING_SUBAGENT_TOOL_NAMES | schema_selection_tools_for_context(ctx)
+
 
 READ_ONLY_PARALLEL_TOOLS: frozenset[str] = frozenset({
     "read_file", "list_files",

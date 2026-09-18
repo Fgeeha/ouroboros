@@ -177,8 +177,15 @@ def write_owner_message(
     kind: str = KIND_OWNER_TEXT,
     client_surface: Optional[Dict[str, Any]] = None,
     attachment_manifest: Optional[List[Dict[str, Any]]] = None,
+    client_message_id: str = "",
 ) -> bool:
-    """Write an owner message or typed control entry to a task's mailbox."""
+    """Write an owner message or typed control entry to a task's mailbox.
+
+    ``client_message_id`` is the owner message id this delivery relays, stored
+    (additively, like ``client_surface``) only when the writer knows it
+    STRUCTURALLY — never parsed back out of ``msg_id``, whose shape is a
+    transport key each producer composes for its own dedupe.
+    """
     path = _mailbox_path(drive_root, task_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     entry = {
@@ -187,6 +194,8 @@ def write_owner_message(
         "text": text,
         "kind": str(kind or KIND_OWNER_TEXT),
     }
+    if str(client_message_id or ""):
+        entry["client_message_id"] = str(client_message_id)
     if isinstance(client_surface, dict) and client_surface:
         # Owner Surface Fact (additive, like ``ts``): which client surface sent
         # this follow-up, so the loop can note a mid-task device change.
@@ -603,6 +612,11 @@ def drain_owner_entries(
                 # dead-wire class this sprint closes).
                 if isinstance(entry.get("client_surface"), dict) and entry.get("client_surface"):
                     drained["client_surface"] = dict(entry["client_surface"])
+                # Same explicit projection for the relayed owner-message id: the
+                # drain seam stamps it onto the turn's context, and a field left
+                # out here is a written fact nobody can read.
+                if str(entry.get("client_message_id") or ""):
+                    drained["client_message_id"] = str(entry["client_message_id"])
                 if isinstance(entry.get("attachment_manifest"), list):
                     drained["attachment_manifest"] = [
                         dict(item) for item in entry["attachment_manifest"]
@@ -685,15 +699,34 @@ def cleanup_task_mailbox(drive_root: pathlib.Path, task_id: str) -> None:
             log.debug("Failed to cleanup mailbox for task %s", task_id, exc_info=True)
 
 
+def settled_mailbox_cleanup_allowed(result: Dict[str, Any]) -> bool:
+    """A settled task still owns its mailbox while post-work or input copy is owed."""
+    from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    if str(result.get("status") or "") not in SETTLED_STATUSES:
+        return False
+    checkpoint = result.get("root_phase_checkpoint") or {}
+    promotion = result.get("child_ref_promotion") or {}
+    if not isinstance(checkpoint, dict) or not isinstance(promotion, dict):
+        return False
+    if post_task_synthesis_is_open(checkpoint.get("post_task_synthesis")):
+        return False
+    pending = promotion.get("pending_refs", [])
+    return isinstance(pending, list) and not any(
+        isinstance(ref, dict) and ref.get("kind") == "task_attachment"
+        for ref in pending
+    )
+
+
 def sweep_settled_owner_mailboxes(drive_root: pathlib.Path) -> Dict[str, Any]:
     """Startup sweep of mailboxes whose task died off the terminal paths (CPL4-C18).
 
     The only regular unlink is the task_done dispatch; a task that never
     reached it (crash, lost event, hard kill) leaked its mailbox forever.
-    A mailbox goes ONLY when the task's durable result is SETTLED — no result
-    or a non-terminal result keeps it (fail-closed: an undelivered owner
-    directive must survive any ambiguity). Lock sidecars are untouched
-    (self-healing by staleness).
+    A mailbox goes only after terminal file recovery, with a settled result,
+    settled post-task work and no pending input copy. No result keeps it.
+    Lock sidecars are untouched (self-healing by staleness).
     """
     report: Dict[str, Any] = {"removed": [], "kept": 0}
     mailbox_dir = pathlib.Path(drive_root) / _MAILBOX_DIR
@@ -712,10 +745,8 @@ def sweep_settled_owner_mailboxes(drive_root: pathlib.Path) -> Dict[str, Any]:
             continue  # not a task mailbox we can reason about: keep
         try:
             from ouroboros.task_results import load_task_result
-            from ouroboros.task_status import SETTLED_STATUSES
-
             result = load_task_result(pathlib.Path(drive_root), task_id) or {}
-            settled = str(result.get("status") or "") in SETTLED_STATUSES
+            settled = settled_mailbox_cleanup_allowed(result)
         except Exception:
             settled = False
         if not settled:

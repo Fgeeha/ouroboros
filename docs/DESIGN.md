@@ -160,6 +160,9 @@ never the field's only name. Help and validation belong to that field without
 changing the alignment of neighboring controls and their actions.
 
 Short fixed choices keep native selects, including the platform's own popup.
+A control never widens its column: a select shows its chosen label on one
+line, clipped at its own edge, and the full label stays in the platform's
+popup.
 Model selection uses the shared editable chooser: suggestions assist typing
 without becoming an allowlist. A saved unknown model remains editable; a
 catalog refresh preserves the real input, selection and composition. Escape
@@ -227,7 +230,13 @@ relabel the whole still-working task. A failed child keeps a compact factual
 authoritative status. Internal reason codes belong in details and diagnostics,
 not compact headlines. Where a card does show a cause, it says it in the owner's
 words while the record keeps the machine code; a cause with no sentence yet stays
-raw rather than borrowing a wrong one.
+raw rather than borrowing a wrong one. A terminal whose preserved output was
+never reviewed shows that output labelled rather than hidden: a short labelled
+excerpt beside the pointer to the full copy, so a `Failed` card over applied work
+is never a bare headline and never names preserved bytes without a way to reach
+them. Where a stop receipt already carries the same text
+in the very chat the card is written to, the card keeps the label and the
+pointer alone; a card in another chat keeps the excerpt.
 
 | Role | Foreground | Background | Border |
 | --- | --- | --- | --- |
@@ -293,6 +302,14 @@ not move them into the migrated set in section 8.
   visually grouped with their own rows, their own add action in the head
   (List editors, below). A heading that floats equidistant between two groups
   belongs to neither.
+- **A collapsed disclosure shows that it opens.** A `<details>` summary always
+  carries a visible open/closed marker — the native triangle, the `▸`/`▾`
+  glyph pair, or button/card chrome. A summary that sits beside a help line at
+  the same size takes control ink (`--text-primary`) and its own line, so it
+  does not read as one more note; a summary that already reads as a control
+  through its own chrome or placement may stay in meta ink. Overriding
+  `display` on a summary drops the native marker, so the glyph must be drawn
+  explicitly.
 - Spacing comes from the 8pt tokens (`--space-*`); a new visual dimension
   becomes a CSS variable before it becomes a page-local literal.
 - An item in a popup menu or a picker list highlights with
@@ -306,7 +323,8 @@ not move them into the migrated set in section 8.
 - **A markdown heading inside chat is a subsection label**, never a page
   title: in chat bubbles every heading level renders at `--type-body`
   semibold; in a task card's timeline it renders inline, without block
-  margins, at its row's own size. The page-size `md-h1` belongs to non-chat
+  margins, at its row's own size, with a copyable line break before the
+  following paragraph. The page-size `md-h1` belongs to non-chat
   surfaces only.
 - **A task card's summary outranks its details.** The latest-activity line is
   `--type-body`; collapsed timeline rows are a dense log at `--type-meta` in
@@ -335,14 +353,35 @@ not move them into the migrated set in section 8.
   facts, not a claim that their union is the current actor. Missing identity
   stays unconfirmed; marks and configured routes never manufacture execution.
 
+### History edges
+
+A paged transcript loads older portions automatically at the reading edge and
+keeps a keyboard-reachable `Load older messages` button that retries the same
+portion when reading fails. A short or empty portion never claims the beginning
+of the archive; only the source reader establishes that boundary, and an empty
+portion is never a reading position. Distant portions may leave the rendered
+window and return quietly as the reader nears the live edge. There is no
+`load newer` control: the one explicit return to the present is the floating
+`Scroll to latest message` button. An edge control states a fact about the
+rendered transcript, never about an internal cache or cursor. The visible
+passage, selected text, focused control and expanded Reviews retain their
+actual nodes.
+
 ### Project work pointer
 
 A Project keeps its conversation and real nested task cards. One compact pointer
 leads to an unfinished represented root, or the latest represented root when all
-are finished. It states `Loaded messages only` unless history coverage is complete;
-without a represented card it states that absence and has no action. Navigation
-moves the conversation to the existing card without changing the next message's
-recipient, opening another work pane or manufacturing activity.
+are finished. It occupies one line: it names the card (its coined name, else its
+title) and ellipsizes rather than restating a status headline in full, so the status bar
+never grows into the reading area; the complete text stays on the card itself,
+one click away, not in a mouse-only tooltip. A default desktop panel keeps the
+pointer, the coverage note and the status pill on one row while the pill is
+short (Online, Working, Thinking, Sending, Queued); a longer pill, a narrower
+panel or a phone wraps the bar to a second row, never a third. It states `Loaded messages only`
+unless history coverage is complete; without a represented card the pointer and
+that note are hidden, which is not a claim that the Project has no work.
+Navigation moves the conversation to the existing card without changing the next
+message's recipient, opening another work pane or manufacturing activity.
 
 ### List editors
 
@@ -446,6 +485,10 @@ element in the card shares one keyboard ring (2px `--focus-accent-border`,
 2px offset). Component geometry (card min/max width) keeps local literals like
 the rest of the chat surface.
 
+Required Project questions appear in Main as one neutral System pointer with `Open question`, then `View question` after the recorded answer or expiry. The form remains in Project. Missing source says `Question status unavailable`; resumed work without a recorded answer keeps neutral `Question in <Project>` wording. An explicit click reveals that exact question without toggling the room closed or moving the viewport on background updates.
+
+History with no current execution or known outcome keeps its expandable content under `Outcome unavailable`, without a task chip, typing or Stop. Before complete live-source reconciliation, it is `Activity unconfirmed`. Positive current activity restores only its proven controls. A delivery warning may coexist with a preserved task-acceptance PASS. Model metadata says `Last solve response`, naming the initial request only when the route changed.
+
 ### Subscription waits inside task cards
 
 Quota exhaustion and a confirmed need to sign in again use the same component,
@@ -546,11 +589,11 @@ instead, and let the status text carry the claim.
 Accounts is the common connection surface for subscriptions and API keys.
 Models and Agents edit assignments; adding a connection updates available
 choices without replacing an owner's assignments. A model role uses one compact
-Source / Model / Account row, with a single grouped source select. The account
-is a property of that role: Auto rotates compatible accounts and an explicit
-pin stays pinned. A model inherited from Main remains visibly inherited while
-its account can be pinned independently. Fallbacks use the same row in their
-saved order, with adjacent move/remove controls and the group's Add action.
+Source / Model / Account row. The account is a property of that role: Auto
+rotates compatible accounts and an explicit pin stays pinned. A model inherited
+from Main remains visibly inherited while its account can be pinned
+independently. Fallbacks use the same row in their saved order, with adjacent
+move/remove controls and the group's Add action.
 
 Context details distinguish the exact route's advertised Auto window from a
 manual value labelled "set by you". Changing an account withdraws the previous
@@ -560,19 +603,35 @@ caret in place and never assign a model. `model_roles.js` and `model_roles.css`
 own the shared Settings/wizard editor; `reviewer_slots.css` supplies the same
 reviewer-row layout to both documents.
 
-Available subagents and all review categories use the same grouped source
-choices and Source / Model / Account controls. Subscription model sources and
-agent sessions are distinct groups: neither implies the other's model inventory.
-Source ids are opaque; the model-sources catalog names the credential harness.
-Saved subscription-model account pins survive catalog gaps and unrelated saves;
-direct API-key models do not offer a subscription-account pin. Catalog entries
-are suggestions, not account-specific entitlement or context evidence.
-Changing a model or account never changes the delivery kind: a configured
-subagent reference remains a reference to its native inspection episode, while
-an inline packed-review model remains inline. Catalog refreshes preserve the
-edited value, focus, selection and scroll position.
-Returning to a reviewer's previous source restores that source's model/account
-draft; a source not previously selected starts without another source's pin.
+A source is chosen, never spelled. Every surface that assigns a model — the
+Models roles, Available subagents, every review lane, the first-run wizard and
+the quota-wait picker — offers one grouped source select with the same groups
+in the same order: configured subagents where references are allowed,
+Subscriptions · models, API keys (one entry per provider with a stored
+credential, then one disabled pointer to Accounts; a saved choice without a
+credential stays selectable as "(no key)"), Agents · sessions where a session
+is possible. The model chooser lists only the chosen source's catalog, so a
+suggestion's transport is the selected source; any id can still be typed. The
+stored spellings (`provider::model`, `claudexor::source=model`,
+`harness=model`) are serialization authored by the editor: never required from
+the owner, never a field placeholder or help-text instruction, never the
+primary displayed value; the exact stored id may appear in a meta line or
+tooltip. The route identity chip names the source (API · OpenAI, Codex · model,
+Claude Code · agent), not the channel alone. A last-run receipt is shown
+against the route that produced it: when the row's route changed since, the
+line says so and names the earlier route.
+
+Subscription model sources and agent sessions never imply each other's model
+inventory. Source ids are opaque; the model-sources catalog names the
+credential harness. Saved subscription-model account pins survive catalog gaps
+and unrelated saves; direct API-key models do not offer a subscription-account
+pin. Catalog entries are suggestions, not account-specific entitlement or
+context evidence. Changing a model or account never changes the delivery kind:
+a configured subagent reference remains a reference to its native inspection
+episode, while an inline packed-review model remains inline. Catalog refreshes
+preserve the edited value, focus, selection and scroll position. Returning to a
+reviewer's previous source restores that source's model/account draft; a source
+not previously selected starts without another source's pin.
 
 The wizard has five steps: Accounts, Models, Review, Budget, Summary. Agent
 connection is inside Accounts; Codex is the recommended connection for starting

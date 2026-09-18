@@ -454,7 +454,8 @@ def test_real_task_context_bootstraps_before_context_and_any_llm(monkeypatch, tm
     assert _ctx._nanny_delegate_baseline == {"round": 0, "cost": 0.0}
 
 
-def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monkeypatch, tmp_path):
+@pytest.mark.parametrize("geometry", [{}, {"directory_strategy": "copy", "scope_paths": ["output.bin"]}])
+def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monkeypatch, tmp_path, geometry):
     import ouroboros.subagent_runtime as runtime
 
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
@@ -474,6 +475,7 @@ def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monk
             "canonical_work_order": "OBJECTIVE\nBuild the patch",
             "work_order_fingerprint": "full-work-order-sha",
             "work_order_chars": 23,
+            **geometry,
         },
     )
 
@@ -486,6 +488,7 @@ def test_actor_first_delegate_start_binds_snapshot_and_canonical_work_order(monk
             "compiled_work_order": True,
             "work_order_fingerprint": "full-work-order-sha",
             "_coordination_context": "",
+            **geometry,
         },
     )]
 
@@ -1398,3 +1401,36 @@ def test_only_approved_restart_causes_reserve_and_abrupt_gap_vetoes(monkeypatch,
     monkeypatch.setattr(custody, "reconcile_task_runs", lambda *_a, **_k: [])
     assert recovery.pre_adopt_planned_handoffs(tmp_path, []) == set()
     assert recovery._read(tmp_path, "child1")["veto_reason"] == "restart_transaction_missing"
+
+
+def test_review_substrate_runs_never_occupy_the_actors_delegation_slot(tmp_path):
+    """I4: the replacement fence counts the ACTOR's own runs, not review runs."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_recovery import unsettled_start_ids
+
+    custody._CUSTODY.clear()
+    custody.record_started(tmp_path, custody.RunCustody(
+        run_id="run-review-open", task_id="actor1", route_id="codex",
+        source="review_substrate",
+    ))
+    captured = custody.RunCustody(
+        run_id="run-review-surface", task_id="actor1", route_id="codex",
+        source="review_substrate:plan_review", snapshot_id="snap-review",
+    )
+    custody.record_started(tmp_path, captured)
+    custody.emit(tmp_path, custody.SETTLED,
+                 {"run_id": "run-review-surface", "task_id": "actor1"})
+    custody.record_patch_captured(tmp_path, captured)
+    custody._CUSTODY.clear()
+
+    assert unsettled_start_ids(tmp_path, "actor1") == {
+        "open_run_ids": [],
+        "pending_invocation_ids": [],
+        "undisposed_patch_run_ids": [],
+    }
+
+    custody.record_started(tmp_path, custody.RunCustody(
+        run_id="run-mine", task_id="actor1", route_id="codex",
+    ))
+    custody._CUSTODY.clear()
+    assert unsettled_start_ids(tmp_path, "actor1")["open_run_ids"] == ["run-mine"]

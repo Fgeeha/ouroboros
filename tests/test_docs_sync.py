@@ -11,11 +11,20 @@ import pathlib
 import re
 
 from ouroboros.tools.registry import ToolRegistry
+from ouroboros.reference_books import (
+    BOOK_ENTRYPOINTS,
+    compose_book,
+    load_reference_book,
+    read_book_section,
+)
 
 REPO = pathlib.Path(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 
 def _read(rel: str) -> str:
+    book_id = next((key for key, path in BOOK_ENTRYPOINTS.items() if path == rel), None)
+    if book_id:
+        return compose_book(load_reference_book(REPO, book_id))
     return (REPO / rel).read_text(encoding="utf-8")
 
 
@@ -24,17 +33,27 @@ def _names_basename(text: str, basename: str) -> bool:
 
     The boundary is stated as "not a file-name character" rather than a list
     of allowed delimiters: the component map introduces modules after a space,
-    a backtick, a path separator AND an opening parenthesis (``(clawhub.py
+    a backtick AND an opening parenthesis (``(clawhub.py
     registry client``), so an allow-list of delimiters would report a module
     the document does name. What must NOT precede the basename is a character
     that could be part of a longer file name — a word character, a dot or a
     hyphen — which is exactly how ``test_s3_task_control_browser.py`` used to
     answer for ``browser.py``. A trailing word character is refused too, so
-    ``x.py`` never answers for ``x.pyi``.
+    ``x.py`` never answers for ``x.pyi``. A basename inside an explicit path
+    names that path only; the caller checks the full requested path separately.
+    Bare module-tree rows remain ambiguous when several modules share a name.
     """
     return re.search(
-        r"(?<![\w.\-])" + re.escape(basename) + r"(?!\w)", text
+        r"(?<![\w.\-/\\])" + re.escape(basename) + r"(?!\w)", text
     ) is not None
+
+
+def test_component_basename_does_not_borrow_another_explicit_path():
+    assert not _names_basename("`ouroboros/tools/knowledge.py`", "knowledge.py")
+    assert not _names_basename(r"`ouroboros\tools\knowledge.py`", "knowledge.py")
+    assert _names_basename("├── knowledge.py ← topic storage", "knowledge.py")
+    assert _names_basename("(clawhub.py registry client)", "clawhub.py")
+    assert not _names_basename("test_s3_task_control_browser.py", "browser.py")
 
 
 def test_the_domain_quotient_report_ends_without_a_blank_line():
@@ -79,8 +98,7 @@ def test_recent_abi_retirements_section_carries_the_abi_70_window():
     `RETIRED_COMMA_LIST_SETTING_KEYS` must be named there, because those are
     the ones whose migration must happen BEFORE the upgrade.
     """
-    arch = _read("docs/ARCHITECTURE.md")
-    section = arch.split("### 11.4 Recent ABI Retirements", 1)[1].split("\n## ", 1)[0]
+    section = _architecture_section("11.4 Recent ABI Retirements")
 
     from ouroboros.settings_defaults import RETIRED_COMMA_LIST_SETTING_KEYS
 
@@ -152,7 +170,7 @@ def test_settings_docs_name_every_key_owner_and_what_startup_persists():
               "review_model_routes", "runtime_limits", "settings_integrity")
     invariant = next(
         line for line in arch.splitlines()
-        if line.startswith("3. **Configuration and messaging have single owners.**")
+        if "**Configuration and messaging have single owners.**" in line
     )
     assert all(owner in invariant for owner in owners), invariant
     assert "exact settings and defaults live in" not in readme_flat
@@ -349,7 +367,7 @@ def test_consciousness_prompt_matches_scope_limited_contracts():
     assert "schedule subagents" in consciousness
     assert "wait on subagents" in consciousness
     assert "Update your scratchpad or identity" in consciousness
-    assert "Message the user proactively" in consciousness
+    assert "Write to my human proactively" in consciousness
     assert "recent_tasks" in consciousness
 
 
@@ -523,6 +541,7 @@ PROMPT_NON_TOOL_IDENTIFIERS = frozenset({
     # safety policy class names (ouroboros/safety.py TOOL_POLICY values) and
     # owner-setting values named as policy
     "check_conditional", "check", "off", "low",
+    "cyber_pro",
     # package managers / interpreters named as acquisition or process choices
     "pip", "pip3", "uv", "brew", "apt", "python", "python3", "sudo", "grep", "env",
     # git branches / remotes / skill buckets / write surfaces named as policy
@@ -632,7 +651,7 @@ DOC_RESIDUE_SKIPPED_SUBSECTIONS = {
 }
 
 
-def doc_residue_counts(rel: str, text: str) -> dict:
+def doc_residue_counts(rel: str, text: str, *, is_entrypoint: bool = True) -> dict:
     """Per-`## ` section counts of residue markers (see DOC_RESIDUE_PATTERNS)."""
     counts: dict = {}
     section = "(preamble)"
@@ -650,7 +669,7 @@ def doc_residue_counts(rel: str, text: str) -> dict:
             section, skipping = line.strip(), False
         if fence_lang is None and line.startswith("### "):
             skipping = any(name in line for name in skipped)
-        if skipping or (rel == "docs/ARCHITECTURE.md" and lineno == 1):
+        if skipping or (is_entrypoint and rel == "docs/ARCHITECTURE.md" and lineno == 1):
             continue
         for kind, pattern in DOC_RESIDUE_PATTERNS.items():
             hits = len(re.findall(pattern, line))
@@ -671,22 +690,24 @@ DOC_RESIDUE_BASELINE = {
 
 def test_resident_docs_residue_only_shrinks():
     for rel, baseline in DOC_RESIDUE_BASELINE.items():
-        current = doc_residue_counts(rel, _read(rel))
-        for section, counts in current.items():
-            allowed = baseline.get(section, {})
-            for kind, hits in counts.items():
-                assert hits <= allowed.get(kind, 0), (
-                    f"{rel} {section!r}: {kind} residue grew to {hits} (baseline "
-                    f"{allowed.get(kind, 0)}); replace the node's description instead of "
-                    "appending history (DEVELOPMENT.md 'Documentation contract')"
-                )
+        book_id = next(key for key, path in BOOK_ENTRYPOINTS.items() if path == rel)
+        book = load_reference_book(REPO, book_id)
+        for source in (book.entrypoint, *book.chapters):
+            # Scan each physical body once, so a chapter's H1 cannot inherit
+            # the prior file's skipped subsection or fenced-example state.
+            current = doc_residue_counts(rel, source.text, is_entrypoint=source.source_path == rel)
+            for section, counts in current.items():
+                allowed = baseline.get(section, {})
+                for kind, hits in counts.items():
+                    assert hits <= allowed.get(kind, 0), (
+                        f"{source.source_path} {section!r}: {kind} residue grew to {hits} (baseline "
+                        f"{allowed.get(kind, 0)}); replace the node's description instead of "
+                        "appending history (DEVELOPMENT.md 'Documentation contract')"
+                    )
 
 
-def _architecture_section(text: str, heading_prefix: str) -> str:
-    lines = text.split("\n")
-    start = next(i for i, l in enumerate(lines) if l.startswith(heading_prefix))
-    end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("## ")), len(lines))
-    return "\n".join(lines[start:end])
+def _architecture_section(title: str) -> str:
+    return read_book_section(load_reference_book(REPO, "architecture"), title).text
 
 
 def test_architecture_endpoint_table_mirrors_route_registries(tmp_path):
@@ -695,7 +716,7 @@ def test_architecture_endpoint_table_mirrors_route_registries(tmp_path):
     from ouroboros.gateway.endpoint_index import HTTP_ENDPOINTS
     from ouroboros.gateway import files as gateway_files
 
-    section = _architecture_section(_read("docs/ARCHITECTURE.md"), "## 4.")
+    section = _architecture_section("4. Server API Endpoints")
     rows = re.findall(r"^\| (GET|POST|PUT|PATCH|DELETE|ANY|WS|STATIC) \| `([^`]+)` \|", section, re.M)
     host_prefix = "127.0.0.1:${OUROBOROS_HOST_SERVICE_PORT:-8767}"
     documented_public = {f"{m} {p}" for m, p in rows if not p.startswith(host_prefix)}
@@ -752,7 +773,7 @@ SETTINGS_TABLE_ENV_ONLY_ROWS = frozenset({
     "OUROBOROS_PRESENTATION", "OUROBOROS_USER_FILES_ROOT", "OUROBOROS_OBSERVABILITY_KEEP_RAW",
     "OUROBOROS_OBSERVABILITY_RETENTION_DAYS", "OUROBOROS_REVIEW_MODEL_TIMEOUT_SEC",
     "OUROBOROS_REVIEW_MAX_TOKENS", "OUROBOROS_PREFLIGHT_TIMEOUT_SEC", "OUROBOROS_PREFLIGHT_SERIAL",
-    "OUROBOROS_BUNDLE_DIR",
+    "OUROBOROS_PREFLIGHT_TEST_WORKERS", "OUROBOROS_BUNDLE_DIR",
 })
 SETTINGS_TABLE_RETIRED_ROWS = frozenset({"OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"})
 
@@ -772,8 +793,7 @@ def test_architecture_settings_table_mirrors_config_defaults():
     lever or retired alias."""
     from ouroboros import config
 
-    section = _architecture_section(_read("docs/ARCHITECTURE.md"), "## 7.")
-    table = section[section.index("### Default settings"):]
+    table = _architecture_section("Default settings")
     rows = re.findall(r"^\| ([A-Z][A-Z0-9_]+) \| ([^|]*?) \|", table, re.M)
     keys = [k for k, _ in rows]
     assert len(keys) == len(set(keys)), f"duplicate settings rows: {sorted(k for k in set(keys) if keys.count(k) > 1)}"

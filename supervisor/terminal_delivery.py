@@ -71,19 +71,13 @@ _HOST_SALVAGE_RECEIPT = (
 def cleanup_settled_owner_mailbox(
     drive_root: Any, task_id: str, task: Optional[Dict[str, Any]] = None,
 ) -> None:
-    """Keep model-wait choices until the canonical post-task phase settles."""
-    from ouroboros.owner_mailbox import cleanup_task_mailbox
-    from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
+    """Release the execution mailbox only after its canonical obligations settle."""
+    from ouroboros.owner_mailbox import cleanup_task_mailbox, settled_mailbox_cleanup_allowed
     from ouroboros.task_results import load_task_result
-    from ouroboros.task_status import SETTLED_STATUSES
     from supervisor.queue import _task_drive_for_task
 
     durable = load_task_result(pathlib.Path(drive_root), str(task_id)) or {}
-    pending = (durable.get("child_ref_promotion") or {}).get("pending_refs", [])
-    if any(isinstance(ref, dict) and ref.get("kind") == "task_attachment" for ref in pending):
-        return  # Accepted inputs still need this mailbox as their retry source.
-    post_status = (durable.get("root_phase_checkpoint") or {}).get("post_task_synthesis")
-    if str(durable.get("status") or "") in SETTLED_STATUSES and not post_task_synthesis_is_open(post_status):
+    if settled_mailbox_cleanup_allowed(durable):
         cleanup_task_mailbox(_task_drive_for_task(task or durable, str(task_id)), str(task_id))
 
 
@@ -692,6 +686,8 @@ def build_completed_result_event(
     chat_id = lineage_chat_id(pathlib.Path(drive_root), task_row, tid)
     if not tid or not core_text or not chat_id:
         return None
+    from ouroboros.task_finalization import terminal_host_notice_text
+
     event = {
         "type": "send_message",
         "chat_id": chat_id,
@@ -701,7 +697,8 @@ def build_completed_result_event(
         # copy that drops the format renders as a different message.
         "format": "markdown",
         "delivery_id": delivery_id_for(tid, core_text),
-        **({"terminal_host_notice": stored["terminal_host_notice"]} if (stored or {}).get("terminal_host_notice") else {}),
+        **({"terminal_host_notice": terminal_host_notice_text(stored or {})}
+           if terminal_host_notice_text(stored or {}) else {}),
     }
     return project_terminal_result_event(
         pathlib.Path(drive_root), task_row, tid,
@@ -1299,6 +1296,8 @@ def _persist_cancel_receipt(
                 return None  # no durable row yet — never mint a block-only file
             merged = dict(current.get("cancel_receipt") or {}) if isinstance(
                 current.get("cancel_receipt"), dict) else {}
+            if block["delivery_id"] != merged.get("delivery_id"):
+                merged.pop("delivered_chat_id", None)
             for key, value in block.items():
                 if (
                     key == "salvage"
@@ -1318,6 +1317,30 @@ def _persist_cancel_receipt(
         update_json_locked(task_result_path(pathlib.Path(drive_root), tid), _mutate)
     except Exception:
         log.debug("cancel-receipt persistence failed for %s", tid, exc_info=True)
+
+
+def record_cancel_receipt_delivery(
+    drive_root: Any, task_id: str, delivery_id: str, chat_id: int,
+) -> None:
+    """Record the actual sent destination on the matching existing receipt.
+
+    This write is separate from delivery registration. A failed write leaves
+    destination evidence unknown; it never authorizes suppressing an excerpt.
+    """
+    try:
+        from ouroboros.task_results import task_result_path
+
+        def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+            receipt = current.get("cancel_receipt")
+            if (str(current.get("task_id") or "") != task_id
+                    or not isinstance(receipt, dict)
+                    or not delivery_id or receipt.get("delivery_id") != delivery_id):
+                return None
+            return {**current, "cancel_receipt": {**receipt, "delivered_chat_id": chat_id}}
+
+        update_json_locked(task_result_path(pathlib.Path(drive_root), task_id), _mutate)
+    except Exception:
+        log.debug("cancel-receipt delivery evidence failed for %s", task_id, exc_info=True)
 
 
 def build_unreviewed_salvage_event(

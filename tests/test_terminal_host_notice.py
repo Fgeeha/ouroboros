@@ -31,6 +31,9 @@ def test_equal_evidence_fields_cannot_revive_changed_owner_authority(tmp_path, m
         tools._ctx._task_acceptance_owner_generation = 1
         tools._ctx.owner_message_admission_agent = SimpleNamespace(_owner_message_generation=2)
     elif change == "superseded":
+        # The release notification follows real ingress; it is no longer a
+        # declaration that the task's meaning changed by itself.
+        tools._ctx._owner_directives = [{"content": "Use the newly supplied source."}]
         loop._supersede_task_acceptance_for_owner_followup(tools._ctx, trace)
     else:
         prior["superseded_by_revision"] = True
@@ -109,6 +112,31 @@ def test_host_notice_does_not_replace_or_supersede_an_unchanged_answer(tmp_path,
     assert not trace["review_runs"][0].get("superseded_by_revision")
     assert trace["acceptance_decision"]["status"] == ("accepted" if verdict == "PASS" else "finalized_unaccepted")
 
+    # #533: transport/finalization warning must not erase the bound assessment.
+    from ouroboros.outcomes import derive_loop_outcome, normalize_outcome_axes, public_task_result
+    from ouroboros.task_results import load_task_result
+
+    trace["delivery_candidate"].update(degraded=True, degraded_reason="advisory_plan_review_open")
+    usage = {"terminal_host_notice": NOTICE}
+    axes = derive_loop_outcome(ANSWER, usage, trace)["outcome_axes"]
+    expected = "pass" if verdict == "PASS" else "fail"
+    assert axes["objective"]["status"] == expected
+    assert axes["objective"]["source"] == "task_acceptance_review"
+    assert axes["execution"]["status"] == "degraded"
+    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path)
+    task = {"id": "parent1", "type": "task", "chat_id": 1, "text": "Produce a report",
+            "task_contract": tools._ctx.task_contract, "_skip_post_task_synthesis": True}
+    pipeline._store_task_result(env, task, ANSWER, usage, trace)
+    stored = load_task_result(tmp_path, "parent1")
+    assert stored["outcome_axes"]["objective"]["status"] == expected
+    assert normalize_outcome_axes(public_task_result(stored))["objective"]["source"] == "task_acceptance_review"
+    pending = []
+    pipeline.emit_task_results(env, None, None, pending, task, ANSWER, usage, trace,
+                              start_time=0.0, drive_logs=tmp_path / "logs")
+    terminal = next(row for row in pending if row["type"] == "task_done")
+    assert terminal["outcome_axes"]["objective"]["status"] == expected
+    assert load_task_result(tmp_path, "parent1")["outcome_axes"]["execution"]["status"] == "degraded"
+
     # Real input changes still supersede the binding even when answer bytes match.
     tools._ctx._owner_directives = [{"text": "Use the newly supplied source."}]
     changed = loop._replace_delivery_candidate(tools, ctx, trace, ANSWER, control="candidate")
@@ -117,7 +145,7 @@ def test_host_notice_does_not_replace_or_supersede_an_unchanged_answer(tmp_path,
     assert trace["review_runs"][0]["superseded_by_revision"] is True
 
 
-def _emit_terminal(tmp_path, monkeypatch, *, ephemeral=False, project=False, child=False, notice=NOTICE, answer=ANSWER):
+def _emit_terminal(tmp_path, monkeypatch, *, direct=False, project=False, child=False, notice=NOTICE, answer=ANSWER):
     from ouroboros.task_finalization import set_terminal_host_notice
 
     monkeypatch.setattr(pipeline, "_run_post_task_processing_async", lambda *_a, **_kw: None)
@@ -130,8 +158,8 @@ def _emit_terminal(tmp_path, monkeypatch, *, ephemeral=False, project=False, chi
         row = create_project(tmp_path, "notice-project", name="Research")
         bind_task_to_project(tmp_path, task["id"], row["id"], row["chat_id"], origin={"absent": "system"})
         task.update(project_id=row["id"], chat_id=row["chat_id"])
-    if ephemeral:
-        task.update(_ephemeral_turn=True, _is_direct_chat=True)
+    if direct:
+        task.update(_is_direct_chat=True)
     usage = {"terminal_origin": "model_final"}
     set_terminal_host_notice(usage, notice)
     pending = []
@@ -295,25 +323,22 @@ def test_child_notice_hash_extension_preserves_legacy_hash_and_telemetry_exclusi
         assert _child_result_sha256({**row, **telemetry}) == _child_result_sha256(row)
 
 
-@pytest.mark.parametrize("ephemeral", [False, True])
+@pytest.mark.parametrize("direct", [False, True])
 @pytest.mark.parametrize("project", [False, True])
-def test_notice_is_a_system_row_live_and_on_history_replay(tmp_path, monkeypatch, ephemeral, project):
+def test_notice_is_a_system_row_live_and_on_history_replay(tmp_path, monkeypatch, direct, project):
     from ouroboros.gateway.history import make_chat_history_endpoint
     from ouroboros.utils import append_jsonl
     from supervisor import events_chat_delivery as delivery, message_bus
     from supervisor.terminal_delivery import build_completed_result_event, pending_deliveries
 
-    task, event = _emit_terminal(tmp_path, monkeypatch, ephemeral=ephemeral, project=project)
+    task, event = _emit_terminal(tmp_path, monkeypatch, direct=direct, project=project)
     assert event["text"] == event["log_text"] == ANSWER
-    if not ephemeral:
-        stored = load_task_result(tmp_path, task["id"])
-        assert stored["result"] == ANSWER and stored["terminal_host_notice"] == NOTICE
-        replay = build_completed_result_event(tmp_path, task, task["id"], stored)
-        assert replay["text"] == ANSWER and replay["terminal_host_notice"] == NOTICE
-        assert replay["delivery_id"] == event["delivery_id"]
-        assert pending_deliveries(tmp_path)[0]["terminal_host_notice"] == NOTICE
-    else:
-        assert load_task_result(tmp_path, task["id"]) is None
+    stored = load_task_result(tmp_path, task["id"])
+    assert stored["result"] == ANSWER and stored["terminal_host_notice"] == NOTICE
+    replay = build_completed_result_event(tmp_path, task, task["id"], stored)
+    assert replay["text"] == ANSWER and replay["terminal_host_notice"] == NOTICE
+    assert replay["delivery_id"] == event["delivery_id"]
+    assert pending_deliveries(tmp_path)[0]["terminal_host_notice"] == NOTICE
 
     bridge = message_bus.LocalChatBridge({})
     frames = []
@@ -327,8 +352,7 @@ def test_notice_is_a_system_row_live_and_on_history_replay(tmp_path, monkeypatch
     ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl,
                           send_with_budget=message_bus.send_with_budget)
     delivery._handle_send_message(event, ctx)
-    if not ephemeral:  # A transient turn has no terminal outbox identity of its own.
-        delivery._handle_send_message(event, ctx)
+    delivery._handle_send_message(event, ctx)
     chats = [row for row in frames if row.get("type") == "chat"]
     assert [(row["role"], row["content"]) for row in chats] == [("assistant", ANSWER), ("system", NOTICE)]
     assert all(row["chat_id"] == task["chat_id"] for row in chats)

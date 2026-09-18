@@ -31,6 +31,12 @@ from typing import Any, Dict, Literal, Optional, Tuple
 # effort. Crossing T never creates a task failure.
 OWNER_LOW_TARGET_TOKENS = 200_000
 
+# Nano's owner-selected total window and free input headroom. The send boundary
+# chooses the largest output allowance up to the caller's existing ceiling;
+# the headroom is a minimum, never a fixed generation cap.
+OWNER_NANO_TARGET_TOKENS = 81_920
+NANO_MIN_HEADROOM_TOKENS = 8_192
+
 # One overflow vocabulary for every seam that must recognize a CONTEXT-WINDOW
 # overflow (Main provider-code precedence, the local transport, and the
 # summarizer split path). A provider code or message shape added here reaches
@@ -91,6 +97,7 @@ MeasurementBasis = Literal["fresh_route_usage", "fresh_model_usage", "cold_estim
 ReclaimStatus = Literal[
     "applied", "no_eligible", "no_positive_reclaim", "checkpoint_failed",
     "summarizer_failed", "no_measurable_shrink", "binding_mismatch",
+    "no_op", "fit_rejected", "source_unavailable",
 ]
 
 
@@ -103,6 +110,11 @@ class ContextReclaimRequest:
     measurement_density: float
     reclaim_goal_tokens: int
     allow_partial_shrink: bool = True
+    working_note: Optional[str] = None
+    expected_view_revision: str = ""
+    keep_unit_ids: Optional[Tuple[str, ...]] = None
+    restore_unit_refs: Tuple[Dict[str, Any], ...] = ()
+    schema_names: Optional[Tuple[str, ...]] = None
 
 
 @dataclass(frozen=True)
@@ -116,6 +128,13 @@ class ContextReclaimReceipt:
     goal_reached: bool
     checkpoint_ref: Optional[Dict[str, Any]]
     capsule_refs: Tuple[Dict[str, Any], ...]
+    observed_view_revision: str = ""
+    view_revision: str = ""
+    retained_unit_ids: Tuple[str, ...] = ()
+    restored_unit_refs: Tuple[Dict[str, Any], ...] = ()
+    source_refs: Tuple[Dict[str, Any], ...] = ()
+    schema_names: Optional[Tuple[str, ...]] = None
+    fit: Optional[Dict[str, Any]] = None
 
 
 class SummarizerContextOverflow(RuntimeError):
@@ -237,10 +256,12 @@ SCRATCHPAD_MAX_CONTENT_CHARS = 60_000
 # starving concurrent workers (the 2026-07-23 lock-timeout incident). Warn at
 # exactly that measured degradation point. Since CPL4-C6, size-triggered
 # compaction (config.USAGE_LEDGER_COMPACT_BYTES, usage_compaction.py) should
-# hold the file far below this — like the rotation-log warns, this fires only
-# if compaction is broken, the unfoldable residue itself grows this large, or
-# the lock directory takes no kernel locks and compaction refuses on the name
-# tier (typed usage_ledger_compaction_refused event, once per process).
+# hold the file far below this. Growth can reflect a large unfoldable residue
+# or compaction that is broken, refused, or skipped. The name tier (no kernel
+# locks) emits usage_ledger_compaction_refused once per process per data root;
+# a policy abort (_Abort) emits usage_ledger_compaction_skipped once per process
+# per (data root, reason). The two snapshot-race exits before archive/swap only
+# log warnings, without a typed event.
 USAGE_LEDGER_WARN_BYTES = 20_000_000
 # events/tools/supervisor/task_reflections logs are ROTATION-BOUNDED since the
 # CPL4-C1..C4 rotation train (same 800KB rotator and supervisor tick as
@@ -283,6 +304,9 @@ CHAT_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
 # archives stay durable history (never GC'd), so the remediation is chain
 # indexing/compaction, never deletion.
 EVENTS_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
+# Warn before the observed 242-of-253 retained-drive corpus becomes routine;
+# count only direct children because startup health is an interactive path.
+RETAINED_EXECUTION_DRIVES_WARN_COUNT = 200
 
 
 def estimate_message_chars(messages: Any) -> int:

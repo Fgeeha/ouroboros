@@ -166,7 +166,7 @@ def _advisory_child_timeout(ctx: object) -> Optional[float]:
 
 def _run_advisory_native(
     prompt: str, repo_dir: pathlib.Path, ctx: ToolContext, slot, model: str,
-    mandatory_read_corpus_chars: int = 0,
+    mandatory_read_corpus_chars: int = 0, task_evidence: Optional[dict] = None,
 ):
     """The advisory as a bounded native inspection episode, rehydrated into the
     same result structure the retired SDK path produced (only the transport
@@ -193,8 +193,12 @@ def _run_advisory_native(
         str(_task_metadata.get("deadline_at") or "")
         if isinstance(_task_metadata, dict) else ""
     )
+    from ouroboros.review_evidence import commit_review_evidence_refs
+    evidence = task_evidence or {}
     request = ReviewRequest(
         surface="advisory_review",
+        evidence={"task_execution": evidence} if evidence else {},
+        evidence_refs=commit_review_evidence_refs(evidence),
         goal="Advisory pre-review of the live worktree.",
         task_id=str(getattr(ctx, "task_id", "") or ""),
         session_root=str(repo_dir),
@@ -207,6 +211,8 @@ def _run_advisory_native(
         no_proxy=True,
         deadline_at=deadline_at,
     )
+    if evidence:
+        request.policy["native_data_root"] = evidence["data_root"]
     # The dispatch builder for api_chat rows (`use_local` off the resolved
     # route): the bound previewed below and the episode's window are ONE route.
     rslot = _dc_replace(
@@ -763,6 +769,16 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
     one unbindable case stays as before: an uncomputable current hash cannot
     establish a mismatch either way.
     """
+    from ouroboros.tools.review_helpers import review_enforcement_blocks
+
+    if not review_enforcement_blocks("blocking"):
+        return (
+            f"Cyber Pro: preflight status={getattr(latest, 'status', 'missing')}; "
+            f"stale={bool(stale_from_edit or not effective_is_fresh)}. "
+            "Ouroboros decides whether to continue or request more feedback. "
+            "Original findings, missing evidence and pending operations remain recorded; this is not a PASS."
+        )
+
     def _debt_hint() -> str:
         parts = []
         if open_obs:
@@ -1181,6 +1197,9 @@ def _handle_advisory_pre_review(
             return counters
         return f"{changed_files.count(chr(10)) + 1} file(s) changed"
 
+    from ouroboros.review_evidence import capture_commit_review_evidence
+    task_evidence = (dict(getattr(ctx, "_commit_review_evidence", None) or {}) if prepared
+                     else capture_commit_review_evidence(ctx)) if not resuming else {}
     import time as _time
     _advisory_start = _time.monotonic()
     items, raw_result, model_used, prompt_chars = _run_claude_advisory(
@@ -1191,7 +1210,8 @@ def _handle_advisory_pre_review(
         scope=scope,
         paths=paths,
         options={"drive_root": drive_root, "review_rebuttal": review_rebuttal,
-                 "execution": execution, "snapshot_hash": snapshot_hash},
+                 "execution": execution, "snapshot_hash": snapshot_hash,
+                 "task_evidence": task_evidence, "owns_task_evidence": not prepared},
     )
     _advisory_duration = _time.monotonic() - _advisory_start
     advisory_meta = dict(getattr(ctx, "_last_claude_advisory_meta", {}) or {})

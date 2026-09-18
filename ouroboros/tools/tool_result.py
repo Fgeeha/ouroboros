@@ -268,7 +268,7 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
             "blocked",
             "light_mode_blocked",
             "warning",
-            "use advanced or pro mode for repository writes",
+            "use advanced, pro, or cyber_pro mode for repository writes",
         ),
         "WORKSPACE_GIT_REF_CHANGED": _code_spec(
             "blocked",
@@ -714,9 +714,13 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         # abandoned call's void result is the call's own timeout; the
         # hung-session backlog refusal is browser unavailability.
         "BROWSER_SESSION_RETIRED": "TOOL_TIMEOUT",
+        "BROWSER_ACTION_OUTCOME_UNKNOWN": "TOOL_ERROR",
         "BROWSER_BACKLOG_RETIRED_SESSIONS": "LEGACY_UNAVAILABLE",
         "TOOL_ARG_ERROR": "TOOL_ARG_ERROR",
         "INVALID_ARG": "TOOL_ARG_ERROR",
+        "CHILD_RESULT_DISPOSITION_INVALID": "TOOL_ARG_ERROR",
+        "STEER_REJECTED": "TOOL_REPORTED_FAILURE",
+        "STEER_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
         "TOOL_ERROR": "TOOL_ERROR",
         "TOOL_INTERNAL_ERROR": "TOOL_INTERNAL_ERROR",
         "EXECUTOR_UNAVAILABLE": "LEGACY_UNAVAILABLE",

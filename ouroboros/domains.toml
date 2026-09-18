@@ -31,6 +31,11 @@
 # context instead of adding an attempt ledger (D09 -> D16). These dependencies
 # implement the accepted shared-wait contract; they add no cycle group.
 
+# Reference books describe physical Markdown sources and composition only, with no
+# cognitive policy or LLM state; their shared reader belongs to D18. Light memory
+# operations reuse the existing file/source reader (D15 -> D05) rather than
+# inventing a second parser, source resolver or review-coverage store.
+
 [meta]
 reference_tree = "ouroboros_v7_wip @ 9f691656e7e756c483f72ef549418c0e7a1b8054 (frozen)"
 population_rule = "git-tracked *.py under ouroboros/ and supervisor/, plus server.py and launcher.py"
@@ -80,6 +85,7 @@ D20 = "Presence"
 "ouroboros/capability_evidence.py" = "D03"
 "ouroboros/claudexor_daemon.py" = "D07"
 "ouroboros/claudexor_runtime.py" = "D07"
+"ouroboros/claudexor_startup_failure.py" = "D07"
 "ouroboros/cli.py" = "D18"
 "ouroboros/client_surface.py" = "D11"
 "ouroboros/code_intelligence.py" = "D05"
@@ -96,6 +102,9 @@ D20 = "Presence"
 "ouroboros/configured_subagents.py" = "D07"
 "ouroboros/consciousness.py" = "D15"
 "ouroboros/consolidator.py" = "D15"
+"ouroboros/knowledge.py" = "D15"
+"ouroboros/markdown_source.py" = "D18"
+"ouroboros/reference_books.py" = "D18"
 "ouroboros/context.py" = "D03"
 "ouroboros/context_runtime_facts.py" = "D03"
 "ouroboros/context_budget.py" = "D03"
@@ -138,6 +147,7 @@ D20 = "Presence"
 "ouroboros/delegate_terminal.py" = "D07"
 "ouroboros/deliverables_paths.py" = "D17"
 "ouroboros/depth_evidence.py" = "D07"
+"ouroboros/dialogue_evidence.py" = "D06"
 "ouroboros/dialogue_provenance.py" = "D15"
 "ouroboros/event_bus.py" = "D14"
 "ouroboros/evolution_checkpoints.py" = "D15"
@@ -163,12 +173,15 @@ D20 = "Presence"
 "ouroboros/gateway/claudexor_quota.py" = "D11"
 "ouroboros/gateway/contracts.py" = "D11"
 "ouroboros/gateway/control.py" = "D11"
+"ouroboros/gateway/update_progress.py" = "D11"
 "ouroboros/gateway/cost_breakdown.py" = "D11"
 "ouroboros/gateway/extensions.py" = "D11"
 "ouroboros/gateway/widgets.py" = "D11"
 "ouroboros/gateway/extension_receipts.py" = "D11"
 "ouroboros/gateway/files.py" = "D11"
 "ouroboros/gateway/history.py" = "D11"
+"ouroboros/gateway/history_paging.py" = "D11"
+"ouroboros/gateway/history_contracts.py" = "D11"
 "ouroboros/gateway/host_service.py" = "D11"
 "ouroboros/gateway/logs.py" = "D11"
 "ouroboros/gateway/marketplace.py" = "D11"
@@ -198,6 +211,7 @@ D20 = "Presence"
 "ouroboros/headless.py" = "D17"
 "ouroboros/headless_status.py" = "D17"
 "ouroboros/workspace_patch_capture.py" = "D17"
+"ouroboros/workspace_file_outputs.py" = "D17"
 "ouroboros/improvement_backlog.py" = "D15"
 "ouroboros/launcher_bootstrap.py" = "D18"
 "ouroboros/launcher_onboarding.py" = "D12"
@@ -216,7 +230,9 @@ D20 = "Presence"
 "ouroboros/llm_routing.py" = "D02"
 "ouroboros/llm_observability.py" = "D02"
 "ouroboros/llm_probe.py" = "D02"
+"ouroboros/llm_stream.py" = "D02"
 "ouroboros/local_model.py" = "D02"
+"ouroboros/local_model_server.py" = "D02"
 "ouroboros/local_model_autostart.py" = "D02"
 "ouroboros/loop.py" = "D01"
 "ouroboros/loop_acceptance.py" = "D01"
@@ -374,6 +390,7 @@ D20 = "Presence"
 "ouroboros/subagent_runtime.py" = "D07"
 "ouroboros/subagent_work_order.py" = "D07"
 "ouroboros/subagent_worktrees.py" = "D07"
+"ouroboros/delegate_directory.py" = "D07"
 "ouroboros/subagents.py" = "D07"
 "ouroboros/subagent_route_health.py" = "D07"
 "ouroboros/subscription_install_presets.py" = "D12"
@@ -436,11 +453,13 @@ D20 = "Presence"
 "ouroboros/tools/media.py" = "D05"
 "ouroboros/tools/memory_tools.py" = "D15"
 "ouroboros/tools/parallel_review.py" = "D06"
+"ouroboros/tools/plan_dialogue.py" = "D06"
 "ouroboros/tools/plan_evidence.py" = "D06"
 "ouroboros/tools/plan_packet.py" = "D06"
 "ouroboros/tools/plan_render.py" = "D06"
 "ouroboros/tools/plan_review.py" = "D06"
 "ouroboros/tools/plan_review_artifacts.py" = "D06"
+"ouroboros/tools/plan_review_collect.py" = "D06"
 "ouroboros/tools/plan_review_references.py" = "D06"
 "ouroboros/tools/plan_review_runtime.py" = "D06"
 "ouroboros/tools/plan_spec.py" = "D06"
@@ -494,6 +513,7 @@ D20 = "Presence"
 "ouroboros/tools/vision.py" = "D05"
 "ouroboros/tools/vision_process.py" = "D05"
 "ouroboros/tools/write_shape.py" = "D13"
+"ouroboros/transcript_prefix.py" = "D01"
 "ouroboros/transport_custody.py" = "D02"
 "ouroboros/triad_review.py" = "D06"
 "ouroboros/update_channels.py" = "D12"
@@ -724,6 +744,7 @@ allowed = [
   "D11->D09",
   "D11->D10",
   "D11->D12",
+  "D11->D13",
   "D11->D14",
   "D11->D16",
   "D11->D17",
@@ -735,6 +756,7 @@ allowed = [
   "D12->D03",
   "D12->D07",
   "D12->D11",
+  "D12->D13",
   "D12->D18",
   "D13->D01",
   "D13->D02",
@@ -750,6 +772,7 @@ allowed = [
   "D14->D10",
   "D14->D11",
   "D14->D12",
+  "D14->D13",
   "D14->D16",
   "D14->D18",
   "D14->D19",
@@ -769,6 +792,7 @@ allowed = [
   "D16->D18",
   "D17->D01",
   "D17->D04",
+  "D17->D06",
   "D17->D15",
   "D17->D16",
   "D17->D18",
@@ -808,6 +832,7 @@ lazy_only = [
   "D03->D17",
   "D03->D20",
   "D04->D06",
+  "D04->D07",
   "D04->D10",
   "D04->D12",
   "D04->D14",
@@ -851,12 +876,13 @@ lazy_only = [
   "D13->D05",
   "D13->D06",
   "D13->D08",
+  "D13->D09",
   "D13->D15",
   "D14->D01",
   "D14->D08",
-  "D14->D13",
   "D14->D17",
   "D14->D20",
+  "D15->D05",
   "D15->D06",
   "D15->D07",
   "D15->D08",
@@ -870,10 +896,11 @@ lazy_only = [
   "D17->D02",
   "D17->D03",
   "D17->D05",
-  "D17->D06",
   "D17->D07",
+  "D17->D08",
   "D17->D09",
   "D17->D12",
+  "D17->D13",
   "D18->D01",
   "D18->D07",
   "D18->D11",

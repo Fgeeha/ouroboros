@@ -38,14 +38,25 @@ def test_chat_marks_pending_messages_until_reconnect():
     assert "result?.status === 'queued'" in source
 
 
+def test_history_replay_does_not_overwrite_recent_session_fallback():
+    source = _read("web/modules/chat.js")
+    assert "if (!isProgress && !ephemeral && !_historyAppending)" in source
+
+
 def test_chat_resyncs_history_after_reconnect():
     source = _read("web/modules/chat.js")
     assert "async function syncHistory" in source
     # perf2 P3: the default history request sends NO quota params — the server's
     # window constants govern; the dead `?limit=1000` placebo is gone.
-    assert "`/api/chat/history${isMain ? '' : `?chat_id=${chatId}`}`" in source
+    client = _read("web/modules/api_client.js")
+    history = client[client.index("chatHistory:"):client.index("health:")]
+    assert "await apiClient.chatHistory({ chatId })" in source
+    assert "if (chatId !== 1) params.set('chat_id', String(chatId));" in history
+    assert "const query = params.toString();" in history
+    assert "fetchJson(`/api/chat/history${query ? `?${query}` : ''}`" in history
+    assert not any(quota in history for quota in ("n_human", "n_progress", "limit"))
     assert "limit=1000" not in source
-    assert "cache: 'no-store'" in source
+    assert "cache: 'no-store'" in history
     assert "syncHistory({ includeUser: !historyLoaded, fromReconnect: isReconnect })" in source
     assert "const expectedDisconnect = socketState !== WebSocket.OPEN" in source
     assert "if (expectedDisconnect && err instanceof TypeError)" in source
@@ -232,12 +243,19 @@ def test_working_live_cards_are_subdued_and_expandable():
 
 
 def test_live_card_blocks_can_expand_to_full_text():
-    """chat.js should preserve expansion state and render per-block toggles."""
+    """Chat keeps expansion state while its activity renderer owns the toggle."""
     source = _read("web/modules/chat.js")
+    activity = _read("web/modules/chat_activity.js")
     assert "expandedLineKeys" in source, "Missing per-line expansion state"
-    assert "data-live-line-toggle" in source, "Missing per-block toggle markup"
-    assert "fullHeadline" in source, "Missing full headline preservation"
-    assert "fullBody" in source, "Missing full body preservation"
+    assert "bindLiveCardTimeline(record.timelineEl," in source
+    assert "record.expandedLineKeys.add(lineKey)" in source
+    assert "renderLiveCardTimeline(record);" in source
+    assert "data-live-line-toggle" in activity, "Missing per-block toggle markup"
+    assert "record.expandedLineKeys.has(item.lineKey)" in activity
+    for field in ("fullHeadline", "fullBody"):
+        assert f"item.{field}" in activity, f"Missing full-text rendering: {field}"
+        assert field in _read("web/modules/chat_render_batch.js"), f"Missing live preservation: {field}"
+        assert field in _read("web/modules/chat_history_replay.js"), f"Missing history preservation: {field}"
 
 
 def test_live_event_summaries_preserve_full_text_for_expansion():
@@ -349,9 +367,12 @@ def test_owner_restart_copy_is_explicit_about_stopped_task():
     assert "stable_skip_flag.unlink(missing_ok=True)" in source
     # Checkout gate first (a refusal leaves the server intact), then the durable
     # no-resume intent, then the owned-work stop, then the owner's stop notice.
-    notice = source.index("Stopping active task. New settings apply to the next message.")
-    assert (source.index("_safe_restart_serialized(") < source.index("owner_restart_no_resume.flag")
-            < source.index("_stop_owned_work(ctx)") < notice)
+    owner_restart = source.split('elif lowered.startswith("/restart"):', 1)[1].split(
+        'elif lowered == "/review"', 1
+    )[0]
+    notice = owner_restart.index("Stopping active task. New settings apply to the next message.")
+    assert (owner_restart.index("_safe_restart_serialized(") < owner_restart.index("owner_restart_no_resume.flag")
+            < owner_restart.index("_stop_owned_work(ctx)") < notice)
     stop = _read("ouroboros/server_restart.py").split("def _stop_owned_work", 1)[1]
     assert (stop.index("request_cancel(") < stop.index("ctx.kill_workers(")
             < stop.index("reconcile_orphaned_runs(") < stop.index("stop_outcome()"))
@@ -394,7 +415,9 @@ def test_auto_resume_skips_owner_restart_no_resume_flag(tmp_path, monkeypatch):
 
 def test_owner_restart_proceeds_when_worker_shutdown_fails(tmp_path, monkeypatch):
     """A worker shutdown that raises is a diagnostic, not a veto: the no-resume
-    intent stays, the owner is told the work is stopped, and the process exits."""
+    intent stays, the owner is told what the restart changes, and the process
+    exits. Nothing is owned here, so the notice claims no stopped task: the
+    owned-work branch is pinned in tests/test_manual_restart_execution.py."""
     import server
     import supervisor.message_bus as message_bus
     from ouroboros import config, server_restart
@@ -449,7 +472,8 @@ def test_owner_restart_proceeds_when_worker_shutdown_fails(tmp_path, monkeypatch
 
     assert (tmp_path / "state" / "owner_restart_no_resume.flag").exists()
     assert (tmp_path / "state" / "panic_stop.flag").exists()
-    assert "Stopping active task. New settings apply to the next message." in messages
+    assert "New settings apply to the next message." in messages
+    assert not any("Stopping active task" in text for text in messages)
     assert not any("cancelled" in text or "deferred" in text for text in messages)
     assert exits == [True]
 

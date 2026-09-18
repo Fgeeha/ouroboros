@@ -18,7 +18,6 @@ import threading
 from pathlib import Path
 from typing import Any, Dict
 
-from ouroboros.tool_policy import swarm_router_turn
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import append_jsonl, utc_now_iso
 
@@ -90,6 +89,9 @@ def _emit_control_event(ctx: ToolContext, evt: Dict[str, Any]) -> str:
                     "ts": utc_now_iso(),
                     "type": "promote_chat_to_task_emitted",
                     "task_id": str(evt.get("task_id") or ""),
+                    # The owner message this root came from: without it the durable
+                    # ingress row cannot be joined to the message that caused it.
+                    "client_message_id": str(evt.get("client_message_id") or ""),
                     "routing_token": str(evt.get("routing_token") or ""),
                     "transport_mode": mode,
                     "sender_pid": os.getpid(),
@@ -190,23 +192,13 @@ def _emit_and_wait_for_routing(
         }
     timeout = _PROMOTE_CONFIRM_TIMEOUT_SEC if mode == "live" else 0.0
     if str(evt.get("type") or "") == "promote_chat_to_task":
-        try:
-            return mode, _wait_for_promotion_admission(
-                ctx,
-                str(evt.get("task_id") or ""),
-                str(evt.get("routing_token") or ""),
-                client_message_id=str(evt.get("client_message_id") or ""),
-                timeout_sec=timeout,
-            )
-        except Exception as exc:
-            if not swarm_router_turn(ctx):
-                raise
-            log.warning("Routing admission receipt failed after event emission", exc_info=True)
-            return mode, {
-                "status": "unconfirmed",
-                "reason": "admission_confirmation_failed",
-                "detail": type(exc).__name__,
-            }
+        return mode, _wait_for_promotion_admission(
+            ctx,
+            str(evt.get("task_id") or ""),
+            str(evt.get("routing_token") or ""),
+            client_message_id=str(evt.get("client_message_id") or ""),
+            timeout_sec=timeout,
+        )
     return mode, _wait_for_routing_annotation(
         ctx,
         str(evt.get("client_message_id") or ""),

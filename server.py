@@ -81,6 +81,8 @@ from ouroboros.server_liveness import (  # noqa: F401
 )
 from ouroboros.server_maintenance import (  # noqa: F401
     _LAST_CANCEL_INTENT_SWEEP,
+    _migrate_startup_cancel_latches,
+    _startup_worker_pids,
     _installed_skill_names,
     _periodic_supervisor_maintenance,
     _periodic_zombie_reconcile,
@@ -168,6 +170,21 @@ def _has_active_evolution_transaction() -> bool:
 
 
 def _restart_current_process(host: str, port: int) -> None:
+    # Every direct restart reaches this seam, including an assisted update whose
+    # native waits were already moved to PENDING before its resolver ran.
+    try:
+        from ouroboros.delegate_recovery import PLANNED_RESTART_TRANSACTION_ENV, arm_active_planned_restart_transaction
+        from ouroboros.server_restart import _RESTARTABLE_UPDATE_PHASES
+        from supervisor.update_merge import read_update_tx_strict
+
+        if any((DATA_DIR / "state" / name).exists() for name in ("owner_restart_no_resume.flag", "panic_stop.flag")):
+            os.environ.pop(PLANNED_RESTART_TRANSACTION_ENV, None)
+        else:
+            status, tx = read_update_tx_strict()
+            if status == "valid" and tx.get("phase") in _RESTARTABLE_UPDATE_PHASES:
+                arm_active_planned_restart_transaction(DATA_DIR)
+    except Exception:
+        log.warning("Direct restart transaction could not be armed; continuation remains unconfirmed", exc_info=True)
     _restart_current_process_impl(
         host, port, repo_dir=REPO_DIR, log=log,
         owner_initiated=_owner_restart_requested.is_set(),
@@ -380,9 +397,15 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
             # Everything reversible is behind us (checkout landed, no-resume
             # intent durable): from here the restart always follows, and every
             # unconfirmed stop is a critical diagnostic, never a deferral.
-            _stop_owned_work(ctx)
+            stopped_task_ids = _stop_owned_work(ctx)
             try:
-                reply("Stopping active task. New settings apply to the next message.", "")
+                # Say only what happened: with nothing owned the stop sentence
+                # named a task that was never running.
+                reply(
+                    "Stopping active task. New settings apply to the next message."
+                    if stopped_task_ids else "New settings apply to the next message.",
+                    "",
+                )
             except Exception:
                 log.warning("Failed to send owner restart stop notice; continuing restart", exc_info=True)
             _request_restart_exit(owner=True)
@@ -571,6 +594,7 @@ def _run_supervisor(settings: dict) -> None:
         except Exception:
             log.debug("Failed to stop previous consciousness instance", exc_info=True)
         _consciousness = None
+    prior_worker_pids: set[int] | None = None
     try:
         ensure_legacy_imported(pathlib.Path(DATA_DIR))
 
@@ -610,7 +634,7 @@ def _run_supervisor(settings: dict) -> None:
         from supervisor.workers import (
             init as workers_init, get_event_q, WORKERS, PENDING, RUNNING,
             spawn_workers, kill_workers, assign_tasks, ensure_workers_healthy,
-            handle_chat_direct, handle_chat_ephemeral, auto_resume_after_restart,
+            handle_chat_direct, auto_resume_after_restart,
         )
 
         max_workers = int(settings.get("OUROBOROS_MAX_WORKERS", 10))
@@ -628,7 +652,10 @@ def _run_supervisor(settings: dict) -> None:
         import types
         import queue as _queue_mod
 
-        restored_pending = restore_pending_from_snapshot()
+        _migrate_startup_cancel_latches(DATA_DIR)
+        prior_worker_pids = _startup_worker_pids(DATA_DIR)
+        interrupted_running: list = []
+        restored_pending = restore_pending_from_snapshot(terminalized=interrupted_running)
         kill_workers(preserve_pending=True)
         spawn_workers(max_workers)
         persist_queue_snapshot(reason="startup")
@@ -638,46 +665,35 @@ def _run_supervisor(settings: dict) -> None:
             pre_adopt_planned_handoffs(DATA_DIR, list(PENDING))
         except Exception:
             log.debug("Planned delegate pre-adoption failed", exc_info=True)
-        _resume_interrupted_project_deletions()
-        # Original startup order preserved: drive prunes, custody sweep (reap
-        # orphaned processes), THEN worktree prune.
-        _startup_prune_sweeps()
         _startup_custody_sweep()
+        recovered_files = _run_startup_task_recovery(
+            DATA_DIR, REPO_DIR, skip_live_data=_pytest_default_real_data_dir,
+            prior_worker_pids=prior_worker_pids,
+        )
+        _resume_interrupted_project_deletions()
+        _startup_prune_sweeps(preserve_task_sources=bool(
+            recovered_files["unresolved"] or recovered_files["protected"] or recovered_files["errors"]))
         _startup_worktree_prune()
 
         _prune_delegated_snapshots()
 
-        try:
-            from ouroboros.observability import prune_observability_blobs
-            from ouroboros.tools.services import prune_service_logs
-
-            observability_report = prune_observability_blobs(DATA_DIR)
-            service_report = prune_service_logs(DATA_DIR)
-            if (
-                observability_report.get("enabled")
-                or observability_report.get("manifest_count")
-                or observability_report.get("blob_count")
-                or observability_report.get("deleted_manifests")
-                or observability_report.get("deleted_blobs")
-                or observability_report.get("errors")
-                or service_report.get("deleted_dirs")
-                or service_report.get("deleted_files")
-                or service_report.get("errors")
-            ):
-                append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(),
-                    "type": "runtime_artifact_prune",
-                    "observability": observability_report,
-                    "services": service_report,
-                })
-        except Exception:
-            log.debug("Runtime artifact prune failed", exc_info=True)
-
-        if restored_pending > 0:
+        if restored_pending > 0 or interrupted_running:
             st_boot = load_state()
             if st_boot.get("owner_chat_id"):
-                send_with_budget(int(st_boot["owner_chat_id"]),
-                    f"♻️ Restored pending queue from snapshot: {restored_pending} tasks.")
+                # The second clause states an INTENT, not an outcome: restore only
+                # fences an interrupted task with a durable cancel intent, and
+                # cancellation custody writes its terminal result a watchdog
+                # window later (task_lifecycle._INTENT_WATCHDOG_MIN_AGE_SEC).
+                notice = ["♻️"]
+                if restored_pending > 0:
+                    notice.append(f"Restored pending queue from snapshot: {restored_pending} tasks.")
+                if interrupted_running:
+                    count = len(interrupted_running)
+                    notice.append(
+                        f"Cancelling {count} task{'' if count == 1 else 's'} that "
+                        f"{'was' if count == 1 else 'were'} still running when the server stopped."
+                    )
+                send_with_budget(int(st_boot["owner_chat_id"]), " ".join(notice))
         _startup_retired_settings_notice(settings)
 
         auto_resume_after_restart()
@@ -714,12 +730,28 @@ def _run_supervisor(settings: dict) -> None:
             safe_restart=safe_restart, kill_workers=kill_workers, spawn_workers=spawn_workers,
             sort_pending=sort_pending, consciousness=_consciousness,
             handle_chat_direct=handle_chat_direct,
-            handle_chat_ephemeral=handle_chat_ephemeral, request_restart=_request_restart_exit,
+            request_restart=_request_restart_exit,
         )
     except Exception as exc:
         _supervisor_error = f"Supervisor init failed: {exc}"
         _consciousness = None
         log.critical("Supervisor initialization failed", exc_info=True)
+        try:
+            # Provider-configured lifespan normally relies on this supervisor
+            # owner for boot recovery. If initialization itself fails, keep the
+            # same custody pass instead of serving with orphan RUNNING rows.
+            recovery_pids = prior_worker_pids
+            if recovery_pids is None:
+                try:
+                    recovery_pids = _startup_worker_pids(DATA_DIR)
+                except Exception:
+                    recovery_pids = None
+            _run_startup_task_recovery(
+                DATA_DIR, REPO_DIR, skip_live_data=_pytest_default_real_data_dir,
+                prior_worker_pids=recovery_pids,
+            )
+        except Exception:
+            log.critical("Startup recovery after supervisor initialization failure failed", exc_info=True)
         _supervisor_ready.set()
         _supervisor_thread = None
         return
@@ -1271,11 +1303,11 @@ async def lifespan(app):
     # Startup-only: after the prior process generation is gone, finalize orphaned
     # RUNNING results and resolve an indeterminate post-task synthesis phase.
     # The periodic zombie sweep intentionally does not perform this recovery.
-    _run_startup_task_recovery(
-        lifespan_drive_root,
-        REPO_DIR,
-        skip_live_data=pytest_default_real_data_dir,
-    )
+    if not has_startup_ready_provider(settings):
+        _run_startup_task_recovery(
+            lifespan_drive_root, REPO_DIR, skip_live_data=pytest_default_real_data_dir,
+            prior_worker_pids=None if pytest_default_real_data_dir else _startup_worker_pids(lifespan_drive_root),
+        )
 
     # Reload enabled+reviewed extensions across restarts.
     try:
@@ -1327,6 +1359,47 @@ async def lifespan(app):
         yield
     finally:
         _supervisor_stop.set()  # first: the loop must know a teardown owns what follows
+        log.info("Server shutting down...")
+        # Let the loop leave its current tick BEFORE workers are killed and the
+        # bridge/Manager go down: a tick still running would otherwise respawn
+        # a killed worker or meet BrokenPipe/EOF. Bounded well inside the
+        # launcher's force-exit budget; the stop flag already suppresses the
+        # crash counter if the join times out.
+        supervisor_thread = _supervisor_thread
+        if supervisor_thread is not None and supervisor_thread.is_alive():
+            supervisor_thread.join(timeout=2)
+        # Terminal custody FIRST: this is the teardown's one irreversible durable
+        # write and every wait below it is best effort (ARCHITECTURE, Shutdown).
+        try:
+            restart_requested = _restart_requested.is_set()
+            from supervisor.workers import kill_workers
+            cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested)
+            kill_workers(
+                force=True,
+                terminal_status=cleanup_status,
+                result_reason=cleanup_reason,
+                **_restart_cleanup_kwargs(),
+                **_managed_update_pending_kwargs(),
+            )
+            # Record an explicit shutdown cause so a task interrupted by the shutdown is
+            # never later read as a worker crash storm. Diagnostic, so it runs AFTER the
+            # custody write: append_jsonl waits up to two seconds for the log lock, and
+            # that wait must never spend the force-exit budget on unterminalized workers.
+            try:
+                from ouroboros.utils import append_jsonl, utc_now_iso
+                append_jsonl(
+                    lifespan_drive_root / "logs" / "supervisor.jsonl",
+                    {
+                        "ts": utc_now_iso(),
+                        "type": "server_shutdown",
+                        "cause": "restart_requested" if restart_requested else "external_signal",
+                        "restart_exit": restart_requested,
+                    },
+                )
+            except Exception:
+                log.debug("Failed to record server_shutdown event", exc_info=True)
+        except Exception:
+            pass
         if extension_reconcile_task is not None:
             extension_reconcile_task.cancel()
             with suppress(asyncio.CancelledError, asyncio.TimeoutError):
@@ -1348,15 +1421,6 @@ async def lifespan(app):
         with suppress(asyncio.CancelledError):
             await ws_heartbeat_task
 
-        log.info("Server shutting down...")
-        # Let the loop leave its current tick BEFORE workers are killed and the
-        # bridge/Manager go down: a tick still running would otherwise respawn
-        # a killed worker or meet BrokenPipe/EOF. Bounded well inside the
-        # launcher's force-exit budget; the stop flag already suppresses the
-        # crash counter if the join times out.
-        supervisor_thread = _supervisor_thread
-        if supervisor_thread is not None and supervisor_thread.is_alive():
-            supervisor_thread.join(timeout=2)
         try:
             from ouroboros.local_model import get_manager
             get_manager().stop_server()
@@ -1382,34 +1446,6 @@ async def lifespan(app):
             supervisor = get_global_supervisor()
             if supervisor is not None:
                 supervisor.stop_all()
-        except Exception:
-            pass
-        try:
-            restart_requested = _restart_requested.is_set()
-            # Record an explicit shutdown cause so a task interrupted by the
-            # shutdown is never later read as a worker crash storm.
-            try:
-                from ouroboros.utils import append_jsonl, utc_now_iso
-                append_jsonl(
-                    lifespan_drive_root / "logs" / "supervisor.jsonl",
-                    {
-                        "ts": utc_now_iso(),
-                        "type": "server_shutdown",
-                        "cause": "restart_requested" if restart_requested else "external_signal",
-                        "restart_exit": restart_requested,
-                    },
-                )
-            except Exception:
-                log.debug("Failed to record server_shutdown event", exc_info=True)
-            from supervisor.workers import kill_workers
-            cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested)
-            kill_workers(
-                force=True,
-                terminal_status=cleanup_status,
-                result_reason=cleanup_reason,
-                **_restart_cleanup_kwargs(),
-                **_managed_update_pending_kwargs(),
-            )
         except Exception:
             pass
         if _restart_requested.is_set():

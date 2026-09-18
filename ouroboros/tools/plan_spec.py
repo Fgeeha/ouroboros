@@ -45,6 +45,16 @@ PACKET_PRIOR_CYCLES_CHARS = 60_000
 
 FINDING_CLASSES = ("blocking", "note", "need_evidence")
 AGGREGATES = ("GREEN", "REVIEW_REQUIRED", "REVISE_PLAN", "DEGRADED")
+
+AUTHOR_DISPOSITION_SCHEMA = {
+    "type": "object", "additionalProperties": False,
+    "description": "Optional advisory author finish bound to the exact review fingerprint; it never manufactures reviewer PASS or releases a blocking gate.",
+    "properties": {
+        "disposition": {"type": "string", "enum": ["accepted", "rejected", "partial", "deferred"]},
+        "rationale": {"type": "string"},
+    },
+    "required": ["disposition", "rationale"],
+}
 DISPOSITION_DECISIONS = ("accept", "reject", "defer")
 
 _SPEC_STRING_LISTS = ("in_scope", "non_goals", "invariants", "affected_resources", "evidence")
@@ -419,7 +429,7 @@ def _is_url(locator: str) -> bool:
 
 
 def _is_path_locator(locator: str) -> bool:
-    return bool(locator) and not _is_url(locator) and not locator.startswith(_TASK_LOCATOR_PREFIX)
+    return bool(locator) and not _is_url(locator) and not locator.startswith((_TASK_LOCATOR_PREFIX, "chat:"))
 
 def _resolve_locator_path(locator: str, root: pathlib.Path) -> tuple[Optional[pathlib.Path], str]:
     """Relative → under ``root``; absolute (or ``file://`` absolute) as-is. Returns
@@ -472,7 +482,7 @@ def resolve_constitutional(
     the system repository. The active binding alone does NOT decide (owner
     decision D29: a plan bound to the system repo that declares no system path
     is not constitutional). Skill-payload paths under ``payload_roots`` are
-    exempt (data plane, as today). URLs and ``task:`` locators never make it
+    exempt (data plane, as today). URLs and ``task:``/``chat:`` locators never make it
     true. Returns ``(constitutional, note)`` — the note names the deciding
     locator for disclosure.
     """
@@ -558,7 +568,7 @@ _PLAN_FINDING_ELEMENT_SCHEMA = """\
   "id": "<short local id, e.g. f1>",
   "class": "blocking" | "note" | "need_evidence",
   "breaks": "<spec id — REQUIRED for blocking: goal | claim_N | invariant_N | decision_N | deferred_N>",
-  "locator": "<REQUIRED for need_evidence: an absolute path, or one relative to the subject workspace root; add ::lines=A-B, ::bytes=A-B, ::tail=N or ::symbol=Name (.py only) for one range; task:<id> = a prior task's result; a URL may be named; the host never fetches it>",
+  "locator": "<for a need_evidence DOCUMENT request: an absolute path, or one relative to the subject workspace root; add ::lines=A-B, ::bytes=A-B, ::tail=N or ::symbol=Name (.py only) for one range; task:<id> = a prior task's result; chat:<id> = a room dialogue, chat:<id>@<sha256> = an exact recorded room snapshot; a URL may be named; the host never fetches it. Leave it out for the other form: a need_evidence that asks the AUTHOR a question names the spec id in `breaks` and needs no locator>",
   "summary": "<what is wrong or missing, concretely>",
   "recommendation": "<the smallest change to the SPEC that resolves it>"
 }"""
@@ -608,7 +618,9 @@ def validate_findings(
 
     Host checks membership/shape only (P5): ``blocking`` needs ``breaks`` ∈
     ``spec_ids`` else DEMOTED to ``note`` (``blocking_without_valid_breaks``);
-    ``need_evidence`` needs a non-empty ``locator`` else demoted; a missing
+    ``need_evidence`` needs a non-empty ``locator`` (a document the host attaches)
+    OR a ``breaks`` ∈ ``spec_ids`` (a question to the author) else demoted; an
+    over-long locator on such a question drops only the locator; a missing
     ``summary`` is filled with ``(missing summary)`` + disclosure (a finding is
     never dropped — an ok slot must not launder its blocking finding away); a
     ``need_evidence`` locator already in ``seen_locators`` — the PER-TASK
@@ -653,22 +665,30 @@ def validate_findings(
             disclosures.append(f"blocking_without_valid_breaks:{fid}")
             klass = "note"
         if klass == "need_evidence":
-            if not locator:
+            # A question to the AUTHOR names the spec id it is about in `breaks` and needs
+            # no locator (the author answers in the disposition); a request for a document
+            # names a locator the host attaches. Neither: optional advice, disclosed.
+            asks_author = breaks in ids
+            if not locator and not asks_author:
                 disclosures.append(f"need_evidence_without_locator:{fid}")
                 klass = "note"
             elif len(locator) > MAX_ITEM_CHARS:
                 # W3 host attachment is bounded like the agent's own evidence items: an over-long
-                # locator is never remembered (state) nor attached — demoted, disclosed.
+                # locator is never remembered (state) nor attached — demoted, disclosed; a
+                # question to the author keeps its class and drops only the locator.
                 disclosures.append(f"need_evidence_locator_too_long:{fid}")
-                klass = "note"
-            elif locator not in seen and len(seen) >= MAX_NEED_EVIDENCE_MEMORY:
+                if asks_author:
+                    locator = ""
+                else:
+                    klass = "note"
+            elif locator and locator not in seen and len(seen) >= MAX_NEED_EVIDENCE_MEMORY:
                 disclosures.append(f"need_evidence_memory_full:{fid}")
-            elif locator in seen:
+            elif locator and locator in seen:
                 # I-03: request deduplication is not a reviewer withdrawing its
                 # need. Keep the typed request for a free disposition; leaving
                 # seen unchanged preserves the attachment and paid-cycle bounds.
                 disclosures.append(f"need_evidence_repeat:{locator}")
-            else:
+            elif locator:
                 seen.add(locator)
         normalized.append({
             "id": fid, "class": klass, "breaks": breaks,
@@ -787,9 +807,9 @@ def closure_after_disposition(
     GREEN → closed. Notes are optional advice, so a note-only REVIEW_REQUIRED
     wave closes without dispositions. Need_evidence still requires a disposition
     (accept|reject|defer + rationale). REVISE_PLAN → NEVER closed by
-    disposition (blocking needs a changed spec → new cycle, or reject-with-
-    rationale → next paid delta cycle). DEGRADED → not closable by disposition
-    (rerun the wave). Advisory enforcement never flips ``closed``: the caller
+    disposition. A subsequent paid delta review may consider a changed spec or
+    justified rejection when another paid cycle is available. DEGRADED is not
+    closable by disposition. Advisory enforcement never flips ``closed``: the caller
     may proceed with the wave open under loud disclosure — this function only
     reports. Control-line invariants (``tools.plan_render
     ._parse_plan_review_control``): GREEN ⇒ closed, REVISE_PLAN ⇒ not closed.
@@ -839,18 +859,16 @@ def closure_after_disposition(
             notes.append("no_findings_recorded: REVIEW_REQUIRED without findings closes vacuously")
         if any(f.get("class") == "blocking" for f in items):
             notes.append(
-                "blocking_finding_below_quorum_stays_open: revise the spec or let the next "
-                "paid delta cycle judge the rejection"
+                "blocking_finding_below_quorum_stays_open: blocking findings remain open after disposition"
             )
     elif verdict == "REVISE_PLAN":
         closed = False
         notes.append(
-            "revise_plan_not_closable_by_disposition: blocking findings need a changed spec "
-            "(new cycle) or reject-with-rationale judged in the next paid delta cycle"
+            "revise_plan_not_closable_by_disposition: disposition does not close blocking findings"
         )
     elif verdict == "DEGRADED":
         closed = False
-        notes.append("degraded_not_closable_by_disposition: fewer parseable reviewer slots than quorum — rerun the wave")
+        notes.append("degraded_not_closable_by_disposition: fewer parseable reviewer slots than quorum; disposition does not close the wave")
     else:
         closed = False
         notes.append(f"unknown_aggregate:{verdict or '<empty>'}")
@@ -861,3 +879,11 @@ def closure_after_disposition(
             "blocking_enforcement: the wave must close before the work starts"
         )
     return {"closed": closed, "open_ids": open_ids, "notes": notes}
+
+
+def plan_fingerprint(goal: str, plan: str, spec: dict, manifest_hash: str, constitutional: bool) -> str:
+    """Identity of one review request (F4): goal, prose, canonical spec, evidence identity,
+    the constitutional fact — never the exploration log (it changes no obligation)."""
+    payload = {"goal": goal, "plan": plan, "spec": spec, "evidence_manifest_hash": manifest_hash,
+               "constitutional": bool(constitutional)}
+    return sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")).hexdigest()

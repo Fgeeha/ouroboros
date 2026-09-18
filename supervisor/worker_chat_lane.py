@@ -1,7 +1,7 @@
-"""The direct and ephemeral chat lanes, and the resume after a restart.
+"""The direct chat lane and its resume after a restart.
 
-Each chat turn owns a fresh native agent and a registered execution; an explicit
-swarm routing turn retains its transient contract. Both are refused while the repo-writer gate is closed
+Each chat turn owns a fresh native agent and a registered execution.
+Turns are refused while the repo-writer gate is closed
 for a DESTRUCTIVE update window (apply/replace prologue, materialization,
 rollback), so a managed update never races a turn that could touch the checkout
 mid-reset. While the ONE authorized assisted resolver holds the repository
@@ -173,7 +173,7 @@ def _handle_chat_direct_locked(
 
     _run_chat_task(
         None, chat_id, text, image_data,
-        task_constraint=task_constraint, task_metadata=task_metadata, ephemeral=False,
+        task_constraint=task_constraint, task_metadata=task_metadata,
     )
 
 
@@ -203,12 +203,9 @@ def _run_chat_task(
     image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None,
     task_constraint: Optional[dict] = None,
     task_metadata: Optional[dict] = None,
-    *,
-    ephemeral: bool = False,
 ) -> None:
     """Build the direct-chat task and run it on the given agent, draining events.
 
-    ``ephemeral`` is only the explicit constrained routing contract. Ordinary
     Main/Project turns use the full native task/result/delivery lifecycle."""
     task: Optional[dict] = None
     client_msg_id = ""
@@ -218,7 +215,7 @@ def _run_chat_task(
             client_msg_id = str(_cmid_ref.get("client_message_id") or "")
         if not client_msg_id:
             client_msg_id = str(task_metadata.get("client_message_id") or "")
-    kind = "ephemeral_decision" if ephemeral else "direct_chat"
+    kind = "direct_chat"
     task: Dict[str, Any] = {
         "id": uuid.uuid4().hex[:8],
         "type": "task",
@@ -248,8 +245,6 @@ def _run_chat_task(
             activity.actor = agent
         from ouroboros.contracts.task_contract import attach_task_contract
 
-        if ephemeral:
-            task["_ephemeral_turn"] = True
         if task_constraint:
             task["task_constraint"] = dict(task_constraint)
         if task_metadata:
@@ -336,7 +331,7 @@ def _run_chat_task(
         # A rejected initial UI task must leave no partial project assignment.
         # Bind only after all declared attachments have passed admission.
         pid = str(task.get("project_id") or "").strip()
-        if pid and not ephemeral:
+        if pid:
             try:
                 from ouroboros.projects_registry import bind_task_to_project
 
@@ -351,9 +346,9 @@ def _run_chat_task(
         if not task["text"]:
             task["text"] = "(image attached)" if image_data else ""
         # Cluster B: proactively coin a project name for a fresh MAIN-CHAT direct card
-        # (not an ephemeral decision turn, not an already-bound project-thread task) so
+        # (not an already-bound project-thread task) so
         # the card shows a human title up front and turn-into-project reuses it.
-        if not ephemeral and not task.get("project_id"):
+        if not task.get("project_id"):
             from ouroboros.project_naming import spawn_proactive_namer
 
             spawn_proactive_namer(
@@ -362,10 +357,10 @@ def _run_chat_task(
         attach_task_contract(task)
 
         # Announce the authoritative start immediately (owner decision 2A):
-        # the client's `Sending...` retires on this frame, not on a socket
-        # echo, and the frame carries the activity<->client_message_id link
-        # so even a turn that fails before its first LLM round concludes
-        # cleanly via its keyed error final.
+        # the client's `Sending...` retires on this receipt (once the census
+        # read it triggers has answered), not on a socket echo; the census row
+        # carries the same activity<->client_message_id link, and a turn the
+        # census never lists is still settled by that read.
         try:
             from supervisor.message_bus import get_bridge
 
@@ -410,10 +405,9 @@ def _run_chat_task(
             # Key the error final with the turn's activity id so the client
             # concludes exactly this turn (active set, 4A) instead of leaving
             # its `Sending.../Thinking...` state to an unkeyed sweep. If the
-            # failure happened before the start announce was broadcast, the
-            # client has no activity<->client_message_id link yet, so announce
-            # it first: the keyed final right after then retires both the
-            # activity and its linked `Sending...` submission.
+            # failure happened before the start announce was broadcast, announce
+            # it first: the receipt's census read settles the linked `Sending...`
+            # and the keyed final right after concludes the turn's census row.
             failed_task_id = str(task.get("id") or "") if isinstance(task, dict) else ""
             if failed_task_id and client_msg_id:
                 try:
@@ -445,33 +439,6 @@ def _run_chat_task(
         registry.unregister(task["id"])
 
 
-def handle_chat_ephemeral(
-    chat_id: int,
-    text: str,
-    image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None,
-    task_constraint: Optional[dict] = None,
-    task_metadata: Optional[dict] = None,
-) -> None:
-    """Run an explicitly constrained swarm routing turn on its own actor."""
-    if not owner_conversation_admitted(chat_id):
-        return
-    from supervisor.state import budget_remaining, load_state
-    failure_meta = _host_operation_failure(task_metadata)
-    try:
-        remaining = budget_remaining(load_state(), strict=True)
-    except Exception:
-        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta)
-        return
-    if remaining <= 0:
-        try:
-            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta)
-        except Exception:
-            pass
-        return
-    _run_chat_task(
-        None, chat_id, text, image_data,
-        task_constraint=task_constraint, task_metadata=task_metadata, ephemeral=True,
-    )
 
 
 def auto_resume_after_restart() -> None:

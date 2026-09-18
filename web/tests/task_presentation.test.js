@@ -9,6 +9,7 @@ import {
     taskDoneIsTerminal,
     taskPresentation,
     taskTerminalPhase,
+    taskTerminalSummary,
 } from '../modules/log_events.js';
 import {
     captureLiveCardPhaseState,
@@ -28,8 +29,12 @@ const terminalCases = [
     ['Done with warnings', {
         status: 'completed', outcome_axes: { execution: { status: 'degraded' } },
     }, { phase: 'warn', headline: 'Done with warnings' }],
+    // The debt list rides along: the host twin states this cause only while the
+    // row still owes it, so a fixture without it would describe a record the
+    // durable writers no longer render this way.
     ['Failed', {
         status: 'failed', reason_code: 'delegated_custody_unreconciled',
+        delegated_runs_unreconciled: ['run-a1'],
     }, { phase: 'error', headline: 'Failed' }],
     ['Cancelled', { status: 'cancelled' }, { phase: 'cancelled', headline: 'Cancelled' }],
 ];
@@ -63,10 +68,9 @@ test('live task_done and replay/log task truth have phase and headline parity', 
             assert.ok(replay.meta.includes('delegated_custody_unreconciled'));
         }
     }
-    assert.match(
-        chatSource,
-        /const presentation = taskPresentation\(finalizing && outcome !== 'error' \? 'working' : outcome\);/,
-    );
+    assert.match(chatSource, /const summary = taskTerminalSummary\(\{ \.\.\.msg, task_id: taskId \}\)/);
+    const finalizing = taskTerminalSummary({ status: 'completed', task_phase: 'finalizing' });
+    assert.deepEqual({ phase: finalizing.phase, terminal: finalizing.terminal }, { phase: 'working', terminal: false });
 });
 
 test('typed terminal status drives an error phase on live and replay cards', () => {
@@ -135,7 +139,7 @@ test('owner soft-stop is factual Done and keeps its marker in details', () => {
     const replay = summarizeLogEvent(evt);
     assert.deepEqual({ phase: live.phase, headline: live.headline }, { phase: 'done', headline: 'Done' });
     assert.deepEqual({ phase: replay.phase, headline: replay.headline }, { phase: 'done', headline: 'Done' });
-    assert.ok(live.meta.includes(OWNER_STOP_DETAIL_MARKER));
+    assert.ok(live.body.includes(OWNER_STOP_DETAIL_MARKER));
     assert.ok(replay.meta.includes(OWNER_STOP_DETAIL_MARKER));
     assert.doesNotMatch(live.headline, /owner_requested_finalization/);
 });
@@ -252,7 +256,12 @@ test('task-detail healing reuses the full terminal-summary projection', () => {
     );
     assert.match(missingHeal, /isTerminalTaskDetail\(detail\)/);
     assert.match(missingHeal, /appendTaskSummaryToLiveCard\(\{ \.\.\.detail, task_id: taskId \}\)/);
-    assert.doesNotMatch(missingHeal, /finishLiveCard\(/);
+    // A retained typed historical lifecycle may finish the card only in the
+    // proven-absent result branch after complete fresh activity excluded it.
+    assert.match(missingHeal, /if \(!vouched && detail === null\)/);
+    assert.match(missingHeal, /applyHistoricalModelExecution\(currentRecord, historical\)/);
+    assert.match(missingHeal, /return finishLiveCard\(taskId, historical\.phase\)/);
+    assert.match(missingHeal, /setHistoricalUnavailable\(currentRecord, true\)/);
 });
 
 test('history replay keeps open summaries live and terminal fallbacks factual', () => {
@@ -261,7 +270,12 @@ test('history replay keeps open summaries live and terminal fallbacks factual', 
         chatSource.indexOf('// child task_id'),
     );
     assert.match(summary, /const finalizing = msg\?\.task_phase === 'finalizing' \|\| msg\?\.outcome_final === false;/);
-    assert.match(summary, /terminal: !finalizing/);
+    assert.match(summary, /taskTerminalSummary\(\{ \.\.\.msg, task_id: taskId \}\)/);
+    for (const frame of [
+        { status: 'completed', task_phase: 'finalizing' },
+        { system_type: 'task_summary', outcome_final: false },
+    ]) assert.equal(taskTerminalSummary(frame).terminal, false);
+    assert.equal(taskTerminalSummary({ system_type: 'task_summary', outcome_final: true }).terminal, true);
     assert.match(summary, /record\.finalizingHold = true/);
     assert.match(summary, /if \(finalizing\) return changed;\s*changed = finishLiveCard/);
 
