@@ -198,3 +198,15 @@ def test_thinking_rows_emit_as_a_separate_reasoning_line_before_the_actions():
     ]
     assert output[1][0] == live_line(
         "run-1", WindowObservations().record({"timeline": rows[2:]}, 18, 3))
+
+
+def test_a_single_argument_progress_callable_still_receives_both_lines():
+    action = {"type": "tool.call", "title": "read file", "severity": "info",
+              "harnessId": "cursor", "attemptId": "a01"}
+    advance = WindowObservations().record({"timeline": [text_event("weigh options"), action]}, 18, 3)
+    output = []
+    emit(SimpleNamespace(emit_progress_fn=output.append), "run-1", advance)
+    assert output == [
+        "🛰 delegated run run-1 @seq 18: weigh options",
+        "🛰 delegated run run-1 @seq 18: [cursor/a01] read file",
+    ]

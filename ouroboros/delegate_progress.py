@@ -624,8 +624,13 @@ def emit(ctx: Any, run_id: str, advance: _Advance, *,
         thinking = [row for row in advance.events if row.get("textKind") == "thinking"]
         actions = [row for row in advance.events if row.get("textKind") != "thinking"]
         if thinking:
-            fn(live_line(run_id, replace(advance, events=thinking, events_omitted=0)),
-               meta={"reasoning": True}, **({} if actions or advance.events_omitted else metadata))
+            line = live_line(run_id, replace(advance, events=thinking, events_omitted=0))
+            try:
+                fn(line, meta={"reasoning": True}, **({} if actions or advance.events_omitted else metadata))
+            except TypeError:
+                # A single-argument ToolContext callable (the documented ABI) cannot take
+                # the stamp; the line still goes out and the action line below survives.
+                fn(line)
         if actions or advance.events_omitted or not thinking:
             fn(live_line(run_id, replace(advance, events=actions)), **metadata)
     except Exception:
