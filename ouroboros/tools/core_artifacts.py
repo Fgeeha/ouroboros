@@ -408,7 +408,11 @@ def _send_links(
     try:
         actions = validate_link_actions(links)
     except LinkActionsValidationError as exc:
-        return f"⚠️ {exc.code}: {exc}"
+        # Typed by its own marker: SEND_LINKS_URL_BLOCKED stays a policy denial, _ARG_ERROR an argument fault.
+        from ouroboros.tools.tool_result import LegacyTextResultAdapter
+
+        return _publish_tool_result(ctx, LegacyTextResultAdapter.from_text(
+            "send_links", f"⚠️ {exc.code}: {exc} No links were sent."))
     from ouroboros.tools.owner_delivery import deliver_owner_event
     mode = deliver_owner_event(ctx, {
         "type": "send_links",

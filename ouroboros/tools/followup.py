@@ -25,6 +25,7 @@ from typing import Any, Dict, List
 
 from ouroboros.consciousness_authority import consciousness_origin_metadata
 from ouroboros.deadline_utils import parse_deadline_ts
+from ouroboros.tools.arg_feedback import ignored_argument_note
 from ouroboros.tools.registry import ToolContext, ToolEntry
 
 _MAX_PENDING_FOLLOWUPS = 2
@@ -63,7 +64,7 @@ def get_tools() -> List[ToolEntry]:
                         },
                         "timezone": {
                             "type": "string",
-                            "description": "Optional IANA timezone for cron (blank = system local timezone).",
+                            "description": "Optional IANA timezone for cron (blank = system local timezone); ignored beside run_at, which is an absolute instant.",
                         },
                         "objective": {
                             "type": "string",
@@ -129,12 +130,13 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             "or cron (recurring).")))
         )
     timezone = str(params.get("timezone") or "").strip()
+    timezone_note = ""
     if run_at_raw:
         if timezone:
-            return (
-                _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: FOLLOWUP_TIMEZONE_WITH_RUN_AT: timezone applies only to recurring "
-                "cron follow-ups; run_at is an absolute instant.")))
-            )
+            # run_at is an absolute instant: a zone beside it asks for nothing (models fill every key).
+            timezone_note = " " + ignored_argument_note(
+                "timezone", timezone, "it applies only to recurring cron follow-ups; run_at is an absolute instant") + "."
+            timezone = ""
         instant = parse_deadline_ts(run_at_raw)
         if instant is None:
             return (
@@ -249,5 +251,5 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
         "enqueue ordinary root tasks through the supervisor scheduler under normal admission; "
         f"pending follow-ups for this task: {len(pending) + 1}/{_MAX_PENDING_FOLLOWUPS}. The "
         f"record is durable in state/scheduled_tasks.json and {lifecycle}; the owner can "
-        "disable or delete it from the Schedules surface."
+        f"disable or delete it from the Schedules surface.{timezone_note}"
     )

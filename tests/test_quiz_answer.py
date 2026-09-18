@@ -924,7 +924,8 @@ def test_two_recommended_options_are_refused_and_one_survives_live_and_replay_al
     out = _escalate(ctx, question="Which db?",
                     options=[{"label": "sqlite", "recommended": True}, {"label": "postgres", "recommended": True}],
                     assumption="sqlite meanwhile")
-    assert out == "⚠️ QUIZ_RECOMMENDED_INVALID: mark at most one option as recommended."
+    assert out == ("⚠️ QUIZ_RECOMMENDED_INVALID: mark at most one option as recommended. "
+                   "The quiz was not sent.")
     assert not [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
     assert quiz_states(tmp_path, "root-1") == {}
     out = _escalate(ctx, question="Which db?",

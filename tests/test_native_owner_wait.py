@@ -227,8 +227,8 @@ def test_escalate_records_the_bound_and_says_what_the_wait_promises(tmp_path):
     assert ctx._owner_wait_requested == quiz_id
 
     bad = _escalate(ctx, question="Continue?", options=[{"label": "Yes"}, {"label": "No"}],
-                    wait_for_answer=True, max_wait_minutes=0)
-    assert bad.startswith("⚠️ QUIZ_WAIT_BOUND_INVALID")
+                    wait_for_answer=True, max_wait_minutes=-3)
+    assert bad.startswith("⚠️ QUIZ_WAIT_BOUND_INVALID") and "max_wait_minutes=-3" in bad
 
     optional = _escalate(ctx, question="Which one?", options=["a", "b"], assumption="a meanwhile")
     assert "the card stays answerable after this task ends" in optional
