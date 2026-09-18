@@ -49,7 +49,7 @@ def test_escalate_ignores_a_wait_bound_on_a_quiz_that_does_not_wait(tmp_path, re
     assert f"max_wait_minutes={reflex!r} ignored: it bounds a required wait only" in result.text
     quiz_id = ctx.event_queue.get_nowait()["quiz_id"]
     block = load_task_result(tmp_path, "root-task")["owner_quiz"][quiz_id]
-    assert "max_wait_minutes" not in block or block["max_wait_minutes"] in (None, 0)
+    assert "max_wait_minutes" not in block
 
 
 def test_escalate_zero_bound_waits_unbounded_and_a_huge_bound_is_lowered(tmp_path, monkeypatch):
@@ -75,3 +75,13 @@ def test_escalate_genuine_argument_mistake_is_one_typed_refusal(tmp_path):
     assert result.status == "error" and result.code == "TOOL_ARG_ERROR"
     assert result.text.startswith("⚠️ QUIZ_WAIT_BOUND_INVALID: max_wait_minutes=-3 ")
     assert result.text.endswith("The quiz was not sent.") and ctx.event_queue.empty()
+
+
+def test_a_blocked_link_stays_a_policy_denial_and_a_malformed_one_an_argument_fault(tmp_path):
+    registry, _ctx = _registry(tmp_path)
+    blocked = registry.execute_result("send_links", {"links": [{"label": "x", "url": "javascript:alert(1)"}]})
+    assert blocked.status == "blocked" and blocked.text.startswith("⚠️ SEND_LINKS_URL_BLOCKED")
+    assert blocked.text.endswith("No links were sent.")
+    malformed = registry.execute_result("send_links", {"links": "nope"})
+    assert malformed.status == "error" and malformed.text.startswith("⚠️ SEND_LINKS_")
+
