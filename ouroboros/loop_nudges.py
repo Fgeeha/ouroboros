@@ -129,13 +129,15 @@ def _build_recent_tool_trace(
     tool answered: a list of calls alone asks "are you repeating yourself?" without the
     one fact that says why. Facts only — what they mean stays with the model.
     """
+    from ouroboros.reflection import _trace_call_errored  # the ONE reading of "this call went wrong"
+
     outcomes: Dict[str, str] = {}
     for row in ((llm_trace or {}).get("tool_calls") or []):
         if not isinstance(row, dict) or not row.get("tool_call_id"):
             continue
         status = str(row.get("status") or ("error" if row.get("is_error") else "ok"))
         note = f" [{status}]"
-        if row.get("is_error") or status != "ok":
+        if _trace_call_errored(row):
             head = str(row.get("result") or "").strip().splitlines()[:1]
             note += f" ← {head[0][:200]}" if head else ""
         outcomes[str(row["tool_call_id"])] = note

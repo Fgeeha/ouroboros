@@ -196,3 +196,33 @@ def test_the_self_check_lists_outcomes_and_a_failed_answer():
     # without a trace the list is exactly what it was
     assert _build_recent_tool_trace(messages) == (
         'Recent tool calls (oldest first):\n  1. escalate({"question":"q","max_wait_minutes":0})\n  2. read_file({"path":"a"})')
+
+
+def test_a_successful_untyped_or_autocorrected_call_is_not_a_failure_anywhere():
+    """`untyped` (a successful extension/MCP body) and `ok_autocorrected` (a shell command the host
+    repaired) are ok statuses in the one SSOT; a private spelling of "ok" once told a clean run that
+    every round had failed."""
+    from ouroboros.loop_nudges import _build_recent_tool_trace
+
+    calls = [{"tool": "ext_demo", "tool_call_id": "u1", "args": {"value": 1}, "result": "hello from extension",
+              "is_error": False, "status": "untyped", "round_id": "e:round:1"},
+             {"tool": "run_command", "tool_call_id": "u2", "args": {"cmd": "grep -E x"}, "result": "match",
+              "is_error": False, "status": "ok_autocorrected", "round_id": "e:round:2"}]
+    listing = build_trace_summary({"tool_calls": calls}, all_calls=True)
+    assert listing.splitlines()[0] == "## Tool trace (2 calls, 0 errors)" and "←" not in listing
+    messages = [{"role": "assistant", "tool_calls": [
+        {"id": "u1", "function": {"name": "ext_demo", "arguments": "{}"}},
+        {"id": "u2", "function": {"name": "run_command", "arguments": "{}"}}]}]
+    rendered = _build_recent_tool_trace(messages, llm_trace={"tool_calls": calls})
+    assert "[untyped]" in rendered and "[ok_autocorrected]" in rendered and "←" not in rendered
+
+
+def test_a_trace_the_listing_shows_whole_retains_no_verbatim_record(tmp_path, captured_calls):
+    trace = {"tool_calls": [_ok("read_file", 1, path="a.md"),
+                            {**_refused(2), "result": "⚠️ QUIZ_WAIT_BOUND_INVALID: one line only."}]}
+    reflection.generate_reflection(
+        {"id": "task-small", "text": "Ask the owner", "drive_root": str(tmp_path)},
+        trace, build_trace_summary(trace, all_calls=True), object(), {"rounds": 2, "cost": 0.0})
+    prompt = next(call for call in captured_calls if call.get("call_type") != "pattern_register_update")["messages"][0]["content"]
+    assert "Complete per-call record" not in prompt
+

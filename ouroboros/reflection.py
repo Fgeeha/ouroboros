@@ -414,12 +414,21 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
     """Retain the per-call record as the actor saw it and name its reader; optional reading.
 
     The listing above it bounds values and shows only the first line of a failed or
-    repeated call's result, so the omission needs a source the same reader can open.
+    repeated call's result; when that really cut something, the omission needs a source
+    the same reader can open. A trace the listing shows whole writes nothing.
     Redacted like every other reflection-visible result. Never a required source: a
     reflection that does not open it is still complete for what its prompt shows.
     """
     tool_calls = [tc for tc in (llm_trace.get("tool_calls") or []) if isinstance(tc, dict)]
-    if not tool_calls:
+    # Written only when the listing really left something out of a row it shows: an argument
+    # value past its width, or a failed call's answer beyond its first line.
+    def _cut(tc: Dict[str, Any]) -> bool:
+        args = tc.get("args")
+        answer = str(tc.get("result") or "").strip()
+        return (any(len(str(value)) > 200 for value in (args.values() if isinstance(args, dict) else [args]))
+                or (_trace_call_errored(tc) and (len(answer.splitlines()) > 1 or len(answer) > 200)))
+
+    if not any(_cut(tc) for tc in tool_calls):
         return ""
     try:
         from ouroboros.consolidator import retain_memory_source

@@ -111,10 +111,6 @@ def _trace_round(tc: dict) -> int | None:
     return int(tail) if tail.isdigit() else None
 
 
-def _trace_row_failed(tc: dict) -> bool:
-    return bool(tc.get("is_error")) or str(tc.get("status") or "ok").strip() not in ("", "ok")
-
-
 def _fold_identical_calls(tool_calls: list) -> list[tuple[int, dict, int, int | None, int | None]]:
     """Run-length fold of consecutive IDENTICAL calls: (first index, row, count, first round, last round).
 
@@ -159,6 +155,7 @@ def build_trace_summary(llm_trace: dict, *, all_calls: bool = False) -> str:
     # ignored read-only blocks. Self-learning (reflection reads this) must not be
     # poisoned by counting policy refusals or intentional probe exits as failures.
     from ouroboros.outcomes import _classify_tool_errors
+    from ouroboros.reflection import _trace_call_errored  # the ONE reading of "this call went wrong"
 
     _buckets = _classify_tool_errors(llm_trace)
     _unresolved = len(_buckets.get("unresolved") or [])
@@ -181,7 +178,7 @@ def build_trace_summary(llm_trace: dict, *, all_calls: bool = False) -> str:
         for tc in tool_calls:
             number = _trace_round(tc)
             if number is not None:
-                rounds[number] = rounds.get(number, True) and _trace_row_failed(tc)
+                rounds[number] = rounds.get(number, True) and _trace_call_errored(tc)
         if any(rounds.values()):
             _breakdown_bits.append(f"{sum(rounds.values())} of {len(rounds)} rounds had only non-ok results")
 
@@ -224,7 +221,7 @@ def build_trace_summary(llm_trace: dict, *, all_calls: bool = False) -> str:
             if count > 1:
                 span = "" if round_a is None else f", rounds {round_a}–{round_b}" if round_b != round_a else f", round {round_a}"
                 suffix += f" ×{count} identical{span}"
-            if all_calls and (count > 1 or _trace_row_failed(tc)):
+            if all_calls and (count > 1 or _trace_call_errored(tc)):
                 # The answer is what a later reader needs to tell a refusal from progress.
                 head = str(redact_projection(str(tc.get("result") or "")).value).strip().splitlines()[:1]
                 if head:
