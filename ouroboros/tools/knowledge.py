@@ -209,7 +209,7 @@ def get_tools() -> List[ToolEntry]:
                 "topic": topic, "scope": scope,
                 "content": {"type": "string", "description": "Markdown, optionally with YAML frontmatter. Write understanding and its sources/uncertainty in your own words; no summary is generated from the body."},
                 "mode": {"type": "string", "enum": ["overwrite", "append"], "description": "overwrite (default) replaces the body; append adds to the current source. Missing notes are created."},
-                "expected_revision": {"type": "string", "description": "Source revision returned by knowledge_read. Required when overwriting an existing note; drift returns the newer source without replacing it."},
+                "expected_revision": {"type": "string", "description": "Source revision returned by knowledge_read. Omit or pass an empty string to create a missing note; an empty string never replaces an existing note. Required when overwriting an existing note; drift returns the newer source without replacing it."},
             }, "required": ["topic", "content"]},
         }, _knowledge_write),
         ToolEntry("knowledge_list", {

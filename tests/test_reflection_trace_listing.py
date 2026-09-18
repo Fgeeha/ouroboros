@@ -226,3 +226,50 @@ def test_a_trace_the_listing_shows_whole_retains_no_verbatim_record(tmp_path, ca
     prompt = next(call for call in captured_calls if call.get("call_type") != "pattern_register_update")["messages"][0]["content"]
     assert "Complete per-call record" not in prompt
 
+
+
+def test_different_long_errors_are_not_labelled_identical():
+    calls = [{"tool": "probe", "is_error": True, "status": "error",
+              "result": "x" * 1200 + ending} for ending in ("one", "two")]
+    details = reflection._collect_error_details({"tool_calls": calls})
+    assert "identical" not in details
+    assert details.count("[probe") == 2
+
+
+def test_post_task_consumer_receives_middle_calls_and_repeated_ok_source(tmp_path, captured_calls, monkeypatch):
+    from types import SimpleNamespace
+    from ouroboros.post_task_synthesis import _run_reflection
+    from ouroboros.consolidator import KnowledgeReadContext
+    from ouroboros.tools.registry import ToolContext
+
+    calls = [_ok("read_file", n, path=f"file-{n}", start_line=1, third="KEEP_THIRD") for n in range(1, 81)]
+    calls += [{**_ok("probe", n, query="same"), "result": "running\nIMPORTANT_TAIL"} for n in (81, 82)]
+    trace = {"tool_calls": calls}
+    preview = build_trace_summary(trace)
+    monkeypatch.setattr(reflection, "append_reflection_routed", lambda *_a: None)
+    entry = _run_reflection(SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path), object(),
+        {"id": "end-to-end", "text": "Inspect outcomes", "drive_root": str(tmp_path)},
+        {"rounds": 82, "cost": 0.0}, trace, {})
+    assert entry is not None and "reflection generation failed" not in entry["reflection"]
+    prompt = next(c for c in captured_calls if c.get("call_type") == "task_reflection")["messages"][0]["content"]
+    assert "file-40" in prompt and "KEEP_THIRD" in prompt and "×2 identical" in prompt
+    assert "middle tool calls omitted" not in prompt
+    marker = "Complete per-call record ("
+    arguments = json.loads(prompt[prompt.index(marker):].split("read_file ", 1)[1].splitlines()[0])
+    # Read through the very tool surface the reflection model holds, not Path alone.
+    reader = KnowledgeReadContext(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="end-to-end"), "task_reflection")
+    result = reader.read_call({"id": "read-source", "function": {"name": "read_file", "arguments": json.dumps(arguments)}})
+    assert "IMPORTANT_TAIL" in str(result) and "file-40" in str(result)
+    assert build_trace_summary(trace) == preview
+
+
+def test_trace_source_failure_is_disclosed(tmp_path, monkeypatch):
+    from ouroboros.tools.registry import ToolContext
+
+    def fail(*_args, **_kwargs):
+        raise OSError("unavailable")
+
+    monkeypatch.setattr("ouroboros.consolidator.retain_memory_source", fail)
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    pointer = reflection._verbatim_trace_pointer(ctx, _streak_trace())
+    assert "unavailable" in pointer and "omits" in pointer

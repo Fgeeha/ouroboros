@@ -257,12 +257,13 @@ def _collect_error_details(llm_trace: Dict[str, Any], cap: int = 3000) -> str:
         # Pre-cap each snippet so one oversized error cannot monopolize the whole
         # budget and hide later distinct errors (breadth over depth). The same
         # refusal repeated ten times is ONE entry with its count, not ten copies.
-        snippet = _truncate_with_notice(f"[{tool_name}{fact_prefix}]: {safe_result}", 1000)
+        snippet = f"[{tool_name}{fact_prefix}]: {safe_result}"
         snippets[snippet] = snippets.get(snippet, 0) + 1
 
     parts: List[str] = []
     total = 0
     for snippet, count in snippets.items():
+        snippet = _truncate_with_notice(snippet, 1000)
         if count > 1:
             snippet = f"(×{count} identical) {snippet}"
         if total + len(snippet) > cap:
@@ -420,15 +421,17 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
     reflection that does not open it is still complete for what its prompt shows.
     """
     tool_calls = [tc for tc in (llm_trace.get("tool_calls") or []) if isinstance(tc, dict)]
-    # Written only when the listing really left something out of a row it shows: an argument
-    # value past its width, or a failed call's answer beyond its first line.
-    def _cut(tc: Dict[str, Any]) -> bool:
+    from ouroboros.post_task_synthesis import _fold_identical_calls
+
+    # Use the listing's same run-length groups: repeated successful answers are
+    # displayed too, and may lose their tail just like a failed answer.
+    def _cut(tc: Dict[str, Any], count: int) -> bool:
         args = tc.get("args")
         answer = str(tc.get("result") or "").strip()
         return (any(len(str(value)) > 200 for value in (args.values() if isinstance(args, dict) else [args]))
-                or (_trace_call_errored(tc) and (len(answer.splitlines()) > 1 or len(answer) > 200)))
+                or ((count > 1 or _trace_call_errored(tc)) and (len(answer.splitlines()) > 1 or len(answer) > 200)))
 
-    if not any(_cut(tc) for tc in tool_calls):
+    if not any(_cut(tc, count) for _, tc, count, _, _ in _fold_identical_calls(tool_calls)):
         return ""
     try:
         from ouroboros.consolidator import retain_memory_source
@@ -446,7 +449,7 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
                 f"reading, {len(safe)} chars): read_file " + json.dumps(ref["read"]["arguments"], ensure_ascii=False))
     except Exception:
         log.debug("Verbatim trace record unavailable for reflection", exc_info=True)
-        return ""
+        return "\n\nComplete per-call record unavailable: the listing omits argument or result text; do not treat it as the complete trace."
 
 
 def generate_reflection(

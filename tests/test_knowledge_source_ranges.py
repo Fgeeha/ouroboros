@@ -79,3 +79,30 @@ def test_a_bound_that_asks_for_nothing_reads_instead_of_refusing(tmp_path):
     for args in ({"start_char": -1, "end_char": 4}, {"start_char": 5, "end_char": 2}, {"start_char": "0", "end_char": 4}):
         text, result = _read(ctx, **args)
         assert result.status == "error" and result.code == "TOOL_ARG_ERROR" and "complete_chars=11" in text
+
+
+def test_blank_revision_creates_only_a_missing_note(tmp_path):
+    from ouroboros.tools.knowledge import _knowledge_write
+
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    assert "saved" in _knowledge_write(ctx, "new", "First body", expected_revision="")
+    path = tmp_path / "memory/knowledge/new.md"
+    original = path.read_bytes()
+    for mode in ("overwrite", "append"):
+        assert "revision_conflict" in _knowledge_write(ctx, "new", "Unsafe change", mode=mode, expected_revision="")
+        assert path.read_bytes() == original
+    assert "revision_required" in _knowledge_write(ctx, "new", "Unsafe change")
+    revision = hashlib.sha256(original).hexdigest()
+    assert "saved" in _knowledge_write(ctx, "new", "Fresh body", expected_revision=revision)
+    assert "Fresh body" in path.read_text()
+    assert "revision_conflict" in _knowledge_write(ctx, "new", "Stale body", expected_revision=revision)
+
+
+def test_boolean_range_bounds_are_not_integer_offsets(tmp_path):
+    path = tmp_path / "memory/knowledge/note.md"
+    path.parent.mkdir(parents=True)
+    path.write_text("Source")
+    ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
+    for args in ({"start_char": False}, {"end_char": True}):
+        text, result = _read(ctx, **args)
+        assert result.code == "TOOL_ARG_ERROR" and "complete_chars=6" in text

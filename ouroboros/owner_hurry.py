@@ -690,6 +690,15 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
         " A paid reviewer slot can still settle, so a late result is still owed."
         if decision.get("review_late_result_pending") else ""
     )
+    if decision.get("author_action"):
+        action = str(decision["author_action"])
+        result = ("the author stopped with unfinished work" if action == "stop" else
+                  "the current plan was accepted by its author under advisory enforcement"
+                  if decision.get("allow") and decision.get("enforcement") == "advisory" else
+                  "the revised author plan has no current critic approval")
+        return (f"\n\n⚠️ Plan author decision: {action}; {result}. "
+                f"Referenced critic review: {outcome or 'unavailable'}. "
+                f"The author decision does not close or replace the critic review.{late}")
     if decision.get("status") == "rail_degraded":
         rail_reason = str(forced_reason or decision.get("reason") or "")
         detail = f" ({outcome})" if outcome else ""

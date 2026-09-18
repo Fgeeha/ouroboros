@@ -1108,25 +1108,20 @@ def plan_review_wave(state: Dict[str, Any], fingerprint: str) -> Optional[Dict[s
 
 
 def current_plan_review_wave(state: Any) -> Optional[Dict[str, Any]]:
-    """The wave the gate projects: the ``current_attempt`` fingerprint's wave, else the
-    latest recorded wave (private copy)."""
+    """Copy the current fingerprint's wave; only an absent fingerprint selects the latest."""
     if not isinstance(state, dict):
         return None
     attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
     fingerprint = str(attempt.get("fingerprint") or "")
-    wave = plan_review_wave(state, fingerprint) if fingerprint else None
-    if wave is None:
-        waves = state.get("waves") if isinstance(state.get("waves"), list) else []
-        wave = copy.deepcopy(waves[-1]) if waves and not fingerprint else None
-    return wave
+    if fingerprint:
+        return plan_review_wave(state, fingerprint)
+    waves = state.get("waves") if isinstance(state.get("waves"), list) else []
+    return copy.deepcopy(waves[-1]) if waves else None
 
 
 def _legacy_projection_of(state: Any) -> Dict[str, Any]:
-    if not isinstance(state, dict):
-        return {}
-    if state.get("schema_version") == 1:
-        return legacy_plan_review_projection(state)
-    projection = state.get("legacy_v1_projection")
+    state = state if isinstance(state, dict) else {}
+    projection = legacy_plan_review_projection(state) if state.get("schema_version") == 1 else state.get("legacy_v1_projection")
     return projection if isinstance(projection, dict) else {}
 
 
@@ -1138,19 +1133,16 @@ def plan_review_gate_projection(
 ) -> Dict[str, Any]:
     """Project finalization permission without changing the durable review facts.
 
-    The current-attempt pointer prevents an older closed wave authorizing new
-    work. In ordinary Blocking, open/unavailable/pending/legacy-open reviews hold
-    finalization; spent cycles (D27), unreachable quorum (B2b) or a hard rail
-    release it for an honest blocked outcome. Advisory releases an open review.
-    Cyber retains judgment even with missing evidence: allow never implies closed
-    or PASS. Accepts v2 state, a v1 wrapper or raw v1 as a read-only projection.
+    Current-attempt identity prevents stale closure. Blocking holds open reviews;
+    spent cycles, unreachable quorum and hard rails permit honest blocked exits.
+    Advisory/Cyber allow is not closure or PASS. Accepts v2 and raw/wrapped v1.
     """
     policy = "blocking" if str(enforcement or "").lower() == "blocking" else "advisory"
     control: Dict[str, Any] = {}
     attempted = False
+    attempt = state.get("current_attempt") if isinstance(state, dict) and isinstance(state.get("current_attempt"), dict) else {}
     if isinstance(state, dict):
         legacy = _legacy_projection_of(state)
-        attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
         wave = current_plan_review_wave(state) if state.get("schema_version") != 1 else None
         if wave is not None or (attempt and state.get("schema_version") != 1):
             attempted = True
@@ -1198,9 +1190,17 @@ def plan_review_gate_projection(
     else:
         control = {"status": "invalid"}
 
-    attempt = (state or {}).get("current_attempt") or {} if isinstance(state, dict) else {}
     subject = attempt.get("author_subject") or {}
     author = validate_author_disposition(subject.get("author_disposition"), subject_hash=str(attempt.get("fingerprint") or ""))
+    if author and attempt.get("reason") in {"author_current_plan", "author_stop"}:
+        # Follow historical criticism only here, never in current_plan_review_wave:
+        # its closed_plan_review_wave consumer binds CURRENT acceptance authority.
+        critic = plan_review_wave(state, str(subject.get("review_fingerprint") or ""))
+        if critic is not None:
+            outcome = str(critic.get("aggregate") or "")
+            control.update(status="open", closed=False, outcome=outcome,
+                           custody_pending=bool(critic.get("custody_pending")),
+                           reviewer_slots_degraded=outcome == "DEGRADED")
     if author and author.get("action") == "stop":
         control.update(status="author_stopped", reason="author_stop", closed=False)
     status = str(control.get("status") or "unavailable")
@@ -1250,6 +1250,7 @@ def plan_review_gate_projection(
         "cycles_paid": int((state or {}).get("cycles_paid") or 0) if isinstance(state, dict) else 0,
         "legacy_v1": bool(control.get("legacy_v1")),
         "source": "durable_state",
+        "author_action": str(author.get("action") or "") if author else "",
     }
 
 
@@ -1261,10 +1262,9 @@ def closed_plan_review_wave(state: Any) -> Optional[Dict[str, Any]]:
     so ``effective_acceptance_claims``' v1 fallback still binds those claims."""
     if not isinstance(state, dict):
         return None
-    if state.get("schema_version") != 1:
-        wave = current_plan_review_wave(state)
-        if wave is not None:
-            return wave if bool(wave.get("closed")) else None
+    wave = current_plan_review_wave(state) if state.get("schema_version") != 1 else None
+    if wave is not None:
+        return wave if bool(wave.get("closed")) else None
     legacy = _legacy_projection_of(state)
     if legacy.get("status") == "closed":
         return {"legacy_v1": True, "request_fingerprint": legacy["fingerprint"],

@@ -1152,6 +1152,7 @@ def handle_tool_calls(
             fn_name = str((tc.get("function") or {}).get("name") or "").strip()
             result = custom_tool_argument_error(fn_name, receipt)
             return {
+                "round_id": getattr(tools._ctx, "_current_llm_call_meta", {}).get("round_id"),
                 "tool_call_id": str(tc.get("id") or ""),
                 "fn_name": fn_name,
                 "result": result,
@@ -1209,6 +1210,7 @@ def handle_tool_calls(
                         text=result,
                     )
                     results[idx] = {
+                        "round_id": getattr(tools._ctx, "_current_llm_call_meta", {}).get("round_id"),
                         "tool_call_id": tc.get("id", ""),
                         "fn_name": fn_name,
                         "result": result,
