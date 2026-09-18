@@ -124,8 +124,8 @@ takes the omitted path, disclosed in the result; only a value that genuinely ask
 for something is refused there, typed, at the earliest layer holding the authority
 to judge it, with the repair named. Models fill every key of a tool schema, so an
 optional argument's empty or mode-irrelevant form (`max_wait_minutes` on a quiz that
-does not wait, `0` with `""`, a range end past the source, a zone beside an absolute
-instant) is that same omitted path, and a refusal that only restates its rule is
+does not wait, `0` with `""`, a range end past a knowledge note, a zone beside an
+offset-carrying instant) is that same omitted path, and a refusal that only restates its rule is
 retried unchanged: it names the field, the value received and the repair in ONE
 reply (house helpers for both sentences: `tools/arg_feedback`).
 

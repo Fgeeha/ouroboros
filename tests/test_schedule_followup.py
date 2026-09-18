@@ -287,6 +287,11 @@ def test_schedule_followup_requires_exactly_one_valid_trigger(tmp_path):
     assert "timezone='Europe/Moscow' ignored: it applies only to recurring cron follow-ups" in run_at_zone
     [stored] = list_scheduled_tasks(tmp_path / "data")["tasks"]
     assert stored["trigger"]["type"] == "once" and not stored.get("timezone")
+    # A zone beside a run_at WITHOUT an offset is not a no-op: the naive time would be read
+    # as UTC, hours off. Still refused, and the refusal names the repair.
+    naive = _followup(ctx, run_at="2030-01-01T09:00:00", timezone="Europe/Moscow")
+    assert naive.startswith("ERROR: FOLLOWUP_TIMEZONE_WITH_RUN_AT") and "+03:00" in naive
+    assert len(list_scheduled_tasks(tmp_path / "data")["tasks"]) == 1
 
 
 def test_schedule_followup_cap_refusal_is_typed_and_disclosed(tmp_path):

@@ -30,9 +30,8 @@ def test_helpers_name_the_field_the_value_and_the_repair(tmp_path):
         "timezone='UTC' ignored: run_at carries its own offset")
     _registry_unused, ctx = _registry(tmp_path)
     text = argument_refusal(ctx, "DEMO_INVALID", ["a=1 must be 2.", "b is missing"],
-                            example="demo(a=2, b='x')", effect="Nothing was recorded.")
-    assert text == ("⚠️ DEMO_INVALID: a=1 must be 2; b is missing. "
-                    "Correct example: demo(a=2, b='x'). Nothing was recorded.")
+                            effect="Nothing was recorded.")
+    assert text == "⚠️ DEMO_INVALID: a=1 must be 2; b is missing. Nothing was recorded."
 
 
 @pytest.mark.parametrize("reflex", [0, 1])

@@ -64,7 +64,7 @@ ALLOWED_DYNAMIC: dict[str, tuple[int, str]] = {
     "ouroboros/tools/core_file_tools.py": (1, "the interpolated identifier always ends in _BLOCKED, which the adapter types"),
     "ouroboros/tools/edit_ops.py": (1, _DYNAMIC_WHY),
     "ouroboros/tools/skill_exec.py": (2, _DYNAMIC_WHY),
-    "ouroboros/tools/tool_resolution.py": (1, "protected registry path; unknown-tool text is typed by the dispatcher"),
+    "ouroboros/tools/tool_resolution.py": (1, "protected registry path; the binding-error text is typed by its SKILL_REDIRECT_ family marker"),
 }
 
 

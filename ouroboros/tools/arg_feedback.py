@@ -19,7 +19,7 @@ def ignored_argument_note(name: str, value: Any, why: str) -> str:
 
 
 def argument_refusal(
-    ctx: Any, identifier: str, problems: Iterable[str], *, example: str = "", effect: str = "",
+    ctx: Any, identifier: str, problems: Iterable[str], *, effect: str = "",
 ) -> str:
     """Publish one typed refusal naming every violated constraint (the W2 shape).
 
@@ -28,8 +28,6 @@ def argument_refusal(
     Pattern Register read. ``effect`` states what the refused call did NOT do.
     """
     text = f"⚠️ {identifier}: " + "; ".join(str(item).rstrip(". ") for item in problems) + "."
-    if example:
-        text += f" Correct example: {example}."
     if effect:
         text += f" {effect}"
     return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=text))

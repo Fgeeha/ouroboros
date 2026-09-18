@@ -870,7 +870,10 @@ def supervised_wait(
     if checkpoint_after_sec == 0 and not reason_text and not isinstance(checkpoint_after_sec, bool):
         # The schema's empty pair asks for no checkpoint: the omitted path, said in the wake.
         checkpoint_after_sec = None
-        ignored_note = "checkpoint_after_sec=0 ignored: with an empty checkpoint_reason it asks for no checkpoint"
+        from ouroboros.tools.arg_feedback import ignored_argument_note
+
+        ignored_note = ignored_argument_note(
+            "checkpoint_after_sec", 0, "with an empty checkpoint_reason it asks for no checkpoint")
     if (checkpoint_after_sec is None) != (not reason_text):
         # The family's ONE refusal author, not a second literal envelope beside
         # it: this is an argument fault, and it is recorded as one.

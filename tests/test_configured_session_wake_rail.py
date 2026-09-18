@@ -536,11 +536,19 @@ def test_the_empty_checkpoint_pair_asks_for_no_checkpoint(tmp_path):
         "checkpoint_after_sec=0 ignored: with an empty checkpoint_reason it asks for no checkpoint"]
 
     for args, missing in (({"checkpoint_after_sec": 60}, "checkpoint_reason is missing"),
-                          ({"checkpoint_reason": "look again"}, "checkpoint_after_sec is missing"),
-                          ({"checkpoint_after_sec": 0, "checkpoint_reason": "look"}, "")):
+                          ({"checkpoint_reason": "look again"}, "checkpoint_after_sec is missing")):
         result = supervised_wait(ctx, "run-1", wait_once=wait_once, **args)
-        if missing:
-            assert result.status == "error" and result.code == "TOOL_ARG_ERROR"
-            assert missing in result.text and "checkpoint_requires_time_and_reason" in result.text
-        else:  # 0 seconds WITH a reason genuinely asks for an immediate inspection
-            assert result.status == "ok"
+        assert result.status == "error" and result.code == "TOOL_ARG_ERROR"
+        assert missing in result.text and "checkpoint_requires_time_and_reason" in result.text
+
+    # 0 seconds WITH a reason genuinely asks for an immediate inspection: on a fresh run
+    # (no pending wake to replay) the checkpoint is really scheduled with that reason.
+    from ouroboros.delegate_supervision import _load_state
+
+    fresh_root = tmp_path / "fresh"
+    fresh_root.mkdir()
+    _child(fresh_root)
+    fresh = _ctx(fresh_root)
+    asked = supervised_wait(fresh, "run-2", checkpoint_after_sec=0, checkpoint_reason="look", wait_once=wait_once)
+    assert asked.status == "ok" and "ignored_arguments" not in json.loads(asked.text)
+    assert (_load_state(fresh, "run-2").get("checkpoint") or {}).get("reason") == "look"
