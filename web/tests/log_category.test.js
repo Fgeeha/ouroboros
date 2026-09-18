@@ -149,6 +149,27 @@ test('reasoning hidden: the stamped Logs row declares itself invisible', () => {
     assert.equal(summarizeLogEvent(REASONING_ROW).visible, false);
 });
 
+test('reasoning hidden: a reasoning-only round keeps its ordinary narration row and card title', () => {
+    // The worker stamps `narration: true` on the reasoning frame only when the round
+    // has no visible text; that frame is then the round's voice, not an extra row.
+    const only = { ...REASONING_ROW, narration: true };
+    setReasoningVisible(false);
+    const log = summarizeLogEvent(only);
+    assert.notEqual(log.visible, false);
+    assert.notEqual(log.phase, 'thinking');
+    assert.equal(categorizeLogEvent(only, log), 'tasks');
+    const chat = summarizeChatLiveEvent(only);
+    assert.equal(chat.visible, true);
+    assert.equal(chat.promote, true, 'it claims the card title, as before the stamp existed');
+    // Beside visible text (`narration: false`) the frame stays hidden.
+    assert.equal(summarizeChatLiveEvent({ ...REASONING_ROW, narration: false }).visible, false);
+    // Display on: the same frame is the collapsed Thinking line again.
+    setReasoningVisible(true);
+    assert.equal(summarizeLogEvent(only).phase, 'thinking');
+    assert.equal(summarizeChatLiveEvent(only).phase, 'thinking');
+    setReasoningVisible(false);
+});
+
 test('the Logs filter chip is offered only while reasoning is displayed', () => {
     // logs.js::renderFilters skips the chip on this exact condition, so the
     // owner is never handed a filter that can never match.

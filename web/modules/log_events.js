@@ -17,8 +17,7 @@ export { formatReviewProjection } from './review_presentation.js';
 // stamped frames either way, so turning it on reveals them on replay too.
 // Both reasoning branches below read it and answer with the file's existing
 // "not visible" contract (`visible: false`) instead of a new sentinel.
-// localStorage only mirrors the server preference (as theme.js does) so history
-// that renders before /api/ui/preferences answers already honours a saved "on".
+// localStorage mirrors the server preference (as theme.js does) for pre-fetch renders.
 const REASONING_STORAGE_KEY = 'ouro.show_reasoning';
 function storedReasoningVisible() {
     try { return localStorage.getItem(REASONING_STORAGE_KEY) === '1'; } catch { return false; }
@@ -706,7 +705,9 @@ export function summarizeLogEvent(evt) {
     const taskMeta = (...items) => [evt.task_id ? `task=${evt.task_id}` : '', ...items];
 
     if (evt.is_progress || t === 'send_message') {
-        if (evt.reasoning === true && (!isSubagentEvent(evt) || !reasoningVisible)) {
+        // Display off + a reasoning-only round's frame (`narration: true`): ordinary row.
+        if (evt.reasoning === true && (reasoningVisible || evt.narration !== true)
+            && (!isSubagentEvent(evt) || !reasoningVisible)) {
             const thinking = view('thinking', 'Thinking', {
                 body: shortText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240),
                 meta: taskMeta(),
@@ -1232,6 +1233,7 @@ function summarizeChatLiveEventView(evt) {
     }
 
     if ((evt.is_progress || t === 'send_message') && evt.reasoning === true
+        && (reasoningVisible || evt.narration !== true)
         && (!reasoningVisible || !isSubagentEvent(evt))) {
         // The agent's own reasoning: a collapsed "Thinking" timeline line (body =
         // preview, fullBody = the whole text for the existing Expand toggle). It is

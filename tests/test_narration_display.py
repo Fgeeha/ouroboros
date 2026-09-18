@@ -193,7 +193,7 @@ def test_round_progress_emits_reasoning_stamped_before_visible_text(monkeypatch)
 
     # think -> say: reasoning goes out first, stamped, even though visible text exists.
     assert calls == [
-        ("weigh the two options", {"meta": {"reasoning": True}, "narration": True}),
+        ("weigh the two options", {"meta": {"reasoning": True}, "narration": False}),
         ("the answer", {"narration": True}),
     ]
     # reasoning is display-only: only the visible text reaches the trace.
