@@ -60,7 +60,6 @@ ALLOWED: dict[str, tuple[int, str]] = {
 _DYNAMIC_WHY = "pre-existing interpolated marker; publish it typed when the producer is next touched"
 ALLOWED_DYNAMIC: dict[str, tuple[int, str]] = {
     "ouroboros/tools/browser.py": (6, _DYNAMIC_WHY),
-    "ouroboros/tools/control_scheduling.py": (1, "typed by the scheduling-forms change (PR #1092); drop on merge"),
     "ouroboros/tools/core.py": (2, _DYNAMIC_WHY),
     "ouroboros/tools/core_file_tools.py": (1, "the interpolated identifier always ends in _BLOCKED, which the adapter types"),
     "ouroboros/tools/edit_ops.py": (1, _DYNAMIC_WHY),
