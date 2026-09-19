@@ -17,6 +17,7 @@ import pathlib
 import uuid
 from typing import Any, Dict, List, Optional
 
+from ouroboros.tools.arg_feedback import argument_refusal
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
@@ -408,7 +409,18 @@ def _send_links(
     try:
         actions = validate_link_actions(links)
     except LinkActionsValidationError as exc:
-        return f"⚠️ {exc.code}: {exc}"
+        # The marker names the CAUSE in the refusal the model reads: SEND_LINKS_URL_BLOCKED a
+        # policy denial, SEND_LINKS_ARG_ERROR an argument fault. Neither name is in the legacy
+        # code map (no _ARG_ERROR suffix rule exists), so the adapter types them from their
+        # SHAPE: the _BLOCKED head becomes LEGACY_BLOCKED and the _ERROR head
+        # LEGACY_TOOL_ERROR. Different buckets, but these TWO are both recorded as a
+        # refusal rather than a successful call, which is why the marker is here. It says
+        # nothing about this tool's other codes: SEND_LINKS_TOO_MANY is a LEGACY_WARNING
+        # whose status stays ok.
+        from ouroboros.tools.tool_result import LegacyTextResultAdapter
+
+        return _publish_tool_result(ctx, LegacyTextResultAdapter.from_text(
+            "send_links", f"⚠️ {exc.code}: {exc} No links were sent."))
     from ouroboros.tools.owner_delivery import deliver_owner_event
     mode = deliver_owner_event(ctx, {
         "type": "send_links",
@@ -451,7 +463,8 @@ def _escalate(
                                         wait_for_answer=wait_for_answer,
                                         max_wait_minutes=max_wait_minutes)
     except QuizValidationError as exc:
-        return f"⚠️ {exc.code}: {exc}"
+        # Typed, and it says what did NOT happen: a refusal that only restates the rule is retried unchanged.
+        return argument_refusal(ctx, exc.code, [str(exc)], effect="The quiz was not sent.")
     ignored_bound = (" max_wait_minutes ignored: it applies only to wait_for_answer=true."
                      if max_wait_minutes is not None and not wait_for_answer else "")
     task_id = str(getattr(ctx, "task_id", "") or "").strip()

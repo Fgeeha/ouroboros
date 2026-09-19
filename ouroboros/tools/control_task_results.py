@@ -236,7 +236,13 @@ def _get_task_result(
             payload["completion_source"] = completion_source_projection(
                 status_drive_root, str(task_id), data, source_start_char, source_end_char,
             )
-        return json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+        if any(isinstance(view, dict) and view.get("reason") == "source_range_invalid"
+               for view in (payload.get("work_order_source"), payload.get("completion_source"))):
+            # The requested text was NOT returned: same JSON (it names complete_chars and
+            # the range received), recorded as the argument fault it is, never as `ok`.
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=text))
+        return text
     status = data.get("status", "unknown")
     result = data.get("result", "")
     trace = data.get("trace_summary", "")

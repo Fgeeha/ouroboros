@@ -1282,7 +1282,7 @@ def get_tools() -> List[ToolEntry]:
                 "since_seq": {"type": "integer", "description": "Event cursor: advances past it are recorded as progress."},
                 "checkpoint_after_sec": {"type": "integer", "description":
                     "Optional one-shot future inspection time. Requires checkpoint_reason; "
-                    "a real earlier wake consumes it."},
+                    "a real earlier wake consumes it. Omit both for no checkpoint (0 with an empty reason also means none)."},
                 "checkpoint_reason": {"type": "string", "description":
                     "Why one proactive inspection is worth a model call. No repeating cadence."},
             }},

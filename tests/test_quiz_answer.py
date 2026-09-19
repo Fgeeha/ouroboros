@@ -398,10 +398,12 @@ def test_escalate_subagent_writes_parent_mailbox_frame(tmp_path, monkeypatch):
                         lambda root, tid: {"status": "running",
                                            "drive_root": str(tmp_path)})
     ctx = _tool_ctx(tmp_path, task_id="child-9", parent="root-1")
+    # A child cannot wait, so a habit-filled bound is ignored — and the receipt says so.
     out = _escalate(ctx, question="Delete the flaky test?",
                     options=[{"label": "delete"}, {"label": "quarantine"}],
-                    stake="CI health", assumption="quarantine meanwhile")
+                    stake="CI health", assumption="quarantine meanwhile", max_wait_minutes=1)
     assert out.startswith("OK: escalated to parent task root-1")
+    assert "max_wait_minutes ignored: it applies only to wait_for_answer=true" in out
     entries = drain_owner_entries(tmp_path, "root-1", set())
     assert entries and entries[0]["provenance"] == "descendant_task"
     text = entries[0]["text"]
@@ -924,7 +926,8 @@ def test_two_recommended_options_are_refused_and_one_survives_live_and_replay_al
     out = _escalate(ctx, question="Which db?",
                     options=[{"label": "sqlite", "recommended": True}, {"label": "postgres", "recommended": True}],
                     assumption="sqlite meanwhile")
-    assert out == "⚠️ QUIZ_RECOMMENDED_INVALID: mark at most one option as recommended."
+    assert out == ("⚠️ QUIZ_RECOMMENDED_INVALID: mark at most one option as recommended. "
+                   "The quiz was not sent.")
     assert not [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
     assert quiz_states(tmp_path, "root-1") == {}
     out = _escalate(ctx, question="Which db?",
