@@ -108,7 +108,7 @@ A registry of `config.SETTINGS_DEFAULTS` (exact defaults canonical in `settings_
 | OUROBOROS_DELIVERABLES_ROOT | (empty) | Deliverables root (empty derives the `~/Ouroboros/Deliverables` sibling; `tool_access.py`) |
 | OUROBOROS_GC_RETENTION_DAYS | 7 | Unified GC retention (`retention.py`) |
 | OUROBOROS_RESTART_DRAIN_MAX_SEC | 120 | Restart drain bound |
-| TOTAL_BUDGET | 200.0 | Global budget (USD); an absent key resolves to this product default, a non-positive value means no finite limit (`resolve_total_budget_usd`) |
+| TOTAL_BUDGET | 200.0 | Global budget (USD); an absent key resolves to this product default, a non-positive value means no finite limit; resolved live from the saved document, so a change binds running tasks at their next model call (`resolve_total_budget_usd`) |
 | OUROBOROS_PER_TASK_COST_USD | 50.0 | Per-task cost cap and tree ceiling basis: the root resolves min(global share, cap minus margin), descendants retain it, admission stays independent, and the wrap-up affordability rail soft-lands under it (`task_pacing.py`, §6 Budget tracking) |
 | OUROBOROS_RUB_USD_RATE | (empty) | Manual RUB→USD rate for RUB-priced providers |
 | OUROBOROS_PRICING_TTL_SEC | 21600 | Provider-catalog pricing cache TTL |

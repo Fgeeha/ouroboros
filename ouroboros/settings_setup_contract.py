@@ -28,6 +28,45 @@ from ouroboros.provider_models import parse_claudexor_model, provider_for_model
 
 
 
+_SAVED_TOTAL_BUDGET: Dict[str, Any] = {"stamp": None, "raw": ""}
+
+
+def _saved_total_budget() -> str:
+    """The owner's CURRENT saved ``TOTAL_BUDGET``, or "" when the document has none.
+
+    ``TOTAL_BUDGET`` is an immediate setting, but a worker process re-projects the
+    settings document into its environment only when a task STARTS, so for the
+    hours a task runs that environment answers with the budget of its first
+    minute: an owner who topped the budget up mid-run watched the task stop at
+    the old number. The document itself is the one channel every process already
+    shares (``loop_tool_execution._get_tool_timeout`` and the MCP reload read it
+    the same way), so the resolver asks it first. The read is unlocked (saves are
+    atomic, and only writers need the settings lock) and re-parses only when the
+    file changed, so a reservation costs one ``stat``; any failure -- a missing
+    file, a refused integrity pin -- leaves the environment answering, because a
+    settings hiccup must never become a money-path exception."""
+    from ouroboros import config
+    from ouroboros.settings_integrity import read_settings_json_verified
+
+    path = config.SETTINGS_PATH
+    try:
+        found = path.stat()
+    except OSError:
+        return ""
+    stamp = (str(path), found.st_dev, found.st_ino, found.st_mtime_ns, found.st_size)
+    if _SAVED_TOTAL_BUDGET["stamp"] != stamp:
+        try:
+            document = read_settings_json_verified(path)
+        except Exception:
+            # Never remembered: a refused pin or a transient read error must not
+            # become a sticky answer; the environment (the last verified
+            # projection of this same document) answers until a read succeeds.
+            return ""
+        saved = document.get("TOTAL_BUDGET") if isinstance(document, dict) else None
+        _SAVED_TOTAL_BUDGET.update(stamp=stamp, raw="" if saved is None else str(saved).strip())
+    return str(_SAVED_TOTAL_BUDGET["raw"])
+
+
 def resolve_total_budget_usd() -> Optional[float]:
     """The effective global money limit, or None when the owner set no limit.
 
@@ -43,7 +82,7 @@ def resolve_total_budget_usd() -> Optional[float]:
     non-positive value IS an owner decision and keeps its historical meaning of
     no finite global budget.
     """
-    raw = str(os.environ.get("TOTAL_BUDGET", "") or "").strip()
+    raw = _saved_total_budget() or str(os.environ.get("TOTAL_BUDGET", "") or "").strip()
     default = float(SETTINGS_DEFAULTS["TOTAL_BUDGET"])
     if not raw:
         return default

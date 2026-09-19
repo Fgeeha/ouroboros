@@ -689,7 +689,8 @@ and what enforces each.
   publishes the same `CostCeiling` object the loop decides on, and prices the wrap-up
   with the fence's own cache-aware reservation (`tests/test_network_budget_wallet.py`).
   Explicitly disabled profiles and real monetary fences stay independent; the
-  configured global budget is read through the one resolver, never an inline default.
+  configured global budget is read LIVE through the one resolver — never an inline
+  default, never a per-task capture (`tests/test_budget_resource_facts.py`).
   Post-task consolidation/synthesis reads one frozen `usage_breakdown` snapshot per
   root subtree (never `$0` on a read failure); no second ledger, no reconciliation LLM.
 - Runtime notices after the first user/assistant/tool turn are `[SYSTEM NOTICE]` user

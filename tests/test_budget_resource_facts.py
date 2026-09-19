@@ -62,18 +62,109 @@ def test_request_override_does_not_inherit_another_limits_provenance(root):
     assert by_id[explicit.attempt_id]["global_limit_revision"] == "caller-revision"
 
 
-def test_task_start_captures_the_resolved_limit_without_inventing_settings_revision(root, monkeypatch):
+def _run_task_scoped(root, monkeypatch, scoped):
     from ouroboros.agent import OuroborosAgent
 
-    monkeypatch.setattr("ouroboros.subagent_runtime.apply_task_start_settings_or_disclose",
-                        lambda *_: monkeypatch.setenv("TOTAL_BUDGET", "250"))
+    monkeypatch.setattr("ouroboros.subagent_runtime.apply_task_start_settings_or_disclose", lambda *_: None)
     monkeypatch.setattr("ouroboros.model_wait.task_model_wait_scope", lambda **_: nullcontext())
     host = SimpleNamespace(env=SimpleNamespace(drive_root=root), _emit_live_log=lambda *_: None,
-                           _event_queue=None, _handle_task_scoped=lambda _: accounting.current_usage_scope())
-    scope = OuroborosAgent.handle_task(host, {"id": "a", "type": "task"})
-    assert scope.global_limit_usd == 250
-    assert scope.global_limit_source == "task_start_budget_resolver"
-    assert scope.global_limit_revision is None
+                           _event_queue=None, _handle_task_scoped=scoped)
+    return OuroborosAgent.handle_task(host, {"id": "a", "type": "task"})
+
+
+def test_task_start_captures_no_global_limit_so_the_fence_resolves_the_current_one(root, monkeypatch):
+    scope = _run_task_scoped(root, monkeypatch, lambda _: accounting.current_usage_scope())
+    assert scope.global_limit_usd is None
+    assert (scope.global_limit_source, scope.global_limit_revision) == ("", None)
+
+
+def test_a_running_task_follows_the_budget_the_owner_saves_mid_run(root, monkeypatch):
+    """The worker's environment keeps the budget of the task's first minute; the saved document does not."""
+    from ouroboros import config
+
+    settings = root / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_PATH", settings)
+    settings.write_text(json.dumps({"TOTAL_BUDGET": 1.5}))
+    monkeypatch.setenv("TOTAL_BUDGET", "1.5")
+
+    def scoped(_task):
+        accounting.reserve_attempt(request(root))
+        with pytest.raises(accounting.BudgetExceeded):
+            accounting.reserve_attempt(request(root))
+        settings.write_text(json.dumps({"TOTAL_BUDGET": 10}))   # the owner tops the budget up; this process's env is untouched
+        raised = accounting.reserve_attempt(request(root))
+        settings.write_text(json.dumps({"TOTAL_BUDGET": 1}))    # ...and lowering it bites the same way
+        with pytest.raises(accounting.BudgetExceeded):
+            accounting.reserve_attempt(request(root))
+        return raised
+
+    raised = _run_task_scoped(root, monkeypatch, scoped)
+    applied = {row["attempt_id"]: row for row in rows(root)}[raised.attempt_id]
+    assert (applied["global_limit_usd"], applied["global_limit_source"], applied["global_limit_revision"]) == (
+        10, "settings_budget_resolver", None)
+
+
+def test_the_wrapup_wallet_observation_follows_the_saved_budget_too(root, monkeypatch):
+    """The last-fit rail read the same frozen number: $21 'left' under a limit the owner had already raised."""
+    from ouroboros import config
+    from ouroboros.loop_budget import _wrapup_global_remaining
+
+    settings = root / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_PATH", settings)
+    settings.write_text(json.dumps({"TOTAL_BUDGET": 100}))
+
+    def scoped(_task):
+        accounting.reserve_attempt(request(root, reservation_usd=90))
+        before = _wrapup_global_remaining()
+        settings.write_text(json.dumps({"TOTAL_BUDGET": 500}))
+        return before, _wrapup_global_remaining()
+
+    assert _run_task_scoped(root, monkeypatch, scoped) == (10, 410)
+
+
+def test_the_saved_document_answers_first_and_the_environment_only_when_it_cannot(root, monkeypatch):
+    from ouroboros import config, settings_integrity
+    from ouroboros.settings_setup_contract import resolve_total_budget_usd
+
+    settings = root / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_PATH", settings)
+    assert resolve_total_budget_usd() == 100            # no document: the environment (fixture) answers
+    settings.write_text(json.dumps({"OTHER": 1}))
+    assert resolve_total_budget_usd() == 100            # a document without the key is silence, not a decision
+    settings.write_text(json.dumps({"TOTAL_BUDGET": 250.5}))
+    assert resolve_total_budget_usd() == 250.5
+    settings.write_text(json.dumps({"TOTAL_BUDGET": 0}))
+    assert resolve_total_budget_usd() is None           # a saved non-positive value stays "no finite budget"
+
+    reads = []
+    real_read = settings_integrity.read_settings_json_verified
+    monkeypatch.setattr(settings_integrity, "read_settings_json_verified",
+                        lambda path: reads.append(path) or real_read(path))
+    settings.write_text(json.dumps({"TOTAL_BUDGET": 75}))
+    assert [resolve_total_budget_usd() for _ in range(3)] == [75, 75, 75]
+    assert len(reads) == 1, "an unchanged file costs one stat, never another parse"
+
+
+def test_a_refused_or_failed_document_read_is_never_remembered(root, monkeypatch):
+    """Under a benchmark pin a changed snapshot RAISES; the money path must answer, and must retry."""
+    from ouroboros import config, settings_integrity
+    from ouroboros.settings_setup_contract import resolve_total_budget_usd
+
+    settings = root / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_PATH", settings)
+    settings.write_text(json.dumps({"TOTAL_BUDGET": 40}))
+    real_read = settings_integrity.read_settings_json_verified
+    refusing = {"on": True}
+
+    def read(path):
+        if refusing["on"]:
+            raise settings_integrity.SettingsIntegrityError("settings snapshot changed")
+        return real_read(path)
+
+    monkeypatch.setattr(settings_integrity, "read_settings_json_verified", read)
+    assert resolve_total_budget_usd() == 100            # the environment: the last verified projection
+    refusing["on"] = False
+    assert resolve_total_budget_usd() == 40             # same file, same stamp: the failure was not cached
 
 
 def test_unbounded_fallback_is_explicit_without_nonfinite_json(root, monkeypatch):
