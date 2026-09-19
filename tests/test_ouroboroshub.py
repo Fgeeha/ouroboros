@@ -267,7 +267,8 @@ def test_ouroboroshub_display_cache_expires_after_ttl(monkeypatch):
 
 
 def test_ouroboroshub_default_and_info_reads_bypass_cache(monkeypatch):
-    """install/info/verifier reads never consume the display memo (§7.1a)."""
+    """install/info and the authoritative verifier (review profile, owner
+    attestation) never consume the display memo (§7.1a); only the listing hint does."""
     ouroboroshub._catalog_cache_clear()
     try:
         poisoned = {"raw_base_url": _RAW_BASE, "skills": [{"slug": "poisoned"}]}

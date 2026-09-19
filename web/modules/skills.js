@@ -7,6 +7,7 @@ import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { apiClient, apiFetch } from './api_client.js';
 import { patchInstalledSkillEnrichment, renderInstalledSkillCard, renderSkillHubBadges } from './skill_card_renderer.js';
+import { hubFactsPending } from './hub_sync.js';
 import { runSkillPublishFlow } from './skill_publish_flow.js';
 import { installedTime } from './ui_helpers.js';
 import {
@@ -312,8 +313,19 @@ async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(),
     container.innerHTML = skills.map((skill) => renderInstalledSkillCard(
         skill, reviewingSkills, repairingSkills, snapshot.live, catalogOptions(),
     )).join('');
-    catalogSettled.then(() => {
+    catalogSettled.then(async () => {
         if (!current()) return;
+        if (hubCatalog.available && hubFactsPending(snapshot.rawSkills)) {
+            // The list never waits for the hub: facts the server could not know
+            // before this catalog read landed arrive with one local re-read.
+            const again = await fetchSkills().catch(() => null);
+            if (!current()) return;
+            if (again) {
+                snapshot.rawSkills = again.skills;
+                snapshot.live = again.live;
+                applyEnrichment();
+            }
+        }
         // Optional badges never recreate a card, its open menu or edited field.
         const byName = new Map(projected().map((skill) => [skill.name, skill]));
         container.querySelectorAll('[data-skill-hub-badges]').forEach((node) => {

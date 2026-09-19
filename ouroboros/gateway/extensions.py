@@ -7,7 +7,6 @@ import base64
 import inspect
 import logging
 import pathlib
-import time
 from datetime import datetime, timezone
 from typing import Any, Dict
 
@@ -24,6 +23,7 @@ from ouroboros.gateway._helpers import (
     request_repo_dir as _request_repo_dir,
 )
 from ouroboros.gateway.extension_receipts import extension_process_receipt, extension_reconcile_receipt
+from ouroboros.marketplace.ouroboroshub import display_catalog_files
 from ouroboros.skill_lifecycle_queue import (
     queue_snapshot,
     run_blocking_preserving_cancellation,
@@ -51,11 +51,6 @@ _CHILD_DISPATCH_HEADER_DENYLIST = {
     "x-auth-token",
 }
 _CHILD_DISPATCH_BODY_CAP = 512 * 1024
-# (name, content_hash) -> (verdict, monotonic stamp). TTL-bounded: the verdict
-# also depends on the LIVE catalog, so an unexpiring memo could keep claiming
-# "published" after the hub advanced or dropped the slug (final-gate finding).
-_OFFICIAL_HUB_VERIFIED_HINT_CACHE: dict[tuple[str, str], tuple[bool, float]] = {}
-_OFFICIAL_HUB_VERIFIED_TTL_SEC = 300.0
 
 
 def _passive_submit_hub(
@@ -118,38 +113,25 @@ async def _read_child_dispatch_body(request: Request) -> bytes:
 def _review_fields(
     loaded: Any, *, stale: bool | None = None, gate: dict[str, Any] | None = None,
     github_token_configured: bool | None = None,
+    hub_catalog_files: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     stale = loaded.review.is_stale_for(loaded.content_hash) if stale is None else stale
     gate = loaded.review.gate_for(loaded.content_hash) if gate is None else gate
     source = str(getattr(loaded, "source", "") or "")
-    official_hub_verified = False
+    # Hub hint: matched against the display-plane catalog view (§7.1a) the caller
+    # peeked, never fetched here — a local listing must not wait for the network.
+    # None = no fresh view yet; the page re-reads once its own catalog read lands.
+    official_hub_verified: bool | None = False
     if source == "ouroboroshub":
-        try:
-            key = (str(getattr(loaded, "name", "") or ""), str(getattr(loaded, "content_hash", "") or ""))
-            cached = _OFFICIAL_HUB_VERIFIED_HINT_CACHE.get(key) if key[0] and key[1] else None
-            now = time.monotonic()
-            if cached is not None and (now - cached[1]) < _OFFICIAL_HUB_VERIFIED_TTL_SEC:
-                official_hub_verified = cached[0]
-            else:
-                from ouroboros.skill_review import is_official_hub_payload_verified
+        from ouroboros.skill_review import hub_payload_matches
 
-                official_hub_verified = bool(is_official_hub_payload_verified(loaded))
-                if key[0] and key[1]:
-                    # Evict expired entries so superseded content hashes do
-                    # not accumulate across skill revisions.
-                    for stale_key in [
-                        k for k, (_, at) in _OFFICIAL_HUB_VERIFIED_HINT_CACHE.items()
-                        if (now - at) >= _OFFICIAL_HUB_VERIFIED_TTL_SEC
-                    ]:
-                        _OFFICIAL_HUB_VERIFIED_HINT_CACHE.pop(stale_key, None)
-                    _OFFICIAL_HUB_VERIFIED_HINT_CACHE[key] = (official_hub_verified, now)
-        except Exception:
-            official_hub_verified = False
-    owner_attestable = (
-        (source == "ouroboroshub" and official_hub_verified)
-        or (source not in {"native", "clawhub", "ouroboroshub"} and (
-            source == "external" or bool(getattr(loaded, "is_self_authored", False))
-        ))
+        official_hub_verified = (
+            None if hub_catalog_files is None
+            else hub_payload_matches(loaded, hub_catalog_files.__getitem__)
+        )
+    owner_attestable = official_hub_verified if source == "ouroboroshub" else (
+        source not in {"native", "clawhub"}
+        and (source == "external" or bool(getattr(loaded, "is_self_authored", False)))
     )
     # FR1: the host computes the single Submit-to-Hub eligibility verdict so the card
     # renders it instead of recomputing a divergent clean-only rule (the SSOT shared with
@@ -259,6 +241,7 @@ def _build_extensions_index(drive_root, repo_path):
     from ouroboros.extension_loader import extension_name_prefix, runtime_state_for_loaded_skill
 
     live_snapshot = snapshot()
+    hub_catalog_files = display_catalog_files()  # one view per response, never a fetch
     # Scan data plane plus optional external checkout; bootstrap copies native refs.
     skills = discover_skills(drive_root, repo_path=repo_path)
     unique_skills = [
@@ -387,7 +370,9 @@ def _build_extensions_index(drive_root, repo_path):
 
         health = read_extension_health(drive_root, s.name) if s.manifest.is_extension() else None
         entry.update({
-            **_review_fields(s, github_token_configured=_gh_token_configured),
+            **_review_fields(
+                s, github_token_configured=_gh_token_configured, hub_catalog_files=hub_catalog_files,
+            ),
             "conflict": skill_conflict_status(s, skills),
             "load_error": runtime_states.get(s.name, {}).get("load_error", s.load_error),
             "desired_live": runtime_states.get(s.name, {}).get("desired_live", False),
@@ -488,7 +473,7 @@ async def api_extension_manifest(request: Request) -> JSONResponse:
                 "ui_tab": loaded.manifest.ui_tab,
             },
             "enabled": loaded.enabled,
-            **_review_fields(loaded),
+            **_review_fields(loaded, hub_catalog_files=display_catalog_files()),
             "content_hash": loaded.content_hash,
             "load_error": load_error,
         }

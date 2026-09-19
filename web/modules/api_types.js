@@ -843,8 +843,8 @@
  * @property {Object=} author_disposition
  * @property {boolean=} executable_review
  * @property {string=} review_profile
- * @property {boolean=} official_hub_verified
- * @property {boolean=} owner_attestable
+ * @property {boolean|null=} official_hub_verified null = no fresh hub catalog view yet (the page re-reads)
+ * @property {boolean|null=} owner_attestable
  * @property {{visible: boolean, publication_ready: boolean, task_start_allowed: boolean, disabled: boolean, state: "ready"|"warnings"|"needs_attention"|"repairable"|"hard_block", reason: string}=} submit_hub
  * @property {{current: Object, history: Object[], history_omitted: number=}=} skill_review
  * @property {boolean=} is_self_authored
