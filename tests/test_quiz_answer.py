@@ -403,7 +403,7 @@ def test_escalate_subagent_writes_parent_mailbox_frame(tmp_path, monkeypatch):
                     options=[{"label": "delete"}, {"label": "quarantine"}],
                     stake="CI health", assumption="quarantine meanwhile", max_wait_minutes=1)
     assert out.startswith("OK: escalated to parent task root-1")
-    assert "max_wait_minutes=1 ignored: it bounds a required wait only" in out
+    assert "max_wait_minutes ignored: it applies only to wait_for_answer=true" in out
     entries = drain_owner_entries(tmp_path, "root-1", set())
     assert entries and entries[0]["provenance"] == "descendant_task"
     text = entries[0]["text"]

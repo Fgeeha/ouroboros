@@ -45,26 +45,27 @@ def test_escalate_ignores_a_wait_bound_on_a_quiz_that_does_not_wait(tmp_path, re
         "assumption": "Light meanwhile", "wait_for_answer": False, "max_wait_minutes": reflex,
     })
     assert result.status == "ok" and result.text.startswith("OK: quiz ")
-    assert f"max_wait_minutes={reflex!r} ignored: it bounds a required wait only" in result.text
+    assert "max_wait_minutes ignored: it applies only to wait_for_answer=true" in result.text
     quiz_id = ctx.event_queue.get_nowait()["quiz_id"]
     block = load_task_result(tmp_path, "root-task")["owner_quiz"][quiz_id]
     assert "max_wait_minutes" not in block
 
 
-def test_escalate_zero_bound_waits_unbounded_and_a_huge_bound_is_lowered(tmp_path, monkeypatch):
+def test_escalate_refuses_a_bound_that_cannot_hold_and_names_the_repair(tmp_path, monkeypatch):
+    """A REQUIRED wait keeps the refusal: `0` and a bound past the task's own ceiling both
+    ask for something the wait cannot serve, so each is one typed refusal that names the
+    repair. The tolerant path is the OPTIONAL question above, not a silent reinterpretation."""
     monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "21600")  # 360 minutes
     registry, ctx = _registry(tmp_path)
-    unbounded = registry.execute_result("escalate", {
-        "question": "Continue?", "options": ["Yes", "No"], "wait_for_answer": True, "max_wait_minutes": 0})
-    assert unbounded.status == "ok" and "the task waits after this tool batch" in unbounded.text
-    assert "max_wait_minutes=0 ignored: 0 means no bound" in unbounded.text
-    assert not getattr(ctx, "_owner_wait_max_minutes", None)
-
-    lowered = registry.execute_result("escalate", {
-        "question": "Continue?", "options": ["Yes", "No"], "wait_for_answer": True, "max_wait_minutes": 100000})
-    assert lowered.status == "ok" and "waits up to 360 minutes" in lowered.text
-    assert "max_wait_minutes=100000 lowered to 360" in lowered.text
-    assert ctx._owner_wait_max_minutes == 360
+    for asks_for_nothing in (0, 100000):
+        refused = registry.execute_result("escalate", {
+            "question": "Continue?", "options": ["Yes", "No"],
+            "wait_for_answer": True, "max_wait_minutes": asks_for_nothing})
+        assert refused.status == "error" and refused.code == "TOOL_ARG_ERROR"
+        assert refused.text.startswith("⚠️ QUIZ_WAIT_BOUND_INVALID")
+        assert "omit it for an unbounded wait" in refused.text  # the repair, not just the rule
+        assert refused.text.endswith("The quiz was not sent.")
+    assert not getattr(ctx, "_owner_wait_max_minutes", None) and ctx.event_queue.empty()
 
 
 def test_escalate_genuine_argument_mistake_is_one_typed_refusal(tmp_path):
@@ -72,7 +73,7 @@ def test_escalate_genuine_argument_mistake_is_one_typed_refusal(tmp_path):
     result = registry.execute_result("escalate", {
         "question": "Continue?", "options": ["Yes", "No"], "wait_for_answer": True, "max_wait_minutes": -3})
     assert result.status == "error" and result.code == "TOOL_ARG_ERROR"
-    assert result.text.startswith("⚠️ QUIZ_WAIT_BOUND_INVALID: max_wait_minutes=-3 ")
+    assert result.text.startswith("⚠️ QUIZ_WAIT_BOUND_INVALID: max_wait_minutes must be ")
     assert result.text.endswith("The quiz was not sent.") and ctx.event_queue.empty()
 
 

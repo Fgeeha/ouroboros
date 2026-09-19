@@ -17,6 +17,7 @@ import pathlib
 import uuid
 from typing import Any, Dict, List, Optional
 
+from ouroboros.tools.arg_feedback import argument_refusal
 from ouroboros.tools.registry import ToolContext
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
@@ -462,7 +463,8 @@ def _escalate(
                                         wait_for_answer=wait_for_answer,
                                         max_wait_minutes=max_wait_minutes)
     except QuizValidationError as exc:
-        return f"⚠️ {exc.code}: {exc}"
+        # Typed, and it says what did NOT happen: a refusal that only restates the rule is retried unchanged.
+        return argument_refusal(ctx, exc.code, [str(exc)], effect="The quiz was not sent.")
     ignored_bound = (" max_wait_minutes ignored: it applies only to wait_for_answer=true."
                      if max_wait_minutes is not None and not wait_for_answer else "")
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
