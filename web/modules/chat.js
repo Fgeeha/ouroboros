@@ -889,8 +889,10 @@ export function createChatInstance({
     // (the one binding fact the /api/state sweep in app.js reads too); the title
     // writers apply the same work predicate.
     function syncBlockChrome(record) {
-        if (record.isSubagent || record.root.dataset.projectCreated === '1') return;
-        const work = blockHasWork(record);
+        if (record.root.dataset.projectCreated === '1') return;
+        // A child is never a convertible unit (it inherits its root's Project by
+        // lineage) and its title is its role: both root writers skip it.
+        const work = !record.isSubagent && blockHasWork(record);
         // The first row of work lands after the title writers ran for its frame:
         // an empty title takes the placeholder here, the writers own it from then on.
         if (work && !record.titleEl.textContent) {
@@ -1494,6 +1496,9 @@ export function createChatInstance({
         if (promoted) {
             record.root.classList.add('subagent');
             record.root.dataset.subagent = '1';
+            // A frame that outran its lineage minted this shell root-shaped:
+            // the conversion a root earned is re-derived from the child's facts.
+            syncBlockChrome(record);
         }
         if (record.root.dataset.parentTaskId !== parentId) record.root.dataset.parentTaskId = parentId;
         if (record.root.dataset.subagentRole !== record.subagentRole) {
@@ -1901,6 +1906,11 @@ export function createChatInstance({
         };
         if (['parentId', 'role', 'model'].every((k) => next[k] === prev[k])) return;
         subagentChildParents.set(childId, next);
+        // Lineage reclassifies a root-shaped shell the moment it is learned,
+        // whatever the frame that carries it goes on to render.
+        if (next.parentId && liveCardRecords.get(childId)?.isSubagent === false) {
+            getSubagentCardRecord(childId, next.parentId, next.role);
+        }
         for (const sid of subagentChildParents.keys()) {
             const rec = liveCardRecords.get(sid);
             // Write only on change: a rewrite would destroy a selection being copied.

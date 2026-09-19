@@ -241,6 +241,34 @@ test('a managed Swarm root keeps the task card with Turn into project; an origin
     } finally { delete globalThis.window.__ouroTaskBindings; f.close(); }
 });
 
+test('lineage reclassifies a root-shaped shell: a child offers no conversion, whichever frame arrives first', () => {
+    // A child's own frame can outrun the frame that names its parent (a
+    // reconnecting socket, a partial window): the shell is minted root-shaped,
+    // with the conversion control. A child is never a convertible unit — it
+    // inherits its root's Project by lineage.
+    const lineage = { delegation_role: 'subagent', parent_task_id: TASK, root_task_id: TASK, subagent_role: 'researcher' };
+    const work = { task_id: 'kid-1', role: 'assistant', is_progress: true, content: 'Reading the registry.' };
+    const scheduled = { ...lineage, task_id: TASK, role: 'assistant', is_progress: true, content: 'scheduled',
+        subagent_event: 'scheduled', subagent_task_id: 'kid-1' };
+    // Lineage on a frame that renders nothing: no row, no lifecycle event.
+    const silent = { ...lineage, task_id: 'kid-1', role: 'assistant', is_progress: true, content: '' };
+    for (const order of [[work, scheduled], [scheduled, work], [work, silent]]) {
+        const f = fixture();
+        try {
+            f.census(managed());
+            f.emit('chat', { task_id: TASK, role: 'assistant', is_progress: true, content: 'Planning the swarm.' });
+            for (const row of order) f.emit('chat', row);
+            const kid = f.card('kid-1');
+            assert.equal(kid.dataset.subagent, '1');
+            assert.equal(kid.dataset.parentTaskId, TASK);
+            // Booleans, not nodes: a failed node comparison prints the whole stub graph.
+            assert.equal(Boolean(kid.querySelector('[data-turn-into-project]')), false, 'a child offers no conversion');
+            // The child holds none, so a hit under the root is the root's own.
+            assert.ok(f.card().querySelector('[data-turn-into-project]'), 'the root keeps its conversion');
+        } finally { f.close(); }
+    }
+});
+
 test('a wake-up is an ordinary direct block: an empty frame mints nothing, a tool call mints the block', () => {
     const f = fixture();
     try {
