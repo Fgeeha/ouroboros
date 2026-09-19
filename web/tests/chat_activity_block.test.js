@@ -277,9 +277,9 @@ test('a child frame that outruns the first history load leaves no root control i
     // Main opened mid-swarm: the child's tool frame lands before the history
     // that holds the root's own row and the lineage.
     const f = fixture([
-        { role: 'assistant', is_progress: true, content: 'Planning the swarm.', task_id: TASK, ts: TS, chat_id: 1,
+        { role: 'assistant', is_progress: true, text: 'Planning the swarm.', content: 'Planning the swarm.', task_id: TASK, ts: TS, chat_id: 1,
             cancelable: true },
-        { role: 'assistant', is_progress: true, content: 'scheduled', task_id: TASK, ts: '2026-09-15T12:00:01Z',
+        { role: 'assistant', is_progress: true, text: 'scheduled', content: 'scheduled', task_id: TASK, ts: '2026-09-15T12:00:01Z',
             chat_id: 1, subagent_event: 'scheduled', subagent_task_id: 'kid-1', parent_task_id: TASK,
             root_task_id: TASK, delegation_role: 'subagent', subagent_role: 'researcher' },
     ]);
