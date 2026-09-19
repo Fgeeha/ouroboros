@@ -17,6 +17,7 @@ def root(tmp_path, monkeypatch):
     monkeypatch.setenv("TOTAL_BUDGET", "100")
     monkeypatch.setenv("OUROBOROS_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("OUROBOROS_SETTINGS_PATH", str(tmp_path / "settings.json"))
+    monkeypatch.setattr("ouroboros.config.SETTINGS_PATH", tmp_path / "settings.json")
     monkeypatch.setattr("ouroboros.pricing._fetch_live_rows", lambda *_a, **_kw: pytest.fail("unexpected pricing lookup"))
     return tmp_path
 
@@ -165,6 +166,26 @@ def test_a_refused_or_failed_document_read_is_never_remembered(root, monkeypatch
     assert resolve_total_budget_usd() == 100            # the environment: the last verified projection
     refusing["on"] = False
     assert resolve_total_budget_usd() == 40             # same file, same stamp: the failure was not cached
+
+
+def test_an_unpinned_failed_document_read_answers_none_and_is_never_remembered(root, monkeypatch):
+    """Without a pin the verified reader returns None (absent/unreadable/undecodable) instead of raising."""
+    from ouroboros import config, settings_integrity
+    from ouroboros.settings_setup_contract import resolve_total_budget_usd
+
+    settings = root / "settings.json"
+    monkeypatch.setattr(config, "SETTINGS_PATH", settings)
+    settings.write_text(json.dumps({"TOTAL_BUDGET": 40}))
+    real_read = settings_integrity.read_settings_json_verified
+    failing = {"on": True}
+
+    def read(path):
+        return None if failing["on"] else real_read(path)
+
+    monkeypatch.setattr(settings_integrity, "read_settings_json_verified", read)
+    assert resolve_total_budget_usd() == 100            # the environment answers the transient failure
+    failing["on"] = False
+    assert resolve_total_budget_usd() == 40             # same stamp: None was not memoized as "no budget saved"
 
 
 def test_unbounded_fallback_is_explicit_without_nonfinite_json(root, monkeypatch):

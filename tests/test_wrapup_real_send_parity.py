@@ -37,6 +37,13 @@ _ROUTES = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _offline(monkeypatch):
+    """pytest is not a worker: keep capability discovery and pricing off the network."""
+    monkeypatch.setattr(LLMClient, "_SUPPORTED_PARAMS_FETCHED", True, raising=False)
+    monkeypatch.setattr("ouroboros.pricing._fetch_live_rows", lambda *_a, **_kw: {})
+
+
 class _Captured(Exception):
     """Stops the real send once the physical request exists."""
 

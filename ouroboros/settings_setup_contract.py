@@ -39,8 +39,9 @@ def _saved_total_budget() -> str:
     hours a task runs that environment answers with the budget of its first
     minute: an owner who topped the budget up mid-run watched the task stop at
     the old number. The document itself is the one channel every process already
-    shares (``loop_tool_execution._get_tool_timeout`` and the MCP reload read it
-    the same way), so the resolver asks it first. The read is unlocked (saves are
+    shares (``loop_tool_execution._get_tool_timeout`` reads it through the locked
+    loader on every tool call; the MCP reload stat-gates it), so the resolver asks
+    it first. The read is unlocked (saves are
     atomic, and only writers need the settings lock) and re-parses only when the
     file changed, so a reservation costs one ``stat``; any failure -- a missing
     file, a refused integrity pin -- leaves the environment answering, because a
@@ -62,7 +63,12 @@ def _saved_total_budget() -> str:
             # become a sticky answer; the environment (the last verified
             # projection of this same document) answers until a read succeeds.
             return ""
-        saved = document.get("TOTAL_BUDGET") if isinstance(document, dict) else None
+        if not isinstance(document, dict):
+            # Without a pin the verified reader answers None for an absent,
+            # unreadable or undecodable file instead of raising: the same
+            # failure, the same rule -- the environment answers, nothing is kept.
+            return ""
+        saved = document.get("TOTAL_BUDGET")
         _SAVED_TOTAL_BUDGET.update(stamp=stamp, raw="" if saved is None else str(saved).strip())
     return str(_SAVED_TOTAL_BUDGET["raw"])
 
