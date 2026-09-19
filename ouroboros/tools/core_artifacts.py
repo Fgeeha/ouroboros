@@ -412,8 +412,10 @@ def _send_links(
         # policy denial, SEND_LINKS_ARG_ERROR an argument fault. Neither name is in the legacy
         # code map (no _ARG_ERROR suffix rule exists), so the adapter types them from their
         # SHAPE: the _BLOCKED head becomes LEGACY_BLOCKED and the _ERROR head
-        # LEGACY_TOOL_ERROR. Different buckets, but both recorded as a refusal — never as a
-        # successful call, which is the property this marker exists for.
+        # LEGACY_TOOL_ERROR. Different buckets, but these TWO are both recorded as a
+        # refusal rather than a successful call, which is why the marker is here. It says
+        # nothing about this tool's other codes: SEND_LINKS_TOO_MANY is a LEGACY_WARNING
+        # whose status stays ok.
         from ouroboros.tools.tool_result import LegacyTextResultAdapter
 
         return _publish_tool_result(ctx, LegacyTextResultAdapter.from_text(

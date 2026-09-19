@@ -473,7 +473,8 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
         ref = retain_memory_source(knowledge_context, "task_trace_verbatim", safe.encode("utf-8"))
         return ("\n\nComplete stored record of every call, each argument and result as the TRACE retained "
                 "them: an oversized argument was already replaced there by a marker naming its length "
-                "and hash, a result is the same actor-visible cap the listing shows (a partial one names "
+                "and hash, a result is the stored actor-visible cap — MORE than the listing, which "
+                "shows only the first line of a failed or repeated answer (a partial one names "
                 "its own FULL_RESULT_SOURCE_JSON, or FULL_RESULT_SOURCE_UNAVAILABLE when persistence "
                 "failed), and a call names its recorded manifest when it has one; "
                 f"optional reading, {len(safe)} chars): read_file "
