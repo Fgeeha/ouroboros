@@ -408,7 +408,10 @@ def _send_links(
     try:
         actions = validate_link_actions(links)
     except LinkActionsValidationError as exc:
-        # Typed by its own marker: SEND_LINKS_URL_BLOCKED stays a policy denial, _ARG_ERROR an argument fault.
+        # The marker names the CAUSE in the refusal the model reads: SEND_LINKS_URL_BLOCKED a
+        # policy denial, SEND_LINKS_ARG_ERROR an argument fault. Neither name is in the legacy
+        # code map (no _ARG_ERROR suffix rule exists), so both land in its generic error
+        # bucket — recorded as a refusal either way, never as a successful call.
         from ouroboros.tools.tool_result import LegacyTextResultAdapter
 
         return _publish_tool_result(ctx, LegacyTextResultAdapter.from_text(

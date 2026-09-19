@@ -412,13 +412,19 @@ def task_inputs_prompt_section(review_evidence: Any) -> str:
     )
 
 def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -> str:
-    """Retain the per-call record as the actor saw it and name its reader; optional reading.
+    """Retain the complete STORED per-call record and name its reader; optional reading.
 
     The listing above it bounds values and shows only the first line of a failed or
     repeated call's result; when that really cut something, the omission needs a source
     the same reader can open. A trace the listing shows whole writes nothing.
     Redacted like every other reflection-visible result. Never a required source: a
     reflection that does not open it is still complete for what its prompt shows.
+
+    Stored, not original: these arguments already passed ``sanitize_tool_args_for_log``,
+    which replaced an oversized value with a short marker naming its length and sha.
+    Calling that "as the actor saw it" overstated a cognitive artifact, so the pointer
+    now says what it holds and each call names the manifest addressing its unbounded
+    recorded projection.
     """
     tool_calls = [tc for tc in (llm_trace.get("tool_calls") or []) if isinstance(tc, dict)]
     from ouroboros.post_task_synthesis import _fold_identical_calls
@@ -428,7 +434,12 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
     def _cut(tc: Dict[str, Any], count: int) -> bool:
         args = tc.get("args")
         answer = str(tc.get("result") or "").strip()
-        return (any(len(str(value)) > 200 for value in (args.values() if isinstance(args, dict) else [args]))
+        rendered = json.dumps(args, ensure_ascii=False, default=str)
+        # A width test alone MISSES the worst cut: the log sanitizer already replaced a
+        # huge value with a short marker, so the biggest argument in the task measured
+        # small here and produced no source pointer at all. The marker is the evidence.
+        return (any(token in rendered for token in ('"<TRUNCATED:', '"_truncated"', '"_depth_limit"'))
+                or any(len(str(value)) > 200 for value in (args.values() if isinstance(args, dict) else [args]))
                 or ((count > 1 or _trace_call_errored(tc)) and (len(answer.splitlines()) > 1 or len(answer) > 200)))
 
     if not any(_cut(tc, count) for _, tc, count, _, _ in _fold_identical_calls(tool_calls)):
@@ -437,19 +448,29 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
         from ouroboros.consolidator import retain_memory_source
         from ouroboros.observability import redact_projection
 
+        def _exact_ref(tc: Dict[str, Any]) -> str:
+            """Address of this call's unbounded recorded projection, when one exists."""
+            ref = tc.get("trace_ref") if isinstance(tc.get("trace_ref"), dict) else {}
+            path = str(((ref or {}).get("manifest_ref") or {}).get("path") or "")
+            return f"\nexact call manifest: {path}" if path else ""
+
         record = "\n\n".join(
             f"### {index}. {tc.get('tool', 'unknown')} [status={tc.get('status') or ''}"
             f"{', round_id=' + str(tc.get('round_id')) if tc.get('round_id') else ''}]\n"
-            f"args: {json.dumps(tc.get('args'), ensure_ascii=False, default=str)}\n"
+            f"args: {json.dumps(tc.get('args'), ensure_ascii=False, default=str)}"
+            f"{_exact_ref(tc)}\n"
             f"result:\n{tc.get('result') or ''}"
             for index, tc in enumerate(tool_calls, 1))
         safe = str(redact_projection(record).value)
         ref = retain_memory_source(knowledge_context, "task_trace_verbatim", safe.encode("utf-8"))
-        return ("\n\nComplete per-call record (every argument and each result as the actor saw it; optional "
-                f"reading, {len(safe)} chars): read_file " + json.dumps(ref["read"]["arguments"], ensure_ascii=False))
+        return ("\n\nComplete stored record of every call (each result in full, and each argument as the "
+                "trace retained it — a value the log sanitizer found oversized was already replaced "
+                "there by a marker naming its length and hash, and each call names the manifest "
+                f"addressing its unbounded projection; optional reading, {len(safe)} chars): read_file "
+                + json.dumps(ref["read"]["arguments"], ensure_ascii=False))
     except Exception:
         log.debug("Verbatim trace record unavailable for reflection", exc_info=True)
-        return "\n\nComplete per-call record unavailable: the listing omits argument or result text; do not treat it as the complete trace."
+        return "\n\nComplete stored record unavailable: the listing omits argument or result text; do not treat it as the complete trace."
 
 
 def generate_reflection(

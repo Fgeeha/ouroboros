@@ -59,3 +59,27 @@ def test_unreadable_plan_source_does_not_invent_a_critic(harness, monkeypatch):
     monkeypatch.setattr("ouroboros.task_results.load_plan_review_state", lambda *_a: (_ for _ in ()).throw(ValueError("source gap")))
     decision = force_plan_decision(ctx, {}, enforcement="blocking")
     assert not decision["allow"] and not decision["closed"] and not decision["outcome"]
+
+
+def test_a_historical_critics_aggregate_is_labelled_not_shown_as_this_plans_verdict():
+    """The revised plan has no wave of its own, so the disclosure attaches the aggregate of
+    the critic the author REFERENCED. Unlabelled, "Plan review is still open (GREEN)" reads
+    to the owner as approval of bytes no reviewer ever saw."""
+    decision = {"required": True, "status": "open", "allow": True, "enforcement": "advisory",
+                "outcome": "GREEN", "historical_critic": True}
+    text = plan_review_disclosure(decision)
+    assert "referenced critic review of the earlier plan: GREEN" in text
+    assert "the current plan has no verdict of its own" in text
+
+
+def test_the_rail_that_forced_finalization_survives_an_author_decision():
+    """Both facts are true and the rail is the one that explains why the task ended.
+    Returning the author sentence first dropped "the cap is spent; the task ends blocked"
+    whenever an author decision and a rail applied together."""
+    decision = {"required": True, "status": "cycles_exhausted", "allow": True,
+                "enforcement": "blocking", "outcome": "REVIEW_REQUIRED", "cycles_paid": 2,
+                "author_action": "finish"}
+    text = plan_review_disclosure(decision)
+    assert "cap spent (2 paid cycle(s))" in text and "ends blocked" in text
+    assert "Plan author decision: finish" in text
+    assert "does not close or replace the critic review" in text

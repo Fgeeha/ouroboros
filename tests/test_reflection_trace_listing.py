@@ -121,7 +121,7 @@ def test_the_reflection_prompt_carries_the_whole_listing_and_an_optional_verbati
     assert "×10 identical, rounds 2–11" in prompt and "pad line 399" in prompt  # no second cut
     assert "truncated at 2000 chars" not in prompt
     # the verbatim record is named with the reader the reflection already holds, and is really there
-    marker = "Complete per-call record (every argument and each result as the actor saw it; optional reading"
+    marker = "Complete stored record of every call ("
     assert marker in prompt
     arguments = json.loads(prompt[prompt.index(marker):].split("read_file ", 1)[1].splitlines()[0])
     assert arguments["root"] == "runtime_data"
@@ -198,6 +198,49 @@ def test_the_self_check_lists_outcomes_and_a_failed_answer():
         'Recent tool calls (oldest first):\n  1. escalate({"question":"q","max_wait_minutes":0})\n  2. read_file({"path":"a"})')
 
 
+def test_repeated_provider_call_ids_keep_each_calls_own_outcome():
+    """Providers are not required to mint unique call ids: GigaChat answers `call_0` every
+    round and the local parser `call_local_<i>`, so ONE id names several calls. Keyed by id
+    alone, the last call overwrote its namesakes, so the FIRST call was printed carrying the
+    second one's status and error text — the prompt that asks "are you repeating yourself?"
+    accusing a call that never failed."""
+    from ouroboros.loop_nudges import _build_recent_tool_trace
+
+    messages = [
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_0", "function": {"name": "escalate", "arguments": '{"a":1}'}}]},
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_0", "function": {"name": "read_file", "arguments": '{"b":2}'}}]},
+    ]
+    trace = {"tool_calls": [
+        {"tool_call_id": "call_0", "status": "argument_error", "is_error": True, "result": "FIRST refusal"},
+        {"tool_call_id": "call_0", "status": "ok", "is_error": False, "result": "second body"}]}
+    rendered = _build_recent_tool_trace(messages, llm_trace=trace)
+    assert '1. escalate({"a":1}) [argument_error] ← FIRST refusal' in rendered
+    assert '2. read_file({"b":2}) [ok]' in rendered
+
+
+def test_a_sanitizer_truncated_argument_still_names_a_source(tmp_path):
+    """The log sanitizer replaces an oversized value with a SHORT marker, so a width test
+    over the stored args measured the widest argument in the task as a small one and the
+    record — the only place its result survives in full — was never retained at all."""
+    from ouroboros.tools.registry import ToolContext
+    from ouroboros.utils import sanitize_tool_args_for_log
+
+    args = sanitize_tool_args_for_log("write_file", {"content": "x" * 5000})
+    assert "<TRUNCATED:" in json.dumps(args)  # what the trace really holds is short
+    call = {"tool": "write_file", "tool_call_id": "w1", "args": args, "result": "OK",
+            "is_error": False, "status": "ok", "round_id": "exec_x:round:1"}
+    pointer = reflection._verbatim_trace_pointer(
+        ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="cut"), {"tool_calls": [call]})
+    assert "Complete stored record of every call (" in pointer
+    arguments = json.loads(pointer.split("read_file ", 1)[1].splitlines()[0])
+    record = (pathlib.Path(tmp_path) / arguments["path"]).read_text(encoding="utf-8")
+    assert "<TRUNCATED:content:5000ch:sha=" in record
+    # the claim names what it holds: the stored trace, not the original arguments
+    assert "as the trace retained it" in pointer and "as the actor saw it" not in pointer
+
+
 def test_a_successful_untyped_or_autocorrected_call_is_not_a_failure_anywhere():
     """`untyped` (a successful extension/MCP body) and `ok_autocorrected` (a shell command the host
     repaired) are ok statuses in the one SSOT; a private spelling of "ok" once told a clean run that
@@ -254,7 +297,7 @@ def test_post_task_consumer_receives_middle_calls_and_repeated_ok_source(tmp_pat
     prompt = next(c for c in captured_calls if c.get("call_type") == "task_reflection")["messages"][0]["content"]
     assert "file-40" in prompt and "KEEP_THIRD" in prompt and "×2 identical" in prompt
     assert "middle tool calls omitted" not in prompt
-    marker = "Complete per-call record ("
+    marker = "Complete stored record of every call ("
     arguments = json.loads(prompt[prompt.index(marker):].split("read_file ", 1)[1].splitlines()[0])
     # Read through the very tool surface the reflection model holds, not Path alone.
     reader = KnowledgeReadContext(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="end-to-end"), "task_reflection")

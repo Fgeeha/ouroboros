@@ -131,7 +131,13 @@ def _build_recent_tool_trace(
     """
     from ouroboros.reflection import _trace_call_errored  # the ONE reading of "this call went wrong"
 
-    outcomes: Dict[str, str] = {}
+    # Providers are not required to mint unique call ids: GigaChat answers `call_0`
+    # every round and the local parser `call_local_<i>`, so ONE id names several calls
+    # in a task. Queue the outcomes in trace order and consume them in message order —
+    # keying a plain dict let the last call with an id overwrite its namesakes, so an
+    # early failed call was printed carrying a later call's status and error text, and
+    # the prompt that asks "are you repeating yourself?" accused the wrong call.
+    outcomes: Dict[str, List[str]] = {}
     for row in ((llm_trace or {}).get("tool_calls") or []):
         if not isinstance(row, dict) or not row.get("tool_call_id"):
             continue
@@ -140,7 +146,7 @@ def _build_recent_tool_trace(
         if _trace_call_errored(row):
             head = str(row.get("result") or "").strip().splitlines()[:1]
             note += f" ← {head[0][:200]}" if head else ""
-        outcomes[str(row["tool_call_id"])] = note
+        outcomes.setdefault(str(row["tool_call_id"]), []).append(note)
     all_calls: List[str] = []
     for msg in messages:
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
@@ -152,7 +158,8 @@ def _build_recent_tool_trace(
                     args = json.dumps(args, sort_keys=True)
                 args_str = str(args)
                 summary = f"{name}({args_str[:80]})" if len(args_str) > 80 else f"{name}({args_str})"
-                all_calls.append(summary + outcomes.get(str(tc.get("id") or ""), ""))
+                queue = outcomes.get(str(tc.get("id") or ""))
+                all_calls.append(summary + (queue.pop(0) if queue else ""))
     recent = all_calls[-window:] if all_calls else []
     if not recent:
         return ""

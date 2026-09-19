@@ -114,9 +114,15 @@ def _trace_round(tc: dict) -> int | None:
 def _fold_identical_calls(tool_calls: list) -> list[tuple[int, dict, int, int | None, int | None]]:
     """Run-length fold of consecutive IDENTICAL calls: (first index, row, count, first round, last round).
 
-    Identity is equality of tool, arguments, recorded status and delivered result — arithmetic,
-    not vocabulary — so a refusal returned as a plain string, a sleep loop and a blind poll
-    fold exactly like a typed error. Nothing is dropped: the count stays on the row.
+    Identity is equality of tool, RECORDED arguments, recorded status and delivered result —
+    arithmetic, not vocabulary — so a refusal returned as a plain string, a sleep loop and a
+    blind poll fold exactly like a typed error. Nothing is dropped: the count stays on the row.
+    Recorded is the load-bearing word, because these arguments already passed the log
+    sanitizer: an oversized string keeps its length and sha in the marker (two different
+    large payloads still differ), but a list past 50 items and a structure past depth 3
+    collapse to a shape that CAN compare equal for two genuinely different consecutive
+    calls, which would fold them into one ``×2`` row. Each row keeps its own trace_ref,
+    which addresses that call's exact recorded projection.
     """
     folded: list[list] = []
     previous = None

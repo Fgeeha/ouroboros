@@ -1154,18 +1154,16 @@ def plan_review_gate_projection(
                 control = {"status": "rail_degraded", "reason": str(attempt.get("reason") or ""),
                            "outcome": outcome}
             elif wave is not None:
+                # B2b typed fact: a wave whose own rows prove no re-dispatch can meet
+                # quorum (structurally dead lanes) carries its earliest recorded reset.
                 control = {
                     "status": "cycles_exhausted" if wave.get("cycles_exhausted") else "open",
                     "outcome": outcome, "closed": False,
                     "fingerprint": str(wave.get("request_fingerprint") or ""),
                     "reviewer_slots_degraded": outcome == "DEGRADED", "custody_pending": bool(wave.get("custody_pending")),
+                    **({"quorum_unreachable": True, "earliest_reset": str(wave.get("earliest_reset") or "")}
+                       if wave.get("quorum_unreachable") else {}),
                 }
-                if wave.get("quorum_unreachable"):
-                    # B2b typed fact: the wave's own rows prove the quorum cannot be
-                    # met by any re-dispatch (structurally dead lanes), with the
-                    # earliest recorded reset when one was named.
-                    control["quorum_unreachable"] = True
-                    control["earliest_reset"] = str(wave.get("earliest_reset") or "")
             else:
                 control = {"status": str(attempt.get("status") or "open"),
                            "reason": str(attempt.get("reason") or "")}
@@ -1193,12 +1191,13 @@ def plan_review_gate_projection(
     subject = attempt.get("author_subject") or {}
     author = validate_author_disposition(subject.get("author_disposition"), subject_hash=str(attempt.get("fingerprint") or ""))
     if author and attempt.get("reason") in {"author_current_plan", "author_stop"}:
-        # Follow historical criticism only here, never in current_plan_review_wave:
-        # its closed_plan_review_wave consumer binds CURRENT acceptance authority.
+        # Follow historical criticism only here, never in current_plan_review_wave: its
+        # closed_plan_review_wave consumer binds CURRENT acceptance authority. EVIDENCE
+        # into a GAP only: it never moves this attempt's lifecycle or outcome (§6 why).
         critic = plan_review_wave(state, str(subject.get("review_fingerprint") or ""))
-        if critic is not None:
+        if critic is not None and not control.get("outcome"):
             outcome = str(critic.get("aggregate") or "")
-            control.update(status="open", closed=False, outcome=outcome,
+            control.update(outcome=outcome, historical_critic=True,
                            custody_pending=bool(critic.get("custody_pending")),
                            reviewer_slots_degraded=outcome == "DEGRADED")
     if author and author.get("action") == "stop":
@@ -1240,6 +1239,7 @@ def plan_review_gate_projection(
         "allow": allow,
         "attempted": attempted,
         "outcome": str(control.get("outcome") or ""),
+        "historical_critic": bool(control.get("historical_critic")),  # whose verdict: label it, never this plan's own
         "closed": closed,
         "review_capacity_reason": "review_cycles_exhausted" if attempt.get("status") == "cycles_exhausted" else "",
         "reviewer_slots_degraded": bool(control.get("reviewer_slots_degraded")),
