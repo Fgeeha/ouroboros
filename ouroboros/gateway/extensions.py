@@ -121,14 +121,19 @@ def _review_fields(
     # Hub hint: matched against the display-plane catalog view (§7.1a) the caller
     # peeked, never fetched here — a local listing must not wait for the network.
     # None = no fresh view yet; the page re-reads once its own catalog read lands.
+    # With a view, an unreadable payload is a definitive negative for THIS row —
+    # never a 500 for the whole listing.
     official_hub_verified: bool | None = False
     if source == "ouroboroshub":
         from ouroboros.skill_review import hub_payload_matches
 
-        official_hub_verified = (
-            None if hub_catalog_files is None
-            else hub_payload_matches(loaded, hub_catalog_files.__getitem__)
-        )
+        if hub_catalog_files is None:
+            official_hub_verified = None
+        else:
+            try:
+                official_hub_verified = hub_payload_matches(loaded, hub_catalog_files.__getitem__)
+            except Exception:
+                official_hub_verified = False
     owner_attestable = official_hub_verified if source == "ouroboroshub" else (
         source not in {"native", "clawhub"}
         and (source == "external" or bool(getattr(loaded, "is_self_authored", False)))

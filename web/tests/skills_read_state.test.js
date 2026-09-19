@@ -518,7 +518,10 @@ test('Skills header Refresh and page revisit call the currently selected catalog
             addEventListener: (event, callback) => { listeners[event] = callback; },
             removeEventListener: event => { delete listeners[event]; },
         },
-        skillsPageTemplate: () => '', activateTab() {}, loadHubCatalog() {},
+        skillsPageTemplate: () => '', activateTab() {},
+        // The listing only peeks at the 120 s display memo, so an Installed Refresh
+        // must refill it: a forced catalog read, recorded beside the pane render.
+        loadHubCatalog: force => { if (force) calls.push('catalog'); },
         attachActionHandlers: () => ({ closeMenus() {}, destroy() {} }),
         bindTabStrip: (strip, { onChange }) => {
             tabs.forEach(tab => { tab.handlers.click = () => onChange(tab.dataset.tab, tab); });
@@ -537,11 +540,13 @@ test('Skills header Refresh and page revisit call the currently selected catalog
         await nextTurn();
         calls.length = 0;
         await nodes['skills-refresh'].handlers.click();
-        assert.deepEqual(calls, [tab.dataset.tab]);
+        assert.deepEqual(calls, tab.dataset.tab === 'installed' ? ['catalog', 'installed'] : [tab.dataset.tab],
+            'Installed Refresh forces the catalog read the listing re-read depends on');
         calls.length = 0;
         listeners['ouro:page-shown']({ detail: { page: 'skills' } });
         await nextTurn();
-        assert.deepEqual(calls, [tab.dataset.tab]);
+        assert.deepEqual(calls, tab.dataset.tab === 'installed' ? ['catalog', 'installed'] : [tab.dataset.tab],
+            'page open forces exactly one catalog read, and only the Installed view consumes it');
     }
     const older = deferred(), current = deferred();
     context.renderMarketplacePane = () => older.promise;

@@ -126,3 +126,31 @@ def test_display_catalog_files_peeks_and_never_fetches(monkeypatch):
         assert ouroboroshub.display_catalog_files() is None
     finally:
         ouroboroshub._catalog_cache_clear()
+
+
+def test_an_unreadable_hub_payload_fails_only_its_own_row(index, monkeypatch):
+    """One payload the matcher cannot read is False for that row; the listing survives."""
+    build, _drive_root = index
+    _rows, skills = build(2)
+    victim = skills[0].skill_dir / "SKILL.md"
+    real_read_bytes = pathlib.Path.read_bytes
+
+    def boom(self):
+        if self == victim.resolve():
+            raise OSError("payload vanished between is_file() and read_bytes()")
+        return real_read_bytes(self)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", boom)
+    rows, _skills = build(0, memo_age_sec=None, extra=skills)
+    assert rows["hub-skill-0"]["official_hub_verified"] is False
+    assert rows["hub-skill-0"]["owner_attestable"] is False
+    assert rows["hub-skill-1"]["official_hub_verified"] is True
+
+
+def test_a_malformed_display_memo_is_no_view_not_a_failed_listing(index):
+    build, _drive_root = index
+    _rows, skills = build(1)
+    ouroboroshub._catalog_cache_inject({"raw_base_url": _RAW_BASE, "skills": {"not": "a list"}})
+    assert ouroboroshub.display_catalog_files() is None
+    rows, _skills = build(0, memo_age_sec=None, extra=skills)
+    assert rows["hub-skill-0"]["official_hub_verified"] is None

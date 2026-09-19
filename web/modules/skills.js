@@ -990,6 +990,10 @@ export function initSkills(ctx) {
         const originalText = refreshBtn.textContent || 'Refresh';
         refreshBtn.textContent = 'Refreshing';
         try {
+            // An explicit Refresh re-reads the catalog too: the listing peeks at a
+            // 120 s display memo, so a reused stale snapshot would leave its hub
+            // facts unknown until the next page open.
+            if (activeTab === 'installed') loadHubCatalog(true);
             await Promise.all([
                 activeTab === 'marketplace' ? renderMarketplacePane()
                     : activeTab === 'ouroboroshub' ? renderOuroborosHubPane() : renderFn(),
@@ -1022,9 +1026,9 @@ export function initSkills(ctx) {
     const onPageShown = (event) => {
         actions.closeMenus();
         if (event.detail?.page === 'skills') {
-            // Fresh catalog snapshot once per page open; re-renders reuse it.
+            // Fresh catalog snapshot once per page open (refreshActive forces it
+            // for the Installed view); ordinary re-renders reuse it.
             tabs.select(activeTab);
-            loadHubCatalog(true);
             refreshActive();
         }
     };

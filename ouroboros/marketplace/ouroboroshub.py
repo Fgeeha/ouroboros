@@ -212,9 +212,15 @@ def load_catalog(fresh: bool = True) -> Dict[str, Any]:
 
 def display_catalog_files() -> Optional[Dict[str, Any]]:
     """Catalog ``files`` by slug from the fresh display memo, ``None`` without
-    one. Never fetches: a local listing must not wait for the network."""
+    one. Never fetches, never raises: a local listing must not wait for the
+    network, and a malformed memo is "no view", not a failed listing."""
     cached = _catalog_cache_get()
-    return None if cached is None else {item.slug: item.files for item in _summaries(cached)}
+    if cached is None:
+        return None
+    try:
+        return {item.slug: item.files for item in _summaries(cached)}
+    except OuroborosHubError:
+        return None
 
 
 def _summaries(catalog: Dict[str, Any]) -> List[HubSkillSummary]:
