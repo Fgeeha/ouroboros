@@ -119,10 +119,11 @@ def _fold_identical_calls(tool_calls: list) -> list[tuple[int, dict, int, int | 
     blind poll fold exactly like a typed error. Nothing is dropped: the count stays on the row.
     Recorded is the load-bearing word, because these arguments already passed the log
     sanitizer: an oversized string keeps its length and sha in the marker (two different
-    large payloads still differ), but a list past 50 items and a structure past depth 3
-    collapse to a shape that CAN compare equal for two genuinely different consecutive
-    calls, which would fold them into one ``×2`` row. Each row keeps its own trace_ref,
-    which addresses that call's exact recorded projection.
+    large payloads still differ) and a truncated list keeps its remaining count (so tails
+    of DIFFERENT length still differ), but two same-length tails with different content, a
+    structure past depth 3, and two different secrets (both ``*** REDACTED ***``) collapse
+    to a shape that compares equal and folds into one ``×2`` row. The returned row is the
+    group's FIRST call, whose trace_ref addresses that call's exact recorded projection.
     """
     folded: list[list] = []
     previous = None

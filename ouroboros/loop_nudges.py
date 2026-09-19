@@ -147,6 +147,19 @@ def _build_recent_tool_trace(
             head = str(row.get("result") or "").strip().splitlines()[:1]
             note += f" ← {head[0][:200]}" if head else ""
         outcomes.setdefault(str(row["tool_call_id"]), []).append(note)
+    # Align from the TAIL, not the head: `llm_trace` keeps every call of the task while
+    # `messages` can have a prefix replaced by a compaction capsule that carries no
+    # tool_calls. Consuming from the front then handed a surviving `call_0` the outcome
+    # of an EVICTED namesake — the same mispairing, one step further out. Messages are a
+    # suffix of the trace, so keep each id's last N notes for the N calls still present.
+    wanted: Dict[str, int] = {}
+    for msg in messages:
+        if msg.get("role") == "assistant" and msg.get("tool_calls"):
+            for tc in msg["tool_calls"]:
+                key = str(tc.get("id") or "")
+                wanted[key] = wanted.get(key, 0) + 1
+    for call_id, notes in outcomes.items():
+        del notes[:max(0, len(notes) - wanted.get(call_id, 0))]
     all_calls: List[str] = []
     for msg in messages:
         if msg.get("role") == "assistant" and msg.get("tool_calls"):

@@ -1157,7 +1157,7 @@ def plan_review_gate_projection(
                 # B2b typed fact: a wave whose own rows prove no re-dispatch can meet
                 # quorum (structurally dead lanes) carries its earliest recorded reset.
                 control = {
-                    "status": "cycles_exhausted" if wave.get("cycles_exhausted") else "open",
+                    "status": "cycles_exhausted" if wave.get("cycles_exhausted") or attempt.get("status") == "cycles_exhausted" else "open",
                     "outcome": outcome, "closed": False,
                     "fingerprint": str(wave.get("request_fingerprint") or ""),
                     "reviewer_slots_degraded": outcome == "DEGRADED", "custody_pending": bool(wave.get("custody_pending")),

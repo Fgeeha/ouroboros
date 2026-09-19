@@ -83,3 +83,40 @@ def test_the_rail_that_forced_finalization_survives_an_author_decision():
     assert "cap spent (2 paid cycle(s))" in text and "ends blocked" in text
     assert "Plan author decision: finish" in text
     assert "does not close or replace the critic review" in text
+
+
+@pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
+def test_an_author_stop_is_never_described_as_work_that_proceeded(enforcement):
+    """An author stop carries allow=True under EVERY enforcement (task_results maps
+    author_stopped to allow), so the generic advisory-continuation sentence would tell the
+    owner work proceeded about a blocking stop that finished nothing."""
+    decision = {"required": True, "status": "author_stopped", "allow": True,
+                "enforcement": enforcement, "outcome": "REVISE_PLAN", "author_action": "stop"}
+    text = plan_review_disclosure(decision)
+    assert "work proceeded" not in text and "advisory enforcement" not in text
+    assert "the author stopped with unfinished work" in text
+
+
+def test_the_blocking_reminder_does_not_advise_disposing_the_earlier_plans_wave():
+    """The reminder is outcome-keyed action guidance. With a historical aggregate it told
+    the agent the review "remains REVIEW_REQUIRED" and to dispose the latest fingerprint —
+    a wave that cannot approve the revised bytes."""
+    from ouroboros.owner_hurry import plan_review_reminder
+
+    text = plan_review_reminder({"required": True, "status": "open", "enforcement": "blocking",
+                                 "outcome": "REVIEW_REQUIRED", "historical_critic": True})
+    assert "reviewed the EARLIER plan" in text and "no verdict of its own" in text
+    assert "remains REVIEW_REQUIRED" not in text
+
+
+def test_an_author_finish_at_a_spent_cap_releases_on_its_own_wave_too():
+    """tools/plan_review._apply_author_subject stamps cycles_exhausted on the ATTEMPT, not
+    on the wave, so reading the wave alone held a task whose author may only finish
+    honestly and cannot buy another cycle."""
+    state = {"schema_version": 2,
+             "current_attempt": {"fingerprint": "F1", "status": "cycles_exhausted",
+                                 "reason": "author_current_plan"},
+             "waves": [{"request_fingerprint": "F1", "aggregate": "REVISE_PLAN", "closed": False}]}
+    gate = plan_review_gate_projection(state, "blocking")
+    assert gate["status"] == "cycles_exhausted" and gate["allow"] is True
+    assert gate["review_capacity_reason"] == "review_cycles_exhausted"

@@ -121,7 +121,7 @@ def test_the_reflection_prompt_carries_the_whole_listing_and_an_optional_verbati
     assert "×10 identical, rounds 2–11" in prompt and "pad line 399" in prompt  # no second cut
     assert "truncated at 2000 chars" not in prompt
     # the verbatim record is named with the reader the reflection already holds, and is really there
-    marker = "Complete stored record of every call ("
+    marker = "Complete stored record of every call"
     assert marker in prompt
     arguments = json.loads(prompt[prompt.index(marker):].split("read_file ", 1)[1].splitlines()[0])
     assert arguments["root"] == "runtime_data"
@@ -233,12 +233,52 @@ def test_a_sanitizer_truncated_argument_still_names_a_source(tmp_path):
             "is_error": False, "status": "ok", "round_id": "exec_x:round:1"}
     pointer = reflection._verbatim_trace_pointer(
         ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="cut"), {"tool_calls": [call]})
-    assert "Complete stored record of every call (" in pointer
+    assert "Complete stored record of every call" in pointer
     arguments = json.loads(pointer.split("read_file ", 1)[1].splitlines()[0])
     record = (pathlib.Path(tmp_path) / arguments["path"]).read_text(encoding="utf-8")
     assert "<TRUNCATED:content:5000ch:sha=" in record
     # the claim names what it holds: the stored trace, not the original arguments
-    assert "as the trace retained it" in pointer and "as the actor saw it" not in pointer
+    assert "as the TRACE retained" in pointer and "as the actor saw it" not in pointer
+    # and it does not promise the result in full: the trace stores the actor-visible cap
+    assert "in full" not in pointer and "result_source_ref" in pointer
+
+
+@pytest.mark.parametrize("args,cut", [
+    ({"handle": {"_repr": "<socket object at 0x1>"}}, True),
+    ({"payload": {"_error": "sanitization_failed"}}, True),
+    ({"note": "_truncated"}, False),
+])
+def test_cut_detection_reads_the_one_shared_sanitizer_marker_list(tmp_path, args, cut):
+    """A hand-rolled subset missed `_repr` and `_error` — the rows whose arguments survive
+    ONLY in the call blob — and its colon-less tokens fired on a literal value."""
+    from ouroboros.artifacts import SANITIZER_OMISSION_MARKERS
+    from ouroboros.tools.registry import ToolContext
+
+    assert '"_repr":' in SANITIZER_OMISSION_MARKERS and '"_error":' in SANITIZER_OMISSION_MARKERS
+    call = {"tool": "demo", "tool_call_id": "d1", "args": args, "result": "OK",
+            "is_error": False, "status": "ok", "round_id": "e:round:1"}
+    pointer = reflection._verbatim_trace_pointer(
+        ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="markers"), {"tool_calls": [call]})
+    assert bool(pointer) is cut
+
+
+def test_outcomes_align_from_the_tail_when_compaction_dropped_earlier_calls():
+    """`llm_trace` keeps every call of the task while `messages` can have a prefix replaced
+    by a compaction capsule carrying no tool_calls. Consuming from the front then handed a
+    surviving `call_0` the outcome of an EVICTED namesake."""
+    from ouroboros.loop_nudges import _build_recent_tool_trace
+
+    messages = [
+        {"role": "assistant", "content": [{"type": "text", "text": "[compacted capsule]"}]},
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_0", "function": {"name": "read_file", "arguments": '{"b":2}'}}]},
+    ]
+    trace = {"tool_calls": [
+        {"tool_call_id": "call_0", "status": "argument_error", "is_error": True, "result": "EVICTED refusal"},
+        {"tool_call_id": "call_0", "status": "ok", "is_error": False, "result": "second body"}]}
+    rendered = _build_recent_tool_trace(messages, llm_trace=trace)
+    assert '1. read_file({"b":2}) [ok]' in rendered
+    assert "EVICTED refusal" not in rendered and "argument_error" not in rendered
 
 
 def test_a_successful_untyped_or_autocorrected_call_is_not_a_failure_anywhere():
@@ -297,7 +337,7 @@ def test_post_task_consumer_receives_middle_calls_and_repeated_ok_source(tmp_pat
     prompt = next(c for c in captured_calls if c.get("call_type") == "task_reflection")["messages"][0]["content"]
     assert "file-40" in prompt and "KEEP_THIRD" in prompt and "×2 identical" in prompt
     assert "middle tool calls omitted" not in prompt
-    marker = "Complete stored record of every call ("
+    marker = "Complete stored record of every call"
     arguments = json.loads(prompt[prompt.index(marker):].split("read_file ", 1)[1].splitlines()[0])
     # Read through the very tool surface the reflection model holds, not Path alone.
     reader = KnowledgeReadContext(ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="end-to-end"), "task_reflection")

@@ -628,6 +628,17 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
             "dispositions remain available; a disposition does not close blocking findings "
             "or a degraded wave. Existing in-flight custody can still settle."
         )
+    if decision.get("historical_critic"):
+        # The aggregate and its custody/degraded facts belong to the plan this author
+        # REVISED, so none of the outcome-keyed advice below applies to the current one:
+        # telling the agent to dispose "the latest fingerprint" would point it at a wave
+        # that cannot approve these bytes.
+        return (
+            f"{tag} Plan review is OPEN: the referenced critic reviewed the EARLIER plan "
+            f"({outcome or 'unavailable'}); the revised plan has no verdict of its own. Call "
+            "plan_task with the current goal, plan and spec to have it reviewed — a disposition "
+            "on the earlier wave cannot approve the revised plan. Implementation stays held."
+        )
     if decision.get("custody_pending"):
         return (
             f"{tag} Plan review is OPEN: reviewer work is still running or awaiting collection. "
@@ -735,7 +746,10 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
             + "); the task ends blocked with its evidence recorded; the planned work "
             f"must not be treated as done.{author_note}"
         )
-    if decision.get("allow"):
+    # An author stop carries allow=True in EVERY enforcement, so the generic branch
+    # below would tell the owner "work proceeded under advisory enforcement" about a
+    # blocking stop that finished nothing. It falls to the author fallback instead.
+    if decision.get("allow") and decision.get("status") != "author_stopped":
         return (
             f"\n\n⚠️ Plan review is still open ({outcome or 'unavailable'}); work proceeded "
             f"under the owner-selected advisory enforcement.{author_note}{late}"

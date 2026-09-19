@@ -420,11 +420,12 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
     Redacted like every other reflection-visible result. Never a required source: a
     reflection that does not open it is still complete for what its prompt shows.
 
-    Stored, not original: these arguments already passed ``sanitize_tool_args_for_log``,
-    which replaced an oversized value with a short marker naming its length and sha.
-    Calling that "as the actor saw it" overstated a cognitive artifact, so the pointer
-    now says what it holds and each call names the manifest addressing its unbounded
-    recorded projection.
+    Stored, not original, on BOTH axes: these arguments already passed
+    ``sanitize_tool_args_for_log`` (an oversized value carries a marker naming its length
+    and sha), and the stored result is the actor-visible cap ``loop_tool_execution``
+    wrote, with ``result_source_ref`` on a partial row. Calling that "every argument and
+    each result as the actor saw it" overstated a cognitive artifact, so the pointer now
+    says exactly what it holds and names a call's recorded manifest only when it has one.
     """
     tool_calls = [tc for tc in (llm_trace.get("tool_calls") or []) if isinstance(tc, dict)]
     from ouroboros.post_task_synthesis import _fold_identical_calls
@@ -435,10 +436,15 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
         args = tc.get("args")
         answer = str(tc.get("result") or "").strip()
         rendered = json.dumps(args, ensure_ascii=False, default=str)
+        from ouroboros.artifacts import SANITIZER_OMISSION_MARKERS
+
         # A width test alone MISSES the worst cut: the log sanitizer already replaced a
         # huge value with a short marker, so the biggest argument in the task measured
-        # small here and produced no source pointer at all. The marker is the evidence.
-        return (any(token in rendered for token in ('"<TRUNCATED:', '"_truncated"', '"_depth_limit"'))
+        # small here and produced no source pointer at all. The marker is the evidence,
+        # read through the ONE shared list — a hand-rolled subset missed `_repr` and
+        # `_error`, exactly the rows whose arguments survive only in the call blob, and
+        # its colon-less tokens also fired on a literal value of "_truncated".
+        return (any(marker in rendered for marker in SANITIZER_OMISSION_MARKERS)
                 or any(len(str(value)) > 200 for value in (args.values() if isinstance(args, dict) else [args]))
                 or ((count > 1 or _trace_call_errored(tc)) and (len(answer.splitlines()) > 1 or len(answer) > 200)))
 
@@ -463,10 +469,11 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
             for index, tc in enumerate(tool_calls, 1))
         safe = str(redact_projection(record).value)
         ref = retain_memory_source(knowledge_context, "task_trace_verbatim", safe.encode("utf-8"))
-        return ("\n\nComplete stored record of every call (each result in full, and each argument as the "
-                "trace retained it — a value the log sanitizer found oversized was already replaced "
-                "there by a marker naming its length and hash, and each call names the manifest "
-                f"addressing its unbounded projection; optional reading, {len(safe)} chars): read_file "
+        return ("\n\nComplete stored record of every call, each argument and result as the TRACE retained "
+                "them: an oversized argument was already replaced there by a marker naming its length "
+                "and hash, a result is the same actor-visible cap the listing shows (a partial one names "
+                "its own result_source_ref), and a call names its recorded manifest when it has one; "
+                f"optional reading, {len(safe)} chars): read_file "
                 + json.dumps(ref["read"]["arguments"], ensure_ascii=False))
     except Exception:
         log.debug("Verbatim trace record unavailable for reflection", exc_info=True)
