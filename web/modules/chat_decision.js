@@ -53,9 +53,6 @@ export function createChatDecision({
     const quizViews = new Map();
     const mirrors = new Map();
     const detailReads = new Map();
-    // Revalidation never joins a navigation read that may predate the forgotten
-    // lifecycle. Pending revalidations for the same task share this fresh read.
-    const revalidationReads = new Map();
     const questionKey = (taskId, quizId) => JSON.stringify([String(taskId || ''), String(quizId || '')]);
     let disposed = false;
     let questionNavigation = 0;
@@ -94,18 +91,18 @@ export function createChatDecision({
         return { ...frame, ...next };
     }
 
-    // Navigation and revalidation each single-flight per task. Revalidation never
-    // joins an older navigation read; repeated deliveries share the owned view's
-    // pending validation.
+    // Navigation single-flights per task. A revalidation is its own read, begun after the copy it
+    // validates mounted: it never joins a navigation read or a sibling copy's earlier validation,
+    // either of which may predate an answer this tab missed. The copy's pending flag shares it
+    // among repeated deliveries (buildQuestionPointer).
     async function readQuestion(taskId, quizId, projectId, { fresh = false } = {}) {
         if (!fetchDetail || disposed) return null;
-        const reads = fresh ? revalidationReads : detailReads;
-        if (!reads.has(taskId)) {
-            const promise = Promise.resolve().then(() => disposed ? null : fetchDetail(taskId))
-                .finally(() => { if (reads.get(taskId) === promise) reads.delete(taskId); });
-            reads.set(taskId, promise);
+        const read = () => Promise.resolve().then(() => disposed ? null : fetchDetail(taskId));
+        if (!fresh && !detailReads.has(taskId)) {
+            const promise = read().finally(() => { if (detailReads.get(taskId) === promise) detailReads.delete(taskId); });
+            detailReads.set(taskId, promise);
         }
-        const detail = await reads.get(taskId);
+        const detail = await (fresh ? read() : detailReads.get(taskId));
         const block = detail?.owner_quiz?.[quizId];
         if (disposed || String(detail?.task_id || detail?.id || '') !== String(taskId)
             || (projectId && String(detail?.project_id || '') !== String(projectId))
@@ -257,9 +254,6 @@ export function createChatDecision({
         view.disposeMarkdown = null;
         if (mirrors.get(view.key) === view) mirrors.delete(view.key);
         if (quizViews.get(view.key) === view.card) quizViews.delete(view.key);
-        if (view.needsValidation && ![...mirrors.values()].some((other) =>
-            other.needsValidation && other.row.task_id === view.row.task_id))
-            revalidationReads.delete(view.row.task_id);
     }
 
     function removeMirror(view) {
@@ -325,14 +319,13 @@ export function createChatDecision({
             if (disposed || mirrors.get(view.key) !== view) return;
             view.revalidationPending = false;
             if (!question) { view.revalidationFailed = true; return; }
-            onDomWrite(() => {
-                if (disposed || mirrors.get(view.key) !== view) return false;
-                if (question.state === 'answered' && !answeredBeforeRead
-                    && view.row.quiz_state !== 'answered') { removeMirror(view); return true; }
-                view.needsValidation = false;
-                view.revalidationFailed = false;
-                return updateMirror(view, question);
-            });
+            // Removal is its own viewport transaction, the one that keeps the leaving node out of
+            // the scroll anchor (removeMessageNode); nested in another write it would anchor there.
+            if (question.state === 'answered' && !answeredBeforeRead
+                && view.row.quiz_state !== 'answered') { removeMirror(view); return; }
+            view.needsValidation = false;
+            view.revalidationFailed = false;
+            updateMirror(view, question);
         });
     }
 
@@ -994,7 +987,7 @@ export function createChatDecision({
         destroy() {
             disposed = true;
             for (const view of [...mirrors.values()]) releaseMirror(view);
-            observations.clear(); quizViews.clear(); detailReads.clear(); revalidationReads.clear();
+            observations.clear(); quizViews.clear(); detailReads.clear();
         },
     };
 }

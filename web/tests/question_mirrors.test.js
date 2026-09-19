@@ -442,6 +442,66 @@ test('revalidation bypasses an already-started navigation detail read', () => wi
     } finally { fx.decision.destroy(); fx.restore(); }
 }));
 
+test('a copy mounted after a sibling started its validation never inherits that older read', () => withTimers(async () => {
+    const pending = [];
+    const fx = mainFixture({ fetchDetail: () => new Promise(resolve => pending.push(resolve)) });
+    const detail = (states) => ({ task_id: 't-1', project_id: 'p1', owner_quiz: Object.fromEntries(Object.entries(states)
+        .map(([quizId, state]) => [quizId, { quiz_id: quizId, state, question: 'Canonical source', options: ['A', 'B'],
+            ...(state === 'answered' ? { answered_index: 1 } : {}) }])) });
+    try {
+        for (let i = 0; i < 2001; i += 1)
+            fx.decision.applyQuizStateFrame({}, { task_id: 'noise', quiz_id: `n-${i}`, state: 'open' });
+        fx.add({ ...WAITING, quiz_id: 'sibling' });
+        await turn();
+        // Meanwhile 'late' is answered and this tab misses the frame; a stale open snapshot of it
+        // arrives while the sibling's read, begun before that answer, is still on the wire.
+        fx.add({ ...WAITING, quiz_id: 'late', ts: ASKED[1] });
+        await turn();
+        assert.equal(pending.length, 2, 'the newer copy validates with its own read');
+        pending[0](detail({ sibling: 'open', late: 'open' }));
+        await turn();
+        const [sibling, late] = fx.cards();
+        assert.deepEqual([sibling.dataset.state, late.dataset.state], ['open', 'unknown']);
+        assert.ok(options(late).every(button => button.disabled) && !late.querySelector('.chat-quiz-comment'),
+            'the older read cannot unlock the newer copy');
+        pending[1](detail({ sibling: 'open', late: 'answered' }));
+        await turn();
+        assert.deepEqual(fx.cards().map(card => [card.dataset.quizId, card.dataset.state]), [['sibling', 'open']]);
+        fx.add({ ...WAITING, quiz_id: 'late', ts: ASKED[1] });
+        assert.deepEqual([fx.cards().length, pending.length], [1, 2], 'the canonical answer is remembered again');
+    } finally { fx.decision.destroy(); fx.restore(); }
+}));
+
+test('a canonical answer removes the copy in its own viewport transaction, never anchored on it', () => withTimers(async () => {
+    const pending = [], anchors = [];
+    let column = null, depth = 0;
+    // chat.js withStableViewport: only the outermost write captures the anchor (the first node it
+    // does not exclude) and restores it afterwards; a nested write joins that transaction.
+    const viewport = (mutate, { excludeAnchorNode = null } = {}) => {
+        if (depth > 0) return mutate();
+        const anchor = column?.children.find(node => node !== excludeAnchorNode) || null;
+        depth = 1;
+        try { return mutate(); } finally { depth = 0; anchors.push(anchor); }
+    };
+    const fx = mainFixture({ onDomWrite: viewport, fetchDetail: () => new Promise(resolve => pending.push(resolve)),
+        removeMessageNode: node => viewport(() => { node.remove(); return true; }, { excludeAnchorNode: node }) });
+    column = fx.column;
+    try {
+        for (let i = 0; i < 2001; i += 1)
+            fx.decision.applyQuizStateFrame({}, { task_id: 'noise', quiz_id: `n-${i}`, state: 'open' });
+        fx.add({ ...WAITING, quiz_id: 'gone' });
+        fx.add({ ...WAITING, quiz_id: 'below', ts: ASKED[1] });
+        await turn();
+        const [gone, below] = fx.column.children;
+        anchors.length = 0;
+        pending[0]({ task_id: 't-1', project_id: 'p1', owner_quiz: {
+            gone: { quiz_id: 'gone', state: 'answered', answered_index: 0, question: 'Canonical source', options: ['A', 'B'] } } });
+        await turn();
+        assert.deepEqual([fx.column.children, gone.parentNode], [[below], null]);
+        assert.deepEqual(anchors, [below], 'the reader stays on the node below, not on the one that left');
+    } finally { fx.decision.destroy(); fx.restore(); }
+}));
+
 test('history retirement cancels pending revalidation and an old response cannot change a replacement copy', () => withTimers(async () => {
     const pending = [], queued = [];
     let queueNext = false;
@@ -613,4 +673,41 @@ test('a Project room never mirrors its own questions', () => {
         assert.equal(fx.decision.appendQuestionPointer(WAITING), false);
         assert.equal(fx.decision.appendActivityQuestion(WAITING), false);
     } finally { fx.restore(); }
+});
+
+// Retained census regressions from question_rows: layout changed, ordering did not.
+test('a census without positive wait evidence leaves earlier waits untouched', () => {
+    const fx = mainFixture();
+    try {
+        fx.add(WAITING);
+        fx.add({ ...WAITING, quiz_id: 'new', ts: ASKED[1] });
+        fx.decision.appendActivityQuestion({ ...WAITING, quiz_id: 'new', ts: ASKED[1], owner_wait_state: undefined });
+        assert.deepEqual(fx.cards().map(card => text(card, 'chat-quiz-status-text')),
+            ['Waiting for your answer', 'Waiting for your answer']);
+    } finally { fx.decision.destroy(); fx.restore(); }
+});
+
+test('a census naming an older resumed wait cannot end the newer wait', () => {
+    const fx = mainFixture();
+    try {
+        fx.add(WAITING);
+        fx.add({ ...WAITING, quiz_id: 'new', ts: ASKED[1] });
+        fx.decision.appendActivityQuestion({ ...WAITING, owner_wait_state: 'resumed' }, Date.now() + 1000);
+        const newer = fx.cards()[1];
+        assert.equal(text(newer, 'chat-quiz-status-text'), 'Waiting for your answer');
+        assert.ok(options(newer).every(button => !button.disabled));
+    } finally { fx.decision.destroy(); fx.restore(); }
+});
+
+test('an optional canonical ask inherits no resumed fact from another quiz wait', async () => {
+    const fx = mainFixture({ fetchDetail: async () => ({ task_id: 't-1', project_id: 'p1',
+        owner_quiz: { opt: { quiz_id: 'opt', state: 'open', question: 'Format?', options: ['A', 'B'], assumption: 'A' } },
+        owner_wait: { quiz_id: 'new', state: 'waiting' } }) });
+    try {
+        const detail = await fx.decision.readQuestion('t-1', 'opt', 'p1');
+        assert.equal(detail.owner_wait_state, undefined);
+        const card = fx.decision.buildQuizCard(detail);
+        assert.equal(text(card, 'chat-quiz-status-text'), 'Unanswered · an answer is still accepted');
+        assert.ok(options(card).every(button => !button.disabled));
+    } finally { fx.decision.destroy(); fx.restore(); }
 });
