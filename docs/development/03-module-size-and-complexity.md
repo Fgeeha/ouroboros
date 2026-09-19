@@ -253,6 +253,39 @@ the typed acceptance bypass and `failure.error_kind`; ordinary provider outages
 keep their existing recovery behavior. Enforcement:
 `tests/test_continuation_context_authority.py`.
 
+### Invariant: notifications ring for live events only
+
+Owner-facing notification POLICY is `docs/DESIGN.md` §9 — one canonical
+section, never re-derived here. The engineering rules are:
+
+The subscription is CLIENT-level and must never move into a chat instance. An
+instance dies with its room — closing a Project panel disposes its `ws.on`
+handlers — so a notifier wired inside one is silent in exactly the case
+notifications exist for: the owner left and the room is closed.
+`notifications.js::attach()` takes one subscription on the shared socket in
+`app.js`, and `chat.js` holds no notification code.
+
+Only live frames reach it; history and reconnect backfill run through the
+instances' own readers, which never call it. That boundary — not a persisted
+ledger — is what makes replay safe, so no notification state survives a reload.
+The room gate is the client's owner-visible chat set: the hidden partition, A2A
+ids and unknown chats are refused.
+
+One ending is one key per task: the `task_done` log frame, the authored summary
+and the turn's ordinary reply all collapse together, and a direct turn's ending
+is the ordinary-reply category rather than a finished task. Lineage comes from
+the delegation facts frames carry, because the terminal frame has none — a child
+must not reach the owner's banner.
+
+Classification and the delivery gate stay pure over one frame plus the stored
+preferences, so the rules are testable without a DOM or a socket. Preferences
+are client-local, carry no `s-` field and are excluded from the settings-dirty
+tracker, so they neither reach `/api/settings` nor offer to discard unsaved
+settings (`tests/test_notifications_static.py` asserts those causes, not only
+their effects). Delivery degrades rather than disappearing, and the status line
+says which surface this client has. Importance must not acquire a new host
+field, a text heuristic or a second model call.
+
 ### Invariant: UI resources carry a disposer
 
 Every long-lived acquisition in `web/` returns or records a disposer, and a UI

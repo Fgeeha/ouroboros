@@ -7,6 +7,8 @@ import { bindScrollFade } from './modules/scroll_fade.js';
 import { initChat, createChatInstance } from './modules/chat.js';
 import { createStateSnapshotSequencer } from './modules/chat_activity.js';
 import { initFiles } from './modules/files.js';
+import { getNotifier } from './modules/notifications.js';
+import { showToast } from './modules/toast.js';
 import { apiClient } from './modules/api_client.js';
 import { openNewProjectDialog, openProjectRowMenu } from './modules/project_create.js';
 
@@ -233,6 +235,35 @@ const ctx = {
         };
     },
 };
+
+// Notifications: ONE notifier and ONE subscription per client. Rooms are
+// destroyed as the owner navigates (closing a Project panel destroys its chat
+// instance), so the subscription cannot live inside a room — it would go silent
+// in exactly the case notifications exist for. app.js owns only the click
+// destination, the in-app fallback surface and which chats are the owner's;
+// every rule lives in modules/notifications.js.
+getNotifier().attach({
+    ws,
+    ownerVisibleChat: (chatId) => chatId === 1 || state.projectChatIds.has(chatId),
+});
+getNotifier().configure({
+    showToast,
+    onActivate: (target) => {
+        const chatId = Number(target?.chatId);
+        const project = Array.isArray(lastProjectRows)
+            ? lastProjectRows.find((row) => Number(row?.chat_id) === chatId)
+            : null;
+        if (project) {
+            void openProjectPanel(project, {
+                openOnly: true,
+                taskId: String(target?.taskId || ''),
+                quizId: String(target?.quizId || ''),
+            });
+            return;
+        }
+        void showPage('chat');
+    },
+});
 
 mainChat = initChat(ctx);
 initFiles(ctx);

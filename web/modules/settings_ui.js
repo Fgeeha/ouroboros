@@ -741,6 +741,53 @@ export function renderSettingsPage() {
                             <div class="settings-inline-note theme-status" data-theme-status role="status" aria-live="polite"></div>
                         </div>
                     </div>
+
+                    <div class="form-section" data-notify-settings>
+                        <h3>Notifications</h3>
+                        <div class="settings-section-copy">
+                            While this client is running, Ouroboros can pull you back to a question or a
+                            finished task. Notifications arrive whether or not this window has focus, and
+                            clicking one opens its source.
+                            <br><strong>Per device, not per account:</strong> like the theme above, these choices
+                            are stored by this client alone and never sent to the server.
+                            Where this system exposes no notifications, or permission is denied, alerts appear
+                            inside the app instead. Do Not Disturb and OS permissions still decide what you see.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="enabled">
+                                Enable notifications
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="needs_answer">
+                                A question or decision is waiting for you
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="task_done">
+                                A task finished or stopped
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="important">
+                                Messages Ouroboros sends you while it works
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="main_reply">
+                                Ordinary replies in Main
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="sound">
+                                Sound
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="show_text">
+                                Show the message text (otherwise only the kind of event)
+                            </label>
+                            <div class="settings-toolbar">
+                                <button type="button" class="btn btn-default btn-sm" data-notify-test>Send a test notification</button>
+                            </div>
+                            <div class="settings-inline-note" data-notify-status role="status" aria-live="polite"></div>
+                        </div>
+                    </div>
                 </section>
 
                 <section class="settings-panel" data-settings-panel="advanced">
