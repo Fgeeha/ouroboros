@@ -462,6 +462,10 @@ async def api_extension_manifest(request: Request) -> JSONResponse:
     load_error = runtime_state.get("load_error")
     if not isinstance(load_error, str) or not load_error.strip():
         load_error = loaded.load_error
+    # The hub hint hashes payload bytes: off the event loop, like the index.
+    review_fields = await asyncio.to_thread(
+        lambda: _review_fields(loaded, hub_catalog_files=display_catalog_files()),
+    )
     return JSONResponse(
         {
             "name": loaded.name,
@@ -478,7 +482,7 @@ async def api_extension_manifest(request: Request) -> JSONResponse:
                 "ui_tab": loaded.manifest.ui_tab,
             },
             "enabled": loaded.enabled,
-            **_review_fields(loaded, hub_catalog_files=display_catalog_files()),
+            **review_fields,
             "content_hash": loaded.content_hash,
             "load_error": load_error,
         }

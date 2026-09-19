@@ -147,10 +147,34 @@ def test_an_unreadable_hub_payload_fails_only_its_own_row(index, monkeypatch):
     assert rows["hub-skill-1"]["official_hub_verified"] is True
 
 
-def test_a_malformed_display_memo_is_no_view_not_a_failed_listing(index):
+@pytest.mark.parametrize("skills_value", [{"not": "a list"}, [{"slug": "hub-skill-0", "files": 7}]])
+def test_a_malformed_display_memo_is_no_view_not_a_failed_listing(index, skills_value):
     build, _drive_root = index
     _rows, skills = build(1)
-    ouroboroshub._catalog_cache_inject({"raw_base_url": _RAW_BASE, "skills": {"not": "a list"}})
+    ouroboroshub._catalog_cache_inject({"raw_base_url": _RAW_BASE, "skills": skills_value})
     assert ouroboroshub.display_catalog_files() is None
     rows, _skills = build(0, memo_age_sec=None, extra=skills)
     assert rows["hub-skill-0"]["official_hub_verified"] is None
+
+
+def test_the_manifest_read_peeks_the_same_view_and_never_downloads(index, monkeypatch):
+    """GET /api/extensions/{skill}/manifest carries the same hub hint: a display
+    peek, never a catalog fetch, unknown without a view."""
+    import asyncio
+
+    from ouroboros.gateway import extensions as extensions_api
+
+    build, drive_root = index
+    _rows, skills = build(1)
+    monkeypatch.setattr(extensions_api, "find_skill", lambda *_a, **_kw: skills[0])
+    monkeypatch.setattr("ouroboros.extension_loader.runtime_state_for_skill_name", lambda *_a, **_kw: {})
+    monkeypatch.setattr(extensions_api, "_request_drive_root", lambda _request: drive_root)
+
+    class _Request:
+        path_params = {"skill": "hub-skill-0"}
+
+    body = json.loads(asyncio.run(extensions_api.api_extension_manifest(_Request())).body)
+    assert body["official_hub_verified"] is True
+    ouroboroshub._catalog_cache_clear()
+    body = json.loads(asyncio.run(extensions_api.api_extension_manifest(_Request())).body)
+    assert body["official_hub_verified"] is None

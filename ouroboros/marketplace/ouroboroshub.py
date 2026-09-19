@@ -151,8 +151,8 @@ def _raw_base(catalog: Dict[str, Any], catalog_url: str) -> str:
 
 # Display-plane catalog memo (§7.1a): ONLY gateway display reads consume it —
 # the catalog endpoint (``fresh=False``: refetches once expired) and the
-# ``/api/extensions`` listing hint (``display_catalog_files``: peeks, never
-# fetches). install/adopt/update, the review profile and owner attestation
+# ``/api/extensions`` listing + ``/manifest`` hint (``display_catalog_files``:
+# peeks, never fetches). install/adopt/update, the review profile and owner attestation
 # always call ``load_catalog()`` fresh; every successful fetch refreshes the
 # memo so display lags at most the TTL.
 _CATALOG_CACHE_TTL_SEC = 120.0
@@ -219,7 +219,7 @@ def display_catalog_files() -> Optional[Dict[str, Any]]:
         return None
     try:
         return {item.slug: item.files for item in _summaries(cached)}
-    except OuroborosHubError:
+    except Exception:  # any malformed row (skills not a list, scalar files, ...)
         return None
 
 
