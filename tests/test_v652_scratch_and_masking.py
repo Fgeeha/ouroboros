@@ -7,6 +7,7 @@ ordered after the red nudge, advisory).
 """
 from __future__ import annotations
 
+import errno
 import json
 import pathlib
 import shutil
@@ -209,6 +210,33 @@ def test_run_script_success_keeps_payload_alongside_undeclared_nudge(tmp_path, m
     assert published.code == "ARTIFACT_OUTPUT_UNDECLARED"
     assert published.status == "blocked"
     assert published.meta["exit_code"] == 0
+
+
+def test_output_audit_skips_unstatable_candidate_and_keeps_real_output(tmp_path, monkeypatch):
+    """Pin pre-3.14 pathlib stat errors without depending on the host filesystem."""
+    from ouroboros.tools.shell_audit import _mentioned_user_file_outputs_without_declaration
+
+    registry, _repo, _data, desktop = _reg(tmp_path, monkeypatch)
+    invalid = (desktop / "unstatable").resolve()
+    target = desktop / "real output.txt"
+    target.write_text("real output", encoding="utf-8")
+    original_is_dir = pathlib.Path.is_dir
+    rejected = []
+
+    def is_dir(path):
+        if path == invalid:
+            rejected.append(path)
+            raise OSError(errno.ENAMETOOLONG, "File name too long", str(path))
+        return original_is_dir(path)
+
+    monkeypatch.setattr(pathlib.Path, "is_dir", is_dir)
+    body = f"open({invalid.as_posix()!r}, 'w'); open({target.as_posix()!r}, 'w')"
+    mentioned = _mentioned_user_file_outputs_without_declaration(
+        registry._ctx, [sys.executable, "-c", body], None, cwd=desktop,
+    )
+    assert rejected
+    assert str(target.resolve()) in mentioned
+    assert str(invalid) not in mentioned
 
 
 def test_undeclared_output_audit_detects_clobber_redirect(tmp_path, monkeypatch):
