@@ -175,6 +175,7 @@ def test_an_unpinned_failed_document_read_answers_none_and_is_never_remembered(r
 
     settings = root / "settings.json"
     monkeypatch.setattr(config, "SETTINGS_PATH", settings)
+    monkeypatch.delenv("OUROBOROS_SETTINGS_SHA256", raising=False)   # unpinned: the reader answers None, never raises
     settings.write_text(json.dumps({"TOTAL_BUDGET": 40}))
     real_read = settings_integrity.read_settings_json_verified
     failing = {"on": True}
