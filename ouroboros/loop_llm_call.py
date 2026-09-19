@@ -23,13 +23,13 @@ from ouroboros.deadline_utils import (
     main_transport_timeout_sec as _main_transport_timeout,
 )
 from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
-from ouroboros.llm_claudexor import cache_key_for_model, propagate_model_error
+from ouroboros.llm_claudexor import propagate_model_error
 from ouroboros.model_wait import propagate_model_control
 from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY, pop_custom_validation_receipts
 from ouroboros.llm_attempt import PROVIDER_POLICY_REFUSAL, _is_provider_policy_refusal  # typed-refusal contract owner
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
-from ouroboros.provider_models import provider_for_model
+from ouroboros.task_pacing import main_loop_wire_options
 from ouroboros.transport_custody import attempt_custody_event_fields, is_pre_dispatch_transport_failure, is_retryable_transport_death
 from ouroboros._usage_response import provider_cost_value as _provider_cost_value
 from ouroboros.usage_accounting import (
@@ -1378,11 +1378,11 @@ def call_llm_with_retry(
                 "context_mode": getattr(physical_context, "rendered_mode", None),
                 "reasoning_effort": effort,
                 "max_tokens": MAIN_LOOP_MAX_TOKENS,
-                "stream": True, "caller_deadline_ts": (None if deadline_ts is None
+                **main_loop_wire_options(model, allow_server_web_search=allow_server_web_search,
+                                         bypass_response_cache=response_cache_bypass_requested),
+                "caller_deadline_ts": (None if deadline_ts is None
                     else float(deadline_ts) - float(transport_reserve_sec or 0.0)),
-                "use_local": use_local, "cache_affinity": cache_key_for_model(model),
-                "allow_server_web_search": bool(allow_server_web_search) and provider_for_model(model) != "claudexor",
-                "bypass_response_cache": response_cache_bypass_requested and provider_for_model(model) != "claudexor",
+                "use_local": use_local,
                 "timeout": _main_transport_timeout(model, deadline_ts, reserve_sec=transport_reserve_sec),
             }
             request_ref = persist_observed_call(

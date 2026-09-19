@@ -811,7 +811,6 @@ class OuroborosAgent:
             root_task_id = str(task.get("root_task_id") or metadata.get("root_task_id") or task_id)
             parent_task_id = str(task.get("parent_task_id") or metadata.get("parent_task_id") or "")
             budget_root = task.get("budget_drive_root") or metadata.get("budget_drive_root") or self.env.drive_root
-            global_limit = resolve_total_budget_usd()
             try:
                 root_limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
             except (TypeError, ValueError):
@@ -823,8 +822,6 @@ class OuroborosAgent:
                 parent_task_id=parent_task_id,
                 category=str(metadata.get("usage_category") or task.get("type") or "task"),
                 source="agent.task",
-                global_limit_usd=global_limit,
-                global_limit_source="task_start_budget_resolver",
                 root_limit_usd=root_limit if root_limit > 0 else None,
                 root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
             )

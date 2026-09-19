@@ -689,7 +689,8 @@ and what enforces each.
   publishes the same `CostCeiling` object the loop decides on, and prices the wrap-up
   with the fence's own cache-aware reservation (`tests/test_network_budget_wallet.py`).
   Explicitly disabled profiles and real monetary fences stay independent; the
-  configured global budget is read through the one resolver, never an inline default.
+  configured global budget is read LIVE through the one resolver — never an inline
+  default, never a per-task capture (`tests/test_budget_resource_facts.py`).
   Post-task consolidation/synthesis reads one frozen `usage_breakdown` snapshot per
   root subtree (never `$0` on a read failure); no second ledger, no reconciliation LLM.
 - Runtime notices after the first user/assistant/tool turn are `[SYSTEM NOTICE]` user
@@ -703,7 +704,8 @@ and what enforces each.
   provider hints and recovery; do not add a generic cache/retry framework.
   Wrap-up calls keep schemas, server-web flag and `tool_choice` unchanged and
   instruct in text, because removing tools or changing tool choice rebuilds
-  cached input. Preserve `context_fit.seal_task_transcript`'s single message
+  cached input; a main-loop payload option lives in `main_loop_wire_options`, never
+  in one lane after its builder (`tests/test_wrapup_real_send_parity.py`). Preserve `context_fit.seal_task_transcript`'s single message
   marker as it moves between task and tool result; direct Anthropic and
   OpenRouter keep their supported wire markers. OpenRouter's derived identity
   excludes cache/host metadata, preserving real task/model differences and
