@@ -1,4 +1,5 @@
 import { refreshModelCatalog } from './settings_catalog.js';
+import { getNotifier } from './notifications.js';
 import { bindEffortSegments, syncEffortSegments, readCustomSecretDraft, collectCustomSecretDraft, paintSettingsFieldErrors, settingsWriteFailure } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
 import { applyMcpSettings, collectMcpSettings, initMcpSettings, validateMcpSettings } from './mcp_settings.js';
@@ -457,6 +458,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     bindEffortSegments(page);
     // Appearance is client-local and injected after boot; never a server setting.
     globalThis.ouroTheme?.mount();
+    // Notification preferences are client-local for the same reason; the module
+    // owns delegated handlers, so mounting only paints current state.
+    getNotifier().mountSettings(page);
     const disposeLocalModel = bindLocalModelControls({ state,
         onApplication: (local) => syncRestartState({ ...restartState, local_model: local }) });
     // Best-effort About version from /api/health.
@@ -1108,8 +1112,16 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
     }
 
-    page.addEventListener('input', onSettingsEdited);
-    page.addEventListener('change', onSettingsEdited);
+    // Client-local blocks (appearance, notifications) live on the Appearance
+    // tab but never enter the /api/settings payload, so their controls must not
+    // make the server draft dirty — otherwise toggling one would ask the owner
+    // to discard "unsaved settings" that do not exist.
+    const onServerSettingEdited = (event) => {
+        if (event?.target?.closest?.('[data-notify-settings]')) return;
+        onSettingsEdited();
+    };
+    page.addEventListener('input', onServerSettingEdited);
+    page.addEventListener('change', onServerSettingEdited);
     page.addEventListener('click', (event) => {
         if (event.target.closest('[data-effort-value], .secret-clear, [data-row-secret-clear], [data-custom-secret-remove]')) {
             queueMicrotask(() => {

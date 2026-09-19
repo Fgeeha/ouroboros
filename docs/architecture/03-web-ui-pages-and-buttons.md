@@ -31,6 +31,34 @@ widget disposers release theme subscriptions; Evolution returns a disposer to
 `app.js`'s non-persisted pagehide cleanup. Shared select arrows are whole-image
 `--select-arrow` tokens, since variables cannot interpolate inside a data URI.
 
+`web/modules/notifications.js` is the one notification owner: pure
+classification plus a delivery gate over one live frame and the client-local
+preferences (`ouroboros.notifications`, stored like the theme choice and
+carrying no `s-` field, so Settings never posts it — and its controls are
+excluded from the settings-dirty tracker, so a client-local toggle never offers
+to discard unsaved server settings), then a thin shell for permission, the
+banner, one tone and click-to-source. `attach()` takes ONE subscription per
+client on the shared socket in `app.js` (`chat`, `quiz`, `log`); `chat.js`
+contains no notification code, because a chat instance dies with its room and a
+closed Project must still be able to pull the owner back. Only live frames reach
+it — history rendering and reconnect backfill never do, which is what makes
+replay safety structural rather than a stored ledger. The room gate mirrors
+`chat_activity.mainThreadAccepts`: a known room (Main plus
+`state.projectChatIds`) or any positive chat not stamped as another Project's,
+so an external owner transport notifies while the hidden partition and A2A ids
+never do. Required categories come from
+confirmed lifecycle facts (a question carrying a positive wait; a SETTLED
+`task_done` status on a ROOT task — an `interrupted` teardown is requeued, not
+finished — or the authored summary, which with the turn's ordinary reply share
+one key per task), lineage is learned from the delegation facts frames
+carry because the terminal log frame has none, importance rides the existing
+`system_type='proactive_message'` discriminator plus optional questions, and
+ordinary Main replies are a separate off-by-default toggle. Where the
+Notification API is missing or denied, delivery degrades to the in-app toast
+plus one tone and the Settings status line says so; no OS permission, Do Not
+Disturb or platform limit is bypassed. Policy and its disclosed limits: DESIGN
+§9; engineering rules: DEVELOPMENT "notifications ring for live events only".
+
 Independent iframe documents do not inherit the host's tokens or stored choice.
 The optional author UI kit supplies styles/primitives, not a hot-theme protocol;
 there is no forced remount. Desktop `webview.start(private_mode=False)` requests
