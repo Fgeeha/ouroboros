@@ -120,3 +120,17 @@ def test_an_author_finish_at_a_spent_cap_releases_on_its_own_wave_too():
     gate = plan_review_gate_projection(state, "blocking")
     assert gate["status"] == "cycles_exhausted" and gate["allow"] is True
     assert gate["review_capacity_reason"] == "review_cycles_exhausted"
+
+
+def test_a_spent_cap_does_not_release_while_a_paid_slot_can_still_settle():
+    """_apply_author_subject is the one cycles_exhausted writer with no in-flight guard, so
+    reading the attempt status alone would release finalization while a paid reviewer could
+    still close the wave — trading an honest hold for a premature blocked terminal."""
+    state = {"schema_version": 2,
+             "current_attempt": {"fingerprint": "F1", "status": "cycles_exhausted",
+                                 "reason": "author_current_plan"},
+             "waves": [{"request_fingerprint": "F1", "aggregate": "REVISE_PLAN",
+                        "closed": False, "custody_pending": True}]}
+    gate = plan_review_gate_projection(state, "blocking")
+    assert gate["status"] == "open" and gate["allow"] is False
+    assert gate["custody_pending"] is True

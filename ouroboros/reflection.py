@@ -458,7 +458,9 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
             """Address of this call's unbounded recorded projection, when one exists."""
             ref = tc.get("trace_ref") if isinstance(tc.get("trace_ref"), dict) else {}
             path = str(((ref or {}).get("manifest_ref") or {}).get("path") or "")
-            return f"\nexact call manifest: {path}" if path else ""
+            # An absolute observability path, NOT a read_file target: that reader defaults to
+            # the active workspace, and only root=runtime_data strips the drive-root prefix.
+            return f"\nobservability call manifest (absolute path): {path}" if path else ""
 
         record = "\n\n".join(
             f"### {index}. {tc.get('tool', 'unknown')} [status={tc.get('status') or ''}"
@@ -472,7 +474,8 @@ def _verbatim_trace_pointer(knowledge_context: Any, llm_trace: Dict[str, Any]) -
         return ("\n\nComplete stored record of every call, each argument and result as the TRACE retained "
                 "them: an oversized argument was already replaced there by a marker naming its length "
                 "and hash, a result is the same actor-visible cap the listing shows (a partial one names "
-                "its own result_source_ref), and a call names its recorded manifest when it has one; "
+                "its own FULL_RESULT_SOURCE_JSON, or FULL_RESULT_SOURCE_UNAVAILABLE when persistence "
+                "failed), and a call names its recorded manifest when it has one; "
                 f"optional reading, {len(safe)} chars): read_file "
                 + json.dumps(ref["read"]["arguments"], ensure_ascii=False))
     except Exception:

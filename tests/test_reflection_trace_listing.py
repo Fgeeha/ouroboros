@@ -239,8 +239,9 @@ def test_a_sanitizer_truncated_argument_still_names_a_source(tmp_path):
     assert "<TRUNCATED:content:5000ch:sha=" in record
     # the claim names what it holds: the stored trace, not the original arguments
     assert "as the TRACE retained" in pointer and "as the actor saw it" not in pointer
-    # and it does not promise the result in full: the trace stores the actor-visible cap
-    assert "in full" not in pointer and "result_source_ref" in pointer
+    # and it does not promise the result in full: the trace stores the actor-visible cap,
+    # naming the marker the record itself carries
+    assert "each result in full" not in pointer and "FULL_RESULT_SOURCE_JSON" in pointer
 
 
 @pytest.mark.parametrize("args,cut", [
@@ -274,11 +275,55 @@ def test_outcomes_align_from_the_tail_when_compaction_dropped_earlier_calls():
             {"id": "call_0", "function": {"name": "read_file", "arguments": '{"b":2}'}}]},
     ]
     trace = {"tool_calls": [
-        {"tool_call_id": "call_0", "status": "argument_error", "is_error": True, "result": "EVICTED refusal"},
-        {"tool_call_id": "call_0", "status": "ok", "is_error": False, "result": "second body"}]}
+        {"tool": "escalate", "tool_call_id": "call_0", "status": "argument_error",
+         "is_error": True, "result": "EVICTED refusal"},
+        {"tool": "read_file", "tool_call_id": "call_0", "status": "ok",
+         "is_error": False, "result": "second body"}]}
     rendered = _build_recent_tool_trace(messages, llm_trace=trace)
     assert '1. read_file({"b":2}) [ok]' in rendered
     assert "EVICTED refusal" not in rendered and "argument_error" not in rendered
+
+
+def test_outcomes_survive_an_authored_view_that_kept_a_non_contiguous_set():
+    """`compact_context(keep_unit_ids=[...])` keeps an ARBITRARY set of units, so counting
+    from either end mispairs too: the surviving calls are only a SUBSEQUENCE of the trace.
+    Here the author kept the 2nd and 4th call of four reused `call_0` ids."""
+    from ouroboros.loop_nudges import _build_recent_tool_trace
+
+    trace = {"tool_calls": [
+        {"tool": "escalate", "tool_call_id": "call_0", "status": "argument_error",
+         "is_error": True, "result": "FIRST refusal"},
+        {"tool": "read_file", "tool_call_id": "call_0", "status": "ok",
+         "is_error": False, "result": "second body"},
+        {"tool": "write_file", "tool_call_id": "call_0", "status": "error",
+         "is_error": True, "result": "THIRD failure"},
+        {"tool": "run_command", "tool_call_id": "call_0", "status": "ok",
+         "is_error": False, "result": "fourth body"}]}
+    messages = [
+        {"role": "assistant", "content": [{"type": "text", "text": "[authored capsule]"}]},
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_0", "function": {"name": "read_file", "arguments": "{}"}}]},
+        {"role": "assistant", "tool_calls": [
+            {"id": "call_0", "function": {"name": "run_command", "arguments": "{}"}}]},
+    ]
+    rendered = _build_recent_tool_trace(messages, llm_trace=trace)
+    assert "read_file({}) [ok]" in rendered and "run_command({}) [ok]" in rendered
+    assert "THIRD failure" not in rendered and "FIRST refusal" not in rendered
+
+
+def test_a_call_with_no_matching_trace_row_gets_no_borrowed_outcome():
+    """A missing outcome is honest; a namesake's error attached to the wrong call is not."""
+    from ouroboros.loop_nudges import _build_recent_tool_trace
+
+    messages = [{"role": "assistant", "tool_calls": [
+        {"id": "call_0", "function": {"name": "read_file", "arguments": "{}"}},
+        {"id": "call_0", "function": {"name": "write_file", "arguments": "{}"}}]}]
+    trace = {"tool_calls": [
+        {"tool": "read_file", "tool_call_id": "call_0", "status": "ok",
+         "is_error": False, "result": "body"}]}
+    rendered = _build_recent_tool_trace(messages, llm_trace=trace)
+    assert "read_file({}) [ok]" in rendered
+    assert "write_file({})" in rendered and "write_file({}) [" not in rendered
 
 
 def test_a_successful_untyped_or_autocorrected_call_is_not_a_failure_anywhere():

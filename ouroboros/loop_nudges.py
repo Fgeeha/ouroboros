@@ -137,29 +137,32 @@ def _build_recent_tool_trace(
     # keying a plain dict let the last call with an id overwrite its namesakes, so an
     # early failed call was printed carrying a later call's status and error text, and
     # the prompt that asks "are you repeating yourself?" accused the wrong call.
-    outcomes: Dict[str, List[str]] = {}
-    for row in ((llm_trace or {}).get("tool_calls") or []):
-        if not isinstance(row, dict) or not row.get("tool_call_id"):
-            continue
+    # Providers are not required to mint unique call ids: GigaChat answers `call_0` every
+    # round and the local parser `call_local_<i>`, so ONE id names several calls in a task.
+    # `llm_trace` keeps every call while `messages` may have lost whole units to compaction
+    # — a capsule replaces a prefix, and an AUTHORED view keeps an arbitrary set
+    # (`context_compaction`: `keep = set(request.keep_unit_ids)`). So neither a per-id dict
+    # (the last call overwrote its namesakes) nor a count from either end is sound. The one
+    # invariant compaction does preserve is ORDER: the surviving calls are a SUBSEQUENCE of
+    # the trace, so walk both with a cursor and match the next row with the same id AND
+    # tool. A call with no match ahead of the cursor gets NO outcome rather than a
+    # namesake's — this prompt asks "are you repeating yourself?", and a wrong error
+    # attached to the wrong call is worse than a missing one.
+    # Residual, disclosed: a LEGACY row that carries no `tool` can only be matched by id,
+    # so two such namesakes stay indistinguishable and the cursor takes the earlier one.
+    # Rows this loop writes today always carry `tool`.
+    rows = [row for row in ((llm_trace or {}).get("tool_calls") or [])
+            if isinstance(row, dict) and row.get("tool_call_id")]
+
+    def _outcome_note(row: Dict[str, Any]) -> str:
         status = str(row.get("status") or ("error" if row.get("is_error") else "ok"))
         note = f" [{status}]"
         if _trace_call_errored(row):
             head = str(row.get("result") or "").strip().splitlines()[:1]
             note += f" ← {head[0][:200]}" if head else ""
-        outcomes.setdefault(str(row["tool_call_id"]), []).append(note)
-    # Align from the TAIL, not the head: `llm_trace` keeps every call of the task while
-    # `messages` can have a prefix replaced by a compaction capsule that carries no
-    # tool_calls. Consuming from the front then handed a surviving `call_0` the outcome
-    # of an EVICTED namesake — the same mispairing, one step further out. Messages are a
-    # suffix of the trace, so keep each id's last N notes for the N calls still present.
-    wanted: Dict[str, int] = {}
-    for msg in messages:
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                key = str(tc.get("id") or "")
-                wanted[key] = wanted.get(key, 0) + 1
-    for call_id, notes in outcomes.items():
-        del notes[:max(0, len(notes) - wanted.get(call_id, 0))]
+        return note
+
+    cursor = 0
     all_calls: List[str] = []
     for msg in messages:
         if msg.get("role") == "assistant" and msg.get("tool_calls"):
@@ -171,8 +174,13 @@ def _build_recent_tool_trace(
                     args = json.dumps(args, sort_keys=True)
                 args_str = str(args)
                 summary = f"{name}({args_str[:80]})" if len(args_str) > 80 else f"{name}({args_str})"
-                queue = outcomes.get(str(tc.get("id") or ""))
-                all_calls.append(summary + (queue.pop(0) if queue else ""))
+                call_id, probe = str(tc.get("id") or ""), cursor
+                while probe < len(rows) and not (
+                        str(rows[probe].get("tool_call_id")) == call_id
+                        and str(rows[probe].get("tool") or name) == name):
+                    probe += 1
+                all_calls.append(summary + (_outcome_note(rows[probe]) if probe < len(rows) else ""))
+                cursor = probe + 1 if probe < len(rows) else cursor
     recent = all_calls[-window:] if all_calls else []
     if not recent:
         return ""

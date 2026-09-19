@@ -410,8 +410,10 @@ def _send_links(
     except LinkActionsValidationError as exc:
         # The marker names the CAUSE in the refusal the model reads: SEND_LINKS_URL_BLOCKED a
         # policy denial, SEND_LINKS_ARG_ERROR an argument fault. Neither name is in the legacy
-        # code map (no _ARG_ERROR suffix rule exists), so both land in its generic error
-        # bucket — recorded as a refusal either way, never as a successful call.
+        # code map (no _ARG_ERROR suffix rule exists), so the adapter types them from their
+        # SHAPE: the _BLOCKED head becomes LEGACY_BLOCKED and the _ERROR head
+        # LEGACY_TOOL_ERROR. Different buckets, but both recorded as a refusal — never as a
+        # successful call, which is the property this marker exists for.
         from ouroboros.tools.tool_result import LegacyTextResultAdapter
 
         return _publish_tool_result(ctx, LegacyTextResultAdapter.from_text(
