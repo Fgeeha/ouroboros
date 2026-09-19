@@ -599,7 +599,9 @@ conversation turn produced it: a title (the coined name, the latest narration
 headline, or the `Working…`/`Task activity` placeholder), the status chip, Stop
 while the host attests it, and `Turn into project` in Main unless its origin is
 already bound (a direct turn's later rows then route to the Project room like a
-turn that called `ensure_project_scope`). A block that exists only for open
+turn that called `ensure_project_scope`). A nested child card is work inside
+its root's block, never a block of its own: it carries neither control, and its
+root's conversion is the conversion of the whole work. A block that exists only for open
 attention — a model wait, a pending or host-offered Stop — or only for a
 non-Done ending of a turn that did no work carries no title placeholder and no
 conversion; its chip says the state it is in (Waiting…, Cancelling…, Failed),

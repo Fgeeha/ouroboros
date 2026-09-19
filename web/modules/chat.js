@@ -132,6 +132,7 @@ import {
     renderCollapsedActivity,
     renderLiveCardMeta as renderCardMeta,
     ensureLiveActionsEl,
+    ownLiveActionsEl,
 } from './chat_activity.js';
 
 export {
@@ -851,7 +852,7 @@ export function createChatInstance({
         const taskId = taskKey(record.groupId);
         const projectId = projectIdFromTask(taskId);
         record.root.dataset.projectCreating = '1';
-        const actions = record.turnProjectBtn?.parentElement || record.root.querySelector('.chat-live-actions');
+        const actions = record.turnProjectBtn?.parentElement || ownLiveActionsEl(record);
         if (actions) {
             withStableViewport(() => {
                 actions.innerHTML = '<button type="button" class="btn btn-xs btn-default" disabled>Creating project…</button>';
@@ -1909,7 +1910,7 @@ export function createChatInstance({
         // Lineage reclassifies a root-shaped shell the moment it is learned,
         // whatever the frame that carries it goes on to render.
         if (next.parentId && liveCardRecords.get(childId)?.isSubagent === false) {
-            getSubagentCardRecord(childId, next.parentId, next.role);
+            ensureLiveCardVisible(getSubagentCardRecord(childId, next.parentId, next.role));
         }
         for (const sid of subagentChildParents.keys()) {
             const rec = liveCardRecords.get(sid);

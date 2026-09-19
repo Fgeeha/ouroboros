@@ -252,21 +252,49 @@ test('lineage reclassifies a root-shaped shell: a child offers no conversion, wh
         subagent_event: 'scheduled', subagent_task_id: 'kid-1' };
     // Lineage on a frame that renders nothing: no row, no lifecycle event.
     const silent = { ...lineage, task_id: 'kid-1', role: 'assistant', is_progress: true, content: '' };
-    for (const order of [[work, scheduled], [scheduled, work], [work, silent]]) {
+    const ownRow = (card) => card.children.find((node) => node.classList.contains('chat-live-actions'));
+    // `rootFirst: false` — the child's frame is the first the client sees of the
+    // whole tree: the root has no actions row of its own yet.
+    for (const rootFirst of [true, false]) for (const order of [[work, scheduled], [scheduled, work], [work, silent]]) {
         const f = fixture();
         try {
             f.census(managed());
-            f.emit('chat', { task_id: TASK, role: 'assistant', is_progress: true, content: 'Planning the swarm.' });
+            if (rootFirst) f.emit('chat', { task_id: TASK, role: 'assistant', is_progress: true, content: 'Planning the swarm.' });
             for (const row of order) f.emit('chat', row);
             const kid = f.card('kid-1');
+            assert.ok(kid, 'the reclassified child stays in the transcript');
             assert.equal(kid.dataset.subagent, '1');
             assert.equal(kid.dataset.parentTaskId, TASK);
             // Booleans, not nodes: a failed node comparison prints the whole stub graph.
             assert.equal(Boolean(kid.querySelector('[data-turn-into-project]')), false, 'a child offers no conversion');
-            // The child holds none, so a hit under the root is the root's own.
-            assert.ok(f.card().querySelector('[data-turn-into-project]'), 'the root keeps its conversion');
+            // The root's conversion sits on the root's OWN row, never on a row its child left behind.
+            assert.ok(ownRow(f.card())?.querySelector('[data-turn-into-project]'), 'the root keeps its conversion');
         } finally { f.close(); }
     }
+});
+
+test('a child frame that outruns the first history load leaves no root control inside the child card', async () => {
+    // Main opened mid-swarm: the child's tool frame lands before the history
+    // that holds the root's own row and the lineage.
+    const f = fixture([
+        { role: 'assistant', is_progress: true, content: 'Planning the swarm.', task_id: TASK, ts: TS, chat_id: 1,
+            cancelable: true },
+        { role: 'assistant', is_progress: true, content: 'scheduled', task_id: TASK, ts: '2026-09-15T12:00:01Z',
+            chat_id: 1, subagent_event: 'scheduled', subagent_task_id: 'kid-1', parent_task_id: TASK,
+            root_task_id: TASK, delegation_role: 'subagent', subagent_role: 'researcher' },
+    ]);
+    try {
+        f.census(managed());
+        f.log({ type: 'tool_call_started', task_id: 'kid-1', tool: 'read_file', tool_call_id: 'k1' });
+        await f.instance.refreshHistory({ revision: 1 });
+        const kid = f.card('kid-1');
+        assert.equal(kid.dataset.parentTaskId, TASK);
+        for (const control of ['[data-turn-into-project]', '[data-cancel-run]']) {
+            assert.equal(Boolean(kid.querySelector(control)), false, `no ${control} inside the child card`);
+        }
+        const own = f.card().children.find((node) => node.classList.contains('chat-live-actions'));
+        assert.ok(own?.querySelector('[data-turn-into-project]'), 'the root holds its conversion on its own row');
+    } finally { f.close(); }
 });
 
 test('a wake-up is an ordinary direct block: an empty frame mints nothing, a tool call mints the block', () => {
