@@ -187,37 +187,35 @@ def test_the_self_check_lists_outcomes_and_a_failed_answer():
         {"role": "assistant", "tool_calls": [{"id": "c2", "function": {"name": "read_file", "arguments": '{"path":"a"}'}}]},
     ]
     trace = {"tool_calls": [
-        {"tool_call_id": "c1", "status": "argument_error", "is_error": True, "result": REFUSAL},
-        {"tool_call_id": "c2", "status": "ok", "is_error": False, "result": "file body"}]}
+        {"tool": "escalate", "tool_call_id": "c1", "args": {"question": "q", "max_wait_minutes": 0},
+         "status": "argument_error", "is_error": True, "result": REFUSAL},
+        {"tool": "read_file", "tool_call_id": "c2", "args": {"path": "a"},
+         "status": "ok", "is_error": False, "result": "file body"}]}
     rendered = _build_recent_tool_trace(messages, llm_trace=trace)
-    assert ('1. escalate({"question":"q","max_wait_minutes":0}) [argument_error] ← '
+    assert ('1. escalate({"max_wait_minutes": 0, "question": "q"}) [argument_error] ← '
             "⚠️ QUIZ_WAIT_BOUND_INVALID: max_wait_minutes applies only") in rendered
-    assert '2. read_file({"path":"a"}) [ok]' in rendered and "file body" not in rendered and "second line" not in rendered
+    assert '2. read_file({"path": "a"}) [ok]' in rendered and "file body" not in rendered and "second line" not in rendered
     # without a trace the list is exactly what it was
     assert _build_recent_tool_trace(messages) == (
         'Recent tool calls (oldest first):\n  1. escalate({"question":"q","max_wait_minutes":0})\n  2. read_file({"path":"a"})')
 
 
-def test_repeated_provider_call_ids_keep_each_calls_own_outcome():
+def test_each_trace_row_carries_its_own_outcome_under_a_reused_provider_id():
     """Providers are not required to mint unique call ids: GigaChat answers `call_0` every
     round and the local parser `call_local_<i>`, so ONE id names several calls. Keyed by id
-    alone, the last call overwrote its namesakes, so the FIRST call was printed carrying the
-    second one's status and error text — the prompt that asks "are you repeating yourself?"
-    accusing a call that never failed."""
+    alone, the last call overwrote its namesakes and an early failed call was printed with a
+    later call's error — the prompt that asks "are you repeating yourself?" accusing the
+    wrong call. Name, arguments and outcome now come from one record."""
     from ouroboros.loop_nudges import _build_recent_tool_trace
 
-    messages = [
-        {"role": "assistant", "tool_calls": [
-            {"id": "call_0", "function": {"name": "escalate", "arguments": '{"a":1}'}}]},
-        {"role": "assistant", "tool_calls": [
-            {"id": "call_0", "function": {"name": "read_file", "arguments": '{"b":2}'}}]},
-    ]
     trace = {"tool_calls": [
-        {"tool_call_id": "call_0", "status": "argument_error", "is_error": True, "result": "FIRST refusal"},
-        {"tool_call_id": "call_0", "status": "ok", "is_error": False, "result": "second body"}]}
-    rendered = _build_recent_tool_trace(messages, llm_trace=trace)
-    assert '1. escalate({"a":1}) [argument_error] ← FIRST refusal' in rendered
-    assert '2. read_file({"b":2}) [ok]' in rendered
+        {"tool": "escalate", "tool_call_id": "call_0", "args": {"a": 1},
+         "status": "argument_error", "is_error": True, "result": "FIRST refusal"},
+        {"tool": "read_file", "tool_call_id": "call_0", "args": {"b": 2},
+         "status": "ok", "is_error": False, "result": "second body"}]}
+    rendered = _build_recent_tool_trace([], llm_trace=trace)
+    assert '1. escalate({"a": 1}) [argument_error] ← FIRST refusal' in rendered
+    assert '2. read_file({"b": 2}) [ok]' in rendered
 
 
 def test_a_sanitizer_truncated_argument_still_names_a_source(tmp_path):
@@ -263,67 +261,41 @@ def test_cut_detection_reads_the_one_shared_sanitizer_marker_list(tmp_path, args
     assert bool(pointer) is cut
 
 
-def test_outcomes_align_from_the_tail_when_compaction_dropped_earlier_calls():
-    """`llm_trace` keeps every call of the task while `messages` can have a prefix replaced
-    by a compaction capsule carrying no tool_calls. Consuming from the front then handed a
-    surviving `call_0` the outcome of an EVICTED namesake."""
+def test_the_same_tool_twice_under_one_id_keeps_its_own_outcome_after_compaction():
+    """The counterexample no join survives: the SAME tool called twice under one reused id,
+    with the earlier call evicted from `messages` by compaction. Matching (id, tool) picked
+    the earlier row, so the surviving call printed the OLD refusal. Reading the trace row
+    itself cannot mispair, and the evicted call stays visible as what the actor really did."""
     from ouroboros.loop_nudges import _build_recent_tool_trace
 
+    trace = {"tool_calls": [
+        {"tool": "read_file", "tool_call_id": "call_0", "args": {"path": "old"},
+         "status": "argument_error", "is_error": True, "result": "OLD refusal"},
+        {"tool": "read_file", "tool_call_id": "call_0", "args": {"path": "new"},
+         "status": "ok", "is_error": False, "result": "new body"}]}
+    # compaction left only the later call in the visible transcript
     messages = [
         {"role": "assistant", "content": [{"type": "text", "text": "[compacted capsule]"}]},
         {"role": "assistant", "tool_calls": [
-            {"id": "call_0", "function": {"name": "read_file", "arguments": '{"b":2}'}}]},
-    ]
-    trace = {"tool_calls": [
-        {"tool": "escalate", "tool_call_id": "call_0", "status": "argument_error",
-         "is_error": True, "result": "EVICTED refusal"},
-        {"tool": "read_file", "tool_call_id": "call_0", "status": "ok",
-         "is_error": False, "result": "second body"}]}
-    rendered = _build_recent_tool_trace(messages, llm_trace=trace)
-    assert '1. read_file({"b":2}) [ok]' in rendered
-    assert "EVICTED refusal" not in rendered and "argument_error" not in rendered
-
-
-def test_outcomes_survive_an_authored_view_that_kept_a_non_contiguous_set():
-    """`compact_context(keep_unit_ids=[...])` keeps an ARBITRARY set of units, so counting
-    from either end mispairs too: the surviving calls are only a SUBSEQUENCE of the trace.
-    Here the author kept the 2nd and 4th call of four reused `call_0` ids."""
-    from ouroboros.loop_nudges import _build_recent_tool_trace
-
-    trace = {"tool_calls": [
-        {"tool": "escalate", "tool_call_id": "call_0", "status": "argument_error",
-         "is_error": True, "result": "FIRST refusal"},
-        {"tool": "read_file", "tool_call_id": "call_0", "status": "ok",
-         "is_error": False, "result": "second body"},
-        {"tool": "write_file", "tool_call_id": "call_0", "status": "error",
-         "is_error": True, "result": "THIRD failure"},
-        {"tool": "run_command", "tool_call_id": "call_0", "status": "ok",
-         "is_error": False, "result": "fourth body"}]}
-    messages = [
-        {"role": "assistant", "content": [{"type": "text", "text": "[authored capsule]"}]},
-        {"role": "assistant", "tool_calls": [
-            {"id": "call_0", "function": {"name": "read_file", "arguments": "{}"}}]},
-        {"role": "assistant", "tool_calls": [
-            {"id": "call_0", "function": {"name": "run_command", "arguments": "{}"}}]},
+            {"id": "call_0", "function": {"name": "read_file", "arguments": '{"path":"new"}'}}]},
     ]
     rendered = _build_recent_tool_trace(messages, llm_trace=trace)
-    assert "read_file({}) [ok]" in rendered and "run_command({}) [ok]" in rendered
-    assert "THIRD failure" not in rendered and "FIRST refusal" not in rendered
+    assert '1. read_file({"path": "old"}) [argument_error] ← OLD refusal' in rendered
+    assert '2. read_file({"path": "new"}) [ok]' in rendered
+    # the later call is not handed the earlier one's failure
+    assert '{"path": "new"}) [argument_error]' not in rendered
 
 
-def test_a_call_with_no_matching_trace_row_gets_no_borrowed_outcome():
-    """A missing outcome is honest; a namesake's error attached to the wrong call is not."""
+def test_without_a_trace_the_messages_render_with_no_borrowed_outcome():
+    """A missing outcome is honest; a namesake's error on the wrong call is not."""
     from ouroboros.loop_nudges import _build_recent_tool_trace
 
     messages = [{"role": "assistant", "tool_calls": [
         {"id": "call_0", "function": {"name": "read_file", "arguments": "{}"}},
         {"id": "call_0", "function": {"name": "write_file", "arguments": "{}"}}]}]
-    trace = {"tool_calls": [
-        {"tool": "read_file", "tool_call_id": "call_0", "status": "ok",
-         "is_error": False, "result": "body"}]}
-    rendered = _build_recent_tool_trace(messages, llm_trace=trace)
-    assert "read_file({}) [ok]" in rendered
-    assert "write_file({})" in rendered and "write_file({}) [" not in rendered
+    rendered = _build_recent_tool_trace(messages, llm_trace={"tool_calls": []})
+    assert "1. read_file({})" in rendered and "2. write_file({})" in rendered
+    assert "[" not in rendered.split("oldest first):", 1)[1]
 
 
 def test_a_successful_untyped_or_autocorrected_call_is_not_a_failure_anywhere():

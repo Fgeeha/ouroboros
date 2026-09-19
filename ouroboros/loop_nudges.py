@@ -128,59 +128,40 @@ def _build_recent_tool_trace(
     Each call carries its recorded outcome, and a failed one the first line of what the
     tool answered: a list of calls alone asks "are you repeating yourself?" without the
     one fact that says why. Facts only — what they mean stays with the model.
+
+    Built from ``llm_trace.tool_calls`` whenever it exists, so name, arguments and outcome
+    all come from ONE record. Joining the visible ``messages`` to the trace by call id
+    cannot be made sound: providers reuse ids (GigaChat answers ``call_0`` every round, the
+    local parser ``call_local_<i>``) and compaction removes whole units from anywhere — a
+    capsule replaces a prefix, ``_select_units`` leaves a zero-reclaim or memo-negative unit
+    in place, an authored view keeps an arbitrary set — so a surviving call took an evicted
+    namesake's error. Keying by id did that, and so did matching (id, tool) whenever both
+    calls were the SAME tool. Without a trace the messages still render, carrying no outcome
+    at all rather than a borrowed one.
     """
     from ouroboros.reflection import _trace_call_errored  # the ONE reading of "this call went wrong"
 
-    # Providers are not required to mint unique call ids: GigaChat answers `call_0`
-    # every round and the local parser `call_local_<i>`, so ONE id names several calls
-    # in a task. Queue the outcomes in trace order and consume them in message order —
-    # keying a plain dict let the last call with an id overwrite its namesakes, so an
-    # early failed call was printed carrying a later call's status and error text, and
-    # the prompt that asks "are you repeating yourself?" accused the wrong call.
-    # Providers are not required to mint unique call ids: GigaChat answers `call_0` every
-    # round and the local parser `call_local_<i>`, so ONE id names several calls in a task.
-    # `llm_trace` keeps every call while `messages` may have lost whole units to compaction
-    # — a capsule replaces a prefix, and an AUTHORED view keeps an arbitrary set
-    # (`context_compaction`: `keep = set(request.keep_unit_ids)`). So neither a per-id dict
-    # (the last call overwrote its namesakes) nor a count from either end is sound. The one
-    # invariant compaction does preserve is ORDER: the surviving calls are a SUBSEQUENCE of
-    # the trace, so walk both with a cursor and match the next row with the same id AND
-    # tool. A call with no match ahead of the cursor gets NO outcome rather than a
-    # namesake's — this prompt asks "are you repeating yourself?", and a wrong error
-    # attached to the wrong call is worse than a missing one.
-    # Residual, disclosed: a LEGACY row that carries no `tool` can only be matched by id,
-    # so two such namesakes stay indistinguishable and the cursor takes the earlier one.
-    # Rows this loop writes today always carry `tool`.
-    rows = [row for row in ((llm_trace or {}).get("tool_calls") or [])
-            if isinstance(row, dict) and row.get("tool_call_id")]
+    def _summary(name: str, args: Any) -> str:
+        if isinstance(args, dict):
+            args = json.dumps(args, sort_keys=True)
+        args_str = str(args or "")
+        return f"{name}({args_str[:80]})" if len(args_str) > 80 else f"{name}({args_str})"
 
-    def _outcome_note(row: Dict[str, Any]) -> str:
+    rows = [row for row in ((llm_trace or {}).get("tool_calls") or []) if isinstance(row, dict)]
+    all_calls: List[str] = []
+    for row in rows:
         status = str(row.get("status") or ("error" if row.get("is_error") else "ok"))
         note = f" [{status}]"
         if _trace_call_errored(row):
             head = str(row.get("result") or "").strip().splitlines()[:1]
             note += f" ← {head[0][:200]}" if head else ""
-        return note
-
-    cursor = 0
-    all_calls: List[str] = []
-    for msg in messages:
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                fn = tc.get("function", {})
-                name = fn.get("name", "")
-                args = fn.get("arguments", "")
-                if isinstance(args, dict):
-                    args = json.dumps(args, sort_keys=True)
-                args_str = str(args)
-                summary = f"{name}({args_str[:80]})" if len(args_str) > 80 else f"{name}({args_str})"
-                call_id, probe = str(tc.get("id") or ""), cursor
-                while probe < len(rows) and not (
-                        str(rows[probe].get("tool_call_id")) == call_id
-                        and str(rows[probe].get("tool") or name) == name):
-                    probe += 1
-                all_calls.append(summary + (_outcome_note(rows[probe]) if probe < len(rows) else ""))
-                cursor = probe + 1 if probe < len(rows) else cursor
+        all_calls.append(_summary(str(row.get("tool") or ""), row.get("args")) + note)
+    if not rows:
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    all_calls.append(_summary(fn.get("name", ""), fn.get("arguments", "")))
     recent = all_calls[-window:] if all_calls else []
     if not recent:
         return ""
