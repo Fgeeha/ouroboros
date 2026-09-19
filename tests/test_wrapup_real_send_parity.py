@@ -164,7 +164,7 @@ def test_a_closed_dispatch_window_is_a_deadline_not_drift(monkeypatch, tmp_path)
 
     def once(ctx, *, initial_messages=None, admitted_request=None):
         calls.append(admitted_request is not None)
-        raise PhysicalDispatchInterrupted("dispatch window closed", attempt_id="late-1")
+        raise PhysicalDispatchInterrupted("dispatch window closed")
 
     monkeypatch.setattr(loop_module, "_call_forced_model_once", once)
     ctx, result = _last_fit_rail(
