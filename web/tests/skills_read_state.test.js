@@ -118,6 +118,41 @@ test('the list never waits for the hub: pending hub facts arrive with one re-rea
     }
 });
 
+test('a render that reused an older catalog snapshot refreshes it before its one re-read', async () => {
+    // Any in-page remount after the server's 120 s display memo expired paints
+    // hub facts as null while the page's own catalog promise is long resolved.
+    // A second listing read on the same unknown answer would change nothing; the
+    // render forces exactly one catalog read first, then re-reads once.
+    const hub = facts => ({ ...demo, name: 'hub', source: 'ouroboroshub', payload_root: 'skills/ouroboroshub/hub', ...facts });
+    const responses = [hub({ official_hub_verified: null, owner_attestable: null }),
+        hub({ official_hub_verified: true, owner_attestable: true })];
+    let reads = 0;
+    const forced = [];
+    const hubCatalog = { byName: new Map(), available: true, settled: true, promise: Promise.resolve() };
+    const view = skillsReader(
+        { extensions: async () => ({ skills: [responses[Math.min(reads++, 1)]], live: {} }) },
+        { hubCatalog, loadHubCatalog: force => { forced.push(Boolean(force)); return hubCatalog.promise; } },
+    );
+    await view.render();
+    await nextTurn();
+    await nextTurn();
+    assert.deepEqual(forced, [false, true], 'the reused snapshot is refreshed exactly once');
+    assert.equal(reads, 2, 'then one listing re-read');
+    assert.equal(view.patches.at(-1).skill.official_hub_verified, true);
+
+    // The refreshed catalog is unavailable: unknown stays unknown, no blind re-read.
+    let count = 0;
+    const offline = { byName: new Map(), available: true, settled: true, promise: Promise.resolve() };
+    const quiet = skillsReader(
+        { extensions: async () => { count += 1; return { skills: [hub({ official_hub_verified: null })], live: {} }; } },
+        { hubCatalog: offline, loadHubCatalog: force => { if (force) offline.available = false; return offline.promise; } },
+    );
+    await quiet.render();
+    await nextTurn();
+    await nextTurn();
+    assert.equal(count, 1);
+});
+
 test('primary failure preserves previous cards and is never a successful empty list', async () => {
     const view = skillsReader({ extensions: async () => { throw new Error('HTTP 503'); } });
     await assert.rejects(view.context.fetchSkills(), /HTTP 503/);
@@ -518,10 +553,7 @@ test('Skills header Refresh and page revisit call the currently selected catalog
             addEventListener: (event, callback) => { listeners[event] = callback; },
             removeEventListener: event => { delete listeners[event]; },
         },
-        skillsPageTemplate: () => '', activateTab() {},
-        // The listing only peeks at the 120 s display memo, so an Installed Refresh
-        // must refill it: a forced catalog read, recorded beside the pane render.
-        loadHubCatalog: force => { if (force) calls.push('catalog'); },
+        skillsPageTemplate: () => '', activateTab() {}, loadHubCatalog() {},
         attachActionHandlers: () => ({ closeMenus() {}, destroy() {} }),
         bindTabStrip: (strip, { onChange }) => {
             tabs.forEach(tab => { tab.handlers.click = () => onChange(tab.dataset.tab, tab); });
@@ -540,13 +572,11 @@ test('Skills header Refresh and page revisit call the currently selected catalog
         await nextTurn();
         calls.length = 0;
         await nodes['skills-refresh'].handlers.click();
-        assert.deepEqual(calls, tab.dataset.tab === 'installed' ? ['catalog', 'installed'] : [tab.dataset.tab],
-            'Installed Refresh forces the catalog read the listing re-read depends on');
+        assert.deepEqual(calls, [tab.dataset.tab]);
         calls.length = 0;
         listeners['ouro:page-shown']({ detail: { page: 'skills' } });
         await nextTurn();
-        assert.deepEqual(calls, tab.dataset.tab === 'installed' ? ['catalog', 'installed'] : [tab.dataset.tab],
-            'page open forces exactly one catalog read, and only the Installed view consumes it');
+        assert.deepEqual(calls, [tab.dataset.tab]);
     }
     const older = deferred(), current = deferred();
     context.renderMarketplacePane = () => older.promise;
