@@ -704,7 +704,8 @@ and what enforces each.
   provider hints and recovery; do not add a generic cache/retry framework.
   Wrap-up calls keep schemas, server-web flag and `tool_choice` unchanged and
   instruct in text, because removing tools or changing tool choice rebuilds
-  cached input. Preserve `context_fit.seal_task_transcript`'s single message
+  cached input; a main-loop payload option lives in `main_loop_wire_options`, never
+  in one lane after its builder (`tests/test_wrapup_real_send_parity.py`). Preserve `context_fit.seal_task_transcript`'s single message
   marker as it moves between task and tool result; direct Anthropic and
   OpenRouter keep their supported wire markers. OpenRouter's derived identity
   excludes cache/host metadata, preserving real task/model differences and

@@ -602,28 +602,76 @@ def tree_spend_line(tree_info: Any, ceiling: Optional[CostCeiling] = None) -> st
     )
 
 
+def _wrapup_stop_facts(
+    deciding_usd: Optional[float], ceiling: CostCeiling, global_remaining_usd: Optional[float],
+) -> Tuple[str, str]:
+    """The stop's money facts with the BINDING bound first, and the owner's way out when there is one.
+
+    The old sentence opened with the tree cap whatever had stopped the task, so an
+    owner whose shared wallet ran dry at $125 of a $400 cap read it as a broken
+    per-task cap. The bound that binds is the one with less room; the wallet is
+    also the only one the owner can lift while the task is still running."""
+    cap = ceiling.root_cap_usd
+    room = None if cap is None or deciding_usd is None else float(cap) - float(deciding_usd)
+    if deciding_usd is None:
+        spent = "This task's tree spend is unavailable"
+    elif cap is not None:
+        spent = f"This task's tree spent ${deciding_usd:.2f} of its own ${cap:.2f} cap"
+    else:
+        spent = f"This task's tree spent ${deciding_usd:.2f}"
+    if global_remaining_usd is not None and (room is None or float(global_remaining_usd) <= room):
+        cleared = ", so the task cap is not what stopped it" if room is not None else ""
+        return (
+            f"The shared Total budget is nearly used up: ${global_remaining_usd:.2f} left across all "
+            f"tasks. {spent}{cleared}.",
+            " Raise Total budget in Settings for more room.",
+        )
+    wallet = (
+        f"; the shared Total budget still has ${global_remaining_usd:.2f}"
+        if global_remaining_usd is not None else ""
+    )
+    return f"{spent}{wallet}.", ""
+
+
 def wrapup_unaffordable_text(deciding_usd: Optional[float], ceiling: CostCeiling, global_remaining_usd: Optional[float] = None) -> str:
     """The owner-facing reason a task ends without even one affordable wrap-up send."""
-    cap = ceiling.root_cap_usd
-    cap_text = f" of the ${cap:.2f} hard tree cap" if cap is not None else ""
-    spent = f"Task tree spent ${deciding_usd:.3f}{cap_text}" if deciding_usd is not None else "Task-tree spend is unavailable"
-    wallet = f"; global model budget remaining is ${global_remaining_usd:.3f}" if global_remaining_usd is not None else ""
+    facts, way_out = _wrapup_stop_facts(deciding_usd, ceiling, global_remaining_usd)
     return (
-        f"{spent}{wallet}; not even one wrap-up call can "
-        "be reserved, so the host delivers the retained evidence without a model synthesis."
+        f"{facts} Not even one wrap-up call can be reserved, so the host delivers the "
+        f"retained evidence without a model synthesis.{way_out}"
     )
 
 
 def wrapup_last_fit_text(deciding_usd: Optional[float], ceiling: CostCeiling, global_remaining_usd: Optional[float] = None) -> str:
     """The owner-facing reason a task claims the last affordable wrap-up send."""
-    cap = ceiling.root_cap_usd
-    cap_text = f" of the ${cap:.2f} hard tree cap" if cap is not None else ""
-    spent = f"Task tree spent ${deciding_usd:.3f}{cap_text}" if deciding_usd is not None else "Task-tree spend is unavailable"
-    wallet = f"; global model budget remaining is ${global_remaining_usd:.3f}" if global_remaining_usd is not None else ""
+    facts, way_out = _wrapup_stop_facts(deciding_usd, ceiling, global_remaining_usd)
     return (
-        f"{spent}{wallet}; one wrap-up call is still "
-        "admissible, but another similarly reserved work call would consume that room."
+        f"{facts} One wrap-up call still fits and another work call of this size would not, "
+        f"so the task is finishing now with its best current answer.{way_out}"
     )
+
+
+def main_loop_wire_options(
+    model: str, *, allow_server_web_search: bool, bypass_response_cache: bool = False,
+) -> Dict[str, Any]:
+    """The payload-shaping options EVERY main-loop send declares — one owner for the send and for its pricing.
+
+    The budget wrap-up is admitted against a candidate built BEFORE the send (below)
+    that must equal it byte for byte. Each option the send grew on its own — cache
+    affinity, then ``stream`` — made the two payloads differ, and the admitted
+    answer was refused at dispatch. ``loop_llm_call.call_llm_with_retry`` spreads
+    this dict into its send and the prospective builder below spreads the same
+    one, so an option added here reaches both and one added elsewhere reaches one."""
+    from ouroboros.llm_claudexor import cache_key_for_model
+    from ouroboros.provider_models import provider_for_model
+
+    remote = provider_for_model(model) != "claudexor"
+    return {
+        "stream": True,
+        "cache_affinity": cache_key_for_model(model),
+        "allow_server_web_search": bool(allow_server_web_search) and remote,
+        "bypass_response_cache": bool(bypass_response_cache) and remote,
+    }
 
 
 def prospective_wrapup_attempt_request(
@@ -671,9 +719,12 @@ def prospective_wrapup_attempt_request(
         return _merge_scope(replace(_attempt_request(target, candidate),
             force_unknown_reservation=True, max_completion_tokens=MAIN_LOOP_MAX_TOKENS))[0]
     with request_wire_call_scope():
+        # The send's own options, from their one owner: a key the send carries and
+        # this copy does not is a different payload, and the admitted answer is refused.
         candidate = llm._build_remote_candidate(
             target, messages, reasoning_effort, MAIN_LOOP_MAX_TOKENS, "auto", None, tools,
-            skip_capability_fetch=True, allow_server_web_search=allow_server_web_search,
+            skip_capability_fetch=True,
+            **main_loop_wire_options(model, allow_server_web_search=allow_server_web_search),
         )
         llm._normalize_payload_cache_ttl(target, candidate)
         candidate = _finalized_physical_candidate(

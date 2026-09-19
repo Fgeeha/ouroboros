@@ -913,6 +913,40 @@ def _resolve_forced_delivery_control(
     )
 
 
+def _send_admitted_forced_candidate(
+    ctx: _RoundLimitContext, initial_messages: Any, admitted_request: Any, reason_code: str,
+) -> str:
+    """Send the admitted wrap-up; one that drifted from its pricing is sent once more, unpredicated.
+
+    The identity predicate refuses BEFORE a byte leaves and the refused
+    reservation is released, so nothing was paid and nothing is sent twice. Ending
+    the task there cost the owner the whole final answer three times in one night
+    (a wire key the send had grown and the priced copy had not), while the money
+    that predicate guards is guarded again by the ledger fence, which prices the
+    send it actually sees. So the drift is recorded as a typed fact — the refused
+    attempt's row and sealed candidate carry the actual identity — and the answer
+    is asked for once more the ordinary way. A closed dispatch window is a
+    deadline, not drift, and keeps its own rail."""
+    from ouroboros.llm_attempt import PhysicalDispatchInterrupted
+    from ouroboros.usage_accounting import PhysicalAttemptPreconditionFailed
+
+    try:
+        return _loop()._call_forced_model_once(
+            ctx, initial_messages=initial_messages, admitted_request=admitted_request)
+    except PhysicalDispatchInterrupted:
+        raise
+    except PhysicalAttemptPreconditionFailed as refusal:
+        log.warning("Admitted %s wrap-up candidate drifted from its pricing; sending it unpredicated", reason_code)
+        _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+            "checkpoint_kind": "forced_candidate_drift",
+            "reason_code": reason_code,
+            "refused_attempt_id": str(getattr(refusal, "attempt_id", "") or ""),
+            "admitted": {key: getattr(admitted_request, key, None) for key in (
+                "model", "provider", "candidate_raw_sha256", "candidate_raw_size_bytes")},
+        })
+        return _loop()._call_forced_model_once(ctx)
+
+
 def _forced_final_answer(
     ctx: _RoundLimitContext,
     *,
@@ -944,8 +978,8 @@ def _forced_final_answer(
         try:
             ctx.accumulated_usage.pop("_forced_response_meta", None)
             if attempt == 0 and _admitted_request is not None:
-                forced = _loop()._call_forced_model_once(
-                    ctx, initial_messages=_initial_messages, admitted_request=_admitted_request)
+                forced = _send_admitted_forced_candidate(
+                    ctx, _initial_messages, _admitted_request, reason_code)
             else:
                 forced = _loop()._call_forced_model_once(ctx)
             extracted, response_meta = forced_response_parts(forced, ctx.accumulated_usage)
