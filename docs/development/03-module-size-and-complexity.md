@@ -277,18 +277,14 @@ is the ordinary-reply category rather than a finished task. Lineage comes from
 the delegation facts frames carry, because the terminal frame has none — a child
 must not reach the owner's banner.
 
-Classification and the delivery gate stay pure over one frame plus the stored
-preferences, so the rules are testable without a DOM or a socket. Preferences
-are client-local, carry no `s-` field and are excluded from the settings-dirty
-tracker, so they neither reach `/api/settings` nor offer to discard unsaved
-settings (`tests/test_notifications_static.py` asserts those causes, not only
-their effects). Delivery degrades rather than disappearing, and the status line
-says which surface this client has. The optional desktop bridge is invoked at
-delivery time, feature-detected per call, and returns a capability fact rather
-than a banner/delivery claim; it may raise the existing window and request one
-system sound, but it must not add a scheduler, persistence or background
-process. Importance must not acquire a new host field, a text heuristic or a
-second model call.
+Classification and delivery are pure over a frame and preferences, testable
+without DOM/socket. Client-local preferences carry no `s-` field, enter neither
+the settings-dirty tracker nor `/api/settings`, and cause no discard prompt
+(`tests/test_notifications_static.py`). Delivery degrades with visible surface
+status. At delivery, feature-detect the optional desktop bridge per call: its
+result is capability evidence, not a delivery claim. It may raise the existing
+window and play one system sound; no scheduler, persistence or background
+process. Importance adds no host field, text heuristic or second model call.
 
 ### Invariant: UI resources carry a disposer
 
