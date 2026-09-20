@@ -1181,3 +1181,37 @@ test('no reviewer control teaches the stored prefix, and the advisory says what 
     assert.match(session, /agent session — retrieves context with its own tools/);
     assert.doesNotMatch(session, /inspection episode/);
 });
+
+test('an owner-disabled roster row leaves the picker but a saved reference to it stays', () => {
+    // The roster's per-row switch is withdrawal from NEW choices, not a silent
+    // rewiring: the save-time parser refuses a fresh reference to a switched-off
+    // row, so offering it here would only manufacture a 400 the owner cannot see
+    // coming. An ALREADY selected reference keeps its option (the same
+    // survive-the-save rule as a row that fell out of the roster) and says why.
+    const roster = [
+        { subagent_id: 'deep', recommended_use: 'Long reasoning over big diffs',
+          route: { kind: 'api_model', target_id: 'openai/gpt-5.6-sol' }, effort: 'high' },
+        { subagent_id: 'paused', recommended_use: 'Paused seat',
+          route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' }, enabled: false },
+    ];
+    assert.deepEqual(subagentOptionsFor(roster, '').map((o) => o.value), ['deep']);
+    assert.deepEqual(subagentOptionsFor(roster, 'deep').map((o) => o.value), ['deep']);
+
+    const holding = subagentOptionsFor(roster, 'paused');
+    assert.deepEqual(holding.map((o) => o.value), ['deep', 'paused']);
+    assert.equal(holding[1].label, '#paused · API · openai/gpt-5.6-luna · switched off — Paused seat');
+    assert.doesNotMatch(holding[1].label, /not in the roster/, 'the row exists; it is switched off');
+
+    // The flat picker keeps the same behaviour through its group builder.
+    const groups = reviewerChoiceGroups({ roster, row: { subagent_id: 'paused' }, harnesses: [] });
+    const rosterGroup = groups.find((group) => group.label === 'Available subagents');
+    assert.deepEqual(rosterGroup.options.map((o) => o.value),
+        [`${SUBAGENT_CHOICE_PREFIX}deep`, `${SUBAGENT_CHOICE_PREFIX}paused`]);
+
+    // The read-only disclosure states the consequence and the way out.
+    const described = describeSubagentReference('paused', roster);
+    assert.match(described, /switched off/);
+    assert.match(described, /refused at save rather than rerouted/);
+    assert.match(described, /turn the row back on/);
+    assert.doesNotMatch(describeSubagentReference('deep', roster), /switched off/);
+});
