@@ -146,7 +146,7 @@ def test_progress_line_states_the_gap_for_each_open_branch():
         "1 not dispatched; cycles paid 1")
     assert _line(_wave([_ok("s1"), _pending("s2", "in_flight"), _pending("s3", "custody_lost")])) == (
         "📐 plan_task: 1 of 3 reviewers answered; 2 unresolved (in_flight, custody_lost) — "
-        "no verdict yet; cycles paid 1/3")
+        "no verdict; cycles paid 1/3")
     late = _wave([_ok("s1"), _pending("s2"), _pending("s3")], pending=False,
                  historical_supplements=[_supplement("s2"), _supplement("s3", "settled")])
     # A settled slot may have settled as a failure: until collected it is "settled", never "answered".
@@ -170,7 +170,7 @@ def test_an_open_line_carries_no_verdict_no_finding_count_and_no_failure_word_fo
 def test_an_unresolved_slot_is_never_worded_as_waiting_and_a_waiting_slot_never_as_unresolved():
     unresolved = _line(_wave([_ok("s1"), _pending("s2"), _pending("s3", "custody_lost")]))
     assert "waiting" not in unresolved
-    assert "2 unresolved (pending_dispatch, custody_lost) — no verdict yet" in unresolved
+    assert "2 unresolved (pending_dispatch, custody_lost) — no verdict" in unresolved
     waiting = _line(_wave([_ok("s1"), _pending("s2")]))
     assert "unresolved" not in waiting and "waiting for reviewers" in waiting
 
@@ -258,7 +258,7 @@ def test_an_awaiting_wave_renders_no_failure_no_verdict_and_keeps_the_control_fo
     assert "· NO ANSWER YET (pending_dispatch)" in text and "· SETTLED — not collected yet" in text
     assert "· FAILED[run_failed]: harness unavailable" in text  # the real failure stays loud
     assert "FAILED: Pending dispatch" not in text and "window 21600s" not in text
-    assert "### Aggregate: no verdict yet — held open as DEGRADED (open)" in text
+    assert "### Aggregate: no verdict — held open as DEGRADED (open)" in text
     assert ("Reasons: slot_unparseable:s3:harness unavailable, parseable_slots_below_quorum:1/2, "
             "review_late_result_pending, awaiting: s2, not collected yet: s4. Counts: ") in text
     assert _parse_plan_review_control(text) == ("DEGRADED", False)
@@ -312,7 +312,7 @@ def test_a_settled_degraded_wave_keeps_its_failure_render_and_gains_the_whole_ro
     wave = _wave([_ok("s1"), _failed("s2"), {"slot_id": "s3", "model": "m", "ok": False, "error": "transport died"}],
                  pending=False)
     text = _render_wave(wave, cap=3, cycles_paid=1, enforcement="blocking")
-    assert "REVIEW CUSTODY PENDING" not in text and "no verdict yet" not in text
+    assert "REVIEW CUSTODY PENDING" not in text and "no verdict —" not in text
     assert "⚠️ DEGRADED: no parseable reviewer quorum — recorded as an OPEN wave; " in text
     assert "· FAILED[run_failed]: harness unavailable" in text and "· FAILED: transport died" in text
     assert "### Aggregate: DEGRADED (open)" in text
@@ -428,7 +428,7 @@ def test_a_fully_awaiting_wave_keeps_the_fail_closed_floor_and_every_line_tells_
     assert held["counts"]["parseable"] == 2 and _control(quorum) == {"outcome": "DEGRADED", "closed": False}
     assert force_plan_decision(ctx, {}, enforcement="blocking")["allow"] is False
     assert "📐 plan_task: waiting for reviewers — 2 of 3 answered; cycles paid 1/2" in harness.progress
-    assert "### Aggregate: no verdict yet — held open as DEGRADED (open)" in quorum and "GREEN" not in quorum
+    assert "### Aggregate: no verdict — held open as DEGRADED (open)" in quorum and "GREEN" not in quorum
     for executor in panel.values():
         executor.release.set()
     assert _wait_until(lambda: len(_mailbox_entries(ctx.drive_root, ctx.task_id)) == 1)

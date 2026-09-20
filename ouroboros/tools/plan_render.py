@@ -438,7 +438,7 @@ def _render_wave(
     reasons = [str(r) for r in wave.get("reasons") or [] if not str(r).startswith(hidden)]
     reasons += [f"{label}: " + ", ".join(str(row.get("slot_id")) for row in rows) for label, rows in gaps.items() if rows]
     lines += [
-        "", "### Aggregate: " + (f"no verdict yet — held open as {aggregate}" if wave.get("custody_pending") else aggregate)
+        "", "### Aggregate: " + (f"no verdict — held open as {aggregate}" if wave.get("custody_pending") else aggregate)
         + (" (closed)" if closed else " (open)"),
         "", "Reasons: " + (", ".join(reasons) or "none")
         + f". Counts: {json.dumps(counts, sort_keys=True)}",
