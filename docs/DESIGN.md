@@ -332,7 +332,9 @@ Model-authored replies use Ouroboros's assistant voice; host-composed commands,
 receipts and diagnostics use System voice. A **System row** is a chat message
 with `role="system"`, rendered with the existing yellow/amber system treatment,
 or its existing task-card placement. `role` alone selects voice; `system_type`
-names the kind, not the author. New host producers stamp both fields. Relays
+names the kind, not the author (two documented presentations of a System pointer row show
+model-authored bytes in Ouroboros's voice: the Project question mirror and the Project
+completion mirror). New host producers stamp both fields. Relays
 preserve them through live delivery, persistence and history. Model narration,
 proactive replies and questions remain model-authored even when typed.
 
@@ -559,6 +561,8 @@ element in the card shares one keyboard ring (2px `--focus-accent-border`,
 the rest of the chat surface.
 
 **Project question mirror.** A Project question the owner has not answered appears in Main as the Project's own quiz card — the same `buildQuizCard` form with the question through the chat markdown pipeline, the options with their details and the `recommended` badge, the stake, the assumption or waiting line, the status and the own-answer field — inside the same assistant bubble. The one addition is a Project chip in the head beside the `Question` chip: a pill in the project chip's own language (the `--project` tints, the Project name in project ink with `↗`) that opens that exact question in its Project, with the card's shared keyboard ring. A long Project name yields first (the chip is capped and ellipsized, its title names the Project whole) so the status keeps its place; a phone column wraps the head. Every lifecycle state reads as it does in the Project: waiting, open, resumed and finished questions stay answerable, and a replaced question stays as a read-only record. An unreadable source keeps what Main already knew; with nothing known the copy says `Status unavailable`, takes no answer and keeps its chip, and a row that cannot carry the form yet shows `Open the original question for its text.` until it can. The first confirmed answer from any source — a press in Main, the Project form or another device, a history or census snapshot — shows the recorded result (the chosen option, `Owner's answer: …`, `You answered`) for five seconds and then removes only the Main copy, through the ordinary message retirement and without moving the reader's viewport; the Project keeps its card. The countdown starts once and later observations never restart it. When focus was inside the copy it stays there while the result shows, then moves to the next Main question, or to the composer for a keyboard owner, never summoning a touch keyboard. A copy that learns its form and its answer in one delivery shows that result for the same five seconds. An answered question never enters Main again: fresh history, a reconnect or a stale open snapshot cannot bring the copy back. Main remembers the lifecycle of a bounded number of questions; a question it no longer remembers mounts a safe unknown copy, whose answer controls appear only after a fresh canonical record confirms it unanswered. A failed, missing or wrong-project canonical read leaves a safe `Status unavailable` copy with its Project chip and no answer controls; the chip opens the original Project form, while a later owned refresh retries the Main copy, so an unavailable read never turns a stale open snapshot into an answerable form and never permanently suppresses a legitimate unanswered question. The mirror and the quiz header share the lifecycle wording above.
+
+**Project completion mirror.** A Project root that ended with Ouroboros's own final answer reaches Main as an ordinary Ouroboros message: that answer through the chat markdown pipeline, in the assistant voice, because the bytes are model-authored — the host stamps the answer on the completion row only for a model-authored final, so the browser never infers authorship. A long answer is folded to about seven lines; the fold is a visual clamp over the complete, selectable text, with a fade only when it really hides something, and never a cut. Under it sits one control: the Project chip in the project chip's own language, which names the Project and opens it. The durable row and its wire frame stay `role="system"`: like the Project question mirror, this is a browser presentation of model-authored bytes, not a change of the row's author. The message carries no status word, cause sentence, title or duration, so a host verdict on that answer (a warning, an unaccepted review) is not shown in Main: it stays loud on the task's card in the Project, one press away. Copy copies the answer. An ending with no model-authored answer (a provider failure, a stop, preserved output), a start row, and every row written before the answer rode the row keep the System row with its `Open Project` action. One durable row either way: its plain text is unchanged, so the Telegram mirror, Ouroboros's own context and one-ending-one-notification behave as before.
 
 Project-lifecycle and routing actions use the shared `createSystemMessageActions` composition. It owns token-based space above and below the controls, wrapping and clearance for the existing button focus ring; action buttons never sit in a clipped/nowrap text line. This is a row composition, not a new card framework or a global button-margin rule.
 
@@ -893,8 +897,9 @@ inside its own module or route-iframe page, override them, or design a completel
 independent interface. `.ouro-ui` supplies font and native dark-control context;
 the named classes opt controls into the recipes, with no page-wide reset.
 The kit reads the installed source at a new mount; retained frames keep the styling
-they loaded. It introduces no theme polling, forced remount or mandatory visual
-conformance. Author layout, validation, operations and loading feedback remain
+they loaded. A module may opt into the existing `OuroborosWidget.onTheme` signal
+and apply its own `data-theme` rules, but the kit introduces no theme polling,
+forced remount or mandatory visual conformance. Author layout, validation, operations and loading feedback remain
 author-owned; the small source recipes are in `docs/examples/author_ui_kit/`.
 
 ---
@@ -962,8 +967,9 @@ task are one event, not two: whichever arrives first rings, and the other is
 collapsed. The same holds for the several wire shapes a finished task has.
 
 **One sound.** At most one sound per event. Where the system shows a banner, the
-system owns the sound; where delivery falls back into the application, the app
-plays one short tone. Never both.
+system owns the sound; where a desktop bridge is available, the launcher owns
+one system sound (or reports that it could not play one); otherwise the app
+plays one short tone. Never both, and the Sound choice remains authoritative.
 
 **Each open window is its own client.** Settings, permission and the
 duplicate-collapsing that keeps one event to one notification all belong to one
@@ -979,9 +985,13 @@ the conversation. No reply is composed from the banner.
 owner turns message text on, because a banner can appear on a shared screen.
 
 **Deliberately absent.** No numeric badge, no repeated reminder, no inline
-reply, no tray icon, no Telegram escalation, and in this version no native dock
-attention — the packaged launcher cannot gain a new bridge method before it is
-rebuilt, and the interface should not promise what the running build cannot do.
+reply, no tray icon, no Telegram escalation, and no promise of a native
+Notification Center/toast banner or attention after the application closes.
+When the packaged desktop launcher exposes its optional `request_attention`
+bridge, a live notification may raise that window and ask the operating system
+for one standard sound. This is a native attention cue, not proof that a
+system banner was delivered; unsupported or older launchers fall back to the
+browser banner or in-app toast and report that capability honestly.
 
 **Settings.** The controls live on **Settings → Appearance**, under the theme
 block, and are stored per client exactly like the appearance choice: the desktop

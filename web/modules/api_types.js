@@ -448,6 +448,7 @@
  * @property {string=} target_label
  * @property {string=} project_id
  * @property {string=} project_name
+ * @property {string=} completion_answer  // a Project root's model-authored final answer, mirrored into Main
  * @property {number=} chat_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  */
@@ -1476,7 +1477,7 @@ export const MAX_QUIZ_OPTIONS = 6;
 // REFUSES a longer comment (it is delivered verbatim, never truncated), so
 // the card must not offer to send one.
 export const MAX_DECISION_COMMENT = 2000;
-export const GATEWAY_CONTRACT_VERSION = '7.3.0';
+export const GATEWAY_CONTRACT_VERSION = '7.4.0';
 
 /**
  * @typedef {Object} ChatHistoryPosition
