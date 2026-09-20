@@ -83,6 +83,7 @@ A registry of `config.SETTINGS_DEFAULTS` (exact defaults canonical in `settings_
 | OUROBOROS_VISION_CAPTION_TIMEOUT_SEC | 90 | Caption-generation ceiling |
 | OUROBOROS_MODEL_CONSCIOUSNESS | "" | Background-consciousness model (empty inherits) |
 | OUROBOROS_MODEL_FALLBACKS | openai/gpt-5.6-luna | Cross-model fallback chain (`fallback_cooldown.py`) |
+| OUROBOROS_SERVED_MODEL_REDOS | 2 | How many times a round another model answered may be asked again, each on a new operation (`runtime_limits.get_model_substitution_redos`, clamped 0-5) |
 | OUROBOROS_MODEL_MAX_CONCURRENCY | 3 | Per-(model,route) concurrent provider-call cap (`model_concurrency.py`) |
 | OUROBOROS_MODEL_SLOT_MAX_WAIT_SEC | 180 | Concurrency-slot wait bound |
 | OUROBOROS_PROJECT_NAMING_TIMEOUT_SEC | 60 | Project-naming call ceiling |

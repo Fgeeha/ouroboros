@@ -608,7 +608,10 @@ and what enforces each.
   problem context. A known terminal with unusable output is a settled provider result
   plus local rejection (`stream_rejected`), never unknown or not-dispatched — keep both
   stream-rejection markers across sync, async and process boundaries, and a local
-  rejection never rotates accounts.
+  rejection never rotates accounts. A round the engine says ANOTHER model answered is
+  not that class: the engine, not the host, compared model identity, so the host never
+  matches model strings of its own, and the refusal it raises is a fresh operation the
+  engine routes — the host still ranks no account and picks no substitute model.
 - Host hints are chosen by their caller from transport capability; an explicitly
   unsupported option refuses rather than being silently dropped and retried. Submitted
   options are recorded beside applied options on the usage row (absent report =

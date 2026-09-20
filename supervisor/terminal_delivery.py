@@ -726,7 +726,8 @@ def project_terminal_result_event(
     """Project one terminal event from producer-stamped origin.
 
     ``host_salvage`` becomes one short keyed plain System receipt (inherited
-    ``format``/``log_text`` dropped; the full bytes stay in task details).
+    ``format``/``log_text`` dropped; the full bytes stay in task details); a
+    subagent's receipt also names its card placement, a root's does not.
     ``host_notice`` is a text the host wrote alone, so it keeps its OWN words
     and inherited markdown and becomes a System row WITHOUT a system_type,
     which is what lets a replayed card conclude on it. ``model_final`` and a
@@ -755,6 +756,15 @@ def project_terminal_result_event(
         if salvage:
             event.pop("log_text", None)
             event.pop("format", None)
+            # A child's receipt is a row of that child's card. The row id derives
+            # from the delivery id, so the live send, the owed outbox row and
+            # its replay all name one row.
+            from ouroboros.subagent_messages import subagent_message_meta
+
+            meta = event.get("progress_meta") if isinstance(event.get("progress_meta"), dict) else {}
+            if subagent_message_meta(task) or subagent_message_meta(meta):
+                event["progress_meta"] = {**meta, "card_row": "timeline",
+                                          "card_row_id": event["delivery_id"] + ":terminal_incident"}
         return event
     if origin == TERMINAL_ORIGIN_MODEL_FINAL:
         event["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL

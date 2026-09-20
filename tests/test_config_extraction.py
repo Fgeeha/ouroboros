@@ -27,6 +27,7 @@ _ADDED_OWNERS = {
     "IMMEDIATE_SETTINGS": settings_scales,
     "RESTART_REQUIRED_SETTINGS": settings_scales,
     "get_finalization_grace_sec": runtime_limits,
+    "get_model_substitution_redos": runtime_limits,
     "NETWORK_WAIT_BACKOFF_MAX_SEC": runtime_limits,
     "MODEL_ACCOUNTS_KEY": model_slots,
     "MODEL_CONTEXT_WINDOWS_KEY": model_slots,

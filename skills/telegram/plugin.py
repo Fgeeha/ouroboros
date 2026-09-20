@@ -30,7 +30,7 @@ from .lib.telegram_state import (
     _state_file, _load_settings, _is_silent_mode_enabled,
     _get_silent_msg, _set_silent_msg, _clear_silent_msg, _subagent_cards_enabled,
     _mirror_progress_enabled, _render_subagent_card, _data_dir,
-    _jsonl_tail, _load_runtime_state, _read_json_file,
+    _jsonl_tail, _load_runtime_state, _read_json_file, _child_row_held_for_root,
 )
 from .lib import telegram_inbound, telegram_quiz
 from .lib.telegram_health import _collect_health, _build_menu_tasks
@@ -1036,6 +1036,15 @@ def _make_outbound(api):
             if sub_event:
                 if _subagent_cards_enabled(local_settings):
                     await _render_subagent_card(api, client, chat_id, event, sub_event, lang)
+                return
+
+            # Card-internal host rows: the web shows them inside a task card, and
+            # this transport has none. A child's row stays out while its root is
+            # unfinished (the lifecycle bubble above keeps saying `failed`; the
+            # root accounts for its children), and a placed progress frame is
+            # never mirrored, whatever the progress toggle says. A root's own
+            # placed System row still goes out: here it has no card to live in.
+            if _child_row_held_for_root(api, event) or (event.get("is_progress") and event.get("card_row")):
                 return
 
             # Generic (non-subagent) progress telemetry → dropped by default; the
