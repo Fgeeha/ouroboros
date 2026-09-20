@@ -247,11 +247,14 @@ until a real task status or activity arrives; review presence alone never means
 `Working`, `Done`, or owner attention.
 
 A review that was only awaited when its task ended is not a warning. Reviewers
-that had simply not answered yet leave the task `Done`: the final message keeps
-the host's disclosure that the review was still open, and the card states the
-same fact as its cause sentence. A real outcome keeps its word: no reviewer
-quorum, a failed, refused or unresolved slot, a reviewer verdict nobody closed,
-a rail or a blocking exit still read `Done with warnings` or `Failed`.
+that had simply not answered yet leave the task `Done`. For a plan review the
+final message keeps the host's disclosure that the review was still open, and a
+clean card states the same fact as its cause sentence; a card that is amber or
+red for another reason keeps that reason. For task acceptance the host's
+decision sentence already says that no reviewer verdict was established. A real
+outcome keeps its word: no reviewer quorum, a failed, refused or unresolved
+slot, a collected blocking finding, a reviewer verdict nobody closed, a rail or
+a blocking exit still read `Done with warnings` or `Failed`.
 
 A host fact about a task is a row of that task's card, never a standalone
 bubble beside it. A reviewer panel that settles after its task already ended

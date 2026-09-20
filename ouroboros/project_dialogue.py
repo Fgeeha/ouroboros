@@ -766,7 +766,7 @@ TASK_CAUSE_PHRASES = {
     "acceptance_bypassed_children_unabsorbed": "Some sub-tasks had not been folded in, so the answer was never reviewed.",
     # Execution reason codes, carried verbatim from the card's own old table.
     "plan_review_advisory": "Plan review never closed; the work continued under advisory enforcement",
-    "plan_review_awaiting": "The plan reviewers had not answered yet when the task ended.",
+    "plan_review_awaiting": "Not every plan reviewer had answered when the task ended.",
     "host_child_status_suffix": "A child task had not settled when the answer was delivered",
     "invalid_delivery_control_after_repair": "The delivery control object was still malformed after repair",
     "budget_exhausted": "The task ran out of budget before it could finish cleanly",
@@ -1306,7 +1306,7 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
         clause = TASK_CAUSE_PHRASES.get(cause, cause)
     elif reason in {REASON_OWNER_REQUESTED_FINALIZATION, REASON_FINAL_MESSAGE, ""}:
         awaited = reason != REASON_OWNER_REQUESTED_FINALIZATION and plan_review_awaiting(event, result)
-        return TASK_CAUSE_PHRASES["plan_review_awaiting"] if awaited else ""  # a gap the row states, never a warning
+        return TASK_CAUSE_PHRASES["plan_review_awaiting"] if awaited and outcome_phase(result, event) == "done" else ""
     else:
         # A healed debt is never restored here. The objective warning the
         # overlay froze keeps the headline and the refresh may not rewrite it,

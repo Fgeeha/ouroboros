@@ -804,8 +804,9 @@ def _plan_open_slots_line(wave: Optional[Dict[str, Any]]) -> str:
     if not (awaiting or unresolved or late):
         return ""
     total, answered = census["configured"], len(census["answered"])
+    noun = "reviewer" if total == 1 else "reviewers"
     if len(awaiting) == total:
-        return f"📐 Plan review: sent to {total} reviewer{'' if total == 1 else 's'}, none has answered yet."
+        return f"📐 Plan review: sent to {total} {noun}, none has answered yet."
     # A settled slot may have settled as a failure: until collected it is named settled, never answered.
     tail = f", {len(late)} settled but not collected yet" if late else ""
     tail += (f", {len(census['failed'])} failed ({plan_slot_reasons(wave, failed_only=True)})"
@@ -814,9 +815,9 @@ def _plan_open_slots_line(wave: Optional[Dict[str, Any]]) -> str:
     if unresolved:
         states = ", ".join(dict.fromkeys(str(row.get("operation_state") or "unknown") for row in unresolved))
         awaited = f", {len(awaiting)} awaited" if awaiting else ""
-        return (f"📐 Plan review: {answered} of {total} reviewers answered{awaited}{tail}; "
+        return (f"📐 Plan review: {answered} of {total} {noun} answered{awaited}{tail}; "
                 f"{len(unresolved)} unresolved ({states}) — no verdict.")
-    return f"📐 Plan review so far: {answered} of {total} reviewers answered{tail}."
+    return f"📐 Plan review so far: {answered} of {total} {noun} answered{tail}."
 
 
 def plan_wave_line_has_news(wave: Optional[Dict[str, Any]]) -> bool:

@@ -444,7 +444,7 @@ const TASK_CAUSE_PHRASES = {
     acceptance_bypassed_context_overflow: "The task outgrew its context before the answer could be reviewed.",
     acceptance_bypassed_children_unabsorbed: "Some sub-tasks had not been folded in, so the answer was never reviewed.",
     plan_review_advisory: "Plan review never closed; the work continued under advisory enforcement",
-    plan_review_awaiting: "The plan reviewers had not answered yet when the task ended.",
+    plan_review_awaiting: "Not every plan reviewer had answered when the task ended.",
     host_child_status_suffix: "A child task had not settled when the answer was delivered",
     invalid_delivery_control_after_repair: "The delivery control object was still malformed after repair",
     budget_exhausted: "The task ran out of budget before it could finish cleanly",
@@ -519,8 +519,10 @@ export function taskReasonDetail(evt) {
         ].filter(Boolean).join(' · ');
     }
     if (!evt?.reason_code || evt.reason_code === 'final_message') {
-        // A clean finish over a plan review that was only awaited states that fact, never a warning.
-        return record.outcome_axes?.execution?.plan_review === 'awaiting' ? taskReasonPhrase('plan_review_awaiting') : '';
+        // A clean finish over a plan review that was only awaited states that fact; an amber
+        // or red card owes its colour to something else, so the fact never sits in its cause slot.
+        return severity === 'done' && record.outcome_axes?.execution?.plan_review === 'awaiting'
+            ? taskReasonPhrase('plan_review_awaiting') : '';
     }
     // A healed debt is never restored: naming it again would state a debt the
     // same record shows as empty. The current execution reason speaks when

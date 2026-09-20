@@ -38,7 +38,7 @@ NO_QUORUM_NOTICE = (
     "under the owner-selected advisory enforcement."
 )
 ADVISORY_SENTENCE = "Plan review never closed; the work continued under advisory enforcement."
-AWAITED_SENTENCE = "The plan reviewers had not answered yet when the task ended."
+AWAITED_SENTENCE = "Not every plan reviewer had answered when the task ended."
 
 
 # ------------------------------------------------------------------ plan: the typed predicate
@@ -92,6 +92,19 @@ NOT_ONLY_AWAITED = {
         [_row(s, failure_code="run_failed") for s in ("s1", "s2", "s3")], custody=False),
     "a settled wave with nothing pending": _wave(
         [_row("s1", ok=True), _row("s2", ok=True), _row("s3", ok=True)], answered=3, custody=False),
+    # A collected blocking finding keeps the wave open whatever the awaited slots answer.
+    "one answer below quorum raised a blocking finding": _wave(
+        [_row("s1", ok=True), _awaiting("s2"), _awaiting("s3")], answered=1,
+        findings=[{"finding_id": "s1:b1", "class": "blocking", "slot": "s1"}]),
+    "one answer below quorum asked for evidence": _wave(
+        [_row("s1", ok=True), _awaiting("s2"), _awaiting("s3")], answered=1,
+        findings=[{"finding_id": "s1:e1", "class": "need_evidence", "slot": "s1"}]),
+    # Facts the typed record cannot vouch for are never a mere wait.
+    "a roster with a row that is not a record": _wave([_awaiting("s1"), "garbage", _awaiting("s3")]),
+    "a wave with no usable quorum": _wave([_awaiting("s1"), _awaiting("s2")], quorum=None),
+    "a pending row that already carries an answer": _wave(
+        [{**_awaiting("s1"), "parsed": {"findings": []}, "raw_text": "{}"}, _awaiting("s2")]),
+    "a pending row marked ok": _wave([{**_awaiting("s1"), "ok": True}, _awaiting("s2")]),
 }
 
 
@@ -266,6 +279,13 @@ def test_a_task_that_finished_over_an_awaited_plan_wave_is_not_degraded(tmp_path
     assert record["outcome_axes"]["objective"]["status"] == "not_evaluated"
     assert completion_status_label(record, {}) == "Done"
     assert _completion_verdict(record, {}) == AWAITED_SENTENCE == TASK_CAUSE_PHRASES["plan_review_awaiting"]
+    assert _completion_verdict({**record, "reason_code": ""}, {}) == AWAITED_SENTENCE  # a row with no reason code
+    # The fact is the cause sentence of a CLEAN card only: an amber or red card owes its colour to something else.
+    warned = {**record, "outcome_axes": {**record["outcome_axes"], "objective": {
+        "status": "not_evaluated", "warning": "residual_tool_errors_without_review"}}}
+    assert completion_status_label(warned, {}) == "Done with warnings" and _completion_verdict(warned, {}) == ""
+    failed = {**record, "outcome_axes": {**record["outcome_axes"], "artifacts": {"status": "missing"}}}
+    assert completion_status_label(failed, {}) == "Failed" and _completion_verdict(failed, {}) == ""
 
 
 @pytest.mark.parametrize("facts, notice", [
@@ -361,6 +381,8 @@ REAL_RUNS = {
     "an infrastructure failure with no actors": _run([]),
     "a pending row that already carries an answer": _run(
         [{**_pending("a"), "parsed": {"verdict": "DEGRADED"}, "raw_text": "{}"}]),
+    "a pending row marked ok": _run([{**_pending("a"), "status": "ok"}, _pending("b")]),
+    "a roster with a row that is not a record": _run([_pending("a"), "garbage"]),
 }
 
 
@@ -395,6 +417,43 @@ def test_a_fail_and_a_pass_keep_their_words_beside_a_wait():
     # A real degradation beside an awaited panel keeps the louder word.
     mixed = [AWAITED_RUNS["nobody answered yet"], REAL_RUNS["a settled no-quorum panel"]]
     assert _review_axis({"review_runs": mixed})["status"] == "degraded"
+
+
+@pytest.mark.parametrize("tier, objective, label", [
+    ("blocked_with_evidence", "fail", "Failed"), ("best_effort", "best_effort", "Done with warnings")])
+def test_a_collected_pass_that_judged_the_work_unsolved_keeps_its_word_beside_a_wait(tier, objective, label):
+    judged = {**_actor("a"), "parsed": {"verdict": "PASS", "outcome_tier": tier}}
+    axis = _review_axis({"review_runs": [_run([judged, _pending("b"), _pending("c")])]})
+    assert axis["status"] == "degraded" and axis["outcome_tier"] == tier  # exactly today's axis
+    assert _objective_axis(axis)["status"] == objective
+    record = {"status": "completed", "reason_code": "final_message",
+              "outcome_axes": {"execution": {"status": "ok"}, "review": axis, "objective": _objective_axis(axis)}}
+    assert completion_status_label(record, {}) == label
+
+
+def test_the_predicate_itself_refuses_a_fail_aggregate_over_awaited_rows():
+    # `_review_axis` answers `fail` before it asks; the ledger asks the predicate directly.
+    assert _outcome_receipts.review_runs_only_awaited([_run([_pending("a"), _pending("b")], signal="FAIL")]) is False
+    assert _outcome_receipts.review_runs_only_awaited([]) is False
+
+
+def _selection(runs, *, replaced=False):
+    return _outcome_receipts.ReviewRunSelection(
+        all_runs=list(runs), current_runs=[run for run in runs if not run.get("superseded_by_revision")],
+        superseded_only_acceptance_gap=False, superseded_aggregate_signals=[],
+        current_candidate_unaccepted=False, has_replacement=replaced)
+
+
+def test_the_verification_ledger_does_not_call_an_awaited_panel_a_failed_verification():
+    for name, run in AWAITED_RUNS.items():
+        status, superseded = _outcome_receipts.review_run_ledger_status(run, _selection([run]))
+        assert (status, superseded) == ("not_evaluated", False), name
+    for name, run in REAL_RUNS.items():
+        assert _outcome_receipts.review_run_ledger_status(run, _selection([run]))[0] == "failed", name
+    passed = _run([_actor("a"), _actor("b"), _pending("c")], signal="PASS")
+    assert _outcome_receipts.review_run_ledger_status(passed, _selection([passed]))[0] == "ok"
+    old = _run([_pending("a")], superseded_by_revision=True)
+    assert _outcome_receipts.review_run_ledger_status(old, _selection([old, passed], replaced=True))[0] == "superseded"
 
 
 def test_a_blocking_unaccepted_terminal_is_unchanged_by_an_awaited_panel():
@@ -438,6 +497,10 @@ def test_a_real_answer_released_over_a_running_panel_is_not_a_degraded_review(fu
     assert axes["review"]["status"] == "awaiting" and axes["review"]["eligibility"] == "review_in_flight"
     assert axes["objective"]["status"] == "pass" and axes["objective"]["source"] == "author_acceptance"
     assert axes["objective"]["review_status"] == "awaiting"
+    # What the owner reads: the host's decision sentence still says no reviewer signed the answer off.
+    card = {"status": "completed", "reason_code": "final_message", "outcome_axes": axes}
+    assert completion_status_label(card, {}) == "Done"
+    assert _completion_verdict(card, {}) == TASK_CAUSE_PHRASES["author_finish"]
     record = {"status": "completed", "reason_code": "final_message", "outcome_axes": axes}
     assert completion_status_label(record, {}) == "Done"
     assert _completion_verdict(record, {}) == TASK_CAUSE_PHRASES["author_finish"]

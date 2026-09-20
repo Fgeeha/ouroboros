@@ -430,7 +430,21 @@
       "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok", "reason_code": "final_message", "plan_review": "awaiting"}, "review": {"status": "skipped"}}},
       "phase": "done",
       "headline": "Done",
-      "acceptance_clause": "The plan reviewers had not answered yet when the task ended."
+      "acceptance_clause": "Not every plan reviewer had answered when the task ended."
+    },
+    {
+      "name": "an awaited plan review on a card that is amber for another reason states no cause",
+      "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok", "reason_code": "final_message", "plan_review": "awaiting"}, "objective": {"status": "not_evaluated", "warning": "residual_tool_errors_without_review"}, "review": {"status": "skipped"}}},
+      "phase": "warn",
+      "headline": "Done with warnings",
+      "acceptance_clause": ""
+    },
+    {
+      "name": "an awaited plan review on a card that is red for another reason states no cause",
+      "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok", "reason_code": "final_message", "plan_review": "awaiting"}, "artifacts": {"status": "missing"}, "review": {"status": "skipped"}}},
+      "phase": "error",
+      "headline": "Failed",
+      "acceptance_clause": ""
     },
     {
       "name": "an acceptance panel that was only awaited is Done under the author's own finish",

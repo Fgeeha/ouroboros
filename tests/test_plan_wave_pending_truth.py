@@ -153,6 +153,9 @@ def test_progress_line_states_the_gap_for_each_open_branch():
     # A plain in-flight line carries no paid-cycle and no declared-effort tail: the verdict line does.
     assert _line(_wave([_pending("s1")], reviewer_effort="high"), cycles_paid=0) == (
         "📐 Plan review: sent to 1 reviewer, none has answered yet.")
+    # A roster of one keeps the singular in every sentence of the family.
+    assert _line(_wave([_pending("s1", "in_flight")])) == (
+        "📐 Plan review: 0 of 1 reviewer answered; 1 unresolved (in_flight) — no verdict.")
     assert _line(_wave([_ok("s1"), _pending("s2")], reviewer_effort="high")) == (
         "📐 Plan review so far: 1 of 2 reviewers answered.")
 
@@ -502,6 +505,19 @@ def test_a_fresh_dispatch_with_an_immediate_refusal_prints_the_wave_line_and_kee
     assert [line for line in harness.progress if line.startswith("📐")] == [
         "📐 Plan review: sending the plan to 2 reviewers (cycle 1/2, blocking); 1 lane skipped at $0…",
         "📐 Plan review so far: 0 of 3 reviewers answered, 1 not dispatched."]
+
+
+def test_a_dispatch_that_reaches_no_lane_never_says_the_plan_is_being_sent(harness, panel, monkeypatch):
+    import ouroboros.tools.plan_review_runtime as runtime
+
+    monkeypatch.setattr(runtime, "plan_panel_health_snapshot", lambda _slots: {
+        slot: {"failure_code": "subscription_window_exhausted", "reset_at": "2030-01-02T00:00:00+00:00"}
+        for slot in ("s1", "s2", "s3")})
+    _call(harness.make_ctx())
+    assert sum(e.execute_calls for e in panel.values()) == 0
+    first = [line for line in harness.progress if line.startswith("📐")][0]
+    assert first == "📐 Plan review: no reviewer lane can take the plan (cycle 1/2, blocking); 3 lanes skipped at $0."
+    assert "sending" not in first
 
 
 def test_every_owner_line_of_the_organ_opens_with_the_one_prefix(harness, monkeypatch):

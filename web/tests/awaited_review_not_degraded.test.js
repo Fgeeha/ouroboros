@@ -9,7 +9,7 @@ import {
 // the chip stays Done and the card states the fact. Every real degradation keeps
 // the chip, the reason and the sentence it had.
 
-const AWAITED_SENTENCE = 'The plan reviewers had not answered yet when the task ended.';
+const AWAITED_SENTENCE = 'Not every plan reviewer had answered when the task ended.';
 const ADVISORY_SENTENCE = 'Plan review never closed; the work continued under advisory enforcement';
 
 const done = (axes, extra = {}) => ({
@@ -30,6 +30,16 @@ test('a finish over an awaited plan review is Done and states the fact', () => {
     assert.equal(summary.body, AWAITED_SENTENCE);
     // A live frame may carry no reason code at all; the typed fact still speaks.
     assert.equal(taskReasonDetail({ ...record, reason_code: undefined }), AWAITED_SENTENCE);
+});
+
+test('the awaited fact is the cause sentence of a clean card only', () => {
+    const execution = { status: 'ok', reason_code: 'final_message', plan_review: 'awaiting' };
+    const warned = done({ execution, objective: { status: 'not_evaluated', warning: 'residual_tool_errors_without_review' } });
+    assert.equal(taskOutcomeSeverity(warned), 'warn');
+    assert.equal(taskReasonDetail(warned), '');
+    const failed = done({ execution, artifacts: { status: 'missing' } });
+    assert.equal(taskOutcomeSeverity(failed), 'error');
+    assert.equal(taskReasonDetail(failed), '');
 });
 
 test('a plan review that really stayed open keeps its warning, code and sentence', () => {

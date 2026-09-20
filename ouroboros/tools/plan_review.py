@@ -779,9 +779,10 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             "review_budget_unavailable")
     ctx.emit_progress_fn(  # a $0 collection dispatches nothing, so it never reads as a plan being sent
         "📐 Plan review: checking for reviewer answers…" if collect is not None or resume_in_flight else
-        f"📐 Plan review: sending the plan to {len(callable_slots)} reviewer{'' if len(callable_slots) == 1 else 's'} "
-        f"(cycle {cycle_index}{'' if cap is None else f'/{cap}'}, {enforcement}{', constitutional' if constitutional else ''})"
-        + (f"; {len(health_skip_rows)} lane{'' if len(health_skip_rows) == 1 else 's'} skipped at $0" if health_skip_rows else "") + "…"
+        (f"📐 Plan review: sending the plan to {len(callable_slots)} reviewer{'' if len(callable_slots) == 1 else 's'} "
+         if callable_slots else "📐 Plan review: no reviewer lane can take the plan ")  # nothing is sent to zero lanes
+        + f"(cycle {cycle_index}{'' if cap is None else f'/{cap}'}, {enforcement}{', constitutional' if constitutional else ''})"
+        + (f"; {len(health_skip_rows)} lane{'' if len(health_skip_rows) == 1 else 's'} skipped at $0" if health_skip_rows else "") + ("…" if callable_slots else ".")
     )
     rows = await _run_plan_review_slots(
         ctx, callable_slots, system_prompt=system_prompt, user_content=user_content,

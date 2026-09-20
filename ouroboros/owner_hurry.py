@@ -457,23 +457,30 @@ def _plan_review_engaged(state: Any) -> bool:
 def plan_wave_only_awaited(wave: Any) -> bool:
     """Whether the wave is open ONLY because reviewers had not answered yet.
 
-    Typed facts alone: every unanswered slot is a planned wait (the census names no
-    unresolved, uncollected, refused or failed slot), and the recorded answers hold
-    no verdict of their own beneath the stored placeholder — they are fewer than the
-    quorum, or they raised no finding. A quorum of answers that raised findings IS a
-    critic verdict the wait merely postpones, so it never reads as a mere wait."""
+    Typed facts alone: every unanswered slot is a planned wait that carries no answer
+    (the census names no unresolved, uncollected, refused or failed slot), and the
+    recorded answers hold no verdict of their own beneath the stored placeholder. A
+    collected blocking or ``need_evidence`` finding keeps the wave open whatever the
+    awaited slots answer, and a quorum of answers that raised findings IS a critic
+    verdict the wait merely postpones — neither reads as a mere wait. A roster or a
+    quorum the typed facts cannot vouch for is never a mere wait either."""
     from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
 
     if not isinstance(wave, dict) or not wave.get("custody_pending"):
         return False
+    roster, findings = wave.get("actors"), wave.get("findings") or []
     census = plan_wave_slot_census(wave)
-    if not census["awaiting"] or any(
-            census[name] for name in ("unresolved", "uncollected", "skipped", "failed")):
+    if (not isinstance(roster, list) or len(roster) != census["configured"] or not census["awaiting"]
+            or any(census[name] for name in ("unresolved", "uncollected", "skipped", "failed"))
+            or any(row.get("ok") or row.get("parsed") is not None or str(row.get("raw_text") or "").strip()
+                   for row in census["awaiting"])):
         return False
     counts = wave.get("counts") if isinstance(wave.get("counts"), dict) else {}
     quorum = counts.get("quorum")
-    below_quorum = type(quorum) is int and quorum > 0 and len(census["answered"]) < quorum
-    return below_quorum or not wave.get("findings")
+    if (type(quorum) is not int or quorum <= 0 or not isinstance(findings, list)
+            or any(not isinstance(item, dict) or item.get("class") != "note" for item in findings)):
+        return False
+    return len(census["answered"]) < quorum or not findings
 
 
 def force_plan_decision(
