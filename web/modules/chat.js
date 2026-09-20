@@ -2434,7 +2434,7 @@ export function createChatInstance({
                         pendingHistoryUpserts.set(row.history_id, row); return false;
                     }
                     pendingHistoryUpserts.delete(row.history_id);
-                    releaseMessageNode(old);
+                    releaseMessageNode(old); seenMessageKeys.delete(`history:${row.history_id}`);
                     return true;
                 });
                 // Retire only local echoes this source snapshot confirms.
@@ -2509,7 +2509,8 @@ export function createChatInstance({
                     if (
                         handleCardReference(msg) !== undefined
                         || attachReviewFromRow(msg, msg.ts || '', true) !== undefined
-                        || cardRowsAttached.has(msg)
+                        // A record minted after its row in pass 1 takes the row here.
+                        || cardRowsAttached.has(msg) || attachCardRow(msg, msg.ts || '') !== undefined
                     ) continue;
                     // Reconnect: a durably recorded submission must not stay
                     // `Sending...` — history + snapshot are the authorities
@@ -3790,7 +3791,8 @@ export function createChatInstance({
                 syncChatStatus();
                 return Boolean(changed);
             }
-            if (explicitTaskId && subagentChildParents.has(explicitTaskId)) {
+            // A placed host row is never a child's answer; with no card it stays a System row.
+            if (explicitTaskId && !msg.card_row && subagentChildParents.has(explicitTaskId)) {
                 const changed = routeSubagentFinalMessageToCard(explicitTaskId, msg);
                 if (changed) incrementUnreadIfNeeded(msg);
                 syncChatStatus();

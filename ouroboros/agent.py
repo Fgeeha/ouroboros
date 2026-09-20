@@ -1110,9 +1110,14 @@ class OuroborosAgent:
 
     def _emit_progress(self, text: str, *, incident: Optional[Dict[str, str]] = None,
                        executor_observation: Optional[Dict[str, Any]] = None,
-                       narration: bool = False) -> None:
+                       narration: bool = False, card_row: str = "", card_row_id: str = "") -> None:
         """Owner-visible note; ``incident`` is the typed ``task_incident``/``toast_once``
         pair the browser toasts once.
+
+        ``card_row`` is the note's PLACEMENT fact: a host fact about this task
+        belongs to a row of its card, so a producer that has one states it here
+        rather than leaving the row to land beside the card. ``card_row_id``
+        keeps that row the same row across a reload.
 
         ``narration`` is the VOICE of the note, not its text: only the model's own
         round narration (``loop_messages._emit_round_progress``) is the turn's
@@ -1135,6 +1140,10 @@ class OuroborosAgent:
             }
             progress_meta: Dict[str, Any] = {}
             progress_meta.update(incident or {})
+            if card_row:
+                progress_meta["card_row"] = card_row
+                if card_row_id:
+                    progress_meta["card_row_id"] = card_row_id
             progress_meta.update(self._subagent_progress_meta("progress"))
             if executor_observation is not None:
                 from ouroboros.subagent_messages import executor_observation_meta

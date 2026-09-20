@@ -9,9 +9,9 @@ from ouroboros.gateways.claudexor import final_attempt_facts
 from ouroboros.llm_claudexor import (
     ClaudexorModelError,
     _ModelInvocation,
-    _remember_failed_profile,
     _request,
 )
+from ouroboros.llm_substitution import remember_failed_profile
 
 
 def _write_telemetry(tmp_path, attempts, *, final_id="a02", run_id="run-fixture"):
@@ -181,7 +181,7 @@ def test_status_null_failure_suppresses_only_the_next_same_route_preference():
         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"},
         unknown=True,
     )
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
 
     assert _request(target, _continuation(), None, parameters)["account"] == {"mode": "auto"}
     assert _request(target, _continuation(), None, parameters)["account"] == {
@@ -198,7 +198,7 @@ def test_failure_fact_survives_an_interleaved_request_on_another_route():
         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "profile-a"},
         unknown=True,
     )
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
 
     # A request on another route neither consumes the fact nor loses its own preference.
     assert _request(other, _continuation("profile-b", "claude", "sonnet"), None, parameters)["account"] == {
@@ -218,14 +218,14 @@ def test_failure_fact_does_not_change_pin_or_single_account_auto_mode():
          "context": {"httpStatus": 429}},
         route={"source": "codex", "model": "gpt-6", "credentialProfileId": "only-profile"},
     )
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
 
     pinned = _request(target, _continuation("only-profile"), None, {
         **parameters, "model_account_override": "only-profile",
     })
     assert pinned["account"] == {"mode": "pin", "profileId": "only-profile"}
 
-    _remember_failed_profile(target, parameters, error)
+    remember_failed_profile(target, parameters, error)
     assert _request(target, _continuation("only-profile"), None, parameters)["account"] == {
         "mode": "auto",
     }
