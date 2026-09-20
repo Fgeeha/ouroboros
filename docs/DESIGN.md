@@ -246,6 +246,16 @@ That row keeps a neutral owner anchor visible, but hides task status and typing
 until a real task status or activity arrives; review presence alone never means
 `Working`, `Done`, or owner attention.
 
+A review that was only awaited when its task ended is not a warning. Reviewers
+that had simply not answered yet leave the task `Done`. For a plan review the
+final message keeps the host's disclosure that the review was still open, and a
+clean card states the same fact as its cause sentence; a card that is amber or
+red for another reason keeps that reason. For task acceptance the host's
+decision sentence already says that no reviewer verdict was established. A real
+outcome keeps its word: no reviewer quorum, a failed, refused or unresolved
+slot, a collected blocking finding, a reviewer verdict nobody closed, a rail or
+a blocking exit still read `Done with warnings` or `Failed`.
+
 A host fact about a task is a row of that task's card, never a standalone
 bubble beside it. A reviewer panel that settles after its task already ended
 adds one System row naming the verdict and which revision it covered; that row
@@ -476,6 +486,24 @@ not child-task cards and never prove execution by themselves.
 - Disclosure is user-owned. Review results, retries, failures, terminal task
   state, reconnect, and lazy-detail loading update content in place but never
   open or close the task, Reviews section, or group.
+- A plan wave whose reviewers may still answer reads as work in progress only
+  while its own task is running: the working tone, `in progress · k of n
+  answered` where the verdict token would sit, and each awaited reviewer listed
+  as awaiting rather than unavailable, under no verdict word. Once the task has
+  ended the same wave reads `no verdict · k of n answered` in the neutral tone.
+  A reviewer whose window expired is unresolved. A settled wave without quorum
+  keeps the warning tone and its `DEGRADED` verdict.
+- A task-acceptance panel whose reviewers may still answer never reads as a bare
+  verdict token. While its own task is running it is work in progress: the
+  working tone and `in progress · k of n answered`, or `PASS so far · k of n
+  answered` once the quorum is met. Once the task has ended the same panel reads
+  `no verdict · k of n answered` in the neutral tone, or `PASS · k of n
+  answered`, until a late settlement replaces it. A reviewer FAIL keeps the
+  error tone and reads `FAIL · k of n answered` in both.
+- On a plan wave and an acceptance panel alike, a slot that is neither answered
+  nor awaited (a settled failure, an expired window, lost custody, a refusal)
+  adds `· m unavailable` and keeps the warning tone beside the awaited slots; a
+  panel with no awaited slot keeps the warning tone and its `DEGRADED` verdict.
 - A panel that settled after its task ended stays one attempt row of its group,
   labelled as settled after the task ended; its note (which verdict, which
   revision, whether a reviewer's outcome is still unknown) is host-composed and

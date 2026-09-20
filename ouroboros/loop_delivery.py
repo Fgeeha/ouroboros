@@ -1057,6 +1057,15 @@ def _compose_delivery_suffix(full_text: str, suffix: str) -> str:
     return text + note
 
 
+def _plan_review_only_awaited(llm_trace: Dict[str, Any]) -> bool:
+    """The projected gate decision's typed fact: the open plan wave was merely awaited.
+
+    The finalization notice and this fact read the SAME decision, so an only-awaited
+    wave keeps its loud notice and is a gap, never a degradation of the task."""
+    plan_gate = llm_trace.get("force_plan_decision")
+    return isinstance(plan_gate, dict) and plan_gate.get("review_only_awaited") is True
+
+
 def _no_tool_final_answer(
     content: Any,
     limit_ctx: _RoundLimitContext,
@@ -1180,7 +1189,7 @@ def _no_tool_final_answer(
             candidate.degraded = True
             candidate.degraded_reason = "host_child_status_suffix"
             _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
-        elif plan_suffix:
+        elif plan_suffix and not _plan_review_only_awaited(llm_trace):
             candidate.degraded = True
             candidate.degraded_reason = "plan_review_advisory"
             _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
