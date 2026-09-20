@@ -104,6 +104,8 @@ History reconciliation is one synchronous two-pass transaction over existing key
 
 `chat_history.js` retains three ordinary rendered pages plus temporarily protected reading/focus/selection pages, holding page descriptors only — content stays with the row/card owners, which release distant page bodies and their media/listener resources while descriptors keep exact return navigation. An empty scan is not a page, there is no newer control, and the per-room scroll stash carries descriptors plus a physical reading anchor, never a second history copy; recent live refresh stays separate from the frozen archive range, and reaching the old physical beginning does not claim every page is loaded.
 
+The recent-window read is the chat's own request, so `createHistoryControls` carries its in-flight and failed state through the same `.chat-load-older` control, armed only over an empty feed. A slow read left the panel blank under a green `Online` header, as a failed one did; `syncHistory` catches its own error, so the state is written inside the sync, and Retry reruns the open transaction.
+
 #### Main rows and host-stamped card rows
 
 Producers stamp DESIGN's chat voice as role/type; `send_with_budget` persists both and history replays them (legacy absence stays assistant). `_emit_progress` uses `narration`. Host Service accepts exact-origin terminal replies in either voice. `tests/test_host_message_voice.py` pins the AST boundary/exceptions; computed aliases remain review-only.

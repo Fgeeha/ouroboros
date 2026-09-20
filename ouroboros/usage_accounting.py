@@ -52,6 +52,7 @@ from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso  # noqa
 from ouroboros._usage_rows import (  # noqa: F401  (re-exported substrate vocabulary)
     REVIEW_ATTRIBUTION_KEYS,
     _breakdown_bucket,
+    _marker_from_final,
     _physical_call_count,
     _summary,
     _with_integrity,
@@ -452,6 +453,35 @@ from ouroboros._usage_rows_memo import (  # noqa: F401,E402  (re-exported seam)
 )
 
 
+def _projection_from_final(
+    final: list, integrity_degraded: bool, configured_limit: Optional[float] = None,
+    *, root_task_id: str = "", include_roots: bool = True,
+) -> Dict[str, Any]:
+    """Render the money projection from ALREADY-VALIDATED final rows: one
+    snapshot, one projection, so a caller deriving the ordering marker from
+    the SAME rows writes both under one authority instead of pairing a marker
+    with a second, later ledger read."""
+    def limit_of(rows: list) -> Optional[float]:
+        known = [v for v in (_number(row.get("root_limit_usd")) for row in rows) if v is not None]
+        return min(known) if known else None
+    if root_task_id:
+        rows = [row for row in final if str(row.get("root_task_id") or "") == root_task_id]
+        return _with_integrity(_with_limit(_summary(rows), limit_of(rows)), integrity_degraded)
+    result = _with_limit(_summary(final), configured_limit)
+    if include_roots:
+        grouped: Dict[str, list] = {}
+        for row in final:
+            rid = str(row.get("root_task_id") or "")
+            if rid:
+                grouped.setdefault(rid, []).append(row)
+        result["by_root"] = {
+            rid: _with_integrity(_with_limit(_summary(grouped[rid]), limit_of(grouped[rid])),
+                                 integrity_degraded)
+            for rid in sorted(grouped)
+        }
+    return _with_integrity(result, integrity_degraded)
+
+
 def usage_projection(
     drive_root: pathlib.Path | str | None = None,
     *,
@@ -460,61 +490,24 @@ def usage_projection(
     include_roots: bool = True,
 ) -> Dict[str, Any]:
     """Return a replayed global projection, or one root/subtree projection.
-
-    ``include_roots=False`` skips building the per-root ``by_root`` map for
-    hot-path readers that never consume it (``/api/state``); the slim result
-    still carries ``limit_usd``/``remaining_known_usd`` — the two fields
-    ``budget_remaining`` consumes. The default keeps the full contract."""
+    ``include_roots=False`` skips the per-root ``by_root`` map for hot-path
+    readers that never consume it (``/api/state``); the slim result still
+    carries the two fields ``budget_remaining`` reads."""
     root = _drive_root(drive_root)
     if root_task_id:
-        cache_key = ("usage_projection", root_task_id, "", None, True)
-
-        def render_root(final: list, integrity_degraded: bool) -> Dict[str, Any]:
-            rows = [row for row in final if str(row.get("root_task_id") or "") == root_task_id]
-            limits = [_number(row.get("root_limit_usd")) for row in rows]
-            known_limits = [value for value in limits if value is not None]
-            result = _with_limit(_summary(rows), min(known_limits) if known_limits else None)
-            return _with_integrity(result, integrity_degraded)
-
-        return _render_cached(root, cache_key, render_root)
+        return _render_cached(
+            root, ("usage_projection", root_task_id, "", None, True),
+            lambda f, degraded: _projection_from_final(f, degraded, root_task_id=root_task_id))
     if global_limit_usd is not None:
         configured_limit = max(0.0, float(global_limit_usd))
     else:
         from ouroboros.settings_setup_contract import resolve_total_budget_usd
-
         configured_limit = resolve_total_budget_usd() or 0.0
-    apply_limit = global_limit_usd is not None or configured_limit > 0
-    cache_key = (
-        "usage_projection", "", "",
-        configured_limit if apply_limit else None,
-        include_roots,
-    )
-
-    def render_global(final: list, integrity_degraded: bool) -> Dict[str, Any]:
-        result = (
-            _with_limit(_summary(final), configured_limit) if apply_limit else _summary(final)
-        )
-        if include_roots:
-            grouped_rows: Dict[str, list] = {}
-            for row in final:
-                rid = str(row.get("root_task_id") or "")
-                if rid:
-                    grouped_rows.setdefault(rid, []).append(row)
-            result["by_root"] = {}
-            for rid in sorted(grouped_rows):
-                root_rows = grouped_rows[rid]
-                known_limits = [
-                    value
-                    for value in (_number(row.get("root_limit_usd")) for row in root_rows)
-                    if value is not None
-                ]
-                result["by_root"][rid] = _with_integrity(
-                    _with_limit(_summary(root_rows), min(known_limits) if known_limits else None),
-                    integrity_degraded,
-                )
-        return _with_integrity(result, integrity_degraded)
-
-    return _render_cached(root, cache_key, render_global)
+    limit = configured_limit if (global_limit_usd is not None or configured_limit > 0) else None
+    return _render_cached(
+        root, ("usage_projection", "", "", limit, include_roots),
+        lambda final, degraded: _projection_from_final(final, degraded, limit,
+                                                       include_roots=include_roots))
 
 
 def usage_breakdown(
@@ -523,11 +516,18 @@ def usage_breakdown(
     root_task_id: str = "",
     task_id: str = "",
 ) -> Dict[str, Any]:
-    """Read-only physical-call/token/cost buckets from validated ledger finals."""
+    """Read-only physical-call/token/cost buckets from validated ledger finals.
+    Both private compatibility fields — the ordered ``[compaction_epoch, seq]``
+    marker in ``_ledger_high_water_seq`` and the money projection in
+    ``_usage_projection`` — are rendered from THIS one validated read, so a
+    writer authorizes its projection with the marker of the same snapshot."""
     root = _drive_root(drive_root)
     cache_key = ("usage_breakdown", root_task_id, task_id, None, True)
 
     def render(final: list, integrity_degraded: bool) -> Dict[str, Any]:
+        # Marker and money are two renderings of THESE rows; unknown marker =>
+        # buckets stay readable while a compatibility writer fails safe.
+        ledger_marker = _marker_from_final(final)
         rows = final
         if root_task_id:
             rows = [row for row in rows if str(row.get("root_task_id") or "") == root_task_id]
@@ -556,20 +556,20 @@ def usage_breakdown(
 
         result = {
             **_with_integrity(_breakdown_bucket(rows), integrity_degraded),
+            "_ledger_high_water_seq": ledger_marker,
             "by_model": by_model,
             "by_provider": by_provider,
             "by_category": by_category,
             "by_task": by_task,
             "by_root": by_root,
-            # Execution-axis filter (v6.91): delegated (subscription-harness) rows only — a
-            # VIEW for "where did the money go" readers, never a third monetary sum or
-            # authority; disclosed-free settles $0, undisclosed stays `unknown`.
+            # v6.91 execution-axis VIEW of delegated (subscription-harness) rows for
+            # "where did the money go" readers; never a third monetary sum or authority.
             "delegated": _with_integrity(
                 _breakdown_bucket([row for row in rows if str(row.get("kind") or "") == "subscription_session"]),
                 integrity_degraded,
             ),
-            # Legacy call-count metadata and monetary delta stay explicit; neither
-            # is fabricated into a model/provider/category identity.
+            # Legacy call-count metadata and monetary delta stay explicit; neither is
+            # fabricated into a model/provider/category identity.
             "unattributed": {
                 "model": model_unattributed,
                 "provider": provider_unattributed,
@@ -585,6 +585,7 @@ def usage_breakdown(
             ):
                 for bucket in grouped_buckets.values():
                     _with_integrity(bucket, True)
+        result["_usage_projection"] = _projection_from_final(final, integrity_degraded)
         return result
 
     return _render_cached(root, cache_key, render)
@@ -605,7 +606,6 @@ def _reservation_cost(request: AttemptRequest) -> Optional[float]:
     prompt_tokens = max(0, int(request.prompt_tokens_estimate or 0))
     # OpenAI-family chars/4 estimates keep the measured 1.10 reservation envelope.
     from ouroboros.provider_models import normalize_model_identity
-
     normalized_model = normalize_model_identity(str(request.model or "").lstrip("~"))
     if (
         str(request.provider or "").strip().lower() in {"openai", "openrouter"}

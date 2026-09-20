@@ -357,6 +357,10 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
                 asPanel: true,
                 title: project.name || project.id,
                 initialScrollState: projectScrollStash.get(project.id) || null,
+                // The panel's Retry reruns the open transaction (fetch, paint, ACK)
+                // against the newest known revision, so a recovered read is also seen.
+                onHistoryRetry: () => acknowledgeProjectAfterPaint(
+                    lastProjectRows.find((row) => row.id === project.id) || project, null, { forcePaint: true }),
             });
             projectScrollStash.delete(project.id);
             projectInstances.set(project.id, inst);
@@ -400,7 +404,12 @@ async function acknowledgeProjectAfterPaint(project, instance = null, { forcePai
     inst.cancelHistoryPaint?.();
     const promise = (async () => {
         let paint = null;
-        try { paint = await inst.refreshHistory?.({ revision }); } catch {}
+        // A failed read is drawn by the instance itself (error + Retry in its
+        // history control) and resolves unpainted. A rejection here is a defect,
+        // not a slow network: it is reported, and still never acknowledged.
+        try { paint = await inst.refreshHistory?.({ revision }); } catch (err) {
+            console.error('Project history paint failed:', err);
+        }
         if (
             paint?.painted
             && Number(paint.revision) === revision
