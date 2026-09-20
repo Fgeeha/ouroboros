@@ -8,7 +8,7 @@ export const RECOVERY_HEALTHY_PROBE_LIMIT = 4;
 
 // Pause before the post-open state read is repeated after a non-answer; it grows
 // 1.5x per attempt up to the cap, the same curve the recovery probe uses.
-export const POST_OPEN_RETRY_MS = 2000;
+const POST_OPEN_RETRY_MS = 2000;
 const POST_OPEN_RETRY_MAX_MS = 30000;
 
 /**
