@@ -3,7 +3,8 @@
 // in-flight direct/ephemeral turn status reducer and snapshot hydration.
 import { executorIdentityMarkup } from './harness_presentation.js';
 import { compactModel, formatLogDuration, modelExecutionLabel } from './log_events.js';
-import { createSystemMessageAction, createSystemMessageActions } from './ui_helpers.js';
+import { createSystemMessageActions } from './ui_helpers.js';
+import { projectReference } from './project_reference.js';
 import { joinMarkdownHeadings } from './utils.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import {
@@ -1169,14 +1170,9 @@ export function renderRoutingAnnotation(bubble, annotation, chatId = 1) {
         && Number(annotation.project_chat_id) !== Number(chatId)
         && ['scheduled', 'delivered'].includes(status);
     if (destination) {
-        const button = createSystemMessageAction({
-            label: 'Open Project', title: 'Open Project',
-            onClick: () => window.dispatchEvent(new CustomEvent('ouro:open-project', { detail: {
-                project: { id: annotation.project_id, chat_id: Number(annotation.project_chat_id) },
-                task_id: annotation.target || '',
-            } })),
-        });
-        const actions = createSystemMessageActions(button);
+        const actions = createSystemMessageActions(projectReference(
+            { id: annotation.project_id, chat_id: Number(annotation.project_chat_id) }, { taskId: annotation.target || '' },
+        ));
         actions.classList.add('msg-routing-actions');
         const time = bubble.querySelector('.msg-time');
         if (time) time.before(actions);
