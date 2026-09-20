@@ -115,7 +115,7 @@ export function fixture({ fetchImpl, renderMarkdown, enhanceMarkdown, onDomWrite
                 ...(sent.comment ? { comment: sent.comment } : {}) }) };
         },
         frameNode,
-        renderMarkdown,
+        mountMarkdown: renderMarkdown ? (host, text) => { host.innerHTML = renderMarkdown(text); } : null,
         enhanceMarkdown: enhanceMarkdown || (renderMarkdown ? () => {} : null),
         showToast: (text, tone) => toasts.push({ text, tone }),
         onDomWrite,
