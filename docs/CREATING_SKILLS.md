@@ -1044,7 +1044,7 @@ are the one exception — "What the frame may do" below). The bridge exposes:
 
 - **`OuroborosWidget.onTheme(callback)`** is an optional resolved-palette
   subscription for module widgets. The callback receives `light` or `dark`
-  through the nonce-bound parent bridge and returns an unsubscribe function.
+  through the nonce-bound parent bridge; `onTheme` returns an unsubscribe function.
   The module applies the value itself, commonly with
   `document.documentElement.dataset.theme = theme`; the host never injects CSS,
   changes the child DOM or forces a remount. The first callback receives the
