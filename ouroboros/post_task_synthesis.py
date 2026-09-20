@@ -332,6 +332,39 @@ def _child_failure_classes(rows: Any) -> list:
     return sorted(classes)
 
 
+def _child_engine_facts(item: Dict[str, Any]) -> Dict[str, Any]:
+    """WHO ran a child and for how long, from the child's OWN stored record.
+
+    Facts only: the frozen ``configured_subagent`` snapshot names the engine
+    (never the live roster, which would relabel the past), under the same handle
+    the catalog shows. ``used_model`` is reported for an API child alone — a
+    session child's ``model_execution`` describes its nanny's rounds, not the
+    leaf. A duration needs both stamps: only the ordinary terminal write stamps
+    ``ts``, so a row whose ``ts`` does not follow its start yields none.
+    """
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.subagent_history import execution_identity, snapshot_handle
+
+    facts: Dict[str, Any] = {}
+    snapshot = item.get("configured_subagent")
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("route"), dict):
+        identity = execution_identity(snapshot)
+        facts["engine"] = {
+            "subagent_id": snapshot_handle(snapshot), "kind": identity["kind"],
+            "target": identity["target_id"],
+            **{key: identity[key] for key in ("effort", "access") if identity.get(key)},
+        }
+        execution = item.get("model_execution")
+        if identity["kind"] == "api_model" and isinstance(execution, dict) and execution.get("used_model"):
+            facts["used_model"] = execution["used_model"]
+    started, finished = parse_deadline_ts(item.get("started_at")), parse_deadline_ts(item.get("ts"))
+    if started is not None:
+        facts["started_at"] = item["started_at"]
+        if finished is not None and finished > started:
+            facts["duration_sec"] = round((finished - started).total_seconds(), 1)
+    return facts
+
+
 def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> tuple:
     """Compact evidence from child/subagent results for parent experience review.
 
@@ -360,6 +393,7 @@ def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> t
                 "task_id": item.get("task_id") or item.get("id"),
                 "status": item.get("status"),
                 "role": item.get("role"),
+                **_child_engine_facts(item),
                 "outcome_axes": normalize_outcome_axes(item),
                 "accounted_upper_bound_usd": child_cost,
                 "trace_summary": _truncate_with_notice(item.get("trace_summary", ""), 800),
