@@ -30,6 +30,7 @@ from ouroboros.configured_subagents import (
 from ouroboros.delegate_shared import delegate_payload
 from ouroboros.route_spec import route_spec_dict
 from ouroboros.settings_integrity import SETTINGS_ENV_LOCK, TaskSettingsSnapshot, runtime_setting
+from ouroboros.subagent_history import snapshot_handle
 from ouroboros.tools.tool_result import ToolResult, _replace_tool_result
 from ouroboros.utils import utc_now_iso
 
@@ -378,7 +379,7 @@ def validate_subagent_snapshot(raw: Any, *, access: Optional[str] = None) -> dic
     if access not in (None, "inherit", *SESSION_ACCESS_LOWERING):
         raise SubagentSelectionError(
             "subagent_access_invalid",
-            f"access={access!r} for subagent_id={snapshot['selected_subagent_id']!r} "
+            f"access={access!r} for subagent_id={snapshot_handle(snapshot)!r} "
             f"({kind}) must be inherit, readonly or workspace_write; inherit preserves "
             "the configured session access, and API-model access is controlled by write_surface.")
     # API actors derive authority from write_surface; a populated session-only
@@ -819,8 +820,6 @@ def exact_start(ctx: Any, prompt: str, spec: Optional[dict[str, Any]] = None) ->
         payload = delegate_payload(result)
         if isinstance(selected_snapshot, dict):
             # Model-facing name: the snapshot's own handle; custody keeps the stored key.
-            from ouroboros.subagent_history import snapshot_handle
-
             payload["selected_subagent_id"] = snapshot_handle(selected_snapshot)
             payload["config_fingerprint"] = str(
                 selected_snapshot.get("config_fingerprint") or ""
@@ -867,8 +866,6 @@ def _names_bound_actor(selector: str, bootstrap: Mapping[str, Any]) -> bool:
     (the one the startup receipt shows) always name it; any other value goes
     through the same resolver as ``schedule_subagent`` against the live roster.
     """
-    from ouroboros.subagent_history import snapshot_handle
-
     expected_id = str(bootstrap.get("selected_subagent_id") or "")
     snapshot = bootstrap.get("snapshot") if isinstance(bootstrap.get("snapshot"), dict) else {}
     if selector in {expected_id, snapshot_handle(snapshot)}:
