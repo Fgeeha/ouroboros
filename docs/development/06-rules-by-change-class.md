@@ -689,7 +689,8 @@ and what enforces each.
   publishes the same `CostCeiling` object the loop decides on, and prices the wrap-up
   with the fence's own cache-aware reservation (`tests/test_network_budget_wallet.py`).
   Explicitly disabled profiles and real monetary fences stay independent; the
-  configured global budget is read through the one resolver, never an inline default.
+  configured global budget is read LIVE through the one resolver — never an inline
+  default, never a per-task capture (`tests/test_budget_resource_facts.py`).
   Post-task consolidation/synthesis reads one frozen `usage_breakdown` snapshot per
   root subtree (never `$0` on a read failure); no second ledger, no reconciliation LLM.
 - Runtime notices after the first user/assistant/tool turn are `[SYSTEM NOTICE]` user
@@ -703,7 +704,8 @@ and what enforces each.
   provider hints and recovery; do not add a generic cache/retry framework.
   Wrap-up calls keep schemas, server-web flag and `tool_choice` unchanged and
   instruct in text, because removing tools or changing tool choice rebuilds
-  cached input. Preserve `context_fit.seal_task_transcript`'s single message
+  cached input; a main-loop payload option lives in `main_loop_wire_options`, never
+  in one lane after its builder (`tests/test_wrapup_real_send_parity.py`). Preserve `context_fit.seal_task_transcript`'s single message
   marker as it moves between task and tool result; direct Anthropic and
   OpenRouter keep their supported wire markers. OpenRouter's derived identity
   excludes cache/host metadata, preserving real task/model differences and
@@ -944,11 +946,11 @@ and what enforces each.
   child-action controls stay strict; owner-source acknowledgement and forced
   finalization retain their rules. Context-only mail wakes waits but does not block
   owner-source acknowledgement or imply an owner revision. Empty or recognizable malformed controls retain
-  the answer (`tests/test_acceptance_optional_control.py`). Running-panel delivery
-  buys no second panel and causes no capacity refusal
-  (`acceptance_settlement._deliver_under_running_panel`). Default: wait; blocking: wait
-  only; Cyber Pro: never wait; advisory: early finish needs explicit
-  `"pending_review":"finish"` on delivery control. Keep the trace
+  the answer (`tests/test_acceptance_optional_control.py`). A text-only rewrite rides a
+  ready or pending PASS (no new panel or capacity refusal); a changed subject or owner
+  source does not (`acceptance_settlement._deliver_under_running_panel`). Pending: default wait;
+  Blocking waits; Cyber Pro never waits; Advisory finish needs explicit
+  `"pending_review":"finish"` in delivery control. Keep the trace
   past exit (`remember_settlement_trace`). Late settlement: attach to the ended result,
   announce once on its task card (`card_row="reviews"`); no model turn or reviewer-as-
   open-delegation. Workers never write Main's candidate/author decision; subtree/status,

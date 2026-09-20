@@ -13,11 +13,20 @@ import pytest
 
 from ouroboros import consciousness as clock_module
 from ouroboros.consciousness import (
-    ARCHIVED_INBOX_REL, INTERVAL_STATE_KEY, LEGACY_INBOX_REL, NEXT_WAKE_STATE_KEY, BackgroundConsciousness,
+    ARCHIVED_INBOX_REL,
+    INTERVAL_STATE_KEY,
+    LAST_WAKE_STATE_KEY,
+    LEGACY_INBOX_REL,
+    NEXT_WAKE_STATE_KEY,
+    BackgroundConsciousness,
 )
 from supervisor.active_activity import get_direct_activity_registry
 
 T0 = 1_800_000_000.0
+
+
+def _iso(ts):
+    return clock_module._iso(ts)
 FLOOR, CEILING, DEFAULT = 900, 14400, 3300
 AVAILABLE = {"status": "available", "limit_usd": 20.0, "accounted_usd": 2.5, "remaining_usd": 17.5,
              "resets_at": "", "unknown_unmetered": 0}
@@ -85,6 +94,35 @@ def test_boot_floor_never_wakes_in_the_first_second(clock):
     later = BackgroundConsciousness(clock.root, clock.root / "repo", lambda: 7, now=T0)
     assert later.next_wake_at == T0 + 5000
     assert later.enabled is True
+
+
+def test_boot_restores_the_previous_wake_boundary_for_context_since_window(clock):
+    clock.store[LAST_WAKE_STATE_KEY] = T0 - 3600
+    later = BackgroundConsciousness(clock.root, clock.root / "repo", lambda: 7, now=T0)
+    assert later.status_snapshot()["last_wake_at"].startswith("2027-")
+    assert later._last_wake_at == T0 - 3600
+
+
+def test_boot_discloses_invalid_wake_boundary_and_uses_process_start(caplog, clock):
+    for raw in ("not-a-timestamp", "NaN", "Infinity", T0 + 3600):
+        clock.store[LAST_WAKE_STATE_KEY] = raw
+        with caplog.at_level("WARNING"):
+            later = BackgroundConsciousness(clock.root, clock.root / "repo", lambda: 7, now=T0)
+        assert later._last_wake_at == 0.0
+    assert any("invalid persisted last wake boundary" in record.message for record in caplog.records)
+
+
+def test_restored_boundary_reaches_the_launched_wake_text(clock):
+    clock.store[LAST_WAKE_STATE_KEY] = T0 - 3600
+    (clock.root / "task_results").mkdir()
+    (clock.root / "task_results" / "settled.json").write_text(json.dumps({
+        "task_id": "settled", "status": "completed", "updated_at": _iso(T0 - 1800),
+        "ts": _iso(T0 - 1800), "description": "settled before restart", "_schema_version": 1,
+    }), encoding="utf-8")
+    later = BackgroundConsciousness(clock.root, clock.root / "repo", lambda: 7, now=T0)
+    assert later.tick(T0 + FLOOR + 1) == "launched"
+    assert "- task settled completed" in clock.launches[-1]["text"]
+    assert "no wake since this process started" not in clock.launches[-1]["text"]
 
 
 def test_legacy_inbox_is_archived_once_without_being_read(clock):
@@ -190,6 +228,12 @@ def test_launch_starts_an_ordinary_main_turn_with_the_wake_envelope(clock):
     assert snapshot["last_wake_task_id"] == "wake0001" and snapshot["last_wake_outcome"] == "running"
     started = [row for row in _events(clock.root) if row["type"] == "consciousness_wake_started"]
     assert started and started[0]["task_id"] == "wake0001" and started[0]["wake_reason"] == "heartbeat"
+
+
+def test_launch_text_carries_the_trigger_line(clock):
+    clock.clock.notify("task_finished:done:completed")
+    assert clock.clock.tick(T0 + FLOOR + 1) == "launched"
+    assert "- wake cause: task done finished (completed)" in clock.launches[-1]["text"]
 
 
 def test_launch_carries_the_main_lane_routing_facts_an_owner_turn_gets(clock):
@@ -343,6 +387,7 @@ def test_finish_schedules_the_chosen_interval_clamped(clock, monkeypatch):
     clock.store[INTERVAL_STATE_KEY] = 100  # below the floor
     finished("wake0001", True)
     assert clock.clock.next_wake_at == T0 + 5000 + FLOOR
+    assert clock.store[LAST_WAKE_STATE_KEY] == T0 + 5000
     snapshot = clock.clock.status_snapshot()
     assert snapshot["last_wake_outcome"] == "done" and snapshot["last_error"] == ""
     assert snapshot["last_wake_at"].startswith("2027-")
@@ -431,7 +476,7 @@ def test_project_digest_and_orphan_heal_reach_notify(monkeypatch, tmp_path):
     _handle_project_digest({"project_id": "p9", "task_id": "t9"}, ctx)
     # A digest of a tree consciousness started is its own news: never a wake reason.
     _handle_project_digest({"project_id": "p9", "task_id": "t10", "initiator": "consciousness"}, ctx)
-    assert reasons == ["project_digest:p9"]
+    assert reasons == ["project_digest:p9:t9"]
     monkeypatch.setattr("ouroboros.skill_review_runner.reconcile_stale_review_jobs", lambda root: None)
     monkeypatch.setattr("ouroboros.task_status.reconcile_orphaned_running_tasks", lambda root, **kw: 2)
     monkeypatch.setattr("ouroboros.projects_registry.reconcile_projects", lambda root: None)

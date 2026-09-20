@@ -873,3 +873,111 @@ they loaded. A module may opt into the existing `OuroborosWidget.onTheme` signal
 and apply its own `data-theme` rules, but the kit introduces no theme polling,
 forced remount or mandatory visual conformance. Author layout, validation, operations and loading feedback remain
 author-owned; the small source recipes are in `docs/examples/author_ui_kit/`.
+
+---
+
+## 9. Notifications
+
+This section is the ONE canonical statement of when Ouroboros pulls the owner
+back to the interface. `docs/DEVELOPMENT.md` points here and adds only
+engineering rules; no second policy list may exist.
+
+**Meaning.** A notification means *come back, there is something here for you* —
+never *look, I am still working*. It exists so the owner can leave the window
+and still be reached by a question or a finished task.
+
+**When the client runs.** Notifications are a property of a running client. This
+version adds no tray agent, no background process and no push channel, so
+closing Ouroboros ends them. The existing Telegram bridge remains the separate
+path that reaches the owner while nothing is open.
+
+**Focus does not suppress, and neither does a closed room.** While a category is
+on, its event notifies whether or not the window has focus and whether or not
+the relevant chat is open. A Project's question reaches the owner even when that
+Project was never opened in this session — which is the whole point, and the
+reason the subscription belongs to the client rather than to a room. That is
+deliberate for the first version: we measure how it feels before adding clever
+exceptions.
+
+**Two authorities, one surface.** Every category is one of two kinds:
+
+| Category | Kind | What decides |
+|---|---|---|
+| A question or decision is waiting | required | a confirmed lifecycle fact: the question carries a positive wait |
+| A task finished or stopped | required | a positive typed terminal fact on a ROOT task |
+| Messages Ouroboros sends while working | LLM-first | Ouroboros chose to speak outside the turn's answer (a proactive message, or an optional question) |
+| Ordinary replies in Main | separate toggle | an ordinary finished reply in the Main thread |
+
+*Required* means the application asks for delivery from its own state rather
+than relying on the model to remember. It does not mean the notification
+bypasses OS permission, Do Not Disturb or platform limits — nothing here
+claims that.
+
+*LLM-first* costs no extra model call and needs no new host field: the signal is
+that Ouroboros already chose to speak outside its answer
+(`send_user_message`) or to ask something optional. The decision to send is the
+mind's; the client only carries it. Stated precisely because the tool contract
+asks for such a message at the START of long work as well: this category means
+"Ouroboros said something while working", not a claim that it weighed whether
+to interrupt you. Judge it by use and turn it off if it is too chatty.
+
+**What never notifies.** Progress, a transient failure, one tool's error and a
+reviewer's finding are not notifications; they stay in the transcript. A child
+task never notifies the owner: it escalates to its parent, and only the parent's
+own message or the root's terminal can ring. Machine partitions — the hidden
+chat and agent-to-agent traffic — never reach a banner. A Project's room
+notifies once this client knows it; any other ordinary conversation, including
+one arriving over an external transport, is treated as the owner's exactly as
+the Main thread itself treats it.
+
+**A terminal is not always an ending.** An update or restart teardown reports a
+task as interrupted and then requeues it; that is not a finished task and does
+not notify, so the task's real completion still can.
+
+**One ending, one notification.** An ordinary reply and the terminal of the same
+task are one event, not two: whichever arrives first rings, and the other is
+collapsed. The same holds for the several wire shapes a finished task has.
+
+**One sound.** At most one sound per event. Where the system shows a banner, the
+system owns the sound; where delivery falls back into the application, the app
+plays one short tone. Never both.
+
+**Each open window is its own client.** Settings, permission and the
+duplicate-collapsing that keeps one event to one notification all belong to one
+running page. Two windows of the same device — the desktop shell and a browser
+tab — are two clients and can each notify for the same event. That is the
+honest consequence of per-client settings, not a bug we have hidden.
+
+**Click goes to the source.** A notification opens the question or the result it
+is about — the Project room and the exact question when it has one, otherwise
+the conversation. No reply is composed from the banner.
+
+**Content is private by default.** Only the kind of event is shown until the
+owner turns message text on, because a banner can appear on a shared screen.
+
+**Deliberately absent.** No numeric badge, no repeated reminder, no inline
+reply, no tray icon, no Telegram escalation, and in this version no native dock
+attention — the packaged launcher cannot gain a new bridge method before it is
+rebuilt, and the interface should not promise what the running build cannot do.
+
+**Settings.** The controls live on **Settings → Appearance**, under the theme
+block, and are stored per client exactly like the appearance choice: the desktop
+window and each browser keep their own, nothing reaches the server. A test
+button is the honest way to see what this system actually does with a
+notification, including a denied permission.
+
+**Known limits of this version**, stated rather than discovered later:
+
+- A task retried under the same id has one conclusion as far as notifications
+  are concerned; a second terminal for that id stays quiet.
+- Duplicate collapsing is bounded (the oldest keys are forgotten after a very
+  large number of events in one session), so a frame for a long-past event
+  could ring again.
+- A child task is recognised from the delegation facts its traffic carries (its
+  declared lineage, or the executor enrichment on its own terminal). Nothing on
+  the wire declares a task to BE a root, so a task with no such fact is treated
+  as one: requiring proof of root-ness would silence every finished task. The
+  narrow residual is a child that carries no delegation fact at all and whose
+  first observed frame is its terminal — it would notify once.
+- An event that happens while the socket is down never rings: reconnect replays
+  history, and history is deliberately silent.

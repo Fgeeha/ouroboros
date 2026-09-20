@@ -785,7 +785,7 @@ export function chatLogThreadAccepts(msg, isMain, chatId, projectChatIds) {
     return chatThreadAccepts(msg, false, chatId, projectChatIds);
 }
 
-const TERMINAL_TASK_STATUSES = new Set([
+export const TERMINAL_TASK_STATUSES = new Set([
     'completed', 'failed', 'cancelled', 'rejected_duplicate',
 ]);
 const TERMINAL_SUBAGENT_EVENTS = new Set([
