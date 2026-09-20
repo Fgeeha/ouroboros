@@ -24,7 +24,7 @@ def test_drift_capture_freezes_evidence_and_safe_reject_releases_empty_snapshot(
     (target / "neighbor.txt").write_text("owner change\n", encoding="utf-8")
 
     capture = _capture_terminal_patch(ctx, entry)
-    assert capture["status"] == "failed"
+    assert capture["status"] == "ready_no_changes"
     assert capture["target_mutated_during_run"] == ["neighbor.txt"]
     manifest_path = custody.delegated_capture_dir(custody.custody_root(ctx), "t-nanny", "snapDrift") / "workspace_patch.json"
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
@@ -32,7 +32,7 @@ def test_drift_capture_freezes_evidence_and_safe_reject_releases_empty_snapshot(
     (target / "neighbor.txt").unlink()
 
     replay = _capture_terminal_patch(ctx, entry)
-    assert replay["status"] == "failed"
+    assert replay["status"] == "ready_no_changes"
     assert replay["target_mutated_during_run"] == ["neighbor.txt"]
     assert "Rejected delegated run" in _integrate_delegated_patch(
         ctx, "run-drift", "reject", "preserve for inspection")
@@ -51,7 +51,22 @@ def test_excluded_untracked_baseline_drift_is_not_clean(tmp_path, monkeypatch):
     (target / ".env").write_text("SECRET=changed\n", encoding="utf-8")
 
     capture = _capture_terminal_patch(ctx, entry)
-    assert capture["status"] == "failed"
+    assert capture["status"] == "ready_no_changes"
     assert capture["target_mutated_during_run"] == [".env"]
-    assert entry.patch_captured is False
+    assert entry.patch_captured is True
     custody._CUSTODY.clear()
+
+
+def test_nested_untracked_git_repository_does_not_break_snapshot_provision(tmp_path):
+    target = _seed_target(tmp_path)
+    nested = target / "vendor" / "inner"
+    nested.mkdir(parents=True)
+    import subprocess
+    subprocess.run(["git", "init", "-q"], cwd=nested, check=True)
+    (nested / "README").write_text("nested\n", encoding="utf-8")
+
+    handle = provision_execution_snapshot(
+        target_root=target, task_id="t-nested", snapshot_id="snapNested")
+
+    assert Path(handle.path).exists()
+    assert any(row.get("reason") == "nested_repository" for row in handle.excluded_untracked)

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from hashlib import sha256
 
 
@@ -88,8 +87,8 @@ def execution_binding_instruction(execution_root: str, authority_root: str) -> s
     if not execution:
         return ""
     return (
-        "\n\nDELEGATED EXECUTION BINDING (canonical host fact; supersedes path fields "
-        "in the inherited contract for this run): "
+        "\n\nDELEGATED EXECUTION BINDING (separate typed host fact; the canonical "
+        "work order remains byte-identical): "
         f"the sole writable execution root for this run is {execution}. "
         "Use relative paths or absolute paths under that root for every shell, "
         "file, and patch operation. The stable authority/project root "
@@ -101,51 +100,23 @@ def execution_binding_instruction(execution_root: str, authority_root: str) -> s
     )
 
 
-def _rebind_json_block(text: str, marker: str, execution_root: str, authority_root: str) -> str:
-    start = text.find(marker)
-    if start < 0:
-        return text
-    json_start = text.find("\n", start)
-    if json_start < 0:
-        return text
-    json_start += 1
-    try:
-        value, used = json.JSONDecoder().raw_decode(text[json_start:])
-    except (TypeError, ValueError):
-        return text
-    if not isinstance(value, dict):
-        return text
-
-    def rewrite(node):
-        if isinstance(node, dict):
-            for key, child in list(node.items()):
-                if key in {"workspace_root", "write_root"} and isinstance(child, str) and child:
-                    node[key] = execution_root
-                else:
-                    rewrite(child)
-            node.setdefault("authority_target_root", authority_root)
-        elif isinstance(node, list):
-            for child in node:
-                rewrite(child)
-
-    rewrite(value)
-    rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
-    return text[:json_start] + rendered + text[json_start + used:]
+def directory_copy_binding_instruction(authority_root: str) -> str:
+    """Tell a directory-copy child that the engine creates its write root later."""
+    authority = str(authority_root or "").strip() or "(unknown)"
+    return (
+        "\n\nDELEGATED DIRECTORY COPY BINDING (separate typed host fact; the canonical "
+        "work order remains byte-identical): the engine will create a private "
+        "execution copy for this run. Use only the engine-provided working "
+        "directory/cwd for writes; the selected authority folder "
+        f"{authority} is a read-only source reference. Do not write to that "
+        "authority folder directly."
+    )
 
 
-def bind_execution_assignment(text: str, execution_root: str, authority_root: str) -> str:
-    """Rewrite child-facing structured path fields before appending the binding."""
-    bound = _rebind_json_block(text, "HOST TASK CONTRACT AUTHORITY", execution_root, authority_root)
-    return _rebind_json_block(bound, "HOST AUTHORITY BINDING", execution_root, authority_root)
-
-
-def apply_execution_binding(instructions: str, prompt: str, compiled: bool,
-                            execution_root: str, authority_root: str) -> tuple[str, str]:
-    binding = execution_binding_instruction(execution_root, authority_root)
-    instructions = bind_execution_assignment(instructions, execution_root, authority_root) + binding
-    if compiled:
-        prompt = bind_execution_assignment(prompt, execution_root, authority_root) + binding
-    return instructions, prompt
+def apply_execution_binding(instructions: str, execution_root: str,
+                            authority_root: str) -> str:
+    """Append one typed binding without rewriting canonical work-order bytes."""
+    return instructions + execution_binding_instruction(execution_root, authority_root)
 
 
 def append_coordination_context(

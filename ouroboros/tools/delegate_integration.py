@@ -465,37 +465,25 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
         block["target_drift_checked"] = True
     if drift_paths:
         block["target_mutated_during_run"] = drift_paths
-        if status == ARTIFACT_STATUS_READY_WITH_CHANGES:
-            block["note"] = (
-                "NOT APPLIED: the run edited its private execution snapshot only. "
-                "Authority-tree drift was observed while the result was captured; "
-                "the existing locked baseline check will decide whether integration "
-                "is safe. Nothing reaches the shared tree until explicit disposition."
-            )
+        block["note"] = (
+            "The private execution snapshot has no captured file changes, but the "
+            "authority tree changed while the run was open. The author is unknown: "
+            "the child, a neighbor, or another process may have written there. "
+            "The drift is diagnostic evidence; it is not attributed to this child."
+            if status == ARTIFACT_STATUS_READY_NO_CHANGES else
+            "NOT APPLIED: the run edited its private execution snapshot only. "
+            "Authority-tree drift was observed while the result was captured; "
+            "the existing locked baseline check will decide whether integration "
+            "is safe. Nothing reaches the shared tree until explicit disposition."
+        )
     if drift_error:
         block["target_drift_unknown"] = drift_error
-        if status == ARTIFACT_STATUS_READY_WITH_CHANGES:
+        if status == ARTIFACT_STATUS_READY_NO_CHANGES:
             block["note"] = (
-                "NOT APPLIED: the run edited its private execution snapshot only. "
-                f"Authority-tree drift could not be verified ({drift_error}); the "
-                "locked integration check remains fail-closed. Nothing reaches the "
-                "shared tree until explicit disposition."
-            )
-    if (drift_paths or drift_error) and status == ARTIFACT_STATUS_READY_NO_CHANGES:
-        block["status"] = "failed"
-        if drift_error:
-            block["note"] = (
-                "TARGET DRIFT UNKNOWN: the host could not prove that the authority "
-                f"tree stayed unchanged ({drift_error}). No disposition is authorized; "
-                "preserve the snapshot and captured material for inspection."
-            )
-        else:
-            block["note"] = (
-                "TARGET MUTATED DURING RUN: the authority tree changed relative to the "
-                "delegated baseline while this run was open. The host cannot attribute "
-                "those bytes to the child, so the private capture is not a clean "
-                "no-changes result and no disposition is authorized. Preserve the "
-                "snapshot and captured material for inspection."
+                "The private execution snapshot has no captured file changes, but "
+                f"authority-tree drift could not be verified ({drift_error}). "
+                "The author is unknown; preserve this diagnostic fact and use the "
+                "normal no-change disposition."
             )
     if status not in {ARTIFACT_STATUS_READY_WITH_CHANGES, ARTIFACT_STATUS_READY_NO_CHANGES}:
         # A failed manifest's own typed note (unreviewable_metadata_change,

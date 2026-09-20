@@ -41,20 +41,18 @@ The harness can execute model-generated commands under the operator's OS
 identity. It is not assumed hostile, but the host cannot review each command
 before it runs.
 
-When a private snapshot exists, the host appends a canonical execution binding
-after the inherited work order: the snapshot is the only writable root and the
-stable project root is a read-only identity until explicit integration. The
-binding supersedes path fields in the inherited assignment; legacy engines that
-expose only the snapshot as `scope.root` receive the same binding using that
-root. Full native access does not make that path binding enforceable by itself,
-so terminal capture rechecks the authority root against the recorded baseline.
-A ready-no-changes result with drift or an unverifiable check is a failed capture
-with retained evidence; an explicit reject can still release that empty private
-snapshot, while apply remains refused. A ready-with-changes result retains its
-private artifact and lets the existing locked apply check decide whether
-integration is safe. Authority checks include eligible file inputs and excluded
-untracked preimages, so an omitted sensitive file cannot turn a changed target
-into a clean result.
+When a private snapshot exists, the host appends a separate typed execution
+binding after the immutable inherited work order: the snapshot is the writable
+root and the stable project root is a read-only identity until explicit
+integration. Legacy engines that expose only the snapshot as `scope.root`
+receive the same binding using that root. Full native access does not make the
+binding enforceable by itself, so terminal capture records authority-tree drift
+as diagnostic evidence. A ready-no-changes result remains a normal no-change
+capture even when the shared authority tree moved; the evidence names the
+changed paths and keeps authorship unknown. A ready-with-changes result retains
+its private artifact and the existing locked apply check decides whether
+integration is safe. Excluded nested repositories remain outside the snapshot
+inventory and are disclosed as an untracked residual.
 
 A read-only child requests `mode: ask`, `access: readonly` under Claudexor's
 ordinary envelope. The host reads effective access back for both shapes;

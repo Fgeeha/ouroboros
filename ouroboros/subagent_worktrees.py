@@ -545,6 +545,10 @@ def provision_execution_snapshot(
             file_inputs: List[str] = []
             capture_warnings: List[Dict[str, Any]] = []
             for rel in (p for p in untracked_raw.split("\0") if p):
+                candidate = target / rel
+                if candidate.is_dir() and not candidate.is_symlink():
+                    excluded.append({"path": rel, "reason": "nested_repository"})
+                    continue
                 reference: List[str] = []
                 reason = untracked_capture_veto_reason(target, rel, file_outputs=reference, warnings=capture_warnings)
                 if reference:

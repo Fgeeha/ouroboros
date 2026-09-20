@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pathlib
+import os
 import subprocess
 from typing import Any, Dict, List
 
@@ -20,13 +21,14 @@ def _target_drift_evidence(entry: Any) -> Dict[str, Any]:
         evidence["error"] = f"authority target is not a Git worktree: {target}"
         return evidence
     try:
+        git_env = {**os.environ, "GIT_OPTIONAL_LOCKS": "0"}
         def git_error(proc, fallback):
             detail = proc.stderr or proc.stdout or b""
             return (detail.decode("utf-8", "replace") if isinstance(detail, bytes) else str(detail)).strip() or fallback
 
         baseline_files = subprocess.run(
             ["git", "ls-tree", "-r", "-z", "--name-only", baseline],
-            cwd=str(target), capture_output=True, check=False,
+            cwd=str(target), capture_output=True, check=False, env=git_env,
         )
         if baseline_files.returncode != 0:
             evidence["error"] = git_error(baseline_files, f"git ls-tree exited {baseline_files.returncode}")
@@ -62,6 +64,8 @@ def _target_drift_evidence(entry: Any) -> Dict[str, Any]:
         for row in excluded_rows:
             if not isinstance(row, dict) or not row.get("path"):
                 continue
+            if row.get("reason") == "nested_repository" and not isinstance(row.get("baseline"), dict):
+                continue
             relative, before = str(row["path"]), row.get("baseline")
             if not isinstance(before, dict):
                 evidence["error"] = f"baseline identity unavailable for excluded path {relative}"
@@ -70,7 +74,7 @@ def _target_drift_evidence(entry: Any) -> Dict[str, Any]:
                 evidence["paths"].append(relative)
         diff = subprocess.run(
             ["git", "diff", "--name-only", "-z", "--no-renames", baseline, "--"],
-            cwd=str(target), capture_output=True, check=False,
+            cwd=str(target), capture_output=True, check=False, env=git_env,
         )
         if diff.returncode != 0:
             evidence["error"] = git_error(diff, f"git diff exited {diff.returncode}")
@@ -82,7 +86,7 @@ def _target_drift_evidence(entry: Any) -> Dict[str, Any]:
         )
         untracked = subprocess.run(
             ["git", "ls-files", "-z", "--others", "--exclude-standard"],
-            cwd=str(target), capture_output=True, check=False,
+            cwd=str(target), capture_output=True, check=False, env=git_env,
         )
         if untracked.returncode != 0:
             evidence["error"] = (untracked.stderr or b"").decode("utf-8", "replace").strip() or \
@@ -109,7 +113,6 @@ def _target_drift_paths(entry: Any) -> List[str]:
 
 def _persist_target_drift(manifest_path: pathlib.Path, manifest: Dict[str, Any],
                          evidence: Dict[str, Any]) -> Dict[str, Any]:
-    from ouroboros.headless import ARTIFACT_STATUS_READY_NO_CHANGES
     from ouroboros.utils import atomic_write_json, utc_now_iso
 
     updated = dict(manifest)
@@ -121,9 +124,5 @@ def _persist_target_drift(manifest_path: pathlib.Path, manifest: Dict[str, Any],
     }
     updated["authority_drift_status"] = (
         "unknown" if evidence.get("error") else "changed" if evidence.get("paths") else "clean")
-    if (evidence.get("error") or evidence.get("paths")) \
-            and updated.get("status") == ARTIFACT_STATUS_READY_NO_CHANGES:
-        updated["status"] = "failed"
-        updated["note"] = "Authority-tree drift was not accepted as a clean no-change capture; snapshot preserved."
     atomic_write_json(manifest_path, updated, trailing_newline=True)
     return updated

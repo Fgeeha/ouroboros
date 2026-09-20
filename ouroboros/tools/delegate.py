@@ -57,6 +57,7 @@ from ouroboros.delegate_start_instructions import (
     access_instruction,
     append_coordination_context,
     apply_execution_binding,
+    directory_copy_binding_instruction,
 )
 from ouroboros.subagent_runtime import (  # noqa: F401 - shared primitive re-export
     delegate_start_entry as _delegate_start_entry,
@@ -471,10 +472,11 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                     resource_ref = dict(record_auth.get("resource_ref") or {})
             execution_root = (root if directory_options.get("isolation") == "live" else "") if directory_options else delegated_execution_workspace_root(gateway, authority, root)
             scope_root = target_root if execution_root or directory_options else root
-            if snapshot is not None or (directory_options and directory_options.get("isolation") == "envelope"):
-                instructions, text = apply_execution_binding(
-                    instructions, text, bool(actor.get("compiled_work_order")),
-                    execution_root or root, target_root)
+            if snapshot is not None:
+                instructions = apply_execution_binding(
+                    instructions, execution_root or root, target_root)
+            elif directory_options and directory_options.get("isolation") == "envelope":
+                instructions += directory_copy_binding_instruction(target_root)
             (project_id, owned_project_id, project_persistent) = resolve_registration(
                 gateway, scope_root, execution_root, getattr(authority, "access", ""))
             if directory_options:
@@ -499,9 +501,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             idempotency_key=key, invocation_id=invocation_id,
             max_seconds=seconds, request=request_body, project_id=project_id,
             project_owned=bool(owned_project_id), project_persistent=project_persistent, route=route.route_id,
-            # Recovered pending invocations retain their original lineage.
             root_task_id=str(lineage.get("root_task_id") or ""), parent_task_id=str(lineage.get("parent_task_id") or ""),
-            # Before POST, persist target/baseline and only known execution paths.
             snapshot_id=snapshot_id, execution_root=(root if snapshot_id or resource_ref.get("strategy") == "direct" else ""),
             baseline_sha=baseline_sha, target_root=target_root,
             authority_source=authority_source, resource_ref=resource_ref,
