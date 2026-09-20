@@ -284,3 +284,27 @@ def test_owner_http_save_projects_full_choice_into_task_start_snapshot(monkeypat
         assert response.status_code == 200
         assert selected['access'] == 'full'
         assert json.loads(start.environ[SUBAGENTS_SETTING])['items'][0]['access'] == 'full'
+
+
+@pytest.mark.parametrize("historical", [False, True])
+def test_retry_preserves_recorded_binding_evidence(full_run, monkeypatch, historical):
+    ctx, target, facts = full_run
+    facts["lost_start"] = True
+    with monkeypatch.context() as prior:
+        if historical:
+            prior.setattr(delegate, "execution_binding_fingerprint", lambda *args: "")
+            prior.setattr(delegate, "apply_execution_binding", lambda instructions, *args: instructions)
+        initial = delegate_payload(delegate._delegate_start(ctx, "Exact original assignment."))
+    invocation = initial["pending_invocation_id"]
+    drive = custody.custody_root(ctx)
+    recorded = custody.invocation_record(drive, invocation)
+    fingerprint = recorded["execution_binding_fingerprint"]
+    assert bool(fingerprint) is not historical
+    original_request = facts["requests"][0]
+    facts["lost_start"] = False
+    result = delegate_payload(delegate._delegate_start(
+        ctx, "Exact original assignment.", retry_of=invocation))
+    assert result["status"] == "started", result
+    assert facts["requests"] == [original_request, original_request]
+    assert custody.invocation_record(drive, invocation)["execution_binding_fingerprint"] == fingerprint
+    assert custody.replay(drive)["full-run"].execution_binding_fingerprint == fingerprint

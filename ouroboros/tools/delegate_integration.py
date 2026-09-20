@@ -244,6 +244,7 @@ class _RetryBinding(NamedTuple):
     authority_source: str
     resource_ref: Dict[str, Any]
     processing: Dict[str, Any]
+    execution_binding_fingerprint: str
 
 
 def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token: str,
@@ -353,6 +354,7 @@ def _resolve_retry_invocation(ctx: ToolContext, drive: pathlib.Path, retry_token
         resource_ref=(record.get("resource_ref")
                       if isinstance(record.get("resource_ref"), dict) else {}),
         processing=deepcopy(record.get("processing") if isinstance(record.get("processing"), dict) else {}),
+        execution_binding_fingerprint=str(record.get("execution_binding_fingerprint") or ""),
     ), None
 
 

@@ -318,17 +318,6 @@ def _processing_start_request(request, actor, gateway, route):
                      "reason": "submitted" if "processingPreference" in request else "processing_not_submitted"}
 
 
-def _start_binding_fingerprint(current: str, root: str, target_root: str,
-                               snapshot_id: str, resource_ref: Dict[str, Any]) -> str:
-    if current:
-        return current
-    if snapshot_id:
-        return execution_binding_fingerprint(root, target_root, "snapshot")
-    if resource_ref.get("strategy") == "copy":
-        return execution_binding_fingerprint("", target_root, "directory_copy")
-    return ""
-
-
 def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = None,
                     retry_of: Optional[str] = None, root: Optional[str] = None,
                     bucket: Optional[str] = None, skill_name: Optional[str] = None,
@@ -390,7 +379,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             return refusal
         (request_body, route, authority, root, key, project_id, owned_project_id,
          project_persistent, seconds, snapshot_id, target_root, baseline_sha,
-         authority_source, resource_ref, processing_info) = binding
+         authority_source, resource_ref, processing_info, binding_fingerprint) = binding
         invocation_id = retry_token
         if directory_strategy is not None or scope_paths is not None:
             return _fail("delegate_start", "retry_selector_conflict",
@@ -519,8 +508,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             project_owned=bool(owned_project_id), project_persistent=project_persistent, route=route.route_id,
             root_task_id=str(lineage.get("root_task_id") or ""), parent_task_id=str(lineage.get("parent_task_id") or ""),
             snapshot_id=snapshot_id, execution_root=(root if snapshot_id or resource_ref.get("strategy") == "direct" else ""),
-            execution_binding_fingerprint=_start_binding_fingerprint(
-                binding_fingerprint, root, target_root, snapshot_id, resource_ref),
+            execution_binding_fingerprint=binding_fingerprint,
             baseline_sha=baseline_sha, target_root=target_root,
             authority_source=authority_source, resource_ref=resource_ref,
             # Recovery proves the original actor and compiled brief before adoption.
@@ -609,8 +597,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         config_fingerprint=config_fingerprint, work_order_fingerprint=work_order_fingerprint,
         work_order_coverage=work_order_coverage, work_order_source_request=work_order_source_request,
         authority_fingerprint=authority_fingerprint, snapshot_id=snapshot_id,
-        execution_binding_fingerprint=_start_binding_fingerprint(
-            binding_fingerprint, root, target_root, snapshot_id, resource_ref),
+        execution_binding_fingerprint=binding_fingerprint,
         target_root=target_root, baseline_sha=baseline_sha,
         authority_source=authority_source, resource_ref=resource_ref, processing=processing_info,
         capture_mode=("engine_directory" if resource_ref.get("workspace_kind") == "directory" else
