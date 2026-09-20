@@ -58,7 +58,7 @@ def _alert_chat_turn_wedge(task_id, gap: float) -> None:
                     "task_incident": "chat_turn_wedge",
                     "toast_once": f"{task_id or 'direct-chat'}:chat_turn_wedge",
                 },
-            )
+                role="system", system_type="runtime_liveness_notice")
     except Exception:
         log.debug("chat-turn wedge owner alert failed", exc_info=True)
 
@@ -112,8 +112,8 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
                             from supervisor.message_bus import send_with_budget
                             send_with_budget(
                                 owner_chat,
-                                f"⚠️ My supervisor loop stalled for ~{int(gap)}s — new messages may be "
-                                "delayed. I recover on the next tick or a restart; investigating.",
+                                f"⚠️ The supervisor loop stalled for ~{int(gap)}s — new messages may be "
+                                "delayed. A later tick or restart may restore responsiveness.",
                                 is_progress=True,
                                 progress_meta={
                                     "task_incident": "supervisor_loop_stall",
@@ -122,7 +122,7 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
                                     # toast-dedupe set outlives this process while the page stays open.
                                     "toast_once": f"supervisor-loop-stall:{os.getpid()}:{int(liveness[0])}",
                                 },
-                            )
+                                role="system", system_type="runtime_liveness_notice")
                     except Exception:
                         log.debug("loop-stall owner alert failed", exc_info=True)
                     loop_alerted = True

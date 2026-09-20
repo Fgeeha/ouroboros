@@ -1394,6 +1394,8 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
             "text": text if log_text is None else log_text,
             "content": _text,
             "format": fmt,
+            "role": str(role or "") or "assistant",
+            "system_type": str(system_type or ""),
         }
         if progress_meta:
             progress_record.update(dict(progress_meta))

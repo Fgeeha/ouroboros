@@ -32,7 +32,7 @@ def test_constrained_repair_promotes_managed_task_before_busy_direct_lane(monkey
         update_state=lambda mutator: (lambda st: (mutator(st), st)[1])({"owner_id": 1}),
         consciousness=SimpleNamespace(inject_observation=lambda *_: None, pause=lambda: None, resume=lambda: None),
         get_chat_agent=lambda: agent,
-        send_with_budget=lambda chat_id, text: calls["sent"].append((chat_id, text)),
+        send_with_budget=lambda chat_id, text, **kw: calls["sent"].append((chat_id, text)),
         handle_chat_direct=lambda cid, txt, img, task_constraint=None, task_metadata=None: calls["direct"].append(task_constraint),
     )
     monkeypatch.setattr(

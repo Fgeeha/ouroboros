@@ -498,7 +498,7 @@ def test_owner_restart_proceeds_when_worker_shutdown_fails(tmp_path, monkeypatch
             mutator(live)
             return live
 
-        def send_with_budget(self, _chat_id, text):
+        def send_with_budget(self, _chat_id, text, **kwargs):
             messages.append(text)
 
         def safe_restart(self, **_kwargs):
@@ -601,7 +601,7 @@ def test_only_an_owner_restart_asks_for_the_runtime_mode_to_be_re_read(tmp_path,
             mutator(live)
             return live
 
-        def send_with_budget(self, _chat_id, _text):
+        def send_with_budget(self, _chat_id, _text, **kwargs):
             return None
 
         def safe_restart(self, **_kwargs):
