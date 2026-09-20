@@ -864,6 +864,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
     # IMPORTANT: live catalog I/O belongs before ``with _locked(root)`` below — the lock protects only the atomic budget read/check/append transaction.
     bound = _reservation_cost(request)
     pricing_known = bound is not None
+    global_limit = _global_limit(request)  # may read the settings document: outside the ledger lock, like pricing
     attempt_id = uuid.uuid4().hex
     with _locked(root) as ledger_lock:
         # CPL4-C6: opportunistic size-triggered compaction on exactly the path
@@ -876,7 +877,6 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
         records = _read_records_locked_cached(root)
         finals = list(_final_rows(records).values())
         global_summary = _summary(finals)
-        global_limit = _global_limit(request)
         accounted = float(global_summary["accounted_usd"])
         if global_limit <= 0 or accounted >= global_limit - 1e-9 or (
             bound is not None and accounted + bound > global_limit + 1e-9

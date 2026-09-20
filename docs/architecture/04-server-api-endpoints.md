@@ -13,7 +13,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | GET | `/` | `server.index_page` |
 | GET | `/api/health` | `gateway.state.api_health` |
 | GET | `/api/state` | `gateway.state.api_state` |
-| GET | `/api/extensions` | `gateway.extensions.api_extensions_index` (unique rows additionally carry `content_hash`, `published` (validated receipt object or null), `published_malformed`; identity-collision rows carry `identity_collision: true` and omit the receipt fields) |
+| GET | `/api/extensions` | `gateway.extensions.api_extensions_index` (unique rows additionally carry `content_hash`, `published` (validated receipt object or null), `published_malformed`; identity-collision rows carry `identity_collision: true` and omit the receipt fields; a hub row's display hints `official_hub_verified`/`owner_attestable` are matched against the fresh display-plane catalog memo and are `null` without one — this GET never fetches the catalog) |
 | POST | `/api/skills/{skill}/publish-preflight` | `gateway.skill_publish.api_skill_publish_preflight` |
 | GET | `/api/extensions/{skill}/manifest` | `gateway.extensions.api_extension_manifest` |
 | GET | `/api/extensions/{skill}/module/{entry:path}` | `gateway.extensions.api_extension_module` (live-registration authorization, reviewed `.js`/`.mjs` siblings from captured texts, `Access-Control-Allow-Origin: *` on every answer) |
