@@ -500,7 +500,7 @@ def test_project_activity_stays_out_of_main_static_contract():
     project_answer = (root / "web" / "modules" / "project_answer.js").read_text(encoding="utf-8")
     door = (root / "web" / "modules" / "project_reference.js").read_text(encoding="utf-8")
     assert "projectReference({ id: projectId, name: projectName })" in project_answer
-    assert "name !== String(project?.id || '') ? name : 'Project'" in door
+    assert "MINTED_ID.test(name)) ? name : 'Project'" in door
     assert "name: projectName || projectId" not in chat + project_answer
 
 

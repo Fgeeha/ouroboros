@@ -36,7 +36,8 @@ _WINDOW = 900  # characters after `createElement('button')` in which its own tex
 
 def _sources() -> list[pathlib.Path]:
     web = REPO_ROOT / "web"
-    return [*sorted((web / "modules").glob("*.js")), web / "app.js", web / "index.html"]
+    shell = [path for path in sorted(web.glob("*.js")) if not path.name.endswith((".min.js", ".config.js"))]
+    return [*sorted((web / "modules").glob("*.js")), *shell, web / "index.html"]
 
 
 def _clean(text: str) -> str:

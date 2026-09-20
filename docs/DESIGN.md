@@ -340,9 +340,11 @@ therefore about intents.
   the owner's routed message, a mirrored answer, a mirrored question's head.
   `web/modules/project_reference.js` builds it and alone raises
   `ouro:open-project`; a caller chooses a layout (`inline`, `bar`, `footer`),
-  never a label or a class. It names the Project — one that was never named
-  reads `Project`, never an id. Words appear only as a closed state of the same
-  control (`running in background` on a converted card). Its accessible name
+  never a label or a class. It names the Project wherever its row carries the
+  name; a Project that was never named, and the owner's routed message (whose
+  caption names the destination), read `Project`, never an id. Words appear
+  only as a closed state of the same control (`running in background` on a
+  converted card). Its accessible name
   says in words what the glyph and the arrow say in pixels (`Open project <name>`),
   and nothing depends on hover.
 - A **command** is a button: it changes or confirms something, or goes to a
@@ -350,9 +352,10 @@ therefore about intents.
   Tabs, toggles, menus and the navigation list keep their own roles; a status
   chip states a fact and is not a destination.
 - An intent that will be drawn in a second place gets its door first.
-  `docs/inventories/UI_CONTROL_TEXT_INVENTORY.md` lists the fixed text of every
-  control sorted by text, and every `ouro:*` event with the modules that raise
-  it, so a diff that adds a control shows its siblings in the same hunk. Read
+  `docs/inventories/UI_CONTROL_TEXT_INVENTORY.md` lists the fixed text of the
+  hand-written buttons sorted by text (a label passed to a factory is that
+  factory's business), and the `ouro:*` events with the modules that raise
+  them, so a diff that adds a button shows its siblings in the same hunk. Read
   them: "it reuses a shared primitive" does not show that two controls agree.
 
 ### Chat authorship and System rows

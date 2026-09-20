@@ -20,10 +20,12 @@ const STATE_WORDS = { '': '', background: 'running in background' };
 // What a press opens, per mounted reference: a name that arrives later reaches the payload too.
 const targets = new WeakMap();
 
-// A row that was never named carries its id as the name (the host says `Project` for it too).
+// A row that was never named carries its minted id as the name. Only that shape is a non-name:
+// an owner's own `blog` has the id `blog` too, and it IS the name.
+const MINTED_ID = /^proj_[0-9a-f]+$/;
 function displayName(project) {
     const name = String(project?.name || '').trim();
-    return name && name !== String(project?.id || '') ? name : 'Project';
+    return name && !(name === String(project?.id || '') && MINTED_ID.test(name)) ? name : 'Project';
 }
 
 /** One name for the visible text, the tooltip and the accessible name, so they cannot disagree. */
@@ -34,7 +36,7 @@ export function nameProjectReference(node, project) {
     const label = node.querySelector('.chat-live-project-name');
     if (label && label.textContent !== name) label.textContent = name;
     const words = STATE_WORDS[node.dataset.state || ''] || '';
-    const base = node.dataset.quizId ? `Open this question in ${name}` : `Open project ${name}`;
+    const base = node.dataset.opensQuestion ? `Open this question in ${name}` : `Open project ${name}`;
     const spoken = words ? `${base}, ${words}` : base;
     node.title = spoken;
     node.setAttribute('aria-label', spoken);
@@ -48,7 +50,7 @@ export function projectReference(project, { layout = 'inline', state = '', taskI
     btn.className = ['chat-live-project-card-btn', LAYOUT_CLASS[layout] || ''].filter(Boolean).join(' ');
     btn.dataset.intent = 'open-project';
     if (STATE_WORDS[state]) btn.dataset.state = state;
-    if (quizId) btn.dataset.quizId = String(quizId);
+    if (quizId) btn.dataset.opensQuestion = '1';
     const icon = document.createElement('span');
     icon.className = 'chat-live-project-icon';
     icon.setAttribute('aria-hidden', 'true');

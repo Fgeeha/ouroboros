@@ -96,10 +96,14 @@ test('a question reference opens that exact question, and an unknown state or la
 
 test('a Project that was never named reads Project, and a name that arrives later reaches text, speech and the press', () => {
     withDom((sent) => {
-        // The registry names an unnamed row by its id; the host says `Project` for it, and so does the reference.
+        // The registry names an unnamed row by its minted id; that shape alone is a non-name.
         const unnamed = projectReference({ id: 'proj_5e8bbf266c89', name: 'proj_5e8bbf266c89' });
         assert.equal(unnamed.children[1].textContent, 'Project');
         assert.equal(unnamed.attributes['aria-label'], 'Open project Project');
+        // An owner's own lowercase name derives the same id, and it IS the name.
+        for (const own of ['blog', 'my-app', 'proj_notes']) {
+            assert.equal(projectReference({ id: own, name: own }).children[1].textContent, own);
+        }
         const late = projectReference({ id: 'launch', chat_id: 3 }, { quizId: 'q', taskId: 't' });
         assert.equal(late.children[1].textContent, 'Project');
         nameProjectReference(late, { id: 'launch', name: 'Launch' });
@@ -115,7 +119,9 @@ test('the door is the only place that raises the event or builds the control', (
     const sources = [path.join(WEB, 'app.js'), ...fs.readdirSync(path.join(WEB, 'modules'))
         .filter((name) => name.endsWith('.js')).map((name) => path.join(WEB, 'modules', name))];
     const raised = /CustomEvent\(\s*['"`]ouro:open-project['"`]/;
-    const raisers = sources.filter((file) => raised.test(fs.readFileSync(file, 'utf8')));
+    // Code only: a comment may name the event. An event name held in a constant is out of this scan's reach.
+    const code = (file) => fs.readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+    const raisers = sources.filter((file) => raised.test(code(file)));
     assert.deepEqual(raisers.map((file) => path.basename(file)), ['project_reference.js']);
     // The other half of the wire stays where it was: one listener, in the shell.
     const app = fs.readFileSync(path.join(WEB, 'app.js'), 'utf8');
