@@ -1045,6 +1045,21 @@ test('twins saved earlier are hinted, never Save-blocking, until the roster is e
     editor.destroy();
 });
 
+test('the row switch is not an engine facet: switching a twin off keeps the twin, so that edit is judged', () => {
+    const dom = accessEditorDom();
+    const editor = createAvailableSubagentsEditor({ doc: dom.doc, win: null });
+    editor.load(setting([apiRow({ subagent_id: 'one' }), apiRow({ subagent_id: 'two' })]));
+    assert.deepEqual(editor.validate(), [], 'twins saved earlier never block an untouched roster');
+    dom.row(1).querySelector('[data-subagent-field="enabled"]').toggle(false);
+    assert.match(editor.validate()[0], /^Subagent 2 runs the same engine as Subagent 1/);
+    // A switched-off row with its own engine is an ordinary seat, and an off twin is hinted like any twin.
+    dom.row(1).querySelector('[data-subagent-field="effort"]').emit('change', 'low');
+    assert.deepEqual(editor.validate(), []);
+    const parked = { setting: setting([apiRow({ subagent_id: 'one' }), apiRow({ subagent_id: 'two', enabled: false })]) };
+    assert.match(rowMeta(parked.setting.items[1], { ...QUIET_STATE, ...parked }, []).text, /^Runs the same engine as Subagent 1/);
+    editor.destroy();
+});
+
 test('engine uniqueness is a SAVE rule: a roster saved with twins still loads, and empty drafts are not twins', () => {
     const twins = setting([apiRow({ subagent_id: 'one' }), apiRow({ subagent_id: 'two', recommended_use: 'x' })]);
     const parsed = parseAvailableSubagentsSetting(twins);

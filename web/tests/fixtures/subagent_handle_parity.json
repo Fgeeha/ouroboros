@@ -362,6 +362,55 @@
           "same_engine_as": 0
         }
       ]
+    },
+    {
+      "case": "the row switch is not an engine facet: an off row keeps its name and its seat, so an off twin is still a twin",
+      "global_processing": "",
+      "items": [
+        {
+          "subagent_id": "on",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          }
+        },
+        {
+          "subagent_id": "off-twin",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "x-ai/grok-4.6"
+          },
+          "enabled": false
+        },
+        {
+          "subagent_id": "off-other",
+          "recommended_use": "",
+          "route": {
+            "kind": "api_model",
+            "target_id": "moonshotai/kimi-k3"
+          },
+          "enabled": false
+        }
+      ],
+      "expected": [
+        {
+          "handle": "x-ai/grok-4.6",
+          "roster": "x-ai/grok-4.6~on",
+          "same_engine_as": null
+        },
+        {
+          "handle": "x-ai/grok-4.6",
+          "roster": "x-ai/grok-4.6~off-twin",
+          "same_engine_as": 0
+        },
+        {
+          "handle": "moonshotai/kimi-k3",
+          "roster": "moonshotai/kimi-k3",
+          "same_engine_as": null
+        }
+      ]
     }
   ],
   "snapshots": [

@@ -369,6 +369,38 @@ def test_stored_twins_never_block_an_unrelated_save_but_any_roster_edit_is_judge
     assert refused.status_code == 400 and b"same engine" in refused.body
 
 
+def test_the_row_switch_is_not_an_engine_facet_one_engine_one_seat(monkeypatch):
+    """`enabled` never enters the handle or the identity. Uniqueness is judged across
+    ALL rows: switching a twin off is a roster edit that keeps the twin, so it is
+    refused like any other (change or remove one instead); an untouched roster with a
+    switched-off twin still saves. Off rows stay named for cards and pickers, while
+    the model's catalog lists enabled rows only - under the name the roster gives them."""
+    from ouroboros.configured_subagents import serialize_configured_subagents
+    from ouroboros.subagent_runtime import model_visible_subagent_catalog
+
+    on, off = _api("one", effort="low"), {**_api("two", effort="low"), "enabled": False}
+    config = _config(on, off)
+    assert engine_identity(config.items[0], NO_GLOBAL) == engine_identity(config.items[1], NO_GLOBAL)
+    assert roster_handles(config, NO_GLOBAL) == {"one": "x-ai/grok-4.6/low~one", "two": "x-ai/grok-4.6/low~two"}
+    with pytest.raises(ValueError, match="same engine"):
+        validate_unique_engines(config, NO_GLOBAL)
+    # Near-duplicate direction: an off row with its own engine is an ordinary seat.
+    validate_unique_engines(_config(on, {**off, "effort": "high"}), NO_GLOBAL)
+
+    stored = {"OUROBOROS_SUBAGENTS": serialize_configured_subagents(_config(*TWINS["items"]))}
+    switched = {"enabled": True, "items": [TWINS["items"][0], {**TWINS["items"][1], "enabled": False}]}
+    refused, saved = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": switched}, stored)
+    assert refused.status_code == 400 and b"same engine" in refused.body and saved == stored
+    parked = {"OUROBOROS_SUBAGENTS": serialize_configured_subagents(_config(on, off))}
+    accepted, _ = _post_settings(
+        monkeypatch, {"OUROBOROS_SUBAGENTS": {"enabled": True, "items": [on, off]},
+                      "OUROBOROS_REVIEW_MAX_CYCLES": "3"}, parked)
+    assert accepted.status_code == 200, accepted.body[:300]
+
+    names = [row["subagent_id"] for row in model_visible_subagent_catalog(parked)["rows"]]
+    assert names == ["x-ai/grok-4.6/low~one"], "the off twin is absent; the live one keeps its roster name"
+
+
 def test_onboarding_tolerates_stored_twins_it_leaves_untouched_and_judges_an_edit(onboarding):
     from ouroboros.configured_subagents import serialize_configured_subagents
 
