@@ -73,7 +73,7 @@ def full_loop(tmp_path, monkeypatch):
                               model_inputs=[], review_requests=[], review_snapshots=[], review_sends=[],
                               entered=threading.Event(), release=threading.Event(), settled=threading.Event(),
                               waits=[], progress=[], model_step=0, condition=threading.Condition(),
-                              settled_count=0, reviewer_verdict="PASS", slots=slots)
+                              settled_count=0, settled_operations=set(), reviewer_verdict="PASS", slots=slots)
     original_settle = review_custody._settle_review_attempt
     def settle(*a, **kw):
         try:
@@ -81,6 +81,7 @@ def full_loop(tmp_path, monkeypatch):
         finally:
             fixture.settled.set()
             with fixture.condition:
+                fixture.settled_operations.add(a[0].operation_id)
                 fixture.settled_count += 1
                 fixture.condition.notify_all()
     monkeypatch.setattr(review_custody, "_settle_review_attempt", settle)
@@ -124,10 +125,18 @@ def full_loop(tmp_path, monkeypatch):
 
     monkeypatch.setattr(review_substrate, "_review_route_executor", lambda assignment, **_kw: HeldExecutor(assignment))
     def park(_ctx, checkpoint):
+        from ouroboros.acceptance_settlement import panel_awaiting_this_turn
+
         fixture.waits.append(copy.deepcopy(checkpoint))
+        run = panel_awaiting_this_turn(_ctx, _ctx._execution_trace)
+        assert run is not None, "review wait has no pending panel"
+        expected = {actor["operation_id"] for actor in run["actors"]}
+        assert expected and all(expected), "pending panel has no operation identity"
         fixture.release.set()
         with fixture.condition:
-            assert fixture.condition.wait_for(lambda: fixture.settled_count >= len(fixture.review_sends), timeout=10), "review did not settle"
+            assert fixture.condition.wait_for(
+                lambda: expected <= fixture.settled_operations, timeout=10,
+            ), "awaited review operations did not settle"
     ctx.owner_wait_callback = park
     fixture.park = park
     fixture.run_args = dict(
