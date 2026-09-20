@@ -469,7 +469,8 @@ def test_the_open_wave_text_names_the_route_that_waits_for_the_settlement_frame(
     wave = _state(harness)["waves"][-1]
     fp = wave["request_fingerprint"]
     for text in (first, _next_step(wave, enforcement="blocking", cap=2, cycles_paid=0)):
-        assert "one or more paid reviewer operations are still in flight" in text
+        # "paid" is not claimed: a slot released at the barrier is $0 until its row proves the send.
+        assert "one or more reviewer operations are still in flight" in text and "paid reviewer" not in text
         assert ("The host writes ONE message into this task's mailbox when every released slot "
                 "settles: wait_task on this task's own id (wait_tasks while children run) "
                 "returns on it") in text

@@ -776,7 +776,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             f"${admission.get('remaining_usd')} ({fence}). No reviewer was called. Shrink the evidence, "
             f"split the plan, or {remedy}.",
             "review_budget_unavailable")
-    ctx.emit_progress_fn(
+    ctx.emit_progress_fn(  # a $0 collection dispatches nothing, so it never reads as a running panel
+        "📐 plan_task: collecting reviewer answers (no new panel)…" if collect is not None else
         f"📐 plan_task: cycle {cycle_index}{'' if cap is None else f'/{cap}'} — running "
         f"{len(callable_slots)} of {len(slots)} reviewer slot(s)"
         + (f", {len(health_skip_rows)} health-skipped at $0" if health_skip_rows else "")

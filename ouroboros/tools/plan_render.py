@@ -81,10 +81,19 @@ def _quote_control_lines(text: str) -> str:
 
 
 
-def _actor_outcome(actor: dict) -> str:
+def _actor_outcome(actor: dict, slot_class: str = "") -> str:
     """``ok``, or a FAILED tail led by the typed facts when the record carries them
     (B1: ``FAILED[code] (resets …): prose``). Without a typed code the prose renders
-    exactly as before — rows from pre-typed engines lose nothing."""
+    exactly as before — rows from pre-typed engines lose nothing. ``slot_class`` is the
+    row's ``plan_wave_slot_census`` class: a slot with no collected answer is a gap, so
+    it never wears the FAILED form (a planned wait omits its window prose, which reads
+    like a timeout; an unresolved custody state keeps its typed state and prose)."""
+    if slot_class == "awaiting":
+        return f"NO ANSWER YET ({actor.get('operation_state')})"
+    if slot_class == "uncollected":
+        return "SETTLED — not collected yet"
+    if slot_class == "unresolved":
+        return f"NO ANSWER — {actor.get('operation_state')}: {actor.get('error')}"
     if actor.get("ok"):
         return "ok"
     code = str(actor.get("failure_code") or "")
@@ -100,7 +109,10 @@ def _degraded_replay_note(wave: dict, *, paid_available: bool = True) -> str:
     engine's `plan_wave_replay_decision`): a wave with structural snapshot evidence
     replays while its epoch and the reviewer roster stand; one without (its slots
     died at dispatch time, invisible to the pre-fan-out snapshot) never replays —
-    a transient death is never cached as structural."""
+    a transient death is never cached as structural. Every re-dispatch asks the WHOLE
+    roster as the next paid cycle: the engine has no failed-slots-only path."""
+    whole = ("the WHOLE configured roster is asked again as the next paid cycle, slots that "
+             "already answered included; no failed-slots-only path exists")
     if not paid_available:
         replay = ("an identical envelope can replay this result for free while its health epoch and roster stand; "
                   if wave.get("health_epoch") else "no structural lane evidence was recorded; ")
@@ -109,12 +121,37 @@ def _degraded_replay_note(wave: dict, *, paid_available: bool = True) -> str:
         return (
             "an identical envelope replays this recorded result at no further cost while "
             "the recorded lane-health epoch and the reviewer roster stand (a healed or "
-            "newly dead lane, or a changed roster, re-dispatches)"
+            f"newly dead lane, or a changed roster, re-dispatches: {whole})"
         )
     return (
         "no structural lane evidence was recorded for this wave (its slots failed at "
         "dispatch time, invisible to the pre-fan-out health snapshot), so an identical "
-        "envelope re-dispatches a fresh panel — a transient death is never cached as structural"
+        f"envelope re-dispatches a fresh panel ({whole}) — a transient death is never cached as structural"
+    )
+
+
+# The enforcement facts every OPEN state ends with; one wording for the settled
+# and the custody-pending contract.
+_BLOCKING_HOLDS = "Blocking enforcement: the review must close before the work starts"
+_ADVISORY_PROCEEDS = (
+    "Advisory enforcement: you may proceed with the review OPEN; the host discloses "
+    "that loudly in the task result."
+)
+
+
+def _quorum_unreachable_fact(wave: dict) -> str:
+    # Naming asymmetry, on purpose: the wave fact is the bare
+    # `quorum_unreachable` (scoped by the record it sits on); the task-level
+    # typed reason is outcomes.REASON_REVIEW_QUORUM_UNREACHABLE
+    # ("plan_review_quorum_unreachable") — surface-prefixed because it
+    # travels task-wide. Do not "align" one to the other.
+    dead = ", ".join(str(s) for s in wave.get("structurally_dead_slots") or [])
+    reset = str(wave.get("earliest_reset") or "")
+    return (
+        f"Quorum is STRUCTURALLY unreachable for this wave: slot(s) {dead} are "
+        "window-spent, leaving fewer live slots than the quorum"
+        + (f"; earliest recorded reset {reset}" if reset else "")
+        + ". "
     )
 
 
@@ -156,15 +193,40 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
         # Facts about the route that exists (B2), not an instruction to take it: the
         # settlement frame is a mailbox message, so the ordinary in-task wait returns
         # on it. A followup would mint a NEW root task, which cannot collect this wave.
-        return (
-            "Open: one or more paid reviewer operations are still in flight. "
-            "The responses received so far are not final authority; wait for "
-            "custody reconciliation before treating this wave as closed. The host writes ONE "
+        # Custody-first on purpose: this branch never reaches the settled-wave advice
+        # below, so a wave that merely awaits is told neither a replay recipe nor an exit.
+        from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
+
+        census = plan_wave_slot_census(wave)
+        lead = (
+            "one or more reviewer operations have no recorded answer and their custody is "
+            "unresolved (typed state under Reviewer slots above)"
+            if census["unresolved"] and not census["awaiting"] else
+            "one or more reviewer operations are still in flight"
+        )
+        text = (
+            f"Open: {lead}. No reviewer verdict exists yet: "
+            "the responses received so far are not final authority, and this wave is not closed "
+            "before custody reconciliation completes. The host writes ONE "
             "message into this task's mailbox when every released slot settles: wait_task on "
             "this task's own id (wait_tasks while children run) returns on it, and the $0 "
             f"plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}}) then "
-            "collects this wave without a second panel."
+            "collects this wave without a second panel. The same $0 call at any earlier moment "
+            "is legitimate: it returns what has settled, never waits and never re-dispatches. "
+            "Answers that settle after this task ends are kept in the durable record and do not "
+            "close this wave: only a collecting call reads them into it. "
         )
+        unreachable = bool(wave.get("quorum_unreachable"))  # typed window-spent lanes: no awaited answer restores the quorum
+        if unreachable:
+            text += _quorum_unreachable_fact(wave)
+        if enforcement != "blocking":
+            return text + _ADVISORY_PROCEEDS
+        # The gate's own release fact, stated without a route: finalization stops being
+        # refused for this wave whether or not a slot is still awaited.
+        return text + _BLOCKING_HOLDS + "." + (
+            " With the quorum structurally unreachable, finalization is RELEASED even while a slot is "
+            "awaited: finalizing now records outcome_tier=blocked_with_evidence with the review left "
+            "OPEN and implementation still held." if unreachable else "")
     if aggregate == "DEGRADED":
         # B2: facts, not a retry coach (BIBLE P5 — the host never dictates the next tool
         # call). Quorum arithmetic, per-slot typed states above, and the replay mechanics;
@@ -179,19 +241,7 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
             + ("A changed spec may start another paid cycle. " if not at_cap else "")
         )
         if wave.get("quorum_unreachable"):
-            # Naming asymmetry, on purpose: the wave fact is the bare
-            # `quorum_unreachable` (scoped by the record it sits on); the task-level
-            # typed reason is outcomes.REASON_REVIEW_QUORUM_UNREACHABLE
-            # ("plan_review_quorum_unreachable") — surface-prefixed because it
-            # travels task-wide. Do not "align" one to the other.
-            dead = ", ".join(str(s) for s in wave.get("structurally_dead_slots") or [])
-            reset = str(wave.get("earliest_reset") or "")
-            text += (
-                f"Quorum is STRUCTURALLY unreachable for this wave: slot(s) {dead} are "
-                "window-spent, leaving fewer live slots than the quorum"
-                + (f"; earliest recorded reset {reset}" if reset else "")
-                + ". "
-            )
+            text += _quorum_unreachable_fact(wave)
     elif aggregate == "REVIEW_REQUIRED":
         blocking = [f for f in wave.get("findings") or [] if f.get("class") == "blocking"]
         text = author_note + (
@@ -224,7 +274,7 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
         )
     if enforcement == "blocking":
         text += (
-            "Blocking enforcement: the review must close before the work starts"
+            _BLOCKING_HOLDS
             + (" — the cycle cap is reached: exits are owner unstick (Swarm/hurry), a revised spec "
                "once the owner raises OUROBOROS_REVIEW_MAX_CYCLES, or finalizing with "
                "outcome_tier=blocked_with_evidence." if at_cap else ".")
@@ -240,10 +290,7 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
                 "earliest reset — as is asking the owner."
             )
     else:
-        text += (
-            "Advisory enforcement: you may proceed with the review OPEN; the host discloses "
-            "that loudly in the task result."
-        )
+        text += _ADVISORY_PROCEEDS
     return text
 
 
@@ -316,10 +363,18 @@ def _render_wave(
         lines += ["", f"(bounded hot history: this wave is a compact summary; {detail})"]
     if reminder:
         lines += ["", "⚠️ " + reminder]
+    # The typed slot census is read before any slot or aggregate is worded: an answer
+    # that has not arrived is a gap, never a failed slot and never a verdict.
+    from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
+
+    census = plan_wave_slot_census(wave)
+    slot_class = {id(row): name for name in ("awaiting", "unresolved", "uncollected") for row in census[name]}
     if wave.get("custody_pending"):
         lines += [
-            "", "⚠️ REVIEW CUSTODY PENDING: the received quorum is provisional; "
-            "a paid reviewer operation is still in flight and this wave remains open."
+            "", f"⚠️ REVIEW CUSTODY PENDING: {len(census['answered'])} of {census['configured']} reviewer(s) have answered"
+            + (f", {len(census['uncollected'])} settled but not collected yet" if census["uncollected"] else "")
+            + "; no reviewer verdict exists yet — the "
+            f"{aggregate or 'recorded'} aggregate below is a placeholder that keeps this wave open."
         ]
     elif aggregate == "DEGRADED" and historical_feedback is None:
         # Banner aligned with _next_step: the replay promise depends on whether the
@@ -328,7 +383,7 @@ def _render_wave(
                   + _degraded_replay_note(wave, paid_available=cap is None or cycles_paid < cap) + "."]
     actor_lines = [
         f"- {a.get('slot_id')} · {a.get('model')} · {a.get('route')} · host_file_read: "
-        f"{a.get('host_file_read_attestation')} · {_actor_outcome(a)}"
+        f"{a.get('host_file_read_attestation')} · {_actor_outcome(a, slot_class.get(id(a), ''))}"
         + (f" · disclosures: {', '.join(a['disclosures'])}" if a.get("disclosures") else "")
         for a in wave.get("actors") or []
     ] or ["(no actor records)"]
@@ -374,9 +429,18 @@ def _render_wave(
                 lines += [_quote_control_lines(str(result.get("text") or "(no reviewer text)"))]
             else:
                 lines += ["Full source is retained at the reference above; its body was not read for this view."]
+    # DISPLAY only — the stored ``reasons`` stay whole (the quorum arithmetic wrote them).
+    # The arithmetic's ``slot_unparseable:<slot>:`` entry of a slot with no collected
+    # answer is left out by that slot's typed census class and the slot is named as what
+    # it is, because later reviewer waves read this text as dialogue evidence.
+    gaps = {"awaiting": census["awaiting"], "not collected yet": census["uncollected"]}
+    hidden = tuple(f"slot_unparseable:{row.get('slot_id')}:" for rows in gaps.values() for row in rows)
+    reasons = [str(r) for r in wave.get("reasons") or [] if not str(r).startswith(hidden)]
+    reasons += [f"{label}: " + ", ".join(str(row.get("slot_id")) for row in rows) for label, rows in gaps.items() if rows]
     lines += [
-        "", f"### Aggregate: {aggregate}" + (" (closed)" if closed else " (open)"),
-        "", "Reasons: " + (", ".join(str(r) for r in wave.get("reasons") or []) or "none")
+        "", "### Aggregate: " + (f"no verdict yet — held open as {aggregate}" if wave.get("custody_pending") else aggregate)
+        + (" (closed)" if closed else " (open)"),
+        "", "Reasons: " + (", ".join(reasons) or "none")
         + f". Counts: {json.dumps(counts, sort_keys=True)}",
     ]
     if wave.get("dispositions"):

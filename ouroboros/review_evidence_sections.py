@@ -549,6 +549,7 @@ def _accept_effective_claims(
         "binding": "not bound: wave open",
         "cycle_index": open_wave.get("cycle_index"),
         "aggregate": str(open_wave.get("aggregate") or ""),
+        "custody_pending": bool(open_wave.get("custody_pending")),  # true: slots unanswered, the aggregate is no verdict
         "acceptance_claims": [
             {key: _accept_redact_cap(value, 600) for key, value in row.items()}
             for row in open_claims if isinstance(row, dict)

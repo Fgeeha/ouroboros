@@ -690,7 +690,8 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
         return ""
     outcome = str(decision.get("outcome") or "")
     if decision.get("custody_pending") or decision.get("review_late_result_pending"):
-        outcome = f"{outcome or 'open'}; reviewer work is running or awaiting collection"
+        # No verdict exists yet: the stored aggregate only keeps the wave open, so its token is not shown as one.
+        outcome = "reviewer work is running or awaiting collection"
     elif decision.get("reviewer_slots_degraded"):
         outcome = f"{outcome or 'open'}; no parseable reviewer quorum"
     # A historical critic's aggregate is EVIDENCE about the plan the author corrected,

@@ -1,0 +1,440 @@
+"""An answer that has not arrived yet is a gap: not a failure and not a verdict.
+
+``plan_task`` returns at the dispatch barrier, so a reviewer slot that has not
+answered is stored as an error actor (``ok=False``, ``operation_state=
+"pending_dispatch"``) and the wave is held fail-closed as an open ``DEGRADED``
+with ``custody_pending``. That stored model is the FLOOR and these tests pin it
+unchanged. What they pin as NEW is that every plan renderer reads the typed slot
+census first: the owner line, the collect pre-line, the finalization disclosure,
+the agent tool result, the advisory-open event and the acceptance exhibit. Every
+guard is asserted in both directions — the awaiting wording AND the still-loud
+real failure — so removing a guard turns its test red.
+
+New module: ``tests/test_phase4_plan_review_continuity.py`` and
+``tests/test_plan_review_w3.py`` sit near their size targets.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+import tempfile
+from pathlib import Path
+
+import pytest
+
+from ouroboros.owner_hurry import force_plan_decision, plan_review_disclosure
+from ouroboros.review_records import review_slot_awaiting, review_slot_unresolved
+from ouroboros.tools import plan_review as pr
+from ouroboros.tools.plan_render import (
+    _actor_outcome, _degraded_replay_note, _next_step, _parse_plan_review_control, _render_wave,
+)
+from ouroboros.tools.plan_review_runtime import (
+    plan_no_dispatch_line, plan_pending_actors, plan_slot_reasons, plan_wave_has_in_flight,
+    plan_wave_progress_line, plan_wave_slot_census,
+)
+from tests.test_plan_finalization_collection import panel as _panel
+from tests.test_plan_review_engine import _call, _control, _state
+from tests.test_plan_review_engine import harness as _engine_harness
+from tests.test_plan_review_event_route import _mailbox_entries, _wait_until
+
+harness = _engine_harness  # noqa: F811 - pytest fixture re-export
+panel = _panel  # noqa: F811 - pytest fixture re-export
+
+PENDING_ERROR = "Pending dispatch; the physical review operation is in flight (window 21600s)"
+FP = "f" * 64
+
+
+def _pending(slot, state="pending_dispatch", **extra):
+    """The error actor ``review_custody`` mints for a slot with no answer yet."""
+    return {"slot_id": slot, "model": "m", "route": "agent_session", "ok": False, "failure_code": "",
+            "error": PENDING_ERROR, "operation_state": state, "late_result_pending": True,
+            "operation_id": f"op-{slot}", **extra}
+
+
+def _ok(slot):
+    return {"slot_id": slot, "model": "m", "route": "api_chat", "ok": True, "error": None,
+            "operation_state": "settled", "operation_id": f"op-{slot}"}
+
+
+def _failed(slot, code="run_failed", error="harness unavailable"):
+    return {"slot_id": slot, "model": "m", "route": "agent_session", "ok": False, "failure_code": code,
+            "error": error, "operation_state": "late_settled", "operation_id": f"op-{slot}"}
+
+
+def _skipped(slot):
+    return {"slot_id": slot, "model": "m", "route": "agent_session", "ok": False,
+            "failure_code": "subscription_window_exhausted", "error": "health_skip[...]: skipped at $0",
+            "operation_state": "not_dispatched"}
+
+
+def _wave(actors, *, pending=True, **extra):
+    """A recorded wave shaped like ``synthesize_plan_review_wave`` leaves it."""
+    parseable = sum(1 for a in actors if isinstance(a, dict) and a.get("ok"))
+    return {
+        "cycle_index": 1, "request_fingerprint": FP, "aggregate": "DEGRADED", "closed": False,
+        "custody_pending": pending, "actors": actors, "findings": [],
+        "counts": {"configured": len(actors), "parseable": parseable, "quorum": 2,
+                   "blocking": 0, "note": 0, "need_evidence": 0, "blocking_slots": 0},
+        "reasons": [f"slot_unparseable:{a['slot_id']}:{a['error']}" for a in actors
+                    if isinstance(a, dict) and not a.get("ok")]
+                   + [f"parseable_slots_below_quorum:{parseable}/2"]
+                   + (["review_late_result_pending"] if pending else []),
+        **extra,
+    }
+
+
+def _line(wave, *, aggregate="DEGRADED", cycles_paid=1, cap=3):
+    return plan_wave_progress_line(aggregate, wave["counts"], cycles_paid=cycles_paid, cap=cap, wave=wave)
+
+
+def _supplement(slot, state="late_settled", cycle=1):
+    return {"slot_id": slot, "operation_id": f"op-{slot}", "operation_state": state, "cycle_index": cycle}
+
+
+# ------------------------------------------------------------------ typed vocabulary
+
+
+def test_awaiting_is_only_pending_dispatch_and_late_result_pending_never_means_a_planned_wait():
+    assert review_slot_awaiting({"operation_state": "pending_dispatch"})
+    for state in ("in_flight", "custody_lost"):
+        row = {"operation_state": state, "late_result_pending": True}
+        assert review_slot_unresolved(row) and not review_slot_awaiting(row)
+    for row in ({"operation_state": "settled", "late_result_pending": True}, {"late_result_pending": True},
+                {"operation_state": "not_dispatched"}, {"operation_state": "late_settled"}, {}, None, "pending_dispatch"):
+        assert not review_slot_awaiting(row) and not review_slot_unresolved(row)
+
+
+def test_census_puts_every_roster_row_in_exactly_one_typed_class():
+    rows = [_ok("a"), _pending("w"), _pending("f", "in_flight"), _pending("l", "custody_lost"),
+            _pending("u"), _skipped("k"), _failed("x"),
+            {"slot_id": "legacy", "ok": False, "error": "transport died"},  # a pre-typed row is a failure
+            {**_ok("stale"), "late_result_pending": True}]  # ok beside pending custody stays fail-closed
+    wave = _wave(rows, historical_supplements=[
+        _supplement("u"), _supplement("w", cycle=2), _supplement("f", state="in_flight")])
+    census = plan_wave_slot_census(wave)
+    names = ("answered", "awaiting", "unresolved", "uncollected", "skipped", "failed")
+    assert {name: [r["slot_id"] for r in census[name]] for name in names} == {
+        "answered": ["a"], "awaiting": ["w"], "unresolved": ["f", "l", "stale"],
+        "uncollected": ["u"], "skipped": ["k"], "failed": ["x", "legacy"]}
+    assert census["configured"] == len(rows) == sum(len(census[name]) for name in names)
+    # ONE definition: the pending classes ARE plan_pending_actors, the same row objects.
+    pending = plan_pending_actors(wave)
+    assert [id(r) for r in pending] == [id(r) for r in rows if r["slot_id"] in {"w", "f", "l", "stale"}]
+    assert {id(r) for r in census["awaiting"] + census["unresolved"]} == {id(r) for r in pending}
+    assert wave["actors"] == rows and all(r is w for r, w in zip(rows, wave["actors"]))  # pure
+
+
+@pytest.mark.parametrize("roster", [None, {}, "rows", 7, [], ["row", 3, None]])
+def test_census_of_a_malformed_roster_classifies_nothing_and_never_raises(roster):
+    census = plan_wave_slot_census({"actors": roster, "custody_pending": True, "paid": True})
+    assert census == {"answered": [], "awaiting": [], "unresolved": [], "uncollected": [],
+                      "skipped": [], "failed": [], "configured": 0}
+    assert plan_wave_slot_census(None)["configured"] == 0
+
+
+# ------------------------------------------------------------------ owner progress line
+
+
+def test_progress_line_states_the_gap_for_each_open_branch():
+    assert _line(_wave([_pending("s1"), _pending("s2"), _pending("s3")]), cycles_paid=0) == (
+        "📐 plan_task: waiting for reviewers — 0 of 3 answered; cycles paid 0/3")
+    assert _line(_wave([_ok("s1"), _pending("s2"), _pending("s3")])) == (
+        "📐 plan_task: waiting for reviewers — 1 of 3 answered; cycles paid 1/3")
+    assert _line(_wave([_ok("s1"), _failed("s2"), _skipped("s3"), _pending("s4")]), cap=None) == (
+        "📐 plan_task: waiting for reviewers — 1 of 4 answered, 1 failed (run_failed), "
+        "1 not dispatched; cycles paid 1")
+    assert _line(_wave([_ok("s1"), _pending("s2", "in_flight"), _pending("s3", "custody_lost")])) == (
+        "📐 plan_task: 1 of 3 reviewers answered; 2 unresolved (in_flight, custody_lost) — "
+        "no verdict yet; cycles paid 1/3")
+    late = _wave([_ok("s1"), _pending("s2"), _pending("s3")], pending=False,
+                 historical_supplements=[_supplement("s2"), _supplement("s3", "settled")])
+    # A settled slot may have settled as a failure: until collected it is "settled", never "answered".
+    assert _line(late) == "📐 plan_task: 1 of 3 reviewers answered, 2 settled but not collected yet; cycles paid 1/3"
+    effort = _line(_wave([_pending("s1")], reviewer_effort="high"), cycles_paid=0)
+    assert effort == ("📐 plan_task: waiting for reviewers — 0 of 1 answered; cycles paid 0/3; "
+                      "declared reviewer effort high")
+
+
+def test_an_open_line_carries_no_verdict_no_finding_count_and_no_failure_word_for_a_waiting_slot():
+    counts = {"configured": 3, "parseable": 2, "quorum": 2, "blocking": 1, "note": 6, "need_evidence": 1}
+    wave = {**_wave([_ok("s1"), _ok("s2"), _pending("s3")]), "counts": counts}
+    line = plan_wave_progress_line("DEGRADED", counts, cycles_paid=1, cap=3, wave=wave)
+    assert line == "📐 plan_task: waiting for reviewers — 2 of 3 answered; cycles paid 1/3"
+    for word in ("DEGRADED", "parseable", "untrusted", "blocking", "note", "need_evidence",
+                 "slot reasons", "Pending dispatch", "failed", "late result pending"):
+        assert word not in line
+    assert "\n" not in line and line.index("answered") < 80  # decisive words lead the row
+
+
+def test_an_unresolved_slot_is_never_worded_as_waiting_and_a_waiting_slot_never_as_unresolved():
+    unresolved = _line(_wave([_ok("s1"), _pending("s2"), _pending("s3", "custody_lost")]))
+    assert "waiting" not in unresolved
+    assert "2 unresolved (pending_dispatch, custody_lost) — no verdict yet" in unresolved
+    waiting = _line(_wave([_ok("s1"), _pending("s2")]))
+    assert "unresolved" not in waiting and "waiting for reviewers" in waiting
+
+
+def test_a_real_failure_is_still_named_while_others_are_awaited_and_awaiting_is_never_a_reason():
+    wave = _wave([_pending("s1"), _failed("s2", "run_failed"), _failed("s3", "", "transport died"),
+                  _skipped("s4"), _pending("s5", "in_flight"), _pending("s6")],
+                 historical_supplements=[_supplement("s6")])
+    assert plan_slot_reasons(wave) == "run_failed; transport died; subscription_window_exhausted"
+    assert plan_slot_reasons(wave, failed_only=True) == "run_failed; transport died"
+    assert "Pending dispatch" not in plan_slot_reasons(wave)
+    line = _line(wave)
+    assert "2 failed (run_failed; transport died), 1 not dispatched" in line
+    # The guard's other direction: with the same rows settled as failures, every reason is named.
+    for row in wave["actors"]:
+        row.update(operation_state="settled", late_result_pending=False)
+    assert plan_slot_reasons(wave) == f"{PENDING_ERROR}; run_failed; transport died; subscription_window_exhausted"
+
+
+def test_settled_aggregates_render_byte_identically():
+    counts = {"parseable": 3, "configured": 3, "blocking": 2, "note": 1, "need_evidence": 4}
+    actors = [_ok("s1"), _ok("s2"), _ok("s3")]
+    for aggregate in ("GREEN", "REVIEW_REQUIRED", "REVISE_PLAN"):
+        expected = f"📐 plan_task: {aggregate} — 2 blocking / 1 note / 4 need_evidence; cycles paid 2/3"
+        assert plan_wave_progress_line(aggregate, counts, cycles_paid=2, cap=3) == expected
+        assert plan_wave_progress_line(aggregate, counts, cycles_paid=2, cap=3,
+                                       wave={"actors": actors, "custody_pending": False}) == expected
+    real = _wave([_ok("s1"), _failed("s2", "run_failed"), _failed("s3", "", "transport died"), _skipped("s4")],
+                 pending=False, reviewer_effort="high")
+    assert _line(real, cap=None) == (
+        "📐 plan_task: DEGRADED (1/4 parseable reviewers; counts are untrusted) — 0 blocking / 0 note / "
+        "0 need_evidence; cycles paid 1; slot reasons: run_failed; transport died; "
+        "subscription_window_exhausted; declared reviewer effort high")
+    # A wave of typed $0 refusals keeps its own line, reasons included.
+    assert plan_no_dispatch_line(_wave([_skipped("s1")], pending=False)) == (
+        "📐 plan_task: no new reviewer cycle dispatched: subscription_window_exhausted")
+
+
+# ------------------------------------------------------------------ finalization disclosure
+
+
+def test_the_disclosure_names_no_verdict_token_while_reviewer_work_is_pending():
+    base = {"required": True, "status": "open", "allow": True, "outcome": "DEGRADED",
+            "enforcement": "advisory", "reviewer_slots_degraded": True}
+    pending = plan_review_disclosure({**base, "custody_pending": True})
+    assert "Plan review is still open (reviewer work is running or awaiting collection)" in pending
+    assert "DEGRADED" not in pending and "no parseable reviewer quorum" not in pending
+    owed = plan_review_disclosure({**base, "review_late_result_pending": True})
+    assert "(reviewer work is running or awaiting collection)" in owed and "DEGRADED" not in owed
+    assert "a late result is still owed" in owed
+    # A settled panel with no quorum keeps its verdict token and its cause, byte for byte.
+    assert plan_review_disclosure(base) == (
+        "\n\n⚠️ Plan review is still open (DEGRADED; no parseable reviewer quorum); work proceeded "
+        "under the owner-selected advisory enforcement.")
+
+
+# ------------------------------------------------------------------ agent tool result
+
+
+def test_actor_rows_word_a_gap_as_a_gap_and_a_failure_as_a_failure():
+    assert _actor_outcome(_pending("s1"), "awaiting") == "NO ANSWER YET (pending_dispatch)"
+    assert _actor_outcome(_pending("s1"), "uncollected") == "SETTLED — not collected yet"
+    lost = {**_pending("s1", "custody_lost"), "error": "no actor record"}
+    assert _actor_outcome(lost, "unresolved") == "NO ANSWER — custody_lost: no actor record"
+    # No census class (a settled row): the FAILED forms are untouched.
+    assert _actor_outcome(_ok("s1")) == "ok"
+    assert _actor_outcome({"ok": False, "error": "transport died"}) == "FAILED: transport died"
+    typed = {"ok": False, "failure_code": "subscription_window_exhausted", "reset_at": "2026-01-01T00:00:00Z",
+             "error": "window spent"}
+    assert _actor_outcome(typed) == "FAILED[subscription_window_exhausted] (resets 2026-01-01T00:00:00Z): window spent"
+    assert _actor_outcome(_skipped("s1")).startswith("FAILED[subscription_window_exhausted]: health_skip")
+
+
+@pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
+def test_an_awaiting_wave_renders_no_failure_no_verdict_and_keeps_the_control_footer(enforcement):
+    wave = _wave([_ok("s1"), _pending("s2"), _failed("s3"), _pending("s4")],
+                 historical_supplements=[{**_supplement("s4"), "source_ref": {}}])
+    before = copy.deepcopy(wave)
+    text = _render_wave(wave, cap=3, cycles_paid=1, enforcement=enforcement)
+    assert wave == before, "rendering never rewrites the stored wave (its reasons are dialogue-free truth)"
+    assert ("⚠️ REVIEW CUSTODY PENDING: 1 of 4 reviewer(s) have answered, 1 settled but not collected yet; "
+            "no reviewer verdict exists yet — "
+            "the DEGRADED aggregate below is a placeholder that keeps this wave open.") in text
+    assert "received quorum" not in text and "paid reviewer" not in text
+    assert "· NO ANSWER YET (pending_dispatch)" in text and "· SETTLED — not collected yet" in text
+    assert "· FAILED[run_failed]: harness unavailable" in text  # the real failure stays loud
+    assert "FAILED: Pending dispatch" not in text and "window 21600s" not in text
+    assert "### Aggregate: no verdict yet — held open as DEGRADED (open)" in text
+    assert ("Reasons: slot_unparseable:s3:harness unavailable, parseable_slots_below_quorum:1/2, "
+            "review_late_result_pending, awaiting: s2, not collected yet: s4. Counts: ") in text
+    assert _parse_plan_review_control(text) == ("DEGRADED", False)
+    assert text.rstrip().endswith('PLAN_REVIEW_CONTROL_JSON: {"outcome":"DEGRADED","closed":false}')
+
+
+@pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
+def test_the_custody_paragraph_states_facts_and_never_a_replay_recipe_or_an_exit(enforcement):
+    wave = _wave([_pending("s1"), _pending("s2"), _pending("s3")])
+    text = _next_step(wave, enforcement=enforcement, cap=2, cycles_paid=2)
+    assert text.startswith("Open: one or more reviewer operations are still in flight. No reviewer verdict exists yet")
+    assert "custody reconciliation" in text
+    assert ("The host writes ONE message into this task's mailbox when every released slot settles: "
+            "wait_task on this task's own id (wait_tasks while children run) returns on it") in text
+    assert f"plan_task(review_disposition={{review_fingerprint: '{FP}', items: []}})" in text
+    assert "The same $0 call at any earlier moment is legitimate" in text
+    assert "never waits and never re-dispatches" in text
+    assert "kept in the durable record and do not close this wave" in text
+    if enforcement == "blocking":
+        assert text.endswith("Blocking enforcement: the review must close before the work starts.")
+        assert "Advisory enforcement" not in text
+    else:
+        assert text.endswith("Advisory enforcement: you may proceed with the review OPEN; the host "
+                             "discloses that loudly in the task result.")
+        assert "Blocking enforcement" not in text
+    for forbidden in ("fresh panel", "RELEASED", "schedule_followup", "paid reviewer", "cycle cap is reached",
+                      "DEGRADED: parseable reviewer verdicts", "A changed spec may start"):
+        assert forbidden not in text
+
+
+def test_an_unresolved_wave_and_a_structurally_unreachable_one_state_their_own_facts():
+    lost = _next_step(_wave([_ok("s1"), _pending("s2", "custody_lost")]), enforcement="blocking", cap=3, cycles_paid=1)
+    assert lost.startswith("Open: one or more reviewer operations have no recorded answer and their "
+                           "custody is unresolved (typed state under Reviewer slots above).")
+    assert "still in flight" not in lost
+    dead = {**_wave([_skipped("s1"), _skipped("s2"), _pending("s3")]), "quorum_unreachable": True,
+            "structurally_dead_slots": ["s1", "s2"], "earliest_reset": "2026-01-01T00:00:00Z"}
+    text = _next_step(dead, enforcement="blocking", cap=3, cycles_paid=0)
+    assert ("Quorum is STRUCTURALLY unreachable for this wave: slot(s) s1, s2 are window-spent, leaving fewer "
+            "live slots than the quorum; earliest recorded reset 2026-01-01T00:00:00Z. ") in text
+    # The gate releases finalization for an unreachable quorum whether or not a slot is awaited
+    # (task_results.plan_review_gate_projection): the mind is told that fact, without a route.
+    assert "finalization is RELEASED even while a slot is awaited" in text and "still in flight" in text
+    assert "schedule_followup" not in text and text.rstrip().endswith("implementation still held.")
+    advisory = _next_step(dead, enforcement="advisory", cap=3, cycles_paid=0)
+    assert "RELEASED" not in advisory and advisory.endswith("discloses that loudly in the task result.")
+    assert "STRUCTURALLY" not in _next_step(_wave([_pending("s1")]), enforcement="blocking", cap=3, cycles_paid=0)
+
+
+def test_a_settled_degraded_wave_keeps_its_failure_render_and_gains_the_whole_roster_fact():
+    wave = _wave([_ok("s1"), _failed("s2"), {"slot_id": "s3", "model": "m", "ok": False, "error": "transport died"}],
+                 pending=False)
+    text = _render_wave(wave, cap=3, cycles_paid=1, enforcement="blocking")
+    assert "REVIEW CUSTODY PENDING" not in text and "no verdict yet" not in text
+    assert "⚠️ DEGRADED: no parseable reviewer quorum — recorded as an OPEN wave; " in text
+    assert "· FAILED[run_failed]: harness unavailable" in text and "· FAILED: transport died" in text
+    assert "### Aggregate: DEGRADED (open)" in text
+    assert ("Reasons: slot_unparseable:s2:harness unavailable, slot_unparseable:s3:transport died, "
+            "parseable_slots_below_quorum:1/2. Counts: ") in text
+    assert "DEGRADED: parseable reviewer verdicts 1 of 3 configured slot(s)" in text
+    whole = ("the WHOLE configured roster is asked again as the next paid cycle, slots that already "
+             "answered included; no failed-slots-only path exists")
+    empty_epoch = _degraded_replay_note({})
+    assert f"an identical envelope re-dispatches a fresh panel ({whole})" in empty_epoch
+    assert empty_epoch in text and "$0" not in empty_epoch
+    with_epoch = _degraded_replay_note({"health_epoch": [{"slot": "s1"}]})
+    assert "re-dispatches a fresh panel" not in with_epoch and f"re-dispatches: {whole})" in with_epoch
+    assert "WHOLE" not in _degraded_replay_note({}, paid_available=False)  # a spent cap dispatches nothing
+
+
+# ------------------------------------------------------------------ durable truth
+
+
+def test_the_advisory_open_event_carries_typed_custody_and_per_slot_state(tmp_path):
+    from ouroboros.tools.plan_review_runtime import emit_plan_review_advisory_open
+
+    ctx = type("Ctx", (), {"event_queue": None})()
+    for fingerprint, wave in (("a" * 64, _wave([_ok("s1"), _pending("s2"), _pending("s3", "custody_lost")])),
+                              ("b" * 64, _wave([_ok("s1"), _failed("s2")], pending=False))):
+        emit_plan_review_advisory_open(ctx, tmp_path, task_id="t-event", cycles_paid=0, cap=3,
+                                       wave={**wave, "request_fingerprint": fingerprint})
+    rows = [json.loads(line) for line in
+            (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    open_row, settled_row = [r for r in rows if r.get("type") == "plan_review_advisory_open"]
+    assert open_row["aggregate"] == "DEGRADED" and open_row["custody_pending"] is True
+    assert [(s["slot_id"], s["ok"], s["operation_state"]) for s in open_row["slots"]] == [
+        ("s1", True, "settled"), ("s2", False, "pending_dispatch"), ("s3", False, "custody_lost")]
+    assert settled_row["custody_pending"] is False
+    assert [s["operation_state"] for s in settled_row["slots"]] == ["settled", "late_settled"]
+    assert [s["failure_code"] for s in settled_row["slots"]] == ["", "run_failed"]
+
+
+@pytest.mark.parametrize("pending", [True, False])
+def test_the_acceptance_exhibit_of_an_open_wave_carries_typed_custody(pending):
+    import types
+
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+    from ouroboros.task_results import STATUS_RUNNING, record_plan_review_wave, write_task_result
+    from tests.test_acceptance_claims_wiring import _v2_wave
+
+    root = Path(tempfile.mkdtemp())
+    write_task_result(root, "acc", STATUS_RUNNING, result="running")
+    record_plan_review_wave(root, "acc", {
+        **_v2_wave("a" * 64, ["unreviewed claim"], aggregate="DEGRADED", closed=False),
+        "custody_pending": pending, "paid": False})
+    ctx = types.SimpleNamespace(task_contract={"requirements": "do X"}, task_metadata={},
+                                drive_root=str(root), task_id="acc", repo_dir=str(root))
+    exhibit = build_task_acceptance_evidence(
+        ctx, llm_trace={"tool_calls": []}, drive_root=root, task_id="acc")["plan_claims_exhibit"]
+    assert exhibit["binding"] == "not bound: wave open" and exhibit["aggregate"] == "DEGRADED"
+    assert exhibit["custody_pending"] is pending
+
+
+# ------------------------------------------------------------------ the floor, through the real substrate
+
+
+def test_a_fully_awaiting_wave_keeps_the_fail_closed_floor_and_every_line_tells_the_truth(harness, panel):
+    ctx = harness.make_ctx()
+    first = _call(ctx)
+    assert _wait_until(lambda: sum(e.execute_calls for e in panel.values()) == 3)
+    state = _state(harness)
+    wave = state["waves"][-1]
+    # FLOOR: the stored model and every gate input are exactly what they were.
+    assert (wave["aggregate"], wave["closed"], wave["custody_pending"], wave["paid"]) == ("DEGRADED", False, True, False)
+    assert wave["counts"]["parseable"] == 0 and wave["counts"]["configured"] == 3 and state["cycles_paid"] == 0
+    assert wave["actors_degraded"] == ["s1", "s2", "s3"] and plan_wave_has_in_flight(wave)
+    assert [r.split(":")[0] for r in wave["reasons"]] == [
+        "slot_unparseable", "slot_unparseable", "slot_unparseable", "parseable_slots_below_quorum",
+        "review_late_result_pending"]
+    for actor in wave["actors"]:
+        assert actor["ok"] is False and actor["error"].startswith("Pending dispatch;")
+        assert (actor["operation_state"], actor["late_result_pending"], actor["failure_code"]) == (
+            "pending_dispatch", True, "")
+    assert _control(first) == {"outcome": "DEGRADED", "closed": False}
+    decision = force_plan_decision(ctx, {}, enforcement="blocking")
+    assert decision["allow"] is False and decision["custody_pending"] and decision["reviewer_slots_degraded"]
+    refused = pr._handle_plan_task(ctx, review_disposition={
+        "review_fingerprint": wave["request_fingerprint"], "items": [], "author_action": "finish",
+        "author_disposition": {"disposition": "accepted", "rationale": "Proceed without the reviewers."}})
+    assert "reviewers are still running" in refused
+    assert not (_state(harness)["current_attempt"] or {}).get("author_subject")
+    # TRUTH: a paid dispatch keeps its line; the wave line states the gap; the text names no failure.
+    assert harness.progress[0] == ("📐 plan_task: cycle 1/2 — running 3 of 3 reviewer slot(s) "
+                                   "(blocking; constitutional=False)…")
+    assert "📐 plan_task: waiting for reviewers — 0 of 3 answered; cycles paid 0/2" in harness.progress
+    assert first.count("· NO ANSWER YET (pending_dispatch)") == 3 and "FAILED" not in first
+    assert "0 of 3 reviewer(s) have answered" in first and "awaiting: s1, s2, s3." in first
+    # A $0 collection dispatches nothing, so it never reads as a running panel.
+    panel["s1"].release.set()
+    assert _wait_until(lambda: any("[s1]: finished;" in line for line in harness.progress))
+    mark = len(harness.progress)
+    collect = {"review_disposition": {"review_fingerprint": wave["request_fingerprint"], "items": []}}
+    partial = pr._handle_plan_task(ctx, **collect)
+    emitted = [line for line in harness.progress[mark:] if line.startswith("📐 plan_task:")]
+    assert emitted == ["📐 plan_task: collecting reviewer answers (no new panel)…",
+                       "📐 plan_task: waiting for reviewers — 1 of 3 answered; cycles paid 1/2"]
+    assert "1 of 3 reviewer(s) have answered" in partial and partial.count("NO ANSWER YET") == 2
+    assert _control(partial) == {"outcome": "DEGRADED", "closed": False}
+    assert sum(e.execute_calls for e in panel.values()) == 3  # nothing was re-sent
+    # FLOOR: two clean answers meet the arithmetic quorum, and the wave still may not read GREEN
+    # while the third slot can land a blocker — it stays the open DEGRADED placeholder.
+    panel["s2"].release.set()
+    assert _wait_until(lambda: any("[s2]: finished;" in line for line in harness.progress))
+    quorum = pr._handle_plan_task(ctx, **collect)
+    held = _state(harness)["waves"][-1]
+    assert (held["aggregate"], held["closed"], held["custody_pending"]) == ("DEGRADED", False, True)
+    assert held["counts"]["parseable"] == 2 and _control(quorum) == {"outcome": "DEGRADED", "closed": False}
+    assert force_plan_decision(ctx, {}, enforcement="blocking")["allow"] is False
+    assert "📐 plan_task: waiting for reviewers — 2 of 3 answered; cycles paid 1/2" in harness.progress
+    assert "### Aggregate: no verdict yet — held open as DEGRADED (open)" in quorum and "GREEN" not in quorum
+    for executor in panel.values():
+        executor.release.set()
+    assert _wait_until(lambda: len(_mailbox_entries(ctx.drive_root, ctx.task_id)) == 1)
+    mark = len(harness.progress)
+    final = pr._handle_plan_task(ctx, **collect)
+    assert _control(final) == {"outcome": "GREEN", "closed": True}
+    assert [line for line in harness.progress[mark:] if line.startswith("📐 plan_task:")] == [
+        "📐 plan_task: collecting reviewer answers (no new panel)…",
+        "📐 plan_task: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"]
