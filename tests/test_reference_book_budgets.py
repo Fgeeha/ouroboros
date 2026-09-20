@@ -19,7 +19,13 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/architecture/01-high-level-architecture.md": 161453,
     "docs/architecture/02-startup-onboarding-flow.md": 15517,
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 97435,
+    # 97435 -> 99500: the notification owner is a new subsystem of this chapter
+    # (its module, its client-level subscription, its room gate and its disclosed
+    # limits), so the description is added rather than replacing another node's.
+    # Raised for the chat-authorship paragraph in "Main rows and host-stamped
+    # card rows": the previous raise consumed its own headroom, and the new
+    # description replaces nothing (System voice is a fact the chapter lacked).
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 100300,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     "docs/architecture/05-supervisor-loop.md": 27137,
     "docs/architecture/06-agent-core.md": 286850,
@@ -32,7 +38,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/architecture/13-external-skills-layer.md": 7764,
     "docs/development/01-role-and-authority.md": 2437,
     "docs/development/02-naming-and-boundaries.md": 36372,
-    "docs/development/03-module-size-and-complexity.md": 22873,
+    # 22873 -> 23100: one new invariant (notifications ring for live events
+    # only). Its text was compressed to the load-bearing facts first; the
+    # remainder is the cost of stating a rule that did not exist before.
+    "docs/development/03-module-size-and-complexity.md": 23100,
     "docs/development/04-core-governance-artifacts.md": 16431,
     "docs/development/05-review-and-commit-protocol.md": 12956,
     "docs/development/06-rules-by-change-class.md": 94197,

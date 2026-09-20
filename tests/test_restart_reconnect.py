@@ -549,7 +549,7 @@ def test_ws_sha_reload_decision_is_single_sourced():
         "arming recovery must be gated on the in-flight probe flag so hung "
         "probes cannot pile up and multi-count the healthy fuse"
     )
-    refresh_body = source.split("_refreshStateAfterOpen(previouslyConnected) {", 1)[1].split(
+    refresh_body = source.split("\n    _refreshStateAfterOpen(", 1)[1].split(
         "_flushPendingMessages() {", 1
     )[0]
     assert "_applyShaDecision(servedSha, previouslyConnected, true)" in refresh_body, (

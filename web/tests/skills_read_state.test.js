@@ -7,7 +7,7 @@ import { setImmediate as nextTurn } from 'node:timers/promises';
 import { renderInstalledSkillCard, renderSkillHubBadges } from '../modules/skill_card_renderer.js';
 import { lifecycleFor } from '../modules/marketplace.js';
 import { lifecycleCardClassFor, lifecycleSpinnerFor } from '../modules/lifecycle_card.js';
-import { hubListingRowFor, hubSyncVerdict } from '../modules/hub_sync.js';
+import { hubFactsPending, hubListingRowFor, hubSyncVerdict } from '../modules/hub_sync.js';
 import { escapeHtmlAttr, isRateLimitError, renderHubCard } from '../modules/utils.js';
 
 // Run the production controllers against their network/DOM boundaries. No
@@ -44,7 +44,7 @@ const demo = {
     permissions: [], grants: { all_granted: true },
 };
 
-function skillsReader(overrides = {}) {
+function skillsReader(overrides = {}, contextOverrides = {}) {
     const status = node(), empty = node(), list = node(), badge = node();
     badge.dataset.skillHubBadges = 'demo';
     let writes = 0, html = '', cards = [];
@@ -71,8 +71,9 @@ function skillsReader(overrides = {}) {
             getElementById: id => id === 'skills-status' ? status : null,
             createElement: () => ({ content: {}, set innerHTML(value) { this.content.firstElementChild = cardFor(value); } }),
         },
-        hubCatalog: { byName: new Map(), available: false },
+        hubCatalog: { byName: new Map(), available: false }, hubFactsPending,
         loadHubCatalog: () => Promise.resolve(), sortSkillsForDisplay: rows => rows,
+        ...contextOverrides,
     });
     vm.runInContext(`let skillsRenderGeneration = 0; let skillsSnapshot = null;
         ${source('skills', 'async function fetchSkills(', '\nfunction updateQueueBadges')}
@@ -81,6 +82,76 @@ function skillsReader(overrides = {}) {
     return { context, apiClient, status, empty, list, badge, patches, writes: () => writes,
         render: interactions => context.renderSkillsList(list, empty, new Set(), new Set(), interactions) };
 }
+
+test('the list never waits for the hub: pending hub facts arrive with one re-read after the catalog', async () => {
+    const hub = facts => ({ ...demo, name: 'hub', source: 'ouroboroshub', payload_root: 'skills/ouroboroshub/hub', ...facts });
+    const catalog = deferred();
+    const responses = [hub({ official_hub_verified: null, owner_attestable: null }),
+        hub({ official_hub_verified: true, owner_attestable: true })];
+    let reads = 0;
+    const hubCatalog = { byName: new Map(), available: false };
+    const view = skillsReader(
+        { extensions: async () => ({ skills: [responses[Math.min(reads++, 1)]], live: {} }) },
+        { hubCatalog, loadHubCatalog: () => catalog.promise },
+    );
+    const rendered = view.render();
+    await rendered;
+    assert.equal(reads, 1, 'first paint comes from the local listing alone');
+    assert.equal(view.writes(), 1);
+    hubCatalog.available = true;
+    catalog.resolve();
+    await nextTurn();
+    assert.equal(reads, 2, 'one re-read once the catalog read has landed');
+    assert.equal(view.writes(), 1, 'cards are patched in place, never recreated');
+    assert.equal(view.patches.at(-1).skill.official_hub_verified, true);
+
+    // No pending fact, or no catalog: nothing to re-read.
+    for (const [facts, available] of [[{ official_hub_verified: false }, true], [{ official_hub_verified: null }, false]]) {
+        let count = 0;
+        const quiet = skillsReader(
+            { extensions: async () => { count += 1; return { skills: [hub(facts)], live: {} }; } },
+            { hubCatalog: { byName: new Map(), available }, loadHubCatalog: () => Promise.resolve() },
+        );
+        await quiet.render();
+        await nextTurn();
+        assert.equal(count, 1);
+    }
+});
+
+test('a render that reused an older catalog snapshot refreshes it before its one re-read', async () => {
+    // Any in-page remount after the server's 120 s display memo expired paints
+    // hub facts as null while the page's own catalog promise is long resolved.
+    // A second listing read on the same unknown answer would change nothing; the
+    // render forces exactly one catalog read first, then re-reads once.
+    const hub = facts => ({ ...demo, name: 'hub', source: 'ouroboroshub', payload_root: 'skills/ouroboroshub/hub', ...facts });
+    const responses = [hub({ official_hub_verified: null, owner_attestable: null }),
+        hub({ official_hub_verified: true, owner_attestable: true })];
+    let reads = 0;
+    const forced = [];
+    const hubCatalog = { byName: new Map(), available: true, settled: true, promise: Promise.resolve() };
+    const view = skillsReader(
+        { extensions: async () => ({ skills: [responses[Math.min(reads++, 1)]], live: {} }) },
+        { hubCatalog, loadHubCatalog: force => { forced.push(Boolean(force)); return hubCatalog.promise; } },
+    );
+    await view.render();
+    await nextTurn();
+    await nextTurn();
+    assert.deepEqual(forced, [false, true], 'the reused snapshot is refreshed exactly once');
+    assert.equal(reads, 2, 'then one listing re-read');
+    assert.equal(view.patches.at(-1).skill.official_hub_verified, true);
+
+    // The refreshed catalog is unavailable: unknown stays unknown, no blind re-read.
+    let count = 0;
+    const offline = { byName: new Map(), available: true, settled: true, promise: Promise.resolve() };
+    const quiet = skillsReader(
+        { extensions: async () => { count += 1; return { skills: [hub({ official_hub_verified: null })], live: {} }; } },
+        { hubCatalog: offline, loadHubCatalog: force => { if (force) offline.available = false; return offline.promise; } },
+    );
+    await quiet.render();
+    await nextTurn();
+    await nextTurn();
+    assert.equal(count, 1);
+});
 
 test('primary failure preserves previous cards and is never a successful empty list', async () => {
     const view = skillsReader({ extensions: async () => { throw new Error('HTTP 503'); } });
@@ -415,7 +486,7 @@ test('Hub failed listing never becomes Install, and failed catalog keeps useful 
     nodes['#oh-results'].querySelectorAll = () => nodes['#oh-results'].innerHTML.includes('data-slug="demo"')
         ? [{ dataset: { slug: 'demo' } }] : [];
     const context = vm.createContext({
-        URLSearchParams, setTimeout, clearTimeout, hubListingRowFor, hubSyncVerdict,
+        URLSearchParams, setTimeout, clearTimeout, hubFactsPending, hubListingRowFor, hubSyncVerdict,
         escapeHtml: escapeHtmlAttr, renderHubCard,
         template: () => '', getPending: slug => pending.get(slug),
         setPending: (slug, value) => { pending.set(slug, value); onPending(); },

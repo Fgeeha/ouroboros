@@ -4,7 +4,7 @@ A wake-up is an ordinary Main turn nobody typed: ``prompts/CONSCIOUSNESS.md`` is
 message (system prompt, memory and tools are Main's own, owner decision В15).
 ``render_wake_message`` fills its placeholders from existing readers (tasks settled since the last
 wake, open owner quiz cards, the count of owner messages) and truncates the event list with an
-explicit ``(+N more; see recent_tasks)`` line, never silently (BIBLE P1). ``wake_task_metadata`` is
+explicit source pointer, never silently (BIBLE P1). ``wake_task_metadata`` is
 the wake's origin/authority envelope for ``handle_wake_direct`` (``consciousness_authority``).
 """
 
@@ -16,7 +16,11 @@ import re
 from typing import Any, Dict, List, Optional
 
 from ouroboros.consciousness_authority import (
-    CONSCIOUSNESS_CATEGORY, CONSCIOUSNESS_INITIATOR, disabled_tools_for, normalize_level, runtime_mode_cap_for,
+    CONSCIOUSNESS_CATEGORY,
+    CONSCIOUSNESS_INITIATOR,
+    disabled_tools_for,
+    normalize_level,
+    runtime_mode_cap_for,
 )
 from ouroboros.context_health import safe_read
 from ouroboros.utils import iter_jsonl_objects
@@ -32,7 +36,7 @@ LEVEL_LINES = {
     "act": "everything your runtime mode allows except editing your own code/prompts, evolution, restart and settings",
     "full": "everything your runtime mode allows, including evolution",
 }
-_FALLBACK_TEMPLATE = "[Wake-up · {reason}] No one wrote to you: this turn is yours. Since your last wake ({last_wake_ago}): {events}"
+_FALLBACK_TEMPLATE = "[Wake-up · {reason}] No one wrote to you: this turn is yours. Wake context (last wake {last_wake_ago}): {events}"
 
 
 def wake_task_metadata(level: Any, reason: str, *, root_cost_ceiling_usd: Optional[float] = None) -> Dict[str, Any]:
@@ -62,26 +66,122 @@ def _iso(ts: float) -> str:
 
 def _ago(seconds: float) -> str:
     seconds = max(0, int(seconds))
+    if seconds >= 86400:
+        return f"{seconds // 86400} d {(seconds % 86400) // 3600} h ago"
     if seconds < 3600:
         return f"{max(1, seconds // 60)} min ago"
     return f"{seconds // 3600} h {(seconds % 3600) // 60} min ago"
 
 
-def wake_events(drive_root: Any, *, since: float, now: float, exclude_task_id: str = "") -> List[str]:
-    """One line per fact since ``since``: settled tasks (never direct chat turns), unanswered
-    owner cards of ANY task — a wake's own included, and a card its task has already left
-    behind (``expired_terminal``) still takes a late answer (В17a) — and the count of owner
-    messages; readers fail soft (a gap line, never a crash)."""
+def _parse_iso(value: Any) -> Optional[float]:
+    try:
+        return _dt.datetime.fromisoformat(str(value).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _clip_preview(value: Any, limit: int = 100) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 18)].rstrip() + f" …[{len(text) - (limit - 18)} chars omitted]"
+
+
+def _project_name(drive_root: pathlib.Path, project_id: str) -> str:
+    try:
+        from ouroboros.projects_registry import get_project
+
+        row = get_project(drive_root, project_id) or {}
+        return str(row.get("name") or project_id)
+    except Exception:
+        return project_id
+
+
+def _trigger_line(
+    drive_root: pathlib.Path, reason: str, rows: List[Dict[str, Any]], *, now: float,
+) -> tuple[str, str]:
+    """Return ``(human line, task id pinned by the trigger)`` without inventing state."""
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    raw = str(reason or "").strip()
+    if not raw:
+        return "", ""
+    if raw.startswith("project_digest:"):
+        parts = raw.split(":", 2)
+        project_id = parts[1].strip() if len(parts) > 1 else ""
+        trigger_task_id = parts[2].strip() if len(parts) > 2 else ""
+        matches = [
+            row for row in rows
+            if str(row.get("project_id") or "").strip() == project_id
+            and str(row.get("status") or "") in SETTLED_STATUSES
+            and not row.get("_is_direct_chat")
+            and str((row.get("metadata") or {}).get("initiator") or "") != "consciousness"
+        ]
+        if trigger_task_id:
+            exact = [row for row in matches if str(row.get("task_id") or "") == trigger_task_id]
+            if exact:
+                matches = exact
+        matches.sort(key=lambda row: str(row.get("updated_at") or row.get("ts") or ""), reverse=True)
+        if matches:
+            row = matches[0]
+            task_id = str(row.get("task_id") or "")
+            status = str(row.get("status") or "settled")
+            title = _clip_preview(row.get("description") or row.get("text") or row.get("result"), 120)
+            cost = row.get("accounted_upper_bound_usd", row.get("cost_usd"))
+            cost_text = f", ${float(cost):.2f}" if isinstance(cost, (int, float)) else ""
+            project = _project_name(drive_root, project_id)
+            stamp = _parse_iso(row.get("updated_at") or row.get("ts"))
+            age_text = f", {_ago(now - stamp)}" if stamp is not None else ""
+            detail = f"; {title}" if title else ""
+            qualifier = "settled task" if trigger_task_id else "latest settled task"
+            return f"- wake cause: project {project} {qualifier} {task_id} ({status}){cost_text}{age_text}{detail}", task_id
+        return f"- wake cause: project {_project_name(drive_root, project_id)} reported a settled task (details unavailable)", ""
+    if raw.startswith("task_finished:"):
+        parts = raw.split(":", 2)
+        task_id, status = (parts[1:] + ["", ""])[:2]
+        row = next((row for row in rows if str(row.get("task_id") or "") == task_id), None)
+        title = _clip_preview((row or {}).get("description") or (row or {}).get("text") or (row or {}).get("result"), 120)
+        detail = f"; {title}" if title else ""
+        return f"- wake cause: task {task_id} finished ({status or 'settled'}){detail}", task_id
+    if raw.startswith("orphans_healed:"):
+        return f"- wake cause: {raw.replace('_', ' ')}", ""
+    if raw == "heartbeat":
+        return "- wake cause: scheduled heartbeat; no event reason is recorded for this wake", ""
+    return f"- wake cause: {raw or 'unknown event'}", ""
+
+
+def _card_line(task_id: str, quiz_id: str, block: Dict[str, Any], *, now: float, owner_wait: Any = None) -> str:
+    from ouroboros.project_dialogue import owner_wait_projection, question_status
+
+    state = str(block.get("state") or "open")
+    facts = owner_wait_projection(quiz_id, owner_wait, block)
+    label = question_status(state, facts, bool(block.get("wait_for_answer")))
+    asked_at = str(block.get("asked_at") or "")
+    asked_ts = _parse_iso(asked_at)
+    age = f", {_ago(now - asked_ts)}" if asked_ts is not None else ""
+    preview = _clip_preview(block.get("question") or "question text unavailable")
+    return f"- owner card {quiz_id} on task {task_id}: {label}{age}; {preview}"
+
+
+def wake_events(
+    drive_root: Any, *, since: float, now: float, reason: str = "", exclude_task_id: str = "",
+) -> List[str]:
+    """Render a trigger-first, bounded view of fresh facts and outstanding cards.
+
+    Settled task rows are filtered by ``since``. Answerable cards intentionally span the
+    full store because ``expired_terminal`` still accepts a late owner answer (В17a),
+    but they are rendered after the fresh trigger/facts and carry their semantic state.
+    """
     from ouroboros.owner_quiz import STATE_EXPIRED_TERMINAL, STATE_OPEN
     from ouroboros.task_results import list_task_results
     from ouroboros.task_status import SETTLED_STATUSES
 
-    root, since_iso, lines = pathlib.Path(drive_root), _iso(since), []
+    root, since_iso, lines, read_errors = pathlib.Path(drive_root), _iso(since), [], []
     try:
         rows = list_task_results(root)
     except Exception as exc:  # a disclosed gap beats a missing wake
-        rows, lines = [], [f"- task_results unreadable: {type(exc).__name__}"]
-    cards, settled = [], []  # (stamp, line) pairs; both classes are listed newest first
+        rows, read_errors = [], [f"- task_results unreadable: {type(exc).__name__}"]
+    cards, settled = [], []  # (stamp, line) / (stamp, task_id, line) pairs
     for row in rows:
         task_id = str(row.get("task_id") or "")
         if not task_id:
@@ -91,21 +191,24 @@ def wake_events(drive_root: Any, *, since: float, now: float, exclude_task_id: s
             if not isinstance(block, dict) or block.get("answered_at"):
                 continue
             if block.get("state") in (STATE_OPEN, STATE_EXPIRED_TERMINAL):
-                cards.append((str(block.get("asked_at") or ""),
-                              f"- open question card {quiz_id} on task {task_id} (no answer yet)"))
+                cards.append((
+                    str(block.get("asked_at") or ""),
+                    _card_line(task_id, str(quiz_id), block, now=now, owner_wait=row.get("owner_wait")),
+                ))
         if task_id == exclude_task_id or row.get("_is_direct_chat"):
             continue
         status, stamp = str(row.get("status") or ""), str(row.get("updated_at") or row.get("ts") or "")
         if status in SETTLED_STATUSES and stamp >= since_iso:
             cost = row.get("accounted_upper_bound_usd", row.get("cost_usd"))
             cost_text = f", ${float(cost):.2f}" if isinstance(cost, (int, float)) else ""
-            title = str(row.get("description") or row.get("text") or row.get("result") or "")[:80]
-            settled.append((stamp, f"- task {task_id} {status}{cost_text}: {title}".rstrip(": ")))
-    # The newest unanswered cards first (a bounded share, so a backlog of old cards never
-    # starves the settled lines), then what settled — newest first, so the honest
-    # truncation below drops the oldest facts, never the ones that just happened.
-    lines += [line for _stamp, line in sorted(cards, reverse=True)[:CARD_LINES_MAX]]
-    lines += [line for _stamp, line in sorted(settled, reverse=True)]
+            title = _clip_preview(row.get("description") or row.get("text") or row.get("result"), 80)
+            settled.append((stamp, task_id, f"- task {task_id} {status}{cost_text}: {title}".rstrip(": ")))
+    trigger, trigger_task_id = _trigger_line(root, reason, rows, now=now)
+    if trigger:
+        lines.append(trigger)
+    lines += read_errors
+    lines += [line for _stamp, task_id, line in sorted(settled, reverse=True)
+              if not trigger_task_id or task_id != trigger_task_id]
     owner_messages = 0
     try:
         for entry in iter_jsonl_objects(root / "logs" / "chat.jsonl", tail_bytes=CHAT_TAIL_BYTES):
@@ -115,6 +218,10 @@ def wake_events(drive_root: Any, *, since: float, now: float, exclude_task_id: s
         lines.append("- chat log unreadable")
     if owner_messages:
         lines.append(f"- {owner_messages} message(s) from your human (see Recent chat)")
+    # Outstanding cards are intentionally bounded, but no longer outrank the fresh
+    # event that caused this wake. Their canonical lifecycle wording makes late-answer
+    # semantics visible without creating a second question-state vocabulary.
+    lines += [line for _stamp, line in sorted(cards, reverse=True)[:CARD_LINES_MAX]]
     return lines
 
 
@@ -124,9 +231,9 @@ def render_wake_message(drive_root: Any, repo_dir: Any, *, reason: str, last_wak
                         spent_is_floor: bool = False) -> str:
     """Fill ``prompts/CONSCIOUSNESS.md`` for one wake; every placeholder is substituted."""
     template = safe_read(pathlib.Path(repo_dir) / PROMPT_REL) or _FALLBACK_TEMPLATE
-    events = wake_events(drive_root, since=since, now=now, exclude_task_id=exclude_task_id)
+    events = wake_events(drive_root, since=since, now=now, reason=reason, exclude_task_id=exclude_task_id)
     omitted = max(0, len(events) - EVENT_LINES_MAX)
-    shown = events[:EVENT_LINES_MAX] + ([f"(+{omitted} more; see recent_tasks)"] if omitted else [])
+    shown = events[:EVENT_LINES_MAX] + ([f"(+{omitted} more; see recent_tasks, get_task_result, and chat_history)"] if omitted else [])
     normalized = normalize_level(level)
     spent = f"{float(spent_usd):.2f}" if isinstance(spent_usd, (int, float)) else "unknown"
     if spent_is_floor and spent != "unknown":

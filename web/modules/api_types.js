@@ -843,8 +843,8 @@
  * @property {Object=} author_disposition
  * @property {boolean=} executable_review
  * @property {string=} review_profile
- * @property {boolean=} official_hub_verified
- * @property {boolean=} owner_attestable
+ * @property {boolean|null=} official_hub_verified null = no fresh hub catalog view yet (the page re-reads)
+ * @property {boolean|null=} owner_attestable
  * @property {{visible: boolean, publication_ready: boolean, task_start_allowed: boolean, disabled: boolean, state: "ready"|"warnings"|"needs_attention"|"repairable"|"hard_block", reason: string}=} submit_hub
  * @property {{current: Object, history: Object[], history_omitted: number=}=} skill_review
  * @property {boolean=} is_self_authored
@@ -1476,7 +1476,7 @@ export const MAX_QUIZ_OPTIONS = 6;
 // REFUSES a longer comment (it is delivered verbatim, never truncated), so
 // the card must not offer to send one.
 export const MAX_DECISION_COMMENT = 2000;
-export const GATEWAY_CONTRACT_VERSION = '7.2.2';
+export const GATEWAY_CONTRACT_VERSION = '7.3.0';
 
 /**
  * @typedef {Object} ChatHistoryPosition

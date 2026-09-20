@@ -469,6 +469,11 @@ class _AnthropicLaneMixin:
             choice = self._build_anthropic_tool_choice(tool_choice)
             if choice:
                 payload["tool_choice"] = choice
+        # A builder input, never a later mutation: whoever prices this payload
+        # before the send (the budget wrap-up) builds it here too, and a key added
+        # after the builder is a key the priced copy never has.
+        if remote_kwargs.get("stream"):
+            payload["stream"] = True
         apply_processing_preference(target, payload)
         return payload
 
@@ -492,9 +497,8 @@ class _AnthropicLaneMixin:
 
         payload = self._build_remote_candidate(
             target, messages, reasoning_effort, max_tokens, tool_choice, temperature, tools,
+            stream=stream,
         )
-        if stream:
-            payload["stream"] = True
         prompt_cache_ttl = self._normalize_payload_cache_ttl(target, payload)
 
         url = f"{str(target.get('base_url') or '').rstrip('/')}/messages"

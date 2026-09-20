@@ -7,6 +7,7 @@ import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { apiClient, apiFetch } from './api_client.js';
 import { patchInstalledSkillEnrichment, renderInstalledSkillCard, renderSkillHubBadges } from './skill_card_renderer.js';
+import { hubFactsPending } from './hub_sync.js';
 import { runSkillPublishFlow } from './skill_publish_flow.js';
 import { installedTime } from './ui_helpers.js';
 import {
@@ -83,7 +84,7 @@ function sortSkillsForDisplay(skills) {
 // OuroborosHub catalog snapshot for the display-only My-skills sync badges
 // (hub_sync verdict). Fetched once per Skills page open and reused across
 // re-renders; fail-soft — a failed fetch only hides catalog-derived badges.
-const hubCatalog = { promise: null, available: false, byName: new Map(), generation: 0 };
+const hubCatalog = { promise: null, settled: false, available: false, byName: new Map(), generation: 0 };
 
 function loadHubCatalog(force = false) {
     if (force) hubCatalog.promise = null;
@@ -91,6 +92,7 @@ function loadHubCatalog(force = false) {
         // Generation guard: only the NEWEST request may commit its snapshot,
         // so a slow older response cannot overwrite fresher catalog state.
         const generation = ++hubCatalog.generation;
+        hubCatalog.settled = false;
         hubCatalog.promise = fetchJson('/api/marketplace/ouroboroshub/catalog')
             .then((data) => {
                 if (generation !== hubCatalog.generation) return;
@@ -106,6 +108,9 @@ function loadHubCatalog(force = false) {
                 if (generation !== hubCatalog.generation) return;
                 hubCatalog.byName = new Map();
                 hubCatalog.available = false;
+            })
+            .finally(() => {
+                if (generation === hubCatalog.generation) hubCatalog.settled = true;
             });
     }
     return hubCatalog.promise;
@@ -223,6 +228,9 @@ async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(),
     if (!container.isConnected) return;
     const renderGeneration = ++skillsRenderGeneration;
     const current = () => renderGeneration === skillsRenderGeneration && container.isConnected;
+    // A snapshot already settled when this render began may be older than the
+    // server's 120 s display memo; a read still in flight is fresh by construction.
+    const catalogWasStale = hubCatalog.settled;
     const catalogSettled = loadHubCatalog();
     const status = document.getElementById('skills-status');
     // Keep primary rows pristine: merging a newer terminal queue into already
@@ -312,8 +320,24 @@ async function renderSkillsList(container, emptyEl, reviewingSkills = new Set(),
     container.innerHTML = skills.map((skill) => renderInstalledSkillCard(
         skill, reviewingSkills, repairingSkills, snapshot.live, catalogOptions(),
     )).join('');
-    catalogSettled.then(() => {
+    catalogSettled.then(async () => {
         if (!current()) return;
+        if (hubFactsPending(snapshot.rawSkills)) {
+            // The list never waits for the hub: facts the server could not know
+            // before a catalog read landed arrive with one local re-read. A
+            // snapshot this render merely reused may be older than the server's
+            // 120 s display memo, so it is refreshed first — never a second
+            // re-read on the same unknown answer.
+            if (catalogWasStale) await loadHubCatalog(true);
+            if (!current() || !hubCatalog.available) return;
+            const again = await fetchSkills().catch(() => null);
+            if (!current()) return;
+            if (again) {
+                snapshot.rawSkills = again.skills;
+                snapshot.live = again.live;
+                applyEnrichment();
+            }
+        }
         // Optional badges never recreate a card, its open menu or edited field.
         const byName = new Map(projected().map((skill) => [skill.name, skill]));
         container.querySelectorAll('[data-skill-hub-badges]').forEach((node) => {
@@ -1010,7 +1034,8 @@ export function initSkills(ctx) {
     const onPageShown = (event) => {
         actions.closeMenus();
         if (event.detail?.page === 'skills') {
-            // Fresh catalog snapshot once per page open; re-renders reuse it.
+            // Fresh catalog snapshot once per page open; re-renders reuse it and
+            // refresh it themselves only when hub facts came back unknown.
             tabs.select(activeTab);
             loadHubCatalog(true);
             refreshActive();

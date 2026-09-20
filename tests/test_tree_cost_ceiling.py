@@ -17,6 +17,7 @@ import pytest
 from ouroboros import task_pacing, usage_accounting
 from ouroboros.contracts.task_contract import normalize_budget_profile
 from ouroboros.loop import _check_budget_limits, _RoundLimitContext
+from ouroboros.task_pacing import main_loop_wire_options
 
 
 @pytest.fixture(autouse=True)
@@ -211,6 +212,12 @@ class TestCacheAwareReservation:
 
 
 
+# These pins rebuild the "actual" candidate by hand, so they carry the send's own
+# options from their one owner; tests/test_wrapup_real_send_parity.py drives the
+# real send, which is where a key these mirrors forget would be caught.
+_MAIN_LOOP_OPTIONS = main_loop_wire_options("openai::gpt-test", allow_server_web_search=False)
+
+
 def _patch_execute_candidate(monkeypatch, llm_module, execute):
     """Patch the physical candidate executor where the v7 lanes BIND it.
 
@@ -381,6 +388,7 @@ class TestWrapupAffordability:
             )
             client._chat_anthropic(
                 target, messages, tools, "high", prospective.max_completion_tokens, "auto",
+                stream=_MAIN_LOOP_OPTIONS["stream"],
             )
 
         actual = captured["request"]
@@ -416,7 +424,7 @@ class TestWrapupAffordability:
             )
             candidate = client._build_remote_candidate(
                 target, messages, "high", prospective.max_completion_tokens, "auto", None, tools,
-                skip_capability_fetch=True,
+                skip_capability_fetch=True, **_MAIN_LOOP_OPTIONS,
             )
             client._normalize_payload_cache_ttl(target, candidate)
             client._create_chat_completion_with_retries(lambda **_kwargs: None, candidate, target)
@@ -462,7 +470,7 @@ class TestWrapupAffordability:
             )
             candidate = client._build_remote_candidate(
                 target, messages, "high", prospective.max_completion_tokens, "auto", None, None,
-                skip_capability_fetch=True,
+                skip_capability_fetch=True, **_MAIN_LOOP_OPTIONS,
             )
             client._normalize_payload_cache_ttl(target, candidate)
             client._create_chat_completion_with_retries(lambda **_kwargs: None, candidate, target)
@@ -963,7 +971,7 @@ class TestWrapupAffordabilityRail:
         assert result is not None
         assert seen["source"] == "budget_wrapup_unaffordable"
         assert seen["reason"] == "budget_exhausted"
-        assert "not even one wrap-up call" in seen["text"]
+        assert "Not even one wrap-up call" in seen["text"]
         assert ctx.accumulated_usage["cost_stop_rail"] == "wrapup_reservation_last_fit"
         assert [call.get("request") for call in calls] == [None, request, request]
 
@@ -1040,7 +1048,7 @@ class TestWrapupAffordabilityRail:
                 candidate = ctx.llm._build_remote_candidate(
                     target, kwargs["initial_messages"], ctx.active_effort,
                     built["request"].max_completion_tokens, "auto", None, ctx.tool_schemas,
-                    skip_capability_fetch=True,
+                    skip_capability_fetch=True, **_MAIN_LOOP_OPTIONS,
                 )
                 ctx.llm._normalize_payload_cache_ttl(target, candidate)
                 candidate = _finalized_physical_candidate(
@@ -1092,7 +1100,7 @@ class TestWrapupAffordabilityRail:
     def test_the_stop_text_names_the_cap_and_the_reason(self):
         text = task_pacing.wrapup_last_fit_text(49.9, self._ceiling(50.0))
 
-        assert "$49.900" in text and "$50.00" in text
+        assert "$49.90 of its own $50.00 cap" in text
         assert "wrap-up call" in text
 
 
