@@ -146,9 +146,9 @@ def _redo_allowed(payload: dict) -> str:
         return "deadline_spent"
     headroom = physical_attempt_headroom()
     if headroom is not None and headroom < 1:
-        # A bounded actor (a density probe, a packet review) owns those sends
-        # for its own rail. A redo that spent the last one would leave the
-        # repair that rail is about to make unable to run.
+        # A bounded actor (a density probe, a packet review) owns those sends.
+        # With none left, asking again would raise that rail's own budget error
+        # instead of this refusal, and the caller would read the wrong cause.
         return "send_budget_spent"
     return ""
 

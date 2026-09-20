@@ -1357,8 +1357,7 @@ def observe_token_density(request: Any, usage: Optional[Dict[str, Any]], *, driv
         # requested model's, so the row would teach one model a stranger's
         # density. The witness belongs to the model that produced it, and this
         # store is keyed by the requested one, so there is nothing to learn.
-        served = ((normalized.get("claudexor") or {}).get("route") or {}).get("model")
-        if served and str(served) != str(getattr(request, "model", "") or ""):
+        if (normalized.get("claudexor") or {}).get("served_other_model"):
             return
         real = int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0)
         # A cache-inclusive total landing on 2 x cached_tokens (+-1) is a gateway

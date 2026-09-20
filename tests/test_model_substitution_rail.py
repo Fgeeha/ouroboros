@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from copy import deepcopy
+from types import SimpleNamespace
 
 import pytest
 
@@ -188,26 +189,47 @@ def test_the_account_preference_is_dropped_on_both_transports(setup, asynchronou
     assert second["account"] == {"mode": "auto"}
 
 
-def test_a_discarded_generation_teaches_the_requested_model_nothing(setup):
+def test_only_the_generation_its_own_model_produced_teaches_a_density(setup):
+    """The guard must fire on the discarded answer AND stay quiet on the real one.
+
+    A negative assertion alone would pass with the whole guard deleted, and did:
+    keying it off a host-side model comparison silenced EVERY Claudexor answer,
+    because the request names the qualified route and the result names the bare
+    wire id. The engine's own fact is the only honest key.
+    """
     from ouroboros import capability_evidence
 
     root, gateway, client = setup
     gateway.results = [substituted(), result()]
     gateway.dispatch = ["response_received"] * 2
-    seen = []
-    original = capability_evidence.observe_token_density
+    stamped, original = [], capability_evidence.observe_token_density
     try:
-        capability_evidence.observe_token_density = (
-            lambda request, usage, **kw: seen.append(
-                ((usage.get("claudexor") or {}).get("route") or {}).get("model")) or original(request, usage, **kw))
+        capability_evidence.observe_token_density = lambda request, usage, **kw: stamped.append(
+            (usage.get("claudexor") or {}).get("served_other_model"))
         call(client)
     finally:
         capability_evidence.observe_token_density = original
-    # Both generations reach the witness; only the one its own model produced
-    # may teach a density, and that guard lives in the witness itself.
-    assert seen == ["cheaper-model", "exact-model"]
-    witnesses = list((root / "state").rglob("*density*"))
-    assert all("cheaper-model" not in path.read_text(encoding="utf-8") for path in witnesses)
+    # The transport marks the discarded generation and only that one; the guard
+    # reads the engine's own fact, never a model string the host compared.
+    assert stamped == [True, None]
+
+    recorded = []
+    request = SimpleNamespace(provider="claudexor", model="claudexor::codex=exact-model",
+                              prompt_tokens_bounded_estimate=500, prompt_tokens_estimate=500,
+                              drive_root=root, physical_context=None)
+    monkey = capability_evidence.record_token_density
+    try:
+        capability_evidence.record_token_density = lambda *a, **kw: recorded.append(kw["prompt_tokens"])
+        capability_evidence.observe_token_density(
+            request, {"input_tokens": 2000}, drive_root_resolver=lambda value: value)
+        capability_evidence.observe_token_density(
+            request, {"input_tokens": 2000, "claudexor": {"served_other_model": True}},
+            drive_root_resolver=lambda value: value)
+    finally:
+        capability_evidence.record_token_density = monkey
+    # The guard must fire on the substituted row AND stay quiet on the ordinary
+    # one: a negative assertion alone passes with the whole guard deleted.
+    assert recorded == [2000]
 
 
 def test_a_failed_acknowledgement_is_disclosed_rather_than_assumed(setup):
@@ -245,6 +267,24 @@ def test_an_unknown_outcome_is_never_treated_as_a_substitution(setup):
     # answer: the rail would be re-asking a round that may still be running.
     assert raised.value.code == "model_outcome_unknown"
     assert not events(root, "model_served_mismatch") and len(gateway.creates) == 1
+
+
+def test_no_outer_paid_repeat_can_nest_another_redo_budget_on_this_transport():
+    """The rail's budget cannot be multiplied by the transport-death repeat.
+
+    A reviewer read the two bounded budgets as a product. They never meet: this
+    transport's route is loopback by construction, and a loopback route is
+    excluded from the paid repeat class, so no outer repeat starts a second
+    call whose redos begin again.
+    """
+    from ouroboros.transport_custody import is_loopback_base_url, is_retryable_transport_death
+
+    target = LLMClient()._resolve_remote_target(MODEL)
+    assert target["provider"] == "claudexor" and is_loopback_base_url(target["base_url"])
+    error = transport.ClaudexorModelError({"code": "model_operation_failed", "message": "died"})
+    error.physical_attempt_capture = SimpleNamespace(
+        state="dispatched", provider="claudexor", route_is_loopback=True)
+    assert is_retryable_transport_death(error) is False
 
 
 def test_a_discarded_generation_never_becomes_the_live_turn(setup, monkeypatch):

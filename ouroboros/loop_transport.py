@@ -854,10 +854,11 @@ def emit_model_effort_mismatch(
 # claim the round moved (architecture: rotation is possible, not guaranteed).
 _SUBSTITUTION_DISPOSITIONS = {
     "redo": "the answer was not accepted and the round was asked again without preferring that account",
-    "redos_exhausted": "the round was asked again and kept being answered by another model",
+    "redos_exhausted": "the answer was not accepted and no further attempt was available",
     "pinned_account": "the account is pinned, so the round was not asked again",
     "admitted_candidate": "this send was already admitted, so the round was not asked again",
-    "send_budget_spent": "this task had no send left for another attempt",
+    "send_budget_spent": "asking again would have spent this task's last send",
+    "deadline_spent": "the task's own time was spent, so the round was not asked again",
 }
 
 
@@ -873,8 +874,7 @@ def emit_model_substitution(
     The sentence names what actually happened — a recovered redo and a refusal
     are different facts and must not share one wording.
     """
-    rows = (accumulated_usage.get("_model_substitutions")
-            or (accumulated_usage.get("_options") or {}).get("substituted"))
+    rows = accumulated_usage.get("_model_substitutions")
     notified = accumulated_usage.setdefault("_model_substitution_notified", [])
     if emit_progress is None or not isinstance(rows, list):
         return
@@ -959,8 +959,8 @@ def provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
         # which is wrong here: the engine refused its OWN continuation record.
         return (
             " The provider refused the stored continuation of this conversation "
-            "rather than the request itself; the next attempt sends the same "
-            "conversation without it."
+            "rather than the request itself. Dropping it and sending the same "
+            "conversation again is the repair, and this round already spent it."
         )
     if kind in {"quota_exhausted", "auth_error", "request_too_large", "bad_request", "context_overflow"}:
         guidance = {

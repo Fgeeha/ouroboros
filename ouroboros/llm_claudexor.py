@@ -60,7 +60,7 @@ from ouroboros.gateways.claudexor import (
 )
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 from ouroboros.llm_substitution import (
-    SubstitutionBudget, failed_account_preference, remember_failed_profile,
+    SubstitutionBudget, substitution_fact, failed_account_preference, remember_failed_profile,
     take_failed_account_preference,
 )
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
@@ -635,9 +635,11 @@ class _ModelInvocation:
     def extract_usage(self, result: dict) -> tuple[dict, float | None, bool]:
         usage, cost, final = _usage(result)
         # Settlement reads this row before the caller decides anything, and the
-        # density witness must know whose tokenizer it measured: a route that
-        # answered with another model teaches nothing about the requested one.
-        usage["claudexor"] = {"route": copy.deepcopy(result.get("route") or {})}
+        # density witness must know whose tokenizer it measured: a generation
+        # another model produced teaches nothing about the requested one. The
+        # ENGINE decided that, here as everywhere; the host compares no models.
+        if substitution_fact(result):
+            usage["claudexor"] = {"served_other_model": True}
         if "processing" not in usage and self.target.get("processing_preference"):
             options = self.payload.get("options") or {}
             usage["processing"] = {
