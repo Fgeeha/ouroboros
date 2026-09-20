@@ -60,9 +60,8 @@ Disturb or platform limit is bypassed. Policy and its disclosed limits: DESIGN
 §9; engineering rules: DEVELOPMENT "notifications ring for live events only".
 
 Independent iframe documents do not inherit the host's tokens or stored choice.
-The optional author UI kit supplies styles/primitives; module theme opt-in is
-documented below and never forces a remount. Route iframes are bridgeless and
-author-owned. Desktop `webview.start(private_mode=False)` requests
+The optional author UI kit supplies styles/primitives, not a hot-theme protocol;
+there is no forced remount. Desktop `webview.start(private_mode=False)` requests
 persistent website storage in `launcher.py` and `launcher_onboarding.py`, including
 cookies, not just appearance. Existing packaged launchers must be rebuilt and
 installed to change that flag. Profile identity, origin and platform storage
@@ -105,7 +104,7 @@ History reconciliation is one synchronous two-pass transaction over existing key
 
 `chat_history.js` retains three ordinary rendered pages plus temporarily protected reading/focus/selection pages, holding page descriptors only — content stays with the row/card owners, which release distant page bodies and their media/listener resources while descriptors keep exact return navigation. An empty scan is not a page, there is no newer control, and the per-room scroll stash carries descriptors plus a physical reading anchor, never a second history copy; recent live refresh stays separate from the frozen archive range, and reaching the old physical beginning does not claim every page is loaded.
 
-The recent-window read is the chat's own request, so `createHistoryControls` carries its in-flight and failed state through the same `.chat-load-older` control, armed only over an empty feed. A slow read left the panel blank under a green `Online` header, as a failed one did; `syncHistory` catches its own error, so the state is written inside the sync, and Retry reruns the open transaction.
+Recent-window reads keep `.chat-load-older` state over an empty feed; Retry reopens it.
 
 #### Main rows and host-stamped card rows
 
