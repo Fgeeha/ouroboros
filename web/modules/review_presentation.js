@@ -40,6 +40,10 @@ const finiteCount = (value) => {
     const number = Number(value);
     return Number.isFinite(number) && number >= 0 ? Math.trunc(number) : null;
 };
+// A reviewer answer that has not arrived is a gap, not a verdict: the host
+// types a planned wait as `pending_dispatch` and an exceptional one otherwise.
+const actorAwaiting = (actor) => text(actor?.operation_state) === 'pending_dispatch';
+const actorUnresolved = (actor) => ['in_flight', 'custody_lost'].includes(text(actor?.operation_state));
 
 export function setReviewAnchor(record, enabled, writePhase) {
     if (!record || (record.historicalUnavailable || record.historicalUnconfirmed) || Boolean(record.reviewAnchor) === enabled) return false;
@@ -406,12 +410,22 @@ function planAttempt(wave, index, isCurrent) {
     const superseded = Boolean(wave.superseded) || !isCurrent;
     // Gate closure and physical reviewer custody are independent. A partial
     // wave can remain in flight after the author selects a different plan.
-    const state = wave.custody_pending === true ? 'running' : superseded ? 'superseded' : 'terminal';
+    const custodyPending = wave.custody_pending === true;
+    const state = custodyPending ? 'running' : superseded ? 'superseded' : 'terminal';
+    const roster = (Array.isArray(wave.actors) ? wave.actors : [])
+        .filter((actor) => actor && typeof actor === 'object');
+    // A wave whose reviewers may still answer reports how far it got; the
+    // verdict token speaks only for a wave that is no longer collecting.
+    const progress = custodyPending
+        ? `${roster.some(actorUnresolved) && !roster.some(actorAwaiting) ? 'unresolved' : 'in progress'}`
+            + ` · ${roster.filter((actor) => actor.ok === true).length} of ${roster.length} answered`
+        : '';
     return {
         id,
         surface: 'plan',
         state,
-        tone: statusTone(state, verdict),
+        progress,
+        tone: statusTone(state, custodyPending ? '' : verdict),
         verdict,
         timestamp: text(wave.reviewed_at || wave.ts || wave.timestamp || wave.closed_at),
         ordinal: index,
@@ -516,6 +530,13 @@ function planActorAvailabilityLines(wave) {
     for (const actor of (Array.isArray(wave.actors) ? wave.actors : [])) {
         if (!actor || typeof actor !== 'object' || actor.ok !== false) continue;
         const identity = [text(actor.slot_id), text(actor.model)].filter(Boolean).join(' · ') || 'reviewer';
+        const gap = actorAwaiting(actor)
+            ? `Awaiting answer: ${identity}`
+            : (actorUnresolved(actor) ? `No answer: ${identity} — ${text(actor.operation_state)}` : '');
+        if (gap) {
+            lines.push(gap);
+            continue;
+        }
         const cause = text(actor.failure_code) || text(actor.error) || 'no parseable verdict';
         lines.push(`Reviewer unavailable: ${identity} — ${cause}`);
     }
@@ -524,7 +545,9 @@ function planActorAvailabilityLines(wave) {
 
 function planWaveDetail(wave) {
     const lines = [
-        wave.aggregate ? `Verdict: ${wave.aggregate}` : '',
+        wave.custody_pending === true
+            ? 'Verdict: none yet (wave held open)'
+            : (wave.aggregate ? `Verdict: ${wave.aggregate}` : ''),
         wave.closed != null ? `Closed: ${wave.closed ? 'yes' : 'no'}` : '',
         wave.paid != null ? `Reviewer panel dispatched: ${wave.paid ? 'yes' : 'no'}` : '',
         wave.quorum_unreachable ? 'Quorum unavailable' : '',
@@ -703,6 +726,9 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
         state = activeAttempts.some((attempt) => attempt.state === 'running') ? 'running' : 'queued';
         activeCount = activeAttempts.length;
     }
+    // The group header speaks for its live wave: progress while that wave is
+    // still collecting answers, the recorded verdict once it is not.
+    const progress = text(activeAttempts.at(-1)?.progress);
     return {
         id: `plan:${owner}`,
         surface: 'plan',
@@ -712,7 +738,8 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
         subjectTaskId: owner,
         initiatorTaskId: owner,
         state,
-        tone: statusTone(state, currentVerdict),
+        progress,
+        tone: statusTone(state, progress ? '' : currentVerdict),
         verdict: currentVerdict,
         summary: text(current.reason || currentAttempt?.summary),
         authorDecisionText,
@@ -1214,7 +1241,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
 function attemptMeta(attempt) {
     return [
         attempt.timestamp,
-        attempt.verdict || (attempt.lifecycleOnly
+        attempt.progress || attempt.verdict || (attempt.lifecycleOnly
             ? (['queued', 'running'].includes(attempt.state) ? attempt.state : 'review verdict unavailable')
             : ''),
         lifecycleMeta(attempt.lifecycleStatus),
@@ -1359,7 +1386,7 @@ export function renderReviewsSection(groupsInput, disclosure = {}) {
                         <span class="chat-review-group-label">${escapeHtmlText(group.label)}</span>
                         ${group.subject ? `<span class="chat-review-subject">${escapeHtmlText(group.subject)}</span>` : ''}
                     </span>
-                    <span class="chat-review-group-meta">${escapeHtmlText([group.verdict || (group.lifecycleOnly
+                    <span class="chat-review-group-meta">${escapeHtmlText([group.progress || group.verdict || (group.lifecycleOnly
                         ? (['queued', 'running'].includes(group.state) ? group.state : 'review verdict unavailable')
                         : group.state), lifecycleMeta(group.lifecycleStatus), shown].filter(Boolean).join(' · '))}</span>
                 </button>

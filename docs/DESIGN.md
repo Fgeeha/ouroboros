@@ -474,6 +474,11 @@ not child-task cards and never prove execution by themselves.
 - Disclosure is user-owned. Review results, retries, failures, terminal task
   state, reconnect, and lazy-detail loading update content in place but never
   open or close the task, Reviews section, or group.
+- A plan wave whose reviewers may still answer reads as work in progress: the
+  working tone, `in progress · k of n answered` where the verdict token would
+  sit, and each awaited reviewer listed as awaiting rather than unavailable,
+  under no verdict word. A reviewer whose window expired is unresolved. A
+  settled wave without quorum keeps the warning tone and its `DEGRADED` verdict.
 - A panel that settled after its task ended stays one attempt row of its group,
   labelled as settled after the task ended; its note (which verdict, which
   revision, whether a reviewer's outcome is still unknown) is host-composed and
