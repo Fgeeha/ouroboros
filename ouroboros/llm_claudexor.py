@@ -40,7 +40,6 @@ from __future__ import annotations
 
 import asyncio
 import copy
-import contextvars
 from dataclasses import replace
 import hashlib
 import json
@@ -60,6 +59,9 @@ from ouroboros.gateways.claudexor import (
     ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported, _READ_TIMEOUT_SEC,
 )
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
+from ouroboros.llm_substitution import (
+    SubstitutionBudget, substitution_fact, failed_account_preference,
+    remember_failed_profile, take_failed_account_preference)
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
 from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait, prepared_call_scope
 from ouroboros.observability import persist_call
@@ -72,16 +74,6 @@ from ouroboros.usage_accounting import (
 from ouroboros.utils import append_jsonl, sanitize_tool_result_for_log, utc_now_iso
 
 log = logging.getLogger(__name__)
-_FAILED_PROFILE = contextvars.ContextVar("claudexor_failed_profile", default=())
-_PER_SUBJECT_REFUSALS = frozenset({
-    "auth_required", "auth_refresh_failed", "credential_unusable", "provider_refused",
-    "rate_limited", "subscription_window_exhausted",
-})
-_NON_PROVIDER_FAILURES = frozenset({
-    "model_operation_cancelled", "model_operation_interrupted",
-})
-
-
 def model_catalog(source: str, credential_profile_id: str | None = None, *,
                   requested_model: str | None = None, timeout_sec: float | None = None) -> dict:
     """Metadata-only transport; the capability evidence owner interprets the envelope."""
@@ -291,18 +283,6 @@ def adopt_turn_state(slot: ModelTurnState | None, payload: dict, result: dict) -
     slot.envelope = copy.deepcopy(envelope) if isinstance(envelope, dict) else None
 
 
-def _remember_failed_profile(target: dict, parameters: dict, error: ClaudexorModelError) -> None:
-    if getattr(error, "stream_rejected", False):
-        return  # Local message normalization says nothing about account readiness.
-    route = error.route or {}
-    key = (parameters.get("cache_affinity"), route.get("source"), route.get("model"))
-    if (key == (parameters.get("cache_affinity"), target["source"], target["resolved_model"])
-            and key[0] and route.get("credentialProfileId")
-            and ((error.status_code == 0 and error.code not in _NON_PROVIDER_FAILURES)
-                 or error.code in _PER_SUBJECT_REFUSALS)):
-        _FAILED_PROFILE.set((*key, route["credentialProfileId"]))
-
-
 def cache_key_for_model(model: str) -> str:
     """The Codex prompt-cache key every main-loop execution of this install shares.
 
@@ -366,18 +346,15 @@ def _request(target: dict, messages: list, tools: list | None, parameters: dict)
         raise ValueError("model_account_override must be a profile name, empty Auto, or None")
     pin = override.strip() if override is not None else model_role_option(MODEL_ACCOUNTS_KEY, role)
     account = {"mode": "pin", "profileId": pin} if pin else {"mode": "auto"}
-    failed = _FAILED_PROFILE.get()
-    failed_key = (parameters.get("cache_affinity"), target["source"], target["resolved_model"])
-    same_route = len(failed) == 4 and failed[:3] == failed_key
-    failed_profile = failed[3] if same_route else ""
-    if same_route and not parameters.get("prospective"):
-        # The next matching-route DISPATCH only; Pin still consumes it. A
-        # prospective build reads the same preference without spending the
-        # fact, so the priced candidate and the send it admits stay identical.
-        _FAILED_PROFILE.set(())
-    if not pin:
-        # Carry the conversation's last account as a preference, not admission.
-        # The engine is still the only actor choosing an eligible account.
+    # The next matching-route DISPATCH only; Pin still consumes it. A prospective
+    # build reads the same fact without spending it, so the priced candidate and
+    # the send it admits stay identical.
+    failed_profile = (take_failed_account_preference if not parameters.get("prospective")
+                      else failed_account_preference)(target, parameters)
+    if not pin and not parameters.get("_no_account_preference"):
+        # Carry the conversation's last account as a preference, not admission;
+        # the engine still chooses. A round already answered by the wrong model
+        # carries none, so its ranking decides where every redo lands.
         for message in reversed(prepared):
             native = message.get("nativeContinuation") or {}
             route = native.get("route") or {}
@@ -657,6 +634,12 @@ class _ModelInvocation:
 
     def extract_usage(self, result: dict) -> tuple[dict, float | None, bool]:
         usage, cost, final = _usage(result)
+        # Settlement reads this row before the caller decides anything, and the
+        # density witness must know whose tokenizer it measured: a generation
+        # another model produced teaches nothing about the requested one. The
+        # ENGINE decided that, here as everywhere; the host compares no models.
+        if substitution_fact(result):
+            usage["claudexor"] = {"served_other_model": True}
         if "processing" not in usage and self.target.get("processing_preference"):
             options = self.payload.get("options") or {}
             usage["processing"] = {
@@ -758,7 +741,7 @@ class _ModelInvocation:
 
 
 def _reset_native(payload: dict, error: ClaudexorModelNotDispatched, invocation: _ModelInvocation) -> dict | None:
-    from ouroboros.llm_messages import reset_native_messages
+    from ouroboros.llm_messages import drop_source_native_messages, reset_native_messages
 
     capture = getattr(error, "physical_attempt_capture", None)
     if error.code != "invalid_continuation" or getattr(capture, "state", None) != "released":
@@ -766,7 +749,13 @@ def _reset_native(payload: dict, error: ClaudexorModelNotDispatched, invocation:
     messages, changed = reset_native_messages(
         payload["messages"], error.route, source=payload["source"], model=payload["model"])
     if not changed:
-        return None
+        # The account never changed, so the refusal is about the continuation
+        # itself — an engine that still binds it to the model that produced it
+        # refuses a route the caller cannot repair by re-routing. Drop this
+        # source's continuations once and let the canonical messages speak.
+        messages, changed = drop_source_native_messages(payload["messages"], source=payload["source"])
+        if not changed:
+            return None
     append_jsonl(invocation.root / "logs" / "events.jsonl", {
         "ts": utc_now_iso(), "type": "native_continuation_reset", "task_id": invocation.task_id,
         "model_role": invocation.role, "operation_id": invocation.operation_id, "routes": changed,
@@ -833,7 +822,8 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
     payload = _request(target, messages, tools, parameters)
     retry_preparation = None
     native_repaired = processing_repaired = False
-    for _preparation in range(3):
+    substitution = SubstitutionBudget(ClaudexorModelError)
+    for _preparation in range(3 + substitution.redos):
         invocation = _ModelInvocation(target, payload, parameters)
         try:
             with prepared_call_scope(retry_preparation or {}) as prepared:
@@ -842,9 +832,15 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 request, before = _accounted_request(invocation)
                 result = execute_physical_attempt(request, invocation.receive, extractor=invocation.extract_usage, before_dispatch=before)
                 invocation.capture = last_physical_attempt_capture()
+                if substitution.admit(invocation, result):
+                    # The same round, asked again naming no account, on this
+                    # call's every later request: the engine alone picks.
+                    retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
+                    payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
+                    continue
                 adopt_turn_state((prepared or parameters).get("model_turn_state"),
                                  invocation.payload, result)
-                return invocation.finish(result)
+                return substitution.disclose(invocation.finish(result))
         except ClaudexorModelNotDispatched as error:
             if invocation.response_ref:
                 invocation.acknowledge()
@@ -857,12 +853,12 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 updated = _reset_native(payload, error, invocation)
                 native_repaired = updated is not None
             if updated is None:
-                _remember_failed_profile(target, parameters, error)
+                remember_failed_profile(target, parameters, error)
                 raise
             payload = updated
             retry_preparation = _native_retry_preparation(target, payload, parameters, error)
         except ClaudexorModelError as error:
-            _remember_failed_profile(target, parameters, error)
+            remember_failed_profile(target, parameters, error)
             raise
         except PhysicalAttemptPreparationFailed as error:
             cause = error.__cause__
@@ -943,7 +939,8 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
     payload = _request(target, messages, tools, parameters)
     retry_preparation = None
     native_repaired = processing_repaired = False
-    for _preparation in range(3):
+    substitution = SubstitutionBudget(ClaudexorModelError)
+    for _preparation in range(3 + substitution.redos):
         invocation = _ModelInvocation(target, payload, parameters)
         try:
             with prepared_call_scope(retry_preparation or {}) as prepared:
@@ -960,9 +957,15 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                 result = await execute_physical_attempt_async(
                     request, receive, extractor=invocation.extract_usage, before_dispatch=prepare)
                 invocation.capture = last_physical_attempt_capture()
+                if await invocation.offload(substitution.admit, invocation, result):
+                    # The same round, asked again naming no account, on this
+                    # call's every later request: the engine alone picks.
+                    retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
+                    payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
+                    continue
                 adopt_turn_state((prepared or parameters).get("model_turn_state"),
                                  invocation.payload, result)
-                return await invocation.offload(invocation.finish, result)
+                return substitution.disclose(await invocation.offload(invocation.finish, result))
         except ClaudexorModelNotDispatched as error:
             if invocation.response_ref:
                 await invocation.offload(invocation.acknowledge)
@@ -975,12 +978,12 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                 updated = _reset_native(payload, error, invocation)
                 native_repaired = updated is not None
             if updated is None:
-                _remember_failed_profile(target, parameters, error)
+                remember_failed_profile(target, parameters, error)
                 raise
             payload = updated
             retry_preparation = _native_retry_preparation(target, payload, parameters, error)
         except ClaudexorModelError as error:
-            _remember_failed_profile(target, parameters, error)
+            remember_failed_profile(target, parameters, error)
             raise
         except PhysicalAttemptPreparationFailed as error:
             cause = error.__cause__

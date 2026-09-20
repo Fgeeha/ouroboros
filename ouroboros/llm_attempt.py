@@ -63,6 +63,19 @@ class _PhysicalSendNotStarted(PhysicalDispatchInterrupted, ProviderNotDispatched
     """Positive no-dispatch evidence for this send alone, not the recovery ladder."""
 
 
+def physical_attempt_headroom() -> Optional[int]:
+    """Sends still claimable in this actor context; None when unbounded.
+
+    An advisory read beside the window above: the claim itself is what enforces
+    the bound, this only lets a caller decline to spend a send it knows belongs
+    to its own later repair.
+    """
+    from ouroboros.usage_accounting import _PHYSICAL_LIMIT
+
+    state = _PHYSICAL_LIMIT.get()
+    return None if state is None else max(0, state.maximum - state.used)
+
+
 def require_physical_dispatch_window() -> Optional[float]:
     from ouroboros.model_wait import current_model_wait, dispatch_deadline_remaining_sec
 

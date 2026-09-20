@@ -113,6 +113,13 @@ def get_per_call_timeout_ceiling_sec() -> int:
     return _clamped_number_setting("OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", low=1, cast=int)
 
 
+def get_model_substitution_redos() -> int:
+    """How many times one round may be asked again after the route served ANOTHER
+    model. Each redo is a new operation, so the ceiling is small on purpose: the
+    configured model fallback chain owns the case where the whole pool substitutes."""
+    return _clamped_number_setting("OUROBOROS_SERVED_MODEL_REDOS", low=0, high=5, cast=int)
+
+
 def get_restart_drain_max_sec() -> int:
     return _clamped_number_setting(
         "OUROBOROS_RESTART_DRAIN_MAX_SEC", low=0, cast=lambda v: int(float(v)))

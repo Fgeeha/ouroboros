@@ -182,6 +182,12 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             )
             note_event.pop("system_type", None)
             note_event["delivery_id"] += ":host_notice"
+            inherited = note_event.get("progress_meta")
+            if isinstance(inherited, dict) and "card_row" in inherited:
+                # The untyped host notice stays an ordinary row: it never takes
+                # the answer's card placement, whose row id would overwrite it.
+                note_event["progress_meta"] = {key: value for key, value in inherited.items()
+                                               if key not in ("card_row", "card_row_id")}
             # Owe the notice before the answer clears its bundled outbox row.
             # Each ordinary send retains its own failure/replay/dedupe semantics.
             register_pending_delivery(ctx.DRIVE_ROOT, note_event)

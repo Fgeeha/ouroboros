@@ -37,6 +37,25 @@ def reset_native_messages(messages: list, route: dict, *, source: str, model: st
     return prepared, changed
 
 
+def drop_source_native_messages(messages: list, *, source: str) -> tuple[list, list]:
+    """Send one source's history without its continuations, keeping the content.
+
+    The account-reset above answers a route that MOVED. This answers a route
+    that refused its own continuation while standing still — an engine that
+    binds a continuation to the model that produced it cannot replay it once
+    another model answered on the same account. The canonical content and tool
+    calls are the message either way, so nothing the caller said is lost.
+    """
+    changed = []
+    prepared = copy.deepcopy(messages)
+    for message in prepared:
+        native = message.get("nativeContinuation")
+        if isinstance(native, dict) and (native.get("route") or {}).get("source") == source:
+            changed.append({"old_route": native.get("route") or {}, "new_route": {}})
+            message.pop("nativeContinuation")
+    return prepared, changed
+
+
 
 
 class _MessageShapingMixin:

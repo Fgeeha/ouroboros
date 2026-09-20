@@ -849,6 +849,51 @@ def emit_model_effort_mismatch(
     )
 
 
+# What the host KNOWS it did. It asks again and names no account; which account
+# answers the redo is the engine's choice, so no wording here may claim the
+# round moved (architecture: rotation is possible, not guaranteed).
+_SUBSTITUTION_DISPOSITIONS = {
+    "redo": "the answer was not accepted and the round was asked again without naming an account",
+    "redos_exhausted": "the answer was not accepted and no further attempt was available",
+    "pinned_account": "the account is pinned, so the round was not asked again",
+    "admitted_candidate": "this send was already admitted, so the round was not asked again",
+    "send_budget_spent": "this caller had no send left, so the round was not asked again",
+    "deadline_spent": "the task's own time was spent, so the round was not asked again",
+}
+
+
+def emit_model_substitution(
+    accumulated_usage: Dict[str, Any], *, task_id: str, emit_progress: Optional[Callable[..., None]],
+) -> None:
+    """Disclose once per task and requested model that another model answered.
+
+    A timeline row of the task that spent the round, never a chat message and
+    never a toast: the round recovers by itself, and the owner's interest is
+    the cognitive horizon the task ran under, not an interruption. A second
+    substitution of the same model in the same task stays in the durable rows.
+    The sentence names what actually happened — a recovered redo and a refusal
+    are different facts and must not share one wording.
+    """
+    rows = accumulated_usage.get("_model_substitutions")
+    notified = accumulated_usage.setdefault("_model_substitution_notified", [])
+    if emit_progress is None or not isinstance(rows, list):
+        return
+    for row in rows:
+        requested, observed = str(row.get("requested") or ""), str(row.get("observed") or "")
+        if not requested or not observed or requested in notified:
+            continue
+        notified.append(requested)
+        account = str(row.get("account") or "")
+        outcome = _SUBSTITUTION_DISPOSITIONS.get(str(row.get("disposition") or ""), "")
+        emit_progress(
+            f"⚠️ {observed} answered instead of the requested {requested}"
+            f"{f' (Claudexor account {account})' if account else ''}"
+            f"{f'; {outcome}' if outcome else ''}.",
+            card_row="timeline",
+            card_row_id=":".join(part for part in (task_id, "model_substitution", requested) if part),
+        )
+
+
 def provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
     """Explain whether retrying later is likely to help."""
     kind = str(accumulated_usage.get("_last_llm_error_kind") or "").strip()
@@ -902,6 +947,20 @@ def provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
             " The subscription window for the delegated route is spent. This is "
             f"TRANSIENT, not a billing refusal — waiting cures it.{when} Retrying is "
             "scheduled against that reset time, not the ordinary short backoff."
+        )
+    if kind == "model_substituted":
+        return (
+            " The route answered with a different model than the one requested, so "
+            "the answer was not accepted. Another account may serve the requested "
+            "model right away; the engine ranks this one lower for a while after this."
+        )
+    if kind == "bad_request" and str(accumulated_usage.get("_last_llm_provider_code") or "") == "invalid_continuation":
+        # The generic bad_request sentence below blames the caller's transcript,
+        # which is wrong here: the engine refused its OWN continuation record.
+        return (
+            " The provider refused the stored continuation of this conversation "
+            "rather than the request itself. Dropping it and sending the same "
+            "conversation again is the repair, and this round already spent it."
         )
     if kind in {"quota_exhausted", "auth_error", "request_too_large", "bad_request", "context_overflow"}:
         guidance = {
