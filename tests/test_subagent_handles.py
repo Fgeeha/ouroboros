@@ -469,3 +469,29 @@ def test_every_childs_engine_survives_the_evidence_cap(tmp_path):
         assert f'"engine": "vendor/model-{index}/low"' in text, f"child {index} lost its engine to the cap"
     assert text.index('"children_overview"') < text.index('"children"')
     assert '"duration_sec": 60.0' in text and "stored-key-" not in text
+
+
+def test_a_processing_only_save_may_create_effective_twins_by_decision(monkeypatch):
+    """A deliberate residual, pinned: uniqueness is judged only when a save changes
+    the ROSTER. Turning the global processing preference to `fast` makes an
+    inheriting row and an explicit-`fast` row one engine, and that save is
+    ACCEPTED (the roster is untouched); the live roster then tells them apart as
+    `<handle>~<stored id>`, and the next roster edit is judged."""
+    from ouroboros.configured_subagents import serialize_configured_subagents
+    from ouroboros.subagent_runtime import model_visible_subagent_catalog
+
+    rows = (_api("inherits"), _api("explicit", processing_preference="fast"))
+    stored = {"OUROBOROS_SUBAGENTS": serialize_configured_subagents(_config(*rows))}
+    roster = {"enabled": True, "items": list(rows)}
+
+    accepted, saved = _post_settings(
+        monkeypatch, {"OUROBOROS_SUBAGENTS": roster, "OUROBOROS_PROCESSING_PREFERENCE": "fast"}, stored)
+    assert accepted.status_code == 200, accepted.body[:300]
+    assert saved["OUROBOROS_PROCESSING_PREFERENCE"] == "fast"
+    names = [row["subagent_id"] for row in model_visible_subagent_catalog(saved)["rows"]]
+    assert names == ["x-ai/grok-4.6/fast~inherits", "x-ai/grok-4.6/fast~explicit"]
+
+    reworded = {"enabled": True, "items": [{**rows[0], "recommended_use": "new words"}, rows[1]]}
+    refused, _ = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": reworded}, saved)
+    assert refused.status_code == 400 and b"same engine" in refused.body
+
