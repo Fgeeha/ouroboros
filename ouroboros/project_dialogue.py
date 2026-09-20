@@ -766,6 +766,7 @@ TASK_CAUSE_PHRASES = {
     "acceptance_bypassed_children_unabsorbed": "Some sub-tasks had not been folded in, so the answer was never reviewed.",
     # Execution reason codes, carried verbatim from the card's own old table.
     "plan_review_advisory": "Plan review never closed; the work continued under advisory enforcement",
+    "plan_review_awaiting": "The plan reviewers had not answered yet when the task ended.",
     "host_child_status_suffix": "A child task had not settled when the answer was delivered",
     "invalid_delivery_control_after_repair": "The delivery control object was still malformed after repair",
     "budget_exhausted": "The task ran out of budget before it could finish cleanly",
@@ -1282,7 +1283,7 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     of ``taskReasonDetail``; callers add no punctuation.
     """
     from ouroboros.outcomes import (
-        ACCEPTANCE_ACCEPTED, REASON_FINAL_MESSAGE, REASON_OWNER_REQUESTED_FINALIZATION,
+        ACCEPTANCE_ACCEPTED, REASON_FINAL_MESSAGE, REASON_OWNER_REQUESTED_FINALIZATION, plan_review_awaiting,
     )
 
     decision: Dict[str, Any] = {}
@@ -1302,8 +1303,9 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
             and (status != ACCEPTANCE_ACCEPTED or cause in TASK_CAUSE_PHRASES)
             and outcome_phase(result, event) in {"done", "warn"}):
         clause = TASK_CAUSE_PHRASES.get(cause, cause)
-    elif reason in {REASON_OWNER_REQUESTED_FINALIZATION, REASON_FINAL_MESSAGE}:
-        return ""
+    elif reason in {REASON_OWNER_REQUESTED_FINALIZATION, REASON_FINAL_MESSAGE, ""}:
+        awaited = reason != REASON_OWNER_REQUESTED_FINALIZATION and plan_review_awaiting(event, result)
+        return TASK_CAUSE_PHRASES["plan_review_awaiting"] if awaited else ""  # a gap the row states, never a warning
     else:
         # A healed debt is never restored here. The objective warning the
         # overlay froze keeps the headline and the refresh may not rewrite it,
@@ -1318,9 +1320,7 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
             clause += f" ({TASK_CAUSE_PHRASES.get(custody, custody)})"
         elif custody:
             clause = TASK_CAUSE_PHRASES.get(custody, custody)
-    if not clause:
-        return ""
-    return clause if clause.endswith((".", "!", "?", "…", ")")) else clause + "."
+    return clause if not clause or clause.endswith((".", "!", "?", "…", ")")) else clause + "."
 
 
 def _run_lives_in_its_project(

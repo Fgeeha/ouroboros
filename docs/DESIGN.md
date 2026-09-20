@@ -246,6 +246,13 @@ That row keeps a neutral owner anchor visible, but hides task status and typing
 until a real task status or activity arrives; review presence alone never means
 `Working`, `Done`, or owner attention.
 
+A review that was only awaited when its task ended is not a warning. Reviewers
+that had simply not answered yet leave the task `Done`: the final message keeps
+the host's disclosure that the review was still open, and the card states the
+same fact as its cause sentence. A real outcome keeps its word: no reviewer
+quorum, a failed, refused or unresolved slot, a reviewer verdict nobody closed,
+a rail or a blocking exit still read `Done with warnings` or `Failed`.
+
 A host fact about a task is a row of that task's card, never a standalone
 bubble beside it. A reviewer panel that settles after its task already ended
 adds one System row naming the verdict and which revision it covered; that row

@@ -454,6 +454,28 @@ def _plan_review_engaged(state: Any) -> bool:
                 or legacy.get("status") not in (None, "", "absent"))
 
 
+def plan_wave_only_awaited(wave: Any) -> bool:
+    """Whether the wave is open ONLY because reviewers had not answered yet.
+
+    Typed facts alone: every unanswered slot is a planned wait (the census names no
+    unresolved, uncollected, refused or failed slot), and the recorded answers hold
+    no verdict of their own beneath the stored placeholder — they are fewer than the
+    quorum, or they raised no finding. A quorum of answers that raised findings IS a
+    critic verdict the wait merely postpones, so it never reads as a mere wait."""
+    from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
+
+    if not isinstance(wave, dict) or not wave.get("custody_pending"):
+        return False
+    census = plan_wave_slot_census(wave)
+    if not census["awaiting"] or any(
+            census[name] for name in ("unresolved", "uncollected", "skipped", "failed")):
+        return False
+    counts = wave.get("counts") if isinstance(wave.get("counts"), dict) else {}
+    quorum = counts.get("quorum")
+    below_quorum = type(quorum) is int and quorum > 0 and len(census["answered"]) < quorum
+    return below_quorum or not wave.get("findings")
+
+
 def force_plan_decision(
     ctx: Any, llm_trace: Dict[str, Any], *,
     hard_rail: str = "", enforcement: Optional[str] = None,
@@ -523,6 +545,12 @@ def force_plan_decision(
         # wave DEGRADED and open for exactly that reason), so the disclosure must
         # say a result is still owed instead of implying the panel is over.
         decision["review_late_result_pending"] = True
+        # An advisory release over a wave that is merely awaited is a gap, not a
+        # degradation: the disclosure stays loud and the task is not stamped for it.
+        # A rail, a spent cap and every blocking exit keep their own outcome.
+        if (decision.get("status") == "advisory_open" and not hard_rail
+                and not decision.get("review_capacity_reason") and plan_wave_only_awaited(wave)):
+            decision["review_only_awaited"] = True
     if hurry_armed and str(enforcement or "").lower() == "blocking":
         # Attribution only (task detail); this changes no global enforcement.
         decision["owner_hurry_local_advisory"] = True
