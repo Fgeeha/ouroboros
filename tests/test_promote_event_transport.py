@@ -914,7 +914,10 @@ def test_source_resolution_runs_off_supervisor_loop_and_continues_once(
     release = threading.Event()
     continuation_bus = thread_queue.Queue()
 
-    def slow_resolve(_ctx, _source, project_id):
+    seen_names = []
+
+    def slow_resolve(_ctx, _source, project_id, *, project_name=""):
+        seen_names.append(project_name)
         started.set()
         assert release.wait(2)
         return "", "source checked", "", project_id, False
@@ -946,6 +949,7 @@ def test_source_resolution_runs_off_supervisor_loop_and_continues_once(
         "routing_token": "source-token",
         "objective": "Inspect source",
         "source": "https://github.com/example/project.git",
+        "project_name": "Исходники проекта",
         "chat_id": 1,
     }
 
@@ -965,3 +969,6 @@ def test_source_resolution_runs_off_supervisor_loop_and_continues_once(
     assert load_task_result(tmp_path, "source-task")["promotion_admission"][
         "routing_token"
     ] == "source-token"
+    # The off-loop half registers the Project row first, so the model's display
+    # name has to reach it: the later named create finds the row and changes nothing.
+    assert seen_names == ["Исходники проекта"]
