@@ -58,9 +58,12 @@ export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '') {
             };
             const onTheme = (callback) => {
                 if (disposing || disposed || typeof callback !== 'function') return () => {};
+                const firstListener = themeListeners.size === 0;
                 themeListeners.add(callback);
                 if (theme) notifyTheme(callback);
-                if (themeListeners.size === 1) post({ type: 'ouro-widget-theme', op: 'subscribe' });
+                if (firstListener && themeListeners.size && !disposed) {
+                    post({ type: 'ouro-widget-theme', op: 'subscribe' });
+                }
                 return () => {
                     if (!themeListeners.delete(callback)) return;
                     if (!themeListeners.size && !disposed) {

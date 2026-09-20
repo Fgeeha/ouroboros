@@ -964,6 +964,7 @@ register the same surface in `plugin.py`:
 def register(api):
     api.register_ui_tab("editor", "Editor", render={
         "kind": "module", "entry": "widget.js", "start": "manual",
+        "appearance": "host",
     })
 ```
 
@@ -1048,7 +1049,8 @@ are the one exception — "What the frame may do" below). The bridge exposes:
   `document.documentElement.dataset.theme = theme`; the host never injects CSS,
   changes the child DOM or forces a remount. The first callback receives the
   resolved value embedded in the frame's initial document, later changes arrive
-  on `ouro:theme-changed`, and disposal releases the parent subscription. Route
+  on authenticated bridge messages derived from the host's `ouro:theme-changed`
+  event, and disposal releases the parent subscription. Route
   iframes have no bridge. A module declaration may record
   `render.appearance: host | independent | fixed` for author/reviewer intent;
   the declaration does not gate legacy modules or prove that the source repaints.

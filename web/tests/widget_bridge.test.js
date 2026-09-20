@@ -216,6 +216,16 @@ test('theme callbacks reject foreign sources, invalid values and dispose cleanly
     assert.equal(posted.length, count);
 });
 
+test('a reentrant first theme callback still subscribes the parent once', () => {
+    const { window, posted } = bridgeHarness({ initialTheme: 'dark' });
+    let nestedOff = () => {};
+    window.OuroborosWidget.onTheme(() => {
+        nestedOff = window.OuroborosWidget.onTheme(() => {});
+    });
+    assert.equal(posted.filter((message) => message.type === 'ouro-widget-theme' && message.op === 'subscribe').length, 1);
+    nestedOff();
+});
+
 test('dispose awaits hooks (bridge live), acks, then fails pending work and unlistens', async () => {
     const { window, posted, listeners, deliver, chunk, flush } = bridgeHarness();
     const hookSaw = [];
