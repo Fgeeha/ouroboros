@@ -32,14 +32,19 @@ from __future__ import annotations
 
 import datetime as _dt
 import logging
+import math
 import pathlib
 import threading
 import time
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ouroboros.config import (
-    WAKE_DEFAULT_SEC, get_bg_wakeup_max_sec, get_bg_wakeup_min_sec, get_consciousness_autonomy,
-    get_consciousness_max_tasks, runtime_setting,
+    WAKE_DEFAULT_SEC,
+    get_bg_wakeup_max_sec,
+    get_bg_wakeup_min_sec,
+    get_consciousness_autonomy,
+    get_consciousness_max_tasks,
+    runtime_setting,
 )
 from ouroboros.consciousness_allowance import STATUS_EXHAUSTED, STATUS_UNKNOWN, allowance_window
 from ouroboros.consciousness_authority import is_consciousness_origin
@@ -52,6 +57,7 @@ log = logging.getLogger(__name__)
 
 NEXT_WAKE_STATE_KEY = "consciousness_next_wake_at"
 INTERVAL_STATE_KEY = "consciousness_next_interval_sec"
+LAST_WAKE_STATE_KEY = "consciousness_last_wake_at"
 LEGACY_INBOX_REL = pathlib.Path("state") / "consciousness_observations.jsonl"
 ARCHIVED_INBOX_REL = pathlib.Path("archive") / "consciousness_observations.jsonl"
 HEARTBEAT = "heartbeat"
@@ -84,7 +90,25 @@ class BackgroundConsciousness:
         # Boot floor (PLAN 5.13 п.8): an overdue persisted value never wakes in the first second.
         self._next_wake_at = max(persisted, self._booted_at + self.floor)
         self._pending_reason: Optional[str] = None
-        self._last_wake_at, self._last_wake_task_id, self._last_wake_outcome, self._last_error = 0.0, "", "", ""
+        raw_last_wake = state.get(LAST_WAKE_STATE_KEY)
+        try:
+            persisted_last_wake = float(raw_last_wake or 0.0)
+            if not math.isfinite(persisted_last_wake):
+                raise ValueError("non-finite timestamp")
+        except (TypeError, ValueError):
+            persisted_last_wake = 0.0
+            log.warning(
+                "consciousness: invalid persisted last wake boundary; using process-start boundary",
+            )
+        if persisted_last_wake < 0 or persisted_last_wake > self._booted_at:
+            log.warning(
+                "consciousness: persisted last wake boundary is outside the current boot window; "
+                "using process-start boundary",
+            )
+            persisted_last_wake = 0.0
+        self._last_wake_at, self._last_wake_task_id, self._last_wake_outcome, self._last_error = (
+            persisted_last_wake, "", "", ""
+        )
         self._last_skip_at = 0.0  # a skipped wake debounces the next event like a wake does
         self._backoff, self._allowance = 1, (0.0, {})
         self._archive_legacy_inbox()
@@ -113,6 +137,14 @@ class BackgroundConsciousness:
             state.update_state(lambda st: st.__setitem__(NEXT_WAKE_STATE_KEY, self._next_wake_at))
         except Exception:
             log.debug("consciousness: next wake time not persisted", exc_info=True)
+
+    def _set_last_wake_at(self, at: float) -> None:
+        from supervisor import state
+
+        try:
+            state.update_state(lambda st: st.__setitem__(LAST_WAKE_STATE_KEY, float(at)))
+        except Exception:
+            log.debug("consciousness: last wake time not persisted", exc_info=True)
 
     def _interval(self) -> int:
         """The model's chosen interval (``set_next_wakeup``) or the default, clamped."""
@@ -237,6 +269,7 @@ class BackgroundConsciousness:
         with self._lock:
             now = time.time()
             self._last_wake_at, self._last_wake_task_id = now, str(task_id)
+            self._set_last_wake_at(now)
             if ok:
                 self._backoff, self._last_wake_outcome, self._last_error = 1, "done", ""
             else:
