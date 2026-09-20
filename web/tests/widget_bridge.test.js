@@ -226,6 +226,23 @@ test('a reentrant first theme callback still subscribes the parent once', () => 
     nestedOff();
 });
 
+test('a listener replaced during a live theme delivery never receives null', () => {
+    const { window, deliver } = bridgeHarness({ initialTheme: 'dark' });
+    const seen = [];
+    let off = () => {};
+    off = window.OuroborosWidget.onTheme((theme) => {
+        seen.push(['first', theme]);
+        if (theme === 'light') {
+            off();
+            window.OuroborosWidget.onTheme((next) => seen.push(['replacement', next]));
+        }
+    });
+    deliver({ type: 'ouro-widget-theme', theme: 'light' });
+    assert.deepEqual(seen, [['first', 'dark'], ['first', 'light']]);
+    deliver({ type: 'ouro-widget-theme', theme: 'light' });
+    assert.deepEqual(seen, [['first', 'dark'], ['first', 'light'], ['replacement', 'light']]);
+});
+
 test('dispose awaits hooks (bridge live), acks, then fails pending work and unlistens', async () => {
     const { window, posted, listeners, deliver, chunk, flush } = bridgeHarness();
     const hookSaw = [];

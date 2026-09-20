@@ -46,6 +46,7 @@ export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '') {
             const eventListeners = new Set();
             const themeListeners = new Set();
             let theme = ['light', 'dark'].includes(initialTheme) ? initialTheme : null;
+            let themeRefreshNeeded = false;
             const post = (message) => window.parent.postMessage({ ...message, nonce }, '*');
             const abortError = () => new DOMException('The operation was aborted.', 'AbortError');
             const onDispose = (fn) => {
@@ -60,14 +61,14 @@ export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '') {
                 if (disposing || disposed || typeof callback !== 'function') return () => {};
                 const firstListener = themeListeners.size === 0;
                 themeListeners.add(callback);
-                if (theme) notifyTheme(callback);
+                if (theme && !themeRefreshNeeded) notifyTheme(callback);
                 if (firstListener && themeListeners.size && !disposed) {
                     post({ type: 'ouro-widget-theme', op: 'subscribe' });
                 }
                 return () => {
                     if (!themeListeners.delete(callback)) return;
                     if (!themeListeners.size && !disposed) {
-                        theme = null;
+                        themeRefreshNeeded = true;
                         post({ type: 'ouro-widget-theme', op: 'unsubscribe' });
                     }
                 };
@@ -100,6 +101,7 @@ export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '') {
                 eventListeners.clear();
                 themeListeners.clear();
                 theme = null;
+                themeRefreshNeeded = false;
                 window.removeEventListener('message', onMessage);
                 window.removeEventListener('error', onError);
                 window.removeEventListener('unhandledrejection', onRejection);
@@ -117,9 +119,10 @@ export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '') {
                 if (disposed) return;
                 if (msg.type === 'ouro-widget-theme') {
                     if (disposing || !themeListeners.size || !['light', 'dark'].includes(msg.theme)) return;
-                    if (msg.theme === theme) return;
+                    if (msg.theme === theme && !themeRefreshNeeded) return;
                     theme = msg.theme;
-                    themeListeners.forEach(notifyTheme);
+                    themeRefreshNeeded = false;
+                    Array.from(themeListeners).forEach(notifyTheme);
                     return;
                 }
                 if (msg.type === 'ouro-widget-event') {
