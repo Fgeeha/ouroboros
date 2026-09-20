@@ -303,6 +303,7 @@ def _prepare_promote_source_off_loop(evt: Dict[str, Any], ctx: Any) -> None:
             ctx,
             str(evt.get("source") or ""),
             str(evt.get("project_id") or ""),
+            project_name=str(evt.get("project_name") or ""),
         )
         continuation["project_id"] = project_id
         continuation["_source_note"] = note
