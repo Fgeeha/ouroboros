@@ -429,7 +429,7 @@ function planAttempt(wave, index, isCurrent, live) {
         surface: 'plan',
         state,
         progress,
-        tone: heldTone || (custodyPending && !live ? 'neutral' : statusTone(state, custodyPending ? '' : verdict)),
+        tone: heldTone || statusTone(state, custodyPending ? '' : verdict),
         verdict,
         timestamp: text(wave.reviewed_at || wave.ts || wave.timestamp || wave.closed_at),
         ordinal: index,
@@ -536,7 +536,7 @@ function planActorAvailabilityLines(wave) {
         const identity = [text(actor.slot_id), text(actor.model)].filter(Boolean).join(' · ') || 'reviewer';
         const gap = actorAwaiting(actor)
             ? `Awaiting answer: ${identity}`
-            : (actorUnresolved(actor) ? `No answer: ${identity} — ${text(actor.operation_state)}` : '');
+            : (actorUnresolved(actor) ? `No answer: ${identity} — ${[text(actor.operation_state), text(actor.failure_code) || text(actor.error)].filter(Boolean).join(': ')}` : '');
         if (gap) {
             lines.push(gap);
             continue;
@@ -772,8 +772,7 @@ export function formatReviewProjection(projection) {
         const awaiting = (Array.isArray(panel.actors) ? panel.actors : []).filter(actorAwaiting).length;
         const signal = String(panel.aggregate_signal || 'UNKNOWN');
         // While a slot is awaited the aggregate is not final; DEGRADED is only the host's placeholder.
-        const verdictText = !awaiting ? signal : (signal === 'DEGRADED' ? `none yet (${awaiting} awaiting; held as DEGRADED)`
-            : `${signal}${signal === 'FAIL' || panel.superseded ? '' : ' so far'} (${awaiting} awaiting)`);
+        const verdictText = !awaiting ? signal : (signal === 'DEGRADED' ? `none (${awaiting} awaiting; held as DEGRADED)` : `${signal} (${awaiting} awaiting)`);
         lines.push(
             `Review panel ${panelId}: ${String(panel.surface || 'review')} · authority=${String(panel.authority || 'unspecified')} · verdict=${verdictText} · transport=${String(panel.transport_status || 'unknown')} · parse=${String(panel.parse_status || 'unknown')} · quorum=${String(quorum.contributed ?? 0)}/${String(quorum.configured ?? 0)} (required ${String(quorum.required ?? 0)}) · enforcement=${String(panel.enforcement_impact || 'unknown')}${panel.single_reviewer_no_diversity ? ' · single-reviewer (no diversity)' : ''}${panel.dialogue && panel.dialogue.status ? ` · dialogue=${String(panel.dialogue.status)}` : ''}${panel.superseded ? ' · superseded' : ''}`,
         );

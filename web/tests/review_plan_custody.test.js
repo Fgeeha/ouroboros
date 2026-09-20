@@ -141,11 +141,14 @@ test('an in-flight wave names its failed slot and its awaited slot separately', 
 });
 
 test('a reviewer whose window expired stays unresolved instead of awaited', () => {
-    const lost = { ...AWAITING, slot_id: 'triad_qq41xk', operation_state: 'custody_lost' };
+    const lost = {
+        ...AWAITING, slot_id: 'triad_qq41xk', operation_state: 'custody_lost',
+        failure_code: 'review_custody_lost', error: 'Review custody was lost before the slot settled',
+    };
     const group = planGroup({ custody_pending: true, actors: [ANSWERED, lost] });
     const attempt = group.attempts[0];
     assert.deepEqual(availabilityLines(attempt, 'No answer:'), [
-        'No answer: triad_qq41xk · codex=gpt-6-astra — custody_lost',
+        'No answer: triad_qq41xk · codex=gpt-6-astra — custody_lost: review_custody_lost', // the typed cause stays named
     ]);
     assert.deepEqual(availabilityLines(attempt, 'Awaiting answer:'), []);
     assert.equal(group.progress, 'unresolved · 1 of 2 answered · 1 unavailable');

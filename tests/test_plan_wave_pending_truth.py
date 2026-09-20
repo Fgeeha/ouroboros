@@ -441,6 +441,23 @@ def test_a_fully_awaiting_wave_keeps_the_fail_closed_floor_and_every_line_tells_
         "📐 plan_task: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"]
 
 
+def test_an_identical_envelope_over_an_uncollected_wave_says_it_collects_and_sends_nothing(harness, panel):
+    ctx = harness.make_ctx()
+    _call(ctx)
+    assert _wait_until(lambda: sum(e.execute_calls for e in panel.values()) == 3)
+    assert harness.progress[0].startswith("📐 plan_task: cycle 1/2 — running 3 of 3 reviewer slot(s)")  # a paid dispatch
+    for executor in panel.values():
+        executor.release.set()
+    assert _wait_until(lambda: len(_mailbox_entries(ctx.drive_root, ctx.task_id)) == 1)
+    mark = len(harness.progress)
+    resumed = _call(ctx)  # the identical envelope only reconciles the recorded wave
+    lines = [line for line in harness.progress[mark:] if line.startswith("📐 plan_task:")]
+    assert lines[0] == "📐 plan_task: collecting reviewer answers (no new panel)…"
+    assert not any("running" in line for line in lines)
+    assert _control(resumed) == {"outcome": "GREEN", "closed": True}
+    assert sum(e.execute_calls for e in panel.values()) == 3  # nothing was re-sent
+
+
 def test_cyber_pro_is_told_the_custody_facts_of_an_awaiting_wave_and_keeps_its_own_words_otherwise(monkeypatch):
     from ouroboros.tools import plan_render
 

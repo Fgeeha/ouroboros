@@ -77,7 +77,7 @@ test('an awaited panel of a running task reads as work in progress', () => {
     assert.deepEqual(facts(live), { ...expected, activeCount: 1 });
     assert.deepEqual(facts(live.attempts[0]), expected);
     const text = live.attempts[0].detailText;
-    assert.match(text, /· verdict=none yet \(3 awaiting; held as DEGRADED\) · transport=awaiting · parse=awaiting ·/);
+    assert.match(text, /· verdict=none \(3 awaiting; held as DEGRADED\) · transport=awaiting · parse=awaiting ·/);
     assert.match(text, /^Reviewer s1: .* · transport=awaiting · parse=awaiting · verdict=none · quorum=abstains/m);
     assert.doesNotMatch(text, /provider_transport_error|malformed|Pending dispatch/);
     const markup = html(live);
@@ -152,7 +152,7 @@ test('a quorum PASS with an awaited slot never reads as a bare PASS', () => {
     assert.deepEqual(facts(live), {
         state: 'running', tone: 'working', progress: 'PASS so far · 2 of 3 answered', verdict: 'PASS', activeCount: 1,
     });
-    assert.match(live.attempts[0].detailText, /· verdict=PASS so far \(1 awaiting\) ·/);
+    assert.match(live.attempts[0].detailText, /· verdict=PASS \(1 awaiting\) ·/);
     for (const status of ['completed', undefined]) {
         const ended = group([passWithHole()], status);
         assert.deepEqual(facts(ended), {
@@ -232,7 +232,7 @@ test('a panel stored with failure words about a wait prints the typed state on i
     assert.match(text, /^Reviewer s1: .* · transport=awaiting · parse=awaiting · verdict=none ·/m);
     assert.match(text, /^Reviewer s2: .* · transport=success · parse=valid · verdict=PASS ·/m);
     // History is immutable: the stored panel line keeps the words it was written with.
-    assert.match(text, /^Review panel .* · verdict=none yet \(1 awaiting; held as DEGRADED\) · transport=partial · parse=malformed ·/m);
+    assert.match(text, /^Review panel .* · verdict=none \(1 awaiting; held as DEGRADED\) · transport=partial · parse=malformed ·/m);
 });
 
 test('merging keeps a terminal group terminal and its header free of a live progress phrase', () => {
