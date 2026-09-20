@@ -290,6 +290,7 @@ class TestBudgetDriftOpenRouterOnly:
             "attempt_counts": {"settled": calls},
             "integrity_degraded": integrity_degraded,
             "by_provider": {"openrouter": {"settled_usd": or_settled}},
+            "_ledger_high_water_seq": [0, calls],
         }
         import ouroboros.usage_accounting as ua
 

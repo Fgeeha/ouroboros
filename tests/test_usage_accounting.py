@@ -944,6 +944,7 @@ def test_legacy_state_projection_cannot_regress_under_reordered_writers(
 
     state.init(data_root, total_budget_limit=0.0)
     first_started = threading.Event()
+    second_started = threading.Event()
     release_first = threading.Event()
     calls = []
 
@@ -954,6 +955,7 @@ def test_legacy_state_projection_cannot_regress_under_reordered_writers(
             assert release_first.wait(2.0)
             value = 1.0
         else:
+            second_started.set()
             value = 2.0
         return {
             "accounted_usd": value, "physical_calls": int(value),
@@ -961,6 +963,7 @@ def test_legacy_state_projection_cannot_regress_under_reordered_writers(
             "settled_usd": value, "confirmed_usd": value, "estimated_usd": 0.0,
             "reserved_usd": 0.0, "unresolved_upper_bound_usd": 0.0,
             "unknown_unmetered": 0, "cost_final": True, "attempt_counts": {},
+            "_ledger_high_water_seq": [0, int(value)],
         }
 
     monkeypatch.setattr(ua, "ensure_legacy_imported", lambda *_args, **_kwargs: {})
@@ -970,8 +973,11 @@ def test_legacy_state_projection_cannot_regress_under_reordered_writers(
     older.start()
     assert first_started.wait(2.0)
     newer.start()
-    time.sleep(0.1)
-    assert calls == [1]
+    # Ledger snapshots are intentionally taken before STATE_LOCK, so the
+    # newer writer can read while the older one is paused; the sequence marker
+    # below prevents the paused snapshot from regressing state afterward.
+    assert second_started.wait(2.0)
+    assert calls == [1, 2]
     release_first.set()
     older.join(2.0)
     newer.join(2.0)

@@ -516,29 +516,33 @@ def test_typed_subject_refusal_suppresses_next_auto_preference(setup):
 
 @pytest.mark.parametrize("change", [{"credentialProfileId": "account-b", "accountFingerprint": "fingerprint-b"},
                                      {"model": None}, {"source": "different-source"}])
-def test_native_reset_requires_actual_account_change_and_keeps_canonical_tools(setup, change):
+def test_native_reset_keeps_canonical_tools_and_only_claims_a_real_account_change(setup, change):
+    """A refused continuation is retried WITHOUT it, whatever the engine's reason.
+
+    The account reset is still the only repair that claims a new account: when
+    the refusal names the same account (an engine that binds a continuation to
+    the model which produced it, and answered with another one), the retry just
+    drops this source's continuations and says so with an empty new route.
+    """
     root, gateway, client = setup
     old = result()["message"]
     messages = [old, {"role": "tool", "tool_call_id": "a", "content": "result-a"},
                 {"role": "tool", "tool_call_id": "b", "content": "result-b"}]
     original = deepcopy(messages)
     changed = {**ROUTE, **change}
+    rerouted = bool(set(change) & {"credentialProfileId", "accountFingerprint"})
     gateway.results = [result(outcome="failed", route=changed, problem={"code": "invalid_continuation", "message": "different account"}), result(route=changed)]
     gateway.dispatch = ["not_started", "response_received"]
-    if not set(change) & {"credentialProfileId", "accountFingerprint"}:
-        with pytest.raises(transport.ClaudexorModelNotDispatched):
-            client.chat(messages, MODEL)
-        assert len(gateway.accepted_operations) == 1
-    else:
-        _, usage = client.chat(messages, MODEL)
-        assert len(usage["ledger_attempt_ids"]) == 2
-        assert gateway.creates[0] != gateway.creates[1]
-        resent = gateway.uploads[1][0]["messages"]
-        assert "nativeContinuation" not in resent[0]
-        assert resent[0]["tool_calls"] == original[0]["tool_calls"] and resent[1:] == original[1:]
-        assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released", "reserved", "dispatched", "settled"]
-        event = json.loads((root / "logs/events.jsonl").read_text().splitlines()[-1])
-        assert event["type"] == "native_continuation_reset" and "payload" not in json.dumps(event)
+    _, usage = client.chat(messages, MODEL)
+    assert len(usage["ledger_attempt_ids"]) == 2
+    assert gateway.creates[0] != gateway.creates[1]
+    resent = gateway.uploads[1][0]["messages"]
+    assert "nativeContinuation" not in resent[0]
+    assert resent[0]["tool_calls"] == original[0]["tool_calls"] and resent[1:] == original[1:]
+    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released", "reserved", "dispatched", "settled"]
+    event = json.loads((root / "logs/events.jsonl").read_text().splitlines()[-1])
+    assert event["type"] == "native_continuation_reset" and "payload" not in json.dumps(event)
+    assert event["routes"] == [{"old_route": ROUTE, "new_route": changed if rerouted else {}}]
     assert messages == original
 
 
@@ -874,15 +878,19 @@ def test_gateway_raw_and_default_result_share_integrity_validation():
         gateway.get_model_result("op-0", expected_ref={**ref, "sizeBytes": len(raw) + 1}, raw_bytes=True)
 
 
-def test_missing_old_account_does_not_authorize_native_reset(setup):
-    _, gateway, client = setup
+def test_missing_old_account_drops_the_continuation_without_claiming_a_reset(setup):
+    root, gateway, client = setup
     message = result()["message"]
     message["nativeContinuation"]["route"] = {"source": "codex", "model": "exact-model"}
-    gateway.results = [result(outcome="failed", problem={"code": "invalid_continuation", "message": "missing binding"})]
-    gateway.dispatch = ["not_started"]
-    with pytest.raises(transport.ClaudexorModelNotDispatched):
-        client.chat([message], MODEL)
-    assert len(gateway.accepted_operations) == 1
+    gateway.results = [result(outcome="failed", problem={"code": "invalid_continuation", "message": "missing binding"}),
+                       result()]
+    gateway.dispatch = ["not_started", "response_received"]
+    client.chat([message], MODEL)
+    # No account identity was invented from an unbound continuation: the retry
+    # simply stops replaying it.
+    assert "nativeContinuation" not in gateway.uploads[1][0]["messages"][0]
+    event = json.loads((root / "logs/events.jsonl").read_text().splitlines()[-1])
+    assert event["routes"] == [{"old_route": {"source": "codex", "model": "exact-model"}, "new_route": {}}]
 
 
 def test_caller_control_before_create_proves_no_dispatch(setup):

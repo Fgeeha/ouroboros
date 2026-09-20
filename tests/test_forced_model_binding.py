@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from ouroboros import llm_claudexor, loop_forced_finalization as forced, task_pacing
+from ouroboros import llm_claudexor, llm_substitution, loop_forced_finalization as forced, task_pacing
 from ouroboros.contracts.task_contract import normalize_budget_profile
 from ouroboros.loop_model_call import _RoundModelCallContext, _adopt_fallback_route, _call_round_model
 from ouroboros.llm import LLMClient
@@ -112,7 +112,7 @@ def test_prospective_build_reads_the_failed_profile_without_spending_it(acting):
     # The fact is keyed by the affinity the dispatch declares: the install-scoped
     # Codex key, no longer the execution id.
     shared_key = llm_claudexor.cache_key_for_model(MODEL)
-    token = llm_claudexor._FAILED_PROFILE.set((shared_key, "codex", "exact-model", "account-a"))
+    token = llm_substitution._FAILED_PROFILE.set((shared_key, "codex", "exact-model", "account-a"))
     try:
         with task_model_wait_scope(task={"id": "task-one", "_attempt": 1}, drive_root=acting.root,
                                    event_queue=None, worker_slot_held=True) as wait:
@@ -120,12 +120,12 @@ def test_prospective_build_reads_the_failed_profile_without_spending_it(acting):
                 "model": MODEL, "use_local": False, "model_account_override": ""}
             request, prepared = task_pacing.prepared_wrapup_candidate(
                 acting.ctx, deepcopy(acting.ctx.messages), allow_server_web_search=False)
-            assert llm_claudexor._FAILED_PROFILE.get()[3] == "account-a"  # observed, not spent
+            assert llm_substitution._FAILED_PROFILE.get()[3] == "account-a"  # observed, not spent
             assert forced._call_forced_model_once(acting.ctx, initial_messages=prepared,
                                                   admitted_request=request) == "Ответ 🐍"
-        assert llm_claudexor._FAILED_PROFILE.get() == ()  # the dispatch spent it, exactly once
+        assert llm_substitution._FAILED_PROFILE.get() == ()  # the dispatch spent it, exactly once
     finally:
-        llm_claudexor._FAILED_PROFILE.reset(token)
+        llm_substitution._FAILED_PROFILE.reset(token)
     payload = acting.gateway.uploads[0][0]
     assert payload["account"] == {"mode": "auto"}  # the refused account is not preferred back
     assert payload["options"] == {"reasoningEffort": "high", "cacheKey": shared_key}

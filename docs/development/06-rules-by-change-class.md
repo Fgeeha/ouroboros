@@ -600,15 +600,15 @@ and what enforces each.
 - Claudexor model calls are a transport, not delegated reasoning: model content and
   native continuation stay byte-faithful through the purpose-bound engine operation;
   never inject its credentials, run its tools, compact inside the adapter or silently
-  repeat a generation. A lost local connection rejoins the same operation ID, unknown
-  stays unknown, ACK only after the private CAS owns the exact result. Failed-response
-  capture uses the catalog's optional query, frozen before create and reused under the
-  same idempotency key (absence keeps the strict legacy result shape); full received
-  bytes and exception chains stay private, and diagnostics stay compact in the ordinary
-  problem context. A known terminal with unusable output is a settled provider result
-  plus local rejection (`stream_rejected`), never unknown or not-dispatched — keep both
-  stream-rejection markers across sync, async and process boundaries, and a local
-  rejection never rotates accounts.
+  repeat a generation. A lost connection rejoins the same operation ID, unknown stays
+  unknown, ACK only after the private CAS owns the exact result. Failed-response capture
+  uses the catalog's optional query, frozen before create and reused under the same
+  idempotency key (absence keeps the legacy shape); received bytes and exception chains
+  stay private, diagnostics compact. A known terminal with unusable output is a
+  settled provider result plus local rejection (`stream_rejected`), never unknown or
+  not-dispatched — keep both markers across sync, async and process boundaries; a
+  local rejection never rotates accounts. A round the ENGINE says another model answered
+  is not that class; the host matches no model strings.
 - Host hints are chosen by their caller from transport capability; an explicitly
   unsupported option refuses rather than being silently dropped and retried. Submitted
   options are recorded beside applied options on the usage row (absent report =

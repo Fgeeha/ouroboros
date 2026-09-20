@@ -1191,6 +1191,11 @@ body.resizing-panels { user-select: none; }
     border-color: var(--accent);
 }
 .chat-load-older-btn:disabled { opacity: 0.6; cursor: default; }
+/* First read of an empty feed: the pill is the only thing in the panel, so it
+   carries the shared in-progress pulse rather than reading as a dead control. */
+.chat-load-older[aria-busy="true"] .chat-load-older-btn {
+    animation: thinking-pulse 1.5s ease-in-out infinite;
+}
 .chat-load-older-btn:focus-visible {
     outline: 2px solid var(--focus-accent-border);
     outline-offset: 2px;
@@ -6234,6 +6239,9 @@ textarea.chat-input {
     .project-panel-backdrop,
     .chat-scroll-bottom-btn {
         transition: none;
+    }
+    .chat-load-older[aria-busy="true"] .chat-load-older-btn {
+        animation: none;
     }
 }
 
