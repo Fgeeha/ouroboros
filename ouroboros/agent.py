@@ -791,8 +791,8 @@ class OuroborosAgent:
 
     def _bind_task_progress_for_task(self, task: Dict[str, Any]) -> Callable[[str], Any]:
         task_id = str(task.get("id") or "")
-        task_meta = subagent_message_meta(task, task_id=task_id, event="progress")
-        task_meta.update(initiator_meta(task))
+        task_meta = subagent_message_meta(self._current_task_metadata, task_id=task_id, event="progress")
+        task_meta.update(initiator_meta(self._current_task_metadata))
         return self._bind_task_progress(
             task_id, self._current_chat_id, task_meta, task.get("_attempt"),
         )
@@ -908,7 +908,8 @@ class OuroborosAgent:
             self._record_executor_facts(task, cap_info)
             # Executor facts are part of the same by-value identity snapshot
             # used by late custody callbacks.
-            ctx.emit_progress_fn = self._bind_task_progress_for_task(task)
+            if ctx is not None:
+                ctx.emit_progress_fn = self._bind_task_progress_for_task(task)
 
             authority_refusal = cap_info.get("authority_source_unavailable")
             if isinstance(authority_refusal, dict) and authority_refusal:
