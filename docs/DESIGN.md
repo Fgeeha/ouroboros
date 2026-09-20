@@ -518,10 +518,14 @@ answer keep both forms readable. Anatomy, top to bottom:
    `Replaced by a newer question` uses the disabled dot; an unreadable source
    reads `Status unavailable`, never an invented invitation. No answer-deadline
    countdown: task completion closes its mailbox, not the question's answerability.
-2. **Question** — the one primary thing, by position and ink: `--type-body`,
-   `--text-primary`, regular weight. Its emphasis is the asker's own — only
-   what the question marks (`**…**`) is semibold — so a question of several
-   lines keeps a title instead of reading as one bold block.
+2. **Question** — the one primary thing, by position and ink: readable
+   `--type-body` text in `--text-primary`, regular weight. Its emphasis is the
+   asker's own — authored headings and `**…**` are semibold — so a question of
+   several lines keeps a title instead of reading as one bold block. It may
+   contain paragraphs, lists, checklists, tables and code; those blocks keep
+   the shared rich-content gutter, rhythm and bounded code scrolling. The card
+   does not infer a title from the first line or rewrite authored Markdown to
+   make it fit.
 3. **Stake** — optional one-liner (`At stake: …`), `--type-meta`, `--text-meta`.
 4. **Options** — real owner actions: buttons with `--text-primary` labels,
    legible at rest; an optional per-option detail steps down to meta ink.
@@ -538,7 +542,8 @@ answer keep both forms readable. Anatomy, top to bottom:
    A settled card instead carries what the owner said as a second primary
    line (`Owner's answer: …`, `--type-body`, `--text-primary`) under the
    options — beside the highlighted option when one was chosen, and as the
-   whole answer when none was.
+   whole answer when none was. Its line breaks stay visible; the recorded
+   answer remains literal text.
 6. **Assumption or waiting** — the signature line (`Continuing meanwhile: …`
    for optional clarification, an explicit waiting statement for required input),
    `--type-meta`, `--text-meta`, separated by a hairline. While the card is
