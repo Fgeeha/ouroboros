@@ -37,7 +37,7 @@ const ROUTING_TOP_OPTIONS = 8;
 export function createChatDecision({
     apiFetch,
     frameNode,
-    renderMarkdown,
+    mountMarkdown,
     enhanceMarkdown,
     showToast,
     fetchDetail = null,
@@ -653,14 +653,14 @@ export function createChatDecision({
         question.className = 'chat-quiz-question';
         question.tabIndex = -1;
         const questionText = quiz.question || 'Open the original question for its text.';
-        if (renderMarkdown) question.innerHTML = renderMarkdown(questionText);
+        if (mountMarkdown) mountMarkdown(question, questionText);
         else question.textContent = questionText;
         card.append(question);
 
         if (quiz.stake) {
             const stake = document.createElement('div');
             stake.className = 'chat-quiz-stake';
-            if (renderMarkdown) stake.innerHTML = renderMarkdown(`At stake: ${quiz.stake}`);
+            if (mountMarkdown) mountMarkdown(stake, `At stake: ${quiz.stake}`);
             else stake.textContent = `At stake: ${quiz.stake}`;
             card.append(stake);
         }
@@ -765,7 +765,7 @@ export function createChatDecision({
         if (quiz.comment) card.dataset.ownerComment = quiz.comment;
         setCardState(card, quiz.state, quiz.answeredIndex);
         const framed = frameNode(msg, card);
-        const disposeMarkdown = enhanceMarkdown && renderMarkdown ? enhanceMarkdown(card) : null;
+        const disposeMarkdown = enhanceMarkdown && mountMarkdown ? enhanceMarkdown(card) : null;
         if (mirror) mirror.disposeMarkdown = disposeMarkdown;
         return framed;
     }

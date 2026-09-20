@@ -57,7 +57,7 @@ def test_chat_header_decoration_does_not_clip_menu_and_system_actions_keep_gap(s
     for action in actions.all():
         metrics = action.evaluate("""el => {
             const prose = el.previousElementSibling;
-            return {previous:prose.className, nested:!!el.closest('.message'),
+            return {previous:prose.classList.contains('message') ? 'message' : prose.className, nested:!!el.closest('.message'),
                 gap:el.querySelector('button').getBoundingClientRect().top - prose.getBoundingClientRect().bottom,
                 below:el.getBoundingClientRect().bottom - el.querySelector('button').getBoundingClientRect().bottom};
         }""")
@@ -389,15 +389,28 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
         'waiting': {'state': 'open', 'wait_for_answer': True, 'recommended_index': 0, 'asked_at': '2026-09-16T00:03:00Z',
             'question': 'Third of three. The **licence** of the external dataset forbids redistribution, so the archive '
                         'can either ship without it and link to the source, or wait for written permission, which the '
-                        'maintainers usually grant within a week. Which way do we go?',
+                        'maintainers usually grant within a week. Which way do we go?\n\n'
+                        'What belongs in the evidence packet:\n'
+                        '- The primary route and its readable explanation.\n'
+                        '- The secondary route and its caveat.\n'
+                        '  - Keep the nested evidence attached to its route.\n\n'
+                        '1. Read the source.\n2. Compare the alternatives.\n\n'
+                        '- [x] The source was checked\n'
+                        '- [ ] The owner still needs to decide\n\n'
+                        '### Evidence shape\n\n'
+                        '```text\n'
+                        'a_very_long_evidence_token_abcdefghijklmnopqrstuvwxyz_0123456789_'
+                        'abcdefghijklmnopqrstuvwxyz_0123456789\n'
+                        '```',
             'options': ['Ship without it and link the source', 'Wait for written permission'],
             'option_details': ['Readers follow one extra link.', 'Publication slips by about a week.'],
-            'stake': 'Whether the archive ships this week.'},
+            'stake': 'Whether `sources.json` ships this week.'},
     }
     asked = copy.deepcopy(blocks)
     wait = {'quiz_id': 'waiting', 'state': 'waiting'}
     decisions, activities, history_reads, sockets, detail_reads = [], [], [], [], []
     mode = {'stale': False}
+    owner_comment = 'Keep each source.\nPreserve its original date.'
     # A second task of the same Project whose form reaches Main only after its wait did.
     late = {'state': 'open', 'question': 'Which licence notice goes on the cover?', 'options': ['Short notice', 'Full notice'],
             'option_details': ['One line with a link.', 'The whole licence text.'], 'stake': 'The cover layout.',
@@ -437,12 +450,13 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
         sent = route.request.post_data_json
         decisions.append(sent)
         qid = sent['decision_id'].split(':')[2]
-        blocks[qid].update(state='answered', answered_index=sent['option_index'])
+        blocks[qid].update(state='answered', answered_index=sent['option_index'], comment=sent.get('comment', ''))
         if qid == wait['quiz_id']:
             wait['state'] = 'resumed'
             activities[0]['required_question'].update(quiz_state='answered', answered_index=sent['option_index'],
                                                       owner_wait_state='resumed')
         route.fulfill(json={'ok': True, 'state': 'answered', 'answered_index': sent['option_index'],
+                            'comment': sent.get('comment', ''),
                             **({'answered_after_terminal': True, 'forwarded': True} if qid == 'finished' else {})})
     page.route('**/api/decisions', decide)
 
@@ -477,7 +491,9 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     by_id = {form['id']: form for form in forms}
     assert {form['chip'] for form in forms} == {project['name']}
     assert by_id['waiting']['status'] == 'Waiting for your answer' and by_id['waiting']['own']
-    assert by_id['waiting']['stake'] == 'At stake: Whether the archive ships this week.'
+    assert by_id['waiting']['stake'] == 'At stake: Whether sources.json ships this week.'
+    assert card('waiting').locator('.chat-quiz-stake .inline-code').evaluate(
+        'el => getComputedStyle(el).fontSize') == '12px'
     assert by_id['waiting']['details'] == ['Readers follow one extra link.', 'Publication slips by about a week.']
     assert by_id['waiting']['recommended'] == 0 and by_id['passed']['recommended'] == 1
     assert by_id['passed']['details'] == ['Lossless, larger', 'Smaller at quality 82'] and by_id['passed']['own']
@@ -485,20 +501,47 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     assert by_id['replaced']['status'] == 'Replaced by a newer question'
     assert by_id['replaced']['disabled'] and not by_id['replaced']['own'], 'a replaced question is a read-only record'
     assert card('waiting').locator('.chat-quiz-question strong').inner_text() == 'licence'
+    weights = card('waiting').locator('.chat-quiz-question').evaluate(
+        "el => [getComputedStyle(el).fontWeight, getComputedStyle(el.querySelector('strong')).fontWeight]")
+    assert weights == ['400', '600'], 'the question reads as text; only its own emphasis is semibold'
     geometry = page.evaluate("""() => {
         const scroller = document.querySelector('#chat-messages');
         const cards = [...document.querySelectorAll('#chat-messages .project-question-card')];
         const box = el => el.getBoundingClientRect();
+        const question = document.querySelector('[data-quiz-id="waiting"] .chat-quiz-question');
+        const list = question.querySelector('ul');
+        const taskList = [...question.querySelectorAll('ul, ol')].find(el => el.querySelector('.md-checkbox'));
+        const code = question.querySelector('.md-code-block pre');
         return {overflow: scroller.scrollWidth - scroller.clientWidth, page: document.documentElement.scrollWidth - innerWidth,
             right: Math.max(...cards.map(el => box(el).right)), viewport: innerWidth,
             chipInside: cards.every(el => box(el.querySelector('.chat-quiz-project')).right <= box(el).right + 0.5),
             chipCut: (() => { const n = cards[0].querySelector('.chat-quiz-project .chat-live-project-name'); return n.scrollWidth > n.clientWidth; })(),
+            richHost: question.classList.contains('ui-rich-content'),
+            listPadding: getComputedStyle(list).paddingInlineStart,
+            nestedOffset: box(list.querySelector('ul').querySelector('li')).left - box(list.querySelector('li')).left,
+            orderedPadding: getComputedStyle(question.querySelector('ol')).paddingInlineStart,
+            heading: [getComputedStyle(question.querySelector('h3')).fontSize, getComputedStyle(question.querySelector('h3')).fontWeight],
+            proseWeight: getComputedStyle(question.querySelector('p')).fontWeight,
+            emphasisWeight: getComputedStyle(question.querySelector('strong')).fontWeight,
+            codeHasOverflow: code.scrollWidth > code.clientWidth,
+            listTextOffset: box(list.querySelector('li')).left - box(question).left,
+            taskListStyle: getComputedStyle(taskList).listStyleType,
+            codeOverflow: getComputedStyle(code).overflowX,
+            codeReachable: code.scrollWidth <= code.clientWidth || getComputedStyle(code).overflowX === 'auto',
             sizes: [...new Set(cards.flatMap(el => [el.querySelector('.chat-quiz-status'), el.querySelector('.chat-quiz-project')])
                 .map(el => getComputedStyle(el).fontSize))]};
     }""")
     print(json.dumps({'question_mirror_geometry': geometry, 'viewport': [width, height]}))
     assert geometry['overflow'] <= 1 and geometry['page'] <= 0 and geometry['right'] <= width, geometry
     assert geometry['chipInside'] and geometry['sizes'] == ['12px'], geometry
+    assert geometry['richHost'] and geometry['listPadding'] == '24px', geometry
+    assert geometry['listTextOffset'] >= 20 and geometry['taskListStyle'] == 'none', geometry
+    assert geometry['codeHasOverflow'] and geometry['codeReachable'] and geometry['codeOverflow'] == 'auto', geometry
+    assert geometry['nestedOffset'] >= 20 and geometry['orderedPadding'] == '24px', geometry
+    assert geometry['heading'] == ['14px', '600'] and geometry['proseWeight'] == '400', geometry
+    assert geometry['emphasisWeight'] == '600', geometry
+    assert card('waiting').locator('.md-code-block pre').evaluate(
+        'el => { el.scrollLeft = el.scrollWidth; return el.scrollLeft > 0; }'), 'the clipped tail is reachable by scrolling'
     card('second').scroll_into_view_if_needed()
     setup_browser.capture(page, f'question-mirrors-burst-{width}')
 
@@ -523,6 +566,7 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
 
     # One touch answers from Main: the recorded result reads for five seconds, then only the
     # Main copy goes. A duplicate live frame and the census's own answer never restart it.
+    card('waiting').locator('.chat-quiz-comment').fill(owner_comment)
     card('waiting').locator('.chat-quiz-option').nth(1).click()
     page.locator('#chat-messages .project-question-card[data-quiz-id="waiting"][data-state="answered"]').wait_for()
     confirmed = page.evaluate('performance.now()')
@@ -530,7 +574,9 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     assert card('waiting').locator('.chat-quiz-status-text').inner_text() == 'You answered'
     assert card('waiting').locator('.chat-quiz-comment').count() == 0
     assert [(sent['decision_id'], sent['option_index'], 'comment' in sent) for sent in decisions] == [
-        ('quiz:proof-task:waiting', 1, False)]
+        ('quiz:proof-task:waiting', 1, True)]
+    assert decisions[0]['comment'] == owner_comment
+    assert card('waiting').locator('.chat-quiz-answer').inner_text() == "Owner's answer: " + owner_comment
     card('waiting').evaluate("el => el.scrollIntoView({block: 'center'})")
     setup_browser.capture(page, f'question-mirror-answered-{width}')
     page.wait_for_timeout(3000)
@@ -646,3 +692,45 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     card('second').scroll_into_view_if_needed()
     setup_browser.capture(page, f'question-mirrors-reloaded-{width}')
     assert len(decisions) == 2, 'a reload and a navigation never answer anything'
+
+
+@pytest.mark.parametrize('width', [1100, 320])
+def test_short_question_and_routing_cards_keep_their_width_floor(subscription_ui, width):
+    """The shared card floor survives shrink-to-fit but yields to a narrow column."""
+    page = subscription_ui['page']
+    page.set_viewport_size({'width': width, 'height': 844})
+    open_app(subscription_ui)
+    page.evaluate("""async () => {
+        const { createChatDecision } = await import('/static/modules/chat_decision.js');
+        const { createChatMedia } = await import('/static/modules/chat_media.js');
+        const { mountChatMarkdown } = await import('/static/modules/chat_markdown.js');
+        const media = createChatMedia({ chatSessionId: 'geometry', formatMsgTime: () => null,
+            stampNodeTimestamp: () => {}, senderLabel: () => 'You' });
+        const decision = createChatDecision({ apiFetch: () => {}, showToast: () => {},
+            frameNode: media.bubbleFrameNode, mountMarkdown: mountChatMarkdown });
+        const column = document.querySelector('#chat-messages');
+        column.append(decision.buildQuizCard({ type: 'quiz', task_id: 'width-proof', quiz_id: 'short',
+            state: 'answered', answered_index: 0, question: 'Ок?', options: ['Да', 'Нет'] }));
+        const owner = media.bubbleFrameNode({ role: 'user' }, document.createElement('span'));
+        owner.dataset.clientMessageId = 'width-route';
+        decision.renderRoutingDecision(owner, { status: 'needs_manual_target', routing_token: 'width-token',
+            options: [{ label: 'A' }, { label: 'B' }] });
+        column.append(owner);
+    }""")
+    metrics = page.evaluate("""() => {
+        const column = document.querySelector('#chat-messages');
+        const cs = getComputedStyle(column), rect = column.getBoundingClientRect();
+        const contentWidth = column.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+        const cards = [...column.querySelectorAll('.chat-quiz-card')];
+        return {overflow: column.scrollWidth - column.clientWidth, cards: cards.map(card => {
+            const bubble = card.parentElement, style = getComputedStyle(bubble), box = card.getBoundingClientRect();
+            const chrome = ['paddingLeft', 'paddingRight', 'borderLeftWidth', 'borderRightWidth']
+                .reduce((n, key) => n + parseFloat(style[key]), 0);
+            return {width: box.width, minimum: Math.min(260, contentWidth - chrome),
+                inside: box.right <= rect.right - parseFloat(cs.paddingRight) + 1};
+        })};
+    }""")
+    assert len(metrics['cards']) == 2, metrics
+    assert metrics['overflow'] <= 1, metrics
+    assert all(card['width'] >= card['minimum'] - 1 and card['inside'] for card in metrics['cards']), metrics
+    setup_browser.capture(page, f'question-routing-width-{width}')

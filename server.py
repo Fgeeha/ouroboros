@@ -345,7 +345,7 @@ def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
                 task_metadata["_host_operation"] = True
         reply_source = origin_message_ref if msg.get("accepted_source_ref") else None
         def reply(body: str, status: str = "completed") -> None:
-            ctx.send_with_budget(chat_id, body, **host_operation_reply_kwargs(reply_source, status))
+            ctx.send_with_budget(chat_id, body, **host_operation_reply_kwargs(reply_source, status), role="system", system_type="command_reply")
         def _stamp_owner_activity(live: dict) -> None:
             if live.get("owner_id") is None and external_identity_present:
                 live["owner_id"] = user_id
@@ -679,7 +679,7 @@ def _run_supervisor(settings: dict) -> None:
                         f"Cancelling {count} task{'' if count == 1 else 's'} that "
                         f"{'was' if count == 1 else 'were'} still running when the server stopped."
                     )
-                send_with_budget(int(st_boot["owner_chat_id"]), " ".join(notice))
+                send_with_budget(int(st_boot["owner_chat_id"]), " ".join(notice), role="system", system_type="startup_notice")
         _startup_retired_settings_notice(settings)
 
         auto_resume_after_restart()
@@ -854,7 +854,7 @@ def _run_supervisor(settings: dict) -> None:
                             "🛑 Supervisor loop died after repeated crashes; tasks are no "
                             "longer being assigned. Saving settings or restarting the app "
                             f"will revive it. Last error: {exc}",
-                        )
+                            role="system", system_type="supervisor_failure")
                 except Exception:
                     log.debug("Failed to notify owner about supervisor death", exc_info=True)
                 break  # this generation is dead: the shared exit below stops its watchdog
@@ -880,7 +880,7 @@ def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
         ctx.send_with_budget(
             int(st["owner_chat_id"]),
             f"♻️ Restart requested by agent: {evt.get('reason')}",
-        )
+            role="system", system_type="restart_notice")
     from ouroboros.config import get_restart_drain_max_sec
 
     max_wait = get_restart_drain_max_sec()
@@ -899,7 +899,7 @@ def _handle_restart_in_supervisor(evt: Dict[str, Any], ctx: Any) -> None:
                 int(st["owner_chat_id"]),
                 f"⏳ Restart drain: waiting up to {max_wait}s for running task(s) "
                 f"{', '.join(sorted(live))} to finish.",
-            )
+                role="system", system_type="restart_notice")
         return
     _perform_supervisor_restart(
         ctx, restart_reason=str(evt.get("reason") or "agent_restart_request"),
@@ -949,7 +949,7 @@ def _perform_supervisor_restart(
             ctx.send_with_budget(
                 int(st["owner_chat_id"]),
                 "🧬 Restart cancelled: the exact evolution restart receipt is missing.",
-            )
+                role="system", system_type="restart_notice")
         return
     if claim:
         from supervisor.evolution_lifecycle import check_evolution_authority
@@ -966,7 +966,7 @@ def _perform_supervisor_restart(
                     int(st["owner_chat_id"]),
                     "🧬 Restart cancelled: evolution authority changed "
                     f"({authority.get('reason') or 'unknown'}).",
-                )
+                    role="system", system_type="restart_notice")
             return
         expected_sha = str(claim.get("commit_sha") or "")
         try:
@@ -995,7 +995,7 @@ def _perform_supervisor_restart(
                     int(st["owner_chat_id"]),
                     "🧬 Restart cancelled: the live checkout no longer matches "
                     "the exact reviewed evolution commit.",
-                )
+                    role="system", system_type="restart_notice")
             return
     ok, msg = _safe_restart_serialized(
         ctx.safe_restart,
@@ -1012,7 +1012,7 @@ def _perform_supervisor_restart(
         except Exception:
             log.debug("Failed to pause evolution after blocked agent restart", exc_info=True)
         if st.get("owner_chat_id"):
-            ctx.send_with_budget(int(st["owner_chat_id"]), f"⚠️ Restart skipped: {msg}")
+            ctx.send_with_budget(int(st["owner_chat_id"]), f"⚠️ Restart skipped: {msg}", role="system", system_type="restart_notice")
         return
     cleanup_status, cleanup_reason = _shutdown_task_cleanup_args(restart_requested=True)
     global _planned_delegate_restart_transaction_id
@@ -1075,7 +1075,7 @@ def _boot_managed_update_tasks() -> None:
 
                 owner_chat = int((_load_state() or {}).get("owner_chat_id") or 0)
                 if owner_chat:
-                    send_with_budget(owner_chat, f"📦 Managed update: {stash_note}")
+                    send_with_budget(owner_chat, f"📦 Managed update: {stash_note}", role="system", system_type="managed_update_notice")
             except Exception:
                 log.debug("stash note owner notification failed", exc_info=True)
         if result.get("rolled_back") is True:

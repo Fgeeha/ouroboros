@@ -19,14 +19,14 @@ def test_progress_thought_keeps_full_content_and_existing_authorship():
     )
     thought = "long visible reasoning\n" + ("x" * 20_000)
 
-    OuroborosAgent._emit_progress(agent, thought)
+    OuroborosAgent._emit_progress(agent, thought, narration=True)
 
     event = events.get_nowait()
     assert event["text"] == f"💬 {thought}"
     assert event["is_progress"] is True
     assert event["task_id"] == "thought-task"
-    assert "role" not in event
-    assert "system_type" not in event
+    assert event["role"] == "assistant"
+    assert event["system_type"] == "model_narration"
 
 
 def test_normal_model_response_stamps_model_final_origin():

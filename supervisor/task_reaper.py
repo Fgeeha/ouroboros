@@ -219,6 +219,7 @@ def request_finalization_grace(
                 f"⏳ Task {task_id} reached {terminal_reason}. "
                 "Finalize artifacts/results now; supervisor will stop the task after the grace window."
             ),
+            "role": "system", "system_type": "finalization_notice",
             "format": "markdown",
             "is_progress": True,
             "task_id": task_id,
@@ -291,6 +292,7 @@ def withdraw_finalization_grace(
                 "the stop request was retracted from its mailbox — if the task had "
                 "already read it, it may still finalize."
             ),
+            "role": "system", "system_type": "finalization_notice",
             "format": "markdown",
             "is_progress": True,
             "task_id": task_id,
@@ -1089,7 +1091,7 @@ def _hold_wedged_worker(task_id: str, task_type: str, worker_id: int, terminal_r
                     "task_incident": "task_reaper_wedged",
                     "toast_once": f"{task_id}:task_reaper_wedged:{worker_id}:{terminal_reason}",
                 },
-            )
+                role="system", system_type="task_reaper_notice")
         except Exception:
             log.debug("Reaper: failed to send wedged owner notification for %s", task_id, exc_info=True)
 
@@ -1558,7 +1560,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                         f"Worker {worker_id} restarted. Task queued for retry attempt={new_attempt}.",
                         is_progress=True, task_id=task_id,
                         progress_meta={"task_incident": "task_reaper_retry", "toast_once": incident_toast_once},
-                    )
+                        role="system", system_type="task_reaper_notice")
                 elif retry_suppression.get("kind") == "cancel_intent":
                     send_with_budget(
                         incident_chat_id,
@@ -1571,7 +1573,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                             "task_incident": "task_reaper_cancel_suppressed_retry",
                             "toast_once": incident_toast_once,
                         },
-                    )
+                        role="system", system_type="task_reaper_notice")
                 elif not retry_suppression:
                     stop_detail = _stop_detail(ceiling_reached, deadline_reached, orchestrator)
                     send_with_budget(
@@ -1580,7 +1582,7 @@ def reap_timed_out_task(job: Dict[str, Any]) -> None:
                         f"Worker {worker_id} restarted. {stop_detail}",
                         is_progress=True, task_id=task_id,
                         progress_meta={"task_incident": "task_reaper_stopped", "toast_once": incident_toast_once},
-                    )
+                        role="system", system_type="task_reaper_notice")
             except Exception:
                 log.debug("Reaper: failed to send owner notification for %s", task_id, exc_info=True)
 

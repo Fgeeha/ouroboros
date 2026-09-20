@@ -6,7 +6,9 @@ import { readFileSync } from 'node:fs';
 import test from 'node:test';
 import vm from 'node:vm';
 
-const source = readFileSync(new URL('../app.js', import.meta.url), 'utf8');
+// The span below is delimited by line breaks; normalize CRLF so a Windows
+// checkout (core.autocrlf) reads the same bytes the delimiters expect.
+const source = readFileSync(new URL('../app.js', import.meta.url), 'utf8').replace(/\r\n?/g, '\n');
 const start = source.indexOf('async function acknowledgeProjectAfterPaint(');
 const end = source.indexOf('\n}\n', start);
 assert.ok(start >= 0 && end > start, 'acknowledgeProjectAfterPaint is a top-level function in app.js');

@@ -325,6 +325,23 @@ Adopting these tokens is applying the semantic status contract, which already
 governs every surface — it is not a token migration of those surfaces and does
 not move them into the migrated set in section 8.
 
+### Chat authorship and System rows
+
+Voice follows authorship, not severity or the transport that delivered the text.
+Model-authored replies use Ouroboros's assistant voice; host-composed commands,
+receipts and diagnostics use System voice. A **System row** is a chat message
+with `role="system"`, rendered with the existing yellow/amber system treatment,
+or its existing task-card placement. `role` alone selects voice; `system_type`
+names the kind, not the author. New host producers stamp both fields. Relays
+preserve them through live delivery, persistence and history. Model narration,
+proactive replies and questions remain model-authored even when typed.
+
+Formatting is asymmetric: assistant text always uses the sanitized chat markdown
+renderer regardless of `markdown`; ordinary System text is escaped unless
+`markdown: true`. The typed `skill_review` row keeps its dedicated renderer.
+Voice does not confer task finality. The existing untyped terminal-host-notice
+contract remains a documented exception, not a pattern for new notices.
+
 ## 5. Card and section composition
 
 - A panel is one `.ui-card`-family surface: `--ui-card-border`,
@@ -501,8 +518,14 @@ answer keep both forms readable. Anatomy, top to bottom:
    `Replaced by a newer question` uses the disabled dot; an unreadable source
    reads `Status unavailable`, never an invented invitation. No answer-deadline
    countdown: task completion closes its mailbox, not the question's answerability.
-2. **Question** — the one primary thing: `--type-body` semibold,
-   `--text-primary`.
+2. **Question** — the one primary thing, by position and ink: readable
+   `--type-body` text in `--text-primary`, regular weight. Its emphasis is the
+   asker's own — authored headings and `**…**` are semibold — so a question of
+   several lines keeps a title instead of reading as one bold block. It may
+   contain paragraphs, lists, checklists, tables and code; those blocks keep
+   the shared rich-content gutter, rhythm and bounded code scrolling. The card
+   does not infer a title from the first line or rewrite authored Markdown to
+   make it fit.
 3. **Stake** — optional one-liner (`At stake: …`), `--type-meta`, `--text-meta`.
 4. **Options** — real owner actions: buttons with `--text-primary` labels,
    legible at rest; an optional per-option detail steps down to meta ink.
@@ -519,7 +542,8 @@ answer keep both forms readable. Anatomy, top to bottom:
    A settled card instead carries what the owner said as a second primary
    line (`Owner's answer: …`, `--type-body`, `--text-primary`) under the
    options — beside the highlighted option when one was chosen, and as the
-   whole answer when none was.
+   whole answer when none was. Its line breaks stay visible; the recorded
+   answer remains literal text.
 6. **Assumption or waiting** — the signature line (`Continuing meanwhile: …`
    for optional clarification, an explicit waiting statement for required input),
    `--type-meta`, `--text-meta`, separated by a hairline. While the card is

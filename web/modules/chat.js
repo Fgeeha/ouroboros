@@ -1,5 +1,5 @@
 import { escapeHtmlAttr, escapeHtmlText as escapeHtml } from './utils.js';
-import { destroyChatMarkdown, enhanceChatMarkdown, renderChatMarkdown } from './chat_markdown.js';
+import { destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown, renderChatMarkdown } from './chat_markdown.js';
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
@@ -306,7 +306,7 @@ export function createChatInstance({
     const chatDecision = createChatDecision({
         apiFetch,
         frameNode: chatMedia.bubbleFrameNode,
-        renderMarkdown: renderChatMarkdown,
+        mountMarkdown: mountChatMarkdown,
         enhanceMarkdown: enhanceMountedMarkdown,
         showToast,
         fetchDetail: fetchTaskDetailStrict,
@@ -2289,6 +2289,7 @@ export function createChatInstance({
         const sender = senderLabel(role, isProgress, systemType, {
             source, senderLabel: senderLabelOverride, senderSessionId, initiator,
         }, chatSessionId);
+        const richMarkdown = role !== 'user' && systemType !== 'skill_review' && (role !== 'system' || markdown === true);
         const rendered = role === 'user'
             ? escapeHtml(text)
             : role === 'system' && systemType === 'skill_review'
@@ -2301,7 +2302,7 @@ export function createChatInstance({
         const pendingHtml = pending ? `<div class="msg-pending">Queued until reconnect</div>` : '';
         bubble.innerHTML = `
             <div class="sender">${escapeHtml(sender)}</div>
-            <div class="message">${rendered}</div>
+            <div class="message${richMarkdown ? ' ui-rich-content' : ''}">${rendered}</div>
             ${pendingHtml}
             ${timeHtml}
         `;
@@ -2318,7 +2319,7 @@ export function createChatInstance({
         wireSkillReviewDisclosure(bubble, { onDomWrite: withStableViewport });
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
-        if (role !== 'user' && systemType !== 'skill_review' && (role !== 'system' || markdown === true)) enhanceMountedMarkdown(bubble);
+        if (richMarkdown) enhanceMountedMarkdown(bubble);
         chatDecision.renderRoutingDecision(bubble, opts.chatAnnotation);
         rememberMessageKey(messageKey);
         if (pending && clientMessageId) pendingUserBubbles.set(clientMessageId, bubble);

@@ -3,7 +3,7 @@ import { openConfirmDialog } from './confirm_dialog.js';
 import { showToast } from './toast.js';
 import { apiClient, apiFetch } from './api_client.js';
 import { verifiedUpdatePlan } from './update_status.js';
-import { destroyChatMarkdown, enhanceChatMarkdown, renderChatMarkdown } from './chat_markdown.js';
+import { destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown } from './chat_markdown.js';
 
 // Known non-state warnings are folded into their verdict states; everything
 // else is surfaced verbatim so a backend warning class can never vanish.
@@ -545,7 +545,7 @@ export function initUpdates({ mount, state, ws, openSettingsTab }) {
         releaseLetterBody();
         letterKey = nextKey;
         letterBody.hidden = !view.markdown;
-        letterBody.innerHTML = view.markdown ? renderChatMarkdown(view.markdown) : '';
+        mountChatMarkdown(letterBody, view.markdown || '');
         if (!view.markdown) return;
         // No anchored scroll to protect on this page, so markdown's deferred
         // writes (highlight, latex, mermaid, charts) run directly.

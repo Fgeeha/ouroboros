@@ -288,7 +288,7 @@ def _repo_writer_turn_allowed(chat_id: int) -> bool:
         send_with_budget(
             chat_id,
             "🔒 An update is using the repository. Try this message again when it finishes.",
-        )
+            role="system", system_type="managed_update_notice")
     except Exception:
         log.debug("Could not report managed-update writer gate", exc_info=True)
     return False
@@ -2117,7 +2117,7 @@ def _worker_crash_storm_detected(
                 "task_incident": "worker_crash_storm",
                 "toast_once": f"worker-crash-storm:{int(min(CRASH_TS) if CRASH_TS else now)}",
             },
-        )
+            role="system", system_type="worker_failure")
     return True
 
 

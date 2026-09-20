@@ -455,6 +455,6 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
                         notice_chat,
                         f"📎 Attachment staging report for {target_label or 'Task'}:\n"
                         f"{attachment_report}",
-                    )
+                        role="system", system_type="attachment_notice")
                 except Exception:
                     log.debug("steer_task attachment report notice failed", exc_info=True)
