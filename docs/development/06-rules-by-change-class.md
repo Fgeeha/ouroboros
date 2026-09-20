@@ -723,11 +723,11 @@ and what enforces each.
   calls". Enforce with `tests/test_review_prompt_caching.py`,
   `tests/test_transcript_prefix.py` (real Main loop, plain/multipart) and
   `tests/test_transcript_provider_shapes.py` (local/GigaChat); CHECKLISTS item 22.
-- Provider fallback is disabled only for a SEALED reasoning artifact
-  (`ouroboros/reasoning_artifacts.py::transcript_has_sealed_reasoning`) — only a sealed
-  artifact is bound to the endpoint that minted it; readable reasoning stays
-  failover-eligible for every family so one outage does not strand valid work
-  (`tests/test_llm_provider_routing.py`).
+- Only sealed reasoning artifacts bind fallback to their endpoint
+  (`reasoning_artifacts.transcript_has_sealed_reasoning`); readable reasoning
+  stays failover-eligible across families (`test_llm_provider_routing.py`).
+  Model handover preserves finalization checks; recovery and warnings:
+  ARCHITECTURE §6 (`test_authoring_handover_loop.py`).
 - Delegated agent sessions and the native review inspection episode get the full
   governance prompt; never truncate BIBLE/ARCHITECTURE/DEVELOPMENT/CHECKLISTS to fit
   argv or transport limits.
