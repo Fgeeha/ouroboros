@@ -873,7 +873,8 @@ def emit_model_substitution(
     The sentence names what actually happened — a recovered redo and a refusal
     are different facts and must not share one wording.
     """
-    rows = accumulated_usage.get("_model_substitutions")
+    rows = (accumulated_usage.get("_model_substitutions")
+            or (accumulated_usage.get("_options") or {}).get("substituted"))
     notified = accumulated_usage.setdefault("_model_substitution_notified", [])
     if emit_progress is None or not isinstance(rows, list):
         return

@@ -85,6 +85,29 @@ def remember_failed_profile(target: dict, parameters: dict, error: Any) -> None:
         _FAILED_PROFILE.set((*key, route["credentialProfileId"]))
 
 
+def same_route_refusal(accumulated_usage: dict) -> bool:
+    """Did this round already get a refusal that a repeat of it cannot cure?"""
+    return (str(accumulated_usage.get("_last_llm_error_kind") or "") == "model_substituted"
+            or str(accumulated_usage.get("_last_llm_provider_code") or "") == "invalid_continuation")
+
+
+def stamp_substitutions(accumulated_usage: dict, error: Any) -> None:
+    """Carry the discarded generations into the round's record for disclosure.
+
+    A refusal names the horizon the round would have run under; an accepted
+    answer whose redo recovered carries its own list on the usage row, which
+    the disclosure owner reads there. Neither is the transport's business.
+    """
+    context = (getattr(error, "problem", {}) or {}).get("context") or {}
+    if context.get("requested_model"):
+        accumulated_usage["_model_substitutions"] = [{
+            "requested": str(context.get("requested_model") or ""),
+            "observed": str(context.get("observed_model") or ""),
+            "account": str((getattr(error, "route", {}) or {}).get("credentialProfileId") or ""),
+            "disposition": str(context.get("reason") or ""),
+        }]
+
+
 def substitution_fact(result: dict) -> dict | None:
     """The engine's typed fact that ANOTHER model answered this request.
 
@@ -107,9 +130,8 @@ def _redo_allowed(payload: dict) -> str:
     candidate is bound to exact bytes, and a redo drops the account preference,
     so re-asking would break that admission instead of honoring it.
     """
-    from ouroboros.usage_accounting import (
-        current_physical_attempt_predicate, physical_attempt_headroom,
-    )
+    from ouroboros.llm_attempt import physical_attempt_headroom
+    from ouroboros.usage_accounting import current_physical_attempt_predicate
 
     if (payload.get("account") or {}).get("mode") == "pin":
         return "pinned_account"
