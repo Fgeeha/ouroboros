@@ -184,6 +184,7 @@ export function createChatInstance({
     // app.js signal "a project panel is opening right now" — Main
     // defers its first hydration to it (bounded by an unconditional deadline).
     isProjectOpening = null,
+    onHistoryRetry = null,
 }) {
     const container = mountEl || document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId(sessionStorage, globalThis.crypto);
@@ -2705,6 +2706,8 @@ export function createChatInstance({
             const armedAtStart = liveCardBound.begin();
             const cardsAtStart = new Set(liveCardRecords.keys());
             try {
+                // An empty feed shows the read in flight (#1102); a painted one is left alone.
+                if (historyControls.beginRecent()) syncLoadOlderControl();
                 const data = await apiClient.chatHistory({ chatId });
                 // Closed rooms do not consume late responses.
                 if (destroyed) {
@@ -2782,6 +2785,7 @@ export function createChatInstance({
                 // ANY successful sync leaves the instance hydrated
                 // — later hydration triggers ride this sticky promise.
                 initialHydrationPromise = historySyncPromise;
+                historyControls.endRecent();
                 syncLoadOlderControl();
                 // A recreated project instance restores its predecessor's stashed
                 // mid-history position on first paint instead of pinning to newest.
@@ -2808,6 +2812,8 @@ export function createChatInstance({
             } catch (err) {
                 lastHistorySyncSucceeded = false;
                 initialHydrationPromise = null;
+                // Never leave an empty feed blank: the failure and its Retry replace the loading state.
+                historyControls.endRecent(err); syncLoadOlderControl();
                 const socketState = ws?.ws?.readyState;
                 const expectedDisconnect = socketState !== WebSocket.OPEN;
                 if (expectedDisconnect && err instanceof TypeError) {
@@ -3440,6 +3446,13 @@ export function createChatInstance({
         });
     }
     async function loadOlderHistory() {
+        // A failed recent read retries as its owner's open transaction (fetch,
+        // paint, ACK). Retry must always read: no owner, or one that declined
+        // (it starts the fetch synchronously when it accepts), refetches here.
+        if (historyControls.recentFailed()) {
+            const owned = onHistoryRetry?.();
+            return historySyncPromise ? owned : syncHistory({ includeUser: true });
+        }
         const snapshot = historyPager.getState();
         if (snapshot.error?.body?.reason_code === 'history_view_changed') return historyPager.latest();
         return snapshot.error ? historyPager.retry() : loadOlderAtEdge();
@@ -3964,6 +3977,7 @@ export function createChatInstance({
                 try { dispose(); } catch {}
             }
             wsDisposers.length = 0;
+            historyControls.endRecent();
             historyPager.destroy();
             messagesDiv.removeEventListener('scroll', navigateHistoryAtEdge);
             document.removeEventListener('selectionchange', retryHistoricalUpserts);
