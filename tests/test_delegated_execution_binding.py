@@ -5,8 +5,12 @@ from __future__ import annotations
 import subprocess
 from types import SimpleNamespace
 
-from ouroboros.delegate_start_instructions import execution_binding_instruction
-from ouroboros.tools.delegate_integration import _capture_block, _target_drift_paths
+from ouroboros.delegate_start_instructions import (
+    apply_execution_binding, execution_binding_instruction,
+)
+from ouroboros.tools.delegate_integration import (
+    _capture_block, _target_drift_evidence, _target_drift_paths,
+)
 
 
 def _git(root, *args):
@@ -28,6 +32,19 @@ def test_runtime_child_environment_drops_launcher_authority(monkeypatch):
 
     monkeypatch.setenv("OUROBOROS_MANAGED_BY_LAUNCHER", "1")
     assert "OUROBOROS_MANAGED_BY_LAUNCHER" not in runtime_environ()
+
+
+def test_compiled_work_order_rebinds_child_facing_write_fields():
+    instructions = (
+        "HOST TASK CONTRACT AUTHORITY (complete normalized JSON; exact strings are authority):\n"
+        '{"workspace_root":"/authority","task_constraint":{"write_root":"/authority"}}'
+    )
+    bound, prompt = apply_execution_binding(
+        instructions, instructions, True, "/private/snapshot", "/authority")
+    assert '"workspace_root": "/private/snapshot"' in bound
+    assert '"write_root": "/private/snapshot"' in bound
+    assert '"authority_target_root": "/authority"' in bound
+    assert "/private/snapshot" in prompt
 
 
 def test_target_drift_is_detected_without_staging_or_rewriting_index(tmp_path):
@@ -67,3 +84,42 @@ def test_capture_block_does_not_claim_private_only_after_target_drift(tmp_path):
     assert block["target_mutated_during_run"] == ["neighbor.txt"]
     assert "TARGET MUTATED DURING RUN" in block["note"]
     assert "private execution snapshot only" not in block["note"]
+
+
+def test_target_drift_probe_failure_is_unknown_not_clean(tmp_path, monkeypatch):
+    target = tmp_path / "target"
+    target.mkdir()
+    _git(target, "init", "-q")
+    baseline = "missing-baseline"
+    entry = SimpleNamespace(target_root=str(target), baseline_sha=baseline)
+
+    def failing_git(*_args, **_kwargs):
+        return subprocess.CompletedProcess(
+            [], 128, stdout="", stderr="fatal: baseline unavailable")
+
+    monkeypatch.setattr(subprocess, "run", failing_git)
+    evidence = _target_drift_evidence(entry)
+
+    assert evidence["checked"] is False
+    assert evidence["paths"] == []
+    assert "baseline unavailable" in evidence["error"]
+    assert _target_drift_paths(entry) == []
+
+
+def test_target_drift_includes_index_deletions(tmp_path):
+    target = tmp_path / "target"
+    target.mkdir()
+    _git(target, "init", "-q")
+    _git(target, "config", "user.name", "test")
+    _git(target, "config", "user.email", "test@example.invalid")
+    (target / "gone.txt").write_text("baseline\n", encoding="utf-8")
+    _git(target, "add", "gone.txt")
+    _git(target, "commit", "-qm", "baseline")
+    baseline = _git(target, "rev-parse", "HEAD").stdout.strip()
+    _git(target, "rm", "gone.txt")
+    entry = SimpleNamespace(target_root=str(target), baseline_sha=baseline)
+
+    evidence = _target_drift_evidence(entry)
+
+    assert evidence["checked"] is True
+    assert evidence["paths"] == ["gone.txt"]

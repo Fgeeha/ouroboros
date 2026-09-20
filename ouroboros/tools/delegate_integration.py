@@ -14,9 +14,8 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
-import subprocess
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Tuple
 
 from ouroboros import delegate_custody as custody
 from ouroboros.delegate_custody import RunCustody as _RunCustody
@@ -28,6 +27,9 @@ from ouroboros.configured_subagents import SESSION_ACCESS_PROFILES
 from ouroboros.tools.tool_result import ToolResult
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for
 from ouroboros.utils import resolve_path_allow_missing
+from ouroboros.delegate_target_drift import (
+    _persist_target_drift, _target_drift_evidence, _target_drift_paths,  # noqa: F401
+)
 
 if TYPE_CHECKING:  # pragma: no cover - typing only
     from ouroboros.subagents import DelegatedRunShape
@@ -414,7 +416,7 @@ def _record_baseline_manifest(drive: pathlib.Path, task_id: str, invocation_id: 
 
 
 def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
-                   manifest: Dict[str, Any], target_drift: Optional[List[str]] = None) -> Dict[str, Any]:
+                   manifest: Dict[str, Any], target_drift: Optional[Any] = None) -> Dict[str, Any]:
     """The terminal-payload projection of one captured run patch (C1)."""
     from ouroboros.headless import (
         ARTIFACT_STATUS_READY_NO_CHANGES,
@@ -452,16 +454,49 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
             "the text patch alone need not contain the complete result."
         ),
     }
-    if target_drift and str(manifest.get("status") or "") == ARTIFACT_STATUS_READY_NO_CHANGES:
+    drift = target_drift if isinstance(target_drift, dict) else {
+        "checked": target_drift is not None,
+        "paths": list(target_drift or []),
+        "error": "",
+    }
+    drift_paths = [str(path) for path in (drift.get("paths") or []) if str(path)]
+    drift_error = str(drift.get("error") or "")
+    if drift.get("checked") is True:
+        block["target_drift_checked"] = True
+    if drift_paths:
+        block["target_mutated_during_run"] = drift_paths
+        if status == ARTIFACT_STATUS_READY_WITH_CHANGES:
+            block["note"] = (
+                "NOT APPLIED: the run edited its private execution snapshot only. "
+                "Authority-tree drift was observed while the result was captured; "
+                "the existing locked baseline check will decide whether integration "
+                "is safe. Nothing reaches the shared tree until explicit disposition."
+            )
+    if drift_error:
+        block["target_drift_unknown"] = drift_error
+        if status == ARTIFACT_STATUS_READY_WITH_CHANGES:
+            block["note"] = (
+                "NOT APPLIED: the run edited its private execution snapshot only. "
+                f"Authority-tree drift could not be verified ({drift_error}); the "
+                "locked integration check remains fail-closed. Nothing reaches the "
+                "shared tree until explicit disposition."
+            )
+    if (drift_paths or drift_error) and status == ARTIFACT_STATUS_READY_NO_CHANGES:
         block["status"] = "failed"
-        block["target_mutated_during_run"] = list(target_drift)
-        block["note"] = (
-            "TARGET MUTATED DURING RUN: the authority tree changed relative to the "
-            "delegated baseline while this run was open. The host cannot attribute "
-            "those bytes to the child, so the private capture is not a clean "
-            "no-changes result and no disposition is authorized. Preserve the "
-            "snapshot and captured material for inspection."
-        )
+        if drift_error:
+            block["note"] = (
+                "TARGET DRIFT UNKNOWN: the host could not prove that the authority "
+                f"tree stayed unchanged ({drift_error}). No disposition is authorized; "
+                "preserve the snapshot and captured material for inspection."
+            )
+        else:
+            block["note"] = (
+                "TARGET MUTATED DURING RUN: the authority tree changed relative to the "
+                "delegated baseline while this run was open. The host cannot attribute "
+                "those bytes to the child, so the private capture is not a clean "
+                "no-changes result and no disposition is authorized. Preserve the "
+                "snapshot and captured material for inspection."
+            )
     if status not in {ARTIFACT_STATUS_READY_WITH_CHANGES, ARTIFACT_STATUS_READY_NO_CHANGES}:
         # A failed manifest's own typed note (unreviewable_metadata_change,
         # non-UTF-8, …) is the actionable fact — never hide it in boilerplate.
@@ -478,70 +513,6 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
         }
     return block
 
-
-def _target_drift_paths(entry: _RunCustody) -> List[str]:
-    """Read-only proof that the authority target moved from the run baseline.
-
-    The target contains the owner's pre-existing dirty state in the baseline
-    commit, so comparing against ``baseline_sha`` isolates later changes without
-    staging or rewriting the target index. Untracked additions are included
-    separately because ``git diff`` cannot enumerate them.
-    """
-    target = pathlib.Path(str(entry.target_root or "")).resolve(strict=False)
-    baseline = str(entry.baseline_sha or "").strip()
-    if not baseline or not (target / ".git").exists():
-        return []
-    changed: set[str] = set()
-    try:
-        baseline_files = subprocess.run(
-            ["git", "ls-tree", "-r", "--name-only", baseline],
-            cwd=str(target), capture_output=True, text=True, check=False,
-        )
-        baseline_paths = {
-            line.strip() for line in baseline_files.stdout.splitlines()
-            if line.strip()
-        } if baseline_files.returncode == 0 else set()
-        indexed_files = subprocess.run(
-            ["git", "ls-files", "-z"],
-            cwd=str(target), capture_output=True, check=False,
-        )
-        indexed_paths = {
-            item.decode("utf-8", errors="surrogateescape")
-            for item in indexed_files.stdout.split(b"\0") if item
-        } if indexed_files.returncode == 0 else set()
-        from ouroboros.subagent_worktrees import find_execution_snapshot
-        snapshot = find_execution_snapshot(
-            getattr(entry, "snapshot_id", ""),
-            data_dir=getattr(entry, "ledger_root", None) or None,
-        ) or {}
-        excluded_paths = {
-            str(row.get("path") or "") for row in snapshot.get("excluded_untracked", [])
-            if isinstance(row, dict) and str(row.get("path") or "")
-        }
-        diff = subprocess.run(
-            ["git", "diff", "--name-only", "--no-renames", baseline, "--"],
-            cwd=str(target), capture_output=True, text=True, check=False,
-        )
-        if diff.returncode == 0:
-            changed.update(
-                line.strip() for line in diff.stdout.splitlines()
-                if line.strip() and (line.strip() in indexed_paths or line.strip() not in baseline_paths)
-                and line.strip() not in excluded_paths
-            )
-        untracked = subprocess.run(
-            ["git", "ls-files", "-z", "--others", "--exclude-standard"],
-            cwd=str(target), capture_output=True, check=False,
-        )
-        if untracked.returncode == 0:
-            changed.update(
-                item.decode("utf-8", errors="surrogateescape")
-                for item in untracked.stdout.split(b"\0")
-                if item and item.decode("utf-8", errors="surrogateescape") not in baseline_paths
-                and item.decode("utf-8", errors="surrogateescape") not in excluded_paths
-            )
-    except OSError:
-        return []
-    return sorted(changed)
 
 
 def _capture_terminal_patch(ctx: ToolContext, entry: Optional[_RunCustody], *, gateway=None) -> Optional[Dict[str, Any]]:
@@ -595,14 +566,21 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody, *, gateway=
     ready = {ARTIFACT_STATUS_READY_WITH_CHANGES, ARTIFACT_STATUS_READY_NO_CHANGES}
     cap_dir = custody.delegated_capture_dir(drive, entry.task_id, entry.snapshot_id or entry.run_id)
     manifest_path = cap_dir / "workspace_patch.json"
-    if entry.patch_captured and manifest_path.exists():
+    if manifest_path.exists():
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError, ValueError):
             manifest = {}
         manifest = manifest if isinstance(manifest, dict) else {}
-        if str(manifest.get("status") or "") in ready:
-            return _capture_block(entry, cap_dir, manifest, _target_drift_paths(entry))
+        if isinstance(manifest.get("authority_drift"), dict) and str(manifest.get("status") or "") == "failed":
+            # A failed no-change capture is durable forensic custody even though
+            # it intentionally never minted PATCH_CAPTURED. Do not recapture it
+            # after a neighbor happens to revert and erase the observation.
+            return _capture_block(entry, cap_dir, manifest, manifest["authority_drift"])
+        if entry.patch_captured and str(manifest.get("status") or "") in ready:
+            stored_drift = manifest.get("authority_drift")
+            evidence = stored_drift if isinstance(stored_drift, dict) else _target_drift_evidence(entry)
+            return _capture_block(entry, cap_dir, manifest, evidence)
     exec_root = pathlib.Path(entry.execution_root)
     if not exec_root.exists():
         return {
@@ -647,6 +625,20 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody, *, gateway=
             "note": f"patch capture failed ({type(exc).__name__}: {exc}); the execution "
                     "snapshot is preserved — inspect it directly.",
         }
+    drift_evidence = _target_drift_evidence(entry)
+    if str(manifest.get("status") or "") in ready:
+        try:
+            manifest = _persist_target_drift(manifest_path, manifest, drift_evidence)
+        except Exception as exc:
+            drift_evidence = {
+                "checked": False, "paths": [],
+                "error": f"authority drift record failed: {type(exc).__name__}: {exc}",
+            }
+            manifest = dict(manifest)
+            manifest["status"] = "failed"
+            manifest["authority_drift"] = drift_evidence
+            manifest["note"] = "Authority drift could not be durably recorded; snapshot preserved."
+            return _capture_block(entry, cap_dir, manifest, drift_evidence)
     if str(manifest.get("status") or "") in ready:
         custody.record_patch_captured(
             drive, entry,
@@ -655,12 +647,7 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody, *, gateway=
             patch_size=manifest.get("patch_size"),
             capture_dir=str(cap_dir),
         )
-    target_drift = _target_drift_paths(entry)
-    if target_drift and str(manifest.get("status") or "") == ARTIFACT_STATUS_READY_NO_CHANGES:
-        # Do not mint PATCH_CAPTURED over a target mutation that the private
-        # snapshot cannot explain. Custody stays open for explicit inspection.
-        return _capture_block(entry, cap_dir, manifest, target_drift)
-    return _capture_block(entry, cap_dir, manifest)
+    return _capture_block(entry, cap_dir, manifest, drift_evidence)
 
 
 def capture_stranded_patch(drive_root: Any, run: _RunCustody) -> Dict[str, Any]:

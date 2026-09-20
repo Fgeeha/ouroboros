@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from hashlib import sha256
 
 
@@ -36,7 +37,9 @@ UNPROVEN_BOUNDARY_INSTRUCTION = (
 
 _ACCESS_PRECEDENCE = (
     "this line governs native process access, while explicit task constraints "
-    "and the assigned edit target still bind."
+    "and the assigned edit target still bind. When a private delegated snapshot "
+    "exists, the later DELEGATED EXECUTION BINDING is the assigned edit target "
+    "and supersedes path fields in the inherited contract."
 )
 
 ACCESS_INSTRUCTIONS = {
@@ -85,7 +88,8 @@ def execution_binding_instruction(execution_root: str, authority_root: str) -> s
     if not execution:
         return ""
     return (
-        "\n\nDELEGATED EXECUTION BINDING (host fact; overrides ambiguous path prose): "
+        "\n\nDELEGATED EXECUTION BINDING (canonical host fact; supersedes path fields "
+        "in the inherited contract for this run): "
         f"the sole writable execution root for this run is {execution}. "
         "Use relative paths or absolute paths under that root for every shell, "
         "file, and patch operation. The stable authority/project root "
@@ -95,6 +99,53 @@ def execution_binding_instruction(execution_root: str, authority_root: str) -> s
         "honor this binding, stop with a typed execution-root mismatch instead of "
         "falling back to the authority root."
     )
+
+
+def _rebind_json_block(text: str, marker: str, execution_root: str, authority_root: str) -> str:
+    start = text.find(marker)
+    if start < 0:
+        return text
+    json_start = text.find("\n", start)
+    if json_start < 0:
+        return text
+    json_start += 1
+    try:
+        value, used = json.JSONDecoder().raw_decode(text[json_start:])
+    except (TypeError, ValueError):
+        return text
+    if not isinstance(value, dict):
+        return text
+
+    def rewrite(node):
+        if isinstance(node, dict):
+            for key, child in list(node.items()):
+                if key in {"workspace_root", "write_root"} and isinstance(child, str) and child:
+                    node[key] = execution_root
+                else:
+                    rewrite(child)
+            node.setdefault("authority_target_root", authority_root)
+        elif isinstance(node, list):
+            for child in node:
+                rewrite(child)
+
+    rewrite(value)
+    rendered = json.dumps(value, ensure_ascii=False, sort_keys=True)
+    return text[:json_start] + rendered + text[json_start + used:]
+
+
+def bind_execution_assignment(text: str, execution_root: str, authority_root: str) -> str:
+    """Rewrite child-facing structured path fields before appending the binding."""
+    bound = _rebind_json_block(text, "HOST TASK CONTRACT AUTHORITY", execution_root, authority_root)
+    return _rebind_json_block(bound, "HOST AUTHORITY BINDING", execution_root, authority_root)
+
+
+def apply_execution_binding(instructions: str, prompt: str, compiled: bool,
+                            execution_root: str, authority_root: str) -> tuple[str, str]:
+    binding = execution_binding_instruction(execution_root, authority_root)
+    instructions = bind_execution_assignment(instructions, execution_root, authority_root) + binding
+    if compiled:
+        prompt = bind_execution_assignment(prompt, execution_root, authority_root) + binding
+    return instructions, prompt
 
 
 def append_coordination_context(

@@ -56,7 +56,7 @@ from ouroboros.delegate_start_instructions import (
     UNPROVEN_BOUNDARY_INSTRUCTION as _UNPROVEN_BOUNDARY_INSTRUCTION,
     access_instruction,
     append_coordination_context,
-    execution_binding_instruction,
+    apply_execution_binding,
 )
 from ouroboros.subagent_runtime import (  # noqa: F401 - shared primitive re-export
     delegate_start_entry as _delegate_start_entry,
@@ -434,6 +434,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 executor="blocked", reset_at=resolution.reset_at, route=route.route_id, definitely_unrun=True,
             )
 
+        snapshot = None
         if not recovering:
             if payload_auth is not None:
                 record_auth = payload_auth
@@ -444,8 +445,6 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             invocation_id = custody.new_invocation_id()
             root = record_auth["target_root"]
             if authority.access in SESSION_ACCESS_PROFILES:
-                # Git/payload snapshots are registered before POST; directory
-                # copies belong to the engine, with the stable target kept separate.
                 target_root = record_auth["target_root"]
                 authority_source = record_auth["source"]
                 if authority_source == "skill_payload":
@@ -472,21 +471,16 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                     resource_ref = dict(record_auth.get("resource_ref") or {})
             execution_root = (root if directory_options.get("isolation") == "live" else "") if directory_options else delegated_execution_workspace_root(gateway, authority, root)
             scope_root = target_root if execution_root or directory_options else root
-            if snapshot is not None:
-                # The normalized task contract necessarily retains the stable
-                # authority target for custody and explicit integration. Once a
-                # private snapshot exists, append the effective write binding
-                # after that contract so a parent path cannot be mistaken for
-                # the child's writable root.
-                instructions += execution_binding_instruction(execution_root, target_root)
+            if snapshot is not None or (directory_options and directory_options.get("isolation") == "envelope"):
+                instructions, text = apply_execution_binding(
+                    instructions, text, bool(actor.get("compiled_work_order")),
+                    execution_root or root, target_root)
             (project_id, owned_project_id, project_persistent) = resolve_registration(
                 gateway, scope_root, execution_root, getattr(authority, "access", ""))
             if directory_options:
                 project_persistent = True
             if authority.access == "full":
                 gateway.ensure_full_access(scope_root)
-            # Assignment plus instructions identifies pending work; the invocation
-            # remains the wire key, and retry replays its original complete body.
             seconds = _bounded_max_seconds(ctx, max_seconds)
             request_body = _start_request(ctx, route, authority, scope_root, text,
                                           seconds, instructions, execution_root,
@@ -498,7 +492,6 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                                           root, text, request_body["instructions"])
         lineage = getattr(ctx, "task_metadata", {}) or {}
         lineage = lineage if isinstance(lineage, dict) else {}
-        # Fresh payload run: busy check + durable write = ONE atomic claim (fix 5).
         requested, claim_refusal = claimed_start_request(
             drive, claim_target=(target_root if not recovering and authority_source == "skill_payload" else ""),
             actor_ctx=ctx, enforce_actor_idle=not recovering,

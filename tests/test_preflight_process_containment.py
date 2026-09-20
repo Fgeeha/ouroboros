@@ -28,14 +28,16 @@ def test_process_container_does_not_propagate_launcher_authority(monkeypatch):
     from ouroboros.process_containment import ProcessContainer
 
     monkeypatch.setenv("OUROBOROS_MANAGED_BY_LAUNCHER", "1")
+    monkeypatch.setenv("OUROBOROS_MANAGED_REPO_DIR", "/private/launcher-repo")
     container = ProcessContainer()
     proc = container.spawn(
-        [sys.executable, "-c", "import os; print(os.environ.get('OUROBOROS_MANAGED_BY_LAUNCHER', ''), flush=True)"],
+        [sys.executable, "-c", "import os; print(os.environ.get('OUROBOROS_MANAGED_BY_LAUNCHER', ''), flush=True); print(os.environ.get('OUROBOROS_MANAGED_REPO_DIR', ''), flush=True)"],
         stdout=subprocess.PIPE,
         text=True,
     )
     try:
         assert proc.stdout is not None
+        assert proc.stdout.readline().strip() == ""
         assert proc.stdout.readline().strip() == ""
         assert proc.wait(timeout=10) == 0
     finally:

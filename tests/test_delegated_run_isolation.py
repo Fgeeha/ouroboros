@@ -1154,6 +1154,7 @@ class TestCaptureHonesty:
         custody._CUSTODY.clear()
 
 
+
 class TestStartupGCFailClosed:
     """CR1-1: the startup GC must not destroy open snapshots when the custody
     log is unreadable. `_iter_rows` swallows OSError (right for the fail-soft

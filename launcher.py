@@ -396,8 +396,8 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     env["OUROBOROS_REPO_DIR"] = str(REPO_DIR)
     env["OUROBOROS_APP_VERSION"] = str(APP_VERSION)
     env["OUROBOROS_MANAGED_BY_LAUNCHER"] = "1"
-    # Owner Surface Fact: the launcher is the only actor that knows HOW this
-    # server will be presented. `_headless` is decided in main() before the
+    env["OUROBOROS_MANAGED_REPO_DIR"] = str(REPO_DIR.resolve())
+    # Owner Surface Fact: the launcher alone knows presentation; `_headless` is decided in main() before the
     # lifecycle loop ever calls start_agent(), and every managed restart funnels
     # back through here, so the export is re-stamped fresh each time. Absence of
     # the var (source mode, Docker, Colab, CLI server) truthfully means "web".

@@ -444,6 +444,7 @@ class ExecutionSnapshotHandle:
     standalone: bool = False
     payload_hash: str = ""
     file_baseline: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+    untracked_baseline: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     capture_warnings: tuple = ()
 
 
@@ -538,8 +539,9 @@ def provision_execution_snapshot(
                 target, "ls-files", "-z", "--others", "--exclude-standard",
                 env=real_env,
             ).stdout.decode("utf-8", errors="surrogateescape")
-            excluded: List[Dict[str, str]] = []
+            excluded: List[Dict[str, Any]] = []
             eligible: List[str] = []
+            untracked_baseline: Dict[str, Dict[str, Any]] = {}
             file_inputs: List[str] = []
             capture_warnings: List[Dict[str, Any]] = []
             for rel in (p for p in untracked_raw.split("\0") if p):
@@ -548,9 +550,15 @@ def provision_execution_snapshot(
                 if reference:
                     file_inputs.append(rel)
                 elif reason:
-                    excluded.append({"path": rel, "reason": reason})
+                    from ouroboros.workspace_file_outputs import _side
+                    excluded.append({"path": rel, "reason": reason,
+                                     "baseline": _side(target / rel)})
                 else:
                     eligible.append(rel)
+                    from ouroboros.workspace_file_outputs import _side
+                    baseline = _side(target / rel)
+                    if baseline is not None:
+                        untracked_baseline[rel] = baseline
             staged_paths = indexed + eligible
             if staged_paths:
                 # `--add --remove` stages each named path's CURRENT worktree content
@@ -629,6 +637,7 @@ def provision_execution_snapshot(
             entry_count=entry_count,
             excluded_untracked=tuple(excluded),
             file_baseline=file_baseline,
+            untracked_baseline=untracked_baseline,
             capture_warnings=tuple(capture_warnings),
         )
         try:

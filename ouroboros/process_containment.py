@@ -34,6 +34,7 @@ CONTAINMENT_ENV_PREFIX = "OURO_PROC_CONTAINER_"
 # children must never inherit the marker and turn an arbitrary checkout into a
 # destructive-bootstrap target.
 _LAUNCHER_AUTHORITY_ENV = "OUROBOROS_MANAGED_BY_LAUNCHER"
+_LAUNCHER_REPO_AUTHORITY_ENV = "OUROBOROS_MANAGED_REPO_DIR"
 
 
 # Tri-state membership: UNREADABLE is deliberately NOT a "no" — reading a nondumpable member as a
@@ -298,6 +299,7 @@ class ProcessContainer:
         env = kwargs.get("env")
         env = dict(os.environ if env is None else env)
         env.pop(_LAUNCHER_AUTHORITY_ENV, None)
+        env.pop(_LAUNCHER_REPO_AUTHORITY_ENV, None)
         kwargs["env"] = {**env, **self.containment_env()}
         if _pl.IS_WINDOWS:
             flags |= getattr(subprocess, "CREATE_SUSPENDED", 0x4)
