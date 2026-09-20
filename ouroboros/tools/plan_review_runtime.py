@@ -806,9 +806,9 @@ def _plan_open_slots_line(wave: Optional[Dict[str, Any]]) -> str:
              if census["failed"] else "")
     tail += f", {len(census['skipped'])} not dispatched" if census["skipped"] else ""
     if unresolved:
-        states = ", ".join(dict.fromkeys(str(row.get("operation_state") or "unknown") for row in awaiting + unresolved))
-        return (f"{answered} of {total} reviewers answered{tail}; "
-                f"{len(awaiting) + len(unresolved)} unresolved ({states}) — no verdict")
+        states = ", ".join(dict.fromkeys(str(row.get("operation_state") or "unknown") for row in unresolved))
+        tail += f", {len(awaiting)} awaited" if awaiting else ""
+        return f"{answered} of {total} reviewers answered{tail}; {len(unresolved)} unresolved ({states}) — no verdict"
     lead = "waiting for reviewers — " if awaiting else ""
     return f"{lead}{answered} of {total} {'' if awaiting else 'reviewers '}answered{tail}"
 

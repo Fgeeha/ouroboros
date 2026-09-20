@@ -90,6 +90,8 @@ def _actor_outcome(actor: dict, slot_class: str = "") -> str:
     like a timeout; an unresolved custody state keeps its typed state and prose)."""
     if slot_class == "awaiting":
         return f"NO ANSWER YET ({actor.get('operation_state')})"
+    if slot_class == "settled_late":
+        return "SETTLED LATE — its answer is under Historical feedback below"
     if slot_class == "uncollected":
         return "SETTLED — not collected yet"
     if slot_class == "unresolved":
@@ -109,10 +111,10 @@ def _degraded_replay_note(wave: dict, *, paid_available: bool = True) -> str:
     engine's `plan_wave_replay_decision`): a wave with structural snapshot evidence
     replays while its epoch and the reviewer roster stand; one without (its slots
     died at dispatch time, invisible to the pre-fan-out snapshot) never replays —
-    a transient death is never cached as structural. Every re-dispatch asks the WHOLE
-    roster as the next paid cycle: the engine has no failed-slots-only path."""
-    whole = ("the WHOLE configured roster is asked again as the next paid cycle, slots that "
-             "already answered included; no failed-slots-only path exists")
+    a transient death is never cached as structural. Every re-dispatch asks every callable
+    slot as the next paid cycle: the engine has no failed-slots-only path."""
+    whole = ("every callable slot is asked again as the next paid cycle, slots that already answered "
+             "included (health-skipped lanes stay $0 rows); no failed-slots-only path exists")
     if not paid_available:
         replay = ("an identical envelope can replay this result for free while its health epoch and roster stand; "
                   if wave.get("health_epoch") else "no structural lane evidence was recorded; ")
@@ -172,7 +174,8 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
             author_note += "Cyber Pro preserves final judgment with Ouroboros. "
         else:
             author_note += "Advisory enforcement permits proceeding with the review open. "
-    if not review_enforcement_blocks("blocking"):
+    cyber = not review_enforcement_blocks("blocking")
+    if cyber and not wave.get("custody_pending"):
         return (
             author_note + "Cyber Pro: Ouroboros decides whether and how to continue. "
             "The recorded verdict, open findings and any unresolved physical reviewers remain "
@@ -219,6 +222,9 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
         unreachable = bool(wave.get("quorum_unreachable"))  # typed window-spent lanes: no awaited answer restores the quorum
         if unreachable:
             text += _quorum_unreachable_fact(wave)
+        if cyber:
+            return text + ("Cyber Pro: Ouroboros decides whether and how to continue; "
+                           "continuation does not close the wave or create a PASS.")
         if enforcement != "blocking":
             return text + _ADVISORY_PROCEEDS
         # The gate's own release fact, stated without a route: finalization stops being
@@ -368,7 +374,9 @@ def _render_wave(
     from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
 
     census = plan_wave_slot_census(wave)
-    slot_class = {id(row): name for name in ("awaiting", "unresolved", "uncollected") for row in census[name]}
+    late_word = "settled_late" if historical_feedback is not None else "uncollected"  # a free historical read collects nothing
+    slot_class = {id(row): (late_word if name == "uncollected" else name)
+                  for name in ("awaiting", "unresolved", "uncollected") for row in census[name]}
     if wave.get("custody_pending"):
         lines += [
             "", f"⚠️ REVIEW CUSTODY PENDING: {len(census['answered'])} of {census['configured']} reviewer(s) have answered"
@@ -433,7 +441,8 @@ def _render_wave(
     # The arithmetic's ``slot_unparseable:<slot>:`` entry of a slot with no collected
     # answer is left out by that slot's typed census class and the slot is named as what
     # it is, because later reviewer waves read this text as dialogue evidence.
-    gaps = {"awaiting": census["awaiting"], "not collected yet": census["uncollected"]}
+    gaps = {"awaiting": census["awaiting"],
+            ("settled late" if historical_feedback is not None else "not collected yet"): census["uncollected"]}
     hidden = tuple(f"slot_unparseable:{row.get('slot_id')}:" for rows in gaps.values() for row in rows)
     reasons = [str(r) for r in wave.get("reasons") or [] if not str(r).startswith(hidden)]
     reasons += [f"{label}: " + ", ".join(str(row.get("slot_id")) for row in rows) for label, rows in gaps.items() if rows]

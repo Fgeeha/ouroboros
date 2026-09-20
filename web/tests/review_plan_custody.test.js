@@ -25,9 +25,11 @@ const FAILED = {
     error: 'delegated review session run-e2336ca586e0 ended failed',
 };
 
-function planGroup(wave) {
+// Custody is activity only while the owning task runs: every live case states that fact.
+function planGroup(wave, status = 'running') {
     return planReviewGroupFromTaskDetail({
         task_id: 'root',
+        status,
         plan_review_state: {
             schema_version: 2,
             current_attempt: { fingerprint: FINGERPRINT, status: 'open', reason: '' },
@@ -67,7 +69,7 @@ test('a plan wave whose reviewers may still answer reads as work in progress', (
     // The stored wave is untouched; only the sentence about it changes.
     assert.equal(attempt.verdict, 'DEGRADED');
     assert.equal(group.verdict, 'DEGRADED');
-    assert.match(attempt.detailText, /^Verdict: none yet \(wave held open\)$/m);
+    assert.match(attempt.detailText, /^Verdict: none \(wave held open\)$/m);
     assert.deepEqual(availabilityLines(attempt, 'Awaiting answer:'), [
         'Awaiting answer: triad_286lhb · codex=gpt-6-astra',
         'Awaiting answer: triad_bkydwq · codex=gpt-6-astra',
@@ -128,7 +130,7 @@ test('an in-flight wave names its failed slot and its awaited slot separately', 
     assert.deepEqual(availabilityLines(attempt, 'Reviewer unavailable:'), [
         'Reviewer unavailable: triad_bkydwq · codex=gpt-6-astra — run_failed',
     ]);
-    assert.match(attempt.detailText, /^Verdict: none yet \(wave held open\)$/m);
+    assert.match(attempt.detailText, /^Verdict: none \(wave held open\)$/m);
     // A slot that is neither answered nor awaited keeps the wave's warning.
     assert.equal(attempt.progress, 'in progress · 1 of 3 answered · 1 unavailable');
     assert.equal(group.progress, attempt.progress);
@@ -173,4 +175,29 @@ test('a wave recorded without the typed custody fields renders exactly as before
         'Cost unavailable',
     ].join('\n'));
     assert.match(expandedHtml(group), /chat-review-group-meta">DEGRADED · 1</);
+});
+
+test('a plan wave of a task that is not running is a recorded gap, never live work', () => {
+    const wave = { custody_pending: true, actors: [AWAITING, ANSWERED, { ...AWAITING, slot_id: 'triad_bkydwq' }] };
+    for (const status of ['completed', 'failed', 'cancelled', 'interrupted', '', null]) { // null: a frame without a status
+        const group = planGroup(wave, status);
+        const attempt = group.attempts[0];
+        assert.equal(attempt.state, 'terminal', String(status));
+        assert.equal(group.state === 'running' || group.activeCount > 0, false, String(status));
+        assert.equal(attempt.progress, 'no verdict · 1 of 3 answered');
+        assert.equal(group.progress, 'no verdict · 1 of 3 answered');
+        assert.equal(attempt.tone, 'neutral');
+        assert.equal(group.tone, 'neutral');
+        assert.equal(attempt.verdict, 'DEGRADED'); // the stored wave is untouched
+        assert.doesNotMatch(expandedHtml(group), /in progress/);
+    }
+    // The same wave under a running task IS live work (the guard fires in both directions).
+    const live = planGroup(wave, 'running');
+    assert.equal(live.attempts[0].state, 'running');
+    assert.equal(live.progress, 'in progress · 1 of 3 answered');
+    assert.equal(live.tone, 'working');
+    // A real failure beside the wait stays loud after the task ended.
+    const mixed = planGroup({ custody_pending: true, actors: [AWAITING, ANSWERED, FAILED] }, 'completed');
+    assert.equal(mixed.progress, 'no verdict · 1 of 3 answered · 1 unavailable');
+    assert.equal(mixed.tone, 'warn');
 });

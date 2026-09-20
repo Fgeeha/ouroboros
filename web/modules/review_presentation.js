@@ -407,29 +407,29 @@ export function classifyReviewLifecyclePointer(row) {
     };
 }
 
-function planAttempt(wave, index, isCurrent) {
+function planAttempt(wave, index, isCurrent, live) {
     if (!wave || typeof wave !== 'object') return null;
     const fingerprint = text(wave.request_fingerprint);
     const id = attemptIdentity(wave, `${fingerprint || 'wave'}:${wave.cycle_index ?? index + 1}`);
     if (!id) return null;
     const verdict = text(wave.aggregate || 'UNKNOWN');
     const superseded = Boolean(wave.superseded) || !isCurrent;
-    // Gate closure and physical reviewer custody are independent. A partial
-    // wave can remain in flight after the author selects a different plan.
+    // Gate closure and physical reviewer custody are independent: a partial wave can stay in flight after the
+    // author selects a different plan — but only while its own task still runs to collect it; afterwards it is a gap.
     const custodyPending = wave.custody_pending === true;
-    const state = custodyPending ? 'running' : superseded ? 'superseded' : 'terminal';
+    const state = custodyPending && live ? 'running' : superseded ? 'superseded' : 'terminal';
     const roster = (Array.isArray(wave.actors) ? wave.actors : [])
         .filter((actor) => actor && typeof actor === 'object');
     // A wave whose reviewers may still answer reports how far it got; the
     // verdict token speaks only for a wave that is no longer collecting.
     const [progress, heldTone] = custodyPending ? heldProgress(
-        roster.some(actorUnresolved) && !roster.some(actorAwaiting) ? 'unresolved' : 'in progress', roster, (actor) => actor.ok === true) : ['', ''];
+        roster.some(actorUnresolved) && !roster.some(actorAwaiting) ? 'unresolved' : (live ? 'in progress' : 'no verdict'), roster, (actor) => actor.ok === true) : ['', ''];
     return {
         id,
         surface: 'plan',
         state,
         progress,
-        tone: heldTone || statusTone(state, custodyPending ? '' : verdict),
+        tone: heldTone || (custodyPending && !live ? 'neutral' : statusTone(state, custodyPending ? '' : verdict)),
         verdict,
         timestamp: text(wave.reviewed_at || wave.ts || wave.timestamp || wave.closed_at),
         ordinal: index,
@@ -550,7 +550,7 @@ function planActorAvailabilityLines(wave) {
 function planWaveDetail(wave) {
     const lines = [
         wave.custody_pending === true
-            ? 'Verdict: none yet (wave held open)'
+            ? 'Verdict: none (wave held open)'
             : (wave.aggregate ? `Verdict: ${wave.aggregate}` : ''),
         wave.closed != null ? `Closed: ${wave.closed ? 'yes' : 'no'}` : '',
         wave.paid != null ? `Reviewer panel dispatched: ${wave.paid ? 'yes' : 'no'}` : '',
@@ -690,7 +690,7 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
         .map((wave, index) => planAttempt(
             wave,
             index,
-            index === currentWaveIndex,
+            index === currentWaveIndex, text(detail?.status).toLowerCase() === 'running',
         ))
         .filter(Boolean);
     let currentAttempt = currentWaveIndex >= 0
@@ -730,9 +730,9 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
         state = activeAttempts.some((attempt) => attempt.state === 'running') ? 'running' : 'queued';
         activeCount = activeAttempts.length;
     }
-    // The group header speaks for its live wave: progress while that wave is
-    // still collecting answers, the recorded verdict once it is not.
-    const progress = text(activeAttempts.at(-1)?.progress);
+    // The group header speaks for its CURRENT wave: a progress phrase while that wave
+    // has unanswered slots, the recorded verdict once every slot is collected.
+    const progress = text(currentAttempt?.progress);
     return {
         id: `plan:${owner}`,
         surface: 'plan',
@@ -743,7 +743,7 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
         initiatorTaskId: owner,
         state,
         progress,
-        tone: progress ? activeAttempts.at(-1).tone : statusTone(state, currentVerdict),
+        tone: progress ? currentAttempt.tone : statusTone(state, currentVerdict),
         verdict: currentVerdict,
         summary: text(current.reason || currentAttempt?.summary),
         authorDecisionText,

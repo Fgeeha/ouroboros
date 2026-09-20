@@ -18,8 +18,6 @@ from __future__ import annotations
 
 import copy
 import json
-import tempfile
-from pathlib import Path
 
 import pytest
 
@@ -169,8 +167,10 @@ def test_an_open_line_carries_no_verdict_no_finding_count_and_no_failure_word_fo
 
 def test_an_unresolved_slot_is_never_worded_as_waiting_and_a_waiting_slot_never_as_unresolved():
     unresolved = _line(_wave([_ok("s1"), _pending("s2"), _pending("s3", "custody_lost")]))
-    assert "waiting" not in unresolved
-    assert "2 unresolved (pending_dispatch, custody_lost) — no verdict" in unresolved
+    # Beside an unresolved slot an awaited one is counted apart — awaited, never unresolved, never "waiting".
+    assert unresolved == ("📐 plan_task: 1 of 3 reviewers answered, 1 awaited; 1 unresolved (custody_lost) — "
+                          "no verdict; cycles paid 1/3")
+    assert "waiting" not in unresolved and "pending_dispatch" not in unresolved
     waiting = _line(_wave([_ok("s1"), _pending("s2")]))
     assert "unresolved" not in waiting and "waiting for reviewers" in waiting
 
@@ -221,6 +221,7 @@ def test_the_disclosure_names_no_verdict_token_while_reviewer_work_is_pending():
     owed = plan_review_disclosure({**base, "review_late_result_pending": True})
     assert "(reviewer work is running or awaiting collection)" in owed and "DEGRADED" not in owed
     assert "a late result is still owed" in owed
+    assert "paid" not in owed  # a slot released at the barrier is $0 until its row proves the send
     # A settled panel with no quorum keeps its verdict token and its cause, byte for byte.
     assert plan_review_disclosure(base) == (
         "\n\n⚠️ Plan review is still open (DEGRADED; no parseable reviewer quorum); work proceeded "
@@ -319,14 +320,14 @@ def test_a_settled_degraded_wave_keeps_its_failure_render_and_gains_the_whole_ro
     assert ("Reasons: slot_unparseable:s2:harness unavailable, slot_unparseable:s3:transport died, "
             "parseable_slots_below_quorum:1/2. Counts: ") in text
     assert "DEGRADED: parseable reviewer verdicts 1 of 3 configured slot(s)" in text
-    whole = ("the WHOLE configured roster is asked again as the next paid cycle, slots that already "
-             "answered included; no failed-slots-only path exists")
+    whole = ("every callable slot is asked again as the next paid cycle, slots that already answered "
+             "included (health-skipped lanes stay $0 rows); no failed-slots-only path exists")
     empty_epoch = _degraded_replay_note({})
     assert f"an identical envelope re-dispatches a fresh panel ({whole})" in empty_epoch
-    assert empty_epoch in text and "$0" not in empty_epoch
+    assert empty_epoch in text and "WHOLE" not in empty_epoch  # health-skipped lanes are not asked: no "whole roster"
     with_epoch = _degraded_replay_note({"health_epoch": [{"slot": "s1"}]})
     assert "re-dispatches a fresh panel" not in with_epoch and f"re-dispatches: {whole})" in with_epoch
-    assert "WHOLE" not in _degraded_replay_note({}, paid_available=False)  # a spent cap dispatches nothing
+    assert "asked again" not in _degraded_replay_note({}, paid_available=False)  # a spent cap dispatches nothing
 
 
 # ------------------------------------------------------------------ durable truth
@@ -352,14 +353,14 @@ def test_the_advisory_open_event_carries_typed_custody_and_per_slot_state(tmp_pa
 
 
 @pytest.mark.parametrize("pending", [True, False])
-def test_the_acceptance_exhibit_of_an_open_wave_carries_typed_custody(pending):
+def test_the_acceptance_exhibit_of_an_open_wave_carries_typed_custody(pending, tmp_path):
     import types
 
     from ouroboros.review_evidence import build_task_acceptance_evidence
     from ouroboros.task_results import STATUS_RUNNING, record_plan_review_wave, write_task_result
     from tests.test_acceptance_claims_wiring import _v2_wave
 
-    root = Path(tempfile.mkdtemp())
+    root = tmp_path
     write_task_result(root, "acc", STATUS_RUNNING, result="running")
     record_plan_review_wave(root, "acc", {
         **_v2_wave("a" * 64, ["unreviewed claim"], aggregate="DEGRADED", closed=False),
@@ -438,3 +439,26 @@ def test_a_fully_awaiting_wave_keeps_the_fail_closed_floor_and_every_line_tells_
     assert [line for line in harness.progress[mark:] if line.startswith("📐 plan_task:")] == [
         "📐 plan_task: collecting reviewer answers (no new panel)…",
         "📐 plan_task: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"]
+
+
+def test_cyber_pro_is_told_the_custody_facts_of_an_awaiting_wave_and_keeps_its_own_words_otherwise(monkeypatch):
+    from ouroboros.tools import plan_render
+
+    monkeypatch.setattr(plan_render, "review_enforcement_blocks", lambda _mode: False)  # Cyber Pro: nothing blocks
+    awaited = _next_step(_wave([_ok("s1"), _pending("s2")]), enforcement="advisory", cap=3, cycles_paid=1)
+    assert awaited.startswith("Open: one or more reviewer operations are still in flight. No reviewer verdict exists yet")
+    assert "never waits and never re-dispatches" in awaited and "wait_task" in awaited
+    assert awaited.endswith("Cyber Pro: Ouroboros decides whether and how to continue; "
+                            "continuation does not close the wave or create a PASS.")
+    assert "recorded verdict" not in awaited and "Advisory enforcement" not in awaited and "Blocking" not in awaited
+    settled = _next_step(_wave([_ok("s1"), _failed("s2")], pending=False), enforcement="advisory", cap=3, cycles_paid=1)
+    assert settled.startswith("Cyber Pro: Ouroboros decides whether and how to continue. The recorded verdict")
+
+
+def test_a_free_historical_read_never_promises_a_collection():
+    wave = _wave([_ok("s1"), _pending("s2")], pending=False, historical_supplements=[_supplement("s2")])
+    live = _render_wave(wave, cap=3, cycles_paid=1, enforcement="advisory")
+    assert "· SETTLED — not collected yet" in live and "not collected yet: s2" in live
+    read = _render_wave(wave, cap=3, cycles_paid=1, enforcement="advisory", historical_feedback=[])
+    assert "· SETTLED LATE — its answer is under Historical feedback below" in read and "settled late: s2" in read
+    assert "not collected yet" not in read

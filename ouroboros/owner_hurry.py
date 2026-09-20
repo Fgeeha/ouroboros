@@ -702,10 +702,11 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
                    "the current plan has no verdict of its own")
     subject = "Blocking plan review" if decision.get("enforcement") == "blocking" else "Plan review"
     # The wave is still OPEN at finalization, so the verb says so: "remained"
-    # told the owner a panel had ended that nobody had closed. When a paid slot
-    # can still settle, the same sentence carries that typed fact.
+    # told the owner a panel had ended that nobody had closed. When a slot can
+    # still settle, the same sentence carries that typed fact — never as "paid":
+    # a slot released at the barrier is $0 until its settled row proves the send.
     late = (
-        " A paid reviewer slot can still settle, so a late result is still owed."
+        " A reviewer slot can still settle, so a late result is still owed."
         if decision.get("review_late_result_pending") else ""
     )
     # The author's decision and the rail that forced finalization are BOTH true, and

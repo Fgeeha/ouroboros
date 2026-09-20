@@ -281,6 +281,7 @@ const PLAN_ANSWERED = { ok: true, operation_state: 'settled', late_result_pendin
 function planGroup(wave, current = { status: 'open' }) {
     return planReviewGroupFromTaskDetail({
         task_id: 'root',
+        status: 'running', // custody is live work only while the owning task runs
         plan_review_state: {
             schema_version: 2,
             current_attempt: { fingerprint: FINGERPRINT, reason: '', ...current },
