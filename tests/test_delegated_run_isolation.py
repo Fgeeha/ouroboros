@@ -154,8 +154,7 @@ def _isolated_entry(ctx, target, handle, *, run_id="run-1", settled=True):
         run_id=run_id, task_id="t-nanny", route_id="some-route",
         snapshot_id=handle.snapshot_id, execution_root=handle.path,
         baseline_sha=handle.baseline_sha, target_root=str(target),
-        authority_source="external_workspace_root", settled=settled,
-        ledger_root=str(custody.custody_root(ctx)),
+        authority_source="external_workspace_root", settled=settled, ledger_root=str(custody.custody_root(ctx)),
     )
     custody._CUSTODY[entry.run_id] = entry
     return entry
