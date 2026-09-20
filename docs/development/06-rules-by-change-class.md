@@ -617,14 +617,14 @@ and what enforces each.
   task emits one typed owner line (keyed by task and model, never per round, naming
   only the reporting route). A mismatch is disclosure, never a dispatch gate.
 - The engine's active-turn token is a transport fact: the CALLER owns the slot
-  (`llm_claudexor.ModelTurnState` on the loop context; a consciousness wake-up needs no
-  slot of its own), the engine boundary is its only writer. Fresh slot per logical
+  (`llm_claudexor.ModelTurnState` on the loop context, also used by consciousness);
+  only the engine boundary writes it. Fresh slot per logical
   turn, cleared when dispatch leaves this transport; never derived from message roles,
   prose or the last stored assistant envelope (BIBLE P5); never checkpointed (a cold
   restart starts empty); never forked by a reprepare, thread offload or kwargs copy;
-  updated only from a dispatched durable result of a request that carried the field (a
-  legacy-shaped exchange is silence, not proof a turn ended); never in usage, events,
-  progress or task cards. Opt-in is gated on the last SUCCESSFUL handshake's version —
+  a dispatched durable result updates it; released `invalid_continuation` repair clears
+  it with message envelopes. Other non-dispatched, unknown or legacy results preserve
+  it; never in usage, events, progress or task cards. Opt-in is gated on the last SUCCESSFUL handshake's version —
   not the next-spawn pin, not a liveness projection a failed probe can blank (WHY:
   ARCHITECTURE §6 "The live turn slot"; the `llm_claudexor.py` docstring).
 - Pass `model_role` and the captured account explicitly at every helper/reviewer seam
