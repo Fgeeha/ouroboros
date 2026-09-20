@@ -469,7 +469,7 @@ def budget_pct(st: Dict[str, Any]) -> float:
         return 100.0
 
 
-def update_budget_from_usage(usage: Dict[str, Any]) -> None:
+def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     """Refresh the legacy state projection from the physical-attempt ledger.
 
     ``usage`` is retained for caller compatibility but is never added to the
@@ -491,42 +491,128 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
             log.debug(f"Failed to convert value to int: {v!r}", exc_info=True)
             return default
 
-    from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown, usage_projection
+    def _ledger_high_water_marker(breakdown: Dict[str, Any]) -> Optional[tuple[int, int]]:
+        """Return the ``(compaction_epoch, seq)`` fact from this read.
 
-    # Serialize the ledger snapshot with its compatibility write. Otherwise an
-    # older concurrent reader can acquire STATE_LOCK later and regress state.json.
-    lock_fd = acquire_file_lock(STATE_LOCK_PATH)
-    _warn_state_unlocked("budget-update", lock_fd)
+        ``usage_breakdown`` supplies this field while rendering the same
+        validated rows used for the monetary buckets.  Do not reconstruct it
+        from a second read or a private accounting cache: a marker that cannot
+        be parsed is unknown, never zero.
+        """
+        marker = breakdown.get("_ledger_high_water_seq")
+        if not isinstance(marker, (list, tuple)) or len(marker) != 2:
+            return None
+        epoch, seq = marker
+        if any(isinstance(value, bool) or not isinstance(value, int) or value < 0
+               for value in (epoch, seq)):
+            return None
+        return int(epoch), int(seq)
+
+    from ouroboros.usage_accounting import (
+        UsageLedgerCorrupt,
+        ensure_legacy_imported,
+        usage_breakdown,
+        usage_projection,
+    )
+
+    # Ledger I/O is deliberately OUTSIDE STATE_LOCK: the lock stays
+    # short-lived, and the validated-snapshot marker below preserves the old
+    # serialization invariant without holding STATE_LOCK across a long read.
     try:
         ensure_legacy_imported(DRIVE_ROOT)
         breakdown = usage_breakdown(DRIVE_ROOT)
         total_limit = float(TOTAL_BUDGET_LIMIT or 0.0)
-        projection = (
-            usage_projection(DRIVE_ROOT, global_limit_usd=total_limit)
-            if total_limit > 0
-            else {key: breakdown.get(key) for key in (
+        projection_snapshot = breakdown.pop("_usage_projection", None)
+        if total_limit > 0 and isinstance(projection_snapshot, dict):
+            from ouroboros._usage_rows import _with_limit
+            roots = projection_snapshot.pop("by_root", None)
+            projection = _with_limit(projection_snapshot, total_limit)
+            if roots is not None:
+                projection["by_root"] = roots
+        else:
+            projection = (
+                usage_projection(DRIVE_ROOT, global_limit_usd=total_limit)
+                if total_limit > 0
+                else {key: breakdown.get(key) for key in (
                 "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
                 "unresolved_upper_bound_usd", "accounted_usd", "unknown_unmetered",
                 "cost_final", "attempt_counts", "integrity_degraded",
-            )}
-        )
+                )}
+            )
+    except UsageLedgerCorrupt:
+        # A damaged ledger is unknown, never zero. Leave the prior projection
+        # in place, report the refusal to the caller, and let the next event
+        # retry: paid usage itself is already persisted in the ledger.
+        log.warning("Skipping legacy budget projection: usage ledger is corrupt", exc_info=True)
+        return False
+    ledger_high_water_marker = (
+        None if breakdown.get("integrity_degraded") else _ledger_high_water_marker(breakdown)
+    )
+    openrouter_ledger_settled = _openrouter_ledger_settled(breakdown)
+
+    should_check_ground_truth = False
+    lock_fd = acquire_file_lock(STATE_LOCK_PATH)
+    _warn_state_unlocked("budget-update", lock_fd)
+    try:
         st = _load_state_unlocked()
-        st["spent_usd"] = _to_float(breakdown.get("accounted_usd"))
-        st["spent_calls"] = _to_int(breakdown.get("physical_calls"))
-        st["spent_tokens_prompt"] = _to_int(breakdown.get("prompt_tokens"))
-        st["spent_tokens_completion"] = _to_int(breakdown.get("completion_tokens"))
-        st["spent_tokens_cached"] = _to_int(breakdown.get("cached_tokens"))
-        st["usage_accounting"] = projection
-        st["openrouter_ledger_settled_usd"] = _openrouter_ledger_settled(breakdown)
-        previous_check_call = _to_int(st.get("openrouter_last_check_call"), -1)
-        should_check_ground_truth = bool(
-            st["spent_calls"] > 0
-            and st["spent_calls"] % 50 == 0
-            and st["spent_calls"] != previous_check_call
+        previous_marker = st.get("usage_ledger_high_water_seq")
+        marker_known = (
+            ledger_high_water_marker is not None
         )
-        if should_check_ground_truth:
-            st["openrouter_last_check_call"] = st["spent_calls"]
-        _save_state_unlocked(st)
+        previous_known = (
+            isinstance(previous_marker, (list, tuple))
+            and len(previous_marker) == 2
+            and all(isinstance(value, int) and not isinstance(value, bool) and value >= 0
+                    for value in previous_marker)
+        )
+        previous_marker_present = "usage_ledger_high_water_seq" in st
+        marker_to_write: Optional[tuple[int, int]] = None
+        if not marker_known or (previous_marker_present and not previous_known):
+            # An unreadable/missing marker is unknown, never zero. Keep the
+            # existing projection untouched: writing money without ordering
+            # evidence could reintroduce the stale-snapshot regression.
+            log.warning(
+                "legacy budget projection FRESHNESS MARKER UNKNOWN: preserving prior projection"
+            )
+            return False
+        elif previous_known:
+            current_marker = ledger_high_water_marker
+            saved_marker = (int(previous_marker[0]), int(previous_marker[1]))
+            if current_marker < saved_marker:
+                # ANY lower marker is refused, epoch or seq: a delayed writer
+                # holding a pre-compaction snapshot must never overwrite money
+                # a newer snapshot already saved. Equal/higher markers keep the
+                # normal positive update path below.
+                log.warning(
+                    "legacy budget projection STALE SNAPSHOT REJECTED: ledger marker %s < saved %s",
+                    current_marker,
+                    saved_marker,
+                )
+                return False
+            marker_to_write = current_marker
+        else:
+            marker_to_write = ledger_high_water_marker
+
+        if marker_to_write is not None:
+            st["spent_usd"] = _to_float(breakdown.get("accounted_usd"))
+            st["spent_calls"] = _to_int(breakdown.get("physical_calls"))
+            st["spent_tokens_prompt"] = _to_int(breakdown.get("prompt_tokens"))
+            st["spent_tokens_completion"] = _to_int(breakdown.get("completion_tokens"))
+            st["spent_tokens_cached"] = _to_int(breakdown.get("cached_tokens"))
+            st["usage_accounting"] = projection
+            st["openrouter_ledger_settled_usd"] = openrouter_ledger_settled
+            # Historical key retained for state.json compatibility; its value
+            # is now the ordered ``[compaction_epoch, seq]`` pair.
+            st["usage_ledger_high_water_seq"] = list(marker_to_write)
+            previous_check_call = _to_int(st.get("openrouter_last_check_call"), -1)
+            should_check_ground_truth = bool(
+                st["spent_calls"] > 0
+                and st["spent_calls"] % 50 == 0
+                and st["spent_calls"] != previous_check_call
+            )
+            if should_check_ground_truth:
+                st["openrouter_last_check_call"] = st["spent_calls"]
+            _save_state_unlocked(st)
     finally:
         release_file_lock(STATE_LOCK_PATH, lock_fd)
 
@@ -540,10 +626,10 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                 st["openrouter_daily_usd"] = ground_truth["daily_usd"]
                 st["openrouter_last_check_at"] = utc_now_iso()
 
-                # Drift compares the OpenRouter-only settled ledger delta with the
-                # queried OpenRouter key's usage delta — the only like-for-like
-                # pair. Direct-provider spend (Anthropic/OpenAI/local) is invisible
-                # to /auth/key by construction and must not count as "drift".
+                # Drift compares the OpenRouter-only settled ledger delta with
+                # the queried key's usage delta — the only like-for-like pair.
+                # Direct-provider spend is invisible to /auth/key by
+                # construction and must not count as "drift".
                 session_total_snap = st.get("session_total_snapshot")
                 session_or_settled_snap = st.get("session_openrouter_settled_snapshot")
                 or_ledger_settled = st.get("openrouter_ledger_settled_usd")
@@ -553,9 +639,9 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                 key_changed = bool(current_fp) and bool(baseline_fp) and current_fp != baseline_fp
 
                 if integrity_degraded:
-                    # A quarantined ledger tail makes the tracked side non-final;
-                    # a confident percentage would be dishonest. Comparison is
-                    # suppressed, not zeroed.
+                    # A quarantined ledger tail makes the tracked side
+                    # non-final; a confident percentage would be dishonest.
+                    # Comparison is suppressed, not zeroed.
                     st["budget_drift_pct"] = None
                     st["budget_drift_alert"] = False
                 elif (
@@ -589,9 +675,9 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                                 DRIVE_ROOT / "logs" / "events.jsonl",
                                 {
                                     "ts": utc_now_iso(),
-                                    # "type" is the events.jsonl schema key every other
-                                    # event uses; type-keyed aggregations used to lose
-                                    # this row when it was written under "event".
+                                    # "type" is the events.jsonl schema key every
+                                    # other event uses; type-keyed aggregations
+                                    # lost this row when it was written as "event".
                                     "type": "budget_drift_warning",
                                     "drift_pct": round(drift_pct, 2),
                                     "our_delta": round(our_delta, 4),
@@ -614,6 +700,8 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> None:
                 _save_state_unlocked(st)
             finally:
                 release_file_lock(STATE_LOCK_PATH, lock_fd)
+
+    return True
 
 
 def budget_breakdown(st: Dict[str, Any]) -> Dict[str, float]:

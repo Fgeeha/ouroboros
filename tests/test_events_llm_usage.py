@@ -101,6 +101,57 @@ def test_llm_usage_preserves_unknown_cost_as_null(tmp_path):
     assert ctx.last_usage["cost"] is None
 
 
+def test_llm_usage_reports_corrupt_projection_unavailable_and_keeps_paid_usage(tmp_path):
+    from supervisor import events as ev_module
+    (tmp_path / "logs").mkdir()
+
+    class FakeCtx:
+        DRIVE_ROOT = tmp_path
+
+        def update_budget_from_usage(self, usage):
+            self.last_usage = usage
+            return False
+
+    ctx = FakeCtx()
+    ev_module._handle_llm_usage(
+        {"type": "llm_usage", "task_id": "paid", "usage": {"prompt_tokens": 4, "cost": 0.75}},
+        ctx,
+    )
+    written = json.loads((tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8"))
+    assert written["projection_update_status"] == "unavailable"
+    assert written["cost"] == 0.75
+    assert ctx.last_usage["cost"] == 0.75
+
+
+def test_llm_usage_real_corrupt_ledger_is_unavailable_and_paid_event_survives(tmp_path):
+    from supervisor import events as ev_module
+    from supervisor import state
+    from ouroboros.usage_ledger import LEDGER_REL
+
+    (tmp_path / "logs").mkdir()
+    state.init(tmp_path, total_budget_limit=0.0)
+    state.save_state({"spent_usd": 1.25})
+    ledger = tmp_path / LEDGER_REL
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("{broken}\n{}\n", encoding="utf-8")
+
+    class Ctx:
+        DRIVE_ROOT = tmp_path
+
+        @staticmethod
+        def update_budget_from_usage(usage):
+            return state.update_budget_from_usage(usage)
+
+    ev_module._handle_llm_usage(
+        {"type": "llm_usage", "task_id": "paid-real", "usage": {"prompt_tokens": 2, "cost": 0.5}},
+        Ctx(),
+    )
+    written = json.loads((tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8"))
+    assert written["projection_update_status"] == "unavailable"
+    assert written["cost"] == 0.5
+    assert state.load_state()["spent_usd"] == 1.25
+
+
 def test_cost_breakdown_aggregates_cache_tokens_and_ttl(tmp_path):
     import asyncio
     import json

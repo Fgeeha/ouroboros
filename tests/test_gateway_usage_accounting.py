@@ -194,6 +194,69 @@ def test_api_state_money_and_call_count_are_ledger_projections(tmp_path, monkeyp
     assert payload["accounting"]["remaining_known_usd"] == 5.75
 
 
+@pytest.mark.serial
+def test_api_state_unbounded_budget_does_not_expose_private_breakdown_keys(tmp_path, monkeypatch):
+    """The no-limit branch keeps internal ledger provenance off the wire."""
+    from ouroboros.gateway.state import api_state
+    from supervisor import queue, state, workers
+
+    root = _data_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 0.0)
+    monkeypatch.setattr(state, "load_state", lambda: {"current_branch": "ouroboros"})
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(workers, "PENDING", [])
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(queue, "get_evolution_status_snapshot", lambda **_kwargs: {})
+    monkeypatch.setattr(
+        ua,
+        "usage_breakdown",
+        lambda *_args, **_kwargs: {
+            "accounted_usd": 2.0,
+            "physical_calls": 1,
+            "settled_usd": 2.0,
+            "confirmed_usd": 2.0,
+            "estimated_usd": 0.0,
+            "reserved_usd": 0.0,
+            "unresolved_upper_bound_usd": 0.0,
+            "unknown_unmetered": 0,
+            "cost_final": True,
+            "attempt_counts": {},
+            "integrity_degraded": False,
+            "_ledger_high_water_seq": [0, 7],
+            "_root_accounting_snapshot": {"accounted_usd": 2.0},
+        },
+    )
+    monkeypatch.setattr(
+        ua,
+        "usage_projection",
+        lambda *_args, **_kwargs: pytest.fail("unbounded /api/state must not call usage_projection"),
+    )
+    request = Request({
+        "type": "http", "method": "GET", "path": "/api/state", "headers": [],
+        "query_string": b"", "scheme": "http", "server": ("test", 80),
+        "client": ("test", 1),
+        "app": types.SimpleNamespace(state=types.SimpleNamespace(drive_root=root, app_start=0.0)),
+    })
+
+    response = asyncio.run(api_state(request))
+    payload = json.loads(response.body)
+
+    assert response.status_code == 200
+    assert payload["budget_limit"] == 0.0
+
+    def walk_keys(value):
+        if isinstance(value, dict):
+            for key, child in value.items():
+                yield key
+                yield from walk_keys(child)
+        elif isinstance(value, list):
+            for child in value:
+                yield from walk_keys(child)
+
+    assert all(not str(key).startswith("_") for key in walk_keys(payload))
+    assert payload["accounting"]["accounted_usd"] == 2.0
+
+
 def test_cost_breakdown_fails_loudly_when_authoritative_history_is_corrupt(tmp_path, monkeypatch):
     from ouroboros.gateway.history import make_cost_breakdown_endpoint
 

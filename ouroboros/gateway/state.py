@@ -152,7 +152,15 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
     accounting_available = True
     try:
         ensure_legacy_imported(drive_root)
-        breakdown = usage_breakdown(drive_root)
+        # ``usage_breakdown`` also carries private provenance used by the
+        # compatibility writer. Keep that internal vocabulary at this
+        # boundary even when the unbounded-budget branch reuses the mapping
+        # directly as its accounting projection.
+        breakdown = {
+            key: value
+            for key, value in usage_breakdown(drive_root).items()
+            if not str(key).startswith("_")
+        }
         # include_roots=False: /api/state serializes named scalars only, so the
         # per-root map would be built per poll and thrown away (O(N×roots) work
         # with zero readers on this path). The slim projection still carries

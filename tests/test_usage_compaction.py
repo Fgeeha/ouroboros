@@ -113,13 +113,21 @@ def _snapshot_looks(monkeypatch, on_look=lambda looks: None):
 
 
 def _projection_snapshot(data_root):
+    def breakdown(**kwargs):
+        result = ua.usage_breakdown(data_root, **kwargs)
+        # The compatibility writer's freshness marker advances across a real
+        # compaction; monetary/non-money projection equality intentionally
+        # excludes that ordering fact.
+        result.pop("_ledger_high_water_seq", None)
+        return result
+
     return (
         ua.usage_projection(data_root),
         ua.usage_projection(data_root, root_task_id="root"),
         ua.usage_projection(data_root, root_task_id="root2"),
-        ua.usage_breakdown(data_root),
-        ua.usage_breakdown(data_root, root_task_id="root"),
-        ua.usage_breakdown(data_root, task_id="t2"),
+        breakdown(),
+        breakdown(root_task_id="root"),
+        breakdown(task_id="t2"),
     )
 
 
