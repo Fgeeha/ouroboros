@@ -370,10 +370,19 @@ def test_no_outer_paid_repeat_can_nest_another_redo_budget_on_this_transport():
 
     target = LLMClient()._resolve_remote_target(MODEL)
     assert target["provider"] == "claudexor" and is_loopback_base_url(target["base_url"])
-    error = transport.ClaudexorModelError({"code": "model_operation_failed", "message": "died"})
-    error.physical_attempt_capture = SimpleNamespace(
-        state="dispatched", provider="claudexor", route_is_loopback=True)
-    assert is_retryable_transport_death(error) is False
+    import httpx
+
+    def died(loopback):
+        # A typed transport death on a dispatched send: the ONLY thing left to
+        # decide the verdict is the route's locality.
+        error = transport.ClaudexorModelError({"code": "model_operation_failed", "message": "died"})
+        error.__cause__ = httpx.ReadError("connection reset")
+        error.physical_attempt_capture = SimpleNamespace(
+            state="dispatched", provider="claudexor", route_is_loopback=loopback)
+        return error
+
+    assert is_retryable_transport_death(died(False)) is True
+    assert is_retryable_transport_death(died(True)) is False
 
 
 def test_a_discarded_generation_never_becomes_the_live_turn(setup, monkeypatch):

@@ -857,7 +857,7 @@ _SUBSTITUTION_DISPOSITIONS = {
     "redos_exhausted": "the answer was not accepted and no further attempt was available",
     "pinned_account": "the account is pinned, so the round was not asked again",
     "admitted_candidate": "this send was already admitted, so the round was not asked again",
-    "send_budget_spent": "asking again would have spent this task's last send",
+    "send_budget_spent": "this caller had no send left, so the round was not asked again",
     "deadline_spent": "the task's own time was spent, so the round was not asked again",
 }
 
