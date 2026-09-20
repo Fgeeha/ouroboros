@@ -71,6 +71,32 @@ def access_instruction(access: str) -> str:
     return ACCESS_INSTRUCTIONS.get(str(access or "").strip(), "")
 
 
+def execution_binding_instruction(execution_root: str, authority_root: str) -> str:
+    """State the host's effective write root after private snapshot provisioning.
+
+    The task contract names the stable authority/project root so the host can
+    reconcile and apply a result. That path is not the child write surface once
+    a private delegated snapshot exists. The binding is appended after the
+    inherited assignment so an owner-facing absolute path cannot silently win by
+    omission or by appearing earlier in the work order.
+    """
+    execution = str(execution_root or "").strip()
+    authority = str(authority_root or "").strip()
+    if not execution:
+        return ""
+    return (
+        "\n\nDELEGATED EXECUTION BINDING (host fact; overrides ambiguous path prose): "
+        f"the sole writable execution root for this run is {execution}. "
+        "Use relative paths or absolute paths under that root for every shell, "
+        "file, and patch operation. The stable authority/project root "
+        f"{authority or '(unknown)'} is a read-only identity/reference until the "
+        "parent explicitly integrates the captured result. Do not write, patch, "
+        "stage, reset, clean, or commit the authority root. If the harness cannot "
+        "honor this binding, stop with a typed execution-root mismatch instead of "
+        "falling back to the authority root."
+    )
+
+
 def append_coordination_context(
     base_instructions: str,
     coordination_context: str,

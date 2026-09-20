@@ -56,6 +56,7 @@ from ouroboros.delegate_start_instructions import (
     UNPROVEN_BOUNDARY_INSTRUCTION as _UNPROVEN_BOUNDARY_INSTRUCTION,
     access_instruction,
     append_coordination_context,
+    execution_binding_instruction,
 )
 from ouroboros.subagent_runtime import (  # noqa: F401 - shared primitive re-export
     delegate_start_entry as _delegate_start_entry,
@@ -471,6 +472,13 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                     resource_ref = dict(record_auth.get("resource_ref") or {})
             execution_root = (root if directory_options.get("isolation") == "live" else "") if directory_options else delegated_execution_workspace_root(gateway, authority, root)
             scope_root = target_root if execution_root or directory_options else root
+            if snapshot is not None:
+                # The normalized task contract necessarily retains the stable
+                # authority target for custody and explicit integration. Once a
+                # private snapshot exists, append the effective write binding
+                # after that contract so a parent path cannot be mistaken for
+                # the child's writable root.
+                instructions += execution_binding_instruction(execution_root, target_root)
             (project_id, owned_project_id, project_persistent) = resolve_registration(
                 gateway, scope_root, execution_root, getattr(authority, "access", ""))
             if directory_options:

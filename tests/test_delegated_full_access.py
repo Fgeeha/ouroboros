@@ -112,6 +112,10 @@ def test_full_start_http_contract_and_real_snapshot_capture(full_run):
     assert 'ACCESS: full native process access is requested' in request['instructions']
     assert 'effective access is established by the run receipt' in request['instructions']
     assert 'private snapshot is not an OS sandbox' in request['instructions']
+    assert result['execution_root'] in request['instructions']
+    assert 'sole writable execution root' in request['instructions']
+    assert target in request['instructions']
+    assert 'read-only identity/reference' in request['instructions']
     assert request['instructions'].count('this line governs native process access') == 1
     assert 'OS-enforced boundary' not in result['note']
     assert facts['trust_posts'] == [{'repoRoot': target, 'allowFullAccess': True}]

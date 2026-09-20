@@ -14,8 +14,9 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+import subprocess
 from copy import deepcopy
-from typing import TYPE_CHECKING, Any, Dict, NamedTuple, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, NamedTuple, Optional, Tuple
 
 from ouroboros import delegate_custody as custody
 from ouroboros.delegate_custody import RunCustody as _RunCustody
@@ -413,7 +414,7 @@ def _record_baseline_manifest(drive: pathlib.Path, task_id: str, invocation_id: 
 
 
 def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
-                   manifest: Dict[str, Any]) -> Dict[str, Any]:
+                   manifest: Dict[str, Any], target_drift: Optional[List[str]] = None) -> Dict[str, Any]:
     """The terminal-payload projection of one captured run patch (C1)."""
     from ouroboros.headless import (
         ARTIFACT_STATUS_READY_NO_CHANGES,
@@ -451,6 +452,16 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
             "the text patch alone need not contain the complete result."
         ),
     }
+    if target_drift and str(manifest.get("status") or "") == ARTIFACT_STATUS_READY_NO_CHANGES:
+        block["status"] = "failed"
+        block["target_mutated_during_run"] = list(target_drift)
+        block["note"] = (
+            "TARGET MUTATED DURING RUN: the authority tree changed relative to the "
+            "delegated baseline while this run was open. The host cannot attribute "
+            "those bytes to the child, so the private capture is not a clean "
+            "no-changes result and no disposition is authorized. Preserve the "
+            "snapshot and captured material for inspection."
+        )
     if status not in {ARTIFACT_STATUS_READY_WITH_CHANGES, ARTIFACT_STATUS_READY_NO_CHANGES}:
         # A failed manifest's own typed note (unreviewable_metadata_change,
         # non-UTF-8, …) is the actionable fact — never hide it in boilerplate.
@@ -466,6 +477,71 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
                     "committed work is still in the captured diff",
         }
     return block
+
+
+def _target_drift_paths(entry: _RunCustody) -> List[str]:
+    """Read-only proof that the authority target moved from the run baseline.
+
+    The target contains the owner's pre-existing dirty state in the baseline
+    commit, so comparing against ``baseline_sha`` isolates later changes without
+    staging or rewriting the target index. Untracked additions are included
+    separately because ``git diff`` cannot enumerate them.
+    """
+    target = pathlib.Path(str(entry.target_root or "")).resolve(strict=False)
+    baseline = str(entry.baseline_sha or "").strip()
+    if not baseline or not (target / ".git").exists():
+        return []
+    changed: set[str] = set()
+    try:
+        baseline_files = subprocess.run(
+            ["git", "ls-tree", "-r", "--name-only", baseline],
+            cwd=str(target), capture_output=True, text=True, check=False,
+        )
+        baseline_paths = {
+            line.strip() for line in baseline_files.stdout.splitlines()
+            if line.strip()
+        } if baseline_files.returncode == 0 else set()
+        indexed_files = subprocess.run(
+            ["git", "ls-files", "-z"],
+            cwd=str(target), capture_output=True, check=False,
+        )
+        indexed_paths = {
+            item.decode("utf-8", errors="surrogateescape")
+            for item in indexed_files.stdout.split(b"\0") if item
+        } if indexed_files.returncode == 0 else set()
+        from ouroboros.subagent_worktrees import find_execution_snapshot
+        snapshot = find_execution_snapshot(
+            getattr(entry, "snapshot_id", ""),
+            data_dir=getattr(entry, "ledger_root", None) or None,
+        ) or {}
+        excluded_paths = {
+            str(row.get("path") or "") for row in snapshot.get("excluded_untracked", [])
+            if isinstance(row, dict) and str(row.get("path") or "")
+        }
+        diff = subprocess.run(
+            ["git", "diff", "--name-only", "--no-renames", baseline, "--"],
+            cwd=str(target), capture_output=True, text=True, check=False,
+        )
+        if diff.returncode == 0:
+            changed.update(
+                line.strip() for line in diff.stdout.splitlines()
+                if line.strip() and (line.strip() in indexed_paths or line.strip() not in baseline_paths)
+                and line.strip() not in excluded_paths
+            )
+        untracked = subprocess.run(
+            ["git", "ls-files", "-z", "--others", "--exclude-standard"],
+            cwd=str(target), capture_output=True, check=False,
+        )
+        if untracked.returncode == 0:
+            changed.update(
+                item.decode("utf-8", errors="surrogateescape")
+                for item in untracked.stdout.split(b"\0")
+                if item and item.decode("utf-8", errors="surrogateescape") not in baseline_paths
+                and item.decode("utf-8", errors="surrogateescape") not in excluded_paths
+            )
+    except OSError:
+        return []
+    return sorted(changed)
 
 
 def _capture_terminal_patch(ctx: ToolContext, entry: Optional[_RunCustody], *, gateway=None) -> Optional[Dict[str, Any]]:
@@ -526,7 +602,7 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody, *, gateway=
             manifest = {}
         manifest = manifest if isinstance(manifest, dict) else {}
         if str(manifest.get("status") or "") in ready:
-            return _capture_block(entry, cap_dir, manifest)
+            return _capture_block(entry, cap_dir, manifest, _target_drift_paths(entry))
     exec_root = pathlib.Path(entry.execution_root)
     if not exec_root.exists():
         return {
@@ -579,6 +655,11 @@ def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody, *, gateway=
             patch_size=manifest.get("patch_size"),
             capture_dir=str(cap_dir),
         )
+    target_drift = _target_drift_paths(entry)
+    if target_drift and str(manifest.get("status") or "") == ARTIFACT_STATUS_READY_NO_CHANGES:
+        # Do not mint PATCH_CAPTURED over a target mutation that the private
+        # snapshot cannot explain. Custody stays open for explicit inspection.
+        return _capture_block(entry, cap_dir, manifest, target_drift)
     return _capture_block(entry, cap_dir, manifest)
 
 
