@@ -341,6 +341,51 @@ test('a completion row carrying the answer renders as an ordinary Ouroboros mess
     }
 });
 
+test('the mirrored answer replays from history exactly as it arrived live', async () => {
+    // The dominant path: Main hydrates from /api/chat/history, where the row is still
+    // role="system" and carries the typed key.
+    let liveHtml = '';
+    {
+        const { prior, mount } = installDom();
+        let instance;
+        try {
+            const made = makeInstance(mount);
+            instance = made.instance;
+            made.handlers.get('chat')(MIRROR_ROW);
+            liveHtml = findBubble('assistant').innerHTML;
+        } finally {
+            instance?.destroy();
+            restoreDom(prior);
+        }
+    }
+    const historyRow = {
+        text: MIRROR_ROW.content, role: 'system', ts: MIRROR_ROW.ts, is_progress: false,
+        system_type: MIRROR_ROW.system_type, markdown: false,
+        project_id: MIRROR_ROW.project_id, project_name: MIRROR_ROW.project_name,
+        completion_answer: MIRROR_ROW.completion_answer,
+    };
+    const { prior, mount } = installDom(async (url) => {
+        if (String(url).startsWith('/api/chat/history')) {
+            return { ok: true, json: async () => ({ messages: [historyRow] }) };
+        }
+        return { ok: true, json: async () => ({ active_direct_turns: [] }) };
+    });
+    let instance;
+    try {
+        ({ instance } = makeInstance(mount));
+        await settle();
+        await settle();
+        assert.equal(findBubble('system'), undefined, 'history never falls back to the pointer when the key is present');
+        const bubble = findBubble('assistant');
+        assert.ok(bubble, 'history replay rendered the mirrored answer');
+        assert.ok(bubble.classList.contains('project-answer'));
+        assert.equal(bubble.innerHTML, liveHtml, 'live DOM and reload DOM are byte-identical for the mirror');
+    } finally {
+        instance?.destroy();
+        restoreDom(prior);
+    }
+});
+
 test('the fold is CSS over the complete answer: clamp always, fade only when folded, tokens only', () => {
     const block = styleSource.slice(styleSource.indexOf('(chat: Project completion mirror)'));
     const rules = block.slice(0, block.indexOf('design-system:migrated-end'));

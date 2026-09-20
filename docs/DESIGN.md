@@ -332,7 +332,9 @@ Model-authored replies use Ouroboros's assistant voice; host-composed commands,
 receipts and diagnostics use System voice. A **System row** is a chat message
 with `role="system"`, rendered with the existing yellow/amber system treatment,
 or its existing task-card placement. `role` alone selects voice; `system_type`
-names the kind, not the author. New host producers stamp both fields. Relays
+names the kind, not the author (two documented presentations of a System pointer row show
+model-authored bytes in Ouroboros's voice: the Project question mirror and the Project
+completion mirror). New host producers stamp both fields. Relays
 preserve them through live delivery, persistence and history. Model narration,
 proactive replies and questions remain model-authored even when typed.
 
