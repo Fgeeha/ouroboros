@@ -42,8 +42,14 @@ const finiteCount = (value) => {
 };
 // A reviewer answer that has not arrived is a gap, not a verdict: the host
 // types a planned wait as `pending_dispatch` and an exceptional one otherwise.
-const actorAwaiting = (actor) => text(actor?.operation_state) === 'pending_dispatch';
+const actorAwaiting = (actor) => text(actor?.operation_state) === 'pending_dispatch' && text(actor?.transport_status) !== 'success';
 const actorUnresolved = (actor) => ['in_flight', 'custody_lost'].includes(text(actor?.operation_state));
+// A roster with an unanswered slot reports how far it got, never a bare verdict;
+// a slot that is neither answered nor awaited keeps the warning tone.
+const heldProgress = (lead, roster, answered) => {
+    const unavailable = roster.filter((actor) => !actorAwaiting(actor) && !answered(actor)).length;
+    return [`${lead} · ${roster.filter(answered).length} of ${roster.length} answered${unavailable ? ` · ${unavailable} unavailable` : ''}`, unavailable ? 'warn' : ''];
+};
 
 export function setReviewAnchor(record, enabled, writePhase) {
     if (!record || (record.historicalUnavailable || record.historicalUnconfirmed) || Boolean(record.reviewAnchor) === enabled) return false;
@@ -416,16 +422,14 @@ function planAttempt(wave, index, isCurrent) {
         .filter((actor) => actor && typeof actor === 'object');
     // A wave whose reviewers may still answer reports how far it got; the
     // verdict token speaks only for a wave that is no longer collecting.
-    const progress = custodyPending
-        ? `${roster.some(actorUnresolved) && !roster.some(actorAwaiting) ? 'unresolved' : 'in progress'}`
-            + ` · ${roster.filter((actor) => actor.ok === true).length} of ${roster.length} answered`
-        : '';
+    const [progress, heldTone] = custodyPending ? heldProgress(
+        roster.some(actorUnresolved) && !roster.some(actorAwaiting) ? 'unresolved' : 'in progress', roster, (actor) => actor.ok === true) : ['', ''];
     return {
         id,
         surface: 'plan',
         state,
         progress,
-        tone: statusTone(state, custodyPending ? '' : verdict),
+        tone: heldTone || statusTone(state, custodyPending ? '' : verdict),
         verdict,
         timestamp: text(wave.reviewed_at || wave.ts || wave.timestamp || wave.closed_at),
         ordinal: index,
@@ -739,7 +743,7 @@ export function planReviewGroupFromTaskDetail(detail, ownerTaskId = '') {
         initiatorTaskId: owner,
         state,
         progress,
-        tone: statusTone(state, progress ? '' : currentVerdict),
+        tone: progress ? activeAttempts.at(-1).tone : statusTone(state, currentVerdict),
         verdict: currentVerdict,
         summary: text(current.reason || currentAttempt?.summary),
         authorDecisionText,
@@ -765,8 +769,13 @@ export function formatReviewProjection(projection) {
         if (!panel || typeof panel !== 'object') return;
         const quorum = panel.quorum && typeof panel.quorum === 'object' ? panel.quorum : {};
         const panelId = String(panel.panel_id || `panel-${panelIndex + 1}`);
+        const awaiting = (Array.isArray(panel.actors) ? panel.actors : []).filter(actorAwaiting).length;
+        const signal = String(panel.aggregate_signal || 'UNKNOWN');
+        // While a slot is awaited the aggregate is not final; DEGRADED is only the host's placeholder.
+        const verdictText = !awaiting ? signal : (signal === 'DEGRADED' ? `none yet (${awaiting} awaiting; held as DEGRADED)`
+            : `${signal}${signal === 'FAIL' || panel.superseded ? '' : ' so far'} (${awaiting} awaiting)`);
         lines.push(
-            `Review panel ${panelId}: ${String(panel.surface || 'review')} · authority=${String(panel.authority || 'unspecified')} · verdict=${String(panel.aggregate_signal || 'UNKNOWN')} · transport=${String(panel.transport_status || 'unknown')} · parse=${String(panel.parse_status || 'unknown')} · quorum=${String(quorum.contributed ?? 0)}/${String(quorum.configured ?? 0)} (required ${String(quorum.required ?? 0)}) · enforcement=${String(panel.enforcement_impact || 'unknown')}${panel.single_reviewer_no_diversity ? ' · single-reviewer (no diversity)' : ''}${panel.dialogue && panel.dialogue.status ? ` · dialogue=${String(panel.dialogue.status)}` : ''}${panel.superseded ? ' · superseded' : ''}`,
+            `Review panel ${panelId}: ${String(panel.surface || 'review')} · authority=${String(panel.authority || 'unspecified')} · verdict=${verdictText} · transport=${String(panel.transport_status || 'unknown')} · parse=${String(panel.parse_status || 'unknown')} · quorum=${String(quorum.contributed ?? 0)}/${String(quorum.configured ?? 0)} (required ${String(quorum.required ?? 0)}) · enforcement=${String(panel.enforcement_impact || 'unknown')}${panel.single_reviewer_no_diversity ? ' · single-reviewer (no diversity)' : ''}${panel.dialogue && panel.dialogue.status ? ` · dialogue=${String(panel.dialogue.status)}` : ''}${panel.superseded ? ' · superseded' : ''}`,
         );
         if (panel.reason) lines.push(`Panel reason: ${String(panel.reason)}`);
         const coverage = compactCoverage(panel.coverage);
@@ -782,7 +791,7 @@ export function formatReviewProjection(projection) {
             if (!actor || typeof actor !== 'object') return;
             const slotId = String(actor.slot_id || '?');
             lines.push(
-                `Reviewer ${slotId}: role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${String(actor.transport_status || 'unknown')} · parse=${String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}`,
+                `Reviewer ${slotId}: role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${actorAwaiting(actor) ? 'awaiting' : String(actor.transport_status || 'unknown')} · parse=${actorAwaiting(actor) ? 'awaiting' : String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}`,
             );
             const actorCoverage = compactCoverage(actor.coverage);
             if (actorCoverage) lines.push(`Reviewer ${slotId} coverage: ${actorCoverage}`);
@@ -851,6 +860,13 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
         }, 'Author stance (unbound)');
     const attempts = panels.map((panel, index) => {
         const verdict = text(panel?.aggregate_signal || 'UNKNOWN');
+        const roster = (Array.isArray(panel?.actors) ? panel.actors : []).filter((actor) => actor && typeof actor === 'object');
+        const awaited = roster.some(actorAwaiting);
+        // An awaited panel is activity only while its own task still runs to collect it;
+        // afterwards an unanswered slot is a recorded gap, not a degraded verdict.
+        const live = awaited && text(detail?.status).toLowerCase() === 'running' && !panel?.superseded && index === panels.length - 1;
+        const held = { FAIL: 'FAIL', PASS: live ? 'PASS so far' : 'PASS' }[verdict.toUpperCase()] || (live ? 'in progress' : 'no verdict');
+        const [progress, heldTone] = awaited ? heldProgress(held, roster, (actor) => text(actor.transport_status) === 'success') : ['', ''];
         // The host composed this sentence; the card prints it verbatim and
         // leads the detail with it, because the renderer shows detailText over
         // summary. The panel's own verdict and identity are untouched.
@@ -861,8 +877,10 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
                 panel.task_attempt == null ? '' : `task-attempt:${panel.task_attempt}`,
                 panel.panel_index == null ? '' : `panel-index:${panel.panel_index}`].filter(Boolean).join(':'),
             surface: 'task_acceptance',
-            state: panel?.superseded ? 'superseded' : 'terminal',
-            tone: statusTone('terminal', verdict),
+            state: live ? 'running' : (panel?.superseded ? 'superseded' : 'terminal'),
+            progress,
+            tone: !awaited || held === 'FAIL' ? statusTone('terminal', verdict)
+                : (heldTone || (live ? 'working' : (held === 'PASS' ? statusTone('terminal', verdict) : 'neutral'))),
             verdict,
             timestamp: text(panel?.ts || panel?.timestamp),
             ordinal: index,
@@ -889,12 +907,13 @@ export function taskAcceptanceGroupFromTaskDetail(detail, ownerTaskId = '') {
         presentationOwnerTaskId: owner,
         subjectTaskId: owner,
         initiatorTaskId: owner,
-        state: 'terminal',
-        tone: statusTone('terminal', latest?.verdict),
+        state: latest?.state === 'running' ? 'running' : 'terminal',
+        progress: text(latest?.progress),
+        tone: latest?.tone || statusTone('terminal', latest?.verdict),
         verdict: text(latest?.verdict),
         summary: text(latest?.summary),
         authorDecisionText,
-        activeCount: 0,
+        activeCount: latest?.state === 'running' ? 1 : 0,
         attemptCount: attempts.length,
         countIsAuthoritative: true,
         attempts,
@@ -980,7 +999,7 @@ export function mergeReviewGroup(store, incoming) {
                 && (attempt.state === 'queued' || attempt.state === 'running')
             ) {
                 mergedById.set(id, {
-                    ...attempt, state: 'superseded', tone: 'neutral', superseded: true,
+                    ...attempt, state: 'superseded', tone: 'neutral', superseded: true, progress: '',
                 });
             }
         }
@@ -1027,7 +1046,7 @@ export function mergeReviewGroup(store, incoming) {
         merged.summary = prior.summary;
         merged.activeCount = prior.activeCount;
         merged.lifecycleStatus = prior.lifecycleStatus;
-        merged.tone = reviewTone(merged.state, merged.verdict, merged.lifecycleStatus);
+        merged.tone = prior.progress ? prior.tone : reviewTone(merged.state, merged.verdict, merged.lifecycleStatus);
     }
     const activeAttempts = merged.attempts.filter(
         (attempt) => attempt.state === 'queued' || attempt.state === 'running',
@@ -1038,7 +1057,7 @@ export function mergeReviewGroup(store, incoming) {
     if (activeAttempts.length) {
         const active = activeAttempts.at(-1);
         merged.state = activeAttempts.some((attempt) => attempt.state === 'running') ? 'running' : 'queued';
-        merged.tone = 'working';
+        merged.tone = (active.progress && active.tone) || 'working';
         merged.verdict = active.verdict || (merged.lifecycleOnly ? '' : merged.state);
         merged.summary = active.summary || merged.summary;
         merged.activeCount = activeAttempts.length;
@@ -1114,6 +1133,8 @@ export function mergeReviewGroup(store, incoming) {
         merged.attempts,
         incoming.initiatorTaskId || prior.initiatorTaskId,
     );
+    // The progress phrase belongs to the attempt the header speaks for.
+    if ('progress' in merged) merged.progress = text((activeAttempts.at(-1) || merged.attempts.at(-1))?.progress);
     if (JSON.stringify(prior) === JSON.stringify(merged)) return prior;
     store.set(merged.id, merged);
     return merged;

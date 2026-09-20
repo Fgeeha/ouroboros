@@ -479,6 +479,17 @@ not child-task cards and never prove execution by themselves.
   sit, and each awaited reviewer listed as awaiting rather than unavailable,
   under no verdict word. A reviewer whose window expired is unresolved. A
   settled wave without quorum keeps the warning tone and its `DEGRADED` verdict.
+- A task-acceptance panel whose reviewers may still answer never reads as a bare
+  verdict token. While its own task is running it is work in progress: the
+  working tone and `in progress · k of n answered`, or `PASS so far · k of n
+  answered` once the quorum is met. Once the task has ended the same panel reads
+  `no verdict · k of n answered` in the neutral tone, or `PASS · k of n
+  answered`, until a late settlement replaces it. A reviewer FAIL keeps the
+  error tone and reads `FAIL · k of n answered` in both.
+- On a plan wave and an acceptance panel alike, a slot that is neither answered
+  nor awaited (a settled failure, an expired window, lost custody, a refusal)
+  adds `· m unavailable` and keeps the warning tone beside the awaited slots; a
+  panel with no awaited slot keeps the warning tone and its `DEGRADED` verdict.
 - A panel that settled after its task ended stays one attempt row of its group,
   labelled as settled after the task ended; its note (which verdict, which
   revision, whether a reviewer's outcome is still unknown) is host-composed and
