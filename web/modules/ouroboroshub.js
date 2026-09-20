@@ -16,7 +16,7 @@ import {
     startLifecyclePoller,
 } from './lifecycle_card.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-import { hubListingRowFor, hubSyncVerdict } from './hub_sync.js';
+import { hubFactsPending, hubListingRowFor, hubSyncVerdict } from './hub_sync.js';
 import {
     emitSkillLifecycle,
     escapeHtmlAttr as escapeHtml,
@@ -282,10 +282,15 @@ export function initOuroborosHub(pane, controlsHost = null) {
             if (state.query.trim()) params.set('q', state.query.trim());
             // Global listing beside the catalog — a listing fetch failure is an
             // honest "Hub facts unavailable" state, never "Not installed".
-            const [catalog, listingData] = await Promise.all([
+            let [catalog, listingData] = await Promise.all([
                 fetchJson(`/api/marketplace/ouroboroshub/catalog?${params}`).then(data => ({ data }), error => ({ error })),
                 fetchJson('/api/extensions').catch(() => null),
             ]);
+            // The listing is a local read that never waits for the hub; facts it
+            // could not know before this catalog read landed need one re-read.
+            if (!catalog.error && hubFactsPending(listingData?.skills)) {
+                listingData = await fetchJson('/api/extensions').catch(() => listingData);
+            }
             if (destroyed || generation !== refreshGeneration) return;
             state.listingUnavailable = !Array.isArray(listingData?.skills);
             if (!state.listingUnavailable) {

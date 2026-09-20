@@ -11,8 +11,9 @@ from __future__ import annotations
 import logging
 import threading
 from typing import Any, Dict, Optional
-from ouroboros.utils import utc_now_iso
+
 from ouroboros.task_results import STATUS_FAILED, STATUS_SCHEDULED, write_task_result
+from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -215,7 +216,9 @@ def _handle_project_digest(evt: Dict[str, Any], ctx: Any) -> None:
 
         consciousness = getattr(ctx, "consciousness", None)
         if consciousness is not None and not is_consciousness_origin(evt):
-            consciousness.notify(f"project_digest:{pid}")
+            digest_task_id = str(evt.get("task_id") or "").strip()
+            reason = f"project_digest:{pid}:{digest_task_id}" if digest_task_id else f"project_digest:{pid}"
+            consciousness.notify(reason)
     except Exception:
         log.debug("project_digest consciousness notify failed", exc_info=True)
 
