@@ -179,7 +179,7 @@ def _send_subagent_rejection(
             status=status,
             error=detail,
         ),
-    )
+        role="system", system_type="subagent_admission_notice")
 
 
 def _record_delegation_constraint(

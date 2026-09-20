@@ -414,7 +414,7 @@ def _finish_task_done_dispatch(
                 is_progress=True,
                 task_id=str(task_id or ""),
                 progress_meta=progress_meta,
-            )
+                role="system", system_type="subagent_terminal_notice")
 
     from supervisor.queue import _queue_lock, clear_acceptance_fence_for_root
 

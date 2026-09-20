@@ -522,6 +522,7 @@ class OuroborosAgent:
                 self._event_queue.put({
                     "type": "send_message",
                     "chat_id": self._current_chat_id,
+                    "role": "system", "system_type": "subagent_started",
                     "text": f"▶️ Subagent {task.get('id')} running ({task.get('role') or 'researcher'}).",
                     "format": "markdown",
                     "is_progress": True,
@@ -1130,6 +1131,8 @@ class OuroborosAgent:
             event = {
                 "type": "send_message", "chat_id": self._current_chat_id,
                 "text": f"💬 {text}", "format": "markdown", "is_progress": True,
+                "role": "assistant" if narration else "system",
+                "system_type": "model_narration" if narration else "host_progress",
                 "task_id": self._current_task_id or "",
                 "ts": utc_now_iso(),
             }

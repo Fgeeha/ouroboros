@@ -325,6 +325,23 @@ Adopting these tokens is applying the semantic status contract, which already
 governs every surface — it is not a token migration of those surfaces and does
 not move them into the migrated set in section 8.
 
+### Chat authorship and System rows
+
+Voice follows authorship, not severity or the transport that delivered the text.
+Model-authored replies use Ouroboros's assistant voice; host-composed commands,
+receipts and diagnostics use System voice. A **System row** is a chat message
+with `role="system"`, rendered with the existing yellow/amber system treatment,
+or its existing task-card placement. `role` alone selects voice; `system_type`
+names the kind, not the author. New host producers stamp both fields. Relays
+preserve them through live delivery, persistence and history. Model narration,
+proactive replies and questions remain model-authored even when typed.
+
+Formatting is asymmetric: assistant text always uses the sanitized chat markdown
+renderer regardless of `markdown`; ordinary System text is escaped unless
+`markdown: true`. The typed `skill_review` row keeps its dedicated renderer.
+Voice does not confer task finality. The existing untyped terminal-host-notice
+contract remains a documented exception, not a pattern for new notices.
+
 ## 5. Card and section composition
 
 - A panel is one `.ui-card`-family surface: `--ui-card-border`,

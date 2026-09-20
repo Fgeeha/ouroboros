@@ -119,6 +119,8 @@ def test_voice_rides_the_live_frame_the_stored_row_and_the_replay(tmp_path, monk
 
     for rows in (live, stored, replay):
         assert [row["narration"] for row in rows] == [False, True], rows
+        assert [row["role"] for row in rows] == ["system", "assistant"], rows
+        assert [row["system_type"] for row in rows] == ["host_progress", "model_narration"], rows
     # The voice is presentation only: the host note keeps its liveness semantics
     # (that marker is supervisor-authored HOST_NARRATION, a different key).
     assert all(events_chat_delivery.HOST_NARRATION not in row for row in live)
