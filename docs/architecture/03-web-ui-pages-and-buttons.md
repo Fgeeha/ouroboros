@@ -62,6 +62,9 @@ Disturb or platform limit is bypassed. Policy and its disclosed limits: DESIGN
 Independent iframe documents do not inherit the host's tokens or stored choice.
 The optional author UI kit supplies styles/primitives, not a hot-theme protocol;
 there is no forced remount. Desktop `webview.start(private_mode=False)` requests
+Module intent is declared inside `render.appearance`: `host` opts into the
+resolved bridge, `independent` leaves palette choice to the author, and `fixed`
+names an intentionally stable visual world. The field is advisory.
 persistent website storage in `launcher.py` and `launcher_onboarding.py`, including
 cookies, not just appearance. Existing packaged launchers must be rebuilt and
 installed to change that flag. Profile identity, origin and platform storage
@@ -230,7 +233,7 @@ Declarative widgets support forms and actions, status/data/text/code/markdown, t
 
 #### Module widget bridge
 
-A module widget receives one parent-mediated I/O bridge on a per-mount nonce — the frame's only scriptable network path, since `connect-src` is closed — which keeps useful route I/O without giving reviewed skill JavaScript the SPA's cookies, DOM or broad API authority. `OuroborosWidget.fetch` (also the frame's `fetch`) is relayed by the parent, which accepts only the exact owning prefix under `/api/extensions/<skill>/...`, sends same-origin credentials, refuses redirects, and streams a real `Response`; `init.signal`/`init.timeoutMs` abort it, while declarative requests and module loading keep a 25-second bound. Namespaced WS events arrive through `onEvent`; downloads and external links reuse the existing native/browser owners. The source endpoint serves only the live reviewed registration and opaque-origin frames use `Access-Control-Allow-Origin: *`; the nonce also carries bounded script/CSP faults and frame-height facts. An opted-in module may subscribe to the host's resolved theme through `OuroborosWidget.onTheme`; delivery is nonce/source-bound and disposal releases it. The parent injects no palette or theme-setting authority.
+A module widget receives one parent-mediated I/O bridge on a per-mount nonce — the frame's only scriptable network path, since `connect-src` is closed — which keeps route I/O without giving reviewed skill JavaScript the SPA's cookies, DOM or broad API authority. `fetch` is relayed only to the owning extension prefix; `onEvent`, downloads and external links reuse existing owners. The source endpoint serves only the live reviewed registration; the nonce also carries bounded faults and frame-height facts. An opted-in module may subscribe to the resolved theme through `OuroborosWidget.onTheme`; delivery is nonce/source-bound and disposal releases it. The parent injects no palette or theme-setting authority.
 
 #### Author UI kit
 

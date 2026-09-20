@@ -1056,7 +1056,9 @@ are the one exception — "What the frame may do" below). The bridge exposes:
   next listener waits for that confirmation instead of using stale bootstrap.
   Route
   iframes have no bridge. A module declaration may record
-  `render.appearance: host | independent | fixed` for author/reviewer intent;
+  `render.appearance: host | independent | fixed` for author/reviewer intent:
+  `host` opts into the resolved bridge, `independent` leaves palette choice to
+  the author, and `fixed` names an intentionally stable visual world;
   the declaration does not gate legacy modules or prove that the source repaints.
   `appearance` is valid only inside a `kind: module` render; adding it to an
   iframe or declarative render is a registration error rather than a theme claim.
