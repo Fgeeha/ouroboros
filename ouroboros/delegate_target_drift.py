@@ -38,10 +38,9 @@ def _target_drift_evidence(entry: Any) -> Dict[str, Any]:
             for item in baseline_files.stdout.split(b"\0") if item
         }
         from ouroboros.subagent_worktrees import find_execution_snapshot
-        snapshot = find_execution_snapshot(
-            getattr(entry, "snapshot_id", ""),
-            data_dir=getattr(entry, "ledger_root", None) or None,
-        ) or {}
+        # Provisioning and capture use the snapshot registry's data root. The
+        # custody ledger may live on a different canonical budget drive.
+        snapshot = find_execution_snapshot(getattr(entry, "snapshot_id", "")) or {}
         excluded = {
             str(row.get("path")) for row in snapshot.get("excluded_untracked", [])
             if isinstance(row, dict) and row.get("path")

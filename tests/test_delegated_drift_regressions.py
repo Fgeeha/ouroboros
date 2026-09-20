@@ -70,3 +70,24 @@ def test_nested_untracked_git_repository_does_not_break_snapshot_provision(tmp_p
 
     assert Path(handle.path).exists()
     assert any(row.get("reason") == "nested_repository" for row in handle.excluded_untracked)
+
+
+def test_drift_uses_snapshot_registry_when_custody_root_differs(tmp_path, monkeypatch):
+    from ouroboros.delegate_target_drift import _target_drift_evidence
+    from ouroboros.tools.delegate import _capture_terminal_patch
+
+    target = _seed_target(tmp_path)
+    ctx = _nanny_ctx(tmp_path, target, monkeypatch)
+    handle = provision_execution_snapshot(
+        target_root=target, task_id="t-nanny", snapshot_id="snapSeparateRoots")
+    entry = _isolated_entry(ctx, target, handle, run_id="run-separate-roots")
+    assert find_execution_snapshot(handle.snapshot_id) is not None
+    assert find_execution_snapshot(handle.snapshot_id, data_dir=entry.ledger_root) is None
+
+    capture = _capture_terminal_patch(ctx, entry)
+    assert capture["status"] == "ready_no_changes"
+    assert capture["target_drift_checked"] is True
+    assert capture.get("target_mutated_during_run", []) == []
+    (target / "untracked.txt").write_text("changed\n", encoding="utf-8")
+    assert _target_drift_evidence(entry)["paths"] == ["untracked.txt"]
+    custody._CUSTODY.clear()
