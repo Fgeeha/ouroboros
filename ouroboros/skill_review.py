@@ -11,7 +11,7 @@ import json
 import logging
 import pathlib
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import adaptive_quorum, get_auto_grant_enabled
 from ouroboros.reviewer_slot_config import commit_triad_delivery, reviewer_slot_config_error
@@ -307,59 +307,61 @@ def _admission_gate(
     )
 
 
+def _hub_file_hashes(files: Any) -> Dict[str, str]:
+    return {str(item.get("path") or ""): str(item.get("sha256") or "").strip().lower()
+            for item in (files or []) if isinstance(item, dict)}
+
+
 def _official_hub_review_profile(skill: Any) -> str:
-    """Return official_hub only when local payload matches its Hub sidecar hashes."""
+    """Return official_hub only when the payload matches the LIVE catalog (fresh read)."""
+    from ouroboros.marketplace import ouroboroshub
+
+    fresh = lambda slug: ouroboroshub.info(slug).files  # noqa: E731
+    return "official_hub" if hub_payload_matches(skill, fresh) else ""
+
+
+def hub_payload_matches(skill: Any, catalog_files_for: Callable[[str], Any]) -> bool:
+    """Sidecar, catalog row and local files agree on every path and SHA-256.
+
+    ``catalog_files_for(slug)`` supplies the catalog row's ``files``: review and
+    owner attestation pass a fresh read; the listing hint passes a display view."""
     if str(getattr(skill, "source", "") or "") != "ouroboroshub":
-        return ""
+        return False
     marker = pathlib.Path(skill.skill_dir) / ".ouroboroshub.json"
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
     except Exception:
-        return ""
+        return False
     if not isinstance(data, dict) or str(data.get("source") or "") != "ouroboroshub":
-        return ""
+        return False
     marker_name = str(data.get("sanitized_name") or data.get("slug") or "").strip()
     if marker_name and marker_name != str(getattr(skill, "name", "") or ""):
-        return ""
+        return False
     slug = str(data.get("slug") or marker_name or getattr(skill, "name", "") or "").strip()
     try:
-        from ouroboros.marketplace import ouroboroshub
-
-        catalog_summary = ouroboroshub.info(slug)
-        catalog_files = {
-            str(item.get("path") or ""): str(item.get("sha256") or "").strip().lower()
-            for item in (catalog_summary.files or [])
-            if isinstance(item, dict)
-        }
+        catalog_files = _hub_file_hashes(catalog_files_for(slug))
     except Exception:
-        return ""
+        return False
     files = data.get("files") if isinstance(data.get("files"), list) else []
-    if not files:
-        return ""
-    sidecar_files = {
-        str(item.get("path") or ""): str(item.get("sha256") or "").strip().lower()
-        for item in files
-        if isinstance(item, dict)
-    }
-    if sidecar_files != catalog_files:
-        return ""
+    if not files or _hub_file_hashes(files) != catalog_files:
+        return False
     root = pathlib.Path(skill.skill_dir).resolve()
     for item in files:
         if not isinstance(item, dict):
-            return ""
+            return False
         rel = pathlib.PurePosixPath(str(item.get("path") or ""))
         expected = str(item.get("sha256") or "").strip().lower()
         if not rel.parts or rel.is_absolute() or ".." in rel.parts or not expected:
-            return ""
+            return False
         path = (root / pathlib.Path(*rel.parts)).resolve(strict=False)
         try:
             path.relative_to(root)
         except ValueError:
-            return ""
+            return False
         if not path.is_file():
-            return ""
+            return False
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-            return ""
+            return False
     # Reject any EXTRA local runtime-reachable file not covered by the catalog.
     # Without this, a locally-added file (e.g. evil.py) would still earn the
     # official_hub fast-path. Provenance/control sidecars are install-time
@@ -375,19 +377,17 @@ def _official_hub_review_profile(skill: Any) -> str:
             manifest_scripts=list(getattr(manifest, "scripts", []) or []),
         )
     except Exception:
-        return ""
+        return False
     local_relset = set()
     for path in local_files:
         try:
             rel = path.relative_to(root).as_posix()
         except ValueError:
-            return ""
+            return False
         if rel in SKILL_PAYLOAD_CONTROL_FILENAMES:
             continue
         local_relset.add(rel)
-    if local_relset != set(catalog_files.keys()):
-        return ""
-    return "official_hub"
+    return local_relset == set(catalog_files)
 
 
 def is_official_hub_payload_verified(skill: Any) -> bool:
