@@ -62,7 +62,7 @@ Disturb or platform limit is bypassed. Policy and its disclosed limits: DESIGN
 Independent iframe documents do not inherit the host's tokens or stored choice.
 The optional author UI kit supplies styles/primitives, not a hot-theme protocol;
 there is no forced remount. Module intent is declared in `render.appearance`:
-`host` follows the resolved bridge, `independent` leaves palette choice to the
+`host` declares intent to follow the resolved bridge, `independent` leaves palette choice to the
 author, and `fixed` names a stable visual world; the field is advisory. Desktop
 `webview.start(private_mode=False)` requests persistent website storage in
 `launcher.py` and `launcher_onboarding.py`, including
@@ -233,7 +233,7 @@ Declarative widgets support forms and actions, status/data/text/code/markdown, t
 
 #### Module widget bridge
 
-A module widget receives one parent-mediated I/O bridge on a per-mount nonce — the frame's only scriptable network path, since `connect-src` is closed — which keeps useful route I/O without giving reviewed skill JavaScript the SPA's cookies, DOM or broad API authority. `OuroborosWidget.fetch` is relayed only to the owning `/api/extensions/<skill>/...` prefix, with same-origin credentials, redirect refusal and author `signal`/`timeoutMs` control; the source load and declarative requests retain their 25-second bound. Namespaced WS events arrive through `onEvent`; downloads use the common save owners; external links use `openExternalViaHostBridge`, and a null `noopener` handle is not failure. The module endpoint serves only live reviewed registration text and its opaque-origin response uses `Access-Control-Allow-Origin: *`. The nonce carries bounded script/CSP faults into the card status while the frame stays mounted, plus content-height and ceiling facts. An opted-in module may subscribe to the resolved theme through `OuroborosWidget.onTheme`; delivery is nonce/source-bound and disposal releases it. The parent injects no palette or theme-setting authority.
+A module widget receives one parent-mediated I/O bridge on a per-mount nonce — the frame's only scriptable network path, since `connect-src` is closed — which keeps useful route I/O without giving reviewed skill JavaScript the SPA's cookies, DOM or broad API authority. `OuroborosWidget.fetch` is relayed only to the owning `/api/extensions/<skill>/...` prefix, with same-origin credentials, redirect refusal and author `signal`/`timeoutMs` control; the source load and declarative requests retain their 25-second bound. Namespaced WS events arrive through `onEvent` filtered by `ws_prefix`; downloads use the common save owners; external links use `openExternalViaHostBridge`, and a null `noopener` handle is not failure. The module endpoint serves only live reviewed registration text and its opaque-origin response uses `Access-Control-Allow-Origin: *`. The nonce carries bounded script/CSP faults into the card status while the frame stays mounted, and exposes `data-widget-content-height` plus `data-widget-frame-capped` to distinguish a ceiling from an empty paint. An opted-in module may subscribe to the resolved theme through `OuroborosWidget.onTheme`; delivery is nonce/source-bound and disposal releases it. The parent injects no palette or theme-setting authority.
 
 #### Author UI kit
 
