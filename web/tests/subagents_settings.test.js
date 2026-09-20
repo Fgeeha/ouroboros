@@ -946,10 +946,12 @@ function accessEditorDom() {
                 const fields = new Map([...match[2].matchAll(/data-subagent-field="([^"]+)"/g)]
                     .map((entry) => [entry[1], field(entry[1])]));
                 const duplicate = field('duplicate');
+                const meta = { dataset: {}, toggleAttribute() {}, textContent: '' };
                 return {
-                    dataset: { subagentRow: match[1] }, toggleAttribute() {},
+                    dataset: { subagentRow: match[1] }, toggleAttribute() {}, meta,
                     querySelector(selector) {
                         if (selector === '[data-subagent-duplicate]') return duplicate;
+                        if (selector === '[data-subagent-meta]') return meta;
                         return fields.get(selector.match(/data-subagent-field="([^"]+)"/)?.[1]) || null;
                     },
                     querySelectorAll: (selector) => selector === '[data-subagent-field]' ? [...fields.values()] : [],
@@ -988,6 +990,45 @@ test('access edit saves and clones the lower choice, resets for API and restores
     control('access').emit('change', 'full');
     assert.equal(editor.collect().OUROBOROS_SUBAGENTS.items[0].access, 'full');
     editor.destroy();
+});
+
+test('Duplicate is born a judged draft that names its twin until one engine field changes', () => {
+    const dom = accessEditorDom();
+    const editor = createAvailableSubagentsEditor({ doc: dom.doc, win: null });
+    editor.load(setting([sessionRow({ subagent_id: 'fast-scout', effort: 'high' })]));
+    assert.deepEqual(editor.validate(), []);
+    const control = (name, index) => dom.row(index).querySelector(`[data-subagent-field="${name}"]`);
+
+    dom.row().querySelector('[data-subagent-duplicate]').emit('click');
+    // The hidden key is neutral: an inherited `<source>_copy` label would rot with the route.
+    assert.match(editor.setting.items[1].subagent_id, /^subagent_[a-z0-9]+$/);
+    // The card names its twin BEFORE any Save click; the source row stays clean.
+    assert.match(dom.row(1).meta.textContent, /^Subagent 2 runs the same engine as Subagent 1 — change its model/);
+    assert.doesNotMatch(dom.row(0).meta.textContent, /same engine/);
+    assert.deepEqual(editor.validate().filter((text) => /same engine/.test(text)).length, 1);
+
+    // The description is not part of the engine; one engine field is.
+    control('recommended_use', 1).emit('input', 'Other words, same engine.');
+    assert.match(editor.validate()[0], /same engine as Subagent 1/);
+    control('effort', 1).emit('change', 'low');
+    assert.deepEqual(editor.validate(), []);
+    assert.doesNotMatch(dom.row(1).meta.textContent, /same engine/);
+    editor.destroy();
+});
+
+test('engine uniqueness is a SAVE rule: a roster saved with twins still loads, and empty drafts are not twins', () => {
+    const twins = setting([apiRow({ subagent_id: 'one' }), apiRow({ subagent_id: 'two', recommended_use: 'x' })]);
+    const parsed = parseAvailableSubagentsSetting(twins);
+    assert.equal(parsed.error, '', 'an existing install never turns invalid on read');
+    assert.deepEqual(validateAvailableSubagentsSetting(parsed.setting), []);
+    assert.deepEqual(validateAvailableSubagentsSetting(parsed.setting, { uniqueEngines: true }),
+        ['Subagent 2 runs the same engine as Subagent 1 — change its model, effort, access, account or processing, or remove it.']);
+    // Two freshly added rows have no engine yet: each asks for a route, neither is called a twin.
+    const blank = { recommended_use: '', route: { kind: ROUTE_KIND_API_MODEL, target_id: '' } };
+    const drafts = validateAvailableSubagentsSetting(
+        setting([{ ...blank, subagent_id: 'a' }, { ...blank, subagent_id: 'b' }]), { uniqueEngines: true });
+    assert.equal(drafts.length, 2);
+    assert.ok(drafts.every((text) => /needs a model or agent-session route/.test(text)));
 });
 
 // ---------------------------------------------------------------------------

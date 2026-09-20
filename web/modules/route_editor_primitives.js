@@ -255,6 +255,45 @@ export function mintStableId(prefix, takenIds) {
     return `${prefix}_${Date.now().toString(36)}`;
 }
 
+// A roster row is NAMED by a projection of its route, never by a stored label
+// (which rots once the owner re-points the row). JS twin of
+// ouroboros/configured_subagents.py — engine_identity / subagent_handle /
+// roster_handles / validate_unique_engines — held together by one parity table,
+// web/tests/fixtures/subagent_handle_parity.json.
+function engineIdentity(row) {
+    const route = row?.route || {};
+    return [
+        String(route.kind || ''), String(route.target_id || '').trim(),
+        String(route.credential_profile_id || '').trim(), String(row?.effort || ''),
+        String(row?.processing_preference || ''),
+        route.kind === ROUTE_KIND_AGENT_SESSION ? String(row?.access || 'full') : '',
+    ];
+}
+
+/** Route target plus the facets set on THIS row; a neighbour never renames it. */
+export function subagentHandle(row) {
+    const [, target, pin, effort, processing, access] = engineIdentity(row);
+    return [target, effort, access === 'full' ? '' : access, pin ? `@${pin}` : '', processing]
+        .filter(Boolean).join('/');
+}
+
+/** Stored id -> the label the live roster shows; twins are told apart by their stored key. */
+export function rosterHandles(rows) {
+    const base = (rows || []).map(subagentHandle);
+    return new Map((rows || []).map((row, index) => [
+        String(row?.subagent_id || ''),
+        base.indexOf(base[index]) === base.lastIndexOf(base[index])
+            ? base[index] : `${base[index]}~${String(row?.subagent_id || '')}`,
+    ]));
+}
+
+/** Index of the EARLIER row running an identical engine, else -1 — a save-time rule; reads stay tolerant. */
+export function sameEngineAs(rows, index) {
+    const key = JSON.stringify(engineIdentity(rows?.[index]));
+    return (rows || []).findIndex(
+        (row, other) => other < index && JSON.stringify(engineIdentity(row)) === key);
+}
+
 export function composeSessionTarget(harness, model) {
     const h = String(harness || '').trim();
     const m = String(model || '').trim();

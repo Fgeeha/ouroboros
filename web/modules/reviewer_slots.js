@@ -280,19 +280,7 @@ export function reviewerChoiceGroups({
     return groups;
 }
 
-export function subagentOptionLabel(row) {
-    const route = row?.route || {};
-    const parts = [`#${String(row?.subagent_id || '')}`];
-    if (route.kind === ROUTE_KIND_SESSION) {
-        const split = splitSessionTarget(route.target_id);
-        parts.push(split.harness || 'agent session');
-        if (split.model) parts.push(split.model);
-    } else {
-        const fields = routeEditor.routeModelFields(route);
-        parts.push(fields.subscription ? `${fields.source} model` : 'API');
-        if (fields.model) parts.push(fields.model);
-    }
-    if (row?.effort) parts.push(row.effort);
+export function subagentOptionLabel(row, handle = routeEditor.subagentHandle(row)) {
     // Free text is a caption, never identity: one line, bounded, with the
     // characters that could visually reorder or break the facts stripped
     // (bidi controls, newlines).
@@ -303,7 +291,7 @@ export function subagentOptionLabel(row) {
     // Code POINTS, not UTF-16 units: a slice must never split a surrogate pair.
     const points = Array.from(use);
     const hint = points.length > 48 ? `${points.slice(0, 45).join('')}…` : use;
-    return parts.join(' · ') + (hint ? ` — ${hint}` : '');
+    return handle + (hint ? ` — ${hint}` : '');
 }
 
 export function subagentOptionsFor(roster, savedId, { rosterKnown = true } = {}) {
@@ -312,13 +300,15 @@ export function subagentOptionsFor(roster, savedId, { rosterKnown = true } = {})
     // roster entry and the next Save really rewires the reviewer. And the
     // absence claim follows provenance: only a roster that was actually READ
     // may say a saved reference is not in it.
-    // Label contract (owner decision 2=A): DERIVED FACTS lead — channel first,
-    // then target and effort — so the delivery is visible BEFORE selection and
-    // free-text intent can never disguise it; the description is a trimmed,
-    // sanitized single-line caption after the facts.
+    // Label contract: the row's HANDLE leads — its route target plus its own
+    // set facets, the same name Ouroboros sees — so the delivery is visible
+    // BEFORE selection and no stored label can disguise it; the description is
+    // a trimmed, sanitized single-line caption after it. The stored id is the
+    // option VALUE only (the reviewer reference follows the row through it).
+    const handles = routeEditor.rosterHandles(roster);
     const options = (roster || []).map((row) => ({
         value: String(row.subagent_id || ''),
-        label: subagentOptionLabel(row),
+        label: subagentOptionLabel(row, handles.get(String(row.subagent_id || ''))),
     }));
     const saved = String(savedId || '');
     if (saved && !options.some((option) => option.value === saved)) {
@@ -418,7 +408,19 @@ export function lastRunRouteChanged(entry, row) {
 /** The earlier route, named the way the owner picked it. */
 function lastRunRanAs(entry, { harnesses = {}, modelSources = [], providerProfiles = {} } = {}) {
     const requested = entry?.requested || {};
-    if (requested.subagent_id) return `the configured subagent #${requested.subagent_id}`;
+    if (requested.subagent_id) {
+        // Named from the receipt's OWN recorded route, never from today's roster.
+        const session = String(requested.route_kind || '') === ROUTE_KIND_SESSION;
+        const handle = routeEditor.subagentHandle({
+            route: {
+                kind: requested.route_kind,
+                target_id: session ? requested.session_target : requested.model,
+                credential_profile_id: requested.profile_id,
+            },
+            effort: requested.effort, processing_preference: requested.processing_preference,
+        });
+        return handle ? `the configured subagent ${handle}` : 'a configured subagent';
+    }
     if (String(requested.route_kind || '') === ROUTE_KIND_SESSION) {
         const { harness } = splitSessionTarget(requested.session_target);
         const label = harnessPresentation(harness, {

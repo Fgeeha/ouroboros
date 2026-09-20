@@ -7,6 +7,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Any, Mapping
 
+from ouroboros.subagent_history import snapshot_handle
 from ouroboros.subagent_work_order import compile_external_work_order
 
 
@@ -679,7 +680,8 @@ def _prepare_actor_first_bootstrap(
                 "zero_run_evidence_unknown"
                 if zero_run_evidence_gaps and not durable_zero_run else "pending"
             ),
-            "selected_subagent_id": str(snapshot.get("selected_subagent_id") or ""),
+            # Model-facing name: the snapshot's own handle, never the stored key.
+            "selected_subagent_id": snapshot_handle(snapshot),
             "route": route_id,
             "work_order_fingerprint": work_order_fingerprint,
             "work_order_chars": work_order_chars,

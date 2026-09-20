@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from collections import Counter
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional, Sequence
 
@@ -61,12 +62,15 @@ ALTERNATIVE_RECOMMENDATION = (
 
 @dataclass(frozen=True)
 class ConfiguredSubagent:
+    # Hidden stored join key (reviewer-slot references, snapshots, custody and
+    # history follow the ROW through it). What minds and owners are shown is
+    # `subagent_handle`, a projection of the route: a role-shaped id rotted the
+    # same way the retired `name` did once the owner re-pointed the row.
     subagent_id: str
     # Retired semantic field (owner decision 1=A, 2026-08-30): a second
     # human-facing label beside recommended_use rotted against route edits
     # (the shipped "Fast scout" incident). The parser accepts legacy values
-    # and drops them; identity everywhere is the neutral subagent_id plus
-    # DERIVED route facts, and recommended_use is the ONE semantic field.
+    # and drops them; recommended_use is the ONE semantic field.
     name: str = ""
     recommended_use: str = ""
     route: RouteSpec = None  # type: ignore[assignment]
@@ -254,6 +258,76 @@ def normalize_configured_subagents(raw: Any) -> tuple[ConfiguredSubagents, str]:
 
 def configured_subagents_fingerprint(config: ConfiguredSubagents) -> str:
     return hashlib.sha256(serialize_configured_subagents(config).encode("utf-8")).hexdigest()
+
+
+def engine_identity(row: ConfiguredSubagent) -> dict[str, str]:
+    """Execution-affecting facts of ONE saved row, with its EFFECTIVE access.
+
+    Same shape as ``subagent_history.execution_identity``, which reads frozen
+    snapshots and therefore defaults a missing access to ``workspace_write``; a
+    saved row's default is ``full`` (already applied by the parser).
+    """
+    return {
+        "kind": row.route.kind,
+        "target_id": row.route.target_id,
+        "credential_profile_id": row.route.credential_profile_id,
+        "effort": row.effort,
+        "processing_preference": row.processing_preference,
+        **({"access": row.access} if row.route.is_session else {}),
+    }
+
+
+def engine_handle(identity: Mapping[str, Any]) -> str:
+    """The name shown for an engine: its route target plus its OWN set facets.
+
+    A pure function of one identity (a saved row, a frozen snapshot or a
+    history record), so a neighbour row can never rename it and the past is
+    never relabelled from the live roster. Facets, in fixed order: effort,
+    session access when not the default ``full``, account pin as ``@<profile>``,
+    processing preference. Compared, never parsed.
+    """
+    access = str(identity.get("access") or "") if identity.get("kind") == ROUTE_KIND_AGENT_SESSION else ""
+    pin = str(identity.get("credential_profile_id") or "")
+    facets = (
+        str(identity.get("effort") or ""),
+        "" if access == "full" else access,
+        f"@{pin}" if pin else "",
+        str(identity.get("processing_preference") or ""),
+    )
+    return "/".join(part for part in (str(identity.get("target_id") or ""), *facets) if part)
+
+
+def subagent_handle(row: ConfiguredSubagent) -> str:
+    return engine_handle(engine_identity(row))
+
+
+def roster_handles(config: ConfiguredSubagents) -> dict[str, str]:
+    """Stored id -> the handle the LIVE roster shows and the tools accept.
+
+    Save-time uniqueness keeps handles distinct; rows that still share one
+    (twins saved before that rule) are told apart by their stored key as
+    ``<handle>~<subagent_id>`` — never by list order, which is not durable.
+    """
+    base = {row.subagent_id: subagent_handle(row) for row in config.items}
+    counts = Counter(base.values())
+    return {
+        row_id: f"{handle}~{row_id}" if counts[handle] > 1 else handle
+        for row_id, handle in base.items()
+    }
+
+
+def validate_unique_engines(config: ConfiguredSubagents) -> None:
+    """SAVE-path rule: two rows may not run an identical engine (reads stay tolerant)."""
+    seen: dict[tuple, int] = {}
+    for index, row in enumerate(config.items):
+        key = tuple(sorted(engine_identity(row).items()))
+        if key in seen:
+            raise ValueError(
+                f"{SUBAGENTS_SETTING}: items[{index}] runs the same engine as items[{seen[key]}] "
+                f"({subagent_handle(row)}); change its model, effort, access, account or "
+                "processing, or remove it"
+            )
+        seen[key] = index
 
 
 def _materialized_source(
@@ -585,10 +659,15 @@ __all__ = [
     "SUBAGENTS_SETTING",
     "configured_subagents_dict",
     "configured_subagents_fingerprint",
+    "engine_handle",
+    "engine_identity",
     "make_configured_subagents",
     "normalize_configured_subagents",
     "parse_configured_subagents",
     "resolve_configured_subagents",
     "resolve_settings_subagent_candidate",
+    "roster_handles",
     "serialize_configured_subagents",
+    "subagent_handle",
+    "validate_unique_engines",
 ]

@@ -44,6 +44,7 @@ from ouroboros.configured_subagents import (
     ConfiguredSubagents,
     configured_subagents_dict,
     normalize_configured_subagents,
+    validate_unique_engines,
 )
 
 from ouroboros.gateway.owner_settings import (
@@ -667,6 +668,7 @@ def _configured_owner_draft(
         return None, ""
     try:
         config, _canonical = normalize_configured_subagents(body.get(SUBAGENTS_SETTING))
+        validate_unique_engines(config)
     except ValueError as exc:
         return None, str(exc)
     return config, ""

@@ -1205,11 +1205,14 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
         # not the stale process env (see the check helper below).
         subagents_key = "OUROBOROS_SUBAGENTS"
         if subagents_key in body and body.get(subagents_key) not in (None, ""):
-            from ouroboros.configured_subagents import normalize_configured_subagents
+            from ouroboros.configured_subagents import (
+                normalize_configured_subagents, validate_unique_engines,
+            )
             try:
-                _subagents, canonical_subagents = normalize_configured_subagents(
+                subagents, canonical_subagents = normalize_configured_subagents(
                     body.get(subagents_key)
                 )
+                validate_unique_engines(subagents)
             except ValueError as exc:
                 return unsaved_error(str(exc), 400)
             body = dict(body)

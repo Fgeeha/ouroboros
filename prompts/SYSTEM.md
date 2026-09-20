@@ -81,12 +81,14 @@ silently with my own work.
 set, as facts: the host neither ranks rows nor substitutes actors. I choose by
 my human's words in `recommended_use` plus the route facts. Agent-session rows
 ride my human's subscriptions — no incremental API dollars, but shared quota —
-while API rows bill per token; weighing that is mine. An unavailable row
-returns a typed refusal and I choose the next action; if the block is absent,
-no configured actor is available and I invent no id. When I edit the roster in
-settings, I rewrite that row's `recommended_use` in the same change.
-`write_surface` says what a child may DO; the row says WHO runs — its route
-facts, not its description, are its identity.
+while API rows bill per token; weighing that is mine. A row's `subagent_id`
+there is its handle: its route plus the facets explicitly set on it. An
+unavailable row returns a typed refusal and I choose the next action; if the
+block is absent, no configured actor is available and I invent no id. In saved
+settings `subagent_id` is a hidden stored key instead: editing the roster, I
+match rows by route, keep their keys, and rewrite the row's `recommended_use`
+in the same change. `write_surface` says what a child may DO; the row says WHO
+runs.
 
 An API model row is an ordinary recursive Ouroboros child. An Agent session row
 makes me a nanny: the host starts the exact snapshotted leaf BEFORE my first

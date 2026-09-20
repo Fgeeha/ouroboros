@@ -1,0 +1,328 @@
+"""Roster handles: a row is NAMED by a projection of its route, never by a stored label.
+
+The stored ``subagent_id`` stays the hidden join key (reviewer references,
+snapshots, custody, history). These tests pin the projection, the one argument
+resolver, the save-time engine uniqueness and the facts-only model catalog —
+each guard in both directions.
+"""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+from types import SimpleNamespace
+
+import pytest
+
+from ouroboros.configured_subagents import (
+    engine_identity,
+    parse_configured_subagents,
+    roster_handles,
+    subagent_handle,
+    validate_unique_engines,
+)
+
+PARITY = json.loads(
+    (Path(__file__).resolve().parents[1] / "web" / "tests" / "fixtures"
+     / "subagent_handle_parity.json").read_text(encoding="utf-8")
+)["rosters"]
+
+
+def _config(*rows):
+    return parse_configured_subagents({"enabled": True, "items": list(rows)})
+
+
+def _settings(*rows):
+    return {"OUROBOROS_SUBAGENTS": json.dumps({"enabled": True, "items": list(rows)})}
+
+
+def _api(row_id, target="x-ai/grok-4.6", **extra):
+    return {"subagent_id": row_id, "recommended_use": f"use {row_id}",
+            "route": {"kind": "api_model", "target_id": target}, **extra}
+
+
+def _session(row_id, target="codex=gpt-6-astra", pin="", **extra):
+    route = {"kind": "agent_session", "target_id": target}
+    if pin:
+        route["credential_profile_id"] = pin
+    return {"subagent_id": row_id, "recommended_use": f"use {row_id}", "route": route, **extra}
+
+
+def _duplicate_of(config):
+    """Index pairs a save refuses, read off the validator's own message."""
+    try:
+        validate_unique_engines(config)
+    except ValueError as exc:
+        text = str(exc)
+        later, earlier = (int(part.split("]")[0]) for part in text.split("items[")[1:3])
+        return later, earlier
+    return None
+
+
+@pytest.mark.parametrize("roster", PARITY, ids=[item["case"] for item in PARITY])
+def test_the_shared_table_pins_handles_roster_labels_and_refused_twins(roster):
+    config = _config(*roster["items"])
+    labels = roster_handles(config)
+    refused = _duplicate_of(config)
+    first_twin = next(
+        ((index, want["same_engine_as"]) for index, want in enumerate(roster["expected"])
+         if want["same_engine_as"] is not None), None)
+    assert refused == first_twin
+    for row, want in zip(config.items, roster["expected"]):
+        assert subagent_handle(row) == want["handle"]
+        assert labels[row.subagent_id] == want["roster"]
+
+
+def test_a_handle_is_a_function_of_one_row_so_a_new_sibling_never_renames_it():
+    alone = _config(_api("one"))
+    crowded = _config(_api("one"), _api("two", effort="low"), _session("three"))
+    assert subagent_handle(alone.items[0]) == subagent_handle(crowded.items[0]) == "x-ai/grok-4.6"
+    assert roster_handles(crowded)["one"] == "x-ai/grok-4.6"
+
+
+def test_row_identity_and_snapshot_identity_are_one_shape():
+    """The save-time identity and the frozen-snapshot identity must not drift:
+    the same row compared through either reader yields the same facts."""
+    from ouroboros.subagent_history import execution_identity, snapshot_handle
+    from ouroboros.subagent_runtime import select_subagent_snapshot
+
+    rows = (_session("s", pin="koshak", effort="xhigh", access="workspace_write"),
+            _api("a", effort="low", processing_preference="fast"))
+    config = _config(*rows)
+    for row in config.items:
+        snapshot, _legacy = select_subagent_snapshot(_settings(*rows), subagent_id=row.subagent_id)
+        assert execution_identity(snapshot) == engine_identity(row)
+        assert snapshot_handle(snapshot) == subagent_handle(row)
+
+
+@pytest.mark.parametrize("facet", [
+    {"effort": "low"}, {"access": "workspace_write"}, {"processing_preference": "economy"},
+])
+def test_identical_engines_are_refused_and_one_differing_facet_is_accepted(facet):
+    base = _session("first", effort="high")
+    twin = _session("second", effort="high", recommended_use="different words, same engine")
+    with pytest.raises(ValueError, match=r"items\[1\] runs the same engine as items\[0\]"):
+        validate_unique_engines(_config(base, twin))
+    validate_unique_engines(_config(base, {**twin, **facet}))
+    validate_unique_engines(_config(base, _session("second", pin="other-account", effort="high")))
+    validate_unique_engines(_config(base, _session("second", target="codex=gpt-5.6-sol", effort="high")))
+
+
+def test_uniqueness_uses_effective_defaults_and_reads_stay_tolerant():
+    """A session row without ``access`` IS a ``full`` row; and a roster saved
+    before the rule still parses, resolves and projects — only a SAVE is refused."""
+    from ouroboros.configured_subagents import resolve_configured_subagents
+    from ouroboros.subagent_runtime import model_visible_subagent_catalog, select_subagent_snapshot
+
+    rows = (_session("implicit"), _session("explicit", access="full"))
+    with pytest.raises(ValueError, match="same engine"):
+        validate_unique_engines(_config(*rows))
+    settings = _settings(*rows)
+    assert resolve_configured_subagents(settings).config is not None
+    labels = [row["subagent_id"] for row in model_visible_subagent_catalog(settings)["rows"]]
+    assert labels == ["codex=gpt-6-astra~implicit", "codex=gpt-6-astra~explicit"]
+    for label, stored in zip(labels, ("implicit", "explicit")):
+        assert select_subagent_snapshot(settings, subagent_id=label)[0]["selected_subagent_id"] == stored
+
+
+def test_the_argument_resolves_by_handle_then_by_stored_id_and_refuses_a_cross_row_collision():
+    from ouroboros.subagent_runtime import SubagentSelectionError, select_subagent_snapshot
+
+    settings = _settings(_session("primary-builder", effort="xhigh"), _api("fast-scout"))
+    by_handle, _ = select_subagent_snapshot(settings, subagent_id="codex=gpt-6-astra/xhigh")
+    by_stored, _ = select_subagent_snapshot(settings, subagent_id="primary-builder")
+    assert by_handle["selected_subagent_id"] == by_stored["selected_subagent_id"] == "primary-builder"
+    assert by_handle["route"] == by_stored["route"]
+
+    with pytest.raises(SubagentSelectionError) as unknown:
+        select_subagent_snapshot(settings, subagent_id="codex=gpt-6-astra")  # facets are part of the name
+    assert unknown.value.code == "unknown_subagent_id"
+    assert "'codex=gpt-6-astra/xhigh'" in unknown.value.detail and "'x-ai/grok-4.6'" in unknown.value.detail
+    assert "primary-builder" not in unknown.value.detail, "the refusal lists handles, not stored keys"
+
+    # A bare session target is a legal stored id too: one string, two rows.
+    collision = _settings(_session("first", target="codex"), _api("codex", target="openai/gpt-5.6-sol"))
+    with pytest.raises(SubagentSelectionError) as conflict:
+        select_subagent_snapshot(collision, subagent_id="codex")
+    assert conflict.value.code == "subagent_selector_conflict"
+    assert "'first'" in conflict.value.detail and "'openai/gpt-5.6-sol'" in conflict.value.detail
+    # Both named values still reach their rows; the same string on ONE row is no conflict.
+    assert select_subagent_snapshot(collision, subagent_id="first")[0]["route"]["target_id"] == "codex"
+    assert select_subagent_snapshot(
+        collision, subagent_id="openai/gpt-5.6-sol")[0]["selected_subagent_id"] == "codex"
+    same_row = _settings(_session("codex", target="codex"))
+    assert select_subagent_snapshot(same_row, subagent_id="codex")[0]["selected_subagent_id"] == "codex"
+
+
+def test_the_model_catalog_is_facts_only_and_keyed_by_handle():
+    from ouroboros.subagent_runtime import model_visible_subagent_catalog
+
+    verbatim = "Любой язык.\nKeep punctuation: a/b, quotes, and cost $0."
+    catalog = model_visible_subagent_catalog(_settings(
+        {**_api("fast-scout", target="google/gemini-3.8-flash"), "recommended_use": verbatim},
+        {**_session("primary-builder", pin="koshak", effort="xhigh"), "recommended_use": "Builds."},
+    ))
+    assert set(catalog) == {"rows"}, "no host-authored guidance, source or fingerprint reaches the model"
+    api, session = catalog["rows"]
+    assert api == {
+        "subagent_id": "google/gemini-3.8-flash", "route_class": "API model",
+        "requested_effort": "(not explicitly set)", "recommended_use": verbatim,
+    }
+    assert list(session) == [
+        "subagent_id", "route_class", "requested_effort", "requested_target",
+        "mutating_access", "credential_profile_id", "recommended_use",
+    ], "facts lead, the owner's words ride last"
+    assert session["subagent_id"] == "codex=gpt-6-astra/xhigh/@koshak"
+    assert session["requested_target"] == "codex=gpt-6-astra"
+    text = json.dumps(catalog)
+    for stored_or_dropped in ("fast-scout", "primary-builder", "account_policy", "config_fingerprint"):
+        assert stored_or_dropped not in text
+
+
+def _post_settings(monkeypatch, body):
+    import asyncio
+
+    from starlette.requests import Request
+
+    import ouroboros.gateway.settings as gws
+
+    saved = {}
+
+    def _fake_load():
+        from ouroboros.config import SETTINGS_DEFAULTS
+        return {**SETTINGS_DEFAULTS, **saved}
+
+    def _fake_write(payload, *, allow_elevation=False, allow_context_lowering=False,
+                    authored_keys=(), boundary=None):
+        saved.clear()
+        saved.update(payload)
+        if boundary is not None:
+            boundary.commit()
+        return payload
+
+    monkeypatch.setattr(gws, "load_settings", _fake_load)
+    monkeypatch.setattr(gws, "_owner_write_settings", _fake_write)
+    monkeypatch.setattr(gws, "_unrecognised_review_models", lambda models: [])
+    monkeypatch.setattr(gws, "_apply_settings_to_env", lambda *a, **k: None)
+
+    async def _receive():
+        return {"type": "http.request", "body": json.dumps(body).encode()}
+
+    request = Request({"type": "http", "method": "POST", "path": "/api/settings",
+                       "headers": [("content-type", "application/json")],
+                       "query_string": b"", "app": None}, receive=_receive)
+    return asyncio.run(gws.api_settings_post(request)), saved
+
+
+def test_every_save_path_refuses_identical_engines_and_accepts_a_near_duplicate(monkeypatch):
+    from ouroboros.gateway.onboarding import _configured_owner_draft
+
+    twins = {"enabled": True, "items": [_api("one", effort="low"), _api("two", effort="low")]}
+    near = {"enabled": True, "items": [_api("one", effort="low"), _api("two", effort="high")]}
+
+    refused, saved = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": twins})
+    assert refused.status_code == 400 and b"same engine" in refused.body
+    assert "OUROBOROS_SUBAGENTS" not in saved
+    accepted, saved = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": near})
+    assert accepted.status_code == 200, accepted.body[:300]
+    assert json.loads(saved["OUROBOROS_SUBAGENTS"])["items"][1]["effort"] == "high"
+
+    # Onboarding preview and completion share this one owner-draft seam.
+    config, error = _configured_owner_draft({"OUROBOROS_SUBAGENTS": twins})
+    assert config is None and "same engine" in error
+    config, error = _configured_owner_draft({"OUROBOROS_SUBAGENTS": near})
+    assert error == "" and [row.subagent_id for row in config.items] == ["one", "two"]
+
+
+def test_an_actor_first_start_accepts_its_own_handle_and_stored_id_and_refuses_another_row(
+    tmp_path, monkeypatch,
+):
+    """The bound start used to compare the raw argument with the stored id, so a
+    handle accepted by ``schedule_subagent`` was rejected at the physical start."""
+    import ouroboros.subagent_runtime as runtime
+
+    rows = (_session("primary-builder", effort="xhigh"), _session("other", target="cursor=kimi-k3-high"))
+    settings = _settings(*rows)
+    monkeypatch.setattr("ouroboros.config.runtime_settings", lambda: settings)
+    monkeypatch.setattr(runtime, "effective_runtime_subagent_settings", dict)
+    snapshot, _ = runtime.select_subagent_snapshot(settings, subagent_id="primary-builder")
+
+    def _start(selector, *, retry=False):
+        ctx = SimpleNamespace(
+            task_id="bound-child", drive_root=tmp_path, budget_drive_root=str(tmp_path), task_metadata={},
+            # No canonical work order: a selector that NAMES the bound actor
+            # passes the binding check and stops at the next typed refusal.
+            _configured_actor_bootstrap={"snapshot": snapshot, "selected_subagent_id": "primary-builder"},
+        )
+        extra = {"retry_of": "inv-1"} if retry else {}
+        return json.loads(runtime.delegate_start_entry(ctx, "", subagent_id=selector, **extra).text)["reason"]
+
+    for retry in (False, True):
+        for own in ("primary-builder", "codex=gpt-6-astra/xhigh"):
+            assert _start(own, retry=retry) == "configured_work_order_unavailable", (own, retry)
+        for foreign in ("other", "cursor=kimi-k3-high", "no-such-row"):
+            assert _start(foreign, retry=retry) == "configured_actor_route_mismatch", (foreign, retry)
+
+    # The roster moved on; the episode is still bound to its frozen snapshot.
+    monkeypatch.setattr("ouroboros.config.runtime_settings", lambda: _settings(rows[1]))
+    assert _start("codex=gpt-6-astra/xhigh") == "configured_work_order_unavailable"
+    assert _start("cursor=kimi-k3-high") == "configured_actor_route_mismatch"
+
+
+def test_history_is_named_from_each_records_own_facts_never_from_the_live_roster(tmp_path, monkeypatch):
+    """The live row stored as ``fast-scout`` runs another engine today; the dated
+    fact keeps the engine it ran, and an old record without a typed identity
+    shows its recorded route target."""
+    from ouroboros.context_runtime_facts import _delegation_capability_fact
+    from ouroboros.subagent_history import recorded_handle
+
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    monkeypatch.setattr("ouroboros.config.load_settings",
+                        lambda: _settings(_api("fast-scout", target="moonshotai/kimi-k3")))
+    typed = {
+        "ts": "2026-09-20T10:00:00+00:00", "route": "cursor", "requested_model": "grok-4.6",
+        "applied_model": "grok-4.6", "selected_subagent_id": "fast-scout", "run_id": "run-2",
+        "identity": {"kind": "agent_session", "target_id": "cursor=grok-4.6", "effort": "high",
+                     "credential_profile_id": "", "processing_preference": "", "access": "full"},
+    }
+    untyped = {"ts": "2026-08-18T02:00:00+00:00", "route": "api_model",
+               "requested_model": "google/gemini-3.7-flash", "applied_model": "",
+               "selected_subagent_id": "fast-scout-2", "run_id": "run-1"}
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "subagent_last_delegation.json").write_text(json.dumps({
+        **typed, "latest_by_subagent": {"fast-scout": typed, "fast-scout-2": untyped},
+    }), encoding="utf-8")
+
+    delegation = _delegation_capability_fact()
+    assert delegation["subagent_last_delegation"]["selected_subagent_id"] == "cursor=grok-4.6/high"
+    assert [row["selected_subagent_id"] for row in delegation["subagents_last_executions"]] == [
+        "cursor=grok-4.6/high", "google/gemini-3.7-flash",
+    ]
+    assert "kimi" not in json.dumps(delegation), "the past is never relabelled from the live roster"
+    assert recorded_handle({"route": "codex", "requested_model": ""}) == "codex"
+    assert recorded_handle({}) == ""
+
+
+def test_the_startup_receipt_and_the_start_result_name_the_snapshots_own_handle(tmp_path, monkeypatch):
+    import ouroboros.subagent_bootstrap as bootstrap
+    import ouroboros.subagent_runtime as runtime
+    import ouroboros.tools.delegate as delegate
+    from ouroboros.delegate_shared import delegate_result
+
+    snapshot, _ = runtime.select_subagent_snapshot(
+        _settings(_session("primary-builder", pin="koshak", effort="xhigh")), subagent_id="primary-builder")
+    monkeypatch.setattr(bootstrap, "_durable_zero_run_receipt", lambda *_a, **_k: {})
+    ctx = SimpleNamespace(task_id="child", drive_root=tmp_path, budget_drive_root=str(tmp_path))
+    receipt = json.loads(bootstrap._prepare_actor_first_bootstrap(
+        ctx, {"id": "child", "objective": "Build", "configured_subagent": snapshot},
+        SimpleNamespace(blocked=False),
+    ))
+    assert receipt["startup"]["selected_subagent_id"] == "codex=gpt-6-astra/xhigh/@koshak"
+    assert ctx._configured_actor_bootstrap["selected_subagent_id"] == "primary-builder", "custody keeps the stored key"
+
+    monkeypatch.setattr(delegate, "_delegate_start",
+                        lambda *_a, **_k: delegate_result({"status": "started", "run_id": "run-1"}))
+    started = json.loads(runtime.exact_start(
+        SimpleNamespace(task_id="child", drive_root=tmp_path, budget_drive_root=str(tmp_path), task_metadata={}),
+        "brief", {"snapshot": snapshot}).text)
+    assert started["selected_subagent_id"] == "codex=gpt-6-astra/xhigh/@koshak"

@@ -67,8 +67,10 @@ def test_catalog_projects_every_saved_row_in_owner_order_verbatim():
     # Facts only: selection prose lives in prompts/SYSTEM.md, and the list
     # fingerprint and provenance stay host-side (snapshots carry them).
     assert set(catalog) == {"rows"}
+    # Rows are named by their handle - the route plus the row's own set facets.
     assert [row["subagent_id"] for row in catalog["rows"]] == [
-        "api-scout", "auto-session", "pinned-session",
+        "google/gemini-3.7-flash/low", "claude=claude-fable-5/high",
+        "cursor=cursor-grok-4.6-high/@cursor-owner",
     ]
     assert catalog["rows"][0]["recommended_use"] == verbatim
     assert list(catalog["rows"][0])[-1] == "recommended_use"
@@ -81,7 +83,6 @@ def test_catalog_projects_every_saved_row_in_owner_order_verbatim():
     assert "credential_profile_id" not in catalog["rows"][1]
     assert catalog["rows"][2]["requested_effort"] == "(not explicitly set)"
     assert catalog["rows"][2]["credential_profile_id"] == "cursor-owner"
-    # An explicit pin is the only account fact; the policy boilerplate is gone.
     assert not any("account_policy" in row for row in catalog["rows"])
 
 
@@ -196,14 +197,16 @@ def test_catalog_is_semi_stable_while_dated_history_stays_dynamic(tmp_path, monk
     assert blocks[2]["text"] == core.dynamic_text
     assert "cache_control" not in blocks[2]
     assert catalog["rows"][0]["recommended_use"] == owner_text
-    assert '"subagent_id": "builder"' in core.semi_stable_text
+    assert '"subagent_id": "codex=gpt-5.6-sol/high"' in core.semi_stable_text
+    assert "builder" not in core.semi_stable_text, "the stored key is not model-facing"
     assert "2026-08-18T01:02:03+00:00" not in core.semi_stable_text
     assert "reviewer_slots_last" not in core.semi_stable_text
     assert "subagent_last_delegation" not in core.semi_stable_text
     assert "2026-08-18T01:02:03+00:00" in core.dynamic_text
     assert "reviewer_slots_last" in core.dynamic_text
     assert "subagent_last_delegation" in core.dynamic_text
-    assert '"selected_subagent_id": "builder"' in core.dynamic_text
+    # An old receipt without a typed identity shows its recorded route target.
+    assert '"selected_subagent_id": "codex=gpt-5.6-sol"' in core.dynamic_text
     for profile in (
         "review-requested", "review-applied", "delegate-requested", "delegate-applied",
     ):
