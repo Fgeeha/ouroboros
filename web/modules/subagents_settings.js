@@ -24,7 +24,7 @@ export const MAX_AVAILABLE_SUBAGENTS = 10;
 export const SUBAGENT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$/;
 
 const SETTING_KEYS = new Set(['enabled', 'items']);
-const ROW_KEYS = new Set(['subagent_id', 'name', 'recommended_use', 'route', 'effort', 'processing_preference', 'access']);
+const ROW_KEYS = new Set(['subagent_id', 'name', 'recommended_use', 'route', 'effort', 'processing_preference', 'access', 'enabled']);
 const ROUTE_KEYS = new Set(['kind', 'target_id', 'credential_profile_id']);
 
 function ownUnknownKeys(value, allowed) {
@@ -44,6 +44,8 @@ function canonicalRow(row) {
     // `name` is retired (owner decision 1=A): a legacy value parses and is
     // DROPPED — identity is the neutral subagent_id plus derived route facts,
     // and recommended_use is the one semantic field.
+    // `enabled` is written only when the owner switched the row OFF: an
+    // untouched roster keeps its exact canonical bytes and fingerprint.
     return {
         subagent_id: String(row?.subagent_id || '').trim(),
         recommended_use: String(row?.recommended_use || ''),
@@ -51,6 +53,7 @@ function canonicalRow(row) {
         ...(row?.effort ? { effort: String(row.effort).trim().toLowerCase() } : {}),
         ...(row?.processing_preference ? { processing_preference: String(row.processing_preference).trim().toLowerCase() } : {}),
         ...(route.kind === ROUTE_KIND_AGENT_SESSION ? { access: row?.access ?? 'full' } : {}),
+        ...(row?.enabled === false ? { enabled: false } : {}),
     };
 }
 
@@ -66,6 +69,38 @@ function attachUiKeys(setting, previousItems = []) {
         return { ...row, _uiKey: key };
     });
     return setting;
+}
+
+// The SHAPE verdict for one saved row, in the owner's words (`row N …`), or ''
+// when the bytes can be canonicalized. Semantic and list-wide rules (stable ID
+// spelling, route completeness, effort conflicts) belong to `rowErrors` below,
+// which judges the live draft; this one answers only "can this be loaded".
+function rowParseError(row, index) {
+    const at = `row ${index + 1}`;
+    if (!row || typeof row !== 'object' || Array.isArray(row)) return `${at} must be an object`;
+    const rowUnknown = ownUnknownKeys(row, ROW_KEYS);
+    if (rowUnknown.length) return `${at} has unknown field: ${rowUnknown[0]}`;
+    if (typeof row.subagent_id !== 'string') return `${at} stable ID must be a string`;
+    if (row.name !== undefined && typeof row.name !== 'string') return `${at} name must be a string`;
+    if (typeof row.recommended_use !== 'string') return `${at} recommended use must be a string`;
+    // Absent means enabled; anything other than a real boolean is refused
+    // rather than coerced, so a typo can never read as "switched off".
+    if (row.enabled !== undefined && typeof row.enabled !== 'boolean') return `${at} enabled must be true or false`;
+    if (row.effort != null && typeof row.effort !== 'string') return `${at} effort must be a string`;
+    if (row.processing_preference != null && typeof row.processing_preference !== 'string') return `${at} processing must be a string`;
+    if (!row.route || typeof row.route !== 'object' || Array.isArray(row.route)) return `${at} needs a route object`;
+    const routeUnknown = ownUnknownKeys(row.route, ROUTE_KEYS);
+    if (routeUnknown.length) return `${at} route has unknown field: ${routeUnknown[0]}`;
+    if (typeof row.route.kind !== 'string') return `${at} route kind must be a string`;
+    if (typeof row.route.target_id !== 'string') return `${at} route target must be a string`;
+    if (row.route.credential_profile_id != null && typeof row.route.credential_profile_id !== 'string') return `${at} account pin must be a string`;
+    const routeKind = row.route.kind.trim().toLowerCase();
+    if (![ROUTE_KIND_API_MODEL, ROUTE_KIND_AGENT_SESSION].includes(routeKind)) return `${at} has unsupported route kind`;
+    if (row.access !== undefined && !['workspace_write', 'full'].includes(row.access)) return `${at} access must be workspace_write or full`;
+    if (row.access !== undefined && routeKind !== ROUTE_KIND_AGENT_SESSION) return `${at} access requires an Agent session`;
+    if (!routeSupportsAccount({ ...row.route, kind: routeKind })
+        && String(row.route.credential_profile_id || '').trim()) return `${at} has an account pin on an API route`;
+    return '';
 }
 
 /** Parse without replacing malformed saved bytes with an empty list. */
@@ -96,61 +131,11 @@ export function parseAvailableSubagentsSetting(value) {
     }
     const canonicalItems = [];
     for (const [index, row] of input.items.entries()) {
-        if (!row || typeof row !== 'object' || Array.isArray(row)) {
-            return { setting: null, error: `row ${index + 1} must be an object` };
-        }
-        const rowUnknown = ownUnknownKeys(row, ROW_KEYS);
-        if (rowUnknown.length) {
-            return { setting: null, error: `row ${index + 1} has unknown field: ${rowUnknown[0]}` };
-        }
-        if (typeof row.subagent_id !== 'string') {
-            return { setting: null, error: `row ${index + 1} stable ID must be a string` };
-        }
-        if (row.name !== undefined && typeof row.name !== 'string') {
-            return { setting: null, error: `row ${index + 1} name must be a string` };
-        }
-        if (typeof row.recommended_use !== 'string') {
-            return { setting: null, error: `row ${index + 1} recommended use must be a string` };
-        }
-        if (row.effort !== undefined && row.effort !== null && typeof row.effort !== 'string') {
-            return { setting: null, error: `row ${index + 1} effort must be a string` };
-        }
-        if (row.processing_preference != null && typeof row.processing_preference !== 'string') return { setting: null, error: `row ${index + 1} processing must be a string` };
-        if (!row.route || typeof row.route !== 'object' || Array.isArray(row.route)) {
-            return { setting: null, error: `row ${index + 1} needs a route object` };
-        }
-        const routeUnknown = ownUnknownKeys(row.route, ROUTE_KEYS);
-        if (routeUnknown.length) {
-            return { setting: null, error: `row ${index + 1} route has unknown field: ${routeUnknown[0]}` };
-        }
-        if (typeof row.route.kind !== 'string') {
-            return { setting: null, error: `row ${index + 1} route kind must be a string` };
-        }
-        if (typeof row.route.target_id !== 'string') {
-            return { setting: null, error: `row ${index + 1} route target must be a string` };
-        }
-        if (row.route.credential_profile_id !== undefined
-            && row.route.credential_profile_id !== null
-            && typeof row.route.credential_profile_id !== 'string') {
-            return { setting: null, error: `row ${index + 1} account pin must be a string` };
-        }
-        const routeKind = row.route.kind.trim().toLowerCase();
-        if (![ROUTE_KIND_API_MODEL, ROUTE_KIND_AGENT_SESSION].includes(routeKind)) {
-            return { setting: null, error: `row ${index + 1} has unsupported route kind` };
-        }
-        if (row.access !== undefined && !['workspace_write', 'full'].includes(row.access)) {
-            return { setting: null, error: `row ${index + 1} access must be workspace_write or full` };
-        }
-        if (row.access !== undefined && routeKind !== ROUTE_KIND_AGENT_SESSION) {
-            return { setting: null, error: `row ${index + 1} access requires an Agent session` };
-        }
-        if (!routeSupportsAccount({ ...row.route, kind: routeKind })
-            && String(row.route.credential_profile_id || '').trim()) {
-            return { setting: null, error: `row ${index + 1} has an account pin on an API route` };
-        }
+        const rowError = rowParseError(row, index);
+        if (rowError) return { setting: null, error: rowError };
         canonicalItems.push(canonicalRow({
             ...row,
-            route: { ...row.route, kind: routeKind },
+            route: { ...row.route, kind: row.route.kind.trim().toLowerCase() },
         }));
     }
     const setting = { enabled: input.enabled, items: canonicalItems };
@@ -340,6 +325,7 @@ export function availableSubagentRowMarkup(row, state, index = 0) {
     return `
         <article class="available-subagent-row" data-subagent-row="${escapeHtml(rowKey)}" aria-labelledby="${escapeHtml(headingId)}"${invalid ? ' data-invalid' : ''}>
             <div class="available-subagent-head">
+                <label class="available-subagent-enable" title="Owner switch: a switched-off subagent keeps its configuration and stays editable, and no new delegation or reviewer reference may select it."><input class="ui-checkbox" type="checkbox" data-subagent-field="enabled" aria-label="Subagent ${ordinal} enabled for new work"${row.enabled === false ? '' : ' checked'}></label>
                 <h4 class="available-subagent-heading" id="${escapeHtml(headingId)}">Subagent ${ordinal}</h4>
                 <div class="available-subagent-route-identity-wrap">${routeIdentity}</div>
                 <span class="settings-inline-status" data-subagent-status data-tone="${escapeHtml(status.tone)}" title="${escapeHtml(status.text)}">${escapeHtml(status.label)}</span>
@@ -534,6 +520,13 @@ export function createAvailableSubagentsEditor({
             if (!row) return;
             rowElement.querySelector('[data-subagent-field="recommended_use"]')?.addEventListener('input', (event) => {
                 row.recommended_use = String(event.target.value || '');
+                markDirty();
+            });
+            // Held as a draft like every other field: the section's Save is the
+            // one writer, and `false` is stored only while the box is cleared.
+            rowElement.querySelector('[data-subagent-field="enabled"]')?.addEventListener('change', (event) => {
+                if (event.target.checked) delete row.enabled;
+                else row.enabled = false;
                 markDirty();
             });
             rowElement.querySelector('[data-subagent-field="route"]')?.addEventListener('change', (event) => {
@@ -866,7 +859,8 @@ export function renderSubagentsSection() {
             <h3>Available subagents</h3>
             <div class="settings-section-copy">
                 Describe when Ouroboros should choose each numbered subagent, then select how it runs.
-                Internal references stay stable automatically. A route that is unavailable stays saved
+                Clearing a subagent's checkbox keeps its configuration and stops new tasks and reviews
+                from choosing it. Internal references stay stable automatically. A route that is unavailable stays saved
                 and returns an explicit refusal instead of silently changing actor or model. An unpinned
                 session row may rotate among compatible healthy accounts for that same route.
             </div>

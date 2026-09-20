@@ -214,3 +214,101 @@ def test_catalog_is_semi_stable_while_dated_history_stays_dynamic(tmp_path, monk
     ):
         assert profile in core.dynamic_text
     assert "configured_route" not in core.dynamic_text
+
+
+def test_catalog_hides_an_owner_disabled_row_and_selection_refuses_it_typed(monkeypatch):
+    """Owner-disabled is a THIRD axis, distinct from the list-level switch and
+    from live availability: the row stays saved and complete, the model never
+    sees it, and an explicit selection of it refuses with its own code rather
+    than `unknown_subagent_id` or a substitute actor."""
+    from ouroboros.subagent_runtime import (
+        SubagentSelectionError,
+        current_subagent_alternatives,
+        model_visible_subagent_catalog,
+        select_subagent_snapshot,
+    )
+
+    settings = _settings(
+        _row("builder", kind="api_model", target="openai/gpt-5.6-sol",
+             recommendation="Use for implementation."),
+        {**_row("paused", kind="api_model", target="openai/gpt-5.6-luna",
+                recommendation="Use for scouting."), "enabled": False},
+    )
+
+    catalog = model_visible_subagent_catalog(settings)
+    assert [row["subagent_id"] for row in catalog["rows"]] == ["builder"]
+
+    with pytest.raises(SubagentSelectionError) as refused:
+        select_subagent_snapshot(settings, subagent_id="paused")
+    assert refused.value.code == "subagent_disabled"
+    assert "switched off" in refused.value.detail
+    # The enabled sibling is unaffected by its neighbour's switch.
+    assert select_subagent_snapshot(settings, subagent_id="builder")[0][
+        "selected_subagent_id"] == "builder"
+
+    import ouroboros.config as config_module
+
+    monkeypatch.setattr(config_module, "runtime_settings", lambda: dict(settings))
+    assert [row["subagent_id"] for row in current_subagent_alternatives()] == ["builder"]
+
+
+def test_a_roster_whose_every_row_is_switched_off_projects_no_catalog():
+    from ouroboros.subagent_runtime import model_visible_subagent_catalog
+
+    settings = _settings({
+        **_row("paused", kind="api_model", target="openai/gpt-5.6-sol",
+               recommendation="Use for implementation."),
+        "enabled": False,
+    })
+    assert model_visible_subagent_catalog(settings) == {}
+
+
+def test_a_captured_snapshot_stays_valid_after_its_row_is_switched_off():
+    """Existing task and review snapshots are immutable intent: validation must
+    not consult live settings, so disabling the row later cannot invalidate a
+    task that is already running on it."""
+    from ouroboros.subagent_runtime import select_subagent_snapshot, validate_subagent_snapshot
+
+    enabled = _settings(_row("builder", kind="api_model", target="openai/gpt-5.6-sol",
+                             recommendation="Use for implementation."))
+    snapshot, _legacy = select_subagent_snapshot(enabled, subagent_id="builder")
+
+    switched_off = _settings({
+        **_row("builder", kind="api_model", target="openai/gpt-5.6-sol",
+               recommendation="Use for implementation."),
+        "enabled": False,
+    })
+    assert switched_off != enabled
+    assert validate_subagent_snapshot(snapshot) == snapshot
+    assert "enabled" not in snapshot
+
+
+def test_schedule_subagent_reaches_the_model_with_the_typed_disabled_refusal(
+    monkeypatch, tmp_path,
+):
+    """The delegation consumer, end to end: the model sees only the enabled row
+    in its catalog, and selecting the switched-off one comes back as a typed
+    refusal it can act on — never a substituted actor."""
+    from ouroboros.tools import control
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+    from ouroboros.subagent_runtime import model_visible_subagent_catalog
+
+    settings = _settings(
+        _row("builder", kind="api_model", target="openai/gpt-5.6-sol",
+             recommendation="Use for implementation."),
+        {**_row("paused", kind="api_model", target="openai/gpt-5.6-luna",
+                recommendation="Use for scouting."), "enabled": False},
+    )
+    monkeypatch.setattr(control, "load_settings", lambda: settings)
+    assert "paused" not in json.dumps(model_visible_subagent_catalog(settings))
+
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry.set_context(ToolContext(repo_dir=tmp_path, drive_root=tmp_path))
+    result = registry.execute("schedule_subagent", {
+        "subagent_id": "paused",
+        "objective": "Implement it",
+        "expected_output": "Patch",
+    })
+    assert "subagent_disabled" in result
+    assert "switched off" in result
+    assert "unknown_subagent_id" not in result
