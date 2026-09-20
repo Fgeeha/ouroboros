@@ -60,9 +60,8 @@ from ouroboros.gateways.claudexor import (
 )
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 from ouroboros.llm_substitution import (
-    SubstitutionBudget, substitution_fact, failed_account_preference, remember_failed_profile,
-    take_failed_account_preference,
-)
+    SubstitutionBudget, substitution_fact, failed_account_preference,
+    remember_failed_profile, take_failed_account_preference)
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
 from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait, prepared_call_scope
 from ouroboros.observability import persist_call
@@ -352,9 +351,10 @@ def _request(target: dict, messages: list, tools: list | None, parameters: dict)
     # the send it admits stay identical.
     failed_profile = (take_failed_account_preference if not parameters.get("prospective")
                       else failed_account_preference)(target, parameters)
-    if not pin:
-        # Carry the conversation's last account as a preference, not admission.
-        # The engine is still the only actor choosing an eligible account.
+    if not pin and not parameters.get("_no_account_preference"):
+        # Carry the conversation's last account as a preference, not admission;
+        # the engine still chooses. A round already answered by the wrong model
+        # carries none, so its ranking decides where every redo lands.
         for message in reversed(prepared):
             native = message.get("nativeContinuation") or {}
             route = native.get("route") or {}
@@ -832,13 +832,11 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 request, before = _accounted_request(invocation)
                 result = execute_physical_attempt(request, invocation.receive, extractor=invocation.extract_usage, before_dispatch=before)
                 invocation.capture = last_physical_attempt_capture()
-                if substitution.admit(invocation, target, invocation.payload, prepared or parameters, result):
-                    # Rebuild the same round so the account preference this
-                    # request carried is re-derived without the substituting
-                    # account; the engine alone picks where the redo lands.
-                    retry_preparation = None
-                    substitution.stop_preferring(target, prepared or parameters)
-                    payload = _request(target, payload["messages"], payload["tools"], prepared or parameters)
+                if substitution.admit(invocation, result):
+                    # The same round, asked again naming no account, on this
+                    # call's every later request: the engine alone picks.
+                    retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
+                    payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
                     continue
                 adopt_turn_state((prepared or parameters).get("model_turn_state"),
                                  invocation.payload, result)
@@ -959,14 +957,11 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                 result = await execute_physical_attempt_async(
                     request, receive, extractor=invocation.extract_usage, before_dispatch=prepare)
                 invocation.capture = last_physical_attempt_capture()
-                if await invocation.offload(substitution.admit, invocation, target,
-                                            invocation.payload, prepared or parameters, result):
-                    # Rebuild the same round so the account preference this
-                    # request carried is re-derived without the substituting
-                    # account; the engine alone picks where the redo lands.
-                    retry_preparation = None
-                    substitution.stop_preferring(target, prepared or parameters)
-                    payload = _request(target, payload["messages"], payload["tools"], prepared or parameters)
+                if await invocation.offload(substitution.admit, invocation, result):
+                    # The same round, asked again naming no account, on this
+                    # call's every later request: the engine alone picks.
+                    retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
+                    payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
                     continue
                 adopt_turn_state((prepared or parameters).get("model_turn_state"),
                                  invocation.payload, result)

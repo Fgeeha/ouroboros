@@ -192,3 +192,27 @@ def test_host_notice_split_never_inherits_the_answer_placement(tmp_path, monkeyp
     assert "type" not in host_row, "the host notice keeps its untyped replay role"
     assert "card_row" not in host_row and "card_row_id" not in host_row
     assert host_row["delegation_role"] == "subagent", "its lineage still rides along"
+
+
+def test_telegram_holds_a_child_row_only_while_its_root_is_unfinished(tmp_path):
+    """The bot has no cards: a child's card row waits for its root, a root's does not.
+
+    Both directions matter. The hold must fire for a child under a live root and
+    stay quiet for the root's own placed row, which is an ordinary progress note
+    there and follows the owner's progress toggle.
+    """
+    from tests.test_telegram_health_tasks import _api_with_data, _load_plugin
+    from ouroboros.task_results import task_result_path
+
+    held = _load_plugin()._child_row_held_for_root
+    api, data = _api_with_data(tmp_path)
+    child = {"delegation_role": "subagent", "root_task_id": "root-one", "card_row": "timeline"}
+    assert held(api, child), "an unreadable root counts as unfinished"
+    assert held(api, {**child, "card_row": "", "system_type": "terminal_incident"})
+    path = task_result_path(data, "root-one")
+    path.write_text(json.dumps({"status": "running"}), encoding="utf-8")
+    assert held(api, child)
+    path.write_text(json.dumps({"status": "completed"}), encoding="utf-8")
+    assert not held(api, child)
+    assert not held(api, {"card_row": "timeline", "is_progress": True}), "a root's own row is never held"
+    assert not held(api, {**child, "card_row": ""}), "an ordinary child message is not a card row"

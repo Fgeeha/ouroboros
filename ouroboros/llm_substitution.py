@@ -1,11 +1,12 @@
-"""Which account should NOT answer the next request of a route, and why.
+"""Which account the next request of a route should NOT ask for, and why.
 
 Two facts share this leaf because they answer one question. A per-subject
 refusal (auth, quota, an unusable credential) says the account that just failed
-should not be preferred again; a served-model mismatch says the account that
-just answered did so with the WRONG MODEL. Both are spent by the next matching
-dispatch, and neither ranks accounts: the engine remains the only chooser, and
-these facts only stop the transport from asking it for the same account again.
+should not be preferred again, and is spent by the next matching dispatch. A
+served-model mismatch says the account that just answered did so with the WRONG
+MODEL, and every redo of that call names no account at all. Neither ranks
+accounts: the engine remains the only chooser, and these facts only stop the
+transport from asking it for the same account again.
 
 ## Refusing a round that ANOTHER model answered
 
@@ -18,11 +19,12 @@ that account for a while; this leaf owns what the caller does with the fact.
 The answer is never the round. It stays retained and acknowledged like any
 other answer, because the horizon a round nearly ran under is evidence, but it
 adopts no turn state, runs no tool call, and is replaced by a NEW operation
-that drops the substituting account's preference. Two cases are refused
-outright instead: a pin names ONE account, and an already admitted candidate is
-bound to exact bytes a redo would change. When no redo is left, the typed
-`model_substituted` refusal reaches the caller, whose configured fallback chain
-owns what happens next.
+that names no account, so the engine's own ranking decides where every redo
+lands. Some rounds are refused outright instead: a pin names ONE account, an
+already admitted candidate is bound to exact bytes a redo would change, and a
+caller with no time or no send left cannot pay for another ask. When no redo is
+left, the typed `model_substituted` refusal reaches the caller, whose
+configured fallback chain owns what happens next.
 
 The budget is its own counter, never the transport's no-start preparation
 loop: a repair fixes a request that was never sent, while a redo spends a
@@ -61,16 +63,6 @@ def take_failed_account_preference(target: dict, parameters: dict) -> str:
     if profile:
         _FAILED_PROFILE.set(())
     return profile
-
-
-def suppress_account_preference(target: dict, parameters: dict, profile: str) -> None:
-    """Keep the next request of this ROUTE from preferring ``profile`` again.
-
-    Route identity is the requested source and model, so a helper that carries
-    no cache affinity suppresses its preference exactly like a task round does.
-    """
-    _FAILED_PROFILE.set((parameters.get("cache_affinity"), target["source"],
-                         target["resolved_model"], profile))
 
 
 def remember_failed_profile(target: dict, parameters: dict, error: Any) -> None:
@@ -127,7 +119,7 @@ def _redo_allowed(payload: dict) -> str:
 
     A pin names ONE account, so re-asking it is the same account and the same
     answer; the caller's configured model fallback owns that case. An admitted
-    candidate is bound to exact bytes, and a redo drops the account preference,
+    candidate is bound to exact bytes, and a redo sends no account preference,
     so re-asking would break that admission instead of honoring it.
     """
     from ouroboros.llm_attempt import physical_attempt_headroom
@@ -160,9 +152,8 @@ def _discard(invocation: Any, fact: dict, result: dict,
     The bytes stay retained and acknowledged exactly as an accepted answer's
     would be, because a discarded answer is still evidence of what the horizon
     was. What it does NOT do is become the round: no turn state is adopted from
-    it, no tool call runs, and the caller drops this account's preference before
-    building the next request, so the engine's selection is free to land
-    elsewhere.
+    it, no tool call runs, and the caller builds the next request with no
+    account preference, so the engine's selection is free to land elsewhere.
     """
     route = result.get("route") or {}
     usage = result.get("usage") or {}
@@ -195,16 +186,6 @@ class SubstitutionBudget:
         self.redos = config.get_model_substitution_redos()
         self.used = 0
         self.discarded: list[dict] = []
-        # The account this call must stop preferring, applied by the CALLER: a
-        # context variable set on an offloaded thread never reaches the loop
-        # that builds the next request.
-        self.avoid = ""
-
-    def stop_preferring(self, target: dict, parameters: dict) -> None:
-        """Apply the pending suppression HERE, where the next request is built."""
-        if self.avoid:
-            suppress_account_preference(target, parameters, self.avoid)
-            self.avoid = ""
 
     def disclose(self, answer: tuple[dict, dict]) -> tuple[dict, dict]:
         """Carry the discarded generations into the accepted answer's usage row.
@@ -217,8 +198,7 @@ class SubstitutionBudget:
             usage["claudexor"]["substituted"] = copy.deepcopy(self.discarded)
         return message, usage
 
-    def admit(self, invocation: Any, target: dict, payload: dict,
-              parameters: dict, result: dict) -> bool:
+    def admit(self, invocation: Any, result: dict) -> bool:
         """True once this substituted generation is discarded and the round re-asked.
 
         False leaves an ordinary answer untouched; a round that may not be
@@ -228,11 +208,11 @@ class SubstitutionBudget:
         fact = substitution_fact(result)
         if fact is None:
             return False
-        reason = _redo_allowed(payload) or (
+        reason = _redo_allowed(invocation.payload) or (
             "" if self.used < self.redos else "redos_exhausted")
         self.used += 1
-        self.avoid = str((result.get("route") or {}).get("credentialProfileId") or "")
-        self.discarded.append({**fact, "account": self.avoid, "disposition": reason or "redo"})
+        account = str((result.get("route") or {}).get("credentialProfileId") or "")
+        self.discarded.append({**fact, "account": account, "disposition": reason or "redo"})
         custody = _discard(invocation, fact, result, reason or "redo", self.used, self.redos)
         self.discarded[-1]["result_custody"] = custody
         if reason:

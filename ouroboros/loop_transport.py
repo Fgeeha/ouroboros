@@ -849,11 +849,11 @@ def emit_model_effort_mismatch(
     )
 
 
-# What the host KNOWS it did. It stops preferring that account and asks again;
-# which account answers the redo is the engine's choice, so no wording here may
-# claim the round moved (architecture: rotation is possible, not guaranteed).
+# What the host KNOWS it did. It asks again and names no account; which account
+# answers the redo is the engine's choice, so no wording here may claim the
+# round moved (architecture: rotation is possible, not guaranteed).
 _SUBSTITUTION_DISPOSITIONS = {
-    "redo": "the answer was not accepted and the round was asked again without preferring that account",
+    "redo": "the answer was not accepted and the round was asked again without naming an account",
     "redos_exhausted": "the answer was not accepted and no further attempt was available",
     "pinned_account": "the account is pinned, so the round was not asked again",
     "admitted_candidate": "this send was already admitted, so the round was not asked again",

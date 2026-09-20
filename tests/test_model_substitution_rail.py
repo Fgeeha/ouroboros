@@ -166,6 +166,95 @@ def test_a_redo_uses_a_send_the_caller_can_still_spare(setup):
     assert message["content"] == "Ответ 🐍" and len(gateway.creates) == 2
 
 
+def test_every_redo_of_one_call_carries_no_account_preference(setup, monkeypatch):
+    """Not just the first redo: a single remembered profile let the second ask
+    for the account that had already substituted."""
+    root, gateway, client = setup
+    monkeypatch.setattr(transport.config, "get_model_substitution_redos", lambda: 2)
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "earlier",
+         "nativeContinuation": {"route": dict(ROUTE), "format": "codex.responses.v1",
+                                "payload": [{"type": "reasoning"}]}},
+        {"role": "user", "content": "second"},
+    ]
+    gateway.results = [substituted(), substituted(), result(route=OTHER_ACCOUNT)]
+    gateway.dispatch = ["response_received"] * 3
+    client.chat(history, MODEL, None, "high")
+    accounts = [payload["account"] for payload, _ in gateway.uploads]
+    assert accounts == [{"mode": "auto", "preferredProfileId": "account-a"},
+                        {"mode": "auto"}, {"mode": "auto"}]
+
+
+def test_a_redo_that_changes_account_spends_the_one_continuation_repair_and_recovers(setup, monkeypatch):
+    """The real engine refuses a redo it routed to another account before sending it.
+
+    The history's continuations are bound to the account that substituted, so the
+    engine answers the redo with a no-start `invalid_continuation` naming the new
+    account. That is the transport's ordinary one-shot repair, not a second
+    substitution: it must neither spend a redo nor bring the old preference back,
+    and the loop bound must still leave room for the redo after it.
+    """
+    root, gateway, client = setup
+    monkeypatch.setattr(transport.config, "get_model_substitution_redos", lambda: 2)
+    third = {**ROUTE, "credentialProfileId": "account-c", "accountFingerprint": "fingerprint-c"}
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "earlier",
+         "nativeContinuation": {"route": dict(ROUTE), "format": "codex.responses.v1",
+                                "payload": [{"type": "reasoning"}]}},
+        {"role": "user", "content": "second"},
+    ]
+    refused = result(outcome="failed", route=OTHER_ACCOUNT,
+                     problem={"code": "invalid_continuation", "message": "different account"})
+    gateway.results = [substituted(), refused, substituted(OTHER_ACCOUNT), result(route=third)]
+    gateway.dispatch = ["response_received", "not_started", "response_received", "response_received"]
+    message, usage = client.chat(history, MODEL, None, "high")
+    assert message["content"] == "Ответ 🐍" and len(gateway.creates) == 4
+    sent = [payload for payload, _ in gateway.uploads]
+    assert [payload["account"] for payload in sent] == [
+        {"mode": "auto", "preferredProfileId": "account-a"}, {"mode": "auto"}, {"mode": "auto"}, {"mode": "auto"}]
+    # The repair dropped the old account's continuation and kept the words.
+    assert "nativeContinuation" in sent[1]["messages"][1]
+    assert all("nativeContinuation" not in row for row in sent[2]["messages"] + sent[3]["messages"])
+    assert sent[3]["messages"][1]["content"] == "earlier"
+    assert [row["disposition"] for row in usage["claudexor"]["substituted"]] == ["redo", "redo"]
+    assert [row["account"] for row in usage["claudexor"]["substituted"]] == ["account-a", "account-b"]
+    assert len(events(root, "native_continuation_reset")) == 1
+    assert len(events(root, "model_served_mismatch")) == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_a_repair_after_a_redo_never_brings_the_account_preference_back(setup, monkeypatch, asynchronous):
+    """A no-start repair rebuilds the request from the caller's parameters.
+
+    Without the redo's decision carried on those parameters, the rebuilt request
+    would read the history again and prefer the account that had just answered
+    with the wrong model, and the engine honours a preference before its ranking.
+    """
+    from tests.test_processing_claudexor import receipt, refusal
+
+    root, gateway, client = setup
+    monkeypatch.setenv("OUROBOROS_PROCESSING_PREFERENCE", "")
+    monkeypatch.setenv("OUROBOROS_MODEL_PROCESSING_PREFERENCES", "{}")
+    monkeypatch.setattr(transport, "model_sources", lambda **kwargs: {
+        "sources": [{"id": "codex", "processingPreferences": ["standard", "fast", "economy"]}]})
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "earlier",
+         "nativeContinuation": {"route": dict(ROUTE), "format": "codex.responses.v1",
+                                "payload": [{"type": "reasoning"}]}},
+        {"role": "user", "content": "second"},
+    ]
+    gateway.results = [substituted(), refusal("fast", "unsupported"), {**result(), "processing": receipt()}]
+    gateway.dispatch = ["response_received"] * 3
+    kwargs = dict(messages=history, model=MODEL, processing_preference="fast")
+    asyncio.run(client.chat_async(**kwargs)) if asynchronous else client.chat(**kwargs)
+    accounts = [payload["account"] for payload, _ in gateway.uploads]
+    assert accounts == [{"mode": "auto", "preferredProfileId": "account-a"}, {"mode": "auto"}, {"mode": "auto"}]
+    assert gateway.uploads[2][0]["options"]["processingPreference"] == "standard"
+
+
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_the_account_preference_is_dropped_on_both_transports(setup, asynchronous):
     root, gateway, client = setup
@@ -374,7 +463,7 @@ def test_the_owner_row_names_what_happened_once_per_task_and_model():
     assert "cheaper-model answered instead of the requested exact-model" in text
     assert "Claudexor account account-a" in text
     # The host stops preferring an account; it never claims the round moved.
-    assert "asked again without preferring that account" in text
+    assert "asked again without naming an account" in text
     assert "another account" not in text
     assert meta == {"card_row": "timeline", "card_row_id": "task-one:model_substitution:exact-model"}
 
