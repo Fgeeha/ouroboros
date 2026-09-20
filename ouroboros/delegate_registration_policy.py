@@ -90,7 +90,7 @@ STARTED_STR_FIELDS: Tuple[Tuple[str, str], ...] = tuple(
         "task_id", "route_id", "model", "profile_id", "project_id", "root_task_id",
         "parent_task_id", "category", "source", *REVIEW_ATTRIBUTION_KEYS,
         "ledger_root", "idempotency_key", "invocation_id",
-        "snapshot_id", "execution_root", "baseline_sha", "target_root",
+        "snapshot_id", "execution_root", "execution_binding_fingerprint", "baseline_sha", "target_root",
         "authority_source", "access", "mode", "isolation",
         "selected_subagent_id", "config_fingerprint", "work_order_fingerprint",
         "work_order_coverage", "authority_fingerprint",
@@ -109,7 +109,7 @@ STARTED_PROGRESS_FLAGS: Tuple[str, ...] = (
 # may be minted by a context that no longer knows the original binding; the
 # first recorded fact is authoritative and is never erased or retargeted.
 STARTED_FIRST_WINS_FACTS: Tuple[str, ...] = (
-    "snapshot_id", "execution_root", "baseline_sha", "target_root",
+    "snapshot_id", "execution_root", "execution_binding_fingerprint", "baseline_sha", "target_root",
     "authority_source", "resource_ref", "selected_subagent_id",
     "config_fingerprint", "work_order_fingerprint", "work_order_coverage",
     "authority_fingerprint", "work_order_source_request", "category", "source",

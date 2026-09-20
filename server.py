@@ -150,6 +150,7 @@ RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 _planned_delegate_restart_transaction_id = ""
 _LAUNCHER_MANAGED = str(os.environ.get("OUROBOROS_MANAGED_BY_LAUNCHER", "") or "").strip() == "1"
+_LAUNCHER_MANAGED_REPO_DIR = str(os.environ.get("OUROBOROS_MANAGED_REPO_DIR", "") or "").strip()
 
 # Captured in main() for Settings LAN-reachability metadata.
 _BIND_HOST = DEFAULT_HOST
@@ -168,6 +169,15 @@ def _has_active_evolution_transaction() -> bool:
         tx = raw.get("active_transaction")
         return isinstance(tx, dict) and not str(tx.get("commit_sha") or "").strip()
     except Exception:
+        return False
+
+
+def _launcher_managed_repo_matches() -> bool:
+    if not _LAUNCHER_MANAGED: return False
+    if not _LAUNCHER_MANAGED_REPO_DIR: return (REPO_DIR / ".git" / "ouroboros-managed.json").is_file()
+    try:
+        return pathlib.Path(_LAUNCHER_MANAGED_REPO_DIR).resolve(strict=False) == REPO_DIR.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
         return False
 
 
@@ -521,7 +531,7 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
     git_ops_module.ensure_repo_present()
     setup_remote_if_configured(settings, log)
 
-    if _LAUNCHER_MANAGED:
+    if _launcher_managed_repo_matches():
         # An in-flight managed-update assisted merge intentionally leaves MERGE_HEAD + the partly
         # resolved merge in the live worktree (over pre_update_sha). Use the NON-destructive
         # rescue_and_block policy so the bootstrap restart does not reset/clean that merge state
@@ -551,6 +561,9 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
             except Exception:
                 log.debug("Failed to pause evolution after blocked bootstrap", exc_info=True)
         return ok, msg
+
+    if _LAUNCHER_MANAGED:
+        log.warning("Managed marker lacks matching repository identity; skipping destructive bootstrap for %s.", REPO_DIR)
 
     log.info("Local-dev server start detected — skipping bootstrap git reset.")
     deps_ok, deps_msg = git_ops_module.sync_runtime_dependencies(reason="bootstrap_local_dev")

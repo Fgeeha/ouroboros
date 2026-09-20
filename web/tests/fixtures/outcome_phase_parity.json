@@ -2,6 +2,15 @@
   "purpose": "One status-word family across the browser and the host. Every case is a terminal-or-not task record read by log_events.js (taskDoneIsTerminal + taskTerminalPhase + taskPresentation) and by ouroboros.project_dialogue (outcome_phase + OUTCOME_PHASE_HEADLINE + _completion_verdict). Every typed cause with an owner sentence carries a case here, so the two TASK_CAUSE_PHRASES twins cannot drift apart unnoticed. A new axis, reason or acceptance status is added to both sides in the same commit, with a row here.",
   "cases": [
     {
+      "name": "unrecovered model handover shows a readable warning",
+      "record": {
+        "status": "completed", "reason_code": "authoring_handover_incomplete",
+        "outcome_axes": {"execution": {"status": "degraded"}, "objective": {"status": "not_evaluated"}}
+      },
+      "phase": "warn", "headline": "Done with warnings",
+      "acceptance_clause": "The replacement model stopped before resuming tool work."
+    },
+    {
       "name": "definite pre-branch publication failure stays Failed beside degraded review",
       "record": {
         "status": "completed",

@@ -219,6 +219,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── subagent_bootstrap.py ← Host pre-start of the exact snapshotted leaf BEFORE the first metered round, through the same wrapper as `delegate_start(prompt="")`; the host never waits (`configured_session_started`); only a definite typed refusal ends unrun at $0 — everything ambiguous wakes the model (§6 Delegated subagents)
       ├── delegate_supervision.py ← Event-only sleeping-nanny loop: quiet windows renew without a model call; a meaningful event (or one reasoned checkpoint) triggers a durable wake with read-only coordination context (`time.state = "not_set"` rather than a latched anchor) (§6 Delegated subagents; `usage_attempts.lock` recovery: Platform substrate below)
       ├── delegate_start_instructions.py ← Stable host start instructions + a complete separately-hashed coordination appendix; host pre-start sends no appendix
+      ├── delegate_target_drift.py ← Read-only authority-tree drift evidence for delegated capture; records changed paths without attributing them to the child or blocking a normal no-change disposition (§6 Delegated subagents)
       ├── delegate_recovery.py ← Narrow exact-leaf recovery for proven crash + planned self-restart; vetoes every no-resume cause
       ├── delegate_registration_policy.py ← `persistent_registration` + the STARTED-row field tables
       ├── delegate_pending.py  ← Durable pending-invocation replay preserving the original idempotency key + canonical start body
@@ -671,4 +672,3 @@ Bundled resources use the CLI / Headless Boundary lookup order rather than assum
 The generated `docs/inventories/DATA_LAYOUT_INVENTORY.md` probes every entry of this tree: its last literal path segment must be a tracked repo path or directory, or a literal in the runtime sources. A durable file renamed in code while its row here survives therefore turns red, not silent — but this is a basename-and-substring check and proves nothing stronger about an entry.
 
 ---
-

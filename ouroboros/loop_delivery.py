@@ -73,9 +73,11 @@ class DeliveryCandidate:
 # required tool call. Gates closable by a reconsidered answer arm normally.
 _SKILL_ACTION_HOLD_CONTROL = "skill_action_or_revision_required"
 _CHILD_ABSORPTION_HOLD_CONTROL = "child_absorption_or_revision_required"
+_AUTHORING_HANDOVER_HOLD_CONTROL = "authoring_handover_recovery_required"
 _DELIVERY_HOLD_CONTROLS = frozenset({
     _SKILL_ACTION_HOLD_CONTROL,
     _CHILD_ABSORPTION_HOLD_CONTROL,
+    _AUTHORING_HANDOVER_HOLD_CONTROL,
 })
 # Header of the host's own rendered control block; identifies the transcript's
 # control history the way ``acceptance_observation`` marks the observation rows.
@@ -1121,6 +1123,8 @@ def _no_tool_final_answer(
     skill_finalization_was_injected = bool(
         getattr(tools._ctx, "_skill_finalization_injected", False)
     )
+    handover = getattr(tools._ctx, "_authoring_handover", None)
+    handover_was_prompted = bool(handover and handover.get("recovery_prompted"))
     if _loop()._maybe_inject_finalization_nudges(
         tools, limit_ctx.drive_root, limit_ctx.task_id, llm_trace, content, messages, emit_progress,
     ):
@@ -1134,6 +1138,11 @@ def _no_tool_final_answer(
         # allowed reconsidered answer; a typed keep cannot close it.
         if skill_finalization_injected_now:
             _hold_delivery_for_skill_action(tools, llm_trace)
+        elif handover and not handover_was_prompted and handover.get("recovery_prompted"):
+            _hold_delivery_for_skill_action(
+                tools, llm_trace,
+                control=_AUTHORING_HANDOVER_HOLD_CONTROL,
+            )
         else:
             _loop()._arm_delivery_control(tools, limit_ctx, llm_trace)
         return None

@@ -128,6 +128,7 @@ REASON_TASK_EXCEPTION = "task_exception"
 REASON_DEEP_SELF_REVIEW_UNAVAILABLE = "deep_self_review_unavailable"
 REASON_DEEP_SELF_REVIEW_ERROR = "deep_self_review_error"
 REASON_TOOL_FAILURE = "tool_failure"
+REASON_AUTHORING_HANDOVER_INCOMPLETE = "authoring_handover_incomplete"
 REASON_DELIVERY_CONTROL_DEGRADED = "delivery_control_degraded"
 REASON_CHILD_RESULTS_DEFERRED = "child_results_deferred"
 REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE = "review_skipped_deadline_reserve"
@@ -1092,6 +1093,13 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         execution_status = EXECUTION_FAILED
         reason_code = usage_reason or REASON_EMPTY_FINAL_TEXT
         failure = {"kind": "agent", "reason_code": reason_code}
+    elif (
+        (usage_status == EXECUTION_DEGRADED and usage_reason == REASON_AUTHORING_HANDOVER_INCOMPLETE)
+        or bool(llm_trace.get("authoring_handover_incomplete"))
+    ):
+        execution_status = EXECUTION_DEGRADED
+        reason_code = usage_reason or REASON_AUTHORING_HANDOVER_INCOMPLETE
+        failure = {"kind": "authoring_handover", "reason_code": reason_code}
     elif not text.strip() and usage.get("presence_completion_outcome") not in {"silent", "tool_delivered"}:
         execution_status = EXECUTION_FAILED
         reason_code = REASON_EMPTY_FINAL_TEXT

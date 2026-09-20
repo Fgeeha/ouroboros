@@ -211,7 +211,8 @@ def record_started_custody(
     selected_subagent_id: str,
     config_fingerprint: str, work_order_fingerprint: str, work_order_coverage: str,
     work_order_source_request: Dict[str, Any], authority_fingerprint: str,
-    snapshot_id: str, target_root: str, baseline_sha: str, authority_source: str,
+    snapshot_id: str, execution_binding_fingerprint: str, target_root: str,
+    baseline_sha: str, authority_source: str,
     resource_ref: Dict[str, Any], capture_mode: str, processing: Mapping[str, Any] | None = None,
 ) -> bool:
     """Write the one STARTED custody row, including the source binding."""
@@ -245,6 +246,7 @@ def record_started_custody(
         snapshot_id=snapshot_id,
         execution_root=(root if snapshot_id or (resource_ref.get("workspace_kind") == "directory"
                                                and resource_ref.get("strategy") == "direct") else ""),
+        execution_binding_fingerprint=execution_binding_fingerprint,
         baseline_sha=baseline_sha,
         target_root=target_root,
         authority_source=authority_source,
