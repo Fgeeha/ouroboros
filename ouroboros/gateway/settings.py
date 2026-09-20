@@ -1206,16 +1206,18 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
         subagents_key = "OUROBOROS_SUBAGENTS"
         if subagents_key in body and body.get(subagents_key) not in (None, ""):
             from ouroboros.configured_subagents import (
-                normalize_configured_subagents, validate_unique_engines,
+                normalize_configured_subagents, roster_save_error,
             )
             try:
-                subagents, canonical_subagents = normalize_configured_subagents(
+                _subagents, canonical_subagents = normalize_configured_subagents(
                     body.get(subagents_key)
                 )
-                # Effective facts of THIS save: a row may inherit the processing it carries.
-                validate_unique_engines(subagents, {**load_settings(), **body})
             except ValueError as exc:
                 return unsaved_error(str(exc), 400)
+            # Twins are refused only when THIS save changes the roster.
+            twin_error = roster_save_error(canonical_subagents, load_settings(), body)
+            if twin_error:
+                return unsaved_error(twin_error, 400)
             body = dict(body)
             body[subagents_key] = canonical_subagents
         # Reviewer-slot SSOT (6.1): 400 on malformed; save-time disclosure returned;

@@ -339,6 +339,30 @@ def validate_unique_engines(config: ConfiguredSubagents, settings: Mapping[str, 
         seen[key] = index
 
 
+def roster_save_error(raw: Any, stored_settings: Mapping[str, Any], body: Mapping[str, Any]) -> str:
+    """The one SAVE-path judge of engine uniqueness; ``""`` means acceptable.
+
+    Judged only when THIS save changes the roster: every Settings save re-posts
+    the roster, so twins stored before the rule must never block an unrelated
+    save. A posted roster whose canonical form equals the stored one is accepted
+    as it was; any roster edit is judged whole, under the facts this save leaves.
+    """
+    if raw in (None, ""):
+        return ""
+    try:
+        config = parse_configured_subagents(raw)
+        try:
+            stored = serialize_configured_subagents(
+                parse_configured_subagents(stored_settings.get(SUBAGENTS_SETTING)))
+        except ValueError:
+            stored = ""  # nothing valid is stored: this save authors the roster
+        if serialize_configured_subagents(config) != stored:
+            validate_unique_engines(config, {**stored_settings, **body})
+    except ValueError as exc:
+        return str(exc)
+    return ""
+
+
 def _materialized_source(
     settings: Mapping[str, Any], config: ConfiguredSubagents,
 ) -> str:
@@ -676,6 +700,7 @@ __all__ = [
     "resolve_configured_subagents",
     "resolve_settings_subagent_candidate",
     "roster_handles",
+    "roster_save_error",
     "serialize_configured_subagents",
     "subagent_handle",
     "validate_unique_engines",

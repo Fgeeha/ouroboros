@@ -1016,6 +1016,26 @@ test('Duplicate is born a judged draft that names its twin until one engine fiel
     editor.destroy();
 });
 
+test('twins saved earlier are hinted, never Save-blocking, until the roster is edited', () => {
+    const dom = accessEditorDom();
+    const editor = createAvailableSubagentsEditor({ doc: dom.doc, win: null });
+    editor.load(setting([apiRow({ subagent_id: 'one' }), apiRow({ subagent_id: 'two' }), sessionRow()]));
+    // Untouched: an unrelated Settings save must go through, so nothing blocks...
+    assert.deepEqual(editor.validate(), []);
+    editor.noteSaveAttempt();
+    assert.deepEqual(editor.validate(), []);
+    // ...but the later twin says what it is, in a neutral tone.
+    assert.match(dom.row(1).meta.textContent, /^Runs the same engine as Subagent 1 — change one of them/);
+    assert.equal(dom.row(1).meta.dataset.tone, undefined);
+    assert.doesNotMatch(dom.row(0).meta.textContent, /same engine/);
+    // Any roster edit - here another row's words - makes the save judge the whole roster.
+    dom.row(2).querySelector('[data-subagent-field="recommended_use"]').emit('input', 'New words.');
+    assert.deepEqual(editor.validate(), ['Subagent 2 runs the same engine as Subagent 1 — change its model, effort, access, account or processing, or remove it.']);
+    editor.noteSaveAttempt();
+    assert.equal(dom.row(1).meta.dataset.tone, 'error');
+    editor.destroy();
+});
+
 test('engine uniqueness is a SAVE rule: a roster saved with twins still loads, and empty drafts are not twins', () => {
     const twins = setting([apiRow({ subagent_id: 'one' }), apiRow({ subagent_id: 'two', recommended_use: 'x' })]);
     const parsed = parseAvailableSubagentsSetting(twins);

@@ -225,14 +225,14 @@ def test_the_model_catalog_is_facts_only_and_keyed_by_handle():
         assert stored_or_dropped not in text
 
 
-def _post_settings(monkeypatch, body):
+def _post_settings(monkeypatch, body, stored=None):
     import asyncio
 
     from starlette.requests import Request
 
     import ouroboros.gateway.settings as gws
 
-    saved = {}
+    saved = dict(stored or {})
 
     def _fake_load():
         from ouroboros.config import SETTINGS_DEFAULTS
@@ -281,6 +281,54 @@ def test_every_save_path_refuses_identical_engines_and_accepts_a_near_duplicate(
     assert refused.status_code == 400 and b"same engine" in refused.body
 
 
+TWINS = {"enabled": True, "items": [_api("one", effort="low"), _api("two", effort="low")]}
+
+
+def test_stored_twins_never_block_an_unrelated_save_but_any_roster_edit_is_judged(monkeypatch):
+    """Every Settings save re-posts the roster, so an install that saved twins
+    before the rule must still save its other settings; the refusal applies only
+    when the save CHANGES the roster - keeping the twin, or making a new one."""
+    from ouroboros.configured_subagents import serialize_configured_subagents
+
+    stored = {"OUROBOROS_SUBAGENTS": serialize_configured_subagents(_config(*TWINS["items"]))}
+    # (1) untouched roster + an unrelated key: accepted, in the dict AND the canonical string form.
+    for same in (TWINS, stored["OUROBOROS_SUBAGENTS"]):
+        accepted, saved = _post_settings(
+            monkeypatch, {"OUROBOROS_SUBAGENTS": same, "OUROBOROS_REVIEW_MAX_CYCLES": "3"}, stored)
+        assert accepted.status_code == 200, accepted.body[:300]
+        assert saved["OUROBOROS_REVIEW_MAX_CYCLES"] == "3"
+    # (2) a roster edit that KEEPS the twin (another row's words) or ADDS a row beside it: refused.
+    reworded = {"enabled": True, "items": [{**TWINS["items"][0], "recommended_use": "new words"}, TWINS["items"][1]]}
+    grown = {"enabled": True, "items": [*TWINS["items"], _api("three", target="moonshotai/kimi-k3")]}
+    for edited in (reworded, grown):
+        refused, saved = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": edited}, stored)
+        assert refused.status_code == 400 and b"same engine" in refused.body
+        assert saved == stored
+    # ...and an edit that tells the twins apart is an ordinary save.
+    fixed = {"enabled": True, "items": [TWINS["items"][0], {**TWINS["items"][1], "effort": "high"}]}
+    accepted, _ = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": fixed}, stored)
+    assert accepted.status_code == 200, accepted.body[:300]
+    # (3) the same twins on an install that stores none are a FRESH twin: refused.
+    refused, _ = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": TWINS})
+    assert refused.status_code == 400 and b"same engine" in refused.body
+
+
+def test_onboarding_tolerates_stored_twins_it_leaves_untouched_and_judges_an_edit(onboarding):
+    from ouroboros.configured_subagents import serialize_configured_subagents
+
+    onboarding.settings_path.write_text(json.dumps({
+        "OUROBOROS_SUBAGENTS": serialize_configured_subagents(_config(*TWINS["items"])),
+        "OUROBOROS_MODEL": "openai/gpt-5.6-luna", "OPENROUTER_API_KEY": "sk-or-v1-abcdefghijklmnop",
+    }), encoding="utf-8")
+    grown = {"enabled": True, "items": [*TWINS["items"], _api("three", target="moonshotai/kimi-k3")]}
+    for path in ("/api/onboarding/subagents/preview", "/api/onboarding/complete"):
+        untouched = onboarding.client.post(path, json={**WIZARD_PAYLOAD, "OUROBOROS_SUBAGENTS": TWINS})
+        assert untouched.status_code == 200, untouched.text
+        edited = onboarding.client.post(path, json={**WIZARD_PAYLOAD, "OUROBOROS_SUBAGENTS": grown})
+        assert edited.status_code == 400 and "same engine" in edited.json()["error"], edited.text
+    assert len(json.loads(onboarding.saved()["OUROBOROS_SUBAGENTS"])["items"]) == 2
+
+
 def test_onboarding_preview_and_completion_refuse_identical_engines(onboarding):
     """Both wizard endpoints write or preview the owner's roster through one
     draft seam; neither may admit twins, and a near-duplicate completes."""
@@ -290,7 +338,6 @@ def test_onboarding_preview_and_completion_refuse_identical_engines(onboarding):
         response = onboarding.client.post(
             path, json={**WIZARD_PAYLOAD, "subscriptionsConnected": True, "OUROBOROS_SUBAGENTS": twins})
         assert response.status_code == 400, response.text
-        assert response.json()["code"] == "invalid_available_subagents"
         assert "same engine" in response.json()["error"]
     assert onboarding.calls["snapshot"] == 0 and not onboarding.settings_path.exists()
 

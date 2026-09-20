@@ -161,8 +161,8 @@ export function parseAvailableSubagentsSetting(value) {
 
 // One row's owner-facing errors, named the way the card is ("Subagent N"); the
 // list validator and the per-row display read this one source. `ids` accumulates
-// in list order so a repeated stable ID blames the later row. `rows` and their
-// inherited processing ride on SAVE paths only: a roster saved earlier still loads.
+// in list order so a repeated stable ID blames the later row. `rows` (with their inherited
+// processing) ride only on the save of an EDITED roster: twins saved earlier load and re-save.
 function rowErrors(row, index, ids, rows = null, inherited = '') {
     const errors = [];
     const id = String(row?.subagent_id || '').trim();
@@ -464,7 +464,7 @@ export function createAvailableSubagentsEditor({
                 || 'Available subagents draft is still loading. Retry the preview before finishing.'];
         }
         if (state.parseError) return [state.parseError];
-        return validateAvailableSubagentsSetting(state.setting, { uniqueEngines: true, processingPreference: state.processingPreference });
+        return validateAvailableSubagentsSetting(state.setting, { uniqueEngines: state.dirty, processingPreference: state.processingPreference });
     }
 
     // Patch verdicts and inherited intent in place, preserving the caret.
@@ -477,7 +477,7 @@ export function createAvailableSubagentsEditor({
             : (state.saveAttempted ? listLevelErrors(state.setting) : []);
         const ids = new Set();
         state.setting.items.forEach((row, index) => {
-            const rowErrs = state.loaded ? rowErrors(row, index, ids, state.setting.items, state.processingPreference) : [];
+            const rowErrs = state.loaded ? rowErrors(row, index, ids, state.dirty ? state.setting.items : null, state.processingPreference) : [];
             const judged = Boolean(row._uiAttempted) && rowErrs.length > 0;
             if (judged && !structural) shown.push(...rowErrs);
             const el = container.querySelector(`[data-subagent-row="${row._uiKey || row.subagent_id}"]`);

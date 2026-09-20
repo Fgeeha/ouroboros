@@ -106,3 +106,26 @@ def test_duplicate_is_a_draft_whose_card_names_its_twin_until_the_engine_changes
         '[data-slot-id="scope_1"] [data-slot-route] optgroup[label="Available subagents"] option'
     ).all_text_contents()
     assert labels == ["codex=gpt-test-0 — Notes 0", "codex=gpt-test-0/low — Notes 0"]
+
+
+def test_twins_saved_earlier_are_hinted_and_never_block_an_unrelated_save(role_ui):
+    ui = role_ui
+    rows = _configure(ui, 1)
+    rows.append({**rows[0], "subagent_id": "fast-scout_copy_legacy"})
+    page = roles.open_agents(ui)
+    twin = page.locator("[data-subagent-row]").nth(1)
+    meta = twin.locator("[data-subagent-meta]")
+    assert "Runs the same engine as Subagent 1" in meta.text_content()
+    assert meta.get_attribute("data-tone") is None and twin.get_attribute("data-invalid") is None
+    roles.capture(page, "roster-handles-legacy-twin-hint")
+    with page.expect_response("**/api/settings"):
+        page.locator("#btn-save-settings").click()
+    saved = [body for path, body in ui["posts"] if path == "/api/settings"][-1]["OUROBOROS_SUBAGENTS"]["items"]
+    assert [row["subagent_id"] for row in saved] == ["fast-scout", "fast-scout_copy_legacy"]
+    # Editing the roster is what makes the twin a Save-blocking error.
+    page.locator("[data-subagent-row]").first.locator('[data-subagent-field="recommended_use"]').fill("New words")
+    posts = len(ui["posts"])
+    page.locator("#btn-save-settings").click()
+    assert "Subagent 2 runs the same engine as Subagent 1" in page.locator("#settings-status").text_content()
+    assert twin.get_attribute("data-invalid") is not None and len(ui["posts"]) == posts
+
