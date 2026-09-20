@@ -1,6 +1,6 @@
 # Module Size & Complexity
 
-This chapter owns the size discipline — the deterministic line, function and byte gates, their debt manifest, and paydown by simplifying where the change lives rather than by extracting a passthrough — and the invariants that keep a growing system readable: projection over replay for hot readers, the source-complete decision pipeline, continuation authority, UI disposers, and embedded-surface geometry and refresh. Every rule here bounds reading cost and names its enforcing surface or discloses that it has none.
+This chapter owns deterministic line/function/byte gates, their debt manifest, and paydown by simplifying in place rather than extracting passthroughs. Its readability invariants cover hot-reader projections, the source-complete decision pipeline, continuation authority, UI disposers, and embedded-surface geometry/refresh. Each rule bounds reading cost and names its enforcement or absence.
 
 P7 makes context fit a maintenance constraint, not a line-count aesthetic.
 
@@ -277,14 +277,16 @@ is the ordinary-reply category rather than a finished task. Lineage comes from
 the delegation facts frames carry, because the terminal frame has none — a child
 must not reach the owner's banner.
 
-Classification and delivery are pure over a frame and preferences, testable
-without DOM/socket. Client-local preferences carry no `s-` field, enter neither
-the settings-dirty tracker nor `/api/settings`, and cause no discard prompt
-(`tests/test_notifications_static.py`). Delivery degrades with visible surface
-status. At delivery, feature-detect the optional desktop bridge per call: its
-result is capability evidence, not a delivery claim. It may raise the existing
-window and play one system sound; no scheduler, persistence or background
-process. Importance adds no host field, text heuristic or second model call.
+Classification and delivery gating are pure over one frame and stored preferences,
+testable without a DOM or socket. Client-local preferences have no `s-` field,
+are excluded from the settings-dirty tracker, never reach `/api/settings` or
+prompt to discard unsaved settings (`tests/test_notifications_static.py` asserts
+these causes, not just effects). Delivery degrades instead of disappearing;
+the status line identifies this client's surface. Feature-detect the optional
+desktop bridge per call at delivery: its result is capability evidence, not a
+banner/delivery claim. It may raise the existing window and request one system
+sound; no scheduler, persistence or background process. Importance adds no host
+field, text heuristic or second model call.
 
 ### Invariant: UI resources carry a disposer
 
