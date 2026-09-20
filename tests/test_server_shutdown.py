@@ -662,6 +662,11 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     for name in (
         "_resume_interrupted_project_deletions", "_startup_prune_sweeps", "_startup_custody_sweep",
         "_startup_worktree_prune", "_prune_delegated_snapshots", "_periodic_supervisor_maintenance",
+        # Its own owner notice is another startup side effect, asserted by
+        # tests/test_retired_settings_chat_notice.py; here it would be a
+        # crash alert (this harness's send_with_budget double records every
+        # send, and the boot/crash assertions below own that list).
+        "_startup_retired_settings_notice",
     ):
         monkeypatch.setattr(server, name, noop)
     monkeypatch.setattr(server, "_start_supervisor_liveness_watchdog",
@@ -670,7 +675,7 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     monkeypatch.setattr(server, "_check_pending_restart_drain", lambda _ctx: True)
     monkeypatch.setattr(bus_mod, "init", noop)
     monkeypatch.setattr(bus_mod, "LocalChatBridge", _Bridge)
-    monkeypatch.setattr(bus_mod, "send_with_budget", lambda chat_id, text: rec.alerts.append((chat_id, text)))
+    monkeypatch.setattr(bus_mod, "send_with_budget", lambda chat_id, text, **kw: rec.alerts.append((chat_id, text)))
     monkeypatch.setattr("ouroboros.utils.set_log_sink", noop)
     monkeypatch.setattr(events_mod, "make_server_log_sink", lambda *_a, **_k: None)
     monkeypatch.setattr(events_mod, "dispatch_event", noop)

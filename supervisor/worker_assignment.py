@@ -286,7 +286,7 @@ def assign_tasks() -> None:
                         int(st["owner_chat_id"]),
                         "🚫 Model budget reached. Queued tasks are paused before dispatch; "
                         "raising the limit does not resume them automatically.",
-                    )
+                        role="system", system_type="budget_notice")
                 queue.persist_queue_snapshot(reason="budget_paused_before_dispatch")
             if not any(task.get("_owner_wait_resume") for task in _pool().PENDING):
                 return
@@ -308,7 +308,7 @@ def assign_tasks() -> None:
                 except Exception:
                     log.debug("Failed to cancel light-mode evolution task %s", tid, exc_info=True)
             if st.get("owner_chat_id"):
-                _pool().send_with_budget(int(st["owner_chat_id"]), evo_block)
+                _pool().send_with_budget(int(st["owner_chat_id"]), evo_block, role="system", system_type="evolution_notice")
             queue.persist_queue_snapshot(reason="evolution_blocked_light")
 
         from ouroboros.project_lease import candidate_is_leasable, running_project_ids
@@ -397,5 +397,5 @@ def assign_tasks() -> None:
                         _pool().send_with_budget(
                             int(st["owner_chat_id"]),
                             f"{emoji} {task_type.capitalize()} task {task['id']} started.",
-                        )
+                            role="system", system_type="task_started")
                 queue.persist_queue_snapshot(reason="assign_task")

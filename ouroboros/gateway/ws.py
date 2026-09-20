@@ -396,7 +396,7 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                 except Exception:
                     await websocket.send_text(json.dumps({
                         "type": "chat",
-                        "role": "assistant",
+                        "role": "system", "system_type": "initialization_notice",
                         "content": "⚠️ System is still initializing. Please wait a moment and try again.",
                         "ts": utc_now_iso(),
                     }))

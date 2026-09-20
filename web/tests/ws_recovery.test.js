@@ -83,6 +83,7 @@ async function teardown(ws) {
     ws._clearUiRecoveryTimer();
     ws._clearReconnectTimer();
     ws._clearWatchdogTimer();
+    ws._clearPostOpenRetryTimer();
     ws.ws = null;
 }
 
@@ -201,6 +202,89 @@ test('a non-OK state response after open never reloads', async () => {
         ws._lastSha = 'abc';
         ws._refreshStateAfterOpen(true);
         await settle();
+        assert.equal(env.replaced.length, 0);
+    } finally {
+        await teardown(ws);
+    }
+});
+
+// A non-answer is no "keep": the comparison a reconnect owes is repeated until the
+// server answers or the socket is gone. Delay 0 chains the retries for the test.
+test('a non-answer after open is retried until the server answers; a changed SHA then reloads once', async () => {
+    const env = installEnv([{ ok: false, body: {} }, { reject: true }, { body: { sha: 'def' } }]);
+    const ws = new WS('ws://unused');
+    try {
+        ws._lastSha = 'abc';
+        ws._refreshStateAfterOpen(true, 0);
+        await waitFor(() => env.replaced.length === 1, 'reload after the third read');
+        assert.match(env.replaced[0], /_ouro_reason=sha-change/);
+        assert.equal(env.fetchCalls(), 3, 'a 500, then a failed request, then the answer');
+        await settle(6);
+        assert.equal(env.fetchCalls(), 3, 'the answer ends the retries');
+        assert.equal(env.replaced.length, 1);
+    } finally {
+        await teardown(ws);
+    }
+});
+
+test('a retried post-open read that finds the same SHA keeps the page and stops', async () => {
+    const env = installEnv([{ ok: false, body: {} }, { body: { sha: 'abc' } }]);
+    const ws = new WS('ws://unused');
+    try {
+        ws._lastSha = 'abc';
+        ws._refreshStateAfterOpen(true, 0);
+        await waitFor(() => env.fetchCalls() === 2, 'second read');
+        await settle(6);
+        assert.equal(env.fetchCalls(), 2);
+        assert.equal(env.replaced.length, 0);
+        assert.equal(ws._postOpenRetryTimer, null);
+    } finally {
+        await teardown(ws);
+    }
+});
+
+test('a first-open non-answer is retried and stores the baseline without reloading', async () => {
+    const env = installEnv([{ ok: false, body: {} }, { body: { sha: 'abc' } }]);
+    const ws = new WS('ws://unused');
+    try {
+        ws._refreshStateAfterOpen(false, 0);
+        await waitFor(() => ws._lastSha === 'abc', 'baseline stored by the retry');
+        assert.equal(env.replaced.length, 0);
+    } finally {
+        await teardown(ws);
+    }
+});
+
+test('post-open retries belong to their socket: a cycled connection ends them', async () => {
+    const env = installEnv([{ ok: false, body: {} }]);
+    const ws = new WS('ws://unused');
+    try {
+        ws._lastSha = 'abc';
+        ws.ws = { readyState: FakeSocket.OPEN };
+        ws._refreshStateAfterOpen(true, 0);
+        await waitFor(() => env.fetchCalls() >= 3, 'retries chain while the socket lives');
+        ws.ws = { readyState: FakeSocket.OPEN };
+        await settle(6);
+        const calls = env.fetchCalls();
+        await settle(6);
+        assert.equal(env.fetchCalls(), calls, 'the old socket no longer reads');
+        assert.equal(env.replaced.length, 0);
+    } finally {
+        await teardown(ws);
+    }
+});
+
+test('a disconnect clears the pending post-open retry', async () => {
+    const env = installEnv([{ ok: false, body: {} }]);
+    const ws = new WS('ws://unused');
+    try {
+        ws.connect();
+        const socket = FakeSocket.instances[0];
+        socket.readyState = FakeSocket.OPEN;
+        socket.onopen();
+        await waitFor(() => ws._postOpenRetryTimer !== null, 'retry armed after the 500');
+        socket.onclose();
+        assert.equal(ws._postOpenRetryTimer, null);
         assert.equal(env.replaced.length, 0);
     } finally {
         await teardown(ws);
