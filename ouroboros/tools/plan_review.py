@@ -67,6 +67,7 @@ from ouroboros.tools.plan_review_runtime import (
     plan_wave_replay_decision as _plan_wave_replay_decision,
     plan_wave_has_in_flight as _plan_wave_has_in_flight,
     plan_no_dispatch_line as _plan_no_dispatch_line,
+    plan_wave_line_has_news as _plan_wave_line_has_news,
     plan_wave_progress_line as _plan_wave_progress_line,
     effective_plan_slots as _effective_plan_slots,
     root_exploration_log as _root_exploration_log,  # noqa: F401 - compatibility seam
@@ -776,12 +777,11 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             f"${admission.get('remaining_usd')} ({fence}). No reviewer was called. Shrink the evidence, "
             f"split the plan, or {remedy}.",
             "review_budget_unavailable")
-    ctx.emit_progress_fn(  # a $0 collection dispatches nothing, so it never reads as a running panel
-        "📐 plan_task: collecting reviewer answers (no new panel)…" if collect is not None or resume_in_flight else
-        f"📐 plan_task: cycle {cycle_index}{'' if cap is None else f'/{cap}'} — running "
-        f"{len(callable_slots)} of {len(slots)} reviewer slot(s)"
-        + (f", {len(health_skip_rows)} health-skipped at $0" if health_skip_rows else "")
-        + f" ({enforcement}; constitutional={constitutional})…"
+    ctx.emit_progress_fn(  # a $0 collection dispatches nothing, so it never reads as a plan being sent
+        "📐 Plan review: checking for reviewer answers…" if collect is not None or resume_in_flight else
+        f"📐 Plan review: sending the plan to {len(callable_slots)} reviewer{'' if len(callable_slots) == 1 else 's'} "
+        f"(cycle {cycle_index}{'' if cap is None else f'/{cap}'}, {enforcement}{', constitutional' if constitutional else ''})"
+        + (f"; {len(health_skip_rows)} lane{'' if len(health_skip_rows) == 1 else 's'} skipped at $0" if health_skip_rows else "") + "…"
     )
     rows = await _run_plan_review_slots(
         ctx, callable_slots, system_prompt=system_prompt, user_content=user_content,
@@ -860,8 +860,9 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             getattr(ctx, "event_queue", None), state_root, surface="plan_review",
             task_id=task_id, cycles_paid=paid_now, cap=cap, enforcement=enforcement,
             fingerprint=fingerprint)
-    ctx.emit_progress_fn(_plan_wave_progress_line(
-        aggregate, agg["counts"], cycles_paid=paid_now, cap=cap, wave=wave))
+    if collect is not None or resume_in_flight or _plan_wave_line_has_news(wave):  # a fresh dispatch prints news only
+        ctx.emit_progress_fn(_plan_wave_progress_line(
+            aggregate, agg["counts"], cycles_paid=paid_now, cap=cap, wave=wave))
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=paid_now, enforcement=enforcement, reminder=reminder)
 
 def _last_paid_wave(state: dict) -> Optional[dict]:
@@ -937,7 +938,7 @@ def _cycles_exhausted(
         cycles_paid=cycles_paid, cap=cap, enforcement=enforcement, fingerprint=fingerprint,
     )
     ctx.emit_progress_fn(
-        f"📐 plan_task: PLAN_REVIEW_CYCLES_EXHAUSTED — {cycles_paid}/{cap} paid cycles spent ({enforcement})."
+        f"📐 Plan review: PLAN_REVIEW_CYCLES_EXHAUSTED — {cycles_paid}/{cap} paid cycles spent ({enforcement})."
     )
     head = (
         f"⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED: {cycles_paid} of {cap} paid plan-review cycles are spent "
@@ -1162,7 +1163,7 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
             ctx, "TOOL_ERROR", "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(exc))
     _emit_plan_review_reference(ctx, task_id, state_root=root)
     ctx.emit_progress_fn(
-        f"📐 plan_task: disposition recorded — {'closed' if closure['closed'] else 'still open'} "
+        f"📐 Plan review: disposition recorded — {'closed' if closure['closed'] else 'still open'} "
         f"({len(closure['open_ids'])} open finding id(s); no reviewer call, no cycle)."
     )
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=cycles_paid,

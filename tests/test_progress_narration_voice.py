@@ -58,7 +58,7 @@ def test_the_tool_context_abi_stays_a_host_voice():
     note keeps the default without the ABI having to know the fact exists."""
     agent, events = _agent()
     ctx = SimpleNamespace(emit_progress_fn=partial(OuroborosAgent._emit_progress, agent))
-    ctx.emit_progress_fn("📐 plan_task: wave 1 dispatched")
+    ctx.emit_progress_fn("📐 Plan review: wave 1 dispatched")
     assert events.get_nowait()["progress_meta"]["narration"] is False
 
 

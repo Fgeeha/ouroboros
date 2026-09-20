@@ -319,7 +319,7 @@ def test_in_flight_panels_count_toward_the_cycle_cap_at_dispatch(harness, monkey
         state = _state(harness)
         assert state["cycles_paid"] == 0  # committed, not yet proven paid: nothing is written as spent
         assert state["current_attempt"]["fingerprint"] == first_fp  # the in-flight wave stays current
-        assert not any(line.startswith("📐 plan_task: PLAN_REVIEW_CYCLES_EXHAUSTED") for line in harness.progress)
+        assert not any(line.startswith("📐 Plan review: PLAN_REVIEW_CYCLES_EXHAUSTED") for line in harness.progress)
     finally:
         executor.release.set()
     assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)

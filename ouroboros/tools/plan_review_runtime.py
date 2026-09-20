@@ -756,50 +756,56 @@ def plan_wave_progress_line(
     aggregate: str, counts: Dict[str, Any], *, cycles_paid: int, cap: Any,
     wave: Optional[Dict[str, Any]] = None,
 ) -> str:
-    """The wave's final owner-visible progress line (pure; ``plan_review.py``
-    sits at its size pin, so the formatting lives here). The slot census is read
-    FIRST: while any slot has no collected answer the line states that gap — how
-    many answered, who really failed (typed reasons), which raw custody states are
-    unresolved — and never a verdict, a finding count or the DEGRADED placeholder
-    that only keeps the stored wave open. Only a fully collected wave states its
-    aggregate. Honest DEGRADED: zero-count tails must never read as a clean
-    result, so the parseable/configured ratio and the distrust are named inline,
-    with the failed slots' typed reasons (deduplicated, bounded); every other
-    aggregate renders byte-identically to the plain form."""
-    paid = f"cycles paid {cycles_paid}{'' if cap is None else f'/{cap}'}"
+    """The wave's owner-visible state line (pure; ``plan_review.py`` sits at its
+    size pin, so the formatting lives here). Every owner progress line of this
+    organ opens with ``📐 Plan review``, so one task card reads as one family. The
+    slot census is read FIRST: while any slot has no collected answer the line is
+    one plain sentence about that gap — how many answered, who really failed
+    (typed reasons), which raw custody states are unresolved — and never a verdict,
+    a finding count, a paid-cycle or declared-effort tail, or the DEGRADED
+    placeholder that only keeps the stored wave open. Only a fully collected wave
+    states its aggregate, and that verdict line carries the tails. Honest DEGRADED:
+    zero-count tails must never read as a clean result, so the
+    parseable/configured ratio and the distrust are named inline, with the failed
+    slots' typed reasons (deduplicated, bounded); every other aggregate renders
+    byte-identically to the plain form."""
     line = _plan_open_slots_line(wave)
     if line:
-        line = f"📐 plan_task: {line}; {paid}"
-    else:
-        verdict = (
-            f"DEGRADED ({counts['parseable']}/{counts['configured']} "
-            "parseable reviewers; counts are untrusted)"
-            if aggregate == "DEGRADED" else aggregate
-        )
-        line = (
-            f"📐 plan_task: {verdict} — {counts['blocking']} blocking / "
-            f"{counts['note']} note / {counts['need_evidence']} need_evidence; {paid}"
-        )
-        reasons = plan_slot_reasons(wave) if aggregate == "DEGRADED" else ""
-        if reasons:
-            line += f"; slot reasons: {reasons}"
-        if (wave or {}).get("custody_pending"):
-            line += "; late result pending (reviewer slots still in flight, not yet collected)"
+        return line
+    verdict = (
+        f"DEGRADED ({counts['parseable']}/{counts['configured']} "
+        "parseable reviewers; counts are untrusted)"
+        if aggregate == "DEGRADED" else aggregate
+    )
+    line = (
+        f"📐 Plan review: {verdict} — {counts['blocking']} blocking / "
+        f"{counts['note']} note / {counts['need_evidence']} need_evidence; "
+        f"cycles paid {cycles_paid}{'' if cap is None else f'/{cap}'}"
+    )
+    reasons = plan_slot_reasons(wave) if aggregate == "DEGRADED" else ""
+    if reasons:
+        line += f"; slot reasons: {reasons}"
+    if (wave or {}).get("custody_pending"):
+        line += "; late result pending (reviewer slots still in flight, not yet collected)"
     if (wave or {}).get("reviewer_effort"):
         line += f"; declared reviewer effort {wave['reviewer_effort']}"
     return line
 
 
 def _plan_open_slots_line(wave: Optional[Dict[str, Any]]) -> str:
-    """The owner words for a wave with uncollected answers, or ``''`` when every slot
-    is collected (the ONLY place these words live). A planned wait reads as waiting;
-    an unresolved custody state is named by its raw typed state and is never called
-    waiting; a typed $0 refusal is ``not dispatched``, never ``failed``."""
+    """The owner sentence for a wave with uncollected answers, or ``''`` when every
+    slot is collected (the ONLY place these words live). A roster of planned waits
+    alone reads as sent and not answered yet; a partly answered one reads ``so far``;
+    an unresolved custody state is named by its raw typed state and is never worded
+    as a wait (no ``so far``, no ``yet``); a typed $0 refusal is ``not dispatched``,
+    never ``failed``."""
     census = plan_wave_slot_census(wave)
     awaiting, unresolved, late = census["awaiting"], census["unresolved"], census["uncollected"]
     if not (awaiting or unresolved or late):
         return ""
     total, answered = census["configured"], len(census["answered"])
+    if len(awaiting) == total:
+        return f"📐 Plan review: sent to {total} reviewer{'' if total == 1 else 's'}, none has answered yet."
     # A settled slot may have settled as a failure: until collected it is named settled, never answered.
     tail = f", {len(late)} settled but not collected yet" if late else ""
     tail += (f", {len(census['failed'])} failed ({plan_slot_reasons(wave, failed_only=True)})"
@@ -807,16 +813,27 @@ def _plan_open_slots_line(wave: Optional[Dict[str, Any]]) -> str:
     tail += f", {len(census['skipped'])} not dispatched" if census["skipped"] else ""
     if unresolved:
         states = ", ".join(dict.fromkeys(str(row.get("operation_state") or "unknown") for row in unresolved))
-        tail += f", {len(awaiting)} awaited" if awaiting else ""
-        return f"{answered} of {total} reviewers answered{tail}; {len(unresolved)} unresolved ({states}) — no verdict"
-    lead = "waiting for reviewers — " if awaiting else ""
-    return f"{lead}{answered} of {total} {'' if awaiting else 'reviewers '}answered{tail}"
+        awaited = f", {len(awaiting)} awaited" if awaiting else ""
+        return (f"📐 Plan review: {answered} of {total} reviewers answered{awaited}{tail}; "
+                f"{len(unresolved)} unresolved ({states}) — no verdict.")
+    return f"📐 Plan review so far: {answered} of {total} reviewers answered{tail}."
+
+
+def plan_wave_line_has_news(wave: Optional[Dict[str, Any]]) -> bool:
+    """Whether the wave-state line tells a FRESH dispatch anything new (pure). The
+    dispatch line and the per-slot started rows already state a roster of planned
+    waits, so right after a dispatch that sentence is withheld; an answered, failed,
+    not dispatched, unresolved or uncollected row is news, and so is a roster the
+    census cannot read. Asked at a fresh dispatch only: every collection and every
+    fully collected wave prints its line."""
+    census = plan_wave_slot_census(wave)
+    return not census["awaiting"] or len(census["awaiting"]) != census["configured"]
 
 
 def plan_no_dispatch_line(wave: Dict[str, Any]) -> str:
     """The separate progress line for an attempt that dispatched no new reviewer
     cycle (every row a typed $0 refusal), naming the typed reasons."""
-    return f"📐 plan_task: no new reviewer cycle dispatched: {plan_slot_reasons(wave) or 'no typed reason recorded'}"
+    return f"📐 Plan review: no new reviewer cycle dispatched: {plan_slot_reasons(wave) or 'no typed reason recorded'}"
 
 
 # Root exploration log (plan F3/S8): the task's OWN tool calls before this call,

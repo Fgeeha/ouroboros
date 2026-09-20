@@ -28,16 +28,16 @@ test('the pointer label names the card and caps a status-line title to one line 
         titleEl: { textContent: title }, ...extra });
     assert.equal(projectWorkLabel(null), '');
     assert.equal(projectWorkLabel(card('Task activity', { finished: false })), 'Working · Task activity');
-    assert.equal(projectWorkLabel(card('plan_task: DEGRADED (0/3 parseable reviewers)',
+    assert.equal(projectWorkLabel(card('Plan review: DEGRADED (0/3 parseable reviewers)',
         { suggestedName: 'Swarm dynamics survey' })), 'Latest task · Swarm dynamics survey');
     assert.equal(projectWorkLabel(card('  multi\n line\t title  ')), 'Latest task · multi line title');
     assert.equal(projectWorkLabel(card('')), 'Latest task · Task');
-    const verdict = 'plan_task: DEGRADED (0/3 parseable reviewers; counts are untrusted) — 0 blocking / '
+    const verdict = 'Plan review: DEGRADED (0/3 parseable reviewers; counts are untrusted) — 0 blocking / '
         + '0 note / 0 need_evidence; cycles paid 1/3; slot reasons: '
         + 'Pending dispatch; the physical review operation is in flight (window 2700s); '.repeat(4);
     assert.ok(verdict.length > 300);
     const label = projectWorkLabel(card(verdict));
-    assert.ok(label.startsWith('Latest task · plan_task: DEGRADED'));
+    assert.ok(label.startsWith('Latest task · Plan review: DEGRADED'));
     assert.ok(label.endsWith('…'));
     assert.ok(label.length <= 'Latest task · '.length + POINTER_NAME_CHARS);
 });
