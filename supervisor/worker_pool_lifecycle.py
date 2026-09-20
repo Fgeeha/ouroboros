@@ -363,7 +363,7 @@ def _open_ready_slot(
         _pool().send_with_budget(
             owner_chat_id,
             f"⚠️ Worker SHA mismatch after spawn: expected {expected_sha[:8]}, got {(observed_sha or 'unknown')[:8]}",
-        )
+            role="system", system_type="worker_readiness_notice")
 
 
 def _release_booting_slot(
@@ -465,7 +465,7 @@ def _replace_unready_slot(wid: int, slot: Any, owner_chat_id: int, started: floa
             owner_chat_id,
             f"⚠️ Worker slot {wid} never confirmed ready in {attempt} attempts "
             f"(waited {time.time() - started:.0f}s on the last attempt); the slot is parked. Use /restart.",
-        )
+            role="system", system_type="worker_readiness_notice")
     _pool().disable_exhausted_worker_pool()
 
 

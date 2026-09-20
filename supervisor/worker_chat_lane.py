@@ -175,11 +175,11 @@ def _handle_chat_direct_locked(
     try:
         remaining = budget_remaining(load_state(), strict=True)
     except Exception:
-        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta)
+        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta, role="system", system_type="task_admission_notice")
         return
     if remaining <= 0:
         try:
-            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta)
+            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta, role="system", system_type="task_admission_notice")
         except Exception:
             pass
         return
@@ -353,7 +353,7 @@ def _admit_chat_task(
                     chat_id,
                     f"⚠️ Task not started: every attachment was rejected.\n{rendered}",
                     **_host_operation_failure(task_metadata),
-                )
+                    role="system", system_type="attachment_notice")
                 registry.unregister(task["id"])
                 return None
             from ouroboros.artifacts import attachment_manifest_projection
@@ -364,7 +364,7 @@ def _admit_chat_task(
                     chat_id,
                     "⚠️ Some declared attachments could not be staged; the task "
                     f"starts with the rest.\n{rendered}",
-                )
+                    role="system", system_type="attachment_notice")
             if manifest:
                 manifest = [dict(row) for row in manifest]
                 task["drive_root"] = str(_pool().DRIVE_ROOT)
@@ -525,7 +525,7 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
             err_msg,
             task_id=failed_task_id,
             progress_meta=progress_meta,
-        )
+            role="system", system_type="task_error")
     except Exception:
         log.debug("Suppressed exception", exc_info=True)
 

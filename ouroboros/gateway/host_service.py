@@ -1061,7 +1061,7 @@ def _operation_state(ctx: HostServiceContext, rows: list, inbound: Dict[str, Any
             return state
     for row in reversed(rows):
         terminal = str(row.get("task_terminal_status") or "")
-        if row.get("direction") == "out" and terminal in SETTLED_STATUSES and owns(row):
+        if row.get("direction") in {"out", "system"} and terminal in SETTLED_STATUSES and owns(row):
             state.update({"status": terminal, "text": str(row.get("text") or "")})
             return state
     accepted_session = str(inbound.get("session_id") or "")
