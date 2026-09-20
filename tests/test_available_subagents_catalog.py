@@ -35,10 +35,6 @@ def _settings(*rows: dict, enabled: bool = True) -> dict:
 
 
 def test_catalog_projects_every_saved_row_in_owner_order_verbatim():
-    from ouroboros.configured_subagents import (
-        configured_subagents_fingerprint,
-        parse_configured_subagents,
-    )
     from ouroboros.subagent_runtime import model_visible_subagent_catalog
 
     verbatim = "Use exact owner wording.\nKeep punctuation: a/b, quotes, and cost $0."
@@ -68,26 +64,25 @@ def test_catalog_projects_every_saved_row_in_owner_order_verbatim():
 
     catalog = model_visible_subagent_catalog(settings)
 
-    config = parse_configured_subagents(settings["OUROBOROS_SUBAGENTS"])
-    assert catalog["source"] == "configured"
-    assert catalog["config_fingerprint"] == configured_subagents_fingerprint(config)
+    # Facts only: selection prose lives in prompts/SYSTEM.md, and the list
+    # fingerprint and provenance stay host-side (snapshots carry them).
+    assert set(catalog) == {"rows"}
     assert [row["subagent_id"] for row in catalog["rows"]] == [
         "api-scout", "auto-session", "pinned-session",
     ]
     assert catalog["rows"][0]["recommended_use"] == verbatim
+    assert list(catalog["rows"][0])[-1] == "recommended_use"
     assert catalog["rows"][0]["route_class"] == "API model"
     assert catalog["rows"][0]["requested_model"] == "google/gemini-3.7-flash"
     assert catalog["rows"][0]["requested_effort"] == "low"
-    assert "session account selection does not apply" in catalog["rows"][0]["account_policy"]
     assert catalog["rows"][1]["route_class"] == "Agent session"
     assert catalog["rows"][1]["requested_target"] == "claude=claude-fable-5"
-    assert catalog["rows"][1]["account_policy"] == "automatic compatible account selection"
+    assert catalog["rows"][1]["mutating_access"] == "full"
     assert "credential_profile_id" not in catalog["rows"][1]
     assert catalog["rows"][2]["requested_effort"] == "(not explicitly set)"
-    assert catalog["rows"][2]["account_policy"] == "explicit profile pin"
     assert catalog["rows"][2]["credential_profile_id"] == "cursor-owner"
-    assert "does not rank or substitute" in catalog["selection_guidance"]
-    assert "typed refusal" in catalog["dispatch_contract"]
+    # An explicit pin is the only account fact; the policy boilerplate is gone.
+    assert not any("account_policy" in row for row in catalog["rows"])
 
 
 @pytest.mark.parametrize(

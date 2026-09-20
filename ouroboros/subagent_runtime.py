@@ -78,7 +78,12 @@ def effective_runtime_subagent_settings(settings: Mapping[str, Any]) -> dict[str
 
 
 def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any]:
-    """Project saved, dispatchable rows without probing or ranking them."""
+    """Project saved, dispatchable rows as facts, without probing or ranking them.
+
+    Facts only: how to choose among rows is the mind's own prose
+    (``prompts/SYSTEM.md`` §Delegation), never a host-authored sentence here;
+    the list fingerprint and provenance stay host-side in snapshots.
+    """
 
     resolution = resolve_configured_subagents(settings)
     config = resolution.config
@@ -93,46 +98,20 @@ def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any
     rows: list[dict[str, Any]] = []
     for row in config.items:
         session = row.route.is_session
-        # FACTS lead (owner decision 1=A/2=A): the neutral id and the derived
-        # route facts are the identity; recommended_use is the one semantic
-        # field and rides LAST as bounded owner intent, never as a title.
         projected: dict[str, Any] = {
             "subagent_id": row.subagent_id,
             "route_class": "Agent session" if session else "API model",
             "requested_effort": row.effort or "(not explicitly set)",
+            "requested_target" if session else "requested_model": row.route.target_id,
         }
         if session:
             projected["mutating_access"] = row.access
-            projected["requested_target"] = row.route.target_id
             if row.route.credential_profile_id:
-                projected["account_policy"] = "explicit profile pin"
                 projected["credential_profile_id"] = row.route.credential_profile_id
-            else:
-                projected["account_policy"] = "automatic compatible account selection"
-        else:
-            projected["requested_model"] = row.route.target_id
-            projected["account_policy"] = (
-                "API provider credentials (session account selection does not apply)"
-            )
+        # The owner's words, verbatim and last: bounded intent, never a title.
         projected["recommended_use"] = row.recommended_use
         rows.append(projected)
-
-    return {
-        "source": resolution.source,
-        "config_fingerprint": configured_subagents_fingerprint(config),
-        "rows": rows,
-        "selection_guidance": (
-            "Choose subagent_id from the owner descriptions and saved route intent. "
-            "Prefer suitable Agent session choices often when they fit, to reduce "
-            "incremental API spend; use API model choices when their described strengths "
-            "fit. The host does not rank or substitute rows."
-        ),
-        "dispatch_contract": (
-            "schedule_subagent attempts the exact selected row. If live dispatch finds it "
-            "unavailable, it returns a typed refusal; choose the next action or another "
-            "subagent_id."
-        ),
-    }
+    return {"rows": rows}
 
 
 def current_model_visible_subagent_catalog() -> dict[str, Any]:
