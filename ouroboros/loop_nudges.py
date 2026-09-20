@@ -649,6 +649,52 @@ def _maybe_inject_finalization_nudges(
         llm_trace["reasoning_notes"].append(note)
         return True
 
+    # A host-driven route change hands an already-active authoring turn to a
+    # new model.  The successor sees the canonical transcript, but without this
+    # typed reminder its first short status response can look like an ordinary
+    # final.  One recovery round is bounded by the existing loop/deadline/budget
+    # rails; a second tool-less response is retained with a degraded execution
+    # fact rather than silently painting a clean Done.
+    handover = (getattr(tools._ctx, "_authoring_handover", None)
+                or llm_trace.get("authoring_handover_incomplete"))
+    if isinstance(handover, dict):
+        baseline = int(handover.get("tool_calls_at_handover") or 0)
+        current = len(llm_trace.get("tool_calls") or [])
+        if current > baseline:
+            handover["status"] = "recovered"
+            incomplete = llm_trace.pop("authoring_handover_incomplete", None)
+            if isinstance(incomplete, dict):
+                incomplete["status"] = "recovered"
+            tools._ctx._authoring_handover = None
+            usage = getattr(tools._ctx, "_accumulated_usage", {})
+            if usage.get("reason_code") == "authoring_handover_incomplete":
+                usage.pop("execution_status", None)
+                usage.pop("reason_code", None)
+        elif baseline > 0 and content and str(content).strip():
+            if not bool(handover.get("recovery_prompted")):
+                handover["recovery_prompted"] = True
+                from_model = str(handover.get("from_model") or "the previous model")
+                to_model = str(handover.get("to_model") or "the current model")
+                return _inject(
+                    f"A host-driven model handover occurred ({from_model} → {to_model}) "
+                    "after the previous model had already used tools. Continue the owner's "
+                    "open task from the preserved plan and tool results. Use tools for the "
+                    "next substantive step or state a concrete blocker; do not stop at a "
+                    "work-in-progress status update.",
+                    "Authoring handover recovery nudge injected before final response.",
+                )
+            tools._ctx._authoring_handover = None
+            handover["status"] = "incomplete"
+            handover["incomplete_observed"] = True
+            usage = getattr(tools._ctx, "_accumulated_usage", None)
+            if isinstance(usage, dict):
+                usage["execution_status"] = "degraded"
+                usage["reason_code"] = "authoring_handover_incomplete"
+            llm_trace["authoring_handover_incomplete"] = handover
+            # Existing one-shot readiness/verification nudges and acceptance
+            # can still continue the task. Later tool work heals only this
+            # warning; the history row retains the handover and its recovery.
+
     if (getattr(tools._ctx, "_nanny_route_dispatched", False)
             and not getattr(tools._ctx, "_nanny_finalization_injected", False)):
         # Nanny postcondition (owner 2026-08-07): a harness-dispatched child must
