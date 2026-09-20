@@ -61,11 +61,11 @@ Disturb or platform limit is bypassed. Policy and its disclosed limits: DESIGN
 
 Independent iframe documents do not inherit the host's tokens or stored choice.
 The optional author UI kit supplies styles/primitives, not a hot-theme protocol;
-there is no forced remount. Desktop `webview.start(private_mode=False)` requests
-Module intent is declared inside `render.appearance`: `host` opts into the
-resolved bridge, `independent` leaves palette choice to the author, and `fixed`
-names an intentionally stable visual world. The field is advisory.
-persistent website storage in `launcher.py` and `launcher_onboarding.py`, including
+there is no forced remount. Module intent is declared in `render.appearance`:
+`host` follows the resolved bridge, `independent` leaves palette choice to the
+author, and `fixed` names a stable visual world; the field is advisory. Desktop
+`webview.start(private_mode=False)` requests persistent website storage in
+`launcher.py` and `launcher_onboarding.py`, including
 cookies, not just appearance. Existing packaged launchers must be rebuilt and
 installed to change that flag. Profile identity, origin and platform storage
 still govern retention: source tests do not certify a cold-launch result. When
@@ -233,11 +233,11 @@ Declarative widgets support forms and actions, status/data/text/code/markdown, t
 
 #### Module widget bridge
 
-A module widget receives one parent-mediated I/O bridge on a per-mount nonce — the frame's only scriptable network path, since `connect-src` is closed — which keeps route I/O without giving reviewed skill JavaScript the SPA's cookies, DOM or broad API authority. `fetch` is relayed only to the owning extension prefix; `onEvent`, downloads and external links reuse existing owners. The source endpoint serves only the live reviewed registration; the nonce also carries bounded faults and frame-height facts. An opted-in module may subscribe to the resolved theme through `OuroborosWidget.onTheme`; delivery is nonce/source-bound and disposal releases it. The parent injects no palette or theme-setting authority.
+A module widget receives one parent-mediated I/O bridge on a per-mount nonce — the frame's only scriptable network path, since `connect-src` is closed — which keeps useful route I/O without giving reviewed skill JavaScript the SPA's cookies, DOM or broad API authority. `OuroborosWidget.fetch` is relayed only to the owning `/api/extensions/<skill>/...` prefix, with same-origin credentials, redirect refusal and author `signal`/`timeoutMs` control; the source load and declarative requests retain their 25-second bound. Namespaced WS events arrive through `onEvent`; downloads use the common save owners; external links use `openExternalViaHostBridge`, and a null `noopener` handle is not failure. The module endpoint serves only live reviewed registration text and its opaque-origin response uses `Access-Control-Allow-Origin: *`. The nonce carries bounded script/CSP faults into the card status while the frame stays mounted, plus content-height and ceiling facts. An opted-in module may subscribe to the resolved theme through `OuroborosWidget.onTheme`; delivery is nonce/source-bound and disposal releases it. The parent injects no palette or theme-setting authority.
 
 #### Author UI kit
 
-Optional author controls reuse the SAME installed CSS and pure field/status source, not a second declarative renderer. `read_author_kit_assets()` reads fixed `ui.css`/`ui_primitives.js` and creates no endpoint, cache or state; the two recipes live under `docs/examples/author_ui_kit/`. Authors may override or omit the kit; modules may opt into `onTheme` and style `data-theme`, while route frames remain independent. No body reset, forced remount or automatic palette injection; retained frames keep their copy. Tests: `tests/test_author_ui_kit.py`, `tests/test_author_ui_kit_browser.py`.
+Optional author controls reuse the SAME installed CSS and pure field/status source, not a second declarative renderer. `ouroboros.server_web.read_author_kit_assets()` reads fixed `ui.css` and `ui_primitives.js` through the serving-root resolver and creates no endpoint, cache or state; the two recipes live under `docs/examples/author_ui_kit/`, with module fetches through their own route and route frames under their own CSP. Authors may override or omit the kit; modules may opt into `onTheme` and style `data-theme`, while route frames remain independent. No body reset, forced remount or automatic palette injection; retained frames keep their copy, and failed kit loads stay inside the author application. Tests: `tests/test_author_ui_kit.py`, `tests/test_author_ui_kit_browser.py`.
 
 #### Out-of-process extension responses
 
