@@ -770,6 +770,7 @@ TASK_CAUSE_PHRASES = {
     "invalid_delivery_control_after_repair": "The delivery control object was still malformed after repair",
     "budget_exhausted": "The task ran out of budget before it could finish cleanly",
     "delivery_control_degraded": "Delivery finished in a degraded control state",
+    "authoring_handover_incomplete": "The replacement model stopped before resuming tool work.",
     "delegated_custody_unreconciled": "Some delegated work was never reconciled.",
 }
 

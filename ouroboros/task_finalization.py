@@ -240,6 +240,9 @@ def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("terminal_provider_notice", "terminal_host_notice"):
         if isinstance(usage.get(key), str) and usage[key]:
             fields[key] = usage[key]
+    handovers = usage.get("authoring_handovers")
+    if isinstance(handovers, list) and handovers:
+        fields["authoring_handovers"] = handovers
     return fields
 
 
