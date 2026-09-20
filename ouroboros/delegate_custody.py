@@ -171,6 +171,7 @@ class RunCustody:
     # where to diff, startup GC tells live snapshots from disposable ones.
     snapshot_id: str = ""
     execution_root: str = ""
+    execution_binding_fingerprint: str = ""
     baseline_sha: str = ""
     target_root: str = ""
     authority_source: str = ""
@@ -760,6 +761,7 @@ def invocation_record(drive_root: Any, invocation_id: str, *,
                 # target the original attempt bound — never a re-derivation.
                 "snapshot_id": str(row.get("snapshot_id") or ""),
                 "execution_root": str(row.get("execution_root") or ""),
+                "execution_binding_fingerprint": str(row.get("execution_binding_fingerprint") or ""),
                 "baseline_sha": str(row.get("baseline_sha") or ""),
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
