@@ -953,6 +953,7 @@ ui_tab:
     kind: module
     entry: widget.js
     start: manual                   # auto | manual | retain — see "Launch policy" below
+    appearance: host                # host | independent | fixed (author intent)
 ```
 
 The manifest declaration is checked during preflight and review; it does not
@@ -1039,6 +1040,18 @@ are the one exception — "What the frame may do" below). The bridge exposes:
   `api.send_ws_message(type, data)` — `type` is the short name you passed; the
   host strips its own namespace prefix. The first listener subscribes the frame,
   the last unsubscribe stops delivery, and other skills' events never reach it.
+
+- **`OuroborosWidget.onTheme(callback)`** is an optional resolved-palette
+  subscription for module widgets. The callback receives `light` or `dark`
+  through the nonce-bound parent bridge and returns an unsubscribe function.
+  The module applies the value itself, commonly with
+  `document.documentElement.dataset.theme = theme`; the host never injects CSS,
+  changes the child DOM or forces a remount. The first callback receives the
+  resolved value embedded in the frame's initial document, later changes arrive
+  on `ouro:theme-changed`, and disposal releases the parent subscription. Route
+  iframes have no bridge. A module declaration may record
+  `render.appearance: host | independent | fixed` for author/reviewer intent;
+  the declaration does not gate legacy modules or prove that the source repaints.
 
 - **`OuroborosWidget.download(name, source)`** saves an existing `Blob`, a
   `data:` URL, or a URL under this skill's extension route prefix. It resolves

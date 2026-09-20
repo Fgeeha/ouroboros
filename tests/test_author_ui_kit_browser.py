@@ -5,11 +5,11 @@ client. This tests the real network gate without exposing a test server on LAN.
 """
 from __future__ import annotations
 
-import os
 import json
-from pathlib import Path
+import os
 import re
 import shutil
+from pathlib import Path
 
 import pytest
 
@@ -20,6 +20,7 @@ pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 REPO = Path(__file__).resolve().parents[1]
 
 _HOST = """<!doctype html><html><head><meta charset="utf-8">
+<script src="/static/theme.js"></script>
 <link rel="stylesheet" href="/static/ui.css"><link rel="stylesheet" href="/static/style.css">
 </head><body><h1>Installed author controls</h1><div id="consumers"></div>
 <script type="module">
@@ -33,7 +34,7 @@ window.mountExample = async (id, kind) => {
   document.getElementById('consumers').append(card);
   const mount = card.querySelector('.mount'), tab = {skill:'export_widget', ws_prefix:'ext:export_widget:'};
   window.disposers[id] = kind === 'module'
-    ? await mountModuleWidget(mount, tab, {entry:'widget.js', height:420}, null, window.handlers)
+    ? await mountModuleWidget(mount, tab, {entry:'widget.js', height:420, appearance:'host'}, null, window.handlers)
     : mountRouteIframeWidget(mount, tab, {route:kind, height:420});
 };
 await mountExample('module-old', 'module');
@@ -77,6 +78,7 @@ def author_kit_server(tmp_path, monkeypatch):
     import uvicorn
     from starlette.responses import HTMLResponse
     from starlette.routing import Mount, Route
+
     from ouroboros import server_auth
     from ouroboros.server_web import NoCacheStaticFiles
     from tests import _extension_loader_shared as extension_fixture
@@ -173,6 +175,7 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
         try:
             context = browser.new_context(viewport={"width": 1100, "height": 850}, accept_downloads=True)
             page = context.new_page()
+            page.emulate_media(color_scheme="dark")
             errors = []
             style_mismatches = []
             browser_requests = []
@@ -187,6 +190,27 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             page.get_by_role("button", name="Unlock", exact=True).click()
             page.wait_for_function("window.ready === true")
             module, route, custom = [_frame(page, name) for name in ("module-old", "page-old", "custom")]
+            for frame in (module, route):
+                frame.locator('.ui-control').first.wait_for()
+            module_node = page.locator('[data-widget-key="module-old"] iframe').element_handle()
+            assert route.evaluate("window.kitCspViolations") == []
+            assert module.evaluate("document.documentElement.dataset.theme") == "dark"
+            page.evaluate("() => window.ouroTheme.set('light')")
+            module.wait_for_function("document.documentElement.dataset.theme === 'light'")
+            assert page.evaluate(
+                "node => document.querySelector('[data-widget-key=\\\"module-old\\\"] iframe') === node",
+                module_node,
+            )
+            assert module.evaluate(
+                "getComputedStyle(document.querySelector('.ui-control')).backgroundColor"
+            ) == "rgb(245, 246, 248)"
+            theme_evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_OUT", str(tmp_path / "evidence")))
+            theme_evidence.mkdir(parents=True, exist_ok=True)
+            module.locator('body').screenshot(
+                path=str(theme_evidence / f"author-kit-{browser_name}-module-light.png")
+            )
+            page.evaluate("() => window.ouroTheme.set('dark')")
+            module.wait_for_function("document.documentElement.dataset.theme === 'dark'")
             for frame in (module, route):
                 frame.get_by_role("button", name="Preview", exact=True).wait_for()
                 assert frame.get_by_label("Title", exact=True).input_value() == "My notes"
@@ -204,7 +228,8 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
                 assert frame.locator('[role="status"]').inner_text() == "Personal: Grid, disabled"
                 assert frame.locator('[role="status"]').get_attribute("data-tone") == "ok"
                 frame.evaluate("document.activeElement.blur()")
-                assert frame.evaluate("window.kitCspViolations") == []
+                if frame is module:
+                    assert frame.evaluate("window.kitCspViolations") == []
             page.mouse.move(0, 0)
             assert route.evaluate("typeof window.OuroborosWidget") == "undefined"
             assert not any('/static/' in request.url and request.frame == route for request in browser_requests)

@@ -5,7 +5,7 @@ import { bridgeChunkBuffer, moduleBridgeScript, moduleResizeScript } from '../mo
 
 // Runs the child bootstrap against a fake `window`; `deliver` plays a
 // parent → child message, `posted` records child → parent messages.
-function bridgeHarness({ active = false, activationApi = true } = {}) {
+function bridgeHarness({ active = false, activationApi = true, initialTheme = '' } = {}) {
     const posted = [];
     const parent = { postMessage(message) { posted.push(message); } };
     const listeners = new Map();
@@ -24,7 +24,7 @@ function bridgeHarness({ active = false, activationApi = true } = {}) {
             if (listeners.get(type) === listener) listeners.delete(type);
         },
     };
-    Function('window', moduleBridgeScript('nonce-1'))(window);
+    Function('window', moduleBridgeScript('nonce-1', '', initialTheme))(window);
     const deliver = (data, source = parent) => listeners.get('message')?.({ source, data: { nonce: 'nonce-1', ...data } });
     const chunk = (id, phase, extra = {}) => deliver({ type: 'ouro-widget-fetch-chunk', id, phase, ...extra });
     const flush = () => new Promise((resolve) => setTimeout(resolve, 0));
@@ -179,6 +179,41 @@ test('events subscribe on the first listener, deliver {type, data}, unsubscribe 
     deliver({ type: 'ouro-widget-event', event: 'tick', data: {} }, {});
     listeners.get('message')({ source: window.parent, data: { nonce: 'other', type: 'ouro-widget-event', event: 'tick', data: {} } });
     assert.equal(seen.length, 2);
+});
+
+test('theme is opt-in, starts from the injected resolved palette and follows live updates', () => {
+    const { window, posted, deliver } = bridgeHarness({ initialTheme: 'light' });
+    const seen = [];
+    const off = window.OuroborosWidget.onTheme((theme) => seen.push(theme));
+    assert.deepEqual(seen, ['light']);
+    assert.deepEqual(posted.at(-1), { type: 'ouro-widget-theme', nonce: 'nonce-1', op: 'subscribe' });
+    // The parent may answer the handshake with the same value; it must not
+    // repaint a host widget twice at mount.
+    deliver({ type: 'ouro-widget-theme', theme: 'light' });
+    assert.deepEqual(seen, ['light']);
+    deliver({ type: 'ouro-widget-theme', theme: 'system' });
+    deliver({ type: 'ouro-widget-theme', theme: 'dark' });
+    assert.deepEqual(seen, ['light', 'dark']);
+    off();
+    assert.deepEqual(posted.at(-1), { type: 'ouro-widget-theme', nonce: 'nonce-1', op: 'unsubscribe' });
+});
+
+test('theme callbacks reject foreign sources, invalid values and dispose cleanly', async () => {
+    const { window, listeners, deliver, posted, flush } = bridgeHarness({ initialTheme: 'dark' });
+    const seen = [];
+    window.OuroborosWidget.onTheme((theme) => seen.push(theme));
+    deliver({ type: 'ouro-widget-theme', theme: 'light' }, {});
+    listeners.get('message')({ source: window.parent, data: { nonce: 'wrong', type: 'ouro-widget-theme', theme: 'light' } });
+    deliver({ type: 'ouro-widget-theme', theme: 'system' });
+    assert.deepEqual(seen, ['dark']);
+    deliver({ type: 'ouro-widget-dispose' });
+    await flush();
+    deliver({ type: 'ouro-widget-theme', theme: 'light' });
+    assert.deepEqual(seen, ['dark']);
+    const count = posted.length;
+    const lateOff = window.OuroborosWidget.onTheme(() => {});
+    lateOff();
+    assert.equal(posted.length, count);
 });
 
 test('dispose awaits hooks (bridge live), acks, then fails pending work and unlistens', async () => {

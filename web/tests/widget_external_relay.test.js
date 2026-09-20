@@ -118,3 +118,24 @@ test('module parent uses the native bridge and detaches the relay after disposal
     assert.equal(h.iframe.isConnected, false);
     assert.equal(native.length, 1);
 });
+
+test('module parent forwards the resolved theme only after child opt-in and releases it on dispose', async (t) => {
+    const h = await relayHarness(t);
+    document.documentElement.dataset.theme = 'light';
+    h.send({ type: 'ouro-widget-theme', op: 'subscribe' });
+    assert.equal(h.replies.at(-1).theme, 'light');
+    h.win.ouroTheme = { theme: 'dark' };
+    h.listeners.get('ouro:theme-changed')?.();
+    assert.equal(h.replies.at(-1).theme, 'dark');
+    const replyCount = h.replies.length;
+    h.send({ type: 'ouro-widget-theme', op: 'unsubscribe' });
+    assert.equal(h.listeners.has('ouro:theme-changed'), false);
+    h.win.ouroTheme = { theme: 'light' };
+    h.listeners.get('ouro:theme-changed')?.();
+    assert.equal(h.replies.length, replyCount, 'unsubscribe itself is not a reply');
+    const stopped = h.dispose();
+    h.send({ type: 'ouro-widget-theme', op: 'subscribe' });
+    h.send({ type: 'ouro-widget-disposed' });
+    await stopped;
+    assert.equal(h.listeners.has('ouro:theme-changed'), false);
+});
