@@ -42,8 +42,8 @@ function canonicalRow(row) {
         if (!route.credential_profile_id) delete route.credential_profile_id;
     }
     // `name` is retired (owner decision 1=A): a legacy value parses and is
-    // DROPPED — identity is the neutral subagent_id plus derived route facts,
-    // and recommended_use is the one semantic field.
+    // DROPPED — a row is named by its route-derived handle, subagent_id is a
+    // hidden stored join key, and recommended_use is the one semantic field.
     return {
         subagent_id: String(row?.subagent_id || '').trim(),
         recommended_use: String(row?.recommended_use || ''),

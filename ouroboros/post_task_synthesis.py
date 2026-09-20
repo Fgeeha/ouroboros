@@ -335,9 +335,10 @@ def _child_failure_classes(rows: Any) -> list:
 def _child_engine_facts(item: Dict[str, Any]) -> Dict[str, Any]:
     """WHO ran a child and for how long, from the child's OWN stored record.
 
-    Facts only: the frozen ``configured_subagent`` snapshot names the engine
-    (never the live roster, which would relabel the past), under the same handle
-    the catalog shows. ``used_model`` is reported for an API child alone — a
+    Facts only: the frozen ``configured_subagent`` snapshot names the engine the
+    way the catalog names a row, but from what actually ran (never the live
+    roster, which would relabel the past), so a lowered access or a legacy twin
+    can read differently from today's catalog. ``used_model`` is reported for an API child alone — a
     session child's ``model_execution`` describes its nanny's rounds, not the
     leaf. A duration needs both stamps: only the ordinary terminal write stamps
     ``ts``, so a row whose ``ts`` does not follow its start yields none.
