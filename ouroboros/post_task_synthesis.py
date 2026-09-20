@@ -402,7 +402,17 @@ def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> t
             })
         if not rows:
             return "", []
-        return _truncate_with_notice(json.dumps(rows, ensure_ascii=False, indent=2), limit), rows
+        # Verbose rows overflow the cap after about three children, so a compact
+        # line per child leads: who ran what survives the truncation for ALL of them.
+        overview = [
+            {"task_id": row["task_id"], "role": row["role"], "status": row["status"],
+             **({"engine": row["engine"]["subagent_id"]} if "engine" in row else {}),
+             **({"duration_sec": row["duration_sec"]} if "duration_sec" in row else {}),
+             "accounted_upper_bound_usd": row["accounted_upper_bound_usd"]}
+            for row in rows
+        ]
+        text = json.dumps({"children_overview": overview, "children": rows}, ensure_ascii=False, indent=2)
+        return _truncate_with_notice(text, limit), rows
     except Exception:
         log.debug("Failed to collect child task evidence", exc_info=True)
         return "", []
