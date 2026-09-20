@@ -22,7 +22,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 97435 -> 99500: the notification owner is a new subsystem of this chapter
     # (its module, its client-level subscription, its room gate and its disclosed
     # limits), so the description is added rather than replacing another node's.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 99500,
+    # Raised for the chat-authorship paragraph in "Main rows and host-stamped
+    # card rows": the previous raise consumed its own headroom, and the new
+    # description replaces nothing (System voice is a fact the chapter lacked).
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 100300,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     "docs/architecture/05-supervisor-loop.md": 27137,
     "docs/architecture/06-agent-core.md": 286850,

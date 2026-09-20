@@ -114,3 +114,46 @@ def test_external_zero_identity_cannot_bind_owner_or_execute_on_retry(monkeypatc
     assert "owner_id" not in ctx.state
     assert "owner_external_id" not in ctx.state
     assert ctx.sent == [(0, "⚠️ Command ignored: this transport did not provide owner identity."), (0, "⚠️ Command ignored: this transport did not provide owner identity.")]
+
+
+def test_command_voice_survives_live_delivery_and_history(tmp_path, monkeypatch):
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    import server
+    from supervisor import message_bus, state
+    from ouroboros.gateway.history import make_chat_history_endpoint
+
+    (tmp_path / "logs").mkdir()
+    live = []
+    bridge = message_bus.LocalChatBridge()
+    bridge._broadcast_fn = live.append
+    ctx = Ctx({"owner_id": 1, "owner_chat_id": 1, "bg_consciousness_enabled": True})
+    ctx.consciousness = SimpleNamespace(start=lambda: "Background consciousness enabled",
+                                        stop=lambda: "Background consciousness disabled")
+    ctx.send_with_budget = message_bus.send_with_budget
+    ctx.WORKERS, ctx.PENDING, ctx.RUNNING = {}, [], {}
+    monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(message_bus, "load_state", ctx.load_state)
+    monkeypatch.setattr(message_bus, "_BRIDGE", bridge)
+    monkeypatch.setattr(message_bus, "publish_event", lambda *_: None)
+    monkeypatch.setattr(state, "status_text", lambda *args: "Runtime status <plain>")
+    monkeypatch.setattr(server, "_describe_bg_consciousness_state",
+                        lambda enabled: {"status": "enabled", "detail": "waiting"})
+    # Exercise the real command dispatcher; only effects/observations are isolated.
+    for i, command in enumerate(("/bg start", "/bg status", "/bg stop", "/status")):
+        server._process_bridge_updates(Bridge([{
+            "chat": {"id": 1}, "from": {"id": 1}, "text": command,
+            "source": "web", "client_message_id": f"voice-command-{i}",
+        }]), i, ctx)
+    rows = [r for r in live if r.get("type") == "chat"]
+    assert len(rows) == 4
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(
+        SimpleNamespace(query_params={"limit": "20"})))
+    replay = [r for r in json.loads(response.body)["messages"]
+              if r.get("system_type") == "command_reply"]
+    assert len(replay) == 4
+    for collection in (rows, replay):
+        assert all(r["role"] == "system" and r["system_type"] == "command_reply"
+                   and not r.get("markdown") for r in collection)
+    assert [r["content"] for r in rows] == [r["text"] for r in replay]

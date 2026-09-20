@@ -19,11 +19,14 @@ def _iso(ts):
     return wake._iso(ts)
 
 
-def _result(root, task_id, *, status="completed", ts, cost=1.25, direct=False, quizzes=None, description=""):
+def _result(root, task_id, *, status="completed", ts, cost=1.25, direct=False, quizzes=None, description="",
+            project_id=""):
     (root / "task_results").mkdir(exist_ok=True)
     row = {"task_id": task_id, "status": status, "ts": _iso(ts), "updated_at": _iso(ts), "_schema_version": 1,
            "accounted_upper_bound_usd": cost, "description": description or f"do {task_id}",
            "metadata": {}, "_is_direct_chat": direct}
+    if project_id:
+        row["project_id"] = project_id
     if quizzes:
         row["owner_quiz"] = quizzes
     (root / "task_results" / f"{task_id}.json").write_text(json.dumps(row), encoding="utf-8")
@@ -73,18 +76,65 @@ def test_events_list_settled_tasks_open_cards_and_owner_messages_since_the_last_
         json.dumps({"direction": "in", "ts": _iso(since + 7), "text": "again"}),
     ]) + "\n", encoding="utf-8")
     lines = wake.wake_events(tmp_path, since=since, now=T0, exclude_task_id="prev1")
-    assert "- open question card q1 on task ask01 (no answer yet)" in lines
-    assert "- open question card q3 on task prev1 (no answer yet)" in lines
+    assert any(line.startswith("- owner card q1 on task ask01: Unanswered") for line in lines)
+    assert any(line.startswith("- owner card q3 on task prev1: Unanswered · the task finished") for line in lines)
     assert not [line for line in lines if "q2" in line or "q4" in line]
-    cards = [line.split()[4] for line in lines if line.startswith("- open question card ")]
+    cards = [line.split()[3] for line in lines if line.startswith("- owner card ")]
     assert cards == ["q3", "q1", "c4", "c3"]  # newest four; c2..c0 wait for their turn
     assert "- task new01 failed, $0.50: build the thing" in lines
     settled = [line for line in lines if line.startswith("- task ")]
     assert [line.split()[2] for line in settled] == ["new02", "new01"]  # newest first
-    assert lines.index("- open question card q1 on task ask01 (no answer yet)") < lines.index(settled[0])
+    assert lines.index(settled[0]) < next(i for i, line in enumerate(lines) if line.startswith("- owner card q1 "))
     assert "- 2 message(s) from your human (see Recent chat)" in lines
     assert not [line for line in lines if "old01" in line or "run01" in line or "chat1" in line or "- task prev1 " in line]
     assert wake.wake_events(tmp_path / "missing", since=since, now=T0) == []
+
+
+def test_project_digest_pins_human_project_and_related_task_before_cards(tmp_path):
+    since = T0 - 3600
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "projects.json").write_text(json.dumps({
+        "projects": [{"id": "p1", "name": "System audit", "chat_id": 42, "lifecycle": "active"}],
+    }), encoding="utf-8")
+    _result(tmp_path, "finished", ts=since - 10, project_id="p1", description="audit completed")
+    _result(tmp_path, "still-running", ts=since + 20, status="running", project_id="p1", description="in progress")
+    _result(tmp_path, "direct-finished", ts=since + 30, direct=True, project_id="p1", description="owner chat")
+    _result(tmp_path, "card-task", ts=since - 100, status="running",
+            quizzes={"q1": {"state": "expired_terminal", "asked_at": _iso(since - 50),
+                              "question": "Should the audit continue?"}})
+    lines = wake.wake_events(tmp_path, since=since, now=T0, reason="project_digest:p1:finished")
+    assert lines[0].startswith("- wake cause: project System audit settled task finished (completed), $1.25")
+    assert "audit completed" in lines[0]
+    assert "1 h 0 min ago" in lines[0]
+    assert "still-running" not in lines[0] and "direct-finished" not in lines[0]
+    assert lines[1].startswith("- owner card q1 on task card-task: Unanswered · the task finished")
+    assert "Should the audit continue?" in lines[1]
+
+
+def test_project_digest_task_id_wins_when_multiple_settled_rows_share_a_project(tmp_path):
+    since = T0 - 3600
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "projects.json").write_text(json.dumps({
+        "projects": [{"id": "p1", "name": "System audit", "chat_id": 42, "lifecycle": "active"}],
+    }), encoding="utf-8")
+    _result(tmp_path, "trigger", ts=since - 10, project_id="p1", description="triggered result")
+    _result(tmp_path, "newer", ts=since + 10, project_id="p1", description="newer result")
+    lines = wake.wake_events(tmp_path, since=since, now=T0, reason="project_digest:p1:trigger")
+    assert "task trigger" in lines[0] and "triggered result" in lines[0]
+    assert "latest settled" not in lines[0]
+    assert "task newer" not in lines[0]
+
+
+def test_trigger_stays_first_when_task_results_are_unreadable(tmp_path, monkeypatch):
+    import ouroboros.task_results as task_results
+
+    def broken(_root):
+        raise OSError("broken task store")
+
+    monkeypatch.setattr(task_results, "list_task_results", broken)
+    lines = wake.wake_events(tmp_path, since=T0 - 1, now=T0, reason="task_finished:t1:completed")
+    assert lines[0] == "- wake cause: task t1 finished (completed)"
+    assert lines[1] == "- task_results unreadable: OSError"
 
 
 def test_render_substitutes_every_placeholder_and_truncates_events_honestly(tmp_path, monkeypatch):
@@ -105,11 +155,12 @@ def test_render_substitutes_every_placeholder_and_truncates_events_honestly(tmp_
     assert "toggle_evolution, request_restart (calling them is refused)" in text
     assert "Allowance (last 24 h): 4.00 / 20.00 USD" in text and "still running: 1/2" in text
     assert "wake-up interval is 3300 s" in text
-    assert text.count("- task t") == wake.EVENT_LINES_MAX and "(+5 more; see recent_tasks)" in text
+    assert "- wake cause: task t14 finished (completed)" in text
+    assert text.count("- task t") == wake.EVENT_LINES_MAX - 1 and "(+5 more; see recent_tasks, get_task_result, and chat_history)" in text
     quiet = wake.render_wake_message(
         tmp_path, repo, reason="heartbeat", last_wake_at=0.0, since=T0 + 1, now=T0, level="full",
         disabled_tools=[], spent_usd=None, daily_usd=0, running=0, max_tasks=0, interval=900)
-    assert "no wake since this process started" in quiet and "nothing new" in quiet
+    assert "no wake since this process started" in quiet and "wake cause: scheduled heartbeat" in quiet
     assert "withheld at this level: none" in quiet and "Allowance (last 24 h): unknown / 0.00 USD" in quiet
     assert "including evolution" in quiet
 
@@ -130,9 +181,11 @@ def test_template_names_only_its_placeholders_and_the_wake_hints():
     assert set(re.findall(r"\{([a-z_]+)\}", template)) == set(wake.PLACEHOLDERS)
     for hint in ("Doing nothing is a fine outcome", "ask only when the answer changes what you do",
                  "say what you assume meanwhile", "choose how long", "do not request an acceptance review",
-                 "One maintenance item per wake is a good rhythm", "`set_next_wakeup`", "Allowance (last 24 h)",
-                 "be brief, no essays unless something matters", "people you talk with"):
+                 "old cards and routine maintenance should not displace", "`set_next_wakeup`", "Allowance (last 24 h)",
+                 "opening with why you woke or what changed", "be brief, no essays unless something matters",
+                 "people you talk with", "task cards", "get_task_result"):
         assert hint in template, hint
+    assert "a heartbeat, a task that finished, a project digest" not in template
     assert "up to 10 rounds" not in template and "300 seconds" not in template
 
 

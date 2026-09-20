@@ -391,7 +391,7 @@ def _recover_crashed_task_without_terminal(job: dict, queue: Any) -> None:
                     "task_incident": reason_code,
                     "toast_once": f"{incident_task_id}:{reason_code}:{attempt}",
                 },
-            )
+                role="system", system_type="worker_failure")
         except Exception:
             log.debug("Failed to send failure message for %s", task_id, exc_info=True)
         terminal_event = ("failed", reason_code)
