@@ -30,6 +30,7 @@ the same thing sit together: when your diff adds a row, read its neighbours.
 | Add fallback | `btn btn-default` | modules/model_roles.js | 1 |
 | Add scope slot | `btn btn-default` | modules/reviewer_slots.js | 1 |
 | Add server | `btn btn-default btn-sm` | modules/settings_ui.js | 1 |
+| Add subagent | `btn btn-default` | modules/subagents_settings.js | 1 |
 | Add triad slot | `btn btn-default` | modules/reviewer_slots.js | 1 |
 | Apply to this task | `btn btn-default` | modules/model_wait.js | 1 |
 | [icon] Attach file | `chat-attach-btn` | modules/chat.js | 1 |
@@ -82,7 +83,6 @@ the same thing sit together: when your diff adds a row, read its neighbours.
 | Main Chat | `nav-row nav-row-main active` | index.html | 1 |
 | Make runnable | `skills-menu-item skills-make-runnable` | modules/skill_card_renderer.js | 1 |
 | Max | `chat-seg` | modules/chat.js | 1 |
-| = MAX_AVAILABLE_SUBAGENTS ? 'disabled' : ''}>Add subagent | `btn btn-default` | modules/subagents_settings.js | 1 |
 | Move | `files-context-item` | modules/files.js | 1 |
 | Nano | `chat-seg` | modules/chat.js | 1 |
 | [icon] New project | `nav-projects-add` | index.html | 1 |

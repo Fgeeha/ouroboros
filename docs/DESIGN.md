@@ -342,8 +342,9 @@ therefore about intents.
   `ouro:open-project`; a caller chooses a layout (`inline`, `bar`, `footer`),
   never a label or a class. It names the Project — one that was never named
   reads `Project`, never an id. Words appear only as a closed state of the same
-  control (`running in background` on a converted card). It says to a screen
-  reader what it says to the eye, and nothing depends on hover.
+  control (`running in background` on a converted card). Its accessible name
+  says in words what the glyph and the arrow say in pixels (`Open project <name>`),
+  and nothing depends on hover.
 - A **command** is a button: it changes or confirms something, or goes to a
   place that is not such a reference (`Load older messages`, `Open widgets`).
   Tabs, toggles, menus and the navigation list keep their own roles; a status

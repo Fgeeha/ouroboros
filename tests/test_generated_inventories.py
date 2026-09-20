@@ -85,6 +85,8 @@ def test_ui_control_scan_lists_fixed_text_and_only_counts_the_rest():
         <button class="btn ${tone}" type="button"><span>Save &amp; close</span></button>
         <button class="btn">${escapeHtml(label)}</button>
         <button class="icon-only"><svg></svg></button>
+        <button class="btn btn-default" type="button"
+            ${rows.length >= MAX_ROWS ? 'disabled' : ''}>Add subagent</button>
         const go = document.createElement('button');
         go.className = 'btn btn-xs btn-default';
         go.textContent = 'Turn into project';
@@ -98,6 +100,8 @@ def test_ui_control_scan_lists_fixed_text_and_only_counts_the_rest():
         ("Retry", "btn btn-default btn-sm"),
         ("[icon] Attach file", "chat-attach-btn"),
         ("Save & close", "btn …"),
+        # A comparison inside a templated attribute is not the end of the tag.
+        ("Add subagent", "btn btn-default"),
         ("Turn into project", "btn btn-xs btn-default"),
     ]
     # Run-time text, a nameless icon and a computed label are counted, not invented.

@@ -24,7 +24,8 @@ from collections import Counter
 REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
 UI_CONTROLS_OUT = REPO_ROOT / "docs" / "inventories" / "UI_CONTROL_TEXT_INVENTORY.md"
 
-_BUTTON = re.compile(r"<button\b([^>]*)>(.*?)</button>", re.S)
+# A `>` inside a `${…}` expression of an attribute (`${rows.length >= MAX ? 'disabled' : ''}`) is not the tag's end.
+_BUTTON = re.compile(r"<button\b((?:\$\{[^}]*\}|[^>])*)>(.*?)</button>", re.S)
 _ATTR = {name: re.compile(name + r'="([^"]*)"') for name in ("class", "aria-label", "title")}
 _TAG = re.compile(r"<[^>]+>", re.S)
 _CREATED = re.compile(r"(?:const|let)\s+(\w+)\s*=\s*document\.createElement\('button'\)")
