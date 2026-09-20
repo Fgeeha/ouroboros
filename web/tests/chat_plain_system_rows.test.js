@@ -527,11 +527,10 @@ test('a refused steer leaves the running target card open', () => {
 
 test('render arm order and enhancement guard are pinned in source', () => {
     // The plain-system arm sits between the dedicated skill_review renderer
-    // (bug report #8) and the byte-pinned final markdown arm
-    // (tests/test_restart_reconnect.py pins ": renderChatMarkdown(text);").
+    // and the rich arm, whose template carries the content contract.
     const ternary = chatSource.slice(
         chatSource.indexOf("const rendered = role === 'user'"),
-        chatSource.indexOf(': renderChatMarkdown(text);'),
+        chatSource.indexOf('const timeFmt =', chatSource.indexOf("const rendered = role === 'user'")),
     );
     assert.match(ternary, /renderSkillReviewDisclosure\(text, opts\.skillReview \|\| null\)/);
     assert.match(ternary, /role === 'system' && systemType !== 'skill_review' && markdown !== true\n\s+\? escapeHtml\(text\)/);
@@ -539,7 +538,7 @@ test('render arm order and enhancement guard are pinned in source', () => {
     // The enhancement pass skips exactly the plain-system case.
     assert.match(
         chatSource,
-        /if \(role !== 'user' && systemType !== 'skill_review' && \(role !== 'system' \|\| markdown === true\)\) enhanceMountedMarkdown\(bubble\);/,
+        /const richMarkdown = role !== 'user' && systemType !== 'skill_review' && \(role !== 'system' \|\| markdown === true\);/,
     );
 });
 

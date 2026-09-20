@@ -501,8 +501,12 @@ answer keep both forms readable. Anatomy, top to bottom:
    `Replaced by a newer question` uses the disabled dot; an unreadable source
    reads `Status unavailable`, never an invented invitation. No answer-deadline
    countdown: task completion closes its mailbox, not the question's answerability.
-2. **Question** — the one primary thing: `--type-body` semibold,
-   `--text-primary`.
+2. **Question** — the one primary thing: readable `--type-body` text in
+   `--text-primary`; authored headings and emphasis are semibold. A long
+   question may contain paragraphs, lists, checklists, tables and code, and
+   those blocks keep the shared rich-content gutter, rhythm and bounded code
+   scrolling. The card does not infer a title from the first line or rewrite
+   authored Markdown to make it fit.
 3. **Stake** — optional one-liner (`At stake: …`), `--type-meta`, `--text-meta`.
 4. **Options** — real owner actions: buttons with `--text-primary` labels,
    legible at rest; an optional per-option detail steps down to meta ink.

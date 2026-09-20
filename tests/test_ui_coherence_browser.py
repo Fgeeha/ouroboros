@@ -57,7 +57,7 @@ def test_chat_header_decoration_does_not_clip_menu_and_system_actions_keep_gap(s
     for action in actions.all():
         metrics = action.evaluate("""el => {
             const prose = el.previousElementSibling;
-            return {previous:prose.className, nested:!!el.closest('.message'),
+            return {previous:prose.classList.contains('message') ? 'message' : prose.className, nested:!!el.closest('.message'),
                 gap:el.querySelector('button').getBoundingClientRect().top - prose.getBoundingClientRect().bottom,
                 below:el.getBoundingClientRect().bottom - el.querySelector('button').getBoundingClientRect().bottom};
         }""")
@@ -389,7 +389,19 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
         'waiting': {'state': 'open', 'wait_for_answer': True, 'recommended_index': 0, 'asked_at': '2026-09-16T00:03:00Z',
             'question': 'Third of three. The **licence** of the external dataset forbids redistribution, so the archive '
                         'can either ship without it and link to the source, or wait for written permission, which the '
-                        'maintainers usually grant within a week. Which way do we go?',
+                        'maintainers usually grant within a week. Which way do we go?\n\n'
+                        'What belongs in the evidence packet:\n'
+                        '- The primary route and its readable explanation.\n'
+                        '- The secondary route and its caveat.\n'
+                        '  - Keep the nested evidence attached to its route.\n\n'
+                        '1. Read the source.\n2. Compare the alternatives.\n\n'
+                        '- [x] The source was checked\n'
+                        '- [ ] The owner still needs to decide\n\n'
+                        '### Evidence shape\n\n'
+                        '```text\n'
+                        'a_very_long_evidence_token_abcdefghijklmnopqrstuvwxyz_0123456789_'
+                        'abcdefghijklmnopqrstuvwxyz_0123456789\n'
+                        '```',
             'options': ['Ship without it and link the source', 'Wait for written permission'],
             'option_details': ['Readers follow one extra link.', 'Publication slips by about a week.'],
             'stake': 'Whether the archive ships this week.'},
@@ -489,16 +501,40 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
         const scroller = document.querySelector('#chat-messages');
         const cards = [...document.querySelectorAll('#chat-messages .project-question-card')];
         const box = el => el.getBoundingClientRect();
+        const question = document.querySelector('[data-quiz-id="waiting"] .chat-quiz-question');
+        const list = question.querySelector('ul');
+        const taskList = [...question.querySelectorAll('ul, ol')].find(el => el.querySelector('.md-checkbox'));
+        const code = question.querySelector('.md-code-block pre');
         return {overflow: scroller.scrollWidth - scroller.clientWidth, page: document.documentElement.scrollWidth - innerWidth,
             right: Math.max(...cards.map(el => box(el).right)), viewport: innerWidth,
             chipInside: cards.every(el => box(el.querySelector('.chat-quiz-project')).right <= box(el).right + 0.5),
             chipCut: (() => { const n = cards[0].querySelector('.chat-quiz-project .chat-live-project-name'); return n.scrollWidth > n.clientWidth; })(),
+            richHost: question.classList.contains('ui-rich-content'),
+            listPadding: getComputedStyle(list).paddingInlineStart,
+            nestedOffset: box(list.querySelector('ul').querySelector('li')).left - box(list.querySelector('li')).left,
+            orderedPadding: getComputedStyle(question.querySelector('ol')).paddingInlineStart,
+            heading: [getComputedStyle(question.querySelector('h3')).fontSize, getComputedStyle(question.querySelector('h3')).fontWeight],
+            proseWeight: getComputedStyle(question.querySelector('p')).fontWeight,
+            emphasisWeight: getComputedStyle(question.querySelector('strong')).fontWeight,
+            codeHasOverflow: code.scrollWidth > code.clientWidth,
+            listTextOffset: box(list.querySelector('li')).left - box(question).left,
+            taskListStyle: getComputedStyle(taskList).listStyleType,
+            codeOverflow: getComputedStyle(code).overflowX,
+            codeReachable: code.scrollWidth <= code.clientWidth || getComputedStyle(code).overflowX === 'auto',
             sizes: [...new Set(cards.flatMap(el => [el.querySelector('.chat-quiz-status'), el.querySelector('.chat-quiz-project')])
                 .map(el => getComputedStyle(el).fontSize))]};
     }""")
     print(json.dumps({'question_mirror_geometry': geometry, 'viewport': [width, height]}))
     assert geometry['overflow'] <= 1 and geometry['page'] <= 0 and geometry['right'] <= width, geometry
     assert geometry['chipInside'] and geometry['sizes'] == ['12px'], geometry
+    assert geometry['richHost'] and geometry['listPadding'] == '24px', geometry
+    assert geometry['listTextOffset'] >= 20 and geometry['taskListStyle'] == 'none', geometry
+    assert geometry['codeHasOverflow'] and geometry['codeReachable'] and geometry['codeOverflow'] == 'auto', geometry
+    assert geometry['nestedOffset'] >= 20 and geometry['orderedPadding'] == '24px', geometry
+    assert geometry['heading'] == ['14px', '600'] and geometry['proseWeight'] == '400', geometry
+    assert geometry['emphasisWeight'] == '600', geometry
+    assert card('waiting').locator('.md-code-block pre').evaluate(
+        'el => { el.scrollLeft = el.scrollWidth; return el.scrollLeft > 0; }'), 'the clipped tail is reachable by scrolling'
     card('second').scroll_into_view_if_needed()
     setup_browser.capture(page, f'question-mirrors-burst-{width}')
 
