@@ -260,55 +260,60 @@ def configured_subagents_fingerprint(config: ConfiguredSubagents) -> str:
     return hashlib.sha256(serialize_configured_subagents(config).encode("utf-8")).hexdigest()
 
 
-def engine_identity(row: ConfiguredSubagent) -> dict[str, str]:
-    """Execution-affecting facts of ONE saved row, with its EFFECTIVE access.
+def engine_identity(row: ConfiguredSubagent, settings: Mapping[str, Any]) -> dict[str, str]:
+    """EFFECTIVE execution-affecting facts of ONE saved row under ``settings``.
 
-    Same shape as ``subagent_history.execution_identity``, which reads frozen
-    snapshots and therefore defaults a missing access to ``workspace_write``; a
-    saved row's default is ``full`` (already applied by the parser).
+    Exactly what ``subagent_runtime.select_subagent_snapshot`` freezes and
+    ``subagent_history.execution_identity`` reads back: processing is resolved
+    (the row's own value, else the inherited one) and a session's access is
+    explicit, so a live row, its snapshot and its history row share one identity.
     """
+    from ouroboros.model_slots import resolve_processing_preference
+
     return {
         "kind": row.route.kind,
         "target_id": row.route.target_id,
         "credential_profile_id": row.route.credential_profile_id,
         "effort": row.effort,
-        "processing_preference": row.processing_preference,
+        "processing_preference": resolve_processing_preference(
+            override=row.processing_preference or None, settings=dict(settings)),
         **({"access": row.access} if row.route.is_session else {}),
     }
 
 
 def engine_handle(identity: Mapping[str, Any]) -> str:
-    """The name shown for an engine: its route target plus its OWN set facets.
+    """The ONE name of an engine on every surface: its route target plus its facets.
 
-    A pure function of one identity (a saved row, a frozen snapshot or a
-    history record), so a neighbour row can never rename it and the past is
-    never relabelled from the live roster. Facets, in fixed order: effort,
-    session access when not the default ``full``, account pin as ``@<profile>``,
-    processing preference. Compared, never parsed.
+    A pure function of one identity (a live row, a frozen snapshot or a history
+    record), so a neighbour row can never rename it and the past is never
+    relabelled from the live roster. Facets, in fixed order: effort, session
+    access, account pin as ``@<profile>``, processing — each omitted at its
+    baseline (``full`` access, ``standard`` processing). Compared, never parsed.
     """
     access = str(identity.get("access") or "") if identity.get("kind") == ROUTE_KIND_AGENT_SESSION else ""
     pin = str(identity.get("credential_profile_id") or "")
+    processing = str(identity.get("processing_preference") or "")
     facets = (
         str(identity.get("effort") or ""),
         "" if access == "full" else access,
         f"@{pin}" if pin else "",
-        str(identity.get("processing_preference") or ""),
+        "" if processing == "standard" else processing,
     )
     return "/".join(part for part in (str(identity.get("target_id") or ""), *facets) if part)
 
 
-def subagent_handle(row: ConfiguredSubagent) -> str:
-    return engine_handle(engine_identity(row))
+def subagent_handle(row: ConfiguredSubagent, settings: Mapping[str, Any]) -> str:
+    return engine_handle(engine_identity(row, settings))
 
 
-def roster_handles(config: ConfiguredSubagents) -> dict[str, str]:
+def roster_handles(config: ConfiguredSubagents, settings: Mapping[str, Any]) -> dict[str, str]:
     """Stored id -> the handle the LIVE roster shows and the tools accept.
 
     Save-time uniqueness keeps handles distinct; rows that still share one
     (twins saved before that rule) are told apart by their stored key as
     ``<handle>~<subagent_id>`` — never by list order, which is not durable.
     """
-    base = {row.subagent_id: subagent_handle(row) for row in config.items}
+    base = {row.subagent_id: subagent_handle(row, settings) for row in config.items}
     counts = Counter(base.values())
     return {
         row_id: f"{handle}~{row_id}" if counts[handle] > 1 else handle
@@ -316,16 +321,20 @@ def roster_handles(config: ConfiguredSubagents) -> dict[str, str]:
     }
 
 
-def validate_unique_engines(config: ConfiguredSubagents) -> None:
-    """SAVE-path rule: two rows may not run an identical engine (reads stay tolerant)."""
-    seen: dict[tuple, int] = {}
+def validate_unique_engines(config: ConfiguredSubagents, settings: Mapping[str, Any]) -> None:
+    """SAVE-path rule: two rows of one kind may not share a handle (reads stay tolerant).
+
+    The handle IS the engine with baselines folded, so an unset row and an
+    explicit row with the same effective value are one engine, and no two saved
+    rows can carry the same name.
+    """
+    seen: dict[tuple[str, str], int] = {}
     for index, row in enumerate(config.items):
-        key = tuple(sorted(engine_identity(row).items()))
+        key = (row.route.kind, subagent_handle(row, settings))
         if key in seen:
             raise ValueError(
                 f"{SUBAGENTS_SETTING}: items[{index}] runs the same engine as items[{seen[key]}] "
-                f"({subagent_handle(row)}); change its model, effort, access, account or "
-                "processing, or remove it"
+                f"({key[1]}); change its model, effort, access, account or processing, or remove it"
             )
         seen[key] = index
 

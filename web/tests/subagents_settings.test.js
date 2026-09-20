@@ -1023,6 +1023,10 @@ test('engine uniqueness is a SAVE rule: a roster saved with twins still loads, a
     assert.deepEqual(validateAvailableSubagentsSetting(parsed.setting), []);
     assert.deepEqual(validateAvailableSubagentsSetting(parsed.setting, { uniqueEngines: true }),
         ['Subagent 2 runs the same engine as Subagent 1 — change its model, effort, access, account or processing, or remove it.']);
+    // The engine is judged under the processing it inherits: an unset row IS a fast row under a global fast.
+    const inherits = setting([apiRow({ subagent_id: 'one' }), apiRow({ subagent_id: 'two', processing_preference: 'fast' })]);
+    assert.deepEqual(validateAvailableSubagentsSetting(inherits, { uniqueEngines: true }), []);
+    assert.match(validateAvailableSubagentsSetting(inherits, { uniqueEngines: true, processingPreference: 'fast' })[0], /same engine as Subagent 1/);
     // Two freshly added rows have no engine yet: each asks for a route, neither is called a twin.
     const blank = { recommended_use: '', route: { kind: ROUTE_KIND_API_MODEL, target_id: '' } };
     const drafts = validateAvailableSubagentsSetting(

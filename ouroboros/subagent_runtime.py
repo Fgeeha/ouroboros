@@ -98,7 +98,7 @@ def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any
     ):
         return {}
 
-    handles = roster_handles(config)
+    handles = roster_handles(config, settings)
     rows: list[dict[str, Any]] = []
     for row in config.items:
         session = row.route.is_session
@@ -261,14 +261,16 @@ def _legacy_matches(
     return rows
 
 
-def resolve_configured_row(config: ConfiguredSubagents, selector: str) -> ConfiguredSubagent:
+def resolve_configured_row(
+    config: ConfiguredSubagents, selector: str, settings: Mapping[str, Any],
+) -> ConfiguredSubagent:
     """The one ``subagent_id`` argument resolver: a handle, else a stored id.
 
     Stored ids stay accepted forever, silently (cached prompts, old habits). A
     selector that is one row's handle AND a different row's stored id is
     refused naming both — never a silent pick.
     """
-    handles = roster_handles(config)
+    handles = roster_handles(config, settings)
     named = next((row for row in config.items if handles[row.subagent_id] == selector), None)
     stored = next((row for row in config.items if row.subagent_id == selector), None)
     if named is not None and stored is not None and named is not stored:
@@ -318,7 +320,7 @@ def select_subagent_snapshot(
     assert config is not None
     used_legacy = False
     if selected_id:
-        row = resolve_configured_row(config, selected_id)
+        row = resolve_configured_row(config, selected_id, settings)
     else:
         lane = str(legacy_model_lane or "auto").strip().lower() or "auto"
         executor = str(legacy_executor or "auto").strip().lower() or "auto"
@@ -552,16 +554,15 @@ def current_subagent_alternatives(exclude_id: str = "") -> list[dict[str, Any]]:
     try:
         from ouroboros.config import runtime_settings
 
-        resolution = resolve_configured_subagents(
-            effective_runtime_subagent_settings(runtime_settings())
-        )
+        settings = effective_runtime_subagent_settings(runtime_settings())
+        resolution = resolve_configured_subagents(settings)
+        config = resolution.config
+        if config is None or not config.enabled:
+            return []
+        handles = roster_handles(config, settings)
     except Exception:
         return []
-    config = resolution.config
-    if config is None or not config.enabled:
-        return []
     excluded = str(exclude_id or "")
-    handles = roster_handles(config)
     return [
         {
             "subagent_id": handles[row.subagent_id],
@@ -875,10 +876,10 @@ def _names_bound_actor(selector: str, bootstrap: Mapping[str, Any]) -> bool:
     try:
         from ouroboros.config import runtime_settings
 
-        config = _resolution(
-            effective_runtime_subagent_settings(runtime_settings()), allow_undecided_legacy=False,
-        ).config
-        return config is not None and resolve_configured_row(config, selector).subagent_id == expected_id
+        settings = effective_runtime_subagent_settings(runtime_settings())
+        config = _resolution(settings, allow_undecided_legacy=False).config
+        return config is not None and resolve_configured_row(
+            config, selector, settings).subagent_id == expected_id
     except SubagentSelectionError:
         return False
 

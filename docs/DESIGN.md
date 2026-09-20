@@ -806,8 +806,8 @@ the owner, never a field placeholder or help-text instruction, never the
 primary displayed value; the exact stored id may appear in a meta line or
 tooltip. A configured-subagent reference is the one place a stored spelling
 names a thing: a roster row is labelled by its handle — its route target plus
-the facets set on that row — because a friendlier stored label rots as soon as
-the owner re-points the row. The route identity chip names the source (API · OpenAI, Codex · model,
+the facets that row really runs with, defaults omitted — because a friendlier
+stored label rots as soon as the owner re-points the row. The route identity chip names the source (API · OpenAI, Codex · model,
 Claude Code · agent), not the channel alone. A last-run receipt is shown
 against the route that produced it: when the row's route changed since, the
 line says so and names the earlier route.

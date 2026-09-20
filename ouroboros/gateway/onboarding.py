@@ -668,7 +668,7 @@ def _configured_owner_draft(
         return None, ""
     try:
         config, _canonical = normalize_configured_subagents(body.get(SUBAGENTS_SETTING))
-        validate_unique_engines(config)
+        validate_unique_engines(config, body)  # the wizard payload carries its own inherited processing
     except ValueError as exc:
         return None, str(exc)
     return config, ""

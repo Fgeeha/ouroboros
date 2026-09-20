@@ -259,27 +259,29 @@ export function mintStableId(prefix, takenIds) {
 // (which rots once the owner re-points the row). JS twin of
 // ouroboros/configured_subagents.py — engine_identity / subagent_handle /
 // roster_handles / validate_unique_engines — held together by one parity table,
-// web/tests/fixtures/subagent_handle_parity.json.
-function engineIdentity(row) {
+// web/tests/fixtures/subagent_handle_parity.json. Facts are EFFECTIVE, exactly
+// what a task snapshot freezes: `inherited` is the global processing preference
+// a row without its own value runs under, and an omitted session access is full.
+function engineIdentity(row, inherited = '') {
     const route = row?.route || {};
     return [
         String(route.kind || ''), String(route.target_id || '').trim(),
         String(route.credential_profile_id || '').trim(), String(row?.effort || ''),
-        String(row?.processing_preference || ''),
+        String(row?.processing_preference || inherited || ''),
         route.kind === ROUTE_KIND_AGENT_SESSION ? String(row?.access || 'full') : '',
     ];
 }
 
-/** Route target plus the facets set on THIS row; a neighbour never renames it. */
-export function subagentHandle(row) {
-    const [, target, pin, effort, processing, access] = engineIdentity(row);
-    return [target, effort, access === 'full' ? '' : access, pin ? `@${pin}` : '', processing]
-        .filter(Boolean).join('/');
+/** Route target plus THIS row's facets, each omitted at its baseline (full access, standard processing). */
+export function subagentHandle(row, inherited = '') {
+    const [, target, pin, effort, processing, access] = engineIdentity(row, inherited);
+    return [target, effort, access === 'full' ? '' : access, pin ? `@${pin}` : '',
+        processing === 'standard' ? '' : processing].filter(Boolean).join('/');
 }
 
 /** Stored id -> the label the live roster shows; twins are told apart by their stored key. */
-export function rosterHandles(rows) {
-    const base = (rows || []).map(subagentHandle);
+export function rosterHandles(rows, inherited = '') {
+    const base = (rows || []).map((row) => subagentHandle(row, inherited));
     return new Map((rows || []).map((row, index) => [
         String(row?.subagent_id || ''),
         base.indexOf(base[index]) === base.lastIndexOf(base[index])
@@ -287,11 +289,10 @@ export function rosterHandles(rows) {
     ]));
 }
 
-/** Index of the EARLIER row running an identical engine, else -1 — a save-time rule; reads stay tolerant. */
-export function sameEngineAs(rows, index) {
-    const key = JSON.stringify(engineIdentity(rows?.[index]));
-    return (rows || []).findIndex(
-        (row, other) => other < index && JSON.stringify(engineIdentity(row)) === key);
+/** Index of the EARLIER row of the same kind sharing this row's handle, else -1 — a save-time rule; reads stay tolerant. */
+export function sameEngineAs(rows, index, inherited = '') {
+    const key = (row) => `${row?.route?.kind || ''}\n${subagentHandle(row, inherited)}`;
+    return (rows || []).findIndex((row, other) => other < index && key(row) === key(rows[index]));
 }
 
 export function composeSessionTarget(harness, model) {

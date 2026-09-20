@@ -161,9 +161,9 @@ export function parseAvailableSubagentsSetting(value) {
 
 // One row's owner-facing errors, named the way the card is ("Subagent N"); the
 // list validator and the per-row display read this one source. `ids` accumulates
-// in list order so a repeated stable ID blames the later row. `rows` rides on SAVE
-// paths only (two rows may not run one engine): a roster saved earlier still loads.
-function rowErrors(row, index, ids, rows = null) {
+// in list order so a repeated stable ID blames the later row. `rows` and their
+// inherited processing ride on SAVE paths only: a roster saved earlier still loads.
+function rowErrors(row, index, ids, rows = null, inherited = '') {
     const errors = [];
     const id = String(row?.subagent_id || '').trim();
     if (!SUBAGENT_ID_PATTERN.test(id)) {
@@ -206,7 +206,7 @@ function rowErrors(row, index, ids, rows = null) {
     if (encodedEffort) {
         errors.push(`effort “${row.effort}” conflicts with compound route effort “${encodedEffort}”.`);
     }
-    const twin = rows && String(route.target_id || '').trim() ? sameEngineAs(rows, index) : -1;
+    const twin = rows && String(route.target_id || '').trim() ? sameEngineAs(rows, index, inherited) : -1;
     if (twin >= 0) errors.push(`runs the same engine as Subagent ${twin + 1} — change its model, effort, access, account or processing, or remove it.`);
     return errors.map((text) => `Subagent ${index + 1} ${text}`);
 }
@@ -216,13 +216,13 @@ function listLevelErrors(setting) {
         ? [`Available subagents supports at most ${MAX_AVAILABLE_SUBAGENTS} rows.`] : [];
 }
 
-export function validateAvailableSubagentsSetting(setting, { uniqueEngines = false } = {}) {
+export function validateAvailableSubagentsSetting(setting, { uniqueEngines = false, processingPreference = '' } = {}) {
     if (!setting || typeof setting.enabled !== 'boolean' || !Array.isArray(setting.items)) {
         return ['Available subagents configuration is not loaded.'];
     }
     const ids = new Set();
     const rows = uniqueEngines ? setting.items : null;
-    return [...listLevelErrors(setting), ...setting.items.flatMap((row, index) => rowErrors(row, index, ids, rows))];
+    return [...listLevelErrors(setting), ...setting.items.flatMap((row, index) => rowErrors(row, index, ids, rows, processingPreference))];
 }
 
 export function buildAvailableSubagentsSetting(setting) {
@@ -464,7 +464,7 @@ export function createAvailableSubagentsEditor({
                 || 'Available subagents draft is still loading. Retry the preview before finishing.'];
         }
         if (state.parseError) return [state.parseError];
-        return validateAvailableSubagentsSetting(state.setting, { uniqueEngines: true });
+        return validateAvailableSubagentsSetting(state.setting, { uniqueEngines: true, processingPreference: state.processingPreference });
     }
 
     // Patch verdicts and inherited intent in place, preserving the caret.
@@ -477,7 +477,7 @@ export function createAvailableSubagentsEditor({
             : (state.saveAttempted ? listLevelErrors(state.setting) : []);
         const ids = new Set();
         state.setting.items.forEach((row, index) => {
-            const rowErrs = state.loaded ? rowErrors(row, index, ids, state.setting.items) : [];
+            const rowErrs = state.loaded ? rowErrors(row, index, ids, state.setting.items, state.processingPreference) : [];
             const judged = Boolean(row._uiAttempted) && rowErrs.length > 0;
             if (judged && !structural) shown.push(...rowErrs);
             const el = container.querySelector(`[data-subagent-row="${row._uiKey || row.subagent_id}"]`);

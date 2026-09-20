@@ -16,19 +16,20 @@ const PARITY = JSON.parse(readFileSync(
 
 for (const roster of PARITY) {
     test(`handle parity with Python: ${roster.case}`, () => {
-        const labels = rosterHandles(roster.items);
+        const inherited = roster.global_processing;
+        const labels = rosterHandles(roster.items, inherited);
         roster.expected.forEach((want, index) => {
             const row = roster.items[index];
-            assert.equal(subagentHandle(row), want.handle);
+            assert.equal(subagentHandle(row, inherited), want.handle);
             assert.equal(labels.get(row.subagent_id), want.roster);
-            assert.equal(sameEngineAs(roster.items, index), want.same_engine_as ?? -1);
+            assert.equal(sameEngineAs(roster.items, index, inherited), want.same_engine_as ?? -1);
         });
     });
 }
 
 // The exact path reviewerPickerHtml takes: groups -> the shared select markup.
-function pickerOptions(roster, row) {
-    const html = selectHtml('data-slot-route', reviewerChoiceGroups({ roster, row }), encodeReviewerChoice(row));
+function pickerOptions(roster, row, processingPreference = '') {
+    const html = selectHtml('data-slot-route', reviewerChoiceGroups({ roster, row, processingPreference }), encodeReviewerChoice(row));
     const group = html.match(/<optgroup label="Available subagents">([\s\S]*?)<\/optgroup>/)?.[1] || '';
     return [...group.matchAll(/<option value="([^"]*)"( selected)?>([^<]*)<\/option>/g)]
         .map((match) => ({ value: match[1], selected: Boolean(match[2]), label: match[3] }));
@@ -71,4 +72,15 @@ test('twins saved before the uniqueness rule stay distinguishable in the picker'
     ];
     const labels = pickerOptions(twins, { subagent_id: 'fast-scout' }).map((option) => option.label);
     assert.deepEqual(labels, ['x-ai/grok-4.6~fast-scout', 'x-ai/grok-4.6~fast-scout_copy_a1']);
+});
+
+test('the picker shows the EFFECTIVE name: an inherited fast is said, the standard baseline is not', () => {
+    const roster = [
+        { subagent_id: 'a', recommended_use: '', route: { kind: 'api_model', target_id: 'x-ai/grok-4.6' } },
+        { subagent_id: 'b', recommended_use: '', route: { kind: 'api_model', target_id: 'openai/gpt-5.6-sol' }, processing_preference: 'standard' },
+    ];
+    const labels = (inherited) => pickerOptions(roster, { subagent_id: 'a' }, inherited).map((option) => option.label);
+    assert.deepEqual(labels(''), ['x-ai/grok-4.6', 'openai/gpt-5.6-sol']);
+    assert.deepEqual(labels('standard'), ['x-ai/grok-4.6', 'openai/gpt-5.6-sol']);
+    assert.deepEqual(labels('fast'), ['x-ai/grok-4.6/fast', 'openai/gpt-5.6-sol']);
 });

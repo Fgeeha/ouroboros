@@ -1212,7 +1212,8 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
                 subagents, canonical_subagents = normalize_configured_subagents(
                     body.get(subagents_key)
                 )
-                validate_unique_engines(subagents)
+                # Effective facts of THIS save: a row may inherit the processing it carries.
+                validate_unique_engines(subagents, {**load_settings(), **body})
             except ValueError as exc:
                 return unsaved_error(str(exc), 400)
             body = dict(body)

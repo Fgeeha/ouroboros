@@ -14,6 +14,10 @@ from types import SimpleNamespace
 
 import pytest
 
+from tests.test_onboarding_complete_endpoint import (
+    WIZARD_PAYLOAD,
+    onboarding as onboarding,  # explicit re-export of the real atomic settings fixture
+)
 from ouroboros.configured_subagents import (
     engine_identity,
     parse_configured_subagents,
@@ -22,10 +26,12 @@ from ouroboros.configured_subagents import (
     validate_unique_engines,
 )
 
-PARITY = json.loads(
+FIXTURE = json.loads(
     (Path(__file__).resolve().parents[1] / "web" / "tests" / "fixtures"
      / "subagent_handle_parity.json").read_text(encoding="utf-8")
-)["rosters"]
+)
+PARITY, SNAPSHOTS = FIXTURE["rosters"], FIXTURE["snapshots"]
+NO_GLOBAL: dict = {}
 
 
 def _config(*rows):
@@ -48,13 +54,12 @@ def _session(row_id, target="codex=gpt-6-astra", pin="", **extra):
     return {"subagent_id": row_id, "recommended_use": f"use {row_id}", "route": route, **extra}
 
 
-def _duplicate_of(config):
-    """Index pairs a save refuses, read off the validator's own message."""
+def _duplicate_of(config, settings):
+    """Index pair a save refuses, read off the validator's own message."""
     try:
-        validate_unique_engines(config)
+        validate_unique_engines(config, settings)
     except ValueError as exc:
-        text = str(exc)
-        later, earlier = (int(part.split("]")[0]) for part in text.split("items[")[1:3])
+        later, earlier = (int(part.split("]")[0]) for part in str(exc).split("items[")[1:3])
         return later, earlier
     return None
 
@@ -62,37 +67,78 @@ def _duplicate_of(config):
 @pytest.mark.parametrize("roster", PARITY, ids=[item["case"] for item in PARITY])
 def test_the_shared_table_pins_handles_roster_labels_and_refused_twins(roster):
     config = _config(*roster["items"])
-    labels = roster_handles(config)
-    refused = _duplicate_of(config)
+    settings = {"OUROBOROS_PROCESSING_PREFERENCE": roster["global_processing"]}
+    labels = roster_handles(config, settings)
     first_twin = next(
         ((index, want["same_engine_as"]) for index, want in enumerate(roster["expected"])
          if want["same_engine_as"] is not None), None)
-    assert refused == first_twin
+    assert _duplicate_of(config, settings) == first_twin
     for row, want in zip(config.items, roster["expected"]):
-        assert subagent_handle(row) == want["handle"]
+        assert subagent_handle(row, settings) == want["handle"]
         assert labels[row.subagent_id] == want["roster"]
+
+
+@pytest.mark.parametrize("record", SNAPSHOTS, ids=[item["case"] for item in SNAPSHOTS])
+def test_a_frozen_record_is_named_from_its_own_facts(record):
+    from ouroboros.subagent_history import execution_identity, recorded_handle, snapshot_handle
+
+    assert snapshot_handle(record["snapshot"]) == record["handle"]
+    assert recorded_handle({"identity": execution_identity(record["snapshot"])}) == record["handle"]
+
+
+@pytest.mark.parametrize("global_processing", ["", "standard", "fast"])
+@pytest.mark.parametrize("row", [
+    {"effort": "xhigh"}, {"effort": "xhigh", "processing_preference": "standard"},
+    {"processing_preference": "economy"}, {"access": "workspace_write", "pin": "koshak"},
+], ids=["unset", "explicit-standard", "explicit-economy", "lowered-and-pinned"])
+def test_one_engine_has_one_name_on_every_surface(row, global_processing, tmp_path):
+    """The live catalog, the frozen snapshot, the startup receipt, the dated
+    history fact and the reflection evidence must all carry the SAME handle for
+    one row - including a row that inherits the global processing preference,
+    which the snapshot freezes RESOLVED while the saved row leaves it empty."""
+    from ouroboros import post_task_synthesis
+    from ouroboros.subagent_history import execution_identity, recorded_handle, snapshot_handle
+    from ouroboros.subagent_runtime import model_visible_subagent_catalog, select_subagent_snapshot
+    from ouroboros.task_results import write_task_result
+
+    settings = {**_settings(_session("primary-builder", target="claude=claude-opus-5", **row)),
+                "OUROBOROS_PROCESSING_PREFERENCE": global_processing}
+    catalog_name = model_visible_subagent_catalog(settings)["rows"][0]["subagent_id"]
+    snapshot, _ = select_subagent_snapshot(settings, subagent_id=catalog_name)  # the name resolves
+    write_task_result(tmp_path, "kid", "completed", result="ok", configured_subagent=snapshot,
+                      parent_task_id="root", root_task_id="root", delegation_role="subagent")
+    _text, evidence = post_task_synthesis._child_task_evidence(
+        SimpleNamespace(drive_root=tmp_path), {"id": "root"})
+
+    assert {
+        catalog_name,
+        snapshot_handle(snapshot),
+        recorded_handle({"identity": execution_identity(snapshot)}),
+        evidence[0]["engine"]["subagent_id"],
+    } == {catalog_name}
+    assert "standard" not in catalog_name and "full" not in catalog_name
+    assert catalog_name.endswith("/fast") == (global_processing == "fast" and "processing_preference" not in row)
 
 
 def test_a_handle_is_a_function_of_one_row_so_a_new_sibling_never_renames_it():
     alone = _config(_api("one"))
     crowded = _config(_api("one"), _api("two", effort="low"), _session("three"))
-    assert subagent_handle(alone.items[0]) == subagent_handle(crowded.items[0]) == "x-ai/grok-4.6"
-    assert roster_handles(crowded)["one"] == "x-ai/grok-4.6"
+    assert subagent_handle(alone.items[0], NO_GLOBAL) == subagent_handle(crowded.items[0], NO_GLOBAL) == "x-ai/grok-4.6"
+    assert roster_handles(crowded, NO_GLOBAL)["one"] == "x-ai/grok-4.6"
 
 
 def test_row_identity_and_snapshot_identity_are_one_shape():
     """The save-time identity and the frozen-snapshot identity must not drift:
-    the same row compared through either reader yields the same facts."""
-    from ouroboros.subagent_history import execution_identity, snapshot_handle
+    the same row read through either reader yields the same facts."""
+    from ouroboros.subagent_history import execution_identity
     from ouroboros.subagent_runtime import select_subagent_snapshot
 
     rows = (_session("s", pin="koshak", effort="xhigh", access="workspace_write"),
-            _api("a", effort="low", processing_preference="fast"))
-    config = _config(*rows)
-    for row in config.items:
-        snapshot, _legacy = select_subagent_snapshot(_settings(*rows), subagent_id=row.subagent_id)
-        assert execution_identity(snapshot) == engine_identity(row)
-        assert snapshot_handle(snapshot) == subagent_handle(row)
+            _api("a", effort="low", processing_preference="fast"), _api("inherits", target="openai/gpt-5.6-sol"))
+    settings = {**_settings(*rows), "OUROBOROS_PROCESSING_PREFERENCE": "economy"}
+    for row in _config(*rows).items:
+        snapshot, _legacy = select_subagent_snapshot(settings, subagent_id=row.subagent_id)
+        assert execution_identity(snapshot) == engine_identity(row, settings)
 
 
 @pytest.mark.parametrize("facet", [
@@ -102,10 +148,10 @@ def test_identical_engines_are_refused_and_one_differing_facet_is_accepted(facet
     base = _session("first", effort="high")
     twin = _session("second", effort="high", recommended_use="different words, same engine")
     with pytest.raises(ValueError, match=r"items\[1\] runs the same engine as items\[0\]"):
-        validate_unique_engines(_config(base, twin))
-    validate_unique_engines(_config(base, {**twin, **facet}))
-    validate_unique_engines(_config(base, _session("second", pin="other-account", effort="high")))
-    validate_unique_engines(_config(base, _session("second", target="codex=gpt-5.6-sol", effort="high")))
+        validate_unique_engines(_config(base, twin), NO_GLOBAL)
+    validate_unique_engines(_config(base, {**twin, **facet}), NO_GLOBAL)
+    validate_unique_engines(_config(base, _session("second", pin="other-account", effort="high")), NO_GLOBAL)
+    validate_unique_engines(_config(base, _session("second", target="codex=gpt-5.6-sol", effort="high")), NO_GLOBAL)
 
 
 def test_uniqueness_uses_effective_defaults_and_reads_stay_tolerant():
@@ -116,7 +162,7 @@ def test_uniqueness_uses_effective_defaults_and_reads_stay_tolerant():
 
     rows = (_session("implicit"), _session("explicit", access="full"))
     with pytest.raises(ValueError, match="same engine"):
-        validate_unique_engines(_config(*rows))
+        validate_unique_engines(_config(*rows), NO_GLOBAL)
     settings = _settings(*rows)
     assert resolve_configured_subagents(settings).config is not None
     labels = [row["subagent_id"] for row in model_visible_subagent_catalog(settings)["rows"]]
@@ -215,8 +261,6 @@ def _post_settings(monkeypatch, body):
 
 
 def test_every_save_path_refuses_identical_engines_and_accepts_a_near_duplicate(monkeypatch):
-    from ouroboros.gateway.onboarding import _configured_owner_draft
-
     twins = {"enabled": True, "items": [_api("one", effort="low"), _api("two", effort="low")]}
     near = {"enabled": True, "items": [_api("one", effort="low"), _api("two", effort="high")]}
 
@@ -227,11 +271,35 @@ def test_every_save_path_refuses_identical_engines_and_accepts_a_near_duplicate(
     assert accepted.status_code == 200, accepted.body[:300]
     assert json.loads(saved["OUROBOROS_SUBAGENTS"])["items"][1]["effort"] == "high"
 
-    # Onboarding preview and completion share this one owner-draft seam.
-    config, error = _configured_owner_draft({"OUROBOROS_SUBAGENTS": twins})
-    assert config is None and "same engine" in error
-    config, error = _configured_owner_draft({"OUROBOROS_SUBAGENTS": near})
-    assert error == "" and [row.subagent_id for row in config.items] == ["one", "two"]
+    # The engine is judged under THIS save's effective facts: the same body that
+    # turns the global preference to fast makes an unset row and an explicit fast row one engine.
+    inherits = {"enabled": True, "items": [_api("one"), _api("two", processing_preference="fast")]}
+    accepted, _ = _post_settings(monkeypatch, {"OUROBOROS_SUBAGENTS": inherits})
+    assert accepted.status_code == 200, accepted.body[:300]
+    refused, _ = _post_settings(
+        monkeypatch, {"OUROBOROS_SUBAGENTS": inherits, "OUROBOROS_PROCESSING_PREFERENCE": "fast"})
+    assert refused.status_code == 400 and b"same engine" in refused.body
+
+
+def test_onboarding_preview_and_completion_refuse_identical_engines(onboarding):
+    """Both wizard endpoints write or preview the owner's roster through one
+    draft seam; neither may admit twins, and a near-duplicate completes."""
+    twins = {"enabled": True, "items": [_api("one", effort="low"), _api("two", effort="low")]}
+    near = {"enabled": True, "items": [_api("one", effort="low"), _api("two", effort="high")]}
+    for path in ("/api/onboarding/subagents/preview", "/api/onboarding/complete"):
+        response = onboarding.client.post(
+            path, json={**WIZARD_PAYLOAD, "subscriptionsConnected": True, "OUROBOROS_SUBAGENTS": twins})
+        assert response.status_code == 400, response.text
+        assert response.json()["code"] == "invalid_available_subagents"
+        assert "same engine" in response.json()["error"]
+    assert onboarding.calls["snapshot"] == 0 and not onboarding.settings_path.exists()
+
+    response = onboarding.client.post(
+        "/api/onboarding/complete",
+        json={**WIZARD_PAYLOAD, "subscriptionsConnected": True, "OUROBOROS_SUBAGENTS": near})
+    assert response.status_code == 200, response.text
+    saved = json.loads(onboarding.saved()["OUROBOROS_SUBAGENTS"])["items"]
+    assert [row["effort"] for row in saved] == ["low", "high"]
 
 
 def test_an_actor_first_start_accepts_its_own_handle_and_stored_id_and_refuses_another_row(

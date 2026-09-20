@@ -59,8 +59,9 @@ def test_actual_auto_and_pinned_attempt_reach_result_and_context(tmp_path, monke
     assert row["observed_route"]["model"] == "observed-model"
     assert row["attempt_id"] == usage["llm_call_refs"][0]["llm_call_id"]
     # The context projection is the stored row with ONE change: the actor is named
-    # by the handle of the row's own recorded identity, never by the stored key.
-    handle = f"{TARGET}/high" + (f"/@{pin}" if pin else "") + "/standard"
+    # by the handle of the row's own recorded identity (its standard processing
+    # is the baseline, so it is not said), never by the stored key.
+    handle = f"{TARGET}/high" + (f"/@{pin}" if pin else "")
     assert _delegation_capability_fact()["subagents_last_executions"][0] == {
         **row["latest_by_subagent"]["worker"], "selected_subagent_id": handle}
 

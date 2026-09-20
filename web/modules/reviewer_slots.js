@@ -258,7 +258,7 @@ export function encodeReviewerChoice(row) {
 
 export function reviewerChoiceGroups({
     roster = [], rosterKnown = true, row = {}, harnesses = [], modelSources = [],
-    providers = [], catalogKnown = true, accountsKnown = true, providerProfiles = {},
+    providers = [], catalogKnown = true, accountsKnown = true, providerProfiles = {}, processingPreference = '',
 } = {}) {
     // Decision 1=B: ONE flat picker — the Available-subagents references lead
     // (facts-first labels, decision 2=A), then the inline channels. A saved
@@ -267,7 +267,7 @@ export function reviewerChoiceGroups({
     // its own choice down so an undiscovered harness stays displayable too.
     const groups = [];
     const savedId = String(row?.subagent_id || '');
-    const rosterOptions = subagentOptionsFor(roster, savedId, { rosterKnown })
+    const rosterOptions = subagentOptionsFor(roster, savedId, { rosterKnown, processingPreference })
         .map((option) => ({ ...option, value: SUBAGENT_CHOICE_PREFIX + option.value }));
     if (rosterOptions.length) {
         groups.push({ label: 'Available subagents', options: rosterOptions });
@@ -294,18 +294,18 @@ export function subagentOptionLabel(row, handle = routeEditor.subagentHandle(row
     return handle + (hint ? ` — ${hint}` : '');
 }
 
-export function subagentOptionsFor(roster, savedId, { rosterKnown = true } = {}) {
+export function subagentOptionsFor(roster, savedId, { rosterKnown = true, processingPreference = '' } = {}) {
     // Same survive-the-save rule as profileOptionsFor: the select's value must
     // EXIST as an option, or the browser silently redraws the row as the first
     // roster entry and the next Save really rewires the reviewer. And the
     // absence claim follows provenance: only a roster that was actually READ
     // may say a saved reference is not in it.
     // Label contract: the row's HANDLE leads — its route target plus its own
-    // set facets, the same name Ouroboros sees — so the delivery is visible
+    // effective facets, the same name Ouroboros sees — so the delivery is visible
     // BEFORE selection and no stored label can disguise it; the description is
     // a trimmed, sanitized single-line caption after it. The stored id is the
     // option VALUE only (the reviewer reference follows the row through it).
-    const handles = routeEditor.rosterHandles(roster);
+    const handles = routeEditor.rosterHandles(roster, processingPreference);
     const options = (roster || []).map((row) => ({
         value: String(row.subagent_id || ''),
         label: subagentOptionLabel(row, handles.get(String(row.subagent_id || ''))),
@@ -834,6 +834,7 @@ function reviewerPickerHtml(attrs, row) {
         providerProfiles: state.providerProfiles,
         catalogKnown: state.catalogKnown,
         accountsKnown: state.accountsKnown,
+        processingPreference: state.processingPreference,
     });
     return selectHtml(attrs, groups, encodeReviewerChoice(row));
 }
