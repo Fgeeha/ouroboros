@@ -115,6 +115,13 @@ def _redo_allowed(payload: dict) -> str:
         return "pinned_account"
     if current_physical_attempt_predicate() is not None:
         return "admitted_candidate"
+    from ouroboros.model_wait import dispatch_deadline_remaining_sec
+
+    remaining = dispatch_deadline_remaining_sec()
+    if remaining is not None and remaining <= 0:
+        # The round already spent its window. Another send would be paid for
+        # out of time the caller no longer has.
+        return "deadline_spent"
     headroom = physical_attempt_headroom()
     if headroom is not None and headroom < 1:
         # A bounded actor (a density probe, a packet review) owns those sends
@@ -125,7 +132,7 @@ def _redo_allowed(payload: dict) -> str:
 
 
 def _discard(invocation: Any, fact: dict, result: dict,
-             disposition: str, redo: int, redos: int) -> None:
+             disposition: str, redo: int, redos: int) -> dict:
     """Keep the paid generation reconstructible, then refuse it as this round's answer.
 
     The bytes stay retained and acknowledged exactly as an accepted answer's
@@ -137,16 +144,20 @@ def _discard(invocation: Any, fact: dict, result: dict,
     """
     route = result.get("route") or {}
     usage = result.get("usage") or {}
-    append_jsonl(invocation.root / "logs" / "events.jsonl", {
+    # A discarded answer is only evidence while its bytes are reachable. Say
+    # what custody it actually has instead of assuming retention and the ACK
+    # both worked; a durable row that hid a failed one would be a false receipt.
+    custody = invocation.acknowledge() if invocation.response_ref else {"state": "absent"}
+    recorded = append_jsonl(invocation.root / "logs" / "events.jsonl", {
         "ts": utc_now_iso(), "type": "model_served_mismatch", "task_id": invocation.task_id,
         "model_role": invocation.role, "operation_id": invocation.operation_id,
         "physical_attempt_id": invocation.invocation_id, "disposition": disposition,
         "redo": redo, "redos": redos, **fact, "route": copy.deepcopy(route),
         "discarded_usage": {key: usage.get(key) for key in
                             ("input_tokens", "output_tokens", "cached_input_tokens")},
+        "result_custody": copy.deepcopy(custody),
     })
-    if invocation.response_ref:
-        invocation.acknowledge()
+    return {**custody, **({} if recorded else {"event_recorded": False})}
 
 
 class SubstitutionBudget:
@@ -200,7 +211,8 @@ class SubstitutionBudget:
         self.used += 1
         self.avoid = str((result.get("route") or {}).get("credentialProfileId") or "")
         self.discarded.append({**fact, "account": self.avoid, "disposition": reason or "redo"})
-        _discard(invocation, fact, result, reason or "redo", self.used, self.redos)
+        custody = _discard(invocation, fact, result, reason or "redo", self.used, self.redos)
+        self.discarded[-1]["result_custody"] = custody
         if reason:
             raise _refusal(self, invocation, fact, result, reason, self.used - 1)
         return True

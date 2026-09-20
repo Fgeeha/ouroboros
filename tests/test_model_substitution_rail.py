@@ -69,10 +69,14 @@ def test_substituted_round_is_discarded_and_asked_again(setup, asynchronous):
     assert usage["claudexor"]["route"]["model"] == "exact-model"
     assert len(gateway.creates) == 2 and len(set(gateway.creates)) == 2
     assert len(gateway.acks) == 2  # the discarded bytes are acknowledged like any other
-    disclosed = usage["claudexor"]["substituted"]
-    assert disclosed == [{"requested": "exact-model", "observed": "cheaper-model",
-                          "account": "account-a", "disposition": "redo"}]
+    disclosed, = usage["claudexor"]["substituted"]
+    assert {key: disclosed[key] for key in ("requested", "observed", "account", "disposition")} == {
+        "requested": "exact-model", "observed": "cheaper-model",
+        "account": "account-a", "disposition": "redo"}
+    # The discarded bytes are only evidence while custody says they are there.
+    assert disclosed["result_custody"]["state"] == "acknowledged"
     row, = events(root, "model_served_mismatch")
+    assert row["result_custody"]["state"] == "acknowledged"
     assert row["requested"] == "exact-model" and row["observed"] == "cheaper-model"
     assert row["disposition"] == "redo" and row["redo"] == 1 and row["redos"] == 2
     assert row["discarded_usage"] == {"input_tokens": 20, "output_tokens": 7, "cached_input_tokens": 12}
@@ -204,6 +208,43 @@ def test_a_discarded_generation_teaches_the_requested_model_nothing(setup):
     assert seen == ["cheaper-model", "exact-model"]
     witnesses = list((root / "state").rglob("*density*"))
     assert all("cheaper-model" not in path.read_text(encoding="utf-8") for path in witnesses)
+
+
+def test_a_failed_acknowledgement_is_disclosed_rather_than_assumed(setup):
+    root, gateway, client = setup
+    gateway.results = [substituted(), result()]
+    gateway.dispatch = ["response_received"] * 2
+    gateway.ack_error = RuntimeError("ACK reply lost")
+    message, usage = call(client)
+    assert message["content"] == "Ответ 🐍"  # the round still recovers
+    custody = usage["claudexor"]["substituted"][0]["result_custody"]
+    assert custody["state"] == "pending" and custody["reason"] == "RuntimeError"
+    assert events(root, "model_served_mismatch")[0]["result_custody"]["reason"] == "RuntimeError"
+
+
+def test_a_redo_never_starts_once_the_owner_window_is_spent(setup):
+    from ouroboros import model_wait
+
+    root, gateway, client = setup
+    gateway.results = [substituted()]
+    with model_wait.calendar_scope("2000-01-01T00:00:00Z"):
+        with pytest.raises(transport.ClaudexorModelError) as raised:
+            call(client)
+    assert raised.value.problem["context"]["reason"] == "deadline_spent"
+    assert len(gateway.creates) == 1
+
+
+def test_an_unknown_outcome_is_never_treated_as_a_substitution(setup):
+    root, gateway, client = setup
+    substitute = substituted()
+    gateway.results = [substitute]
+    gateway.dispatch = ["unknown"]
+    with pytest.raises(transport.ClaudexorModelError) as raised:
+        call(client)
+    # An operation whose outcome nobody knows must not become a discarded
+    # answer: the rail would be re-asking a round that may still be running.
+    assert raised.value.code == "model_outcome_unknown"
+    assert not events(root, "model_served_mismatch") and len(gateway.creates) == 1
 
 
 def test_a_discarded_generation_never_becomes_the_live_turn(setup, monkeypatch):

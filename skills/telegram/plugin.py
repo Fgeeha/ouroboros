@@ -1040,10 +1040,11 @@ def _make_outbound(api):
 
             # Card-internal host rows: the web shows them inside a task card, and
             # this transport has none. A child's row stays out while its root is
-            # unfinished (the lifecycle bubble above keeps saying `failed`; the
-            # root accounts for its children), and a placed progress frame is
-            # never mirrored, whatever the progress toggle says. A root's own
-            # placed System row still goes out: here it has no card to live in.
+            # unfinished (the lifecycle bubble above keeps saying `failed`, the
+            # root accounts for its children). A PLACED PROGRESS frame is never
+            # mirrored here at all, root or child, whatever the progress toggle
+            # says: it is a line of a card this transport cannot draw, and the
+            # root's own terminal answer carries whatever the owner must know.
             if _child_row_held_for_root(api, event) or (event.get("is_progress") and event.get("card_row")):
                 return
 
