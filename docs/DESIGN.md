@@ -523,7 +523,8 @@ answer keep both forms readable. Anatomy, top to bottom:
    A settled card instead carries what the owner said as a second primary
    line (`Owner's answer: …`, `--type-body`, `--text-primary`) under the
    options — beside the highlighted option when one was chosen, and as the
-   whole answer when none was.
+   whole answer when none was. Its line breaks stay visible; the recorded
+   answer remains literal text.
 6. **Assumption or waiting** — the signature line (`Continuing meanwhile: …`
    for optional clarification, an explicit waiting statement for required input),
    `--type-meta`, `--text-meta`, separated by a hairline. While the card is

@@ -2456,7 +2456,8 @@ body.resizing-panels { user-select: none; }
     font-size: var(--type-body);
     line-height: var(--line-body);
 }
-.ui-rich-content code,
+.ui-rich-content .inline-code,
+.ui-rich-content .md-code-block code,
 .chat-bubble .message code {
     font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
     font-size: var(--type-body);
@@ -2587,9 +2588,7 @@ body.resizing-panels { user-select: none; }
 .chat-bubble .message .md-h1 { margin-block: var(--space-5) var(--space-3); }
 .chat-bubble .message .md-h2 { margin-block: var(--space-4) var(--space-2); }
 .chat-bubble .message .md-h3 { margin-block: var(--space-3) var(--space-2); }
-.ui-rich-content > :first-child,
 .chat-bubble .message > :first-child { margin-block-start: 0; }
-.ui-rich-content > :last-child,
 .chat-bubble .message > :last-child { margin-block-end: 0; }
 .md-li {
     display: block;
@@ -7018,6 +7017,13 @@ textarea.chat-input {
 
 .chat-link-button:hover { background: var(--accent-18); }
 
+/* The bubble owns the width floor against the definite transcript column:
+   260px card plus its 28px bubble padding and 2px border. A child percentage
+   alone would lose that floor in a shrink-to-fit bubble, even on desktop. */
+.chat-bubble:has(> .chat-quiz-card) {
+    min-width: min(290px, 100%);
+    margin-inline: 0;
+}
 /* Owner quiz card (design system: born on tokens; DESIGN.md "Quiz card"). */
 .chat-quiz-card {
     display: flex;
@@ -7074,6 +7080,7 @@ textarea.chat-input {
     color: var(--text-meta);
     min-inline-size: 0;
 }
+.chat-quiz-stake .inline-code { font-size: inherit; }
 .chat-quiz-options {
     display: flex;
     flex-direction: column;
@@ -7159,6 +7166,7 @@ textarea.chat-input {
 }
 /* The settled record of what the owner answered: a second primary line. */
 .chat-quiz-answer {
+    white-space: pre-wrap;
     font-size: var(--type-body);
     line-height: var(--line-body, 1.5);
     color: var(--text-primary);

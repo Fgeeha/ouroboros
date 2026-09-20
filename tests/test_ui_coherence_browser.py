@@ -404,12 +404,13 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
                         '```',
             'options': ['Ship without it and link the source', 'Wait for written permission'],
             'option_details': ['Readers follow one extra link.', 'Publication slips by about a week.'],
-            'stake': 'Whether the archive ships this week.'},
+            'stake': 'Whether `sources.json` ships this week.'},
     }
     asked = copy.deepcopy(blocks)
     wait = {'quiz_id': 'waiting', 'state': 'waiting'}
     decisions, activities, history_reads, sockets, detail_reads = [], [], [], [], []
     mode = {'stale': False}
+    owner_comment = 'Keep each source.\nPreserve its original date.'
     # A second task of the same Project whose form reaches Main only after its wait did.
     late = {'state': 'open', 'question': 'Which licence notice goes on the cover?', 'options': ['Short notice', 'Full notice'],
             'option_details': ['One line with a link.', 'The whole licence text.'], 'stake': 'The cover layout.',
@@ -449,12 +450,13 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
         sent = route.request.post_data_json
         decisions.append(sent)
         qid = sent['decision_id'].split(':')[2]
-        blocks[qid].update(state='answered', answered_index=sent['option_index'])
+        blocks[qid].update(state='answered', answered_index=sent['option_index'], comment=sent.get('comment', ''))
         if qid == wait['quiz_id']:
             wait['state'] = 'resumed'
             activities[0]['required_question'].update(quiz_state='answered', answered_index=sent['option_index'],
                                                       owner_wait_state='resumed')
         route.fulfill(json={'ok': True, 'state': 'answered', 'answered_index': sent['option_index'],
+                            'comment': sent.get('comment', ''),
                             **({'answered_after_terminal': True, 'forwarded': True} if qid == 'finished' else {})})
     page.route('**/api/decisions', decide)
 
@@ -489,7 +491,9 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     by_id = {form['id']: form for form in forms}
     assert {form['chip'] for form in forms} == {project['name']}
     assert by_id['waiting']['status'] == 'Waiting for your answer' and by_id['waiting']['own']
-    assert by_id['waiting']['stake'] == 'At stake: Whether the archive ships this week.'
+    assert by_id['waiting']['stake'] == 'At stake: Whether sources.json ships this week.'
+    assert card('waiting').locator('.chat-quiz-stake .inline-code').evaluate(
+        'el => getComputedStyle(el).fontSize') == '12px'
     assert by_id['waiting']['details'] == ['Readers follow one extra link.', 'Publication slips by about a week.']
     assert by_id['waiting']['recommended'] == 0 and by_id['passed']['recommended'] == 1
     assert by_id['passed']['details'] == ['Lossless, larger', 'Smaller at quality 82'] and by_id['passed']['own']
@@ -559,6 +563,7 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
 
     # One touch answers from Main: the recorded result reads for five seconds, then only the
     # Main copy goes. A duplicate live frame and the census's own answer never restart it.
+    card('waiting').locator('.chat-quiz-comment').fill(owner_comment)
     card('waiting').locator('.chat-quiz-option').nth(1).click()
     page.locator('#chat-messages .project-question-card[data-quiz-id="waiting"][data-state="answered"]').wait_for()
     confirmed = page.evaluate('performance.now()')
@@ -566,7 +571,9 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     assert card('waiting').locator('.chat-quiz-status-text').inner_text() == 'You answered'
     assert card('waiting').locator('.chat-quiz-comment').count() == 0
     assert [(sent['decision_id'], sent['option_index'], 'comment' in sent) for sent in decisions] == [
-        ('quiz:proof-task:waiting', 1, False)]
+        ('quiz:proof-task:waiting', 1, True)]
+    assert decisions[0]['comment'] == owner_comment
+    assert card('waiting').locator('.chat-quiz-answer').inner_text() == "Owner's answer: " + owner_comment
     card('waiting').evaluate("el => el.scrollIntoView({block: 'center'})")
     setup_browser.capture(page, f'question-mirror-answered-{width}')
     page.wait_for_timeout(3000)
@@ -682,3 +689,45 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     card('second').scroll_into_view_if_needed()
     setup_browser.capture(page, f'question-mirrors-reloaded-{width}')
     assert len(decisions) == 2, 'a reload and a navigation never answer anything'
+
+
+@pytest.mark.parametrize('width', [1100, 320])
+def test_short_question_and_routing_cards_keep_their_width_floor(subscription_ui, width):
+    """The shared card floor survives shrink-to-fit but yields to a narrow column."""
+    page = subscription_ui['page']
+    page.set_viewport_size({'width': width, 'height': 844})
+    open_app(subscription_ui)
+    page.evaluate("""async () => {
+        const { createChatDecision } = await import('/static/modules/chat_decision.js');
+        const { createChatMedia } = await import('/static/modules/chat_media.js');
+        const { mountChatMarkdown } = await import('/static/modules/chat_markdown.js');
+        const media = createChatMedia({ chatSessionId: 'geometry', formatMsgTime: () => null,
+            stampNodeTimestamp: () => {}, senderLabel: () => 'You' });
+        const decision = createChatDecision({ apiFetch: () => {}, showToast: () => {},
+            frameNode: media.bubbleFrameNode, mountMarkdown: mountChatMarkdown });
+        const column = document.querySelector('#chat-messages');
+        column.append(decision.buildQuizCard({ type: 'quiz', task_id: 'width-proof', quiz_id: 'short',
+            state: 'answered', answered_index: 0, question: 'Ок?', options: ['Да', 'Нет'] }));
+        const owner = media.bubbleFrameNode({ role: 'user' }, document.createElement('span'));
+        owner.dataset.clientMessageId = 'width-route';
+        decision.renderRoutingDecision(owner, { status: 'needs_manual_target', routing_token: 'width-token',
+            options: [{ label: 'A' }, { label: 'B' }] });
+        column.append(owner);
+    }""")
+    metrics = page.evaluate("""() => {
+        const column = document.querySelector('#chat-messages');
+        const cs = getComputedStyle(column), rect = column.getBoundingClientRect();
+        const contentWidth = column.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight);
+        const cards = [...column.querySelectorAll('.chat-quiz-card')];
+        return {overflow: column.scrollWidth - column.clientWidth, cards: cards.map(card => {
+            const bubble = card.parentElement, style = getComputedStyle(bubble), box = card.getBoundingClientRect();
+            const chrome = ['paddingLeft', 'paddingRight', 'borderLeftWidth', 'borderRightWidth']
+                .reduce((n, key) => n + parseFloat(style[key]), 0);
+            return {width: box.width, minimum: Math.min(260, contentWidth - chrome),
+                inside: box.right <= rect.right - parseFloat(cs.paddingRight) + 1};
+        })};
+    }""")
+    assert len(metrics['cards']) == 2, metrics
+    assert metrics['overflow'] <= 1, metrics
+    assert all(card['width'] >= card['minimum'] - 1 and card['inside'] for card in metrics['cards']), metrics
+    setup_browser.capture(page, f'question-routing-width-{width}')
