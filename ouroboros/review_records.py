@@ -143,6 +143,19 @@ def review_outcome_received(actors: Any, *, findings: Any = (), terminal: bool =
         (item.get("item") or item.get("summary")) for item in findings or []))
 
 
+def review_slot_awaiting(row: Any) -> bool:
+    """A PLANNED wait: the caller released the dispatch barrier before this slot
+    answered. An answer that has not arrived is a gap, never a failure or a verdict."""
+    return isinstance(row, dict) and row.get("operation_state") == "pending_dispatch"
+
+
+def review_slot_unresolved(row: Any) -> bool:
+    """No answer and NOT a planned wait: the logical window expired or the worker
+    handle is gone. ``late_result_pending`` is true for these rows and for awaiting
+    ones alike, so it never tells the two apart — only ``operation_state`` does."""
+    return isinstance(row, dict) and row.get("operation_state") in {"in_flight", "custody_lost"}
+
+
 def apply_review_model_override(slot: Any, overrides: Dict[str, dict], *, slot_id: str = "") -> Any:
     """Project an explicit owner model choice onto one frozen reviewer row.
 

@@ -319,7 +319,7 @@ def test_in_flight_panels_count_toward_the_cycle_cap_at_dispatch(harness, monkey
         state = _state(harness)
         assert state["cycles_paid"] == 0  # committed, not yet proven paid: nothing is written as spent
         assert state["current_attempt"]["fingerprint"] == first_fp  # the in-flight wave stays current
-        assert not any(line.startswith("📐 plan_task: PLAN_REVIEW_CYCLES_EXHAUSTED") for line in harness.progress)
+        assert not any(line.startswith("📐 Plan review: PLAN_REVIEW_CYCLES_EXHAUSTED") for line in harness.progress)
     finally:
         executor.release.set()
     assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)
@@ -469,7 +469,8 @@ def test_the_open_wave_text_names_the_route_that_waits_for_the_settlement_frame(
     wave = _state(harness)["waves"][-1]
     fp = wave["request_fingerprint"]
     for text in (first, _next_step(wave, enforcement="blocking", cap=2, cycles_paid=0)):
-        assert "one or more paid reviewer operations are still in flight" in text
+        # "paid" is not claimed: a slot released at the barrier is $0 until its row proves the send.
+        assert "one or more reviewer operations are still in flight" in text and "paid reviewer" not in text
         assert ("The host writes ONE message into this task's mailbox when every released slot "
                 "settles: wait_task on this task's own id (wait_tasks while children run) "
                 "returns on it") in text

@@ -426,6 +426,41 @@
       "acceptance_clause": "Plan review never closed; the work continued under advisory enforcement."
     },
     {
+      "name": "a plan review that was only awaited is Done and states that fact",
+      "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok", "reason_code": "final_message", "plan_review": "awaiting"}, "review": {"status": "skipped"}}},
+      "phase": "done",
+      "headline": "Done",
+      "acceptance_clause": "Not every plan reviewer had answered when the task ended."
+    },
+    {
+      "name": "an awaited plan review on a card that is amber for another reason states no cause",
+      "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok", "reason_code": "final_message", "plan_review": "awaiting"}, "objective": {"status": "not_evaluated", "warning": "residual_tool_errors_without_review"}, "review": {"status": "skipped"}}},
+      "phase": "warn",
+      "headline": "Done with warnings",
+      "acceptance_clause": ""
+    },
+    {
+      "name": "an awaited plan review on a card that is red for another reason states no cause",
+      "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok", "reason_code": "final_message", "plan_review": "awaiting"}, "artifacts": {"status": "missing"}, "review": {"status": "skipped"}}},
+      "phase": "error",
+      "headline": "Failed",
+      "acceptance_clause": ""
+    },
+    {
+      "name": "an acceptance panel that was only awaited is Done under the author's own finish",
+      "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok"}, "objective": {"status": "pass", "source": "author_acceptance", "reason": "author_finish"}, "review": {"status": "awaiting", "eligibility": "review_in_flight", "acceptance_decision": {"status": "finalized_unaccepted", "reason": "author_finish", "enforcement": "advisory", "author_action": "finish", "author_disposition": {"disposition": "accepted", "rationale": "Main submitted this complete response for delivery.", "subject_hash": "s1", "reviewer_signal": "", "enforcement": "advisory", "recorded_at": "2026-09-20T00:00:00+00:00", "source": "author_final_response"}}}}},
+      "phase": "done",
+      "headline": "Done",
+      "acceptance_clause": "The answer was delivered on Main's own judgement; the reviewers had not signed it off."
+    },
+    {
+      "name": "an awaited acceptance panel with no author decision is still not a warning",
+      "record": {"status": "completed", "reason_code": "final_message", "outcome_axes": {"execution": {"status": "ok"}, "review": {"status": "awaiting"}}},
+      "phase": "done",
+      "headline": "Done",
+      "acceptance_clause": ""
+    },
+    {
       "name": "an open delegated-custody debt says its own sentence",
       "record": {"status": "completed", "reason_code": "delegated_custody_unreconciled", "delegated_runs_unreconciled": ["run-a1"], "outcome_axes": {"execution": {"status": "degraded"}}},
       "phase": "warn",

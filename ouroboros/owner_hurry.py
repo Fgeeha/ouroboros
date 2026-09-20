@@ -454,6 +454,35 @@ def _plan_review_engaged(state: Any) -> bool:
                 or legacy.get("status") not in (None, "", "absent"))
 
 
+def plan_wave_only_awaited(wave: Any) -> bool:
+    """Whether the wave is open ONLY because reviewers had not answered yet.
+
+    Typed facts alone: every unanswered slot is a planned wait that carries no answer
+    (the census names no unresolved, uncollected, refused or failed slot), and the
+    recorded answers hold no verdict of their own beneath the stored placeholder. A
+    collected blocking or ``need_evidence`` finding keeps the wave open whatever the
+    awaited slots answer, and a quorum of answers that raised findings IS a critic
+    verdict the wait merely postpones — neither reads as a mere wait. A roster or a
+    quorum the typed facts cannot vouch for is never a mere wait either."""
+    from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
+
+    if not isinstance(wave, dict) or not wave.get("custody_pending"):
+        return False
+    roster, findings = wave.get("actors"), wave.get("findings") or []
+    census = plan_wave_slot_census(wave)
+    if (not isinstance(roster, list) or len(roster) != census["configured"] or not census["awaiting"]
+            or any(census[name] for name in ("unresolved", "uncollected", "skipped", "failed"))
+            or any(row.get("ok") or row.get("parsed") is not None or str(row.get("raw_text") or "").strip()
+                   for row in census["awaiting"])):
+        return False
+    counts = wave.get("counts") if isinstance(wave.get("counts"), dict) else {}
+    quorum = counts.get("quorum")
+    if (type(quorum) is not int or quorum <= 0 or not isinstance(findings, list)
+            or any(not isinstance(item, dict) or item.get("class") != "note" for item in findings)):
+        return False
+    return len(census["answered"]) < quorum or not findings
+
+
 def force_plan_decision(
     ctx: Any, llm_trace: Dict[str, Any], *,
     hard_rail: str = "", enforcement: Optional[str] = None,
@@ -523,6 +552,12 @@ def force_plan_decision(
         # wave DEGRADED and open for exactly that reason), so the disclosure must
         # say a result is still owed instead of implying the panel is over.
         decision["review_late_result_pending"] = True
+        # An advisory release over a wave that is merely awaited is a gap, not a
+        # degradation: the disclosure stays loud and the task is not stamped for it.
+        # A rail, a spent cap and every blocking exit keep their own outcome.
+        if (decision.get("status") == "advisory_open" and not hard_rail
+                and not decision.get("review_capacity_reason") and plan_wave_only_awaited(wave)):
+            decision["review_only_awaited"] = True
     if hurry_armed and str(enforcement or "").lower() == "blocking":
         # Attribution only (task detail); this changes no global enforcement.
         decision["owner_hurry_local_advisory"] = True
@@ -690,7 +725,8 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
         return ""
     outcome = str(decision.get("outcome") or "")
     if decision.get("custody_pending") or decision.get("review_late_result_pending"):
-        outcome = f"{outcome or 'open'}; reviewer work is running or awaiting collection"
+        # No verdict exists yet: the stored aggregate only keeps the wave open, so its token is not shown as one.
+        outcome = "reviewer work is running or awaiting collection"
     elif decision.get("reviewer_slots_degraded"):
         outcome = f"{outcome or 'open'}; no parseable reviewer quorum"
     # A historical critic's aggregate is EVIDENCE about the plan the author corrected,
@@ -701,10 +737,11 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
                    "the current plan has no verdict of its own")
     subject = "Blocking plan review" if decision.get("enforcement") == "blocking" else "Plan review"
     # The wave is still OPEN at finalization, so the verb says so: "remained"
-    # told the owner a panel had ended that nobody had closed. When a paid slot
-    # can still settle, the same sentence carries that typed fact.
+    # told the owner a panel had ended that nobody had closed. When a slot can
+    # still settle, the same sentence carries that typed fact — never as "paid":
+    # a slot released at the barrier is $0 until its settled row proves the send.
     late = (
-        " A paid reviewer slot can still settle, so a late result is still owed."
+        " A reviewer slot can still settle, so a late result is still owed."
         if decision.get("review_late_result_pending") else ""
     )
     # The author's decision and the rail that forced finalization are BOTH true, and
