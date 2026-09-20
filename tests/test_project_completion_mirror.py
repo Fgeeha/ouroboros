@@ -40,6 +40,7 @@ def test_model_final_answer_is_mirrored_whole_for_every_terminal_phase(phase):
     (_result(terminal_origin="host_notice"), "error"),    # the host's own notice is not his voice
     (_result(terminal_origin=""), "done"),                # unknown authorship is never assumed
     (_result(result="   "), "done"),                      # nothing to say
+    (_result(result={"answer": "x"}), "done"),            # a malformed result is never repr()-ed into his voice
     (_result(), "working"),                               # the outbox freezes the first send
     (_result(), ""),
     (_result(result="x" * (MIRRORED_ANSWER_MAX_CHARS + 1)), "done"),  # over the ceiling: pointer, never a cut

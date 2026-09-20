@@ -858,7 +858,7 @@ def mirrored_answer(result: Any, phase: str) -> Dict[str, str]:
     from ouroboros.task_finalization import TERMINAL_ORIGIN_MODEL_FINAL
 
     row = result if isinstance(result, dict) else {}
-    answer = str(row.get("result") or "").strip()
+    answer = row["result"].strip() if isinstance(row.get("result"), str) else ""
     if (str(row.get("terminal_origin") or "") != TERMINAL_ORIGIN_MODEL_FINAL
             or str(phase or "") not in _TERMINAL_MIRROR_PHASES
             or not answer or len(answer) > MIRRORED_ANSWER_MAX_CHARS):
