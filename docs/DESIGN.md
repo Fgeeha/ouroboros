@@ -501,8 +501,10 @@ answer keep both forms readable. Anatomy, top to bottom:
    `Replaced by a newer question` uses the disabled dot; an unreadable source
    reads `Status unavailable`, never an invented invitation. No answer-deadline
    countdown: task completion closes its mailbox, not the question's answerability.
-2. **Question** — the one primary thing: `--type-body` semibold,
-   `--text-primary`.
+2. **Question** — the one primary thing, by position and ink: `--type-body`,
+   `--text-primary`, regular weight. Its emphasis is the asker's own — only
+   what the question marks (`**…**`) is semibold — so a question of several
+   lines keeps a title instead of reading as one bold block.
 3. **Stake** — optional one-liner (`At stake: …`), `--type-meta`, `--text-meta`.
 4. **Options** — real owner actions: buttons with `--text-primary` labels,
    legible at rest; an optional per-option detail steps down to meta ink.

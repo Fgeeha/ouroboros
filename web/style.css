@@ -7042,9 +7042,10 @@ textarea.chat-input {
 .chat-quiz-question {
     font-size: var(--type-body);
     line-height: var(--line-body, 1.5);
-    font-weight: 600;
+    font-weight: 400;
     color: var(--text-primary);
 }
+.chat-quiz-question strong { font-weight: 600; }
 .chat-quiz-stake {
     font-size: var(--type-meta);
     line-height: var(--line-meta, 1.35);

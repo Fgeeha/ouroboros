@@ -485,6 +485,9 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
     assert by_id['replaced']['status'] == 'Replaced by a newer question'
     assert by_id['replaced']['disabled'] and not by_id['replaced']['own'], 'a replaced question is a read-only record'
     assert card('waiting').locator('.chat-quiz-question strong').inner_text() == 'licence'
+    weights = card('waiting').locator('.chat-quiz-question').evaluate(
+        "el => [getComputedStyle(el).fontWeight, getComputedStyle(el.querySelector('strong')).fontWeight]")
+    assert weights == ['400', '600'], 'the question reads as text; only its own emphasis is semibold'
     geometry = page.evaluate("""() => {
         const scroller = document.querySelector('#chat-messages');
         const cards = [...document.querySelectorAll('#chat-messages .project-question-card')];
