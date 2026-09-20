@@ -31,7 +31,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/architecture/03-web-ui-pages-and-buttons.md": 100900,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     "docs/architecture/05-supervisor-loop.md": 27137,
-    "docs/architecture/06-agent-core.md": 286850,
+    # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
+    # plan review and task acceptance (the slot census vocabulary, the `awaiting`
+    # projection, the only-awaited task outcome); the in-flight sentence it grew from is
+    # replaced, the rest has no older text to displace.
+    "docs/architecture/06-agent-core.md": 287600,
     "docs/architecture/07-configuration.md": 36991,
     "docs/architecture/08-git-branching-ci-and-build.md": 18947,
     "docs/architecture/09-shutdown-and-process-cleanup.md": 12405,

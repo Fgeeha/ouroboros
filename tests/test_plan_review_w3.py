@@ -731,7 +731,7 @@ def test_progress_line_dedups_typed_reasons_and_names_the_late_result():
     plain = plan_wave_progress_line("GREEN", {**counts, "parseable": 6}, cycles_paid=1, cap=2)
     assert plain == plan_wave_progress_line("GREEN", {**counts, "parseable": 6}, cycles_paid=1, cap=2,
                                             wave={"actors": same, "custody_pending": False})
-    assert plain == "📐 plan_task: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"
+    assert plain == "📐 Plan review: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"
 
 
 def test_refused_redispatch_emits_a_separate_no_dispatch_line(harness, monkeypatch):
@@ -755,9 +755,9 @@ def test_refused_redispatch_emits_a_separate_no_dispatch_line(harness, monkeypat
     harness.progress.clear()
     _call(ctx)  # stale empty-epoch wave re-dispatches; every row refuses pre-send at $0
     assert _state(harness)["cycles_paid"] == 1
-    no_dispatch = [line for line in harness.progress if line.startswith("📐 plan_task: no new reviewer cycle dispatched")]
-    assert no_dispatch == ["📐 plan_task: no new reviewer cycle dispatched: session_task_missing"]
-    assert harness.progress[-1].startswith("📐 plan_task: DEGRADED") and "session_task_missing" in harness.progress[-1]
+    no_dispatch = [line for line in harness.progress if line.startswith("📐 Plan review: no new reviewer cycle dispatched")]
+    assert no_dispatch == ["📐 Plan review: no new reviewer cycle dispatched: session_task_missing"]
+    assert harness.progress[-1].startswith("📐 Plan review: DEGRADED") and "session_task_missing" in harness.progress[-1]
 
 
 def test_gate_projection_carries_custody_pending_before_the_aggregate():

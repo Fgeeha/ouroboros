@@ -257,6 +257,7 @@ def _terminal_zero_run_receipt_present(receipts: List[Dict[str, Any]]) -> bool:
 # Historical name of the RED-reconciling statuses; the SSOT now lives next to the
 # reconciliation core it parameterizes (see `_outcome_receipts.RED_RECONCILING_STATUSES`).
 _RECEIPT_RED_RECONCILING_STATUSES = _outcome_receipts.RED_RECONCILING_STATUSES
+plan_review_awaiting = _outcome_receipts.plan_review_awaiting  # the task-row reader of `execution.plan_review`
 
 # Ledger entry statuses that do NOT count as a failure for ``summary.has_failures``.
 # SSOT: the receipt grounding statuses (pass/observed/declared) are folded in so a turn
@@ -609,6 +610,7 @@ def _aggregate_outcome_tier(tiers: List[str]) -> str:
     return OUTCOME_TIER_SOLVED if tiers else ""
 
 
+from ouroboros.review_projection import AWAITING_PROJECTION  # noqa: E402 - the one word for an answer that has not arrived
 from ouroboros.review_projection import acceptance_decision_projection as _acceptance_decision_projection  # noqa: E402,F401
 
 
@@ -648,7 +650,8 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     if "FAIL" in signals:
         status = "fail"
     elif "DEGRADED" in signals or any(bool(run.get("degraded")) for run in runs):
-        status = "degraded"
+        # A panel that was only awaited holds no verdict yet: a gap, not a degraded review.
+        status = AWAITING_PROJECTION if _outcome_receipts.review_runs_only_awaited(runs) else "degraded"
     elif "PASS" in signals:
         status = "pass"
     else:
@@ -661,7 +664,7 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
         "aggregate_signals": signals,
     }
     tier = _aggregate_outcome_tier(_extract_outcome_tiers(runs))
-    if tier:
+    if tier and status != AWAITING_PROJECTION:  # a minority answer is not the panel's tier
         axis["outcome_tier"] = tier
     # Only applied host facts demote a valid non-clean PASS; legacy rows retain their projection.
     impacts = {str(run.get("enforcement_impact") or "") for run in runs
@@ -1243,6 +1246,8 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "reason_code": reason_code,
             "failure": failure,
             **({"resource_limit": resource_limit} if resource_limit else {}),
+            # The durable fact of a clean finish over a plan review that was only awaited.
+            **({"plan_review": AWAITING_PROJECTION} if execution_status == EXECUTION_OK and plan_gate.get("review_only_awaited") is True else {}),
             "recoveries": recovered_tool_errors[:20],
             "cosmetic_tool_errors": cosmetic_tool_errors[:20],
             "ignored_tool_errors": ignored_tool_errors[:20],

@@ -99,7 +99,7 @@ test('a host-notes-only turn keeps its coined name and an empty activity line', 
     try {
         f.census(direct());
         f.emit({ content: NOTE, narration: false, suggested_name: NAME });
-        f.emit({ content: '📐 plan_task: wave 1 dispatched', narration: false });
+        f.emit({ content: '📐 Plan review: wave 1 dispatched', narration: false });
         assert.equal(f.rows().length, 2);
         assert.equal(f.title(), NAME);
         assert.equal(f.activity(), '', 'no host note ever reaches the collapsed line');
@@ -137,7 +137,7 @@ test('replay reads the voice exactly as live did', async () => {
     const opening = { role: 'user', text: 'fix the flake', ts: TS, chat_id: 1 };
     const f = fixture([opening,
         row({ text: NOTE, content: NOTE, narration: false, suggested_name: NAME }),
-        row({ text: '📐 plan_task: wave 1 dispatched', content: '📐 plan_task: wave 1 dispatched',
+        row({ text: '📐 Plan review: wave 1 dispatched', content: '📐 Plan review: wave 1 dispatched',
             narration: false, ts: '2026-09-16T12:00:02Z' })]);
     try {
         await f.instance.refreshHistory({ revision: 1 });
