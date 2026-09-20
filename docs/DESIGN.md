@@ -460,6 +460,12 @@ keys.
   status pair, never dimmed — with the section-level line as the summary. A
   save attempt judges the entries that existed then; one added afterwards is
   an invitation again.
+- A per-entry on/off switch is a native `.ui-checkbox` leading that entry's
+  head, before its title, with its own accessible name and pointer target. It
+  is a draft like every other field — the section's Save is the one writer, and
+  no entry saves on its own click. An entry switched off is not dimmed, locked
+  or removed: it keeps every control editable and its own status reading, and
+  the switch never merges into the availability axis beside it.
 - A multi-field card (an MCP server) follows the add-and-reveal rule without
   adopting the §6 row anatomy.
 

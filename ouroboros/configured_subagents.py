@@ -34,7 +34,7 @@ SOURCE_INVALID = "invalid"
 
 _ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _TOP_KEYS = frozenset({"enabled", "items"})
-_ROW_KEYS = frozenset({"subagent_id", "name", "recommended_use", "route", "effort", "processing_preference", "access"})
+_ROW_KEYS = frozenset({"subagent_id", "name", "recommended_use", "route", "effort", "processing_preference", "access", "enabled"})
 _ROUTE_ALIASES = {
     ROUTE_KIND_API_MODEL: ROUTE_KIND_API_MODEL,
     ROUTE_KIND_AGENT_SESSION: ROUTE_KIND_AGENT_SESSION,
@@ -73,6 +73,11 @@ class ConfiguredSubagent:
     effort: str = ""
     processing_preference: str = ""
     access: str = "full"
+    # Owner's per-row switch, distinct from the list-level `enabled` and from
+    # live availability: a disabled row keeps its complete configuration and
+    # stays editable, but no NEW use (delegation or reviewer reference) may
+    # select it. Absent in older saved bytes, which means enabled.
+    enabled: bool = True
 
 
 @dataclass(frozen=True)
@@ -180,6 +185,9 @@ def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
             raise ValueError(f"{SUBAGENTS_SETTING}: {where}.name must be a string")
         if not isinstance(row.get("recommended_use"), str):
             raise ValueError(f"{SUBAGENTS_SETTING}: {where}.recommended_use must be a string")
+        row_enabled = row.get("enabled", True)
+        if not isinstance(row_enabled, bool):
+            raise ValueError(f"{SUBAGENTS_SETTING}: {where}.enabled must be a boolean")
         # Legacy `name` values are accepted and DROPPED (retired field): the
         # next serialize omits the key, which is the whole migration.
         route = parse_route_spec(
@@ -210,6 +218,7 @@ def parse_configured_subagents(raw: Any) -> ConfiguredSubagents:
                 effort=effort,
                 processing_preference=normalize_processing_preference(row.get("processing_preference")),
                 access=access,
+                enabled=row_enabled,
             )
         )
     return ConfiguredSubagents(enabled=payload["enabled"], items=tuple(items))
@@ -234,6 +243,12 @@ def configured_subagents_dict(config: ConfiguredSubagents) -> dict[str, Any]:
         # A saved lower choice must not become the full default on its next read.
         if row.route.is_session:
             payload["access"] = row.access
+        # Omitted while true: an existing roster's canonical bytes — and every
+        # fingerprint, receipt and snapshot bound to them — are unchanged by
+        # this field. Only an owner-disabled row writes it, and changing its
+        # fingerprint is the honest consequence of a changed configuration.
+        if not row.enabled:
+            payload["enabled"] = False
         items.append(payload)
     return {"enabled": config.enabled, "items": items}
 
@@ -538,6 +553,7 @@ def _append_candidate_rows(
                 route=candidate.route,
                 effort=candidate.effort,
                 access=candidate.access,
+                enabled=candidate.enabled,
             )
         )
         seen.add(identity)

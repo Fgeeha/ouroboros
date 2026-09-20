@@ -92,6 +92,10 @@ def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any
 
     rows: list[dict[str, Any]] = []
     for row in config.items:
+        # An owner-disabled row keeps its saved configuration and stays
+        # editable in Settings; it is simply not offered for a NEW selection.
+        if not row.enabled:
+            continue
         session = row.route.is_session
         # FACTS lead (owner decision 1=A/2=A): the neutral id and the derived
         # route facts are the identity; recommended_use is the one semantic
@@ -117,6 +121,8 @@ def model_visible_subagent_catalog(settings: Mapping[str, Any]) -> dict[str, Any
         projected["recommended_use"] = row.recommended_use
         rows.append(projected)
 
+    if not rows:
+        return {}
     return {
         "source": resolution.source,
         "config_fingerprint": configured_subagents_fingerprint(config),
@@ -260,7 +266,7 @@ def _legacy_matches(
 
     if resolution.source not in {SOURCE_LEGACY_MIGRATED, SOURCE_UNDECIDED}:
         return []
-    rows = list(resolution.config.items if resolution.config else ())
+    rows = [row for row in (resolution.config.items if resolution.config else ()) if row.enabled]
     if executor == "harness":
         rows = [row for row in rows if row.route.is_session]
     elif executor == "native":
@@ -312,6 +318,16 @@ def select_subagent_snapshot(
                 "unknown_subagent_id", f"No configured subagent has id {selected_id!r}."
             )
         row = matches[0]
+        # Typed and distinct from the list-level `subagents_disabled` and from a
+        # live-availability refusal: the row exists and is fully configured, the
+        # owner has switched it off for new work. Never a substitute actor.
+        if not row.enabled:
+            raise SubagentSelectionError(
+                "subagent_disabled",
+                f"Configured subagent {selected_id!r} is switched off in Available "
+                "subagents; its configuration is kept. Choose an enabled subagent_id, "
+                "or turn that row back on in Settings.",
+            )
     else:
         lane = str(legacy_model_lane or "auto").strip().lower() or "auto"
         executor = str(legacy_executor or "auto").strip().lower() or "auto"
@@ -565,7 +581,7 @@ def current_subagent_alternatives(exclude_id: str = "") -> list[dict[str, Any]]:
             "availability": "check_at_dispatch",
         }
         for row in config.items
-        if row.subagent_id != excluded
+        if row.subagent_id != excluded and row.enabled
     ]
 
 

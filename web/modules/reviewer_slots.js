@@ -293,6 +293,9 @@ export function subagentOptionLabel(row) {
         if (fields.model) parts.push(fields.model);
     }
     if (row?.effort) parts.push(row.effort);
+    // The owner's row switch is a FACT, so it rides with the facts: after the
+    // caption it would read as part of the owner's own prose.
+    if (row?.enabled === false) parts.push('switched off');
     // Free text is a caption, never identity: one line, bounded, with the
     // characters that could visually reorder or break the facts stripped
     // (bidi controls, newlines).
@@ -316,11 +319,16 @@ export function subagentOptionsFor(roster, savedId, { rosterKnown = true } = {})
     // then target and effort — so the delivery is visible BEFORE selection and
     // free-text intent can never disguise it; the description is a trimmed,
     // sanitized single-line caption after the facts.
-    const options = (roster || []).map((row) => ({
-        value: String(row.subagent_id || ''),
-        label: subagentOptionLabel(row),
-    }));
+    // An owner-disabled roster row is withdrawn from NEW choices (the parser
+    // refuses a fresh reference to it); an already-selected one stays visible
+    // and annotated rather than being silently cleared.
     const saved = String(savedId || '');
+    const options = (roster || [])
+        .filter((row) => row.enabled !== false || String(row.subagent_id || '') === saved)
+        .map((row) => ({
+            value: String(row.subagent_id || ''),
+            label: subagentOptionLabel(row),
+        }));
     if (saved && !options.some((option) => option.value === saved)) {
         options.push({
             value: saved,
@@ -355,7 +363,10 @@ export function describeSubagentReference(subagentId, roster, { rosterKnown = tr
     if (routeEditor.routeSupportsAccount(route) && route.credential_profile_id) parts.push(`account ${route.credential_profile_id}`);
     if (row.effort) parts.push(`effort ${row.effort}`);
     parts.push(`processing ${routeEditor.processingIntentLabel(row.processing_preference, processingPreference)}`);
-    return `Runs as ${parts.join(' · ')} — from its roster row under Available subagents`;
+    const off = row.enabled === false
+        ? '. That row is switched off, so this reference is refused at save rather than rerouted — choose another reviewer or turn the row back on'
+        : '';
+    return `Runs as ${parts.join(' · ')} — from its roster row under Available subagents${off}`;
 }
 
 export function describeLastExecution(entry) {
