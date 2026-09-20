@@ -234,12 +234,15 @@ def test_catalog_hides_an_owner_disabled_row_and_selection_refuses_it_typed(monk
     )
 
     catalog = model_visible_subagent_catalog(settings)
-    assert [row["subagent_id"] for row in catalog["rows"]] == ["builder"]
+    assert [row["subagent_id"] for row in catalog["rows"]] == ["openai/gpt-5.6-sol"]  # named by handle
 
-    with pytest.raises(SubagentSelectionError) as refused:
-        select_subagent_snapshot(settings, subagent_id="paused")
-    assert refused.value.code == "subagent_disabled"
-    assert "switched off" in refused.value.detail
+    # Resolution comes first, the row switch second: the same typed refusal by
+    # the row's stored id and by its handle, never `unknown_subagent_id`.
+    for selector in ("paused", "openai/gpt-5.6-luna"):
+        with pytest.raises(SubagentSelectionError) as refused:
+            select_subagent_snapshot(settings, subagent_id=selector)
+        assert refused.value.code == "subagent_disabled", selector
+        assert "switched off" in refused.value.detail
     # The enabled sibling is unaffected by its neighbour's switch.
     assert select_subagent_snapshot(settings, subagent_id="builder")[0][
         "selected_subagent_id"] == "builder"
@@ -247,7 +250,7 @@ def test_catalog_hides_an_owner_disabled_row_and_selection_refuses_it_typed(monk
     import ouroboros.config as config_module
 
     monkeypatch.setattr(config_module, "runtime_settings", lambda: dict(settings))
-    assert [row["subagent_id"] for row in current_subagent_alternatives()] == ["builder"]
+    assert [row["subagent_id"] for row in current_subagent_alternatives()] == ["openai/gpt-5.6-sol"]
 
 
 def test_a_roster_whose_every_row_is_switched_off_projects_no_catalog():

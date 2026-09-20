@@ -336,6 +336,34 @@ def roster_handles(config: ConfiguredSubagents, settings: Mapping[str, Any]) -> 
     }
 
 
+def resolve_roster_selector(
+    config: ConfiguredSubagents, selector: str, settings: Mapping[str, Any],
+) -> tuple[Optional[ConfiguredSubagent], str, str]:
+    """``(row, "", "")`` for a handle, else a stored id; ``(None, code, detail)`` otherwise.
+
+    Stored ids stay accepted forever, silently (cached prompts, old habits). A
+    selector that is one row's handle AND a different row's stored id is refused
+    naming both — never a silent pick. The row switch is NOT consulted here: a
+    switched-off row still resolves, so its caller can refuse it as itself
+    rather than as unknown; only the choice set an unknown selector is offered
+    lists enabled rows.
+    """
+    handles = roster_handles(config, settings)
+    named = next((row for row in config.items if handles[row.subagent_id] == selector), None)
+    stored = next((row for row in config.items if row.subagent_id == selector), None)
+    if named is not None and stored is not None and named is not stored:
+        return None, "subagent_selector_conflict", (
+            f"{selector!r} is ambiguous: it is the handle of the row stored as "
+            f"{named.subagent_id!r} and the stored id of the row whose handle is "
+            f"{handles[stored.subagent_id]!r}; pass one of those two values instead.")
+    row = named or stored
+    if row is None:
+        offered = ", ".join(repr(handles[item.subagent_id]) for item in config.items if item.enabled)
+        return None, "unknown_subagent_id", (
+            f"No configured subagent is named {selector!r}. Available: {offered or 'none enabled'}.")
+    return row, "", ""
+
+
 def validate_unique_engines(config: ConfiguredSubagents, settings: Mapping[str, Any]) -> None:
     """SAVE-path rule: two rows of one kind may not share a handle (reads stay tolerant).
 
@@ -714,6 +742,7 @@ __all__ = [
     "normalize_configured_subagents",
     "parse_configured_subagents",
     "resolve_configured_subagents",
+    "resolve_roster_selector",
     "resolve_settings_subagent_candidate",
     "roster_handles",
     "roster_save_error",

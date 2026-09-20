@@ -25,6 +25,7 @@ from ouroboros.configured_subagents import (
     SOURCE_UNDECIDED,
     configured_subagents_fingerprint,
     resolve_configured_subagents,
+    resolve_roster_selector,
     roster_handles,
 )
 from ouroboros.delegate_shared import delegate_payload
@@ -271,29 +272,11 @@ def _legacy_matches(
 def resolve_configured_row(
     config: ConfiguredSubagents, selector: str, settings: Mapping[str, Any],
 ) -> ConfiguredSubagent:
-    """The one ``subagent_id`` argument resolver: a handle, else a stored id.
-
-    Stored ids stay accepted forever, silently (cached prompts, old habits). A
-    selector that is one row's handle AND a different row's stored id is
-    refused naming both — never a silent pick.
-    """
-    handles = roster_handles(config, settings)
-    named = next((row for row in config.items if handles[row.subagent_id] == selector), None)
-    stored = next((row for row in config.items if row.subagent_id == selector), None)
-    if named is not None and stored is not None and named is not stored:
-        raise SubagentSelectionError(
-            "subagent_selector_conflict",
-            f"{selector!r} is ambiguous: it is the handle of the row stored as "
-            f"{named.subagent_id!r} and the stored id of the row whose handle is "
-            f"{handles[stored.subagent_id]!r}; pass one of those two values instead.",
-        )
-    row = named or stored
+    """The one ``subagent_id`` argument resolver (a handle, else a stored id) for scheduling
+    and exact starts; whether the row may take NEW work is asked after resolution."""
+    row, code, detail = resolve_roster_selector(config, selector, settings)
     if row is None:
-        raise SubagentSelectionError(
-            "unknown_subagent_id",
-            f"No configured subagent is named {selector!r}. Available: "
-            + ", ".join(repr(handle) for handle in handles.values()) + ".",
-        )
+        raise SubagentSelectionError(code, detail)
     return row
 
 
@@ -327,10 +310,12 @@ def select_subagent_snapshot(
     assert config is not None
     used_legacy = False
     if selected_id:
+        # Resolve FIRST, then ask the row: a switched-off row is refused the same
+        # way by its handle and by its stored id. Typed and distinct from the
+        # list-level `subagents_disabled` and from a live-availability refusal:
+        # the row exists and is fully configured, the owner has switched it off
+        # for new work. Never a substitute actor.
         row = resolve_configured_row(config, selected_id, settings)
-        # Typed and distinct from the list-level `subagents_disabled` and from a
-        # live-availability refusal: the row exists and is fully configured, the
-        # owner has switched it off for new work. Never a substitute actor.
         if not row.enabled:
             raise SubagentSelectionError(
                 "subagent_disabled",

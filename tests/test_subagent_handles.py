@@ -200,6 +200,62 @@ def test_the_argument_resolves_by_handle_then_by_stored_id_and_refuses_a_cross_r
     assert select_subagent_snapshot(same_row, subagent_id="codex")[0]["selected_subagent_id"] == "codex"
 
 
+def test_a_switched_off_row_resolves_first_and_is_refused_as_itself():
+    """The row switch composes with the resolver in ONE order: handle-or-stored-id
+    to the row, then the switch. A switched-off row is refused `subagent_disabled`
+    by either name; an unknown selector is offered the ENABLED choice set only;
+    the cross-row conflict rule does not look at the switch."""
+    from ouroboros.subagent_runtime import SubagentSelectionError, select_subagent_snapshot
+
+    settings = _settings(
+        _session("primary-builder", effort="xhigh"),
+        {**_api("fast-scout"), "enabled": False},
+    )
+    for selector in ("fast-scout", "x-ai/grok-4.6"):
+        with pytest.raises(SubagentSelectionError) as off:
+            select_subagent_snapshot(settings, subagent_id=selector)
+        assert off.value.code == "subagent_disabled", selector
+    # ...and the same row, switched on, is selected by either name.
+    on = _settings(_session("primary-builder", effort="xhigh"), _api("fast-scout"))
+    for selector in ("fast-scout", "x-ai/grok-4.6"):
+        assert select_subagent_snapshot(on, subagent_id=selector)[0]["selected_subagent_id"] == "fast-scout"
+
+    with pytest.raises(SubagentSelectionError) as unknown:
+        select_subagent_snapshot(settings, subagent_id="no-such-row")
+    assert unknown.value.code == "unknown_subagent_id"
+    assert "'codex=gpt-6-astra/xhigh'" in unknown.value.detail
+    assert "grok" not in unknown.value.detail, "a switched-off row is not part of the choice set"
+
+    collision = _settings({**_session("first", target="codex"), "enabled": False},
+                          _api("codex", target="openai/gpt-5.6-sol"))
+    with pytest.raises(SubagentSelectionError) as conflict:
+        select_subagent_snapshot(collision, subagent_id="codex")
+    assert conflict.value.code == "subagent_selector_conflict"
+
+
+def test_a_bound_start_is_not_unbound_by_switching_its_row_off(tmp_path, monkeypatch):
+    """A running episode is bound to its frozen snapshot: the owner switching the
+    row off afterwards refuses NEW selections, never the bound actor's own start."""
+    import ouroboros.subagent_runtime as runtime
+
+    row = _session("primary-builder", effort="xhigh")
+    snapshot, _ = runtime.select_subagent_snapshot(_settings(row), subagent_id="primary-builder")
+    # The live row has since been re-pointed (another handle) AND switched off.
+    live = _settings({**row, "effort": "high", "enabled": False})
+    monkeypatch.setattr("ouroboros.config.runtime_settings", lambda: live)
+    monkeypatch.setattr(runtime, "effective_runtime_subagent_settings", dict)
+
+    def _start(selector):
+        ctx = SimpleNamespace(
+            task_id="bound-child", drive_root=tmp_path, budget_drive_root=str(tmp_path), task_metadata={},
+            _configured_actor_bootstrap={"snapshot": snapshot, "selected_subagent_id": "primary-builder"})
+        return json.loads(runtime.delegate_start_entry(ctx, "", subagent_id=selector).text)["reason"]
+
+    for own in ("primary-builder", "codex=gpt-6-astra/xhigh", "codex=gpt-6-astra/high"):
+        assert _start(own) == "configured_work_order_unavailable", own
+    assert _start("cursor=kimi-k3-high") == "configured_actor_route_mismatch"
+
+
 def test_the_model_catalog_is_facts_only_and_keyed_by_handle():
     from ouroboros.subagent_runtime import model_visible_subagent_catalog
 
