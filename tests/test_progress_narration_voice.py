@@ -62,6 +62,54 @@ def test_the_tool_context_abi_stays_a_host_voice():
     assert events.get_nowait()["progress_meta"]["narration"] is False
 
 
+def test_task_bound_progress_keeps_identity_after_worker_moves_on():
+    """A late review note keeps its owner's task/chat, not the worker's next task."""
+    agent, events = _agent()
+    agent._emit_progress = partial(OuroborosAgent._emit_progress, agent)
+    emit_task = OuroborosAgent._bind_task_progress(agent, "task-a", 5)
+
+    # Simulate the worker being reused for a different task before the review
+    # custody callback emits its settled note.
+    agent._current_task_id = "task-b"
+    agent._current_chat_id = 1
+    emit_task("late review result")
+
+    event = events.get_nowait()
+    assert event["task_id"] == "task-a"
+    assert event["chat_id"] == 5
+
+    # An ownerless task stays ownerless; it must not inherit the next task's
+    # chat when the worker is reused.
+    emit_ownerless = OuroborosAgent._bind_task_progress(agent, "task-no-room", None)
+    emit_ownerless("ownerless late note")
+    assert events.empty()
+
+
+def test_task_bound_progress_keeps_lineage_meta_after_worker_moves_to_child():
+    agent, events = _agent()
+    agent._emit_progress = partial(OuroborosAgent._emit_progress, agent)
+    agent._current_task_metadata = {
+        "delegation_role": "subagent", "parent_task_id": "parent-a",
+        "root_task_id": "root-a", "subagent_role": "reviewer",
+    }
+    agent._current_task_id = "task-a"
+    bound = OuroborosAgent._bind_task_progress(
+        agent, "task-a", 5, OuroborosAgent._subagent_progress_meta(agent, "progress"), 2,
+    )
+    agent._current_task_id = "child-b"
+    agent._current_chat_id = 1
+    agent._current_task_metadata = {
+        "delegation_role": "subagent", "parent_task_id": "parent-b",
+        "root_task_id": "root-b", "subagent_role": "writer",
+    }
+    bound("late child review")
+    event = events.get_nowait()
+    assert event["task_id"] == "task-a"
+    assert event["chat_id"] == 5
+    assert event["progress_meta"]["subagent_task_id"] == "task-a"
+    assert event["progress_meta"]["parent_task_id"] == "parent-a"
+
+
 @pytest.mark.parametrize("content, msg, expected", [
     ("The answer is 42.", {}, "The answer is 42."),
     ([{"type": "thinking", "thinking": "x"}], {"reasoning": "weighing the options"},

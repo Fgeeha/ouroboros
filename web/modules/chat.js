@@ -838,7 +838,10 @@ export function createChatInstance({
     }
 
     function queueTaskLiveUpdateMutation(summary, taskId, ts, dedupeKey = '', rawTs = '') {
-        const resolvedTaskId = taskId || activeLiveGroupId || '';
+        // A live card is owned by an explicit task id (or by a classified
+        // review/pointer path before this seam).  The last visible card is a
+        // viewport fact, never an identity source for an unkeyed frame.
+        const resolvedTaskId = taskId || '';
         if (!resolvedTaskId) return false;
         let changed = false;
         const record = liveCardRecords.get(resolvedTaskId);
@@ -1836,9 +1839,7 @@ export function createChatInstance({
     }
 
     function finishLiveCardMutation(groupId = '', phase = '') {
-        const record = groupId
-            ? liveCardRecords.get(groupId)
-            : (activeLiveGroupId ? liveCardRecords.get(activeLiveGroupId) : null);
+        const record = groupId ? liveCardRecords.get(groupId) : null;
         if (!record) return false;
         // A converted card is a terminal project chip now — ignore late terminal
         // frames so they neither overwrite the chip nor touch its element refs (T4).
@@ -1867,10 +1868,12 @@ export function createChatInstance({
     }
 
     function appendTaskSummaryToLiveCard(msg, { suppressDomInsert = false } = {}) {
-        const taskId = msg?.task_id || activeLiveGroupId || '';
+        const taskId = msg?.task_id || '';
         const rawTs = msg?.ts || new Date().toISOString();
         if (!taskId) {
-            return finishLiveCard(taskId, 'done');
+            // An unkeyed summary cannot prove which task finished.  Keep the
+            // ownerless durable/log evidence, but never close the current card.
+            return false;
         }
         let changed = false;
         // Restore task name from history.
@@ -1969,7 +1972,7 @@ export function createChatInstance({
     }
 
     function updateLiveCardFromProgressMessage(msg, { grantCancelAuthority = true } = {}) {
-        const taskId = msg?.task_id || activeLiveGroupId || '';
+        const taskId = msg?.task_id || '';
         const rawTs = msg?.ts || new Date().toISOString();
         const review = attachReviewFromRow(msg, rawTs);
         if (review !== undefined) return review;
@@ -2154,7 +2157,7 @@ export function createChatInstance({
         const reference = handleCardReference(evt);
         if (reference !== undefined) return reference;
         if (!isGroupedTaskEvent(evt)) return false;
-        const taskId = getLogTaskGroupId(evt) || activeLiveGroupId || '';
+        const taskId = getLogTaskGroupId(evt) || '';
         if (!taskId) return false;
         const rawTs = evt.ts || evt.timestamp || new Date().toISOString();
         // Task-bound Skill lifecycle is presentation on its explicit owner,

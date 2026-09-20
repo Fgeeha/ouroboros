@@ -14,9 +14,10 @@ import traceback
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 log = logging.getLogger(__name__)
+_PROGRESS_ID_UNSET = object()
 
 from ouroboros.utils import (
     append_jsonl,
@@ -638,7 +639,7 @@ class OuroborosAgent:
             pending_events=self._pending_events,
             current_chat_id=self._current_chat_id,
             current_task_type=self._current_task_type,
-            emit_progress_fn=self._emit_progress,
+            emit_progress_fn=self._bind_task_progress_for_task(task),
             event_queue=self._event_queue,
             task_id=str(task.get("id") or ""),
             task_depth=int(task.get("depth", 0)),
@@ -788,6 +789,31 @@ class OuroborosAgent:
         )
         return ctx, messages, cap_info
 
+    def _bind_task_progress_for_task(self, task: Dict[str, Any]) -> Callable[[str], Any]:
+        task_id = str(task.get("id") or "")
+        task_meta = subagent_message_meta(task, task_id=task_id, event="progress")
+        task_meta.update(initiator_meta(task))
+        return self._bind_task_progress(
+            task_id, self._current_chat_id, task_meta, task.get("_attempt"),
+        )
+
+    def _bind_task_progress(
+        self, task_id: str, chat_id: Optional[int], progress_meta: Optional[Dict[str, Any]] = None,
+        task_attempt: Any = None,
+    ) -> Callable[[str], Any]:
+        """Keep a task's progress address stable after its worker turn ends."""
+        def emit_task_progress(text: str, **kwargs: Any) -> None:
+            self._emit_progress(
+                text,
+                _task_id_override=task_id,
+                _chat_id_override=chat_id,
+                _progress_meta_override=progress_meta or {},
+                _task_attempt_override=task_attempt,
+                **kwargs,
+            )
+
+        return emit_task_progress
+
     def handle_task(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Run one task under the root/subtree monetary attribution scope."""
         # A reused worker agent still carries the PREVIOUS task's chat binding;
@@ -880,6 +906,9 @@ class OuroborosAgent:
             # already projects — read from the ONE record the dispatch resolution
             # stamped onto the task, never re-derived per surface.
             self._record_executor_facts(task, cap_info)
+            # Executor facts are part of the same by-value identity snapshot
+            # used by late custody callbacks.
+            ctx.emit_progress_fn = self._bind_task_progress_for_task(task)
 
             authority_refusal = cap_info.get("authority_source_unavailable")
             if isinstance(authority_refusal, dict) and authority_refusal:
@@ -1110,7 +1139,11 @@ class OuroborosAgent:
 
     def _emit_progress(self, text: str, *, incident: Optional[Dict[str, str]] = None,
                        executor_observation: Optional[Dict[str, Any]] = None,
-                       narration: bool = False, card_row: str = "", card_row_id: str = "") -> None:
+                       narration: bool = False, card_row: str = "", card_row_id: str = "",
+                       _task_id_override: Any = _PROGRESS_ID_UNSET,
+                       _chat_id_override: Any = _PROGRESS_ID_UNSET,
+                       _progress_meta_override: Any = _PROGRESS_ID_UNSET,
+                       _task_attempt_override: Any = _PROGRESS_ID_UNSET) -> None:
         """Owner-visible note; ``incident`` is the typed ``task_incident``/``toast_once``
         pair the browser toasts once.
 
@@ -1127,15 +1160,21 @@ class OuroborosAgent:
         the default. Both voices stay visible rows; the flag decides only whether
         a note may claim the card title and the collapsed activity line."""
         self._last_progress_ts = time.time()
-        if self._event_queue is None or self._current_chat_id is None:
+        chat_id = (
+            self._current_chat_id if _chat_id_override is _PROGRESS_ID_UNSET else _chat_id_override
+        )
+        task_id = (
+            self._current_task_id if _task_id_override is _PROGRESS_ID_UNSET else _task_id_override
+        )
+        if self._event_queue is None or chat_id is None:
             return
         try:
             event = {
-                "type": "send_message", "chat_id": self._current_chat_id,
+                "type": "send_message", "chat_id": chat_id,
                 "text": f"💬 {text}", "format": "markdown", "is_progress": True,
                 "role": "assistant" if narration else "system",
                 "system_type": "model_narration" if narration else "host_progress",
-                "task_id": self._current_task_id or "",
+                "task_id": task_id or "",
                 "ts": utc_now_iso(),
             }
             progress_meta: Dict[str, Any] = {}
@@ -1144,13 +1183,19 @@ class OuroborosAgent:
                 progress_meta["card_row"] = card_row
                 if card_row_id:
                     progress_meta["card_row_id"] = card_row_id
-            progress_meta.update(self._subagent_progress_meta("progress"))
+            if _progress_meta_override is _PROGRESS_ID_UNSET:
+                progress_meta.update(self._subagent_progress_meta("progress"))
+            else:
+                progress_meta.update(_progress_meta_override or {})
             if executor_observation is not None:
                 from ouroboros.subagent_messages import executor_observation_meta
 
                 observation = executor_observation_meta(
                     executor_observation, task_id=event["task_id"],
-                    task_attempt=getattr(getattr(self.tools, "_ctx", None), "task_attempt", None),
+                    task_attempt=(
+                        getattr(getattr(self.tools, "_ctx", None), "task_attempt", None)
+                        if _task_attempt_override is _PROGRESS_ID_UNSET else _task_attempt_override
+                    ),
                 )
                 if observation:
                     progress_meta["executor_observation"] = observation
