@@ -964,7 +964,8 @@ def _collect_progress_rows(
                 continue
             rec = {
                 "text": text,
-                "role": "assistant",
+                "role": str(entry.get("role") or "assistant"),
+                "system_type": str(entry.get("system_type") or ""),
                 "ts": str(entry.get("ts", "")),
                 "is_progress": True,
                 "markdown": str(entry.get("format", "")).lower() == "markdown",
@@ -1117,7 +1118,7 @@ def _active_lifecycle_row(row_matches_thread) -> Optional[Dict[str, Any]]:
             chat_id = int(route if route is not None else 0)
             row = {
                 "text": text,
-                "role": "assistant",
+                "role": "system", "system_type": "skill_lifecycle",
                 "ts": utc_now_iso(),
                 "is_progress": True,
                 "markdown": False,

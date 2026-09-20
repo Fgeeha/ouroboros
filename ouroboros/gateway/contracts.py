@@ -239,7 +239,7 @@ class ChatOutbound(TypedDict):
     sender_session_id: NotRequired[str]
     client_message_id: NotRequired[str]
     transport: NotRequired[TransportMetadata]
-    # UI-only system annotation emitted by skill-repair visible commands.
+    # Typed message kind; role alone selects authorship (DESIGN: Chat authorship and System rows).
     system_type: NotRequired[str]
     # A host-stamped placement fact for a task-keyed System row: "timeline" = a timeline item of the task's card,
     # "reviews" = the card's Reviews group carries the fact (the row is still attached to the card); absent = an
