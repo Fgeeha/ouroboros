@@ -62,6 +62,57 @@ def test_the_tool_context_abi_stays_a_host_voice():
     assert events.get_nowait()["progress_meta"]["narration"] is False
 
 
+@pytest.mark.parametrize("chat_id", [0, 5])
+def test_task_bound_progress_keeps_identity_after_worker_moves_on(chat_id):
+    """Production callback wiring survives idle, reused worker and hidden chat."""
+    agent, events = _agent()
+    agent._emit_progress = partial(OuroborosAgent._emit_progress, agent)
+    agent._bind_task_progress = partial(OuroborosAgent._bind_task_progress, agent)
+    agent._current_chat_id, agent._current_task_metadata = chat_id, {}
+    emit_task = OuroborosAgent._bind_task_progress_for_task(agent, {"id": "task-a", "_attempt": 2})
+    for current in (None, "task-b"):
+        agent._current_task_id, agent._current_chat_id = current, 1
+        emit_task("late review result")
+        event = events.get_nowait()
+        assert (event["task_id"], event["chat_id"]) == ("task-a", chat_id)
+    # Surviving normal path: the new task's callback addresses the new task.
+    emit_b = OuroborosAgent._bind_task_progress_for_task(agent, {"id": "task-b"})
+    emit_b("current narration", narration=True)
+    event = events.get_nowait()
+    assert (event["task_id"], event["chat_id"], event["progress_meta"]["narration"]) == ("task-b", 1, True)
+    emit_ownerless = OuroborosAgent._bind_task_progress(agent, "task-no-room", None)
+    emit_ownerless("ownerless late note")
+    assert events.empty()
+
+
+def test_task_bound_progress_keeps_lineage_meta_after_worker_moves_to_child():
+    agent, events = _agent()
+    agent._emit_progress = partial(OuroborosAgent._emit_progress, agent)
+    agent._bind_task_progress = partial(OuroborosAgent._bind_task_progress, agent)
+    agent._current_chat_id = 5
+    agent._current_task_metadata = {
+        "delegation_role": "subagent", "parent_task_id": "parent-a",
+        "root_task_id": "root-a", "subagent_role": "reviewer", "initiator": "consciousness",
+    }
+    task = {"id": "task-a", "_attempt": 2, "effective_executor": "blocked", "executor_route": ""}
+    OuroborosAgent._record_executor_facts(agent, task, {"executor_blocked_route": "codex"})
+    bound = OuroborosAgent._bind_task_progress_for_task(agent, task)
+    agent._current_task_id, agent._current_chat_id = "child-b", 1
+    agent._current_task_metadata.update(parent_task_id="parent-b", root_task_id="root-b",
+                                        subagent_role="writer", executor_route="claude")
+    agent.tools._ctx.task_attempt = 3
+    observation = {"task_id": "task-a", "task_attempt": "2", "run_id": "run-a",
+                   "attempt_id": "a01", "harness_id": "codex", "phase": "finished", "revision": 1}
+    bound("late child review", executor_observation=observation)
+    event = events.get_nowait()
+    assert (event["task_id"], event["chat_id"]) == ("task-a", 5)
+    meta = event["progress_meta"]
+    assert (meta["subagent_task_id"], meta["parent_task_id"], meta["root_task_id"]) == (
+        "task-a", "parent-a", "root-a")
+    assert (meta["executor_route"], meta["initiator"]) == ("codex", "consciousness")
+    assert meta["executor_observation"] == observation
+
+
 @pytest.mark.parametrize("content, msg, expected", [
     ("The answer is 42.", {}, "The answer is 42."),
     ([{"type": "thinking", "thinking": "x"}], {"reasoning": "weighing the options"},

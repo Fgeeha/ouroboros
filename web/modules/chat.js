@@ -3,7 +3,8 @@ import { destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown, renderChat
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
-import { createSystemMessageAction, createSystemMessageActions, renderProjectChip } from './ui_helpers.js';
+import { renderProjectChip } from './ui_helpers.js';
+import { decorateProjectRow } from './project_answer.js';
 import { bindComposerFileTargets, cleanupUploadedAttachments, createChatMedia, showTaskIncidentToast } from './chat_media.js';
 import { createChatDecision } from './chat_decision.js';
 import { bindProjectWorkPointer } from './project_work_pointer.js';
@@ -837,7 +838,10 @@ export function createChatInstance({
     }
 
     function queueTaskLiveUpdateMutation(summary, taskId, ts, dedupeKey = '', rawTs = '') {
-        const resolvedTaskId = taskId || activeLiveGroupId || '';
+        // A live card is owned by an explicit task id (or by a classified
+        // review/pointer path before this seam).  The last visible card is a
+        // viewport fact, never an identity source for an unkeyed frame.
+        const resolvedTaskId = taskId || '';
         if (!resolvedTaskId) return false;
         let changed = false;
         const record = liveCardRecords.get(resolvedTaskId);
@@ -1835,9 +1839,7 @@ export function createChatInstance({
     }
 
     function finishLiveCardMutation(groupId = '', phase = '') {
-        const record = groupId
-            ? liveCardRecords.get(groupId)
-            : (activeLiveGroupId ? liveCardRecords.get(activeLiveGroupId) : null);
+        const record = groupId ? liveCardRecords.get(groupId) : null;
         if (!record) return false;
         // A converted card is a terminal project chip now — ignore late terminal
         // frames so they neither overwrite the chip nor touch its element refs (T4).
@@ -1866,10 +1868,12 @@ export function createChatInstance({
     }
 
     function appendTaskSummaryToLiveCard(msg, { suppressDomInsert = false } = {}) {
-        const taskId = msg?.task_id || activeLiveGroupId || '';
+        const taskId = msg?.task_id || '';
         const rawTs = msg?.ts || new Date().toISOString();
         if (!taskId) {
-            return finishLiveCard(taskId, 'done');
+            // An unkeyed summary cannot prove which task finished.  Keep the
+            // ownerless durable/log evidence, but never close the current card.
+            return false;
         }
         let changed = false;
         // Restore task name from history.
@@ -1968,7 +1972,7 @@ export function createChatInstance({
     }
 
     function updateLiveCardFromProgressMessage(msg, { grantCancelAuthority = true } = {}) {
-        const taskId = msg?.task_id || activeLiveGroupId || '';
+        const taskId = msg?.task_id || '';
         const rawTs = msg?.ts || new Date().toISOString();
         const review = attachReviewFromRow(msg, rawTs);
         if (review !== undefined) return review;
@@ -2153,7 +2157,7 @@ export function createChatInstance({
         const reference = handleCardReference(evt);
         if (reference !== undefined) return reference;
         if (!isGroupedTaskEvent(evt)) return false;
-        const taskId = getLogTaskGroupId(evt) || activeLiveGroupId || '';
+        const taskId = getLogTaskGroupId(evt) || '';
         if (!taskId) return false;
         const rawTs = evt.ts || evt.timestamp || new Date().toISOString();
         // Task-bound Skill lifecycle is presentation on its explicit owner,
@@ -2307,15 +2311,7 @@ export function createChatInstance({
             ${timeHtml}
         `;
         if (!isProgress && text) chatMedia.attachCopyControl(bubble, String(text));
-        if (PROJECT_ROW_TYPES.has(systemType) && projectId) {
-            const actions = createSystemMessageActions(createSystemMessageAction({
-                label: 'Open Project ↗',
-                onClick: () => window.dispatchEvent(new CustomEvent('ouro:open-project', {
-                    detail: { project: { id: projectId, name: projectName || 'Project' } },
-                })),
-            }));
-            bubble.querySelector('.message')?.after(actions);
-        }
+        if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName });
         wireSkillReviewDisclosure(bubble, { onDomWrite: withStableViewport });
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
@@ -2528,7 +2524,8 @@ export function createChatInstance({
                     }
                     if (msg.system_type === 'task_summary') continue;
                     if (PROJECT_ROW_TYPES.has(msg.system_type)) {
-                        addMessage(msg.text, 'system', !!msg.markdown, msg.ts || null, false, {
+                        const a = msg.completion_answer;
+                        addMessage(a || msg.text, a ? 'assistant' : 'system', !!(a || msg.markdown), msg.ts || null, false, {
                             historyId: msg.history_id, historyPosition: msg.history_position,
                         systemType: msg.system_type,
                             taskId,
@@ -3745,7 +3742,8 @@ export function createChatInstance({
                 return cardRow;
             }
             if (PROJECT_ROW_TYPES.has(msg.system_type)) {
-                const added = addMessage(msg.content, 'system', msg.markdown, msg.ts || null, false, {
+                const a = msg.completion_answer;
+                const added = addMessage(a || msg.content, a ? 'assistant' : 'system', !!(a || msg.markdown), msg.ts || null, false, {
                     systemType: msg.system_type,
                     taskId: explicitTaskId,
                     projectId: msg.project_id || '',
