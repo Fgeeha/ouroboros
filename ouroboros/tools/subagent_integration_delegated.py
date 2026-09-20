@@ -106,6 +106,7 @@ def _capture_at_disposition(
         except (OSError, json.JSONDecodeError, ValueError):
             saved = {}
         if (isinstance(saved, dict) and saved.get("status") == "failed"
+                and saved.get("authority_drift_source_status") == ARTIFACT_STATUS_READY_NO_CHANGES
                 and isinstance(saved.get("authority_drift"), dict)
                 and (saved.get("authority_drift", {}).get("paths")
                      or saved.get("authority_drift", {}).get("error"))):
@@ -521,6 +522,7 @@ def _integrate_git_capture(ctx, entry, decision, reason, manifest, cap_dir, orph
     if decision == "reject":
         drifted_no_change = (
             capture_status == "failed"
+            and manifest.get("authority_drift_source_status") == ARTIFACT_STATUS_READY_NO_CHANGES
             and isinstance(manifest.get("authority_drift"), dict)
             and (manifest["authority_drift"].get("paths")
                  or manifest["authority_drift"].get("error"))

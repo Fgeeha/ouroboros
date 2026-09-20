@@ -125,6 +125,7 @@ def test_full_start_http_contract_and_real_snapshot_capture(full_run):
     assert not (Path(target) / 'native-result.py').exists()
     row = custody.replay(custody.custody_root(ctx))['full-run']
     assert row.access == 'full' and row.project_persistent and row.snapshot_id == key
+    assert row.execution_binding_fingerprint
     row.settled = True
     custody._CUSTODY['full-run'] = row
     capture = delegate._capture_terminal_patch(ctx, row)

@@ -58,6 +58,7 @@ from ouroboros.delegate_start_instructions import (
     append_coordination_context,
     apply_execution_binding,
     directory_copy_binding_instruction,
+    execution_binding_fingerprint,
 )
 from ouroboros.subagent_runtime import (  # noqa: F401 - shared primitive re-export
     delegate_start_entry as _delegate_start_entry,
@@ -317,6 +318,17 @@ def _processing_start_request(request, actor, gateway, route):
                      "reason": "submitted" if "processingPreference" in request else "processing_not_submitted"}
 
 
+def _start_binding_fingerprint(current: str, root: str, target_root: str,
+                               snapshot_id: str, resource_ref: Dict[str, Any]) -> str:
+    if current:
+        return current
+    if snapshot_id:
+        return execution_binding_fingerprint(root, target_root, "snapshot")
+    if resource_ref.get("strategy") == "copy":
+        return execution_binding_fingerprint("", target_root, "directory_copy")
+    return ""
+
+
 def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = None,
                     retry_of: Optional[str] = None, root: Optional[str] = None,
                     bucket: Optional[str] = None, skill_name: Optional[str] = None,
@@ -349,6 +361,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     drive = custody.custody_root(ctx)
     owned_project_id, project_persistent = "", False
     invocation_id = snapshot_id = baseline_sha = target_root = authority_source = ""
+    binding_fingerprint = ""
     processing_info: Dict[str, Any] = {}
     resource_ref, directory_options = {}, {}
     retry_token = str(retry_of or "").strip()
@@ -473,10 +486,13 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             execution_root = (root if directory_options.get("isolation") == "live" else "") if directory_options else delegated_execution_workspace_root(gateway, authority, root)
             scope_root = target_root if execution_root or directory_options else root
             if snapshot is not None:
+                binding_fingerprint = execution_binding_fingerprint(
+                    execution_root or root, target_root)
                 instructions = apply_execution_binding(
-                    instructions, execution_root or root, target_root)
+                    instructions, execution_root or root, target_root, binding_fingerprint)
             elif directory_options and directory_options.get("isolation") == "envelope":
-                instructions += directory_copy_binding_instruction(target_root)
+                binding_fingerprint = execution_binding_fingerprint("", target_root, "directory_copy")
+                instructions += directory_copy_binding_instruction(target_root, binding_fingerprint)
             (project_id, owned_project_id, project_persistent) = resolve_registration(
                 gateway, scope_root, execution_root, getattr(authority, "access", ""))
             if directory_options:
@@ -503,6 +519,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             project_owned=bool(owned_project_id), project_persistent=project_persistent, route=route.route_id,
             root_task_id=str(lineage.get("root_task_id") or ""), parent_task_id=str(lineage.get("parent_task_id") or ""),
             snapshot_id=snapshot_id, execution_root=(root if snapshot_id or resource_ref.get("strategy") == "direct" else ""),
+            execution_binding_fingerprint=_start_binding_fingerprint(
+                binding_fingerprint, root, target_root, snapshot_id, resource_ref),
             baseline_sha=baseline_sha, target_root=target_root,
             authority_source=authority_source, resource_ref=resource_ref,
             # Recovery proves the original actor and compiled brief before adoption.
@@ -525,11 +543,6 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 ),
             )
         if not requested:
-            # The POST is CONDITIONAL on the durable request row: a run started
-            # without it is live and unfindable if this worker dies. A fresh
-            # start's registration is definitively retirable; a RETRY's project
-            # belongs to the original attempt, whose POST may have bound a live
-            # run — its fate stays unknown and its invocation stays pending.
             return _fail(
                 "delegate_start", "start_request_row_unwritable",
                 "The durable start-request row could not be written, so the run was "
@@ -541,13 +554,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                                                 invocation_id=invocation_id,
                                                 snapshot_id=("" if recovering else snapshot_id)))
         handle = gateway.start_run(request_body, idempotency_key=invocation_id)
-        # A 202 answers with `jobId` and no `runId` when the run has not bound a run
-        # dir inside the daemon's start timeout; `jobId` is a usable GET/control
-        # handle — discarding it left a live run nobody could wait on or cancel.
         run_id = str(handle.get("runId") or handle.get("jobId") or "")
         if not run_id:
-            # The POST SUCCEEDED, so a run is more likely live here than on the
-            # refusal branch beside it — the registration is retained, not abandoned.
             return _fail("delegate_start", "queued_without_run_id",
                          f"Claudexor returned a queued handle without a run id: {handle!r}",
                          pending_invocation_id=invocation_id,
@@ -601,6 +609,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         config_fingerprint=config_fingerprint, work_order_fingerprint=work_order_fingerprint,
         work_order_coverage=work_order_coverage, work_order_source_request=work_order_source_request,
         authority_fingerprint=authority_fingerprint, snapshot_id=snapshot_id,
+        execution_binding_fingerprint=_start_binding_fingerprint(
+            binding_fingerprint, root, target_root, snapshot_id, resource_ref),
         target_root=target_root, baseline_sha=baseline_sha,
         authority_source=authority_source, resource_ref=resource_ref, processing=processing_info,
         capture_mode=("engine_directory" if resource_ref.get("workspace_kind") == "directory" else

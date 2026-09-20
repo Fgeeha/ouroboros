@@ -471,8 +471,9 @@ def _capture_block(entry: _RunCustody, cap_dir: pathlib.Path,
             "the child, a neighbor, or another process may have written there. "
             "The drift is diagnostic evidence; it is not attributed to this child."
             if status == ARTIFACT_STATUS_READY_NO_CHANGES else
-            "NOT APPLIED: the run edited its private execution snapshot only. "
-            "Authority-tree drift was observed while the result was captured; "
+            "NOT APPLIED: the private execution snapshot contains captured changes, "
+            "and authority-tree drift was also observed; "
+            "the author of that drift is unknown. "
             "the existing locked baseline check will decide whether integration "
             "is safe. Nothing reaches the shared tree until explicit disposition."
         )

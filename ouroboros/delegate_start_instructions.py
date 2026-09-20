@@ -83,12 +83,29 @@ def execution_binding_instruction(execution_root: str, authority_root: str) -> s
     omission or by appearing earlier in the work order.
     """
     execution = str(execution_root or "").strip()
+    if not execution:
+        return ""
+    return execution_binding_text(execution_root, authority_root)
+
+
+def execution_binding_fingerprint(execution_root: str, authority_root: str,
+                                  binding_kind: str = "snapshot") -> str:
+    """Digest the typed execution/authority binding stored with custody."""
+    execution = str(execution_root or "").strip()
+    authority = str(authority_root or "").strip()
+    return sha256(f"{binding_kind}\0{execution}\0{authority}".encode("utf-8")).hexdigest()
+
+
+def execution_binding_text(execution_root: str, authority_root: str,
+                           binding_sha256: str = "") -> str:
+    execution = str(execution_root or "").strip()
     authority = str(authority_root or "").strip()
     if not execution:
         return ""
+    digest = binding_sha256 or execution_binding_fingerprint(execution, authority)
     return (
         "\n\nDELEGATED EXECUTION BINDING (separate typed host fact; the canonical "
-        "work order remains byte-identical): "
+        f"work order remains byte-identical; sha256={digest}): "
         f"the sole writable execution root for this run is {execution}. "
         "Use relative paths or absolute paths under that root for every shell, "
         "file, and patch operation. The stable authority/project root "
@@ -100,12 +117,13 @@ def execution_binding_instruction(execution_root: str, authority_root: str) -> s
     )
 
 
-def directory_copy_binding_instruction(authority_root: str) -> str:
+def directory_copy_binding_instruction(authority_root: str, binding_sha256: str = "") -> str:
     """Tell a directory-copy child that the engine creates its write root later."""
     authority = str(authority_root or "").strip() or "(unknown)"
+    digest = binding_sha256 or execution_binding_fingerprint("", authority, "directory_copy")
     return (
         "\n\nDELEGATED DIRECTORY COPY BINDING (separate typed host fact; the canonical "
-        "work order remains byte-identical): the engine will create a private "
+        f"work order remains byte-identical; sha256={digest}): the engine will create a private "
         "execution copy for this run. Use only the engine-provided working "
         "directory/cwd for writes; the selected authority folder "
         f"{authority} is a read-only source reference. Do not write to that "
@@ -114,9 +132,9 @@ def directory_copy_binding_instruction(authority_root: str) -> str:
 
 
 def apply_execution_binding(instructions: str, execution_root: str,
-                            authority_root: str) -> str:
+                            authority_root: str, binding_sha256: str = "") -> str:
     """Append one typed binding without rewriting canonical work-order bytes."""
-    return instructions + execution_binding_instruction(execution_root, authority_root)
+    return instructions + execution_binding_text(execution_root, authority_root, binding_sha256)
 
 
 def append_coordination_context(

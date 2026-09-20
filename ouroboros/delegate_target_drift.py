@@ -116,6 +116,7 @@ def _persist_target_drift(manifest_path: pathlib.Path, manifest: Dict[str, Any],
     from ouroboros.utils import atomic_write_json, utc_now_iso
 
     updated = dict(manifest)
+    updated["authority_drift_source_status"] = str(manifest.get("status") or "")
     updated["authority_drift"] = {
         "checked": bool(evidence.get("checked")),
         "paths": list(evidence.get("paths") or []),

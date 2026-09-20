@@ -25,6 +25,7 @@ def test_execution_binding_makes_private_root_the_only_write_target():
     assert "/tmp/authority" in text
     assert "sole writable execution root" in text
     assert "read-only identity/reference" in text
+    assert "sha256=" in text
     assert "typed execution-root mismatch" in text
 
 
