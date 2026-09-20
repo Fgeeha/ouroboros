@@ -69,7 +69,7 @@ __all__ = (
     "current_physical_attempt_predicate", "current_usage_scope",
     "ensure_legacy_imported", "execute_physical_attempt", "execute_physical_attempt_async",
     "last_physical_attempt_capture", "last_root_accounting", "physical_attempt_capture_from_exception",
-    "mark_dispatched", "mark_unresolved", "physical_attempt_limit",
+    "mark_dispatched", "mark_unresolved", "physical_attempt_headroom", "physical_attempt_limit",
     "record_subscription_session",
     "record_unmetered_external_dispatch", "refresh_root_accounting",
     "release_attempt", "reserve_attempt", "settle_attempt",
@@ -391,6 +391,15 @@ def physical_attempt_limit(maximum: int) -> Iterator[None]:
         yield
     finally:
         _PHYSICAL_LIMIT.reset(token)
+def physical_attempt_headroom() -> Optional[int]:
+    """Sends still claimable in this actor context; None when unbounded."""
+    state = _PHYSICAL_LIMIT.get()
+    if state is None:
+        return None
+    with state.lock:
+        return max(0, state.maximum - state.used)
+
+
 def _claim_physical_dispatch(attempt_id: str = "") -> None:
     state = _PHYSICAL_LIMIT.get()
     if state is None:

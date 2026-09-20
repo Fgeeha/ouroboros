@@ -107,29 +107,35 @@ def _redo_allowed(payload: dict) -> str:
     candidate is bound to exact bytes, and a redo drops the account preference,
     so re-asking would break that admission instead of honoring it.
     """
-    from ouroboros.usage_accounting import current_physical_attempt_predicate
+    from ouroboros.usage_accounting import (
+        current_physical_attempt_predicate, physical_attempt_headroom,
+    )
 
     if (payload.get("account") or {}).get("mode") == "pin":
         return "pinned_account"
     if current_physical_attempt_predicate() is not None:
         return "admitted_candidate"
+    headroom = physical_attempt_headroom()
+    if headroom is not None and headroom < 1:
+        # A bounded actor (a density probe, a packet review) owns those sends
+        # for its own rail. A redo that spent the last one would leave the
+        # repair that rail is about to make unable to run.
+        return "send_budget_spent"
     return ""
 
 
-def _discard(invocation: Any, target: dict, parameters: dict, fact: dict,
-             result: dict, disposition: str, redo: int, redos: int) -> None:
+def _discard(invocation: Any, fact: dict, result: dict,
+             disposition: str, redo: int, redos: int) -> None:
     """Keep the paid generation reconstructible, then refuse it as this round's answer.
 
     The bytes stay retained and acknowledged exactly as an accepted answer's
     would be, because a discarded answer is still evidence of what the horizon
     was. What it does NOT do is become the round: no turn state is adopted from
-    it, no tool call runs, and the next request drops this account's preference
-    so the engine's own selection is free to land elsewhere.
+    it, no tool call runs, and the caller drops this account's preference before
+    building the next request, so the engine's selection is free to land
+    elsewhere.
     """
     route = result.get("route") or {}
-    profile = str(route.get("credentialProfileId") or "")
-    if profile:
-        suppress_account_preference(target, parameters, profile)
     usage = result.get("usage") or {}
     append_jsonl(invocation.root / "logs" / "events.jsonl", {
         "ts": utc_now_iso(), "type": "model_served_mismatch", "task_id": invocation.task_id,
@@ -156,6 +162,16 @@ class SubstitutionBudget:
         self.redos = config.get_model_substitution_redos()
         self.used = 0
         self.discarded: list[dict] = []
+        # The account this call must stop preferring, applied by the CALLER: a
+        # context variable set on an offloaded thread never reaches the loop
+        # that builds the next request.
+        self.avoid = ""
+
+    def stop_preferring(self, target: dict, parameters: dict) -> None:
+        """Apply the pending suppression HERE, where the next request is built."""
+        if self.avoid:
+            suppress_account_preference(target, parameters, self.avoid)
+            self.avoid = ""
 
     def disclose(self, answer: tuple[dict, dict]) -> tuple[dict, dict]:
         """Carry the discarded generations into the accepted answer's usage row.
@@ -182,11 +198,9 @@ class SubstitutionBudget:
         reason = _redo_allowed(payload) or (
             "" if self.used < self.redos else "redos_exhausted")
         self.used += 1
-        route = result.get("route") or {}
-        self.discarded.append({**fact, "account": str(route.get("credentialProfileId") or ""),
-                               "disposition": reason or "redo"})
-        _discard(invocation, target, parameters, fact, result,
-                              reason or "redo", self.used, self.redos)
+        self.avoid = str((result.get("route") or {}).get("credentialProfileId") or "")
+        self.discarded.append({**fact, "account": self.avoid, "disposition": reason or "redo"})
+        _discard(invocation, fact, result, reason or "redo", self.used, self.redos)
         if reason:
             raise _refusal(self, invocation, fact, result, reason, self.used - 1)
         return True

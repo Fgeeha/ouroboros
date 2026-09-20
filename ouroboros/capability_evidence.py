@@ -1353,6 +1353,13 @@ def observe_token_density(request: Any, usage: Optional[Dict[str, Any]], *, driv
         provider = str(request.provider or "").strip().lower()
         if cache_bearing and provider not in _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS:
             return
+        # A route may answer with ANOTHER model. Its tokenizer is not the
+        # requested model's, so the row would teach one model a stranger's
+        # density. The witness belongs to the model that produced it, and this
+        # store is keyed by the requested one, so there is nothing to learn.
+        served = ((normalized.get("claudexor") or {}).get("route") or {}).get("model")
+        if served and str(served) != str(getattr(request, "model", "") or ""):
+            return
         real = int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0)
         # A cache-inclusive total landing on 2 x cached_tokens (+-1) is a gateway
         # adding the cache read on top of an already inclusive total, not a

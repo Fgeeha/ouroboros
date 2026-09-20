@@ -634,6 +634,10 @@ class _ModelInvocation:
 
     def extract_usage(self, result: dict) -> tuple[dict, float | None, bool]:
         usage, cost, final = _usage(result)
+        # Settlement reads this row before the caller decides anything, and the
+        # density witness must know whose tokenizer it measured: a route that
+        # answered with another model teaches nothing about the requested one.
+        usage["claudexor"] = {"route": copy.deepcopy(result.get("route") or {})}
         if "processing" not in usage and self.target.get("processing_preference"):
             options = self.payload.get("options") or {}
             usage["processing"] = {
@@ -831,6 +835,7 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                     # request carried is re-derived without the substituting
                     # account; the engine alone picks where the redo lands.
                     retry_preparation = None
+                    substitution.stop_preferring(target, prepared or parameters)
                     payload = _request(target, payload["messages"], payload["tools"], prepared or parameters)
                     continue
                 adopt_turn_state((prepared or parameters).get("model_turn_state"),
@@ -958,6 +963,7 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                     # request carried is re-derived without the substituting
                     # account; the engine alone picks where the redo lands.
                     retry_preparation = None
+                    substitution.stop_preferring(target, prepared or parameters)
                     payload = _request(target, payload["messages"], payload["tools"], prepared or parameters)
                     continue
                 adopt_turn_state((prepared or parameters).get("model_turn_state"),

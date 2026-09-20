@@ -139,6 +139,73 @@ def test_no_redo_changes_the_bytes_of_an_admitted_candidate(setup):
     assert len(gateway.creates) == 1
 
 
+def test_a_redo_never_spends_a_send_its_caller_still_needs(setup):
+    root, gateway, client = setup
+    gateway.results = [substituted()]
+    # A packet review or a density probe owns its sends for its own rail: the
+    # last one must stay available for the repair that rail is going to make.
+    with ua.physical_attempt_limit(1):
+        with pytest.raises(transport.ClaudexorModelError) as raised:
+            call(client)
+    assert raised.value.problem["context"]["reason"] == "send_budget_spent"
+    assert len(gateway.creates) == 1
+    assert events(root, "model_served_mismatch")[0]["disposition"] == "send_budget_spent"
+
+
+def test_a_redo_uses_a_send_the_caller_can_still_spare(setup):
+    root, gateway, client = setup
+    gateway.results = [substituted(), result()]
+    gateway.dispatch = ["response_received"] * 2
+    with ua.physical_attempt_limit(2):
+        message, _usage = call(client)
+    assert message["content"] == "Ответ 🐍" and len(gateway.creates) == 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_the_account_preference_is_dropped_on_both_transports(setup, asynchronous):
+    root, gateway, client = setup
+    history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "earlier",
+         "nativeContinuation": {"route": dict(ROUTE), "format": "codex.responses.v1",
+                                "payload": [{"type": "reasoning"}]}},
+        {"role": "user", "content": "second"},
+    ]
+    gateway.results = [substituted(), result(route=OTHER_ACCOUNT)]
+    gateway.dispatch = ["response_received"] * 2
+    # The async loop offloads its blocking work to a thread, whose context is a
+    # copy: a preference dropped there would never reach the next request.
+    if asynchronous:
+        asyncio.run(client.chat_async(history, MODEL, None, "high"))
+    else:
+        client.chat(history, MODEL, None, "high")
+    first, second = (payload for payload, _ in gateway.uploads)
+    assert first["account"] == {"mode": "auto", "preferredProfileId": "account-a"}
+    assert second["account"] == {"mode": "auto"}
+
+
+def test_a_discarded_generation_teaches_the_requested_model_nothing(setup):
+    from ouroboros import capability_evidence
+
+    root, gateway, client = setup
+    gateway.results = [substituted(), result()]
+    gateway.dispatch = ["response_received"] * 2
+    seen = []
+    original = capability_evidence.observe_token_density
+    try:
+        capability_evidence.observe_token_density = (
+            lambda request, usage, **kw: seen.append(
+                ((usage.get("claudexor") or {}).get("route") or {}).get("model")) or original(request, usage, **kw))
+        call(client)
+    finally:
+        capability_evidence.observe_token_density = original
+    # Both generations reach the witness; only the one its own model produced
+    # may teach a density, and that guard lives in the witness itself.
+    assert seen == ["cheaper-model", "exact-model"]
+    witnesses = list((root / "state").rglob("*density*"))
+    assert all("cheaper-model" not in path.read_text(encoding="utf-8") for path in witnesses)
+
+
 def test_a_discarded_generation_never_becomes_the_live_turn(setup, monkeypatch):
     root, gateway, client = setup
     monkeypatch.setattr(transport, "owned_engine_version", lambda: "3.12.5")
@@ -191,6 +258,7 @@ def test_the_refusal_is_its_own_kind_that_rotates_without_cooling_the_model():
 
 @pytest.mark.parametrize("usage, expected", [
     ({"_last_llm_error_kind": "model_substituted"}, "different model than the one requested"),
+    ({"_last_llm_error_kind": "model_substituted"}, "ranks this one lower"),
     ({"_last_llm_error_kind": "bad_request", "_last_llm_provider_code": "invalid_continuation"},
      "refused the stored continuation"),
     ({"_last_llm_error_kind": "bad_request", "_last_llm_provider_code": "unsupported_parameter"},
@@ -223,7 +291,10 @@ def test_the_owner_row_names_what_happened_once_per_task_and_model():
     text, meta = notes[0]
     assert len(notes) == 1
     assert "cheaper-model answered instead of the requested exact-model" in text
-    assert "Claudexor account account-a" in text and "asked again on another account" in text
+    assert "Claudexor account account-a" in text
+    # The host stops preferring an account; it never claims the round moved.
+    assert "asked again without preferring that account" in text
+    assert "another account" not in text
     assert meta == {"card_row": "timeline", "card_row_id": "task-one:model_substitution:exact-model"}
 
 

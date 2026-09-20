@@ -849,11 +849,15 @@ def emit_model_effort_mismatch(
     )
 
 
+# What the host KNOWS it did. It stops preferring that account and asks again;
+# which account answers the redo is the engine's choice, so no wording here may
+# claim the round moved (architecture: rotation is possible, not guaranteed).
 _SUBSTITUTION_DISPOSITIONS = {
-    "redo": "the round was asked again on another account",
-    "redos_exhausted": "the round was asked again and kept being answered by it",
+    "redo": "the answer was not accepted and the round was asked again without preferring that account",
+    "redos_exhausted": "the round was asked again and kept being answered by another model",
     "pinned_account": "the account is pinned, so the round was not asked again",
     "admitted_candidate": "this send was already admitted, so the round was not asked again",
+    "send_budget_spent": "this task had no send left for another attempt",
 }
 
 
@@ -946,8 +950,8 @@ def provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
     if kind == "model_substituted":
         return (
             " The route answered with a different model than the one requested, so "
-            "the answer was not accepted. Another account can serve the requested "
-            "model right away, and the engine prefers one for a while after this."
+            "the answer was not accepted. Another account may serve the requested "
+            "model right away; the engine ranks this one lower for a while after this."
         )
     if kind == "bad_request" and str(accumulated_usage.get("_last_llm_provider_code") or "") == "invalid_continuation":
         # The generic bad_request sentence below blames the caller's transcript,
