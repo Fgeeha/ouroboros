@@ -1369,7 +1369,7 @@ def enqueue_project_completion_summary(
     ):
         return False
     try:
-        from ouroboros.projects_registry import task_presentation_snapshot
+        from ouroboros.projects_registry import mirrored_answer, task_presentation_snapshot
         from ouroboros.task_results import resolve_task_lineage
         from ouroboros.task_status import SETTLED_STATUSES
         from supervisor.terminal_delivery import enqueue_terminal_delivery
@@ -1423,6 +1423,7 @@ def enqueue_project_completion_summary(
                 "project_id": snapshot["project_id"],
                 "project_name": snapshot["project_name"],
                 "target_label": snapshot["target_label"], "status": status,
+                **mirrored_answer(result, outcome_phase(result, task_done_event)),
             },
         }
         return bool(enqueue_terminal_delivery(drive_root, event))
