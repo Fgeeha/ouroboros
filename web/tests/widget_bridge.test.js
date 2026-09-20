@@ -243,6 +243,47 @@ test('a listener replaced during a live theme delivery never receives null', () 
     assert.deepEqual(seen, [['first', 'dark'], ['first', 'light'], ['replacement', 'light']]);
 });
 
+test('unsubscribing a sibling during delivery suppresses its pending callback', () => {
+    const { window, deliver } = bridgeHarness({ initialTheme: 'dark' });
+    const seen = [];
+    let live = false;
+    let offSibling = () => {};
+    window.OuroborosWidget.onTheme(() => {
+        if (live) offSibling();
+        seen.push('first');
+    });
+    offSibling = window.OuroborosWidget.onTheme(() => seen.push('sibling'));
+    live = true;
+    deliver({ type: 'ouro-widget-theme', theme: 'light' });
+    assert.deepEqual(seen, ['first', 'sibling', 'first']);
+});
+
+test('re-registering the same sibling callback does not duplicate live delivery', () => {
+    const { window, deliver } = bridgeHarness({ initialTheme: 'dark' });
+    const seen = [];
+    let live = false;
+    let offSibling = () => {};
+    const sibling = (theme) => {
+        seen.push(['sibling', theme]);
+    };
+    window.OuroborosWidget.onTheme((theme) => {
+        seen.push(['first', theme]);
+        if (live && theme === 'light') {
+            offSibling();
+            offSibling = window.OuroborosWidget.onTheme(sibling);
+        }
+    });
+    offSibling = window.OuroborosWidget.onTheme(sibling);
+    live = true;
+    deliver({ type: 'ouro-widget-theme', theme: 'light' });
+    assert.deepEqual(seen, [
+        ['first', 'dark'],
+        ['sibling', 'dark'],
+        ['first', 'light'],
+        ['sibling', 'light'],
+    ]);
+});
+
 test('dispose awaits hooks (bridge live), acks, then fails pending work and unlistens', async () => {
     const { window, posted, listeners, deliver, chunk, flush } = bridgeHarness();
     const hookSaw = [];

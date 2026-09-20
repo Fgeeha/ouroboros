@@ -204,11 +204,6 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             assert module.evaluate(
                 "getComputedStyle(document.querySelector('.ui-control')).backgroundColor"
             ) == "rgb(245, 246, 248)"
-            theme_evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_OUT", str(tmp_path / "evidence")))
-            theme_evidence.mkdir(parents=True, exist_ok=True)
-            module.locator('body').screenshot(
-                path=str(theme_evidence / f"author-kit-{browser_name}-module-light.png")
-            )
             page.evaluate("() => window.ouroTheme.set('dark')")
             module.wait_for_function("document.documentElement.dataset.theme === 'dark'")
             for frame in (module, route):
@@ -228,8 +223,7 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
                 assert frame.locator('[role="status"]').inner_text() == "Personal: Grid, disabled"
                 assert frame.locator('[role="status"]').get_attribute("data-tone") == "ok"
                 frame.evaluate("document.activeElement.blur()")
-                if frame is module:
-                    assert frame.evaluate("window.kitCspViolations") == []
+                assert frame.evaluate("window.kitCspViolations") == []
             page.mouse.move(0, 0)
             assert route.evaluate("typeof window.OuroborosWidget") == "undefined"
             assert not any('/static/' in request.url and request.frame == route for request in browser_requests)
@@ -340,6 +334,11 @@ def test_author_kit_authenticated_mount_and_lifetime(author_kit_server, tmp_path
             assert route.get_by_role("button", name="Preview", exact=True).is_visible()
             evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_OUT", str(tmp_path / "evidence")))
             evidence.mkdir(parents=True, exist_ok=True)
+            page.evaluate("() => window.ouroTheme.set('light')")
+            module.wait_for_function("document.documentElement.dataset.theme === 'light'")
+            module.locator('body').screenshot(
+                path=str(evidence / f"author-kit-{browser_name}-module-light.png")
+            )
             for key in ("module-old", "page-old", "custom", "module-new", "page-new", "unavailable"):
                 card = page.locator(f'[data-widget-key="{key}"]')
                 card.scroll_into_view_if_needed()

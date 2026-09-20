@@ -60,10 +60,9 @@ Disturb or platform limit is bypassed. Policy and its disclosed limits: DESIGN
 §9; engineering rules: DEVELOPMENT "notifications ring for live events only".
 
 Independent iframe documents do not inherit the host's tokens or stored choice.
-The optional author UI kit supplies styles/primitives. A module may opt into the
-resolved host palette through `OuroborosWidget.onTheme(callback)`; the callback
-is opt-in, applies no styling automatically, and does not force a remount. Route
-iframes have no bridge and remain author-owned. Desktop `webview.start(private_mode=False)` requests
+The optional author UI kit supplies styles/primitives; module theme opt-in is
+documented below and never forces a remount. Route iframes are bridgeless and
+author-owned. Desktop `webview.start(private_mode=False)` requests
 persistent website storage in `launcher.py` and `launcher_onboarding.py`, including
 cookies, not just appearance. Existing packaged launchers must be rebuilt and
 installed to change that flag. Profile identity, origin and platform storage

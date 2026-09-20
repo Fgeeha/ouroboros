@@ -1050,10 +1050,16 @@ are the one exception — "What the frame may do" below). The bridge exposes:
   changes the child DOM or forces a remount. The first callback receives the
   resolved value embedded in the frame's initial document, later changes arrive
   on authenticated bridge messages derived from the host's `ouro:theme-changed`
-  event, and disposal releases the parent subscription. Route
+  event, and disposal releases the parent subscription. The first listener
+  normally sees the injected bootstrap value immediately, then the parent
+  confirms the current value asynchronously; after a prior unsubscribe, the
+  next listener waits for that confirmation instead of using stale bootstrap.
+  Route
   iframes have no bridge. A module declaration may record
   `render.appearance: host | independent | fixed` for author/reviewer intent;
   the declaration does not gate legacy modules or prove that the source repaints.
+  `appearance` is valid only inside a `kind: module` render; adding it to an
+  iframe or declarative render is a registration error rather than a theme claim.
 
 - **`OuroborosWidget.download(name, source)`** saves an existing `Blob`, a
   `data:` URL, or a URL under this skill's extension route prefix. It resolves

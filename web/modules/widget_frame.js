@@ -60,13 +60,14 @@ export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '') {
             const onTheme = (callback) => {
                 if (disposing || disposed || typeof callback !== 'function') return () => {};
                 const firstListener = themeListeners.size === 0;
-                themeListeners.add(callback);
+                const listener = { callback };
+                themeListeners.add(listener);
                 if (theme && !themeRefreshNeeded) notifyTheme(callback);
                 if (firstListener && themeListeners.size && !disposed) {
                     post({ type: 'ouro-widget-theme', op: 'subscribe' });
                 }
                 return () => {
-                    if (!themeListeners.delete(callback)) return;
+                    if (!themeListeners.delete(listener)) return;
                     if (!themeListeners.size && !disposed) {
                         themeRefreshNeeded = true;
                         post({ type: 'ouro-widget-theme', op: 'unsubscribe' });
@@ -122,7 +123,9 @@ export function moduleBridgeScript(nonce, routeBase = '', initialTheme = '') {
                     if (msg.theme === theme && !themeRefreshNeeded) return;
                     theme = msg.theme;
                     themeRefreshNeeded = false;
-                    Array.from(themeListeners).forEach(notifyTheme);
+                    Array.from(themeListeners).forEach((listener) => {
+                        if (themeListeners.has(listener)) notifyTheme(listener.callback);
+                    });
                     return;
                 }
                 if (msg.type === 'ouro-widget-event') {

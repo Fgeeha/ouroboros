@@ -175,9 +175,10 @@ export async function mountModuleWidget(mount, tab, render, mountSignal = null, 
         if (themeSubscribed) post({ type: 'ouro-widget-theme', theme });
     };
     const startTheme = () => {
-        if (themeSubscribed) return;
-        themeSubscribed = true;
-        stopTheme = onThemeChange(postTheme);
+        if (!themeSubscribed) {
+            themeSubscribed = true;
+            stopTheme = onThemeChange(postTheme);
+        }
         postTheme();
     };
     const stopThemeSubscription = () => {
