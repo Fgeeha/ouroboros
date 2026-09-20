@@ -1463,8 +1463,8 @@ body.resizing-panels { user-select: none; }
 .chat-bubble.assistant .message { color: var(--assistant-text); }
 .chat-bubble.system .message { color: var(--system-text); }
 
-/* Shared rich-content contract (v6.71.0): rendered markdown/lists inside
-   cards and review disclosures. NOT applied to chat-bubble .message. */
+/* Shared block presentation: hosts opt in when mounting rich Markdown.
+   Chat bubbles retain their own density; publisher HTML keeps its own tags. */
 .ui-rich-content {
     overflow-wrap: anywhere;
     min-inline-size: 0;
@@ -2456,10 +2456,13 @@ body.resizing-panels { user-select: none; }
     font-size: var(--type-body);
     line-height: var(--line-body);
 }
+.ui-rich-content .inline-code,
+.ui-rich-content .md-code-block code,
 .chat-bubble .message code {
     font-family: 'SF Mono', 'Fira Code', 'Consolas', monospace;
     font-size: var(--type-body);
 }
+.ui-rich-content .inline-code,
 .chat-bubble .message .inline-code {
     background: rgba(var(--neutral-rgb), 0.08);
     padding: 1px 5px;
@@ -2475,21 +2478,21 @@ body.resizing-panels { user-select: none; }
 .chat-bubble .message p {
     margin: 0 0 var(--space-3);
 }
-.chat-bubble .message > :first-child { margin-top: 0; }
-.chat-bubble .message > :last-child { margin-bottom: 0; }
 .chat-bubble .message ul,
 .chat-bubble .message ol {
     margin: var(--space-2) 0 var(--space-3);
-    padding-left: var(--space-5);
+    padding-inline-start: var(--space-5);
 }
 .chat-bubble .message li { margin: var(--space-1) 0; }
+.ui-rich-content li.task-list-item,
 .chat-bubble .message li.task-list-item {
     display: flex;
     align-items: flex-start;
     gap: var(--space-2);
-    margin-left: calc(-1 * var(--space-5));
+    margin-inline-start: calc(-1 * var(--space-5));
     list-style: none;
 }
+.ui-rich-content .task-list,
 .chat-bubble .message .task-list { list-style: none; }
 .md-checkbox {
     display: inline-flex;
@@ -2566,6 +2569,13 @@ body.resizing-panels { user-select: none; }
     margin: var(--space-3) 0 var(--space-2);
     line-height: var(--line-title);
 }
+/* Rich content uses subsection labels at every mount, including cards. */
+.ui-rich-content :is(.md-h1, .md-h2, .md-h3) {
+    font-size: var(--type-body);
+    color: var(--text-primary);
+    font-weight: 600;
+    margin-block: var(--space-3) var(--space-2);
+}
 /* Chat-scoped heading clamp: a markdown heading inside a chat bubble is a
    section label, never a page title (--type-page stays for real page titles). */
 .chat-bubble .message .md-h1,
@@ -2574,6 +2584,12 @@ body.resizing-panels { user-select: none; }
     font-size: var(--type-body);
     font-weight: 600;
 }
+/* The ordinary transcript keeps its established heading rhythm. */
+.chat-bubble .message .md-h1 { margin-block: var(--space-5) var(--space-3); }
+.chat-bubble .message .md-h2 { margin-block: var(--space-4) var(--space-2); }
+.chat-bubble .message .md-h3 { margin-block: var(--space-3) var(--space-2); }
+.chat-bubble .message > :first-child { margin-block-start: 0; }
+.chat-bubble .message > :last-child { margin-block-end: 0; }
 .md-li {
     display: block;
     padding-left: 12px;
@@ -2606,6 +2622,7 @@ body.resizing-panels { user-select: none; }
     background: var(--code-bg);
     color: var(--text-primary);
 }
+.ui-rich-content .md-code-block pre,
 .chat-bubble .message .md-code-block pre {
     margin: 0;
     padding: var(--space-4);
@@ -2672,7 +2689,9 @@ body.resizing-panels { user-select: none; }
 .md-code-block .hljs-variable,
 .md-code-block .hljs-template-variable { color: #add782; }
 
+.ui-rich-content .katex,
 .chat-bubble .message .katex { color: var(--text-primary); }
+.ui-rich-content .katex-display,
 .chat-bubble .message .katex-display {
     max-width: 100%;
     margin: var(--space-4) 0;
@@ -6998,12 +7017,20 @@ textarea.chat-input {
 
 .chat-link-button:hover { background: var(--accent-18); }
 
+/* The bubble owns the width floor against the definite transcript column:
+   260px card plus its 28px bubble padding and 2px border. A child percentage
+   alone would lose that floor in a shrink-to-fit bubble, even on desktop. */
+.chat-bubble:has(> .chat-quiz-card) {
+    min-width: min(290px, 100%);
+    margin-inline: 0;
+}
 /* Owner quiz card (design system: born on tokens; DESIGN.md "Quiz card"). */
 .chat-quiz-card {
     display: flex;
     flex-direction: column;
     gap: var(--space-2, 8px);
-    min-width: 260px;
+    width: 100%;
+    min-width: min(260px, 100%);
     max-width: 560px;
     padding: var(--space-3, 12px);
     border: 1px solid var(--ui-card-border);
@@ -7044,13 +7071,16 @@ textarea.chat-input {
     line-height: var(--line-body, 1.5);
     font-weight: 400;
     color: var(--text-primary);
+    min-inline-size: 0;
 }
 .chat-quiz-question strong { font-weight: 600; }
 .chat-quiz-stake {
     font-size: var(--type-meta);
     line-height: var(--line-meta, 1.35);
     color: var(--text-meta);
+    min-inline-size: 0;
 }
+.chat-quiz-stake .inline-code { font-size: inherit; }
 .chat-quiz-options {
     display: flex;
     flex-direction: column;
@@ -7136,6 +7166,7 @@ textarea.chat-input {
 }
 /* The settled record of what the owner answered: a second primary line. */
 .chat-quiz-answer {
+    white-space: pre-wrap;
     font-size: var(--type-body);
     line-height: var(--line-body, 1.5);
     color: var(--text-primary);
