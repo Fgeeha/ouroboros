@@ -623,6 +623,13 @@
       "acceptance_clause": "Too few plan reviewers could answer, so the work was held."
     },
     {
+      "name": "a held task that also recorded the open-review flag and a class states only why it was held",
+      "record": {"status": "completed", "reason_code": "final_message", "terminal_plan_review_open": true, "outcome_axes": {"execution": {"status": "ok", "plan_review": "none_answered"}, "objective": {"status": "fail", "source": "plan_review_quorum_unreachable", "reason": "plan_review_quorum_unreachable", "outcome_tier": "blocked_with_evidence"}, "review": {"status": "skipped"}}},
+      "phase": "error",
+      "headline": "Failed",
+      "acceptance_clause": "Too few plan reviewers could answer, so the work was held."
+    },
+    {
       "name": "only some of the plan reviewers answered: Done with warnings, and the card says so",
       "record": {"status": "completed", "reason_code": "plan_review_advisory", "terminal_plan_review_open": true, "outcome_axes": {"execution": {"status": "degraded", "reason_code": "plan_review_advisory", "plan_review": "unanswered"}}},
       "phase": "warn",

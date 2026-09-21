@@ -140,7 +140,7 @@ def panel(monkeypatch):
 
 def _settled(harness_, count):
     return _wait_until(lambda: sum(
-        " answered" in line and "reviewer" in line for line in harness_.progress) == count)
+        " answered — " in line for line in harness_.progress) == count)  # the reviewer row family, never the wave line
 
 
 @pytest.fixture

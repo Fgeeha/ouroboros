@@ -545,6 +545,7 @@ export function taskReasonDetail(evt) {
     // same record shows as empty. Resolved once for every branch.
     const [reason, custody] = custodyDebtReason(record);
     const origin = record.cancel_origin;
+    const held = severity === 'error' && String(objective?.source || '').startsWith('plan_review_');
     let clause;
     if (taskStoppedWithSummary(evt)) {
         // An owner-requested stop is a success and carries its own marker instead.
@@ -563,7 +564,7 @@ export function taskReasonDetail(evt) {
             origin.scope === 'cascade' ? 'this task and its sub-tasks' : '',
             `initiator: ${String(actor || origin.requested_by || '') || 'not recorded'}`,
         ].filter(Boolean).join(' · ');
-    } else if (severity === 'error' && String(objective?.source || '').startsWith('plan_review_')) {
+    } else if (held) {
         // A task HELD by a blocking plan review states the objective's own reason, so it
         // never reads as work that went on.
         clause = taskReasonPhrase(String(objective.reason || ''));
@@ -580,7 +581,9 @@ export function taskReasonDetail(evt) {
             ? String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')
             : taskReasonPhrase(reason === 'plan_review_advisory' ? planReviewKey(record, reason) : reason);
     }
-    return joinCauseClauses([clause, ...terminalLimitations(record, reason), custody ? taskReasonPhrase(custody) : '']);
+    const limitations = terminalLimitations(record, reason);
+    if (held) limitations[1] = ''; // the held work never "went on": the open review IS the primary cause
+    return joinCauseClauses([clause, ...limitations, custody ? taskReasonPhrase(custody) : '']);
 }
 
 // S3 (HQ1): the ONE shared projection of a typed owner_hurry event for the

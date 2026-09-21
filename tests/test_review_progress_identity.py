@@ -51,7 +51,7 @@ def test_requested_model_is_never_substituted_for_missing_observed_model():
     served = _actor(usage={"provider": "claudexor", "delegated_route": "cursor",
                            "resolved_model": "Cursor Grok 4.6 Extra High Fast", "applied_profile": "valintine"})
     assert review_actor_progress_text("plan_review", "finished", slot, served) == (
-        "Plan reviewer requested-model answered — ran as cursor Cursor Grok 4.6 Extra High Fast (account valintine).")
+        "Plan reviewer requested-model answered — ran as Cursor Grok 4.6 Extra High Fast (account valintine).")
 
 
 def test_same_requested_model_keeps_per_task_observed_route_and_profile():
@@ -68,7 +68,7 @@ def test_same_requested_model_keeps_per_task_observed_route_and_profile():
                         slot=slot, phase="finished", actor=actor)
         assert events.get_nowait()["task_id"] == task
         assert len(progress) == 1
-        assert progress[0] == f"Acceptance reviewer requested-model answered — ran as cursor {model} (account {profile})."
+        assert progress[0] == f"Acceptance reviewer requested-model answered — ran as {model} (account {profile})."
         messages.append(progress[0])
     assert "observed-two" not in messages[0]
     assert "observed-one" not in messages[1]

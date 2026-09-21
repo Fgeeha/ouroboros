@@ -1372,12 +1372,13 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     # Resolved once for every branch: the custody debt is a standing limitation
     # of the same answer, not a property of the branch that happened to fire.
     reason, custody = _custody_debt_reason(raw_reason, result, event)
+    held = phase == "error" and str(objective.get("source") or "").startswith("plan_review_")
     if raw_reason == REASON_OWNER_REQUESTED_FINALIZATION:
         clause = ""  # an owner-requested stop is a success and carries its own marker
     elif (status and (status != ACCEPTANCE_ACCEPTED or cause in TASK_CAUSE_PHRASES)
             and phase in {"done", "warn"}):
         clause = TASK_CAUSE_PHRASES.get(cause, cause)
-    elif phase == "error" and str(objective.get("source") or "").startswith("plan_review_"):
+    elif held:
         # A task HELD by a blocking plan review states the objective's own reason.
         clause = TASK_CAUSE_PHRASES.get(str(objective.get("reason") or ""), str(objective.get("reason") or ""))
     elif raw_reason in {REASON_FINAL_MESSAGE, ""}:
@@ -1391,8 +1392,10 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
         key = _plan_review_key(result, event, reason) if reason == "plan_review_advisory" else reason
         clause = (" ".join(strip_markdown(str(detail)).split()) if detail
                   else TASK_CAUSE_PHRASES.get(key, key))
-    line = _join_cause_clauses([clause, *_terminal_limitations(result, event, reason),
-                                TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
+    limitations = _terminal_limitations(result, event, reason)
+    if held:
+        limitations[1] = ""  # the held work never "went on": the open review IS the primary cause
+    line = _join_cause_clauses([clause, *limitations, TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
     return line if not line or line.endswith((".", "!", "?", "…", ")")) else line + "."
 
 

@@ -174,7 +174,7 @@ def review_actor_progress_text(surface: str, phase: str, slot: Any, actor: Any =
     elif verb == "answered":
         row = (review_executions_from_actor_usage([{"usage": usage}]) or [{}])[0]
         if row.get("kind") == "harness":
-            ran = " ".join(part for part in (row.get("harness_id", ""), row.get("model", "")) if part)
+            ran = row.get("model") or row.get("harness_id", "")
             text += (f" — ran as {ran}" if ran else " — how it ran was not reported") + (
                 "" if row.get("model") else ("; which model served it was not reported" if ran else ""))
         elif row:
