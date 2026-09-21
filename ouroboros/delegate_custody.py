@@ -261,6 +261,18 @@ def daemon_says_absent(exc: Any) -> bool:
     """
     return int(getattr(exc, "status_code", 0) or 0) == 404
 
+PROJECT_HAS_THREADS = "project_has_threads"  # the engine's typed refusal of a project DELETE
+
+def daemon_keeps_project(exc: Any) -> bool:
+    """True when the daemon ANSWERED that it keeps the project: it still holds threads
+    on it. The twin of ``daemon_says_absent`` — a definite fact from a reachable daemon,
+    and a PERMANENT one for the host (Ouroboros creates sticky review threads scoped to
+    the project root and the gateway has no thread delete), so retrying it on a timer
+    costs a daemon round trip per sweep forever. The CODE decides, never the message —
+    a transient, a 5xx or an unreadable body is a failure to find out, still retryable.
+    """
+    return str(getattr(exc, "code", "") or "") == PROJECT_HAS_THREADS
+
 def custody_log_unreadable(drive_root: Any) -> bool:
     """Whether the custody event log EXISTS but cannot be opened (GR6-4).
 
@@ -878,6 +890,48 @@ def retire_project(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
         _retire_project_locked(drive_root, gateway, custody)
 
 
+def _project_runs(drive_root: Any, custody: RunCustody) -> Optional[List[RunCustody]]:
+    """This project's runs from a COMPLETE custody view; ``None`` when no such view exists."""
+    from ouroboros.delegate_custody_usage import complete_custody_rows
+
+    rows_raw = complete_custody_rows(
+        event_log_path(drive_root), _ROW_MARKER, started_type=STARTED)
+    if rows_raw is None:
+        log.warning("Retirement deferred: custody log view incomplete")
+        return None
+    state = replay(drive_root, rows=rows_raw)
+    if custody.run_id and custody.run_id not in state:
+        log.warning("Retirement deferred: run %s not in replay", custody.run_id)
+        return None
+    return [run for run in state.values() if run.project_id == custody.project_id and run.run_id]
+
+
+def _project_settled(drive_root: Any, custody: RunCustody) -> bool:
+    """Every run of the project is settled, per a complete view read NOW.
+
+    Re-read under the retirement lock right before a discharge row is appended,
+    because STARTED appends take no lock: a PROJECT_RETIRED replayed after a
+    sibling's STARTED strips that sibling's ownership. Nothing proven means no.
+    """
+    try:
+        rows = _project_runs(drive_root, custody)
+    except Exception:
+        log.warning("Discharge deferred: replay failed for %s", custody.run_id, exc_info=True)
+        return False
+    return bool(rows) and all(run.settled for run in rows)
+
+
+def _release_registration(drive_root: Any, custody: RunCustody, **facts: Any) -> None:
+    """Our custody over the registration ends: the memo (every sibling, exactly as
+    the replay clears them) and the durable row, ``facts`` naming why it was kept."""
+    custody.project_owned = False
+    for sibling in _CUSTODY.values():
+        if sibling.project_id == custody.project_id:
+            sibling.project_owned = False
+    emit(drive_root, PROJECT_RETIRED, {"run_id": custody.run_id, "task_id": custody.task_id,
+                                       "project_id": custody.project_id, **facts})
+
+
 def _retire_project_locked(drive_root: Any, gateway: Any, custody: RunCustody) -> None:
     if custody.project_persistent:
         custody.project_owned = False
@@ -887,20 +941,8 @@ def _retire_project_locked(drive_root: Any, gateway: Any, custody: RunCustody) -
     if not custody.project_id:
         return
     try:
-        from ouroboros.delegate_custody_usage import complete_custody_rows
-
-        rows_raw = complete_custody_rows(
-            event_log_path(drive_root), _ROW_MARKER, started_type=STARTED)
-        if rows_raw is None:
-            log.warning("Retirement deferred: custody log view incomplete")
-            return
-        state = replay(drive_root, rows=rows_raw)
-        if custody.run_id and custody.run_id not in state:
-            log.warning("Retirement deferred: run %s not in replay", custody.run_id)
-            return
-        rows = [run for run in state.values()
-                if run.project_id == custody.project_id and run.run_id]
-        if not any(run.project_owned for run in rows):
+        rows = _project_runs(drive_root, custody)
+        if rows is None or not any(run.project_owned for run in rows):
             return
         if any(run.project_persistent for run in rows):
             # #362: ANY persistent sharer makes the project a durable user
@@ -923,18 +965,19 @@ def _retire_project_locked(drive_root: Any, gateway: Any, custody: RunCustody) -
             # The daemon's typed refusal rides the row beside its text: "failed"
             # without the WHY made every retire loop a forensic dig, and the CODE
             # is what tells a permanent refusal from one worth retrying.
+            refusal = {"code": str(getattr(exc, "code", "") or ""),
+                       "status": int(getattr(exc, "status_code", 0) or 0)}
+            if daemon_keeps_project(exc) and _project_settled(drive_root, custody):
+                # The #362 vocabulary — our custody ends, the engine keeps the
+                # project — under the engine's own code; never a deletion claim.
+                _release_registration(drive_root, custody, project_kept=True,
+                                      reason=PROJECT_HAS_THREADS, **refusal)
+                return
             emit(drive_root, PROJECT_RETIRE_FAILED, {"run_id": custody.run_id, "task_id": custody.task_id,
                                                      "project_id": custody.project_id,
-                                                     "reason": str(exc)[:500],
-                                                     "code": str(getattr(exc, "code", "") or ""),
-                                                     "status": int(getattr(exc, "status_code", 0) or 0)})
+                                                     "reason": str(exc)[:500], **refusal})
             return
-    custody.project_owned = False
-    for sibling in _CUSTODY.values():
-        if sibling.project_id == custody.project_id:
-            sibling.project_owned = False
-    emit(drive_root, PROJECT_RETIRED, {"run_id": custody.run_id, "task_id": custody.task_id,
-                                       "project_id": custody.project_id})
+    _release_registration(drive_root, custody)
 
 
 def close_absent_run(drive_root: Any, gateway: Any, custody: RunCustody, reason: str) -> None:
