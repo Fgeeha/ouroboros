@@ -1199,7 +1199,9 @@ test('an owner-disabled roster row leaves the picker but a saved reference to it
 
     const holding = subagentOptionsFor(roster, 'paused');
     assert.deepEqual(holding.map((o) => o.value), ['deep', 'paused']);
-    assert.equal(holding[1].label, '#paused · API · openai/gpt-5.6-luna · switched off — Paused seat');
+    // The handle leads, the owner's switch rides with the facts, the caption follows.
+    assert.equal(holding[1].label, 'openai/gpt-5.6-luna · switched off — Paused seat');
+    assert.equal(holding[0].label, 'openai/gpt-5.6-sol/high — Long reasoning over big diffs');
     assert.doesNotMatch(holding[1].label, /not in the roster/, 'the row exists; it is switched off');
 
     // The flat picker keeps the same behaviour through its group builder.

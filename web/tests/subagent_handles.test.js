@@ -84,3 +84,20 @@ test('the picker shows the EFFECTIVE name: an inherited fast is said, the standa
     assert.deepEqual(labels('standard'), ['x-ai/grok-4.6', 'openai/gpt-5.6-sol']);
     assert.deepEqual(labels('fast'), ['x-ai/grok-4.6/fast', 'openai/gpt-5.6-sol']);
 });
+
+test('a switched-off row leaves new choices, keeps its name where it is still referenced, and never renames a neighbour', () => {
+    const roster = [
+        { subagent_id: 'fast-scout', recommended_use: 'Scouts', route: { kind: 'api_model', target_id: 'x-ai/grok-4.6' } },
+        { subagent_id: 'fast-scout_copy_a1', recommended_use: 'Parked', enabled: false,
+          route: { kind: 'api_model', target_id: 'moonshotai/kimi-k3' }, effort: 'high' },
+    ];
+    // Not offered for a NEW choice; the enabled neighbour reads exactly as it does alone.
+    assert.deepEqual(pickerOptions(roster, { subagent_id: 'fast-scout' }).map((option) => option.label),
+        pickerOptions(roster.slice(0, 1), { subagent_id: 'fast-scout' }).map((option) => option.label));
+    // Still referenced: the option survives, named by its handle, with the switch as a fact before the caption.
+    const held = pickerOptions(roster, { subagent_id: 'fast-scout_copy_a1' });
+    assert.deepEqual(held.map((option) => option.label),
+        ['x-ai/grok-4.6 — Scouts', 'moonshotai/kimi-k3/high · switched off — Parked']);
+    assert.equal(held[1].selected, true);
+    assert.doesNotMatch(held[1].label, /fast-scout|#/);
+});

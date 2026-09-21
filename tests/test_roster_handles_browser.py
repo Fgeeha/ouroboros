@@ -129,3 +129,19 @@ def test_twins_saved_earlier_are_hinted_and_never_block_an_unrelated_save(role_u
     assert "Subagent 2 runs the same engine as Subagent 1" in page.locator("#settings-status").text_content()
     assert twin.get_attribute("data-invalid") is not None and len(ui["posts"]) == posts
 
+
+def test_a_switched_off_row_is_named_by_its_handle_with_the_switch_as_a_fact(role_ui):
+    ui = role_ui
+    rows = _configure(ui, 3)
+    rows[0]["enabled"] = False  # the scope slot still references this row
+    rows[2]["enabled"] = False  # nothing references this one
+    page = roles.open_agents(ui)
+    labels = page.locator(
+        '[data-slot-id="scope_1"] [data-slot-route] optgroup[label="Available subagents"] option'
+    ).all_text_contents()
+    # The referenced off row keeps its option under its handle; the unreferenced one is no new choice.
+    assert labels == ["codex=gpt-test-0 · switched off — Notes 0", "openai::gpt-api-1/low — Notes 1"]
+    card = page.locator("[data-subagent-row]").first
+    assert not card.locator('[data-subagent-field="enabled"]').is_checked()
+    roles.capture(page, "roster-handles-switched-off-row")
+
