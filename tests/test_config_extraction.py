@@ -24,6 +24,9 @@ _LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes,
 # the historical extraction's facade and need not add compatibility re-exports.
 _ADDED_OWNERS = {
     "WORKER_READY_CEILING_SEC": runtime_limits,
+    # The two bounds of the usage ledger's display (stale-while-revalidate) read path.
+    "USAGE_DISPLAY_LOCK_TIMEOUT_SEC": runtime_limits,
+    "USAGE_DISPLAY_REVALIDATE_AFTER_SEC": runtime_limits,
     "IMMEDIATE_SETTINGS": settings_scales,
     "RESTART_REQUIRED_SETTINGS": settings_scales,
     "get_finalization_grace_sec": runtime_limits,

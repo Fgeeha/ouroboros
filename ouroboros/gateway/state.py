@@ -156,9 +156,11 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
         # compatibility writer. Keep that internal vocabulary at this
         # boundary even when the unbounded-budget branch reuses the mapping
         # directly as its accounting projection.
+        # /api/state is polled: both reads are display reads, so a contended ledger lock
+        # serves the last validated snapshot instead of parking this worker thread.
         breakdown = {
             key: value
-            for key, value in usage_breakdown(drive_root).items()
+            for key, value in usage_breakdown(drive_root, allow_stale=True).items()
             if not str(key).startswith("_")
         }
         # include_roots=False: /api/state serializes named scalars only, so the
@@ -166,7 +168,7 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
         # with zero readers on this path). The slim projection still carries
         # limit_usd/remaining_known_usd for the evolution budget snapshot below.
         accounting = (
-            usage_projection(drive_root, global_limit_usd=limit, include_roots=False)
+            usage_projection(drive_root, global_limit_usd=limit, include_roots=False, allow_stale=True)
             if limit > 0
             else dict(breakdown)
         )

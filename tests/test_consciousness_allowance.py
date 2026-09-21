@@ -146,7 +146,7 @@ def test_zero_allowance_means_consciousness_may_not_spend(data_root, monkeypatch
 def test_an_unreadable_ledger_is_the_typed_unknown_outcome(data_root, monkeypatch):
     monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_DAILY_USD", "20")
 
-    def boom(root, key, render):
+    def boom(root, key, render, **_display_read):
         raise OSError("ledger locked")
 
     monkeypatch.setattr(allowance, "_render_cached", boom)
