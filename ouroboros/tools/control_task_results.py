@@ -78,6 +78,9 @@ def _subtask_outcome_summary(data: Dict[str, Any], receipts: list | None = None)
             for field in ("open_run_ids", "pending_invocation_ids", "undisposed_patch_run_ids", "terminal_runs"):
                 values = envelope.get(field)
                 values = list(values) if isinstance(values, list) else []
+                if field == "terminal_runs":  # the stored actor key is a durable join key, never a model-facing name
+                    values = [{k: v for k, v in row.items() if k != "selected_subagent_id"}
+                              if isinstance(row, dict) else row for row in values]
                 custody[field] = values[:10]
                 if len(values) > 10:
                     custody[field + "_omitted"] = len(values) - 10

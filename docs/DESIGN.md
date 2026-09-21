@@ -493,6 +493,12 @@ keys.
   status pair, never dimmed — with the section-level line as the summary. A
   save attempt judges the entries that existed then; one added afterwards is
   an invitation again.
+- A per-entry on/off switch is a native `.ui-checkbox` leading that entry's
+  head, before its title, with its own accessible name and pointer target. It
+  is a draft like every other field — the section's Save is the one writer, and
+  no entry saves on its own click. An entry switched off is not dimmed, locked
+  or removed: it keeps every control editable and its own status reading, and
+  the switch never merges into the availability axis beside it.
 - A multi-field card (an MCP server) follows the add-and-reveal rule without
   adopting the §6 row anatomy.
 
@@ -865,7 +871,10 @@ stored spellings (`provider::model`, `claudexor::source=model`,
 `harness=model`) are serialization authored by the editor: never required from
 the owner, never a field placeholder or help-text instruction, never the
 primary displayed value; the exact stored id may appear in a meta line or
-tooltip. The route identity chip names the source (API · OpenAI, Codex · model,
+tooltip. A configured-subagent reference is the one place a stored spelling
+names a thing: a roster row is labelled by its handle — its route target plus
+the facets that row really runs with, defaults omitted — because a friendlier
+stored label rots as soon as the owner re-points the row. The route identity chip names the source (API · OpenAI, Codex · model,
 Claude Code · agent), not the channel alone. A last-run receipt is shown
 against the route that produced it: when the row's route changed since, the
 line says so and names the earlier route.

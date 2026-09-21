@@ -236,8 +236,8 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   Delivery is at-least-once: an exact task id with live or durable custody is
   an idempotent no-op, and semantic duplicate judgement is never the physical
   identity fence.
-- `subagent_id` selects one complete row from the canonical enabled
-  `OUROBOROS_SUBAGENTS` list; freeze the normalized row at schedule time and
+- `subagent_id` selects one complete `OUROBOROS_SUBAGENTS` row both
+  `enabled` axes admit; freeze the normalized row at schedule time and
   dispatch/restart from that snapshot, never from mutable Settings. No second
   model/lane/executor selector, no host-side ranking, no substitute actor
   after a typed refusal.
@@ -461,10 +461,10 @@ Settings, accounts and shared controls. Tests: `test_owner_settings_write_seam.p
   native inspection, and model/account edits never silently turn it into a packet.
 - One capability, one section: the task-actor story lives in Agents →
   Available subagents (`web/modules/subagents_settings.js`), editing one
-  canonical `OUROBOROS_SUBAGENTS` object (list-level Enabled, at most ten
-  stable rows, one prose field `recommended_use`; id and compatibility name
-  automatic and hidden). Never derive durable identity from the visual
-  ordinal, and never render a second control over the same settings key
+  canonical `OUROBOROS_SUBAGENTS` object (list-level and row Enabled, at most
+  ten rows, one prose field `recommended_use`; the stored id is a hidden join
+  key). Name a row by its route-derived handle, never by a stored label or
+  the ordinal, and never render a second control over the same settings key
   (`OUROBOROS_MAX_WORKERS` stays in Advanced because it sizes the process
   pool). Share only neutral route/model/account/effort/status primitives with
   reviewer rows (`route_editor_primitives.js`): task routes serialize

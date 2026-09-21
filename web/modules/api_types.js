@@ -131,7 +131,7 @@
 /**
  * @typedef {Object} AvailableSubagentItem
  * @property {string} subagent_id
- * @property {string} name
+ * @property {boolean=} enabled - Omitted means true; false withdraws new selections.
  * @property {string} recommended_use
  * @property {AvailableSubagentRoute} route
  * @property {string=} effort
