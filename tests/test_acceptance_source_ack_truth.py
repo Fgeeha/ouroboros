@@ -148,7 +148,8 @@ def test_unknown_at_capture_and_ack_still_fails_closed_at_the_end_seal(case):
     tool_ctx.end_acceptance_fence = end
     tool_ctx.inspect_acceptance_fence = lambda **_kw: (_ for _ in ()).throw(INSPECT_FAILURE)
     tool_ctx._execution_trace = trace
-    assert _begin_task_acceptance_fence(tool_ctx, "root") == (True, "final")
+    opened, token = _begin_task_acceptance_fence(tool_ctx, "root")
+    assert opened and token == "final"
     assert tool_ctx._task_acceptance_fence_generation == 0
 
     observed = capture_acceptance_observation(tool_ctx, trace, ctx.incoming_messages)

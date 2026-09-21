@@ -672,7 +672,7 @@ def _finish_cyber_acceptance(ctx: _TaskAcceptanceContext, result: Any) -> bool:
         enforcement="advisory", source="author_final_response",
     )
     ctx.llm_trace["review_decision"].update(author_finish=True, review_pending=pending,
-                                          admission_released=released)
+                                          admission_released=bool(released))
     _loop()._set_acceptance_decision(ctx.llm_trace, {
         "status": ACCEPTANCE_ACCEPTED if clean else ACCEPTANCE_FINALIZED_UNACCEPTED,
         "reason": "clean_pass" if clean else "author_finish", "source": "task_acceptance_review",
@@ -1383,7 +1383,7 @@ def _run_task_acceptance_review_once(
         )
         emit_progress("Task acceptance review waiting for recursive subtree quiescence.")
         return True
-    llm_trace["review_decision"].update(admission_fence_available=fence_ok, subtree_quiescent=quiescent)
+    llm_trace["review_decision"].update(admission_fence_available=bool(fence_ok), subtree_quiescent=quiescent)
     # One effective profile carries explicit author caps/Hurry to gates and display.
     budget_profile = effective_budget_profile(
         tools._ctx, task_pacing.resolve_budget_profile(tools._ctx),

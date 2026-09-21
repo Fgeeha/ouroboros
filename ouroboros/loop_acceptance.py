@@ -7,17 +7,16 @@ from __future__ import annotations
 import json
 import logging
 import pathlib
+import time
+from dataclasses import dataclass
 
-from typing import Any, Callable, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from ouroboros.acceptance_settlement import forced_rail_panel_verdict
 from ouroboros.review_cycles import REASON_REVIEW_CYCLES_EXHAUSTED
 from ouroboros.review_projection import publish_acceptance_checkpoint
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_IDENTICAL_ACCEPTANCE_REFUSED, extract_final_answer, turn_has_reviewable_effects
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.utils import truncate_review_artifact
-
-
-from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # annotation-only names; lazy under future annotations, never imported at runtime
     from ouroboros.loop_delivery import DeliveryCandidate
@@ -93,7 +92,71 @@ from ouroboros.loop_messages import (  # noqa: F401 — shared owner-source surf
 )
 
 
-def _begin_task_acceptance_fence(ctx: Any, task_id: str) -> tuple[bool, Any]:
+@dataclass(frozen=True)
+class FenceOutcome:
+    """Typed answer to one queue-fence request; truthy iff the supervisor said yes.
+
+    ``refused``: it answered no (``reason``). ``unknown``: no answer arrived within
+    ``waited_sec`` — a gap, never a refusal, a verdict or an owner message.
+    """
+
+    status: str = "ok"
+    op: str = ""
+    reason: str = ""
+    waited_sec: float = 0.0
+
+    def __bool__(self) -> bool:
+        return self.status == "ok"
+
+
+def _root_task_id(ctx: Any, task_id: str) -> str:
+    meta = getattr(ctx, "task_metadata", {})
+    meta = meta if isinstance(meta, dict) else {}
+    return str(meta.get("root_task_id") or getattr(ctx, "root_task_id", "") or task_id)
+
+
+def _settle_fence_outcome(ctx: Any, outcome: FenceOutcome) -> FenceOutcome:
+    """Expose the outcome on ctx; a refusal or a gap leaves ONE durable worker-side row."""
+    ctx._task_acceptance_fence_outcome = outcome
+    if not outcome:
+        from ouroboros import task_pacing
+        from ouroboros.utils import append_jsonl, utc_now_iso
+
+        task_id = str(getattr(ctx, "task_id", "") or "")
+        try:
+            append_jsonl(task_pacing.acceptance_timing_events_path(ctx), {
+                "ts": utc_now_iso(), "type": "supervisor_ack_unavailable", "task_id": task_id,
+                "root_task_id": _root_task_id(ctx, task_id), "op": outcome.op, "outcome": outcome.status,
+                "reason": outcome.reason, "waited_sec": outcome.waited_sec,
+            })
+        except Exception:
+            log.warning("supervisor_ack_unavailable row could not be written for %s", task_id, exc_info=True)
+    return outcome
+
+
+def _fence_request(ctx: Any, op: str, callback: Callable[..., Any], **kwargs: Any) -> tuple[FenceOutcome, Any]:
+    """One request to the queue-owned fence: ok | refused(reason) | unknown(waited_sec)."""
+    started = time.monotonic()
+    try:
+        response = callback(**kwargs)
+        if not (isinstance(response, dict) and not response.get("ok", True)):
+            return _settle_fence_outcome(ctx, FenceOutcome(op=op)), response
+        outcome = FenceOutcome("refused", op, str(response.get("error") or response.get("status") or ""))
+    except RuntimeError as exc:
+        outcome = FenceOutcome("refused", op, str(exc))
+    except Exception as exc:
+        outcome = FenceOutcome("unknown", op, type(exc).__name__, round(time.monotonic() - started, 3))
+    return _settle_fence_outcome(ctx, outcome), None
+
+
+def _drop_fence_binding(ctx: Any) -> None:
+    """The queue owns the fence; a token whose state is unproven is never retained."""
+    ctx._task_acceptance_fence_token = None
+    ctx._task_acceptance_fence_generation = None
+    ctx._task_acceptance_queue_descendants = []
+
+
+def _begin_task_acceptance_fence(ctx: Any, task_id: str) -> tuple[FenceOutcome, Any]:
     """Optional seam implemented by the supervisor under its queue lock."""
     admission_lock = getattr(ctx, "owner_message_admission_lock", None)
     admission_agent = getattr(ctx, "owner_message_admission_agent", None)
@@ -101,57 +164,38 @@ def _begin_task_acceptance_fence(ctx: Any, task_id: str) -> tuple[bool, Any]:
         with admission_lock:
             ctx._task_acceptance_owner_generation = int(getattr(admission_agent, "_owner_message_generation", 0) or 0)
     existing = getattr(ctx, "_task_acceptance_fence_token", None)
+    inspect = getattr(ctx, "inspect_acceptance_fence", None)
+    if existing is not None and not callable(inspect):
+        return FenceOutcome(op="begin"), existing
     if existing is not None:
-        inspect = getattr(ctx, "inspect_acceptance_fence", None)
-        if callable(inspect):
-            try:
-                refreshed = inspect(token=str(existing))
-                ctx._task_acceptance_queue_descendants = (
-                    list(refreshed.get("queue_descendants") or [])
-                    if isinstance(refreshed, dict) else []
-                )
-                if isinstance(refreshed, dict):
-                    ctx._task_acceptance_fence_generation = int(
-                        refreshed.get("owner_message_generation") or 0
-                    )
-            except Exception:
-                log.debug("Queue-owned acceptance fence inspection failed", exc_info=True)
-                return False, existing
-        return True, existing
+        outcome, refreshed = _fence_request(ctx, "inspect", inspect, token=str(existing))
+        if outcome:
+            ctx._task_acceptance_queue_descendants = []
+        if outcome and isinstance(refreshed, dict):
+            ctx._task_acceptance_queue_descendants = list(refreshed.get("queue_descendants") or [])
+            ctx._task_acceptance_fence_generation = int(refreshed.get("owner_message_generation") or 0)
+        if outcome or outcome.status == "unknown":
+            return outcome, existing  # no answer is a gap: the binding and its known generation stay
+        _drop_fence_binding(ctx)  # refused: the row is gone — rebind through the idempotent begin
     callback = getattr(ctx, "begin_acceptance_fence", None)
     if not callable(callback):
-        return True, None  # one-minor/direct-context compatibility
-    try:
-        meta = getattr(ctx, "task_metadata", {})
-        meta = meta if isinstance(meta, dict) else {}
-        response = callback(
-            root_task_id=str(
-                meta.get("root_task_id") or getattr(ctx, "root_task_id", "") or task_id
-            ),
-            task_id=str(task_id),
-        )
-    except Exception:
-        log.debug("Queue-owned acceptance fence begin failed", exc_info=True)
-        return False, None
-    if isinstance(response, dict):
-        token = response.get("token")
-        ctx._task_acceptance_queue_descendants = list(response.get("queue_descendants") or [])
-        ctx._task_acceptance_fence_generation = int(
-            response.get("owner_message_generation") or 0
-        )
-    else:
-        token = response
-        ctx._task_acceptance_queue_descendants = []
-        ctx._task_acceptance_fence_generation = None
-    if token in (None, False, ""):
-        return False, None
-    ctx._task_acceptance_fence_token = token
-    return True, token
+        return FenceOutcome(op="begin"), None  # one-minor/direct-context compatibility
+    outcome, response = _fence_request(
+        ctx, "begin", callback, root_task_id=_root_task_id(ctx, task_id), task_id=str(task_id))
+    answer = response if isinstance(response, dict) else {"token": response}
+    if outcome and answer.get("token") in (None, False, ""):
+        outcome = _settle_fence_outcome(ctx, FenceOutcome("refused", "begin", "no_token"))
+    if not outcome:
+        return outcome, None
+    ctx._task_acceptance_queue_descendants = list(answer.get("queue_descendants") or [])
+    ctx._task_acceptance_fence_generation = (
+        int(answer.get("owner_message_generation") or 0) if isinstance(response, dict) else None
+    )
+    ctx._task_acceptance_fence_token = answer["token"]
+    return outcome, answer["token"]
 
 
-def _end_task_acceptance_fence(
-    ctx: Any, *, outcome: str, admission_locked: bool = False,
-) -> bool:
+def _end_task_acceptance_fence(ctx: Any, *, outcome: str, admission_locked: bool = False) -> FenceOutcome:
     if getattr(ctx, "_acceptance_review_only", False) and outcome != "revision":
         outcome = "revision"  # Early feedback never closes the root's future work.
     token = getattr(ctx, "_task_acceptance_fence_token", None)
@@ -169,57 +213,44 @@ def _end_task_acceptance_fence(
         from ouroboros.loop_messages import owner_source_sha256
         from ouroboros.loop_transport import _owner_signal_pending
 
-        acknowledged_source = getattr(ctx, "_acceptance_ack_source_sha256", "")
-        direct_generation_mismatch = bool(
-            (acknowledged_source and (
-                acknowledged_source != owner_source_sha256(ctx)
-                or _owner_signal_pending(
-                    getattr(ctx, "_acceptance_observation_incoming", None), getattr(ctx, "drive_root", None),
-                    str(getattr(ctx, "task_id", "") or ""), getattr(ctx, "_loop_mailbox_seen_ids", None),
-                    getattr(ctx, "task_attempt", None) or 1,
-                    owner_authority_only=True,
-                )
-            )) or (
-            expected_owner_generation is not None
-            and admission_agent is not None
-            and int(getattr(admission_agent, "_owner_message_generation", 0) or 0)
-            != int(expected_owner_generation))
-        )
-        effective_outcome = "revision" if direct_generation_mismatch else str(outcome)
-        if token is None or not callable(callback):
-            ctx._task_acceptance_fence_generation_mismatch = direct_generation_mismatch
-            return True
-        expected_queue_generation = getattr(ctx, "_task_acceptance_fence_generation", None)
-        if expected_queue_generation is None:
-            response = callback(token=token, outcome=effective_outcome)
-        else:
-            response = callback(
-                token=token,
-                outcome=effective_outcome,
-                expected_generation=int(expected_queue_generation),
+        def owner_mail_pending() -> bool:
+            return _owner_signal_pending(
+                getattr(ctx, "_acceptance_observation_incoming", None), getattr(ctx, "drive_root", None),
+                str(getattr(ctx, "task_id", "") or ""), getattr(ctx, "_loop_mailbox_seen_ids", None),
+                getattr(ctx, "task_attempt", None) or 1, owner_authority_only=True,
             )
-    except Exception:
-        log.debug("Queue-owned acceptance fence transition failed", exc_info=True)
-        return False
+
+        acknowledged_source = getattr(ctx, "_acceptance_ack_source_sha256", "")
+        generation_mismatch = bool(
+            (acknowledged_source and (acknowledged_source != owner_source_sha256(ctx) or owner_mail_pending()))
+            or (expected_owner_generation is not None and admission_agent is not None
+                and int(getattr(admission_agent, "_owner_message_generation", 0) or 0) != int(expected_owner_generation))
+        )
+        effective_outcome = "revision" if generation_mismatch else str(outcome)
+        if token is None or not callable(callback):
+            ctx._task_acceptance_fence_generation_mismatch = generation_mismatch
+            return FenceOutcome(op="end")
+        expected_queue_generation = getattr(ctx, "_task_acceptance_fence_generation", None)
+        result, response = _fence_request(
+            ctx, "end", callback, token=token, outcome=effective_outcome,
+            **({} if expected_queue_generation is None else {"expected_generation": int(expected_queue_generation)}),
+        )
+        status = str(response.get("status") or "") if isinstance(response, dict) else ""
+        generation_mismatch = generation_mismatch or bool(isinstance(response, dict) and response.get("generation_mismatch"))
+        if result and status == "released" and effective_outcome != "revision" and not generation_mismatch:
+            # Only ``sealed`` is a seal. An unexplained release may echo a lost ``released +
+            # generation_mismatch`` answer: owner mail is durably written before the generation
+            # moves, so the local mailbox decides here, never a blind seal.
+            generation_mismatch = owner_mail_pending()
     finally:
         if acquired:
             admission_lock.release()
-    if isinstance(response, dict) and not bool(response.get("ok", True)):
-        return False
-    status = str((response or {}).get("status") or "") if isinstance(response, dict) else ""
-    generation_mismatch = bool(
-        direct_generation_mismatch
-        or (isinstance(response, dict) and response.get("generation_mismatch"))
-    )
-    ctx._task_acceptance_fence_generation_mismatch = generation_mismatch
-    ctx._task_acceptance_fence_token = None
-    ctx._task_acceptance_fence_generation = None
-    ctx._task_acceptance_queue_descendants = []
-    if status == "sealed" or (not status and effective_outcome != "revision"):
-        ctx._task_acceptance_sealed_fence_token = token
-    else:
-        ctx._task_acceptance_sealed_fence_token = None
-    return True
+    _drop_fence_binding(ctx)  # also after a refusal or a gap: the next begin re-adopts or reopens
+    if result:
+        ctx._task_acceptance_fence_generation_mismatch = generation_mismatch
+        sealed = status == "sealed" or (not status and effective_outcome != "revision")
+        ctx._task_acceptance_sealed_fence_token = token if sealed else None
+    return result
 
 
 def _supersede_delivery_acceptance_binding(
@@ -439,17 +470,15 @@ def _task_acceptance_subtree_snapshot(
         from ouroboros.tools.join_ledger import _child_result_sha256
 
         meta = getattr(ctx, "task_metadata", {})
-        meta = meta if isinstance(meta, dict) else {}
-        root_id = str(meta.get("root_task_id") or getattr(ctx, "root_task_id", "") or task_id)
         status_root = pathlib.Path(str(
-            meta.get("budget_drive_root")
+            (meta.get("budget_drive_root") if isinstance(meta, dict) else "")
             or getattr(ctx, "budget_drive_root", "")
             or drive_root
         ))
         rows = find_child_tasks(
             status_root,
             parent_task_id=str(task_id),
-            root_task_id=root_id,
+            root_task_id=_root_task_id(ctx, task_id),
             exclude_task_id=str(task_id),
             scope="subtree",
         )
@@ -497,21 +526,9 @@ def _mark_root_acceptance_checkpoint(
     ctx: Any, llm_trace: Dict[str, Any], *, status: str, pass_index: int = 0,
 ) -> None:
     """Minimal in-result phase checkpoint; no parallel acceptance journal."""
-    from ouroboros.task_results import resolve_task_lineage
+    from ouroboros.loop_acceptance_review import _resolve_ctx_lineage
 
-    meta = getattr(ctx, "task_metadata", {})
-    meta = meta if isinstance(meta, dict) else {}
-    task_id = str(getattr(ctx, "task_id", "") or "")
-    lineage = resolve_task_lineage(
-        task_id,
-        metadata=meta,
-        root_task_id=getattr(ctx, "root_task_id", None),
-        parent_task_id=getattr(ctx, "parent_task_id", None),
-        delegation_role=getattr(ctx, "delegation_role", None),
-        original_task_id=getattr(ctx, "original_task_id", None),
-        timeout_retry_from=getattr(ctx, "timeout_retry_from", None),
-    )
-    if not lineage["is_root_task"]:
+    if not _resolve_ctx_lineage(ctx)["is_root_task"]:
         return
     llm_trace["root_phase_checkpoint"] = {
         "phase": "task_acceptance",
@@ -675,7 +692,6 @@ def merge_agent_acceptance_stance(trace: Dict[str, Any], decision: dict, ctx: An
             "evidence_fingerprint": delivery_evidence_fingerprint(ctx, trace),
         }
     trace["acceptance_decision"] = merged
-
 
 
 def _collect_acceptance_obligations(llm_trace: Dict[str, Any], result: Any) -> None:
