@@ -188,9 +188,9 @@ def _begin_task_acceptance_fence(ctx: Any, task_id: str) -> tuple[FenceOutcome, 
     if not outcome:
         return outcome, None
     ctx._task_acceptance_queue_descendants = list(answer.get("queue_descendants") or [])
-    ctx._task_acceptance_fence_generation = (
-        int(answer.get("owner_message_generation") or 0) if isinstance(response, dict) else None
-    )
+    # Never None: ``end`` omits ``expected_generation`` for None, and a seal without the queue's
+    # compare-and-seal is the blind seal (#406). A fresh fence starts at 0; a wrong 0 refuses.
+    ctx._task_acceptance_fence_generation = int(answer.get("owner_message_generation") or 0)
     ctx._task_acceptance_fence_token = answer["token"]
     return outcome, answer["token"]
 

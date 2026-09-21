@@ -198,6 +198,23 @@ def test_end_carries_the_known_generation(tmp_path):
     assert sent == [{"token": "t", "outcome": "terminal", "expected_generation": 3}]
 
 
+@pytest.mark.parametrize("begin_answer,expected", [("bare-token", 0), ({"token": "t", "owner_message_generation": 2}, 2)])
+def test_a_begin_answer_never_leaves_the_generation_unknown(tmp_path, begin_answer, expected):
+    """``end`` omits ``expected_generation`` for ``None`` and a seal without the queue's
+    compare-and-seal is the blind seal (#406): whatever shape ``begin`` answered in, the
+    end carries a number — a fresh fence starts at 0, and a wrong 0 is refused by the queue."""
+    from ouroboros.loop import _begin_task_acceptance_fence, _end_task_acceptance_fence
+
+    sent: list = []
+    ctx = _loop_ctx(tmp_path, None)
+    ctx.begin_acceptance_fence = lambda **_kwargs: begin_answer
+    ctx.end_acceptance_fence = lambda **kwargs: sent.append(kwargs) or {"ok": True, "status": "sealed"}
+    assert _begin_task_acceptance_fence(ctx, "root-1")[0]
+    assert ctx._task_acceptance_fence_generation == expected
+    assert _end_task_acceptance_fence(ctx, outcome="terminal")
+    assert sent[0]["expected_generation"] == expected
+
+
 # --- ``released`` is not a seal --------------------------------------------------------------
 
 

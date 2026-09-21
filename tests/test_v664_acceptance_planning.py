@@ -576,7 +576,8 @@ def test_queue_owned_acceptance_fence_uses_only_optional_ctx_hooks():
     assert released and released.status == "ok"
     assert calls == [
         ("begin", {"root_task_id": "root", "task_id": "root"}),
-        ("end", {"token": "fence-1", "outcome": "revision"}),
+        # A bare-token begin still yields a number: ``end`` always carries the generation the queue compares.
+        ("end", {"token": "fence-1", "outcome": "revision", "expected_generation": 0}),
     ]
 
 
