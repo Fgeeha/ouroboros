@@ -5,6 +5,7 @@ import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
 import { projectReference } from './project_reference.js';
 import { decorateProjectRow } from './project_answer.js';
+import { createProjectHandoffs } from './project_handoff.js';
 import { bindComposerFileTargets, cleanupUploadedAttachments, createChatMedia, showTaskIncidentToast } from './chat_media.js';
 import { createChatDecision } from './chat_decision.js';
 import { bindProjectWorkPointer } from './project_work_pointer.js';
@@ -161,7 +162,7 @@ export {
     shouldFirePanic,
 };
 
-const PROJECT_ROW_TYPES = new Set(['project_started', 'project_completion_summary']);
+const PROJECT_ROW_TYPES = new Set(['project_started', 'project_handoff', 'project_completion_summary']);
 // The host's card placement values and the timeline phase each one reads as: a
 // custody fact warns, a settled review reads as a result.
 const CARD_ROW_PHASES = new Map([['timeline', 'warn'], ['reviews', 'result']]);
@@ -595,8 +596,11 @@ export function createChatInstance({
         if (budgetFill) budgetFill.style.width = `${budget.fillPct}%`;
     }
 
+    const handoffs = createProjectHandoffs({ feed: messagesDiv, fetchDetail: fetchTaskDetailStrict, mutate: withStableViewport });
+
     function hydrateStateSnapshot(data, snapshotRequestedAt = Infinity) {
         syncHeaderControlState(data);
+        if (isMain) handoffs.snapshot(data);
         const activities = Array.isArray(data?.active_chat_activities)
             ? data.active_chat_activities
             : data?.active_direct_turns;
@@ -874,12 +878,16 @@ export function createChatInstance({
             // title, coined name, then the task's own origin text) and adopts
             // the project the task's owner message already has.
             const payload = await apiClient.projectFromTask(taskId, projectId, '');
-            const project = payload.project || { id: projectId, name: projectId };
+            const project = payload?.project;
+            if (!project?.id || payload?.binding?.project_id !== project.id) {
+                throw new Error('Project binding response is unconfirmed; check the Project list before retrying.');
+            }
             showToast(`${payload.adopted ? 'Project opened' : 'Project created'}: ${project.name || project.id}`, 'ok');
             window.dispatchEvent(new CustomEvent('ouro:project-created', { detail: { project } }));
-            markCardConverted(record, project);
+            markCardConverted(record, project, payload.handoff_id);
+            if (payload.handoff_queued === false) showToast('Project binding saved; Main history receipt is unavailable.', 'warn');
         } catch (exc) {
-            showToast(`Project creation failed: ${exc.message || exc}`, 'error');
+            showToast(`Project conversion not confirmed: ${exc.message || exc}`, 'error');
             delete record.root.dataset.projectCreating;
             // innerHTML replaced both controls: the chrome and cancel writers
             // put back exactly what the record's facts still call for.
@@ -1101,19 +1109,19 @@ export function createChatInstance({
     // chip. The live task is now owned by the project panel (it's bound there),
     // so the main chat is freed — the card stops being a busy red task and
     // recolors to the project fuchsia. Plain wording (no "ack"); click opens the panel.
-    function markCardConverted(record, project) {
-        return withStableViewport(() => markCardConvertedMutation(record, project));
+    function markCardConverted(record, project, handoffId) {
+        return withStableViewport(() => markCardConvertedMutation(record, project, handoffId));
     }
 
-    function markCardConvertedMutation(record, project) {
+    function markCardConvertedMutation(record, project, handoffId) {
         modelWaits.forget(record.groupId);
         delete record.root.dataset.projectCreating;
         record.root.dataset.projectCreated = '1';
         record.root.dataset.projectId = project.id || '';
-        const chip = projectReference(project, { layout: 'bar', state: 'background' });
+        const title = record.titleEl?.textContent || project.name;
         // Atomic detach-and-reparent (C4.5): replaceChildren swaps the whole live
         // timeline (subagent cards, working bubble) for the chip in one paint.
-        record.root.replaceChildren(chip);
+        handoffs.mount(record.root, { taskId: record.groupId, projectId: project.id, projectName: project.name, title, handoffId });
         record.turnProjectBtn = null;
         record.cancelRunBtn = null;
         record.finished = true;
@@ -2266,6 +2274,7 @@ export function createChatInstance({
                 taskId,
                 projectId,
                 projectName,
+                handoffId: opts.handoffId || '',
                 skillReview: opts.skillReview || null,
             });
             // Mirror the sessionStorage slice(-200): the in-memory copy exists
@@ -2284,6 +2293,7 @@ export function createChatInstance({
         if (systemType) bubble.dataset.systemType = systemType;
         if (senderSessionId) bubble.dataset.senderSessionId = senderSessionId;
         if (taskId) bubble.dataset.taskId = taskId;
+        if (projectId) bubble.dataset.projectId = projectId;
         if (legacyKey) bubble.dataset.messageKey = legacyKey;
         stampHistoryNode(bubble, opts.historyId, opts.historyPosition);
 
@@ -2308,12 +2318,14 @@ export function createChatInstance({
             ${timeHtml}
         `;
         if (!isProgress && text) chatMedia.attachCopyControl(bubble, String(text));
-        if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName });
+        if (systemType === 'project_handoff') handoffs.mount(bubble, { taskId, projectId, projectName, title: text, handoffId: opts.handoffId });
+        else if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName });
         wireSkillReviewDisclosure(bubble, { onDomWrite: withStableViewport });
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
         if (richMarkdown) enhanceMountedMarkdown(bubble);
         chatDecision.renderRoutingDecision(bubble, opts.chatAnnotation);
+        if (isMain) handoffs.reconcile();
         rememberMessageKey(messageKey);
         if (pending && clientMessageId) pendingUserBubbles.set(clientMessageId, bubble);
         return bubble;
@@ -2327,7 +2339,9 @@ export function createChatInstance({
         if (journalEntry) journalEntry.annotation = annotation || null;
         const bubble = Array.from(messagesDiv.querySelectorAll('.chat-bubble.user[data-client-message-id]'))
             .find((candidate) => candidate.dataset.clientMessageId === messageId);
-        return chatDecision.renderRoutingDecision(bubble, annotation);
+        const changed = chatDecision.renderRoutingDecision(bubble, annotation);
+        if (isMain) handoffs.reconcile();
+        return changed;
     }
 
     function markPendingDelivered(clientMessageId, dropped = false) {
@@ -2528,6 +2542,7 @@ export function createChatInstance({
                             taskId,
                             projectId: msg.project_id || '',
                             projectName: msg.project_name || '',
+                            handoffId: msg.handoff_id || '',
                         });
                         continue;
                     }
@@ -2882,6 +2897,7 @@ export function createChatInstance({
                     taskId: msg.taskId || '',
                     projectId: msg.projectId || '',
                     projectName: msg.projectName || '',
+                    handoffId: msg.handoffId || '',
                     skillReview: msg.skillReview || null,
                 });
             }
@@ -3745,6 +3761,7 @@ export function createChatInstance({
                     taskId: explicitTaskId,
                     projectId: msg.project_id || '',
                     projectName: msg.project_name || '',
+                            handoffId: msg.handoff_id || '',
                 });
                 if (added) incrementUnreadIfNeeded(msg);
                 syncChatStatus();
@@ -3883,6 +3900,7 @@ export function createChatInstance({
     let wsHasConnectedOnce = false;
 
     onWs('open', (msg) => {
+        handoffs.setConnected(true);
         refreshHeaderControlState(true);
         syncChatStatus();
         // Reconnect truth comes from the ws CLIENT
@@ -3925,6 +3943,7 @@ export function createChatInstance({
     });
 
     onWs('close', () => {
+        handoffs.setConnected(false);
         hideTypingIndicatorOnly();
         syncChatStatus();
         syncHeaderControlState({ accounting: { available: false } });
@@ -3983,6 +4002,7 @@ export function createChatInstance({
             workPointer?.destroy();
             chatDecision.destroy();
             modelWaits.destroy();
+            handoffs.destroy();
             window.removeEventListener('ouro:page-shown', handlePageShown);
             document.removeEventListener('visibilitychange', handlePageShown);
             if (documentClickHandler) document.removeEventListener('click', documentClickHandler);

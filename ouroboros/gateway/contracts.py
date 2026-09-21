@@ -250,6 +250,7 @@ class ChatOutbound(TypedDict):
     target_label: NotRequired[str]
     project_id: NotRequired[str]
     project_name: NotRequired[str]
+    handoff_id: NotRequired[str]  # immutable origin/destination receipt identity
     completion_answer: NotRequired[str]  # a Project root's model-authored final answer, mirrored into Main (DESIGN)
     # Present on some transport re-broadcast paths.
     chat_id: NotRequired[int]

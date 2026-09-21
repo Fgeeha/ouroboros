@@ -819,6 +819,9 @@ async def api_project_from_task(request: Request) -> JSONResponse:
                     raise
                 return refusal
             touch_project(drive_root, pid)
+            from ouroboros.project_handoff import enqueue_project_handoff, handoff_identity
+
+            handoff_queued = enqueue_project_handoff(drive_root, task_id, source_ref=origin_ref)
             if not adopted:
                 # This conversion minted the project for THIS owner message, so the
                 # message's other live task ids join it now instead of each keeping a
@@ -834,7 +837,9 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             # that from a key's absence, which is also how a transport that drops
             # unknown fields looks.
             return JSONResponse(
-                {"project": project, "binding": binding, "adopted": bool(adopted)},
+                {"project": project, "binding": binding, "adopted": bool(adopted),
+                 "handoff_queued": handoff_queued,
+                 "handoff_id": handoff_identity(pid, task_id, origin_ref)},
             )
 
         def _claim(project_name: str = "", naming_reason: str = "") -> Any:

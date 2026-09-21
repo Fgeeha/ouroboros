@@ -436,6 +436,29 @@ body.resizing-panels { user-select: none; }
     color: var(--text-meta);
 }
 
+.project-handoff-heading {
+    display: flex;
+    align-items: baseline;
+    flex-wrap: wrap;
+    gap: var(--space-2);
+    padding: var(--space-3);
+}
+
+.project-handoff-title {
+    min-width: 0;
+    overflow-wrap: anywhere;
+    font-size: var(--type-body);
+    color: var(--text-primary);
+}
+
+.chat-bubble.system.project-handoff {
+    border-color: var(--project-18);
+    background: var(--project-08);
+}
+
+.project-handoff > .sender { display: none; }
+.project-handoff .message { padding: 0; }
+
 .nav-section {
     display: flex;
     flex-direction: column;
