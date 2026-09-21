@@ -682,7 +682,7 @@ and what enforces each.
   the supervisor loop or a gateway thread never waits on it: it passes `allow_stale`
   and rides the last validated snapshot. A reader that admits, reserves, settles or
   refuses spend never does; a pre-check lets a snapshot admit and decides its refusal
-  on the exact read (ARCHITECTURE §10 invariant 26).
+  on the exact read (ARCHITECTURE §10 invariant 28).
 - Keep root ceilings explicitly unreserved under the shared pool; persist the applied
   global limit and its source/revision on the physical attempt through every
   transition (a missing revision is unknown, never the settings-file hash). Pacing
