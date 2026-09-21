@@ -147,7 +147,7 @@ def _canonical_promoted_repair_constraint(value: Any) -> tuple[Optional[dict], s
     }, ""
 
 
-def _promote_duplicate_reason(task_id: str, ctx: Any, *, admission_token: str = "") -> str:
+def _promote_duplicate_reason(task_id: str, ctx: Any, *, admission_token: str) -> str:
     """Fail closed if a promoted id is already live, durable, or uncheckable.
 
     A row that is only THIS admission's emitted stub (#1160) is its own
@@ -161,13 +161,13 @@ def _promote_duplicate_reason(task_id: str, ctx: Any, *, admission_token: str = 
             for row in list(pending or [])
         ) or task_id in (running or {})
     try:
-        from ouroboros.routing_wait import is_emitted_admission_stub
+        from ouroboros.routing_wait import is_own_admission_stub
         from ouroboros.task_results import load_task_result
 
         stored = load_task_result(
             getattr(ctx, "DRIVE_ROOT", _pool().DRIVE_ROOT), task_id, strict=True,
         )
-        stored_duplicate = bool(stored) and not is_emitted_admission_stub(
+        stored_duplicate = bool(stored) and not is_own_admission_stub(
             stored, admission_token,
         )
     except Exception:

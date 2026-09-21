@@ -209,12 +209,12 @@ def enqueue_task(
                 t["_admission_blocked"] = "duplicate_task_id"
                 return t
             try:
-                from ouroboros.routing_wait import is_emitted_admission_stub
+                from ouroboros.routing_wait import is_own_admission_stub
                 from ouroboros.task_results import load_task_result
                 stored = load_task_result(DRIVE_ROOT, task_id, strict=True)
                 # The emitted promote stub (#1160) belongs to THIS admission token:
                 # its own enqueue reads around it, any other row still owns the id.
-                if stored and not is_emitted_admission_stub(stored, admission_token):
+                if stored and not is_own_admission_stub(stored, admission_token):
                     if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
                         ADMISSION_RESERVATIONS.pop(task_id, None)
                     t["_admission_blocked"] = "duplicate_task_id"

@@ -122,6 +122,7 @@ def _predecessor_door_refusal(
     project to compare against, and an absent project is not a match: there the
     host's own list still decides.
     """
+    from ouroboros.routing_wait import is_emitted_admission_stub
     from ouroboros.server_routing_context import _is_child_result
     from ouroboros.task_status import SETTLED_STATUSES
 
@@ -131,6 +132,9 @@ def _predecessor_door_refusal(
             "belongs to - a child's work is reachable through its root"
         )
     status = str(result.get("status") or "")
+    if is_emitted_admission_stub(result):
+        return ("the selected predecessor is a promote whose admission is still pending, not a "
+                "result; read get_task_result on it, and name a finished root instead")
     if status not in SETTLED_STATUSES:
         return (
             f"the selected predecessor is still live (status {status or 'unknown'}); "

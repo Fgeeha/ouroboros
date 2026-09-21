@@ -73,6 +73,33 @@ def test_a_root_the_room_manifest_lists_is_still_addressable(tmp_path):
     assert evt["predecessor_authority_source"]["tool"] == "get_task_result"
 
 
+def test_a_listed_row_is_accepted_only_with_the_pointer_the_host_issued_for_it(tmp_path):
+    """A row the host showed carries its own host-issued authority source, and only
+    that one is accepted: rebuilding a source for a shown row would make a tampered
+    manifest row indistinguishable from a host-built one."""
+    import copy
+
+    import server
+    from ouroboros.projects_registry import create_project
+    from ouroboros.task_results import write_task_result
+
+    project = create_project(tmp_path, "racer", name="Racer")
+    write_task_result(tmp_path, "racer-root", "completed", project_id="racer",
+                      objective="the root", ts="2026-08-10T00:00:01Z")
+    metadata = server._decision_turn_metadata(
+        _host_ctx(tmp_path), int(project["chat_id"]), "room-2", {"project_id": "racer"},
+    )
+    tampered = copy.deepcopy(metadata)
+    tampered["project_last_task_result"]["authority_source"] = {"kind": "invented"}
+    for row in tampered["project_routing_manifest"]["final_results"]:
+        row["authority_source"] = {"kind": "invented"}
+
+    evt: dict = {}
+    assert "no readable authority source" in _door(_room_ctx(tmp_path, tampered), "racer-root", evt)
+    assert evt == {}
+    assert _door(_room_ctx(tmp_path, metadata), "racer-root") == ""  # the host's own row passes
+
+
 def test_a_room_root_older_than_the_list_is_addressable_all_the_same(tmp_path, monkeypatch):
     """The 16-row cap is a HINT window, never the door: the night's root was a
     finished root of this very project, and only the cap hid it."""
@@ -308,6 +335,34 @@ def test_a_pointer_a_child_stamped_before_the_rule_heals_onto_the_root(tmp_path)
     assert get_project(tmp_path, "racer")["last_task_result_id"] == "racer-root"
 
 
+def test_a_pending_promote_is_neither_the_last_result_nor_a_predecessor(tmp_path):
+    """An emitted stub carries the project's id and is the newest file, but it is an
+    admission still pending, not a result: the lookup answers with the root and never
+    stamps the stub, and the door says what it is instead of "steer this live root"."""
+    import os
+
+    import server
+    from ouroboros.projects_registry import create_project, get_project
+    from ouroboros.task_results import task_results_dir, write_task_result
+
+    create_project(tmp_path, "racer", name="Racer")
+    write_task_result(tmp_path, "racer-root", "completed", project_id="racer", result="root answer")
+    write_task_result(tmp_path, "racer-promote", "requested", project_id="racer", promotion_admission={
+        "status": "emitted", "routing_token": "tok-1", "emitted_at": "2026-09-21T10:00:00Z"})
+    results = task_results_dir(tmp_path, create=False)
+    os.utime(results / "racer-root.json", (1_000, 1_000))
+    os.utime(results / "racer-promote.json", (2_000, 2_000))
+
+    assert server._latest_project_task_result(_host_ctx(tmp_path), "racer")["task_id"] == "racer-root"
+    assert get_project(tmp_path, "racer")["last_task_result_id"] == "racer-root"
+
+    refusal = _door(_room_ctx(tmp_path, {}), "racer-promote")
+    assert "admission is still pending" in refusal and "steer_task" not in refusal
+    # The quiet direction: a root that really is live keeps its own sentence.
+    write_task_result(tmp_path, "racer-live", "running", project_id="racer")
+    assert "steer_task" in _door(_room_ctx(tmp_path, {}), "racer-live")
+
+
 def test_the_room_manifest_carries_cancel_facts_and_an_honest_omission_count(tmp_path):
     import server
     from ouroboros.cancel_intents import request_cancel
@@ -327,7 +382,11 @@ def test_the_room_manifest_carries_cancel_facts_and_an_honest_omission_count(tmp
                       ts="2026-08-10T00:00:02Z")
     running = {"racer-live": {"task": {"id": "racer-live", "project_id": "racer",
                                        "title": "Live", "objective": "in flight"},
-                              "started_at": "2026-08-10T00:00:03Z"}}
+                              "started_at": "2026-08-10T00:00:03Z"},
+               # Another project's live root is none of this room's business.
+               "other-live": {"task": {"id": "other-live", "project_id": "other",
+                                       "title": "Elsewhere", "objective": "not this room"},
+                              "started_at": "2026-08-10T00:00:04Z"}}
     request_cancel(tmp_path, "racer-live", source="owner", reason="stop it")
 
     manifest = server._decision_turn_metadata(
@@ -343,6 +402,15 @@ def test_the_room_manifest_carries_cancel_facts_and_an_honest_omission_count(tmp
     assert live["task_id"] == "racer-live" and live["cancel_state"] == "pending"
     assert manifest["omissions"]["children"] == 1
     assert manifest["omissions"]["final_results"] == 0
+    assert manifest["omissions"]["active_roots"] == 0
+
+    # The live list is bounded too, and says how many of this room's roots it left out.
+    crowd = {f"racer-live-{index:02d}": {"task": {"id": f"racer-live-{index:02d}", "project_id": "racer"},
+                                          "started_at": "2026-08-10T00:00:05Z"} for index in range(43)}
+    crowded = server._decision_turn_metadata(
+        _host_ctx(tmp_path, running=crowd), int(project["chat_id"]), "room-8", {"project_id": "racer"},
+    )["project_routing_manifest"]
+    assert len(crowded["active_roots"]) == 40 and crowded["omissions"]["active_roots"] == 3
 
 
 def test_the_manifest_row_cap_is_one_runtime_limit(tmp_path, monkeypatch):

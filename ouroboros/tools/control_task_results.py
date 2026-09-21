@@ -26,7 +26,7 @@ from ouroboros.task_status import (
     wait_for_effective_tasks,
 )
 from ouroboros.tools.registry import ToolContext
-from ouroboros.utils import truncate_review_artifact
+from ouroboros.utils import truncate_review_artifact, utc_now_iso
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
 
@@ -208,10 +208,11 @@ def _get_task_result(
         return _publish_tool_result(ctx, ToolResult(
             status="unavailable", code="LEGACY_UNAVAILABLE",
             text=(
-                f"Task {task_id}: admission pending since {since} - the promote was emitted and "
-                "the supervisor has not confirmed or refused it yet. This id is durably reserved: "
-                f"call get_task_result({task_id}) again to read the outcome, and do not promote "
-                "the same work a second time."
+                f"Task {task_id}: admission pending since {since} (now {utc_now_iso()}) - the promote "
+                "was emitted and this row carries no supervisor receipt yet, neither scheduled nor "
+                f"refused. Read get_task_result({task_id}) again before promoting the same work: the "
+                "supervisor answers within seconds of draining its queue. If the row is still "
+                "pending minutes later, the event did not land and a new promote is the way forward."
             ),
         ))
     if bool(include_authority) or bool(include_work_order_source) or bool(include_completion_source):

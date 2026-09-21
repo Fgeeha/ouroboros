@@ -184,6 +184,26 @@ def test_lineage_is_read_only_even_for_a_top_level_parent_drive(geometry):
     assert target.read_text(encoding="utf-8") == before
 
 
+def test_the_lineage_redirect_is_a_read_redirect_whatever_the_matrix_says(geometry):
+    """The write above is refused by the matrix first, so it never reaches the
+    resolver. This one does: the redirect onto a lineage root exists for READ
+    operations alone, so a profile whose matrix allows the write (an acting child
+    in cyber_pro) still cannot be resolved into its parent's drive."""
+    from ouroboros.tool_access import _resolve_target_in_selected_base
+
+    _registry, ctx = child_registry(geometry, acting=True)
+    target = geometry.parent_drive / "triage-draft.json"
+    own_base = geometry.headless / "task_drives" / CHILD
+
+    assert _resolve_target_in_selected_base(
+        ctx, root="task_drive", base_path=own_base, path=str(target), operation="read",
+    ) == target.resolve()
+    for operation in ("write", "edit"):
+        with pytest.raises(ValueError):
+            _resolve_target_in_selected_base(
+                ctx, root="task_drive", base_path=own_base, path=str(target), operation=operation)
+
+
 # --- owner 7A: an absolute path without a root runs under the root holding it --
 
 def test_child_reads_its_parents_task_drive_by_absolute_path_and_no_root(geometry):
@@ -342,6 +362,18 @@ def test_child_lists_the_parents_drive_with_secret_names_hidden(geometry):
     items = json.loads(out)
     assert "triage-draft.json" in items and "source/" in items, items
     assert ".env" not in items and "settings.json" not in items, items
+    assert any("hidden from this subagent" in item for item in items), items
+
+
+def test_child_lists_deliverables_with_secret_names_hidden(geometry):
+    """Deliverables is a new listing root for the child, so it gets the same
+    secret-name filter as every other root it lists; an ordinary file stays."""
+    (geometry.deliverables / ".env").write_text("SECRET_TOKEN=sk-secret\n", encoding="utf-8")
+    registry, _ctx = child_registry(geometry)
+
+    items = json.loads(registry.execute("list_files", {"root": "deliverables", "path": str(geometry.deliverables)}))
+
+    assert "answer.txt" in items and ".env" not in items, items
     assert any("hidden from this subagent" in item for item in items), items
 
 

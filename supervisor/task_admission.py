@@ -624,9 +624,9 @@ def reserve_task_admission(
             ) or {}
         except Exception:
             return {"status": "blocked", "reason": "task_id_lookup_failed"}
-        from ouroboros.routing_wait import is_emitted_admission_stub
+        from ouroboros.routing_wait import is_own_admission_stub
 
-        if existing and not is_emitted_admission_stub(existing, token):
+        if existing and not is_own_admission_stub(existing, token):
             # The emitted stub of THIS admission is its own pre-receipt (#1160), not
             # another task owning the id: the request it belongs to still reserves.
             admission = existing.get("promotion_admission")

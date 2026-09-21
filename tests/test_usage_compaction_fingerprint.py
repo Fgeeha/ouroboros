@@ -383,10 +383,16 @@ def test_a_peer_process_does_not_refold_what_another_just_folded(data_root, monk
     assert _folds(data_root) == 1
     assert _skip_events(data_root) == []  # declined before the pass, not aborted inside it
 
+    # The floor is what that pass READ plus the retry window, not the bare size: a
+    # ledger that regrew just past the old size is still inside the window (at the
+    # measured 0.02 % gain that is a few KB, the very cascade this guard removes).
+    _grow_past(data_root, monkeypatch, before.st_size + 1, "peer-growth")
+    assert _trigger(data_root) is False
+    assert len(entered) == 1
+
     # Quiet on real growth: once the file passes what that pass READ plus the
     # retry window, the peer folds on its own.
     monkeypatch.setattr("ouroboros.config.USAGE_LEDGER_COMPACT_RETRY_GROWTH_BYTES", 1)
-    _grow_past(data_root, monkeypatch, before.st_size + 1, "peer-growth")
     assert _trigger(data_root) is True
     assert len(entered) == 2
     assert int(_ledger_rows(data_root)[0]["compaction_epoch"]) == 2

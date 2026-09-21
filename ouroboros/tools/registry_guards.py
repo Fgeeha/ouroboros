@@ -677,7 +677,7 @@ def _direct_shell_write_block(self, raw_cmd: Any, work_dir: pathlib.Path, runtim
         writable = ", ".join(dict.fromkeys(
             f"{root}={pathlib.Path(base).resolve(strict=False)}" for root, base, _source, _skill in roots
             if not (light_internal and pathlib.Path(base).resolve(strict=False) == system_repo))) or "(none)"
-        reason = ("runtime_mode=light keeps the Ouroboros repository and runtime data read-only"
+        reason = ("runtime_mode=light keeps the Ouroboros repository and runtime control data read-only"
                   if light_internal else "explicit write target is outside every root this task may write")
         return ToolResult(
             status="blocked", code="LIGHT_MODE_BLOCKED" if light_internal else "WORKSPACE_BLOCKED",

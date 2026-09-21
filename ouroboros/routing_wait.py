@@ -17,6 +17,13 @@ from typing import Any, Dict
 PROMOTE_CONFIRM_POLL_SEC = 0.05
 
 
+def is_own_admission_stub(result: Any, routing_token: str) -> bool:
+    """The admission gates' form: a stub is read around ONLY by the token that wrote
+    it. No token is no claim, so a tokenless admission meets any stub as a row that
+    owns the id (``is_emitted_admission_stub`` without a token is for readers)."""
+    token = str(routing_token or "").strip()
+    return bool(token) and is_emitted_admission_stub(result, token)
+
 def _confirm_wait_sec(timeout_sec: float | None) -> float:
     """The one bound of both confirmation waits (``runtime_limits``), read at the
     wait itself so this routing leaf keeps no import-time edge into the limits."""

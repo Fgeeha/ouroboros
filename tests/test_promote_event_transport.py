@@ -786,7 +786,7 @@ def test_exact_id_ingress_fails_closed_on_unreadable_result(monkeypatch, tmp_pat
     duplicate_reason = workers._promote_duplicate_reason(
         "malformed-id", types.SimpleNamespace(
             DRIVE_ROOT=tmp_path, PENDING=[], RUNNING={},
-        ),
+        ), admission_token="",
     )
 
     assert reservation == {"status": "blocked", "reason": "task_id_lookup_failed"}

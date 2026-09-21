@@ -270,6 +270,14 @@ def _project_routing_manifest(ctx: Any, project_id: str) -> Dict[str, Any]:
     }
 
 
+def _not_a_root_result(row: Dict[str, Any]) -> bool:
+    """A row that is never "the project's last result": a child's result, or a
+    promote's emitted stub (an admission still pending, no result at all)."""
+    from ouroboros.routing_wait import is_emitted_admission_stub
+
+    return _is_child_result(row) or is_emitted_admission_stub(row)
+
+
 def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str, Any]]:
     """Newest ROOT task result bound to ``project_id`` (a child's is never the room's
     continuation: the promote door refuses it, ``_is_child_result``) WITHOUT replaying the whole
@@ -309,7 +317,7 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
     if pointer:
         pointed = load_task_result(ctx.DRIVE_ROOT, pointer)
         if isinstance(pointed, dict) and str(pointed.get("project_id") or "") == project_id:
-            if not _is_child_result(pointed):
+            if not _not_a_root_result(pointed):
                 return pointed
             pointer = ""  # a child-stamped pointer is provably wrong, not in flight: heal it
         log.debug(
@@ -348,7 +356,7 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
         if candidate is None:
             uncertain = True
             continue
-        if str(candidate.get("project_id") or "") != project_id or _is_child_result(candidate):
+        if str(candidate.get("project_id") or "") != project_id or _not_a_root_result(candidate):
             continue
         row = candidate
         # The match's whole equal-mtime group is read to its end — across the
@@ -360,7 +368,7 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
             other = read_json_dict(tied)
             if other is None:
                 uncertain = True
-            elif (str(other.get("project_id") or "") == project_id and not _is_child_result(other)
+            elif (str(other.get("project_id") or "") == project_id and not _not_a_root_result(other)
                   and _order(other) > _order(row)):
                 row = other
         break
