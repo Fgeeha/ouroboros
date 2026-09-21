@@ -12,6 +12,7 @@ is invented for an event a worker never stamped.
 from __future__ import annotations
 
 import inspect
+from pathlib import PurePath
 import logging
 import re
 import threading
@@ -107,7 +108,7 @@ def test_stall_row_carries_phase_cpu_and_event_lag(monkeypatch, journal):
         _stop_watchdog(stop)
     stalls = [row for _path, row in journal if row["type"] == "supervisor_loop_stall"]
     assert len(stalls) == 1, journal
-    assert journal[0][0].endswith("logs/supervisor.jsonl")
+    assert PurePath(journal[0][0]).as_posix().endswith("logs/supervisor.jsonl")
     row = stalls[0]
     assert row["stalled_sec"] == pytest.approx(100.0, abs=1.0)
     assert row["phase"] == "maintenance"
