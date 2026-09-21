@@ -338,8 +338,9 @@ def forced_rail_panel_verdict(tools_ctx: Any, llm_trace: Dict[str, Any], rail_re
 
     run = next((row for row in reversed(llm_trace.get("review_runs") or [])
                 if isinstance(row, dict) and row.get("authority") == "host_root"), None)
+    unreviewed = {"reason": rail_reason}  # the one way this helper says "this answer was never reviewed"
     if run is None:
-        return {"reason": rail_reason}
+        return unreviewed
     if acceptance_run_pending(run):
         try:
             reconcile_pending_acceptance_runs({"review_runs": [run]}, usage_ctx=tools_ctx,
@@ -350,7 +351,7 @@ def forced_rail_panel_verdict(tools_ctx: Any, llm_trace: Dict[str, Any], rail_re
             return {"reason": "review_degraded", "review_pending": True}
     reviewed_source = str(run.get("owner_source_sha256") or "")
     if run.get("superseded_by_revision") or (reviewed_source and reviewed_source != str(owner_source_sha256(tools_ctx) or "")):
-        return {"reason": rail_reason}  # that panel judged an earlier revision or older owner premises: this answer was never reviewed
+        return unreviewed  # that panel judged an earlier revision or older owner premises
     reviewed = (run.get("request") or {}).get("subject", "")
     if (not task_acceptance_is_clean(SimpleNamespace(**run))
             or run.get("subject_hash") != delivery_subject_hash(tools_ctx, llm_trace, reviewed)):
