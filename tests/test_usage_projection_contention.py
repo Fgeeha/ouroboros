@@ -419,6 +419,24 @@ def test_every_display_reader_answers_under_a_held_monetary_lock(data_root, supe
     assert elapsed < _MAX_READ_SEC, f"{reader} waited {elapsed:.1f}s on the monetary lock"
 
 
+def test_a_wake_admission_reads_the_allowance_exactly(data_root):
+    """The dangerous direction of the status view's snapshot read: the SAME reader
+    admits a consciousness wake, and an admission waits for the exact read however
+    warm the memo is (``allow_stale`` is opt-in; the status view alone opts in)."""
+    from ouroboros.consciousness_allowance import allowance_window
+
+    _spend(data_root, 0.40)
+    assert allowance_window(data_root)["status"]  # warms the memo
+    verdict: list = []
+    with _held_ledger_lock(data_root):
+        admission = threading.Thread(target=lambda: verdict.append(allowance_window(data_root)), daemon=True)
+        admission.start()
+        admission.join(timeout=1.5)
+        assert admission.is_alive() and not verdict, "a wake admission was decided on a snapshot"
+    admission.join(timeout=60)
+    assert verdict and verdict[0]["status"] != "allowance_unknown"
+
+
 def test_the_live_limit_is_applied_to_the_snapshot_never_remembered_with_it(
     data_root, supervisor_state, monkeypatch,
 ):
