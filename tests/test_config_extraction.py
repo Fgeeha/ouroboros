@@ -59,6 +59,9 @@ _ADDED_OWNERS = {
     "get_bg_wakeup_max_sec": runtime_limits,
     # Governance tiers: the share of a reviewer's usable window tier-2 documents may take inline.
     "REVIEW_GOVERNANCE_INLINE_SHARE": runtime_limits,
+    # The pooled worker's short acceptance-fence ack wait (one wait, one re-send, then a typed unknown).
+    "ACCEPTANCE_FENCE_ACK_WAIT_SEC": runtime_limits,
+    "get_acceptance_fence_ack_wait_sec": runtime_limits,
 }
 
 _MOVED_OWNERS = {

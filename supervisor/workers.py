@@ -300,11 +300,11 @@ def _get_chat_agent():
         sys.path.insert(0, str(REPO_DIR))
     from ouroboros.agent import make_agent
     from ouroboros.owner_wait import direct_owner_wait
+    from supervisor.queue import transition_acceptance_fence
 
-    agent = make_agent(
-        repo_dir=str(REPO_DIR), drive_root=str(DRIVE_ROOT), event_queue=get_event_q(),
-    )
+    agent = make_agent(repo_dir=str(REPO_DIR), drive_root=str(DRIVE_ROOT), event_queue=get_event_q())
     agent.owner_wait_callback = direct_owner_wait
+    agent.fence_transition = transition_acceptance_fence  # in-process fence: no event, no ack file, no wait
     return agent
 
 

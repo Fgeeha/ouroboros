@@ -190,6 +190,17 @@ def get_direct_turn_stop_wait_sec() -> float:
     return _clamped_number_setting("OUROBOROS_DIRECT_TURN_STOP_WAIT_SEC", low=0, high=10, cast=float)
 
 
+# How long a pooled worker waits for ONE answer to an acceptance-fence request; it re-sends
+# the same request once and waits this long again, then the outcome is a typed unknown. Short
+# by design: the idle rail does not count heartbeats as progress, so this wait is never
+# lengthened to ride out a stalled supervisor. Structural, not a settings key.
+ACCEPTANCE_FENCE_ACK_WAIT_SEC = 10.0
+
+
+def get_acceptance_fence_ack_wait_sec() -> float:
+    return ACCEPTANCE_FENCE_ACK_WAIT_SEC
+
+
 def get_vision_caption_timeout_sec() -> int:
     return _clamped_number_setting("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", low=1, cast=int)
 

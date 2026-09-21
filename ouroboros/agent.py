@@ -261,24 +261,40 @@ class OuroborosAgent:
             log_label="agent live",
         )
 
-    def _await_acceptance_fence_ack(self, token: str, *, timeout_sec: float = 10.0) -> Dict[str, Any]:
-        """Wait for the supervisor to apply a queue-owned acceptance fence.
+    def _fence_request(self, accept: Tuple[str, ...], **request: Any) -> Dict[str, Any]:
+        """The ONE transport seam of the queue-owned acceptance fence.
 
-        Worker processes cannot share the supervisor's ``_queue_lock``.  The
-        event is therefore acknowledged through a tiny one-shot file only after
-        the supervisor has changed the fence while holding that lock.  The file
-        is transport acknowledgement, not a second lifecycle authority.
+        A direct turn runs inside the supervisor process: built with the queue's own
+        transition (``fence_transition``), it applies the fence in-process — no event,
+        no ack file, no wait (lock order: admission lock, then ``_queue_lock``). A pooled
+        worker cannot share ``_queue_lock``: it sends the event, polls its own one-shot
+        ack and re-sends the SAME request once; no answer raises ``TimeoutError`` (a gap),
+        a refusal raises ``RuntimeError``. The ack is transport, not a lifecycle authority.
         """
-        metadata = (
-            self._current_task_metadata
-            if isinstance(self._current_task_metadata, dict)
-            else {}
-        )
-        ack_root = pathlib.Path(
-            str(metadata.get("budget_drive_root") or self.env.drive_root)
-        ).resolve(strict=False)
-        ack_path = ack_root / "state" / "acceptance_fence_acks" / f"{token}.json"
-        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        request.setdefault("task_id", str(self._current_task_id or ""))
+        transition = getattr(self, "fence_transition", None)
+        if transition is not None:
+            ack = transition(**request)
+        elif self._event_queue is None:
+            raise RuntimeError("acceptance fence requires a supervisor event queue")
+        else:
+            event = {"type": "acceptance_fence", "req": uuid.uuid4().hex, **request}
+            ack = self._send_fence_event(event) or self._send_fence_event(event)
+            if not ack:
+                raise TimeoutError(f"supervisor did not acknowledge acceptance fence {request['action']}")
+        if not ack.get("ok", True) or str(ack.get("status") or "") not in accept:
+            raise RuntimeError(str(ack.get("error") or f"acceptance fence {request['action']} failed"))
+        return ack
+
+    def _send_fence_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Send one pooled fence event and poll ITS OWN ``<token>.<req>.json`` ack; ``{}`` = unanswered."""
+        from ouroboros.runtime_limits import get_acceptance_fence_ack_wait_sec
+
+        self._event_queue.put({**event, "ts": utc_now_iso()})
+        metadata = self._current_task_metadata if isinstance(self._current_task_metadata, dict) else {}
+        ack_root = pathlib.Path(str(metadata.get("budget_drive_root") or self.env.drive_root)).resolve(strict=False)
+        ack_path = ack_root / "state" / "acceptance_fence_acks" / f"{event['token']}.{event['req']}.json"
+        deadline = time.monotonic() + get_acceptance_fence_ack_wait_sec()
         while time.monotonic() < deadline:
             payload = read_json_dict(ack_path)
             if payload:
@@ -288,61 +304,23 @@ class OuroborosAgent:
                     log.debug("Unable to remove acceptance-fence ack %s", ack_path, exc_info=True)
                 return payload
             time.sleep(0.02)
-        raise TimeoutError(f"supervisor did not acknowledge acceptance fence {token}")
+        return {}
 
     def _begin_acceptance_fence(self, *, root_task_id: str, task_id: str) -> Dict[str, Any]:
-        if self._event_queue is None:
-            raise RuntimeError("acceptance fence requires a supervisor event queue")
-        token = uuid.uuid4().hex
-        self._event_queue.put({
-            "type": "acceptance_fence",
-            "action": "begin",
-            "token": token,
-            "root_task_id": str(root_task_id or task_id),
-            "task_id": str(task_id),
-            "ts": utc_now_iso(),
-        })
-        ack = self._await_acceptance_fence_ack(token)
-        if str(ack.get("status") or "") != "active":
-            raise RuntimeError(str(ack.get("error") or "acceptance fence was not activated"))
-        return ack
+        return self._fence_request(
+            ("active",), action="begin", token=uuid.uuid4().hex,
+            root_task_id=str(root_task_id or task_id), task_id=str(task_id))
 
     def _inspect_acceptance_fence(self, *, token: str) -> Dict[str, Any]:
         """Refresh queue-level quiescence while keeping the same admission fence."""
-        if self._event_queue is None:
-            raise RuntimeError("acceptance fence requires a supervisor event queue")
-        self._event_queue.put({
-            "type": "acceptance_fence",
-            "action": "inspect",
-            "token": str(token),
-            "task_id": str(self._current_task_id or ""),
-            "ts": utc_now_iso(),
-        })
-        ack = self._await_acceptance_fence_ack(str(token))
-        if str(ack.get("status") or "") not in {"active", "sealed"}:
-            raise RuntimeError(str(ack.get("error") or "acceptance fence inspection failed"))
-        return ack
+        return self._fence_request(("active", "sealed"), action="inspect", token=str(token))
 
     def _end_acceptance_fence(
         self, *, token: str, outcome: str, expected_generation: Optional[int] = None,
     ) -> Dict[str, Any]:
-        if self._event_queue is None:
-            raise RuntimeError("acceptance fence requires a supervisor event queue")
-        event = {
-            "type": "acceptance_fence",
-            "action": "end",
-            "token": str(token),
-            "outcome": str(outcome),
-            "task_id": str(self._current_task_id or ""),
-            "ts": utc_now_iso(),
-        }
-        if expected_generation is not None:
-            event["expected_generation"] = int(expected_generation)
-        self._event_queue.put(event)
-        ack = self._await_acceptance_fence_ack(str(token))
-        if str(ack.get("status") or "") not in {"released", "sealed"}:
-            raise RuntimeError(str(ack.get("error") or "acceptance fence transition failed"))
-        return ack
+        generation = {} if expected_generation is None else {"expected_generation": int(expected_generation)}
+        return self._fence_request(
+            ("released", "sealed"), action="end", token=str(token), outcome=str(outcome), **generation)
 
     def _log_worker_boot_once(self) -> None:
         global _worker_boot_logged
