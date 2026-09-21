@@ -21,6 +21,17 @@ from types import SimpleNamespace
 
 import pytest
 
+@pytest.fixture(autouse=True)
+def _fresh_custody_sweep_latch(monkeypatch):
+    """The custody latch is process-global and a pass may outlive the test that started it
+    (the first tick of any real loop starts one): every test here gets its own latch, so a
+    busy one left behind by another test can neither skip this sweep nor be released by it."""
+    import threading
+
+    from ouroboros import server_maintenance
+
+    monkeypatch.setattr(server_maintenance, "_CUSTODY_SWEEP_LOCK", threading.Lock())
+
 
 def _track_threads(monkeypatch) -> list:
     """Capture the threads the tick starts so a test can join them."""

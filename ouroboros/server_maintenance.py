@@ -239,20 +239,21 @@ def _periodic_supervisor_maintenance(
         except Exception:
             _CANCEL_INTENT_SWEEP_LOCK.release()
             log.warning("Terminal maintenance could not start", exc_info=True)
-    if time.time() - last_custody_reap[0] > 600 and _CUSTODY_SWEEP_LOCK.acquire(blocking=False):
+    latch = _CUSTODY_SWEEP_LOCK  # the pass releases THIS object, never a later generation's
+    if time.time() - last_custody_reap[0] > 600 and latch.acquire(blocking=False):
         last_custody_reap[0] = time.time()
         try:
-            threading.Thread(target=_run_periodic_custody_sweep, args=(stop_event,),
+            threading.Thread(target=_run_periodic_custody_sweep, args=(stop_event, latch),
                              name="custody-maintenance", daemon=True).start()
         except Exception:
-            _CUSTODY_SWEEP_LOCK.release()
+            latch.release()
             log.warning("Periodic custody sweep could not start", exc_info=True)
     if time.time() - last_review_reconcile[0] > 300:
         last_review_reconcile[0] = time.time()
         _periodic_zombie_reconcile(on_orphans_healed=on_orphans_healed)
 
 
-def _run_periodic_custody_sweep(stop_event: Any = None) -> None:
+def _run_periodic_custody_sweep(stop_event: Any = None, latch: Any = None) -> None:
     """The ~600 s custody block, OFF the thread that answers workers (INV-B).
 
     Skill-payload hashing, the orphaned-process reaper, delegated-run reconciliation
@@ -309,7 +310,7 @@ def _run_periodic_custody_sweep(stop_event: Any = None) -> None:
         except Exception:
             log.warning("Periodic custody step %s failed", step, exc_info=True)
     finally:
-        _CUSTODY_SWEEP_LOCK.release()
+        (latch or _CUSTODY_SWEEP_LOCK).release()
 
 
 def _retry_latched_daemon_start() -> None:
