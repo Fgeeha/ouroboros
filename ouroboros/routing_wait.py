@@ -14,10 +14,17 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-from ouroboros.runtime_limits import get_promote_confirm_wait_sec
-
-PROMOTE_CONFIRM_TIMEOUT_SEC = get_promote_confirm_wait_sec()
 PROMOTE_CONFIRM_POLL_SEC = 0.05
+
+
+def _confirm_wait_sec(timeout_sec: float | None) -> float:
+    """The one bound of both confirmation waits (``runtime_limits``), read at the
+    wait itself so this routing leaf keeps no import-time edge into the limits."""
+    if timeout_sec is not None:
+        return max(0.0, float(timeout_sec))
+    from ouroboros.runtime_limits import get_promote_confirm_wait_sec
+
+    return get_promote_confirm_wait_sec()
 
 # The promote's OWN pre-receipt, written at emit into the task-result record it
 # reserves: the request exists and durably says so, while the supervisor alone
@@ -49,13 +56,13 @@ def wait_for_promotion_admission(
     routing_token: str,
     *,
     client_message_id: str = "",
-    timeout_sec: float = PROMOTE_CONFIRM_TIMEOUT_SEC,
+    timeout_sec: float | None = None,
     poll_sec: float = PROMOTE_CONFIRM_POLL_SEC,
 ) -> Dict[str, Any]:
     """Wait for matching-token admission in the canonical task-result SSOT."""
     from ouroboros.task_results import load_task_result
 
-    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    deadline = time.monotonic() + _confirm_wait_sec(timeout_sec)
     while True:
         result = load_task_result(root, task_id) or {}
         admission = result.get("promotion_admission")
@@ -101,7 +108,7 @@ def wait_for_routing_annotation(
     client_message_id: str,
     routing_token: str,
     *,
-    timeout_sec: float = PROMOTE_CONFIRM_TIMEOUT_SEC,
+    timeout_sec: float | None = None,
     poll_sec: float = PROMOTE_CONFIRM_POLL_SEC,
 ) -> Dict[str, Any]:
     """Wait for an exact existing chat-annotation receipt (manual/steer).
@@ -119,7 +126,7 @@ def wait_for_routing_annotation(
 
     if not str(client_message_id or "").strip():
         return {"status": "unconfirmed", "reason": "client_message_id_missing"}
-    deadline = time.monotonic() + max(0.0, float(timeout_sec))
+    deadline = time.monotonic() + _confirm_wait_sec(timeout_sec)
     while True:
         receipt = chat_annotation_receipt(root, client_message_id, routing_token)
         status = str(receipt.get("status") or "")

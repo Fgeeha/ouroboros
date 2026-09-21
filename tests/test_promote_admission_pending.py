@@ -198,5 +198,8 @@ def test_one_runtime_limit_bounds_both_promote_confirmation_waits():
     from ouroboros.tools import control_events
 
     assert runtime_limits.get_promote_confirm_wait_sec() == 15.0
-    assert routing_wait.PROMOTE_CONFIRM_TIMEOUT_SEC == runtime_limits.get_promote_confirm_wait_sec()
+    # The routing leaf reads the bound at the wait itself (no import-time edge): its
+    # default IS the getter, and an explicit caller bound still wins, floored at zero.
+    assert routing_wait._confirm_wait_sec(None) == runtime_limits.get_promote_confirm_wait_sec()
+    assert routing_wait._confirm_wait_sec(0.05) == 0.05 and routing_wait._confirm_wait_sec(-1) == 0.0
     assert control_events._PROMOTE_CONFIRM_TIMEOUT_SEC == runtime_limits.get_promote_confirm_wait_sec()
