@@ -687,9 +687,10 @@ test('the roster select survives a saved reference the roster no longer lists', 
     ];
     const listed = subagentOptionsFor(roster, 'deep');
     assert.deepEqual(listed.map((o) => o.value), ['deep', 'fast']);
-    // 2=A label contract: FACTS lead (channel first), description is a caption.
-    assert.equal(listed[0].label, '#deep · API · openai/gpt-5.6-sol · high — Long reasoning over big diffs');
-    assert.equal(listed[1].label, '#fast · cursor · grok-4.6');
+    // Label contract: the row's HANDLE leads (route target plus its own set
+    // facets), the description is a caption; the stored id is the VALUE only.
+    assert.equal(listed[0].label, 'openai/gpt-5.6-sol/high — Long reasoning over big diffs');
+    assert.equal(listed[1].label, 'cursor=grok-4.6');
 
     const missing = subagentOptionsFor(roster, 'gone');
     assert.deepEqual(missing.map((o) => o.value), ['deep', 'fast', 'gone']);
@@ -713,7 +714,7 @@ test('the one flat reviewer picker leads with roster references, then the inline
     const refGroups = reviewerChoiceGroups({ roster, row: refRow, harnesses });
     assert.equal(refGroups[0].label, 'Available subagents');
     assert.deepEqual(refGroups[0].options.map((o) => o.value), [`${SUBAGENT_CHOICE_PREFIX}deep`]);
-    assert.match(refGroups[0].options[0].label, /^#deep · API/);
+    assert.match(refGroups[0].options[0].label, /^openai\/gpt-5\.6-sol\/high — /);
     assert.deepEqual(refGroups.slice(1).map((g) => g.label),
         ['Subscriptions · models', 'API keys', 'Agents · sessions']);
     assert.ok(!refGroups.slice(1).flatMap((g) => g.options).some((o) => o.value === 'session:gone'));
@@ -771,7 +772,7 @@ test('picker captions strip directional marks and never split a surrogate pair',
         recommended_use: '\u200Efast\u200F \u061Ccheap\u202Eevil',
         route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' },
     }], '')[0].label;
-    assert.equal(marked, '#row · API · openai/gpt-5.6-luna — fast cheap' + 'evil');
+    assert.equal(marked, 'openai/gpt-5.6-luna — fast cheap' + 'evil');
 
     const emoji = '\u{1F9EA}'.repeat(60); // 60 code points, 120 UTF-16 units
     const long = subagentOptionsFor([{
@@ -1144,9 +1145,19 @@ test('a last-run receipt is read against the route that produced it', () => {
         lastRunMetaPrefix(receipt({ route_kind: 'api_chat', model: 'claudexor::codex-models=gpt' }), sessionRow,
             { modelSources: [{ id: 'codex-models', label: 'Codex' }] }),
         'Last run, before this row changed (it ran as a model on Codex)');
+    // A reference is named from the receipt's OWN recorded route — never by the
+    // stored id, and never from today's roster (that would relabel the past).
+    assert.equal(
+        lastRunMetaPrefix(receipt({ route_kind: 'api_chat', subagent_id: 'deep', model: 'openai/gpt-5.6-sol',
+            effort: 'high', processing_preference: 'fast' }), apiRow),
+        'Last run, before this row changed (it ran as the configured subagent openai/gpt-5.6-sol/high/fast)');
+    assert.equal(
+        lastRunMetaPrefix(receipt({ route_kind: ROUTE_KIND_SESSION, subagent_id: 'deep', model: 'ignored',
+            session_target: 'codex=gpt-6-astra', profile_id: 'koshak' }), apiRow),
+        'Last run, before this row changed (it ran as the configured subagent codex=gpt-6-astra/@koshak)');
     assert.equal(
         lastRunMetaPrefix(receipt({ route_kind: 'api_chat', subagent_id: 'deep' }), apiRow),
-        'Last run, before this row changed (it ran as the configured subagent #deep)');
+        'Last run, before this row changed (it ran as a configured subagent)');
 });
 
 test('no reviewer control teaches the stored prefix, and the advisory says what it delivers', () => {
@@ -1188,7 +1199,9 @@ test('an owner-disabled roster row leaves the picker but a saved reference to it
 
     const holding = subagentOptionsFor(roster, 'paused');
     assert.deepEqual(holding.map((o) => o.value), ['deep', 'paused']);
-    assert.equal(holding[1].label, '#paused · API · openai/gpt-5.6-luna · switched off — Paused seat');
+    // The handle leads, the owner's switch rides with the facts, the caption follows.
+    assert.equal(holding[1].label, 'openai/gpt-5.6-luna · switched off — Paused seat');
+    assert.equal(holding[0].label, 'openai/gpt-5.6-sol/high — Long reasoning over big diffs');
     assert.doesNotMatch(holding[1].label, /not in the roster/, 'the row exists; it is switched off');
 
     // The flat picker keeps the same behaviour through its group builder.

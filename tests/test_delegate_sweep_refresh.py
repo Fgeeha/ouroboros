@@ -133,9 +133,10 @@ def test_boot_backfill_fixes_row_settled_in_a_previous_generation(tmp_path):
     assert custody == {
         "unreconciled": [], "trigger": "boot_backfill", "audit_status": "ok",
         "open_run_ids": [], "pending_invocation_ids": [], "undisposed_patch_run_ids": [],
-        "terminal_runs": [{"run_id": "run-1", "state": "succeeded", "model": "",
-                           "profile_id": "", "selected_subagent_id": ""}],
+        # The stored actor key stays in the durable audit row, never in this model-facing handoff.
+        "terminal_runs": [{"run_id": "run-1", "state": "succeeded", "model": "", "profile_id": ""}],
     }
+    assert "selected_subagent_id" in envelope["terminal_runs"][0]
 
 
 def test_truncated_custody_disclosure_names_both_retry_lineage_rows(tmp_path):

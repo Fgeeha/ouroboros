@@ -462,9 +462,9 @@ Settings, accounts and shared controls. Tests: `test_owner_settings_write_seam.p
 - One capability, one section: the task-actor story lives in Agents →
   Available subagents (`web/modules/subagents_settings.js`), editing one
   canonical `OUROBOROS_SUBAGENTS` object (list-level and row Enabled, at most
-  ten stable rows, one prose field `recommended_use`; id and compatibility
-  name automatic and hidden). Never derive durable identity from the visual
-  ordinal, and never render a second control over the same settings key
+  ten rows, one prose field `recommended_use`; the stored id is a hidden join
+  key). Name a row by its route-derived handle, never by a stored label or
+  the ordinal, and never render a second control over the same settings key
   (`OUROBOROS_MAX_WORKERS` stays in Advanced because it sizes the process
   pool). Share only neutral route/model/account/effort/status primitives with
   reviewer rows (`route_editor_primitives.js`): task routes serialize
@@ -937,7 +937,7 @@ and what enforces each.
   `review_cycles_exhausted`, reconcile every paid panel still running for that root: $0,
   recorded request/roster; reauthoring loses no verdict. Settlement wakes bring verdicts
   whatever Main's draft. Re-offer only changed contract bytes; a spent repair stays spent, a
-  host-caused refusal (typed cause, facts, current selector) spends none. A host-spoken pass
+  host-caused refusal (typed cause, facts, selector) spends none. A host-spoken pass
   never parks; settled panels/queued wakes skip only parking. Accept complete revised prose,
   never a status note; typed keep/replace/finish are optional. Prose resets pending-review
   choice to wait, never infers finish. Effect, owner-revision and child-action controls stay

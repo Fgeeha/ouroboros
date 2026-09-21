@@ -258,7 +258,7 @@ export function encodeReviewerChoice(row) {
 
 export function reviewerChoiceGroups({
     roster = [], rosterKnown = true, row = {}, harnesses = [], modelSources = [],
-    providers = [], catalogKnown = true, accountsKnown = true, providerProfiles = {},
+    providers = [], catalogKnown = true, accountsKnown = true, providerProfiles = {}, processingPreference = '',
 } = {}) {
     // Decision 1=B: ONE flat picker — the Available-subagents references lead
     // (facts-first labels, decision 2=A), then the inline channels. A saved
@@ -267,7 +267,7 @@ export function reviewerChoiceGroups({
     // its own choice down so an undiscovered harness stays displayable too.
     const groups = [];
     const savedId = String(row?.subagent_id || '');
-    const rosterOptions = subagentOptionsFor(roster, savedId, { rosterKnown })
+    const rosterOptions = subagentOptionsFor(roster, savedId, { rosterKnown, processingPreference })
         .map((option) => ({ ...option, value: SUBAGENT_CHOICE_PREFIX + option.value }));
     if (rosterOptions.length) {
         groups.push({ label: 'Available subagents', options: rosterOptions });
@@ -280,22 +280,10 @@ export function reviewerChoiceGroups({
     return groups;
 }
 
-export function subagentOptionLabel(row) {
-    const route = row?.route || {};
-    const parts = [`#${String(row?.subagent_id || '')}`];
-    if (route.kind === ROUTE_KIND_SESSION) {
-        const split = splitSessionTarget(route.target_id);
-        parts.push(split.harness || 'agent session');
-        if (split.model) parts.push(split.model);
-    } else {
-        const fields = routeEditor.routeModelFields(route);
-        parts.push(fields.subscription ? `${fields.source} model` : 'API');
-        if (fields.model) parts.push(fields.model);
-    }
-    if (row?.effort) parts.push(row.effort);
+export function subagentOptionLabel(row, handle = routeEditor.subagentHandle(row)) {
     // The owner's row switch is a FACT, so it rides with the facts: after the
     // caption it would read as part of the owner's own prose.
-    if (row?.enabled === false) parts.push('switched off');
+    const facts = row?.enabled === false ? `${handle} · switched off` : handle;
     // Free text is a caption, never identity: one line, bounded, with the
     // characters that could visually reorder or break the facts stripped
     // (bidi controls, newlines).
@@ -306,28 +294,30 @@ export function subagentOptionLabel(row) {
     // Code POINTS, not UTF-16 units: a slice must never split a surrogate pair.
     const points = Array.from(use);
     const hint = points.length > 48 ? `${points.slice(0, 45).join('')}…` : use;
-    return parts.join(' · ') + (hint ? ` — ${hint}` : '');
+    return facts + (hint ? ` — ${hint}` : '');
 }
 
-export function subagentOptionsFor(roster, savedId, { rosterKnown = true } = {}) {
+export function subagentOptionsFor(roster, savedId, { rosterKnown = true, processingPreference = '' } = {}) {
     // Same survive-the-save rule as profileOptionsFor: the select's value must
     // EXIST as an option, or the browser silently redraws the row as the first
     // roster entry and the next Save really rewires the reviewer. And the
     // absence claim follows provenance: only a roster that was actually READ
     // may say a saved reference is not in it.
-    // Label contract (owner decision 2=A): DERIVED FACTS lead — channel first,
-    // then target and effort — so the delivery is visible BEFORE selection and
-    // free-text intent can never disguise it; the description is a trimmed,
-    // sanitized single-line caption after the facts.
+    // Label contract: the row's HANDLE leads — its route target plus its own
+    // effective facets, the same name Ouroboros sees — so the delivery is visible
+    // BEFORE selection and no stored label can disguise it; the description is
+    // a trimmed, sanitized single-line caption after it. The stored id is the
+    // option VALUE only (the reviewer reference follows the row through it).
     // An owner-disabled roster row is withdrawn from NEW choices (the parser
     // refuses a fresh reference to it); an already-selected one stays visible
     // and annotated rather than being silently cleared.
+    const handles = routeEditor.rosterHandles(roster, processingPreference);
     const saved = String(savedId || '');
     const options = (roster || [])
         .filter((row) => row.enabled !== false || String(row.subagent_id || '') === saved)
         .map((row) => ({
             value: String(row.subagent_id || ''),
-            label: subagentOptionLabel(row),
+            label: subagentOptionLabel(row, handles.get(String(row.subagent_id || ''))),
         }));
     if (saved && !options.some((option) => option.value === saved)) {
         options.push({
@@ -429,7 +419,19 @@ export function lastRunRouteChanged(entry, row) {
 /** The earlier route, named the way the owner picked it. */
 function lastRunRanAs(entry, { harnesses = {}, modelSources = [], providerProfiles = {} } = {}) {
     const requested = entry?.requested || {};
-    if (requested.subagent_id) return `the configured subagent #${requested.subagent_id}`;
+    if (requested.subagent_id) {
+        // Named from the receipt's OWN recorded route, never from today's roster.
+        const session = String(requested.route_kind || '') === ROUTE_KIND_SESSION;
+        const handle = routeEditor.subagentHandle({
+            route: {
+                kind: requested.route_kind,
+                target_id: session ? requested.session_target : requested.model,
+                credential_profile_id: requested.profile_id,
+            },
+            effort: requested.effort, processing_preference: requested.processing_preference,
+        });
+        return handle ? `the configured subagent ${handle}` : 'a configured subagent';
+    }
     if (String(requested.route_kind || '') === ROUTE_KIND_SESSION) {
         const { harness } = splitSessionTarget(requested.session_target);
         const label = harnessPresentation(harness, {
@@ -843,6 +845,7 @@ function reviewerPickerHtml(attrs, row) {
         providerProfiles: state.providerProfiles,
         catalogKnown: state.catalogKnown,
         accountsKnown: state.accountsKnown,
+        processingPreference: state.processingPreference,
     });
     return selectHtml(attrs, groups, encodeReviewerChoice(row));
 }

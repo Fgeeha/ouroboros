@@ -1205,13 +1205,19 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
         # not the stale process env (see the check helper below).
         subagents_key = "OUROBOROS_SUBAGENTS"
         if subagents_key in body and body.get(subagents_key) not in (None, ""):
-            from ouroboros.configured_subagents import normalize_configured_subagents
+            from ouroboros.configured_subagents import (
+                normalize_configured_subagents, roster_save_error,
+            )
             try:
                 _subagents, canonical_subagents = normalize_configured_subagents(
                     body.get(subagents_key)
                 )
             except ValueError as exc:
                 return unsaved_error(str(exc), 400)
+            # Twins are refused only when THIS save changes the roster.
+            twin_error = roster_save_error(canonical_subagents, load_settings(), body)
+            if twin_error:
+                return unsaved_error(twin_error, 400)
             body = dict(body)
             body[subagents_key] = canonical_subagents
         # Reviewer-slot SSOT (6.1): 400 on malformed; save-time disclosure returned;

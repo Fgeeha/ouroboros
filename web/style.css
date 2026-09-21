@@ -293,21 +293,14 @@ body.resizing-panels { user-select: none; }
     content: ' ⏩';
 }
 
-/* Layout-only composition for question, Project lifecycle and routing
-   actions, with room for keyboard focus above and below. Buttons use the shared
-   `.btn.btn-default.btn-sm` role — no new colors, radii, or variants. */
+/* Layout-only composition for the row under a question, a Project lifecycle row or a
+   routed message, with room for keyboard focus above and below. What sits in it is a
+   reference (`project_reference.js`) or the shared `.btn.btn-default.btn-sm` verb. */
 .system-message-actions {
     display: flex;
     flex-wrap: wrap;
     gap: var(--space-3);
     padding-block: var(--space-3);
-}
-
-.system-message-action {
-    flex: 0 1 auto;
-    max-width: 100%;
-    white-space: normal;
-    overflow-wrap: anywhere;
 }
 
 /* === design-system:migrated-begin (chat: Project question mirror) === */
@@ -349,7 +342,8 @@ body.resizing-panels { user-select: none; }
 }
 .chat-bubble.project-answer > .message > :first-child { margin-top: 0; }
 .chat-bubble.project-answer > .system-message-actions { align-items: center; padding-block: var(--space-2) var(--space-1); }
-.chat-bubble.project-answer .chat-quiz-project { margin-inline-end: 0; max-width: min(100%, 44ch); }
+/* Under any message the reference has the row to itself, so its name may run longer than in a quiz head. */
+.system-message-actions .chat-quiz-project { margin-inline-end: 0; max-width: min(100%, 44ch); }
 /* === design-system:migrated-end === */
 
 

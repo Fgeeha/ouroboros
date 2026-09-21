@@ -37,7 +37,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # replaced, the rest has no older text to displace.
     "docs/architecture/06-agent-core.md": 287600,
     "docs/architecture/07-configuration.md": 36991,
-    "docs/architecture/08-git-branching-ci-and-build.md": 18947,
+    # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
+    "docs/architecture/08-git-branching-ci-and-build.md": 19287,
     "docs/architecture/09-shutdown-and-process-cleanup.md": 12405,
     # 17655 -> 20400: the supervisor-reliability sprint adds eight invariants the chapter lacked
     # (typed permanent engine refusal, interrupted parent, stalled-loop facts, source-ack
@@ -62,10 +63,14 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/development/10-platform-abstraction-rule.md": 3316,
     # 27103 -> 27600: one bullet for the Project completion mirror (the engineering
     # twin of the DESIGN paragraph); it describes a new seam, so it replaces nothing.
-    "docs/development/11-design-system.md": 27600,
+    # 27600 -> 28300: the "one owner intent has one control" rule. It REPLACES the
+    # system-message-actions bullet and adds what no older text held: the door, the
+    # regenerate-and-read-the-neighbours duty and what enforces each half.
+    "docs/development/11-design-system.md": 28300,
     "docs/development/12-mcp-client-integration.md": 3313,
     "docs/development/13-gateway-boundary-pattern.md": 2228,
-    "docs/development/14-build-and-ci.md": 14958,
+    # 14958 -> 16100: release proof now records diagnostic signing/attestation side effects, authority asymmetry, and fail-closed prerequisites.
+    "docs/development/14-build-and-ci.md": 16100,
 }
 
 

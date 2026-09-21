@@ -335,6 +335,39 @@ Adopting these tokens is applying the semantic status contract, which already
 governs every surface — it is not a token migration of those surfaces and does
 not move them into the migrated set in section 8.
 
+### References and actions
+
+One owner intent has one control, built in one module. Tokens and primitives
+cannot guarantee that on their own: every copy of a control can truthfully reuse
+a primitive while its callers still choose the words, the glyph and the class —
+that is how "take me to this Project" came to be drawn six ways. The rule is
+therefore about intents.
+
+- A **reference** points at an entity that exists in the product and goes there
+  when pressed. A Project is referred to by the Project reference — the Projects
+  glyph, the Project's name, `↗` — and by nothing else, wherever content points
+  at it: a bound task card's footer, a converted card, a System lifecycle row,
+  the owner's routed message, a mirrored answer, a mirrored question's head.
+  `web/modules/project_reference.js` builds it and alone raises
+  `ouro:open-project`; a caller chooses a layout (`inline`, `bar`, `footer`),
+  never a label or a class. It names the Project wherever its row carries the
+  name; a Project that was never named, and the owner's routed message (whose
+  caption names the destination), read `Project`, never an id. Words appear
+  only as a closed state of the same control (`running in background` on a
+  converted card). Its accessible name
+  says in words what the glyph and the arrow say in pixels (`Open project <name>`),
+  and nothing depends on hover.
+- A **command** is a button: it changes or confirms something, or goes to a
+  place that is not such a reference (`Load older messages`, `Open widgets`).
+  Tabs, toggles, menus and the navigation list keep their own roles; a status
+  chip states a fact and is not a destination.
+- An intent that will be drawn in a second place gets its door first.
+  `docs/inventories/UI_CONTROL_TEXT_INVENTORY.md` lists the fixed text of the
+  hand-written buttons sorted by text (a label passed to a factory is that
+  factory's business), and the `ouro:*` events with the modules that raise
+  them, so a diff that adds a button shows its siblings in the same hunk. Read
+  them: "it reuses a shared primitive" does not show that two controls agree.
+
 ### Chat authorship and System rows
 
 Voice follows authorship, not severity or the transport that delivered the text.
@@ -594,11 +627,11 @@ element in the card shares one keyboard ring (2px `--focus-accent-border`,
 2px offset). Component geometry (card min/max width) keeps local literals like
 the rest of the chat surface.
 
-**Project question mirror.** A Project question the owner has not answered appears in Main as the Project's own quiz card — the same `buildQuizCard` form with the question through the chat markdown pipeline, the options with their details and the `recommended` badge, the stake, the assumption or waiting line, the status and the own-answer field — inside the same assistant bubble. The one addition is a Project chip in the head beside the `Question` chip: a pill in the project chip's own language (the `--project` tints, the Project name in project ink with `↗`) that opens that exact question in its Project, with the card's shared keyboard ring. A long Project name yields first (the chip is capped and ellipsized, its title names the Project whole) so the status keeps its place; a phone column wraps the head. Every lifecycle state reads as it does in the Project: waiting, open, resumed and finished questions stay answerable, and a replaced question stays as a read-only record. An unreadable source keeps what Main already knew; with nothing known the copy says `Status unavailable`, takes no answer and keeps its chip, and a row that cannot carry the form yet shows `Open the original question for its text.` until it can. The first confirmed answer from any source — a press in Main, the Project form or another device, a history or census snapshot — shows the recorded result (the chosen option, `Owner's answer: …`, `You answered`) for five seconds and then removes only the Main copy, through the ordinary message retirement and without moving the reader's viewport; the Project keeps its card. The countdown starts once and later observations never restart it. When focus was inside the copy it stays there while the result shows, then moves to the next Main question, or to the composer for a keyboard owner, never summoning a touch keyboard. A copy that learns its form and its answer in one delivery shows that result for the same five seconds. An answered question never enters Main again: fresh history, a reconnect or a stale open snapshot cannot bring the copy back. Main remembers the lifecycle of a bounded number of questions; a question it no longer remembers mounts a safe unknown copy, whose answer controls appear only after a fresh canonical record confirms it unanswered. A failed, missing or wrong-project canonical read leaves a safe `Status unavailable` copy with its Project chip and no answer controls; the chip opens the original Project form, while a later owned refresh retries the Main copy, so an unavailable read never turns a stale open snapshot into an answerable form and never permanently suppresses a legitimate unanswered question. The mirror and the quiz header share the lifecycle wording above.
+**Project question mirror.** A Project question the owner has not answered appears in Main as the Project's own quiz card — the same `buildQuizCard` form with the question through the chat markdown pipeline, the options with their details and the `recommended` badge, the stake, the assumption or waiting line, the status and the own-answer field — inside the same assistant bubble. The one addition is the Project reference ("References and actions") in the head beside the `Question` chip: its inline pill (the `--project` tints, the Project name in project ink with `↗`) opens that exact question in its Project, with the card's shared keyboard ring. A long Project name yields first (the chip is capped and ellipsized, its title names the Project whole) so the status keeps its place; a phone column wraps the head. Every lifecycle state reads as it does in the Project: waiting, open, resumed and finished questions stay answerable, and a replaced question stays as a read-only record. An unreadable source keeps what Main already knew; with nothing known the copy says `Status unavailable`, takes no answer and keeps its chip, and a row that cannot carry the form yet shows `Open the original question for its text.` until it can. The first confirmed answer from any source — a press in Main, the Project form or another device, a history or census snapshot — shows the recorded result (the chosen option, `Owner's answer: …`, `You answered`) for five seconds and then removes only the Main copy, through the ordinary message retirement and without moving the reader's viewport; the Project keeps its card. The countdown starts once and later observations never restart it. When focus was inside the copy it stays there while the result shows, then moves to the next Main question, or to the composer for a keyboard owner, never summoning a touch keyboard. A copy that learns its form and its answer in one delivery shows that result for the same five seconds. An answered question never enters Main again: fresh history, a reconnect or a stale open snapshot cannot bring the copy back. Main remembers the lifecycle of a bounded number of questions; a question it no longer remembers mounts a safe unknown copy, whose answer controls appear only after a fresh canonical record confirms it unanswered. A failed, missing or wrong-project canonical read leaves a safe `Status unavailable` copy with its Project chip and no answer controls; the chip opens the original Project form, while a later owned refresh retries the Main copy, so an unavailable read never turns a stale open snapshot into an answerable form and never permanently suppresses a legitimate unanswered question. The mirror and the quiz header share the lifecycle wording above.
 
-**Project completion mirror.** A Project root that ended with Ouroboros's own final answer reaches Main as an ordinary Ouroboros message: that answer through the chat markdown pipeline, in the assistant voice, because the bytes are model-authored — the host stamps the answer on the completion row only for a model-authored final, so the browser never infers authorship. A long answer is folded to about seven lines; the fold is a visual clamp over the complete, selectable text, with a fade only when it really hides something, and never a cut. Under it sits one control: the Project chip in the project chip's own language, which names the Project and opens it. The durable row and its wire frame stay `role="system"`: like the Project question mirror, this is a browser presentation of model-authored bytes, not a change of the row's author. The message carries no status word, cause sentence, title or duration, so a host verdict on that answer (a warning, an unaccepted review) is not shown in Main: it stays loud on the task's card in the Project, one press away. Copy copies the answer. An ending with no model-authored answer (a provider failure, a stop, preserved output), a start row, and every row written before the answer rode the row keep the System row with its `Open Project` action. One durable row either way: its plain text is unchanged, so the Telegram mirror, Ouroboros's own context and one-ending-one-notification behave as before.
+**Project completion mirror.** A Project root that ended with Ouroboros's own final answer reaches Main as an ordinary Ouroboros message: that answer through the chat markdown pipeline, in the assistant voice, because the bytes are model-authored — the host stamps the answer on the completion row only for a model-authored final, so the browser never infers authorship. A long answer is folded to about seven lines; the fold is a visual clamp over the complete, selectable text, with a fade only when it really hides something, and never a cut. Under it sits one control, the Project reference ("References and actions"). The durable row and its wire frame stay `role="system"`: like the Project question mirror, this is a browser presentation of model-authored bytes, not a change of the row's author. The message carries no status word, cause sentence, title or duration, so a host verdict on that answer (a warning, an unaccepted review) is not shown in Main: it stays loud on the task's card in the Project, one press away. Copy copies the answer. An ending with no model-authored answer (a provider failure, a stop, preserved output), a start row, and every row written before the answer rode the row keep the System row, which ends with that same reference: the voice of a row never chooses how the UI points at its Project. One durable row either way: its plain text is unchanged, so the Telegram mirror, Ouroboros's own context and one-ending-one-notification behave as before.
 
-Project-lifecycle and routing actions use the shared `createSystemMessageActions` composition. It owns token-based space above and below the controls, wrapping and clearance for the existing button focus ring; action buttons never sit in a clipped/nowrap text line. This is a row composition, not a new card framework or a global button-margin rule.
+The row under a Project lifecycle row or a routed message is the shared `createSystemMessageActions` composition around the Project reference. It owns token-based space above and below the controls, wrapping and clearance for the focus ring; a control never sits in a clipped/nowrap text line. This is a row composition, not a new card framework or a global button-margin rule.
 
 History with no current execution or known outcome keeps its expandable content under `Outcome unavailable`, without a task chip, typing or Stop. Before complete live-source reconciliation, it is `Activity unconfirmed`. Positive current activity restores only its proven controls. A delivery warning may coexist with a preserved task-acceptance PASS. Model metadata says `Last solve response`, naming the initial request only when the route changed.
 
@@ -838,7 +871,10 @@ stored spellings (`provider::model`, `claudexor::source=model`,
 `harness=model`) are serialization authored by the editor: never required from
 the owner, never a field placeholder or help-text instruction, never the
 primary displayed value; the exact stored id may appear in a meta line or
-tooltip. The route identity chip names the source (API · OpenAI, Codex · model,
+tooltip. A configured-subagent reference is the one place a stored spelling
+names a thing: a roster row is labelled by its handle — its route target plus
+the facets that row really runs with, defaults omitted — because a friendlier
+stored label rots as soon as the owner re-points the row. The route identity chip names the source (API · OpenAI, Codex · model,
 Claude Code · agent), not the channel alone. A last-run receipt is shown
 against the route that produced it: when the row's route changed since, the
 line says so and names the earlier route.
