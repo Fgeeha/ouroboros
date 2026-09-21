@@ -353,3 +353,16 @@ def test_records_never_share_nested_containers_with_the_memo(tmp_path):
     assert custody.invocation_record(root, "inv-b")["resource_ref"]["nested"]["k"] == "v"
     memo_row = next(r for r in custody.custody_rows(root) if r.get("invocation_id") == "inv-b")
     assert memo_row["resource_ref"]["nested"]["k"] == "v"
+
+
+def test_locator_never_returns_another_invocations_body(tmp_path):
+    root = tmp_path
+    _requested(root, "inv-a", "task-a", {"prompt": "AAA"})
+    _requested(root, "inv-b", "task-a", {"prompt": "BBB"})
+    rows = custody.custody_rows(root)
+    locator_a = next(r for r in rows if r.get("invocation_id") == "inv-a")[memo.REQUEST_LOCATOR_KEY]
+    locator_b = next(r for r in rows if r.get("invocation_id") == "inv-b")[memo.REQUEST_LOCATOR_KEY]
+    assert memo.read_locator_request(root, locator_a, invocation_id="inv-a") == {"prompt": "AAA"}
+    # A locator that points at another invocation's line is refused for this one.
+    assert memo.read_locator_request(root, locator_b, invocation_id="inv-a") is None
+    assert custody.invocation_record(root, "inv-a")["request"] == {"prompt": "AAA"}

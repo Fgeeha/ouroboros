@@ -971,16 +971,21 @@ def build_recent_sections(
     # the window (BIBLE P1); a reader pages the rest with read_file on the log.
     from ouroboros.jsonl_tail import coverage_line
 
-    for log_name, header, formatter, want in (
-        ("progress.jsonl", "## Recent progress", lambda rows: memory.summarize_progress(rows, limit=50), 50),
-        ("tools.jsonl", "## Recent tools", memory.summarize_tools, 20),
-        ("events.jsonl", "## Recent events", memory.summarize_events, 200),
+    for log_name, header, formatter, want, rendered in (
+        ("progress.jsonl", "## Recent progress", lambda rows: memory.summarize_progress(rows, limit=50), 50, 50),
+        ("tools.jsonl", "## Recent tools", memory.summarize_tools, 20, 10),  # + 20 scanned for review markers
+        ("events.jsonl", "## Recent events", memory.summarize_events, 200, 200),
     ):
         entries, coverage = memory.read_task_recent(log_name, task_id, want if task_id else 200)
+        if len(entries) > rendered:
+            # The header must not call rows "rendered" that the formatter only
+            # scanned (tools renders its newest 10 and scans 20 for review markers).
+            coverage["rendered"] = f"{rendered} rendered, {len(entries)} scanned for review markers"
         summary = formatter(entries)
-        if summary or coverage.get("gaps"):
-            # A window that met read or parse gaps is disclosed even when no row
-            # survived: silence would hide the gap itself (BIBLE P1).
+        if summary or coverage.get("gaps") or coverage.get("archives_bounded"):
+            # A window that met gaps, or left older archives unopened without
+            # finding a row, is disclosed even when nothing rendered: silence
+            # would hide the incompleteness itself (BIBLE P1).
             sections.append(f"{header} ({coverage_line(coverage)})" + (f"\n\n{summary}" if summary else ""))
 
     supervisor_rows, supervisor_coverage = memory.read_task_recent("supervisor.jsonl", "", 200)

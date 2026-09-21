@@ -168,3 +168,28 @@ def test_supervisor_section_carries_its_coverage_line(tmp_path):
     section = _section(build_recent_sections(Memory(drive_root=tmp_path), env=None), "## Supervisor")
     assert section.splitlines()[0].startswith("## Supervisor (all tasks: all 1 matching rows; window: whole live file of logs/supervisor.jsonl")
     assert "boot: 2026-09-22T00:00:00Z branch=ouroboros sha=abcdef123456" in section
+
+
+def test_bounded_window_with_no_matching_rows_is_still_disclosed(tmp_path):
+    """The task's only row sits in the fourth-oldest archive: the window is empty
+    AND incomplete, and the section must say so (scope finding, 2026-09-22)."""
+    archive = tmp_path / "archive"
+    _write(archive / "tools_20260901T000000.jsonl",
+           [{"ts": "t", "task_id": "task-a", "tool": "old", "args": {}, "result_preview": "ok"}])
+    for i in range(2, 5):
+        _write(archive / f"tools_2026090{i}T000000.jsonl",
+               [{"ts": "t", "task_id": "task-b", "tool": "b", "args": {}, "result_preview": "ok"}])
+    _write(tmp_path / "logs" / "tools.jsonl", [{"ts": "t", "task_id": "task-b", "tool": "live", "args": {}, "result_preview": "ok"}])
+    tools = _section(build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a"), "## Recent tools")
+    header = tools.splitlines()[0]
+    assert "no matching rows" in header and "older archives not opened" in header and "3 of 4 newest archives" in header
+    assert tools.strip() == header  # nothing rendered below the disclosure
+
+
+def test_tools_header_says_how_many_rows_are_rendered(tmp_path):
+    rows = [{"ts": "t", "task_id": "task-a", "tool": "shell", "args": {"cmd": f"c{i}"}, "result_preview": "ok"}
+            for i in range(30)]
+    _write(tmp_path / "logs" / "tools.jsonl", rows)
+    tools = _section(build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a"), "## Recent tools")
+    assert "newest 20 of 30 matching rows in the window (10 rendered, 20 scanned for review markers)" in tools.splitlines()[0]
+    assert tools.count("shell cmd=") == 10

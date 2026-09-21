@@ -99,7 +99,7 @@ def request_body(drive_root: Any, row: Dict[str, Any]) -> Optional[Dict[str, Any
         # A memo row carries the legacy inline body's location, not the body.
         from ouroboros.delegate_custody_memo import read_locator_request
 
-        located = read_locator_request(drive_root, locator)
+        located = read_locator_request(drive_root, locator, invocation_id=str(row.get("invocation_id") or ""))
         if located is not None:
             return located
     ref = row.get("request_ref")

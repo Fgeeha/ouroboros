@@ -198,6 +198,9 @@ def coverage_line(coverage: dict) -> str:
     archives, available = int(coverage.get("archives") or 0), int(coverage.get("archives_available") or 0)
     if archives:
         window += f" + {archives} of {available} newest archives"
+    rendered = str(coverage.get("rendered") or "")
+    if rendered and shown:
+        rows += f" ({rendered})"
     source = str(coverage.get("source") or "")
     parts = [f"{whose}: {rows}", f"window: {window}" + (f" of {source}" if source else "")]
     if coverage.get("archives_bounded"):

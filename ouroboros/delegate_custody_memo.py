@@ -364,8 +364,14 @@ def clone_custody_state(state: Dict[str, Any]) -> Dict[str, Any]:
     return clones
 
 
-def read_locator_request(drive_root: Any, locator: Any) -> Optional[Dict[str, Any]]:
-    """Re-read the inline ``request`` body a compacted row points at, or None."""
+def read_locator_request(drive_root: Any, locator: Any, *, invocation_id: str = "") -> Optional[Dict[str, Any]]:
+    """Re-read the inline ``request`` body a compacted row points at, or None.
+
+    Bound to the file identity AND, when given, to the invocation the caller
+    expects: a line that names another invocation is never returned as this
+    one's body (an unknown body keeps the invocation pending; a foreign body
+    would replay someone else's request).
+    """
     if not isinstance(locator, dict):
         return None
     try:
@@ -382,7 +388,11 @@ def read_locator_request(drive_root: Any, locator: Any) -> Optional[Dict[str, An
                 handle.seek(offset)
                 raw = handle.read(length)
             row = json.loads(raw.decode("utf-8", errors="replace"))
-            body = row.get("request") if isinstance(row, dict) else None
+            if not isinstance(row, dict):
+                return None
+            if invocation_id and str(row.get("invocation_id") or "") != invocation_id:
+                return None
+            body = row.get("request")
             return body if isinstance(body, dict) and body else None
     except (OSError, ValueError, JsonlChainUnreadable, _Refold):
         return None
