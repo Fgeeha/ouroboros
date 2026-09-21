@@ -115,10 +115,12 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
     # bound joins its parameters. Rolled again for the owner's "autonomy first" decision:
     # the escalate description states when waiting is worth it (an irreversible or costly
     # next step, or a choice that is the owner's to make) and that waiting questions of one
-    # batch share one wait, ended by the first incoming message; 935 -> 932 bytes. Diffing the
-    # whole catalog base to head shows exactly those edits and nothing else.
+    # batch share one wait, ended by the first incoming message; 935 -> 932 bytes. Rolled
+    # again for owner decision 7A: the read_file description states that an absolute path
+    # with no root selects the permitted root holding it (one sentence replaced, 103 -> 100
+    # bytes). Diffing the whole catalog base to head shows exactly those edits and nothing else.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "0f72df2827a90d691d5c3fd1107170b050489061e9d55201a1feda0da647f82b"
+        "7eeb884ea869707df9e7660083bd62b83a1fcffa3a748d9ccf696562a8c9b1dc"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)

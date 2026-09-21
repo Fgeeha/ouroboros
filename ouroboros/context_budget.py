@@ -247,8 +247,10 @@ SCRATCHPAD_MAX_CONTENT_CHARS = 60_000
 # starving concurrent workers (the 2026-07-23 lock-timeout incident). Warn at
 # exactly that measured degradation point. Since CPL4-C6, size-triggered
 # compaction (config.USAGE_LEDGER_COMPACT_BYTES, usage_compaction.py) should
-# hold the file far below this. Growth can reflect a large unfoldable residue
-# or compaction that is broken, refused, or skipped. The name tier (no kernel
+# hold the file far below this. Growth can reflect a large unfoldable residue,
+# compaction that is broken or refused, or a file that has not yet outgrown the
+# growth floor its last committed pass stamped into the ledger header (declined
+# before the pass, so no typed event). The name tier (no kernel
 # locks) emits usage_ledger_compaction_refused once per process per data root;
 # a policy abort (_Abort) emits usage_ledger_compaction_skipped once per process
 # per (data root, reason). The two snapshot-race exits before archive/swap only

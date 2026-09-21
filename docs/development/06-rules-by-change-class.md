@@ -158,11 +158,11 @@ Run roots are append-only outside `repo/` and live `data/`; the focused contract
   read-only git works everywhere, the network fence still applies, and acting
   `self_worktree` children keep the strict no-commit policy. `git
   init`/`commit`/`push` in an external project tree is legitimate task work.
-- In external workspace mode, light-mode self-repo dirty checks snapshot the
-  system repo, not the active workspace, and workspace patches are captured
-  against the preflight git base; project-room promotion provisions a
-  standalone repo through `ensure_project_workspace` and fails loudly on a
-  broken binding or unreadable registry.
+- In external workspace mode, light-mode dirty checks snapshot the system
+  repo, not the workspace; patches are captured against the preflight base;
+  project-room promotion provisions a repo (`ensure_project_workspace`),
+  records an explicit folder into an empty `working_dir`, and fails loudly on
+  a broken binding or unreadable registry.
 - `claude_code_edit` is a retired tool name with a one-way, permanent
   compatibility contract: a saved contract carrying
   `disabled_tools=["claude_code_edit"]` also withholds the successor

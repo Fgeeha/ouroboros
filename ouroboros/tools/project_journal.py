@@ -226,12 +226,20 @@ def record_task_finalization(
         )
     except Exception:
         log.debug("project journal task-done entry failed", exc_info=True)
-    record_project_last_result(project_id, tid, drive_root)
+    is_root = not str(task.get("parent_task_id") or "").strip() and str(
+        task.get("delegation_role") or "") != "subagent"  # the door's own child predicate
+    if is_root:
+        # The pointer answers "continue from here" for the ROOM, so only a ROOT may
+        # stamp it: a child finalizing after its root moved the room's single
+        # candidate onto work no owner ever addressed, and the room was then left
+        # naming a result the promote door refuses (the mirror below is root-only
+        # for the same reason).
+        record_project_last_result(project_id, tid, drive_root)
     try:
         _record_work_location(project_id, task)
     except Exception:
         log.debug("project journal work-location entry failed", exc_info=True)
-    if not str(task.get("parent_task_id") or "").strip():
+    if is_root:
         try:
             mirror_tree_coordination_to_journal(
                 project_id, str(task.get("root_task_id") or tid), task_id=tid,

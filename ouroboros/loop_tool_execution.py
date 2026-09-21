@@ -22,6 +22,7 @@ from ouroboros.config import (
 )
 from ouroboros.deadline_utils import deadline_remaining_sec
 from ouroboros.observability import new_call_id, persist_call
+from ouroboros.task_results import resolve_task_lineage
 from ouroboros.tool_capabilities import (
     FOREGROUND_MUTATIVE_TOOLS,
     PARALLEL_SAFE_ENQUEUE_TOOLS,
@@ -162,7 +163,14 @@ def _tool_task_metadata(tools: ToolRegistry) -> Dict[str, Any]:
 
 def _append_tool_log(tools: ToolRegistry, drive_logs: pathlib.Path, payload: Dict[str, Any]) -> None:
     meta = _tool_task_metadata(tools)
-    for key in ("parent_task_id", "root_task_id", "delegation_role", "task_depth"):
+    if task_id := str(payload.get("task_id") or "").strip():
+        # ONE lineage resolver (a direct root is its own root), so every task row
+        # carries root_task_id/delegation_role for the task log stream readers.
+        lineage = resolve_task_lineage(task_id, metadata=meta)
+        payload["root_task_id"] = lineage["root_task_id"]
+        if role := lineage["delegation_role"] or ("root" if lineage["is_root_task"] else ""):
+            payload["delegation_role"] = role
+    for key in ("parent_task_id", "task_depth"):
         if meta.get(key) not in (None, ""):
             payload[key] = meta.get(key)
     append_jsonl(drive_logs / "tools.jsonl", payload)

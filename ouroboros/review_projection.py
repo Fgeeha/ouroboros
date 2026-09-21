@@ -16,9 +16,10 @@ import json
 import copy
 import logging
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any, Dict, List, TYPE_CHECKING
 
-from ouroboros.review_records import review_slot_awaiting
+from ouroboros.review_records import review_slot_awaiting, review_slot_unresolved
 
 # A slot released at the dispatch barrier has no transport or parse event:
 # its projection is a gap, never a transport failure or a malformed answer.
@@ -186,6 +187,17 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
         # Flat, redacted pointer to the private full response artifact.
         "response_ref": _response_ref_projection(row.get("response_ref")),
     }
+    # Since when this row has been waiting, published only where the host wrote
+    # a real instant on a row the two wait predicates still call unanswered. An
+    # absent key is a hole, never a back-filled or inferred moment.
+    if awaiting or review_slot_unresolved(row):
+        since = str(row.get("awaiting_since") or "").strip()
+        try:
+            datetime.fromisoformat(since)
+        except ValueError:
+            pass
+        else:
+            projection["awaiting_since"] = since
     # Structured rows ride only where a parsed response exists: an absent
     # `findings` key is a hole, never the claim "zero findings reported".
     if parsed is not None:

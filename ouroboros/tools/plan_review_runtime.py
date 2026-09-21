@@ -543,6 +543,7 @@ def _plan_row_from_actor(actor: Dict[str, Any], slot: Any) -> dict:
         "operation_id": str(actor.get("operation_id") or ""),
         "operation_state": str(actor.get("operation_state") or "settled"),
         "late_result_pending": bool(actor.get("late_result_pending")),
+        "awaiting_since": str(actor.get("awaiting_since") or ""),
         "pending_invocation_id": str(
             usage.get("pending_invocation_id") or actor.get("pending_invocation_id") or ""
         ),
@@ -580,6 +581,8 @@ def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
             "operation_id": str(row.get("operation_id") or ""),
             "operation_state": str(row.get("operation_state") or "settled"),
             "late_result_pending": bool(row.get("late_result_pending")),
+            # Since when the host has been waiting; '' whenever it never sent.
+            "awaiting_since": str(row.get("awaiting_since") or ""),
             "pending_invocation_id": pending_invocation_id,
             "delegated_run_id": delegated_run_id,
         })

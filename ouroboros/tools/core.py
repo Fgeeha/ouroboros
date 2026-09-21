@@ -1293,7 +1293,7 @@ def get_tools() -> List[ToolEntry]:
             "name": "read_file",
             "description": (
                 "Read a UTF-8 text file from a declared resource root. "
-                "Default root=active_workspace (the user's workspace or the Ouroboros repo in self-modification tasks). "
+                "Default root=active_workspace; an absolute path with no root selects the permitted root holding it. "
                 "Use max_lines (default 2000) and start_line (default 1) to read large files in chunks. "
                 "The result header shows root:path and 'lines X\u2013Y of Z' so you know where and how much you read. "
                 "Prefer this over cat/head/sed-as-reader in run_command; to locate code first use query_code "

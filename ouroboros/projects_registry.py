@@ -918,12 +918,16 @@ def create_project(
         return {**entry, "created": True}
 
 
-def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional[Dict[str, Any]]:
+def update_project(
+    drive_root: Any, project_id: str, *, only_if_empty: tuple = (), **updates: Any,
+) -> Optional[Dict[str, Any]]:
     """Update mutable fields. v6.59.0 adds the additive source-provenance facts:
     ``provenance`` (attached|cloned|genesis|none — how the working_dir came to be),
     ``clone_url`` (historical fact; live git data is always read from .git), and
     ``trusted_at`` (stamped automatically on attach/clone — the notification trust
-    model: attaching IS the owner's explicit grant, no second confirmation gate)."""
+    model: attaching IS the owner's explicit grant, no second confirmation gate).
+    A field named in ``only_if_empty`` is written only while still empty — a
+    compare-and-set under the registry lock; the caller reads the winner back."""
     pid = sanitize_project_id(project_id)
     if not pid:
         return None
@@ -943,7 +947,7 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
             if entry.get("id") != pid or entry.get("lifecycle") != PROJECT_ACTIVE:
                 continue
             for key, value in updates.items():
-                if key not in allowed:
+                if key not in allowed or (key in only_if_empty and str(entry.get(key) or "").strip()):
                     continue
                 if key == "name":
                     value = _validated_name(value, str(entry.get("id") or ""))
