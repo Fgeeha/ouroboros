@@ -112,9 +112,11 @@ def test_shell_catalog_schema_bytes_and_handler_owners_are_stable():
     # Workflow scope: explicit saved-setting references and lazy-output guidance.
     # run_command states its real contract: only a bare builtin as cmd[0] is
     # refused, a background child stalls the call and is never tracked after it
-    # (tests/test_run_command_schema_truth.py).
+    # (tests/test_run_command_schema_truth.py). Rolled once more: the sentence no
+    # longer says the child is never STOPPED, which is false where the timeout kill
+    # still reaches the exited shell's process group (Linux).
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "61a0e6006f609e84e7e9f71b82e376896a0fc9287b295fe75e6fe22d96e870e7"
+        "7d7a07b763cec4e8fc95bdfb733c2b8362bb8c0f0648b33825b56e52dccda4ce"
     )
     original = json.loads(schema_bytes)
     for schema in original:
@@ -129,7 +131,7 @@ def test_shell_catalog_schema_bytes_and_handler_owners_are_stable():
     )
     assert hashlib.sha256(json.dumps(original, sort_keys=True, ensure_ascii=False,
                                     separators=(",", ":")).encode()).hexdigest() == (
-        "d1ee448cd3c283f769dfc2a0de3d2771d7270720931223d64757575ab42a54f5"
+        "c6504272bceed19cc138a9cc8ee98a04db2f6ac3b41d70fdacbc4fa4022542bc"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)
