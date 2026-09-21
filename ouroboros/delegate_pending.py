@@ -15,7 +15,7 @@ def pending_invocations(
 
     found: Dict[str, Dict[str, Any]] = {}
     state: Dict[str, str] = {}
-    source = rows if rows is not None else c._iter_rows(c.event_log_path(drive_root))
+    source = rows if rows is not None else c.custody_rows(drive_root)
     for row in source:
         invocation_id = str(row.get("invocation_id") or "")
         if not invocation_id:
@@ -30,6 +30,7 @@ def pending_invocations(
                 "operation_id": str(row.get("operation_id") or ""),
                 "request": row.get("request") if isinstance(row.get("request"), dict) else None,
                 "request_ref": row.get("request_ref"),
+                "request_locator": row.get("request_locator"),
                 "route": str(row.get("route") or ""),
                 "project_id": str(row.get("project_id") or ""),
                 "project_owned": bool(row.get("project_owned")),
@@ -74,8 +75,9 @@ def pending_invocations(
         # Resolve only survivors, not every historical start on each sweep.
         body = request_body(drive_root, record)
         ref = record.pop("request_ref")
+        locator = record.pop("request_locator")
         # An unreadable stored body does not discharge the pending start.
-        if body or ref is not None:
+        if body or ref is not None or locator is not None:
             record["request"] = body
             pending.append(record)
     return pending
@@ -90,6 +92,14 @@ def request_body(drive_root: Any, row: Dict[str, Any]) -> Optional[Dict[str, Any
     inline = row.get("request")
     if isinstance(inline, dict) and inline:
         return inline
+    locator = row.get("request_locator")
+    if locator is not None:
+        # A memo row carries the legacy inline body's location, not the body.
+        from ouroboros.delegate_custody_memo import read_locator_request
+
+        located = read_locator_request(drive_root, locator)
+        if located is not None:
+            return located
     ref = row.get("request_ref")
     if not isinstance(ref, dict) or not ref:
         return None

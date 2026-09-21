@@ -35,7 +35,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
     # replaced, the rest has no older text to displace.
-    "docs/architecture/06-agent-core.md": 287600,
+    # +1000 (2026-09-22): the custody row memo and the per-task recent-activity
+    # windows are two new mechanisms described in the paragraphs they changed;
+    # the base sat 28 bytes under the previous budget.
+    "docs/architecture/06-agent-core.md": 288600,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
@@ -51,7 +54,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 20650 -> 21100: one more rule the chapter lacked, the usage ledger's reader contract
     # ("money never reads a snapshot; a display never waits on money"). It REPLACES the
     # residual sentence of the off-thread invariant; the rule itself has no older text.
-    "docs/architecture/10-key-invariants.md": 21100,
+    # +200 (2026-09-22): invariant 10 names the process-local fingerprint memos
+    # and their fallback rule; the base sat 23 bytes under the previous budget.
+    "docs/architecture/10-key-invariants.md": 21300,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
     "docs/architecture/12-host-service-companions-and-chat-ids.md": 11007,
     "docs/architecture/13-external-skills-layer.md": 7764,
@@ -60,7 +65,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 22873 -> 23100: one new invariant (notifications ring for live events
     # only). Its text was compressed to the load-bearing facts first; the
     # remainder is the cost of stating a rule that did not exist before.
-    "docs/development/03-module-size-and-complexity.md": 23100,
+    # +300 (2026-09-22): two new house precedents (custody row memo, bounded
+    # filtered tail reader) join the projection-over-replay list; the base sat
+    # 15 bytes under the previous budget.
+    "docs/development/03-module-size-and-complexity.md": 23400,
     "docs/development/04-core-governance-artifacts.md": 16431,
     "docs/development/05-review-and-commit-protocol.md": 12956,
     # 94197 -> 94520: the usage-ledger lock rule gains its reader contract (a display read

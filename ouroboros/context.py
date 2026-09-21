@@ -963,19 +963,25 @@ def build_recent_sections(
             + json.dumps(coverage_projection, ensure_ascii=False, sort_keys=True, default=str)
         )
 
-    for log_name, header, formatter in (
-        ("progress.jsonl", "## Recent progress", lambda rows: memory.summarize_progress(rows, limit=50)),
-        ("tools.jsonl", "## Recent tools", memory.summarize_tools),
-        ("events.jsonl", "## Recent events", memory.summarize_events),
+    # Each task reads ITS OWN newest rows through a bounded window (#131): a
+    # global tail filtered afterwards handed every task whatever share of the
+    # shared suffix it happened to occupy. Quotas are what the formatters render
+    # (progress 50; tools: 10 rendered + 20 scanned for review markers; events:
+    # type counts over the rows it is given, today's 200). The header states
+    # the window (BIBLE P1); a reader pages the rest with read_file on the log.
+    from ouroboros.jsonl_tail import coverage_line
+
+    for log_name, header, formatter, want in (
+        ("progress.jsonl", "## Recent progress", lambda rows: memory.summarize_progress(rows, limit=50), 50),
+        ("tools.jsonl", "## Recent tools", memory.summarize_tools, 20),
+        ("events.jsonl", "## Recent events", memory.summarize_events, 200),
     ):
-        entries = memory.read_jsonl_tail(log_name, 200)
-        if task_id:
-            entries = [e for e in entries if str(e.get("task_id", "")).strip() == task_id]
+        entries, coverage = memory.read_task_recent(log_name, task_id, want if task_id else 200)
         summary = formatter(entries)
         if summary:
-            sections.append(f"{header}\n\n{summary}")
+            sections.append(f"{header} ({coverage_line(coverage)})\n\n{summary}")
 
-    supervisor_summary = memory.summarize_supervisor(memory.read_jsonl_tail("supervisor.jsonl", 200))
+    supervisor_summary = memory.summarize_supervisor(memory.read_task_recent("supervisor.jsonl", "", 200)[0])
     if supervisor_summary:
         sections.append("## Supervisor\n\n" + supervisor_summary)
 

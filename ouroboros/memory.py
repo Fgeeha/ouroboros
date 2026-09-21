@@ -878,6 +878,40 @@ class Memory:
     def read_jsonl_tail(self, log_name: str, max_entries: int = 100) -> List[Dict[str, Any]]:
         return self._read_jsonl_entries(log_name, max_entries=max_entries)
 
+    def read_task_recent(
+        self, log_name: str, task_id: str, want: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """The newest ``want`` rows of ONE task (or of the log when ``task_id`` is
+        empty) through the bounded rotation-aware reader (razzant/ouroboros#131).
+
+        The window is a doubling byte tail of the live file plus at most the
+        three newest archives, so a busy neighbour cannot push this task's own
+        rows out of a shared global suffix, and the whole file is never parsed
+        for its tail. ``coverage`` states what the window was and whether the
+        quota went unmet while older archives stayed unopened (BIBLE P1: the
+        section discloses it; ``read_file`` on the log pages the rest).
+        """
+        from ouroboros.jsonl_tail import read_rotated_jsonl_entries
+
+        wanted = str(task_id or "").strip()
+
+        def counts(entry: Dict[str, Any]) -> bool:
+            return not wanted or str(entry.get("task_id", "")).strip() == wanted
+
+        stem = log_name[:-len(".jsonl")] if log_name.endswith(".jsonl") else log_name
+        coverage: Dict[str, Any] = {"task_id": wanted}
+        try:
+            rows = read_rotated_jsonl_entries(
+                self.logs_path(log_name), self.drive_root / "archive", stem,
+                max(1, int(want)), counts, coverage=coverage,
+            )
+        except Exception:
+            log.warning("Failed to read recent %s rows", log_name, exc_info=True)
+            return [], {**coverage, "shown": 0, "matched": 0, "quota_met": False, "gaps": ["read_failed"]}
+        shown = [row for row in rows if counts(row)][-max(1, int(want)):]
+        coverage.update({"shown": len(shown), "quota_met": int(coverage.get("matched") or 0) >= int(want)})
+        return shown, coverage
+
     def read_jsonl_tail_after_offset(
         self,
         log_name: str,
