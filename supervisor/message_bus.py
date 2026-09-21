@@ -1238,10 +1238,10 @@ def budget_line(force: bool = False) -> str:
 
             ensure_legacy_imported(DATA_DIR)
             total = float(TOTAL_BUDGET_LIMIT or 0.0)
-            accounting = (
-                usage_projection(DATA_DIR, global_limit_usd=total)
+            accounting = (  # display: messages are sent from the supervisor loop too
+                usage_projection(DATA_DIR, global_limit_usd=total, allow_stale=True)
                 if total > 0
-                else usage_breakdown(DATA_DIR)
+                else usage_breakdown(DATA_DIR, allow_stale=True)
             )
             display_state["spent_usd"] = float(accounting.get("accounted_usd") or 0.0)
             display_state["usage_accounting"] = accounting
