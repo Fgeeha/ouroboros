@@ -334,7 +334,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_project_child_result_dispositions", "_publish_delivery_candidate",
         "_replace_delivery_candidate", "_resolve_delivery_control",
         "_run_task_acceptance_review_once", "_service_finalization_evidence",
-        "_supersede_delivery_acceptance_binding",
+        "_set_acceptance_decision", "_supersede_delivery_acceptance_binding",
         "_supersede_task_acceptance_for_evidence_change",
         "_supersede_task_acceptance_for_owner_followup",
         "_task_acceptance_owner_generation_changed",

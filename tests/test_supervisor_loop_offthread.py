@@ -31,6 +31,10 @@ def _fresh_custody_sweep_latch(monkeypatch):
     from ouroboros import server_maintenance
 
     monkeypatch.setattr(server_maintenance, "_CUSTODY_SWEEP_LOCK", threading.Lock())
+    # The stop/restart flags are process-global too: another test in this worker may have left one set,
+    # which would end every pass here before its first step.
+    monkeypatch.setattr(server_maintenance, "_restart_requested", threading.Event())
+    monkeypatch.setattr(server_maintenance, "_supervisor_stop", threading.Event())
 
 
 def _track_threads(monkeypatch) -> list:
@@ -258,7 +262,6 @@ def test_a_stop_in_flight_makes_the_sweep_gateway_attach_only(tmp_path, monkeypa
     from ouroboros import claudexor_daemon as daemon_mod
     from ouroboros import delegate_custody as dc
     from ouroboros import delegate_recovery, server_maintenance as sm
-    from ouroboros.server_process import _restart_requested
     from supervisor import queue
 
     monkeypatch.setattr(sm, "DATA_DIR", tmp_path)
@@ -280,9 +283,6 @@ def test_a_stop_in_flight_makes_the_sweep_gateway_attach_only(tmp_path, monkeypa
     sm._reconcile_delegated_runs(lambda: set(), stop_event=stop)
     assert used[-1] == ("attach", {}), "a closed generation never ensures"
 
-    _restart_requested.set()
-    try:
-        sm._reconcile_delegated_runs(lambda: set())
-    finally:
-        _restart_requested.clear()
+    sm._restart_requested.set()  # this test's own flag (the fixture replaced the process-global one)
+    sm._reconcile_delegated_runs(lambda: set())
     assert used[-1] == ("attach", {}), "a restart in flight never ensures either"
