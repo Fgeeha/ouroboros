@@ -201,6 +201,17 @@ def get_acceptance_fence_ack_wait_sec() -> float:
     return ACCEPTANCE_FENCE_ACK_WAIT_SEC
 
 
+# How many of a lane's newest ROOT results one routing manifest offers as continuation
+# candidates. A HINT window: what promote ACCEPTS is a predicate (same project, a root, a
+# readable result, not live), so a root older than this window stays addressable in its own
+# room. Structural, not a settings key.
+ROUTING_MANIFEST_RESULT_ROWS = 16
+
+
+def get_routing_manifest_result_rows() -> int:
+    return ROUTING_MANIFEST_RESULT_ROWS
+
+
 def get_vision_caption_timeout_sec() -> int:
     return _clamped_number_setting("OUROBOROS_VISION_CAPTION_TIMEOUT_SEC", low=1, cast=int)
 

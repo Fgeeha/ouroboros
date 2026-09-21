@@ -519,23 +519,18 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
             "your judgment picks the target (or none -> answer inline / promote_chat_to_task). A "
             "message in a project room defaults to that project unless it clearly says otherwise."
         )
-    _main_manifest = (
-        _meta.get("main_routing_manifest")
-        if isinstance(_meta.get("main_routing_manifest"), dict)
-        else None
-    )
-    if _main_manifest:
-        runtime_data["main_routing_manifest"] = _main_manifest
-    _last_result = (
-        _meta.get("project_last_task_result")
-        if isinstance(_meta.get("project_last_task_result"), dict)
-        else None
-    )
-    if _last_result:
-        # Host-built ground truth about the thread's most recent task result
-        # (id/status/workspace facts/artifact refs) — read THIS before framing a
-        # "continue" promotion; never reconstruct prior work from chat memory.
-        runtime_data["project_last_task_result"] = _last_result
+    # Host-built ground truth about what THIS lane may continue: Main's bounded
+    # manifest, a project room's own hint (its recent ROOT results and the roots
+    # still live in it) and the thread's most recent result (id/status/workspace
+    # facts/artifact refs). Read these before framing a "continue" promotion;
+    # never reconstruct prior work from chat memory. What promote ACCEPTS is the
+    # predicate in ARCHITECTURE ch. 10 - these rows are the hint, not the door.
+    for _routing_key in (
+        "main_routing_manifest", "project_routing_manifest", "project_last_task_result",
+    ):
+        _routing_fact = _meta.get(_routing_key)
+        if isinstance(_routing_fact, dict) and _routing_fact:
+            runtime_data[_routing_key] = _routing_fact
     _routing_contract = (
         _meta.get("routing_contract")
         if isinstance(_meta.get("routing_contract"), dict)
