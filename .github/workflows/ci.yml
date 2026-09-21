@@ -120,8 +120,6 @@ jobs:
         id: setup_node
         with:
           node-version: '22'
-          cache: 'pnpm'
-          cache-dependency-path: site/pnpm-lock.yaml
       # Independent checks keep running after a red sibling; setup outcomes suppress cascaded noise.
       - name: Verify generated Pages output
         if: ${{ !cancelled() && steps.setup_pnpm.outcome == 'success' && steps.setup_node.outcome == 'success' }}
@@ -253,7 +251,7 @@ jobs:
           install: rsync
       - name: Select Windows POSIX test utilities
         id: select_posix_tools
-        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.posix_tools.outcome == 'success' }}
         shell: pwsh
         run: '"${{ steps.posix_tools.outputs.msys2-location }}\usr\bin" >> $env:GITHUB_PATH'
       # Independent checks keep running after a red sibling; setup outcomes suppress cascaded noise.
@@ -818,6 +816,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: e2e-live-run
+          overwrite: true
           path: |
             ${{ runner.temp }}/e2e_live/run_manifest.json
             ${{ runner.temp }}/e2e_live/result_index.jsonl
@@ -1068,6 +1067,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: android-native-ui-api-${{ matrix.api-level }}
+          overwrite: true
           path: |
             ${{ runner.temp }}/android-smoke/screenshots/
             ${{ runner.temp }}/android-smoke/emulator.log
