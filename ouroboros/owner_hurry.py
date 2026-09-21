@@ -34,6 +34,9 @@ import logging
 import pathlib
 from typing import Any, Callable, Dict, List, Optional
 
+from ouroboros.review_projection import (
+    PLAN_REVIEW_ANSWERED_OPEN, PLAN_REVIEW_NONE_ANSWERED, PLAN_REVIEW_UNANSWERED,
+)
 from ouroboros.utils import update_json_locked, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -483,6 +486,32 @@ def plan_wave_only_awaited(wave: Any) -> bool:
     return len(census["answered"]) < quorum or not findings
 
 
+def plan_review_class_facts(wave: Any, *, awaited: bool) -> Dict[str, Any]:
+    """The typed outcome CLASS of an OPEN plan wave at delivery, with its answer counts.
+
+    Closed vocabulary (``review_projection``): ``answered_open`` — every slot
+    answered and the verdict was not closed; ``unanswered`` — at least one slot
+    answered and at least one failed, was refused at $0, expired or was never
+    collected; ``none_answered`` — nobody answered and nobody is merely awaited. The
+    awaited case is ``review_only_awaited`` and carries no class; the counts ride in
+    every case for the mind's own reading of the gate."""
+    from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
+
+    census = plan_wave_slot_census(wave)
+    answered, configured = len(census["answered"]), int(census["configured"])
+    facts: Dict[str, Any] = {"reviewers_answered": answered, "reviewers_configured": configured}
+    silent = any(census[name] for name in ("failed", "skipped", "unresolved", "uncollected"))
+    if awaited or not configured:
+        return facts
+    if answered == configured:
+        facts["plan_review_class"] = PLAN_REVIEW_ANSWERED_OPEN
+    elif answered and silent:
+        facts["plan_review_class"] = PLAN_REVIEW_UNANSWERED
+    elif not answered and not census["awaiting"]:
+        facts["plan_review_class"] = PLAN_REVIEW_NONE_ANSWERED
+    return facts
+
+
 def force_plan_decision(
     ctx: Any, llm_trace: Dict[str, Any], *,
     hard_rail: str = "", enforcement: Optional[str] = None,
@@ -558,6 +587,10 @@ def force_plan_decision(
         if (decision.get("status") == "advisory_open" and not hard_rail
                 and not decision.get("review_capacity_reason") and plan_wave_only_awaited(wave)):
             decision["review_only_awaited"] = True
+    if wave:
+        # The open wave's typed outcome class and its answer counts ride the decision
+        # into the delivery record (outcomes.derive_loop_outcome) and the forced prompt.
+        decision.update(plan_review_class_facts(wave, awaited=bool(decision.get("review_only_awaited"))))
     if hurry_armed and str(enforcement or "").lower() == "blocking":
         # Attribution only (task detail); this changes no global enforcement.
         decision["owner_hurry_local_advisory"] = True

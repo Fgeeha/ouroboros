@@ -374,6 +374,24 @@ def test_budget_rejection_before_any_work_is_a_host_notice(monkeypatch):
     assert usage["reason_code"] == "budget_exhausted"
 
 
+def test_the_round_one_budget_rejection_still_makes_no_call_and_gains_no_facts_block(monkeypatch):
+    """A no-call rail never enters the forced prompt, so the typed facts block that
+    rides ``_prepare_forced_prompt`` cannot turn it into an LLM call."""
+    import ouroboros.loop as L
+
+    def never(*_a, **_k):
+        raise AssertionError("a no-call rail entered _prepare_forced_prompt")
+
+    monkeypatch.setattr(L, "_prepare_forced_prompt", never)
+    ctx = _rail_ctx(task_id="t-budget", round_idx=1)
+    result = L._check_budget_limits(ctx, 0.0)
+    assert result is not None
+    text, usage, _trace = result
+    assert text.startswith("🚫 Task rejected") and "[TASK_STATE_FACTS]" not in text
+    assert usage["terminal_origin"] == L.TERMINAL_ORIGIN_HOST_NOTICE
+    assert usage["reason_code"] == "budget_exhausted"
+
+
 def test_a_host_notice_publishes_its_own_words_with_its_markdown(tmp_path):
     """A notice is NOT salvage: replacing its text with the outage receipt would
     name the wrong cause, and dropping its markdown would render the host's own
@@ -481,6 +499,43 @@ def test_a_non_provider_rail_with_a_complete_candidate_stays_model_final(tmp_pat
     assert usage["terminal_host_notice"] == "Plan review was left open."
     assert usage["terminal_origin"] == loop.TERMINAL_ORIGIN_MODEL_FINAL
     assert usage["terminal_plan_review_open"] is True
+
+
+def test_the_normal_rail_types_an_open_plan_review(tmp_path, monkeypatch):
+    """The forced rails typed the fact; the normal rail left it to the single
+    degraded_reason slot, which an unsettled child overwrites, so the plan fact
+    survived only as prose. Now every rail that discloses types it, and a clean
+    finalization stores no field at all (absent means "not stated")."""
+    import queue
+
+    from ouroboros.task_finalization import terminal_result_fields
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    for suffix, expected in (("\n\nPlan review is still open.", True), ("", False)):
+        loop, registry, limit_ctx, trace = _forced_test_context(tmp_path / str(expected))
+        monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+        monkeypatch.setattr(loop, "_maybe_inject_finalization_nudges", lambda *_a, **_k: False)
+        monkeypatch.setattr(loop, "_force_plan_disclosure", lambda *_a, **_k: suffix)
+        text, usage, _trace = loop._no_tool_final_answer(
+            "Complete answer.", limit_ctx, trace, registry, queue.Queue(), set(), lambda _t: None)
+        assert text == "Complete answer."
+        assert usage["terminal_plan_review_open"] is expected
+        assert ("terminal_plan_review_open" in terminal_result_fields(usage)) is expected
+        assert ("terminal_host_notice" in usage) is expected  # the typed fact never travels alone
+
+
+def test_a_candidateless_fallback_types_the_open_plan_review(tmp_path, monkeypatch):
+    """A host-notice fallback (no delivery candidate) disclosed the open review in
+    prose while nothing typed carried it; the stamp now happens for both arms."""
+    from tests.test_delivery_forced_finalization import _forced_test_context
+
+    loop, _registry, limit_ctx, _trace = _forced_test_context(tmp_path)
+    monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (None, 0.0))
+    monkeypatch.setattr(loop, "_force_plan_disclosure", lambda *_a, **_k: "\n\nPlan review is still open.")
+    _text, usage, _returned = loop._handle_round_limit(limit_ctx)
+    assert usage["terminal_origin"] == loop.TERMINAL_ORIGIN_HOST_NOTICE
+    assert usage["terminal_plan_review_open"] is True
+    assert usage["terminal_host_notice"].startswith("Plan review is still open.")
 
 
 def test_a_non_provider_rail_without_a_candidate_is_a_host_notice(tmp_path, monkeypatch):

@@ -28,14 +28,18 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 100300 -> 100900: the Project completion mirror adds a typed key and a
     # second rendering to "Main rows"; the stale sentence is replaced, and the
     # new mechanism (gate, ordinary-message path, decorator) has no older text to displace.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 100900,
+    # 100900 -> 101700: the ONE explanatory line states every fact (the assembler's clauses
+    # replace the single-cause sentence); the Telegram non-clean line has no older text.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 101700,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     "docs/architecture/05-supervisor-loop.md": 27137,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
     # replaced, the rest has no older text to displace.
-    "docs/architecture/06-agent-core.md": 287600,
+    # 287600 -> 289400: scene A/C2/C3 sentences replace the progress-identity, advisory and
+    # split sentences; the plan-review class and the advisory-open cardinality have no older text.
+    "docs/architecture/06-agent-core.md": 289400,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,

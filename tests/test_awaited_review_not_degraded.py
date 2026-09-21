@@ -37,7 +37,7 @@ NO_QUORUM_NOTICE = (
     "\n\n⚠️ Plan review is still open (DEGRADED; no parseable reviewer quorum); work proceeded "
     "under the owner-selected advisory enforcement."
 )
-ADVISORY_SENTENCE = "Plan review never closed; the work continued under advisory enforcement."
+ADVISORY_SENTENCE = "The plan review was never closed; the work went on with what the reviewers said."
 AWAITED_SENTENCE = "Not every plan reviewer had answered when the task ended."
 
 
@@ -223,6 +223,93 @@ def test_a_wait_beside_a_real_failure_is_not_a_mere_wait(harness, panel):
     assert "review_only_awaited" not in decision
 
 
+def _class_outcome(tmp_path, monkeypatch, decision):
+    """Finalize over a projected decision and return (outcome, the record's execution axis)."""
+    _usage, _trace, outcome, record = _finalize(tmp_path, monkeypatch, decision)
+    return outcome, record["outcome_axes"]["execution"]
+
+
+def test_the_gate_decision_names_the_plan_review_class(harness, panel, tmp_path, monkeypatch):
+    """From REAL waves through ``force_plan_decision``: an only-awaited wave carries no
+    class; one answer beside two failures is ``unanswered``; three failures are
+    ``none_answered``; three answers left open by REVISE_PLAN are ``answered_open``;
+    a closed wave carries nothing. The class then rides ``execution.plan_review``
+    while the execution status, reason code, failure and ``degraded_reason`` stay
+    byte-identical to a decision without it."""
+    harness.state["enforcement"] = "advisory"
+    ctx = harness.make_ctx()
+    _call(ctx)
+    assert _wait_until(lambda: _sent(panel) == 3)
+    awaited = force_plan_decision(ctx, {}, enforcement="advisory")
+    assert awaited["review_only_awaited"] is True and "plan_review_class" not in awaited
+    assert (awaited["reviewers_answered"], awaited["reviewers_configured"]) == (0, 3)
+
+    panel["s2"].answer = panel["s3"].answer = "this is not a findings document"
+    for slot in ("s1", "s2", "s3"):
+        panel[slot].release.set()
+    assert _settled(harness, 3)
+    unanswered = force_plan_decision(ctx, {}, enforcement="advisory")
+    assert unanswered["plan_review_class"] == "unanswered" and "review_only_awaited" not in unanswered
+    assert (unanswered["reviewers_answered"], unanswered["reviewers_configured"]) == (1, 3)
+
+    # The record: the class rides the execution axis and nothing else moves.
+    outcome, execution = _class_outcome(tmp_path / "unanswered", monkeypatch, unanswered)
+    plain, plain_execution = _class_outcome(tmp_path / "plain", monkeypatch, {
+        key: value for key, value in unanswered.items()
+        if key not in {"plan_review_class", "reviewers_answered", "reviewers_configured"}})
+    assert execution["plan_review"] == "unanswered" and "plan_review" not in plain_execution
+    for key in ("status", "reason_code", "failure"):
+        assert execution[key] == plain_execution[key], key
+    assert (outcome["degraded"], outcome["degraded_reason"], outcome["reason_code"]) == (
+        plain["degraded"], plain["degraded_reason"], plain["reason_code"]) == (True, "plan_review_advisory", "plan_review_advisory")
+    assert _completion_verdict({"status": "completed", "reason_code": outcome["reason_code"],
+                                "outcome_axes": outcome["outcome_axes"]}, {}) == (
+        "Only some of the plan reviewers answered; the work went on with their notes.")
+
+
+def test_every_other_real_wave_names_its_class(harness, panel):
+    harness.state["enforcement"] = "advisory"
+    for slot in ("s1", "s2", "s3"):
+        panel[slot].answer = "this is not a findings document"
+    ctx = harness.make_ctx()
+    _call(ctx)
+    assert _wait_until(lambda: _sent(panel) == 3)
+    for slot in ("s1", "s2", "s3"):
+        panel[slot].release.set()
+    assert _settled(harness, 3)
+    none = force_plan_decision(ctx, {}, enforcement="advisory")
+    assert none["plan_review_class"] == "none_answered" and none["reviewers_answered"] == 0
+
+
+def test_an_open_wave_every_reviewer_answered_is_answered_open(harness, panel):
+    harness.state["enforcement"] = "advisory"
+    for slot in ("s1", "s2", "s3"):
+        panel[slot].answer = json.dumps([_finding("b1", "blocking", breaks="claim_1")])
+    ctx = harness.make_ctx()
+    _call(ctx)
+    assert _wait_until(lambda: _sent(panel) == 3)
+    for slot in ("s1", "s2", "s3"):
+        panel[slot].release.set()
+    assert _settled(harness, 3)
+    decision = force_plan_decision(ctx, {}, enforcement="advisory")
+    assert decision["outcome"] == "REVISE_PLAN" and decision["closed"] is False
+    assert decision["plan_review_class"] == "answered_open"
+    assert (decision["reviewers_answered"], decision["reviewers_configured"]) == (3, 3)
+
+
+def test_a_closed_wave_carries_no_class(harness, panel):
+    harness.state["enforcement"] = "advisory"
+    ctx = harness.make_ctx()
+    _call(ctx)
+    assert _wait_until(lambda: _sent(panel) == 3)
+    for slot in ("s1", "s2", "s3"):
+        panel[slot].release.set()
+    assert _settled(harness, 3)
+    decision = force_plan_decision(ctx, {}, enforcement="advisory")
+    assert decision["closed"] is True and decision["status"] == "closed"
+    assert not {"plan_review_class", "reviewers_answered"} & decision.keys()
+
+
 def test_a_spent_cap_keeps_its_own_outcome_under_advisory(monkeypatch):
     """The gate's typed capacity fact outranks the wait: nothing about a spent cap changes."""
     from ouroboros import owner_hurry, task_results
@@ -308,7 +395,10 @@ def test_every_other_open_plan_review_keeps_todays_degraded_outcome(tmp_path, mo
     assert trace["delivery_candidate"]["degraded_reason"] == "plan_review_advisory"
     assert outcome["degraded"] is True and outcome["reason_code"] == "plan_review_advisory"
     execution = outcome["outcome_axes"]["execution"]
-    assert execution["status"] == "degraded" and "plan_review" not in execution
+    # The AWAITING fact never leaks onto a degraded task; a projected decision
+    # with no wave class stamps nothing else either (the class rides a real wave).
+    assert execution["status"] == "degraded" and execution.get("plan_review") != "awaiting"
+    assert "plan_review" not in execution
     assert execution["failure"] == {"kind": "finalization_control", "reason_code": "plan_review_advisory"}
     assert outcome["outcome_axes"]["objective"] == {
         "status": "degraded", "source": "delivery_finalization_control", "review_status": "skipped"}

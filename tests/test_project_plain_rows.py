@@ -391,6 +391,23 @@ def _a4_result(**overrides):
     return result
 
 
+def test_the_task_summary_row_carries_reason_detail_only_when_there_is_a_cause(tmp_path):
+    """C6 (w): the durable row's ``reason_detail`` equals the renderer's own clause
+    when a cause exists, and the key is ABSENT when the verdict is empty — an
+    always-written empty key would be a claim of its own."""
+    from ouroboros.project_dialogue import _completion_verdict, append_terminal_task_projection
+
+    root = {"id": "root-project", "project_id": "launch", "title": "Ship release", "chat_id": 1}
+    clean = _a4_result(outcome_axes={"execution": {"status": "ok"}, "review": {"status": "skipped"}})
+    assert _completion_verdict(clean, {}) == ""
+    assert append_terminal_task_projection(tmp_path, "root-project", root, clean,
+                                           {"status": "completed", "outcome_axes": clean["outcome_axes"]})
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    (projection,) = [row for row in rows if row.get("summary_kind") == "terminal_root_projection"]
+    assert projection["outcome"] == "Done" and "reason_detail" not in projection
+
+
 def test_host_verdict_states_an_unaccepted_acceptance_decision_in_its_own_words():
     """S5-04: a warning caused by REVIEW used to be explained by the execution
     reason that happened to sit beside it (``Reason: final_message``), which
@@ -504,7 +521,7 @@ def test_host_verdict_leads_both_lifecycle_rows(tmp_path, monkeypatch):
     ) is True
     assert queued[0]["text"] == (
         "Launch 🚀 › Ship release · Done with warnings\n"
-        "No reviewer verdict was established for this answer. "
+        "No reviewer gave a verdict on this answer. "
         "Open the Project for details."
     )
     assert "final_message" not in queued[0]["text"]
@@ -533,8 +550,11 @@ def test_host_verdict_leads_both_lifecycle_rows(tmp_path, monkeypatch):
     projection = next(row for row in rows if row.get("summary_kind") == "terminal_root_projection")
     assert projection["text"] == (
         "Done with warnings. Root task root-project. "
-        "No reviewer verdict was established for this answer."
+        "No reviewer gave a verdict on this answer."
     )
+    # C6: the same clause rides the row as a FIELD for transports with no card,
+    # exactly as the renderer composed it, and only when there is a cause.
+    assert projection["reason_detail"] == "No reviewer gave a verdict on this answer."
     assert "final_message" not in projection["text"]
     # The room is the project and result_ref is the reader, so neither the id
     # soup nor a tool name has to be spelled into owner-visible prose.

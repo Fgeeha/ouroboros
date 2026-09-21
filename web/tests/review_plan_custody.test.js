@@ -55,9 +55,10 @@ const expandedHtml = (group) => renderReviewsSection([group], {
     expandedAttempts: new Set([`${group.id}:${group.attempts[0].id}`]),
 });
 
-const availabilityLines = (attempt, prefix) => attempt.detailText
+// A reviewer row is `<model> · <state>`; the marker is the state word, never a slot id.
+const availabilityLines = (attempt, marker) => attempt.detailText
     .split('\n')
-    .filter((line) => line.startsWith(prefix));
+    .filter((line) => line.includes(marker));
 
 test('a plan wave whose reviewers may still answer reads as work in progress', () => {
     const group = planGroup({
@@ -71,12 +72,12 @@ test('a plan wave whose reviewers may still answer reads as work in progress', (
     assert.equal(attempt.verdict, 'DEGRADED');
     assert.equal(group.verdict, 'DEGRADED');
     assert.match(attempt.detailText, /^Verdict: none \(wave held open\)$/m);
-    assert.deepEqual(availabilityLines(attempt, 'Awaiting answer:'), [
-        'Awaiting answer: triad_286lhb · codex=gpt-6-astra',
-        'Awaiting answer: triad_bkydwq · codex=gpt-6-astra',
+    assert.deepEqual(availabilityLines(attempt, ' · awaiting'), [
+        'codex=gpt-6-astra · awaiting',
+        'codex=gpt-6-astra · awaiting',
     ]);
-    assert.deepEqual(availabilityLines(attempt, 'Reviewer unavailable:'), []);
-    assert.doesNotMatch(attempt.detailText, /Pending dispatch/);
+    assert.deepEqual(availabilityLines(attempt, ' · unavailable'), []);
+    assert.doesNotMatch(attempt.detailText, /Pending dispatch|triad_/);
 
     const html = expandedHtml(group);
     assert.match(html, /chat-review-group working/);
@@ -87,26 +88,28 @@ test('a plan wave whose reviewers may still answer reads as work in progress', (
     assert.doesNotMatch(html, /DEGRADED|\d unavailable/);
 });
 
-test('a settled wave without quorum keeps its warning, its verdict and its unavailable reviewers', () => {
+test('a settled wave without quorum reads no verdict in the neutral tone and names its unavailable reviewers', () => {
     const group = planGroup({
         custody_pending: false,
         actors: [{ ...FAILED, slot_id: 'triad_286lhb' }, FAILED],
     });
     const attempt = group.attempts[0];
-    assert.equal(attempt.tone, 'warn');
-    assert.equal(group.tone, 'warn');
-    assert.equal(attempt.progress, '');
-    assert.match(attempt.detailText, /^Verdict: DEGRADED$/m);
-    assert.deepEqual(availabilityLines(attempt, 'Reviewer unavailable:'), [
-        'Reviewer unavailable: triad_286lhb · codex=gpt-6-astra — run_failed',
-        'Reviewer unavailable: triad_bkydwq · codex=gpt-6-astra — run_failed',
+    // The stored DEGRADED word is the host's placeholder: it stays on the record and never paints.
+    assert.equal(attempt.tone, 'neutral');
+    assert.equal(group.tone, 'neutral');
+    assert.equal(attempt.verdict, 'DEGRADED');
+    assert.equal(attempt.progress, 'no verdict · 0 of 2 answered · 2 unavailable');
+    assert.match(attempt.detailText, /^Verdict: none — fewer reviewers answered than needed$/m);
+    assert.deepEqual(availabilityLines(attempt, ' · unavailable'), [
+        'codex=gpt-6-astra · unavailable',
+        'codex=gpt-6-astra · unavailable',
     ]);
-    assert.deepEqual(availabilityLines(attempt, 'Awaiting answer:'), []);
+    assert.deepEqual(availabilityLines(attempt, ' · awaiting'), []);
 
     const html = expandedHtml(group);
-    assert.match(html, /chat-review-group warn/);
-    assert.match(html, /chat-review-group-meta">DEGRADED/);
-    assert.doesNotMatch(html, /in progress/);
+    assert.match(html, /chat-review-group neutral/);
+    assert.match(html, /chat-review-group-meta">no verdict · 0 of 2 answered · 2 unavailable/);
+    assert.doesNotMatch(html, /in progress|DEGRADED|run_failed/);
 
     // A slot that settled after the wave closed is a terminal answer too: only
     // the typed wait states change the wording.
@@ -114,9 +117,36 @@ test('a settled wave without quorum keeps its warning, its verdict and its unava
         custody_pending: false,
         actors: [{ ...FAILED, operation_state: 'late_settled', late_result_pending: true }],
     });
-    assert.deepEqual(availabilityLines(late.attempts[0], 'Reviewer unavailable:'), [
-        'Reviewer unavailable: triad_bkydwq · codex=gpt-6-astra — run_failed',
+    assert.deepEqual(availabilityLines(late.attempts[0], ' · unavailable'), [
+        'codex=gpt-6-astra · unavailable',
     ]);
+    // A settled wave with a real verdict word keeps it: only the placeholder is replaced.
+    const revise = planGroup({ custody_pending: false, aggregate: 'REVISE_PLAN', actors: [ANSWERED] });
+    assert.equal(revise.attempts[0].progress, '');
+    assert.match(revise.attempts[0].detailText, /^Verdict: REVISE_PLAN$/m);
+});
+
+test('a dead reviewer row quotes the reported sentence and never the code', () => {
+    const cause = 'Selected model is at capacity.\nPlease try a different model.';
+    const dead = { ...FAILED, reported_cause: cause };
+    const group = planGroup({ custody_pending: false, actors: [dead, ANSWERED] });
+    const attempt = group.attempts[0];
+    assert.deepEqual(availabilityLines(attempt, ' · unavailable'), [
+        'codex=gpt-6-astra · unavailable — "Selected model is at capacity. Please try a different model."',
+    ]);
+    assert.doesNotMatch(attempt.detailText, /run_failed|triad_|ended failed/);
+    assert.equal(attempt.progress, 'no verdict · 1 of 2 answered · 1 unavailable');
+    // Without a reported sentence the row ends at the state word; the code stays in Logs.
+    const silent = planGroup({ custody_pending: false, actors: [{ ...FAILED, reported_cause: '' }, ANSWERED] });
+    assert.deepEqual(availabilityLines(silent.attempts[0], ' · unavailable'), ['codex=gpt-6-astra · unavailable']);
+    // A $0 refusal was never sent the plan: it is not called unavailable.
+    const refused = planGroup({
+        custody_pending: false,
+        actors: [{ ...FAILED, operation_state: 'not_dispatched', failure_code: 'subscription_window_exhausted' }, ANSWERED],
+    });
+    assert.deepEqual(availabilityLines(refused.attempts[0], ' · not sent'), ['codex=gpt-6-astra · not sent']);
+    assert.deepEqual(availabilityLines(refused.attempts[0], ' · unavailable'), []);
+    assert.equal(refused.attempts[0].progress, 'no verdict · 1 of 2 answered · 1 unavailable');
 });
 
 test('an in-flight wave names its failed slot and its awaited slot separately', () => {
@@ -125,11 +155,11 @@ test('an in-flight wave names its failed slot and its awaited slot separately', 
         actors: [ANSWERED, FAILED, { ...AWAITING, slot_id: 'triad_qq41xk' }],
     });
     const attempt = group.attempts[0];
-    assert.deepEqual(availabilityLines(attempt, 'Awaiting answer:'), [
-        'Awaiting answer: triad_qq41xk · codex=gpt-6-astra',
+    assert.deepEqual(availabilityLines(attempt, ' · awaiting'), [
+        'codex=gpt-6-astra · awaiting',
     ]);
-    assert.deepEqual(availabilityLines(attempt, 'Reviewer unavailable:'), [
-        'Reviewer unavailable: triad_bkydwq · codex=gpt-6-astra — run_failed',
+    assert.deepEqual(availabilityLines(attempt, ' · unavailable'), [
+        'codex=gpt-6-astra · unavailable',
     ]);
     assert.match(attempt.detailText, /^Verdict: none \(wave held open\)$/m);
     // A slot that is neither answered nor awaited keeps the wave's warning.
@@ -148,10 +178,10 @@ test('a reviewer whose window expired stays unresolved instead of awaited', () =
     };
     const group = planGroup({ custody_pending: true, actors: [ANSWERED, lost] });
     const attempt = group.attempts[0];
-    assert.deepEqual(availabilityLines(attempt, 'No answer:'), [
-        'No answer: triad_qq41xk · codex=gpt-6-astra — custody_lost: review_custody_lost', // the typed cause stays named
+    assert.deepEqual(availabilityLines(attempt, ' · no answer'), [
+        'codex=gpt-6-astra · no answer — custody_lost: review_custody_lost', // the raw typed state stays a fact in Reviews
     ]);
-    assert.deepEqual(availabilityLines(attempt, 'Awaiting answer:'), []);
+    assert.deepEqual(availabilityLines(attempt, ' · awaiting'), []);
     assert.equal(group.progress, 'unresolved · 1 of 2 answered · 1 unavailable');
     assert.deepEqual([attempt.tone, group.tone], ['warn', 'warn']);
     assert.match(expandedHtml(group), /chat-review-group-meta">unresolved · 1 of 2 answered · 1 unavailable/);
@@ -163,22 +193,22 @@ test('a reviewer whose window expired stays unresolved instead of awaited', () =
     assert.match(expandedHtml(mixed), /chat-review-group-meta">in progress · 1 of 3 answered · 1 unavailable/);
 });
 
-test('a wave recorded without the typed custody fields renders exactly as before', () => {
+test('a wave recorded without the typed custody fields reads the same plain family', () => {
     const group = planGroup({
         actors: [{ slot_id: 'slot_3', model: 'openai/gpt-5.6-sol', ok: false, failure_code: 'window_exhausted' }],
     });
     const attempt = group.attempts[0];
-    assert.equal(attempt.tone, 'warn');
-    assert.equal(attempt.progress, '');
+    assert.equal(attempt.tone, 'neutral');
+    assert.equal(attempt.progress, 'no verdict · 0 of 1 answered · 1 unavailable');
     assert.equal(attempt.detailText, [
-        'Verdict: DEGRADED',
+        'Verdict: none — fewer reviewers answered than needed',
         'Closed: no',
         'Reviewer panel dispatched: yes',
         'Findings: 0 blocking · 3 note · 0 need_evidence',
-        'Reviewer unavailable: slot_3 · openai/gpt-5.6-sol — window_exhausted',
+        'openai/gpt-5.6-sol · unavailable',
         'Cost unavailable',
     ].join('\n'));
-    assert.match(expandedHtml(group), /chat-review-group-meta">DEGRADED · 1</);
+    assert.match(expandedHtml(group), /chat-review-group-meta">no verdict · 0 of 1 answered · 1 unavailable · 1</);
 });
 
 test('a plan wave of a task that is not running is a recorded gap, never live work', () => {
@@ -229,22 +259,22 @@ test('an awaited reviewer says since when, in the viewer local clock', () => {
         custody_pending: true,
         actors: [{ ...AWAITING, awaiting_since: sent }, ANSWERED],
     });
-    const [line] = availabilityLines(group.attempts[0], 'Awaiting answer:');
-    assert.match(line, /^Awaiting answer: .* · since \d{2}:\d{2}$/);
-    assert.equal(line, `Awaiting answer: triad_286lhb · codex=gpt-6-astra · since ${localClock(sent)}`);
+    const [line] = availabilityLines(group.attempts[0], ' · awaiting');
+    assert.match(line, /^.* · awaiting · since \d{2}:\d{2}$/);
+    assert.equal(line, `codex=gpt-6-astra · awaiting · since ${localClock(sent)}`);
 });
 
-test('a reviewer row the host never timed keeps exactly its former line', () => {
+test('a reviewer row the host never timed keeps exactly its untimed line', () => {
     // Both directions of the same guard: no field, an empty field and a value that
-    // is not an instant all render byte-identically to the line shipped before.
-    const before = 'Awaiting answer: triad_286lhb · codex=gpt-6-astra';
+    // is not an instant all render byte-identically to the untimed line.
+    const before = 'codex=gpt-6-astra · awaiting';
     for (const awaiting_since of [undefined, '', '   ', 'soon', 'since yesterday']) {
         const group = planGroup({
             custody_pending: true,
             actors: [{ ...AWAITING, ...(awaiting_since === undefined ? {} : { awaiting_since }) }],
         });
         assert.deepEqual(
-            availabilityLines(group.attempts[0], 'Awaiting answer:'), [before], String(awaiting_since),
+            availabilityLines(group.attempts[0], ' · awaiting'), [before], String(awaiting_since),
         );
     }
 });
@@ -253,9 +283,9 @@ test('a wait that began on an earlier day names that day too', () => {
     // "since 23:50" must never be misread as tonight when the wait is 30 hours old.
     const sent = daysAgoAt(1, 23, 50);
     const group = planGroup({ custody_pending: true, actors: [{ ...AWAITING, awaiting_since: sent }] });
-    const [line] = availabilityLines(group.attempts[0], 'Awaiting answer:');
-    assert.equal(line, `Awaiting answer: triad_286lhb · codex=gpt-6-astra · since ${localDay(sent)} ${localClock(sent)}`);
-    assert.doesNotMatch(line, /^Awaiting answer: .* · since \d{2}:\d{2}$/);
+    const [line] = availabilityLines(group.attempts[0], ' · awaiting');
+    assert.equal(line, `codex=gpt-6-astra · awaiting · since ${localDay(sent)} ${localClock(sent)}`);
+    assert.doesNotMatch(line, /^.* · awaiting · since \d{2}:\d{2}$/);
 });
 
 test('an unresolved reviewer says since when it was sent, under the same rule', () => {
@@ -265,12 +295,12 @@ test('an unresolved reviewer says since when it was sent, under the same rule', 
         error: 'Review custody was lost before the slot settled',
     };
     const timed = planGroup({ custody_pending: true, actors: [{ ...lost, awaiting_since: sent }] });
-    assert.deepEqual(availabilityLines(timed.attempts[0], 'No answer:'), [
-        `No answer: triad_286lhb · codex=gpt-6-astra — custody_lost: review_custody_lost · since ${localClock(sent)}`,
+    assert.deepEqual(availabilityLines(timed.attempts[0], ' · no answer'), [
+        `codex=gpt-6-astra · no answer — custody_lost: review_custody_lost · since ${localClock(sent)}`,
     ]);
     const untimed = planGroup({ custody_pending: true, actors: [lost] });
-    assert.deepEqual(availabilityLines(untimed.attempts[0], 'No answer:'), [
-        'No answer: triad_286lhb · codex=gpt-6-astra — custody_lost: review_custody_lost',
+    assert.deepEqual(availabilityLines(untimed.attempts[0], ' · no answer'), [
+        'codex=gpt-6-astra · no answer — custody_lost: review_custody_lost',
     ]);
 });
 
@@ -280,8 +310,8 @@ test('a settled reviewer never grows a since suffix', () => {
         custody_pending: false,
         actors: [{ ...FAILED, awaiting_since: todayAt(6, 30) }],
     });
-    assert.deepEqual(availabilityLines(group.attempts[0], 'Reviewer unavailable:'), [
-        'Reviewer unavailable: triad_bkydwq · codex=gpt-6-astra — run_failed',
+    assert.deepEqual(availabilityLines(group.attempts[0], ' · unavailable'), [
+        'codex=gpt-6-astra · unavailable',
     ]);
 });
 

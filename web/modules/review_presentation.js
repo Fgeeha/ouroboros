@@ -420,16 +420,18 @@ function planAttempt(wave, index, isCurrent, live) {
     const state = custodyPending && live ? 'running' : superseded ? 'superseded' : 'terminal';
     const roster = (Array.isArray(wave.actors) ? wave.actors : [])
         .filter((actor) => actor && typeof actor === 'object');
-    // A wave whose reviewers may still answer reports how far it got; the
-    // verdict token speaks only for a wave that is no longer collecting.
-    const [progress, heldTone] = custodyPending ? heldProgress(
-        roster.some(actorUnresolved) && !roster.some(actorAwaiting) ? 'unresolved' : (live ? 'in progress' : 'no verdict'), roster, (actor) => actor.ok === true) : ['', ''];
+    // A wave whose reviewers may still answer reports how far it got; a settled wave
+    // whose reviewers were too few for a verdict reports the same counts in the neutral
+    // tone (the stored DEGRADED word is the host's placeholder and never paints).
+    const settledNoQuorum = !custodyPending && verdict === 'DEGRADED';
+    const [progress, heldTone] = custodyPending || settledNoQuorum ? heldProgress(
+        custodyPending && roster.some(actorUnresolved) && !roster.some(actorAwaiting) ? 'unresolved' : (custodyPending && live ? 'in progress' : 'no verdict'), roster, (actor) => actor.ok === true) : ['', ''];
     return {
         id,
         surface: 'plan',
         state,
         progress,
-        tone: heldTone || statusTone(state, custodyPending ? '' : verdict),
+        tone: settledNoQuorum ? 'neutral' : heldTone || statusTone(state, custodyPending ? '' : verdict),
         verdict,
         timestamp: text(wave.reviewed_at || wave.ts || wave.timestamp || wave.closed_at),
         ordinal: index,
@@ -529,20 +531,18 @@ function planFindingLines(wave) {
 
 function planActorAvailabilityLines(wave) {
     // The bug report's own bar: a result that was never received must say so
-    // explicitly instead of contributing silently-zero findings.
+    // explicitly instead of contributing silently-zero findings. A row names the
+    // model and quotes the engine's reported sentence; the failure code and the
+    // slot id stay in the task detail and Logs (an unresolved slot keeps its raw state).
     const lines = [];
     for (const actor of (Array.isArray(wave.actors) ? wave.actors : [])) {
         if (!actor || typeof actor !== 'object' || actor.ok !== false) continue;
-        const identity = [text(actor.slot_id), text(actor.model)].filter(Boolean).join(' · ') || 'reviewer';
-        const gap = actorAwaiting(actor)
-            ? `Awaiting answer: ${identity}${sinceLocalTime(actor.awaiting_since)}`
-            : (actorUnresolved(actor) ? `No answer: ${identity} — ${[text(actor.operation_state), text(actor.failure_code) || text(actor.error)].filter(Boolean).join(': ')}${sinceLocalTime(actor.awaiting_since)}` : '');
-        if (gap) {
-            lines.push(gap);
-            continue;
-        }
-        const cause = text(actor.failure_code) || text(actor.error) || 'no parseable verdict';
-        lines.push(`Reviewer unavailable: ${identity} — ${cause}`);
+        const model = text(actor.model) || 'reviewer';
+        const cause = text(actor.reported_cause).split(/\s+/).join(' ');
+        if (actorAwaiting(actor)) lines.push(`${model} · awaiting${sinceLocalTime(actor.awaiting_since)}`);
+        else if (actorUnresolved(actor)) lines.push(`${model} · no answer — ${[text(actor.operation_state), text(actor.failure_code) || text(actor.error)].filter(Boolean).join(': ')}${sinceLocalTime(actor.awaiting_since)}`);
+        else if (text(actor.operation_state) === 'not_dispatched') lines.push(`${model} · not sent`);
+        else lines.push(`${model} · unavailable${cause ? ` — "${cause}"` : ''}`);
     }
     return lines;
 }
@@ -551,7 +551,7 @@ function planWaveDetail(wave) {
     const lines = [
         wave.custody_pending === true
             ? 'Verdict: none (wave held open)'
-            : (wave.aggregate ? `Verdict: ${wave.aggregate}` : ''),
+            : (text(wave.aggregate) === 'DEGRADED' ? 'Verdict: none — fewer reviewers answered than needed' : (wave.aggregate ? `Verdict: ${wave.aggregate}` : '')),
         wave.closed != null ? `Closed: ${wave.closed ? 'yes' : 'no'}` : '',
         wave.paid != null ? `Reviewer panel dispatched: ${wave.paid ? 'yes' : 'no'}` : '',
         wave.quorum_unreachable ? 'Quorum unavailable' : '',
