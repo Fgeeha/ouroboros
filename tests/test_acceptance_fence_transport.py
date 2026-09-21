@@ -266,7 +266,7 @@ def test_late_ack_of_a_previous_request_is_read_by_nobody(monkeypatch, tmp_path,
         with pytest.raises(TimeoutError):
             agent._inspect_acceptance_fence(token=token)
         stalled.resume()  # the loop catches up and answers the inspect LATE
-        assert stalled.drained(2)
+        assert stalled.drained(1)  # a read is sent once, never re-sent
         late = _ack_names(tmp_path)
         assert late and all(name.startswith(f"{token}.") for name in late)
 
@@ -297,14 +297,23 @@ def test_pooled_request_is_resent_once_with_the_same_identity(monkeypatch, tmp_p
     assert (first["token"], first["req"]) == (second["token"], second["req"]) == (ack["token"], first["req"])
     assert queue_mod.ACCEPTANCE_FENCES["root-1"]["token"] == ack["token"]
 
-    # Never answered: exactly ONE re-send, then a TimeoutError — no loop, no long wait.
+    # A transition never answered: exactly ONE re-send, then a TimeoutError — no loop, no long wait.
     silent: stdqueue.Queue = stdqueue.Queue()
     started = time.monotonic()
     with pytest.raises(TimeoutError):
-        _pooled_agent(tmp_path, silent)._inspect_acceptance_fence(token=ack["token"])
+        _pooled_agent(tmp_path, silent)._end_acceptance_fence(token=ack["token"], outcome="revision")
     assert time.monotonic() - started < WAIT_SEC * 2 + 2.0
     sent = [silent.get_nowait() for _ in range(silent.qsize())]
     assert len(sent) == 2 and sent[0]["req"] == sent[1]["req"]
+
+    # A READ (inspect is asked many times a turn; its loss is harmless) is never re-sent:
+    # one wait, one event — a stalled supervisor cannot multiply into minutes of host blocking.
+    quiet: stdqueue.Queue = stdqueue.Queue()
+    started = time.monotonic()
+    with pytest.raises(TimeoutError):
+        _pooled_agent(tmp_path, quiet)._inspect_acceptance_fence(token=ack["token"])
+    assert time.monotonic() - started < WAIT_SEC + 2.0
+    assert quiet.qsize() == 1
 
 
 def test_every_request_carries_a_fresh_req_and_one_token_per_logical_begin(monkeypatch, tmp_path, short_wait):

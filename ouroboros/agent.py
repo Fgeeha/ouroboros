@@ -268,8 +268,9 @@ class OuroborosAgent:
         transition (``fence_transition``), it applies the fence in-process — no event,
         no ack file, no wait (lock order: admission lock, then ``_queue_lock``). A pooled
         worker cannot share ``_queue_lock``: it sends the event, polls its own one-shot
-        ack and re-sends the SAME request once; no answer raises ``TimeoutError`` (a gap),
-        a refusal raises ``RuntimeError``. The ack is transport, not a lifecycle authority.
+        ack and re-sends the SAME transition once — a read (``inspect``, asked many times a
+        turn) is never re-sent, its loss is harmless; no answer raises ``TimeoutError`` (a
+        gap), a refusal raises ``RuntimeError``. The ack is transport, not an authority.
         """
         request.setdefault("task_id", str(self._current_task_id or ""))
         transition = getattr(self, "fence_transition", None)
@@ -279,7 +280,7 @@ class OuroborosAgent:
             raise RuntimeError("acceptance fence requires a supervisor event queue")
         else:
             event = {"type": "acceptance_fence", "req": uuid.uuid4().hex, **request}
-            ack = self._send_fence_event(event) or self._send_fence_event(event)
+            ack = self._send_fence_event(event) or (request["action"] != "inspect" and self._send_fence_event(event)) or {}
             if not ack:
                 raise TimeoutError(f"supervisor did not acknowledge acceptance fence {request['action']}")
         if not ack.get("ok", True) or str(ack.get("status") or "") not in accept:
