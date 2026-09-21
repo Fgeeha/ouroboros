@@ -495,6 +495,7 @@ def _frozen_actor(row: Dict[str, Any], slot: Any) -> Any:
         transport_status=str(row.get("transport_status") or ""),
         failure_code=str(row.get("failure_code") or ""),
         reset_at=str(row.get("reset_at") or ""),
+        reported_cause=str(row.get("reported_cause") or ""),
         http_status=http_status,
         parse_status=str(row.get("parse_status") or ""),
         semantic_verdict=str(row.get("semantic_verdict") or ""),

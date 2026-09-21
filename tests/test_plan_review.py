@@ -912,7 +912,7 @@ class TestPlanRowTypedFacts(unittest.TestCase):
         self.assertEqual(plan_row_typed_facts(row), {
             "failure_code": "subscription_window_exhausted",
             "reset_at": "2030-01-01T00:00:00Z", "http_status": 429,
-            "transport_status": "provider_transport_error",
+            "transport_status": "provider_transport_error", "reported_cause": "",
             "capability_delta": [{"reason": "reduced"}],
         })
 
