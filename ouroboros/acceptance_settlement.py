@@ -20,7 +20,10 @@ Main moves on — so they live together:
 * a panel that settles after its task ended is collected at $0, republished on
   the task's own review projection with the host's own settlement note, and
   announced once in the task's room as one row of that card's Reviews group
-  (``attach_late_acceptance_settlement``); no model turn starts (fork 2=A).
+  (``attach_late_acceptance_settlement``); no model turn starts (fork 2=A);
+* a forced rail that ends the turn while the panel is still out collects it at
+  $0 before recording anything, so the rail's "never reviewed" reason is never
+  stamped over a panel that ran (``forced_rail_panel_verdict``).
 """
 from __future__ import annotations
 
@@ -311,6 +314,45 @@ def _deliver_under_running_panel(ctx: Any, prior_run: Any) -> Optional[bool]:
         "reviewers' word (the rewrite itself was not re-reviewed)."
     )
     return False
+
+
+def forced_rail_panel_verdict(tools_ctx: Any, llm_trace: Dict[str, Any], rail_reason: str) -> Dict[str, Any]:
+    """What a forced rail may honestly record about the panel its turn owns.
+
+    Every rail bypass reason says "the answer was never reviewed", so one may
+    be stamped only when no panel ran. The turn's own panel is collected at $0
+    first — the same free collection delivery performs — and then speaks for
+    itself: a clean PASS on the SAME subject accepts the answer on the
+    reviewers' word; reviewers who had not answered leave it unaccepted with
+    ``review_pending``, because an answer that has not arrived is a gap and
+    never a verdict; any other settled outcome leaves it unaccepted with no
+    verdict established. Returns the decision fields the recorder merges — the
+    existing acceptance vocabulary only, no reason is minted here.
+    """
+    from ouroboros.loop_acceptance_review import acceptance_run_pending
+    from ouroboros.loop_delivery import delivery_subject_hash
+    from ouroboros.outcomes import ACCEPTANCE_ACCEPTED
+    from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
+    from ouroboros.review_verdict import task_acceptance_is_clean
+
+    run = next((row for row in reversed(llm_trace.get("review_runs") or [])
+                if isinstance(row, dict) and row.get("authority") == "host_root"), None)
+    if run is None:
+        return {"reason": rail_reason}
+    if acceptance_run_pending(run):
+        try:
+            reconcile_pending_acceptance_runs({"review_runs": [run]}, usage_ctx=tools_ctx,
+                                              drive_root=pathlib.Path(tools_ctx.drive_root))
+        except Exception:
+            log.debug("a forced rail could not collect its own acceptance panel", exc_info=True)
+        if acceptance_run_pending(run):
+            return {"reason": "review_degraded", "review_pending": True}
+    reviewed = (run.get("request") or {}).get("subject", "")
+    if (not task_acceptance_is_clean(SimpleNamespace(**run))
+            or run.get("subject_hash") != delivery_subject_hash(tools_ctx, llm_trace, reviewed)):
+        return {"reason": "review_degraded"}
+    return {"status": ACCEPTANCE_ACCEPTED, "reason": "clean_pass", "reviewer_signal": "PASS",
+            "reviewed_panel_id": str(run.get("panel_id") or "")}
 
 
 def _unsettled_head(run: Dict[str, Any]) -> str:

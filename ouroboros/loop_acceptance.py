@@ -9,6 +9,7 @@ import logging
 import pathlib
 
 from typing import Any, Callable, Dict, List, Optional
+from ouroboros.acceptance_settlement import forced_rail_panel_verdict
 from ouroboros.review_cycles import REASON_REVIEW_CYCLES_EXHAUSTED
 from ouroboros.review_projection import publish_acceptance_checkpoint
 from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, ACCEPTANCE_BYPASS_REASONS, ACCEPTANCE_BYPASS_REASON_BY_RAIL, ACCEPTANCE_DECISION_STATUSES, ACCEPTANCE_FINALIZED_UNACCEPTED, ACCEPTANCE_REVISION_REQUESTED, REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE, REASON_DELIVERY_CONTROL_DEGRADED, REASON_IDENTICAL_ACCEPTANCE_REFUSED, extract_final_answer, turn_has_reviewable_effects
@@ -913,18 +914,18 @@ def _record_forced_acceptance_bypass(
     llm_trace: Dict[str, Any],
     reason_code: str,
 ) -> None:
-    """Typed acceptance-bypass record on a forced rail — a LEDGER write, never a gate.
+    """Typed acceptance record on a forced rail — a LEDGER write, never a gate.
 
-    The panel's only launch site is the voluntary no-tool finalization, so
-    forced exits used to leave the review axis at {skipped, not_eligible,
+    Forced exits used to leave the review axis at {skipped, not_eligible,
     run_count:0} — indistinguishable from "no panel warranted". Stamp the
     terminal truth instead: eligibility is evaluated PURE against the live
     trace (no fence begin, quiescence wait, panel, model round, or prompt text
-    — forced exits are the v6.29 honesty/salvage shelf, byte-identical); an
-    OWED-but-bypassed panel lands as ``finalized_unaccepted`` with a
-    closed-enum reason (`ACCEPTANCE_BYPASS_REASON_BY_RAIL`, v6.54.4
-    deadline-reserve precedent generalized; v6.74.4). Reason tokens stay
-    ledger-only (v6.61.4 token-parroting class). Never raises."""
+    — forced exits are the v6.29 honesty/salvage shelf, byte-identical), and
+    the turn's own panel is COLLECTED at $0 before anything is recorded, so a
+    closed-enum bypass reason (`ACCEPTANCE_BYPASS_REASON_BY_RAIL`) lands only
+    on a turn whose owed panel never ran (`forced_rail_panel_verdict` owns what
+    a collected one says). Reason tokens stay ledger-only (v6.61.4
+    token-parroting class). Never raises."""
     rail_reason = ACCEPTANCE_BYPASS_REASON_BY_RAIL.get(str(reason_code or ""))
     if rail_reason is None:
         return
@@ -950,19 +951,9 @@ def _record_forced_acceptance_bypass(
         return
     trigger = f"bypassed_{reason_code}"
     try:
-        from ouroboros.task_results import resolve_task_lineage
+        from ouroboros.loop_acceptance_review import _resolve_ctx_lineage
 
-        meta = getattr(tools_ctx, "task_metadata", {})
-        meta = meta if isinstance(meta, dict) else {}
-        lineage = resolve_task_lineage(
-            str(ctx.task_id or getattr(tools_ctx, "task_id", "") or ""),
-            metadata=meta,
-            root_task_id=getattr(tools_ctx, "root_task_id", None),
-            parent_task_id=getattr(tools_ctx, "parent_task_id", None),
-            delegation_role=getattr(tools_ctx, "delegation_role", None),
-            original_task_id=getattr(tools_ctx, "original_task_id", None),
-            timeout_retry_from=getattr(tools_ctx, "timeout_retry_from", None),
-        )
+        lineage = _resolve_ctx_lineage(tools_ctx, str(ctx.task_id or ""))
         eligible, probe_trigger = _loop()._task_acceptance_eligible(
             _loop().get_task_review_mode(),
             llm_trace,
@@ -987,6 +978,6 @@ def _record_forced_acceptance_bypass(
     llm_trace["review_decision"] = {"eligibility": "eligible", "trigger": trigger}
     _loop()._set_acceptance_decision(llm_trace, {
         "status": ACCEPTANCE_FINALIZED_UNACCEPTED,
-        "reason": rail_reason,
         "source": "forced_finalization",
+        **forced_rail_panel_verdict(tools_ctx, llm_trace, rail_reason),
     })
