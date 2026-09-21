@@ -920,11 +920,14 @@ def _retire_project_locked(drive_root: Any, gateway: Any, custody: RunCustody) -
     except Exception as exc:
         if not daemon_says_absent(exc):
             log.warning("Failed to retire delegated project %s", custody.project_id, exc_info=True)
-            # The daemon's own refusal text rides the row: "failed" without the
-            # WHY made every retire loop a forensic dig.
+            # The daemon's typed refusal rides the row beside its text: "failed"
+            # without the WHY made every retire loop a forensic dig, and the CODE
+            # is what tells a permanent refusal from one worth retrying.
             emit(drive_root, PROJECT_RETIRE_FAILED, {"run_id": custody.run_id, "task_id": custody.task_id,
                                                      "project_id": custody.project_id,
-                                                     "reason": str(exc)[:500]})
+                                                     "reason": str(exc)[:500],
+                                                     "code": str(getattr(exc, "code", "") or ""),
+                                                     "status": int(getattr(exc, "status_code", 0) or 0)})
             return
     custody.project_owned = False
     for sibling in _CUSTODY.values():
