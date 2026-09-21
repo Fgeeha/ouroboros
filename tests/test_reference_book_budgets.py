@@ -44,7 +44,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # (typed permanent engine refusal, interrupted parent, stalled-loop facts, source-ack
     # pre-check, host-owed round, reviewer tool bound, off-thread custody, fence transport) —
     # new rules, one or two sentences each, so nothing is replaced; ~4 % maintenance margin.
-    "docs/architecture/10-key-invariants.md": 20400,
+    # 20400 -> 20650: the contracts PR adds two more rules the chapter lacked (a cross-process
+    # guard derives from the durable artifact it guards; the predecessor list is a hint and an
+    # emitted promote is a pending fact). Six neighbouring invariants were compressed first
+    # (-153 bytes, no fact removed); the remainder is the cost of the two new rules.
+    "docs/architecture/10-key-invariants.md": 20650,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
     "docs/architecture/12-host-service-companions-and-chat-ids.md": 11007,
     "docs/architecture/13-external-skills-layer.md": 7764,
