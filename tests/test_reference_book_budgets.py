@@ -58,7 +58,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/development/10-platform-abstraction-rule.md": 3316,
     # 27103 -> 27600: one bullet for the Project completion mirror (the engineering
     # twin of the DESIGN paragraph); it describes a new seam, so it replaces nothing.
-    "docs/development/11-design-system.md": 27600,
+    # 27600 -> 28300: the "one owner intent has one control" rule. It REPLACES the
+    # system-message-actions bullet and adds what no older text held: the door, the
+    # regenerate-and-read-the-neighbours duty and what enforces each half.
+    "docs/development/11-design-system.md": 28300,
     "docs/development/12-mcp-client-integration.md": 3313,
     "docs/development/13-gateway-boundary-pattern.md": 2228,
     "docs/development/14-build-and-ci.md": 14958,

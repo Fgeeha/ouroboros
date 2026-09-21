@@ -1393,8 +1393,8 @@ def enqueue_project_completion_summary(
         )
         if not snapshot["project_id"] or not snapshot["project_routable"]:
             # Owner decision 3A: a run whose project id was DERIVED from a
-            # workspace has no room, so Main stays silent instead of offering an
-            # "Open Project" that lands in an empty duplicate of itself. The same
+            # workspace has no room, so Main stays silent instead of offering a
+            # Project reference that lands in an empty duplicate of itself. The same
             # holds once a project is deleting or tombstoned.
             return False
         if not _run_lives_in_its_project(drive_root, tid, snapshot["project_id"], task, result):

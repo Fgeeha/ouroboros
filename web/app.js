@@ -25,7 +25,8 @@ import { initDashboard } from './modules/dashboard.js';
 import { hydrateNavIcons } from './modules/page_icons.js';
 
 import { initOnboardingOverlay } from './modules/onboarding_overlay.js';
-import { installAltMenuSuppression, installDesktopShellLinkInterceptor, renderProjectChip } from './modules/ui_helpers.js';
+import { installAltMenuSuppression, installDesktopShellLinkInterceptor } from './modules/ui_helpers.js';
+import { nameProjectReference, projectReference } from './modules/project_reference.js';
 
 const state = {
     messages: [],
@@ -650,19 +651,11 @@ function renderBoundProjectPointer(card, projectId, chatId = 0) {
     const project = (Array.isArray(lastProjectRows) && lastProjectRows.find((p) => p.id === projectId))
         || { id: projectId, name: projectId, chat_id: chatId };
     let ptr = card.querySelector('.chat-live-bound-pointer');
-    if (!ptr) {
-        ptr = renderProjectChip({
-            name: project.name || project.id,
-            status: 'in project ↗',
-            className: 'chat-live-bound-pointer',
-            // Open-or-noop: openProjectPanel toggles, and a pointer must never close
-            // the panel it points at.
-            onClick: () => { if (navState.activeProjectId !== project.id) openProjectPanel(project); },
-        });
-        card.appendChild(ptr);
-    }
+    // The reference opens through `ouro:open-project`, whose listener below is
+    // open-or-noop and resolves the freshest project row at click time.
+    if (!ptr) card.appendChild(ptr = projectReference(project, { layout: 'footer' }));
     card.dataset.projectBound = '1';
-    ptr.querySelector('.chat-live-project-name').textContent = project.name || project.id;
+    nameProjectReference(ptr, project);
 }
 
 window.addEventListener('ouro:project-created', async (event) => {

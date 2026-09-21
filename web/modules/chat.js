@@ -3,7 +3,7 @@ import { destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown, renderChat
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
-import { renderProjectChip } from './ui_helpers.js';
+import { projectReference } from './project_reference.js';
 import { decorateProjectRow } from './project_answer.js';
 import { bindComposerFileTargets, cleanupUploadedAttachments, createChatMedia, showTaskIncidentToast } from './chat_media.js';
 import { createChatDecision } from './chat_decision.js';
@@ -1110,11 +1110,7 @@ export function createChatInstance({
         delete record.root.dataset.projectCreating;
         record.root.dataset.projectCreated = '1';
         record.root.dataset.projectId = project.id || '';
-        const chip = renderProjectChip({
-            name: String(project.name || project.id || 'Project').trim(),
-            status: 'running in background ↗',
-            onClick: () => window.dispatchEvent(new CustomEvent('ouro:open-project', { detail: { project } })),
-        });
+        const chip = projectReference(project, { layout: 'bar', state: 'background' });
         // Atomic detach-and-reparent (C4.5): replaceChildren swaps the whole live
         // timeline (subagent cards, working bubble) for the chip in one paint.
         record.root.replaceChildren(chip);
