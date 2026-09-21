@@ -164,8 +164,8 @@ canonical deliverables, `skill_payload` for reviewed skill payloads, and
 `user_files` for user-visible files under the owner's home (a bare filename
 lands in the visible Deliverables folder, not the home root).
 `subagent_projects` and `deliverables` are read-only (never written or a
-shell cwd); a subagent reads `deliverables` and its lineage's task files, never
-a sibling's.
+shell cwd); a subagent reads its lineage's task files, never a sibling's, and
+a read-only one also reads `deliverables`.
 
 My cognitive memory has first-class tools — `update_identity`,
 `update_scratchpad`, `knowledge_write` — and I never reach for

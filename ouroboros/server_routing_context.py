@@ -271,7 +271,8 @@ def _project_routing_manifest(ctx: Any, project_id: str) -> Dict[str, Any]:
 
 
 def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str, Any]]:
-    """Newest task result bound to ``project_id`` WITHOUT replaying the whole
+    """Newest ROOT task result bound to ``project_id`` (a child's is never the room's
+    continuation: the promote door refuses it, ``_is_child_result``) WITHOUT replaying the whole
     store (DEVELOPMENT "Projection over replay"). The registry row's durable
     ``last_task_result_id`` pointer (stamped at project-task finalization) is
     read FIRST — one direct file fetch, immune to how many newer foreign
@@ -308,7 +309,9 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
     if pointer:
         pointed = load_task_result(ctx.DRIVE_ROOT, pointer)
         if isinstance(pointed, dict) and str(pointed.get("project_id") or "") == project_id:
-            return pointed
+            if not _is_child_result(pointed):
+                return pointed
+            pointer = ""  # a child-stamped pointer is provably wrong, not in flight: heal it
         log.debug(
             "project last-task-result pointer for %r is stale (%s); "
             "falling back to the bounded scan", project_id, pointer,
@@ -345,7 +348,7 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
         if candidate is None:
             uncertain = True
             continue
-        if str(candidate.get("project_id") or "") != project_id:
+        if str(candidate.get("project_id") or "") != project_id or _is_child_result(candidate):
             continue
         row = candidate
         # The match's whole equal-mtime group is read to its end — across the
@@ -357,7 +360,8 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
             other = read_json_dict(tied)
             if other is None:
                 uncertain = True
-            elif str(other.get("project_id") or "") == project_id and _order(other) > _order(row):
+            elif (str(other.get("project_id") or "") == project_id and not _is_child_result(other)
+                  and _order(other) > _order(row)):
                 row = other
         break
     if row is not None and not pointer and not uncertain:

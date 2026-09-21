@@ -106,9 +106,10 @@ def test_a_room_root_older_than_the_list_is_addressable_all_the_same(tmp_path, m
     }
 
 
-def test_a_child_result_is_never_the_continuation_even_when_the_host_offered_it(tmp_path):
-    """A pointer stamped by a child before this release still names a child; the
-    door refuses it and says where the work is reachable (I29 stays closed)."""
+def test_a_child_result_is_never_the_continuation_and_the_host_stops_offering_it(tmp_path):
+    """A pointer stamped by a child before this release still names a child: the
+    host offers the ROOT instead, and the door refuses the child if the model names
+    it all the same, saying where the work is reachable (I29 stays closed)."""
     import server
     from ouroboros.projects_registry import create_project
     from ouroboros.task_results import write_task_result
@@ -126,7 +127,7 @@ def test_a_child_result_is_never_the_continuation_even_when_the_host_offered_it(
     metadata = server._decision_turn_metadata(
         _host_ctx(tmp_path), int(project["chat_id"]), "room-3", {"project_id": "racer"},
     )
-    assert metadata["project_last_task_result"]["task_id"] == "racer-child"
+    assert metadata["project_last_task_result"]["task_id"] == "racer-root"
     assert [row["task_id"] for row in
             metadata["project_routing_manifest"]["final_results"]] == ["racer-root"]
 
@@ -256,6 +257,54 @@ def test_only_a_root_finalization_moves_the_projects_pointer(tmp_path):
                   "root_task_id": "racer-root", "delegation_role": "subagent"},
         objective="helper work", kind="task", exec_status="completed", drive_root=tmp_path,
     )
+    assert get_project(tmp_path, "racer")["last_task_result_id"] == "racer-root"
+
+
+def test_the_self_heal_scan_never_offers_or_stamps_a_child(tmp_path):
+    """The lookup's fallback scan is the pointer's SECOND writer: with no pointer
+    yet and a child as the project's newest result, it answers with the newest ROOT
+    and stamps that, never the child the door would refuse."""
+    import os
+
+    import server
+    from ouroboros.projects_registry import create_project, get_project
+    from ouroboros.task_results import task_results_dir, write_task_result
+
+    create_project(tmp_path, "racer", name="Racer")
+    write_task_result(tmp_path, "racer-root", "completed", project_id="racer", result="root answer")
+    write_task_result(tmp_path, "racer-child", "completed", project_id="racer", result="helper answer",
+                      parent_task_id="racer-root", root_task_id="racer-root", delegation_role="subagent")
+    results = task_results_dir(tmp_path, create=False)
+    os.utime(results / "racer-root.json", (1_000, 1_000))
+    os.utime(results / "racer-child.json", (2_000, 2_000))  # the child is the newest file
+    assert not get_project(tmp_path, "racer").get("last_task_result_id")
+
+    row = server._latest_project_task_result(_host_ctx(tmp_path), "racer")
+    assert row["task_id"] == "racer-root"
+    assert get_project(tmp_path, "racer")["last_task_result_id"] == "racer-root"
+
+
+def test_a_pointer_a_child_stamped_before_the_rule_heals_onto_the_root(tmp_path):
+    """A pointer written before "only a root stamps it" may name a child. That is
+    provably wrong (not a copy-back in flight), so the lookup answers with the root
+    and repairs the pointer; a pointer naming a ROOT is served as it is."""
+    import server
+    from ouroboros.projects_registry import create_project, get_project, update_project
+    from ouroboros.task_results import write_task_result
+
+    create_project(tmp_path, "racer", name="Racer")
+    write_task_result(tmp_path, "racer-root", "completed", project_id="racer", result="root answer")
+    write_task_result(tmp_path, "racer-child", "completed", project_id="racer", result="helper answer",
+                      parent_task_id="racer-root", root_task_id="racer-root", delegation_role="subagent")
+    update_project(tmp_path, "racer", last_task_result_id="racer-child")
+
+    assert server._latest_project_task_result(_host_ctx(tmp_path), "racer")["task_id"] == "racer-root"
+    assert get_project(tmp_path, "racer")["last_task_result_id"] == "racer-root"
+
+    # The quiet direction: a root pointer is one direct fetch and is left alone.
+    write_task_result(tmp_path, "racer-root-2", "completed", project_id="racer", result="later root")
+    update_project(tmp_path, "racer", last_task_result_id="racer-root")
+    assert server._latest_project_task_result(_host_ctx(tmp_path), "racer")["task_id"] == "racer-root"
     assert get_project(tmp_path, "racer")["last_task_result_id"] == "racer-root"
 
 
