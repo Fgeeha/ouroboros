@@ -8,7 +8,6 @@ both outside the loop it watches.
 
 from __future__ import annotations
 
-import os
 import threading
 import time
 from typing import Any, Optional
@@ -152,14 +151,17 @@ def _alert_chat_turn_wedge(task_id, gap: float) -> None:
 
 def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None:
     """Dedicated daemon thread (NOT inside the supervisor loop, so it fires even when
-    that loop stalls). It ALERTS the owner on two silent-wedge classes — a supervisor
-    loop stall (new-message intake starvation) and a heartbeat-silent in-process
-    direct-chat turn — converting a multi-hour silent wedge into an immediate signal.
+    that loop stalls). It observes two silent-wedge classes and reports them
+    DIFFERENTLY (owner decision 4C). A heartbeat-silent in-process direct-chat turn
+    ALERTS the owner, because /restart is a recovery they can perform. A supervisor
+    loop stall (new-message intake starvation) is JOURNAL ONLY: the ``log.error``
+    and one durable ``supervisor_loop_stall`` row with the phase facts the loop
+    published with its last stamp, closed once the loop ticks again by one
+    ``supervisor_loop_stall_end`` — onset without an end is a generation that never
+    recovered. Nothing reaches the owner's chat from that half: a stall they cannot
+    act on is an alarm, not information, and the rows carry the diagnosis anyway.
     It deliberately does NOT kill a hung thread; independent native actors keep
-    the chat responsive meanwhile. A loop stall journals ``supervisor_loop_stall``
-    with the phase facts the loop published with its last stamp and, once the loop
-    ticks again, one ``supervisor_loop_stall_end`` — onset without an end is a
-    generation that never recovered. ``stop_event`` is
+    the chat responsive meanwhile. ``stop_event`` is
     a PER-GENERATION token: when the supervisor loop that owns ``liveness`` exits (incl.
     the crash-storm death path, which never sets the global restart flag), it is set so
     this watchdog stops watching a now-stale liveness list (no false post-revival alert)."""
@@ -170,7 +172,7 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
         return
 
     def _watch() -> None:
-        from supervisor.state import append_jsonl, load_state
+        from supervisor.state import append_jsonl
         interval = min(15, max(1, deadline // 3))
         loop_alerted = False
         stall_onset: tuple = ()  # (stalled stamp, phase) of the OPEN alerted stall
@@ -202,25 +204,6 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
                         })
                     except Exception:
                         log.debug("loop-stall log failed", exc_info=True)
-                    try:
-                        owner_chat = int((load_state() or {}).get("owner_chat_id") or 0)
-                        if owner_chat:
-                            from supervisor.message_bus import send_with_budget
-                            send_with_budget(
-                                owner_chat,
-                                f"⚠️ The supervisor loop stalled for ~{int(gap)}s — new messages may be "
-                                "delayed. A later tick or restart may restore responsiveness.",
-                                is_progress=True,
-                                progress_meta={
-                                    "task_incident": "supervisor_loop_stall",
-                                    # pid disambiguates server GENERATIONS: the monotonic stamp alone can
-                                    # repeat at a similar uptime offset across restarts, and the browser's
-                                    # toast-dedupe set outlives this process while the page stays open.
-                                    "toast_once": f"supervisor-loop-stall:{os.getpid()}:{int(liveness[_STAMP])}",
-                                },
-                                role="system", system_type="runtime_liveness_notice")
-                    except Exception:
-                        log.debug("loop-stall owner alert failed", exc_info=True)
                     loop_alerted = True
                     stall_onset = (liveness[_STAMP], facts.get("phase"))
             else:
