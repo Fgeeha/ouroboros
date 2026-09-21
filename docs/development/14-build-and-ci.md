@@ -84,6 +84,7 @@ Prerelease artifacts may intentionally be unsigned and must report that state; s
 
 The artifact pipeline — per-platform archive smokes, native Linux packages, the AppImage custody chain, SBOM and attestation binding, and the seven-required-desktop plus optional-Android release job — lives in ARCHITECTURE §8 and `.github/workflows/ci.yml`. The honesty invariants a change must preserve:
 
+- On a valid release tag, `release-preflight` records the tag/VERSION and prerelease state before checking its required job results. A failed test prerequisite makes the preflight red but permits the desktop build to run as a diagnostic rehearsal; this can consume configured signing/notarization and records attestations in the repository and public transparency log; artifacts remain downloadable from the run, but no GitHub Release is published; the release job still requires a successful preflight. Android publisher builds retain their Android proof dependencies because the signed source/APK pair is optional release content, so failed or skipped Android proofs exclude both optional assets; desktop diagnostics remain evidence only and cannot publish a Release.
 - Publication is draft-first with a per-tag concurrency group; the remote
   annotated tag is revalidated against the event SHA immediately before
   draft creation AND again before publication, and a published release is

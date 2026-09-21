@@ -37,7 +37,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # replaced, the rest has no older text to displace.
     "docs/architecture/06-agent-core.md": 287600,
     "docs/architecture/07-configuration.md": 36991,
-    "docs/architecture/08-git-branching-ci-and-build.md": 18947,
+    # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
+    "docs/architecture/08-git-branching-ci-and-build.md": 19287,
     "docs/architecture/09-shutdown-and-process-cleanup.md": 12405,
     "docs/architecture/10-key-invariants.md": 17655,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
@@ -64,7 +65,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/development/11-design-system.md": 28300,
     "docs/development/12-mcp-client-integration.md": 3313,
     "docs/development/13-gateway-boundary-pattern.md": 2228,
-    "docs/development/14-build-and-ci.md": 14958,
+    # 14958 -> 16100: release proof now records diagnostic signing/attestation side effects, authority asymmetry, and fail-closed prerequisites.
+    "docs/development/14-build-and-ci.md": 16100,
 }
 
 

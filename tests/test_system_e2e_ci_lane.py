@@ -40,14 +40,15 @@ def test_pull_requests_run_only_the_narrow_publish_browser_proof():
     )
     steps = {step.get("name"): step for step in job["steps"] if step.get("name")}
     narrow = steps["Run Publish admission browser proof"]
-    assert narrow["if"] == "github.event_name == 'pull_request'"
+    assert narrow["if"] == "${{ !cancelled() && steps.install_chromium.outcome == 'success' && github.event_name == 'pull_request' }}"
     assert narrow["run"] == (
         'python -m pytest tests/test_skill_publish_browser.py -o addopts="" -m ui_browser -q --tb=short'
     )
     assert narrow["env"]["OUROBOROS_RUN_UI_SMOKE"] == "1"
     assert narrow["env"]["OUROBOROS_EXPECT_BROWSER_ENGINES"] == "chromium"
-    for name in ("Install full UI smoke WebKit", "Run host UI smoke", "Run browser tools Chromium/WebKit smoke"):
-        assert steps[name]["if"] == "github.event_name != 'pull_request'"
+    assert steps["Install full UI smoke WebKit"]["if"] == "${{ !cancelled() && steps.setup_python.outcome == 'success' && github.event_name != 'pull_request' }}"
+    for name in ("Run host UI smoke", "Run browser tools Chromium/WebKit smoke"):
+        assert steps[name]["if"] == "${{ !cancelled() && steps.install_chromium.outcome == 'success' && steps.install_webkit.outcome == 'success' && github.event_name != 'pull_request' }}"
     assert "secrets." not in _job_text("ui-smoke")
 
 
