@@ -48,7 +48,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # guard derives from the durable artifact it guards; the predecessor list is a hint and an
     # emitted promote is a pending fact). Six neighbouring invariants were compressed first
     # (-153 bytes, no fact removed); the remainder is the cost of the two new rules.
-    "docs/architecture/10-key-invariants.md": 20650,
+    # 20650 -> 21100: one more rule the chapter lacked, the usage ledger's reader contract
+    # ("money never reads a snapshot; a display never waits on money"). It REPLACES the
+    # residual sentence of the off-thread invariant; the rule itself has no older text.
+    "docs/architecture/10-key-invariants.md": 21100,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
     "docs/architecture/12-host-service-companions-and-chat-ids.md": 11007,
     "docs/architecture/13-external-skills-layer.md": 7764,
@@ -60,7 +63,12 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/development/03-module-size-and-complexity.md": 23100,
     "docs/development/04-core-governance-artifacts.md": 16431,
     "docs/development/05-review-and-commit-protocol.md": 12956,
-    "docs/development/06-rules-by-change-class.md": 94197,
+    # 94197 -> 94520: the usage-ledger lock rule gains its reader contract (a display read
+    # on the supervisor loop or a gateway thread rides the last validated snapshot; money
+    # never does; a pre-check's refusal takes the exact read). The one sentence it touches
+    # (the lock's caller wait) is replaced; the rest is a rule the chapter lacked, and the
+    # chapter had 5 bytes left. Sized to the text: 10 bytes of margin.
+    "docs/development/06-rules-by-change-class.md": 94520,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,
