@@ -143,6 +143,9 @@ def test_stall_end_is_written_once_per_alerted_stall(monkeypatch, journal):
     end = next(row for _p, row in journal if row["type"] == "supervisor_loop_stall_end")
     assert end["stalled_sec"] == pytest.approx(100.0, abs=1.0)
     assert end["phase"] == "maintenance"  # where it was stuck, not where it resumed
+    # The recovery stamp publishes the loop thread's CPU over the stalled interval itself.
+    assert end["loop_thread_cpu_sec"] == liveness[1]["loop_thread_cpu_sec"]
+    assert isinstance(end["loop_thread_cpu_sec"], float)
 
 
 def test_a_healthy_loop_journals_neither_row(monkeypatch, journal):

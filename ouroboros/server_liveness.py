@@ -235,6 +235,10 @@ def _start_supervisor_liveness_watchdog(liveness: list, stop_event=None) -> None
                             "ts": utc_now_iso(), "type": "supervisor_loop_stall_end",
                             "stalled_sec": round(liveness[_STAMP] - stall_onset[0], 1),
                             "phase": stall_onset[1],
+                            # The recovery stamp's CPU delta covers the stalled interval itself:
+                            # beside the wall gap it tells a thread that burned it from one that
+                            # waited on a lock, IO or the GIL.
+                            "loop_thread_cpu_sec": _published_loop_facts(liveness).get("loop_thread_cpu_sec"),
                         })
                     except Exception:
                         log.debug("loop-stall-end log failed", exc_info=True)

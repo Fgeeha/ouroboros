@@ -39,7 +39,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/architecture/07-configuration.md": 36991,
     "docs/architecture/08-git-branching-ci-and-build.md": 18947,
     "docs/architecture/09-shutdown-and-process-cleanup.md": 12405,
-    "docs/architecture/10-key-invariants.md": 17655,
+    # 17655 -> 19200: the supervisor-reliability sprint adds invariants the chapter lacked
+    # (typed permanent engine refusal, interrupted parent, stalled-loop facts, and the
+    # acceptance transport/parking floor) — new rules, not restatements, so nothing is replaced.
+    "docs/architecture/10-key-invariants.md": 19200,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
     "docs/architecture/12-host-service-companions-and-chat-ids.md": 11007,
     "docs/architecture/13-external-skills-layer.md": 7764,
