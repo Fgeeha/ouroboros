@@ -79,10 +79,14 @@ def init(drive_root: pathlib.Path) -> None:
     QUEUE_SNAPSHOT_PATH = drive_root / "state" / "queue_snapshot.json"
     FINALIZATION_GRACE_SEC = get_finalization_grace_sec()
     BUDGET_ROOT_FENCES.clear()
-    # A previous process's direct-chat turns must not outlive it in the roster.
-    from supervisor.direct_roots import clear_direct_roots
+    # A previous process's direct-chat turns must not outlive it in the roster,
+    # and this clear is the last moment their ids exist: the roster is taken over
+    # here and handed to snapshot restore below, which fences them like any other
+    # row the stop caught.
+    from supervisor.direct_roots import take_direct_roots
 
-    clear_direct_roots(drive_root)
+    PRIOR_DIRECT_ROOTS.clear()
+    PRIOR_DIRECT_ROOTS.update(take_direct_roots(drive_root))
 
 
 def refresh_timeouts_from_settings(settings: dict) -> None:
@@ -95,6 +99,11 @@ def refresh_timeouts_from_settings(settings: dict) -> None:
     global FINALIZATION_GRACE_SEC
     FINALIZATION_GRACE_SEC = get_finalization_grace_sec(settings)
 
+
+# The previous process's direct-chat roots, taken from `state/direct_roots.json`
+# by init above and consumed once by snapshot restore. A process-local handover
+# of the SAME fragment, never a second store.
+PRIOR_DIRECT_ROOTS: Dict[str, Any] = {}
 
 # Set by workers.init_queue_refs().
 PENDING: List[Dict[str, Any]] = []
