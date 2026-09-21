@@ -931,7 +931,7 @@ and what enforces each.
   settles it.
 - Host acceptance: root-only, structured eligibility (`outcomes.turn_has_reviewable_effects`
   plus a typed deliverable/criterion), never keywords or authoritative agent nomination
-  (BIBLE P3/P5; acceptance model, per-enforcement waiting, `previous_revision_accepted`,
+  (BIBLE P3/P5; acceptance model, waiting, unanswered fence, `previous_revision_accepted`,
   `late_settlement`: ARCHITECTURE §6 "Task acceptance"). Freeze request/roster; existing
   review custody/mailbox handles pending/free collection. Before new-panel evidence or
   `review_cycles_exhausted`, reconcile every paid panel still running for that root: $0,

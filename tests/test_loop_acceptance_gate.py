@@ -163,7 +163,8 @@ def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason(
     ]
     # Include the separate infrastructure-outcome handback; it requests an
     # author response without manufacturing a critic capsule or reviewer PASS.
-    assert len(starts) == 22, f"writer inventory changed: {len(starts)} call sites"
+    # ... and the final seal's `admission_close_unconfirmed` note (owner 2A) in the delivery leaf.
+    assert len(starts) == 23, f"writer inventory changed: {len(starts)} call sites"
     allowed_status = {
         "ACCEPTANCE_ACCEPTED", "ACCEPTANCE_REVISION_REQUESTED",
         "ACCEPTANCE_FINALIZED_UNACCEPTED",

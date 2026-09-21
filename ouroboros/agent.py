@@ -283,8 +283,9 @@ class OuroborosAgent:
             ack = self._send_fence_event(event) or (request["action"] != "inspect" and self._send_fence_event(event)) or {}
             if not ack:
                 raise TimeoutError(f"supervisor did not acknowledge acceptance fence {request['action']}")
-        if not ack.get("ok", True) or str(ack.get("status") or "") not in accept:
-            raise RuntimeError(str(ack.get("error") or f"acceptance fence {request['action']} failed"))
+        status = str(ack.get("status") or "")
+        if not ack.get("ok", True) or status not in accept:  # the row's typed state is the reason; only a malformed request keeps its error text
+            raise RuntimeError(status if status not in ("", "error") else str(ack.get("error") or f"acceptance fence {request['action']} failed"))
         return ack
 
     def _send_fence_event(self, event: Dict[str, Any]) -> Dict[str, Any]:

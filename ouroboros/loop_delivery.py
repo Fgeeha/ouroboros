@@ -14,7 +14,7 @@ import queue
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from ouroboros.config import get_context_mode
-from ouroboros.outcomes import reviewable_effect_projection
+from ouroboros.outcomes import ACCEPTANCE_ACCEPTED, reviewable_effect_projection
 from ouroboros.task_finalization import set_terminal_host_notice
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.utils import sanitize_tool_result_for_log
@@ -1113,6 +1113,44 @@ def _plan_review_only_awaited(llm_trace: Dict[str, Any]) -> bool:
     return isinstance(plan_gate, dict) and plan_gate.get("review_only_awaited") is True
 
 
+def _seal_admission_before_delivery(tools: ToolRegistry, limit_ctx: Any, llm_trace: Dict[str, Any]) -> bool:
+    """Seal root admission once more right before delivery; False arms the owner-revision round.
+
+    The queue's typed answer decides. ``ok`` seals, and a generation mismatch (also one seen
+    locally while the transport was silent) is a real owner follow-up. A begin ``refused``
+    because the root is already ``sealed`` is the worker's own earlier seal whose ack was
+    lost. Any other refusal keeps the revision path. ``unknown`` is a gap — never a refusal,
+    a verdict or an owner message: the answer is delivered with ``admission_released=False``
+    (the durable ``supervisor_ack_unavailable`` row is the record) and a blocking install
+    whose reviewers approved this subject says so on the card (owner decision 2A).
+    """
+    tool_ctx = tools._ctx
+    opened, _token = _loop()._begin_task_acceptance_fence(tool_ctx, limit_ctx.task_id)
+    answer = opened and _loop()._end_task_acceptance_fence(tool_ctx, outcome="terminal")
+    own_seal = (opened.status, opened.reason) == ("refused", "sealed")
+    if getattr(tool_ctx, "_task_acceptance_fence_generation_mismatch", False) or not (answer or own_seal or answer.status == "unknown"):
+        _loop()._supersede_task_acceptance_for_owner_followup(tool_ctx, llm_trace)
+        admission_lock = getattr(tool_ctx, "owner_message_admission_lock", None)
+        admission_agent = getattr(tool_ctx, "owner_message_admission_agent", None)
+        if admission_lock is not None and admission_agent is not None:
+            with admission_lock:
+                admission_agent._accepting_owner_messages = True
+        _loop()._arm_delivery_control(tools, limit_ctx, llm_trace, control="owner_revision_required")
+        return False
+    if not answer and not own_seal:
+        from ouroboros.review_projection import publish_acceptance_checkpoint
+        from ouroboros.tools.review_helpers import review_enforcement_blocks
+
+        llm_trace.setdefault("review_decision", {})["admission_released"] = False
+        decision = llm_trace.get("acceptance_decision") if isinstance(llm_trace.get("acceptance_decision"), dict) else {}
+        if (decision.get("status") == ACCEPTANCE_ACCEPTED and review_enforcement_blocks()
+                and decision.get("reason") in ("clean_pass", "clean_pass_obligations_closed")):
+            _loop()._set_acceptance_decision(llm_trace, {**decision, "status": ACCEPTANCE_ACCEPTED, "reason": "admission_close_unconfirmed",
+                "rationale": "Quorum PASS accepted the deliverable; the supervisor did not confirm that task admission was closed."})
+            publish_acceptance_checkpoint(tool_ctx, llm_trace)
+    return True
+
+
 def _no_tool_final_answer(
     content: Any,
     limit_ctx: _RoundLimitContext,
@@ -1386,16 +1424,9 @@ def _no_tool_final_answer(
         _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
         content = candidate.full_text
     if (getattr(tools._ctx, "_task_acceptance_reviewed", False)
-            and not getattr(tools._ctx, "_task_acceptance_sealed_fence_token", None)):
-        opened, _token = _loop()._begin_task_acceptance_fence(tools._ctx, limit_ctx.task_id)
-        sealed = opened and _loop()._end_task_acceptance_fence(tools._ctx, outcome="terminal")
-        if not sealed or getattr(tools._ctx, "_task_acceptance_fence_generation_mismatch", False):
-            _loop()._supersede_task_acceptance_for_owner_followup(tools._ctx, llm_trace)
-            if admission_lock is not None and admission_agent is not None:
-                with admission_lock:
-                    admission_agent._accepting_owner_messages = True
-            _loop()._arm_delivery_control(tools, limit_ctx, llm_trace, control="owner_revision_required")
-            return None
+            and not getattr(tools._ctx, "_task_acceptance_sealed_fence_token", None)
+            and not _seal_admission_before_delivery(tools, limit_ctx, llm_trace)):
+        return None
     if isinstance(getattr(tools._ctx, "_presence_completion", None), dict):
         # Only this successful common exit accepts the requested outcome. Holds,
         # owner controls and budget exits must not inherit an earlier silent/send.

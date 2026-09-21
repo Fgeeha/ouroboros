@@ -246,8 +246,8 @@ def _end_task_acceptance_fence(ctx: Any, *, outcome: str, admission_locked: bool
         if acquired:
             admission_lock.release()
     _drop_fence_binding(ctx)  # also after a refusal or a gap: the next begin re-adopts or reopens
+    ctx._task_acceptance_fence_generation_mismatch = generation_mismatch  # local owner facts stand whatever the queue answered
     if result:
-        ctx._task_acceptance_fence_generation_mismatch = generation_mismatch
         sealed = status == "sealed" or (not status and effective_outcome != "revision")
         ctx._task_acceptance_sealed_fence_token = token if sealed else None
     return result

@@ -118,10 +118,9 @@ def test_refused_begin_is_typed_refused_with_its_reason(monkeypatch, tmp_path, s
     finally:
         supervisor.stop()
     assert not outcome and token is None
-    assert outcome.status == "refused" and "already sealed" in outcome.reason
+    assert (outcome.status, outcome.reason) == ("refused", "sealed")  # the row's typed state, not prose
     rows = _unavailable_rows(tmp_path)
-    assert [(row["op"], row["outcome"]) for row in rows] == [("begin", "refused")]
-    assert "already sealed" in rows[0]["reason"]
+    assert [(row["op"], row["outcome"], row["reason"]) for row in rows] == [("begin", "refused", "sealed")]
 
 
 def test_begin_with_stale_token_rebinds_through_fresh_begin(tmp_path):

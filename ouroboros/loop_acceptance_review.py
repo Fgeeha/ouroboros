@@ -718,7 +718,8 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     capacity = project_task_acceptance_review_capacity(ctx.tools._ctx, task_id=ctx.task_id) if action == "stop" else {}
     terminal_reason = (REASON_REVIEW_CYCLES_EXHAUSTED if action == "stop" and capacity.get("reason") == REASON_REVIEW_CYCLES_EXHAUSTED
                        else "author_stop" if action == "stop" else "author_finish")
-    if not _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal"):
+    ended = _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="terminal")
+    if ended.status == "refused":  # a gap is not a refusal: the final seal asks again and discloses
         _loop()._supersede_task_acceptance_for_owner_followup(ctx.tools._ctx, ctx.llm_trace)
         return True
     ctx.tools._ctx._task_acceptance_reviewed = True
@@ -726,7 +727,8 @@ def _finish_advisory_author(ctx: _TaskAcceptanceContext) -> bool:
     _loop()._mark_root_acceptance_checkpoint(
         ctx.tools._ctx, ctx.llm_trace, status=author["reviewer_signal"].lower(), pass_index=ctx.passes_done,
     )
-    ctx.llm_trace["review_decision"].update({"binding_hash": ctx.review_binding["binding_hash"], "author_finish": action == "finish"})
+    ctx.llm_trace["review_decision"].update({"binding_hash": ctx.review_binding["binding_hash"], "author_finish": action == "finish",
+                                             "admission_released": bool(ended)})
     _loop()._set_acceptance_decision(ctx.llm_trace, {
         "status": ACCEPTANCE_FINALIZED_UNACCEPTED, "reason": terminal_reason,
         "author_action": action, **({"review_capacity": capacity} if capacity else {}),
@@ -1349,19 +1351,9 @@ def _run_task_acceptance_review_once(
         set_decision=_loop()._set_acceptance_decision, emit_progress=emit_progress,
     ):
         return False
+    # A fence that answered no or not at all buys no model round: the panel runs on the
+    # disclosed rail `admission_fence_available=False` and final delivery seals again.
     fence_ok, _fence_token = _loop()._begin_task_acceptance_fence(tools._ctx, task_id)
-    if not fence_ok and review_enforcement_blocks("blocking"):
-        llm_trace["review_decision"] = {
-            "eligibility": "acceptance_fence_failed", "trigger": trigger,
-        }
-        _loop()._append_or_merge_user_message(
-            messages,
-            "[TASK ACCEPTANCE WAIT] The supervisor could not atomically close "
-            "subtask admission. Do not finalize or spawn more work; retry after the "
-            "queue fence is available.",
-        )
-        emit_progress("Task acceptance review waiting for the queue-owned admission fence.")
-        return True
     quiescent, subtree_statuses = _loop()._task_acceptance_subtree_snapshot(
         tools._ctx, drive_root, task_id,
     )
