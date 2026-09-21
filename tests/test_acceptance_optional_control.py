@@ -225,7 +225,9 @@ def test_feedback_ready_before_parking_preserves_answer_protocol(tmp_path, monke
     candidate = loop._replace_delivery_candidate(tools, ctx, trace, ANSWER, control="candidate")
     tools._ctx._task_acceptance_pending = "paid-binding"
     monkeypatch.setattr("ouroboros.acceptance_settlement.awaited_panel_has_settled", lambda *_: early == "settled")
-    monkeypatch.setattr("ouroboros.loop_transport._owner_signal_pending", lambda *_: early == "queued_wake")
+    # The stub takes the seam's keyword (owner_authority_only): the observation capture
+    # no longer swallows a stub's TypeError behind a blanket except.
+    monkeypatch.setattr("ouroboros.loop_transport._owner_signal_pending", lambda *_a, **_k: early == "queued_wake")
     monkeypatch.setattr("ouroboros.owner_wait.wait_after_tools", lambda *_a, **_k: pytest.fail("settled feedback must not park"))
     wait_for_acceptance_feedback(tools, ctx, trace, [], set())
     assert candidate.control_episode_seen

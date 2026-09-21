@@ -88,6 +88,7 @@ from ouroboros.loop_messages import (  # noqa: F401 — shared owner-source surf
     capture_acceptance_observation,
     acknowledge_acceptance_observation,
     acceptance_observation_prompt,
+    queue_inspection_unknown,
 )
 
 
@@ -372,16 +373,10 @@ def _task_acceptance_owner_generation_changed(ctx: Any) -> bool:
             and int(state.get("owner_message_generation") or 0) != int(expected_queue)
         )
     except Exception as exc:
-
-        trace = getattr(ctx, "_execution_trace", None)
-        if isinstance(trace, dict):
-            trace.setdefault("review_decision", {})["admission_inspection"] = {
-                "status": "unknown", "reason": "queue_inspection_failed",
-                "error_type": type(exc).__name__,
-            }
         # Unknown queue state is not evidence that a new message arrived. Keep
-        # the existing acceptance candidate; the inspection failure is already
-        # disclosed above and must not manufacture a semantic owner change.
+        # the existing acceptance candidate; the inspection failure is disclosed
+        # by the shared stamp and must not manufacture a semantic owner change.
+        queue_inspection_unknown(ctx, exc)
         return False
 
 
