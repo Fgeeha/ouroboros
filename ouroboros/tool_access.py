@@ -393,19 +393,17 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
     return result
 
 
-def profile_readable_root_paths(ctx: Any) -> list[tuple[str, pathlib.Path]]:
-    """Project readable ``(label, path)`` pairs from the policy SSOT.
-
-    ``skill_payload`` needs selectors and is omitted; individual resolution is
-    fail-soft so one unavailable root cannot hide the rest.
-    """
+def profile_readable_root_paths(ctx: Any, *, operation: Operation = "read") -> list[tuple[str, pathlib.Path]]:
+    """Project the ``(label, path)`` pairs this profile may ``operation`` from the
+    policy SSOT. ``skill_payload`` needs selectors and is omitted; individual
+    resolution is fail-soft so one unavailable root cannot hide the rest."""
     out: list[tuple[str, pathlib.Path]] = []
     try:
         policy = _POLICY.get(_effective_policy_profile(active_tool_profile(ctx)), {})
     except Exception:
         return out
     for root, ops in sorted(policy.items()):
-        if "read" not in ops or root == "skill_payload":
+        if operation not in ops or root == "skill_payload":
             continue
         try:
             out.append((root, pathlib.Path(resource_root_path(ctx, root)).resolve(strict=False)))
@@ -690,9 +688,9 @@ def _resolve_target_in_selected_base(
                             return anchored
         if is_absolute_path_text(path_text):
             raise ValueError(
-                f"absolute path {path!r} is outside selected root={root} ({resolved_base}); "
-                "use a path inside that root or select the corresponding resource "
-                "(root='user_files' for authorized external files)"
+                f"absolute path {path!r} is outside selected root={root} ({resolved_base}). "
+                f"Roots your profile can {operation}: "
+                f"{operation_roots(active_tool_profile(ctx), operation)}."
             )
     if root == "artifact_store" and operation in _READ_OPS:
         # C1 delegated captures (CR1-2): written on the CANONICAL drive, read from

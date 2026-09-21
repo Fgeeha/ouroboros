@@ -1,15 +1,20 @@
-"""A read-only child reads what its parent points it to (owner T4=A, #1105).
+"""A read-only child reads what its parent points it to (owner T4=A + 7A, #1105).
 
 Measured on a live install: a root task put files into its own ``task_drive``
-and sent four read-only children to check them; all four were refused with
-``outside selected root``. The recorded reason for hiding the orchestrator
-roots from children (``tool_access.py``: "a child must not read sibling
-projects") covers ``subagent_projects`` only. Now a child reads the
-owner-visible Deliverables root and the ``task_drive``/``artifact_store`` of
-its OWN lineage (parent and root ids from its own lineage fields), anchored on
-the canonical data root while the child itself runs on a headless drive. A
-sibling's or a stranger's task files stay refused; secret-named files in a
-parent's drive stay denied by name; ``subagent_projects`` stays top-level only.
+and sent four read-only children to check them; all four called ``read_file``
+with the ABSOLUTE path and NO root, and the default ``active_workspace`` refused
+them with ``outside selected root``. The recorded reason for hiding the
+orchestrator roots from children (``tool_access.py``: "a child must not read
+sibling projects") covers ``subagent_projects`` only. Now a child reads the
+owner-visible Deliverables root and the ``task_drive``/``artifact_store`` of its
+OWN lineage (parent and root ids from its own lineage fields), anchored on the
+canonical data root while the child itself runs on a headless drive; and an
+absolute path given without a root runs under the permitted root that
+physically contains it, the path itself never rewritten. A sibling's or a
+stranger's task files stay refused, and the refusal names the roots this
+profile can actually use; a NAMED wrong root still refuses; secret-named files
+in a parent's drive stay denied by name; ``subagent_projects`` stays top-level
+only.
 """
 from __future__ import annotations
 
@@ -101,6 +106,20 @@ def child_registry(geo, *, drive=None, acting=False):
     return registry, ctx
 
 
+def top_level_registry(geo, *, external=False):
+    """A top-level task (the ROOT itself) on the canonical drive; ``external``
+    gives it a workspace outside the system repo so the two roots differ."""
+    ctx = ToolContext(repo_dir=geo.repo, drive_root=geo.canonical, task_id=ROOT)
+    if external:
+        work = geo.home / "work"
+        work.mkdir(exist_ok=True)
+        ctx.workspace_root = work
+        ctx.workspace_mode = "external"
+    registry = ToolRegistry(repo_dir=geo.repo, drive_root=geo.canonical)
+    registry.set_context(ctx)
+    return registry, ctx
+
+
 # --- the lineage read: parent's and root's task files, never a sibling's ------
 
 def test_child_reads_its_parents_task_drive_from_a_headless_drive(geometry):
@@ -163,6 +182,146 @@ def test_lineage_is_read_only_even_for_a_top_level_parent_drive(geometry):
 
     assert out.startswith("⚠️"), out
     assert target.read_text(encoding="utf-8") == before
+
+
+# --- owner 7A: an absolute path without a root runs under the root holding it --
+
+def test_child_reads_its_parents_task_drive_by_absolute_path_and_no_root(geometry):
+    """The 2026-09-19 shape: the child names the absolute path of a file in
+    the PARENT's task_drive and no root; the host selects task_drive."""
+    registry, ctx = child_registry(geometry)
+    target = geometry.parent_drive / "source" / "ouroboros" / "update_letter.py"
+
+    out = registry.execute("read_file", {"path": str(target)})
+
+    assert "PARENT_DRIVE_BYTES" in out, out
+    assert ctx.last_read_view["opened_root"] == "task_drive"
+    assert ctx.last_read_view["target"] == str(target.resolve())
+
+
+def test_child_reads_the_root_tasks_artifact_by_absolute_path_and_no_root(geometry):
+    registry, ctx = child_registry(geometry)
+
+    out = registry.execute("read_file", {"path": str(geometry.root_artifacts / "report.txt")})
+
+    assert "ROOT_ARTIFACT_BYTES" in out, out
+    assert ctx.last_read_view["opened_root"] == "artifact_store"
+
+
+def test_child_reads_and_lists_deliverables_by_absolute_path_and_no_root(geometry):
+    registry, ctx = child_registry(geometry)
+
+    read = registry.execute("read_file", {"path": str(geometry.deliverables / "answer.txt")})
+    listing = registry.execute("list_files", {"path": str(geometry.deliverables)})
+
+    assert "DELIVERABLE_BYTES" in read, read
+    assert ctx.last_read_view["opened_root"] == "deliverables"
+    assert "answer.txt" in json.loads(listing), listing
+
+
+def test_search_selects_the_root_for_its_own_operation(geometry):
+    """Selection follows the tool's operation: a child may search Deliverables
+    but no profile may search a task_drive, so that path stays refused and the
+    refusal names the roots this profile can search."""
+    registry, _ctx = child_registry(geometry)
+
+    found = registry.execute("search_code", {"query": "needle", "path": str(geometry.deliverables)})
+    refused = registry.execute("search_code", {"query": "PARENT", "path": str(geometry.parent_drive)})
+
+    assert "answer.txt:1:" in found and "needle" in found, found
+    assert "PARENT_DRIVE_BYTES" not in refused, refused
+    assert "outside selected root=active_workspace" in refused, refused
+    named = refused.split("Roots your profile can search:")[1]
+    assert "deliverables" in named and "task_drive" not in named and "user_files" not in named, refused
+
+
+def test_a_siblings_or_strangers_file_without_root_is_refused_naming_real_roots(geometry):
+    registry, _ctx = child_registry(geometry)
+
+    sibling = registry.execute("read_file", {"path": str(geometry.sibling_drive / "notes.txt")})
+    stranger = registry.execute("read_file", {"path": str(geometry.stranger_artifacts / "out.txt")})
+
+    for out in (sibling, stranger):
+        assert "SIBLING_BYTES" not in out and "STRANGER_BYTES" not in out, out
+        assert "outside selected root=active_workspace" in out, out
+        named = out.split("Roots your profile can read:")[1]
+        assert "task_drive" in named and "deliverables" in named, out
+        assert "user_files" not in named and "subagent_projects" not in named, out
+
+
+def test_a_named_wrong_root_still_refuses_a_reachable_file(geometry):
+    """No silent re-rooting: the containing root is chosen only when none was named."""
+    registry, _ctx = child_registry(geometry)
+    target = geometry.parent_drive / "triage-draft.json"
+
+    out = registry.execute("read_file", {"root": "artifact_store", "path": str(target)})
+
+    assert '"triage"' not in out and "outside selected root=artifact_store" in out, out
+
+
+def test_an_unreachable_path_without_root_never_reads_a_same_named_workspace_mirror(geometry):
+    """The `01aea0663` pin on the no-root path: an absolute path no permitted
+    root holds is refused, never sliced by safe_relpath into a same-named file
+    inside the workspace."""
+    registry, _ctx = child_registry(geometry)
+    outside = geometry.home / "elsewhere" / "target.txt"  # under the owner home: no child root
+    outside.parent.mkdir()
+    outside.write_text("correct", encoding="utf-8")
+    mirror = geometry.repo.joinpath(*outside.parts[1:])
+    mirror.parent.mkdir(parents=True)
+    mirror.write_text("wrong-file", encoding="utf-8")
+
+    out = registry.execute("read_file", {"path": str(outside)})
+
+    assert "outside selected root" in out, out
+    assert "wrong-file" not in out and "correct" not in out, out
+
+
+def test_top_level_task_reads_the_system_repo_by_absolute_path_without_root(geometry):
+    """An external-workspace task names no root for an absolute repo path: the
+    host selects system_repo; the same path under a NAMED active_workspace stays refused."""
+    registry, _ctx = top_level_registry(geometry, external=True)
+    target = geometry.repo / "README.md"
+
+    out = registry.execute("read_file", {"path": str(target)})
+    named = registry.execute("read_file", {"root": "active_workspace", "path": str(target)})
+
+    assert "repo readme" in out and out.startswith("# system_repo:README.md"), out
+    assert "repo readme" not in named and "outside selected root=active_workspace" in named, named
+
+
+def test_top_level_task_reads_its_own_artifact_by_absolute_path_without_root(geometry):
+    """The deepest containing root wins: the artifact lies under runtime_data
+    too, and the binding names artifact_store."""
+    registry, ctx = top_level_registry(geometry)
+
+    out = registry.execute("read_file", {"path": str(geometry.root_artifacts / "report.txt")})
+
+    assert "ROOT_ARTIFACT_BYTES" in out, out
+    assert ctx.last_read_view["opened_root"] == "artifact_store"
+
+
+def test_dispatch_selects_a_root_only_for_an_absolute_path_without_one(geometry):
+    from ouroboros.tools.tool_resolution import _normalize_dispatch_path_args_result
+
+    _registry, ctx = child_registry(geometry)
+    parent_file = str(geometry.parent_drive / "triage-draft.json")
+
+    selected = {"path": parent_file}
+    assert _normalize_dispatch_path_args_result(ctx, "read_file", selected).text == ""
+    assert selected == {"path": parent_file, "root": "task_drive"}  # the path is never rewritten
+    named = {"root": "artifact_store", "path": parent_file}
+    _normalize_dispatch_path_args_result(ctx, "read_file", named)
+    assert named["root"] == "artifact_store"
+    for untouched in ({"path": "README.md"}, {"path": str(geometry.sibling_drive / "notes.txt")}):
+        _normalize_dispatch_path_args_result(ctx, "read_file", untouched)
+        assert "root" not in untouched, untouched
+    in_workspace = {"path": str(geometry.repo / "README.md")}
+    _normalize_dispatch_path_args_result(ctx, "read_file", in_workspace)
+    assert in_workspace == {"path": "README.md"}  # the in-workspace normalization is unchanged
+    query = {"path": parent_file, "op": "digest"}
+    _normalize_dispatch_path_args_result(ctx, "query_code", query)
+    assert "root" not in query  # query_code keeps its own external-target contract
 
 
 # --- secrets in a parent's drive stay denied by NAME -------------------------
