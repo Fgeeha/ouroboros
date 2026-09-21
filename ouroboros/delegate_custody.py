@@ -1014,10 +1014,17 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
         return {"settled": True, "ledger_recorded": True,
                 "project_retired": not custody.project_owned and not custody.project_persistent,
                 "project_persistent": custody.project_persistent, "retried": False}
-    from ouroboros.gateways.claudexor import final_attempt_facts
+    from ouroboros.gateways.claudexor import final_attempt_facts, run_failure_cause
 
     summary = summary_of(detail)
     observed = final_attempt_facts(detail, custody.run_id)
+    # A run that did not succeed says WHY on its settlement row: the model asked for, the
+    # ENGINE's own code ("" = it gave none) and the words it reported (opaque, never
+    # branched on). A succeeded row is byte-identical to before.
+    failure = summary.get("failure") if isinstance(summary.get("failure"), dict) else {}
+    failure_facts = {} if str(summary.get("state") or "") in SUCCEEDED_STATES else {
+        "requested_model": custody.model, "failure_code": str(failure.get("code") or ""),
+        "reported_cause": run_failure_cause(failure)}
     # Claudexor reports CASH in `spendUsd`, EXACTNESS in `spendEstimated`. A run
     # is only free when the amount is really zero AND really settled: expired
     # sessions, bill-by-construction routes and auth fallbacks all charge, and
@@ -1085,6 +1092,7 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 "model": observed.get("model", ""),
                 "observed_attempt": observed,
                 "state": str(summary.get("state") or ""),
+                **failure_facts,
                 # The SAME facts the ledger row just recorded. An undisclosed spend was emitted
                 # here as `0.0` beside a flag — the render-unknown-as-zero shape the ledger row
                 # itself stopped doing — and finality ignored the estimated half exactly as the
