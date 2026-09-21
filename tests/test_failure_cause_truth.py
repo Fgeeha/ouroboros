@@ -143,3 +143,36 @@ def test_the_last_execution_projection_keeps_the_cause_only_when_one_was_reporte
     rows = reviewer_slot_last_executions()
     assert rows["c_dead"]["reported_cause"] == WORDS
     assert "reported_cause" not in rows["c_wordless"] and "reported_cause" not in rows["c_alive"]
+
+
+def test_the_mind_reads_typed_facts_and_never_the_engines_retry_coach():
+    """What the model reads for a wave with a dead reviewer: the typed facts (code, reset,
+    model) and the engine's reported sentence — never its ``nextActions`` retry coach. The
+    stored wave is untouched (its ``reasons`` keep the raw prose); a row that reported no
+    words renders exactly today's bytes."""
+    import copy
+
+    from ouroboros.tools.plan_render import _render_wave
+
+    prose = "delegated review session run-e23 ended failed: " + json.dumps(INCIDENT_FAILURE, ensure_ascii=False)
+
+    def _wave(actor):
+        return {"cycle_index": 1, "request_fingerprint": "f" * 64, "aggregate": "DEGRADED", "closed": False,
+                "custody_pending": False, "findings": [], "actors": [actor, {"slot_id": "s2", "model": "m", "ok": True}],
+                "counts": {"configured": 2, "parseable": 1, "quorum": 2, "blocking": 0, "note": 0, "need_evidence": 0},
+                "reasons": [f"slot_unparseable:s1:{prose}", "parseable_slots_below_quorum:1/2"]}
+
+    dead = {"slot_id": "s1", "model": "codex=gpt-6-astra", "route": "agent_session", "ok": False,
+            "failure_code": "run_failed", "error": prose, "reported_cause": WORDS, "operation_state": "late_settled"}
+    wave = _wave(dead)
+    before = copy.deepcopy(wave)
+    text = _render_wave(wave, cap=3, cycles_paid=1, enforcement="advisory")
+    assert wave == before and "nextActions" in wave["reasons"][0], "a display substitution never rewrites the stored wave"
+    assert f'· FAILED[run_failed] — model=codex=gpt-6-astra; reported cause: "{WORDS}"' in text
+    assert f"Reasons: slot_unparseable:s1:{WORDS}, parseable_slots_below_quorum:1/2." in text
+    for coach in ("nextActions", "Retry the run", "Inspect the run", "safeMessage", "harness_error"):
+        assert coach not in text, coach
+    # Other direction: a row that reported no words renders today's bytes, prose included.
+    wordless = _render_wave(_wave({**dead, "reported_cause": ""}), cap=3, cycles_paid=1, enforcement="advisory")
+    assert f"· FAILED[run_failed]: {prose}" in wordless and f"Reasons: slot_unparseable:s1:{prose}," in wordless
+    assert "reported cause" not in wordless

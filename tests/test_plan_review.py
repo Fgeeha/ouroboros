@@ -633,6 +633,9 @@ class TestPlanReviewToolRegistration(unittest.TestCase):
         self.assertNotIn("skip", lower)
         for word in ("research", "deliverable", "action in the world"):
             self.assertIn(word, lower)
+        # The description states where the open review lives; it promises no host bubble.
+        self.assertNotIn("the host discloses", desc)
+        self.assertIn("your own answer states it", desc)
 
     def test_plan_task_contract_has_no_swarm_knobs(self):
         from ouroboros.config import RETIRED_SETTING_KEYS, SETTINGS_DEFAULTS

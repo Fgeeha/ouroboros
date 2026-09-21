@@ -140,7 +140,7 @@ def panel(monkeypatch):
 
 def _settled(harness_, count):
     return _wait_until(lambda: sum(
-        ": finished;" in line and "state=settled" in line for line in harness_.progress) == count)
+        " answered" in line and "reviewer" in line for line in harness_.progress) == count)
 
 
 @pytest.fixture

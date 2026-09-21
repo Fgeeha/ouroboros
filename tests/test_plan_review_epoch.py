@@ -583,6 +583,7 @@ def test_revise_plan_render_names_only_available_paid_cycles_and_exits(enforceme
         assert "OUROBOROS_REVIEW_MAX_CYCLES" not in text
     if enforcement == "advisory":
         assert "Advisory enforcement: you may proceed" in text
+        assert "host discloses" not in text and "your own final answer" in text
     evidence_text = _next_step({"aggregate": "REVIEW_REQUIRED", "closed": False},
                                enforcement=enforcement, cap=cap, cycles_paid=2)
     assert "ONE $0 call" in evidence_text and "no reviewer call, no cycle" in evidence_text
@@ -682,3 +683,86 @@ def test_real_new_plan_keeps_an_explicit_effort(harness, monkeypatch, effort):
     assert _control(_call(harness.make_ctx(), reviewer_effort=effort))["closed"]
     assert _state(harness)["waves"][-1]["reviewer_effort"] == effort
     assert [slot.effort for slot in transport.calls[0]["slots"]] == [effort] * 3
+
+
+def test_no_model_facing_text_promises_that_a_host_will_disclose_the_open_review(harness, monkeypatch):
+    """The CLASS is closed, not three instances: every model-facing surface that permits
+    proceeding with the review open (the tool description, the rendered next step of a
+    settled and of a custody-pending open wave, the spent-cap head) says where the fact
+    lives (typed state, the model's own answer) and never that a host will disclose it —
+    and a concatenation-flattening scan of the runtime source finds no fourth string."""
+    import pathlib
+    import re
+
+    from ouroboros.tools import plan_render
+    from ouroboros.tools.plan_review import get_tools
+    from tests.test_plan_review_engine import DECK_SPEC
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
+    harness.state["enforcement"] = "advisory"
+    harness.install({"s1": json.dumps([_finding("n1", "note")]), "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    pending = [{"slot_id": s, "model": "m", "ok": False, "error": "Pending dispatch;", "operation_state": "pending_dispatch",
+                "late_result_pending": True, "operation_id": f"op-{s}"} for s in ("s1", "s2")]
+    surfaces = {
+        "tool description": next(t for t in get_tools() if t.name == "plan_task").schema["description"],
+        "settled open wave": plan_render._next_step({"aggregate": "REVISE_PLAN", "closed": False, "request_fingerprint": "f" * 64},
+                                                    enforcement="advisory", cap=3, cycles_paid=1),
+        "custody-pending wave": plan_render._next_step({"aggregate": "DEGRADED", "closed": False, "custody_pending": True,
+                                                        "request_fingerprint": "f" * 64, "actors": pending},
+                                                       enforcement="advisory", cap=3, cycles_paid=1),
+        "spent cap": _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]}),
+    }
+    for name, text in surfaces.items():
+        for promise in ("host discloses", "host records and", "discloses it", "discloses that loudly"):
+            assert promise not in text, (name, promise)
+        assert re.search(r"your own (final )?answer", text), name
+    # The class, not the instances: no runtime source (implicit concatenation flattened) still carries one.
+    root = pathlib.Path(plan_render.__file__).resolve().parents[1]
+    for path in (*root.rglob("*.py"), *(root.parent / "prompts").glob("*.md")):
+        flat = re.sub(r'"\s*\n\s*"', "", path.read_text(encoding="utf-8"))
+        assert "host discloses" not in flat and "host records and discloses" not in flat, path
+
+
+def test_an_author_finish_narrates_its_rationale_in_the_models_voice(harness, monkeypatch):
+    """The mind's recorded reason reaches the owner as ITS OWN row (``narration=True``),
+    verbatim, exactly once per durable author record — never on a refusal, never
+    for an empty rationale, and never a second time from the tool's host lines."""
+    import ouroboros.review_records as review_records
+    from ouroboros.tools import plan_review as pr
+
+    harness.state["enforcement"] = "advisory"
+    harness.install({"s1": json.dumps([_finding("b1", "blocking", breaks="claim_1")]), "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    seen: list = []
+    ctx.emit_progress_fn = lambda text, **kw: seen.append((text, kw))
+    _call(ctx)
+    fp = _state(harness)["waves"][-1]["request_fingerprint"]
+    rationale = "The blocking finding assumes a chart per slide; the brief fixes one table, so I proceed."
+    seen.clear()
+    result = pr._handle_plan_task(ctx, review_disposition={
+        "review_fingerprint": fp, "items": [], "author_action": "finish",
+        "author_disposition": {"disposition": "accepted", "rationale": rationale}})
+    assert "Your rationale was shown to the owner in your own voice." in result
+    assert [row for row in seen if row[1]] == [(rationale, {"narration": True})]
+    assert _state(harness)["current_attempt"]["author_subject"]["author_disposition"]["rationale"] == rationale
+    # An empty rationale records the finish and says nothing in the model's voice.
+    seen.clear()
+    pr._handle_plan_task(ctx, review_disposition={
+        "review_fingerprint": fp, "items": [], "author_action": "finish",
+        "author_disposition": {"disposition": "accepted", "rationale": ""}})
+    assert not [row for row in seen if row[1].get("narration")]
+    # The disposition path with an author disposition narrates once too; the host line stays host voice.
+    seen.clear()
+    pr._handle_plan_task(ctx, review_disposition={
+        "review_fingerprint": fp, "items": [], "author_disposition": {"disposition": "rejected", "rationale": "Kept as is."}})
+    assert [row for row in seen if row[1]] == [("Kept as is.", {"narration": True})]
+    assert any(text.startswith("📐 Plan review: findings answered") and not kw for text, kw in seen)
+    # A refused finish (reviewers still running) records nothing and narrates nothing.
+    monkeypatch.setattr(review_records, "review_outcome_received", lambda *_a, **_kw: False)
+    seen.clear()
+    refused = pr._handle_plan_task(ctx, review_disposition={
+        "review_fingerprint": fp, "items": [], "author_action": "finish",
+        "author_disposition": {"disposition": "accepted", "rationale": "Proceed without the reviewers."}})
+    assert "reviewers are still running" in refused and seen == []
