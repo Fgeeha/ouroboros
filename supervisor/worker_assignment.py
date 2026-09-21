@@ -198,7 +198,10 @@ def assign_tasks() -> None:
                 ", ".join(unresolved_invalid_ids),
             )
         try:  # every loop tick: ride the snapshot; a refusal re-reads exactly, reserve_attempt is the gate
-            remaining = budget_remaining(st, strict=True, allow_stale=True)
+            evolution_queued = any(str(row.get("type") or "") == "evolution" for row in _pool().PENDING)
+            remaining = budget_remaining(  # this tick refuses at zero AND, for evolution, at its reserve
+                st, strict=True, allow_stale=True,
+                refuse_below=EVOLUTION_BUDGET_RESERVE if evolution_queued else 0.0)
         except Exception:
             log.error("Task assignment blocked: monetary authority unavailable")
             return

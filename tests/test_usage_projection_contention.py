@@ -294,6 +294,131 @@ def test_a_snapshot_may_admit_but_never_refuses(data_root, supervisor_state, mon
     assert not waiting.is_alive()
 
 
+def _assignment_with_an_evolution_row(data_root, monkeypatch, *, settle_at):
+    """The real ``assign_tasks`` over a real ledger: a $5 limit, one lane that reserved $4
+    (the snapshot says $1 left, under the $2 evolution reserve) and then settled."""
+    from types import SimpleNamespace
+
+    from supervisor import queue, state, workers
+
+    state.init(data_root, total_budget_limit=5.0)
+    queue.init(data_root)
+    for module in (workers, queue):
+        monkeypatch.setattr(module, "DRIVE_ROOT", data_root)
+    monkeypatch.setattr(state, "check_openrouter_ground_truth", lambda: None)
+    monkeypatch.setattr(workers, "load_state", lambda: {"owner_chat_id": 0})
+    monkeypatch.setattr(workers, "_evolution_assignment_error", lambda _task: "")
+    pending, running, pool = [], {}, {}
+    for name, value in (("PENDING", pending), ("RUNNING", running), ("WORKERS", pool)):
+        monkeypatch.setattr(workers, name, value)
+    monkeypatch.setattr(queue, "BUDGET_ROOT_FENCES", {})
+    queue.init_queue_refs(pending, running, workers.QUEUE_SEQ_COUNTER_REF)
+    reservation = ua.reserve_attempt(_request(data_root, reservation_usd=4.0, limit=5.0))
+    ua.mark_dispatched(reservation)
+    assert state.budget_remaining({}, strict=True, allow_stale=True) == pytest.approx(1.0)  # warms the memo
+    ua.settle_attempt(reservation, {"prompt_tokens": 5, "completion_tokens": 2}, cost_usd=settle_at, cost_final=True)
+    sent: list = []
+    pool[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
+                              in_q=SimpleNamespace(put=lambda task: sent.append(dict(task))))
+    pending.append({"id": "evo-1", "type": "evolution", "chat_id": 0, "priority": 1})
+    reasons: list = []
+    real_persist = queue.persist_queue_snapshot
+    monkeypatch.setattr(queue, "persist_queue_snapshot",
+                        lambda reason="", **kw: (reasons.append(reason), real_persist(reason=reason, **kw))[1])
+    return workers, pending, reasons
+
+
+def test_an_evolution_row_is_never_dropped_on_a_snapshot(data_root, monkeypatch):
+    """``assign_tasks`` refuses at TWO floors: zero, and the evolution reserve. A lagging
+    snapshot inside the reserve must not drop an evolution row the exact budget affords."""
+    workers, pending, reasons = _assignment_with_an_evolution_row(data_root, monkeypatch, settle_at=0.10)
+    with _held_ledger_lock(data_root):
+        tick = threading.Thread(target=workers.assign_tasks, daemon=True)
+        tick.start()
+        tick.join(timeout=1.5)
+        assert tick.is_alive(), "the evolution reserve refusal was decided on a snapshot"
+        assert [row["id"] for row in pending] == ["evo-1"] and not reasons
+    tick.join(timeout=60)
+    assert not tick.is_alive() and "evolution_dropped_budget" not in reasons  # exact budget: $4.90
+
+
+def test_an_evolution_row_the_exact_budget_cannot_afford_is_still_dropped(data_root, monkeypatch):
+    """The quiet direction: the refusal itself is untouched when the money is really gone."""
+    workers, pending, reasons = _assignment_with_an_evolution_row(data_root, monkeypatch, settle_at=3.50)
+    workers.assign_tasks()
+    assert pending == [] and "evolution_dropped_budget" in reasons  # exact budget: $1.50
+
+
+def test_a_cold_memo_reads_exactly_instead_of_refusing(data_root, supervisor_state, monkeypatch):
+    """"May admit, never refuses" includes the refusal by absence: with no validated
+    snapshot a pre-check waits for the exact read, as it did before, instead of telling
+    the owner that cost accounting is unavailable after a quarter of a second."""
+    monkeypatch.setattr(supervisor_state, "TOTAL_BUDGET_LIMIT", 5.0)
+    _spend(data_root, 0.40, limit=5.0)
+    rows_memo._ROWS_MEMO.clear()  # a fresh supervisor generation: nothing validated yet
+    answer: list = []
+    with _held_ledger_lock(data_root):
+        pre_check = threading.Thread(
+            target=lambda: answer.append(supervisor_state.budget_remaining({}, strict=True, allow_stale=True)),
+            daemon=True,
+        )
+        pre_check.start()
+        pre_check.join(timeout=1.5)
+        assert pre_check.is_alive() and not answer, "a cold memo refused instead of reading exactly"
+    pre_check.join(timeout=60)
+    assert answer == [pytest.approx(4.60)]
+    # A DISPLAY reader keeps failing closed on a cold memo (the test below): it has no refusal to decide.
+
+
+def test_assignment_rides_the_snapshot_when_it_shows_money(data_root, monkeypatch):
+    """The other direction of the two tests above: with money plainly there the tick
+    never touches the lock, which is why this package exists."""
+    from supervisor import state
+
+    workers, pending, reasons = _assignment_with_an_evolution_row(data_root, monkeypatch, settle_at=0.10)
+    assert state.budget_remaining({}, strict=True, allow_stale=True) == pytest.approx(4.90)  # revalidates
+    with _held_ledger_lock(data_root):
+        _, elapsed = _timed(workers.assign_tasks)
+    assert elapsed < _MAX_READ_SEC and pending == [] and "evolution_dropped_budget" not in reasons
+
+
+def _display_readers(data_root, state):
+    """Every DISPLAY reader this package moved onto the snapshot, as the real callable."""
+    from ouroboros.consciousness_allowance import allowance_window
+    from ouroboros.gateway.cost_breakdown import _task_cost_breakdown_view
+    from supervisor import message_bus, queue
+
+    return {
+        "status_text": lambda: state.status_text({}, [], {}),
+        "budget_breakdown": lambda: state.budget_breakdown({}),
+        "model_breakdown": lambda: state.model_breakdown({}),
+        "budget_line": lambda: message_bus._format_budget_line({}),
+        "evolution_status": lambda: queue.get_evolution_status_snapshot(),
+        "task_cost_view": lambda: _task_cost_breakdown_view(data_root, {"task_id": "task", "root_task_id": "task"}),
+        "consciousness_status": lambda: allowance_window(data_root, allow_stale=True),
+    }
+
+
+@pytest.mark.parametrize("reader", [
+    "status_text", "budget_breakdown", "model_breakdown", "budget_line",
+    "evolution_status", "task_cost_view", "consciousness_status",
+])
+def test_every_display_reader_answers_under_a_held_monetary_lock(data_root, supervisor_state, monkeypatch, reader):
+    """The wiring, caller by caller: a silent return to the exact read would park the
+    supervisor loop (or a gateway worker) for the 45-second monetary timeout again."""
+    from supervisor import message_bus, queue
+
+    for module in (message_bus, queue):
+        monkeypatch.setattr(module, "DRIVE_ROOT", data_root, raising=False)
+    monkeypatch.setattr(message_bus, "TOTAL_BUDGET_LIMIT", 1_000_000.0, raising=False)
+    _spend(data_root, 0.40)
+    read = _display_readers(data_root, supervisor_state)[reader]
+    read()  # warm: the first read validates a snapshot
+    with _held_ledger_lock(data_root):
+        _, elapsed = _timed(read)
+    assert elapsed < _MAX_READ_SEC, f"{reader} waited {elapsed:.1f}s on the monetary lock"
+
+
 def test_the_live_limit_is_applied_to_the_snapshot_never_remembered_with_it(
     data_root, supervisor_state, monkeypatch,
 ):

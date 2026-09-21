@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -284,19 +285,15 @@ def budget_remaining(
     unavailable monetary ledger fails closed while a configured limit is in
     force, so the supervisor cannot dispatch against stale counters.
 
-    ``projection`` is an optional pre-computed global usage projection (same
-    ``global_limit_usd`` and drive root as this function would use itself) so a
-    caller that already replayed the ledger — e.g. ``/api/state`` — does not
-    trigger a second replay. It is accepted only when its ``limit_usd`` equals
-    the limit this function reads itself (``round(max(0.0, total), 6)``, the
-    exact value ``usage_projection`` stamps); any mismatch — a settings hot-reload
-    in between, another limit — falls through to the strict self-computation.
+    ``projection`` is an optional pre-computed global usage projection (same limit and drive
+    root) so a caller that already replayed the ledger — e.g. ``/api/state`` — does not replay
+    it again. It is accepted only when its ``limit_usd`` equals the limit this function reads
+    itself (what ``usage_projection`` stamps); a mismatch falls through to the read below.
 
-    ``allow_stale`` is for a pre-check on a thread that must not wait on money (the
-    supervisor loop): it rides the last validated ledger snapshot against the LIVE
-    limit. A snapshot may only say "there is money", which admits nothing — every paid
-    attempt still passes ``reserve_attempt``. An answer at or below ``refuse_below``,
-    the amount the caller refuses at, is decided on the exact locked read only.
+    ``allow_stale`` is for a loop-thread pre-check that must not wait on money: it rides the
+    last validated snapshot against the LIVE limit. A snapshot may only ADMIT (every paid
+    attempt still passes ``reserve_attempt``): an answer at or below ``refuse_below`` and a cold
+    memo are decided on the exact locked read; a passed ``projection`` is display, never re-read.
     """
     total = float(TOTAL_BUDGET_LIMIT or 0.0)
     if total <= 0:
@@ -306,10 +303,13 @@ def budget_remaining(
     try:
         if projection is None:
             from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection
+            from ouroboros.usage_ledger import UsageLockUnavailable
 
             ensure_legacy_imported(DRIVE_ROOT)
-            projection = usage_projection(DRIVE_ROOT, global_limit_usd=total, allow_stale=allow_stale)
-            if allow_stale and float(projection.get("remaining_known_usd") or 0.0) <= refuse_below:
+            with contextlib.suppress(*((UsageLockUnavailable,) if allow_stale else ())):
+                projection = usage_projection(DRIVE_ROOT, global_limit_usd=total, allow_stale=allow_stale)
+            if projection is None or (
+                    allow_stale and float(projection.get("remaining_known_usd") or 0.0) <= refuse_below):
                 projection = usage_projection(DRIVE_ROOT, global_limit_usd=total)
         return float(projection.get("remaining_known_usd") or 0.0)
     except Exception:

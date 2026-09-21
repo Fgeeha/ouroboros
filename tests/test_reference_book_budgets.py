@@ -67,7 +67,7 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # on the supervisor loop or a gateway thread rides the last validated snapshot; money
     # never does; a pre-check's refusal takes the exact read). The one sentence it touches
     # (the lock's caller wait) is replaced; the rest is a rule the chapter lacked, and the
-    # chapter had 5 bytes left. Sized to the text: 10 bytes of margin.
+    # chapter had 5 bytes left. Sized to the text: 5 bytes of margin.
     "docs/development/06-rules-by-change-class.md": 94520,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
