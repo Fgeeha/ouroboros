@@ -195,6 +195,42 @@ def test_tools_header_says_how_many_rows_are_rendered(tmp_path):
     assert tools.count("shell cmd=") == 10
 
 
+def test_unreadable_live_file_is_disclosed_as_unread(tmp_path, monkeypatch):
+    """A live log that cannot be read is never called "whole live file" (BIBLE P1)."""
+    _write(tmp_path / "logs" / "tools.jsonl",
+           [{"ts": "t", "task_id": "task-a", "tool": "shell", "args": {}, "result_preview": "ok"}])
+    real_stat = pathlib.Path.stat
+
+    def denied(self, *args, **kwargs):
+        if self.name == "tools.jsonl":
+            raise PermissionError(13, "simulated EACCES", str(self))
+        return real_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "stat", denied)
+    header = _section(build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a"),
+                      "## Recent tools").splitlines()[0]
+    assert "window: unread of logs/tools.jsonl" in header and "unreadable_source" in header
+    assert "whole live file" not in header and "no matching rows" in header
+    monkeypatch.setattr(pathlib.Path, "stat", real_stat)
+    # A log that was never written is an empty window, not a gap: no section at all.
+    (tmp_path / "logs" / "tools.jsonl").unlink()
+    sections = build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a")
+    assert not any(s.startswith("## Recent tools") for s in sections)
+
+
+def test_no_task_headers_do_not_overclaim_what_was_scanned(tmp_path):
+    """Without a task id the global 200-row tail is kept; progress renders 50 of it and
+    tools scans only its newest 20 for review markers, and the headers say exactly that."""
+    _write(tmp_path / "logs" / "progress.jsonl", [{"ts": "t", "task_id": "t", "text": f"p{i}"} for i in range(260)])
+    _write(tmp_path / "logs" / "tools.jsonl",
+           [{"ts": "t", "task_id": "t", "tool": "shell", "args": {"cmd": f"c{i}"}, "result_preview": "ok"} for i in range(260)])
+    sections = build_recent_sections(Memory(drive_root=tmp_path), env=None)
+    progress = _section(sections, "## Recent progress").splitlines()[0]
+    assert "(newest 50 rendered of 200 loaded)" in progress and "review markers" not in progress
+    tools = _section(sections, "## Recent tools").splitlines()[0]
+    assert "(10 rendered, 20 scanned for review markers)" in tools and "200 scanned" not in tools
+
+
 def _repo_and_drive(tmp_path):
     repo_dir = tmp_path / "repo"
     drive_root = tmp_path / "drive"
@@ -272,7 +308,7 @@ def test_child_reads_its_own_drive_beside_working_sources(tmp_path):
     assert "host-side rows such as waits stay in the canonical log" in events.splitlines()[0]
     progress = dynamic[dynamic.index("## Recent progress"):].split("\n## ", 1)[0]
     assert "child-step" in progress and "parent-step" not in progress
-    assert "of logs/progress.jsonl" in progress.splitlines()[0]
+    assert "of canonical logs/progress.jsonl" in progress.splitlines()[0]
     # The Working sources block precedes the child's own windows.
     assert dynamic.index("## Working sources") < dynamic.index("## Recent progress")
 

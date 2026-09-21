@@ -1005,22 +1005,25 @@ class Memory:
         from ouroboros.jsonl_tail import coverage_line
 
         sections: List[str] = []
-        for log_name, header, formatter, want, rendered in (
-            ("progress.jsonl", "## Recent progress", lambda rows: self.summarize_progress(rows, limit=50), 50, 50),
-            ("tools.jsonl", "## Recent tools", self.summarize_tools, 20, 10),  # + 20 scanned for review markers
-            ("events.jsonl", "## Recent events", self.summarize_events, 200, 200),
+        # (log, header, formatter, quota, note): the note names what the formatter really
+        # does with more rows than it renders (progress renders its newest 50; tools renders
+        # 10 and scans 20 for review markers; events counts every row it is given).
+        for log_name, header, formatter, want, note in (
+            ("progress.jsonl", "## Recent progress", lambda rows: self.summarize_progress(rows, limit=50), 50,
+             lambda n: f"newest 50 rendered of {n} loaded" if n > 50 else ""),
+            ("tools.jsonl", "## Recent tools", self.summarize_tools, 20,
+             lambda n: f"10 rendered, {min(n, 20)} scanned for review markers" if n > 10 else ""),
+            ("events.jsonl", "## Recent events", self.summarize_events, 200, lambda n: ""),
         ):
             source = own_drive if own_drive is not None and log_name != "progress.jsonl" else self
             entries, coverage = source.read_task_recent(log_name, task_id, want if task_id else 200)
-            if source is not self:
-                coverage["source"] = f"task drive logs/{log_name}" + (
-                    " (worker rows; host-side rows such as waits stay in the canonical log)"
-                    if log_name == "events.jsonl" else ""
-                )
-            if len(entries) > rendered:
-                # The header must not call rows "rendered" that the formatter only
-                # scanned (tools renders its newest 10 and scans 20 for review markers).
-                coverage["rendered"] = f"{rendered} rendered, {len(entries)} scanned for review markers"
+            if own_drive is not None:  # a child's header says which drive each window came from
+                coverage["source"] = "canonical logs/progress.jsonl" if source is self else (
+                    f"task drive logs/{log_name}" + (
+                        " (worker rows; host-side rows such as waits stay in the canonical log)"
+                        if log_name == "events.jsonl" else ""))
+            if note(len(entries)):
+                coverage["rendered"] = note(len(entries))
             summary = formatter(entries)
             if summary or coverage.get("gaps") or coverage.get("archives_bounded"):
                 sections.append(f"{header} ({coverage_line(coverage)})" + (f"\n\n{summary}" if summary else ""))

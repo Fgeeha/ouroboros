@@ -102,17 +102,22 @@ def read_rotated_jsonl_entries(
 
     ``iter_objects`` is the parser seam (the gateway wrapper passes its own
     name so its tests keep governing it). ``coverage``, when given, is filled
-    with ``live_size``, ``live_window`` (bytes of the live file read), ``archives``
-    (consulted count), ``archives_available`` and ``archives_bounded``.
+    with ``live_size``, ``live_window`` (bytes of the live file read; both absent
+    when the live file could not be read), ``archives`` (consulted count),
+    ``archives_available`` and ``archives_bounded``.
     """
     live = pathlib.Path(live)
     parse = iter_objects or iter_jsonl_objects  # module name resolved at call time (test seam)
+    gaps: set[str] = set()
+    live_readable = True
     try:
         size = live.stat().st_size
+    except FileNotFoundError:
+        size = 0  # not written yet: an empty window, not a gap
     except OSError:
-        size = 0
+        size, live_readable = 0, False  # cannot be read: disclosed as unread, never as "whole live file"
+        gaps.add("unreadable_source")
     window = TAIL_WINDOW_START_BYTES
-    gaps: set[str] = set()
     collect = include_gaps or coverage is not None  # a coverage claim needs the gap facts too
     while True:
         if window >= size:
@@ -156,11 +161,12 @@ def read_rotated_jsonl_entries(
     ordered.extend(live_entries)
     if coverage is not None:
         coverage.update({
-            "live_size": size, "live_window": min(window, size),
             "archives": len(chosen), "archives_available": len(archives),
             "archives_bounded": collected < want and len(chosen) < len(archives),
             "matched": collected, "gaps": sorted(gaps),
         })
+        if live_readable:  # an unreadable live file leaves no window facts: the line says "unread"
+            coverage["live_size"], coverage["live_window"] = size, min(window, size)
     return (ordered, gaps) if include_gaps else ordered
 
 

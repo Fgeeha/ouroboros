@@ -217,7 +217,7 @@ def test_unreadable_archive_directory_bypasses_the_memo(tmp_path, monkeypatch):
     def unreadable(path, *, strict=False):
         if strict:
             raise JsonlChainUnreadable("archive directory unreadable (simulated)")
-        return []  # the lenient enumeration reads "never rotated", exactly as on a real EACCES
+        return []  # only the memo's strict enumeration is patched; `_iter_rows` walks the real chain
 
     monkeypatch.setattr(memo, "jsonl_archive_segments", unreadable)
     rows = custody.custody_rows(root)
@@ -343,16 +343,19 @@ def test_records_never_share_nested_containers_with_the_memo(tmp_path):
     _requested(root, "inv-a", "task-a", {"prompt": "p"})
     assert custody.emit(root, custody.START_REQUESTED, {
         "invocation_id": "inv-b", "task_id": "task-a", "route": "codex", "request_ref": {"path": "x"},
-        "resource_ref": {"root": "skill_payload", "nested": {"k": "v"}}})
+        "resource_ref": {"root": "skill_payload", "nested": {"k": "v"}},
+        "processing": {"nested": {"k": "v"}}})
     record = next(r for r in custody.pending_invocations(root) if r["invocation_id"] == "inv-b")
     record["resource_ref"]["nested"]["k"] = "tampered"
     again = next(r for r in custody.pending_invocations(root) if r["invocation_id"] == "inv-b")
     assert again["resource_ref"] == {"root": "skill_payload", "nested": {"k": "v"}}
     detail = custody.invocation_record(root, "inv-b")
     detail["resource_ref"]["nested"]["k"] = "tampered"
-    assert custody.invocation_record(root, "inv-b")["resource_ref"]["nested"]["k"] == "v"
+    detail["processing"]["nested"]["k"] = "tampered"
+    fresh = custody.invocation_record(root, "inv-b")
+    assert fresh["resource_ref"]["nested"]["k"] == "v" and fresh["processing"]["nested"]["k"] == "v"
     memo_row = next(r for r in custody.custody_rows(root) if r.get("invocation_id") == "inv-b")
-    assert memo_row["resource_ref"]["nested"]["k"] == "v"
+    assert memo_row["resource_ref"]["nested"]["k"] == "v" and memo_row["processing"]["nested"]["k"] == "v"
 
 
 def test_locator_never_returns_another_invocations_body(tmp_path):
@@ -366,3 +369,9 @@ def test_locator_never_returns_another_invocations_body(tmp_path):
     # A locator that points at another invocation's line is refused for this one.
     assert memo.read_locator_request(root, locator_b, invocation_id="inv-a") is None
     assert custody.invocation_record(root, "inv-a")["request"] == {"prompt": "AAA"}
+    # The pending-invocation resolver passes the row's own invocation id along.
+    from ouroboros import delegate_pending as pending
+
+    row_a = dict(next(r for r in rows if r.get("invocation_id") == "inv-a"))
+    assert pending.request_body(root, row_a) == {"prompt": "AAA"}
+    assert pending.request_body(root, {**row_a, memo.REQUEST_LOCATOR_KEY: locator_b}) is None
