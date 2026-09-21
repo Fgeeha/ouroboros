@@ -95,6 +95,56 @@ def _inherited_project_scope(ctx: ToolContext) -> str:
     return _durable_project_of_request(ctx) or str(getattr(ctx, "project_id", "") or "")
 
 
+def _host_listed_predecessors(metadata: Dict[str, Any]) -> list:
+    """Every result THIS turn's host facts put in front of the model: the Main
+    lane's manifest, the room's own hint list, and the room's pointer row."""
+    rows: list = []
+    for key in ("main_routing_manifest", "project_routing_manifest"):
+        manifest = metadata.get(key)
+        if isinstance(manifest, dict) and isinstance(manifest.get("final_results"), list):
+            rows.extend(row for row in manifest["final_results"] if isinstance(row, dict))
+    previous = metadata.get("project_last_task_result")
+    if isinstance(previous, dict) and previous:
+        rows.append(previous)
+    return rows
+
+
+def _predecessor_door_refusal(
+    ctx: ToolContext, result: Dict[str, Any], listed: bool,
+) -> str:
+    """Why this readable result may NOT be continued from here, or ``""``.
+
+    The door is a PREDICATE, not membership of a bounded list: same project, a
+    ROOT, a readable result, not live. The list is a hint - a window that fits
+    16 rows became a ceiling saying "exactly one result is addressable", so a
+    room could not name its own interrupted root and promoted again instead,
+    minting the duplicate root the night ended with. Outside a room there is no
+    project to compare against, and an absent project is not a match: there the
+    host's own list still decides.
+    """
+    from ouroboros.server_routing_context import _is_child_result
+    from ouroboros.task_status import SETTLED_STATUSES
+
+    if _is_child_result(result):
+        return (
+            "the selected predecessor is a delegated child result; name the ROOT task it "
+            "belongs to - a child's work is reachable through its root"
+        )
+    status = str(result.get("status") or "")
+    if status not in SETTLED_STATUSES:
+        return (
+            f"the selected predecessor is still live (status {status or 'unknown'}); "
+            "steer_task continues a live root, and promoting it would start a second one"
+        )
+    room = _inherited_project_scope(ctx)
+    if not listed and not (room and room == str(result.get("project_id") or "")):
+        return (
+            "predecessor_task_id is not an addressable result in the host routing "
+            "manifest, and it is not a finished root task of this room's project"
+        )
+    return ""
+
+
 def _attach_predecessor_authority_from_metadata(
     ctx: ToolContext, evt: Dict[str, Any], predecessor_task_id: str = "",
 ) -> str:
@@ -103,30 +153,30 @@ def _attach_predecessor_authority_from_metadata(
     selected_id = str(predecessor_task_id or "").strip()
     if not selected_id:
         return ""
-    previous = metadata.get("project_last_task_result")
-    manifest = metadata.get("main_routing_manifest")
-    candidates = (
-        manifest.get("final_results")
-        if isinstance(manifest, dict) and isinstance(manifest.get("final_results"), list)
-        else [previous] if isinstance(previous, dict) else []
-    )
-    previous = next((
-        row for row in candidates
-        if isinstance(row, dict) and str(row.get("task_id") or "") == selected_id
+    listed = next((
+        row for row in _host_listed_predecessors(metadata)
+        if str(row.get("task_id") or "") == selected_id
     ), None)
-    if not isinstance(previous, dict):
-        return (
-            "predecessor_task_id is not an addressable result in the host "
-            "routing manifest"
-        )
     status_root = Path(str(
         metadata.get("budget_drive_root")
         or getattr(ctx, "budget_drive_root", "")
         or ctx.drive_root
     ))
-    if not load_effective_task_result(status_root, selected_id, materialize_artifacts=False):
+    result = load_effective_task_result(status_root, selected_id, materialize_artifacts=False)
+    if not isinstance(result, dict) or not result:
         return "the selected predecessor task result is missing or unreadable"
-    source = previous.get("authority_source") if isinstance(previous, dict) else None
+    refusal = _predecessor_door_refusal(ctx, result, listed is not None)
+    if refusal:
+        return refusal
+    if listed is not None:
+        # A row the host showed carries its own host-issued pointer, and only that
+        # one is accepted for it: rebuilding a source for a shown row would make a
+        # tampered manifest row indistinguishable from a host-built one.
+        source = listed.get("authority_source")
+    else:
+        from ouroboros.server_routing_context import _task_result_ground_truth
+
+        source = _task_result_ground_truth(result).get("authority_source")
     from ouroboros.agent_startup_checks import valid_task_result_authority_source
 
     if valid_task_result_authority_source(source, selected_id):
@@ -470,7 +520,8 @@ def _promote_chat_to_task(
         f"⚠️ PROMOTE_UNCONFIRMED: task {tid} admission was not confirmed {confirmation_window}; "
         f"the requested destination was {_requested_scope_label(display_name, pid)} and the "
         "effective one is unknown until the admission is reconciled. Do not report this task as "
-        "created and do not retry automatically; keep this task id for reconciliation."
+        f"created and do not retry automatically: call get_task_result({tid}) to read the durable "
+        "outcome before promoting the same work again."
     )
     return _finish_swarm_handoff(
         ctx, evt, response, status="unconfirmed", reason=reason or "confirmation_timeout",
