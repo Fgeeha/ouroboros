@@ -532,7 +532,7 @@ def _run_shell(
         _record_scratch_fingerprints(ctx, scratch_abs)
         return (
             f"⚠️ TOOL_TIMEOUT (run_command): command exceeded the per-command timeout of {timeout_sec}s "
-            f"and its process group was killed; a child it detached may survive untracked (root={binding.root}, cwd={work_dir}). NOTE: this is the per-command "
+            f"and the host killed what it could still reach of its process tree; a background child may survive untracked (root={binding.root}, cwd={work_dir}). NOTE: this is the per-command "
             f"FOREGROUND timeout, NOT the task deadline. For genuinely long-running compute (training, "
             f"sampling, large builds/downloads), start it with start_service and poll "
             f"service_status/service_logs while you do other work, or pass an explicit timeout_sec=<seconds> "
@@ -681,7 +681,7 @@ def get_tools() -> List[ToolEntry]:
                 "cmd MUST be an array of strings, never one shell string. A builtin as cmd[0] (cd, export, ...) "
                 "is refused: use cwd= or [\"sh\", \"-c\", \"cd x && a | b\"] (also for pipes/chaining). "
                 "A background child (&, nohup) is no service: holding stdout/stderr it stalls the call until "
-                "timeout_sec, and afterwards nothing tracks or stops it (use start_service). "
+                "timeout_sec, and once the call returns nothing tracks it (use start_service). "
                 "Prefer read_file, search_code/query_code, write_file/edit_text to cat/head/sed, grep/find, redirects."
             ),
             "parameters": {"type": "object", "properties": {
