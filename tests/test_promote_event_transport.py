@@ -538,6 +538,7 @@ def test_steer_tool_reports_delivery_only_after_mailbox_receipt(
 
 
 def test_stale_live_transport_returns_unconfirmed_not_ok(monkeypatch, tmp_path):
+    from ouroboros.task_results import STATUS_REQUESTED, load_task_result
     from ouroboros.tools import control, control_events
 
     monkeypatch.setattr(control_events, "_PROMOTE_CONFIRM_TIMEOUT_SEC", 0.05)
@@ -556,7 +557,12 @@ def test_stale_live_transport_returns_unconfirmed_not_ok(monkeypatch, tmp_path):
         assert event["type"] == "promote_chat_to_task"
         assert out.startswith("⚠️ PROMOTE_UNCONFIRMED:")
         assert "Do not report this task as created" in out
-        assert not (tmp_path / "task_results" / f"{event['task_id']}.json").exists()
+        # #1160: the id is durably PENDING, never scheduled - the emitted stub is
+        # exactly the reconciliation read the refusal names, and it grants nothing.
+        stored = load_task_result(tmp_path, event["task_id"])
+        assert stored["status"] == STATUS_REQUESTED
+        assert stored["promotion_admission"]["status"] == "emitted"
+        assert stored["promotion_admission"]["routing_token"] == event["routing_token"]
     finally:
         stale_queue.close()
         stale_queue.cancel_join_thread()

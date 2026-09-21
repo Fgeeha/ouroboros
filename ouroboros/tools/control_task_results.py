@@ -197,6 +197,23 @@ def _get_task_result(
             status="unavailable", code="LEGACY_UNAVAILABLE",
             text=f"Task {task_id}: unknown or not yet registered",
         ))
+    from ouroboros.routing_wait import is_emitted_admission_stub
+
+    if is_emitted_admission_stub(data):
+        # #1160: a promote whose admission the supervisor has not confirmed yet is
+        # PENDING, not unknown. Answering "unknown or not yet registered" read as
+        # "your promote never happened" and invited the second promote that mints a
+        # duplicate root; the id stays reserved and this read is the reconciliation.
+        since = str((data.get("promotion_admission") or {}).get("emitted_at") or "")
+        return _publish_tool_result(ctx, ToolResult(
+            status="unavailable", code="LEGACY_UNAVAILABLE",
+            text=(
+                f"Task {task_id}: admission pending since {since} - the promote was emitted and "
+                "the supervisor has not confirmed or refused it yet. This id is durably reserved: "
+                f"call get_task_result({task_id}) again to read the outcome, and do not promote "
+                "the same work a second time."
+            ),
+        ))
     if bool(include_authority) or bool(include_work_order_source) or bool(include_completion_source):
         from ouroboros.agent_startup_checks import task_result_authority_projection
 

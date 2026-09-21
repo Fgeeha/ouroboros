@@ -147,8 +147,12 @@ def _canonical_promoted_repair_constraint(value: Any) -> tuple[Optional[dict], s
     }, ""
 
 
-def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
-    """Fail closed if a promoted id is already live, durable, or uncheckable."""
+def _promote_duplicate_reason(task_id: str, ctx: Any, *, admission_token: str = "") -> str:
+    """Fail closed if a promoted id is already live, durable, or uncheckable.
+
+    A row that is only THIS admission's emitted stub (#1160) is its own
+    pre-receipt, not a second owner of the id, so it is read around here.
+    """
     pending = getattr(ctx, "PENDING", _pool().PENDING)
     running = getattr(ctx, "RUNNING", _pool().RUNNING)
     with _queue_lock:
@@ -157,12 +161,14 @@ def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
             for row in list(pending or [])
         ) or task_id in (running or {})
     try:
+        from ouroboros.routing_wait import is_emitted_admission_stub
         from ouroboros.task_results import load_task_result
 
-        stored_duplicate = bool(
-            load_task_result(
-                getattr(ctx, "DRIVE_ROOT", _pool().DRIVE_ROOT), task_id, strict=True,
-            )
+        stored = load_task_result(
+            getattr(ctx, "DRIVE_ROOT", _pool().DRIVE_ROOT), task_id, strict=True,
+        )
+        stored_duplicate = bool(stored) and not is_emitted_admission_stub(
+            stored, admission_token,
         )
     except Exception:
         log.warning("promote: duplicate-id lookup failed for %s", task_id, exc_info=True)
@@ -405,7 +411,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         return {"status": "needs_manual_target", "reason": "empty_objective", "task_id": tid}
     # Reject before project/source/workspace side effects. enqueue_task repeats
     # the check atomically for the tiny race before queue insertion.
-    duplicate_reason = _promote_duplicate_reason(tid, ctx)
+    duplicate_reason = _promote_duplicate_reason(tid, ctx, admission_token=admission_token)
     if duplicate_reason:
         return {
             "status": "needs_manual_target",

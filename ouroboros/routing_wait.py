@@ -14,8 +14,33 @@ import time
 from pathlib import Path
 from typing import Any, Dict
 
-PROMOTE_CONFIRM_TIMEOUT_SEC = 15.0
+from ouroboros.runtime_limits import get_promote_confirm_wait_sec
+
+PROMOTE_CONFIRM_TIMEOUT_SEC = get_promote_confirm_wait_sec()
 PROMOTE_CONFIRM_POLL_SEC = 0.05
+
+# The promote's OWN pre-receipt, written at emit into the task-result record it
+# reserves: the request exists and durably says so, while the supervisor alone
+# still grants the positive `scheduled` authority. `emitted` is therefore never a
+# settled admission for the waiter, and never an owner of the id for the three
+# admission gates (`is_emitted_admission_stub`).
+PROMOTION_ADMISSION_EMITTED = "emitted"
+
+
+def is_emitted_admission_stub(result: Any, routing_token: str = "") -> bool:
+    """Whether ``result`` is ONLY a promote's emitted stub - optionally of this
+    exact routing token, which is how an admission recognises its own pre-receipt
+    instead of reading it as another task already owning the id."""
+    if not isinstance(result, dict):
+        return False
+    admission = result.get("promotion_admission")
+    token = str(routing_token or "").strip()
+    return bool(
+        isinstance(admission, dict)
+        and str(admission.get("status") or "") == PROMOTION_ADMISSION_EMITTED
+        and str(result.get("status") or "") == "requested"
+        and (not token or str(admission.get("routing_token") or "") == token)
+    )
 
 
 def wait_for_promotion_admission(
