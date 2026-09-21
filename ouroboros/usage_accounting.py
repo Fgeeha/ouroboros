@@ -487,17 +487,17 @@ def usage_projection(
     *,
     root_task_id: str = "",
     global_limit_usd: Optional[float] = None,
-    include_roots: bool = True,
+    include_roots: bool = True, allow_stale: bool = False,
 ) -> Dict[str, Any]:
     """Return a replayed global projection, or one root/subtree projection.
-    ``include_roots=False`` skips the per-root ``by_root`` map for hot-path
-    readers that never consume it (``/api/state``); the slim result still
-    carries the two fields ``budget_remaining`` reads."""
+    ``include_roots=False`` skips the per-root ``by_root`` map for hot-path readers
+    (``/api/state``); the slim result keeps the two fields ``budget_remaining`` reads.
+    ``allow_stale``: DISPLAY readers only, never money (``_memoized_final_rows``)."""
     root = _drive_root(drive_root)
     if root_task_id:
         return _render_cached(
             root, ("usage_projection", root_task_id, "", None, True),
-            lambda f, degraded: _projection_from_final(f, degraded, root_task_id=root_task_id))
+            lambda f, degraded: _projection_from_final(f, degraded, root_task_id=root_task_id), allow_stale=allow_stale)
     if global_limit_usd is not None:
         configured_limit = max(0.0, float(global_limit_usd))
     else:
@@ -507,20 +507,20 @@ def usage_projection(
     return _render_cached(
         root, ("usage_projection", "", "", limit, include_roots),
         lambda final, degraded: _projection_from_final(final, degraded, limit,
-                                                       include_roots=include_roots))
+                                                       include_roots=include_roots), allow_stale=allow_stale)
 
 
 def usage_breakdown(
     drive_root: pathlib.Path | str | None = None,
     *,
     root_task_id: str = "",
-    task_id: str = "",
+    task_id: str = "", allow_stale: bool = False,
 ) -> Dict[str, Any]:
     """Read-only physical-call/token/cost buckets from validated ledger finals.
-    Both private compatibility fields — the ordered ``[compaction_epoch, seq]``
-    marker in ``_ledger_high_water_seq`` and the money projection in
-    ``_usage_projection`` — are rendered from THIS one validated read, so a
-    writer authorizes its projection with the marker of the same snapshot."""
+    Both private compatibility fields — the ordered ``[compaction_epoch, seq]`` marker in
+    ``_ledger_high_water_seq`` and the money projection in ``_usage_projection`` — are
+    rendered from THIS one validated read, so a writer authorizes its projection with the
+    marker of the same snapshot, a lagging ``allow_stale`` one (display only) included."""
     root = _drive_root(drive_root)
     cache_key = ("usage_breakdown", root_task_id, task_id, None, True)
 
@@ -588,7 +588,7 @@ def usage_breakdown(
         result["_usage_projection"] = _projection_from_final(final, integrity_degraded)
         return result
 
-    return _render_cached(root, cache_key, render)
+    return _render_cached(root, cache_key, render, allow_stale=allow_stale)
 
 
 def _reservation_cost(request: AttemptRequest) -> Optional[float]:
