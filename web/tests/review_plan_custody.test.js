@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 
 import {
+    formatReviewProjection,
     planReviewGroupFromTaskDetail,
     renderReviewsSection,
 } from '../modules/review_presentation.js';
@@ -203,4 +204,117 @@ test('a plan wave of a task that is not running is a recorded gap, never live wo
     const mixed = planGroup({ custody_pending: true, actors: [AWAITING, ANSWERED, FAILED] }, 'completed');
     assert.equal(mixed.progress, 'no verdict · 1 of 3 answered · 1 unavailable');
     assert.equal(mixed.tone, 'warn');
+});
+
+// --- "since HH:MM": the host's own record of when it sent the request ---------
+// The clock is the VIEWER's local time, so every expectation is computed with the
+// same platform API the renderer uses; the suite must pass in any timezone.
+const localClock = (iso) => new Date(iso)
+    .toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', hour12: false });
+const localDay = (iso) => new Date(iso).toLocaleDateString([], { month: 'short', day: 'numeric' });
+const todayAt = (hour, minute) => {
+    const at = new Date();
+    at.setHours(hour, minute, 0, 0);
+    return at.toISOString();
+};
+const daysAgoAt = (days, hour, minute) => {
+    const at = new Date(Date.now() - days * 86400000);
+    at.setHours(hour, minute, 0, 0);
+    return at.toISOString();
+};
+
+test('an awaited reviewer says since when, in the viewer local clock', () => {
+    const sent = todayAt(9, 15);
+    const group = planGroup({
+        custody_pending: true,
+        actors: [{ ...AWAITING, awaiting_since: sent }, ANSWERED],
+    });
+    const [line] = availabilityLines(group.attempts[0], 'Awaiting answer:');
+    assert.match(line, /^Awaiting answer: .* · since \d{2}:\d{2}$/);
+    assert.equal(line, `Awaiting answer: triad_286lhb · codex=gpt-6-astra · since ${localClock(sent)}`);
+});
+
+test('a reviewer row the host never timed keeps exactly its former line', () => {
+    // Both directions of the same guard: no field, an empty field and a value that
+    // is not an instant all render byte-identically to the line shipped before.
+    const before = 'Awaiting answer: triad_286lhb · codex=gpt-6-astra';
+    for (const awaiting_since of [undefined, '', '   ', 'soon', 'since yesterday']) {
+        const group = planGroup({
+            custody_pending: true,
+            actors: [{ ...AWAITING, ...(awaiting_since === undefined ? {} : { awaiting_since }) }],
+        });
+        assert.deepEqual(
+            availabilityLines(group.attempts[0], 'Awaiting answer:'), [before], String(awaiting_since),
+        );
+    }
+});
+
+test('a wait that began on an earlier day names that day too', () => {
+    // "since 23:50" must never be misread as tonight when the wait is 30 hours old.
+    const sent = daysAgoAt(1, 23, 50);
+    const group = planGroup({ custody_pending: true, actors: [{ ...AWAITING, awaiting_since: sent }] });
+    const [line] = availabilityLines(group.attempts[0], 'Awaiting answer:');
+    assert.equal(line, `Awaiting answer: triad_286lhb · codex=gpt-6-astra · since ${localDay(sent)} ${localClock(sent)}`);
+    assert.doesNotMatch(line, /^Awaiting answer: .* · since \d{2}:\d{2}$/);
+});
+
+test('an unresolved reviewer says since when it was sent, under the same rule', () => {
+    const sent = todayAt(7, 5);
+    const lost = {
+        ...AWAITING, operation_state: 'custody_lost', failure_code: 'review_custody_lost',
+        error: 'Review custody was lost before the slot settled',
+    };
+    const timed = planGroup({ custody_pending: true, actors: [{ ...lost, awaiting_since: sent }] });
+    assert.deepEqual(availabilityLines(timed.attempts[0], 'No answer:'), [
+        `No answer: triad_286lhb · codex=gpt-6-astra — custody_lost: review_custody_lost · since ${localClock(sent)}`,
+    ]);
+    const untimed = planGroup({ custody_pending: true, actors: [lost] });
+    assert.deepEqual(availabilityLines(untimed.attempts[0], 'No answer:'), [
+        'No answer: triad_286lhb · codex=gpt-6-astra — custody_lost: review_custody_lost',
+    ]);
+});
+
+test('a settled reviewer never grows a since suffix', () => {
+    // The stored moment belongs to the wait; an answer that arrived is judged by itself.
+    const group = planGroup({
+        custody_pending: false,
+        actors: [{ ...FAILED, awaiting_since: todayAt(6, 30) }],
+    });
+    assert.deepEqual(availabilityLines(group.attempts[0], 'Reviewer unavailable:'), [
+        'Reviewer unavailable: triad_bkydwq · codex=gpt-6-astra — run_failed',
+    ]);
+});
+
+test('the acceptance panel reviewer line says since when, under the same rule', () => {
+    const sent = todayAt(8, 41);
+    const row = (fields) => ({
+        slot_id: 's1', model: 'codex=gpt-6-astra', provider: 'openrouter',
+        actor_role: 'task acceptance', transport_status: 'awaiting', parse_status: 'awaiting',
+        semantic_verdict: '', coverage: { criteria_total: 0, findings: 0 },
+        quorum_contribution: false, enforcement_impact: 'abstains', operation_id: 'op-s1',
+        operation_state: 'pending_dispatch', late_result_pending: true, executions: [],
+        response_ref: {}, reason: 'no answer yet', ...fields,
+    });
+    const panelText = (fields) => formatReviewProjection({
+        panels: [{
+            panel_id: 'panel_a72b23783ba34908', surface: 'task_acceptance', authority: 'host_root',
+            aggregate_signal: 'DEGRADED', transport_status: 'awaiting', parse_status: 'awaiting',
+            quorum: { required: 1, contributed: 0, configured: 1 },
+            enforcement_impact: 'pending_feedback', actors: [row(fields)],
+        }],
+    }).split('\n').filter((line) => line.startsWith('Reviewer s1:'));
+
+    assert.deepEqual(panelText({ awaiting_since: sent }), [
+        `Reviewer s1: role=task acceptance · provider=openrouter · model=codex=gpt-6-astra · transport=awaiting · parse=awaiting · verdict=none · quorum=abstains · enforcement=abstains · since ${localClock(sent)}`,
+    ]);
+    assert.deepEqual(panelText({}), [
+        'Reviewer s1: role=task acceptance · provider=openrouter · model=codex=gpt-6-astra · transport=awaiting · parse=awaiting · verdict=none · quorum=abstains · enforcement=abstains',
+    ]);
+    assert.deepEqual(panelText({ awaiting_since: 'soon' }), panelText({}));
+    // A settled reviewer line is untouched even if a moment rode along.
+    assert.deepEqual(
+        panelText({ operation_state: 'settled', transport_status: 'success', parse_status: 'valid',
+                    semantic_verdict: 'PASS', awaiting_since: sent }),
+        ['Reviewer s1: role=task acceptance · provider=openrouter · model=codex=gpt-6-astra · transport=success · parse=valid · verdict=PASS · quorum=abstains · enforcement=abstains'],
+    );
 });

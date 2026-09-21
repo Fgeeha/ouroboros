@@ -312,6 +312,11 @@ class ReviewActorRecord:
     operation_state: str = "settled"
     late_result_pending: bool = False
     recovery_binding: Dict[str, Any] = field(default_factory=dict)
+    # Wall clock at which THIS process sent this reviewer its request, for the
+    # rows that are still waiting for an answer. Empty whenever the host did not
+    # perform the send itself (a free replay, a rejoin of an earlier process's
+    # paid operation): the owner is never shown an inferred moment.
+    awaiting_since: str = ""
 
 
 @dataclass

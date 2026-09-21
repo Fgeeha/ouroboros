@@ -28,7 +28,7 @@ from ouroboros.review_dispatch import slot_id_for_row
 from ouroboros.usage_accounting import (
     PHYSICAL_ATTEMPT_STATES, POSITIVE_PHYSICAL_ATTEMPT_STATES,
 )
-from ouroboros.utils import emit_cognitive_operation_event
+from ouroboros.utils import emit_cognitive_operation_event, utc_now_iso
 
 log = logging.getLogger("review_custody")
 
@@ -45,6 +45,9 @@ class ActiveReviewAttempt:
     retry_state: Dict[str, Any] = field(default_factory=dict)
     pending_invocation_checkpoint: Callable[[str], None] | None = None
     recovery_binding: Dict[str, Any] = field(default_factory=dict)
+    # Wall clock of the send THIS process performs; empty when it rejoins an
+    # operation an earlier process paid for, whose send moment it cannot know.
+    started_at: str = ""
 
 
 _ACTIVE_LOCK = threading.Lock()
@@ -833,6 +836,7 @@ def _late_or_timeout_actor(
             entry.operation_id, "pending_dispatch",
         )
         actor.late_result_pending = True
+        actor.awaiting_since = entry.started_at
         return actor
     actor = error_actor(
         slot,
@@ -840,6 +844,8 @@ def _late_or_timeout_actor(
         entry.operation_id if entry is not None else "",
         "in_flight" if entry is not None else "settled",
     )
+    if entry is not None:
+        actor.awaiting_since = entry.started_at
     if entry is not None and entry.retry_state:
         usage = dict(getattr(actor, "usage", None) or {})
         usage.update({
@@ -1287,6 +1293,9 @@ def run_custodied_review_slots(
                         operation_id=retry_operation_id or reserved_operation_id or new_call_id(
                             f"review_{getattr(request, 'surface', 'review')}_{getattr(slot, 'slot_id', 'slot')}"),
                         retry_state=retry_payload,
+                        # A rejoin inherits an EARLIER process's send; only a new
+                        # physical operation is sent from here, and only now.
+                        started_at="" if exact_recovery else utc_now_iso(),
                     )
                     entry.recovery_binding = review_operation_binding(request, slot, entry.operation_id)
                     entry.wave_key = _wave_key(request)

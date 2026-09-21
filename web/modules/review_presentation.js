@@ -1,5 +1,5 @@
 import { setInertCardPresentation } from './task_phase_chip.js';
-import { escapeHtmlAttr } from './utils.js';
+import { escapeHtmlAttr, sinceLocalTime } from './utils.js';
 import { taskSourceDownloadUrl } from './api_client.js';
 import { harnessIdentityMarkup } from './harness_presentation.js';
 import { reconcileReviewMarkup } from './review_dom_patch.js';
@@ -535,8 +535,8 @@ function planActorAvailabilityLines(wave) {
         if (!actor || typeof actor !== 'object' || actor.ok !== false) continue;
         const identity = [text(actor.slot_id), text(actor.model)].filter(Boolean).join(' · ') || 'reviewer';
         const gap = actorAwaiting(actor)
-            ? `Awaiting answer: ${identity}`
-            : (actorUnresolved(actor) ? `No answer: ${identity} — ${[text(actor.operation_state), text(actor.failure_code) || text(actor.error)].filter(Boolean).join(': ')}` : '');
+            ? `Awaiting answer: ${identity}${sinceLocalTime(actor.awaiting_since)}`
+            : (actorUnresolved(actor) ? `No answer: ${identity} — ${[text(actor.operation_state), text(actor.failure_code) || text(actor.error)].filter(Boolean).join(': ')}${sinceLocalTime(actor.awaiting_since)}` : '');
         if (gap) {
             lines.push(gap);
             continue;
@@ -790,7 +790,7 @@ export function formatReviewProjection(projection) {
             if (!actor || typeof actor !== 'object') return;
             const slotId = String(actor.slot_id || '?');
             lines.push(
-                `Reviewer ${slotId}: role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${actorAwaiting(actor) ? 'awaiting' : String(actor.transport_status || 'unknown')} · parse=${actorAwaiting(actor) ? 'awaiting' : String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}`,
+                `Reviewer ${slotId}: role=${String(actor.actor_role || 'reviewer')} · provider=${String(actor.provider || 'unknown')} · model=${String(actor.model || 'unknown')} · transport=${actorAwaiting(actor) ? 'awaiting' : String(actor.transport_status || 'unknown')} · parse=${actorAwaiting(actor) ? 'awaiting' : String(actor.parse_status || 'unknown')} · verdict=${String(actor.semantic_verdict || 'none')}${actor.outcome_tier ? ` · outcome_tier=${String(actor.outcome_tier)}` : ''}${actor.dialogue_status ? ` · dialogue=${String(actor.dialogue_status)}` : ''} · quorum=${actor.quorum_contribution ? 'contributes' : 'abstains'} · enforcement=${String(actor.enforcement_impact || 'unknown')}${actorAwaiting(actor) || actorUnresolved(actor) ? sinceLocalTime(actor.awaiting_since) : ''}`,
             );
             const actorCoverage = compactCoverage(actor.coverage);
             if (actorCoverage) lines.push(`Reviewer ${slotId} coverage: ${actorCoverage}`);

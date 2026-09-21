@@ -543,6 +543,10 @@ not child-task cards and never prove execution by themselves.
   nor awaited (a settled failure, an expired window, lost custody, a refusal)
   adds `· m unavailable` and keeps the warning tone beside the awaited slots; a
   panel with no awaited slot keeps the warning tone and its `DEGRADED` verdict.
+- An awaited or unresolved reviewer row adds `· since HH:MM` in the viewer's
+  local 24-hour clock, prefixed with the short date when the wait began on an
+  earlier day, only where the host recorded the moment it sent that reviewer's
+  request; a time is never inferred.
 - A panel that settled after its task ended stays one attempt row of its group,
   labelled as settled after the task ended; its note (which verdict, which
   revision, whether a reviewer's outcome is still unknown) is host-composed and
