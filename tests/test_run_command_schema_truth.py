@@ -61,9 +61,12 @@ def test_description_states_the_bare_builtin_refusal_and_the_sh_c_escape():
 
 def test_description_states_what_happens_to_a_background_child():
     description = _schema()["description"]
-    # What the empirical tests below prove: the call stalls until timeout_sec
-    # while the child holds stdio, and the child survives untracked either way.
-    for word in ("&", "nohup", "stalls the call until timeout_sec", "nothing tracks or stops it", "start_service"):
+    # What the empirical tests below prove on every platform: the call stalls until
+    # timeout_sec while the child holds stdio, and nothing tracks the child afterwards.
+    # Whether the timeout kill still REACHES it is the platform's business (Linux can
+    # resolve the exited shell's process group and kills it, macOS cannot and it
+    # survives), so the description promises neither a cleanup nor a survival.
+    for word in ("&", "nohup", "stalls the call until timeout_sec", "once the call returns nothing tracks it", "start_service"):
         assert word in description, word
     assert "killed" not in description and "cleaned up" not in description  # no promise the host does not keep
 
@@ -92,10 +95,11 @@ def test_background_child_holding_stdout_makes_the_call_wait_until_timeout(tmp_p
     try:
         assert result.startswith("⚠️ TOOL_TIMEOUT"), result
         assert elapsed >= 0.9, elapsed
-        # "nothing tracks or stops it": the shell exited at once, so the timeout's
-        # group kill had no tree left — the backgrounded child is still running.
+        # "once the call returns nothing tracks it": the shell exited at once. On
+        # Linux the timeout kill still resolves the dead shell's process group and
+        # takes the child with it; on macOS it cannot and the child keeps running.
+        # Either way the host holds no handle on it.
         alive = subprocess.run(["pgrep", "-f", marker], capture_output=True, text=True).stdout.split()
-        assert alive, "the backgrounded child did not outlive the timeout kill"
         assert not any(str(proc.pid) in alive for proc in list(_active_subprocesses)), "nothing tracks it"
     finally:
         subprocess.run(["pkill", "-f", marker], check=False)
