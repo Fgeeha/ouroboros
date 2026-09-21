@@ -751,8 +751,10 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
             "(~0.5s hold at 20MB — see usage_ledger.py); size-triggered "
             "compaction (usage_compaction.py, CPL4-C6) should hold the file "
             "far below this — growth can mean broken compaction, a large "
-            "unfoldable residue, a policy abort, or refusal on the name tier "
-            "(no kernel locks). Check usage_ledger_compaction_refused or "
+            "unfoldable residue, a policy abort, refusal on the name tier "
+            "(no kernel locks), or a file that has not yet outgrown the floor "
+            "its last committed pass stamped into the ledger header (declined "
+            "before the pass, so no event). Check usage_ledger_compaction_refused or "
             "usage_ledger_compaction_skipped in events.jsonl; the two snapshot-race "
             "exits before archive/swap only log warnings, without a typed event.",
         ),
