@@ -286,6 +286,13 @@ def test_only_a_root_finalization_moves_the_projects_pointer(tmp_path):
     )
     assert get_project(tmp_path, "racer")["last_task_result_id"] == "racer-root"
 
+    # The door calls a row a child by its parent OR by its role; so does the stamp.
+    record_task_finalization(
+        "racer", {"id": "racer-role-only", "root_task_id": "racer-root", "delegation_role": "subagent"},
+        objective="helper with no parent field", kind="task", exec_status="completed", drive_root=tmp_path,
+    )
+    assert get_project(tmp_path, "racer")["last_task_result_id"] == "racer-root"
+
 
 def test_the_self_heal_scan_never_offers_or_stamps_a_child(tmp_path):
     """The lookup's fallback scan is the pointer's SECOND writer: with no pointer

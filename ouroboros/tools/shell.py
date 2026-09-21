@@ -532,7 +532,7 @@ def _run_shell(
         _record_scratch_fingerprints(ctx, scratch_abs)
         return (
             f"⚠️ TOOL_TIMEOUT (run_command): command exceeded the per-command timeout of {timeout_sec}s "
-            f"and its subprocess tree was terminated (root={binding.root}, cwd={work_dir}). NOTE: this is the per-command "
+            f"and its process group was killed; a child it detached may survive untracked (root={binding.root}, cwd={work_dir}). NOTE: this is the per-command "
             f"FOREGROUND timeout, NOT the task deadline. For genuinely long-running compute (training, "
             f"sampling, large builds/downloads), start it with start_service and poll "
             f"service_status/service_logs while you do other work, or pass an explicit timeout_sec=<seconds> "
