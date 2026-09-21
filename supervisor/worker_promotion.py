@@ -750,6 +750,18 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         task["workspace_root"] = resolved_ws
         task["workspace_mode"] = "external"
         task["memory_mode"] = "forked"
+        if pid and str(evt.get("workspace_root") or "").strip():
+            # An explicit folder for a room that has none yet becomes the room's
+            # folder: the same validated canonical path this task runs in, written
+            # only while `working_dir` is still empty (compare-and-set under the
+            # registry lock), so a set value is never overwritten and the room's
+            # later direct turns are not blind to where the work went.
+            try:
+                from ouroboros.projects_registry import update_project
+
+                update_project(_pool().DRIVE_ROOT, pid, working_dir=resolved_ws, only_if_empty=("working_dir",))
+            except Exception:
+                log.warning("promote: could not record working_dir for project %s", pid, exc_info=True)
         # The lease lane keys off task["project_id"]: for a project room it is already
         # set; for a bare workspace promote, resolve it (registry-first → derived hash)
         # so one folder is one serialized lane on EVERY entry path (slice 0 invariant).
