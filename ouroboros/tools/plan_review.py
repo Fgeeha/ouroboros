@@ -1052,8 +1052,7 @@ def _apply_author_subject(ctx: ToolContext, disposition: dict, envelope: Optiona
     allowed = action == "finish" and not review_enforcement_blocks(enforcement)
     text = (f"Current author plan saved: {fingerprint}. Critic subject: {critic_fp}. "
             "No reviewer called and no cycle consumed; original findings and custody remain unchanged. "
-            + ("Your rationale was shown to the owner in your own voice. "
-               if str(author.get("rationale") or "").strip() else "")
+            "Your rationale was shown to the owner in your own voice. "  # an empty rationale is refused before this line
             + ("Advisory author finish permits proceeding with this plan." if allowed else
                "No implementation approval granted. You may preserve the plan and finish with work blocked/unfinished.")
             + "\n" + json.dumps({"author_disposition": author, "source_ref": ref}, ensure_ascii=False))
