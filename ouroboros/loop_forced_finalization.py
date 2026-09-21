@@ -904,8 +904,10 @@ def _forced_fallback_result(
     )
     suffix = plan_suffix + _loop()._forced_orphan_note(ctx)
     # Every rail that DISCLOSES types the fact: a host-notice fallback used to state
-    # the open review in prose while nothing typed carried it.
-    ctx.accumulated_usage["terminal_plan_review_open"] = bool(plan_suffix)
+    # the open review in prose while nothing typed carried it. Absent = not open: a
+    # clean result carries no key (pinned usage shapes).
+    if plan_suffix:
+        ctx.accumulated_usage["terminal_plan_review_open"] = True
     set_terminal_host_notice(ctx.accumulated_usage, suffix)
     live_candidate = _loop()._live_delivery_candidate(ctx)
     fallback_is_retained_model_text = (
@@ -1180,7 +1182,8 @@ def _forced_final_answer(
             _loop()._force_plan_disclosure(tools_ctx, llm_trace, forced_reason=reason_code)
             if tools_ctx is not None else ""
         )
-        ctx.accumulated_usage["terminal_plan_review_open"] = bool(plan_suffix)
+        if plan_suffix:  # absent = not open: a clean result carries no key (pinned usage shapes)
+            ctx.accumulated_usage["terminal_plan_review_open"] = True
         set_terminal_host_notice(ctx.accumulated_usage, plan_suffix, _loop()._forced_orphan_note(ctx))
         full_text = extracted
         ctx.accumulated_usage["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL

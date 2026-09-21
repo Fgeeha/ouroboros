@@ -519,7 +519,7 @@ def test_the_normal_rail_types_an_open_plan_review(tmp_path, monkeypatch):
         text, usage, _trace = loop._no_tool_final_answer(
             "Complete answer.", limit_ctx, trace, registry, queue.Queue(), set(), lambda _t: None)
         assert text == "Complete answer."
-        assert usage["terminal_plan_review_open"] is expected
+        assert usage.get("terminal_plan_review_open", False) is expected  # absent = not open
         assert ("terminal_plan_review_open" in terminal_result_fields(usage)) is expected
         assert ("terminal_host_notice" in usage) is expected  # the typed fact never travels alone
 
