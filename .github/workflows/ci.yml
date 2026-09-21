@@ -1092,6 +1092,15 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+      # Match desktop packaging: checkout may leave a commit at the tag ref.
+      - name: Ensure annotated tag object is fetched
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_REF="refs/tags/$GITHUB_REF_NAME"
+          git update-ref -d "$TAG_REF" || true
+          git fetch origin "$TAG_REF:$TAG_REF"
+          test "$(git cat-file -t "$TAG_REF")" = "tag"
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: '3.10'

@@ -452,6 +452,7 @@ and the reason.
 
 | Version | Date | Description |
 |---------|------|-------------|
+| 7.4.4 | 2026-09-21 | **fix: restore annotated tags in Android packaging and stabilize release checks.** CI retains independent failures, browser tests use portable focus and distinct subagent routes, and release metadata stays synchronized. |
 | 7.4.2 | 2026-09-21 | **fix: fetch annotated release tags before packaging and keep cross-platform release gates honest.** |
 | 7.4.1 | 2026-09-21 | **fix: collect independent CI and diagnostic release-build failures without weakening publication gates.** Failed test steps continue to their independent checks, valid tags retain release metadata for diagnostic desktop builds, and publication remains fail-closed on required results. |
 | 7.4.0 | 2026-09-20 | **feat: add an honest desktop attention cue for live notifications.** The optional launcher bridge can raise the existing desktop window and request one platform system sound, returning explicit native/unsupported/window_only/unavailable facts; it does not claim Notification Center delivery, run after close, or add a tray/background process. Browser banners and in-app toasts remain the fallback, with capability text visible in Settings. Focused native, launcher and notification tests cover the seam. |
