@@ -193,3 +193,105 @@ def test_tools_header_says_how_many_rows_are_rendered(tmp_path):
     tools = _section(build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a"), "## Recent tools")
     assert "newest 20 of 30 matching rows in the window (10 rendered, 20 scanned for review markers)" in tools.splitlines()[0]
     assert tools.count("shell cmd=") == 10
+
+
+def _repo_and_drive(tmp_path):
+    repo_dir = tmp_path / "repo"
+    drive_root = tmp_path / "drive"
+    (repo_dir / "prompts").mkdir(parents=True, exist_ok=True)
+    (repo_dir / "docs").mkdir(parents=True, exist_ok=True)
+    (drive_root / "memory" / "knowledge").mkdir(parents=True, exist_ok=True)
+    (drive_root / "logs").mkdir(parents=True, exist_ok=True)
+    (drive_root / "state").mkdir(parents=True, exist_ok=True)
+    (repo_dir / "prompts" / "SYSTEM.md").write_text("System prompt", encoding="utf-8")
+    (repo_dir / "BIBLE.md").write_text("Bible", encoding="utf-8")
+    (repo_dir / "VERSION").write_text("1.2.3", encoding="utf-8")
+    (repo_dir / "pyproject.toml").write_text('version = "1.2.3"', encoding="utf-8")
+    (repo_dir / "README.md").write_text("README", encoding="utf-8")
+    (repo_dir / "docs" / "ARCHITECTURE.md").write_text("# Ouroboros v1.2.3", encoding="utf-8")
+    (repo_dir / "docs" / "DEVELOPMENT.md").write_text(
+        "### File Size Budgets\n| Path | Budget chars |\n|------|--------------|\n| memory/identity.md | 1000 |\n",
+        encoding="utf-8",
+    )
+    (drive_root / "state" / "state.json").write_text('{"spent_usd": 0, "budget_drift_alert": false}', encoding="utf-8")
+    (drive_root / "memory" / "identity.md").write_text("x" * 950, encoding="utf-8")
+    (drive_root / "memory" / "scratchpad.md").write_text("scratchpad", encoding="utf-8")
+    for name in ("chat", "supervisor", "task_reflections"):
+        (drive_root / "logs" / f"{name}.jsonl").write_text("", encoding="utf-8")
+
+    class FakeEnv:
+        def drive_path(self, p):
+            return drive_root / p
+
+        def repo_path(self, p):
+            return repo_dir / p
+
+        @property
+        def repo_dir(self):
+            return repo_dir
+
+        @property
+        def drive_root(self):
+            return drive_root
+
+    return repo_dir, drive_root, FakeEnv()
+
+
+def test_child_reads_its_own_drive_beside_working_sources(tmp_path):
+    """A subagent gets its process memory from its execution drive (owner decision 2026-09-22)."""
+    from ouroboros.context import build_llm_messages
+
+    repo_dir, canonical, env = _repo_and_drive(tmp_path)
+    child_drive = tmp_path / "child"
+    (child_drive / "logs").mkdir(parents=True)
+    # Canonical logs: the parent's traffic plus the child's mirrored tool rows and its progress.
+    _write(canonical / "logs" / "tools.jsonl",
+           [{"ts": "t", "task_id": "parent", "tool": "parent_tool", "args": {}, "result_preview": "ok"}] * 5
+           + [{"ts": "t", "task_id": "child", "tool": "mirrored", "args": {}, "result_preview": "ok"}])
+    _write(canonical / "logs" / "events.jsonl",
+           [{"ts": "t", "task_id": "child", "type": "delegate_supervision_wait_renewed"}] * 3)
+    _write(canonical / "logs" / "progress.jsonl",
+           [{"ts": "t", "task_id": "parent", "text": "parent-step"}, {"ts": "t", "task_id": "child", "text": "child-step"}])
+    # The child's own drive: exactly its worker rows.
+    _write(child_drive / "logs" / "tools.jsonl",
+           [{"ts": "t", "task_id": "child", "tool": "own_tool", "args": {"path": "x.py"}, "result_preview": "ok"}])
+    _write(child_drive / "logs" / "events.jsonl", [{"ts": "t", "task_id": "child", "type": "llm_round"}] * 4)
+
+    messages, _cap = build_llm_messages(
+        env=env, memory=Memory(drive_root=child_drive, repo_dir=repo_dir),
+        task={"id": "child", "type": "task", "text": "work", "delegation_role": "subagent",
+              "parent_task_id": "parent", "root_task_id": "parent", "budget_drive_root": str(canonical)},
+    )
+    dynamic = messages[0]["content"][2]["text"]
+    assert "## Working sources" in dynamic and "your own recent process" in dynamic
+    tools = dynamic[dynamic.index("## Recent tools"):].split("\n## ", 1)[0]
+    assert "own_tool" in tools and "parent_tool" not in tools and "mirrored" not in tools
+    assert "of task drive logs/tools.jsonl" in tools.splitlines()[0]
+    events = dynamic[dynamic.index("## Recent events"):].split("\n## ", 1)[0]
+    assert "llm_round: 4" in events and "delegate_supervision" not in events
+    assert "host-side rows such as waits stay in the canonical log" in events.splitlines()[0]
+    progress = dynamic[dynamic.index("## Recent progress"):].split("\n## ", 1)[0]
+    assert "child-step" in progress and "parent-step" not in progress
+    assert "of logs/progress.jsonl" in progress.splitlines()[0]
+    # The Working sources block precedes the child's own windows.
+    assert dynamic.index("## Working sources") < dynamic.index("## Recent progress")
+
+
+def test_child_without_its_own_drive_reads_the_canonical_filtered_windows(tmp_path):
+    from ouroboros.context import build_llm_messages
+
+    repo_dir, canonical, env = _repo_and_drive(tmp_path)
+    _write(canonical / "logs" / "tools.jsonl",
+           [{"ts": "t", "task_id": "parent", "tool": "parent_tool", "args": {}, "result_preview": "ok"}] * 5
+           + [{"ts": "t", "task_id": "child", "tool": "shared_drive_tool", "args": {}, "result_preview": "ok"}])
+    for name in ("events", "progress"):
+        (canonical / "logs" / f"{name}.jsonl").write_text("", encoding="utf-8")
+    messages, _cap = build_llm_messages(
+        env=env, memory=Memory(drive_root=canonical, repo_dir=repo_dir),
+        task={"id": "child", "type": "task", "text": "work", "delegation_role": "subagent",
+              "parent_task_id": "parent", "root_task_id": "parent"},
+    )
+    dynamic = messages[0]["content"][2]["text"]
+    tools = dynamic[dynamic.index("## Recent tools"):].split("\n## ", 1)[0]
+    assert "shared_drive_tool" in tools and "parent_tool" not in tools
+    assert "of logs/tools.jsonl" in tools.splitlines()[0] and "task drive" not in tools.splitlines()[0]

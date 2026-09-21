@@ -965,28 +965,10 @@ def build_recent_sections(
 
     # Each task reads ITS OWN newest rows through a bounded window (#131): a
     # global tail filtered afterwards handed every task whatever share of the
-    # shared suffix it happened to occupy. Quotas are what the formatters render
-    # (progress 50; tools: 10 rendered + 20 scanned for review markers; events:
-    # type counts over the rows it is given, today's 200). The header states
-    # the window (BIBLE P1); a reader pages the rest with read_file on the log.
+    # shared suffix it happened to occupy (Memory.recent_activity_sections).
     from ouroboros.jsonl_tail import coverage_line
 
-    for log_name, header, formatter, want, rendered in (
-        ("progress.jsonl", "## Recent progress", lambda rows: memory.summarize_progress(rows, limit=50), 50, 50),
-        ("tools.jsonl", "## Recent tools", memory.summarize_tools, 20, 10),  # + 20 scanned for review markers
-        ("events.jsonl", "## Recent events", memory.summarize_events, 200, 200),
-    ):
-        entries, coverage = memory.read_task_recent(log_name, task_id, want if task_id else 200)
-        if len(entries) > rendered:
-            # The header must not call rows "rendered" that the formatter only
-            # scanned (tools renders its newest 10 and scans 20 for review markers).
-            coverage["rendered"] = f"{rendered} rendered, {len(entries)} scanned for review markers"
-        summary = formatter(entries)
-        if summary or coverage.get("gaps") or coverage.get("archives_bounded"):
-            # A window that met gaps, or left older archives unopened without
-            # finding a row, is disclosed even when nothing rendered: silence
-            # would hide the incompleteness itself (BIBLE P1).
-            sections.append(f"{header} ({coverage_line(coverage)})" + (f"\n\n{summary}" if summary else ""))
+    sections.extend(memory.recent_activity_sections(task_id))
 
     supervisor_rows, supervisor_coverage = memory.read_task_recent("supervisor.jsonl", "", 200)
     supervisor_summary = memory.summarize_supervisor(supervisor_rows)
@@ -1336,11 +1318,18 @@ def _capture_context_core(
     if is_child:
         dynamic_parts.append(
             "## Working sources\n\n"
-            "The shared biography is loaded above. Your parent's selected discussion and working "
-            "sources are in this assignment's context. Other raw conversations, the global scratchpad "
-            "and earlier task reports are not preloaded: use chat_history, knowledge_read, "
-            "get_task_result or ask your parent for exact sources when useful."
+            "The shared biography is loaded above; your own recent process (progress, tools, events) "
+            "is loaded below. Your parent's selected discussion and working sources are in this "
+            "assignment's context. Other raw conversations, the global scratchpad and earlier task "
+            "reports are not preloaded: use chat_history, knowledge_read, get_task_result or ask "
+            "your parent for exact sources when useful."
         )
+        # A child keeps its own process memory too (owner decision 2026-09-22):
+        # its execution drive holds exactly its worker rows, progress is canonical.
+        own_drive = memory if context_memory is not memory else None
+        dynamic_parts.extend(context_memory.recent_activity_sections(
+            str(task.get("id") or ""), own_drive=own_drive,
+        ))
     else:
         dynamic_parts.extend(build_recent_sections(
             context_memory, env, task_id=task.get("id", ""), thread_chat_id=int(task.get("chat_id") or 0),

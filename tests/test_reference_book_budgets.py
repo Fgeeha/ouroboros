@@ -35,10 +35,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
     # replaced, the rest has no older text to displace.
-    # +1000 (2026-09-22): the custody row memo and the per-task recent-activity
-    # windows are two new mechanisms described in the paragraphs they changed;
-    # the base sat 28 bytes under the previous budget.
-    "docs/architecture/06-agent-core.md": 288600,
+    # +1300 (2026-09-22): the custody row memo, the per-task recent-activity
+    # windows and the subagent child's own windows are new mechanisms described
+    # in the paragraphs they changed; the base sat 28 bytes under the previous budget.
+    "docs/architecture/06-agent-core.md": 288900,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,

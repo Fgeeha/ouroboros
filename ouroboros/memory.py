@@ -986,6 +986,46 @@ class Memory:
         username = dialogue_author(e)
         return f"← {ts} [{username}] {raw_text}" if compact else f"← [{ts}] [{username}] {raw_text}"
 
+    def recent_activity_sections(
+        self, task_id: str, *, own_drive: Optional["Memory"] = None,
+    ) -> List[str]:
+        """The `## Recent progress/tools/events` sections of ONE task (razzant/ouroboros#131).
+
+        Each is the task's own newest rows through the bounded reader
+        (progress 50 rendered; tools 20 selected, 10 rendered and 20 scanned for
+        review markers; events 200 counted by type), never a global tail
+        filtered afterwards. ``own_drive`` is a task's execution-drive Memory:
+        its ``tools.jsonl``/``events.jsonl`` hold exactly that task's worker
+        rows (the tools rows are mirrored to the canonical log; host-side event
+        rows such as waits and supervision live only on the canonical log, and
+        the header says so), while progress is always canonical. The header
+        discloses the window (BIBLE P1); a window that met gaps or left older
+        archives unopened without a row is disclosed even when nothing rendered.
+        """
+        from ouroboros.jsonl_tail import coverage_line
+
+        sections: List[str] = []
+        for log_name, header, formatter, want, rendered in (
+            ("progress.jsonl", "## Recent progress", lambda rows: self.summarize_progress(rows, limit=50), 50, 50),
+            ("tools.jsonl", "## Recent tools", self.summarize_tools, 20, 10),  # + 20 scanned for review markers
+            ("events.jsonl", "## Recent events", self.summarize_events, 200, 200),
+        ):
+            source = own_drive if own_drive is not None and log_name != "progress.jsonl" else self
+            entries, coverage = source.read_task_recent(log_name, task_id, want if task_id else 200)
+            if source is not self:
+                coverage["source"] = f"task drive logs/{log_name}" + (
+                    " (worker rows; host-side rows such as waits stay in the canonical log)"
+                    if log_name == "events.jsonl" else ""
+                )
+            if len(entries) > rendered:
+                # The header must not call rows "rendered" that the formatter only
+                # scanned (tools renders its newest 10 and scans 20 for review markers).
+                coverage["rendered"] = f"{rendered} rendered, {len(entries)} scanned for review markers"
+            summary = formatter(entries)
+            if summary or coverage.get("gaps") or coverage.get("archives_bounded"):
+                sections.append(f"{header} ({coverage_line(coverage)})" + (f"\n\n{summary}" if summary else ""))
+        return sections
+
     def summarize_progress(self, entries: List[Dict[str, Any]], limit: int = 15) -> str:
         if not entries:
             return ""
