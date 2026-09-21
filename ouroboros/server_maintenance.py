@@ -223,6 +223,10 @@ def _periodic_supervisor_maintenance(
                                  name="owned-daemon-latch-retry", daemon=True).start()
         except Exception:
             log.debug("Owned daemon latch release failed", exc_info=True)
+        # The steps share one guard (a failure still ends the pass), but the row
+        # must say WHICH one died: at DEBUG, and unnamed, a block that silently
+        # stopped reaping for weeks looked exactly like one that had nothing to do.
+        step = "live_task_snapshot"
         try:
             from ouroboros.claudexor_daemon import CUSTODY_PURPOSE
             from ouroboros.process_custody import reap_orphaned_processes
@@ -233,6 +237,7 @@ def _periodic_supervisor_maintenance(
             live_tasks = set(_running_tasks) | {
                 row["activity_id"] for row in get_direct_activity_registry().snapshot()
             }
+            step = "reap_orphaned_processes"
             reap_orphaned_processes(
                 DATA_DIR, running_task_ids=live_tasks,
                 live_owner_skills=_installed_skill_names(),
@@ -241,10 +246,12 @@ def _periodic_supervisor_maintenance(
             # A delegated Claudexor run is an orphan under exactly the same predicate:
             # its owning task is no longer running. It has no pid, so the process
             # reaper cannot see it — but it is still spending quota and still writing.
+            step = "reconcile_delegated_runs"
             _reconcile_delegated_runs(live_tasks)
+            step = "cursor_refresh_settled_terminals"
             _cursor_refresh_settled_terminals()
         except Exception:
-            log.debug("Periodic custody reap failed", exc_info=True)
+            log.warning("Periodic custody step %s failed", step, exc_info=True)
     if time.time() - last_review_reconcile[0] > 300:
         last_review_reconcile[0] = time.time()
         _periodic_zombie_reconcile(on_orphans_healed=on_orphans_healed)
@@ -462,12 +469,8 @@ def _startup_prune_sweeps(*, preserve_task_sources: bool = False) -> None:
             task_drive_report = prune_task_drives(DATA_DIR)
             prune_task_trees(DATA_DIR)
             sweep_stale_temp_files(DATA_DIR)
-        if (
-            prune_report.get("pruned")
-            or prune_report.get("errors")
-            or task_drive_report.get("pruned")
-            or task_drive_report.get("errors")
-        ):
+        if any(report.get(key) for report in (prune_report, task_drive_report)
+               for key in ("pruned", "errors")):
             append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
                 "ts": utc_now_iso(),
                 "type": "headless_task_drive_prune",
@@ -545,11 +548,7 @@ def _startup_prune_sweeps(*, preserve_task_sources: bool = False) -> None:
         # CPL4-C21 (owner 6A): agent screenshots/views follow GC retention;
         # owner attachments in the uploads/ root are never touched.
         media_report = prune_agent_media_uploads(DATA_DIR)
-        if (
-            media_report.get("removed")
-            or media_report.get("skipped")
-            or media_report.get("errors")
-        ):
+        if any(media_report.get(key) for key in ("removed", "skipped", "errors")):
             append_jsonl(DATA_DIR / "logs" / "events.jsonl", {
                 "ts": utc_now_iso(),
                 "type": "agent_media_prune",
