@@ -884,12 +884,15 @@ def root_exploration_log(ctx: ToolContext) -> Optional[str]:
     return "\n".join([header, *tail])
 
 
-# Dedup memo for the advisory-open event: one event per recorded-open
-# (data root, task, fingerprint, health-epoch) STATE, not per call — empty-epoch
-# DEGRADED re-dispatches and unpaid $0 re-discoveries re-enter the emitter with
-# an unchanged state and must not spam the owner. Process-local by design: a
-# restart may re-announce an already-announced state once (disclosed residual —
-# this is an event rail, never authority).
+# Dedup memo for the advisory-open event: one event per ANNOUNCED OUTCOME of a
+# (data root, task, fingerprint, health-epoch) wave — its aggregate, whether answers
+# are still awaited, and the slots that FAILED with their code and reported cause —
+# not per call, so the settled failures are announced after the dispatch snapshot
+# while a slot that merely answered is no news. A re-dispatch that ends in the SAME outcome
+# is deliberately not re-announced (owner anti-spam, pinned by tests/
+# test_plan_review_epoch.py::test_three_identical_recalls_emit_one_advisory_open_event).
+# Process-local by design: a restart may re-announce an outcome once (disclosed
+# residual — this is an event rail, never authority).
 _ADVISORY_OPEN_SEEN: Dict[tuple, bool] = {}
 _ADVISORY_OPEN_SEEN_MAX = 512
 
@@ -898,23 +901,39 @@ def emit_plan_review_advisory_open(
     ctx: ToolContext, drive_root: Any, *, task_id: str, wave: Dict[str, Any],
     cycles_paid: int, cap: Any,
 ) -> None:
-    """ONE typed owner-visible event when a wave RECORDS open under advisory
-    enforcement (B2): loud at the moment it happens, not only when finalization
-    later appends ``owner_hurry.plan_review_disclosure``. Deduplicated per
-    (fingerprint, health-epoch) recorded-open state (see ``_ADVISORY_OPEN_SEEN``);
-    replays, dispositions and re-renders never reach this emitter at all.
+    """ONE typed owner-visible event per announced outcome of a wave that RECORDS
+    open under advisory enforcement (B2): loud at the moment it happens, not only
+    when finalization later appends ``owner_hurry.plan_review_disclosure``.
+    Deduplicated on the outcome the row announces (see ``_ADVISORY_OPEN_SEEN``):
+    cycle counters are not part of it, so a same-outcome re-dispatch stays quiet
+    while a wave that settles after its dispatch snapshot is announced again.
     Durability is UNCONDITIONAL: the ``events.jsonl`` append always lands — the
     live queue path persists only task_checkpoint rows — and a live queue
-    additionally gets the UI push. The dedup memo is inserted ONLY AFTER the
-    durable append succeeded (review fix 6): a failed append is logged loudly and
-    NOT memoized, so the next call for the same state retries the whole emission
-    instead of the memo silently swallowing an event that never landed. Never
-    raises."""
+    additionally gets the UI push. The memo is inserted ONLY AFTER the durable
+    append reported success: an append that raised OR returned False is logged
+    loudly and NOT memoized, so the next call for the same outcome retries the
+    whole emission instead of the memo swallowing an event that never landed.
+    Never raises."""
     from ouroboros.utils import append_jsonl, emit_log_event
 
+    # Bounded per-slot typed facts: who failed, with what code and reported cause, until
+    # when — and the custody state that tells a slot still unanswered from a slot that failed.
+    slots = [
+        {"slot_id": a.get("slot_id"), "ok": bool(a.get("ok")),
+         "failure_code": str(a.get("failure_code") or ""),
+         "operation_state": str(a.get("operation_state") or "settled"),
+         "reset_at": str(a.get("reset_at") or ""),
+         "reported_cause": str(a.get("reported_cause") or "")}
+        for a in (wave.get("actors") or []) if isinstance(a, dict)
+    ]
+    aggregate, custody_pending = str(wave.get("aggregate") or ""), bool(wave.get("custody_pending"))
+    # News = verdict, awaited-or-not, and who FAILED with what; a slot that merely answered is none.
+    failed = [s for s in slots if s["failure_code"] or s["reported_cause"]]
+    announced = json.dumps([aggregate, custody_pending, failed], sort_keys=True, default=str)
     key = (str(drive_root or ""), str(task_id or ""),
            str(wave.get("request_fingerprint") or ""),
-           json.dumps(wave.get("health_epoch") or [], sort_keys=True, default=str))
+           json.dumps(wave.get("health_epoch") or [], sort_keys=True, default=str),
+           sha256(announced.encode("utf-8")).hexdigest())
     if key in _ADVISORY_OPEN_SEEN:
         return
     from ouroboros.config import get_review_enforcement
@@ -925,29 +944,21 @@ def emit_plan_review_advisory_open(
         "surface": "plan_review",
         "task_id": str(task_id or ""),
         "fingerprint": str(wave.get("request_fingerprint") or ""),
-        "aggregate": str(wave.get("aggregate") or ""),
+        "aggregate": aggregate,
         # Read BEFORE the aggregate: true = slots have not answered yet, no verdict exists.
-        "custody_pending": bool(wave.get("custody_pending")),
+        "custody_pending": custody_pending,
         "cycle_index": wave.get("cycle_index"),
         "paid": bool(wave.get("paid")),
         "cycles_paid": int(cycles_paid),
         "cap": cap,
         "enforcement": get_review_enforcement(),
         "decision_authority": "cyber_pro" if not review_enforcement_blocks("blocking") else "advisory",
-        # Bounded per-slot typed facts: who failed, with what code, until when — and the
-        # custody state that tells a slot still unanswered from a slot that failed.
-        "slots": [
-            {"slot_id": a.get("slot_id"), "ok": bool(a.get("ok")),
-             "failure_code": str(a.get("failure_code") or ""),
-             "operation_state": str(a.get("operation_state") or "settled"),
-             "reset_at": str(a.get("reset_at") or "")}
-            for a in (wave.get("actors") or []) if isinstance(a, dict)
-        ],
+        "slots": slots,
     }
     stamped = {"ts": utc_now_iso(), **row}
     try:
-        if drive_root:
-            append_jsonl(pathlib.Path(str(drive_root)) / "logs" / "events.jsonl", stamped)
+        if drive_root and not append_jsonl(pathlib.Path(str(drive_root)) / "logs" / "events.jsonl", stamped):
+            raise OSError("append_jsonl reported a failed write")
     except Exception:
         log.warning("plan_review_advisory_open durable append failed for %s; "
                     "not memoized — the next call retries", task_id, exc_info=True)

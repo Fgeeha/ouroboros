@@ -291,6 +291,87 @@ def test_failed_durable_append_is_not_memoized_and_retries(harness, monkeypatch)
     assert len([r for r in rows if r.get("fingerprint") == "f" * 64]) == 1
 
 
+def _advisory_open_rows(harness, fingerprint):
+    path = harness.drive / "logs" / "events.jsonl"
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    return [row for row in map(json.loads, lines)
+            if row.get("type") == "plan_review_advisory_open" and row.get("fingerprint") == fingerprint]
+
+
+def test_the_settled_outcome_is_announced_after_the_dispatch_snapshot(harness):
+    """The memo keys on the OUTCOME the event announces, not on the wave alone: the
+    dispatch snapshot (nothing answered yet) used to mute the settled failures of the
+    same fingerprint and epoch forever. Cycle counters stay out of the key, so a
+    re-dispatch that ends in the same outcome is still announced once."""
+    from ouroboros.tools.plan_review_runtime import emit_plan_review_advisory_open
+
+    words = "Selected model is at capacity. Please try a different model."
+    fingerprint = "c" * 64
+
+    def _emit(actors, *, pending, cycle_index=1, cycles_paid=1):
+        emit_plan_review_advisory_open(
+            ctx, harness.drive, task_id="task-outcome", cycles_paid=cycles_paid, cap=3,
+            wave={"request_fingerprint": fingerprint, "aggregate": "DEGRADED", "health_epoch": [],
+                  "custody_pending": pending, "paid": not pending, "cycle_index": cycle_index,
+                  "actors": actors})
+
+    def _dead(slot_id, cause=words):
+        return {"slot_id": slot_id, "ok": False, "failure_code": "run_failed",
+                "operation_state": "late_settled", "reported_cause": cause}
+
+    ctx = harness.make_ctx()
+    waiting = [{"slot_id": s, "ok": False, "operation_state": "pending_dispatch"} for s in ("s1", "s2", "s3")]
+    settled = [_dead("s1"), {"slot_id": "s2", "ok": True}, _dead("s3")]
+    _emit(waiting, pending=True, cycles_paid=0)
+    assert [[s["failure_code"] for s in row["slots"]] for row in _advisory_open_rows(harness, fingerprint)] == [["", "", ""]]
+    _emit(settled, pending=False)
+    rows = _advisory_open_rows(harness, fingerprint)
+    assert len(rows) == 2, "the settled outcome must not be muted by the dispatch snapshot"
+    assert (rows[1]["custody_pending"], rows[1]["paid"]) == (False, True)
+    assert [(s["slot_id"], s["ok"], s["failure_code"], s["reported_cause"]) for s in rows[1]["slots"]] == [
+        ("s1", False, "run_failed", words), ("s2", True, "", ""), ("s3", False, "run_failed", words)]
+    # Other direction — the SAME outcome is never re-announced: not on an identical call,
+    # not on the identical snapshot, not when only the cycle counters moved.
+    _emit(settled, pending=False)
+    _emit(waiting, pending=True, cycles_paid=0)
+    _emit(settled, pending=False, cycle_index=2, cycles_paid=2)
+    assert len(_advisory_open_rows(harness, fingerprint)) == 2
+    # A panel that dies of a DIFFERENT reported cause is a different outcome.
+    _emit([_dead("s1", "usage limit reached"), {"slot_id": "s2", "ok": True}, _dead("s3")], pending=False)
+    assert len(_advisory_open_rows(harness, fingerprint)) == 3
+
+
+def test_an_append_that_reports_failure_is_not_memoized_and_the_next_call_emits(harness, monkeypatch, caplog):
+    """``append_jsonl`` reports a failed write by RETURNING False, without raising.
+    That is a lost event exactly like a raised one: logged, nothing pushed, nothing
+    memoized — so the next call for the same outcome lands it. A successful append
+    is memoized and the following call stays quiet."""
+    import ouroboros.utils as utils
+    from ouroboros.tools.plan_review_runtime import emit_plan_review_advisory_open
+
+    ctx = harness.make_ctx()
+    fingerprint = "d" * 64
+    wave = {"request_fingerprint": fingerprint, "aggregate": "DEGRADED", "cycle_index": 1,
+            "paid": True, "health_epoch": [], "actors": []}
+    real_append = utils.append_jsonl
+    monkeypatch.setattr(utils, "append_jsonl", lambda *args, **kwargs: False)
+    with caplog.at_level(logging.WARNING, logger="ouroboros.tools.plan_review_runtime"):
+        emit_plan_review_advisory_open(ctx, harness.drive, task_id="task-false", wave=wave,
+                                       cycles_paid=1, cap=2)
+    assert [r for r in caplog.records if "durable append failed" in r.getMessage()]
+    assert _advisory_open_rows(harness, fingerprint) == []
+    assert harness.events.empty(), "no UI push for an event that never landed durably"
+    monkeypatch.setattr(utils, "append_jsonl", real_append)
+    for _ in range(2):  # the retry lands the event; the call after it is memoized
+        emit_plan_review_advisory_open(ctx, harness.drive, task_id="task-false", wave=wave,
+                                       cycles_paid=1, cap=2)
+    assert len(_advisory_open_rows(harness, fingerprint)) == 1
+    pushed = []
+    while not harness.events.empty():
+        pushed.append(harness.events.get_nowait())
+    assert len([e for e in pushed if e.get("data", {}).get("type") == "plan_review_advisory_open"]) == 1
+
+
 def test_cached_replay_of_an_open_wave_retries_a_failed_advisory_open_append(harness, monkeypatch):
     """Post-merge follow-up (sol finding 3): the durable advisory-open append that
     FAILED at record time was unreachable forever — the identical envelope's cached
