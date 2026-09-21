@@ -817,7 +817,7 @@ def _run_supervisor(settings: dict) -> None:
             except Exception:
                 log.warning("Scheduled task check failed", exc_info=True)
             _periodic_supervisor_maintenance(
-                _last_custody_reap, _last_review_job_reconcile,
+                _last_custody_reap, _last_review_job_reconcile, stop_event=_watchdog_stop,
                 on_orphans_healed=lambda count: _consciousness and _consciousness.notify(f"orphans_healed:{count}"),
             )
             _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "assign"), time.monotonic()

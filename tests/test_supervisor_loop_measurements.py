@@ -228,9 +228,22 @@ def test_the_loop_publishes_one_monotonic_stamp_per_tick_phase():
 
 
 def _run_custody_tick(monkeypatch, *, failing_step=None):
-    """Drive ONE 600s custody pass with every step stubbed; ``failing_step`` raises."""
+    """Drive ONE 600s custody pass with every step stubbed; ``failing_step`` raises.
+
+    The pass runs on its own daemon thread (INV-B), so the tick is joined before the
+    caller reads what it logged."""
+    import threading
+    from types import SimpleNamespace
+
     import ouroboros.process_custody as pc
     import ouroboros.server_maintenance as sm
+
+    threads: list = []
+
+    def tracked(**kwargs):
+        thread = threading.Thread(**kwargs)
+        threads.append(thread)
+        return thread
 
     def _step(name):
         def _run(*_a, **_k):
@@ -248,7 +261,11 @@ def _run_custody_tick(monkeypatch, *, failing_step=None):
         "ouroboros.claudexor_daemon.get_owned_daemon",
         lambda: type("_D", (), {"clear_start_failure_latch": lambda self, **_k: False})(),
     )
+    monkeypatch.setattr(sm, "threading", SimpleNamespace(Thread=tracked))
     sm._periodic_supervisor_maintenance([0.0], [time.time()])
+    for thread in threads:
+        thread.join(5)
+    assert all(not thread.is_alive() for thread in threads)
 
 
 @pytest.mark.parametrize("failing_step", ["reap_orphaned_processes", "reconcile_delegated_runs",
