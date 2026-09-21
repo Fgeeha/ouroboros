@@ -670,7 +670,10 @@ step, a wait, a review, a child. What the host says about how the turn is
 running (a checkpoint, a model fallback, a review verdict, a nudge) is a
 visible timeline row that never claims the title or the collapsed line, so a
 turn whose only notes were the host's keeps its coined or task name and an
-empty activity line. Successful tool calls are not rows at all: they fold into
+empty activity line. When the task ends with a cause, the collapsed line states
+that cause in the owner's words — the same sentence as the durable row and the
+expanded body — so a `Done with warnings` chip never stands beside an unrelated
+last action; a clean ending keeps the last narration. Successful tool calls are not rows at all: they fold into
 ONE evidence row per block — `N tool calls`, or `N tool calls · M errors` once
 a call failed — that stands at the first call's position and time and is
 patched in place; Expand shows the per-tool counts (`read_file ×3 ·

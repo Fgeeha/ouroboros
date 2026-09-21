@@ -492,7 +492,8 @@ def plan_review_class_facts(wave: Any, *, awaited: bool) -> Dict[str, Any]:
     Closed vocabulary (``review_projection``): ``answered_open`` — every slot
     answered and the verdict was not closed; ``unanswered`` — at least one slot
     answered and at least one failed, was refused at $0, expired or was never
-    collected; ``none_answered`` — nobody answered and nobody is merely awaited. The
+    collected; ``none_answered`` — nobody answered and at least one slot failed, was refused
+    or is unresolved (an awaited sibling does not hide that). The
     awaited case is ``review_only_awaited`` and carries no class; the counts ride in
     every case for the mind's own reading of the gate."""
     from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
@@ -507,7 +508,9 @@ def plan_review_class_facts(wave: Any, *, awaited: bool) -> Dict[str, Any]:
         facts["plan_review_class"] = PLAN_REVIEW_ANSWERED_OPEN
     elif answered and silent:
         facts["plan_review_class"] = PLAN_REVIEW_UNANSWERED
-    elif not answered and not census["awaiting"]:
+    elif not answered and silent:
+        # Nobody answered and at least one reviewer failed, was refused or is unresolved:
+        # an awaited sibling does not turn that into "work went on with what they said".
         facts["plan_review_class"] = PLAN_REVIEW_NONE_ANSWERED
     return facts
 

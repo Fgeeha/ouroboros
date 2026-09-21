@@ -160,7 +160,7 @@ const A4 = {
 test('an unaccepted decision explains the warning in its own words', () => {
     assert.equal(
         taskReasonDetail(A4),
-        'No reviewer gave a verdict on this answer.',
+        'The reviewers did not reach a verdict on this answer.',
     );
     assert.doesNotMatch(taskReasonDetail(A4), /final_message/);
     // The stored reviewer rationale belongs to the card body, the task result
@@ -340,10 +340,16 @@ test('the plan review class picks the owner sentence for an open plan review', (
         'The plan review was never closed; the work went on with what the reviewers said.');
     assert.equal(taskReasonDetail(openPlan('some_future_class')),
         'The plan review was never closed; the work went on with what the reviewers said.');
-    // The class is a plan-review fact: another execution reason is never reworded by it.
+    // The class is a plan-review fact: another execution reason is never reworded by it, and the
+    // class states the standing limitation beside that reason (it rides the live event and the
+    // replayed row where the result-only flag does not); a record with neither stays silent.
     assert.equal(taskReasonDetail({
         status: 'completed', reason_code: 'budget_exhausted',
         outcome_axes: { execution: { status: 'degraded', reason_code: 'budget_exhausted', plan_review: 'unanswered' } },
+    }), 'The task ran out of budget before it could finish cleanly · Only some of the plan reviewers answered; the work went on with their notes.');
+    assert.equal(taskReasonDetail({
+        status: 'completed', reason_code: 'budget_exhausted',
+        outcome_axes: { execution: { status: 'degraded', reason_code: 'budget_exhausted' } },
     }), 'The task ran out of budget before it could finish cleanly');
 });
 

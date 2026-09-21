@@ -418,7 +418,7 @@ const TASK_CAUSE_PHRASES = {
     author_stop: "Ouroboros stopped with unfinished work; no review approval was granted.",
     review_outcome_received: "Ouroboros received the reviewers' outcome and finished on that.",
     author_finish: "Ouroboros delivered this answer on its own judgement; the reviewers had not signed it off.",
-    review_degraded: "No reviewer gave a verdict on this answer.",
+    review_degraded: "The reviewers did not reach a verdict on this answer.",
     infra_failure: "The review could not run because of an infrastructure failure, so there is no verdict.",
     dialogue_terminal: "The reviewers and Ouroboros could not agree, and both positions were kept.",
     improvement_capsule: "The reviewers asked for one more pass and Ouroboros was given their notes.",
@@ -515,11 +515,17 @@ function joinCauseClauses(clauses) {
 // record: deferred children, and a plan review still open at delivery (the
 // result's terminal_plan_review_open flag), worded by its class when one is
 // named. The twin of project_dialogue._terminal_limitations.
-function terminalLimitations(record, reason) {
+// The open-review classes that state a standing limitation (never the merely awaited case).
+const PLAN_REVIEW_OPEN_CLASSES = new Set(['plan_review_unanswered', 'plan_review_none_answered', 'plan_review_answered_open']);
+
+function terminalLimitations(record, reason, held = false) {
     const deferred = Number(record?.outcome_axes?.objective?.deferred_count || 0) > 0;
     const planKey = reason === 'plan_review_advisory' ? reason : 'terminal_plan_review_open';
-    return [deferred ? taskReasonPhrase('child_results_deferred') : '',
-        record?.terminal_plan_review_open === true ? taskReasonPhrase(planReviewKey(record, planKey)) : ''];
+    // The class rides the live event and the replayed row where the result-only flag does not;
+    // a HELD task states the hold as its primary cause and never a limitation of work that went on.
+    const open = !held && (record?.terminal_plan_review_open === true
+        || PLAN_REVIEW_OPEN_CLASSES.has(`plan_review_${String(record?.outcome_axes?.execution?.plan_review || '')}`));
+    return [deferred ? taskReasonPhrase('child_results_deferred') : '', open ? taskReasonPhrase(planReviewKey(record, planKey)) : ''];
 }
 
 // Transport is recorded fact, never proof that an HTTP caller was the owner.
@@ -581,9 +587,7 @@ export function taskReasonDetail(evt) {
             ? String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')
             : taskReasonPhrase(reason === 'plan_review_advisory' ? planReviewKey(record, reason) : reason);
     }
-    const limitations = terminalLimitations(record, reason);
-    if (held) limitations[1] = ''; // the held work never "went on": the open review IS the primary cause
-    return joinCauseClauses([clause, ...limitations, custody ? taskReasonPhrase(custody) : '']);
+    return joinCauseClauses([clause, ...terminalLimitations(record, reason, held), custody ? taskReasonPhrase(custody) : '']);
 }
 
 // S3 (HQ1): the ONE shared projection of a typed owner_hurry event for the
@@ -1153,11 +1157,14 @@ export function taskTerminalSummary(evt = {}) {
     const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working');
     const body = [taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : '', taskReasonDetail(evt)]
         .filter(Boolean).join('\n');
+    const cause = terminal ? taskReasonDetail(evt) : '';
     return {
         ...chatView({
             phase: presentation.phase, headline: presentation.headline, body,
             visible: true, promote: true, terminal,
             dedupeKey: `task_done|${evt.task_id || ''}`,
+            // A task that ends with a cause states it on the collapsed line (DESIGN, activity block).
+            ...(cause ? { activityPreview: cause } : {}),
         }),
         ...(evt.model_execution && typeof evt.model_execution === 'object'
             ? { modelExecution: evt.model_execution } : {}),

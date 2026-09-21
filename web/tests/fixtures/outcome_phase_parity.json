@@ -120,7 +120,7 @@
       },
       "phase": "warn",
       "headline": "Done with warnings",
-      "acceptance_clause": "No reviewer gave a verdict on this answer."
+      "acceptance_clause": "The reviewers did not reach a verdict on this answer."
     },
     {
       "name": "an accepted decision leaves the execution reason standing",
@@ -220,7 +220,7 @@
       "record": {"status": "completed", "outcome_axes": {"execution": {"status": "ok"}, "review": {"status": "degraded", "acceptance_decision": {"status": "finalized_unaccepted", "reason": "review_degraded"}}}},
       "phase": "warn",
       "headline": "Done with warnings",
-      "acceptance_clause": "No reviewer gave a verdict on this answer."
+      "acceptance_clause": "The reviewers did not reach a verdict on this answer."
     },
     {
       "name": "acceptance reason infra_failure says its own sentence",

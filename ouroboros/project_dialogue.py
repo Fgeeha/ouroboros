@@ -738,7 +738,7 @@ TASK_CAUSE_PHRASES = {
     "author_stop": "Ouroboros stopped with unfinished work; no review approval was granted.",
     "review_outcome_received": "Ouroboros received the reviewers' outcome and finished on that.",
     "author_finish": "Ouroboros delivered this answer on its own judgement; the reviewers had not signed it off.",
-    "review_degraded": "No reviewer gave a verdict on this answer.",
+    "review_degraded": "The reviewers did not reach a verdict on this answer.",
     "infra_failure": "The review could not run because of an infrastructure failure, so there is no verdict.",
     "dialogue_terminal": "The reviewers and Ouroboros could not agree, and both positions were kept.",
     "improvement_capsule": "The reviewers asked for one more pass and Ouroboros was given their notes.",
@@ -1292,6 +1292,10 @@ def _custody_debt_reason(reason: str, result: Dict[str, Any], event: Dict[str, A
     return execution_reason, (WARN_DELEGATED_CUSTODY_UNRECONCILED if debt else "")
 
 
+# The open-review classes that state a standing limitation (never the merely awaited case).
+PLAN_REVIEW_OPEN_CLASSES = frozenset({"plan_review_unanswered", "plan_review_none_answered", "plan_review_answered_open"})
+
+
 def _plan_review_key(result: Dict[str, Any], event: Dict[str, Any], fallback: str) -> str:
     """``plan_review_<class>`` when ``execution.plan_review`` names a class with a
     sentence, else the caller's fallback. The twin of ``planReviewKey``."""
@@ -1304,19 +1308,26 @@ def _plan_review_key(result: Dict[str, Any], event: Dict[str, Any], fallback: st
     return fallback
 
 
-def _terminal_limitations(result: Dict[str, Any], event: Dict[str, Any], reason: str) -> List[str]:
+def _terminal_limitations(result: Dict[str, Any], event: Dict[str, Any], reason: str,
+                          *, held: bool = False) -> List[str]:
     """Standing limitations of the delivered answer, from facts already stored:
     deferred children, and a plan review still open at delivery. The plan clause
-    is stated ONLY when the record carries the ``terminal_plan_review_open`` flag;
-    the class on ``execution.plan_review`` only chooses its wording, and without a
-    class ``plan_review_advisory`` speaks when that is the recorded reason (so the
-    join states it once). The twin of ``terminalLimitations``."""
+    is stated when the record carries the ``terminal_plan_review_open`` flag OR
+    names an open-review class on ``execution.plan_review`` (the class rides the
+    live event and the replayed row where the result-only flag does not); the
+    class chooses the wording, and without one ``plan_review_advisory`` speaks
+    when that is the recorded reason (so the join states it once). A HELD task
+    states the hold as its primary cause and never a limitation of work that
+    went on. The twin of ``terminalLimitations``."""
     deferred, flagged = False, False
     for source in (result, event):
         axes = source.get("outcome_axes") if isinstance(source.get("outcome_axes"), dict) else {}
         objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else {}
+        execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
         deferred = deferred or str(objective.get("deferred_count") or "0").strip() not in {"0", ""}
-        flagged = flagged or source.get("terminal_plan_review_open") is True
+        flagged = flagged or source.get("terminal_plan_review_open") is True or (
+            f"plan_review_{execution.get('plan_review') or ''}" in PLAN_REVIEW_OPEN_CLASSES)
+    flagged = flagged and not held
     plan_key = reason if reason == "plan_review_advisory" else "terminal_plan_review_open"
     return [TASK_CAUSE_PHRASES["child_results_deferred"] if deferred else "",
             TASK_CAUSE_PHRASES[_plan_review_key(result, event, plan_key)] if flagged else ""]
@@ -1392,10 +1403,8 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
         key = _plan_review_key(result, event, reason) if reason == "plan_review_advisory" else reason
         clause = (" ".join(strip_markdown(str(detail)).split()) if detail
                   else TASK_CAUSE_PHRASES.get(key, key))
-    limitations = _terminal_limitations(result, event, reason)
-    if held:
-        limitations[1] = ""  # the held work never "went on": the open review IS the primary cause
-    line = _join_cause_clauses([clause, *limitations, TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
+    line = _join_cause_clauses([clause, *_terminal_limitations(result, event, reason, held=held),
+                                TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
     return line if not line or line.endswith((".", "!", "?", "…", ")")) else line + "."
 
 

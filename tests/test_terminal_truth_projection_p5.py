@@ -172,13 +172,17 @@ def test_the_plan_review_class_picks_the_owner_sentence(plan_class, sentence) ->
     # The flag beside the recorded advisory reason is the same fact: stated once.
     flagged = {**legacy, "terminal_plan_review_open": True}
     assert _completion_verdict(flagged, {}) == TASK_CAUSE_PHRASES["plan_review_advisory"]
-    # Beside a different primary cause the class only WORDS the standing limitation;
-    # the limitation itself is stated only when the record carries the typed flag.
+    # Beside a different primary cause the class states the standing limitation and words
+    # it; the class rides the live event and the replayed row where the result-only flag
+    # does not, so the flag is redundant beside it and only a record with NEITHER stays silent.
     beside = {"status": "completed", "reason_code": "budget_exhausted", "terminal_plan_review_open": True,
               "outcome_axes": {"execution": {"status": "degraded", "plan_review": plan_class}}}
     assert _completion_verdict(beside, {}) == f"{TASK_CAUSE_PHRASES['budget_exhausted']} · {sentence}"
     unflagged = {key: value for key, value in beside.items() if key != "terminal_plan_review_open"}
-    assert _completion_verdict(unflagged, {}) == f"{TASK_CAUSE_PHRASES['budget_exhausted']}."
+    assert _completion_verdict(unflagged, {}) == f"{TASK_CAUSE_PHRASES['budget_exhausted']} · {sentence}"
+    neither = {"status": "completed", "reason_code": "budget_exhausted",
+               "outcome_axes": {"execution": {"status": "degraded"}}}
+    assert _completion_verdict(neither, {}) == f"{TASK_CAUSE_PHRASES['budget_exhausted']}."
 
 
 @pytest.mark.parametrize("source, reason, sentence", [
@@ -193,7 +197,7 @@ def test_a_held_task_never_says_the_work_went_on(source, reason, sentence) -> No
     states the hold as its primary cause, never the recorded advisory reason's
     sentence about work that went on (the fixture's own shape, both twins)."""
     for reason_code in ("plan_review_advisory", "final_message"):
-        held = {"status": "completed", "reason_code": reason_code,
+        held = {"status": "completed", "reason_code": reason_code, "terminal_plan_review_open": True,
                 "outcome_axes": {"execution": {"status": "degraded", "plan_review": "unanswered"},
                                  "objective": {"status": "fail", "source": source, "reason": reason,
                                                "outcome_tier": "blocked_with_evidence"}}}

@@ -594,3 +594,25 @@ def test_a_real_answer_released_over_a_running_panel_is_not_a_degraded_review(fu
     record = {"status": "completed", "reason_code": "final_message", "outcome_axes": axes}
     assert completion_status_label(record, {}) == "Done"
     assert _completion_verdict(record, {}) == TASK_CAUSE_PHRASES["author_finish"]
+
+
+def test_nobody_answered_beside_a_failed_reviewer_is_none_answered_even_with_an_awaited_sibling(monkeypatch):
+    """A wave where one reviewer failed and another is still awaited, with no answer at all,
+    is ``none_answered`` — not the legacy "the work went on with what the reviewers said";
+    a wave that is ONLY awaited still carries no class (the awaited fact speaks instead)."""
+    from ouroboros import owner_hurry
+    from ouroboros.tools import plan_review_runtime as runtime
+
+    def census(counts):
+        base = {"answered": [], "failed": [], "skipped": [], "unresolved": [], "uncollected": [], "awaiting": [], "configured": 0}
+        base.update({k: [object()] * v for k, v in counts.items() if k != "configured"})
+        base["configured"] = counts["configured"]
+        return base
+
+    monkeypatch.setattr(runtime, "plan_wave_slot_census", lambda wave: census(wave))
+    mixed = owner_hurry.plan_review_class_facts({"answered": 0, "failed": 1, "awaiting": 1, "configured": 2}, awaited=False)
+    assert mixed["plan_review_class"] == "none_answered" and mixed["reviewers_answered"] == 0
+    only_awaited = owner_hurry.plan_review_class_facts({"answered": 0, "awaiting": 2, "configured": 2}, awaited=False)
+    assert "plan_review_class" not in only_awaited
+    partial = owner_hurry.plan_review_class_facts({"answered": 1, "failed": 1, "awaiting": 1, "configured": 3}, awaited=False)
+    assert partial["plan_review_class"] == "unanswered"

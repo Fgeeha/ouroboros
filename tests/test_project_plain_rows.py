@@ -406,6 +406,15 @@ def test_the_task_summary_row_carries_reason_detail_only_when_there_is_a_cause(t
             if line.strip()]
     (projection,) = [row for row in rows if row.get("summary_kind") == "terminal_root_projection"]
     assert projection["outcome"] == "Done" and "reason_detail" not in projection
+    # The other direction: a non-clean result writes the renderer's own clause, byte-identical.
+    warn = _a4_result()
+    root_warn = {**root, "id": "root-project-warn"}
+    assert append_terminal_task_projection(tmp_path, "root-project-warn", root_warn, warn,
+                                           {"status": "completed", "outcome_axes": warn["outcome_axes"]})
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+            if line.strip()]
+    warned = [row for row in rows if row.get("summary_kind") == "terminal_root_projection"][-1]
+    assert warned["reason_detail"] == _completion_verdict(warn, {}) != ""
 
 
 def test_host_verdict_states_an_unaccepted_acceptance_decision_in_its_own_words():
@@ -521,7 +530,7 @@ def test_host_verdict_leads_both_lifecycle_rows(tmp_path, monkeypatch):
     ) is True
     assert queued[0]["text"] == (
         "Launch 🚀 › Ship release · Done with warnings\n"
-        "No reviewer gave a verdict on this answer. "
+        "The reviewers did not reach a verdict on this answer. "
         "Open the Project for details."
     )
     assert "final_message" not in queued[0]["text"]
@@ -550,11 +559,11 @@ def test_host_verdict_leads_both_lifecycle_rows(tmp_path, monkeypatch):
     projection = next(row for row in rows if row.get("summary_kind") == "terminal_root_projection")
     assert projection["text"] == (
         "Done with warnings. Root task root-project. "
-        "No reviewer gave a verdict on this answer."
+        "The reviewers did not reach a verdict on this answer."
     )
     # C6: the same clause rides the row as a FIELD for transports with no card,
     # exactly as the renderer composed it, and only when there is a cause.
-    assert projection["reason_detail"] == "No reviewer gave a verdict on this answer."
+    assert projection["reason_detail"] == "The reviewers did not reach a verdict on this answer."
     assert "final_message" not in projection["text"]
     # The room is the project and result_ref is the reader, so neither the id
     # soup nor a tool name has to be spelled into owner-visible prose.

@@ -147,3 +147,19 @@ def test_progress_failure_cannot_drop_started_custody_event():
     assert event["type"] == "cognitive_operation"
     assert event["phase"] == "started"
     assert event["operation_id"] == "operation"
+
+
+def test_an_empty_answer_reads_as_an_empty_answer_never_as_answered():
+    """A reviewer that returned nothing (typed status ``empty``) must not read as
+    ``answered``; a reviewer that returned text still does."""
+    from types import SimpleNamespace
+
+    from ouroboros.review_execution_projection import review_actor_progress_text
+
+    slot = SimpleNamespace(model="codex=gpt-6-astra", route="agent_session", effort="xhigh", session_profile="")
+    empty = SimpleNamespace(status="empty", operation_state="settled", usage={}, reset_at="", reported_cause="")
+    line = review_actor_progress_text("plan_review", "finished", slot, empty)
+    assert line == "Plan reviewer codex=gpt-6-astra gave an empty answer."
+    assert " answered — " not in line
+    full = SimpleNamespace(status="ok", operation_state="settled", usage={}, reset_at="", reported_cause="")
+    assert review_actor_progress_text("plan_review", "finished", slot, full).startswith("Plan reviewer codex=gpt-6-astra answered — ")

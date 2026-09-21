@@ -150,6 +150,8 @@ def _reviewer_verb(surface: str, phase: str, actor: Any) -> str:
         return "wasn't sent " + ("the plan" if surface == "plan_review" else "its request")
     if actor is None or phase == "started":
         return "started"
+    if getattr(actor, "status", "") == "empty":
+        return "gave an empty answer"
     if getattr(actor, "status", "") == "error" or getattr(actor, "ok", None) is False:
         return "didn't answer"
     return "answered"

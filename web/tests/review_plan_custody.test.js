@@ -179,8 +179,11 @@ test('a reviewer whose window expired stays unresolved instead of awaited', () =
     const group = planGroup({ custody_pending: true, actors: [ANSWERED, lost] });
     const attempt = group.attempts[0];
     assert.deepEqual(availabilityLines(attempt, ' · no answer'), [
-        'codex=gpt-6-astra · no answer — custody_lost: review_custody_lost', // the raw typed state stays a fact in Reviews
+        'codex=gpt-6-astra · no answer', // the raw custody state stays in the task detail and Logs, never on the row
     ]);
+    const quoted = planGroup({ custody_pending: true, actors: [ANSWERED, { ...lost, reported_cause: 'Selected model is at capacity.' }] });
+    assert.deepEqual(availabilityLines(quoted.attempts[0], ' · no answer'), ['codex=gpt-6-astra · no answer — "Selected model is at capacity."']);
+    assert.doesNotMatch(availabilityLines(quoted.attempts[0], ' · no answer').join(' '), /custody_lost|review_custody_lost/);
     assert.deepEqual(availabilityLines(attempt, ' · awaiting'), []);
     assert.equal(group.progress, 'unresolved · 1 of 2 answered · 1 unavailable');
     assert.deepEqual([attempt.tone, group.tone], ['warn', 'warn']);
@@ -296,11 +299,11 @@ test('an unresolved reviewer says since when it was sent, under the same rule', 
     };
     const timed = planGroup({ custody_pending: true, actors: [{ ...lost, awaiting_since: sent }] });
     assert.deepEqual(availabilityLines(timed.attempts[0], ' · no answer'), [
-        `codex=gpt-6-astra · no answer — custody_lost: review_custody_lost · since ${localClock(sent)}`,
+        `codex=gpt-6-astra · no answer · since ${localClock(sent)}`,
     ]);
     const untimed = planGroup({ custody_pending: true, actors: [lost] });
     assert.deepEqual(availabilityLines(untimed.attempts[0], ' · no answer'), [
-        'codex=gpt-6-astra · no answer — custody_lost: review_custody_lost',
+        'codex=gpt-6-astra · no answer',
     ]);
 });
 

@@ -749,10 +749,11 @@ def test_an_author_finish_narrates_its_rationale_in_the_models_voice(harness, mo
     assert _state(harness)["current_attempt"]["author_subject"]["author_disposition"]["rationale"] == rationale
     # An empty rationale records the finish and says nothing in the model's voice.
     seen.clear()
-    pr._handle_plan_task(ctx, review_disposition={
+    result_empty = pr._handle_plan_task(ctx, review_disposition={
         "review_fingerprint": fp, "items": [], "author_action": "finish",
         "author_disposition": {"disposition": "accepted", "rationale": ""}})
     assert not [row for row in seen if row[1].get("narration")]
+    assert "Your rationale was shown to the owner" not in result_empty
     # The disposition path with an author disposition narrates once too; the host line stays host voice.
     seen.clear()
     pr._handle_plan_task(ctx, review_disposition={

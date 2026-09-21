@@ -540,7 +540,7 @@ function planActorAvailabilityLines(wave) {
         const model = text(actor.model) || 'reviewer';
         const cause = text(actor.reported_cause).split(/\s+/).join(' ');
         if (actorAwaiting(actor)) lines.push(`${model} · awaiting${sinceLocalTime(actor.awaiting_since)}`);
-        else if (actorUnresolved(actor)) lines.push(`${model} · no answer — ${[text(actor.operation_state), text(actor.failure_code) || text(actor.error)].filter(Boolean).join(': ')}${sinceLocalTime(actor.awaiting_since)}`);
+        else if (actorUnresolved(actor)) lines.push(`${model} · no answer${cause ? ` — "${cause}"` : ''}${sinceLocalTime(actor.awaiting_since)}`);
         else if (text(actor.operation_state) === 'not_dispatched') lines.push(`${model} · not sent`);
         else lines.push(`${model} · unavailable${cause ? ` — "${cause}"` : ''}`);
     }
