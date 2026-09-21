@@ -511,9 +511,8 @@ def _owner_signal_pending(
     if drive_root is None or not task_id:
         return False
     try:
-        from ouroboros.owner_mailbox import (
-            CONTEXT_ONLY_TASK_PROVENANCES, KIND_TASK_MESSAGE, drain_owner_entries,
-        )
+        from ouroboros.loop_messages import owner_authority_kinds
+        from ouroboros.owner_mailbox import drain_owner_entries
 
         if mailbox_peek is not None and not owner_authority_only:
             return mailbox_peek.pending(pathlib.Path(drive_root), task_id, set(owner_msg_seen or ()), attempt)
@@ -522,10 +521,7 @@ def _owner_signal_pending(
         entries = drain_owner_entries(
             pathlib.Path(drive_root), task_id, set(owner_msg_seen or ()), attempt,
         )
-        return any(not (
-            owner_authority_only and entry.get("kind") == KIND_TASK_MESSAGE
-            and str(entry.get("provenance") or "ancestor_task") in CONTEXT_ONLY_TASK_PROVENANCES
-        ) for entry in entries)
+        return bool(owner_authority_kinds(entries) if owner_authority_only else entries)
     except Exception:
         log.debug("owner-signal peek failed during transport wait", exc_info=True)
         return False

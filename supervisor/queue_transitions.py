@@ -46,7 +46,14 @@ def transition_acceptance_fence(
     *, action: str, token: str, root_task_id: str = "", task_id: str = "", outcome: str = "",
     expected_generation: Optional[int] = None,
 ) -> Dict[str, Any]:
-    """Atomically open, inspect, release, or seal a root admission fence."""
+    """Atomically open, inspect, release, or seal a root admission fence.
+
+    ``begin`` is idempotent for its requester: the same token, or the SAME task with a
+    new one (its answer was lost), re-adopts the ``active`` row and rebinds it, so a dead
+    attempt's late events own no row. A ``sealed`` row is never re-adopted. A token that
+    owns no row answers ``released`` + ``row_absent`` — idempotent after ``task_done``
+    cleared the fence, and never a seal. Every answer carries the row's real status.
+    """
     q = _queue_module()
     action = str(action or "").strip().lower()
     token = str(token or "").strip()
@@ -57,87 +64,48 @@ def transition_acceptance_fence(
         if action == "begin":
             if not root_task_id:
                 return {"ok": False, "status": "error", "error": "missing root_task_id"}
-            existing = q.ACCEPTANCE_FENCES.get(root_task_id)
-            if isinstance(existing, dict) and str(existing.get("token") or "") != token:
-                return {
-                    "ok": False,
-                    "status": "error",
-                    "error": f"acceptance fence already active for root {root_task_id}",
-                }
-            if isinstance(existing, dict):
-                row = existing
-            else:
+            matched_root, requester = root_task_id, str(task_id or root_task_id)
+            row = q.ACCEPTANCE_FENCES.get(root_task_id)
+            if not isinstance(row, dict):
                 row = q.ACCEPTANCE_FENCES[root_task_id] = {
-                    "token": token,
-                    "root_task_id": root_task_id,
-                    "task_id": str(task_id or root_task_id),
-                    "status": "active",
-                    "opened_at": utc_now_iso(),
-                    "owner_message_generation": 0,
+                    "token": token, "root_task_id": root_task_id, "task_id": requester,
+                    "status": "active", "opened_at": utc_now_iso(), "owner_message_generation": 0,
                 }
-            result = {
-                "ok": True,
-                "status": "active",
-                "root_task_id": root_task_id,
-                "token": token,
-                "owner_message_generation": int(row.get("owner_message_generation") or 0),
-                "queue_descendants": _live_descendants_locked(
-                    q, root_task_id, exclude_task_id=str(task_id or root_task_id),
-                ),
-            }
+            elif str(row.get("token") or "") != token:
+                status = str(row.get("status") or "active")
+                if status != "active" or str(row.get("task_id") or "") != requester:
+                    return {"ok": False, "status": status,
+                            "error": f"acceptance fence already {status} for root {root_task_id}"}
+                row["token"] = token
         else:
             matched_root = next(
                 (rid for rid, row in q.ACCEPTANCE_FENCES.items() if str(row.get("token") or "") == token),
                 "",
             )
             if not matched_root:
-                return {"ok": False, "status": "error", "error": "unknown acceptance fence token"}
+                return {"ok": True, "status": "released", "token": token, "row_absent": True}
             row = q.ACCEPTANCE_FENCES[matched_root]
+        current_generation = int(row.get("owner_message_generation") or 0)
+        result = {"ok": True, "status": str(row.get("status") or "active"), "root_task_id": matched_root, "token": token}
+        if action != "end":
+            result["owner_message_generation"] = current_generation
+            result["queue_descendants"] = _live_descendants_locked(
+                q, matched_root, exclude_task_id=str(row.get("task_id") or matched_root),
+            )
             if action == "inspect":
-                return {
-                    "ok": True,
-                    "status": str(row.get("status") or "active"),
-                    "root_task_id": matched_root,
-                    "token": token,
-                    "owner_message_generation": int(row.get("owner_message_generation") or 0),
-                    "queue_descendants": _live_descendants_locked(
-                        q, matched_root, exclude_task_id=str(row.get("task_id") or matched_root),
-                    ),
-                }
-            normalized_outcome = str(outcome or "").strip().lower()
-            if normalized_outcome == "revision":
-                q.ACCEPTANCE_FENCES.pop(matched_root, None)
-                result = {
-                    "ok": True,
-                    "status": "released",
-                    "root_task_id": matched_root,
-                    "token": token,
-                }
-            elif (
-                expected_generation is not None
-                and int(row.get("owner_message_generation") or 0) != int(expected_generation)
-            ):
-                current_generation = int(row.get("owner_message_generation") or 0)
-                q.ACCEPTANCE_FENCES.pop(matched_root, None)
-                result = {
-                    "ok": True,
-                    "status": "released",
-                    "root_task_id": matched_root,
-                    "token": token,
-                    "generation_mismatch": True,
-                    "expected_generation": int(expected_generation),
-                    "owner_message_generation": current_generation,
-                }
-            else:
-                row["status"] = "sealed"
-                row["outcome"] = normalized_outcome or "terminal"
-                row["sealed_at"] = utc_now_iso()
-                result = {
-                    "ok": True,
-                    "status": "sealed",
-                    "root_task_id": matched_root,
-                    "token": token,
-                }
+                return result
+        elif (normalized_outcome := str(outcome or "").strip().lower()) == "revision":
+            q.ACCEPTANCE_FENCES.pop(matched_root, None)
+            result["status"] = "released"
+        elif expected_generation is not None and current_generation != int(expected_generation):
+            q.ACCEPTANCE_FENCES.pop(matched_root, None)
+            result.update(
+                status="released", generation_mismatch=True,
+                expected_generation=int(expected_generation), owner_message_generation=current_generation,
+            )
+        else:
+            row.update(status="sealed", outcome=normalized_outcome or "terminal", sealed_at=utc_now_iso())
+            result["status"] = "sealed"
     q.persist_queue_snapshot(reason=f"acceptance_fence_{result['status']}")
     return result
 

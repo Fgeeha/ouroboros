@@ -407,14 +407,14 @@ export function taskStoppedWithSummary(evt) {
     return String(evt?.reason_code || '') === 'owner_requested_finalization';
 }
 
-// The typed causes a card can state in the owner's words, keyed on the CODE
-// alone. The record keeps the machine code (Logs, task detail, benchmark
-// ledgers); only the card speaks. An UNKNOWN code stays raw on purpose: a
-// reason we have no sentence for must read as itself rather than as a wrong
-// sentence. The byte-identical twin of project_dialogue.TASK_CAUSE_PHRASES;
-// web/tests/fixtures/outcome_phase_parity.json pins both.
+// The typed causes a card can state in the owner's words, keyed on the CODE alone. The
+// record keeps the machine code (Logs, task detail, benchmark ledgers); only the card
+// speaks. An UNKNOWN code stays raw on purpose: a reason we have no sentence for must read
+// as itself rather than as a wrong sentence. The byte-identical twin of
+// project_dialogue.TASK_CAUSE_PHRASES; web/tests/fixtures/outcome_phase_parity.json pins both.
 const TASK_CAUSE_PHRASES = {
     previous_revision_accepted: "The reviewers approved an earlier version of this answer; the current version was not re-reviewed.",
+    admission_close_unconfirmed: "Reviewers approved this answer; the supervisor did not confirm that task admission was closed.",
     author_stop: "Main stopped with unfinished work; no review approval was granted.",
     review_outcome_received: "Main received the review outcome or recorded limitation.",
     author_finish: "The answer was delivered on Main's own judgement; the reviewers had not signed it off.",

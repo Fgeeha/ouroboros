@@ -929,32 +929,30 @@ and what enforces each.
   choosing a value and its enum reads the validator's own set. A child in the legacy
   `cancel_requested` latch is intent, not outcome — cancel-pending until custody
   settles it.
-- Host acceptance: root-only, structured eligibility
-  (`outcomes.turn_has_reviewable_effects` plus a typed deliverable/criterion), never
-  keywords or authoritative agent nomination (BIBLE P3/P5; acceptance model,
-  per-enforcement waiting, `previous_revision_accepted`, `late_settlement`:
-  ARCHITECTURE §6 "Task acceptance"). Freeze request/roster; existing review custody/
-  mailbox handles pending/free collection. Before new-panel evidence or
-  `review_cycles_exhausted`, reconcile every paid panel still marked running for that
-  root: $0, recorded request/roster; reauthoring loses no verdict. Settlement wakes bring
-  verdicts whatever Main's draft. Re-offer only changed contract bytes; a spent repair
-  stays spent. Settled panels/queued wakes
-  skip parking, not retained-answer control preparation or typed provenance.
-  Accept complete revised prose, never a status note; typed keep/replace/finish are
-  optional. Prose resets pending-review choice to wait, never infers finish.
-  Effect, owner-revision and
-  child-action controls stay strict; owner-source acknowledgement and forced
-  finalization retain their rules. Context-only mail wakes waits but does not block
-  owner-source acknowledgement or imply an owner revision. Empty or recognizable malformed controls retain
-  the answer (`tests/test_acceptance_optional_control.py`). A text-only rewrite rides a
-  ready or pending PASS (no new panel or capacity refusal); a changed subject or owner
-  source does not (`acceptance_settlement._deliver_under_running_panel`). Pending: default wait;
-  Blocking waits; Cyber Pro never waits; Advisory finish needs explicit
-  `"pending_review":"finish"` in delivery control. Keep the trace
-  past exit (`remember_settlement_trace`). Late settlement: attach to the ended result,
-  announce once on its task card (`card_row="reviews"`); no model turn or reviewer-as-
-  open-delegation. Workers never write Main's candidate/author decision; subtree/status,
-  findings and Cyber authority stay separate (BIBLE P0).
+- Host acceptance: root-only, structured eligibility (`outcomes.turn_has_reviewable_effects`
+  plus a typed deliverable/criterion), never keywords or authoritative agent nomination
+  (BIBLE P3/P5; acceptance model, waiting, unanswered fence, `previous_revision_accepted`,
+  `late_settlement`: ARCHITECTURE §6 "Task acceptance"). Freeze request/roster; existing
+  review custody/mailbox handles pending/free collection. Before new-panel evidence or
+  `review_cycles_exhausted`, reconcile every paid panel still running for that root: $0,
+  recorded request/roster; reauthoring loses no verdict. Settlement wakes bring verdicts
+  whatever Main's draft. Re-offer only changed contract bytes; a spent repair stays spent, a
+  host-caused refusal (typed cause, facts, selector) spends none. A host-spoken pass
+  never parks; settled panels/queued wakes skip only parking. Accept complete revised prose,
+  never a status note; typed keep/replace/finish are optional. Prose resets pending-review
+  choice to wait, never infers finish. Effect, owner-revision and child-action controls stay
+  strict; owner-source acknowledgement and forced finalization keep their rules.
+  Context-only mail wakes waits, blocks no owner-source acknowledgement, implies no owner
+  revision. Empty or recognizable malformed controls keep the answer
+  (`test_acceptance_optional_control.py`). A text-only rewrite rides a ready or pending PASS
+  (no new panel or capacity refusal); a changed subject or owner source does not
+  (`acceptance_settlement._deliver_under_running_panel`). Pending: default wait; Blocking
+  waits; Cyber Pro never waits; Advisory finish needs an explicit
+  `"pending_review":"finish"`. Keep the trace past exit (`remember_settlement_trace`). Late
+  settlement: attach to the ended result, announce once on its task card
+  (`card_row="reviews"`); no model turn or reviewer-as-open-delegation. Workers never write
+  Main's candidate/author decision; subtree/status, findings and Cyber authority stay
+  separate (BIBLE P0).
 - Delivery-control JSON governs only tool-less final responses; retention leaves tools
   available. Changed criteria/material evidence mean a new subject even with kept text,
   never old verdict authority. Source acknowledgement infers no semantic change from

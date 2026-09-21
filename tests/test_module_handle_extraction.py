@@ -91,7 +91,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     # tree did not bear it out, so the three invariants below were not running on
     # them. Sets are the tool-derived exact read sets on these bytes.
     "supervisor/queue_snapshot.py": ("supervisor/queue.py", "_queue", frozenset({
-        "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES", "DRIVE_ROOT", "PENDING",
+        "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES", "DRIVE_ROOT", "PENDING", "PRIOR_DIRECT_ROOTS",
         "QUEUE_SEQ_COUNTER_REF", "QUEUE_SNAPSHOT_PATH", "RUNNING", "_queue_lock",
         "append_jsonl", "atomic_write_text", "enqueue_task", "parse_iso_to_ts",
         "persist_queue_snapshot", "restore_invalid_depth_admission", "sort_pending",
@@ -334,7 +334,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_project_child_result_dispositions", "_publish_delivery_candidate",
         "_replace_delivery_candidate", "_resolve_delivery_control",
         "_run_task_acceptance_review_once", "_service_finalization_evidence",
-        "_supersede_delivery_acceptance_binding",
+        "_set_acceptance_decision", "_supersede_delivery_acceptance_binding",
         "_supersede_task_acceptance_for_evidence_change",
         "_supersede_task_acceptance_for_owner_followup",
         "_task_acceptance_owner_generation_changed",

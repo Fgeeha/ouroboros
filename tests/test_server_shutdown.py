@@ -648,7 +648,9 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     noop = lambda *_a, **_k: None  # noqa: E731
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
     # Patch the module's bound name, not the process-wide time.sleep.
-    monkeypatch.setattr(server, "time", SimpleNamespace(sleep=noop, monotonic=time_mod.monotonic, time=time_mod.time))
+    monkeypatch.setattr(server, "time", SimpleNamespace(
+        sleep=noop, monotonic=time_mod.monotonic, time=time_mod.time,
+        thread_time=time_mod.thread_time))  # the loop samples its OWN thread's CPU per phase stamp
     monkeypatch.setattr(server, "_supervisor_stop", rec.stop)
     monkeypatch.setattr(server, "_restart_requested", rec.restart)
     monkeypatch.setattr(server, "_supervisor_ready", rec.ready)

@@ -1299,12 +1299,21 @@ def _persist_cancel_receipt(
             block["unreconciled_runs"] = runs
         try:
             from ouroboros.cancel_intents import active_intent
+            from ouroboros.task_results import load_task_result
 
-            reason = str((active_intent(pathlib.Path(drive_root), tid) or {}).get("reason") or "")
-            if reason:
-                block["stop_reason"] = reason
+            # The cause outlives the intent: once custody settles, `cancel_origin`
+            # on the stored result is where the same scalars live, and a receipt
+            # rebuilt after the settle must name the stop the owner actually made.
+            cause = active_intent(pathlib.Path(drive_root), tid) or {}
+            if not cause:
+                stored = load_task_result(pathlib.Path(drive_root), tid) or {}
+                origin = stored.get("cancel_origin")
+                cause = origin if isinstance(origin, dict) else {}
+            for key, field in (("reason", "stop_reason"), ("requested_at", "stop_requested_at")):
+                if cause.get(key):
+                    block[field] = str(cause[key])
         except Exception:
-            log.debug("cancel-receipt intent reason read failed for %s", tid, exc_info=True)
+            log.debug("cancel-receipt stop cause read failed for %s", tid, exc_info=True)
 
         def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             if not isinstance(current, dict) or not current:
