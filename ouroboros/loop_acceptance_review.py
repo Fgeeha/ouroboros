@@ -116,9 +116,9 @@ def prepare_acceptance_observation(ctx: Any, trace: dict, incoming: Any, message
     from ouroboros.loop_acceptance import capture_acceptance_observation, acceptance_observation_prompt
 
     observed = capture_acceptance_observation(ctx, trace, incoming)
-    if (_loop().get_task_review_mode() not in {"auto", "required"}
+    if not getattr(ctx, "_delivery_control_required", False) and (_loop().get_task_review_mode() not in {"auto", "required"}
             or not any(row.get("function", {}).get("name") == "task_acceptance_review" for row in tool_schemas)):
-        return
+        return  # an armed control always shows the selector it asks Main to name (subagents, review mode off)
     # Cognitive-only direct turns (for example ``update_identity``) are ordinary
     # conversation and are explicitly ineligible for task acceptance. Do not
     # expose the internal source-selector protocol to Main in that case: after a

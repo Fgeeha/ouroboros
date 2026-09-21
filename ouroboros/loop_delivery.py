@@ -82,6 +82,39 @@ _DELIVERY_HOLD_CONTROLS = frozenset({
 # Header of the host's own rendered control block; identifies the transcript's
 # control history the way ``acceptance_observation`` marks the observation rows.
 _DELIVERY_CONTROL_MARKER = "[DELIVERY_FINALIZATION_CONTROL]"
+_OBSERVATION_MARKER = "[ACCEPTANCE_SUBJECT_OBSERVATION]"
+
+
+def _selector_rendered(messages: List[Dict[str, Any]], sha256: str) -> bool:
+    """Whether Main was shown a source selector naming ``sha256`` — a host row it
+    could act on. A refusal about a selector never rendered is the host's, not Main's."""
+    return bool(sha256) and any(
+        _OBSERVATION_MARKER in text and sha256 in text
+        for text in (str(row.get("content") or "") for row in messages if row.get("role") == "user")
+    )
+
+
+def _finalization_repair_message(
+    tools: ToolRegistry, ctx: _RoundLimitContext, llm_trace: Dict[str, Any], candidate: DeliveryCandidate,
+    error: str, *, host_caused: bool, keep_allowed: bool,
+) -> str:
+    """The one repair row. Main's own malformed control is named invalid; a
+    host-caused refusal is its typed cause plus facts and carries the CURRENT
+    selector, so the next answer can name what the host actually holds."""
+    from ouroboros.acceptance_settlement import acceptance_choice_offered
+
+    contract = _delivery_control_prompt(
+        candidate, keep_allowed=keep_allowed,
+        pending_review_choice=bool(getattr(tools._ctx, "_task_acceptance_pending", "") and acceptance_choice_offered()),
+    )
+    if not host_caused:
+        return "[DELIVERY_CONTROL_REPAIR] Invalid finalization control: " + error + ".\n" + contract
+    from ouroboros.loop_acceptance import acceptance_observation_prompt, capture_acceptance_observation
+
+    selector = acceptance_observation_prompt(tools._ctx, capture_acceptance_observation(
+        tools._ctx, llm_trace, getattr(ctx, "incoming_messages", None)))
+    return ("[DELIVERY_CONTROL_REPAIR] The finalization control was not applied: " + error + "\n"
+            + (selector + "\n" if selector else "") + contract)
 
 
 def _swarm_handoff_attempt(ctx: Any) -> Dict[str, Any]:
@@ -202,8 +235,12 @@ def apply_delivery_subject_decision(
     if not isinstance(indices, (list, tuple)) or any(type(i) is not int or not 0 <= i < count for i in indices):
         return False, "material_tool_indices must address tool results available to this Main turn"
     source = subject.get("owner_source_sha256")
-    if not isinstance(source, str) or not acknowledge_acceptance_observation(tools._ctx, source):
-        return False, "owner source is stale or unread input remains; consume the current message first"
+    if not isinstance(source, str):
+        return False, "acceptance_subject.owner_source_sha256 must be the observed selector's sha256 string"
+    ack = acknowledge_acceptance_observation(tools._ctx, source)
+    if not ack:
+        # The typed cause and its facts; what Main does next is Main's decision.
+        return False, f"{ack.cause} {json.dumps(ack.facts, ensure_ascii=False, sort_keys=True, default=str)}"
     tools._ctx._delivery_effective_criteria = json.loads(json.dumps(criteria, ensure_ascii=False, default=str))
     tools._ctx._delivery_material_tool_indices = tuple(sorted(set(indices)))
     revision, fingerprint = _loop()._delivery_evidence_state(tools, ctx, llm_trace)
@@ -962,13 +999,16 @@ def _resolve_delivery_control(
                 from ouroboros.loop_acceptance import acknowledge_acceptance_observation
 
                 observed = getattr(tools._ctx, "_acceptance_observation", {})
-                acknowledge_acceptance_observation(tools._ctx, observed.get("owner_source_sha256", ""))
+                if observed.get("owner_source_sha256"):
+                    acknowledge_acceptance_observation(tools._ctx, observed["owner_source_sha256"])
             return "fresh", _loop()._extract_plain_text_from_content(content)
-    subject_error = ""
+    refusal = None  # the typed acknowledgement when the ack itself refused a well-formed subject
     if control_kind in {"keep", "replace"} and isinstance(parsed, dict) and "acceptance_subject" in parsed:
+        tools._ctx._acceptance_source_ack = None
         applied, subject_error = apply_delivery_subject_decision(tools, ctx, llm_trace, parsed["acceptance_subject"])
         if not applied:
             control_kind, error = "invalid", subject_error
+            refusal = getattr(tools._ctx, "_acceptance_source_ack", None)
     if control_kind in {"keep", "replace"} and isinstance(parsed, dict):
         # Recorded on every control answer (the classifier already refused any
         # other value), so an answer without the key always means "wait" rather
@@ -981,9 +1021,20 @@ def _resolve_delivery_control(
             candidate, evidence_revision, evidence_fingerprint,
         )
         error = "keep cannot bind changed evidence; send replace with the complete answer"
-    if _loop()._task_acceptance_owner_generation_changed(tools._ctx):
+    # Host-caused: the world moved under a well-formed control (unread input, a
+    # changed source or queue) or the host never rendered the selector it demands.
+    # Main-caused: Main named a selector other than the one it was shown.
+    host_caused = refusal is not None and (
+        refusal.cause != "source_not_observed"
+        or not _selector_rendered(ctx.messages, str(refusal.facts.get("latest_observed_sha256") or ""))
+    )
+    if valid and _loop()._task_acceptance_owner_generation_changed(tools._ctx):
+        # Never overwrites a more precise earlier error (an envelope error stands).
+        from ouroboros.loop_messages import owner_source_sha256
+
         valid = False
         error = "owner input has not been acknowledged by this Main turn; use its exact source selector"
+        host_caused = not _selector_rendered(ctx.messages, owner_source_sha256(tools._ctx))
 
     if valid and control_kind == "keep":
         tools._ctx._delivery_control_required = False
@@ -1003,26 +1054,22 @@ def _resolve_delivery_control(
         # re-arming a control round the host never opened this turn.
         return "resolved", candidate.full_text
 
-    if not candidate.repair_attempted:
-        candidate.repair_attempted = True
-        candidate.finalization_control = (
-            f"{candidate.finalization_control}_repair_requested"
-            if (_loop()._delivery_replace_required(candidate)
-                or candidate.finalization_control.startswith("acceptance_feedback"))
-            else "repair_requested"
-        )
+    if host_caused or not candidate.repair_attempted:
+        # Only Main's own malformed control spends the single repair.
+        candidate.repair_attempted = candidate.repair_attempted or not host_caused
+        if not candidate.finalization_control.endswith("repair_requested"):
+            candidate.finalization_control = (
+                f"{candidate.finalization_control}_repair_requested"
+                if (_loop()._delivery_replace_required(candidate)
+                    or candidate.finalization_control.startswith("acceptance_feedback"))
+                else "repair_requested"
+            )
         if raw:
             ctx.messages.append({"role": "assistant", "content": raw})
-        _loop()._append_or_merge_user_message(
-            ctx.messages,
-            "[DELIVERY_CONTROL_REPAIR] Invalid finalization control: " + error + ".\n"
-            + _delivery_control_prompt(
-                candidate,
-                keep_allowed=_delivery_keep_allowed(
-                    candidate, evidence_revision, evidence_fingerprint,
-                ),
-            ),
-        )
+        _loop()._append_or_merge_user_message(ctx.messages, _finalization_repair_message(
+            tools, ctx, llm_trace, candidate, error, host_caused=host_caused,
+            keep_allowed=_delivery_keep_allowed(candidate, evidence_revision, evidence_fingerprint),
+        ))
         candidate.control_episode_seen = True
         _loop()._publish_delivery_candidate(tools, candidate, llm_trace)
         return "retry", ""
