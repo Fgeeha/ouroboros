@@ -92,6 +92,22 @@ def _install_registry(monkeypatch, *, hold_sec):
     return release, holder
 
 
+class _ReleasingLLM(_ScriptedLLM):
+    """Frees the held tool the moment the model is asked a SECOND time, which can
+    only happen after the first call was abandoned. An event, not a wall-clock
+    guess: a timer that fired 0.3 s after the abandonment put the second call
+    exactly on its own 0.3 s bound, and a slow CI runner lost that race."""
+
+    def __init__(self, script, release):
+        super().__init__(script)
+        self._release = release
+
+    def chat(self, **kwargs):
+        if self.calls:
+            self._release.set()
+        return super().chat(**kwargs)
+
+
 def _reading_script():
     return _ScriptedLLM([
         {"tool_calls": [_tool_call("read_file", {"path": "greeting.txt"})]},
@@ -196,12 +212,11 @@ def test_abandoned_call_stops_the_episode_crediting_read_extents(repo, monkeypat
     can never become this episode's coverage."""
     release, _holder = _install_registry(monkeypatch, hold_sec=5.0)
     monkeypatch.setattr(loop_tool_execution, "_get_tool_timeout", lambda *_a, **_k: 0.3)
-    llm = _ScriptedLLM([
+    llm = _ReleasingLLM([
         {"tool_calls": [_tool_call("read_file", {"path": "greeting.txt"}, "c1")]},
         {"tool_calls": [_tool_call("read_file", {"path": "greeting.txt"}, "c2")]},
         {"content": _VERDICT},
-    ])
-    threading.Timer(0.6, release.set).start()
+    ], release)
     result = NativeToolRoundReviewExecutor(_assignment(repo), llm=llm).execute()
 
     receipts = result.usage["native_tool_receipts"]

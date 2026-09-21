@@ -1334,7 +1334,12 @@ jobs:
       # gate runs.
       - name: Ensure annotated tag object is fetched
         shell: bash
-        run: git fetch origin --tags --force
+        run: |
+          set -euo pipefail
+          TAG_REF="refs/tags/$GITHUB_REF_NAME"
+          git update-ref -d "$TAG_REF" || true
+          git fetch origin "$TAG_REF:$TAG_REF"
+          test "$(git cat-file -t "$TAG_REF")" = "tag"
 
       - uses: ./.github/actions/setup-python-env
         with:
@@ -2139,7 +2144,8 @@ jobs:
             echo "Remote tag $GITHUB_REF_NAME is missing or is not annotated." >&2
             exit 1
           fi
-          git fetch origin "$TAG_REF:$TAG_REF" --force
+          git update-ref -d "$TAG_REF" || true
+          git fetch origin "$TAG_REF:$TAG_REF"
           test "$(git cat-file -t "$TAG_REF")" = "tag"
           LOCAL_PEELED="$(git rev-parse "$PEELED_REF")"
           if [ "$LOCAL_PEELED" != "$GITHUB_SHA" ] || [ "$PEELED_SHA" != "$GITHUB_SHA" ]; then
@@ -2185,7 +2191,8 @@ jobs:
             echo "Remote tag $GITHUB_REF_NAME is missing or is not annotated." >&2
             exit 1
           fi
-          git fetch origin "$TAG_REF:$TAG_REF" --force
+          git update-ref -d "$TAG_REF" || true
+          git fetch origin "$TAG_REF:$TAG_REF"
           test "$(git cat-file -t "$TAG_REF")" = "tag"
           LOCAL_PEELED="$(git rev-parse "$PEELED_REF")"
           if [ "$LOCAL_PEELED" != "$GITHUB_SHA" ] || [ "$PEELED_SHA" != "$GITHUB_SHA" ]; then
