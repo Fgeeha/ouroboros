@@ -13,7 +13,7 @@ import os
 import pathlib
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from ouroboros.config import (
     NESTED_SETTLEMENT_MARGIN_SEC,
@@ -811,6 +811,44 @@ class StatefulToolExecutor:
             self._executor = None
 
 
+def tool_timeout_text(fn_name: str, timeout_sec: float, reset_msg: str = "") -> str:
+    """The ONE sentence a model reads when its own tool call was abandoned.
+
+    Shared with the native reviewer episode, whose inspection calls run under
+    this same timeout policy: two spellings of "your tool did not come back"
+    would be two contracts for one host fact.
+    """
+    return (
+        f"⚠️ TOOL_TIMEOUT ({fn_name}): exceeded {timeout_sec}s limit. "
+        f"The tool is still running in background but control is returned to you. "
+        f"{reset_msg}Try a different approach or inform the user{' about the issue' if not reset_msg else ''}."
+    )
+
+
+@contextlib.contextmanager
+def abandoned_on_timeout(timeout_sec: float, *, bounded: bool = True) -> Iterator[Callable[..., Any]]:
+    """Own the private worker of ONE call so a timed-out call can be ABANDONED.
+
+    The late-settlement half of tool execution, without its task-log rows, so
+    the native reviewer episode bounds its inspection calls on the same
+    mechanics the loop uses: the worker inherits the caller's execution
+    deadline through a copied context (its inner waits share the bound), the
+    caller waits with ``future_result`` (a quota pause does not spend the
+    budget), and the executor is retired WITHOUT joining — a caller that timed
+    out walks away, and the value the worker settles on later is evidence of
+    nothing. ``bounded=False`` leaves the context unscoped for a terminal wait
+    that must not be cut at all.
+    """
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        with (execution_deadline_scope(monotonic_now() + timeout_sec) if bounded
+              else contextlib.nullcontext()):
+            context = contextvars.copy_context()
+        yield lambda fn, *args: executor.submit(context.run, fn, *args)
+    finally:
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def _make_timeout_result(
     fn_name: str,
     tool_call_id: str,
@@ -832,11 +870,7 @@ def _make_timeout_result(
     except Exception:
         pass
 
-    result = (
-        f"⚠️ TOOL_TIMEOUT ({fn_name}): exceeded {timeout_sec}s limit. "
-        f"The tool is still running in background but control is returned to you. "
-        f"{reset_msg}Try a different approach or inform the user{' about the issue' if not reset_msg else ''}."
-    )
+    result = tool_timeout_text(fn_name, timeout_sec, reset_msg)
     tool_result = ToolResult(
         status="timeout",
         code="TOOL_TIMEOUT",
@@ -1026,13 +1060,8 @@ def _execute_with_timeout(
             }, correlation, tool_call_id=tool_call_id))
             return timeout_result
     else:
-        executor = ThreadPoolExecutor(max_workers=1)
-        try:
-            with (contextlib.nullcontext() if is_reviewed_mutative else execution_deadline_scope(monotonic_now() + timeout_sec)):
-                context = contextvars.copy_context()
-            future = executor.submit(
-                context.run, _execute_single_tool, tools, tc, drive_logs, task_id,
-            )
+        with abandoned_on_timeout(timeout_sec, bounded=not is_reviewed_mutative) as submit:
+            future = submit(_execute_single_tool, tools, tc, drive_logs, task_id)
             try:
                 result = future.result() if is_reviewed_mutative else future_result(future, timeout_sec)
                 result_meta = result.get("result_meta") or {}
@@ -1102,8 +1131,6 @@ def _execute_with_timeout(
                         "timeout_sec": timeout_sec,
                     }, correlation, tool_call_id=tool_call_id))
                     return timeout_result
-        finally:
-            executor.shutdown(wait=False, cancel_futures=True)
 
 
 _PARALLEL_SAFE_TOOLS: frozenset[str] = READ_ONLY_PARALLEL_TOOLS | PARALLEL_SAFE_ENQUEUE_TOOLS
