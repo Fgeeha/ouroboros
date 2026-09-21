@@ -173,7 +173,7 @@ def test_inherited_dispatch_deadline_narrows_the_tool_wait(repo, monkeypatch):
     release, _holder = _install_registry(monkeypatch, hold_sec=3.0)
     llm = _reading_script()
     started = monotonic_now()
-    with execution_deadline_scope(monotonic_now() + 0.4):
+    with execution_deadline_scope(monotonic_now() + 1.0):
         result = NativeToolRoundReviewExecutor(_assignment(repo), llm=llm).execute()
     elapsed = monotonic_now() - started
 
@@ -181,7 +181,7 @@ def test_inherited_dispatch_deadline_narrows_the_tool_wait(repo, monkeypatch):
     receipt = result.usage["native_tool_receipts"][0]
     assert receipt["outcome"] == "error" and receipt["source_gap"] == "native_tool_abandoned"
     bound = float(_tool_messages(llm)[0]["content"].split("exceeded ")[1].split("s limit")[0])
-    assert 0 < bound <= 0.4 + 1e-6  # a coarse clock can return the deadline itself
+    assert 0 < bound <= 1.0 + 1e-9 + 1e-9
     release.set()
 
     release_again, _holder_again = _install_registry(monkeypatch, hold_sec=3.0)

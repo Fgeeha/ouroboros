@@ -612,7 +612,7 @@ def test_question_mirrors_full_form_settle_and_reload(subscription_ui, width, he
 
     # A keyboard answer: focus stays in the settled copy, then moves on to the next question.
     card('finished').locator('.chat-quiz-question').focus()
-    page.keyboard.press('Alt+Tab')
+    page.keyboard.press('Tab')
     assert page.evaluate("document.activeElement.classList.contains('chat-quiz-option')"), \
         page.evaluate('document.activeElement.outerHTML')
     page.keyboard.press('Enter')
