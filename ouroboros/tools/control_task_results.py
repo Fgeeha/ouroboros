@@ -197,6 +197,7 @@ def _get_task_result(
             status="unavailable", code="LEGACY_UNAVAILABLE",
             text=f"Task {task_id}: unknown or not yet registered",
         ))
+    from ouroboros.project_sources import CLONE_TIMEOUT_SEC
     from ouroboros.routing_wait import is_emitted_admission_stub
 
     if is_emitted_admission_stub(data):
@@ -210,9 +211,10 @@ def _get_task_result(
             text=(
                 f"Task {task_id}: admission pending since {since} (now {utc_now_iso()}) - the promote "
                 "was emitted and this row carries no supervisor receipt yet, neither scheduled nor "
-                f"refused. Read get_task_result({task_id}) again before promoting the same work: the "
-                "supervisor answers within seconds of draining its queue. If the row is still "
-                "pending minutes later, the event did not land and a new promote is the way forward."
+                f"refused. Read get_task_result({task_id}) again before promoting the same work: a "
+                f"promote that prepares a source can stay pending for up to {CLONE_TIMEOUT_SEC // 60} "
+                "minutes. A new promote is a NEW task id; this row does not forbid one, and whether "
+                "this one is lost is yours to judge from the two times above."
             ),
         ))
     if bool(include_authority) or bool(include_work_order_source) or bool(include_completion_source):

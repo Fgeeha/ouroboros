@@ -309,8 +309,9 @@ def test_the_attachment_refusal_without_a_stub_still_writes_no_result(swarm_host
 
 def test_the_pending_sentence_never_forbids_a_new_promote_for_ever(tmp_path, _short_confirmation_window):
     """The row proves one thing: emitted, no receipt yet. An event can be lost (a
-    supervisor restart drops its in-memory queue), so the sentence hands the
-    decision back with the facts instead of a standing ban."""
+    supervisor restart drops its in-memory queue) and a source can take minutes to
+    prepare, and the row cannot tell the two apart; so the sentence gives the facts
+    and hands the decision back, with neither a standing ban nor an invented cause."""
     from ouroboros.tools.control_routing import _promote_chat_to_task
     from ouroboros.tools.control_task_results import _get_task_result
 
@@ -321,4 +322,7 @@ def test_the_pending_sentence_never_forbids_a_new_promote_for_ever(tmp_path, _sh
     read = _get_task_result(ctx, task_id)
     assert "admission pending since" in read and f"get_task_result({task_id})" in read
     assert "do not promote the same work a second time" not in read
-    assert "did not land" in read and "new promote" in read
+    # Facts only: the row cannot tell a lost event from a source still being prepared,
+    # so the sentence names the longest honest wait and leaves the judgement to the model.
+    assert "did not land" not in read and "within seconds" not in read
+    assert "can stay pending for up to 15 minutes" in read and "NEW task id" in read
