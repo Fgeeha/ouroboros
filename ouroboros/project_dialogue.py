@@ -731,10 +731,10 @@ OUTCOME_PHASE_HEADLINE = {"working": "Working", "done": "Done", "warn": "Done wi
 # code stays typed on the row. web/modules/log_events.js carries the twin;
 # web/tests/fixtures/outcome_phase_parity.json pins both.
 TASK_CAUSE_PHRASES = {
-    # Acceptance-decision reasons. A clean accepted decision renders no clause,
-    # so clean_pass and clean_pass_obligations_closed carry no sentence; an
-    # accepted decision with a sentence here still states its cause.
+    # Acceptance-decision reasons. A clean accepted decision renders no clause (clean_pass and
+    # clean_pass_obligations_closed carry no sentence); an accepted decision with a sentence states its cause.
     "previous_revision_accepted": "The reviewers approved an earlier version of this answer; the current version was not re-reviewed.",
+    "admission_close_unconfirmed": "Reviewers approved this answer; the supervisor did not confirm that task admission was closed.",
     "author_stop": "Main stopped with unfinished work; no review approval was granted.",
     "review_outcome_received": "Main received the review outcome or recorded limitation.",
     "author_finish": "The answer was delivered on Main's own judgement; the reviewers had not signed it off.",

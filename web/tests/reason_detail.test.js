@@ -70,6 +70,10 @@ test('an accepted decision with a sentence still states its cause', () => {
     });
     assert.equal(accepted('previous_revision_accepted'),
         'The reviewers approved an earlier version of this answer; the current version was not re-reviewed.');
+    // Owner 2A (2026-09-21): a blocking install accepts a reviewer-approved answer whose
+    // admission close the supervisor never confirmed, and the row says so.
+    assert.equal(accepted('admission_close_unconfirmed'),
+        'Reviewers approved this answer; the supervisor did not confirm that task admission was closed.');
     assert.equal(accepted('clean_pass'), '');
     assert.equal(accepted(''), '');
 });
@@ -83,7 +87,8 @@ test('every acceptance reason the host can record has a sentence', () => {
     const pkg = new URL('../../ouroboros/', import.meta.url);
     const read = (name) => readFileSync(new URL(name, pkg), 'utf8');
     const decisions = [
-        'loop_acceptance_review.py', 'loop_acceptance.py', 'loop_forced_finalization.py', 'acceptance_settlement.py',
+        'loop_acceptance_review.py', 'loop_acceptance.py', 'loop_delivery.py', 'loop_forced_finalization.py',
+        'acceptance_settlement.py',
     ].map(read).join('\n');
     const outcomes = read('outcomes.py');
     const acceptance = new Set([

@@ -611,6 +611,7 @@ ACCEPTANCE_DECISION_REASONS = (
     "author_finish",
     "author_stop",
     "review_outcome_received",
+    "admission_close_unconfirmed",  # owner 2A: blocking, clean PASS, the supervisor never confirmed the close
     # An explicit author stop can retain the wallet's exhausted-cycle reason.
     REASON_REVIEW_CYCLES_EXHAUSTED,
     # A-material (2026-08-30): the resubmit carried no changed candidate and no new
