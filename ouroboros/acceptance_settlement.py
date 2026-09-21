@@ -331,6 +331,7 @@ def forced_rail_panel_verdict(tools_ctx: Any, llm_trace: Dict[str, Any], rail_re
     """
     from ouroboros.loop_acceptance_review import acceptance_run_pending
     from ouroboros.loop_delivery import delivery_subject_hash
+    from ouroboros.loop_messages import owner_source_sha256
     from ouroboros.outcomes import ACCEPTANCE_ACCEPTED
     from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
     from ouroboros.review_verdict import task_acceptance_is_clean
@@ -347,6 +348,9 @@ def forced_rail_panel_verdict(tools_ctx: Any, llm_trace: Dict[str, Any], rail_re
             log.debug("a forced rail could not collect its own acceptance panel", exc_info=True)
         if acceptance_run_pending(run):
             return {"reason": "review_degraded", "review_pending": True}
+    reviewed_source = str(run.get("owner_source_sha256") or "")
+    if run.get("superseded_by_revision") or (reviewed_source and reviewed_source != str(owner_source_sha256(tools_ctx) or "")):
+        return {"reason": rail_reason}  # that panel judged an earlier revision or older owner premises: this answer was never reviewed
     reviewed = (run.get("request") or {}).get("subject", "")
     if (not task_acceptance_is_clean(SimpleNamespace(**run))
             or run.get("subject_hash") != delivery_subject_hash(tools_ctx, llm_trace, reviewed)):

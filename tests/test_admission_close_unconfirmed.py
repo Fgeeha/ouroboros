@@ -278,6 +278,24 @@ def test_the_final_seal_reads_the_queues_typed_answer(tmp_path, monkeypatch, enf
         assert llm_trace["review_decision"]["admission_released"] is False
 
 
+def test_owner_mail_that_arrived_during_the_silent_wait_is_not_delivered_over(tmp_path, monkeypatch):
+    """The wait for a silent supervisor is long enough for the owner to write, and their mail is
+    durable before any generation moves: a gap delivers only after the local mailbox was read once
+    more. Quiet direction: the same gap with an empty mailbox delivers with the note (table above)."""
+    from ouroboros.loop_delivery import _seal_admission_before_delivery
+    from ouroboros.owner_mailbox import write_owner_message
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "blocking")
+    tools, limit_ctx = _seal_context(tmp_path, False)
+    tools._ctx.begin_acceptance_fence = _gap
+    assert write_owner_message(tmp_path, "Use the blue variant instead", "root-1", msg_id="owner-blue")
+    llm_trace = {"review_decision": {"eligibility": "eligible"}, "review_runs": [],
+                 "acceptance_decision": {"status": ACCEPTANCE_ACCEPTED, "reason": "clean_pass", "source": "task_acceptance_review"}}
+    assert _seal_admission_before_delivery(tools, limit_ctx, llm_trace) is False
+    assert llm_trace["acceptance_decision"]["reason"] == "owner_followup"
+    assert llm_trace["acceptance_decision"]["status"] == "revision_requested"
+
+
 def test_a_locally_seen_owner_change_survives_a_silent_end(tmp_path):
     """`refused(generation_mismatch)` is a real owner follow-up even when the transport went
     silent: the local comparison decides the flag, not the missing ack. The quiet direction:

@@ -256,6 +256,28 @@ def test_a_direct_root_killed_by_the_window_is_cancelled_not_orphaned(qenv, monk
     assert load_task_result(qenv.drive, "direct-child")["status"] == STATUS_CANCELLED
 
 
+def test_a_supervisor_revival_never_fences_a_direct_turn_alive_in_this_process(qenv, monkeypatch):
+    """An in-process supervisor revival re-runs queue init while direct turns of THIS process
+    are still running: the roster then names live work, not what a stop caught. The quiet
+    direction is the window-close test above — a turn nobody runs any more IS fenced."""
+    from supervisor.active_activity import get_direct_activity_registry
+
+    _boot_pool(qenv, monkeypatch)
+    write_task_result(qenv.drive, "live-direct-turn", STATUS_RUNNING, chat_id=1)
+    _restart_snapshot(qenv, monkeypatch, running=[])
+    _direct_roots_fragment(qenv.drive, [{"task_id": "live-direct-turn", "chat_id": 1}])
+    registry = get_direct_activity_registry()
+    registry.register("live-direct-turn", 1)
+    try:
+        qenv.q.init(qenv.drive)
+        fenced: list = []
+        assert qenv.q.restore_pending_from_snapshot(terminalized=fenced) == 0
+    finally:
+        registry.unregister("live-direct-turn")
+    assert fenced == []
+    assert ci.active_intent(qenv.drive, "live-direct-turn") is None
+
+
 @pytest.mark.parametrize("fragment", ["incomplete", "missing"])
 def test_a_direct_root_the_roster_does_not_name_is_never_fabricated(qenv, monkeypatch, fragment):
     """A turn the roster does not name gets no invented row: an ``incomplete``

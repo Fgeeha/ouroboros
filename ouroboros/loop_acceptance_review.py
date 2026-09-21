@@ -857,7 +857,7 @@ def _apply_task_acceptance_result(
             "dissent_noted": bool(dissent),
         })
         ctx.tools._ctx._task_acceptance_improvement_passes = ctx.passes_done + 1
-        if not _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="revision"):
+        if _loop()._end_task_acceptance_fence(ctx.tools._ctx, outcome="revision").status == "refused":  # a gap is not a refusal
             ctx.tools._ctx._task_acceptance_reviewed = True
             _loop()._set_acceptance_decision(ctx.llm_trace, {
                 "status": ACCEPTANCE_FINALIZED_UNACCEPTED,

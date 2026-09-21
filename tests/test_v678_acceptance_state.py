@@ -74,7 +74,8 @@ def _apply_ctx(tmp_path, *, prior_trace=None, passes_done=0, budget_profile=None
         task_metadata={},
         task_contract={"budget_profile": budget_profile} if budget_profile else {},
         is_direct_chat=False,
-        end_acceptance_fence=(lambda **_k: {"ok": True}) if fence_ok else (lambda **_k: {"ok": False}),
+        end_acceptance_fence=(lambda **_k: (_ for _ in ()).throw(TimeoutError("no ack"))) if fence_ok == "silent"
+        else (lambda **_k: {"ok": True}) if fence_ok else (lambda **_k: {"ok": False}),
         _task_acceptance_fence_token="tok",
     )
     trace = dict(prior_trace or {})
@@ -186,6 +187,12 @@ _DIALOGUE_TERMINAL = dict(
         (
             "fence_reopen_failed", _ACTIONABLE_FAIL, {"fence_ok": False},
             (ACCEPTANCE_FINALIZED_UNACCEPTED, "fence_reopen_failed"),
+        ),
+        (
+            # A supervisor that never answered the reopen is a gap, not a refusal: the improvement
+            # round still happens (the queued end reaches the queue first; the next begin re-adopts).
+            "fence_reopen_unanswered", _ACTIONABLE_FAIL, {"fence_ok": "silent"},
+            (ACCEPTANCE_REVISION_REQUESTED, "improvement_capsule"),
         ),
         ("dialogue_terminal", _DIALOGUE_TERMINAL, {}, (ACCEPTANCE_REVISION_REQUESTED, "improvement_capsule")),
         ("review_degraded", _NO_QUORUM, {}, (ACCEPTANCE_REVISION_REQUESTED, "improvement_capsule")),

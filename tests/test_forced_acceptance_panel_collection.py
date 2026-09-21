@@ -110,6 +110,21 @@ def test_settled_clean_pass_on_a_different_subject_does_not_accept(recorder):
     assert "review_pending" not in decision
 
 
+@pytest.mark.parametrize("stale", [{"superseded_by_revision": True}, {"owner_source_sha256": "an-older-owner-corpus"}])
+def test_a_clean_pass_that_no_longer_speaks_for_this_turn_does_not_accept(recorder, stale):
+    """A panel that judged an earlier revision, or older owner premises, is not this answer's
+    review: the rail keeps its own "never reviewed" reason. The quiet direction is the
+    same-subject test above — an un-superseded PASS on the current owner source accepts."""
+    ctx, record = recorder
+    trace = _trace(ctx)
+    subject = delivery_subject_hash(ctx, trace, ANSWER)
+    trace["review_runs"] = [{**_run(subject, actors=[_clean_actor()]), **stale}]
+    record(trace)
+    decision = trace["acceptance_decision"]
+    assert decision["status"] == "finalized_unaccepted"
+    assert decision["reason"] == BYPASS
+
+
 def test_pending_panel_stays_unaccepted_with_review_pending_and_keeps_its_rows(recorder):
     ctx, record = recorder
     trace = _trace(ctx)

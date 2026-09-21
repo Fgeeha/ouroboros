@@ -423,10 +423,14 @@ def restore_pending_from_snapshot(
         # they are named; both lists describe work the stop caught, and one fence
         # call gives them the one cancel-intent path custody settles.
         direct_roots = dict(_queue().PRIOR_DIRECT_ROOTS)
+        # An in-process supervisor revival re-runs queue init while direct turns of THIS process are
+        # alive: the roster then names live work, not what a stop caught.
+        from supervisor.active_activity import get_direct_activity_registry
+        live_direct = {str(row.get("activity_id") or "") for row in get_direct_activity_registry().snapshot()}
         running_rows = snap.get("running")
         fenced_running = _fence_snapshot_running_rows(
             (running_rows if isinstance(running_rows, list) else [])
-            + [{"id": task_id} for task_id in direct_roots.get("task_ids") or []],
+            + [{"id": task_id} for task_id in direct_roots.get("task_ids") or [] if task_id not in live_direct],
             restored_ids={str(task.get("id") or "") for task in snapshot_pending},
         )
         if terminalized is not None:

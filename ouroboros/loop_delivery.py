@@ -1128,7 +1128,12 @@ def _seal_admission_before_delivery(tools: ToolRegistry, limit_ctx: Any, llm_tra
     opened, _token = _loop()._begin_task_acceptance_fence(tool_ctx, limit_ctx.task_id)
     answer = opened and _loop()._end_task_acceptance_fence(tool_ctx, outcome="terminal")
     own_seal = (opened.status, opened.reason) == ("refused", "sealed")
-    if getattr(tool_ctx, "_task_acceptance_fence_generation_mismatch", False) or not (answer or own_seal or answer.status == "unknown"):
+    from ouroboros.loop_messages import _pending_owner_input_kinds
+
+    # The wait for a silent supervisor is long enough for the owner to write: their mail is durable
+    # before any generation moves, so the local mailbox is read once more before a gap delivers.
+    gap = not answer and not own_seal and answer.status == "unknown" and not _pending_owner_input_kinds(tool_ctx)
+    if getattr(tool_ctx, "_task_acceptance_fence_generation_mismatch", False) or not (answer or own_seal or gap):
         _loop()._supersede_task_acceptance_for_owner_followup(tool_ctx, llm_trace)
         admission_lock = getattr(tool_ctx, "owner_message_admission_lock", None)
         admission_agent = getattr(tool_ctx, "owner_message_admission_agent", None)
