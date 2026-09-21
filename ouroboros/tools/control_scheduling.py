@@ -29,6 +29,7 @@ from ouroboros.contracts.task_contract import (
     normalize_allowed_resources,
 )
 from ouroboros.headless import prepare_task_drive, task_state_dir
+from ouroboros.subagent_history import snapshot_handle
 from ouroboros.subagent_runtime import (
     SubagentSelectionError,
     effective_runtime_subagent_settings,
@@ -251,7 +252,8 @@ def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> s
     configured = emission.get("configured_subagent") if isinstance(
         emission.get("configured_subagent"), dict
     ) else {}
-    selected_id = str(configured.get("selected_subagent_id") or "")
+    # Model-facing name: the snapshot's own handle; the stored key stays in durable records.
+    selected_name = snapshot_handle(configured) if configured else ""
     selected_route = configured.get("route") if isinstance(configured.get("route"), dict) else {}
     route_kind = str(selected_route.get("kind") or "")
     legacy_selection = bool(emission.get("legacy_selection"))
@@ -318,13 +320,13 @@ def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> s
         if legacy_selection else ""
     )
     access_note = (
-        f"\naccess={emission['requested_access']!r} ignored for subagent_id={selected_id!r} "
+        f"\naccess={emission['requested_access']!r} ignored for subagent_id={selected_name!r} "
         "(api_model); write_surface controls read/write authority."
         if route_kind == "api_model" and emission.get("requested_access") is not None else ""
     )
     return (
         f"Subagent request queued {task_ids[0]}: {objective} "
-        f"(subagent_id={selected_id}, route={route_kind}, {commitment})"
+        f"(subagent_id={selected_name}, route={route_kind}, {commitment})"
         f"{worker_note}{slot_note}{profile_note}{coop_note}{legacy_note}{access_note}"
     )
 

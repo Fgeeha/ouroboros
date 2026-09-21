@@ -11,7 +11,7 @@ import {
     compoundSessionEffortConflict, configuredApiProviders, changeRouteChoice, routeModelFields,
     routeModelInputHtml, routeTargetFromModel, routeSupportsAccount, effortSelectHtml,
     encodeRouteChoice, indexProfilesByHarness, mintStableId, profileOptionsFor,
-    routeChoiceGroups, selectHtml, serializeRouteSpec, sessionModelOptions, updateRouteControlOptions,
+    routeChoiceGroups, sameEngineAs, selectHtml, serializeRouteSpec, sessionModelOptions, updateRouteControlOptions,
     PROCESSING_CHOICES, PROCESSING_PREFERENCE_KEY, processingDetailsHtml, processingIntentLabel, accountScopedModelCatalog,
 } from './route_editor_primitives.js';
 import { modelChooserHtml, bindModelChoosers } from './model_chooser.js';
@@ -42,8 +42,8 @@ function canonicalRow(row) {
         if (!route.credential_profile_id) delete route.credential_profile_id;
     }
     // `name` is retired (owner decision 1=A): a legacy value parses and is
-    // DROPPED — identity is the neutral subagent_id plus derived route facts,
-    // and recommended_use is the one semantic field.
+    // DROPPED — a row is named by its route-derived handle, subagent_id is a
+    // hidden stored join key, and recommended_use is the one semantic field.
     // `enabled` is written only when the owner switched the row OFF: an
     // untouched roster keeps its exact canonical bytes and fingerprint.
     return {
@@ -144,10 +144,11 @@ export function parseAvailableSubagentsSetting(value) {
     return { setting, error: '' };
 }
 
-// One row's owner-facing errors, named the way the card is ("Subagent N").
-// `ids` accumulates in list order so a repeated stable ID blames the later row;
-// the list validator and the per-row display read this one source.
-function rowErrors(row, index, ids) {
+// One row's owner-facing errors, named the way the card is ("Subagent N"); the
+// list validator and the per-row display read this one source. `ids` accumulates
+// in list order so a repeated stable ID blames the later row. `rows` (with their inherited
+// processing) ride only on the save of an EDITED roster: twins saved earlier load and re-save.
+function rowErrors(row, index, ids, rows = null, inherited = '') {
     const errors = [];
     const id = String(row?.subagent_id || '').trim();
     if (!SUBAGENT_ID_PATTERN.test(id)) {
@@ -190,6 +191,8 @@ function rowErrors(row, index, ids) {
     if (encodedEffort) {
         errors.push(`effort “${row.effort}” conflicts with compound route effort “${encodedEffort}”.`);
     }
+    const twin = rows && String(route.target_id || '').trim() ? sameEngineAs(rows, index, inherited) : -1;
+    if (twin >= 0) errors.push(`runs the same engine as Subagent ${twin + 1} — change its model, effort, access, account or processing, or remove it.`);
     return errors.map((text) => `Subagent ${index + 1} ${text}`);
 }
 
@@ -198,14 +201,13 @@ function listLevelErrors(setting) {
         ? [`Available subagents supports at most ${MAX_AVAILABLE_SUBAGENTS} rows.`] : [];
 }
 
-export function validateAvailableSubagentsSetting(setting) {
+export function validateAvailableSubagentsSetting(setting, { uniqueEngines = false, processingPreference = '' } = {}) {
     if (!setting || typeof setting.enabled !== 'boolean' || !Array.isArray(setting.items)) {
         return ['Available subagents configuration is not loaded.'];
     }
-    const errors = listLevelErrors(setting);
     const ids = new Set();
-    setting.items.forEach((row, index) => errors.push(...rowErrors(row, index, ids)));
-    return errors;
+    const rows = uniqueEngines ? setting.items : null;
+    return [...listLevelErrors(setting), ...setting.items.flatMap((row, index) => rowErrors(row, index, ids, rows, processingPreference))];
 }
 
 export function buildAvailableSubagentsSetting(setting) {
@@ -448,7 +450,7 @@ export function createAvailableSubagentsEditor({
                 || 'Available subagents draft is still loading. Retry the preview before finishing.'];
         }
         if (state.parseError) return [state.parseError];
-        return validateAvailableSubagentsSetting(state.setting);
+        return validateAvailableSubagentsSetting(state.setting, { uniqueEngines: state.dirty, processingPreference: state.processingPreference });
     }
 
     // Patch verdicts and inherited intent in place, preserving the caret.
@@ -461,7 +463,7 @@ export function createAvailableSubagentsEditor({
             : (state.saveAttempted ? listLevelErrors(state.setting) : []);
         const ids = new Set();
         state.setting.items.forEach((row, index) => {
-            const rowErrs = state.loaded ? rowErrors(row, index, ids) : [];
+            const rowErrs = state.loaded ? rowErrors(row, index, ids, state.dirty ? state.setting.items : null, state.processingPreference) : [];
             const judged = Boolean(row._uiAttempted) && rowErrs.length > 0;
             if (judged && !structural) shown.push(...rowErrs);
             const el = container.querySelector(`[data-subagent-row="${row._uiKey || row.subagent_id}"]`);
@@ -511,6 +513,12 @@ export function createAvailableSubagentsEditor({
         renderValidation();
         onChange(buildAvailableSubagentsSetting(state.setting));
     }
+
+    // A new row's hidden keys are neutral: a label copied from its source would rot with the route.
+    const mintRowKeys = () => ({
+        subagent_id: mintStableId('subagent', state.setting.items.map((item) => item.subagent_id)),
+        _uiKey: mintStableId('actor_row', state.setting.items.map((item) => item._uiKey)),
+    });
 
     function bindRows(container) {
         container.querySelectorAll?.('[data-subagent-row]').forEach((rowElement) => {
@@ -563,11 +571,9 @@ export function createAvailableSubagentsEditor({
             }
             rowElement.querySelector('[data-subagent-duplicate]')?.addEventListener('click', () => {
                 if (state.setting.items.length >= MAX_AVAILABLE_SUBAGENTS) return;
-                const copy = canonicalRow(row);
-                copy.subagent_id = mintStableId(`${row.subagent_id || 'subagent'}_copy`,
-                    state.setting.items.map((item) => item.subagent_id));
-                copy._uiKey = mintStableId('actor_row',
-                    state.setting.items.map((item) => item._uiKey));
+                // A copy IS the same engine, so it is born a judged draft: its card
+                // names the twin until one engine field changes.
+                const copy = { ...canonicalRow(row), ...mintRowKeys(), _uiAttempted: true };
                 state.setting.items.splice(state.setting.items.indexOf(row) + 1, 0, copy);
                 markDirty({ structural: true });
                 paint();
@@ -635,17 +641,11 @@ export function createAvailableSubagentsEditor({
         });
         container.querySelector('[data-subagent-add]')?.addEventListener('click', () => {
             if (state.setting.items.length >= MAX_AVAILABLE_SUBAGENTS) return;
-            const id = mintStableId('subagent', state.setting.items.map((row) => row.subagent_id));
-            const uiKey = mintStableId('actor_row', state.setting.items.map((row) => row._uiKey));
-            state.setting.items.push({
-                subagent_id: id,
-                recommended_use: '',
-                route: { kind: ROUTE_KIND_API_MODEL, target_id: '' },
-                _uiKey: uiKey,
-            });
+            const row = { recommended_use: '', route: { kind: ROUTE_KIND_API_MODEL, target_id: '' }, ...mintRowKeys() };
+            state.setting.items.push(row);
             markDirty({ structural: true });
             paint();
-            revealRow(uiKey);
+            revealRow(row._uiKey);
         });
         bindRows(container);
         disposeChoosers = bindModelChoosers(container);

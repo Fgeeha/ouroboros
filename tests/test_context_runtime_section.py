@@ -452,7 +452,8 @@ def test_delegation_fact_carries_historical_rows_and_profile_evidence(tmp_path, 
     assert last["applied_model"] == "claude-opus-5"
     assert last["requested_profile"] == "requested-delegate-profile"
     assert last["applied_profile"] == "applied-delegate-profile"
-    assert last["selected_subagent_id"] == "builder"
+    # Named from the record's own facts (no typed identity here: its route target).
+    assert last["selected_subagent_id"] == "claudexor=opus-5"
     assert last["observed"] == "last observed at 2026-08-18T02:00:00+00:00"
     assert "historical" not in rows["triad_1"]["observed"]
     # The prompt-visible note teaches the semantics ONCE: rows are history, live

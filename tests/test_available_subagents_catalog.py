@@ -35,10 +35,6 @@ def _settings(*rows: dict, enabled: bool = True) -> dict:
 
 
 def test_catalog_projects_every_saved_row_in_owner_order_verbatim():
-    from ouroboros.configured_subagents import (
-        configured_subagents_fingerprint,
-        parse_configured_subagents,
-    )
     from ouroboros.subagent_runtime import model_visible_subagent_catalog
 
     verbatim = "Use exact owner wording.\nKeep punctuation: a/b, quotes, and cost $0."
@@ -68,26 +64,26 @@ def test_catalog_projects_every_saved_row_in_owner_order_verbatim():
 
     catalog = model_visible_subagent_catalog(settings)
 
-    config = parse_configured_subagents(settings["OUROBOROS_SUBAGENTS"])
-    assert catalog["source"] == "configured"
-    assert catalog["config_fingerprint"] == configured_subagents_fingerprint(config)
+    # Facts only: selection prose lives in prompts/SYSTEM.md, and the list
+    # fingerprint and provenance stay host-side (snapshots carry them).
+    assert set(catalog) == {"rows"}
+    # Rows are named by their handle - the route plus the row's own set facets.
     assert [row["subagent_id"] for row in catalog["rows"]] == [
-        "api-scout", "auto-session", "pinned-session",
+        "google/gemini-3.7-flash/low", "claude=claude-fable-5/high",
+        "cursor=cursor-grok-4.6-high/@cursor-owner",
     ]
     assert catalog["rows"][0]["recommended_use"] == verbatim
+    assert list(catalog["rows"][0])[-1] == "recommended_use"
     assert catalog["rows"][0]["route_class"] == "API model"
     assert catalog["rows"][0]["requested_model"] == "google/gemini-3.7-flash"
     assert catalog["rows"][0]["requested_effort"] == "low"
-    assert "session account selection does not apply" in catalog["rows"][0]["account_policy"]
     assert catalog["rows"][1]["route_class"] == "Agent session"
     assert catalog["rows"][1]["requested_target"] == "claude=claude-fable-5"
-    assert catalog["rows"][1]["account_policy"] == "automatic compatible account selection"
+    assert catalog["rows"][1]["mutating_access"] == "full"
     assert "credential_profile_id" not in catalog["rows"][1]
     assert catalog["rows"][2]["requested_effort"] == "(not explicitly set)"
-    assert catalog["rows"][2]["account_policy"] == "explicit profile pin"
     assert catalog["rows"][2]["credential_profile_id"] == "cursor-owner"
-    assert "does not rank or substitute" in catalog["selection_guidance"]
-    assert "typed refusal" in catalog["dispatch_contract"]
+    assert not any("account_policy" in row for row in catalog["rows"])
 
 
 @pytest.mark.parametrize(
@@ -201,14 +197,16 @@ def test_catalog_is_semi_stable_while_dated_history_stays_dynamic(tmp_path, monk
     assert blocks[2]["text"] == core.dynamic_text
     assert "cache_control" not in blocks[2]
     assert catalog["rows"][0]["recommended_use"] == owner_text
-    assert '"subagent_id": "builder"' in core.semi_stable_text
+    assert '"subagent_id": "codex=gpt-5.6-sol/high"' in core.semi_stable_text
+    assert "builder" not in core.semi_stable_text, "the stored key is not model-facing"
     assert "2026-08-18T01:02:03+00:00" not in core.semi_stable_text
     assert "reviewer_slots_last" not in core.semi_stable_text
     assert "subagent_last_delegation" not in core.semi_stable_text
     assert "2026-08-18T01:02:03+00:00" in core.dynamic_text
     assert "reviewer_slots_last" in core.dynamic_text
     assert "subagent_last_delegation" in core.dynamic_text
-    assert '"selected_subagent_id": "builder"' in core.dynamic_text
+    # An old receipt without a typed identity shows its recorded route target.
+    assert '"selected_subagent_id": "codex=gpt-5.6-sol"' in core.dynamic_text
     for profile in (
         "review-requested", "review-applied", "delegate-requested", "delegate-applied",
     ):
@@ -236,12 +234,15 @@ def test_catalog_hides_an_owner_disabled_row_and_selection_refuses_it_typed(monk
     )
 
     catalog = model_visible_subagent_catalog(settings)
-    assert [row["subagent_id"] for row in catalog["rows"]] == ["builder"]
+    assert [row["subagent_id"] for row in catalog["rows"]] == ["openai/gpt-5.6-sol"]  # named by handle
 
-    with pytest.raises(SubagentSelectionError) as refused:
-        select_subagent_snapshot(settings, subagent_id="paused")
-    assert refused.value.code == "subagent_disabled"
-    assert "switched off" in refused.value.detail
+    # Resolution comes first, the row switch second: the same typed refusal by
+    # the row's stored id and by its handle, never `unknown_subagent_id`.
+    for selector in ("paused", "openai/gpt-5.6-luna"):
+        with pytest.raises(SubagentSelectionError) as refused:
+            select_subagent_snapshot(settings, subagent_id=selector)
+        assert refused.value.code == "subagent_disabled", selector
+        assert "switched off" in refused.value.detail
     # The enabled sibling is unaffected by its neighbour's switch.
     assert select_subagent_snapshot(settings, subagent_id="builder")[0][
         "selected_subagent_id"] == "builder"
@@ -249,7 +250,7 @@ def test_catalog_hides_an_owner_disabled_row_and_selection_refuses_it_typed(monk
     import ouroboros.config as config_module
 
     monkeypatch.setattr(config_module, "runtime_settings", lambda: dict(settings))
-    assert [row["subagent_id"] for row in current_subagent_alternatives()] == ["builder"]
+    assert [row["subagent_id"] for row in current_subagent_alternatives()] == ["openai/gpt-5.6-sol"]
 
 
 def test_a_roster_whose_every_row_is_switched_off_projects_no_catalog():
