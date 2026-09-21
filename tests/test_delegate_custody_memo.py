@@ -155,6 +155,31 @@ def test_same_size_rewrite_of_consumed_bytes_refolds(tmp_path):
     _assert_equivalent(root)
 
 
+def test_rewrite_of_consumed_live_bytes_plus_append_refolds(tmp_path):
+    """Growth alone must not certify the consumed prefix (triad finding, 2026-09-22)."""
+    root = tmp_path
+    _started(root, "run-1", "task-a")
+    assert custody.replay(root)["run-1"].task_id == "task-a"
+    path = custody.event_log_path(root)
+    original = path.read_bytes()
+    path.write_bytes(original.replace(b'"task-a"', b'"task-b"'))
+    _started(root, "run-2", "task-c")  # an append after the in-place rewrite
+    assert custody.replay(root)["run-1"].task_id == "task-b"
+    _assert_equivalent(root)
+    # A torn tail held back and later completed keeps the prefix hash consistent.
+    row = json.dumps({"ts": "t", "type": custody.SETTLED, "run_id": "run-2", "task_id": "task-c", "state": "failed"})
+    with path.open("ab") as handle:
+        handle.write(row[:15].encode("utf-8"))
+    assert not custody.replay(root)["run-2"].settled
+    with path.open("ab") as handle:
+        handle.write(row[15:].encode("utf-8") + b"\n")
+    assert custody.replay(root)["run-2"].settled
+    _assert_equivalent(root)
+    # The rewrite forced a refold (generation back to 1); completing the torn
+    # tail was an ADVANCE on the verified prefix (2), not another refold (1).
+    assert memo.memo_diagnostics(root)["generation"] == 2
+
+
 @pytest.mark.parametrize("anomaly", ["archive_deleted", "archive_inserted_before", "live_truncated"])
 def test_chain_anomalies_refold_to_the_full_replay(tmp_path, anomaly):
     root = tmp_path
@@ -180,24 +205,70 @@ def test_chain_anomalies_refold_to_the_full_replay(tmp_path, anomaly):
         assert "run-3" not in custody.replay(root)
 
 
-def test_unreadable_archive_directory_bypasses_the_memo(tmp_path):
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        pytest.skip("root ignores directory permissions")
+def test_unreadable_archive_directory_bypasses_the_memo(tmp_path, monkeypatch):
+    from ouroboros.utils import JsonlChainUnreadable
+
     root = tmp_path
     _started(root, "run-1", "task-a")
     _rotate(root)
     _started(root, "run-2", "task-a")
-    archive_dir = root / "archive"
-    archive_dir.chmod(0o000)
-    try:
-        rows = custody.custody_rows(root)
-        lenient = list(custody._iter_rows(custody.event_log_path(root)))
-        assert [r["run_id"] for r in rows] == [r["run_id"] for r in lenient] == ["run-2"]
-        assert memo.memo_diagnostics(root)["cold"]
-    finally:
-        archive_dir.chmod(0o755)
+    real = memo.jsonl_archive_segments
+
+    def unreadable(path, *, strict=False):
+        if strict:
+            raise JsonlChainUnreadable("archive directory unreadable (simulated)")
+        return []  # the lenient enumeration reads "never rotated", exactly as on a real EACCES
+
+    monkeypatch.setattr(memo, "jsonl_archive_segments", unreadable)
+    rows = custody.custody_rows(root)
+    # Whatever the lenient full scan answers is served verbatim, and nothing is cached.
+    lenient = [r["run_id"] for r in custody._iter_rows(custody.event_log_path(root))]
+    assert [r["run_id"] for r in rows] == lenient and "run-2" in lenient
+    assert memo.memo_diagnostics(root)["cold"]
+    monkeypatch.setattr(memo, "jsonl_archive_segments", real)
     _assert_equivalent(root)
     assert {r["run_id"] for r in custody.custody_rows(root)} == {"run-1", "run-2"}
+
+
+def test_rotation_inside_the_enumerate_window_never_answers_less(tmp_path, monkeypatch):
+    """A rotation landing between the chain's stat and its open (or between the
+    live stat and the archive listing) must not serve an amputated chain, and
+    must never cache one — the answer falls back to the lenient full scan."""
+    root = tmp_path
+    _started(root, "run-1", "task-a")
+    custody.custody_rows(root)
+    _started(root, "run-2", "task-a")
+    original = memo._enumerate
+
+    def enumerate_then_rotate(path):
+        chain = original(path)
+        _rotate(root)  # the stat'ed live file is now an archive; a new empty live exists
+        return chain
+
+    monkeypatch.setattr(memo, "_enumerate", enumerate_then_rotate)
+    assert [r["run_id"] for r in custody.custody_rows(root)] == ["run-1", "run-2"]
+    monkeypatch.undo()
+    _assert_equivalent(root)
+
+    _started(root, "run-3", "task-a")
+    listing = memo.jsonl_archive_segments
+
+    def list_then_rotate(path, *, strict=False):
+        found = listing(path, strict=strict)
+        _rotate(root)  # after the live file was pinned, before the fold opens it
+        return found
+
+    monkeypatch.setattr(memo, "jsonl_archive_segments", list_then_rotate)
+    assert set(custody.replay(root)) == {"run-1", "run-2", "run-3"}
+    monkeypatch.undo()
+    _assert_equivalent(root)
+    # A cold memo under the same race still yields the whole keep-set (startup GC input).
+    memo.reset_custody_memo(root)
+    _started(root, "run-4", "task-a", snapshot_id="snap-4")
+    monkeypatch.setattr(memo, "jsonl_archive_segments", list_then_rotate)
+    assert "snap-4" in custody.open_snapshot_ids(root)
+    monkeypatch.undo()
+    _assert_equivalent(root)
 
 
 def test_warm_reads_open_no_archive_segment(tmp_path, monkeypatch):
@@ -225,13 +296,14 @@ def test_warm_reads_open_no_archive_segment(tmp_path, monkeypatch):
 
 def test_replay_returns_independent_copies(tmp_path):
     root = tmp_path
-    _started(root, "run-1", "task-a", resource_ref={"root": "skill_payload"})
+    _started(root, "run-1", "task-a", resource_ref={"root": "skill_payload", "scopePaths": ["/a"]})
     first = custody.replay(root)["run-1"]
     first.resource_ref["root"] = "tampered"
+    first.resource_ref["scopePaths"].append("/tampered")
     first.verified_source_ranges.append((0, 1))
     first.settled = True
     second = custody.replay(root)["run-1"]
-    assert second.resource_ref == {"root": "skill_payload"}
+    assert second.resource_ref == {"root": "skill_payload", "scopePaths": ["/a"]}
     assert second.verified_source_ranges == [] and not second.settled
     assert second is not first
 
@@ -264,3 +336,20 @@ def test_reset_forgets_the_memo(tmp_path):
     custody.custody_rows(root)
     memo.reset_custody_memo()
     assert memo.memo_diagnostics(root)["cold"]
+
+
+def test_records_never_share_nested_containers_with_the_memo(tmp_path):
+    root = tmp_path
+    _requested(root, "inv-a", "task-a", {"prompt": "p"})
+    assert custody.emit(root, custody.START_REQUESTED, {
+        "invocation_id": "inv-b", "task_id": "task-a", "route": "codex", "request_ref": {"path": "x"},
+        "resource_ref": {"root": "skill_payload", "nested": {"k": "v"}}})
+    record = next(r for r in custody.pending_invocations(root) if r["invocation_id"] == "inv-b")
+    record["resource_ref"]["nested"]["k"] = "tampered"
+    again = next(r for r in custody.pending_invocations(root) if r["invocation_id"] == "inv-b")
+    assert again["resource_ref"] == {"root": "skill_payload", "nested": {"k": "v"}}
+    detail = custody.invocation_record(root, "inv-b")
+    detail["resource_ref"]["nested"]["k"] = "tampered"
+    assert custody.invocation_record(root, "inv-b")["resource_ref"]["nested"]["k"] == "v"
+    memo_row = next(r for r in custody.custody_rows(root) if r.get("invocation_id") == "inv-b")
+    assert memo_row["resource_ref"]["nested"]["k"] == "v"

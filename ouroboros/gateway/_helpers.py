@@ -18,7 +18,10 @@ _TRUE_LITERALS = frozenset({"1", "true", "yes", "on"})
 _FALSE_LITERALS = frozenset({"0", "false", "no", "off"})
 
 
-from ouroboros.jsonl_tail import TAIL_WINDOW_START_BYTES as _TAIL_WINDOW_START_BYTES  # noqa: E402,F401  (re-exported for gateway/history.py)
+from ouroboros.jsonl_tail import (  # noqa: E402
+    ARCHIVE_BACKFILL_MAX,
+    TAIL_WINDOW_START_BYTES as _TAIL_WINDOW_START_BYTES,  # noqa: F401  (re-exported for gateway/history.py)
+)
 
 
 async def run_sync_to_completion(function, /, *args, **kwargs):
@@ -73,7 +76,7 @@ def read_rotated_jsonl_entries(
     archive_prefix: str,
     want: int,
     counts_toward_quota,
-    max_archives: int = 3,
+    max_archives: int = ARCHIVE_BACKFILL_MAX,
     *,
     include_gaps: bool = False,
 ) -> list | tuple[list, set[str]]:

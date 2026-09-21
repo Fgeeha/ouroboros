@@ -899,7 +899,7 @@ class Memory:
             return not wanted or str(entry.get("task_id", "")).strip() == wanted
 
         stem = log_name[:-len(".jsonl")] if log_name.endswith(".jsonl") else log_name
-        coverage: Dict[str, Any] = {"task_id": wanted}
+        coverage: Dict[str, Any] = {"task_id": wanted, "source": f"logs/{log_name}"}
         try:
             rows = read_rotated_jsonl_entries(
                 self.logs_path(log_name), self.drive_root / "archive", stem,

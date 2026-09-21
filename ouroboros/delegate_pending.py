@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import pathlib
 from typing import Any, Dict, List, Optional
 
@@ -49,14 +50,15 @@ def pending_invocations(
                 "baseline_sha": str(row.get("baseline_sha") or ""),
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
-                "resource_ref": row.get("resource_ref") if isinstance(row.get("resource_ref"), dict) else {},
+                # Copies: the source rows may be the shared, read-only custody memo.
+                "resource_ref": copy.deepcopy(row.get("resource_ref")) if isinstance(row.get("resource_ref"), dict) else {},
                 "selected_subagent_id": str(row.get("selected_subagent_id") or ""),
                 "config_fingerprint": str(row.get("config_fingerprint") or ""),
                 "work_order_fingerprint": str(row.get("work_order_fingerprint") or ""),
                 "work_order_coverage": str(row.get("work_order_coverage") or ""),
                 "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
                 "work_order_source_request": (
-                    row.get("work_order_source_request")
+                    copy.deepcopy(row.get("work_order_source_request"))
                     if isinstance(row.get("work_order_source_request"), dict) else {}
                 ),
             }

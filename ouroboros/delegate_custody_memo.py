@@ -27,11 +27,15 @@ prefix it consumed stays consumed; every consumed segment has
 (a same-size rewrite refolds); a segment that grew is folded from ``consumed``
 onward. A torn LIVE tail (no trailing newline) waits for the next call; a torn
 line inside an immutable archive can never complete, so its bytes are consumed
-and counted (the ``refresh_recently_settled_terminals`` rule). Disclosed
-residual: a rewrite of an already-consumed prefix that preserves size and
-mtime is invisible — the log is append-only by construction (``append_jsonl``
-under the writer lock, rotation by ``os.replace``), and tests reset the memo
-through ``reset_custody_memo`` (autouse fixture in ``tests/conftest.py``).
+and counted (the ``refresh_recently_settled_terminals`` rule). The live
+file's consumed prefix is additionally hashed and re-verified before every
+advance (it is the only segment allowed to grow, and growth alone cannot prove
+the prefix); an archive is immutable by contract, so a same-size rewrite shows
+in its mtime and any growth refolds. Disclosed residual: a rewrite of an
+archive that preserves both size and mtime is invisible — the log is
+append-only by construction (``append_jsonl`` under the writer lock, rotation
+by ``os.replace``), and tests reset the memo through ``reset_custody_memo``
+(autouse fixture in ``tests/conftest.py``).
 
 Inline request bodies (legacy ``delegate_run_start_requested`` rows, hundreds of
 KB each) are not retained: the row carries a ``request_locator`` instead and
@@ -42,6 +46,7 @@ memo holds a few MB of compact rows, never the legacy bodies.
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import logging
 import os
@@ -74,6 +79,12 @@ class _Segment:
     st_ino: int
     consumed: int
     st_mtime_ns: int
+    # SHA-256 of the consumed bytes, kept only for the chain's LAST segment (the
+    # live file): the one segment that may legitimately grow, so size growth alone
+    # cannot certify its consumed prefix — an in-place rewrite followed by an
+    # append would otherwise fold from the old offset over stale rows. Verified
+    # by re-reading the prefix (bounded by the rotation cap) before each advance.
+    prefix_sha256: str = ""
 
 
 @dataclass
@@ -114,20 +125,51 @@ def reset_custody_memo(drive_root: Any = None) -> None:
 
 
 def _enumerate(path: pathlib.Path) -> List[Tuple[pathlib.Path, os.stat_result, bool]]:
-    """The chain as ``(segment, stat, is_live)`` in fold order; strict on archives."""
+    """The chain as ``(segment, stat, is_live)`` in fold order; strict on archives.
+
+    The live file is pinned by identity BEFORE the archives are listed (the
+    ``jsonl_chain_handles`` rule): a rotation between the two steps renames
+    that inode into the archive, where it is then excluded as the live file's
+    alias instead of being counted twice or lost from both lists.
+    """
+    try:
+        live_stat: Optional[os.stat_result] = path.stat()
+    except FileNotFoundError:
+        live_stat = None  # an absent live file is a positively empty tail
+    live_identity = (live_stat.st_dev, live_stat.st_ino) if live_stat is not None else None
     chain: List[Tuple[pathlib.Path, os.stat_result, bool]] = []
     for segment in jsonl_archive_segments(path, strict=True):
         try:
-            chain.append((segment, segment.stat(), False))
+            stat = segment.stat()
         except FileNotFoundError:
             continue  # rotated away between enumeration and stat: not part of history
         except OSError as exc:
             raise JsonlChainUnreadable(f"cannot stat {segment}: {exc}") from exc
-    try:
-        chain.append((path, path.stat(), True))
-    except FileNotFoundError:
-        pass  # an absent live file is a positively empty tail
+        if (stat.st_dev, stat.st_ino) == live_identity:
+            continue  # the pinned live generation under its new archive name
+        chain.append((segment, stat, False))
+    if live_stat is not None:
+        chain.append((path, live_stat, True))
     return chain
+
+
+def _open_identified(segment: pathlib.Path, stat: os.stat_result):
+    """Open ``segment`` and prove the handle is the enumerated inode.
+
+    A rotation between the stat and this open would otherwise hand the fold a
+    NEW empty live file under the OLD identity, and its consumed offset would
+    be applied to bytes that were never there. A mismatch refolds.
+    """
+    handle = segment.open("rb")
+    try:
+        actual = os.fstat(handle.fileno())
+    except OSError:
+        handle.close()
+        raise
+    if (actual.st_dev, actual.st_ino) != (stat.st_dev, stat.st_ino):
+        handle.close()
+        raise _Refold(f"{segment} changed identity between stat and open")
+    return handle
 
 
 def _prefix_intact(memo: _ChainMemo, chain: List[Tuple[pathlib.Path, os.stat_result, bool]]) -> bool:
@@ -170,8 +212,15 @@ def _fold_segment(
     marker = _custody()._ROW_MARKER.encode("ascii")
     start = known.consumed if known is not None else 0
     consumed = start
-    with segment.open("rb") as handle:
+    hasher = hashlib.sha256() if is_live else None
+    with _open_identified(segment, stat) as handle:
         if start:
+            if hasher is not None:
+                # Growth alone cannot certify the consumed prefix of a growing
+                # file: re-read and compare it (bounded by the rotation cap).
+                hasher.update(handle.read(start))
+                if not known or hasher.hexdigest() != known.prefix_sha256:
+                    raise _Refold("consumed live prefix changed under the memo")
             handle.seek(start)
         for raw in handle:
             if not raw.endswith(b"\n"):
@@ -184,6 +233,8 @@ def _fold_segment(
             if inner:
                 raise _Refold("inner archive segment grew after it was consumed")
             offset, consumed = consumed, consumed + len(raw)
+            if hasher is not None:
+                hasher.update(raw)
             if marker not in raw:
                 continue
             try:
@@ -196,7 +247,8 @@ def _fold_segment(
             after = os.fstat(handle.fileno())
         except OSError:
             after = stat
-    return _Segment(st_dev=stat.st_dev, st_ino=stat.st_ino, consumed=consumed, st_mtime_ns=after.st_mtime_ns)
+    return _Segment(st_dev=stat.st_dev, st_ino=stat.st_ino, consumed=consumed, st_mtime_ns=after.st_mtime_ns,
+                    prefix_sha256=hasher.hexdigest() if hasher is not None else "")
 
 
 def _advance(memo: _ChainMemo, chain: List[Tuple[pathlib.Path, os.stat_result, bool]]) -> None:
@@ -258,7 +310,10 @@ def custody_rows(drive_root: Any) -> Tuple[Dict[str, Any], ...]:
     """Every custody row of ``drive_root``'s chain, in chain order (read-only).
 
     The same dicts ``_iter_rows`` yields, except that an inline request body is
-    replaced by ``request_locator``; callers never mutate them.
+    replaced by ``request_locator``. READ-ONLY: the tuple holds the memo's own
+    row objects (copying 13k rows per warm read would cost what the memo saves);
+    a reader that hands rows onward copies the nested containers it exposes
+    (``pending_invocations`` / ``invocation_record`` do).
     """
     key = _key(_custody().event_log_path(drive_root))
     with _lock_for(key):
@@ -299,8 +354,8 @@ def clone_custody_state(state: Dict[str, Any]) -> Dict[str, Any]:
     clones: Dict[str, Any] = {}
     for run_id, entry in state.items():
         clone = copy.copy(entry)
-        clone.resource_ref = dict(entry.resource_ref)
-        clone.work_order_source_request = dict(entry.work_order_source_request)
+        clone.resource_ref = copy.deepcopy(entry.resource_ref)
+        clone.work_order_source_request = copy.deepcopy(entry.work_order_source_request)
         clone.verified_source_ranges = list(entry.verified_source_ranges)
         confirmations = getattr(entry, "_source_delivery_confirmations", None)
         if confirmations is not None:
@@ -323,13 +378,13 @@ def read_locator_request(drive_root: Any, locator: Any) -> Optional[Dict[str, An
         for segment, stat, _is_live in _enumerate(path):
             if (stat.st_dev, stat.st_ino) != identity:
                 continue
-            with segment.open("rb") as handle:
+            with _open_identified(segment, stat) as handle:
                 handle.seek(offset)
                 raw = handle.read(length)
             row = json.loads(raw.decode("utf-8", errors="replace"))
             body = row.get("request") if isinstance(row, dict) else None
             return body if isinstance(body, dict) and body else None
-    except (OSError, ValueError, JsonlChainUnreadable):
+    except (OSError, ValueError, JsonlChainUnreadable, _Refold):
         return None
     return None
 

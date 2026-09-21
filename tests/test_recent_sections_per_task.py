@@ -9,10 +9,7 @@ header must carry (BIBLE P1: a bounded window is disclosed, never silent).
 from __future__ import annotations
 
 import json
-import os
 import pathlib
-
-import pytest
 
 from ouroboros.context import build_recent_sections
 from ouroboros.memory import Memory
@@ -64,7 +61,7 @@ def test_single_task_log_renders_exactly_as_before(tmp_path):
     memory = Memory(drive_root=tmp_path)
     tools = _section(build_recent_sections(memory, env=None, task_id="task-a"), "## Recent tools")
     assert tools.split("\n\n", 1)[1] == memory.summarize_tools(rows)
-    assert "task task-a: all 5 matching rows; window: live file" in tools.splitlines()[0]
+    assert "task task-a: all 5 matching rows; window: whole live file of logs/tools.jsonl" in tools.splitlines()[0]
 
 
 def test_no_task_id_keeps_the_global_tail(tmp_path):
@@ -100,15 +97,40 @@ def test_coverage_line_discloses_bounded_archives_and_gaps(tmp_path):
     header = _section(build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a"),
                       "## Recent tools").splitlines()[0]
     assert "3 of 5 newest archives" in header and "older archives not opened" in header
+    assert "of logs/tools.jsonl" in header
 
-    if hasattr(os, "geteuid") and os.geteuid() == 0:
-        pytest.skip("root ignores directory permissions")
-    archive.chmod(0o000)
-    try:
-        rows, coverage = Memory(drive_root=tmp_path).read_task_recent("tools.jsonl", "task-a", 20)
-    finally:
-        archive.chmod(0o755)
+
+def test_unreadable_archive_directory_is_a_disclosed_gap(tmp_path, monkeypatch):
+    """Portable stand-in for an EACCES archive directory (chmod is not a Windows fact)."""
+    import os as _os
+
+    _write(tmp_path / "logs" / "tools.jsonl", [{"ts": "t", "task_id": "task-a", "tool": "live", "args": {}, "result_preview": "ok"}])
+    (tmp_path / "archive").mkdir()
+    real_scandir = _os.scandir
+
+    def denied(path, *args, **kwargs):
+        if str(path).endswith("archive"):
+            raise PermissionError(13, "denied", str(path))
+        return real_scandir(path, *args, **kwargs)
+
+    monkeypatch.setattr(_os, "scandir", denied)
+    rows, coverage = Memory(drive_root=tmp_path).read_task_recent("tools.jsonl", "task-a", 20)
     assert [r["tool"] for r in rows] == ["live"] and coverage["gaps"] == ["unreadable_source"]
+
+
+def test_coverage_line_never_says_all_under_a_bounded_window(tmp_path):
+    from ouroboros.jsonl_tail import TAIL_WINDOW_START_BYTES, coverage_line
+
+    padded = [{"ts": "t", "task_id": "task-b", "text": "x" * 4000} for _ in range(400)]  # > 512 KB
+    padded += [{"ts": "t", "task_id": "task-a", "text": f"a-{i}"} for i in range(50)]
+    _write(tmp_path / "logs" / "progress.jsonl", padded)
+    rows, coverage = Memory(drive_root=tmp_path).read_task_recent("progress.jsonl", "task-a", 50)
+    assert len(rows) == 50 and coverage["live_window"] == TAIL_WINDOW_START_BYTES
+    line = coverage_line(coverage)
+    assert "all " not in line and "newest 50 matching rows in the window" in line
+    assert "live tail 512 KB of" in line and "of logs/progress.jsonl" in line
+    assert coverage_line({"task_id": "t", "shown": 0, "matched": 0, "gaps": ["read_failed"]}).endswith(
+        "window: unread; gaps: read_failed")
 
 
 def test_reader_never_parses_the_whole_live_file_when_the_tail_suffices(tmp_path, monkeypatch):
@@ -127,3 +149,22 @@ def test_reader_never_parses_the_whole_live_file_when_the_tail_suffices(tmp_path
     shown, coverage = Memory(drive_root=tmp_path).read_task_recent("progress.jsonl", "task-a", 50)
     assert len(shown) == 50 and windows == [jsonl_tail.TAIL_WINDOW_START_BYTES]
     assert coverage["live_window"] == jsonl_tail.TAIL_WINDOW_START_BYTES < coverage["live_size"]
+
+
+def test_malformed_only_log_still_discloses_its_gap(tmp_path):
+    (tmp_path / "logs").mkdir(parents=True)
+    (tmp_path / "logs" / "tools.jsonl").write_text("{not json}\n", encoding="utf-8")
+    sections = build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a")
+    tools = _section(sections, "## Recent tools")
+    assert "no matching rows" in tools and "gaps: malformed_jsonl" in tools
+    # A log with neither rows nor gaps stays silent, as before.
+    (tmp_path / "logs" / "tools.jsonl").write_text("", encoding="utf-8")
+    assert not [s for s in build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a")
+                if s.startswith("## Recent tools")]
+
+
+def test_supervisor_section_carries_its_coverage_line(tmp_path):
+    _write(tmp_path / "logs" / "supervisor.jsonl", [{"ts": "2026-09-22T00:00:00Z", "type": "boot", "branch": "ouroboros", "sha": "abcdef123456"}])
+    section = _section(build_recent_sections(Memory(drive_root=tmp_path), env=None), "## Supervisor")
+    assert section.splitlines()[0].startswith("## Supervisor (all tasks: all 1 matching rows; window: whole live file of logs/supervisor.jsonl")
+    assert "boot: 2026-09-22T00:00:00Z branch=ouroboros sha=abcdef123456" in section

@@ -178,16 +178,28 @@ def coverage_line(coverage: dict) -> str:
     task_id = str(coverage.get("task_id") or "")
     shown, matched = int(coverage.get("shown") or 0), int(coverage.get("matched") or 0)
     whose = f"task {task_id}" if task_id else "all tasks"
-    if shown and matched > shown:
-        rows = f"newest {shown} of {matched} matching rows"
-    else:
-        rows = f"all {shown} matching rows" if shown else "no matching rows"
     live_size, live_window = int(coverage.get("live_size") or 0), int(coverage.get("live_window") or 0)
-    window = "live file" if live_window >= live_size else f"live tail {_kb(live_window)} of {_kb(live_size)}"
+    unread = "live_size" not in coverage
+    whole = live_window >= live_size and not coverage.get("archives_bounded") and not unread
+    if shown and matched > shown:
+        rows = f"newest {shown} of {matched} matching rows in the window"
+    elif shown and whole:
+        rows = f"all {shown} matching rows"
+    elif shown:
+        rows = f"newest {shown} matching rows in the window"
+    else:
+        rows = "no matching rows"
+    if unread:
+        window = "unread"
+    elif live_window >= live_size:
+        window = "whole live file"
+    else:
+        window = f"live tail {_kb(live_window)} of {_kb(live_size)}"
     archives, available = int(coverage.get("archives") or 0), int(coverage.get("archives_available") or 0)
     if archives:
         window += f" + {archives} of {available} newest archives"
-    parts = [f"{whose}: {rows}", f"window: {window}"]
+    source = str(coverage.get("source") or "")
+    parts = [f"{whose}: {rows}", f"window: {window}" + (f" of {source}" if source else "")]
     if coverage.get("archives_bounded"):
         parts.append("older archives not opened")
     gaps = coverage.get("gaps") or []

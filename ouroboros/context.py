@@ -978,14 +978,17 @@ def build_recent_sections(
     ):
         entries, coverage = memory.read_task_recent(log_name, task_id, want if task_id else 200)
         summary = formatter(entries)
-        if summary:
-            sections.append(f"{header} ({coverage_line(coverage)})\n\n{summary}")
+        if summary or coverage.get("gaps"):
+            # A window that met read or parse gaps is disclosed even when no row
+            # survived: silence would hide the gap itself (BIBLE P1).
+            sections.append(f"{header} ({coverage_line(coverage)})" + (f"\n\n{summary}" if summary else ""))
 
-    supervisor_summary = memory.summarize_supervisor(memory.read_task_recent("supervisor.jsonl", "", 200)[0])
+    supervisor_rows, supervisor_coverage = memory.read_task_recent("supervisor.jsonl", "", 200)
+    supervisor_summary = memory.summarize_supervisor(supervisor_rows)
     if supervisor_summary:
-        sections.append("## Supervisor\n\n" + supervisor_summary)
+        sections.append(f"## Supervisor ({coverage_line(supervisor_coverage)})\n\n" + supervisor_summary)
 
-    reflections_entries = memory.read_jsonl_tail("task_reflections.jsonl", 20)
+    reflections_entries = memory.read_task_recent("task_reflections.jsonl", "", 20)[0]
     reflections_text = _format_recent_reflections(reflections_entries, limit=10)
     if reflections_text:
         sections.append("## Execution reflections\n\n" + reflections_text)
