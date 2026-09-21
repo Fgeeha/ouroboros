@@ -593,8 +593,7 @@ def _run_supervisor(settings: dict) -> None:
     try:
         ensure_legacy_imported(pathlib.Path(DATA_DIR))
 
-        from supervisor.message_bus import init as bus_init
-        from supervisor.message_bus import LocalChatBridge
+        from supervisor.message_bus import LocalChatBridge, init as bus_init
 
         bridge = LocalChatBridge(settings)
         bridge._broadcast_fn = broadcast_ws_sync
@@ -699,9 +698,7 @@ def _run_supervisor(settings: dict) -> None:
 
         def _get_owner_chat_id() -> Optional[int]:
             try:
-                st = load_state()
-                cid = st.get("owner_chat_id")
-                return int(cid) if cid else None
+                return int((load_state() or {}).get("owner_chat_id") or 0) or None
             except Exception:
                 return None
 
@@ -709,8 +706,7 @@ def _run_supervisor(settings: dict) -> None:
             drive_root=DATA_DIR, repo_dir=REPO_DIR, owner_chat_id_fn=_get_owner_chat_id,
             routing_metadata_fn=lambda cid: main_lane_routing_metadata(_event_ctx, cid))  # _event_ctx is built below
 
-        _bg_st = load_state()
-        if _bg_st.get("bg_consciousness_enabled"):
+        if load_state().get("bg_consciousness_enabled"):
             _consciousness.start()
             log.info("Background consciousness auto-restored from saved state.")
 
@@ -763,15 +759,16 @@ def _run_supervisor(settings: dict) -> None:
     _last_review_job_reconcile = [time.time()]
     # WS3: a dedicated watchdog thread (outside this loop, so it fires even if the
     # loop stalls) surfaces a wedge as an observable signal + owner alert instead
-    # of silent hours; the loop publishes a liveness tick each iteration. The tick
-    # is MONOTONIC: it is only ever read as an elapsed gap, so a wall-clock jump
-    # must not turn a healthy loop into a phantom stall (nor hide a real one).
-    _loop_liveness = [time.monotonic()]
+    # of silent hours; the loop publishes a liveness tick at each tick PHASE. The
+    # tick is MONOTONIC: it is only ever read as an elapsed gap, so a wall-clock
+    # jump must not turn a healthy loop into a phantom stall (nor hide a real one).
+    from ouroboros.server_liveness import loop_phase_facts, observe_worker_event_lag
+    _loop_liveness = [time.monotonic(), {}, time.thread_time(), None]  # slots: server_liveness.py
     _watchdog_stop = threading.Event()  # per-generation: stops the watchdog when THIS loop exits
     _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
     while not _restart_requested.is_set() and not _supervisor_stop.is_set():
         try:
-            _loop_liveness[0] = time.monotonic()
+            _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "events", new_tick=True), time.monotonic()
             rotate_chat_log_if_needed(DATA_DIR)
             # progress.jsonl rotates on the same supervisor tick (v6.90.x P2); its
             # readers (history backfill, SSE replay, api_logs_tail, TB ATIF) are
@@ -800,6 +797,7 @@ def _run_supervisor(settings: dict) -> None:
                 if evt.get("type") == "restart_request":
                     _handle_restart_in_supervisor(evt, _event_ctx)
                     continue
+                observe_worker_event_lag(_loop_liveness, evt)
                 dispatch_event(evt, _event_ctx)
 
             if _restart_requested.is_set():
@@ -811,6 +809,7 @@ def _run_supervisor(settings: dict) -> None:
             # where no task_received fired for hours until a full restart).
             offset = _process_bridge_updates(bridge, offset, _event_ctx)
 
+            _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "maintenance"), time.monotonic()
             enforce_task_timeouts()
             try:
                 from supervisor.queue import check_scheduled_tasks
@@ -821,6 +820,7 @@ def _run_supervisor(settings: dict) -> None:
                 _last_custody_reap, _last_review_job_reconcile,
                 on_orphans_healed=lambda count: _consciousness and _consciousness.notify(f"orphans_healed:{count}"),
             )
+            _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "assign"), time.monotonic()
             # Loop-tick restart drain (no sleep, events keep flowing): while
             # draining a deferred restart, skip starting new work the restart
             # deadline would immediately chop (evolution / pending project tasks).
