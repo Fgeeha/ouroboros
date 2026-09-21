@@ -800,7 +800,7 @@ def _run_real_sweep(monkeypatch, manager, order: list) -> list:
     from ouroboros import server_maintenance as sm
     from supervisor import queue
 
-    for _name, _fresh in (("_CUSTODY_SWEEP_LOCK", __import__("threading").Lock()), ("_restart_requested", __import__("threading").Event()), ("_supervisor_stop", __import__("threading").Event())): monkeypatch.setattr(sm, _name, _fresh)  # process-global state another test may have left busy/set
+    monkeypatch.setattr(sm, "_CUSTODY_SWEEP_LOCK", __import__("threading").Lock())  # own latch: a pass may outlive a test
     threads = _track_sweep_threads(monkeypatch)
     monkeypatch.setattr(sm, "_LAST_CANCEL_INTENT_SWEEP", [time.time()])  # 20 s cadence idle
     monkeypatch.setattr(sm, "_installed_skill_names", lambda: None)

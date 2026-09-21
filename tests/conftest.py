@@ -495,6 +495,22 @@ def _unlatch_supervisor_event_bus_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def _clear_server_stop_flags_between_tests():
+    """The same class as the event-bus latch above: a TestClient lifespan teardown (and the
+    shutdown tests) SET the process-global ``_supervisor_stop`` / ``_restart_requested`` events
+    and nothing clears them, so every later test in that xdist worker that ran the off-thread
+    custody pass saw "this process is stopping" and the pass ended before its first step — red
+    only in the full battery. A test that wants a flag sets it itself."""
+    import sys
+
+    server_process = sys.modules.get("ouroboros.server_process")
+    if server_process is not None:
+        server_process._supervisor_stop.clear()
+        server_process._restart_requested.clear()
+    yield
+
+
+@pytest.fixture(autouse=True)
 def _restore_gateway_settings_bindings_between_tests():
     """``server._sync_gateway_settings_module()`` copies the server module's CURRENT
     ``load_settings`` / ``save_settings`` / ``_apply_settings_to_env`` /
