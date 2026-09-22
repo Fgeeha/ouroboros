@@ -207,7 +207,11 @@ def test_running_direct_turn_converts_to_project_and_its_answer_follows(
                         "the final answer of a converted turn was also delivered to Main"
                     # Main keeps the transfer receipt and a separate final-answer
                     # mirror; the original authored row belongs to the Project.
-                    rows = _task_rows(oracle, task_id)
+                    # The completion mirror is the supervisor's task_done row, written after
+                    # the worker's own final delivery: wait for it like every other durable fact.
+                    rows = wait_until(lambda: (lambda r: r if any(
+                        row["chat_id"] == 1 and row["type"] == "project_completion_summary" for row in r) else None)(
+                        _task_rows(oracle, task_id)), 60) or _task_rows(oracle, task_id)
                     main_rows = [row for row in rows if row["chat_id"] == 1]
                     handoff_rows = [row for row in main_rows if row["type"] == "project_handoff"]
                     completion_rows = [row for row in main_rows if row["type"] == "project_completion_summary"]
