@@ -197,7 +197,7 @@ def summarize_source(
         return content, {**_merge_consolidation_usage(*usages), "_consolidation_retry": input_limit,
                          **({"_knowledge_entries": entries} if entries else {})}
 
-    def split(start: int, end: int, failure: Dict[str, Any]) -> bool:
+    def split(start: int, end: int, failure: Dict[str, Any], *, correction: bool = False) -> bool:
         nonlocal input_limit
         if not failure["preflight_only"] and "input_bytes" in failure:
             input_limit = {key: failure[key] for key in ("route_fp", "capacity_tokens", "output_reserve_tokens")}
@@ -206,8 +206,12 @@ def summarize_source(
             if on_refusal is not None:
                 on_refusal(input_limit)
         halves = split_source_text(text[start:end], tuple(a - start for a, _, _ in spans))
-        if halves is None or any(failure.get(limit) is not None and failure[fixed] > failure[limit]
-                                 for fixed, limit in (("fixed_tokens", "input_limit"), ("fixed_bytes", "byte_limit"))):
+        # A correction's fixed prefix carries the whole draft, so "fixed alone
+        # exceeds the limit" says nothing about re-drafting smaller halves; only
+        # a DRAFT prefix that cannot fit makes the part unsplittable.
+        if halves is None or (not correction and any(
+                failure.get(limit) is not None and failure[fixed] > failure[limit]
+                for fixed, limit in (("fixed_tokens", "input_limit"), ("fixed_bytes", "byte_limit")))):
             return False
         midpoint = start + len(halves[0])
         pending.extend([(midpoint, end), (start, midpoint)])
@@ -235,7 +239,7 @@ def summarize_source(
                 summaries.append(corrected.strip())
                 continue
         failure = usage["_consolidation_errors"][-1]
-        if failure["kind"] != "context_overflow" or not split(start, end, failure):
+        if failure["kind"] != "context_overflow" or not split(start, end, failure, correction=bool(draft.strip())):
             return result("")
     return result("\n\n".join(summaries))
 

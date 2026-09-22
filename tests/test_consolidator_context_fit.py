@@ -683,3 +683,4 @@ def test_output_truncation_is_refused_on_every_lane_shape(fit, shape):
     content, usage = _summary(llm)
     assert content == ""
     assert [error["kind"] for error in usage["_consolidation_errors"]] == ["output_truncated"]
+

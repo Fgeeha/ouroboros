@@ -386,8 +386,8 @@ def _run_block_consolidation(
             log.warning("Dialogue knowledge nominations could not be retained; preserving original blocks/cursor")
             total_usage["_blocks_written"] = 0
             return total_usage
-        for block, _entries in pending_knowledge:
-            block["knowledge_source_ref"] = ref
+        for nominated_block, _entries in pending_knowledge:
+            nominated_block["knowledge_source_ref"] = ref
 
     existing_blocks = _load_blocks(blocks_path)
     all_blocks = existing_blocks + new_blocks

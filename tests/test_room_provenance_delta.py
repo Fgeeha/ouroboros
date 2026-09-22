@@ -261,3 +261,30 @@ def test_draft_nominations_are_released_only_with_their_corrected_part():
     labels = [label for label, _ in calls]
     assert labels == ["Room summary", "Room correction"] + ["Room summary", "Room correction"] * 2
     assert "_knowledge_entries" not in usage, usage.get("_knowledge_entries")
+
+
+def test_correction_prefix_over_the_limit_still_splits_and_redrafts_the_halves():
+    """A correction's fixed prompt carries the whole draft; when that alone
+    exceeds the route limit the part is still split and each half re-drafted,
+    instead of the chunk being withheld forever."""
+    spans = []
+    rows = [{"ts": f"2026-01-01T00:0{i}:00Z", "direction": "in", "text": f"entry-{i} " + "Ж🙂x" * 40, "chat_id": 1}
+            for i in range(2)]
+    text = c._format_entries_for_block(rows, include_room_labels=True, source_spans=spans)
+    calls = []
+
+    def call(prompt, label, *, fixed_prompt="", input_limit=None, call_type=""):
+        calls.append(label)
+        usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "cost": 0.0}
+        if len(calls) == 2:  # whole-source correction: its fixed prefix alone is over the limit
+            return "", {**usage, "_consolidation_errors": [{
+                "kind": "context_overflow", "preflight_only": True, "message": "too big",
+                "fixed_tokens": 900, "input_limit": 500, "fixed_bytes": 1, "byte_limit": None}]}, None
+        return f"{label}-{len(calls)}", usage, None
+
+    draft_prompt = lambda part, note: rc.room_draft_prompt(  # noqa: E731
+        part, room_label="Main", block_range_text="r", message_count=2, identity_text="", continuation_note=note)
+    correct_prompt = lambda draft, part, note: rc.correction_prompt(  # noqa: E731
+        draft, part, room_label="Main", scope="block r", identity_text="", continuation_note=note)
+    content, _usage = rc.summarize_source(call, text, [(s, e, n) for s, e, n in spans], draft_prompt, correct_prompt)
+    assert content and calls == ["Room summary", "Room correction"] + ["Room summary", "Room correction"] * 2

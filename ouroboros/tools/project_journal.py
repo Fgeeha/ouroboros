@@ -509,6 +509,14 @@ def _update_focus(ctx: ToolContext, text: str, source_ref: Any) -> str:
     task_id = str(getattr(ctx, "task_id", "") or "").strip()
     if not task_id:
         return "⚠️ TOOL_ARG_ERROR (update_focus): task_id is required"
+    # The schema requires only ``reader``; a project reader without an explicit
+    # project_id means the caller's own current project (the handler canonicalizes
+    # what the provider was allowed to omit).
+    if isinstance(source_ref, dict) and str(source_ref.get("reader") or "") in ("journal_read", "workpad_read") \
+            and not str(source_ref.get("project_id") or "").strip():
+        own_project = str(getattr(ctx, "project_id", "") or "").strip()
+        if own_project:
+            source_ref = {**source_ref, "project_id": own_project}
     from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
     import pathlib
 
