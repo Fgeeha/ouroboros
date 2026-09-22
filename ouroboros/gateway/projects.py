@@ -821,7 +821,9 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             touch_project(drive_root, pid)
             from ouroboros.project_handoff import enqueue_project_handoff, handoff_identity
 
-            handoff_queued = enqueue_project_handoff(drive_root, task_id, source_ref=origin_ref)
+            # One typed word for the Main history receipt; the binding above is
+            # committed whatever it says (ouroboros/project_handoff.py).
+            handoff_receipt = enqueue_project_handoff(drive_root, task_id, source_ref=origin_ref)
             if not adopted:
                 # This conversion minted the project for THIS owner message, so the
                 # message's other live task ids join it now instead of each keeping a
@@ -838,7 +840,7 @@ async def api_project_from_task(request: Request) -> JSONResponse:
             # unknown fields looks.
             return JSONResponse(
                 {"project": project, "binding": binding, "adopted": bool(adopted),
-                 "handoff_queued": handoff_queued,
+                 "handoff_receipt": handoff_receipt,
                  "handoff_id": handoff_identity(pid, task_id, origin_ref)},
             )
 

@@ -550,8 +550,9 @@ def test_project_lifecycle_rows_render_design_system_action_static_contract():
     door = (root / "web" / "modules" / "project_reference.js").read_text(encoding="utf-8")
     assert "chat-live-project-card-btn" in door and "chat-live-project-card-btn" not in helpers
     handoff = (root / "web" / "modules" / "project_handoff.js").read_text(encoding="utf-8")
-    assert "handoffs.mount(record.root" in chat
-    assert "projectReference({ id: projectId, name: projectName }, { layout: 'footer', taskId })" in handoff
+    # Main alone owns a handoff controller; the converted card mounts through it.
+    assert "handoffs?.mount(record.root" in chat and "isMain ? createProjectHandoffs(" in chat
+    assert "projectReference({ id: projectId, name: projectName }, { layout: 'inline', taskId })" in handoff
     assert "state: 'background'" not in handoff
     assert "projectReference(project, { layout: 'footer' })" in app
     # The project pointer is a Main-root affordance: applyTaskBindings walks

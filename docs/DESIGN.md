@@ -646,11 +646,15 @@ The anchor names the work, projects its observed phase and ends with the shared
 Project reference. It uses Project colour, not a warning treatment. Binding alone
 means neither Working nor Done; unavailable activity stays explicitly unconfirmed.
 A manually converted card opens its room; an agent-created handoff does not steal
-focus. Repeated delivery preserves the original anchor. Matching Started and routing
+focus. One anchor per transfer: the converted card itself when it is on screen, the
+durable receipt row otherwise — whichever arrives second is folded, never a live card,
+and the folded one returns when the anchor leaves the feed. Matching Started and routing
 references fold visually into that anchor only while it is mounted; their durable
 records remain, including their plain-text presentation to non-browser consumers.
-Genuine initiator work and failures are not hidden. A later final answer remains a
-separate message at its completion time, never a replacement for the handoff.
+A converted card whose Main receipt is not durable keeps a dashed border and a plain
+warning names the gap; the binding still holds. Genuine initiator work and failures
+are not hidden. A later final answer remains a separate message at its completion
+time, never a replacement for the handoff.
 
 **Project completion mirror.** A Project root that ended with Ouroboros's own final answer reaches Main as an ordinary Ouroboros message: that answer through the chat markdown pipeline, in the assistant voice, because the bytes are model-authored — the host stamps the answer on the completion row only for a model-authored final, so the browser never infers authorship. A long answer is folded to about seven lines; the fold is a visual clamp over the complete, selectable text, with a fade only when it really hides something, and never a cut. Under it sits one control, the Project reference ("References and actions"). The durable row and its wire frame stay `role="system"`: like the Project question mirror, this is a browser presentation of model-authored bytes, not a change of the row's author. The message carries no status word, cause sentence, title or duration, so a host verdict on that answer (a warning, an unaccepted review) is not shown in Main: it stays loud on the task's card in the Project, one press away. Copy copies the answer. An ending with no model-authored answer (a provider failure, a stop, preserved output), a start row, and every row written before the answer rode the row keep the System row, which ends with that same reference: the voice of a row never chooses how the UI points at its Project. One durable row either way: its plain text is unchanged, so the Telegram mirror, Ouroboros's own context and one-ending-one-notification behave as before.
 

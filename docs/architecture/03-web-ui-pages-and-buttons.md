@@ -131,25 +131,9 @@ Finality metadata is row-specific. Durable `task_summary` rows carry the SAME ph
 
 #### Project handoff receipts
 
-`project_handoff.py` owes one Main transfer receipt through the existing terminal
-outbox only after durable binding/admission. `handoff_id` binds the captured ingress
-message and Project; a known-Main legacy source without a message uses the exact
-original task. Missing Main provenance publishes nothing. Bind success and receipt
-delivery are separate: a failed receipt never undoes a binding. History and the
-session snapshot retain the identity. The browser's `project_handoff.js` keeps the
-first mounted anchor for that identity and folds only matching target/Project
-Started and routing references; raw history and external transports retain the
-separate factual records. No new store, endpoint or polling loop exists.
+`project_handoff.py` owes one Main transfer receipt (`project_handoff`) through the existing terminal outbox, after the durable bind, keyed by `handoff_id` = the captured ingress message plus Project — so a technical retry of one request shares its receipt and independent requests never merge. The answer is one typed word (`RECEIPT_STATES`), never a boolean, because the bind is committed under every word: `durable`/`already_delivered` mean the Main row is owed or already out; `unregistered` means the live send went but the owed row did not (`register_pending_delivery` False is a durability gap); `unavailable` means nothing was sent; `origin_unproven` means the binding records no Main message — a ref-less legacy binding or a Project-room origin — and NO receipt is written: Main is never a default. The outbox answers through `enqueue_terminal_delivery_outcome`; its boolean twin keeps its meaning for older callers. `POST /api/projects/from-task` returns `handoff_receipt` and `handoff_id`; `chat.js` speaks a non-durable word as a warning and marks the converted card `data-receipt`, so a temporary chip is never presented as history. History and the session snapshot carry the identity.
 
-The controller consumes the existing complete census and task-detail reader. Positive
-activity supplies its phase; absence starts one single-flight detail read per
-absence episode, not terminality. Explicit retry links select the execution subject
-without changing anchor identity. Failed reads remain unknown until a re-entry or
-reconnect; repeated census ticks do not retry them. New positive subject evidence
-invalidates an older read, while unrelated ticks cannot starve a slow response.
-Disposal ignores late replies. Final direct-turn mirroring requires a durable
-Main-origin binding; ordinary Project-native direct conversations remain in their
-room. The existing folded final-answer renderer is unchanged.
+`project_handoff.js` (Main only) keeps ONE anchor per identity: the converted live card outranks the receipt row whatever order they arrive, an earlier node outranks a later one of its kind, and every outranked node is a hidden shadow restored when the anchor leaves the feed — a live card is never hidden as a duplicate. Matching `project_started` rows and routing references fold under a mounted anchor; the durable rows and external transports keep both records. Reconcile is node-scoped on ordinary messages and feed-wide only when an anchor mounts or is evicted, so replay stays linear. Phase comes from the existing census (`thinking`/`working`/`queued`/`budget_paused`/`finalizing`, `Waiting` on a required question or an active model wait); absence buys one single-flight task-detail read per episode, terminal detail wins, a failed read stays unknown until reconnect, an effective retry (`task_id`/`original_task_id`/`retry_lineage`) moves the liveness subject without moving the anchor, and disposal ignores late replies. A Main-origin direct turn moved into a Project gets the ordinary completion mirror; a Project-native one stays in its room.
 
 #### Composer, attachments and delivered media
 

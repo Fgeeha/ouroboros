@@ -443,8 +443,7 @@
  *   timeline item of the task's card, "reviews" = the card's Reviews group
  *   carries the fact (the row is still attached to the card); absent = an
  *   ordinary row.
- * @property {string=} card_row_id
- *   The row's stable identity across live delivery, outbox replay and history.
+ * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
  * @property {string=} target_label
  * @property {string=} project_id
  * @property {string=} project_name

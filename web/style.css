@@ -456,6 +456,11 @@ body.resizing-panels { user-select: none; }
     background: var(--project-08);
 }
 
+/* A converted card whose Main history receipt is not durable: the binding
+   holds, the anchor does not survive a reload — say so with the border. */
+.chat-bubble.system.project-handoff--unsaved,
+.project-handoff--unsaved { border-style: dashed; }
+
 .project-handoff > .sender { display: none; }
 .project-handoff .message { padding: 0; }
 
@@ -3018,10 +3023,14 @@ body.resizing-panels { user-select: none; }
 }
 
 /* "Chat freed" cue (P3): a brief fuchsia brighten when a task moves out to a
-   project, signalling the main chat is free again. Self-clears after ~900ms. */
-.chat-text-row.chat-freed {
-    border-color: var(--project);
-    box-shadow: inset 0 1px 0 rgba(var(--neutral-rgb), 0.04), 0 0 0 3px var(--project-12);
+   project, signalling the main chat is free again. The animation owns the
+   900ms and the class comes off on animationend, so no chat-instance timer. */
+.chat-text-row.chat-freed { animation: chat-freed 900ms ease-out; }
+@keyframes chat-freed {
+    0%, 70% {
+        border-color: var(--project);
+        box-shadow: inset 0 1px 0 rgba(var(--neutral-rgb), 0.04), 0 0 0 3px var(--project-12);
+    }
 }
 
 .chat-toolbar-row {
