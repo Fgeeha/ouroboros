@@ -21,9 +21,16 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # queue_schedules.py and names Observe's argument-level narrowing on the
     # consciousness_authority.py row; upstream had already filled the previous
     # headroom with the handoff and sidebar-activity rows landing in the same window.
-    # +400: two new module rows (focus.py, room_consolidation.py) in the tree map.
-    "docs/architecture/01-high-level-architecture.md": 162600,
-    "docs/architecture/02-startup-onboarding-flow.md": 15517,
+    # 162200 -> 164200 (#1195 merge): four module-map rows for the new leaves
+    # startup_historical_audit.py, skill_peer_inventory.py/skill_conflicts.py, the
+    # extension_isolated_deps.py barrier and the widget_list.js request seam land
+    # beside the handoff/schedule rows the base added; none displaces older text.
+    # +400 (#1213): two new module rows (focus.py, room_consolidation.py) in the tree map.
+    "docs/architecture/01-high-level-architecture.md": 164800,
+    # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
+    # new node of the startup flow (readiness no longer waits for the historical
+    # seal diagnostic); the chapter had no older description of that pass to replace.
+    "docs/architecture/02-startup-onboarding-flow.md": 16200,
     # 97435 -> 99500: the notification owner is a new subsystem of this chapter
     # (its module, its client-level subscription, its room gate and its disclosed
     # limits), so the description is added rather than replacing another node's.
@@ -46,7 +53,13 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # Restore's re-evaluation, the named-action endpoint, and what a lifecycle
     # response is allowed to claim. The stale "read-only here" sentence it replaces
     # is gone and the paragraph was compressed by 298 bytes first (no fact removed).
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 105700,
+    # 105700 -> 106400 (#1195 merge): the Widgets list-request deadline lifecycle
+    # (one AbortController over list+preferences, timeout error + Retry, last-good
+    # cards kept) is a new mechanism of the Widgets page with no older text to displace.
+    # 106400 -> 106600 (#1195 merge of 32d8dfc6): the base's settings_catalog.js
+    # paragraph (#1214, +319 bytes) landed in the same window; both additions stand,
+    # neither displaces the other's text.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 106600,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
@@ -101,9 +114,12 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # and their fallback rule; the base sat 23 bytes under the previous budget.
     "docs/architecture/10-key-invariants.md": 21300,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
-    # +400: Presence turns are named as actors without cross-focus catalogue or focus authority.
+    # +400 (#1213): Presence turns are named as actors without cross-focus catalogue or focus authority.
     "docs/architecture/12-host-service-companions-and-chat-ids.md": 11400,
-    "docs/architecture/13-external-skills-layer.md": 7764,
+    # 7764 -> 8600 (#1195): the fresh selected-subject + immutable peer projection
+    # execution check (`skill_peer_inventory.py`, `skill_conflicts.py`) replaces
+    # whole-inventory hashing; the chapter had no description of that seam to swap out.
+    "docs/architecture/13-external-skills-layer.md": 8600,
     "docs/development/01-role-and-authority.md": 2437,
     "docs/development/02-naming-and-boundaries.md": 36372,
     # 22873 -> 23100: one new invariant (notifications ring for live events

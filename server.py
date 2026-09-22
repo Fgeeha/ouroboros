@@ -5,7 +5,6 @@ import base64  # noqa: F401
 import json
 import logging
 import subprocess
-
 import os
 import pathlib
 import sys
@@ -17,13 +16,10 @@ from typing import Any, Dict, Optional
 
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
-
 import uvicorn
-
-from ouroboros.server_control import (
-    execute_panic_stop as _execute_panic_stop_impl,
-    restart_current_process as _restart_current_process_impl,
-)
+from ouroboros.server_control import (execute_panic_stop as _execute_panic_stop_impl,
+                                      restart_current_process as _restart_current_process_impl)
+from ouroboros.startup_historical_audit import audit as _historical_audit
 from ouroboros.server_auth import (
     NetworkAuthGate,
     get_network_auth_startup_warning,
@@ -752,6 +748,7 @@ def _run_supervisor(settings: dict) -> None:
 
     _supervisor_ready.set()
     log.info("Supervisor ready.")
+    _historical_audit.start(DATA_DIR, REPO_DIR)
 
     offset = 0
     crash_count = 0
@@ -1391,6 +1388,7 @@ async def lifespan(app):
         yield
     finally:
         _supervisor_stop.set()  # first: the loop must know a teardown owns what follows
+        _historical_audit.stop()
         log.info("Server shutting down...")
         # Let the loop leave its current tick BEFORE workers are killed and the
         # bridge/Manager go down: a tick still running would otherwise respawn
@@ -1530,6 +1528,7 @@ def _restart_cleanup_kwargs() -> dict:
 
 def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
     """Kill child processes, workers, companions, and runtime port holders."""
+    _historical_audit.stop()  # forced path may skip lifespan's finally; stop never waits
     try:
         from ouroboros.tools.shell import kill_all_tracked_subprocesses
         kill_all_tracked_subprocesses()
