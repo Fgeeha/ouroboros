@@ -57,7 +57,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 30400 -> 30600: restore over an absent skill/manifest entry is a new typed
     # refusal (`manifest_absent`, suppression kept) with no older text to
     # displace; two neighbouring sentences were compressed by 168 bytes first.
-    "docs/architecture/05-supervisor-loop.md": 30600,
+    # +300: the queue snapshot and the supervisor focus event carry the root's
+    # bounded authored focus (cross-focus awareness).
+    "docs/architecture/05-supervisor-loop.md": 30900,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
