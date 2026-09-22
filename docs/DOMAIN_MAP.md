@@ -8,7 +8,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 
 | domain | name | modules | proposed |
 |---|---|---:|---:|
-| D01 | Agent core & main loop | 33 | 0 |
+| D01 | Agent core & main loop | 34 | 0 |
 | D02 | LLM client, routing & providers | 38 | 0 |
 | D03 | Context assembly, fit & compaction | 11 | 0 |
 | D04 | Tool execution: registry, access & typed results | 21 | 0 |
@@ -22,13 +22,13 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D12 | Settings & configuration | 15 | 0 |
 | D13 | Safety, guards & runtime mode | 9 | 0 |
 | D14 | Skills & extensions | 54 | 0 |
-| D15 | Memory, knowledge, consciousness & self-evolution | 21 | 0 |
+| D15 | Memory, knowledge, consciousness & self-evolution | 22 | 0 |
 | D16 | Observability, usage accounting & cost | 11 | 0 |
 | D17 | Projects, workspaces & task results | 22 | 0 |
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **561** | **0** |
+| **total** | | **563** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -188,6 +188,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/agent_startup_checks.py`
 - `ouroboros/agent_task_pipeline.py`
 - `ouroboros/deadline_utils.py`
+- `ouroboros/focus.py`
 - `ouroboros/loop.py`
 - `ouroboros/loop_acceptance.py`
 - `ouroboros/loop_acceptance_review.py`
@@ -709,6 +710,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/post_task_evolution.py`
 - `ouroboros/project_facts.py`
 - `ouroboros/reflection.py`
+- `ouroboros/room_consolidation.py`
 - `ouroboros/semantic_dedup.py`
 - `ouroboros/tools/evolution_stats.py`
 - `ouroboros/tools/knowledge.py`

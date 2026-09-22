@@ -871,7 +871,7 @@ def write_task_result(
     task_id: str,
     status: str,
     *,
-    _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = None,
+    _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     strict_existing_dict: bool = False,
     create_only: bool = False,
     **fields: Any,
@@ -902,8 +902,7 @@ def write_task_result(
             raise ValueError(
                 f"task result authority is unreadable or invalid: {path}"
             )
-        # ABI 7.0: every write stamps the row; a row another schema version
-        # owns (a rollback survivor) is never silently downgraded.
+        # ABI 7.0: every write stamps the row; another schema's row is never downgraded.
         require_writable_task_result_schema(existing, path)
         if create_only and existing:
             return None
@@ -913,12 +912,13 @@ def write_task_result(
                 existing.get("review_projection"), prepared_fields["review_projection"],
             )
         projected_fields = _field_projector(existing, {**prepared_fields, "status": status}) if _field_projector else prepared_fields
+        if projected_fields is None:  # projector saw a terminal/stale row: no mutation
+            return None
         projected_status = str(projected_fields.pop("status", status))
         # Monotonic lifecycle: no stale mirror may overwrite a terminal outcome.
         existing_status = str(existing.get("status") or "")
         if existing and _is_status_regression(existing_status, projected_status):
-            # Surface the blocked transition: when debugging a "stuck" task this
-            # is the only signal that a stale/late write was intentionally dropped.
+            # Debugging a "stuck" task: the only signal that a stale/late write was dropped.
             log.debug("Blocked status regression %s -> %s for task %s",
                       existing.get("status"), projected_status, task_id)
             return None

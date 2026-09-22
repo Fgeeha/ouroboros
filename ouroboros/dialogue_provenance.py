@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping
 
+from ouroboros.contracts.chat_id_policy import HIDDEN_CHAT_ID, WEB_UI_CHAT_ID
+
 
 def _mapping(value: Any) -> Mapping[str, Any]:
     return value if isinstance(value, Mapping) else {}
@@ -117,11 +119,115 @@ def dialogue_text(entry: Mapping[str, Any]) -> str:
     return text
 
 
+class RoomLabelResolver:
+    """Resolve source-room labels from one immutable registry snapshot.
+
+    ``chat_id`` is the room authority.  Lineage fields such as ``project_id``
+    are deliberately ignored here: a row can retain its original room while
+    its work is later bound to a Project.  The snapshot is read once by the
+    caller for a render/consolidation window, so formatting a line never scans
+    the registry or writes resolver state.
+    """
+
+    def __init__(self, drive_root: Any = None, *, projects: Any = None) -> None:
+        self._by_chat: dict[int, str] = {}
+        self._ambiguous: set[int] = set()
+        if projects is None and drive_root is not None:
+            try:
+                from ouroboros.projects_registry import list_reserved_projects
+
+                projects = list_reserved_projects(drive_root)
+            except Exception:
+                projects = []
+        for project in projects or []:
+            if not isinstance(project, Mapping):
+                continue
+            try:
+                raw_chat_id = project.get("chat_id")
+                if isinstance(raw_chat_id, (bool, float)):
+                    continue
+                chat_id = int(raw_chat_id)
+            except (TypeError, ValueError):
+                continue
+            if chat_id in {HIDDEN_CHAT_ID, WEB_UI_CHAT_ID}:
+                continue
+            if chat_id in self._by_chat:
+                self._ambiguous.add(chat_id)
+            else:
+                self._by_chat[chat_id] = " ".join(str(project.get("name") or "").split())
+        for chat_id in self._ambiguous:
+            self._by_chat.pop(chat_id, None)
+
+    @property
+    def project_chat_ids(self) -> frozenset[int]:
+        # Membership controls the existing focused view, independently of
+        # whether a display name can be resolved without ambiguity.
+        return frozenset(self._by_chat) | self._ambiguous
+
+    @staticmethod
+    def _chat_id(entry: Mapping[str, Any]) -> tuple[int | None, str]:
+        """``(integral chat id, "")`` or ``(None, unresolved spelling)``; never a guess."""
+        if "chat_id" not in entry or entry.get("chat_id") is None:
+            return None, "missing"
+        raw_chat_id = entry.get("chat_id")
+        if isinstance(raw_chat_id, (bool, float)):
+            return None, str(raw_chat_id)
+        try:
+            return int(raw_chat_id), ""
+        except (TypeError, ValueError):
+            return None, str(raw_chat_id)
+
+    def room_id(self, entry: Mapping[str, Any]) -> str:
+        """Stable host-set grouping key: the chat id itself, or the unresolved spelling.
+
+        Consolidation partitions and era compression regroup by this key, so a
+        renamed project keeps one room while a missing or malformed id can never
+        merge into Main or into another room.
+        """
+        chat_id, unresolved = self._chat_id(entry)
+        return str(chat_id) if chat_id is not None else f"unresolved:{unresolved}"
+
+    def label(self, entry: Mapping[str, Any]) -> str:
+        """Return an honest display label; no missing value defaults to Main."""
+        chat_id, unresolved = self._chat_id(entry)
+        if chat_id is None:
+            return f"Unresolved room [chat_id={unresolved}]"
+        if chat_id == WEB_UI_CHAT_ID:
+            return "Main"
+        if chat_id == HIDDEN_CHAT_ID:
+            return "Hidden [chat_id=0]"
+        if chat_id in self._ambiguous:
+            return f"Ambiguous room [chat_id={chat_id}]"
+        name = self._by_chat.get(chat_id)
+        if name is not None:
+            if name:
+                return f"Project {name} [chat_id={chat_id}]"
+            return f"Project name unavailable [chat_id={chat_id}]"
+        return f"Unknown room [chat_id={chat_id}]"
+
+
+def source_continuation_note(spans: list[tuple[int, int, str]], offset: int, part_end: int) -> str:
+    """Carry only the continued message's header, never parse quoted body text.
+
+    Spans are ephemeral character offsets recorded by the formatter, not a
+    persistent ledger. Original source slices stay byte-exact and disjoint.
+    """
+    for index, (start, end, header) in enumerate(spans, 1):
+        if start <= offset < end and (offset > start or part_end < start + len(header)):
+            return ("## Source continuation\n"
+                    f"This part continues source message {index}. Attribution: {header}\n"
+                    "The header is context, not another message. Summarize only the supplied "
+                    "source portion; do not infer or repeat unsupplied body text.\n")
+    return ""
+
+
 __all__ = [
     "dialogue_author",
     "dialogue_provenance",
     "dialogue_speaker",
     "dialogue_text",
+    "RoomLabelResolver",
+    "source_continuation_note",
     "is_presence_task",
     "presence_provenance_fields",
     "presence_provenance_from_task",

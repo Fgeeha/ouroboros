@@ -628,7 +628,8 @@ def _run_chat_consolidation(env, memory, llm, task, drive_logs):
                     task_id=str(_id or ""), project_id=str(task.get("project_id") or ""))
                 u = consolidate(chat_path=chat_path, blocks_path=blocks_path,
                                 meta_path=meta_path, llm_client=_llm, identity_text=_ident,
-                                knowledge_context=knowledge_context)
+                                knowledge_context=knowledge_context,
+                                room_registry_root=knowledge_context.budget_drive_root)
             if u:
                 # A run that produced no block and a run that never happened look the
                 # same in this stream without a written count; last_error_kind names the

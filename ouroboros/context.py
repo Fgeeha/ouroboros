@@ -898,16 +898,19 @@ def build_recent_sections(
     # awareness/biography (BIBLE P1). A project TASK gets a FOCUSED view of its own
     # thread as working context to reduce interference — focus, not isolation.
     try:
-        from ouroboros.projects_registry import reserved_project_chat_ids
+        from ouroboros.dialogue_provenance import RoomLabelResolver
 
-        _project_chat_ids = reserved_project_chat_ids(memory.drive_root)
+        _room_resolver = RoomLabelResolver(memory.drive_root)
+        _project_chat_ids = _room_resolver.project_chat_ids
     except Exception:
+        _room_resolver = None
         _project_chat_ids = set()
 
     _chat_tail = MAX_RECENT_CHAT_TAIL
     retained_project_origins: List[Dict[str, Any]] = []
 
-    if thread_chat_id and thread_chat_id in _project_chat_ids:
+    _focused_project = bool(thread_chat_id and thread_chat_id in _project_chat_ids)
+    if _focused_project:
         # Post-hoc bindings and retention-proof origins belong to the existing
         # Project dialogue read model; focus changes the working view, not memory.
         from ouroboros.project_dialogue import project_recent_dialogue
@@ -923,7 +926,11 @@ def build_recent_sections(
         )
     if chat_coverage_out is not None:
         chat_coverage_out.update(chat_coverage)
-    chat_summary = memory.summarize_chat(chat_entries, limit=_chat_tail)
+    chat_summary = memory.summarize_chat(
+        chat_entries, limit=_chat_tail,
+        include_room_labels=not _focused_project,
+        room_resolver=_room_resolver,
+    )
     if chat_summary:
         sections.append("## Recent chat\n\n" + chat_summary)
     if retained_project_origins:

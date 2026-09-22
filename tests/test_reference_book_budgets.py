@@ -21,7 +21,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # queue_schedules.py and names Observe's argument-level narrowing on the
     # consciousness_authority.py row; upstream had already filled the previous
     # headroom with the handoff and sidebar-activity rows landing in the same window.
-    "docs/architecture/01-high-level-architecture.md": 162200,
+    # +400: two new module rows (focus.py, room_consolidation.py) in the tree map.
+    "docs/architecture/01-high-level-architecture.md": 162600,
     "docs/architecture/02-startup-onboarding-flow.md": 15517,
     # 97435 -> 99500: the notification owner is a new subsystem of this chapter
     # (its module, its client-level subscription, its room gate and its disclosed
@@ -56,7 +57,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 30400 -> 30600: restore over an absent skill/manifest entry is a new typed
     # refusal (`manifest_absent`, suppression kept) with no older text to
     # displace; two neighbouring sentences were compressed by 168 bytes first.
-    "docs/architecture/05-supervisor-loop.md": 30600,
+    # +300: the queue snapshot and the supervisor focus event carry the root's
+    # bounded authored focus (cross-focus awareness).
+    "docs/architecture/05-supervisor-loop.md": 30900,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
@@ -70,7 +73,15 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # (the argument-narrowing predicate, which names it keeps and why, the
     # own-child custody reuse, and the non-inherited mutating delegation budget);
     # the Observe half of the AUTHORITY sentence is replaced, the rest is new.
-    "docs/architecture/06-agent-core.md": 292800,
+    # +2200: per-room memory consolidation (room_consolidation.py: draft +
+    # source-grounded correction, typed room sections through era, chunk-level
+    # transaction) and the cross-focus authored-focus contract are new
+    # subsystems of this chapter; the era paragraph they replaced was shorter.
+    # +400: the focus source is now RETAINED at authoring time (source_handle,
+    # FOCUS_SOURCE_UNRESOLVED) and a settled root's focus is dropped — new
+    # contract facts of the cross-focus paragraph, not a restatement; +250 for
+    # the digest-selected historical read and the reader admission rule.
+    "docs/architecture/06-agent-core.md": 295650,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
@@ -90,7 +101,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # and their fallback rule; the base sat 23 bytes under the previous budget.
     "docs/architecture/10-key-invariants.md": 21300,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
-    "docs/architecture/12-host-service-companions-and-chat-ids.md": 11007,
+    # +400: Presence turns are named as actors without cross-focus catalogue or focus authority.
+    "docs/architecture/12-host-service-companions-and-chat-ids.md": 11400,
     "docs/architecture/13-external-skills-layer.md": 7764,
     "docs/development/01-role-and-authority.md": 2437,
     "docs/development/02-naming-and-boundaries.md": 36372,

@@ -156,6 +156,9 @@ def project_replica_task_result_fields(
     for field in (
         "delegated_runs_unreconciled",
         "delegate_terminal_reconciliation",
+        # update_focus writes the canonical result only; a split root's worker
+        # replica carries the stale (often null) execution-local copy.
+        "focus",
     ):
         if field in canonical_fields:
             overlay.pop(field, None)

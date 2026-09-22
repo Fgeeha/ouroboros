@@ -362,6 +362,9 @@ def direct_chat_turn(task_id: str = "") -> Optional[Dict[str, Any]]:
         "_is_direct_chat": True,
         "_started_at": float(getattr(agent, "_task_started_ts", 0.0) or 0.0),
     }
+    current_focus = metadata.get("focus")
+    if current_focus is not None:
+        record["focus"] = current_focus
     stamps = getattr(agent, "_direct_turn_stamps", None)
     if isinstance(stamps, dict) and str(stamps.get("_task_id") or "") == current:
         record.update({key: value for key, value in stamps.items() if key != "_task_id"})

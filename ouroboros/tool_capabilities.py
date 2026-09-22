@@ -48,7 +48,7 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "list_projects", "route_to_project", "promote_chat_to_task", "steer_task",
     "ensure_project_scope",
     *COGNITIVE_MEMORY_TOOL_NAMES,
-    "recent_tasks",
+    "recent_tasks", "live_roots", "update_focus",
     "web_search",
     "browse_page", "browser_action", "analyze_screenshot", "view_image",
     "ocr_pdf", "youtube_transcript", "extract_video_frames",
@@ -235,6 +235,9 @@ TOOL_RESULT_LIMITS: dict[str, int] = {
     # tree_read returns the shared task-tree coordination tail (up to 200 entries); the 15k
     # default would truncate the swarm blackboard and defeat the coordination contract.
     "tree_read": 80_000,
+    # live_roots pages up to 100 catalogue rows of structured JSON; the 15k
+    # default would head-truncate a valid page into unparseable text.
+    "live_roots": 80_000,
     # apply_patch results carry per-hunk diagnostics, edit_batch per-edit ones
     # (an aborted batch reports EVERY failed edit so one retry can fix them all);
     # write_file appends the overwrite diff.
