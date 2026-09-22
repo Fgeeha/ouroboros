@@ -698,7 +698,8 @@ def _coerce_setting_value(key: str, value):
     if isinstance(default, (int, float)):
         cast = int if isinstance(default, int) else float
         try:
-            return cast(value)
+            parsed = cast(value)  # Legacy wake minima share the 60s UI/runtime floor.
+            return max(60, parsed) if key in {"OUROBOROS_BG_WAKEUP_MIN", "OUROBOROS_BG_WAKEUP_MAX"} else parsed
         except (TypeError, ValueError):
             return default
     return str(value or "")
