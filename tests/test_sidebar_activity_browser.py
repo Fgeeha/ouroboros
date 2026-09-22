@@ -48,7 +48,10 @@ def activity(identity, project='', phase='working', **extra):
 
 
 def model_wait(identity, project):
-    return activity(identity, project, task_attempt=1, model_waits={'access': dict(state='waiting', task_attempt=1)})
+    # The producer's complete wait row: the sidebar admits waits exactly as the
+    # chat card does, so a bare {state, task_attempt} would be dropped.
+    return activity(identity, project, task_attempt=1, model_waits={'access': dict(
+        wait_id='access', revision=1, task_attempt=1, state='waiting', reason='quota')})
 
 
 def token_color(page, project, token):
