@@ -340,9 +340,9 @@ not move them into the migrated set in section 8.
 Project navigation rows may carry the existing three 4px working dots
 (`chat-live-typing`, 3px gap) for the live `active_chat_activities` census.
 `Working`, `Thinking` and `Finalizing` are the only moving states, using the
-existing 1.4s bounce rhythm; `Queued` and budget-paused work stay static at a
-quieter step. Confirmed model access waits and required owner questions are
-static amber, with `resumed` questions no longer waiting. A wait on the same
+existing 1.4s bounce rhythm; `Queued` stays static at a quieter step.
+Budget-paused work, confirmed model access waits and required owner questions
+are static amber, with `resumed` questions no longer waiting. A wait on the same
 producer row suppresses its working motion; an independent working row keeps
 motion, and the row's accessible name states both facts. Unknown or unconfirmed
 census state stays static and explicitly unavailable. The dots take the row's
