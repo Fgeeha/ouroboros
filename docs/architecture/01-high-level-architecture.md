@@ -84,7 +84,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── packaged_cli.py      ← Packaged desktop CLI bridge: resolves bundle roots, bootstraps the launcher-managed repo, delegates to cli.py
       ├── packaged_cli_install.py ← Packaged CLI installer planning/execution for user-local command shims
       ├── agent.py             ← Task orchestrator; the dispatch-note pair lives in `subagent_dispatch_notes.py`. `_task_exception_terminal` projects a loop crash: a lost capture stays explicitly unknown (never zero counters or unverified checkpoint bytes), and a `task_exception` is `failure.kind = "runtime"`, never a fabricated provider failure (§6 Task lifecycle)
-      ├── focus.py             ← Bounded authored focus + typed source reference + retained-source handle (no dialogue, attachments or path escapes)
+      ├── focus.py             ← Authored focus + typed source ref + retained-source handle (no dialogue or path escapes)
       ├── agent_startup_checks.py ← Worker-boot verification: dirty repo, version sync, budget, memory files, health checks (warning-only: §2) and generation-bound native-host adoption for self-restart
       ├── agent_task_pipeline.py ← Task execution pipeline: result and artifacts, the frozen non-final cost snapshot and task-local owner/verification inputs for summary/reflection, the review lens those prompts get — commit/advisory review plus the task's own acceptance-panel projection, an absence statement naming the lens it describes — and the root-only post-task work (§6 Task lifecycle, Budget tracking)
       ├── agent_dispatch.py, post_task_synthesis.py ← The agent's delegated-child dispatch seam, and the post-task synthesis workers (§6 Post-task reflection)

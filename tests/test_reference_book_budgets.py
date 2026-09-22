@@ -77,7 +77,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # source-grounded correction, typed room sections through era, chunk-level
     # transaction) and the cross-focus authored-focus contract are new
     # subsystems of this chapter; the era paragraph they replaced was shorter.
-    "docs/architecture/06-agent-core.md": 295000,
+    # +400: the focus source is now RETAINED at authoring time (source_handle,
+    # FOCUS_SOURCE_UNRESOLVED) and a settled root's focus is dropped — new
+    # contract facts of the cross-focus paragraph, not a restatement.
+    "docs/architecture/06-agent-core.md": 295400,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
