@@ -695,10 +695,9 @@ class EvolutionStateSnapshot(TypedDict):
 class ActiveDirectTurn(TypedDict):
     """An active in-process direct chat or ephemeral decision turn.
 
-    Snapshot rows in ``StateResponse.active_direct_turns``; the seven identity
-    and activity fields are always emitted by ``DirectActivityRegistry.snapshot()``
-    (empty-string for absent values), so the mirror marks them required.
-    A model_waits projection is optional and must be supplied by its live owner.
+    Rows of ``StateResponse.active_direct_turns``: ``DirectActivityRegistry.snapshot()``
+    always emits the seven identity/activity fields (empty string for absent values),
+    so the mirror marks them required; ``model_waits`` comes only from its live owner.
     """
 
     activity_id: str
@@ -715,17 +714,18 @@ class ActiveDirectTurn(TypedDict):
 class ActiveChatActivity(ActiveDirectTurn):
     """One in-flight chat activity in ``StateResponse.active_chat_activities``.
 
-    The combined snapshot: direct/ephemeral registry turns (same rows as
-    ``active_direct_turns``) plus ROOT managed queue tasks projected as
-    ``kind="managed_task"`` with ``phase`` ``queued`` | ``budget_paused``
-    (zero-dispatch member awaiting an explicit resume — never plain
-    "queued") | ``working`` | ``finalizing`` (final answer stored, post-task
-    synthesis still open).
-    Field shape mirrors ``ActiveDirectTurn`` so one client reducer hydrates
-    both; managed rows carry an empty ``client_message_id``.
+    Direct/ephemeral registry turns (the ``active_direct_turns`` rows) plus ROOT
+    managed queue tasks as ``kind="managed_task"`` with ``phase`` ``queued`` |
+    ``budget_paused`` (zero-dispatch member awaiting an explicit resume — never
+    plain "queued") | ``working`` | ``finalizing`` (answer stored, post-task
+    synthesis open); a direct row whose live wait owner could not be read is
+    ``phase="unknown"``. Same shape as ``ActiveDirectTurn`` so one reducer hydrates
+    both (managed rows: empty ``client_message_id``). ``required_question_unavailable``:
+    a recorded owner-question wait whose detail could not be resolved — possibly blocked.
     """
 
     required_question: NotRequired[Dict[str, Any]]
+    required_question_unavailable: NotRequired[bool]
 
 
 class StateResponse(TypedDict):
