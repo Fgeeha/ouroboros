@@ -166,6 +166,10 @@ def test_running_direct_turn_converts_to_project_and_its_answer_follows(
                     assert ANSWER not in str(project["name"]), project
                     project_chat = int(project["chat_id"])
                     assert project_chat != 1, project
+                    # The receipt is one typed word beside the binding: a captured
+                    # Main origin makes it durable, so the card carries no gap mark.
+                    assert payload["handoff_receipt"] == "durable", payload
+                    assert payload["handoff_id"].startswith("project-handoff:"), payload
 
                     # The Main card became the project chip, and stopped offering
                     # a second conversion of the same work.
@@ -175,6 +179,8 @@ def test_running_direct_turn_converts_to_project_and_its_answer_follows(
                     page.wait_for_selector(
                         f'.chat-live-card[data-task-id="{task_id}"].is-project', timeout=30000)
                     assert converted.get_attribute("data-project-id") == project["id"]
+                    assert converted.get_attribute("data-handoff-id") == payload["handoff_id"]
+                    assert converted.get_attribute("data-receipt") is None, "a durable receipt is not marked as a gap"
                     assert converted.locator(".chat-live-project-name").inner_text().strip()
                     assert page.locator(f'.chat-live-card[data-task-id="{task_id}"]'
                                         ' [data-turn-into-project]').count() == 0
