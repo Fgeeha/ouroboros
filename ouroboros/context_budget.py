@@ -287,11 +287,13 @@ SKILL_REVIEW_ROOT_TASKS_WARN_BYTES = 20_000_000
 # explicit full-history read becomes seconds-scale; this is observability, not
 # a retention gate and never shortens the memory horizon.
 CHAT_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
-# Custody replay (delegate_custody) walks the WHOLE events chain — live file
-# plus archive/events_*.jsonl — on ownership questions. This inherits the
+# The FIRST custody read of each process folds the WHOLE events chain — live
+# file plus archive/events_*.jsonl — into the process-local row memo
+# (delegate_custody_memo); later reads fold only appended bytes. Explicit
+# forensic and retirement scans still walk the chain. This inherits the
 # pre-rotation 100MB replay-degradation signal, now measured over the chain;
-# archives stay durable history (never GC'd), so the remediation is chain
-# indexing/compaction, never deletion.
+# archives stay durable history (never GC'd), so the remediation is a durable
+# compact custody projection, never deletion.
 EVENTS_ARCHIVE_SCAN_WARN_BYTES = 100_000_000
 # Warn before the observed 242-of-253 retained-drive corpus becomes routine;
 # count only direct children because startup health is an interactive path.

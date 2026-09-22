@@ -248,9 +248,11 @@ until a real task status or activity arrives; review presence alone never means
 
 A review that was only awaited when its task ended is not a warning. Reviewers
 that had simply not answered yet leave the task `Done`. For a plan review the
-final message keeps the host's disclosure that the review was still open, and a
-clean card states the same fact as its cause sentence; a card that is amber or
-red for another reason keeps that reason. For task acceptance the host's
+task result keeps the host's typed disclosure that the review was still open
+(the `terminal_host_notice` field, read by the CLI and by parents), the card
+states the same fact as its cause sentence, and no second chat bubble carries
+it; a card that is amber or red for another reason keeps that reason, with the
+open review stated beside it when the result records it. For task acceptance the host's
 decision sentence already says that no reviewer verdict was established. A real
 outcome keeps its word: no reviewer quorum, a failed, refused or unresolved
 slot, a collected blocking finding, a reviewer verdict nobody closed, a rail or
@@ -553,8 +555,10 @@ not child-task cards and never prove execution by themselves.
   answered` where the verdict token would sit, and each awaited reviewer listed
   as awaiting rather than unavailable, under no verdict word. Once the task has
   ended the same wave reads `no verdict · k of n answered` in the neutral tone.
-  A reviewer whose window expired is unresolved. A settled wave without quorum
-  keeps the warning tone and its `DEGRADED` verdict.
+  A reviewer whose window expired is unresolved. A settled wave whose reviewers
+  were too few for a verdict reads `no verdict · k of n answered · m
+  unavailable` in the neutral tone: the verdict word `DEGRADED` is the host's
+  placeholder and never paints.
 - A task-acceptance panel whose reviewers may still answer never reads as a bare
   verdict token. While its own task is running it is work in progress: the
   working tone and `in progress · k of n answered`, or `PASS so far · k of n
@@ -565,7 +569,11 @@ not child-task cards and never prove execution by themselves.
 - On a plan wave and an acceptance panel alike, a slot that is neither answered
   nor awaited (a settled failure, an expired window, lost custody, a refusal)
   adds `· m unavailable` and keeps the warning tone beside the awaited slots; a
-  panel with no awaited slot keeps the warning tone and its `DEGRADED` verdict.
+  settled plan wave with no awaited slot reads its `no verdict` line in the
+  neutral tone (an acceptance panel with none still keeps the warning tone and
+  its `DEGRADED` verdict), and each unavailable plan reviewer row names the
+  model and quotes the engine's reported sentence when one exists — the
+  failure code stays in the task detail and Logs.
 - An awaited or unresolved reviewer row adds `· since HH:MM` in the viewer's
   local 24-hour clock, prefixed with the short date when the wait began on an
   earlier day, only where the host recorded the moment it sent that reviewer's
@@ -685,7 +693,10 @@ step, a wait, a review, a child. What the host says about how the turn is
 running (a checkpoint, a model fallback, a review verdict, a nudge) is a
 visible timeline row that never claims the title or the collapsed line, so a
 turn whose only notes were the host's keeps its coined or task name and an
-empty activity line. Successful tool calls are not rows at all: they fold into
+empty activity line. When the task ends with a cause, the collapsed line states
+that cause in the owner's words — the same sentence as the durable row and the
+expanded body — so a `Done with warnings` chip never stands beside an unrelated
+last action; a clean ending keeps the last narration. Successful tool calls are not rows at all: they fold into
 ONE evidence row per block — `N tool calls`, or `N tool calls · M errors` once
 a call failed — that stands at the first call's position and time and is
 patched in place; Expand shows the per-tool counts (`read_file ×3 ·

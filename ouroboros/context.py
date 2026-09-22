@@ -963,23 +963,19 @@ def build_recent_sections(
             + json.dumps(coverage_projection, ensure_ascii=False, sort_keys=True, default=str)
         )
 
-    for log_name, header, formatter in (
-        ("progress.jsonl", "## Recent progress", lambda rows: memory.summarize_progress(rows, limit=50)),
-        ("tools.jsonl", "## Recent tools", memory.summarize_tools),
-        ("events.jsonl", "## Recent events", memory.summarize_events),
-    ):
-        entries = memory.read_jsonl_tail(log_name, 200)
-        if task_id:
-            entries = [e for e in entries if str(e.get("task_id", "")).strip() == task_id]
-        summary = formatter(entries)
-        if summary:
-            sections.append(f"{header}\n\n{summary}")
+    # Each task reads ITS OWN newest rows through a bounded window (#131): a
+    # global tail filtered afterwards handed every task whatever share of the
+    # shared suffix it happened to occupy (Memory.recent_activity_sections).
+    from ouroboros.jsonl_tail import coverage_line
 
-    supervisor_summary = memory.summarize_supervisor(memory.read_jsonl_tail("supervisor.jsonl", 200))
+    sections.extend(memory.recent_activity_sections(task_id))
+
+    supervisor_rows, supervisor_coverage = memory.read_task_recent("supervisor.jsonl", "", 200)
+    supervisor_summary = memory.summarize_supervisor(supervisor_rows)
     if supervisor_summary:
-        sections.append("## Supervisor\n\n" + supervisor_summary)
+        sections.append(f"## Supervisor ({coverage_line(supervisor_coverage)})\n\n" + supervisor_summary)
 
-    reflections_entries = memory.read_jsonl_tail("task_reflections.jsonl", 20)
+    reflections_entries = memory.read_task_recent("task_reflections.jsonl", "", 20)[0]
     reflections_text = _format_recent_reflections(reflections_entries, limit=10)
     if reflections_text:
         sections.append("## Execution reflections\n\n" + reflections_text)
@@ -1322,11 +1318,18 @@ def _capture_context_core(
     if is_child:
         dynamic_parts.append(
             "## Working sources\n\n"
-            "The shared biography is loaded above. Your parent's selected discussion and working "
-            "sources are in this assignment's context. Other raw conversations, the global scratchpad "
-            "and earlier task reports are not preloaded: use chat_history, knowledge_read, "
-            "get_task_result or ask your parent for exact sources when useful."
+            "The shared biography is loaded above; your own recent process (progress, tools, events) "
+            "is loaded below. Your parent's selected discussion and working sources are in this "
+            "assignment's context. Other raw conversations, the global scratchpad and earlier task "
+            "reports are not preloaded: use chat_history, knowledge_read, get_task_result or ask "
+            "your parent for exact sources when useful."
         )
+        # A child keeps its own process memory too (owner decision 2026-09-22):
+        # its execution drive holds exactly its worker rows, progress is canonical.
+        own_drive = memory if context_memory is not memory else None
+        dynamic_parts.extend(context_memory.recent_activity_sections(
+            str(task.get("id") or ""), own_drive=own_drive,
+        ))
     else:
         dynamic_parts.extend(build_recent_sections(
             context_memory, env, task_id=task.get("id", ""), thread_chat_id=int(task.get("chat_id") or 0),

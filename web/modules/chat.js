@@ -1753,7 +1753,8 @@ export function createChatInstance({
         // overwrite the last action.
         const previewSource = record.isSubagent && summary.human !== false
             ? String(summary.activityPreview ?? summary.body ?? '')
-            : (summary.human ? String(summary.activityPreview ?? activeHeadline ?? '') : '');
+            : (summary.human ? String(summary.activityPreview ?? activeHeadline ?? '')
+                : (summary.terminal && summary.activityPreview ? String(summary.activityPreview) : ''));
         const activityCandidate = previewSource.trim();
         if (activityCandidate) record.collapsedActivity = boundActivityPreview(activityCandidate);
         const activityText = projectCollapsedActivity({

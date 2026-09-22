@@ -1247,7 +1247,7 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "failure": failure,
             **({"resource_limit": resource_limit} if resource_limit else {}),
             # The durable fact of a clean finish over a plan review that was only awaited.
-            **({"plan_review": AWAITING_PROJECTION} if execution_status == EXECUTION_OK and plan_gate.get("review_only_awaited") is True else {}),
+            **({"plan_review": AWAITING_PROJECTION} if execution_status == EXECUTION_OK and plan_gate.get("review_only_awaited") is True else ({"plan_review": plan_gate["plan_review_class"]} if plan_gate.get("plan_review_class") else {})),
             "recoveries": recovered_tool_errors[:20],
             "cosmetic_tool_errors": cosmetic_tool_errors[:20],
             "ignored_tool_errors": ignored_tool_errors[:20],
