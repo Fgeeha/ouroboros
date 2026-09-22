@@ -47,20 +47,33 @@ def test_root_focus_persists_and_terminal_race_refuses(tmp_path, monkeypatch):
     # The reader's exact answer is RETAINED beside the focus: the pointer keeps
     # identifying its evidence after the author is dormant and the journal grows.
     handle = stored["focus"]["source_handle"]
-    assert handle["root"] == "runtime_data" and handle["task_id"] == "root"
-    retained = (tmp_path / handle["path"]).read_bytes()
+    assert set(handle) == {"kind", "root", "path", "size", "sha256"} and handle["root"] == "artifact_store"
+    retained = (tmp_path / "task_results" / "artifacts" / "root" / handle["path"]).read_bytes()
     assert hashlib.sha256(retained).hexdigest() == handle["sha256"] and len(retained) == handle["size"]
     assert b"seam exact evidence" in retained
     from ouroboros.focus import compact_focus, focus_fingerprint
     assert compact_focus(stored["focus"]) == stored["focus"]
     assert handle["sha256"] in focus_fingerprint(stored["focus"])
-    forged = {**stored["focus"], "source_handle": {**handle, "path": "../secret"}}
-    assert compact_focus(forged) is None
+    for forged_path in ("../secret", "source_handles/context_checkpoints/../../x.md",
+                        "task_results/artifacts/other/source_handles/context_checkpoints/a.md"):
+        assert compact_focus({**stored["focus"], "source_handle": {**handle, "path": forged_path}}) is None
     from ouroboros.peer_roster import render_roster_note
     _queue_snapshot(tmp_path, [{"id": "root", "task": {"id": "root", "focus": stored["focus"]}}])
     from ouroboros.peer_roster import independent_roots
     note = render_roster_note(independent_roots(tmp_path))
-    assert f"retained_source=read_file(root='runtime_data', path={json.dumps(handle['path'])})" in note
+    assert "retained_source=get_task_result(task_id=\"root\", include_focus_source=True)" in note
+    # A PEER on another (forked) drive reads the retained bytes through the one
+    # cross-task reader, against the canonical root; the reader verifies the hash.
+    from ouroboros.tools.control_task_results import _get_task_result
+    peer = types.SimpleNamespace(task_id="peer", drive_root=tmp_path / "fork", task_metadata={"budget_drive_root": str(tmp_path)})
+    view = json.loads(_get_task_result(peer, "root", include_focus_source=True))["focus_source"]
+    assert view["reason"] == "source_range_required" and view["complete_sha256"] == handle["sha256"]
+    assert view["complete_chars"] == len(retained.decode("utf-8")) and "status" not in view
+    assert view["source_ref"] == {"reader": "journal_read", "project_id": "alpha"}
+    ranged = json.loads(_get_task_result(peer, "root", include_focus_source=True, source_start_char=0, source_end_char=20))["focus_source"]
+    assert ranged["text"] == retained.decode("utf-8")[:20]
+    (tmp_path / "task_results" / "artifacts" / "root" / handle["path"]).write_bytes(b"tampered")
+    assert json.loads(_get_task_result(peer, "root", include_focus_source=True))["focus_source"]["reason"] == "source_identity_mismatch"
 
     write_task_result(tmp_path, "root", STATUS_COMPLETED, result="done")
     refused = _update_focus(ctx, "Too late", {"reader": "journal_read"})
@@ -256,3 +269,25 @@ def test_settled_root_carries_no_live_focus_when_the_queue_snapshot_lags(tmp_pat
     rows = {row["task_id"]: row for row in independent_roots(tmp_path)["roots"]}
     assert "focus" not in rows["root"]
     assert rows["live"]["focus"]["author_task_id"] == "live"
+
+
+def test_focus_source_refuses_unsettled_task_results_and_oversized_answers(tmp_path, monkeypatch):
+    """A get_task_result source with no settled row is prose, not evidence; a
+    reader answer above the focus bound is refused with the repair, never clipped."""
+    from ouroboros.tools import project_journal as pj
+    from ouroboros.utils import append_jsonl
+
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    write_task_result(tmp_path, "root", STATUS_RUNNING, project_id="alpha")
+    ctx = types.SimpleNamespace(
+        task_id="root", drive_root=tmp_path, project_id="alpha", is_direct_chat=False,
+        task_metadata={"root_task_id": "root", "budget_drive_root": str(tmp_path)}, event_queue=None,
+    )
+    refused = pj._update_focus(ctx, "Pointing at a ghost", {"reader": "get_task_result", "task_id": "missing1"})
+    assert "FOCUS_SOURCE_UNRESOLVED" in refused and "unknown or admission pending" in refused
+    write_task_result(tmp_path, "done1", STATUS_COMPLETED, result="settled answer")
+    ok = pj._update_focus(ctx, "Pointing at a settled result", {"reader": "get_task_result", "task_id": "done1"})
+    assert ok.startswith("OK: focus[root]")
+    append_jsonl(tmp_path / "projects" / "alpha" / "journal.jsonl", {"kind": "note", "text": "x" * (pj._FOCUS_SOURCE_MAX_BYTES + 10)})
+    too_big = pj._update_focus(ctx, "Whole journal", {"reader": "journal_read", "project_id": "alpha"})
+    assert "FOCUS_SOURCE_UNRESOLVED" in too_big and "narrower page" in too_big

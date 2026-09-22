@@ -939,6 +939,22 @@
    "is_error": true,
    "status": "error"
   },
+  "ident:FOCUS_SOURCE_UNRESOLVED:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:FOCUS_SOURCE_UNRESOLVED:plain": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:FOCUS_SOURCE_UNRETAINED:named": {
+   "is_error": false,
+   "status": "ok"
+  },
+  "ident:FOCUS_SOURCE_UNRETAINED:plain": {
+   "is_error": false,
+   "status": "ok"
+  },
   "ident:FOCUS_STALE:named": {
    "is_error": false,
    "status": "ok"

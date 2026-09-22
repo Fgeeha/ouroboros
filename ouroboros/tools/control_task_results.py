@@ -186,7 +186,7 @@ def _get_task_result(
     ctx: ToolContext, task_id: str, include_authority: bool = False,
     include_work_order_source: bool = False, source_start_char: Any = None,
     source_end_char: Any = None, include_completion_source: bool = False,
-    known_result_sha256: str = "",
+    known_result_sha256: str = "", include_focus_source: bool = False,
 ) -> str:
     """Read a task result, or a bounded canonical work-order/completion source range."""
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
@@ -217,7 +217,7 @@ def _get_task_result(
                 "this one is lost is yours to judge from the two times above."
             ),
         ))
-    if bool(include_authority) or bool(include_work_order_source) or bool(include_completion_source):
+    if bool(include_authority) or bool(include_work_order_source) or bool(include_completion_source) or bool(include_focus_source):
         from ouroboros.agent_startup_checks import task_result_authority_projection
 
         authority = task_result_authority_projection(data, drive_root=status_drive_root)
@@ -259,9 +259,15 @@ def _get_task_result(
             payload["completion_source"] = completion_source_projection(
                 status_drive_root, str(task_id), data, source_start_char, source_end_char,
             )
+        if bool(include_focus_source):
+            from ouroboros.task_finalization import focus_source_projection
+
+            payload["focus_source"] = focus_source_projection(
+                status_drive_root, str(task_id), data, source_start_char, source_end_char,
+            )
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         if any(isinstance(view, dict) and view.get("reason") == "source_range_invalid"
-               for view in (payload.get("work_order_source"), payload.get("completion_source"))):
+               for view in (payload.get("work_order_source"), payload.get("completion_source"), payload.get("focus_source"))):
             # The requested text was NOT returned: same JSON (it names complete_chars and
             # the range received), recorded as the argument fault it is, never as `ok`.
             return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=text))

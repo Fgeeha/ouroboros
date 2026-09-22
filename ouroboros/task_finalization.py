@@ -442,6 +442,31 @@ def completion_source_projection(
     return {**payload, **({"reason": reason} if reason else {})}
 
 
+def focus_source_projection(
+    drive_root: Any, task_id: str, result: Dict[str, Any], start_char: Any = None, end_char: Any = None,
+) -> Dict[str, Any]:
+    """Read the bytes a task's focus source_ref answered at authoring time (focus.source_handle)."""
+    from ouroboros.artifacts import read_actor_source_bytes, text_source_range_projection
+    from ouroboros.focus import compact_focus
+
+    unavailable = {"schema": 1, "kind": "task_focus_source", "status": "unavailable"}
+    focus = compact_focus(result.get("focus"))
+    handle = focus.get("source_handle") if focus else None
+    if not isinstance(handle, dict):
+        return {**unavailable, "reason": "source_unavailable"}
+    try:
+        raw = read_actor_source_bytes(drive_root, str(result.get("task_id") or task_id), handle)
+        projection, reason = text_source_range_projection(raw.decode("utf-8"), unavailable["kind"], start_char, end_char)
+    except ValueError as exc:
+        reason = "source_identity_mismatch" if "verification" in str(exc) else "source_ref_invalid"
+        return {**unavailable, "reason": reason}
+    except (OSError, RuntimeError):
+        return {**unavailable, "reason": "source_unavailable"}
+    payload = projection or unavailable
+    return {**payload, "source_ref": focus["source_ref"], "authored_at": focus["authored_at"],
+            **({"reason": reason} if reason else {})}
+
+
 def build_sealed_final_package(result_row: Any, final_text: str) -> Dict[str, Any]:
     """Host-attested final outcome: delivered text + artifact-store manifest.
 

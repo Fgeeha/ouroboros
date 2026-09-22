@@ -279,6 +279,8 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     "FOCUS_PROJECTION_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.25", "a direct focus projection the host cannot accept is unavailable, not a generic execution error"),
     "FOCUS_TASK_NOT_LIVE": Delta(False, "ok", True, "unavailable", "A.25", "a focus update for a settled task has no live publication target"),
     "FOCUS_STALE": Delta(False, "ok", True, "blocked", "A.25", "a newer focus wins the CAS and blocks the stale publication"),
+    "FOCUS_SOURCE_UNRESOLVED": Delta(False, "ok", True, "unavailable", "A.25", "a focus source the named reader refused or cannot answer is unavailable evidence, not a published focus"),
+    "FOCUS_SOURCE_UNRETAINED": Delta(False, "ok", True, "unavailable", "A.25", "a focus whose source answer could not be stored has no retained evidence to publish"),
     "TOOL_FORBIDDEN": Delta(True, "error", True, "blocked", "A.25", "an unauthorized project/focus operation is a policy denial, not a generic tool failure"),
     # Owner's recovered transport WORK-ORDER B7 / #744: these producers now
     # publish existing codes for known refusals. No text-adapter policy changed.

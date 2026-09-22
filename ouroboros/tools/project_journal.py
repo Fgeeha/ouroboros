@@ -497,6 +497,10 @@ def _workpad_write(ctx: ToolContext, content: str, project_id: str = "") -> str:
 _FOCUS_SOURCE_REFUSAL_PREFIXES = (
     "⚠️", "JOURNAL_READ_SNAPSHOT_CHANGED", "CHAT_HISTORY_SNAPSHOT_CHANGED",
 )
+# A focus points at ONE bounded page of an existing reader; a retained answer is
+# a cognitive artifact, not a mirror of the store. Larger answers are refused
+# with the repair (narrow the page), never clipped.
+_FOCUS_SOURCE_MAX_BYTES = 256 * 1024
 
 
 def _read_focus_source(ctx: ToolContext, source: Dict[str, Any]) -> Tuple[Optional[str], str]:
@@ -523,7 +527,15 @@ def _read_focus_source(ctx: ToolContext, source: Dict[str, Any]) -> Tuple[Option
             from ouroboros.tools.recent_tasks import _handle_live_roots
             text = _handle_live_roots(ctx, offset=int(args.get("offset") or 0), snapshot=str(args.get("snapshot") or ""))
         elif reader == "get_task_result":
+            from ouroboros.task_status import load_effective_task_result
+            from ouroboros.routing_wait import is_emitted_admission_stub
+            from ouroboros.tool_access import canonical_data_root
             from ouroboros.tools.control_task_results import _get_task_result
+            row = load_effective_task_result(canonical_data_root(ctx), str(args.get("task_id") or ""))
+            if not row or is_emitted_admission_stub(row):
+                # The reader's unavailable/pending answers are prose without a
+                # typed marker; a task with no settled result is not a source.
+                return "", f"{reader} refused: task {args.get('task_id')} unknown or admission pending"
             text = _get_task_result(ctx, task_id=str(args.get("task_id") or ""))
         elif reader == "chat_history":
             from ouroboros.tools.control_runtime import _chat_history
@@ -548,25 +560,26 @@ def _read_focus_source(ctx: ToolContext, source: Dict[str, Any]) -> Tuple[Option
             error = payload.get("error")
             code = error.get("code") if isinstance(error, dict) else payload.get("host_code")
             return "", f"{reader} refused: {code or 'typed error'}"
+    if len(body.encode("utf-8")) > _FOCUS_SOURCE_MAX_BYTES:
+        return "", (f"{reader} answered {len(body.encode('utf-8'))} bytes, above the {_FOCUS_SOURCE_MAX_BYTES}-byte "
+                    "focus source bound; point the focus at a narrower page (limit/offset/snapshot)")
     return body, ""
 
 
 def _retain_focus_source(canonical: pathlib.Path, task_id: str, source: Dict[str, Any], body: str) -> Dict[str, Any]:
-    """Store the reader's exact answer write-once and return the focus handle."""
-    from ouroboros.artifacts import store_actor_source_bytes, task_artifact_dir_path
+    """Store the reader's exact answer write-once on the canonical root; return the handle.
+
+    The handle is the native ``task_source`` ref minus its ``read`` block: peers
+    resolve it through ``get_task_result(include_focus_source=True)`` against the
+    same canonical root the durable task result lives on, not through the
+    author's own (possibly forked) ``artifact_store``.
+    """
+    from ouroboros.artifacts import store_actor_source_bytes
 
     ref = store_actor_source_bytes(canonical, task_id, category="context_checkpoints",
                                    source_id=f"focus_source_{source.get('reader')}",
                                    data=body.encode("utf-8"), extension="md")
-    path = task_artifact_dir_path(canonical, task_id, create=False) / ref["path"]
-    return {
-        "kind": "task_source",
-        "root": "runtime_data",
-        "path": path.relative_to(canonical).as_posix(),
-        "size": int(ref["size"]),
-        "sha256": str(ref["sha256"]),
-        "task_id": task_id,
-    }
+    return {key: ref[key] for key in ("kind", "root", "path", "size", "sha256")}
 
 
 def _update_focus(ctx: ToolContext, text: str, source_ref: Any) -> str:
