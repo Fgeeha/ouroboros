@@ -97,7 +97,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # and their fallback rule; the base sat 23 bytes under the previous budget.
     "docs/architecture/10-key-invariants.md": 21300,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
-    "docs/architecture/12-host-service-companions-and-chat-ids.md": 11007,
+    # +400: Presence turns are named as actors without cross-focus catalogue or focus authority.
+    "docs/architecture/12-host-service-companions-and-chat-ids.md": 11400,
     "docs/architecture/13-external-skills-layer.md": 7764,
     "docs/development/01-role-and-authority.md": 2437,
     "docs/development/02-naming-and-boundaries.md": 36372,
