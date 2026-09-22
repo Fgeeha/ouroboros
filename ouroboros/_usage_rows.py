@@ -200,6 +200,7 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
 
 
 def _with_limit(summary: Dict[str, Any], limit: Optional[float]) -> Dict[str, Any]:
+    """Decorate a summary with its configured limit and remaining headroom."""
     if limit is None:
         return summary
     summary["limit_usd"] = round(max(0.0, float(limit)), 6)
@@ -213,6 +214,36 @@ def _with_integrity(summary: Dict[str, Any], degraded: bool) -> Dict[str, Any]:
     if degraded:
         summary["cost_final"] = False
     return summary
+
+
+def _marker_from_final(final: Sequence[Dict[str, Any]]) -> Optional[list]:
+    """The ordered ``[compaction_epoch, seq]`` fact of these validated rows.
+
+    Compaction advances the epoch in its leading ``usage_baseline`` header
+    while renumbering live rows, so the PAIR stays ordered even when the file
+    gets shorter. ``None`` means unknown ordering — never zero — so a
+    compatibility writer can fail safe instead of writing money it cannot
+    place in time.
+    """
+    try:
+        baselines = [row for row in final
+                     if isinstance(row, dict) and str(row.get("kind") or "") == "usage_baseline"]
+        if len(baselines) > 1:
+            raise ValueError("multiple usage baseline headers")
+        epoch = baselines[0].get("compaction_epoch", 0) if baselines else 0
+        if isinstance(epoch, bool) or not isinstance(epoch, int) or epoch < 0:
+            raise ValueError("invalid usage baseline compaction epoch")
+        seqs = []
+        for row in final:
+            value = row.get("seq") if isinstance(row, dict) else None
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError("invalid usage ledger sequence marker")
+            seqs.append(value)
+        return [epoch, max(seqs, default=0)]
+    except (OSError, TypeError, ValueError):
+        return None
+
+
 
 
 def _physical_call_count(row: Dict[str, Any]) -> int:

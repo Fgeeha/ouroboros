@@ -104,14 +104,19 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
         ):
             return None
         content = completion.get("message") or ""
+    spoken_before = transcript_growth_signature(limit_ctx.messages)
     result = _no_tool_final_answer(
         content, limit_ctx, limit_ctx.llm_trace, tools, limit_ctx.incoming_messages,
         limit_ctx.owner_msg_seen, emit_progress, **({"explicit_candidate": True} if after_tools else {}),
     )
     if result is None:
         ctx._presence_completion = None
-        wait_for_acceptance_feedback(tools, limit_ctx, limit_ctx.llm_trace,
-                                     limit_ctx.tool_schemas, limit_ctx.owner_msg_seen)
+        # A turn in which the host has just spoken to Main (a repair, a reminder,
+        # a drained follow-up) owes it a round; only a pass that appended nothing
+        # may park behind the panel (the wait's own re-offer comes after this).
+        if transcript_growth_signature(limit_ctx.messages) == spoken_before:
+            wait_for_acceptance_feedback(tools, limit_ctx, limit_ctx.llm_trace,
+                                         limit_ctx.tool_schemas, limit_ctx.owner_msg_seen)
     return result
 
 
@@ -423,7 +428,7 @@ def run_llm_loop(
     ctx._presence_completion, ctx._presence_completion_accepted = None, False
     ctx._delivery_candidate, ctx._delivery_candidate_revision, ctx._delivery_control_required = None, 0, False
     ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
-    ctx.model_turn_state = ModelTurnState()  # one loop invocation is one active transport turn
+    ctx.model_turn_state, ctx._authoring_handover, ctx._pending_model_wait_handover = ModelTurnState(), None, None
     _initialize_owner_directives(ctx, messages)
     task_model_override = str(getattr(ctx, "task_model_override", "") or "").strip()
     active_model = task_model_override or llm.default_model()
@@ -527,14 +532,14 @@ def run_llm_loop(
                 return text, accumulated_usage, llm_trace
 
             # Tuple, not a sum: an APPENDED short owner message must also read as new input (final-pair fable F1).
-            _pre_drain_sig = (len(messages), len(str(messages[-1].get("content") or "")))
+            _pre_drain_sig = transcript_growth_signature(messages)
             _controls = _drain_incoming_messages(
                 messages, incoming_messages, drive_root, task_id, event_queue,
                 _owner_msg_seen, owner_ctx=ctx)
             if _delegate_hold_step(
                     tools, controls=_controls, messages=messages, drive_logs=drive_logs,
                     task_id=task_id, emit_progress=emit_progress,
-                    new_input=(len(messages), len(str(messages[-1].get("content") or ""))) != _pre_drain_sig) == "terminal":
+                    new_input=transcript_growth_signature(messages) != _pre_drain_sig) == "terminal":
                 # The no-call decision reads the usage record, not the error_kind argument — stamp first.
                 accumulated_usage["_last_llm_error_kind"] = "provider_outcome_unknown"
                 text, accumulated_usage, forced_trace = _handle_provider_unavailable(
@@ -719,6 +724,7 @@ from ouroboros.loop_messages import (  # noqa: E402, F401 -- intentional public 
     _initialize_owner_directives,
     _visible_round_text,
     _emit_round_progress,
+    transcript_growth_signature,
 )
 from ouroboros.loop_acceptance import (  # noqa: E402, F401 -- intentional public re-exports
     _task_acceptance_eligible,

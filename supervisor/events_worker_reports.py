@@ -175,10 +175,14 @@ def _handle_skill_lifecycle(evt: Dict[str, Any], ctx: Any) -> None:
 
 
 def _handle_acceptance_fence(evt: Dict[str, Any], ctx: Any) -> None:
-    """Apply a worker's acceptance fence under the supervisor queue lock, then ack."""
-    token = str(evt.get("token") or "").strip().lower()
-    if not token or len(token) > 64 or any(ch not in "0123456789abcdef" for ch in token):
-        log.warning("Rejected malformed acceptance-fence token")
+    """Apply a worker's acceptance fence under the supervisor queue lock, then ack.
+
+    The ack belongs to ONE request: ``<token>.<req>.json``. begin/inspect/end share
+    the fence token, so a late answer must never be readable as another request's.
+    """
+    token, req = (str(evt.get(key) or "").strip().lower() for key in ("token", "req"))
+    if any(not part or len(part) > 64 or any(ch not in "0123456789abcdef" for ch in part) for part in (token, req)):
+        log.warning("Rejected malformed acceptance-fence token or request id")
         return
     try:
         from supervisor.queue import transition_acceptance_fence
@@ -198,7 +202,7 @@ def _handle_acceptance_fence(evt: Dict[str, Any], ctx: Any) -> None:
         log.warning("Acceptance-fence transition failed", exc_info=True)
         result = {"ok": False, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
     ack_dir = pathlib.Path(ctx.DRIVE_ROOT) / "state" / "acceptance_fence_acks"
-    ack_path = ack_dir / f"{token}.json"
+    ack_path = ack_dir / f"{token}.{req}.json"
     try:
         now = time.time()
         prior = sorted(ack_dir.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)

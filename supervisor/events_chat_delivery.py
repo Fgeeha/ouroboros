@@ -153,9 +153,17 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
 
                 base_id = delivery_id_for(str(evt.get("task_id")), str(evt.get("text") or ""))
             if not base_id:
-                answer["terminal_host_notice"] = "\n\n".join(
-                    part for part in (str(answer.get("terminal_host_notice") or ""), custody) if part)
+                # Nothing to key the row by: the custody fact still reaches the
+                # chat as its OWN typed row instead of riding a host-notice
+                # field no consumer reads, and it mints no task-independent
+                # delivery id the delivered registry would suppress for every
+                # later task.
+                answer.pop("terminal_host_notice", None)
+                row = {**answer, "text": custody, "log_text": custody,
+                       "role": "system", "system_type": "custody_notice"}
+                row.pop("terminal_origin", None)
                 _handle_send_message(answer, ctx)
+                _handle_send_message(row, ctx)
                 return
             row_id = base_id + ":custody_notice"
             row = {**answer, "text": custody, "log_text": custody, "role": "system",
@@ -169,24 +177,6 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
             register_pending_delivery(ctx.DRIVE_ROOT, row)
             _handle_send_message(answer, ctx)
             _handle_send_message(row, ctx)
-            return
-        if evt.get("terminal_host_notice"):
-            from supervisor.terminal_delivery import project_terminal_result_event, register_pending_delivery
-
-            answer = dict(evt)
-            notice = str(answer.pop("terminal_host_notice"))
-            note_event = project_terminal_result_event(
-                ctx.DRIVE_ROOT, None, str(evt.get("task_id") or ""),
-                result_text=notice, terminal_origin="host_notice",
-                base_event={**answer, "text": notice, "log_text": notice},
-            )
-            note_event.pop("system_type", None)
-            note_event["delivery_id"] += ":host_notice"
-            # Owe the notice before the answer clears its bundled outbox row.
-            # Each ordinary send retains its own failure/replay/dedupe semantics.
-            register_pending_delivery(ctx.DRIVE_ROOT, note_event)
-            _handle_send_message(answer, ctx)
-            _handle_send_message(note_event, ctx)
             return
         delivery_id = str(evt.get("delivery_id") or "")
         if delivery_id and delivery_id in _DELIVERED_MESSAGE_IDS:

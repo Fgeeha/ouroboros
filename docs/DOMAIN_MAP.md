@@ -9,12 +9,12 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | domain | name | modules | proposed |
 |---|---|---:|---:|
 | D01 | Agent core & main loop | 33 | 0 |
-| D02 | LLM client, routing & providers | 37 | 0 |
+| D02 | LLM client, routing & providers | 38 | 0 |
 | D03 | Context assembly, fit & compaction | 11 | 0 |
 | D04 | Tool execution: registry, access & typed results | 21 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 28 | 0 |
 | D06 | Review stack | 67 | 0 |
-| D07 | Delegation, subagents & Claudexor | 51 | 0 |
+| D07 | Delegation, subagents & Claudexor | 53 | 0 |
 | D08 | Supervisor: queue, workers, events & runtime control | 46 | 0 |
 | D09 | Cancellation, owner control & process custody | 13 | 0 |
 | D10 | Git, update & release machinery | 28 | 0 |
@@ -25,10 +25,10 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D15 | Memory, knowledge, consciousness & self-evolution | 21 | 0 |
 | D16 | Observability, usage accounting & cost | 11 | 0 |
 | D17 | Projects, workspaces & task results | 21 | 0 |
-| D18 | Launcher, packaging, platform & shared substrate | 14 | 0 |
+| D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **554** | **0** |
+| **total** | | **558** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -233,6 +233,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/llm_probe.py`
 - `ouroboros/llm_routing.py`
 - `ouroboros/llm_stream.py`
+- `ouroboros/llm_substitution.py`
 - `ouroboros/local_model.py`
 - `ouroboros/local_model_autostart.py`
 - `ouroboros/local_model_server.py`
@@ -401,6 +402,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/configured_subagents.py`
 - `ouroboros/delegate_containment.py`
 - `ouroboros/delegate_custody.py`
+- `ouroboros/delegate_custody_memo.py`
 - `ouroboros/delegate_custody_reconcile.py`
 - `ouroboros/delegate_custody_usage.py`
 - `ouroboros/delegate_directory.py`
@@ -418,6 +420,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/delegate_start_instructions.py`
 - `ouroboros/delegate_state_sweep.py`
 - `ouroboros/delegate_supervision.py`
+- `ouroboros/delegate_target_drift.py`
 - `ouroboros/delegate_terminal.py`
 - `ouroboros/depth_evidence.py`
 - `ouroboros/gateways/__init__.py`
@@ -754,6 +757,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `launcher.py`
 - `ouroboros/__init__.py`
 - `ouroboros/cli.py`
+- `ouroboros/jsonl_tail.py`
 - `ouroboros/launcher_bootstrap.py`
 - `ouroboros/launcher_server_reaper.py`
 - `ouroboros/launcher_windows_runtime.py`

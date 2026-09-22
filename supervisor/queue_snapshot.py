@@ -272,15 +272,92 @@ def _fence_snapshot_running_rows(rows: Any, *, restored_ids: "set[str]") -> "lis
     return fenced
 
 
+def _descends_from(task: Any, roots: "set[str]", pending_by_id: dict) -> bool:
+    """Whether this row's lineage reaches ANY of ``roots``.
+
+    The whole ancestry is walked, not just the immediate parent: a snapshot holds
+    a tree, and a grandchild of an interrupted root is as unstartable as its
+    child. ``root_task_id`` answers first because a deep row names its root
+    directly; the parent chain is then followed through the snapshot's own rows,
+    which is every ancestor a restore can resolve without reading disk.
+    """
+    if not roots or not isinstance(task, dict):
+        return False
+    if str(task.get("root_task_id") or "") in roots:
+        return True
+    current = task
+    seen: set[str] = set()
+    while isinstance(current, dict):
+        parent_id = str(current.get("parent_task_id") or "")
+        if not parent_id or parent_id in seen:
+            return False
+        if parent_id in roots:
+            return True
+        seen.add(parent_id)
+        current = pending_by_id.get(parent_id)
+    return False
+
+
+def _interrupted_ancestors(
+    fenced_running: "list[str]", snapshot_pending: list, pending_by_id: dict,
+) -> "set[str]":
+    """The ids whose interruption a restored PENDING child cannot survive.
+
+    The rows this boot just fenced, plus the ancestors an EARLIER boot already
+    handed to cancellation custody: a multi-boot stop settles the root first, so
+    by the time the child is read again its parent is no longer a RUNNING row —
+    only an active intent or a stored ``cancelled`` result with the shutdown
+    cause proves what happened to it. Ancestors the restore is reviving are
+    deliberately absent: an owner-wait handoff is a continuation, not an
+    interruption, and its children keep their place in the queue.
+    """
+    from ouroboros.cancel_intents import has_active_intent
+    from ouroboros.task_results import STATUS_CANCELLED, load_task_result
+
+    interrupted = set(fenced_running)
+    candidates: set[str] = set()
+    for task in snapshot_pending:
+        if not isinstance(task, dict) or not str(task.get("parent_task_id") or ""):
+            continue
+        for key in ("parent_task_id", "root_task_id"):
+            ancestor = str(task.get(key) or "")
+            if ancestor and ancestor not in interrupted and ancestor not in pending_by_id:
+                candidates.add(ancestor)
+    for ancestor in candidates:
+        try:
+            if has_active_intent(_queue().DRIVE_ROOT, ancestor, strict=True):
+                interrupted.add(ancestor)
+                continue
+            stored = load_task_result(_queue().DRIVE_ROOT, ancestor, strict=True) or {}
+        except Exception:
+            # An unreadable ancestor is an UNKNOWN, never a proven interruption:
+            # the child keeps the dispatch authority the existing gates decide.
+            log.warning("Snapshot restore could not read ancestor %s", ancestor, exc_info=True)
+            continue
+        origin = stored.get("cancel_origin")
+        if (
+            str(stored.get("status") or "") == STATUS_CANCELLED
+            and isinstance(origin, dict)
+            and str(origin.get("reason") or "") == "server_shutdown"
+        ):
+            interrupted.add(ancestor)
+    return interrupted
+
+
 def _record_queue_restore(
     *, restored: int = 0, skipped_terminal: int = 0,
     cancel_authority_holds: Optional[list] = None, blocked_admission: Optional[list] = None,
     invalid_task_depth: Optional[list] = None, terminalized_running: Optional[list] = None,
+    pending_parent_interrupted: Optional[list] = None, direct_roots_incomplete: bool = False,
 ) -> None:
     """The one durable row a restore leaves: what it revived, what it left to
-    cancellation custody, and which surviving RUNNING rows it fenced. A stale
-    snapshot with nothing to revive still records the fences it minted."""
-    if not (restored or skipped_terminal or blocked_admission or terminalized_running):
+    cancellation custody, which surviving RUNNING rows it fenced, and which
+    PENDING children it refused to start behind an interrupted parent. A stale
+    snapshot with nothing to revive still records the fences it minted, and a
+    direct-root roster that could not name its live turns is disclosed as the
+    gap it is."""
+    if not (restored or skipped_terminal or blocked_admission or terminalized_running
+            or pending_parent_interrupted or direct_roots_incomplete):
         return
     _queue().append_jsonl(
         _queue().DRIVE_ROOT / "logs" / "supervisor.jsonl",
@@ -293,6 +370,8 @@ def _record_queue_restore(
             "blocked_admission": list(blocked_admission or []),
             "invalid_task_depth": list(invalid_task_depth or []),
             "terminalized_running": list(terminalized_running or []),
+            "pending_parent_interrupted": list(pending_parent_interrupted or []),
+            "direct_roots_incomplete": bool(direct_roots_incomplete),
         },
     )
 
@@ -339,15 +418,26 @@ def restore_pending_from_snapshot(
         ]
         # The pre-restart RUNNING rows are read HERE, before the stale gate: this
         # is the last moment the list exists, and a stale snapshot is exactly the
-        # case where nothing else will ever settle them.
+        # case where nothing else will ever settle them. Direct-chat roots never
+        # reach the queue, so the roster `queue.init` took over is the only place
+        # they are named; both lists describe work the stop caught, and one fence
+        # call gives them the one cancel-intent path custody settles.
+        direct_roots = dict(_queue().PRIOR_DIRECT_ROOTS)
+        # An in-process supervisor revival re-runs queue init while direct turns of THIS process are
+        # alive: the roster then names live work, not what a stop caught.
+        from supervisor.active_activity import get_direct_activity_registry
+        live_direct = {str(row.get("activity_id") or "") for row in get_direct_activity_registry().snapshot()}
+        running_rows = snap.get("running")
         fenced_running = _fence_snapshot_running_rows(
-            snap.get("running"),
+            (running_rows if isinstance(running_rows, list) else [])
+            + [{"id": task_id} for task_id in direct_roots.get("task_ids") or [] if task_id not in live_direct],
             restored_ids={str(task.get("id") or "") for task in snapshot_pending},
         )
         if terminalized is not None:
             terminalized.extend(fenced_running)
         if stale and not snapshot_pending:
-            _record_queue_restore(terminalized_running=fenced_running)
+            _record_queue_restore(terminalized_running=fenced_running,
+                                  direct_roots_incomplete=direct_roots.get("incomplete", False))
             return 0
         snapshot_pending, pending_by_id, restored = restore_terminalization_retry_rows(
             snapshot_pending, pending=_queue().PENDING, running=_queue().RUNNING,
@@ -363,7 +453,8 @@ def restore_pending_from_snapshot(
             # The fence was already minted above, and the boot notice names it:
             # a fail-closed exit may skip the restore, never the record of what
             # it handed to cancellation custody.
-            _record_queue_restore(restored=restored, terminalized_running=fenced_running)
+            _record_queue_restore(restored=restored, terminalized_running=fenced_running,
+                                  direct_roots_incomplete=direct_roots.get("incomplete", False))
             return restored
         if malformed_fences:
             affected = [str(task.get("id") or "") for task in snapshot_pending if task.get("id")]
@@ -393,35 +484,19 @@ def restore_pending_from_snapshot(
                         )
             except Exception:
                 log.warning("Failed to terminalize tasks from invalid acceptance-fence snapshot", exc_info=True)
-            _record_queue_restore(restored=restored, terminalized_running=fenced_running)
+            _record_queue_restore(restored=restored, terminalized_running=fenced_running,
+                                  direct_roots_incomplete=direct_roots.get("incomplete", False))
             return restored
 
         skipped_terminal, invalid_depth_restore = 0, []
         cancel_authority_holds: list[str] = []
-        skipped_fenced, blocked_restore = [], []
+        skipped_fenced, blocked_restore, orphan_children = [], [], []
+        interrupted = _interrupted_ancestors(fenced_running, snapshot_pending, pending_by_id)
         for task in snapshot_pending:
             chat_id = task.get("chat_id")
             if not task.get("id") or chat_id is None or chat_id == "":
                 continue
-            fenced = False
-            for fenced_root in fenced_roots:
-                if str(task.get("root_task_id") or "") == fenced_root:
-                    fenced = True
-                    break
-                current = task
-                seen: set[str] = set()
-                while isinstance(current, dict):
-                    parent_id = str(current.get("parent_task_id") or "")
-                    if not parent_id or parent_id in seen:
-                        break
-                    if parent_id == fenced_root:
-                        fenced = True
-                        break
-                    seen.add(parent_id)
-                    current = pending_by_id.get(parent_id)
-                if fenced:
-                    break
-            if fenced:
+            if _descends_from(task, fenced_roots, pending_by_id):
                 task_id = str(task.get("id") or "")
                 skipped_fenced.append(task_id)
                 try:
@@ -519,6 +594,33 @@ def restore_pending_from_snapshot(
                 if skip_revival:
                     skipped_terminal += 1
                     continue
+                if str(task.get("parent_task_id") or "") and _descends_from(
+                    task, interrupted, pending_by_id
+                ):
+                    # #1104: a planned shutdown already refuses to start these
+                    # (`kill_workers(preserve_pending=True)`); an unplanned one
+                    # left them in the snapshot, where reviving one starts a child
+                    # whose parent no longer exists. Everything above has just
+                    # proved this row is otherwise revivable and unowned, so it
+                    # takes the SAME shutdown-custody marker the planned path
+                    # writes: the boot's own kill step settles it with a
+                    # ledger-reconstructed cost and publishes its task_done. Rows
+                    # without a parent — roots, schedules, evolution — never match.
+                    task = dict(task)
+                    task["_terminalization_retry"] = {
+                        "reason": "Parent task was interrupted before this child started.",
+                        "status": STATUS_CANCELLED,
+                        "trigger": "pending_parent_interrupted",
+                        "reconcile_delegate_custody": True,
+                    }
+                    restore_terminalization_retry(
+                        task, pending=_queue().PENDING, running=_queue().RUNNING,
+                        queue_seq_counter_ref=_queue().QUEUE_SEQ_COUNTER_REF,
+                        sort_pending=_queue().sort_pending,
+                    )
+                    orphan_children.append(str(task.get("id") or ""))
+                    skipped_terminal += 1
+                    continue
                 admitted = _queue().enqueue_task(task, restoring_snapshot=True)
                 if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
                     _queue().restore_invalid_depth_admission(task, admitted, drive_root=_queue().DRIVE_ROOT, pending=_queue().PENDING, blocked=blocked_restore, terminalized=invalid_depth_restore, queue_seq_counter_ref=_queue().QUEUE_SEQ_COUNTER_REF)
@@ -542,7 +644,8 @@ def restore_pending_from_snapshot(
             restored=restored, skipped_terminal=skipped_terminal,
             cancel_authority_holds=cancel_authority_holds,
             blocked_admission=blocked_restore, invalid_task_depth=invalid_depth_restore,
-            terminalized_running=fenced_running,
+            terminalized_running=fenced_running, pending_parent_interrupted=orphan_children,
+            direct_roots_incomplete=direct_roots.get("incomplete", False),
         )
         from supervisor.queue_transitions import sweep_orphaned_budget_fences
 

@@ -757,6 +757,7 @@ def run_delegated_review_session(
     from ouroboros.claudexor_daemon import ensure_owned_gateway
     from ouroboros.gateways.claudexor import (
         WINDOW_EXHAUSTED_CODES, ClaudexorSubscriptionWindowExhausted, ClaudexorUnavailable, final_attempt_facts,
+        run_failure_error,
     )
     from ouroboros.subagents import delegated_run_shape, route_health
     from ouroboros.usage_accounting import current_usage_scope
@@ -983,16 +984,9 @@ def run_delegated_review_session(
         observed = final_attempt_facts(detail, run_id)
         run_state = str(summary.get("state") or "")
         if run_state != "succeeded":
-            failure = summary.get("failure") if isinstance(summary.get("failure"), dict) else {}
-            message = (f"delegated review session {run_id} ended {run_state or 'unknown'}"
-                       + (f": {json.dumps(failure, ensure_ascii=False)}" if failure else ""))
-            code = str(failure.get("code") or "")
             state.pop("pending_invocation_id", None)
             state.pop("delegated_run_id", None)
-            if code in WINDOW_EXHAUSTED_CODES:
-                raise ClaudexorSubscriptionWindowExhausted(
-                    message, reset_at=str(failure.get("resetsAt") or ""), code=code)
-            raise ClaudexorUnavailable(code or f"run_{run_state or 'unknown'}", message)
+            raise run_failure_error(run_id, run_state, summary.get("failure"))
         text = _full_session_text(gateway, run_id, detail)
         spend, estimated = custody.disclosed_spend(summary)
         thread_receipt: Dict[str, Any] = {}

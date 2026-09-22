@@ -152,13 +152,23 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
     accounting_available = True
     try:
         ensure_legacy_imported(drive_root)
-        breakdown = usage_breakdown(drive_root)
+        # ``usage_breakdown`` also carries private provenance used by the
+        # compatibility writer. Keep that internal vocabulary at this
+        # boundary even when the unbounded-budget branch reuses the mapping
+        # directly as its accounting projection.
+        # /api/state is polled: both reads are display reads, so a contended ledger lock
+        # serves the last validated snapshot instead of parking this worker thread.
+        breakdown = {
+            key: value
+            for key, value in usage_breakdown(drive_root, allow_stale=True).items()
+            if not str(key).startswith("_")
+        }
         # include_roots=False: /api/state serializes named scalars only, so the
         # per-root map would be built per poll and thrown away (O(N×roots) work
         # with zero readers on this path). The slim projection still carries
         # limit_usd/remaining_known_usd for the evolution budget snapshot below.
         accounting = (
-            usage_projection(drive_root, global_limit_usd=limit, include_roots=False)
+            usage_projection(drive_root, global_limit_usd=limit, include_roots=False, allow_stale=True)
             if limit > 0
             else dict(breakdown)
         )
@@ -230,7 +240,10 @@ def _direct_turns_snapshot_safe(*, availability=None) -> list:
     try:
         from supervisor.active_activity import get_direct_activity_registry
 
-        return get_direct_activity_registry().snapshot()
+        registry = get_direct_activity_registry()
+        if availability is None:
+            return registry.snapshot()
+        return registry.snapshot(availability=availability)
     except Exception:
         if availability is not None:
             availability["complete"] = False
@@ -415,7 +428,15 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
         from ouroboros.projects_registry import list_reserved_projects
 
         projects = {str(row["id"]): row for row in list_reserved_projects(drive_root)}
+    except Exception:
+        # Without the registry no row's question can be resolved: every row
+        # discloses that instead of reading as "no question pending".
+        log.debug("Required-question activity detail unavailable", exc_info=True)
         for activity in activities:
+            activity["required_question_unavailable"] = True
+        return activities
+    for activity in activities:
+        try:
             facts = _task_activity_facts(drive_root, str(activity.get("activity_id") or ""))
             wait = facts.get("owner_wait", {})
             if not wait.get("quiz_id"):
@@ -424,11 +445,18 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 {"task_id": activity["activity_id"], "quiz_id": wait["quiz_id"], "wait_for_answer": True},
                 facts.get("quiz"), projects.get(str(activity.get("project_id") or "")), wait,
             )
-            if pointer:
-                activity["required_question"] = pointer
-    except Exception:
-        # Optional display detail cannot disprove the copied live-id census.
-        log.debug("Required-question activity detail unavailable", exc_info=True)
+        except Exception:
+            # Optional display detail cannot disprove the copied live-id census,
+            # but a row that MAY be blocked on an answer must say it is unknown.
+            log.debug("Required-question activity detail unavailable", exc_info=True)
+            activity["required_question_unavailable"] = True
+            continue
+        if pointer:
+            activity["required_question"] = pointer
+        else:
+            # A recorded quiz wait with no readable Project pointer: the wait is
+            # real, its detail is not; disclose rather than animate.
+            activity["required_question_unavailable"] = True
     return activities
 
 

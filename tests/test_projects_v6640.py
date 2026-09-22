@@ -495,8 +495,13 @@ def test_project_activity_stays_out_of_main_static_contract():
     assert "appendTaskSummaryToLiveCard(msg" in history
     assert "PROJECT_ROW_TYPES.has(msg.system_type)" in history
     assert "incrementUnreadIfNeeded" not in history
-    assert "name: projectName || 'Project'" in chat
-    assert "name: projectName || projectId" not in chat
+    # The lifecycle row points at its Project through the door, which alone decides the
+    # fallback word: a missing or never-given name reads `Project`, never the raw id.
+    project_answer = (root / "web" / "modules" / "project_answer.js").read_text(encoding="utf-8")
+    door = (root / "web" / "modules" / "project_reference.js").read_text(encoding="utf-8")
+    assert "projectReference({ id: projectId, name: projectName })" in project_answer
+    assert "MINTED_ID.test(name)) ? name : 'Project'" in door
+    assert "name: projectName || projectId" not in chat + project_answer
 
 
 def test_project_lifecycle_rows_render_design_system_action_static_contract():
@@ -517,12 +522,11 @@ def test_project_lifecycle_rows_render_design_system_action_static_contract():
         "const PROJECT_ROW_TYPES = new Set(['project_started', 'project_completion_summary']);"
         in chat
     )
-    render = chat[
-        chat.index("if (PROJECT_ROW_TYPES.has(systemType) && projectId) {"):
-        chat.index("function updateMessageAnnotation")
-    ]
-    assert "createSystemMessageAction({" in render
-    assert "createSystemMessageActions(" in render
+    # chat.js only delegates; the lifecycle-row module puts the one Project reference
+    # (web/modules/project_reference.js) into the shared action composition.
+    assert "if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName });" in chat
+    render = (root / "web" / "modules" / "project_answer.js").read_text(encoding="utf-8")
+    assert "createSystemMessageActions(projectReference(" in render
     assert "row.className = 'system-message-actions'" in helpers
     # The Main mirror of a Project question carries no system action: its Project chip is the way there.
     assert "createSystemMessageActions(" in (root / "web/modules/chat_activity.js").read_text(encoding="utf-8")
@@ -540,21 +544,22 @@ def test_project_lifecycle_rows_render_design_system_action_static_contract():
     assert "btn.className = 'btn btn-xs btn-default';" in chrome
     assert "btn.dataset.turnIntoProject = '1';" in chrome
     assert "btn.textContent = 'Turn into project';" in chrome
-    # The identity chip keeps its own role, now built once in ui_helpers and
-    # shared by the converted card (chat.js) and the bound-task footer (app.js).
-    assert "chat-live-project-card-btn" in helpers
-    assert "renderProjectChip(" in chat
-    assert "renderProjectChip(" in app
+    # One owner intent, one control: the converted card (chat.js), the bound-task
+    # footer (app.js) and every row that points at a Project get it from the door,
+    # which alone knows its classes and words.
+    door = (root / "web" / "modules" / "project_reference.js").read_text(encoding="utf-8")
+    assert "chat-live-project-card-btn" in door and "chat-live-project-card-btn" not in helpers
+    assert "projectReference(project, { layout: 'bar', state: 'background' })" in chat
+    assert "projectReference(project, { layout: 'footer' })" in app
     # The project pointer is a Main-root affordance: applyTaskBindings walks
     # only Main root cards, never the Project panel's copy or nested subagents
     # (D15; the browser flow is pinned by the marker-gated continuity smoke).
     assert "'#page-chat .chat-live-card[data-task-id]:not(.subagent)'" in app
 
-    # Layout-only container CSS; the helper owns the one semantic button role.
+    # Layout-only container CSS; the page-local `Open Project` button and its rule are gone.
     assert ".system-message-actions {" in style
-    assert ".system-message-action {" in style
-    assert "export function createSystemMessageAction(" in helpers
-    assert "'btn btn-default btn-sm system-message-action'" in helpers
+    assert ".system-message-action {" not in style
+    assert "export function createSystemMessageAction(" not in helpers
 
 
 def test_chat_ws_subscriptions_flow_through_disposer_helper():

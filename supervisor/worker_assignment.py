@@ -197,8 +197,11 @@ def assign_tasks() -> None:
                 "Invalid-depth rows deferred until terminal custody is available; continuing assignment for other tasks: %s",
                 ", ".join(unresolved_invalid_ids),
             )
-        try:
-            remaining = budget_remaining(st, strict=True)
+        try:  # every loop tick: ride the snapshot; a refusal re-reads exactly, reserve_attempt is the gate
+            evolution_queued = any(str(row.get("type") or "") == "evolution" for row in _pool().PENDING)
+            remaining = budget_remaining(  # this tick refuses at zero AND, for evolution, at its reserve
+                st, strict=True, allow_stale=True,
+                refuse_below=EVOLUTION_BUDGET_RESERVE if evolution_queued else 0.0)
         except Exception:
             log.error("Task assignment blocked: monetary authority unavailable")
             return

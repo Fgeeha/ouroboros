@@ -150,6 +150,7 @@ RESTART_EXIT_CODE = 42
 PANIC_EXIT_CODE = 99
 _planned_delegate_restart_transaction_id = ""
 _LAUNCHER_MANAGED = str(os.environ.get("OUROBOROS_MANAGED_BY_LAUNCHER", "") or "").strip() == "1"
+_LAUNCHER_MANAGED_REPO_DIR = str(os.environ.get("OUROBOROS_MANAGED_REPO_DIR", "") or "").strip()
 
 # Captured in main() for Settings LAN-reachability metadata.
 _BIND_HOST = DEFAULT_HOST
@@ -168,6 +169,15 @@ def _has_active_evolution_transaction() -> bool:
         tx = raw.get("active_transaction")
         return isinstance(tx, dict) and not str(tx.get("commit_sha") or "").strip()
     except Exception:
+        return False
+
+
+def _launcher_managed_repo_matches() -> bool:
+    if not _LAUNCHER_MANAGED: return False
+    if not _LAUNCHER_MANAGED_REPO_DIR: return (REPO_DIR / ".git" / "ouroboros-managed.json").is_file()
+    try:
+        return pathlib.Path(_LAUNCHER_MANAGED_REPO_DIR).resolve(strict=False) == REPO_DIR.resolve(strict=False)
+    except (OSError, RuntimeError, ValueError):
         return False
 
 
@@ -521,7 +531,7 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
     git_ops_module.ensure_repo_present()
     setup_remote_if_configured(settings, log)
 
-    if _LAUNCHER_MANAGED:
+    if _launcher_managed_repo_matches():
         # An in-flight managed-update assisted merge intentionally leaves MERGE_HEAD + the partly
         # resolved merge in the live worktree (over pre_update_sha). Use the NON-destructive
         # rescue_and_block policy so the bootstrap restart does not reset/clean that merge state
@@ -552,6 +562,9 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
                 log.debug("Failed to pause evolution after blocked bootstrap", exc_info=True)
         return ok, msg
 
+    if _LAUNCHER_MANAGED:
+        log.warning("Managed marker lacks matching repository identity; skipping destructive bootstrap for %s.", REPO_DIR)
+
     log.info("Local-dev server start detected — skipping bootstrap git reset.")
     deps_ok, deps_msg = git_ops_module.sync_runtime_dependencies(reason="bootstrap_local_dev")
     if not deps_ok:
@@ -580,8 +593,7 @@ def _run_supervisor(settings: dict) -> None:
     try:
         ensure_legacy_imported(pathlib.Path(DATA_DIR))
 
-        from supervisor.message_bus import init as bus_init
-        from supervisor.message_bus import LocalChatBridge
+        from supervisor.message_bus import LocalChatBridge, init as bus_init
 
         bridge = LocalChatBridge(settings)
         bridge._broadcast_fn = broadcast_ws_sync
@@ -686,9 +698,7 @@ def _run_supervisor(settings: dict) -> None:
 
         def _get_owner_chat_id() -> Optional[int]:
             try:
-                st = load_state()
-                cid = st.get("owner_chat_id")
-                return int(cid) if cid else None
+                return int((load_state() or {}).get("owner_chat_id") or 0) or None
             except Exception:
                 return None
 
@@ -696,8 +706,7 @@ def _run_supervisor(settings: dict) -> None:
             drive_root=DATA_DIR, repo_dir=REPO_DIR, owner_chat_id_fn=_get_owner_chat_id,
             routing_metadata_fn=lambda cid: main_lane_routing_metadata(_event_ctx, cid))  # _event_ctx is built below
 
-        _bg_st = load_state()
-        if _bg_st.get("bg_consciousness_enabled"):
+        if load_state().get("bg_consciousness_enabled"):
             _consciousness.start()
             log.info("Background consciousness auto-restored from saved state.")
 
@@ -750,15 +759,16 @@ def _run_supervisor(settings: dict) -> None:
     _last_review_job_reconcile = [time.time()]
     # WS3: a dedicated watchdog thread (outside this loop, so it fires even if the
     # loop stalls) surfaces a wedge as an observable signal + owner alert instead
-    # of silent hours; the loop publishes a liveness tick each iteration. The tick
-    # is MONOTONIC: it is only ever read as an elapsed gap, so a wall-clock jump
-    # must not turn a healthy loop into a phantom stall (nor hide a real one).
-    _loop_liveness = [time.monotonic()]
+    # of silent hours; the loop publishes a liveness tick at each tick PHASE. The
+    # tick is MONOTONIC: it is only ever read as an elapsed gap, so a wall-clock
+    # jump must not turn a healthy loop into a phantom stall (nor hide a real one).
+    from ouroboros.server_liveness import loop_phase_facts, observe_worker_event_lag
+    _loop_liveness = [time.monotonic(), {}, time.thread_time(), None]  # slots: server_liveness.py
     _watchdog_stop = threading.Event()  # per-generation: stops the watchdog when THIS loop exits
     _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
     while not _restart_requested.is_set() and not _supervisor_stop.is_set():
         try:
-            _loop_liveness[0] = time.monotonic()
+            _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "events", new_tick=True), time.monotonic()
             rotate_chat_log_if_needed(DATA_DIR)
             # progress.jsonl rotates on the same supervisor tick (v6.90.x P2); its
             # readers (history backfill, SSE replay, api_logs_tail, TB ATIF) are
@@ -787,6 +797,7 @@ def _run_supervisor(settings: dict) -> None:
                 if evt.get("type") == "restart_request":
                     _handle_restart_in_supervisor(evt, _event_ctx)
                     continue
+                observe_worker_event_lag(_loop_liveness, evt)
                 dispatch_event(evt, _event_ctx)
 
             if _restart_requested.is_set():
@@ -798,6 +809,7 @@ def _run_supervisor(settings: dict) -> None:
             # where no task_received fired for hours until a full restart).
             offset = _process_bridge_updates(bridge, offset, _event_ctx)
 
+            _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "maintenance"), time.monotonic()
             enforce_task_timeouts()
             try:
                 from supervisor.queue import check_scheduled_tasks
@@ -805,9 +817,10 @@ def _run_supervisor(settings: dict) -> None:
             except Exception:
                 log.warning("Scheduled task check failed", exc_info=True)
             _periodic_supervisor_maintenance(
-                _last_custody_reap, _last_review_job_reconcile,
+                _last_custody_reap, _last_review_job_reconcile, stop_event=_watchdog_stop,
                 on_orphans_healed=lambda count: _consciousness and _consciousness.notify(f"orphans_healed:{count}"),
             )
+            _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "assign"), time.monotonic()
             # Loop-tick restart drain (no sleep, events keep flowing): while
             # draining a deferred restart, skip starting new work the restart
             # deadline would immediately chop (evolution / pending project tasks).

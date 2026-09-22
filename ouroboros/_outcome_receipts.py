@@ -138,7 +138,53 @@ def review_run_ledger_status(
         or (selection.current_candidate_unaccepted and signal == "PASS")
     )
     failed = run.get("aggregate_signal") in {"FAIL", "DEGRADED"} or bool(run.get("degraded"))
+    if failed and not superseded and review_runs_only_awaited([run]):
+        return "not_evaluated", False  # reviewers had not answered yet: a gap, never a failed verification
     return ("superseded" if superseded else ("failed" if failed else "ok")), superseded
+
+
+def plan_review_awaiting(*records: Any) -> bool:
+    """Whether a task record carries the typed fact of a clean finish over a plan review
+    that was only awaited (``outcome_axes.execution.plan_review``)."""
+    from ouroboros.review_projection import AWAITING_PROJECTION
+
+    for record in records:
+        axes = record.get("outcome_axes") if isinstance(record, dict) else None
+        execution = axes.get("execution") if isinstance(axes, dict) else None
+        if isinstance(execution, dict) and execution.get("plan_review") == AWAITING_PROJECTION:
+            return True
+    return False
+
+
+def review_runs_only_awaited(runs: List[Dict[str, Any]]) -> bool:
+    """Whether the runs lack a verdict ONLY because reviewers had not answered yet.
+
+    Typed rows alone: every run without a PASS holds at least one slot released at the
+    dispatch barrier that carries no answer, and nothing else beside it — every other
+    slot answered a PASS whose tier, if any, is ``solved``. A recorded FAIL, a PASS that
+    judged the work blocked or best-effort, or a failed, refused, unresolved or
+    parse-degraded slot, is a real outcome and keeps its own word; an answer that has
+    not arrived is a gap, never a degradation of the task."""
+    from ouroboros.review_records import review_slot_awaiting
+
+    unsettled = [run for run in runs
+                 if str(run.get("aggregate_signal") or "").upper() != "PASS" or run.get("degraded")]
+    for run in unsettled:
+        awaited = 0
+        for row in run.get("actors") or []:
+            if not isinstance(row, dict):
+                return False
+            parsed = row.get("parsed")
+            if review_slot_awaiting(row):
+                if row.get("status") == "ok" or parsed is not None or str(row.get("raw_text") or "").strip():
+                    return False  # a pending row that carries an answer is judged by its answer
+                awaited += 1
+            elif (row.get("status") != "ok" or str(row.get("signal") or "").upper() != "PASS"
+                  or (isinstance(parsed, dict) and str(parsed.get("outcome_tier") or "solved") != "solved")):
+                return False
+        if not awaited or str(run.get("aggregate_signal") or "").upper() == "FAIL":
+            return False
+    return bool(unsettled)
 
 
 def canonical_path_set(paths: Any) -> tuple[str, ...]:

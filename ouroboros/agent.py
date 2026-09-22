@@ -14,9 +14,10 @@ import traceback
 import uuid
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 log = logging.getLogger(__name__)
+_PROGRESS_ID_UNSET = object()
 
 from ouroboros.utils import (
     append_jsonl,
@@ -260,24 +261,42 @@ class OuroborosAgent:
             log_label="agent live",
         )
 
-    def _await_acceptance_fence_ack(self, token: str, *, timeout_sec: float = 10.0) -> Dict[str, Any]:
-        """Wait for the supervisor to apply a queue-owned acceptance fence.
+    def _fence_request(self, accept: Tuple[str, ...], **request: Any) -> Dict[str, Any]:
+        """The ONE transport seam of the queue-owned acceptance fence.
 
-        Worker processes cannot share the supervisor's ``_queue_lock``.  The
-        event is therefore acknowledged through a tiny one-shot file only after
-        the supervisor has changed the fence while holding that lock.  The file
-        is transport acknowledgement, not a second lifecycle authority.
+        A direct turn runs inside the supervisor process: built with the queue's own
+        transition (``fence_transition``), it applies the fence in-process — no event,
+        no ack file, no wait (lock order: admission lock, then ``_queue_lock``). A pooled
+        worker cannot share ``_queue_lock``: it sends the event, polls its own one-shot
+        ack and re-sends the SAME transition once — a read (``inspect``, asked many times a
+        turn) is never re-sent, its loss is harmless; no answer raises ``TimeoutError`` (a
+        gap), a refusal raises ``RuntimeError``. The ack is transport, not an authority.
         """
-        metadata = (
-            self._current_task_metadata
-            if isinstance(self._current_task_metadata, dict)
-            else {}
-        )
-        ack_root = pathlib.Path(
-            str(metadata.get("budget_drive_root") or self.env.drive_root)
-        ).resolve(strict=False)
-        ack_path = ack_root / "state" / "acceptance_fence_acks" / f"{token}.json"
-        deadline = time.monotonic() + max(0.1, float(timeout_sec))
+        request.setdefault("task_id", str(self._current_task_id or ""))
+        transition = getattr(self, "fence_transition", None)
+        if transition is not None:
+            ack = transition(**request)
+        elif self._event_queue is None:
+            raise RuntimeError("acceptance fence requires a supervisor event queue")
+        else:
+            event = {"type": "acceptance_fence", "req": uuid.uuid4().hex, **request}
+            ack = self._send_fence_event(event) or (request["action"] != "inspect" and self._send_fence_event(event)) or {}
+            if not ack:
+                raise TimeoutError(f"supervisor did not acknowledge acceptance fence {request['action']}")
+        status = str(ack.get("status") or "")
+        if not ack.get("ok", True) or status not in accept:  # the row's typed state is the reason; only a malformed request keeps its error text
+            raise RuntimeError(status if status not in ("", "error") else str(ack.get("error") or f"acceptance fence {request['action']} failed"))
+        return ack
+
+    def _send_fence_event(self, event: Dict[str, Any]) -> Dict[str, Any]:
+        """Send one pooled fence event and poll ITS OWN ``<token>.<req>.json`` ack; ``{}`` = unanswered."""
+        from ouroboros.runtime_limits import get_acceptance_fence_ack_wait_sec
+
+        self._event_queue.put({**event, "ts": utc_now_iso()})
+        metadata = self._current_task_metadata if isinstance(self._current_task_metadata, dict) else {}
+        ack_root = pathlib.Path(str(metadata.get("budget_drive_root") or self.env.drive_root)).resolve(strict=False)
+        ack_path = ack_root / "state" / "acceptance_fence_acks" / f"{event['token']}.{event['req']}.json"
+        deadline = time.monotonic() + get_acceptance_fence_ack_wait_sec()
         while time.monotonic() < deadline:
             payload = read_json_dict(ack_path)
             if payload:
@@ -287,61 +306,23 @@ class OuroborosAgent:
                     log.debug("Unable to remove acceptance-fence ack %s", ack_path, exc_info=True)
                 return payload
             time.sleep(0.02)
-        raise TimeoutError(f"supervisor did not acknowledge acceptance fence {token}")
+        return {}
 
     def _begin_acceptance_fence(self, *, root_task_id: str, task_id: str) -> Dict[str, Any]:
-        if self._event_queue is None:
-            raise RuntimeError("acceptance fence requires a supervisor event queue")
-        token = uuid.uuid4().hex
-        self._event_queue.put({
-            "type": "acceptance_fence",
-            "action": "begin",
-            "token": token,
-            "root_task_id": str(root_task_id or task_id),
-            "task_id": str(task_id),
-            "ts": utc_now_iso(),
-        })
-        ack = self._await_acceptance_fence_ack(token)
-        if str(ack.get("status") or "") != "active":
-            raise RuntimeError(str(ack.get("error") or "acceptance fence was not activated"))
-        return ack
+        return self._fence_request(
+            ("active",), action="begin", token=uuid.uuid4().hex,
+            root_task_id=str(root_task_id or task_id), task_id=str(task_id))
 
     def _inspect_acceptance_fence(self, *, token: str) -> Dict[str, Any]:
         """Refresh queue-level quiescence while keeping the same admission fence."""
-        if self._event_queue is None:
-            raise RuntimeError("acceptance fence requires a supervisor event queue")
-        self._event_queue.put({
-            "type": "acceptance_fence",
-            "action": "inspect",
-            "token": str(token),
-            "task_id": str(self._current_task_id or ""),
-            "ts": utc_now_iso(),
-        })
-        ack = self._await_acceptance_fence_ack(str(token))
-        if str(ack.get("status") or "") not in {"active", "sealed"}:
-            raise RuntimeError(str(ack.get("error") or "acceptance fence inspection failed"))
-        return ack
+        return self._fence_request(("active", "sealed"), action="inspect", token=str(token))
 
     def _end_acceptance_fence(
         self, *, token: str, outcome: str, expected_generation: Optional[int] = None,
     ) -> Dict[str, Any]:
-        if self._event_queue is None:
-            raise RuntimeError("acceptance fence requires a supervisor event queue")
-        event = {
-            "type": "acceptance_fence",
-            "action": "end",
-            "token": str(token),
-            "outcome": str(outcome),
-            "task_id": str(self._current_task_id or ""),
-            "ts": utc_now_iso(),
-        }
-        if expected_generation is not None:
-            event["expected_generation"] = int(expected_generation)
-        self._event_queue.put(event)
-        ack = self._await_acceptance_fence_ack(str(token))
-        if str(ack.get("status") or "") not in {"released", "sealed"}:
-            raise RuntimeError(str(ack.get("error") or "acceptance fence transition failed"))
-        return ack
+        generation = {} if expected_generation is None else {"expected_generation": int(expected_generation)}
+        return self._fence_request(
+            ("released", "sealed"), action="end", token=str(token), outcome=str(outcome), **generation)
 
     def _log_worker_boot_once(self) -> None:
         global _worker_boot_logged
@@ -638,7 +619,7 @@ class OuroborosAgent:
             pending_events=self._pending_events,
             current_chat_id=self._current_chat_id,
             current_task_type=self._current_task_type,
-            emit_progress_fn=self._emit_progress,
+            emit_progress_fn=self._bind_task_progress_for_task(task),
             event_queue=self._event_queue,
             task_id=str(task.get("id") or ""),
             task_depth=int(task.get("depth", 0)),
@@ -788,6 +769,31 @@ class OuroborosAgent:
         )
         return ctx, messages, cap_info
 
+    def _bind_task_progress_for_task(self, task: Dict[str, Any]) -> Callable[[str], Any]:
+        task_id = str(task.get("id") or "")
+        task_meta = subagent_message_meta(self._current_task_metadata, task_id=task_id, event="progress")
+        task_meta.update(initiator_meta(self._current_task_metadata))
+        return self._bind_task_progress(
+            task_id, self._current_chat_id, task_meta, task.get("_attempt"),
+        )
+
+    def _bind_task_progress(
+        self, task_id: str, chat_id: Optional[int], progress_meta: Optional[Dict[str, Any]] = None,
+        task_attempt: Any = None,
+    ) -> Callable[[str], Any]:
+        """Keep a task's progress address stable after its worker turn ends."""
+        def emit_task_progress(text: str, **kwargs: Any) -> None:
+            self._emit_progress(
+                text,
+                _task_id_override=task_id,
+                _chat_id_override=chat_id,
+                _progress_meta_override=progress_meta or {},
+                _task_attempt_override=task_attempt,
+                **kwargs,
+            )
+
+        return emit_task_progress
+
     def handle_task(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         """Run one task under the root/subtree monetary attribution scope."""
         # A reused worker agent still carries the PREVIOUS task's chat binding;
@@ -880,6 +886,10 @@ class OuroborosAgent:
             # already projects — read from the ONE record the dispatch resolution
             # stamped onto the task, never re-derived per surface.
             self._record_executor_facts(task, cap_info)
+            # Executor facts are part of the same by-value identity snapshot
+            # used by late custody callbacks.
+            if ctx is not None:
+                ctx.emit_progress_fn = self._bind_task_progress_for_task(task)
 
             authority_refusal = cap_info.get("authority_source_unavailable")
             if isinstance(authority_refusal, dict) and authority_refusal:
@@ -1110,9 +1120,18 @@ class OuroborosAgent:
 
     def _emit_progress(self, text: str, *, incident: Optional[Dict[str, str]] = None,
                        executor_observation: Optional[Dict[str, Any]] = None,
-                       narration: bool = False) -> None:
+                       narration: bool = False, card_row: str = "", card_row_id: str = "",
+                       _task_id_override: Any = _PROGRESS_ID_UNSET,
+                       _chat_id_override: Any = _PROGRESS_ID_UNSET,
+                       _progress_meta_override: Any = _PROGRESS_ID_UNSET,
+                       _task_attempt_override: Any = _PROGRESS_ID_UNSET) -> None:
         """Owner-visible note; ``incident`` is the typed ``task_incident``/``toast_once``
         pair the browser toasts once.
+
+        ``card_row`` is the note's PLACEMENT fact: a host fact about this task
+        belongs to a row of its card, so a producer that has one states it here
+        rather than leaving the row to land beside the card. ``card_row_id``
+        keeps that row the same row across a reload.
 
         ``narration`` is the VOICE of the note, not its text: only the model's own
         round narration (``loop_messages._emit_round_progress``) is the turn's
@@ -1122,26 +1141,42 @@ class OuroborosAgent:
         the default. Both voices stay visible rows; the flag decides only whether
         a note may claim the card title and the collapsed activity line."""
         self._last_progress_ts = time.time()
-        if self._event_queue is None or self._current_chat_id is None:
+        chat_id = (
+            self._current_chat_id if _chat_id_override is _PROGRESS_ID_UNSET else _chat_id_override
+        )
+        task_id = (
+            self._current_task_id if _task_id_override is _PROGRESS_ID_UNSET else _task_id_override
+        )
+        if self._event_queue is None or chat_id is None:
             return
         try:
             event = {
-                "type": "send_message", "chat_id": self._current_chat_id,
+                "type": "send_message", "chat_id": chat_id,
                 "text": f"💬 {text}", "format": "markdown", "is_progress": True,
                 "role": "assistant" if narration else "system",
                 "system_type": "model_narration" if narration else "host_progress",
-                "task_id": self._current_task_id or "",
+                "task_id": task_id or "",
                 "ts": utc_now_iso(),
             }
             progress_meta: Dict[str, Any] = {}
             progress_meta.update(incident or {})
-            progress_meta.update(self._subagent_progress_meta("progress"))
+            if card_row:
+                progress_meta["card_row"] = card_row
+                if card_row_id:
+                    progress_meta["card_row_id"] = card_row_id
+            if _progress_meta_override is _PROGRESS_ID_UNSET:
+                progress_meta.update(self._subagent_progress_meta("progress"))
+            else:
+                progress_meta.update(_progress_meta_override or {})
             if executor_observation is not None:
                 from ouroboros.subagent_messages import executor_observation_meta
 
                 observation = executor_observation_meta(
                     executor_observation, task_id=event["task_id"],
-                    task_attempt=getattr(getattr(self.tools, "_ctx", None), "task_attempt", None),
+                    task_attempt=(
+                        getattr(getattr(self.tools, "_ctx", None), "task_attempt", None)
+                        if _task_attempt_override is _PROGRESS_ID_UNSET else _task_attempt_override
+                    ),
                 )
                 if observation:
                     progress_meta["executor_observation"] = observation

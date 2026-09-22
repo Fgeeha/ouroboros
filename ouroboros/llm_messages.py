@@ -37,6 +37,43 @@ def reset_native_messages(messages: list, route: dict, *, source: str, model: st
     return prepared, changed
 
 
+def drop_source_native_messages(messages: list, *, source: str) -> tuple[list, list]:
+    """Send one source's history without its continuations, keeping the content.
+
+    The account-reset above answers a route that MOVED. This answers a route
+    that refused its own continuation while standing still — an engine that
+    binds a continuation to the model that produced it cannot replay it once
+    another model answered on the same account. The canonical content and tool
+    calls are the message either way, so nothing the caller said is lost.
+    """
+    changed = []
+    prepared = copy.deepcopy(messages)
+    for message in prepared:
+        native = message.get("nativeContinuation")
+        if isinstance(native, dict) and (native.get("route") or {}).get("source") == source:
+            changed.append({"old_route": native.get("route") or {}, "new_route": {}})
+            message.pop("nativeContinuation")
+    return prepared, changed
+
+
+def reset_native_payload(payload: dict, route: dict, *, source: str, model: str, turn_state: Any = None):
+    """Apply an authorized no-start reset to both continuation surfaces."""
+    messages, changed = reset_native_messages(
+        payload["messages"], route, source=source, model=model)
+    if not changed:
+        messages, changed = drop_source_native_messages(payload["messages"], source=source)
+    slot = payload.get("nativeContinuation")
+    if not changed and not isinstance(slot, dict):
+        return None
+    updated = {**payload, "messages": messages}
+    surface = ""
+    if isinstance(slot, dict):
+        updated.pop("nativeContinuation", None)
+        if turn_state is not None and hasattr(turn_state, "envelope"):
+            turn_state.envelope = None
+        changed = [{"old_route": slot.get("route") or {}, "new_route": {}}, *changed]
+        surface = "top_level_turn_slot"
+    return updated, changed, surface
 
 
 class _MessageShapingMixin:

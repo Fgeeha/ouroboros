@@ -841,6 +841,31 @@ def task_presentation_snapshot(drive_root: Any, task_id: str, *, task: Any = Non
             "target_label": label}
 
 
+# A Project root's final answer rides Main's completion row so Main can show it as
+# an ordinary Ouroboros message (DESIGN "Project completion mirror"). Above this
+# size the row stays a pointer: nothing is ever cut host-side (BIBLE P1).
+MIRRORED_ANSWER_MAX_CHARS = 32000
+_TERMINAL_MIRROR_PHASES = frozenset({"done", "warn", "error", "cancelled"})
+
+
+def mirrored_answer(result: Any, phase: str) -> Dict[str, str]:
+    """The typed key Main's completion row carries, or nothing.
+
+    Present only for a MODEL-AUTHORED final answer of a settled task: host
+    salvage and host notices are not Ouroboros's words, and a row sent while the
+    task still reads ``working`` is frozen by the outbox and must stay a pointer.
+    """
+    from ouroboros.task_finalization import TERMINAL_ORIGIN_MODEL_FINAL
+
+    row = result if isinstance(result, dict) else {}
+    answer = row["result"].strip() if isinstance(row.get("result"), str) else ""
+    if (str(row.get("terminal_origin") or "") != TERMINAL_ORIGIN_MODEL_FINAL
+            or str(phase or "") not in _TERMINAL_MIRROR_PHASES
+            or not answer or len(answer) > MIRRORED_ANSWER_MAX_CHARS):
+        return {}
+    return {"completion_answer": answer}
+
+
 def create_project(
     drive_root: Any,
     project_id: str,
@@ -893,12 +918,16 @@ def create_project(
         return {**entry, "created": True}
 
 
-def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional[Dict[str, Any]]:
+def update_project(
+    drive_root: Any, project_id: str, *, only_if_empty: tuple = (), **updates: Any,
+) -> Optional[Dict[str, Any]]:
     """Update mutable fields. v6.59.0 adds the additive source-provenance facts:
     ``provenance`` (attached|cloned|genesis|none — how the working_dir came to be),
     ``clone_url`` (historical fact; live git data is always read from .git), and
     ``trusted_at`` (stamped automatically on attach/clone — the notification trust
-    model: attaching IS the owner's explicit grant, no second confirmation gate)."""
+    model: attaching IS the owner's explicit grant, no second confirmation gate).
+    A field named in ``only_if_empty`` is written only while still empty — a
+    compare-and-set under the registry lock; the caller reads the winner back."""
     pid = sanitize_project_id(project_id)
     if not pid:
         return None
@@ -918,7 +947,7 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
             if entry.get("id") != pid or entry.get("lifecycle") != PROJECT_ACTIVE:
                 continue
             for key, value in updates.items():
-                if key not in allowed:
+                if key not in allowed or (key in only_if_empty and str(entry.get(key) or "").strip()):
                     continue
                 if key == "name":
                     value = _validated_name(value, str(entry.get("id") or ""))

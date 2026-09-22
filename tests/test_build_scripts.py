@@ -12,8 +12,11 @@ In v5.15.x this module also absorbed packaging-asset completeness checks
 contract checks (formerly tests/test_release_workflow.py) so packaging
 contracts evolve in one place.
 """
+import os
 import pathlib
 import re
+import shutil
+import subprocess
 
 import pytest
 
@@ -1099,6 +1102,96 @@ def test_ci_release_preflight_validates_tag_matches_version():
     assert "Validate tag matches VERSION" in workflow
     assert 'expected_tag = f"v{version}"' in workflow
     assert 'tag != expected_tag' in workflow
+
+
+def test_ci_collects_independent_failures_without_relaxing_release_gates():
+    workflow = _ci_workflow()
+    assert "${{ always() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}" in workflow
+    assert "tag_valid: ${{ steps.release_meta.outputs.tag_valid }}" in workflow
+    assert "needs.release-preflight.outputs.tag_valid == 'true'" in workflow
+    assert "needs.release-preflight.result == 'success'" in workflow.split("\n  release:\n", 1)[1]
+    for expression in (
+        "FULL_TEST_RESULT: ${{ needs.full-test.result }}",
+        "INTEGRATION_RESULT: ${{ needs.integration-test.result }}",
+        "SYSTEM_E2E_RESULT: ${{ needs.system-e2e-mock.result }}",
+    ):
+        assert expression in workflow
+    assert '"$FULL_TEST_RESULT" != success' in workflow
+    assert '"$INTEGRATION_RESULT" != success' in workflow
+    assert '"$SYSTEM_E2E_RESULT" != success' in workflow
+    assert "if: startsWith(github.ref, 'refs/tags/v')" in workflow.split("  android-build:", 1)[1].split("  release-preflight:", 1)[0]
+    assert "continue-on-error: true" in workflow.split("  vendor-package-smoke:", 1)[1].split("  release:", 1)[0]
+
+
+def test_ci_setup_aware_failure_collection_guards_each_independent_lane():
+    import yaml
+    jobs = yaml.safe_load(_ci_workflow())["jobs"]
+    for job_name in ("quick-test", "full-test", "marker-guards", "ui-smoke", "docker-ui-smoke", "system-e2e-mock", "android-test"):
+        steps = jobs[job_name]["steps"]
+        assert any("!cancelled()" in str(step.get("if", "")) for step in steps if "run" in step), job_name
+    ui = {step.get("name"): step for step in jobs["ui-smoke"]["steps"]}
+    assert "github.event_name == 'pull_request'" in ui["Run Publish admission browser proof"]["if"]
+    assert "github.event_name != 'pull_request'" in ui["Run host UI smoke"]["if"]
+    assert "github.event_name != 'pull_request'" in ui["Run browser tools Chromium/WebKit smoke"]["if"]
+
+
+def test_ci_release_prerequisite_shell_gate_truth_table():
+    import yaml
+
+    jobs = yaml.safe_load(_ci_workflow())["jobs"]
+    step = next(step for step in jobs["release-preflight"]["steps"]
+                if step.get("name") == "Require test prerequisites for publication")
+    cases = [
+        (("success", "success", "success"), True),
+        (("failure", "success", "success"), False),
+        (("success", "skipped", "success"), False),
+        (("success", "success", "cancelled"), False),
+        (("", "success", "success"), False),
+    ]
+    for (full, integration, system), expected in cases:
+        env = os.environ.copy()
+        env.update(FULL_TEST_RESULT=full, INTEGRATION_RESULT=integration, SYSTEM_E2E_RESULT=system)
+        bash = shutil.which("bash")
+        if bash is None:
+            pytest.skip("workflow shell is unavailable on this host")
+        result = subprocess.run([bash, "-c", step["run"]], env=env, capture_output=True, text=True)
+        assert (result.returncode == 0) is expected, (full, integration, system, result.stderr)
+
+
+def test_ci_failure_collection_guards_every_independent_step_and_rerun_uploads():
+    import yaml
+
+    jobs = yaml.safe_load(_ci_workflow())["jobs"]
+    expected = {
+        "quick-test": ["Verify generated Pages output", "Lint (deterministic F-rule gate — catches the NameError-under-except class)", "Run browser-module tests (node --test — mirrored by the hermetic commit gate)", "Lint browser modules (ESLint no-undef — CI-only second layer of the acorn gate)", "Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)", "Run tests (serial — real subprocess/port/global-state suites that flake under -n)", "Run tests (size-ratchet lane — blocking here, warning-only locally)", "Guard extracted transport imports stay out of core"],
+        "full-test": ["Run browser-module tests (node --test — mirrored by the hermetic commit gate)", "Lint browser modules (ESLint no-undef — CI-only second layer of the acorn gate)", "Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)", "Run tests (serial — real subprocess/port/global-state suites that flake under -n)", "Run tests (size-ratchet lane — blocking here, warning-only locally)", "Guard extracted transport imports stay out of core"],
+        "marker-guards": ["Guard non-empty browser marker lanes", "Guard non-empty serial marker lane", "Guard non-empty skill_smoke marker lane", "Guard non-empty size_ratchet marker lane"],
+        "ui-smoke": ["Install UI smoke Chromium", "Install full UI smoke WebKit", "Run Publish admission browser proof", "Run host UI smoke", "Run browser tools Chromium/WebKit smoke"],
+        "docker-ui-smoke": ["Install UI smoke browser binaries", "Run Docker UI smoke", "Run Docker browser tools Chromium/WebKit smoke"],
+        "system-e2e-mock": ["Run the keyless system E2E scenario lane (real isolated servers)", "Run the cancellation E-suite mock lane"],
+        "android-test": ["Run Android source and release contract tests", "Compile and verify explicitly test-signed Android host"],
+    }
+    for job, names in expected.items():
+        steps = {step.get("name"): step for step in jobs[job]["steps"]}
+        for name in names:
+            assert "!cancelled()" in str(steps[name].get("if", "")), (job, name)
+    assert "overwrite: true" in _ci_workflow().split("name: Upload build artifact", 1)[1].split("name: Vendor", 1)[0]
+    assert "overwrite: true" in _ci_workflow().split("name: Upload Android release artifacts", 1)[1].split("  release-preflight:", 1)[0]
+
+def test_ci_step_outcome_references_resolve_to_prior_step_ids():
+    import yaml
+
+    jobs = yaml.safe_load(_ci_workflow())["jobs"]
+    pattern = re.compile(r"steps\.([A-Za-z_][A-Za-z0-9_]*)\.outcome")
+    for job_name, job in jobs.items():
+        declared = set()
+        for step in job.get("steps", []):
+            for step_id in pattern.findall(str(step.get("if", ""))):
+                assert step_id in declared, (job_name, step_id)
+            if step.get("id"):
+                declared.add(step["id"])
+
+
 
 
 def test_ci_branch_filters_include_packaging_assets():

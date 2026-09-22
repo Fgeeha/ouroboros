@@ -481,6 +481,18 @@ def _rebind_runtime_roots_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def _reset_custody_memo_between_tests():
+    """The custody row memo is process-local and keyed by events-log path; a test
+    that rewrites its log in place (``write_text``) or reuses a path must never
+    inherit another test's consumed prefix (``delegate_custody_memo``)."""
+    from ouroboros.delegate_custody_memo import reset_custody_memo
+
+    reset_custody_memo()
+    yield
+    reset_custody_memo()
+
+
+@pytest.fixture(autouse=True)
 def _unlatch_supervisor_event_bus_between_tests():
     """A TestClient lifespan runs the server shutdown, whose ``workers.shutdown_event_q()``
     latches ``_EVENT_Q_SHUTDOWN`` for the rest of the xdist worker; the next test in that
@@ -491,6 +503,22 @@ def _unlatch_supervisor_event_bus_between_tests():
     from supervisor import workers
 
     workers._EVENT_Q_SHUTDOWN = False
+    yield
+
+
+@pytest.fixture(autouse=True)
+def _clear_server_stop_flags_between_tests():
+    """The same class as the event-bus latch above: a TestClient lifespan teardown (and the
+    shutdown tests) SET the process-global ``_supervisor_stop`` / ``_restart_requested`` events
+    and nothing clears them, so every later test in that xdist worker that ran the off-thread
+    custody pass saw "this process is stopping" and the pass ended before its first step — red
+    only in the full battery. A test that wants a flag sets it itself."""
+    import sys
+
+    server_process = sys.modules.get("ouroboros.server_process")
+    if server_process is not None:
+        server_process._supervisor_stop.clear()
+        server_process._restart_requested.clear()
     yield
 
 

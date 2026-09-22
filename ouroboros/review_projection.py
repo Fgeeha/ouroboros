@@ -16,7 +16,22 @@ import json
 import copy
 import logging
 from dataclasses import asdict
+from datetime import datetime
 from typing import Any, Dict, List, TYPE_CHECKING
+
+from ouroboros.review_records import review_slot_awaiting, review_slot_unresolved
+
+# A slot released at the dispatch barrier has no transport or parse event:
+# its projection is a gap, never a transport failure or a malformed answer.
+AWAITING_PROJECTION = "awaiting"
+_AWAITING_REASON = "No answer recorded: the host returned at the dispatch barrier before this reviewer answered."
+# The closed vocabulary of a plan review's outcome CLASS at delivery, beside the
+# awaited case above: stamped by owner_hurry.force_plan_decision from the wave's
+# slot census and carried on outcome_axes.execution.plan_review. Nothing branches
+# on it except the two cause renderers (project_dialogue / log_events).
+PLAN_REVIEW_UNANSWERED = "unanswered"      # some answered; some failed, were refused at $0 or are unresolved
+PLAN_REVIEW_NONE_ANSWERED = "none_answered"  # nobody answered and nobody is merely awaited
+PLAN_REVIEW_ANSWERED_OPEN = "answered_open"  # everybody answered; the verdict was not closed
 
 if TYPE_CHECKING:  # annotation-only names; lazy under future annotations, never imported at runtime
     from ouroboros.review_records import ReviewActorRecord, ReviewRequest
@@ -65,11 +80,22 @@ def _public_review_reason(value: Any) -> str:
     return str(_sub().redact_projection(text).value)
 
 
+def awaiting_panel_reason(slot_ids: List[str], configured: int, aggregate: str) -> str:
+    """The one host sentence for the slots of a panel released at the dispatch barrier."""
+    return (f"awaiting {len(slot_ids)} of {configured} reviewer slot(s): {', '.join(slot_ids)}"
+            + (" — no verdict" if aggregate == "DEGRADED" else ""))
+
+
 def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
     row = actor if isinstance(actor, dict) else asdict(actor)
     parsed = row.get("parsed") if isinstance(row.get("parsed"), (dict, list)) else None
+    # The one decision point: a slot is awaited only while it carries no answer. A row that
+    # carries one is judged by its answer, whatever its custody state says.
+    awaiting = review_slot_awaiting(row) and parsed is None and not str(row.get("raw_text") or "").strip()
     usage = row.get("usage") if isinstance(row.get("usage"), dict) else {}
     explicit_parse = str(row.get("parse_status") or "")
+    if explicit_parse == AWAITING_PROJECTION:
+        explicit_parse = ""  # derived state: true only while the row is awaiting, recomputed below
     semantic = str(row.get("semantic_verdict") or "").upper()
     if not semantic and isinstance(parsed, dict):
         semantic = str(parsed.get("verdict") or parsed.get("status") or "").upper()
@@ -82,7 +108,9 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
     )
     error = str(row.get("error") or "")
     transport = str(row.get("transport_status") or "")
-    if not transport:
+    if awaiting:
+        transport = AWAITING_PROJECTION  # the typed state outranks a word stored by an earlier projection
+    elif not transport or transport == AWAITING_PROJECTION:
         not_dispatched = (
             str(row.get("status") or "") == "not_dispatched"
             or str(row.get("operation_state") or "") == "not_dispatched"
@@ -121,6 +149,8 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
             if reason:
                 break
     reason = reason or error or ("Reviewer response was malformed or absent." if not valid else "")
+    if awaiting:
+        reason = _AWAITING_REASON
     model = str(usage.get("resolved_model") or row.get("model") or "")
     provider = str(usage.get("provider") or row.get("provider") or "")
     if not provider:
@@ -145,7 +175,7 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
         "slot_id": str(row.get("slot_id") or ""), "model": model, "provider": provider,
         "actor_role": str(row.get("actor_role") or f"{surface} reviewer"),
         "transport_status": transport,
-        "parse_status": explicit_parse or ("valid" if valid else "malformed"),
+        "parse_status": AWAITING_PROJECTION if awaiting else (explicit_parse or ("valid" if valid else "malformed")),
         "semantic_verdict": semantic if valid else "",
         "outcome_tier": outcome_tier if valid else "",
         "dialogue_status": dialogue_vote if valid else "",
@@ -164,6 +194,17 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
         # Flat, redacted pointer to the private full response artifact.
         "response_ref": _response_ref_projection(row.get("response_ref")),
     }
+    # Since when this row has been waiting, published only where the host wrote
+    # a real instant on a row the two wait predicates still call unanswered. An
+    # absent key is a hole, never a back-filled or inferred moment.
+    if awaiting or review_slot_unresolved(row):
+        since = str(row.get("awaiting_since") or "").strip()
+        try:
+            datetime.fromisoformat(since)
+        except ValueError:
+            pass
+        else:
+            projection["awaiting_since"] = since
     # Structured rows ride only where a parsed response exists: an absent
     # `findings` key is a hole, never the claim "zero findings reported".
     if parsed is not None:
@@ -263,7 +304,9 @@ def compact_review_projection(review_runs: Any) -> Dict[str, Any]:
         policy = request.get("policy") if isinstance(request.get("policy"), dict) else {}
         min_successful = max(1, int(policy.get("min_successful_slots") or 1))
         contributing = sum(1 for actor in actors if actor["quorum_contribution"])
-        transport_statuses = [actor["transport_status"] for actor in actors]
+        awaited = [actor["slot_id"] for actor in actors if actor["transport_status"] == AWAITING_PROJECTION]
+        collected = [actor for actor in actors if actor["transport_status"] != AWAITING_PROJECTION]
+        transport_statuses = [actor["transport_status"] for actor in collected]
         transport = (
             "success" if transport_statuses and all(s == "success" for s in transport_statuses)
             else ("partial" if "success" in transport_statuses else (
@@ -272,16 +315,35 @@ def compact_review_projection(review_runs: Any) -> Dict[str, Any]:
                       else "provider_transport_error")
             ))
         )
+        parse = "valid" if collected and all(a["parse_status"] == "valid" for a in collected) else "malformed"
         reasons = raw_run.get("degraded_reasons") if isinstance(raw_run.get("degraded_reasons"), list) else []
+        reasons = [str(item) for item in reasons]
+        aggregate = str(raw_run.get("aggregate_signal") or "UNKNOWN").upper()
+        if awaited:
+            # The panel words follow the typed rows, so a run-level word recorded for an
+            # awaited slot cannot outlive it. Awaited slots speak for the panel only when
+            # every collected slot is clean; a real failure beside a wait keeps its own word.
+            transport = AWAITING_PROJECTION if (not collected or transport == "success") else transport
+            parse = AWAITING_PROJECTION if (not collected or parse == "valid") else parse
+            note = awaiting_panel_reason(awaited, len(actors), aggregate)
+            reason = "; ".join([note] + [
+                item for item in reasons if item != note and item.split(":", 1)[0] not in awaited
+            ])
+        else:
+            transport = str(raw_run.get("transport_status") or transport)
+            parse = str(raw_run.get("parse_status") or parse)
+            # v6.74.0 (A6): the fallback reason is the structured panel_reason
+            # reducer — it names the real blocker (tier + finding / degraded
+            # causes) instead of an opaque aggregate label. An explicitly
+            # recorded reason still wins.
+            reason = str(raw_run.get("reason") or "; ".join(reasons) or _sub().panel_reason(raw_run))
         panel: Dict[str, Any] = {
             "panel_id": str(raw_run.get("panel_id") or f"panel_{index + 1}"),
             "surface": surface,
             "authority": str(raw_run.get("authority") or "unspecified"),
-            "aggregate_signal": str(raw_run.get("aggregate_signal") or "UNKNOWN").upper(),
-            "transport_status": str(raw_run.get("transport_status") or transport),
-            "parse_status": str(raw_run.get("parse_status") or (
-                "valid" if actors and all(a["parse_status"] == "valid" for a in actors) else "malformed"
-            )),
+            "aggregate_signal": aggregate,
+            "transport_status": transport,
+            "parse_status": parse,
             "coverage": {
                 "actors_configured": len(actors),
                 "transport_success": sum(1 for actor in actors if actor["transport_status"] == "success"),
@@ -289,14 +351,7 @@ def compact_review_projection(review_runs: Any) -> Dict[str, Any]:
                 "quorum_contributing": contributing,
             },
             "quorum": {"required": min_successful, "contributed": contributing, "configured": len(actors)},
-            # v6.74.0 (A6): the fallback reason is the structured panel_reason
-            # reducer — it names the real blocker (tier + finding / degraded
-            # causes) instead of an opaque aggregate label. An explicitly
-            # recorded reason still wins.
-            "reason": _public_review_reason(
-                str(raw_run.get("reason") or "; ".join(str(item) for item in reasons)
-                    or _sub().panel_reason(raw_run)),
-            ),
+            "reason": _public_review_reason(reason),
             "enforcement_impact": _review_enforcement_impact(raw_run),
             "actors": actors,
             "superseded": bool(raw_run.get("superseded_by_revision")),

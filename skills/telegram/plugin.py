@@ -30,7 +30,7 @@ from .lib.telegram_state import (
     _state_file, _load_settings, _is_silent_mode_enabled,
     _get_silent_msg, _set_silent_msg, _clear_silent_msg, _subagent_cards_enabled,
     _mirror_progress_enabled, _render_subagent_card, _data_dir,
-    _jsonl_tail, _load_runtime_state, _read_json_file,
+    _jsonl_tail, _load_runtime_state, _read_json_file, _child_row_held_for_root,
 )
 from .lib import telegram_inbound, telegram_quiz
 from .lib.telegram_health import _collect_health, _build_menu_tasks
@@ -1038,6 +1038,14 @@ def _make_outbound(api):
                     await _render_subagent_card(api, client, chat_id, event, sub_event, lang)
                 return
 
+            # Card-internal host rows: the web shows them inside a task card, and
+            # this transport has none. A child's row stays out while its root is
+            # unfinished (the lifecycle bubble above keeps saying `failed`, the
+            # root accounts for its children). A root's own placed row is an
+            # ordinary progress note here and follows the progress toggle below.
+            if _child_row_held_for_root(api, event):
+                return
+
             # Generic (non-subagent) progress telemetry → dropped by default; the
             # typing indicator already signals "working". Opt in via the toggle.
             if event.get("is_progress") and not _mirror_progress_enabled(local_settings):
@@ -1059,7 +1067,7 @@ def _make_outbound(api):
                 labels = [label for label in labels if label][:8]
                 if not labels:
                     return
-                lines = ["I couldn't pick a destination for your last message. Options:"]
+                lines = ["Choose a target for the last message:"]
                 lines.extend(f"{index}. {label}" for index, label in enumerate(labels, 1))
                 if len(raw_options) > len(labels):
                     lines.append(f"…and {len(raw_options) - len(labels)} more in the web chat.")
@@ -1426,9 +1434,11 @@ def register(api):
                          "placeholder": "on"},
                         {"name": "TELEGRAM_NOTIFY_TASKS", "label": "Notify on task completion", "type": "select",
                          "options": [
-                             {"value": "off", "label": "Off"},
+                             {"value": "off", "label": "Off — non-clean finishes only"},
                              {"value": "on", "label": "On — ✅ Task done · cost · rounds"},
                          ],
+                         "help": "A task that ends with warnings, fails or is cancelled always sends one short "
+                                 "line, because Telegram has no task card. On adds the clean finishes.",
                          "placeholder": "off"},
                         {"name": "TELEGRAM_NOTIFY_BUDGET", "label": "Notify on budget thresholds", "type": "select",
                          "options": [

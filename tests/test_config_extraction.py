@@ -24,9 +24,17 @@ _LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes,
 # the historical extraction's facade and need not add compatibility re-exports.
 _ADDED_OWNERS = {
     "WORKER_READY_CEILING_SEC": runtime_limits,
+    # The two bounds of the usage ledger's display (stale-while-revalidate) read path.
+    "USAGE_DISPLAY_LOCK_TIMEOUT_SEC": runtime_limits,
+    "USAGE_DISPLAY_REVALIDATE_AFTER_SEC": runtime_limits,
     "IMMEDIATE_SETTINGS": settings_scales,
     "RESTART_REQUIRED_SETTINGS": settings_scales,
     "get_finalization_grace_sec": runtime_limits,
+    "PROMOTE_CONFIRM_WAIT_SEC": runtime_limits,
+    "get_promote_confirm_wait_sec": runtime_limits,
+    "ROUTING_MANIFEST_RESULT_ROWS": runtime_limits,
+    "get_routing_manifest_result_rows": runtime_limits,
+    "get_model_substitution_redos": runtime_limits,
     "NETWORK_WAIT_BACKOFF_MAX_SEC": runtime_limits,
     "MODEL_ACCOUNTS_KEY": model_slots,
     "MODEL_CONTEXT_WINDOWS_KEY": model_slots,
@@ -58,6 +66,9 @@ _ADDED_OWNERS = {
     "get_bg_wakeup_max_sec": runtime_limits,
     # Governance tiers: the share of a reviewer's usable window tier-2 documents may take inline.
     "REVIEW_GOVERNANCE_INLINE_SHARE": runtime_limits,
+    # The pooled worker's short acceptance-fence ack wait (one wait, one re-send, then a typed unknown).
+    "ACCEPTANCE_FENCE_ACK_WAIT_SEC": runtime_limits,
+    "get_acceptance_fence_ack_wait_sec": runtime_limits,
 }
 
 _MOVED_OWNERS = {

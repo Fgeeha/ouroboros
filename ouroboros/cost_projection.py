@@ -213,9 +213,11 @@ def live_root_cost_projection(
     try:
         from ouroboros.usage_accounting import usage_projection
 
+        # Every root heartbeat runs this on the supervisor loop: a contended ledger lock
+        # serves the last validated snapshot, it never parks the loop behind money.
         usage = usage_projection(
             pathlib.Path(task.get("budget_drive_root") or drive_root),
-            root_task_id=str(lineage["root_task_id"] or task_id),
+            root_task_id=str(lineage["root_task_id"] or task_id), allow_stale=True,
         )
         # A root-filtered summary with no attributable rows is an empty view,
         # not measured zero.  The task-detail reader applies the same rule:

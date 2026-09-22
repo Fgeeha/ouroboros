@@ -192,16 +192,14 @@ def prepare_terminal_send_event(
         usage["delegate_terminal_reconciliation"] = current["delegate_terminal_reconciliation"]
     origin = str(usage.get("terminal_origin") or "")
     notice = str(usage.get("terminal_provider_notice") or "")
-    # Two facts, two rows: the base host notice keeps the untyped System row a
-    # replayed card concludes on, and current delegated custody travels in its
-    # own field so the delivery seam can type it as a card row (#1006).
-    host_notice = str(usage.get("terminal_host_notice") or "")
+    # One voice: the host disclosure stays a typed field OF THE RESULT (CLI
+    # stderr, --jsonl, parent handoff, reviewers, synthesis, the child-result
+    # hash) and never becomes a second chat row. Current delegated custody
+    # still travels in its own field so the delivery seam can type it as a
+    # card row (#1006).
     custody_notice = terminal_custody_notice_text(usage)
-    if not presence:
-        if host_notice:
-            send_event["terminal_host_notice"] = host_notice
-        if custody_notice:
-            send_event["terminal_custody_notice"] = custody_notice
+    if not presence and custody_notice:
+        send_event["terminal_custody_notice"] = custody_notice
     if origin not in _STAMPED_TERMINAL_ORIGINS:
         return send_event
     canonical_root = pathlib.Path(task.get("budget_drive_root") or env_drive_root)
@@ -240,6 +238,9 @@ def terminal_result_fields(usage: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("terminal_provider_notice", "terminal_host_notice"):
         if isinstance(usage.get(key), str) and usage[key]:
             fields[key] = usage[key]
+    handovers = usage.get("authoring_handovers")
+    if isinstance(handovers, list) and handovers:
+        fields["authoring_handovers"] = handovers
     return fields
 
 

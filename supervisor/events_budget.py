@@ -106,7 +106,8 @@ def _handle_llm_usage(evt: Dict[str, Any], ctx: Any) -> None:
     }
     projection_update_status = "available"
     try:
-        ctx.update_budget_from_usage(usage_for_budget)
+        if ctx.update_budget_from_usage(usage_for_budget) is False:
+            projection_update_status = "unavailable"
     except Exception:
         projection_update_status = "unavailable"
         log.error("Paid llm_usage retained but compatibility projection update failed", exc_info=True)

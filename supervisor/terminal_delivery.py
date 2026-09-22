@@ -693,7 +693,6 @@ def build_completed_result_event(
     note = unreconciled_runs_note(runs).lstrip("\n")
     if note and any(run not in custody for run in runs):
         custody = "\n\n".join(part for part in (note, custody) if part)
-    base_notice = str((stored or {}).get("terminal_host_notice") or "")
     event = {
         "type": "send_message",
         "chat_id": chat_id,
@@ -702,7 +701,6 @@ def build_completed_result_event(
         # A re-delivered copy that drops markdown renders as a different message.
         "format": "markdown",
         "delivery_id": delivery_id_for(tid, core_text),
-        **({"terminal_host_notice": base_notice} if base_notice else {}),
         **({"terminal_custody_notice": custody} if custody else {}),
     }
     return project_terminal_result_event(
@@ -726,7 +724,8 @@ def project_terminal_result_event(
     """Project one terminal event from producer-stamped origin.
 
     ``host_salvage`` becomes one short keyed plain System receipt (inherited
-    ``format``/``log_text`` dropped; the full bytes stay in task details).
+    ``format``/``log_text`` dropped; the full bytes stay in task details); a
+    subagent's receipt also names its card placement, a root's does not.
     ``host_notice`` is a text the host wrote alone, so it keeps its OWN words
     and inherited markdown and becomes a System row WITHOUT a system_type,
     which is what lets a replayed card conclude on it. ``model_final`` and a
@@ -755,6 +754,15 @@ def project_terminal_result_event(
         if salvage:
             event.pop("log_text", None)
             event.pop("format", None)
+            # A child's receipt is a row of that child's card. The row id derives
+            # from the delivery id, so the live send, the owed outbox row and
+            # its replay all name one row.
+            from ouroboros.subagent_messages import subagent_message_meta
+
+            meta = event.get("progress_meta") if isinstance(event.get("progress_meta"), dict) else {}
+            if subagent_message_meta(task) or subagent_message_meta(meta):
+                event["progress_meta"] = {**meta, "card_row": "timeline",
+                                          "card_row_id": event["delivery_id"] + ":terminal_incident"}
         return event
     if origin == TERMINAL_ORIGIN_MODEL_FINAL:
         event["terminal_origin"] = TERMINAL_ORIGIN_MODEL_FINAL
@@ -1289,12 +1297,21 @@ def _persist_cancel_receipt(
             block["unreconciled_runs"] = runs
         try:
             from ouroboros.cancel_intents import active_intent
+            from ouroboros.task_results import load_task_result
 
-            reason = str((active_intent(pathlib.Path(drive_root), tid) or {}).get("reason") or "")
-            if reason:
-                block["stop_reason"] = reason
+            # The cause outlives the intent: once custody settles, `cancel_origin`
+            # on the stored result is where the same scalars live, and a receipt
+            # rebuilt after the settle must name the stop the owner actually made.
+            cause = active_intent(pathlib.Path(drive_root), tid) or {}
+            if not cause:
+                stored = load_task_result(pathlib.Path(drive_root), tid) or {}
+                origin = stored.get("cancel_origin")
+                cause = origin if isinstance(origin, dict) else {}
+            for key, field in (("reason", "stop_reason"), ("requested_at", "stop_requested_at")):
+                if cause.get(key):
+                    block[field] = str(cause[key])
         except Exception:
-            log.debug("cancel-receipt intent reason read failed for %s", tid, exc_info=True)
+            log.debug("cancel-receipt stop cause read failed for %s", tid, exc_info=True)
 
         def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             if not isinstance(current, dict) or not current:

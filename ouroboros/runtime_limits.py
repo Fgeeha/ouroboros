@@ -113,6 +113,13 @@ def get_per_call_timeout_ceiling_sec() -> int:
     return _clamped_number_setting("OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC", low=1, cast=int)
 
 
+def get_model_substitution_redos() -> int:
+    """How many times one round may be asked again after the route served ANOTHER
+    model. Each redo is a new operation, so the ceiling is small on purpose: the
+    configured model fallback chain owns the case where the whole pool substitutes."""
+    return _clamped_number_setting("OUROBOROS_SERVED_MODEL_REDOS", low=0, high=5, cast=int)
+
+
 def get_restart_drain_max_sec() -> int:
     return _clamped_number_setting(
         "OUROBOROS_RESTART_DRAIN_MAX_SEC", low=0, cast=lambda v: int(float(v)))
@@ -181,6 +188,39 @@ def get_settings_document_lock_timeout_sec() -> int:
 def get_direct_turn_stop_wait_sec() -> float:
     """How long custody waits for a stopped direct-chat turn to reach its next round boundary."""
     return _clamped_number_setting("OUROBOROS_DIRECT_TURN_STOP_WAIT_SEC", low=0, high=10, cast=float)
+
+
+# How long a pooled worker waits for ONE answer to an acceptance-fence request; it re-sends
+# the same request once and waits this long again, then the outcome is a typed unknown. Short
+# by design: the idle rail does not count heartbeats as progress, so this wait is never
+# lengthened to ride out a stalled supervisor. Structural, not a settings key.
+ACCEPTANCE_FENCE_ACK_WAIT_SEC = 10.0
+
+
+def get_acceptance_fence_ack_wait_sec() -> float:
+    return ACCEPTANCE_FENCE_ACK_WAIT_SEC
+
+
+# How long a routing verb waits for the supervisor's DURABLE admission receipt before it
+# reports an unconfirmed promote/route. Short by design: the cure for a busy supervisor is
+# the reconciliation read of the emitted admission, never a longer wait. Structural, not a
+# settings key; the tool layer and the gateway dispatcher share this one bound.
+PROMOTE_CONFIRM_WAIT_SEC = 15.0
+
+
+def get_promote_confirm_wait_sec() -> float:
+    return PROMOTE_CONFIRM_WAIT_SEC
+
+
+# How many of a lane's newest ROOT results one routing manifest offers as continuation
+# candidates. A HINT window: what promote ACCEPTS is a predicate (same project, a root, a
+# readable result, not live), so a root older than this window stays addressable in its own
+# room. Structural, not a settings key.
+ROUTING_MANIFEST_RESULT_ROWS = 16
+
+
+def get_routing_manifest_result_rows() -> int:
+    return ROUTING_MANIFEST_RESULT_ROWS
 
 
 def get_vision_caption_timeout_sec() -> int:
@@ -282,6 +322,16 @@ CONSCIOUSNESS_AUTONOMY_LEVELS = ("observe", "act", "full")
 # (``consciousness_allowance``, a 24 h window) reads. Twice the window, so a root that
 # spent inside the window is still attributable when the window closes.
 USAGE_LEDGER_FOLD_MIN_AGE_SEC = 48 * 3600
+# A DISPLAY reader of the usage ledger (heartbeat cost fields, the ``llm_usage`` budget
+# refresh, loop-thread budget pre-checks, ``/api/state``, the cost views) waits at most
+# this long for the monetary lock, then serves the last validated snapshot: a 45 s wait on
+# the supervisor loop or a gateway thread starves every worker behind it. Money never
+# reads through this bound — ``reserve_attempt`` keeps the full monetary timeout.
+USAGE_DISPLAY_LOCK_TIMEOUT_SEC = 0.25
+# After one contended display read, further display reads of that ledger serve the
+# snapshot without touching the lock for this long, so a sustained write convoy costs a
+# display thread about one bounded attempt per second instead of one per read.
+USAGE_DISPLAY_REVALIDATE_AFTER_SEC = 1.0
 
 
 def get_consciousness_autonomy() -> str:

@@ -141,6 +141,7 @@ from ouroboros.runtime_limits import (
     get_per_call_timeout_ceiling_sec,  # noqa: F401
     get_plan_task_deadline_min_sec,  # noqa: F401
     get_post_task_evolution_budget_usd,  # noqa: F401
+    get_model_substitution_redos,  # noqa: F401
     get_restart_drain_max_sec,  # noqa: F401
     get_safety_call_timeout_sec,  # noqa: F401
     get_settings_document_lock_timeout_sec,  # noqa: F401

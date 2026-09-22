@@ -29,6 +29,7 @@ from ouroboros.contracts.task_contract import (
     normalize_allowed_resources,
 )
 from ouroboros.headless import prepare_task_drive, task_state_dir
+from ouroboros.subagent_history import snapshot_handle
 from ouroboros.subagent_runtime import (
     SubagentSelectionError,
     effective_runtime_subagent_settings,
@@ -251,7 +252,8 @@ def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> s
     configured = emission.get("configured_subagent") if isinstance(
         emission.get("configured_subagent"), dict
     ) else {}
-    selected_id = str(configured.get("selected_subagent_id") or "")
+    # Model-facing name: the snapshot's own handle; the stored key stays in durable records.
+    selected_name = snapshot_handle(configured) if configured else ""
     selected_route = configured.get("route") if isinstance(configured.get("route"), dict) else {}
     route_kind = str(selected_route.get("kind") or "")
     legacy_selection = bool(emission.get("legacy_selection"))
@@ -318,13 +320,13 @@ def _finalize_schedule_emission(ctx: ToolContext, emission: Dict[str, Any]) -> s
         if legacy_selection else ""
     )
     access_note = (
-        f"\naccess={emission['requested_access']!r} ignored for subagent_id={selected_id!r} "
+        f"\naccess={emission['requested_access']!r} ignored for subagent_id={selected_name!r} "
         "(api_model); write_surface controls read/write authority."
         if route_kind == "api_model" and emission.get("requested_access") is not None else ""
     )
     return (
         f"Subagent request queued {task_ids[0]}: {objective} "
-        f"(subagent_id={selected_id}, route={route_kind}, {commitment})"
+        f"(subagent_id={selected_name}, route={route_kind}, {commitment})"
         f"{worker_note}{slot_note}{profile_note}{coop_note}{legacy_note}{access_note}"
     )
 
@@ -670,18 +672,18 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
             current_depth=current_depth, new_depth=new_depth, max_depth=max_depth,
         )
 
+    current_task_id = str(getattr(ctx, "task_id", "") or "")
     if getattr(ctx, 'is_direct_chat', False):
-        from ouroboros.utils import append_jsonl
         try:
             append_jsonl(ctx.drive_logs() / "events.jsonl", {
                 "ts": utc_now_iso(),
                 "type": "schedule_task_from_direct_chat",
+                "task_id": current_task_id,
                 "description": objective[:200],
                 "warning": "schedule_subagent called from direct chat context — potential duplicate work",
             })
         except Exception:
             pass
-    current_task_id = str(getattr(ctx, "task_id", "") or "")
     parent_task_id = str(current_task_id or metadata.get("parent_task_id") or "").strip()
     root_task_id_seed = str(metadata.get("root_task_id") or current_task_id or "").strip()
     session_id = str(metadata.get("session_id") or "")
