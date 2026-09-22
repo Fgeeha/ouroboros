@@ -668,23 +668,6 @@ def _startup_custody_sweep() -> None:
                      report=sweep_settled_delegate_state(DATA_DIR))
     except Exception:
         log.debug("Delegate state sweep failed", exc_info=True)
-    try:
-        # CPL-5 reverse direction (model_send only): every seal joins exactly
-        # one accounting attempt, every seam-sealed dispatched attempt still
-        # resolves to its durable seal. Orphans on either side become typed
-        # facts — the sweep deletes nothing and fabricates nothing, so there is
-        # no destructive conclusion for an UNKNOWN state to skip (it skips the
-        # whole pass instead when the ledger is unreadable).
-        from ouroboros.model_send_seal import reconcile_model_send_seals
-
-        seal_report = reconcile_model_send_seals(DATA_DIR)
-        if seal_report.get("facts_written"):
-            log.warning(
-                "model_send invariant reconciliation wrote %d typed fact(s): %s",
-                seal_report["facts_written"], seal_report,
-            )
-    except Exception:
-        log.debug("model_send seal reconciliation failed", exc_info=True)
 
 
 def _prune_delegated_snapshots() -> None:

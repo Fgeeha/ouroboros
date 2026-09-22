@@ -18,17 +18,17 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D08 | Supervisor: queue, workers, events & runtime control | 47 | 0 |
 | D09 | Cancellation, owner control & process custody | 13 | 0 |
 | D10 | Git, update & release machinery | 28 | 0 |
-| D11 | Gateway, server & Web UI | 55 | 0 |
+| D11 | Gateway, server & Web UI | 56 | 0 |
 | D12 | Settings & configuration | 15 | 0 |
 | D13 | Safety, guards & runtime mode | 9 | 0 |
-| D14 | Skills & extensions | 54 | 0 |
+| D14 | Skills & extensions | 56 | 0 |
 | D15 | Memory, knowledge, consciousness & self-evolution | 21 | 0 |
 | D16 | Observability, usage accounting & cost | 11 | 0 |
 | D17 | Projects, workspaces & task results | 22 | 0 |
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **561** | **0** |
+| **total** | | **564** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -603,6 +603,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/server_routing_context.py`
 - `ouroboros/server_runtime.py`
 - `ouroboros/server_web.py`
+- `ouroboros/startup_historical_audit.py`
 - `server.py`
 
 ### D12 — Settings & configuration
@@ -662,12 +663,14 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/marketplace/isolated_deps.py`
 - `ouroboros/marketplace/ouroboroshub.py`
 - `ouroboros/marketplace/provenance.py`
+- `ouroboros/skill_conflicts.py`
 - `ouroboros/skill_dependencies.py`
 - `ouroboros/skill_lifecycle_actions.py`
 - `ouroboros/skill_lifecycle_queue.py`
 - `ouroboros/skill_loader.py`
 - `ouroboros/skill_owner_attestation.py`
 - `ouroboros/skill_payload_binding.py`
+- `ouroboros/skill_peer_inventory.py`
 - `ouroboros/skill_publish_eligibility.py`
 - `ouroboros/skill_publish_github.py`
 - `ouroboros/skill_publish_result.py`
