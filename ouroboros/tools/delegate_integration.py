@@ -703,7 +703,7 @@ def _payload_delegation_busy(drive: pathlib.Path, target: pathlib.Path) -> str:
     from ouroboros.delegate_terminal import _task_is_terminal
 
     resolved = _resolved(target)
-    rows = list(custody._iter_rows(custody.event_log_path(drive)))
+    rows = list(custody.custody_rows(drive))
     for run in custody.replay(drive, rows=rows).values():
         if (run.authority_source == "skill_payload"
                 and _resolved(run.target_root) == resolved

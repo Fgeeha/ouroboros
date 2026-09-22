@@ -849,11 +849,12 @@ def hot_store_growth_notes(env: Any) -> list:
         notes.append(
             "WARNING: HOT STORE GROWTH — the events chain (logs/events.jsonl + "
             f"archive/events_*.jsonl) totals {events_chain_size / 1_000_000:.1f} MB "
-            f"(threshold {EVENTS_ARCHIVE_SCAN_WARN_BYTES // 1_000_000} MB). Custody "
-            "replay scans this chain on ownership questions. Legacy segments retain "
-            "inline delegated request bodies; new start rows reference the observability "
-            "store, without shrinking existing history. Investigate chain "
-            "indexing/compaction; archives are durable history and are never deleted."
+            f"(threshold {EVENTS_ARCHIVE_SCAN_WARN_BYTES // 1_000_000} MB). Each process's "
+            "first custody read folds this whole chain into its row memo (later reads fold "
+            "only appended bytes); forensic and retirement scans still walk it. Legacy "
+            "segments retain inline delegated request bodies; new start rows reference the "
+            "observability store, without shrinking existing history. Investigate a durable "
+            "compact custody projection; archives are durable history and are never deleted."
         )
     from ouroboros.context_budget import RETAINED_EXECUTION_DRIVES_WARN_COUNT
     from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR

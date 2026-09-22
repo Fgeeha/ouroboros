@@ -481,6 +481,18 @@ def _rebind_runtime_roots_between_tests():
 
 
 @pytest.fixture(autouse=True)
+def _reset_custody_memo_between_tests():
+    """The custody row memo is process-local and keyed by events-log path; a test
+    that rewrites its log in place (``write_text``) or reuses a path must never
+    inherit another test's consumed prefix (``delegate_custody_memo``)."""
+    from ouroboros.delegate_custody_memo import reset_custody_memo
+
+    reset_custody_memo()
+    yield
+    reset_custody_memo()
+
+
+@pytest.fixture(autouse=True)
 def _unlatch_supervisor_event_bus_between_tests():
     """A TestClient lifespan runs the server shutdown, whose ``workers.shutdown_event_q()``
     latches ``_EVENT_Q_SHUTDOWN`` for the rest of the xdist worker; the next test in that

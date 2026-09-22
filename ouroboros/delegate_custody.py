@@ -18,6 +18,7 @@ owner indistinguishable from an intruder.
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import logging
@@ -536,16 +537,40 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         custody.settled = True
 
 
+def _fold_rows(rows: Any) -> Dict[str, RunCustody]:
+    state: Dict[str, RunCustody] = {}
+    for row in rows:
+        _apply(state, row)
+    return state
+
+
+
+
+def custody_rows(drive_root: Any) -> Tuple[Dict[str, Any], ...]:
+    """Every custody row of the chain, served from the process-local memo.
+
+    The same rows ``_iter_rows`` yields (inline request bodies replaced by a
+    locator), advanced by the bytes appended since the last read and refolded
+    on any fingerprint doubt (``delegate_custody_memo``). Read-only.
+    """
+    from ouroboros.delegate_custody_memo import custody_rows as _memo_rows
+
+    return _memo_rows(drive_root)
+
+
 def replay(drive_root: Any,
            rows: Optional[List[Dict[str, Any]]] = None) -> Dict[str, RunCustody]:
     """Rebuild every known run's custody from the durable rows (one pass).
 
     ``rows`` replays a pre-read snapshot so several projections can share ONE
-    consistent traversal (the atomic payload busy claim, gate fix 5a)."""
-    state: Dict[str, RunCustody] = {}
-    for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
-        _apply(state, row)
-    return state
+    consistent traversal (the atomic payload busy claim, gate fix 5a). Without
+    ``rows`` the fold runs over the memo's rows and is cached per memo
+    generation; the returned objects are always this caller's own copies."""
+    if rows is not None:
+        return _fold_rows(rows)
+    from ouroboros.delegate_custody_memo import clone_custody_state, folded_state
+
+    return folded_state(drive_root, _fold_rows, clone_custody_state)
 
 def lookup(drive_root: Any, task_id: str, run_id: str) -> Tuple[str, Optional[RunCustody]]:
     """Answer OWNED / FOREIGN / UNKNOWN for ``run_id`` as seen by ``task_id``."""
@@ -676,7 +701,7 @@ def run_timing(drive_root: Any, run_id: str) -> Tuple[str, int]:
     started_ts, max_seconds = "", 0
     if not rid:
         return started_ts, max_seconds
-    for row in _iter_rows(event_log_path(drive_root)):
+    for row in custody_rows(drive_root):
         if str(row.get("run_id") or "") != rid or str(row.get("type") or "") != STARTED:
             continue
         started_ts = started_ts or str(row.get("ts") or "")
@@ -745,7 +770,7 @@ def invocation_record(drive_root: Any, invocation_id: str, *,
         return None
     found: Optional[Dict[str, Any]] = None
     state, run_id = "pending", ""
-    for row in rows if rows is not None else _iter_rows(event_log_path(drive_root)):
+    for row in rows if rows is not None else custody_rows(drive_root):
         if str(row.get("invocation_id") or "") != target:
             continue
         kind = str(row.get("type") or "")
@@ -777,15 +802,16 @@ def invocation_record(drive_root: Any, invocation_id: str, *,
                 "baseline_sha": str(row.get("baseline_sha") or ""),
                 "target_root": str(row.get("target_root") or ""),
                 "authority_source": str(row.get("authority_source") or ""),
-                "resource_ref": row.get("resource_ref") if isinstance(row.get("resource_ref"), dict) else {},
+                # A copy: the source rows may be the shared, read-only custody memo.
+                "resource_ref": copy.deepcopy(row.get("resource_ref")) if isinstance(row.get("resource_ref"), dict) else {},
                 "selected_subagent_id": str(row.get("selected_subagent_id") or ""),
                 "config_fingerprint": str(row.get("config_fingerprint") or ""),
                 "work_order_fingerprint": str(row.get("work_order_fingerprint") or ""),
                 "work_order_coverage": str(row.get("work_order_coverage") or ""),
                 "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
-                "processing": row.get("processing") if isinstance(row.get("processing"), dict) else {},
+                "processing": copy.deepcopy(row.get("processing")) if isinstance(row.get("processing"), dict) else {},
                 "work_order_source_request": (
-                    row.get("work_order_source_request")
+                    copy.deepcopy(row.get("work_order_source_request"))
                     if isinstance(row.get("work_order_source_request"), dict) else {}
                 ),
             }
