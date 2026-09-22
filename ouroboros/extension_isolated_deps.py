@@ -25,6 +25,13 @@ class _ExecutionBarrier:
     and blocks new readers once it declares intent.  Ownership is deliberately
     not associated with a thread or task, preserving the old non-reentrant
     scope contract and avoiding ContextVar inheritance across child tasks.
+
+    A lease may also carry a ``key`` — the skill it executes.  Leases of the
+    SAME key never overlap: the old exclusive lock serialized every handler,
+    and a bundled consumer (the Telegram card renderer) relies on its own
+    callbacks running one after another.  Independent skills still overlap;
+    only the cross-skill exclusion was the #1195 F3 defect, never the per-skill
+    ordering a skill author may assume.
     """
 
     def __init__(self) -> None:
@@ -32,37 +39,51 @@ class _ExecutionBarrier:
         self.readers = 0
         self.writer_active = False
         self.writers_waiting = 0
+        self.active_keys: set[str] = set()
 
-    def try_enter(self, writer: bool) -> bool:
+    def try_enter(self, writer: bool, key: str | None = None) -> bool:
         with self.condition:
+            if key is not None and key in self.active_keys:
+                return False
             if writer:
                 if self.writer_active or self.readers:
                     return False
                 self.writer_active = True
-                return True
-            if self.writer_active or self.writers_waiting:
-                return False
-            self.readers += 1
+            else:
+                if self.writer_active or self.writers_waiting:
+                    return False
+                self.readers += 1
+            if key is not None:
+                self.active_keys.add(key)
             return True
 
-    def acquire(self, blocking: bool = True, *, writer: bool = True) -> bool:
+    def acquire(self, blocking: bool = True, *, writer: bool = True, key: str | None = None) -> bool:
         if not blocking:
-            return self.try_enter(writer)
+            return self.try_enter(writer, key)
         with self.condition:
+            def key_free() -> bool:
+                return key is None or key not in self.active_keys
+
             if writer:
                 self.writers_waiting += 1
                 try:
-                    self.condition.wait_for(lambda: not self.writer_active and self.readers == 0)
+                    self.condition.wait_for(
+                        lambda: not self.writer_active and self.readers == 0 and key_free()
+                    )
                     self.writer_active = True
                 finally:
                     self.writers_waiting -= 1
                     self.condition.notify_all()
             else:
-                self.condition.wait_for(lambda: not self.writer_active and not self.writers_waiting)
+                self.condition.wait_for(
+                    lambda: not self.writer_active and not self.writers_waiting and key_free()
+                )
                 self.readers += 1
+            if key is not None:
+                self.active_keys.add(key)
             return True
 
-    def release(self, *, writer: bool = True) -> None:
+    def release(self, *, writer: bool = True, key: str | None = None) -> None:
         with self.condition:
             if writer:
                 if not self.writer_active:
@@ -72,6 +93,8 @@ class _ExecutionBarrier:
                 if self.readers <= 0:
                     raise RuntimeError("execution reader lease released without enter")
                 self.readers -= 1
+            if key is not None:
+                self.active_keys.discard(key)
             self.condition.notify_all()
 
 
@@ -352,12 +375,20 @@ def _release_site_dirs_best_effort(site_dirs: Sequence[str]) -> None:
         log.warning("isolated dependency scope cleanup failed after body success: %s", exc)
 
 
-async def _acquire_execution_barrier_async(*, writer: bool) -> None:
+def _scope_key(skill_dir: pathlib.Path) -> str:
+    """One key per skill payload; two spellings of one directory are one skill."""
+    try:
+        return str(pathlib.Path(skill_dir).resolve())
+    except OSError:
+        return str(skill_dir)
+
+
+async def _acquire_execution_barrier_async(*, writer: bool, key: str | None = None) -> None:
     if writer:
         with _execution_lock.condition:
             _execution_lock.writers_waiting += 1
     try:
-        while not _execution_lock.try_enter(writer):
+        while not _execution_lock.try_enter(writer, key):
             await asyncio.sleep(0.01)
         # No await between grant and the caller's try/finally: cancellation can
         # only be delivered while polling or inside the protected scope body.
@@ -372,13 +403,15 @@ async def _acquire_execution_barrier_async(*, writer: bool) -> None:
 def isolated_site_dirs_scope(skill_dir: pathlib.Path, *, enabled: bool) -> Iterator[None]:
     """Expose reviewed deps in a local reader/writer isolation scope.
 
-    No-deps scopes are readers and overlap.  A deps-bearing scope is a writer:
-    it excludes readers while the shared ``sys.path`` is changed and cleaned.
-    Both leases remain non-reentrant and last through handler waits and cleanup.
+    No-deps scopes are readers and overlap ACROSS skills; the scopes of one
+    skill run one at a time.  A deps-bearing scope is a writer: it excludes
+    readers while the shared ``sys.path`` is changed and cleaned.  Both leases
+    remain non-reentrant and last through handler waits and cleanup.
     """
 
     writer = bool(enabled)
-    _execution_lock.acquire(writer=writer)
+    key = _scope_key(skill_dir)
+    _execution_lock.acquire(writer=writer, key=key)
     site_dirs: List[str] = []
     try:
         site_dirs = inject_isolated_site_dirs(skill_dir) if enabled else []
@@ -387,7 +420,7 @@ def isolated_site_dirs_scope(skill_dir: pathlib.Path, *, enabled: bool) -> Itera
         try:
             _release_site_dirs_best_effort(site_dirs)
         finally:
-            _execution_lock.release(writer=writer)
+            _execution_lock.release(writer=writer, key=key)
 
 
 @asynccontextmanager
@@ -395,7 +428,8 @@ async def async_isolated_site_dirs_scope(skill_dir: pathlib.Path, *, enabled: bo
     # Same reader/writer barrier as the sync scope.  Async acquisition polls
     # cooperatively so the ASGI loop never blocks on a threading.Condition.
     writer = bool(enabled)
-    await _acquire_execution_barrier_async(writer=writer)
+    key = _scope_key(skill_dir)
+    await _acquire_execution_barrier_async(writer=writer, key=key)
     site_dirs: List[str] = []
     try:
         site_dirs = inject_isolated_site_dirs(skill_dir) if enabled else []
@@ -404,4 +438,4 @@ async def async_isolated_site_dirs_scope(skill_dir: pathlib.Path, *, enabled: bo
         try:
             _release_site_dirs_best_effort(site_dirs)
         finally:
-            _execution_lock.release(writer=writer)
+            _execution_lock.release(writer=writer, key=key)

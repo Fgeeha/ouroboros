@@ -40,7 +40,8 @@ def _barrier_is_free_before_and_after():
 def _free() -> bool:
     barrier = deps._execution_lock
     with barrier.condition:
-        return not barrier.writer_active and barrier.readers == 0 and barrier.writers_waiting == 0
+        return (not barrier.writer_active and barrier.readers == 0
+                and barrier.writers_waiting == 0 and not barrier.active_keys)
 
 
 def _reader(skill_dir, entered: threading.Event, release: threading.Event, sink: list):
@@ -661,3 +662,111 @@ def test_a_deps_bearing_load_excludes_a_concurrent_no_deps_load(tmp_path):
         extension_loader.unload_extension("reader_neighbour")
     finally:
         del builtins._ouro_1195_gate
+
+
+# One skill, one handler at a time: the per-skill sequencing a consumer such as
+# the bundled Telegram card renderer relies on (read the message id, await the
+# send, record it). Cross-skill overlap is the F3 gain; same-skill ordering is
+# the contract the old exclusive lock gave every skill author for free.
+
+
+def test_same_skill_sync_readers_run_one_at_a_time(tmp_path):
+    skill_dir = tmp_path / "telegram"
+    first_in, first_out, second_in = threading.Event(), threading.Event(), threading.Event()
+    sink: list = []
+    first = threading.Thread(target=_reader(skill_dir, first_in, first_out, sink))
+    second_release = threading.Event()
+    second = threading.Thread(target=_reader(skill_dir, second_in, second_release, sink))
+    first.start()
+    assert first_in.wait(GATE)
+    second.start()
+    assert not second_in.wait(0.3), "a second handler of the SAME skill entered while the first was live"
+    assert not deps._execution_lock.try_enter(False, deps._scope_key(skill_dir))
+    assert deps._execution_lock.try_enter(False, deps._scope_key(tmp_path / "other"))
+    deps._execution_lock.release(writer=False, key=deps._scope_key(tmp_path / "other"))
+    first_out.set()
+    assert second_in.wait(GATE), "the second handler never entered after the first left"
+    second_release.set()
+    first.join(GATE)
+    second.join(GATE)
+    assert sink == ["reader", "reader"], sink
+
+
+def test_same_skill_async_handlers_run_one_at_a_time(tmp_path):
+    async def main():
+        skill_dir = tmp_path / "telegram"
+        first_in = asyncio.Event()
+        first_out = asyncio.Event()
+        order: list = []
+
+        async def handler(label, gate_in, gate_out):
+            async with deps.async_isolated_site_dirs_scope(skill_dir, enabled=False):
+                order.append(f"{label}:in")
+                if gate_in is not None:
+                    gate_in.set()
+                if gate_out is not None:
+                    await gate_out.wait()
+                order.append(f"{label}:out")
+
+        one = asyncio.create_task(handler("one", first_in, first_out))
+        await first_in.wait()
+        two = asyncio.create_task(handler("two", None, None))
+        await asyncio.sleep(0.2)
+        assert order == ["one:in"], order  # two is waiting, not inside
+        first_out.set()
+        await asyncio.wait_for(asyncio.gather(one, two), GATE)
+        assert order == ["one:in", "one:out", "two:in", "two:out"], order
+
+    asyncio.run(main())
+
+
+def test_registered_handlers_of_one_skill_serialize_and_of_two_skills_overlap(tmp_path):
+    """Through the real PluginAPIImpl wrapper: same skill sequential, other skill concurrent."""
+    from ouroboros.extension_plugin_api import PluginAPIImpl, _PluginAPIConfig
+
+    def api_for(label):
+        state_dir = tmp_path / "state" / label
+        state_dir.mkdir(parents=True, exist_ok=True)
+        return PluginAPIImpl(_PluginAPIConfig(
+            skill_name=label, permissions=[], env_allowlist=[], state_dir=state_dir,
+            settings_reader=lambda: {}, skill_dir=tmp_path / label,
+        ))
+
+    api_a = api_for("skill_a")
+    api_b = api_for("skill_b")
+
+    a_inside = threading.Event()
+    a_release = threading.Event()
+    seen: list = []
+
+    def slow_a(*_args):
+        seen.append("a:in")
+        a_inside.set()
+        a_release.wait(GATE)
+        seen.append("a:out")
+
+    def quick(label):
+        def run(*_args):
+            seen.append(f"{label}:in")
+            seen.append(f"{label}:out")
+        return run
+
+    wrapped_slow_a = api_a._wrap_runtime_handler(slow_a)
+    wrapped_quick_a = api_a._wrap_runtime_handler(quick("a2"))
+    wrapped_quick_b = api_b._wrap_runtime_handler(quick("b"))
+
+    slow = threading.Thread(target=wrapped_slow_a)
+    slow.start()
+    assert a_inside.wait(GATE)
+    other = threading.Thread(target=wrapped_quick_b)
+    other.start()
+    other.join(GATE)
+    assert not other.is_alive(), "another skill's handler was blocked by skill_a's live handler"
+    assert seen[:3] == ["a:in", "b:in", "b:out"], seen
+    same = threading.Thread(target=wrapped_quick_a)
+    same.start()
+    assert not same.join(0.3) and same.is_alive(), "skill_a's second handler overlapped its first"
+    a_release.set()
+    same.join(GATE)
+    slow.join(GATE)
+    assert seen == ["a:in", "b:in", "b:out", "a:out", "a2:in", "a2:out"], seen

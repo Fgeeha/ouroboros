@@ -203,8 +203,10 @@ flowchart LR
 - **Isolated deps** (pip / npm / uv / node) install into
   `data/skills/<bucket>/<name>/.ouroboros_env/`. Status is recorded
   in `data/state/skills/<name>/deps.json`.
-  In-process extension scopes are non-reentrant: no-dependency handlers share
-  a read lease, while a dependency-bearing handler owns an exclusive lease
+  In-process extension scopes are non-reentrant: no-dependency handlers of
+  DIFFERENT skills share a read lease and overlap, the handlers of ONE skill
+  run one at a time (your callbacks stay sequential, as under the old
+  exclusive lock), and a dependency-bearing handler owns an exclusive lease
   through import, handler waits and cleanup. The async form polls
   cooperatively, so it never blocks the ASGI loop; nested scopes and
   unwrapped child work remain unsupported rather than inheriting a lease.

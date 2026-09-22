@@ -12,6 +12,8 @@ import sys
 
 import pytest
 
+from ouroboros.platform_layer import subprocess_new_group_kwargs
+
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
 _POSIX_ONLY = pytest.mark.skipif(os.name == "nt", reason="POSIX process groups only")
 
@@ -49,7 +51,8 @@ def test_record_failure_kills_only_the_child_never_the_spawners_group(tmp_path):
     spawner = subprocess.run(
         [sys.executable, "-c", _RECORD_FAILURE_SPAWNER, str(tmp_path)],
         cwd=str(REPO_ROOT), capture_output=True, text=True, timeout=60,
-        start_new_session=True, env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        env={**os.environ, "PYTHONPATH": str(REPO_ROOT)},
+        **subprocess_new_group_kwargs(),
     )
     assert spawner.returncode == 0, spawner.stderr
     assert spawner.stdout.split() == ["survived", "OSError"], (spawner.stdout, spawner.stderr)
