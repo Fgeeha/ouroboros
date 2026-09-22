@@ -9,7 +9,9 @@ from ouroboros import consolidator as c, projects_registry, room_consolidation a
 from ouroboros.context import build_recent_sections
 from ouroboros.dialogue_provenance import RoomLabelResolver, source_continuation_note
 from ouroboros.memory import Memory
-from tests.test_consolidator_context_fit import _LLM, fit  # shared isolated Light route fixture
+from tests.test_consolidator_context_fit import _LLM, fit as _fit
+
+fit = _fit  # noqa: F811 - shared isolated Light route fixture re-export
 
 
 def _write_chat(root, rows):
@@ -171,7 +173,6 @@ def test_actual_consolidation_labels_every_source_and_retains_token_ceiling(tmp_
     # Each room is drafted and then source-checked; two logical chunks are
     # processed, with one or two rooms per chunk depending on the fixture.
     assert len(llm.calls) == (4 if len(set(rooms)) == 1 else 8)
-    resolver = RoomLabelResolver(projects=read(tmp_path))
     for call in llm.calls:
         assert call["max_tokens"] == 16384
         assert "A2A EXCLUDED" not in call["messages"][0]["content"]
