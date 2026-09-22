@@ -1576,7 +1576,9 @@ export function initWidgets(ctx = {}) {
             render();
         } else {
             cardMenus.close();
-            listRequests.abortAll();
+            // Leaving Widgets cancels ITS sync; once hidden, an unrelated page change
+            // must not cancel a skill-disable retention check (its kept frame would run on).
+            if (widgetsVisible) listRequests.abortAll();
             // Leaving disposes the mounted work — except the frames the owner
             // keeps running, which stay mounted in the hidden page — and stops
             // stale paints; the cards stay in the DOM so the next entry mounts
