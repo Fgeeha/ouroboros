@@ -228,8 +228,8 @@ def summarize_source(
     while pending:
         start, end = pending.pop()
         part, note = text[start:end], source_continuation_note(spans, start, end)
-        draft, usage, knowledge = call(draft_prompt(part, note), "Room summary", fixed_prompt=draft_prompt("", note),
-                                       input_limit=input_limit, call_type="memory_consolidation")
+        draft, usage, draft_knowledge = call(draft_prompt(part, note), "Room summary", fixed_prompt=draft_prompt("", note),
+                                             input_limit=input_limit, call_type="memory_consolidation")
         usages.append(usage)
         if draft.strip():
             corrected, usage, knowledge = call(
@@ -241,7 +241,10 @@ def summarize_source(
                 # only with its corrected text: a draft whose correction failed
                 # (and was then split) never entered the block, and a draft
                 # nomination the correction dropped was never source-checked.
-                corrected, found = _extract_nominations(corrected, knowledge)
+                # Bound through the DRAFT call's read context: that call held the
+                # knowledge instruction and read the notes it nominates against,
+                # so its recorded reads attest the corrected block's revisions.
+                corrected, found = _extract_nominations(corrected, draft_knowledge if draft_knowledge is not None else knowledge)
                 entries.extend(found)
                 summaries.append(corrected.strip())
                 continue

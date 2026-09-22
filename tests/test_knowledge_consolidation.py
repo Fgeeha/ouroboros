@@ -35,8 +35,13 @@ class MemoryLLM:
     def chat(self, **kwargs):
         self.calls.append(deepcopy(kwargs))
         if kwargs["messages"][0]["content"].startswith("Compare this draft memory"):
-            # The correction pass answers with the checked memory text only.
-            return {"content": "Checked interpretation."}, {
+            # The correction answers with the checked memory text and carries the
+            # draft's nomination block through the same source check (the
+            # corrected block is the one released).
+            prompt = kwargs["messages"][0]["content"]
+            block = prompt.split("## Draft memory", 1)[1].split("\n\n", 1)[0] if "## Draft memory" in prompt else ""
+            nominations = block[block.index("KNOWLEDGE_ENTRIES_JSON:"):] if "KNOWLEDGE_ENTRIES_JSON:" in block else ""
+            return {"content": "Checked interpretation." + ("\n" + nominations if nominations else "")}, {
                 "prompt_tokens": 5, "completion_tokens": 5, "total_tokens": 10, "cost": 0.02}
         if len(self.calls) == 1:
             return {"content": "", "tool_calls": [_call()]}, {
@@ -205,7 +210,8 @@ def test_era_compression_cannot_erase_unpublished_knowledge_proposals(tmp_path, 
             if prompt.startswith("Compress these older memory blocks"):
                 return {"content": "The full historical span remains represented."}, {"cost": 0.01}
             if prompt.startswith("Compare this draft memory"):
-                return {"content": f"Episode {self.count}, checked."}, {"cost": 0.01}
+                return {"content": f"Episode {self.count}, checked.\nKNOWLEDGE_ENTRIES_JSON: " + json.dumps([
+                    {"topic": "people/alex", "content": f"Unpublished complete proposal {self.count}."}])}, {"cost": 0.01}
             self.count += 1
             return {"content": f"Episode {self.count}.\nKNOWLEDGE_ENTRIES_JSON: " + json.dumps([
                 {"topic": "people/alex", "content": f"Unpublished complete proposal {self.count}."}])}, {"cost": 0.01}
