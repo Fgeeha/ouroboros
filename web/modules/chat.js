@@ -621,6 +621,7 @@ export function createChatInstance({
         } catch {
             if (stateSnapshots.isCurrent(request)) {
                 syncHeaderControlState({ accounting: { available: false } });
+                stateSnapshots.fail?.(request);
             }
         }
     }
