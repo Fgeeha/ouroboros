@@ -30,7 +30,13 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # new mechanism (gate, ordinary-message path, decorator) has no older text to displace.
     # 100900 -> 101700: the ONE explanatory line states every fact (the assembler's clauses
     # replace the single-cause sentence); the Telegram non-clean line has no older text.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 101700,
+    # 101700 -> 104400: "Project handoff receipts" is a subsystem the chapter lacked
+    # (the typed receipt vocabulary at the outbox, the one-anchor precedence rule and
+    # its shadows, node-scoped reconcile, the phase/retry reading); the sentence it
+    # touched in "Main rows" is replaced, the rest has no older text to displace.
+    # 104400 -> 104900: the anchor rule gained its multi-card clause (cards are never
+    # shadows; a surviving card inherits folded receipts) after review found the gap.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 104900,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     "docs/architecture/05-supervisor-loop.md": 27137,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
