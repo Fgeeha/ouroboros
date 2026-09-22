@@ -17,13 +17,17 @@ import hashlib
 import json
 import logging
 import pathlib
-from typing import Any, Dict, List
+from contextlib import nullcontext
+from typing import Any, Dict, List, Optional
 
 from ouroboros.project_facts import (
     project_journal_path,
     project_workpad_path,
     sanitize_project_id,
+    explicit_project_id_ok,
 )
+from ouroboros.dialogue_provenance import is_presence_task
+from ouroboros.focus import normalize_focus
 from ouroboros.tools.registry import ToolContext, ToolEntry
 from ouroboros.utils import (
     append_jsonl,
@@ -38,22 +42,67 @@ _MAX_TEXT_CHARS = 4000
 _WORKPAD_MAX_BYTES = 256 * 1024
 
 
+def _scope_authority(ctx: ToolContext) -> tuple[str, Dict[str, Any]]:
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    contract = getattr(ctx, "task_contract", {})
+    contract = contract if isinstance(contract, dict) else {}
+    lineage = contract.get("lineage") if isinstance(contract.get("lineage"), dict) else {}
+    task = {"metadata": metadata, "task_contract": contract,
+            "_presence_turn": bool(metadata.get("_presence_turn") or getattr(ctx, "_presence_turn", False)),
+            "_presence_origin": getattr(ctx, "_presence_origin", None)}
+    parent_task_id = str(lineage.get("parent_task_id") or metadata.get("parent_task_id") or "").strip()
+    delegation_role = str(lineage.get("delegation_role") or metadata.get("delegation_role") or "").strip()
+    root_task_id = str(lineage.get("root_task_id") or metadata.get("root_task_id") or "").strip()
+    child = bool(parent_task_id) or delegation_role == "subagent"
+    if is_presence_task(task):
+        return "presence", metadata
+    if child:
+        return "child", metadata
+    # Root markers are host admission facts. A drive path or a missing metadata
+    # object is not evidence of root authority: test-shaped fallbacks here used
+    # to let an arbitrary scoped actor read another project's journal.
+    root = bool(getattr(ctx, "is_direct_chat", False)) or delegation_role == "root" or bool(root_task_id)
+    return ("root" if root else "scoped"), metadata
+
+
+def _resolve_project_id(ctx: ToolContext, explicit: Any, *, write: bool = False) -> tuple[str, str]:
+    own_value = getattr(ctx, "project_id", "")
+    if own_value not in (None, "") and not isinstance(own_value, str):
+        return "", "⚠️ TOOL_ARG_ERROR: current project scope is malformed"
+    if explicit not in (None, "") and not isinstance(explicit, str):
+        return "", "⚠️ TOOL_ARG_ERROR: project_id is malformed"
+    own_raw = str(own_value or "").strip()
+    requested_raw = str(explicit or "").strip()
+    own = sanitize_project_id(own_raw) if own_raw else ""
+    if requested_raw and not explicit_project_id_ok(requested_raw):
+        return "", "⚠️ TOOL_ARG_ERROR: project_id is malformed"
+    requested = sanitize_project_id(requested_raw) if requested_raw else ""
+    authority, _metadata = _scope_authority(ctx)
+    if requested_raw and not requested:
+        return "", "⚠️ TOOL_ARG_ERROR: project_id is malformed"
+    if own_raw and not own:
+        return "", "⚠️ TOOL_ARG_ERROR: current project scope is malformed"
+    if own and requested and requested != own:
+        if write:
+            return "", "⚠️ TOOL_FORBIDDEN: foreign project writes are refused; write only the current project"
+        if authority != "root":
+            return "", "⚠️ TOOL_FORBIDDEN: this actor may read only its current project"
+        return requested, ""
+    if requested and not own and authority != "root":
+        return "", "⚠️ TOOL_FORBIDDEN: restricted actors may not access a foreign project"
+    return own or requested, ""
+
+
 def _authorized_project_id(ctx: ToolContext, explicit: Any) -> str:
-    """AUTHORIZATION (not membership): which project THIS journal write may touch.
-    Distinct from project_facts.resolve_project_id (task->project MEMBERSHIP): a
-    project-scoped task may only journal into ITS OWN project (no cross-project
-    writes); an explicit id is honored only from an unscoped (main/штаб) context,
-    where curating a specific project is legitimate. Never consults post-hoc UI
-    bindings — only the task's resolved scope (ctx.project_id) + an explicit arg."""
-    own = sanitize_project_id(getattr(ctx, "project_id", "") or "")
-    requested = sanitize_project_id(explicit) if explicit else ""
-    if own:
-        return own
-    return requested
+    """Compatibility resolver for the current scope (read semantics)."""
+    return _resolve_project_id(ctx, explicit, write=False)[0]
 
 
 def _journal_write(ctx: ToolContext, kind: str, text: str, project_id: str = "") -> str:
-    pid = _authorized_project_id(ctx, project_id)
+    pid, scope_error = _resolve_project_id(ctx, project_id, write=True)
+    if scope_error:
+        return scope_error + " (journal_write)"
     if not pid:
         return ("⚠️ TOOL_ARG_ERROR (journal_write): no project scope — this task is not "
                 "project-scoped and no explicit project_id was given.")
@@ -345,7 +394,9 @@ def _journal_read(
     offset: int = 0,
     snapshot: str = "",
 ) -> str:
-    pid = _authorized_project_id(ctx, project_id)
+    pid, scope_error = _resolve_project_id(ctx, project_id, write=False)
+    if scope_error:
+        return scope_error + " (journal_read)"
     if not pid:
         return ("⚠️ TOOL_ARG_ERROR (journal_read): no project scope — this task is not "
                 "project-scoped and no explicit project_id was given.")
@@ -410,7 +461,9 @@ def _journal_read(
 
 
 def _workpad_read(ctx: ToolContext, project_id: str = "") -> str:
-    pid = _authorized_project_id(ctx, project_id)
+    pid, scope_error = _resolve_project_id(ctx, project_id, write=False)
+    if scope_error:
+        return scope_error + " (workpad_read)"
     if not pid:
         return "⚠️ TOOL_ARG_ERROR (workpad_read): no project scope."
     path = project_workpad_path(pid)
@@ -423,7 +476,9 @@ def _workpad_read(ctx: ToolContext, project_id: str = "") -> str:
 
 
 def _workpad_write(ctx: ToolContext, content: str, project_id: str = "") -> str:
-    pid = _authorized_project_id(ctx, project_id)
+    pid, scope_error = _resolve_project_id(ctx, project_id, write=True)
+    if scope_error:
+        return scope_error + " (workpad_write)"
     if not pid:
         return "⚠️ TOOL_ARG_ERROR (workpad_write): no project scope."
     body = str(content or "")
@@ -437,6 +492,93 @@ def _workpad_write(ctx: ToolContext, content: str, project_id: str = "") -> str:
     except OSError as exc:
         return f"⚠️ TOOL_ERROR (workpad_write): {exc}"
     return f"OK: workpad[{pid}] written ({len(body)} chars)."
+
+
+def _update_focus(ctx: ToolContext, text: str, source_ref: Any) -> str:
+    """Publish one short authored focus onto this live root's existing records."""
+    metadata = getattr(ctx, "task_metadata", {})
+    metadata = metadata if isinstance(metadata, dict) else {}
+    task_contract = getattr(ctx, "task_contract", {})
+    task_contract = task_contract if isinstance(task_contract, dict) else {}
+    task = {"metadata": metadata, "task_contract": task_contract,
+            "_presence_turn": bool(getattr(ctx, "_presence_turn", False)),
+            "_presence_origin": getattr(ctx, "_presence_origin", None)}
+    authority, _ = _scope_authority(ctx)
+    if authority != "root" or is_presence_task(task):
+        return "⚠️ TOOL_FORBIDDEN (update_focus): only an independent project/root task may publish focus"
+    task_id = str(getattr(ctx, "task_id", "") or "").strip()
+    if not task_id:
+        return "⚠️ TOOL_ARG_ERROR (update_focus): task_id is required"
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
+    import pathlib
+
+    canonical = pathlib.Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or getattr(ctx, "drive_root", "")))
+    direct = bool(getattr(ctx, "is_direct_chat", False))
+    if direct:
+        try:
+            from supervisor.workers import direct_chat_turn
+            if direct_chat_turn(task_id) is None:
+                return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current direct turn is no longer live"
+        except Exception:
+            return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current direct turn is no longer live"
+    else:
+        current = load_task_result(canonical, task_id)
+        if isinstance(current, dict) and str(current.get("status") or "") != STATUS_RUNNING:
+            return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current task is no longer live"
+    try:
+        focus = normalize_focus(text, source_ref, task_id=task_id)
+    except ValueError as exc:
+        return f"⚠️ TOOL_ARG_ERROR (update_focus): {exc}"
+
+    def _project(current: Dict[str, Any], fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if str(current.get("status") or "") != STATUS_RUNNING:
+            return None
+        prior = current.get("focus")
+        if prior:
+            from ouroboros.focus import compact_focus
+            prior_focus = compact_focus(prior)
+            if prior_focus and str(prior_focus.get("authored_at") or "") >= str(focus.get("authored_at") or ""):
+                return None
+        return fields
+
+    # A direct turn is owned by the live ingress actor rather than the queue.
+    # Hold its existing admission lock across the liveness check and the locked
+    # result write, then require the same actor projection to accept the stamp.
+    lock = getattr(ctx, "owner_message_admission_lock", None) if direct else None
+    guard = lock if lock is not None else nullcontext()
+    try:
+        with guard:
+            if direct:
+                from supervisor.workers import direct_chat_turn, stamp_direct_chat_turn
+                if direct_chat_turn(task_id) is None:
+                    return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current direct turn is no longer live"
+            current = load_task_result(canonical, task_id)
+            if not isinstance(current, dict) or str(current.get("status") or "") != STATUS_RUNNING:
+                return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current task is no longer live"
+            stored = write_task_result(canonical, task_id, STATUS_RUNNING, focus=focus, _field_projector=_project)
+            if not isinstance(stored, dict) or str(stored.get("status") or "") != STATUS_RUNNING:
+                return "⚠️ FOCUS_TASK_NOT_LIVE (update_focus): the current task is no longer live"
+            if stored.get("focus") != focus:
+                return "⚠️ FOCUS_STALE (update_focus): a newer focus already exists"
+            if direct:
+                if not stamp_direct_chat_turn(task_id, focus=focus):
+                    return "⚠️ FOCUS_PROJECTION_UNAVAILABLE (update_focus): the direct turn projection rejected the focus"
+    except Exception:
+        log.debug("focus persistence failed", exc_info=True)
+        return "⚠️ TOOL_ERROR (update_focus): live focus could not be persisted"
+    event_queue = getattr(ctx, "event_queue", None)
+    if event_queue is not None:
+        try:
+            event_queue.put_nowait({"type": "task_focus_updated", "task_id": task_id, "focus": focus})
+        except Exception:
+            log.debug("focus projection event failed", exc_info=True)
+            # The durable task-result write succeeded, but the fast projection
+            # notification did not.  Do not claim a fully published update:
+            # callers may retry, while peer_roster independently reconciles
+            # the durable carrier on its next read.
+            return ("⚠️ FOCUS_PROJECTION_UNAVAILABLE (update_focus): focus was stored, "
+                    "but the live projection notification could not be queued")
+    return f"OK: focus[{task_id}] updated (authored_at={focus['authored_at']})."
 
 
 def journal_tail_digest(project_id: str, *, limit: int = 40) -> str:
@@ -492,6 +634,41 @@ def get_tools() -> List[ToolEntry]:
         },
     }
     return [
+        ToolEntry(
+            "update_focus",
+            {
+                "name": "update_focus",
+                "description": (
+                    "Publish a short authored focus for this live root. The source_ref is a "
+                    "typed reader/cursor reference; focus is awareness, never an owner directive."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "Short focus text (<=280 chars)."},
+                        "source_ref": {
+                            "type": "object",
+                            "description": "Reference to an existing bounded reader; this carries no content or path.",
+                            "properties": {
+                                "reader": {"type": "string", "enum": [
+                                    "journal_read", "workpad_read", "recent_tasks",
+                                    "get_task_result", "chat_history", "live_roots",
+                                ]},
+                                "project_id": {"type": "string"},
+                                "task_id": {"type": "string"},
+                                "offset": {"type": "integer", "minimum": 0},
+                                "snapshot": {"type": "string"},
+                            },
+                            "required": ["reader"],
+                            "additionalProperties": False,
+                        },
+                    },
+                    "required": ["text", "source_ref"],
+                },
+            },
+            lambda ctx, text, source_ref: _update_focus(ctx, text, source_ref),
+            timeout_sec=15,
+        ),
         ToolEntry(
             "journal_write",
             {

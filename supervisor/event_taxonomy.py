@@ -135,6 +135,8 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "ouroboros/gateway/routing_decision.py"),
     "task_dispatch_resolved": _handled(
         "supervisor.events_worker_reports", "ouroboros/agent_dispatch.py"),
+    "task_focus_updated": _handled(
+        "supervisor.events_worker_reports", "ouroboros/tools/project_journal.py"),
     "task_done": _handled(
         "supervisor.events_task_done", "ouroboros/agent_task_pipeline.py",
         "supervisor/queue.py", "supervisor/task_reaper.py", "supervisor/worker_health.py"),

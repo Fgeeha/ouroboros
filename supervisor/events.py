@@ -243,6 +243,7 @@ from supervisor.events_worker_reports import (  # noqa: E402, F401 -- intentiona
     _handle_log_event,
     _handle_skill_lifecycle,
     _handle_task_dispatch_resolved,
+    _handle_task_focus_updated,
     _handle_task_heartbeat,
     _handle_task_metrics,
 )
@@ -263,6 +264,7 @@ EVENT_HANDLERS = {
     "budget_root_fence": _handle_budget_root_fence,
     "task_heartbeat": _handle_task_heartbeat,
     "task_dispatch_resolved": _handle_task_dispatch_resolved,
+    "task_focus_updated": _handle_task_focus_updated,
     "typing_start": _handle_typing_start,
     "send_message": _handle_send_message,
     "task_done": _handle_task_done,

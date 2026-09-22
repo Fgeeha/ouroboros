@@ -270,6 +270,16 @@ APPROVED_DELTAS: Mapping[str, Delta] = MappingProxyType({
     # same defect class the 329 OSWorld rows measured, on the composition seam.
     "compose:reported:route": Delta(False, "ok", True, "tool_reported_failure", "A.24", "a tool that reported its own failure is a failure, even behind an appended host note"),
     "compose:reported:route+safety": Delta(False, "ok", True, "tool_reported_failure", "A.24", "a tool that reported its own failure is a failure, even behind two appended host notes"),
+    # A.25 — cross-focus publication refusals.  The retired text chain only
+    # recognized the generic *_UNAVAILABLE suffix; stale/liveness names were
+    # warnings, while a TOOL_ prefix was still a generic execution failure.  The one identifier register now recovers
+    # the producer's substrate/policy split as typed results: an unavailable
+    # target or projection is policy-denied availability, while a stale or
+    # unauthorized publication is an explicit policy block.
+    "FOCUS_PROJECTION_UNAVAILABLE": Delta(True, "error", True, "unavailable", "A.25", "a direct focus projection the host cannot accept is unavailable, not a generic execution error"),
+    "FOCUS_TASK_NOT_LIVE": Delta(False, "ok", True, "unavailable", "A.25", "a focus update for a settled task has no live publication target"),
+    "FOCUS_STALE": Delta(False, "ok", True, "blocked", "A.25", "a newer focus wins the CAS and blocks the stale publication"),
+    "TOOL_FORBIDDEN": Delta(True, "error", True, "blocked", "A.25", "an unauthorized project/focus operation is a policy denial, not a generic tool failure"),
     # Owner's recovered transport WORK-ORDER B7 / #744: these producers now
     # publish existing codes for known refusals. No text-adapter policy changed.
     "native:LEGACY_BLOCKED:CHILD_RESULT_STALE": Delta(False, "ok", True, "blocked", "A.B7", "join_ledger refuses a disposition when the inspected child result changed"),

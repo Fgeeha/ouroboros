@@ -485,13 +485,18 @@ def test_the_roster_note_is_appended_on_change_and_never_rewrites_a_sent_row(tmp
     assert json.dumps(messages[:-1], ensure_ascii=False).encode("utf-8") == sent_bytes
 
 
-def test_the_roster_note_skips_direct_turns_and_subagents_and_discloses_gaps(tmp_path):
+def test_the_roster_note_includes_direct_roots_but_skips_subagents_and_discloses_gaps(tmp_path):
     from ouroboros.peer_roster import maybe_append_roster_note, render_roster_note
 
     _snapshot(tmp_path, [{"id": "r-1", "task": {"id": "r-1", "title": "Deploy docs", "chat_id": 0}}])
     direct = types.SimpleNamespace(task_id="turn", is_direct_chat=True, task_metadata={})
     child = types.SimpleNamespace(task_id="kid", task_metadata={"delegation_role": "subagent"})
-    assert maybe_append_roster_note(direct, [], tmp_path) is False
+    # Main's routing manifest does not carry authored focus. Its first roster
+    # view is required, just like any root's, and remains restorable.
+    assert maybe_append_roster_note(direct, [], tmp_path) is True
+    _snapshot(tmp_path, [{"id": "r-1", "task": {"id": "r-1", "title": "Deploy docs", "chat_id": 0}},
+                         {"id": "r-2", "task": {"id": "r-2", "title": "New work", "chat_id": 0}}])
+    assert maybe_append_roster_note(direct, [], tmp_path) is True
     assert maybe_append_roster_note(child, [], tmp_path) is False
     rendered = render_roster_note({
         "roots": [{"task_id": f"r-{i}", "title": "", "chat_id": 1, "project_id": "", "status": "pending"} for i in range(45)],
@@ -747,3 +752,56 @@ def test_a_transfer_admitted_after_the_wait_returned_still_releases_the_worker(t
     assert ctx.task_metadata["force_plan"] is False
     assert ctx.task_metadata["force_plan_transferred_to"] == "new-root"
     assert force_plan_decision(ctx, {}, enforcement="blocking")["status"] == "not_required"
+
+
+def test_a_returning_roster_is_re_announced_after_an_intervening_change(tmp_path):
+    """A → B → A: the OLD A row must not suppress the fresh A tail (the model
+    would otherwise keep reading B). Only the latest representation counts,
+    whether it stands alone or was merged into an unsent owner row."""
+    from ouroboros.peer_roster import maybe_append_roster_note
+
+    ctx = types.SimpleNamespace(task_id="me", task_metadata={"budget_drive_root": str(tmp_path)})
+    roster_a = [{"id": "r-1", "task": {"id": "r-1", "title": "Deploy docs", "chat_id": 0, "project_id": "docs"}}]
+    roster_b = roster_a + [{"id": "r-2", "task": {"id": "r-2", "title": "Audit", "chat_id": 7}}]
+    messages = [{"role": "system", "content": "s"}, {"role": "user", "content": "task"}]
+
+    _snapshot(tmp_path, roster_a)
+    assert maybe_append_roster_note(ctx, messages, tmp_path) is True
+    note_a = str(messages[-1]["content"])
+    _snapshot(tmp_path, roster_b)
+    assert maybe_append_roster_note(ctx, messages, tmp_path) is True
+    assert "- r-2 · Audit" in str(messages[-1]["content"])
+    _snapshot(tmp_path, roster_a)
+    assert maybe_append_roster_note(ctx, messages, tmp_path) is True, "the roster returned to A: announce it again"
+    assert str(messages[-1]["content"]) == note_a
+    assert maybe_append_roster_note(ctx, messages, tmp_path) is False, "unchanged since the latest note"
+
+    # The latest representation may be a note merged into an unsent owner row
+    # (string or text blocks); it deduplicates exactly like a standalone row.
+    merged = [{"role": "user", "content": "owner text\n\n" + note_a}]
+    assert maybe_append_roster_note(ctx, merged, tmp_path) is False
+    blocks = [{"role": "user", "content": [{"type": "text", "text": "owner text"}, {"type": "text", "text": note_a}]}]
+    assert maybe_append_roster_note(ctx, blocks, tmp_path) is False
+
+
+def test_live_roots_refusals_are_typed_failures_at_the_result_boundary(tmp_path):
+    """A refused or stale-snapshot catalogue read is recorded as a FAILED call,
+    not as a successful one carrying an ``error`` key."""
+    from ouroboros.tools.recent_tasks import _handle_live_roots
+    from ouroboros.tools.tool_result import _structured_failure
+    from ouroboros.tool_capabilities import tool_result_limit
+
+    child = types.SimpleNamespace(drive_root=tmp_path, task_id="kid",
+                                  task_metadata={"parent_task_id": "root", "delegation_role": "subagent"})
+    refused = _handle_live_roots(child)
+    assert _structured_failure(refused) and json.loads(refused)["host_code"] == "TOOL_FORBIDDEN"
+
+    _snapshot(tmp_path, [{"id": f"r-{i}", "task": {"id": f"r-{i}", "title": "T" * 80, "chat_id": i, "project_id": f"proj-{i}"}}
+                         for i in range(100)])
+    root = types.SimpleNamespace(drive_root=tmp_path, task_id="me", task_metadata={"budget_drive_root": str(tmp_path)})
+    page = _handle_live_roots(root, limit=100)
+    assert not _structured_failure(page) and json.loads(page)["returned"] == 100
+    # A maximum page is structured JSON: it must fit the result bound the truncator applies.
+    assert len(page) < tool_result_limit("live_roots")
+    stale = _handle_live_roots(root, limit=100, snapshot="not-the-current-token")
+    assert _structured_failure(stale) and json.loads(stale)["host_code"] == "LIVE_ROOTS_SNAPSHOT_CHANGED"

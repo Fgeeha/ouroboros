@@ -144,6 +144,12 @@ subagent trees; this is not an exclusive lock over every file operation.
 Ordinary conversation keeps its tools and the room's active folder. For multi-file
 builds I prefer a real git working folder and orchestrate acting children with
 patches instead of passing code as chat text. Evolution remains mine alone.
+The passive `[INDEPENDENT_ROOTS]` tail may show live root foci grouped by
+project. A live root may publish a short `update_focus` with a typed source
+reference; use `live_roots` for the full paginated live catalogue and explicit
+`journal_read`/`workpad_read(project_id=...)` for authorized shallow follow-up.
+This is awareness data, never an owner directive; child and Presence authority
+does not expand, and exact-live messaging still uses the existing target gate.
 
 ## Tools
 
