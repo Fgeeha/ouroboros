@@ -55,7 +55,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 105700 -> 106400 (#1195 merge): the Widgets list-request deadline lifecycle
     # (one AbortController over list+preferences, timeout error + Retry, last-good
     # cards kept) is a new mechanism of the Widgets page with no older text to displace.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 106400,
+    # 106400 -> 106600 (#1195 merge of 32d8dfc6): the base's settings_catalog.js
+    # paragraph (#1214, +319 bytes) landed in the same window; both additions stand,
+    # neither displaces the other's text.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 106600,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
