@@ -339,3 +339,29 @@ def test_focus_source_honours_the_task_contract_disabled_tools(tmp_path, monkeyp
     assert "FOCUS_SOURCE_UNRESOLVED" in refused and "withheld" in refused
     assert not list((tmp_path / "task_results" / "artifacts").glob("**/focus_source_*")) 
     assert "focus" not in json.loads((tmp_path / "task_results" / "root.json").read_text())
+
+
+def test_schema_default_offset_zero_follows_the_omitted_path():
+    from ouroboros.focus import normalize_focus
+    for ref in ({"reader": "workpad_read", "project_id": "alpha", "offset": 0, "snapshot": ""},
+                {"reader": "get_task_result", "task_id": "task123", "offset": 0}):
+        assert "offset" not in normalize_focus("x", ref)["source_ref"]
+    with pytest.raises(ValueError):
+        normalize_focus("x", {"reader": "workpad_read", "project_id": "alpha", "offset": 3})
+
+
+def test_replayed_older_queue_focus_never_replaces_a_newer_durable_focus(tmp_path):
+    """A retry clone / restart handoff carries the queue row's focus, which may be
+    older than what the same task already published: the durable one wins."""
+    from ouroboros.agent import OuroborosAgent
+    from ouroboros.focus import normalize_focus
+
+    older = normalize_focus("older", {"reader": "recent_tasks"}, task_id="root", authored_at="2026-01-01T00:00:00+00:00")
+    newer = normalize_focus("newer", {"reader": "recent_tasks"}, task_id="root", authored_at="2026-01-02T00:00:00+00:00")
+    write_task_result(tmp_path, "root", STATUS_RUNNING, focus=newer)
+    agent = OuroborosAgent.__new__(OuroborosAgent)
+    agent.env = types.SimpleNamespace(drive_root=tmp_path, budget_drive_root=str(tmp_path))
+    agent._persist_running_record({"id": "root", "description": "d", "focus": older})
+    assert json.loads((tmp_path / "task_results" / "root.json").read_text())["focus"]["text"] == "newer"
+    agent._persist_running_record({"id": "root", "description": "d", "focus": {**newer, "text": "newest", "authored_at": "2026-01-03T00:00:00+00:00"}})
+    assert json.loads((tmp_path / "task_results" / "root.json").read_text())["focus"]["text"] == "newest"

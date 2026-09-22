@@ -355,7 +355,8 @@ def test_nominations_come_from_the_corrected_response_not_the_draft():
         if label == "Room summary":
             return ('draft memory\nKNOWLEDGE_ENTRIES_JSON: [{"topic":"leak","scope":"global","content":"owner approved"}]',
                     usage, _Knowledge())
-        return ('corrected memory\nKNOWLEDGE_ENTRIES_JSON: [{"topic":"kept","scope":"global","content":"owner asked"}]',
+        return ('corrected memory\nKNOWLEDGE_ENTRIES_JSON: [{"topic":"leak","scope":"global","content":"owner asked"},'
+                ' {"topic":"invented","scope":"global","content":"never read"}]',
                 usage, _Knowledge())
 
     content, usage = rc.summarize_source(
@@ -366,5 +367,6 @@ def test_nominations_come_from_the_corrected_response_not_the_draft():
     assert content == "corrected memory"
     # The draft's block reaches the correction under the same source check...
     assert "KNOWLEDGE_ENTRIES_JSON" in prompts[1][1] and "owner approved" in prompts[1][1]
-    # ...and only the corrected block is released.
-    assert [entry["topic"] for entry in usage["_knowledge_entries"]] == ["kept"]
+    # ...and only the corrected block is released: the draft's topic with the
+    # corrected content, never a topic the correction invented without a read.
+    assert [(e["topic"], e["content"]) for e in usage["_knowledge_entries"]] == [("leak", "owner asked")]

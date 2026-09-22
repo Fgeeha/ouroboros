@@ -352,6 +352,19 @@ class OuroborosAgent:
         """
         try:
             started = getattr(self, "_task_started_ts", None)
+            # A queue row's focus is a REPLAY (retry clone, owner-wait restart
+            # handoff): it may be older than the focus the same task id already
+            # published durably, so it is accepted only when it is newer.
+            focus_kw: Dict[str, Any] = {}
+            if task.get("focus"):
+                from ouroboros.focus import compact_focus
+                from ouroboros.task_results import load_task_result
+
+                incoming = compact_focus(task.get("focus"))
+                current = load_task_result(self.env.drive_root, str(task.get("id") or ""))
+                durable = compact_focus(current.get("focus")) if isinstance(current, dict) else None
+                if incoming and (durable is None or str(durable.get("authored_at") or "") < str(incoming.get("authored_at") or "")):
+                    focus_kw = {"focus": incoming}
             running = write_task_result(
                 self.env.drive_root,
                 str(task.get("id") or ""),
@@ -398,8 +411,9 @@ class OuroborosAgent:
                 subagent_envelope=task.get("subagent_envelope"), configured_subagent=task.get("configured_subagent"), parent_cognitive_route=task.get("parent_cognitive_route"), subagent_availability=task.get("subagent_availability"),
                 metadata=task.get("metadata") if isinstance(task.get("metadata"), dict) else {},
                 # A queue row without a focus (a retry clone, a fresh task) must not
-                # erase the durable focus the same task id already authored.
-                **({"focus": task["focus"]} if task.get("focus") else {}),
+                # erase the durable focus the same task id already authored, and a
+                # replayed older focus must not replace a newer durable one.
+                **focus_kw,
                 # Ingress-captured owner-message identity (v6.73.0): persisted on the
                 # durable record so a post-hoc "Turn into project" binds the start
                 # message by value, never by content lookup.

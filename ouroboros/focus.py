@@ -49,7 +49,8 @@ def _safe_source(value: Any) -> Optional[Any]:
     # Provider-valid calls may spell an omitted optional field as "": treat
     # that exactly like omission so the schema and the handler agree.
     source = {key: item for key, item in source.items()
-              if not (isinstance(item, str) and not item.strip() and key != "reader")}
+              if not (isinstance(item, str) and not item.strip() and key != "reader")
+              and not (key == "offset" and item == 0 and not isinstance(item, bool))}
     reader = source.get("reader")
     if not isinstance(reader, str) or reader not in _SOURCE_FIELDS:
         return None

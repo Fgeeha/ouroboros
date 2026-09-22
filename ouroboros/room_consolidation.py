@@ -241,11 +241,20 @@ def summarize_source(
                 # only with its corrected text: a draft whose correction failed
                 # (and was then split) never entered the block, and a draft
                 # nomination the correction dropped was never source-checked.
-                # Bound through the DRAFT call's read context: that call held the
-                # knowledge instruction and read the notes it nominates against,
-                # so its recorded reads attest the corrected block's revisions.
-                corrected, found = _extract_nominations(corrected, draft_knowledge if draft_knowledge is not None else knowledge)
-                entries.extend(found)
+                # The corrected block may DROP or FIX the draft's entries, never add
+                # topics: only the draft call read the notes it nominates against, so
+                # its recorded reads attest exactly those topics' revisions, and an
+                # entry the correction invented has no read behind it.
+                from ouroboros.reflection import _extract_trailing_json
+
+                _, draft_raw = _extract_trailing_json(draft, "KNOWLEDGE_ENTRIES_JSON:")
+                draft_topics = {(str(e.get("topic") or ""), str(e.get("scope") or ""))
+                                for e in (draft_raw if isinstance(draft_raw, list) else []) if isinstance(e, dict)}
+                corrected, raw = _extract_trailing_json(corrected, "KNOWLEDGE_ENTRIES_JSON:")
+                kept = [e for e in (raw if isinstance(raw, list) else []) if isinstance(e, dict)
+                        and (str(e.get("topic") or ""), str(e.get("scope") or "")) in draft_topics]
+                binder = draft_knowledge if draft_knowledge is not None else knowledge
+                entries.extend(binder.bind_entries(kept) if binder is not None and kept else [])
                 summaries.append(corrected.strip())
                 continue
         failure = usage["_consolidation_errors"][-1]
