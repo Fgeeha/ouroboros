@@ -444,18 +444,40 @@ def completion_source_projection(
 
 def focus_source_projection(
     drive_root: Any, task_id: str, result: Dict[str, Any], start_char: Any = None, end_char: Any = None,
+    sha256: str = "",
 ) -> Dict[str, Any]:
-    """Read the bytes a task's focus source_ref answered at authoring time (focus.source_handle)."""
-    from ouroboros.artifacts import read_actor_source_bytes, text_source_range_projection
+    """Read the bytes a task's focus source_ref answered at authoring time (focus.source_handle).
+
+    ``sha256`` selects a HISTORICAL retained source by digest: a roster row quotes
+    the handle it saw, and a later focus of the same author must not substitute
+    its own evidence for that row's.  The store is write-once and digest-named,
+    so the selector resolves to exactly one immutable file or to nothing.
+    """
+    from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path, text_source_range_projection
     from ouroboros.focus import compact_focus
 
     unavailable = {"schema": 1, "kind": "task_focus_source", "status": "unavailable"}
     focus = compact_focus(result.get("focus"))
     handle = focus.get("source_handle") if focus else None
+    wanted = str(sha256 or "").strip().lower()
+    if wanted and (not isinstance(handle, dict) or str(handle.get("sha256") or "") != wanted):
+        if len(wanted) != 64 or any(c not in "0123456789abcdef" for c in wanted):
+            return {**unavailable, "reason": "source_ref_invalid"}
+        try:
+            store = task_artifact_dir_path(drive_root, str(task_id), create=False) / "source_handles" / "context_checkpoints"
+            matches = sorted(p for p in store.glob(f"focus_source_*-{wanted}.md") if not p.is_symlink())
+        except (OSError, ValueError):
+            matches = []
+        if len(matches) != 1:
+            return {**unavailable, "reason": "source_unavailable", "requested_sha256": wanted}
+        handle = {"kind": "task_source", "root": "artifact_store",
+                  "path": f"source_handles/context_checkpoints/{matches[0].name}",
+                  "size": matches[0].stat().st_size, "sha256": wanted}
+        focus = None  # a historical selector carries no current source_ref/authored_at claim
     if not isinstance(handle, dict):
         return {**unavailable, "reason": "source_unavailable"}
     try:
-        raw = read_actor_source_bytes(drive_root, str(result.get("task_id") or task_id), handle)
+        raw = read_actor_source_bytes(drive_root, str(task_id), handle)
         projection, reason = text_source_range_projection(raw.decode("utf-8"), unavailable["kind"], start_char, end_char)
     except ValueError as exc:
         reason = "source_identity_mismatch" if "verification" in str(exc) else "source_ref_invalid"
@@ -463,8 +485,8 @@ def focus_source_projection(
     except (OSError, RuntimeError):
         return {**unavailable, "reason": "source_unavailable"}
     payload = projection or unavailable
-    return {**payload, "source_ref": focus["source_ref"], "authored_at": focus["authored_at"],
-            **({"reason": reason} if reason else {})}
+    current = {"source_ref": focus["source_ref"], "authored_at": focus["authored_at"]} if focus else {"historical": True}
+    return {**payload, **current, **({"reason": reason} if reason else {})}
 
 
 def build_sealed_final_package(result_row: Any, final_text: str) -> Dict[str, Any]:

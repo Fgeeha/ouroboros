@@ -514,6 +514,19 @@ def _read_focus_source(ctx: ToolContext, source: Dict[str, Any]) -> Tuple[Option
     """
     reader = str(source.get("reader") or "")
     args = {key: item for key, item in source.items() if key != "reader"}
+    # The same admission the registry applies to a direct call of that reader:
+    # a task whose contract withholds `journal_read` cannot read it through
+    # update_focus either (and a consciousness Observe level keeps its argument
+    # refusals).  Retention never widens what the caller could dispatch.
+    try:
+        from ouroboros.tools.registry_guards import _capability_resource_guard_result
+
+        guard = _capability_resource_guard_result(ctx, reader, dict(args))
+    except Exception as exc:  # a guard that cannot be consulted is not permission
+        log.debug("focus source guard failed", exc_info=True)
+        return "", f"{reader} admission could not be established ({type(exc).__name__})"
+    if guard is not None:
+        return "", f"{reader} withheld for this task: {str(getattr(guard, 'text', '') or '').splitlines()[0][:160]}"
     try:
         if reader == "journal_read":
             text = _journal_read(ctx, project_id=str(args.get("project_id") or ""),

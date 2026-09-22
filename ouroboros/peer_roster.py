@@ -208,8 +208,8 @@ def render_roster_note(roster: Dict[str, Any], *, exclude: str = "") -> str:
                 # The retained bytes the reader answered at authoring time: what
                 # the source_ref still identifies once the author is dormant,
                 # readable from any drive through the one cross-task reader.
-                line += (f" · retained_source=get_task_result(task_id={json.dumps(focus['author_task_id'])}, include_focus_source=True)"
-                         f" sha256={handle['sha256'][:12]}… size={handle['size']}")
+                line += (f" · retained_source=get_task_result(task_id={json.dumps(focus['author_task_id'])}, include_focus_source=True,"
+                         f" focus_source_sha256={json.dumps(handle['sha256'])}) size={handle['size']}")
             lines.append(line)
     if not shown:
         lines.append("- (none)")

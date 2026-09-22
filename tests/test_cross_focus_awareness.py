@@ -61,7 +61,7 @@ def test_root_focus_persists_and_terminal_race_refuses(tmp_path, monkeypatch):
     _queue_snapshot(tmp_path, [{"id": "root", "task": {"id": "root", "focus": stored["focus"]}}])
     from ouroboros.peer_roster import independent_roots
     note = render_roster_note(independent_roots(tmp_path))
-    assert "retained_source=get_task_result(task_id=\"root\", include_focus_source=True)" in note
+    assert f'retained_source=get_task_result(task_id="root", include_focus_source=True, focus_source_sha256="{handle["sha256"]}")' in note
     # A PEER on another (forked) drive reads the retained bytes through the one
     # cross-task reader, against the canonical root; the reader verifies the hash.
     from ouroboros.tools.control_task_results import _get_task_result
@@ -77,8 +77,25 @@ def test_root_focus_persists_and_terminal_race_refuses(tmp_path, monkeypatch):
     child = types.SimpleNamespace(task_id="child", drive_root=tmp_path, task_metadata={"budget_drive_root": str(tmp_path), "delegation_role": "subagent"})
     forbidden = _get_task_result(child, "root", include_focus_source=True)
     assert "TOOL_FORBIDDEN" in forbidden and handle["sha256"] not in forbidden
+    # A LATER focus of the same author must not substitute its evidence for the row a
+    # peer read: the digest the roster quoted selects the immutable historical file.
+    append_jsonl(tmp_path / "projects" / "alpha" / "journal.jsonl", {"kind": "note", "text": "later evidence"})
+    later = _update_focus(ctx, "Second focus, new page", {"reader": "journal_read", "project_id": "alpha"})
+    assert later.startswith("OK: focus[root]")
+    current = json.loads(_get_task_result(peer, "root", include_focus_source=True, source_start_char=0, source_end_char=20))["focus_source"]
+    assert current["complete_sha256"] != handle["sha256"] and "later evidence" in (tmp_path / "task_results" / "artifacts" / "root" / json.loads((tmp_path / "task_results" / "root.json").read_text())["focus"]["source_handle"]["path"]).read_text()
+    historical = json.loads(_get_task_result(peer, "root", include_focus_source=True, focus_source_sha256=handle["sha256"], source_start_char=0, source_end_char=20))["focus_source"]
+    assert historical["complete_sha256"] == handle["sha256"] and historical["historical"] is True and historical["text"] == retained.decode("utf-8")[:20]
+    assert json.loads(_get_task_result(peer, "root", include_focus_source=True, focus_source_sha256="0" * 64))["focus_source"]["reason"] == "source_unavailable"
+    # A retry that supersedes the author's EFFECTIVE result does not redirect the
+    # retained source: the roster names the physical author.
+    write_task_result(tmp_path, "root", STATUS_RUNNING, superseded_by="root-retry")
+    write_task_result(tmp_path, "root-retry", STATUS_RUNNING, result="Task is running.")
+    via_retry = json.loads(_get_task_result(peer, "root", include_focus_source=True, focus_source_sha256=handle["sha256"]))["focus_source"]
+    assert via_retry["complete_sha256"] == handle["sha256"]
     (tmp_path / "task_results" / "artifacts" / "root" / handle["path"]).write_bytes(b"tampered")
-    assert json.loads(_get_task_result(peer, "root", include_focus_source=True))["focus_source"]["reason"] == "source_identity_mismatch"
+    tampered = _get_task_result(peer, "root", include_focus_source=True, focus_source_sha256=handle["sha256"])
+    assert json.loads(tampered)["focus_source"]["reason"] == "source_identity_mismatch"
 
     write_task_result(tmp_path, "root", STATUS_COMPLETED, result="done")
     refused = _update_focus(ctx, "Too late", {"reader": "journal_read"})
@@ -298,3 +315,23 @@ def test_focus_source_refuses_unsettled_task_results_and_oversized_answers(tmp_p
     append_jsonl(tmp_path / "projects" / "alpha" / "journal.jsonl", {"kind": "note", "text": "x" * (pj._FOCUS_SOURCE_MAX_BYTES + 10)})
     too_big = pj._update_focus(ctx, "Whole journal", {"reader": "journal_read", "project_id": "alpha"})
     assert "FOCUS_SOURCE_UNRESOLVED" in too_big and "narrower page" in too_big
+
+
+def test_focus_source_honours_the_task_contract_disabled_tools(tmp_path, monkeypatch):
+    """update_focus reads a source through the SAME admission a direct call of that
+    reader would get: a contract that withholds journal_read cannot retain it."""
+    from ouroboros.tools.project_journal import _update_focus
+    from ouroboros.utils import append_jsonl
+
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    append_jsonl(tmp_path / "projects" / "alpha" / "journal.jsonl", {"kind": "note", "text": "withheld"})
+    write_task_result(tmp_path, "root", STATUS_RUNNING, project_id="alpha")
+    ctx = types.SimpleNamespace(
+        task_id="root", drive_root=tmp_path, project_id="alpha", is_direct_chat=False, event_queue=None,
+        task_metadata={"root_task_id": "root", "budget_drive_root": str(tmp_path)},
+        task_contract={"disabled_tools": ["journal_read"]},
+    )
+    refused = _update_focus(ctx, "Reading what I may not", {"reader": "journal_read", "project_id": "alpha"})
+    assert "FOCUS_SOURCE_UNRESOLVED" in refused and "withheld" in refused
+    assert not list((tmp_path / "task_results" / "artifacts").glob("**/focus_source_*")) 
+    assert "focus" not in json.loads((tmp_path / "task_results" / "root.json").read_text())

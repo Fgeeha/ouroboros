@@ -186,7 +186,7 @@ def _get_task_result(
     ctx: ToolContext, task_id: str, include_authority: bool = False,
     include_work_order_source: bool = False, source_start_char: Any = None,
     source_end_char: Any = None, include_completion_source: bool = False,
-    known_result_sha256: str = "", include_focus_source: bool = False,
+    known_result_sha256: str = "", include_focus_source: bool = False, focus_source_sha256: str = "",
 ) -> str:
     """Read a task result, or a bounded canonical work-order/completion source range."""
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
@@ -272,9 +272,14 @@ def _get_task_result(
             )
         if bool(include_focus_source):
             from ouroboros.task_finalization import focus_source_projection
+            from ouroboros.task_results import load_task_result
 
+            # The PHYSICAL author's record: a retry supersedes the effective
+            # result, but the roster names the task that retained the bytes.
+            physical = load_task_result(status_drive_root, str(task_id))
             payload["focus_source"] = focus_source_projection(
-                status_drive_root, str(task_id), data, source_start_char, source_end_char,
+                status_drive_root, str(task_id), physical if isinstance(physical, dict) else {},
+                source_start_char, source_end_char, sha256=str(focus_source_sha256 or ""),
             )
         text = json.dumps(payload, ensure_ascii=False, sort_keys=True)
         if any(isinstance(view, dict) and view.get("reason") == "source_range_invalid"
