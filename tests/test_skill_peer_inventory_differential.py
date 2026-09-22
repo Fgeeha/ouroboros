@@ -245,3 +245,24 @@ def test_skill_peer_is_immutable_and_non_executable():
     assert not hasattr(peer, "content_hash")
     assert not hasattr(peer, "review")
     assert not hasattr(peer, "manifest")
+
+
+def test_a_peer_is_a_valid_subject_of_the_conflict_projection(tmp_path):
+    """Duck typing holds on BOTH sides: a SkillPeer subject reaches the same verdict.
+
+    `enabled_skill_conflicts` reads `skill.conflicts`, never `skill.manifest`,
+    because `SkillPeer` deliberately has no manifest.
+    """
+    drive = tmp_path / "drive"
+    skills = drive / "skills" / "external"
+    _write(skills / "declares", _manifest("declares", conflicts=("target",)))
+    _write(skills / "target", _manifest("target"))
+    save_enabled(drive, "declares", True)
+    save_enabled(drive, "target", True)
+    full = {s.name: s for s in discover_skills(drive, repo_path="")}
+    peers = {p.name: p for p in discover_skill_peers(drive, repo_path="")}
+    for name in ("declares", "target"):
+        as_full = skill_conflict_status(full[name], list(peers.values()))
+        as_peer = skill_conflict_status(peers[name], list(peers.values()))
+        assert as_peer is not None, name
+        assert as_full == as_peer, name

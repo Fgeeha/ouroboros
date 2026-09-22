@@ -1406,6 +1406,34 @@ def discover_selected_skill_candidates(
     )
 
 
+def discover_skill_identity(
+    drive_root: pathlib.Path,
+    name: str,
+    *,
+    repo_path: str | None = None,
+) -> List[LoadedSkill]:
+    """Load one identity with ORDINARY discovery semantics, nothing else read.
+
+    Same inventory and collision rules as ``discover_skills`` restricted to one
+    canonical name — no manifestless opt-in, so a directory without a manifest
+    beside a valid skill of the same name stays invisible here exactly as it is
+    to passive discovery. This is the resolver every EXECUTION caller uses
+    (liveness, reconcile, the extension child); the repair/publication lanes
+    keep ``discover_selected_skill_candidates`` and its deliberately stricter
+    manifestless ambiguity.
+    """
+    if repo_path is None:
+        from ouroboros.config import get_skills_repo_path
+
+        repo_path = get_skills_repo_path()
+    safe = _sanitize_skill_name(name)
+    candidates = tuple(
+        item for item in _skill_location_inventory(drive_root, repo_path=repo_path)
+        if item.name == safe
+    )
+    return _load_skill_location_candidates(candidates, drive_root=drive_root)
+
+
 def find_skill(
     drive_root: pathlib.Path,
     name: str,
@@ -1414,8 +1442,7 @@ def find_skill(
 ) -> Optional[LoadedSkill]:
     """Return one skill by name, including broken manifests with ``load_error``."""
     safe = _sanitize_skill_name(name)
-    candidates = tuple(item for item in _skill_location_inventory(drive_root, repo_path=repo_path) if item.name == safe)
-    for skill in _load_skill_location_candidates(candidates, drive_root=drive_root):
+    for skill in discover_skill_identity(drive_root, name, repo_path=repo_path):
         if skill.name == safe:
             return skill
     return None
@@ -1560,7 +1587,7 @@ __all__ = [
     "AutoGrantOutcome", "LoadedSkill", "HASH_EXEMPT_CONTROL_FILENAMES",
     "SkillReviewState", "auto_grant_if_enabled",
     "VALID_REVIEW_STATUSES", "compute_content_hash", "reduce_skill_content_hash", "discover_skills",
-    "discover_selected_skill_candidates", "find_skill",
+    "discover_selected_skill_candidates", "discover_skill_identity", "find_skill",
     "enabled_skill_conflicts", "skill_conflict_status",
     "grant_status_for_skill", "is_self_authored_skill_dir", "list_available_for_execution",
     "load_enabled", "load_review_state", "load_skill_grants", "load_skill",

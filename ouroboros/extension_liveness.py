@@ -17,7 +17,7 @@ from ouroboros.extension_registry_state import _extensions, _load_failures, _loc
 from ouroboros.skill_loader import (
     LoadedSkill,
     _sanitize_skill_name,
-    discover_selected_skill_candidates,
+    discover_skill_identity,
     grant_status_for_skill,
     skill_conflict_status,
 )
@@ -191,7 +191,7 @@ def runtime_state_for_skill_name(
     elif skills is not None:
         selected = list(skills)
     else:
-        selected = discover_selected_skill_candidates(drive_root, skill_name, repo_path=resolved_repo_path)
+        selected = discover_skill_identity(drive_root, skill_name, repo_path=resolved_repo_path)
     peer_projection = list(skills) if skills is not None else list(
         discover_skill_peers(drive_root, repo_path=resolved_repo_path)
     )

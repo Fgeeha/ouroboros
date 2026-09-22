@@ -166,14 +166,14 @@ def test_reconcile_loads_selected_payload_without_full_peer_discovery(tmp_path, 
         permissions=[],
     )
     calls = 0
-    real_discover = extension_loader.discover_selected_skill_candidates
+    real_discover = extension_loader.discover_skill_identity
 
     def counted_discover(*args, **kwargs):
         nonlocal calls
         calls += 1
         return real_discover(*args, **kwargs)
 
-    monkeypatch.setattr(extension_loader, "discover_selected_skill_candidates", counted_discover)
+    monkeypatch.setattr(extension_loader, "discover_skill_identity", counted_discover)
 
     state = extension_loader.reconcile_extension(
         loaded.name,

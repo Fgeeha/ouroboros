@@ -23,7 +23,7 @@ def enabled_skill_conflicts(skill: Any, skills: List[Any]) -> List[str]:
     A declaration on either side is authoritative, so one-sided manifests are
     enforced symmetrically. Missing and disabled peers are deliberately inert.
     """
-    declared = set(skill.manifest.conflicts or [])
+    declared = set(skill.conflicts or ())
     conflicts = {
         peer.name
         for peer in skills

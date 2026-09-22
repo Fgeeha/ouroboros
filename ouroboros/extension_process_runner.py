@@ -865,7 +865,7 @@ def _load_child_extension(skill_name: str, drive_root: pathlib.Path, repo_dir: p
     from ouroboros.config import load_settings
     from ouroboros.extension_loader import load_extension
     from ouroboros.settings_integrity import _next_task_setting
-    from ouroboros.skill_loader import discover_selected_skill_candidates
+    from ouroboros.skill_loader import discover_skill_identity
 
     def settings_reader():
         live = load_settings()
@@ -876,7 +876,7 @@ def _load_child_extension(skill_name: str, drive_root: pathlib.Path, repo_dir: p
         return {**{key: value for key, value in live.items() if not _next_task_setting(key)},
                 **task_settings}
 
-    skills = discover_selected_skill_candidates(drive_root, skill_name, repo_path=str(skills_repo_path))
+    skills = discover_skill_identity(drive_root, skill_name, repo_path=str(skills_repo_path))
     skill = next((item for item in skills if item.name == skill_name), None)
     if skill is None:
         raise ExtensionProcessError(f"extension skill {skill_name!r} is missing")
