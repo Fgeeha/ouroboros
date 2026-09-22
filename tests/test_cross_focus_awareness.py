@@ -77,6 +77,10 @@ def test_root_focus_persists_and_terminal_race_refuses(tmp_path, monkeypatch):
     child = types.SimpleNamespace(task_id="child", drive_root=tmp_path, task_metadata={"budget_drive_root": str(tmp_path), "delegation_role": "subagent"})
     forbidden = _get_task_result(child, "root", include_focus_source=True)
     assert "TOOL_FORBIDDEN" in forbidden and handle["sha256"] not in forbidden
+    # ...and no other projection of the record hands it over either.
+    authority_view = _get_task_result(child, "root", include_authority=True)
+    assert "focus" not in json.loads(authority_view)["authority"] and handle["sha256"] not in authority_view
+    assert "focus" in json.loads(_get_task_result(peer, "root", include_authority=True))["authority"]
     # A LATER focus of the same author must not substitute its evidence for the row a
     # peer read: the digest the roster quoted selects the immutable historical file.
     append_jsonl(tmp_path / "projects" / "alpha" / "journal.jsonl", {"kind": "note", "text": "later evidence"})

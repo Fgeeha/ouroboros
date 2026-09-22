@@ -123,6 +123,7 @@ Check sentence by sentence. Fix misattributed actors or approvals; decisions mov
 Keep the first-person Ouroboros voice, quotes, task_ids and everything the draft got right; adapt length to the content.
 {FIDELITY_RULES}
 Return only the corrected memory text: no headers, commentary or diff. If the draft is already faithful, return it unchanged.
+If the draft ends with a `KNOWLEDGE_ENTRIES_JSON:` block, it is subject to the same check: return it after the corrected memory with the same shape, dropping or fixing every entry the source does not support; a claim the correction removed from the memory must not survive as an entry.
 {_identity_section(identity_text)}
 {continuation_note}## Draft memory
 {draft}
@@ -191,9 +192,10 @@ def summarize_source(
     fixed prompt alone is the remaining excess — no other repair loop exists.
     Parts cover the source in order without clipping; any failed or empty
     response withholds the whole source. A real refusal lowers the same route's
-    byte limit for remaining parts and the next cycle. Nominations are bound by
-    the call that made them and never validated by the correction, but they are
-    released only together with the corrected part they came from.
+    byte limit for remaining parts and the next cycle. Knowledge nominations
+    are released only from the CORRECTED response: the draft's trailing block
+    travels into the correction under the same source check, so a false claim
+    the correction removed from the memory cannot survive as a durable entry.
     """
     pending, summaries, usages = [(0, len(text))], [], []
     entries: List[Dict[str, Any]] = []
@@ -230,17 +232,16 @@ def summarize_source(
                                        input_limit=input_limit, call_type="memory_consolidation")
         usages.append(usage)
         if draft.strip():
-            draft, draft_found = _extract_nominations(draft, knowledge)
             corrected, usage, knowledge = call(
                 correct_prompt(draft, part, note), "Room correction", fixed_prompt=correct_prompt(draft, "", note),
                 input_limit=input_limit, call_type="memory_correction")
             usages.append(usage)
             if corrected.strip():
-                # A part's nominations are released only with its corrected text:
-                # a draft whose correction failed (and was then split) never
-                # entered the block, so its nominations must not survive it.
+                # A part's nominations are the corrected response's, released
+                # only with its corrected text: a draft whose correction failed
+                # (and was then split) never entered the block, and a draft
+                # nomination the correction dropped was never source-checked.
                 corrected, found = _extract_nominations(corrected, knowledge)
-                entries.extend(draft_found)
                 entries.extend(found)
                 summaries.append(corrected.strip())
                 continue

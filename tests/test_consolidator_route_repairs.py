@@ -216,7 +216,7 @@ def test_quota_wait_reprepares_auto_with_the_new_accounts_capacity(tmp_path, cap
     ) as waiter:
         content, usage = _summary(client, source)
     assert content and len(calls) > 2 and usage["cost"] is None
-    assert _source(accepted) == source
+    assert _corrected_source(accepted) == source  # corrected coverage; drafts may repeat a redrafted part
     assert all(row["resolution"] == "resource_available" for row in waiter.waits.values())
     assert any(ev.credential_profile_id == "account-b" and ev.window_tokens == 17000
                for _, ev in capacity.resolutions)

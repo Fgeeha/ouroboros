@@ -290,7 +290,10 @@ def test_single_large_entry_is_lossless_even_without_line_boundaries(fit):
     llm = _LLM()
     content, _ = _summary(llm, source)
     assert content and len(llm.calls) > 2
-    assert _source(llm.accepted) == source
+    # A correction whose fixed prefix overflowed re-drafts its halves, so the
+    # DRAFT sources may cover a part twice; the CORRECTED sources — what the
+    # published text was checked against — cover the source exactly once.
+    assert _corrected_source(llm.accepted) == source
 
 
 @pytest.mark.parametrize("stale", [False, True])
@@ -463,7 +466,9 @@ def test_rotation_append_and_partial_failure_only_advance_completed_chunks(tmp_p
 
     succeeding = _LLM()
     c.consolidate(chat, blocks, meta, succeeding)
-    assert _source(succeeding.accepted) == c._format_entries_for_block(rows[100:], include_room_labels=True) + c._format_entries_for_block(c._read_chat_entries(chat)[:100], include_room_labels=True)
+    # Corrected coverage is the invariant: a correction whose prefix overflowed
+    # re-drafts its halves, so draft sources may repeat a part.
+    assert _corrected_source(succeeding.accepted) == c._format_entries_for_block(rows[100:], include_room_labels=True) + c._format_entries_for_block(c._read_chat_entries(chat)[:100], include_room_labels=True)
     saved = json.loads(meta.read_text())
     assert saved["last_consolidated_offset"] == 100
     assert saved["chat_log_signature"]["first_line_sha256"] == c._chat_log_signature(chat)["first_line_sha256"]
@@ -515,7 +520,7 @@ def test_light_account_and_manual_window_share_real_context_resolver(monkeypatch
     assert all(p["options"]["credential_profile_id"] == "light-account" for p in probes)
     assert all(p["provider"] == "claudexor" and p["allow_fetch"] is True for p in probes)
     assert all(context_fit.estimate_context_prompt_tokens(call["messages"]) + 16384 <= 17000 for call in llm.calls)
-    assert _source(llm.accepted) == text
+    assert _corrected_source(llm.accepted) == text
 
 
 def test_local_and_auto_account_are_passed_explicitly(fit, monkeypatch):

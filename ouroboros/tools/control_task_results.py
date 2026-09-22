@@ -192,10 +192,11 @@ def _get_task_result(
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
     status_drive_root = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
     data = load_effective_task_result(status_drive_root, task_id)
-    if bool(include_focus_source):
-        from ouroboros.tools.recent_tasks import _restricted_actor
+    from ouroboros.tools.recent_tasks import _restricted_actor
 
-        if _restricted_actor(ctx):
+    restricted = _restricted_actor(ctx)
+    if restricted:
+        if bool(include_focus_source):
             # Children and Presence turns hold no cross-focus view (recent_tasks
             # strips focus, live_roots refuses); the retained SOURCE of a focus is
             # part of that view, not of the ordinary task result.
@@ -203,6 +204,10 @@ def _get_task_result(
             # block (the same spelling project_journal and live_roots publish).
             return ("⚠️ TOOL_FORBIDDEN (get_task_result): restricted actors have no cross-focus "
                     "catalogue; include_focus_source is not available to them")
+        if isinstance(data, dict) and "focus" in data:
+            # The same ceiling on every projection of the record: the authority
+            # view copies top-level fields, so focus leaves before it is built.
+            data = {key: value for key, value in data.items() if key != "focus"}
     if not data:
         return _publish_tool_result(ctx, ToolResult(
             status="unavailable", code="LEGACY_UNAVAILABLE",

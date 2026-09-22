@@ -333,3 +333,38 @@ def test_main_era_path_replaces_blocks_only_when_the_era_is_shorter(tmp_path, fi
     else:
         assert stored[0]["content"] == era_content and stored[1:c.MAX_SUMMARY_BLOCKS - c.ERA_COMPRESS_COUNT + 1] == old[c.ERA_COMPRESS_COUNT:]
     assert len(stored) == (c.MAX_SUMMARY_BLOCKS if era_grows else c.MAX_SUMMARY_BLOCKS - c.ERA_COMPRESS_COUNT + 1) + 1
+
+
+def test_nominations_come_from_the_corrected_response_not_the_draft():
+    """A false claim the correction removed from the memory cannot survive as a
+    durable knowledge entry: only the CORRECTED response's block is released."""
+    spans = []
+    rows = [{"ts": f"2026-01-01T00:0{i}:00Z", "direction": "in", "text": f"entry-{i} plain", "chat_id": 1} for i in range(2)]
+    text = c._format_entries_for_block(rows, include_room_labels=True, source_spans=spans)
+    spans = [(start, end, note) for start, end, note in spans]
+
+    class _Knowledge:
+        def bind_entries(self, entries):
+            return list(entries or [])
+
+    prompts = []
+
+    def call(prompt, label, *, fixed_prompt="", input_limit=None, call_type=""):
+        prompts.append((label, prompt))
+        usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "cost": 0.0, "_consolidation_errors": []}
+        if label == "Room summary":
+            return ('draft memory\nKNOWLEDGE_ENTRIES_JSON: [{"topic":"leak","scope":"global","content":"owner approved"}]',
+                    usage, _Knowledge())
+        return ('corrected memory\nKNOWLEDGE_ENTRIES_JSON: [{"topic":"kept","scope":"global","content":"owner asked"}]',
+                usage, _Knowledge())
+
+    content, usage = rc.summarize_source(
+        call, text, spans,
+        lambda part, note: rc.room_draft_prompt(part, room_label="Main", block_range_text="r", message_count=2, continuation_note=note),
+        lambda draft, part, note: rc.correction_prompt(draft, part, room_label="Main", scope="block r", continuation_note=note),
+    )
+    assert content == "corrected memory"
+    # The draft's block reaches the correction under the same source check...
+    assert "KNOWLEDGE_ENTRIES_JSON" in prompts[1][1] and "owner approved" in prompts[1][1]
+    # ...and only the corrected block is released.
+    assert [entry["topic"] for entry in usage["_knowledge_entries"]] == ["kept"]
