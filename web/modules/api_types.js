@@ -37,8 +37,7 @@
 
 /**
  * Background Consciousness alarm-clock snapshot (server._describe_bg_consciousness_state over
- * consciousness.status_snapshot). A wake-up is an ordinary Main turn; its liveness is the
- * direct-activity census, never a flag here.
+ * consciousness.status_snapshot). A wake-up is an ordinary Main turn; its liveness is the direct-activity census, never a flag here.
  * @typedef {Object} BgConsciousnessState
  * @property {boolean} enabled
  * @property {string} status  // disabled | stopped | thinking | sleeping | waiting_for_first_conversation | allowance_exhausted | allowance_unknown | wake_rejected | wake_failed
