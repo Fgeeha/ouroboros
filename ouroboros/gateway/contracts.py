@@ -723,9 +723,14 @@ class ActiveChatActivity(ActiveDirectTurn):
     synthesis still open).
     Field shape mirrors ``ActiveDirectTurn`` so one client reducer hydrates
     both; managed rows carry an empty ``client_message_id``.
+    A direct row whose live wait owner could not be read carries
+    ``phase="unknown"``. ``required_question_unavailable`` marks a row with a
+    recorded owner-question wait whose detail could not be resolved: the row is
+    possibly blocked on an answer and must not be read as unblocked.
     """
 
     required_question: NotRequired[Dict[str, Any]]
+    required_question_unavailable: NotRequired[bool]
 
 
 class StateResponse(TypedDict):

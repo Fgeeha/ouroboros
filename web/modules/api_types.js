@@ -76,6 +76,7 @@
 /**
  * @typedef {Object} ActiveChatActivity
  * @property {Object=} required_question  // read-only pointer to the current required Project quiz
+ * @property {boolean=} required_question_unavailable  // a recorded owner-question wait whose detail could not be read: possibly blocked, never "no question"
  * @property {Object.<string,Object>=} model_waits
  * @property {number=} task_attempt
  * @property {string} activity_id
@@ -83,7 +84,7 @@
  * @property {string} project_id
  * @property {string} client_message_id  // empty for managed queue rows
  * @property {string} kind  // direct_chat | managed_task — presentational label; membership in this census, not kind, decides liveness
- * @property {string} phase  // managed rows: queued | working | finalizing
+ * @property {string} phase  // managed rows: queued | budget_paused | working | finalizing; direct rows: thinking, or unknown when the live wait owner could not be read
  * @property {number} started_at
  */
 

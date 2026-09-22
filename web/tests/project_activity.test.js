@@ -28,9 +28,10 @@ test('working, thinking and finalizing are the only animated phases', () => {
 });
 
 test('waits are amber facts and resumed questions are not waits', () => {
-    const modelWait = activity({ project_id: 'p', phase: 'working', model_waits: {
-        w: { state: 'waiting', task_attempt: 1 },
-    }, task_attempt: 1 });
+    // Fixtures carry the producer's complete wait row: the reducer admits waits
+    // exactly as the chat card does, so a bare {state, task_attempt} is dropped.
+    const wait = (patch = {}) => ({ wait_id: 'w', revision: 1, task_attempt: 1, state: 'waiting', reason: 'quota', ...patch });
+    const modelWait = activity({ project_id: 'p', phase: 'working', model_waits: { w: wait() }, task_attempt: 1 });
     const question = activity({ project_id: 'p', phase: 'queued', required_question: {
         wait_for_answer: true, owner_wait_state: 'waiting',
     } });
@@ -131,9 +132,9 @@ test('complete needs an array and literal true readiness before it can clear abs
 
 test('model waits use the existing current-attempt rule and questions end on their own lifecycle', () => {
     const row = activity({ phase: 'finalizing', task_attempt: 2,
-        model_waits: { previous: { state: 'waiting', task_attempt: 1 } } });
+        model_waits: { previous: { wait_id: 'previous', revision: 1, task_attempt: 1, state: 'waiting', reason: 'quota' } } });
     assert.equal(summarizeProjectActivities([row]).motion, true);
-    row.model_waits.current = { state: 'waiting', task_attempt: 2 };
+    row.model_waits.current = { wait_id: 'current', revision: 1, task_attempt: 2, state: 'waiting', reason: 'auth' };
     assert.equal(summarizeProjectActivities([row]).state, 'waiting');
     row.model_waits.current.state = 'resolved';
     assert.equal(summarizeProjectActivities([row]).motion, true);
@@ -148,3 +149,32 @@ test('model waits use the existing current-attempt rule and questions end on the
 });
 
 test('budget-paused work is a stationary wait, not a queue', () => { const s=summarizeProjectActivities([activity({phase:'budget_paused'})]); assert.equal(s.state,'waiting'); assert.equal(s.motion,false); assert.equal(s.label,'Paused'); });
+
+test('model wait rows pass the same admission as the chat card: malformed waits cannot stop motion', () => {
+    // Missing wait_id/revision/reason: the card would drop this row, so must the sidebar.
+    const malformed = activity({ project_id: 'p', phase: 'working', task_attempt: 1,
+        model_waits: { w: { state: 'waiting', task_attempt: 1 } } });
+    const s = summarizeProjectActivities([malformed]);
+    assert.equal(s.motion, true);
+    assert.equal(s.state, 'working');
+    assert.doesNotMatch(s.label, /Waiting for access/);
+    // The complete row the producer writes (wait_id echoes its key, positive revision, typed reason).
+    const wellFormed = activity({ project_id: 'p', phase: 'working', task_attempt: 1,
+        model_waits: { w: { wait_id: 'w', revision: 1, task_attempt: 1, state: 'waiting', reason: 'quota' } } });
+    const w = summarizeProjectActivities([wellFormed]);
+    assert.equal(w.motion, false);
+    assert.equal(w.state, 'waiting');
+    assert.match(w.label, /Waiting for access/);
+});
+
+test('a row whose owner-question detail could not be read is static unknown, never moving', () => {
+    const row = activity({ project_id: 'p', phase: 'working', required_question_unavailable: true });
+    const s = summarizeProjectActivities([row]);
+    assert.equal(s.motion, false);
+    assert.equal(s.state, 'unknown');
+    assert.match(s.label, /Activity status unavailable/);
+    // Beside an independently confirmed working row the project still moves, and the gap stays named.
+    const mixed = summarizeProjectActivities([row, activity({ activity_id: 'b', project_id: 'p', phase: 'working' })]);
+    assert.equal(mixed.motion, true);
+    assert.match(mixed.label, /Activity status unavailable/);
+});

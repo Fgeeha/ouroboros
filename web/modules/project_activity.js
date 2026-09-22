@@ -4,7 +4,7 @@
 // This module deliberately owns no timer, request, socket or durable state. A
 // caller supplies the previous projection when reconciling a partial census.
 
-import { activeModelWaits } from './model_wait.js';
+import { activeModelWaits, mergeModelWaits } from './model_wait.js';
 import { waitFacts } from './question_presentation.js';
 
 const WORKING_PHASES = new Set(['thinking', 'working', 'finalizing']);
@@ -36,7 +36,11 @@ function waitingQuestion(row) {
 function waitingModel(row) {
     const waits = row?.model_waits;
     if (!waits || typeof waits !== 'object') return false;
-    return activeModelWaits(waits, false, Number(row?.task_attempt) || 0).length > 0;
+    // The same admission rule the chat card applies: a malformed wait row is
+    // dropped here exactly as there, so the sidebar cannot go static on a row
+    // the card would never show.
+    const admitted = mergeModelWaits({}, waits);
+    return activeModelWaits(admitted, false, Number(row?.task_attempt) || 0).length > 0;
 }
 
 function waitLabels(row) {
@@ -70,7 +74,9 @@ export function summarizeProjectActivities(rows = []) {
     let unknown = false;
     for (const row of Array.isArray(rows) ? rows : []) {
         if (!row || typeof row !== 'object') continue;
-        if (row._activityUnconfirmed) { unknown = true; continue; }
+        // A row whose owner-question detail the census could not read may be
+        // blocked on an answer: it stays static unknown rather than moving.
+        if (row._activityUnconfirmed || row.required_question_unavailable === true) { unknown = true; continue; }
         const phase = String(row.phase || '').trim().toLowerCase();
         const rowWaits = waitLabels(row);
         // A same-row wait supersedes its coarse queue/execution phase.
