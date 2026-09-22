@@ -73,7 +73,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # (the argument-narrowing predicate, which names it keeps and why, the
     # own-child custody reuse, and the non-inherited mutating delegation budget);
     # the Observe half of the AUTHORITY sentence is replaced, the rest is new.
-    "docs/architecture/06-agent-core.md": 292800,
+    # +2200: per-room memory consolidation (room_consolidation.py: draft +
+    # source-grounded correction, typed room sections through era, chunk-level
+    # transaction) and the cross-focus authored-focus contract are new
+    # subsystems of this chapter; the era paragraph they replaced was shorter.
+    "docs/architecture/06-agent-core.md": 295000,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
