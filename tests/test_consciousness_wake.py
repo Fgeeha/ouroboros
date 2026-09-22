@@ -150,18 +150,18 @@ def test_render_substitutes_every_placeholder_and_truncates_events_honestly(tmp_
         running=1, max_tasks=2, interval=3300)
     for key in wake.PLACEHOLDERS:
         assert "{" + key + "}" not in text, key
-    assert text.startswith("[Wake-up · task_finished:t14:completed]")
-    assert "1 h 30 min ago" in text and "autonomy act — everything your runtime mode allows except" in text
-    assert "toggle_evolution, request_restart (calling them is refused)" in text
-    assert "Allowance (last 24 h): 4.00 / 20.00 USD" in text and "still running: 1/2" in text
-    assert "wake-up interval is 3300 s" in text
+    assert text.startswith("You are Ouroboros. No one has asked for a task")
+    assert "1 h 30 min ago" in text and "autonomy: act — everything your runtime mode allows except" in text
+    assert "toggle_evolution, request_restart" in text
+    assert "allowance accounting (last 24 h): 4.00 / 20.00 USD" in text and "tasks running: 1/2" in text
+    assert "next interval: 3300 s" in text
     assert "- wake cause: task t14 finished (completed)" in text
     assert text.count("- task t") == wake.EVENT_LINES_MAX - 1 and "(+5 more; see recent_tasks, get_task_result, and chat_history)" in text
     quiet = wake.render_wake_message(
         tmp_path, repo, reason="heartbeat", last_wake_at=0.0, since=T0 + 1, now=T0, level="full",
         disabled_tools=[], spent_usd=None, daily_usd=0, running=0, max_tasks=0, interval=900)
     assert "no wake since this process started" in quiet and "wake cause: scheduled heartbeat" in quiet
-    assert "withheld at this level: none" in quiet and "Allowance (last 24 h): unknown / 0.00 USD" in quiet
+    assert "unavailable tools: none" in quiet and "allowance accounting (last 24 h): unknown / 0.00 USD" in quiet
     assert "including evolution" in quiet
 
 
@@ -179,11 +179,8 @@ def test_template_names_only_its_placeholders_and_the_wake_hints():
     import re
 
     assert set(re.findall(r"\{([a-z_]+)\}", template)) == set(wake.PLACEHOLDERS)
-    for hint in ("Doing nothing is a fine outcome", "ask only when the answer changes what you do",
-                 "say what you assume meanwhile", "choose how long", "do not request an acceptance review",
-                 "old cards and routine maintenance should not displace", "`set_next_wakeup`", "Allowance (last 24 h)",
-                 "opening with why you woke or what changed", "be brief, no essays unless something matters",
-                 "people you talk with", "task cards", "get_task_result"):
+    for hint in ("A pause is a legitimate decision", "Distinguish incremental cash cost",
+                 "do not request task acceptance", "wake facts", "recent facts"):
         assert hint in template, hint
     assert "a heartbeat, a task that finished, a project digest" not in template
     assert "up to 10 rounds" not in template and "300 seconds" not in template

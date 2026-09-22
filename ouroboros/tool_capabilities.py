@@ -32,7 +32,7 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     # can register it without an enable_tools detour. Deliberately absent from
     # the subagent profiles below — a child may not mint future root tasks.
     "schedule_followup",
-    "schedule_subagent", "integrate_subagent_patch", "compare_subagent_patches",
+    "schedule_subagent", "manage_schedules", "integrate_subagent_patch", "compare_subagent_patches",
     "integrate_delegated_patch",
     "wait_task", "wait_tasks", "get_task_result",
     # D#7 soft-join child controls (siblings of steer_task): inspect/decide a child's fate
@@ -84,6 +84,10 @@ LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "escalate",
     "forward_to_worker", "peek_task", "cancel_task", "discard_child_result",
     "schedule_subagent",
+    # Reading the schedule table is research: a child asked about what this mind
+    # has standing can see it. The tool's own authority check refuses every
+    # MUTATING action to a delegated task, so the name grants no control here.
+    "manage_schedules",
     # Task-tree coordination: a child reads the shared frame and raises beacons. tree_note
     # is a bounded tree-scoped write; its tagged child-result disposition branch also
     # updates the existing child result through join_ledger's lineage/hash authority.
@@ -316,6 +320,12 @@ OBSERVE_WORLD_MUTATION_TOOLS: frozenset[str] = frozenset({
     "vcs_pull_ff", "vcs_restore", "vcs_revert",
     "fetch_pr_ref", "create_integration_branch", "cherry_pick_pr_commits",
     "stage_adaptations", "stage_pr_merge",
+    # disposing a captured patch — into a Git root, or LIVE into an installed
+    # skill payload; an orphan capture may belong to an unrelated earlier task,
+    # so a read-only-children rule alone does not cover this path
+    "integrate_delegated_patch", "integrate_subagent_patch",
+    # pushes docs/evolution.json to the public dashboard through the GitHub API
+    "generate_evolution_stats",
     # the world beyond the repository: forms, skills, project notes
     "browser_action", "submit_skill_to_hub", "toggle_skill", "skill_owner_action",
     "journal_write", "workpad_write",

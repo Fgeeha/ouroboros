@@ -208,6 +208,12 @@ def _derive_authority(ctx: ToolContext, access: str = "workspace_write") -> "Del
     )
 
     profile = active_tool_profile(ctx)
+    from ouroboros.consciousness_authority import is_observe_origin
+
+    if is_observe_origin(getattr(ctx, "task_metadata", {})):
+        # Observe can use the delegated harness for research, but never turns it
+        # into an in-place writer merely because the caller omitted/raised access.
+        return delegated_run_shape(False, "readonly")
     mutating = profile in ("acting_subagent", "external_workspace_task") or (
         profile in _TOP_LEVEL_PRINCIPAL_PROFILES and project_room_lens_dir(ctx) is not None
     )

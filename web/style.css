@@ -4424,13 +4424,18 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     font-size: 11.5px;
 }
 
-.skills-details {
+/* One disclosure, two surfaces: a Skills card's detail and Activity's retained
+   schedules (a fired one-shot, a suppressed skill row) read the same, so they
+   share these rules instead of growing a second look for the same gesture. */
+.skills-details,
+.activity-history {
     margin-top: 4px;
     border-top: 1px solid rgba(var(--neutral-rgb), 0.06);
     padding-top: 10px;
 }
 
-.skills-details > summary {
+.skills-details > summary,
+.activity-history > summary {
     cursor: pointer;
     user-select: none;
     color: var(--text-meta);
@@ -4441,18 +4446,21 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     gap: 4px;
 }
 
-.skills-details > summary::-webkit-details-marker {
+.skills-details > summary::-webkit-details-marker,
+.activity-history > summary::-webkit-details-marker {
     display: none;
 }
 
-.skills-details > summary::before {
+.skills-details > summary::before,
+.activity-history > summary::before {
     content: '\25B8';
     display: inline-block;
     transition: transform 120ms ease;
     font-size: 10px;
 }
 
-.skills-details[open] > summary::before {
+.skills-details[open] > summary::before,
+.activity-history[open] > summary::before {
     transform: rotate(90deg);
 }
 

@@ -624,8 +624,13 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     # Subagent isolation: a delegated child may cancel only its own children.
     # Project focus does not narrow an ordinary top-level principal; workspace
     # parents keep the same task-control authority as other top-level tasks.
-    if not own and _is_delegated_task(ctx):
-        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(f"⚠️ cancel_task: {tid} is not a child of this task — a delegated task may only cancel its own children.")))
+    # A consciousness wake at Observe is narrowed the same way for the same
+    # reason: it may stop the work it started, which is the other half of being
+    # allowed to start read-only children, but not the owner's own running work.
+    from ouroboros.consciousness_authority import is_observe_origin
+
+    if not own and (_is_delegated_task(ctx) or is_observe_origin(getattr(ctx, "task_metadata", {}))):
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(f"⚠️ cancel_task: {tid} is not a child of this task — a delegated task may only cancel its own children, and a consciousness wake at the Observe level is held to the same rule.")))
     # Durable cancel intent — the ONE ingress (phase A, owner batch-4 1=A). The
     # canonical status never carries intent: the supervisor's cancellation
     # custody claims this intent, tears the task down, and settles the terminal
