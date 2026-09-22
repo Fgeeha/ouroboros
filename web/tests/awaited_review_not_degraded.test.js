@@ -10,7 +10,7 @@ import {
 // the chip, the reason and the sentence it had.
 
 const AWAITED_SENTENCE = 'Not every plan reviewer had answered when the task ended.';
-const ADVISORY_SENTENCE = 'Plan review never closed; the work continued under advisory enforcement';
+const ADVISORY_SENTENCE = 'The plan review was never closed; the work went on with what the reviewers said.';
 
 const done = (axes, extra = {}) => ({
     status: 'completed', task_id: 't1', reason_code: 'final_message', outcome_axes: axes, ...extra,
@@ -82,7 +82,7 @@ test('an acceptance panel that was only awaited is not a warning', () => {
     assert.equal(taskOutcomeSeverity(authored), 'done');
     assert.equal(
         taskReasonDetail(authored),
-        "The answer was delivered on Main's own judgement; the reviewers had not signed it off.",
+        'Ouroboros delivered this answer on its own judgement; the reviewers had not signed it off.',
     );
     // The legacy top-level mirror of the review axis reads the same way.
     assert.equal(taskOutcomeSeverity({ status: 'completed', review_status: { status: 'awaiting' } }), 'done');

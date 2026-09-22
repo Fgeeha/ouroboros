@@ -1271,6 +1271,10 @@ def _no_tool_final_answer(
 
     _loop()._project_child_result_dispositions(limit_ctx, llm_trace)
     plan_suffix = _loop()._force_plan_disclosure(tools._ctx, llm_trace)
+    # The forced rails already type this fact; the single degraded_reason slot below
+    # cannot hold it beside an unsettled child, so the normal rail types it too.
+    if plan_suffix:  # absent = not open: a clean result carries no key (pinned usage shapes)
+        limit_ctx.accumulated_usage["terminal_plan_review_open"] = True
     orphan_suffix = _loop()._forced_orphan_note(limit_ctx, include_terminal=False)
     set_terminal_host_notice(limit_ctx.accumulated_usage, plan_suffix, orphan_suffix)
     candidate = getattr(tools._ctx, "_delivery_candidate", None)

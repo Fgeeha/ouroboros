@@ -272,7 +272,8 @@ def get_tools():
                     "permits unfinished finalization only. Advisory author_action=finish may select a corrected "
                     "goal+plan+spec in the same call without another panel, citing the earlier review_fingerprint "
                     "and author_disposition rationale. Under advisory you may proceed with the "
-                    "review open and the host discloses it. Declare evidence reviewers need; "
+                    "review open; it stays typed in the task's state and your own answer states it. "
+                    "Declare evidence reviewers need; "
                     "affected_paths is required — the files the work will change ([] when none) — "
                     "and is what gives a self-modification the constitutional pack."
                 ),
@@ -781,7 +782,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         "📐 Plan review: checking for reviewer answers…" if collect is not None or resume_in_flight else
         (f"📐 Plan review: sending the plan to {len(callable_slots)} reviewer{'' if len(callable_slots) == 1 else 's'} "
          if callable_slots else "📐 Plan review: no reviewer lane can take the plan ")  # nothing is sent to zero lanes
-        + f"(cycle {cycle_index}{'' if cap is None else f'/{cap}'}, {enforcement}{', constitutional' if constitutional else ''})"
+        + f"(round {cycle_index}{'' if cap is None else f' of {cap}'}, {enforcement}{', constitutional' if constitutional else ''})"
         + (f"; {len(health_skip_rows)} lane{'' if len(health_skip_rows) == 1 else 's'} skipped at $0" if health_skip_rows else "") + ("…" if callable_slots else ".")
     )
     rows = await _run_plan_review_slots(
@@ -939,7 +940,7 @@ def _cycles_exhausted(
         cycles_paid=cycles_paid, cap=cap, enforcement=enforcement, fingerprint=fingerprint,
     )
     ctx.emit_progress_fn(
-        f"📐 Plan review: PLAN_REVIEW_CYCLES_EXHAUSTED — {cycles_paid}/{cap} paid cycles spent ({enforcement})."
+        f"📐 Plan review: no review rounds left — {cycles_paid} of {cap} used ({enforcement})."
     )
     head = (
         f"⚠️ PLAN_REVIEW_CYCLES_EXHAUSTED: {cycles_paid} of {cap} paid plan-review cycles are spent "
@@ -957,8 +958,9 @@ def _cycles_exhausted(
         head += "Cyber Pro permits proceeding by Ouroboros's judgment; the open review and spent cycles remain recorded facts."
     else:
         head += (
-            "Advisory enforcement: you may proceed with the review open; the host records and "
-            "discloses it loudly (typed event review_cycles_exhausted)."
+            "Advisory enforcement: you may proceed with the review open; the spent cycles and "
+            "the open review stay typed in this task's state (event review_cycles_exhausted), "
+            "and your own answer is where they are stated."
         )
     if current:
         return _publish_rendered_wave(
@@ -976,6 +978,15 @@ def _cycles_exhausted(
         ctx, {"aggregate_signal": "REVISE_PLAN", "closed": False}, text)
 
 # ---------------------------------------------------------------------- disposition
+
+def _narrate_author_rationale(ctx: ToolContext, author: Optional[dict]) -> None:
+    """The mind's recorded reason, verbatim, as ITS OWN row (``narration=True``): the
+    browser paints it in the assistant voice. Called only after the durable write
+    landed; an empty rationale says nothing."""
+    rationale = str((author or {}).get("rationale") or "").strip()
+    if rationale:
+        ctx.emit_progress_fn(rationale, narration=True)
+
 
 def _apply_author_subject(ctx: ToolContext, disposition: dict, envelope: Optional[dict]) -> str:
     """Save the author's current plan without rewriting the referenced critic wave."""
@@ -1037,9 +1048,11 @@ def _apply_author_subject(ctx: ToolContext, disposition: dict, envelope: Optiona
     except (OSError, TimeoutError, ValueError) as exc:
         return _typed_refusal(ctx, "TOOL_ARG_ERROR", f"ERROR: PLAN_AUTHOR_SUBJECT_INVALID: {exc}; "
             + _argument_values(disposition, ("author_action", "review_fingerprint", "items", "author_disposition")))
+    _narrate_author_rationale(ctx, author)  # the durable write landed: the mind's own words reach the owner
     allowed = action == "finish" and not review_enforcement_blocks(enforcement)
     text = (f"Current author plan saved: {fingerprint}. Critic subject: {critic_fp}. "
             "No reviewer called and no cycle consumed; original findings and custody remain unchanged. "
+            "Your rationale was shown to the owner in your own voice. "  # an empty rationale is refused before this line
             + ("Advisory author finish permits proceeding with this plan." if allowed else
                "No implementation approval granted. You may preserve the plan and finish with work blocked/unfinished.")
             + "\n" + json.dumps({"author_disposition": author, "source_ref": ref}, ensure_ascii=False))
@@ -1162,10 +1175,12 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
     except (OSError, TimeoutError, ValueError) as exc:
         return _typed_refusal(
             ctx, "TOOL_ERROR", "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(exc))
+    _narrate_author_rationale(ctx, author_record)
     _emit_plan_review_reference(ctx, task_id, state_root=root)
-    ctx.emit_progress_fn(
-        f"📐 Plan review: disposition recorded — {'closed' if closure['closed'] else 'still open'} "
-        f"({len(closure['open_ids'])} open finding id(s); no reviewer call, no cycle)."
-    )
+    open_count = len(closure["open_ids"])
+    ctx.emit_progress_fn("📐 Plan review: findings answered — " + (
+        "review closed." if closure["closed"] else
+        f"{open_count} finding{'s'[:open_count != 1]} remain{'s'[:open_count == 1]} open." if open_count else
+        "review stays open."))
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=cycles_paid,
                                   enforcement=enforcement, notes=list(closure["notes"]))

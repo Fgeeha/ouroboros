@@ -183,3 +183,24 @@ test('finalizing outcome overlay keeps narration as title while publishing phase
         assert.equal(f.title(), 'still working');
     } finally { f.close(); }
 });
+
+test('the collapsed line states the terminal cause, and a clean ending keeps the last narration', () => {
+    const f = fixture();
+    try {
+        f.census(direct());
+        f.emit({ content: '💬 reading the failing test first', narration: true, suggested_name: 'Flake hunt' });
+        assert.equal(f.activity(), 'reading the failing test first');
+        f.emit({ is_progress: false, role: 'system', system_type: 'task_summary', content: 'Done with warnings.',
+            outcome_final: true, outcome_phase: 'warn', reason_code: 'plan_review_advisory',
+            outcome_axes: { execution: { status: 'degraded', reason_code: 'plan_review_advisory', plan_review: 'unanswered' } } });
+        assert.equal(f.activity(), 'Only some of the plan reviewers answered; the work went on with their notes.');
+    } finally { f.close(); }
+    const g = fixture();
+    try {
+        g.census(direct());
+        g.emit({ content: '💬 reading the failing test first', narration: true, suggested_name: 'Flake hunt' });
+        g.emit({ is_progress: false, role: 'system', system_type: 'task_summary', content: 'Done.',
+            outcome_final: true, outcome_phase: 'done', outcome_axes: { execution: { status: 'ok' } } });
+        assert.equal(g.activity(), 'reading the failing test first');
+    } finally { g.close(); }
+});
