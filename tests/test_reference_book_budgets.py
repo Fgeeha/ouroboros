@@ -34,7 +34,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # (the typed receipt vocabulary at the outbox, the one-anchor precedence rule and
     # its shadows, node-scoped reconcile, the phase/retry reading); the sentence it
     # touched in "Main rows" is replaced, the rest has no older text to displace.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 104400,
+    # 104400 -> 104900: the anchor rule gained its multi-card clause (cards are never
+    # shadows; a surviving card inherits folded receipts) after review found the gap.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 104900,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     "docs/architecture/05-supervisor-loop.md": 27137,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
