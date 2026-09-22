@@ -22,4 +22,6 @@ Companion processes are host-supervised: reviewed manifest-declared descriptors 
 
 Chat IDs: a chat id is a VALUE and absence is `None`. `HIDDEN_CHAT_ID` (0) is the hidden partition — the Skill Review panel plus every headless task admitted without a registered project — a REAL destination that no browser surface reads: delivery goes through membership routing (`message_bus.notification_chat_route`; every producer that tested `if chat_id:` dropped its notices), a `chat_id=0` history query coerces to Main and the Main filter drops chat-0 rows, so explicit panel rows never become ordinary conversation history, and a chat-0 row reaches a project thread only via a durable lineage binding; negative ids are synthetic A2A traffic and never enter a human stream (the id policy SSOT is the §11.1 `chat_id_policy` row).
 
+Memory and consolidation provenance follows that value/`None` policy: a per-window registry snapshot names actual Main and current Project names with stable chat ids, while missing, unknown or ambiguous values stay explicit and never default to Main. The labels are read-only source attribution; they do not alter routing, visibility or delivery state.
+
 ---

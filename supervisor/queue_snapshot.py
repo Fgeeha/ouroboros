@@ -131,6 +131,7 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "actor_id": t.get("actor_id"), "delegation_role": t.get("delegation_role"),
                 "workspace_root": t.get("workspace_root"), "workspace_mode": t.get("workspace_mode"),
                 "project_id": t.get("project_id"),
+                "focus": t.get("focus"),
                 "allowed_resources": t.get("allowed_resources"), "deadline_at": t.get("deadline_at"),
                 "task_contract": t.get("task_contract"),
                 # Scheduling INTENT survives a restart and is all a PENDING child has;

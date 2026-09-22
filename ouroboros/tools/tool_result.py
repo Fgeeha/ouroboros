@@ -731,10 +731,11 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "ROUTE_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
         "ROUTING_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
         "NEEDS_MANUAL_TARGET": "TOOL_REPORTED_FAILURE",
-        # ensure_project_scope joined the same rail: a refused or unconfirmed
-        # bind scoped nothing durably.
-        "SCOPE_REJECTED": "TOOL_REPORTED_FAILURE",
-        "SCOPE_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
+        # ensure_project_scope joined the same rail (a refused/unconfirmed bind scoped
+        # nothing durably); cross-focus refusals split availability from policy.
+        "SCOPE_REJECTED": "TOOL_REPORTED_FAILURE", "SCOPE_UNCONFIRMED": "TOOL_REPORTED_FAILURE",
+        "FOCUS_PROJECTION_UNAVAILABLE": "LEGACY_UNAVAILABLE", "FOCUS_TASK_NOT_LIVE": "LEGACY_UNAVAILABLE",
+        "FOCUS_STALE": "LEGACY_BLOCKED", "TOOL_FORBIDDEN": "LEGACY_BLOCKED", "FOCUS_SOURCE_UNRESOLVED": "LEGACY_UNAVAILABLE", "FOCUS_SOURCE_UNRETAINED": "LEGACY_UNAVAILABLE",
         "TOOL_ERROR": "TOOL_ERROR",
         "TOOL_INTERNAL_ERROR": "TOOL_INTERNAL_ERROR",
         "EXECUTOR_UNAVAILABLE": "LEGACY_UNAVAILABLE",
