@@ -288,3 +288,47 @@ def test_correction_prefix_over_the_limit_still_splits_and_redrafts_the_halves()
         draft, part, room_label="Main", scope="block r", identity_text="", continuation_note=note)
     content, _usage = rc.summarize_source(call, text, [(s, e, n) for s, e, n in spans], draft_prompt, correct_prompt)
     assert content and calls == ["Room summary", "Room correction"] + ["Room summary", "Room correction"] * 2
+
+
+def test_room_labels_enter_prompts_as_one_quoted_json_string():
+    label = 'Alpha ] team\n## Rules'
+    quoted = json.dumps(label, ensure_ascii=False)
+    for prompt in (
+        rc.room_draft_prompt("src", room_label=label, block_range_text="r", message_count=1),
+        rc.correction_prompt("draft", "src", room_label=label, scope="block r"),
+        rc.era_room_prompt("sections", room_label=label, start_date="a", end_date="b"),
+    ):
+        assert f"Room: {quoted}." in prompt or f"room: {quoted}." in prompt
+        assert label not in prompt  # the raw label never stands unquoted as prompt structure
+
+
+@pytest.mark.parametrize("era_grows", [True, False])
+def test_main_era_path_replaces_blocks_only_when_the_era_is_shorter(tmp_path, fit, monkeypatch, era_grows):
+    """The era of the ordinary consolidation run is a compression (A6): a per-room
+    era longer than the blocks it summarizes keeps those blocks, exactly as
+    _compact_chronicle already requires."""
+    from tests.test_consolidator_context_fit import _paths, _write_chat
+
+    chat, blocks_path, meta_path = _paths(tmp_path)
+    _write_chat(chat, count=c.BLOCK_SIZE, text_size=2)
+    old = [{"range": f"2026-01-01 0{i}:00 - 0{i}:59", "message_count": 1, "content": f"block-{i} " + "x" * 40}
+           for i in range(c.MAX_SUMMARY_BLOCKS)]
+    blocks_path.parent.mkdir(parents=True, exist_ok=True)
+    blocks_path.write_text(json.dumps(old), encoding="utf-8")
+    run_len = sum(len(b["content"]) for b in old[:c.ERA_COMPRESS_COUNT])
+    era_content = "e" * (run_len + 10 if era_grows else max(1, run_len // 4))
+    seen = {}
+
+    def fake_era(run, *_args, **_kwargs):
+        seen["run"] = list(run)
+        return {"range": "era", "message_count": len(run), "content": era_content, "era": True}, {}
+
+    monkeypatch.setattr(c, "_compress_blocks_to_era", fake_era)
+    assert c._run_block_consolidation(chat, blocks_path, meta_path, _LLM(), "", force_tail=True) is not None
+    stored = json.loads(blocks_path.read_text(encoding="utf-8"))
+    assert seen["run"] == old[:c.ERA_COMPRESS_COUNT]
+    if era_grows:
+        assert stored[:c.MAX_SUMMARY_BLOCKS] == old and not any(b.get("era") for b in stored)
+    else:
+        assert stored[0]["content"] == era_content and stored[1:c.MAX_SUMMARY_BLOCKS - c.ERA_COMPRESS_COUNT + 1] == old[c.ERA_COMPRESS_COUNT:]
+    assert len(stored) == (c.MAX_SUMMARY_BLOCKS if era_grows else c.MAX_SUMMARY_BLOCKS - c.ERA_COMPRESS_COUNT + 1) + 1

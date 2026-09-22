@@ -411,7 +411,11 @@ def _run_block_consolidation(
                 **({"knowledge_context": knowledge_context} if knowledge_context is not None else {}),
             )
             total_usage = _merge_consolidation_usage(total_usage, era_usage)
-        if era is not None:
+        # An era is a COMPRESSION: replace the run only when it is shorter, as
+        # _compact_chronicle already requires. Per-room sections and the
+        # length-adaptive correction pass can make an era longer than the
+        # blocks it summarizes; keeping those blocks loses nothing.
+        if era is not None and len(era.get("content", "")) < sum(len(b.get("content", "")) for b in old_blocks[run_start:run_end]):
             all_blocks = [
                 *old_blocks[:run_start], era, *old_blocks[run_end:], *remaining,
             ]

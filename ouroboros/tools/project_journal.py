@@ -18,7 +18,7 @@ import json
 import logging
 import pathlib
 from contextlib import nullcontext
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.project_facts import (
     project_journal_path,
@@ -494,6 +494,81 @@ def _workpad_write(ctx: ToolContext, content: str, project_id: str = "") -> str:
     return f"OK: workpad[{pid}] written ({len(body)} chars)."
 
 
+_FOCUS_SOURCE_REFUSAL_PREFIXES = (
+    "⚠️", "JOURNAL_READ_SNAPSHOT_CHANGED", "CHAT_HISTORY_SNAPSHOT_CHANGED",
+)
+
+
+def _read_focus_source(ctx: ToolContext, source: Dict[str, Any]) -> Tuple[Optional[str], str]:
+    """Answer the focus source_ref through the very reader it names, as the caller.
+
+    Returns ``(text, "")`` when the reader answered, else ``("", reason)``.  The
+    call runs under the caller's own authority (the same scope checks the
+    reader applies to the model), so a focus cannot retain what its author
+    could not read.  A typed refusal or a snapshot mismatch is NOT evidence:
+    the focus is refused instead of pointing at nothing.
+    """
+    reader = str(source.get("reader") or "")
+    args = {key: item for key, item in source.items() if key != "reader"}
+    try:
+        if reader == "journal_read":
+            text = _journal_read(ctx, project_id=str(args.get("project_id") or ""),
+                                 offset=int(args.get("offset") or 0), snapshot=str(args.get("snapshot") or ""))
+        elif reader == "workpad_read":
+            text = _workpad_read(ctx, project_id=str(args.get("project_id") or ""))
+        elif reader == "recent_tasks":
+            from ouroboros.tools.recent_tasks import _handle_recent_tasks
+            text = _handle_recent_tasks(ctx, offset=int(args.get("offset") or 0), snapshot=str(args.get("snapshot") or ""))
+        elif reader == "live_roots":
+            from ouroboros.tools.recent_tasks import _handle_live_roots
+            text = _handle_live_roots(ctx, offset=int(args.get("offset") or 0), snapshot=str(args.get("snapshot") or ""))
+        elif reader == "get_task_result":
+            from ouroboros.tools.control_task_results import _get_task_result
+            text = _get_task_result(ctx, task_id=str(args.get("task_id") or ""))
+        elif reader == "chat_history":
+            from ouroboros.tools.control_runtime import _chat_history
+            text = _chat_history(ctx, offset=int(args.get("offset") or 0), snapshot=str(args.get("snapshot") or ""))
+        else:
+            return "", f"reader {reader!r} has no resolver"
+    except Exception as exc:  # a reader that raised answered nothing
+        log.debug("focus source read failed", exc_info=True)
+        return "", f"{reader} raised {type(exc).__name__}"
+    body = str(text or "")
+    stripped = body.lstrip()
+    if not stripped:
+        return "", f"{reader} answered nothing"
+    if stripped.startswith(_FOCUS_SOURCE_REFUSAL_PREFIXES):
+        return "", f"{reader} refused: {stripped.splitlines()[0][:160]}"
+    if stripped.startswith("{"):
+        try:
+            payload = json.loads(stripped)
+        except ValueError:
+            payload = None
+        if isinstance(payload, dict) and (payload.get("ok") is False or payload.get("error")):
+            error = payload.get("error")
+            code = error.get("code") if isinstance(error, dict) else payload.get("host_code")
+            return "", f"{reader} refused: {code or 'typed error'}"
+    return body, ""
+
+
+def _retain_focus_source(canonical: pathlib.Path, task_id: str, source: Dict[str, Any], body: str) -> Dict[str, Any]:
+    """Store the reader's exact answer write-once and return the focus handle."""
+    from ouroboros.artifacts import store_actor_source_bytes, task_artifact_dir_path
+
+    ref = store_actor_source_bytes(canonical, task_id, category="context_checkpoints",
+                                   source_id=f"focus_source_{source.get('reader')}",
+                                   data=body.encode("utf-8"), extension="md")
+    path = task_artifact_dir_path(canonical, task_id, create=False) / ref["path"]
+    return {
+        "kind": "task_source",
+        "root": "runtime_data",
+        "path": path.relative_to(canonical).as_posix(),
+        "size": int(ref["size"]),
+        "sha256": str(ref["sha256"]),
+        "task_id": task_id,
+    }
+
+
 def _update_focus(ctx: ToolContext, text: str, source_ref: Any) -> str:
     """Publish one short authored focus onto this live root's existing records."""
     metadata = getattr(ctx, "task_metadata", {})
@@ -537,6 +612,21 @@ def _update_focus(ctx: ToolContext, text: str, source_ref: Any) -> str:
         focus = normalize_focus(text, source_ref, task_id=task_id)
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (update_focus): {exc}"
+    # A source_ref is a pointer; the pointer must identify evidence after this
+    # task goes dormant (a workpad or live-root page is rewritten by then).  Read
+    # it now through the named reader and retain the exact answer beside the
+    # focus, so peers read what the author saw rather than what the page says
+    # later.  A source that cannot be read is not a source.
+    body, refusal = _read_focus_source(ctx, focus["source_ref"])
+    if refusal:
+        return f"⚠️ FOCUS_SOURCE_UNRESOLVED (update_focus): {refusal}"
+    try:
+        handle = _retain_focus_source(canonical, task_id, focus["source_ref"], body)
+        focus = normalize_focus(text, source_ref, task_id=task_id,
+                                authored_at=focus["authored_at"], source_handle=handle)
+    except (OSError, ValueError) as exc:
+        log.debug("focus source retention failed", exc_info=True)
+        return f"⚠️ FOCUS_SOURCE_UNRETAINED (update_focus): the source answer could not be retained ({type(exc).__name__})"
 
     def _project(current: Dict[str, Any], fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if str(current.get("status") or "") != STATUS_RUNNING:

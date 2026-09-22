@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import threading
 import types
@@ -19,8 +20,9 @@ def _queue_snapshot(root, rows):
     })
 
 
-def test_root_focus_persists_and_terminal_race_refuses(tmp_path):
+def test_root_focus_persists_and_terminal_race_refuses(tmp_path, monkeypatch):
     from ouroboros.tools.project_journal import _update_focus
+    from ouroboros.utils import append_jsonl
 
     write_task_result(tmp_path, "root", STATUS_RUNNING, project_id="alpha")
     events = []
@@ -29,11 +31,36 @@ def test_root_focus_persists_and_terminal_race_refuses(tmp_path):
         task_metadata={"root_task_id": "root", "budget_drive_root": str(tmp_path)},
         event_queue=types.SimpleNamespace(put_nowait=events.append),
     )
-    result = _update_focus(ctx, "Investigating the migration seam", {"reader": "journal_read", "project_id": "alpha", "snapshot": "abc"})
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    append_jsonl(tmp_path / "projects" / "alpha" / "journal.jsonl", {"kind": "note", "text": "seam exact evidence"})
+    # A source the named reader cannot answer is not a source: refused, nothing stored.
+    refused = _update_focus(ctx, "Investigating the migration seam",
+                            {"reader": "journal_read", "project_id": "alpha", "snapshot": "abc"})
+    assert "FOCUS_SOURCE_UNRESOLVED" in refused and "JOURNAL_READ_SNAPSHOT_CHANGED" in refused
+    assert "focus" not in json.loads((tmp_path / "task_results" / "root.json").read_text())
+    assert events == []
+    result = _update_focus(ctx, "Investigating the migration seam", {"reader": "journal_read", "project_id": "alpha"})
     assert result.startswith("OK: focus[root]")
     stored = json.loads((tmp_path / "task_results" / "root.json").read_text())
     assert stored["focus"]["text"] == "Investigating the migration seam"
     assert events[0]["type"] == "task_focus_updated"
+    # The reader's exact answer is RETAINED beside the focus: the pointer keeps
+    # identifying its evidence after the author is dormant and the journal grows.
+    handle = stored["focus"]["source_handle"]
+    assert handle["root"] == "runtime_data" and handle["task_id"] == "root"
+    retained = (tmp_path / handle["path"]).read_bytes()
+    assert hashlib.sha256(retained).hexdigest() == handle["sha256"] and len(retained) == handle["size"]
+    assert b"seam exact evidence" in retained
+    from ouroboros.focus import compact_focus, focus_fingerprint
+    assert compact_focus(stored["focus"]) == stored["focus"]
+    assert handle["sha256"] in focus_fingerprint(stored["focus"])
+    forged = {**stored["focus"], "source_handle": {**handle, "path": "../secret"}}
+    assert compact_focus(forged) is None
+    from ouroboros.peer_roster import render_roster_note
+    _queue_snapshot(tmp_path, [{"id": "root", "task": {"id": "root", "focus": stored["focus"]}}])
+    from ouroboros.peer_roster import independent_roots
+    note = render_roster_note(independent_roots(tmp_path))
+    assert f"retained_source=read_file(root='runtime_data', path={json.dumps(handle['path'])})" in note
 
     write_task_result(tmp_path, "root", STATUS_COMPLETED, result="done")
     refused = _update_focus(ctx, "Too late", {"reader": "journal_read"})
@@ -212,3 +239,20 @@ def test_focus_framing_and_retry_author_identity_are_preserved(tmp_path):
 def test_chat_history_focus_pointer_uses_existing_public_arguments():
     from ouroboros.focus import normalize_focus
     assert normalize_focus('Read history', {'reader': 'chat_history', 'offset': 0})['source_ref']['reader'] == 'chat_history'
+
+
+def test_settled_root_carries_no_live_focus_when_the_queue_snapshot_lags(tmp_path):
+    """A3: the durable result outranks a stale projection row — a root that already
+    settled has no LIVE focus, whatever the queue snapshot still carries."""
+    from ouroboros.focus import normalize_focus
+    from ouroboros.peer_roster import independent_roots
+    focus = normalize_focus("Still shown by a lagging snapshot", {"reader": "recent_tasks"}, task_id="root")
+    _queue_snapshot(tmp_path, [
+        {"id": "root", "task": {"id": "root", "title": "Root", "focus": focus}},
+        {"id": "live", "task": {"id": "live", "title": "Live", "focus": {**focus, "author_task_id": "live"}}},
+    ])
+    write_task_result(tmp_path, "root", STATUS_COMPLETED, result="done", focus=focus)
+    write_task_result(tmp_path, "live", STATUS_RUNNING, focus={**focus, "author_task_id": "live"})
+    rows = {row["task_id"]: row for row in independent_roots(tmp_path)["roots"]}
+    assert "focus" not in rows["root"]
+    assert rows["live"]["focus"]["author_task_id"] == "live"

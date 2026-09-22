@@ -15,6 +15,7 @@ typed failures) stays with ``consolidator.py``; this module receives it as one
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -89,6 +90,9 @@ def room_draft_prompt(
     source: str, *, room_label: str, block_range_text: str, message_count: int,
     identity_text: str = "", continuation_note: str = "", knowledge_instruction: str = "",
 ) -> str:
+    # Room labels are owner-authored project names: data, quoted as one JSON
+    # string so a label cannot read as prompt structure or a header.
+    room_label = json.dumps(str(room_label), ensure_ascii=False)
     return f"""{knowledge_instruction}You are the memory consolidator of Ouroboros, a self-modifying AI agent.
 Write the episodic memory of one room's messages inside the dialogue block {block_range_text}.
 Room: {room_label}. This room contributed {message_count} messages; other rooms of the block are written separately and the host assembles them.
@@ -112,6 +116,7 @@ def correction_prompt(
     draft: str, source: str, *, room_label: str, scope: str,
     identity_text: str = "", continuation_note: str = "",
 ) -> str:
+    room_label = json.dumps(str(room_label), ensure_ascii=False)
     return f"""Compare this draft memory of Ouroboros against its complete source and return the corrected memory.
 Scope: {scope}; room: {room_label}. The draft was written from exactly this source; the host assembles rooms and headers separately.
 Check sentence by sentence. Fix misattributed actors or approvals; decisions moved between rooms, tasks or people; invented, dropped or altered budgets, deadlines, checkpoints, boundaries and obligations; completion, review, verification or publication the source does not show; anything called approved that the source shows proposed, asked or rejected.
@@ -131,6 +136,7 @@ def era_room_prompt(
     sections: str, *, room_label: str, start_date: str, end_date: str,
     identity_text: str = "", legacy: bool = False,
 ) -> str:
+    room_label = json.dumps(str(room_label), ensure_ascii=False)
     legacy_note = ("These sections come from legacy records whose messages' rooms were not recorded: "
                    "keep their provenance unknown and assign no decision to a named room.\n") if legacy else ""
     return f"""Compress these older memory blocks of one room into a single era section.
