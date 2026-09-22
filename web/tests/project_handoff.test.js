@@ -140,8 +140,11 @@ test('two converted cards of one owner message share an identity and both stay v
         h.controller.snapshot(census([{ activity_id: 't2promoted', phase: 'working' }]));
         assert.equal(second.node.children[0].children[0].textContent, 'Working');
         assert.equal(first.node.children[0].children[0].textContent, 'Activity unconfirmed', 'each card paints its own subject');
+        const started = new Element(); started.dataset = { systemType: 'project_started', taskId: 't1direct', projectId: 'p' };
         h.nodes.delete(first.node); h.controller.snapshot(census());
         assert.equal(receipt.node.hidden, true, 'a surviving card keeps representing the transfer');
+        h.controller.reconcile(started);
+        assert.equal(started.hidden, true, 'the survivor inherits the evicted card\'s own subjects');
         h.nodes.delete(second.node); h.controller.snapshot(census());
         assert.equal(receipt.node.hidden, false, 'the receipt takes over only when no card remains');
     } finally { h.done(); }

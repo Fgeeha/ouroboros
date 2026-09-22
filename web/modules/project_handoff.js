@@ -82,6 +82,7 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
     function promote(row) {
         rows.delete(row.key);
         const survivor = visibleAnchor(row.id);
+        if (survivor) for (const taskId of row.subjects) survivor.subjects.add(taskId);
         for (const next of row.shadows) {
             if (survivor) { fold(next, survivor); continue; }
             if (!inFeed(next.node)) continue;

@@ -51,7 +51,16 @@ def enqueue_project_handoff(drive_root, task_id: str, *, source_ref=None) -> str
     ``already_delivered`` once the row went out. A ref-less legacy binding has
     no Main origin on record, so no receipt is written (``origin_unproven``):
     the origin is never inferred from an absent source or guessed from text.
+    Every non-durable word is logged here, so a producer that discards the
+    answer (the agent-side promote/scope handlers) still leaves a trace.
     """
+    state = _receipt_state(drive_root, task_id, source_ref=source_ref)
+    if state not in DURABLE_RECEIPTS:
+        log.info("project handoff receipt for %s: %s", task_id, state)
+    return state
+
+
+def _receipt_state(drive_root, task_id: str, *, source_ref=None) -> str:
     from ouroboros.projects_registry import project_binding_for_task, task_presentation_snapshot
     from supervisor import terminal_delivery as outbox
 

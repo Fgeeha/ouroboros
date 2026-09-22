@@ -1122,7 +1122,11 @@ export function createChatInstance({
     function signalChatFreed() {
         const row = page.querySelector('.chat-text-row');
         row?.classList.add('chat-freed');
-        row?.addEventListener('animationend', () => row.classList.remove('chat-freed'), { once: true });
+        row?.addEventListener('animationend', function done(event) {
+            if (event.target !== row) return;  // a child's animation is not this cue
+            row.classList.remove('chat-freed');
+            row.removeEventListener('animationend', done);
+        });
     }
 
     const reviewAnchorEligible = (id) => !liveCardRecords.has(id) && !activeDirectActivities.has(id);
