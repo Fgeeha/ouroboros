@@ -1218,15 +1218,15 @@ def bind_author_commit_candidate(ctx: ToolContext, commit_message: str, pre_fing
     from ouroboros.tools import git as git_mod
     author_source = ctx._author_commit_source
     from ouroboros.review_records import build_author_disposition_from_mapping
-    from ouroboros.tools.review import _preflight_check
+    from ouroboros.tools.review import _preflight_check, format_name_status_for_preflight
     from ouroboros.config import get_review_enforcement
 
     author = build_author_disposition_from_mapping(ctx._author_commit_decision, subject_hash=pre_fingerprint["fingerprint"],
         reviewer_signal=author_source.block_reason or author_source.status, enforcement=get_review_enforcement())
     author["review_reference"] = ctx._author_commit_reference
     ctx._author_commit_record = author
-    preflight = _preflight_check(commit_message, git_mod.run_cmd(["git", "diff", "--cached", "--name-status"], cwd=ctx.repo_dir), ctx.repo_dir)
-    return preflight
+    staged = git_mod.run_cmd(["git", "diff", "--cached", "--name-status"], cwd=ctx.repo_dir)
+    return _preflight_check(commit_message, format_name_status_for_preflight(staged), ctx.repo_dir)
 
 
 def record_bound_commit_success(ctx: ToolContext, commit_message: str, started_at: float, before: dict, after: dict) -> None:

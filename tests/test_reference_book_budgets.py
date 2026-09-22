@@ -94,7 +94,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # FOCUS_SOURCE_UNRESOLVED) and a settled root's focus is dropped — new
     # contract facts of the cross-focus paragraph, not a restatement; +250 for
     # the digest-selected historical read and the reader admission rule.
-    "docs/architecture/06-agent-core.md": 295650,
+    # 295650 -> 297250: document the new diagnostic-only source/coverage contract,
+    # unavailable evidence and no-effects ordering without removing review/custody rules.
+    "docs/architecture/06-agent-core.md": 297250,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
