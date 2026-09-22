@@ -1252,18 +1252,35 @@
  */
 
 /**
+ * Mirrors `gateway/schedule_contracts.py`, which states what each field means.
  * @typedef {Object} ScheduledTasksResponse
  * @property {number} schema_version
- * @property {Object[]} tasks
+ * @property {Object[]} tasks  // each row carries status/retained/restorable
  */
 
 /**
  * @typedef {Object} ScheduleUpsertResponse
- * @property {boolean} ok
+ * @property {boolean} ok  // follows schedule.audit: an incomplete audit is not ok
  * @property {Object} schedule
  */
 
 /**
+ * @typedef {Object} ScheduleActionResponse
+ * @property {boolean} ok  // the requested state was ACHIEVED and both audit records landed (restored_not_ready: changed, not ok)
+ * @property {boolean} changed  // the durable fact, whatever the audit did
+ * @property {string} status
+ * @property {string} schedule_id
+ * @property {string=} operation_id
+ * @property {?boolean=} running_or_queued  // already admitted; null = unknown
+ * @property {('recorded'|'incomplete'|'not_written')} audit
+ * @property {string=} detail
+ * @property {Object=} schedule
+ * @property {string[]=} allowed
+ */
+
+/**
+ * Legacy name for the DELETE response: the subset every previous caller read of
+ * what that endpoint now answers as a ScheduleActionResponse.
  * @typedef {Object} ScheduleDeleteResponse
  * @property {boolean} ok
  */

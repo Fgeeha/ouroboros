@@ -241,6 +241,16 @@ Status, owner action, and urgent notification are separate product concepts:
   product's explicit incident/notification seam, not a red status or a failed
   task as a proxy.
 
+Activity schedule rows use the same factual status rule: `active`, `disabled`,
+`suppressed`, and `consumed once · history` describe lifecycle state, while the
+adjacent Disable/Enable, Restore, and Delete controls state the owner action. A
+consumed one-shot is history even when its task succeeded or failed; the status
+never implies a result. Retained rows — consumed and suppressed — collapse into
+one disclosure rather than padding the standing list or disappearing: history
+the owner can still open, read and act on. A suppressed skill row keeps Restore
+so the owner can ask for it back; a consumed one keeps only Delete, because
+offering Enable on a schedule that cannot fire again would be a lie.
+
 A task-bound `Reviews` history row may be the only retained fact for its owner.
 That row keeps a neutral owner anchor visible, but hides task status and typing
 until a real task status or activity arrives; review presence alone never means

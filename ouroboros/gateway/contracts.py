@@ -11,6 +11,12 @@ from typing import Any, Dict, List, Optional
 from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
 from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetTab, WidgetsResponse
 from ouroboros.gateway.decision_contracts import DecisionRequest, DecisionResponse  # noqa: F401 -- public re-exports
+from ouroboros.gateway.schedule_contracts import (  # noqa: F401 -- public re-exports
+    ScheduleActionResponse,
+    ScheduledTasksResponse,
+    ScheduleDeleteResponse,
+    ScheduleUpsertResponse,
+)
 
 try:  # Python 3.11+
     from typing import Literal, NotRequired, Required, TypedDict  # type: ignore[attr-defined]
@@ -926,20 +932,6 @@ class EvolutionDataResponse(TypedDict):
     cached: bool
 
 
-class ScheduledTasksResponse(TypedDict):
-    schema_version: int
-    tasks: list[Dict[str, Any]]
-
-
-class ScheduleUpsertResponse(TypedDict):
-    ok: bool
-    schedule: Dict[str, Any]
-
-
-class ScheduleDeleteResponse(TypedDict):
-    ok: bool
-
-
 class UploadResponse(TypedDict):
     ok: bool
     filename: str
@@ -1557,6 +1549,7 @@ __all__ = [
     "ScheduledTasksResponse",
     "ScheduleUpsertResponse",
     "ScheduleDeleteResponse",
+    "ScheduleActionResponse",
     "UploadResponse",
     "ExtensionsIndexResponse",
     "ExtensionLiveSnapshot",

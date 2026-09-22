@@ -92,6 +92,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `/api/decisions` | `gateway.tasks.api_decision_answer` |
 | GET | `/api/schedules` | `gateway.schedules.api_schedules_list` |
 | POST | `/api/schedules` | `gateway.schedules.api_schedules_upsert` |
+| POST | `/api/schedules/{schedule_id}/action` | `gateway.schedules.api_schedules_action` |
 | DELETE | `/api/schedules/{schedule_id}` | `gateway.schedules.api_schedules_delete` |
 | POST | `/api/command` | `gateway.control.api_command` |
 | POST | `/api/reset` | `gateway.control.api_reset` |

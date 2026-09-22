@@ -102,7 +102,7 @@ EXPECTED_TOOLS = [
     "run_ci_tests",
     "preflight_review", "review_status",
     "compact_context", "set_tool_timeout", "request_restart",
-    "promote_to_stable", "schedule_subagent", "schedule_followup",
+    "promote_to_stable", "schedule_subagent", "schedule_followup", "manage_schedules",
     "configure_presence", "initiate_presence",
     "integrate_subagent_patch", "compare_subagent_patches",
     # C1: the explicit acceptance seam for a delegated run's captured patch —

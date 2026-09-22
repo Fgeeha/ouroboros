@@ -32,7 +32,7 @@ CHAT_TAIL_BYTES = 512_000
 PLACEHOLDERS = ("reason", "last_wake_ago", "events", "level", "level_line", "withheld_tools",
                 "spent_usd", "daily_usd", "running", "max_tasks", "interval")
 LEVEL_LINES = {
-    "observe": "think, keep memory/knowledge, write to your human; no tasks, no changes in the world",
+    "observe": "research and internal work, memory, project notes, your own children and schedules, owner delivery; no shell, user-file, source, skill/settings or publication changes",
     "act": "everything your runtime mode allows except editing your own code/prompts, evolution, restart and settings",
     "full": "everything your runtime mode allows, including evolution",
 }
