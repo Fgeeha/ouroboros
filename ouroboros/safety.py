@@ -108,6 +108,9 @@ TOOL_POLICY: Dict[str, str] = {
 
     # Control / messaging / internal side effects.
     "schedule_subagent": POLICY_SKIP,
+    # Owner-governed schedule inspection/mutation is narrow, reasoned and audited;
+    # it never edits task payloads or cancels an admitted task.
+    "manage_schedules": POLICY_SKIP,
     # One-shot deferred follow-up through the existing supervisor scheduler: the
     # future task re-enters normal admission/safety, so registration itself has
     # no reach beyond what the task already has (same reasoning as schedule_subagent).

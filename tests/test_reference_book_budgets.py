@@ -17,7 +17,11 @@ REPO = pathlib.Path(__file__).resolve().parents[1]
 
 # UTF-8 bytes of each chapter source. Raise a value in the same diff that needs it, with a reason.
 CHAPTER_BYTE_BUDGETS: dict[str, int] = {
-    "docs/architecture/01-high-level-architecture.md": 161453,
+    # 161453 -> 162200: the module tree gains the `schedule_lifecycle.py` leaf beside
+    # queue_schedules.py and names Observe's argument-level narrowing on the
+    # consciousness_authority.py row; upstream had already filled the previous
+    # headroom with the handoff and sidebar-activity rows landing in the same window.
+    "docs/architecture/01-high-level-architecture.md": 162200,
     "docs/architecture/02-startup-onboarding-flow.md": 15517,
     # 97435 -> 99500: the notification owner is a new subsystem of this chapter
     # (its module, its client-level subscription, its room gate and its disclosed
@@ -30,9 +34,29 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # new mechanism (gate, ordinary-message path, decorator) has no older text to displace.
     # 100900 -> 101700: the ONE explanatory line states every fact (the assembler's clauses
     # replace the single-cause sentence); the Telegram non-clean line has no older text.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 101700,
+    # 101700 -> 104400: "Project handoff receipts" is a subsystem the chapter lacked
+    # (the typed receipt vocabulary at the outbox, the one-anchor precedence rule and
+    # its shadows, node-scoped reconcile, the phase/retry reading); the sentence it
+    # touched in "Main rows" is replaced, the rest has no older text to displace.
+    # 104400 -> 104900: the anchor rule gained its multi-card clause (cards are never
+    # shadows; a surviving card inherits folded receipts) after review found the gap.
+    # 104900 -> 105700: Activity gains the schedule LIFECYCLE surface the chapter
+    # lacked — the retained/consumed/suppressed vocabulary and its one disclosure,
+    # Restore's re-evaluation, the named-action endpoint, and what a lifecycle
+    # response is allowed to claim. The stale "read-only here" sentence it replaces
+    # is gone and the paragraph was compressed by 298 bytes first (no fact removed).
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 105700,
     "docs/architecture/04-server-api-endpoints.md": 26833,
-    "docs/architecture/05-supervisor-loop.md": 27137,
+    # 27137 -> 30400: the schedule table gains a documented write contract the
+    # chapter had no text for — one transaction owning the lock ORDER, the strict
+    # store read's three refusal cases, intent-then-outcome audit with its
+    # disclosed incomplete outcome, and the lifecycle actions' future-dispatch-only
+    # scope including the unknown in-flight answer. Both paragraphs were compressed
+    # by 286 bytes first; nothing older describes any of these rules.
+    # 30400 -> 30600: restore over an absent skill/manifest entry is a new typed
+    # refusal (`manifest_absent`, suppression kept) with no older text to
+    # displace; two neighbouring sentences were compressed by 168 bytes first.
+    "docs/architecture/05-supervisor-loop.md": 30600,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
@@ -42,7 +66,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 289400 -> 290700 (2026-09-22): the custody row memo, the per-task recent-activity
     # windows and the subagent child's own windows are new mechanisms described in the
     # paragraphs they changed.
-    "docs/architecture/06-agent-core.md": 290700,
+    # 290700 -> 292800: Observe's positive path is a new seam of this chapter
+    # (the argument-narrowing predicate, which names it keeps and why, the
+    # own-child custody reuse, and the non-inherited mutating delegation budget);
+    # the Observe half of the AUTHORITY sentence is replaced, the rest is new.
+    "docs/architecture/06-agent-core.md": 292800,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,

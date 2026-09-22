@@ -707,7 +707,7 @@ export function isTerminalTaskPhase(phase = '', terminal = false) {
  * and is the barrier for the CARD scan (`lastLiveObservedAt`) only — activity
  * hydration is a plain projection of the census and has no barrier.
  */
-export function createStateSnapshotSequencer(onApply, now = () => Date.now()) {
+export function createStateSnapshotSequencer(onApply, now = () => Date.now(), onUnavailable = () => {}) {
     let requestedGeneration = 0;
     let appliedGeneration = 0;
     return {
@@ -723,6 +723,13 @@ export function createStateSnapshotSequencer(onApply, now = () => Date.now()) {
         },
         isCurrent(request) {
             return (Number(request?.generation) || 0) > appliedGeneration;
+        },
+        fail(request) {
+            const generation = Number(request?.generation) || 0;
+            if (!generation || generation <= appliedGeneration) return false;
+            appliedGeneration = generation;
+            onUnavailable();
+            return true;
         },
     };
 }

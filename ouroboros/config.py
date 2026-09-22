@@ -699,7 +699,7 @@ def _coerce_setting_value(key: str, value):
     if isinstance(default, (int, float)):
         cast = int if isinstance(default, int) else float
         try:
-            return cast(value)
+            return max(60, cast(value)) if key in {"OUROBOROS_BG_WAKEUP_MIN", "OUROBOROS_BG_WAKEUP_MAX"} else cast(value)
         except (TypeError, ValueError):
             return default
     return str(value or "")

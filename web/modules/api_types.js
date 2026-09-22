@@ -37,8 +37,7 @@
 
 /**
  * Background Consciousness alarm-clock snapshot (server._describe_bg_consciousness_state over
- * consciousness.status_snapshot). A wake-up is an ordinary Main turn; its liveness is the
- * direct-activity census, never a flag here.
+ * consciousness.status_snapshot). A wake-up is an ordinary Main turn; its liveness is the direct-activity census, never a flag here.
  * @typedef {Object} BgConsciousnessState
  * @property {boolean} enabled
  * @property {string} status  // disabled | stopped | thinking | sleeping | waiting_for_first_conversation | allowance_exhausted | allowance_unknown | wake_rejected | wake_failed
@@ -76,6 +75,7 @@
 /**
  * @typedef {Object} ActiveChatActivity
  * @property {Object=} required_question  // read-only pointer to the current required Project quiz
+ * @property {boolean=} required_question_unavailable  // a recorded owner-question wait whose detail could not be read: possibly blocked, never "no question"
  * @property {Object.<string,Object>=} model_waits
  * @property {number=} task_attempt
  * @property {string} activity_id
@@ -83,7 +83,7 @@
  * @property {string} project_id
  * @property {string} client_message_id  // empty for managed queue rows
  * @property {string} kind  // direct_chat | managed_task — presentational label; membership in this census, not kind, decides liveness
- * @property {string} phase  // managed rows: queued | working | finalizing
+ * @property {string} phase  // managed rows: queued | budget_paused | working | finalizing; direct rows: thinking, or unknown when the live wait owner could not be read
  * @property {number} started_at
  */
 
@@ -443,11 +443,11 @@
  *   timeline item of the task's card, "reviews" = the card's Reviews group
  *   carries the fact (the row is still attached to the card); absent = an
  *   ordinary row.
- * @property {string=} card_row_id
- *   The row's stable identity across live delivery, outbox replay and history.
+ * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
  * @property {string=} target_label
  * @property {string=} project_id
  * @property {string=} project_name
+ * @property {string=} handoff_id  // immutable origin/destination receipt identity
  * @property {string=} completion_answer  // a Project root's model-authored final answer, mirrored into Main
  * @property {number=} chat_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
@@ -1252,18 +1252,35 @@
  */
 
 /**
+ * Mirrors `gateway/schedule_contracts.py`, which states what each field means.
  * @typedef {Object} ScheduledTasksResponse
  * @property {number} schema_version
- * @property {Object[]} tasks
+ * @property {Object[]} tasks  // each row carries status/retained/restorable
  */
 
 /**
  * @typedef {Object} ScheduleUpsertResponse
- * @property {boolean} ok
+ * @property {boolean} ok  // follows schedule.audit: an incomplete audit is not ok
  * @property {Object} schedule
  */
 
 /**
+ * @typedef {Object} ScheduleActionResponse
+ * @property {boolean} ok  // the requested state was ACHIEVED and both audit records landed (restored_not_ready: changed, not ok)
+ * @property {boolean} changed  // the durable fact, whatever the audit did
+ * @property {string} status
+ * @property {string} schedule_id
+ * @property {string=} operation_id
+ * @property {?boolean=} running_or_queued  // already admitted; null = unknown
+ * @property {('recorded'|'incomplete'|'not_written')} audit
+ * @property {string=} detail
+ * @property {Object=} schedule
+ * @property {string[]=} allowed
+ */
+
+/**
+ * Legacy name for the DELETE response: the subset every previous caller read of
+ * what that endpoint now answers as a ScheduleActionResponse.
  * @typedef {Object} ScheduleDeleteResponse
  * @property {boolean} ok
  */

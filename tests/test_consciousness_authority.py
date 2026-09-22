@@ -57,8 +57,11 @@ def test_levels_and_their_two_consequences():
     assert ca.disabled_tools_for("act") == list(ca.ACT_DISABLED)
     observe = ca.disabled_tools_for("observe")
     assert set(ca.ACT_DISABLED) <= set(observe)
-    assert {"promote_chat_to_task", "schedule_subagent", "write_file", "run_command",
+    assert {"promote_chat_to_task", "run_command",
             "browser_action", "initiate_presence", "submit_skill_to_hub"} <= set(observe)
+    # The names with a real read-only path are kept and narrowed on ARGUMENTS.
+    assert ca.OBSERVE_ARGUMENT_NARROWED.isdisjoint(observe)
+    assert {"schedule_subagent", "delegate_start", "cancel_task"} <= ca.OBSERVE_ARGUMENT_NARROWED
     # The nanny of a running campaign is never withheld, at any level.
     assert "steer_task" not in observe and "steer_task" not in ca.disabled_tools_for("act")
     # Observe is an EXCEPTION list: reading and talking stay available by default.
@@ -81,7 +84,9 @@ def test_observe_table_covers_every_registry_entry_marked_mutates_worktree(tmp_p
     reg = _registry(tmp_path)
     marked = {e.name for e in reg._entries.values() if e.mutates_worktree and not e.alias_for}
     assert marked, "the catalog carries mutates_worktree entries"
-    missing = marked - set(ca.OBSERVE_DISABLED)
+    # The argument-narrowed names have a read-only Observe path; what they may be
+    # ASKED to do is checked at dispatch instead of hiding the whole tool.
+    missing = marked - set(ca.OBSERVE_DISABLED) - ca.OBSERVE_ARGUMENT_NARROWED
     assert not missing, f"mutates_worktree entries missing from OBSERVE_WORLD_MUTATION_TOOLS: {sorted(missing)}"
     unknown = set(ca.OBSERVE_DISABLED) - {e.name for e in reg._entries.values()}
     # Skill/project tools are registered lazily (skills, journal); the built-in names must exist.

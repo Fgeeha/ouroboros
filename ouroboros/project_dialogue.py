@@ -289,7 +289,7 @@ def room_membership(chat_id: int, project_chat_ids: set, source_refs: list,
         # A routing refusal belongs to the issuing chat, even when the target
         # is bound to another Project. Its lineage must not move the notice.
         bound = 0 if row.get("type") in ORIGIN_ADDRESSED_NOTICE_TYPES else bound_room_chat(bindings, row)
-        lifecycle = row.get("type") in {"project_started", "project_completion_summary"}
+        lifecycle = row.get("type") in {"project_started", "project_handoff", "project_completion_summary"}
         if chat_id in project_chat_ids:
             return not lifecycle and (bound == chat_id or entry_chat == chat_id
                                       or entry_matches_source_ref(row, source_refs))
@@ -1444,17 +1444,26 @@ def enqueue_project_completion_summary(
     drive_root: Any, evt: Dict[str, Any], task_id: str, task: Dict[str, Any],
     result: Dict[str, Any], task_done_event: Dict[str, Any],
 ) -> bool:
-    """Owe Main's compact row for a managed Project root, not a conversation."""
+    """Owe Main's answer for Project roots, including conversations moved from Main.
+
+    A direct conversation born inside a Project stays there. Only its durable,
+    ingress-bound source can prove that a direct turn was transferred from Main;
+    current chat addressing and project existence cannot establish that origin.
+    """
     tid = str(task_id or "").strip()
     task = task if isinstance(task, dict) else {}
     result = result if isinstance(result, dict) else {}
-    if not tid or any(
-        bool(row.get("_is_direct_chat"))
-        for row in (evt, task, result, task_done_event) if isinstance(row, dict)
-    ):
+    if not tid:
         return False
     try:
-        from ouroboros.projects_registry import mirrored_answer, task_presentation_snapshot
+        from ouroboros.projects_registry import mirrored_answer, project_binding_for_task, task_presentation_snapshot
+
+        if any(bool(row.get("_is_direct_chat")) for row in (evt, task, result, task_done_event)
+               if isinstance(row, dict)):
+            binding = project_binding_for_task(drive_root, tid) or {}
+            source = binding.get("source_ref")
+            if not owner_message_ref_is_valid(source) or source["chat_id"] != 1:
+                return False
         from ouroboros.task_results import resolve_task_lineage
         from ouroboros.task_status import SETTLED_STATUSES
         from supervisor.terminal_delivery import enqueue_terminal_delivery

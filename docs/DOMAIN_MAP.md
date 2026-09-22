@@ -15,20 +15,20 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D05 | Tool surfaces: files, code, shell, media, external | 28 | 0 |
 | D06 | Review stack | 67 | 0 |
 | D07 | Delegation, subagents & Claudexor | 53 | 0 |
-| D08 | Supervisor: queue, workers, events & runtime control | 46 | 0 |
+| D08 | Supervisor: queue, workers, events & runtime control | 47 | 0 |
 | D09 | Cancellation, owner control & process custody | 13 | 0 |
 | D10 | Git, update & release machinery | 28 | 0 |
-| D11 | Gateway, server & Web UI | 54 | 0 |
+| D11 | Gateway, server & Web UI | 55 | 0 |
 | D12 | Settings & configuration | 15 | 0 |
 | D13 | Safety, guards & runtime mode | 9 | 0 |
 | D14 | Skills & extensions | 54 | 0 |
 | D15 | Memory, knowledge, consciousness & self-evolution | 22 | 0 |
 | D16 | Observability, usage accounting & cost | 11 | 0 |
-| D17 | Projects, workspaces & task results | 21 | 0 |
+| D17 | Projects, workspaces & task results | 22 | 0 |
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **560** | **0** |
+| **total** | | **563** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -484,6 +484,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `supervisor/queue_snapshot.py`
 - `supervisor/queue_timeouts.py`
 - `supervisor/queue_transitions.py`
+- `supervisor/schedule_lifecycle.py`
 - `supervisor/schedule_time.py`
 - `supervisor/state.py`
 - `supervisor/subagent_task_truth.py`
@@ -577,6 +578,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/gateway/projects.py`
 - `ouroboros/gateway/router.py`
 - `ouroboros/gateway/routing_decision.py`
+- `ouroboros/gateway/schedule_contracts.py`
 - `ouroboros/gateway/schedules.py`
 - `ouroboros/gateway/schema.py`
 - `ouroboros/gateway/settings.py`
@@ -737,6 +739,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/headless.py`
 - `ouroboros/headless_status.py`
 - `ouroboros/project_dialogue.py`
+- `ouroboros/project_handoff.py`
 - `ouroboros/project_lease.py`
 - `ouroboros/project_naming.py`
 - `ouroboros/project_sources.py`
