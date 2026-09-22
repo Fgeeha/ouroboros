@@ -562,7 +562,10 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # and its startup fold; the archive segments ``archive/consciousness_observations_<ts>``
 # left the population and the one-time ``archive/consciousness_observations.jsonl``
 # move target (``ouroboros/consciousness.py``) took their place.
-EXPECTED_SCAN_PATHS = 290  # Linked project knowledge history is a dynamic validated shelf.
+# 290 -> 291: the retained focus source (``task_results/artifacts/*/source_handles/
+# context_checkpoints``, ``ouroboros/task_finalization.py``'s digest glob) is the
+# one new durable plane of cross-focus awareness; it has its own row in section 2.
+EXPECTED_SCAN_PATHS = 291  # Linked project knowledge history is a dynamic validated shelf.
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts
