@@ -412,7 +412,7 @@ function undiscoveredLabel(value, known) {
 export function routeChoiceGroups({
     harnesses = [], modelSources = [], providers = [], currentChoice = '',
     catalogKnown = true, accountsKnown = true, includeSessions = true,
-    includeSubscriptions = true, providerProfiles = {},
+    includeSubscriptions = true, providerProfiles = {}, hasConfiguredAccounts = false,
 } = {}) {
     const sessionValues = (harnesses || [])
         .filter((harness) => harness && harness.id)
@@ -452,7 +452,9 @@ export function routeChoiceGroups({
         ...(includeSubscriptions ? [{ label: 'Subscriptions · models', options: modelValues.length
             ? modelValues
             : [{ value: '', disabled: true, label: catalogKnown && accountsKnown
-                ? 'No model sources listed — connect one in Accounts'
+                ? (hasConfiguredAccounts
+                    ? 'No model sources listed — refresh Model Catalog'
+                    : 'No model sources listed — connect one in Accounts')
                 : catalogKnown ? 'No model sources listed; accounts have not been checked'
                     : 'Model sources have not been read — use Refresh Model Catalog' }] }] : []),
         { label: 'API keys', options: apiValues },
