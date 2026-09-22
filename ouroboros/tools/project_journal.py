@@ -528,14 +528,16 @@ def _read_focus_source(ctx: ToolContext, source: Dict[str, Any]) -> Tuple[Option
             text = _handle_live_roots(ctx, offset=int(args.get("offset") or 0), snapshot=str(args.get("snapshot") or ""))
         elif reader == "get_task_result":
             from ouroboros.task_status import load_effective_task_result
+            from ouroboros.task_status import SETTLED_STATUSES
             from ouroboros.routing_wait import is_emitted_admission_stub
             from ouroboros.tool_access import canonical_data_root
             from ouroboros.tools.control_task_results import _get_task_result
             row = load_effective_task_result(canonical_data_root(ctx), str(args.get("task_id") or ""))
-            if not row or is_emitted_admission_stub(row):
-                # The reader's unavailable/pending answers are prose without a
-                # typed marker; a task with no settled result is not a source.
-                return "", f"{reader} refused: task {args.get('task_id')} unknown or admission pending"
+            if not row or is_emitted_admission_stub(row) or str(row.get("status") or "") not in SETTLED_STATUSES:
+                # The reader's unavailable/pending/running answers are prose
+                # without a typed marker; a task with no settled result is not a
+                # source (its live text is "Task is running.").
+                return "", f"{reader} refused: task {args.get('task_id')} unknown, admission pending or not yet settled"
             text = _get_task_result(ctx, task_id=str(args.get("task_id") or ""))
         elif reader == "chat_history":
             from ouroboros.tools.control_runtime import _chat_history
@@ -562,7 +564,7 @@ def _read_focus_source(ctx: ToolContext, source: Dict[str, Any]) -> Tuple[Option
             return "", f"{reader} refused: {code or 'typed error'}"
     if len(body.encode("utf-8")) > _FOCUS_SOURCE_MAX_BYTES:
         return "", (f"{reader} answered {len(body.encode('utf-8'))} bytes, above the {_FOCUS_SOURCE_MAX_BYTES}-byte "
-                    "focus source bound; point the focus at a narrower page (limit/offset/snapshot)")
+                    "focus source bound; point the focus at a narrower page (offset/snapshot) or a smaller reader")
     return body, ""
 
 

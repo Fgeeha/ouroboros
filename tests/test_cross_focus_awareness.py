@@ -72,6 +72,11 @@ def test_root_focus_persists_and_terminal_race_refuses(tmp_path, monkeypatch):
     assert view["source_ref"] == {"reader": "journal_read", "project_id": "alpha"}
     ranged = json.loads(_get_task_result(peer, "root", include_focus_source=True, source_start_char=0, source_end_char=20))["focus_source"]
     assert ranged["text"] == retained.decode("utf-8")[:20]
+    # A restricted actor (child / Presence) holds no cross-focus view: the retained
+    # source is part of that view, so the reader refuses it typed.
+    child = types.SimpleNamespace(task_id="child", drive_root=tmp_path, task_metadata={"budget_drive_root": str(tmp_path), "delegation_role": "subagent"})
+    forbidden = _get_task_result(child, "root", include_focus_source=True)
+    assert "TOOL_FORBIDDEN" in forbidden and handle["sha256"] not in forbidden
     (tmp_path / "task_results" / "artifacts" / "root" / handle["path"]).write_bytes(b"tampered")
     assert json.loads(_get_task_result(peer, "root", include_focus_source=True))["focus_source"]["reason"] == "source_identity_mismatch"
 
@@ -284,7 +289,9 @@ def test_focus_source_refuses_unsettled_task_results_and_oversized_answers(tmp_p
         task_metadata={"root_task_id": "root", "budget_drive_root": str(tmp_path)}, event_queue=None,
     )
     refused = pj._update_focus(ctx, "Pointing at a ghost", {"reader": "get_task_result", "task_id": "missing1"})
-    assert "FOCUS_SOURCE_UNRESOLVED" in refused and "unknown or admission pending" in refused
+    assert "FOCUS_SOURCE_UNRESOLVED" in refused and "not yet settled" in refused
+    write_task_result(tmp_path, "live1", STATUS_RUNNING, result="Task is running.")
+    assert "FOCUS_SOURCE_UNRESOLVED" in pj._update_focus(ctx, "Pointing at a live task", {"reader": "get_task_result", "task_id": "live1"})
     write_task_result(tmp_path, "done1", STATUS_COMPLETED, result="settled answer")
     ok = pj._update_focus(ctx, "Pointing at a settled result", {"reader": "get_task_result", "task_id": "done1"})
     assert ok.startswith("OK: focus[root]")
