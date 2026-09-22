@@ -1,4 +1,5 @@
-import { refreshModelCatalog } from './settings_catalog.js';
+import { refreshModelCatalog, watchAccountModelCatalog } from './settings_catalog.js';
+export { accountCatalogRefreshKey } from './settings_catalog.js';
 import { getNotifier } from './notifications.js';
 import { bindEffortSegments, syncEffortSegments, readCustomSecretDraft, collectCustomSecretDraft, paintSettingsFieldErrors, settingsWriteFailure } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
@@ -22,7 +23,7 @@ import { PROVIDER_TEST_INPUTS, SECRET_KEYS, bindSecretInputs, bindSettingsTabs, 
 import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
 import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
-import { accountRows, claudexorStatus, READ_OK } from './claudexor_status_store.js';
+import { claudexorStatus } from './claudexor_status_store.js';
 import { createModelRolesEditor, modelRoleMap } from './model_roles.js';
 import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY } from './route_editor_primitives.js';
 import { collectSafeFieldValues, normalizeTone, renderSafeField, setInlineStatus, revealNewRow } from './ui_helpers.js';
@@ -100,26 +101,6 @@ function applyCheckboxValue(id, value) {
 function isTruthySetting(value) {
     const normalized = String(value ?? '').trim().toLowerCase();
     return value === true || ['true', '1', 'yes', 'on'].includes(normalized);
-}
-
-// Account login/status is the authority for subscription model discovery. Keep
-// one small signature of the confirmed account facts so a newly settled login
-// (or a changed account) can refresh the existing catalog without polling or
-// replacing the owner's in-memory model draft.
-export function accountCatalogRefreshKey(view) {
-    if (view?.reads?.accounts !== READ_OK) return null;
-    return JSON.stringify(accountRows(view.snapshot || {}).map((row) => ({
-        harness: row.harness,
-        profile_id: row.profile_id,
-        display_name: row.display_name,
-        enabled: row.enabled,
-        identity: {
-            email: row.identity?.email || '',
-            plan: row.identity?.plan || '',
-        },
-        verification: row.status?.verification || '',
-        availability: row.status?.availability || '',
-    })));
 }
 
 // A loading, validation or editor owner may update its own status. A later
@@ -503,9 +484,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let settingsSaving = false;
     let saveOutcomeUnknown = false;
     let validationAttempted = false;
-    let modelCatalogStatusReady = false;
-    let lastAccountCatalogKey = null;
-    let disposeModelCatalogStatus = null;
     const providerTestGenerations = new Map();
     const providerTestsInFlight = new Set();
     const modelRoles = createModelRolesEditor({ hostId: 'settings-model-roles',
@@ -871,13 +849,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                     'warn'
                 );
             }
-            if (applied) {
-                // The initial catalog read is already the page-load refresh. Arm
-                // account-change detection only after it so the same settled
-                // status snapshot cannot issue a duplicate request.
-                lastAccountCatalogKey = accountCatalogRefreshKey(claudexorStatus);
-                modelCatalogStatusReady = true;
-            }
+            // Catalog readiness is independent of Settings GET completion:
+            // a superseding page-show load may still be waiting for its document.
+            // Arm after discovery so its settled Accounts snapshot stays quiet.
+            accountModelCatalog.arm();
         } catch (error) {
             if (reloadSequence !== loadSequence) return;
             settingsLoaded = false;
@@ -905,25 +880,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         } finally {
             extensionRefreshPending = false;
         }
-    }
-
-    function noteAccountCatalogStatus(view) {
-        const next = accountCatalogRefreshKey(view);
-        if (!modelCatalogStatusReady) {
-            lastAccountCatalogKey = next;
-            return;
-        }
-        // A failed/unread Accounts facet clears the confirmation. The next
-        // successful answer therefore refreshes even when the account rows look
-        // unchanged, which is the reconnect path; a settled identical poll is
-        // quiet and cannot become a timer-driven catalog refresh.
-        if (next === null) {
-            lastAccountCatalogKey = null;
-            return;
-        }
-        if (next === lastAccountCatalogKey) return;
-        lastAccountCatalogKey = next;
-        void refreshModelCatalog();
     }
 
     function collectBody() {
@@ -1207,7 +1163,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // A confirmed Accounts facet is the existing status-store seam for login
     // completion. It refreshes the catalog only on a changed/rehydrated account
     // answer, while modelRoles.adoptCatalog keeps unsaved assignments intact.
-    disposeModelCatalogStatus = claudexorStatus.subscribe(noteAccountCatalogStatus);
+    const accountModelCatalog = watchAccountModelCatalog();
     const disposeRestartReconnect = ws?.on?.('open', () => {
         refreshRestartState();
         if (settingsLoaded) void refreshModelCatalog();
@@ -1232,8 +1188,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         window.removeEventListener('beforeunload', beforeUnload);
         disposeLocalModel();
         disposeRestartReconnect?.();
-        disposeModelCatalogStatus?.();
-        disposeModelCatalogStatus = null;
+        accountModelCatalog.dispose();
         restartReadSequence += 1;
         baselineSettleDisposer?.();
         modelRoles.destroy();
