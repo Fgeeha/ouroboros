@@ -19,25 +19,13 @@ import urllib.request
 
 import pytest
 
+from tests import _f1_archive_fixture_shared as f1_archive_fixture
 from tests.test_ui_smoke_playwright import direct_server_with_data as _direct_server_with_data
 
 direct_server_with_data = _direct_server_with_data
 
-REPO = pathlib.Path(__file__).resolve().parents[1]
 GENERATIONS = int(os.environ.get("OUROBOROS_1195_AUDIT_GENERATIONS", "300"))
 ROWS = int(os.environ.get("OUROBOROS_1195_AUDIT_ROWS", "1000"))
-
-
-def _fixture_module():
-    import importlib.util
-
-    path = REPO / "research" / "f1_archive_fixture.py"
-    if not path.is_file():
-        pytest.skip("research/f1_archive_fixture.py is not present in this checkout")
-    spec = importlib.util.spec_from_file_location("f1_archive_fixture", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
 
 
 def _audit_records(data_dir: pathlib.Path, since_bytes: int = 0) -> list[dict]:
@@ -122,7 +110,7 @@ def test_real_server_serves_readiness_and_requests_while_history_runs_elsewhere(
     data_dir: pathlib.Path = direct_server_with_data["data_dir"]
 
     direct_server_with_data["stop_server"]()
-    fixture = _fixture_module()
+    fixture = f1_archive_fixture
     os.environ["OUROBOROS_DATA_DIR"] = str(data_dir)
     build_started = time.monotonic()
     facts = fixture.prepare_root(
