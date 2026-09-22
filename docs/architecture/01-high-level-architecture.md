@@ -19,7 +19,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── modules/chat_history.js, chat_history_replay.js ← Per-chat history pages with bounded retention and exact return handles; source-keyed replay merging without live-task authority (§3 Timeline ownership and ordering)
   │   ├── modules/project_answer.js ← Main's Project lifecycle rows: the fold of a mirrored final answer and the Project reference under every row (§3 Main rows)
   │   ├── modules/project_reference.js ← the one control that points at a Project, and the only raiser of `ouro:open-project` (DESIGN "References and actions")
-  │   ├── modules/project_activity.js ← pure `active_chat_activities` census projection for Main and Project navigation dots; complete supervisor-ready snapshots clear absences, while partial/unavailable/disconnected reads retain explicitly unknown rows (§3 Navigation and shared UI contracts)
+  │   ├── modules/project_activity.js ← pure `active_chat_activities` census projection for Project navigation dots; complete supervisor-ready snapshots clear absences, while partial/unavailable/disconnected reads retain explicitly unknown rows (§3 Liveness census and the chat header)
   │   ├── modules/project_work_pointer.js ← Project-room pointer to an already loaded root card; no execution or history authority (§3 Project rooms)
   │   ├── modules/model_wait.js ← Model-wait views and owner actions inside existing chat cards, through the shared decision ingress (§6 Quota and auth waits)
   │   ├── modules/dashboard.js, logs.js, costs.js, files.js ← Dashboard tab host; Logs (backfill plus live-stream duplicate guard); Costs (an open zero is never shown as free); Files browser over `/api/files/*` (§3 Dashboard, Files)

@@ -90,7 +90,7 @@ export function summarizeProjectActivities(rows = []) {
     }
     if (unknown) phaseParts.push('Activity status unavailable');
     const parts = [...phaseParts, ...waits];
-    const waiting = waits.size > 0;
+    const waiting = waits.size > 0 || phases.has('budget_paused');
     const state = motion ? 'working' : waiting ? 'waiting'
         : phaseParts.some((part) => part === 'Queued' || part === 'Paused') ? 'queued'
             : phaseParts.length ? 'unknown' : 'idle';
@@ -99,32 +99,27 @@ export function summarizeProjectActivities(rows = []) {
         motion,
         waiting,
         label: parts.join(' · '),
-        key: `${state}|${parts.join('|')}`,
     };
 }
 
 /** Build project and direct-conversation summaries from census rows. */
 export function buildProjectActivityIndex(rows = []) {
     const byProjectRows = new Map();
-    const directRows = [];
     const seen = new Set();
     for (const row of Array.isArray(rows) ? rows : []) {
         const id = activityId(row);
         if (!id || seen.has(id) || isChildActivity(row)) continue;
         seen.add(id);
         const pid = projectId(row);
-        if (!pid) directRows.push(row);
-        else byProjectRows.set(pid, [...(byProjectRows.get(pid) || []), row]);
+        if (pid) byProjectRows.set(pid, [...(byProjectRows.get(pid) || []), row]);
     }
     const byProject = new Map();
     for (const [pid, projectRows] of byProjectRows) {
         byProject.set(pid, summarizeProjectActivities(projectRows));
     }
-    const directSummary = summarizeProjectActivities(directRows);
     const aggregateSummary = summarizeProjectActivities([...byProjectRows.values()].flat());
     return {
         byProject,
-        direct: directSummary,
         aggregate: aggregateSummary,
     };
 }
@@ -148,19 +143,8 @@ export function reconcileProjectActivityCensus(previous = new Map(), data = {}) 
         const id = activityId(row);
         if (id && !isChildActivity(row)) next.set(id, { ...row, _activityUnconfirmed: false });
     }
-    let changed = next.size !== prior.size;
-    if (!changed) {
-        for (const [id, row] of next) {
-            if (prior.get(id) !== row && JSON.stringify(prior.get(id)) !== JSON.stringify(row)) {
-                changed = true;
-                break;
-            }
-        }
-    }
     return {
         rows: next,
         complete,
-        changed,
     };
 }
-

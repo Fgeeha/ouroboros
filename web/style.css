@@ -152,9 +152,11 @@ body.resizing-panels { user-select: none; }
     white-space: nowrap;
 }
 
-/* Sidebar activity reuses the live-card's three 4px dots. Static states keep
-   the same rhythm and geometry; only confirmed computation inherits the
-   existing typing-bounce animation. */
+/* Sidebar activity reuses the live-card's three 4px dots (`.chat-live-typing`
+   supplies the size, 3px gap and 1.4s bounce). The dots take the row's own
+   foreground, like the shared status-sentence dot, so they never out-shout the
+   title and follow its hover/active ink; a confirmed wait is the one amber
+   fact; queued and unknown work stay static at a quieter step of that ink. */
 .nav-activity-marker {
     pointer-events: none;
 }
@@ -171,14 +173,14 @@ body.resizing-panels { user-select: none; }
 
 .nav-activity-marker[hidden] { display: none; }
 
-.nav-activity-marker[data-state="working"] span { background: var(--accent-55); }
-.nav-project-row .nav-activity-marker[data-state="working"] span,
-.nav-section-toggle .nav-activity-marker[data-state="working"] span { background: var(--project); }
+/* Same specificity as the later shared `.chat-live-typing span` accent rule
+   would lose on order; name the composed marker so the row ink wins. */
+.nav-activity-marker.chat-live-typing span { background: currentColor; }
 .nav-activity-marker[data-state="waiting"] span { background: var(--amber); }
-.nav-activity-marker[data-state="queued"] span,
-.nav-activity-marker[data-state="unknown"] span { background: var(--text-secondary); }
+.nav-activity-marker[data-state="queued"],
+.nav-activity-marker[data-state="unknown"] { opacity: 0.55; }
 
-/* The shared .chat-live-typing rule supplies the three dots and bounce. */
+/* Only confirmed computation inherits the bounce. */
 .nav-activity-marker[data-state="waiting"] span,
 .nav-activity-marker[data-state="queued"] span,
 .nav-activity-marker[data-state="unknown"] span,
@@ -5866,7 +5868,28 @@ textarea.chat-input {
     padding-left: calc(var(--space-3) + 18px + var(--space-3));
     padding-right: var(--space-1);
     border-radius: var(--radius-sm);
+    /* One trailing rail per row: label, activity column, unread column. Each
+       trailing child is placed explicitly in its own always-reserved column
+       (the global [hidden] rule removes an idle marker from layout, so the
+       tracks, not the children, hold the slots): the dots and the unread dot
+       keep one x across rows whether or not the other is present, whatever
+       the name length, and while the sibling kebab (the item's own 28px
+       column) is hovered or focused. 18px is the marker's own width, three
+       4px dots and two 3px gaps; 8px is the unread dot's. */
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 18px 8px;
+    column-gap: var(--space-2);
 }
+
+.nav-project-row > .nav-row-label { grid-column: 1; }
+.nav-project-row > .nav-activity-marker { grid-column: 2; }
+.nav-project-row > .nav-unread-dot { grid-column: 3; }
+
+/* A deleting row states one trailing fact, `Deleting…`, in its wider sibling
+   column. Its census marker stays in the accessible name but is not drawn:
+   motion on a row the owner cannot open would read as work to look at. */
+.nav-project-item.is-deleting .nav-project-row { grid-template-columns: minmax(0, 1fr); }
+.nav-project-item.is-deleting .nav-activity-marker { display: none; }
 
 .nav-project-row:hover {
     color: var(--text-primary);

@@ -240,7 +240,10 @@ def _direct_turns_snapshot_safe(*, availability=None) -> list:
     try:
         from supervisor.active_activity import get_direct_activity_registry
 
-        return get_direct_activity_registry().snapshot()
+        registry = get_direct_activity_registry()
+        if availability is None:
+            return registry.snapshot()
+        return registry.snapshot(availability=availability)
     except Exception:
         if availability is not None:
             availability["complete"] = False

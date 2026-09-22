@@ -47,29 +47,34 @@ def activity(identity, project='', phase='working', **extra):
                 kind='managed_task' if project else 'direct_chat', phase=phase, **extra)
 
 
-@pytest.mark.parametrize('width,theme,reduced', [
-    (1360, 'dark', False), (1360, 'light', True),
-    (390, 'light', False), (390, 'dark', True),
-])
-def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, reduced):
-    ui, page = subscription_ui, subscription_ui['page']
+def model_wait(identity, project):
+    return activity(identity, project, task_attempt=1, model_waits={'access': dict(state='waiting', task_attempt=1)})
+
+
+def token_color(page, project, token):
+    """Computed colour of a CSS token resolved inside the given project row."""
+    return page.locator(f'[data-project-id="{project}"]').evaluate("""(el, token) => {
+        const probe = document.createElement('span'); probe.style.color = 'var(' + token + ')';
+        el.append(probe); const color = getComputedStyle(probe).color; probe.remove(); return color;}""", token)
+
+
+def dot_color(page, project):
+    return page.locator(f'[data-project-id="{project}"] .nav-activity-marker').evaluate(
+        'el => getComputedStyle(el.firstElementChild).backgroundColor')
+
+
+def row_color(page, project):
+    return page.locator(f'[data-project-id="{project}"]').evaluate('el => getComputedStyle(el).color')
+
+
+def mount_sidebar(ui, width, theme, reduced, projects, census):
+    """Open the real SPA over synthetic state replies; return the mutable body and its controls."""
+    page = ui['page']
     page.set_viewport_size(dict(width=width, height=844))
     page.emulate_media(color_scheme=theme, reduced_motion='reduce' if reduced else 'no-preference')
     page.add_init_script('(' + OBSERVE + ')()')
-    projects = [dict(id='p-' + key, name=name, chat_id=42 + i, lifecycle='active', visible_revision=0)
-                for i, (key, name) in enumerate([
-                    ('work', 'Working room'), ('queue', 'Queued room'), ('wait', 'Waiting room'),
-                    ('empty', 'Empty room'), ('delete', 'Deleting room')])]
-    projects[0]['visible_revision'] = 4
-    projects[-1]['lifecycle'] = 'deleting'
-    work = activity('work', 'p-work')
-    wait = activity('wait', 'p-wait', task_attempt=1, model_waits={
-        'access': dict(state='waiting', task_attempt=1),
-    })
-    initial = [work, activity('queue', 'p-queue', 'queued'), wait,
-               activity('deleting', 'p-delete'), activity('main', phase='thinking')]
     body = dict(sha='sidebar-fixture', supervisor_ready=True, active_chat_activities_complete=True,
-                active_chat_activities=initial, projects=projects, project_chat_ids=[p['chat_id'] for p in projects],
+                active_chat_activities=census, projects=projects, project_chat_ids=[p['chat_id'] for p in projects],
                 _testRevision=1)
     mode, sockets, held = {'fault': ''}, [], []
 
@@ -95,10 +100,37 @@ def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, r
     page.goto(ui['url'] + '/', wait_until='domcontentloaded')
     page.wait_for_function('() => window.__ouroWs?.ws?.readyState === WebSocket.OPEN')
     page.wait_for_function('() => sidebarReads.includes(1)')
-    page.locator(WORK).wait_for(state='attached')
+    page.locator(f'.nav-project-row[data-project-id="{projects[0]["id"]}"]').wait_for(state='attached')
     if width < 700:
         page.locator('#page-chat [data-mobile-nav-toggle]').click()
         page.wait_for_function("() => document.querySelector('#primary-sidebar').getBoundingClientRect().left >= 0")
+
+    def refresh(**changes):
+        body.update(changes)
+        body['_testRevision'] += 1
+        sockets[-1].send(json.dumps({'type': 'projects_changed'}))
+        page.wait_for_function('rev => sidebarReads.includes(rev)', arg=body['_testRevision'])
+
+    return dict(body=body, mode=mode, sockets=sockets, held=held, refresh=refresh)
+
+
+@pytest.mark.parametrize('width,theme,reduced', [
+    (1360, 'dark', False), (1360, 'light', True),
+    (390, 'light', False), (390, 'dark', True),
+])
+def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, reduced):
+    ui, page = subscription_ui, subscription_ui['page']
+    projects = [dict(id='p-' + key, name=name, chat_id=42 + i, lifecycle='active', visible_revision=0)
+                for i, (key, name) in enumerate([
+                    ('work', 'Working room'), ('queue', 'Queued room'), ('wait', 'Waiting room'),
+                    ('empty', 'Empty room'), ('delete', 'Deleting room')])]
+    projects[0]['visible_revision'] = 4
+    projects[-1]['lifecycle'] = 'deleting'
+    work = activity('work', 'p-work')
+    initial = [work, activity('queue', 'p-queue', 'queued'), model_wait('wait', 'p-wait'),
+               activity('deleting', 'p-delete'), activity('main', phase='thinking')]
+    mounted = mount_sidebar(ui, width, theme, reduced, projects, initial)
+    body, mode, sockets, held, refresh = (mounted[key] for key in ('body', 'mode', 'sockets', 'held', 'refresh'))
 
     def marker(project):
         return page.locator(f'[data-project-id="{project}"] .nav-activity-marker')
@@ -120,12 +152,6 @@ def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, r
                 assert dot['duration'] == '1.4s'
                 assert float(dot['delay'].removesuffix('s')) == pytest.approx(index * .2)
 
-    def refresh(**changes):
-        body.update(changes)
-        body['_testRevision'] += 1
-        sockets[-1].send(json.dumps({'type': 'projects_changed'}))
-        page.wait_for_function('rev => sidebarReads.includes(rev)', arg=body['_testRevision'])
-
     def capture(suffix):
         setup_browser.capture(page, f'sidebar-{theme}-{width}-{reduced}-{suffix}')
 
@@ -136,14 +162,20 @@ def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, r
     assert marker('p-empty').is_hidden()
     assert page.locator('[data-project-id="p-empty"]').is_enabled()
     assert page.locator('[data-project-id="p-delete"]').is_disabled()
-    assert page.locator('#nav-main-activity').get_attribute('data-motion') == '1'
+    assert page.locator('[data-project-id="p-delete"]').get_attribute('title') == 'Deleting room — Deleting… · Working'
+    assert marker('p-delete').get_attribute('data-state') == 'working'
+    assert marker('p-delete').is_hidden()
     assert page.locator(WORK + ' .nav-unread-dot').count() == 1
     assert page.locator('#nav-projects-count').inner_text() == '1'
     assert 'Unread' in page.locator(WORK).get_attribute('aria-label')
-    for project, token in [('p-wait', '--amber'), ('p-queue', '--text-secondary')]:
-        assert marker(project).evaluate("""(el, token) => getComputedStyle(el.firstElementChild).backgroundColor
-            === (() => {const probe=document.createElement('span'); probe.style.color='var('+token+')';
-                el.append(probe); const color=getComputedStyle(probe).color; probe.remove();return color;})()""", token)
+    # Ink: a wait is the one amber fact; working and queued dots take the row's own
+    # foreground (never the saturated project token on a plain row), queued quieter.
+    assert dot_color(page, 'p-wait') == token_color(page, 'p-wait', '--amber')
+    for project in ('p-work', 'p-queue'):
+        assert dot_color(page, project) == row_color(page, project)
+        assert dot_color(page, project) != token_color(page, project, '--project')
+    assert marker('p-queue').evaluate('el => getComputedStyle(el).opacity') == '0.55'
+    assert marker('p-work').evaluate('el => getComputedStyle(el).opacity') == '1'
     geometry = page.locator('#nav-projects-activity').evaluate("""el => {
         const a=el.getBoundingClientRect(), b=el.previousElementSibling.getBoundingClientRect();
         return {gap:a.left-b.right, top:a.top, labelTop:b.top, height:b.height};}""")
@@ -240,7 +272,6 @@ def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, r
     connections = len(sockets)
     sockets[-1].close()
     observe('p-work', 'unknown')
-    assert page.locator('#nav-main-activity').get_attribute('data-state') == 'unknown'
     page.wait_for_function('n => sidebarSockets.length > n && sidebarSockets.at(-1).readyState === WebSocket.OPEN', arg=connections)
     page.evaluate(FRAMES)
     observe('p-work', 'unknown')
@@ -256,7 +287,6 @@ def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, r
     page.wait_for_function('n => sidebarSockets.length > n && sidebarSockets.at(-1).readyState === WebSocket.OPEN', arg=connections + 1)
     refresh(active_chat_activities=[], active_chat_activities_complete=True, supervisor_ready=True)
     assert marker('p-work').is_hidden()
-    assert page.locator('#nav-main-activity').is_hidden()
     assert page.locator('#nav-projects-activity').is_hidden()
     assert page.locator(WORK + ' .nav-unread-dot').count() == 1
     assert page.locator('#nav-projects-count').inner_text() == '1'
@@ -277,3 +307,197 @@ def test_sidebar_activity_census_and_navigation(subscription_ui, width, theme, r
     page.locator('#project-panel-close').click()
     page.locator('#project-panel').wait_for(state='hidden')
     assert page.locator('[data-nav-page="chat"]').get_attribute('aria-current') == 'page'
+
+
+LONG_NAME = 'A deliberately long project name that must ellipsize before it reaches the rail'
+RAIL = """() => {
+    const rect = (el) => {
+        if (!el) return null;
+        const b = el.getBoundingClientRect();
+        return {left: b.left, right: b.right, top: b.top, bottom: b.bottom, width: b.width, height: b.height};
+    };
+    return [...document.querySelectorAll('.nav-project-item')].map((item) => {
+        const row = item.querySelector('.nav-project-row');
+        const marker = row.querySelector('.nav-activity-marker');
+        const label = row.querySelector('.nav-row-label');
+        const style = getComputedStyle(marker);
+        return {
+            id: row.dataset.projectId, state: marker.dataset.state, deleting: item.classList.contains('is-deleting'),
+            active: row.classList.contains('active'), row: rect(row), label: rect(label),
+            ellipsized: label.scrollWidth > label.clientWidth, marker: rect(marker),
+            drawn: style.display !== 'none' && style.visibility !== 'hidden', opacity: style.opacity,
+            dots: [...marker.children].map((dot) => rect(dot).left - rect(marker).left),
+            dotColor: getComputedStyle(marker.firstElementChild).backgroundColor, rowColor: getComputedStyle(row).color,
+            unread: rect(row.querySelector('.nav-unread-dot')),
+            trailing: rect(item.lastElementChild), trailingKind: item.lastElementChild.className,
+        };
+    });
+}"""
+
+
+def rail_rows(page):
+    return {row['id']: row for row in page.evaluate(RAIL)}
+
+
+def horizontal(rect):
+    return rect and {key: rect[key] for key in ('left', 'right', 'width')}
+
+
+def assert_rail(page, rows, states, *, lit=()):
+    """Every drawn marker shares one column; unread dots share another; nothing overlaps."""
+    live = [row for row in rows.values() if not row['deleting']]
+    marker = next(row['marker'] for row in live if row['drawn'])
+    unread = next(row['unread'] for row in live if row['unread'])
+    amber = token_color(page, live[0]['id'], '--amber')
+    project = token_color(page, live[0]['id'], '--project')
+    for row in live:
+        assert row['state'] == states[row['id']], (row['id'], row['state'])
+        assert row['drawn'] == (row['state'] != 'idle'), row['id']
+        # The label cell ends one gap before the activity column in every row,
+        # so an idle row (its marker removed from layout) still holds the slot.
+        assert row['label']['right'] == pytest.approx(marker['left'] - 8, abs=0.01), (row['id'], row['label'], marker)
+        assert row['trailingKind'] == 'nav-project-kebab'
+        assert row['trailing']['left'] >= row['row']['right'] - 0.01, (row['id'], row['trailing'], row['row'])
+        if row['unread']:
+            for key in ('left', 'right', 'width'):
+                assert row['unread'][key] == pytest.approx(unread[key], abs=0.01), (row['id'], key)
+            assert row['unread']['left'] >= marker['right'] + 7.99
+            assert row['unread']['right'] <= row['row']['right'] + 0.01
+        if not row['drawn']:
+            continue
+        for key in ('left', 'right', 'width', 'height'):
+            assert row['marker'][key] == pytest.approx(marker[key], abs=0.01), (row['id'], key, row['marker'], marker)
+        assert row['marker']['width'] == pytest.approx(18, abs=0.01)  # three 4px dots, two 3px gaps
+        assert row['dots'] == pytest.approx([0, 7, 14], abs=0.01)
+        assert abs((row['marker']['top'] + row['marker']['bottom']) - (row['row']['top'] + row['row']['bottom'])) <= 1
+        if row['state'] == 'waiting':
+            assert row['dotColor'] == amber
+        elif row['state'] != 'idle':
+            assert row['dotColor'] == row['rowColor'], (row['id'], row['dotColor'], row['rowColor'])
+            assert row['opacity'] == ('0.55' if row['state'] in ('queued', 'unknown') else '1'), row['id']
+            if row['id'] not in lit:
+                assert row['dotColor'] != project, row['id']
+    for row in rows.values():
+        if not row['deleting']:
+            continue
+        assert row['state'] == states[row['id']]
+        assert not row['drawn'] and row['unread'] is None
+        assert row['trailingKind'] == 'nav-project-deleting-status'
+        assert row['label']['right'] <= row['trailing']['left'] + 0.01, (row['id'], row['label'], row['trailing'])
+    assert any(row['ellipsized'] for row in live)
+    return {key: (row['marker'], row['unread']) for key, row in rows.items()}
+
+
+@pytest.mark.parametrize('width,theme,reduced', [
+    (1360, 'dark', False), (1360, 'light', False), (390, 'dark', True),
+])
+def test_sidebar_activity_rail_geometry(subscription_ui, width, theme, reduced):
+    ui, page = subscription_ui, subscription_ui['page']
+    specs = [  # key, name, unread, deleting, census rows
+        ('wu', 'Working unread', True, False, [activity('wu', 'p-wu')]),
+        ('w', 'Working room', False, False, [activity('w', 'p-w')]),
+        ('wl', LONG_NAME, True, False, [activity('wl', 'p-wl', 'thinking')]),
+        ('qu', 'Queued unread', True, False, [activity('qu', 'p-qu', 'queued')]),
+        ('q', 'Paused room', False, False, [activity('q', 'p-q', 'budget_paused')]),
+        ('a', 'Waiting room', False, False, [model_wait('a', 'p-a')]),
+        ('iu', 'Idle unread', True, False, []),
+        ('i', 'Idle room', False, False, []),
+        ('dw', 'Deleting working', False, True, [activity('dw', 'p-dw')]),
+        ('d', 'Deleting room', False, True, []),
+    ]
+    projects = [dict(id='p-' + key, name=name, chat_id=42 + i, lifecycle='deleting' if deleting else 'active',
+                     visible_revision=4 if unread else 0)
+                for i, (key, name, unread, deleting, _) in enumerate(specs)]
+    initial = [row for spec in specs for row in spec[-1]] + [activity('main', phase='thinking')]
+    mounted = mount_sidebar(ui, width, theme, reduced, projects, initial)
+    refresh = mounted['refresh']
+    states = dict(wu='working', w='working', wl='working', qu='queued', q='waiting', a='waiting',
+                  iu='idle', i='idle', dw='working', d='idle')
+    states = {'p-' + key: value for key, value in states.items()}
+
+    def capture(suffix):
+        setup_browser.capture(page, f'sidebar-{theme}-{width}-{reduced}-rail-{suffix}')
+
+    def same_rail(reference, current, ids=None):
+        # Rows may legitimately re-order (unread rooms sort first); the columns may not move.
+        for key in ids or reference:
+            for expected, actual in zip(reference[key], current[key]):
+                if expected is None or actual is None:
+                    assert expected == actual, key
+                else:
+                    assert horizontal(actual) == pytest.approx(horizontal(expected), abs=0.01), key
+
+    def settled(project, token):
+        # Row ink transitions over 0.15s; measure only once it reached the token.
+        page.wait_for_function("([project, color]) => getComputedStyle(document.querySelector("
+                               "'[data-project-id=\"' + project + '\"]')).color === color",
+                               arg=[project, token_color(page, project, token)])
+
+    page.wait_for_function("() => document.querySelector('[data-project-id=\"p-a\"] .nav-activity-marker')?.dataset.state === 'waiting'")
+    assert page.locator('[data-project-id="p-dw"]').get_attribute('title') == 'Deleting working — Deleting… · Working'
+    reference = assert_rail(page, rail_rows(page), states)
+    capture('default')
+
+    # Hovering a row reveals its sibling kebab and brightens the title; the dots follow the title ink.
+    plain = rail_rows(page)['p-w']['rowColor']
+    page.locator('[data-project-id="p-w"]').hover()
+    page.wait_for_function("() => getComputedStyle(document.querySelector('[data-project-id=\"p-w\"] ~ .nav-project-kebab')).opacity === '1'")
+    settled('p-w', '--text-primary')
+    hovered = rail_rows(page)
+    assert hovered['p-w']['rowColor'] != plain and hovered['p-w']['dotColor'] == hovered['p-w']['rowColor']
+    same_rail(reference, assert_rail(page, hovered, states))
+    capture('hover')
+    page.mouse.move(width / 2, 600)
+
+    # Keyboard focus on a kebab and the open portalled menu leave every slot where it was.
+    kebab = page.locator('[data-project-id="p-qu"] ~ .nav-project-kebab')
+    kebab.focus()
+    same_rail(reference, assert_rail(page, rail_rows(page), states))
+    page.keyboard.press('Enter')
+    page.locator('body > .project-row-menu').wait_for()
+    same_rail(reference, assert_rail(page, rail_rows(page), states))
+    capture('menu')
+    page.keyboard.press('Escape')
+    page.locator('body > .project-row-menu').wait_for(state='detached')
+
+    # An incomplete census retains every observed row as static unknown at the quieter step.
+    refresh(active_chat_activities=[], active_chat_activities_complete=False)
+    unknown = {key: ('unknown' if value != 'idle' else 'idle') for key, value in states.items()}
+    page.wait_for_function("() => document.querySelector('[data-project-id=\"p-w\"] .nav-activity-marker')?.dataset.state === 'unknown'")
+    same_rail(reference, assert_rail(page, rail_rows(page), unknown))
+    capture('unknown')
+
+    # Reading a room removes only its unread dot; the marker column does not move.
+    refresh(active_chat_activities=initial, active_chat_activities_complete=True)
+    page.wait_for_function("() => document.querySelector('[data-project-id=\"p-w\"] .nav-activity-marker')?.dataset.state === 'working'")
+    projects[0]['visible_revision'] = 0
+    refresh(projects=projects)
+    page.locator('[data-project-id="p-wu"] .nav-unread-dot').wait_for(state='detached')
+    read = rail_rows(page)
+    assert read['p-wu']['unread'] is None
+    same_rail(reference, assert_rail(page, read, states), ids=[key for key in reference if key != 'p-wu'])
+    assert horizontal(read['p-wu']['marker']) == pytest.approx(horizontal(reference['p-wu'][0]), abs=0.01)
+    capture('read')
+
+    if width >= 700:
+        # The open room's title takes the project ink and its dots follow it; slots stay put.
+        page.locator('[data-project-id="p-w"]').click()
+        page.locator('#project-panel').wait_for(state='visible')
+        page.mouse.move(width / 2, 600)
+        settled('p-w', '--project')
+        lit = rail_rows(page)
+        assert lit['p-w']['active'] and lit['p-w']['dotColor'] == lit['p-w']['rowColor'] == token_color(page, 'p-w', '--project')
+        same_rail(reference, assert_rail(page, lit, states, lit=('p-w',)), ids=[key for key in reference if key != 'p-wu'])
+        capture('active')
+        page.locator('#project-panel-close').click()
+        page.locator('#project-panel').wait_for(state='hidden')
+
+    # A complete empty census hides every marker; the unread column still does not move.
+    refresh(active_chat_activities=[])
+    page.wait_for_function("() => document.querySelector('[data-project-id=\"p-w\"] .nav-activity-marker')?.hidden === true")
+    empty = rail_rows(page)
+    for key, row in empty.items():
+        assert not row['drawn'] and row['state'] == 'idle', key
+        if row['unread']:
+            assert horizontal(row['unread']) == pytest.approx(horizontal(reference[key][1]), abs=0.01), key
+    capture('empty')

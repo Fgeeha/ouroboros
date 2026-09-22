@@ -72,7 +72,6 @@ const navProjects = document.getElementById('nav-projects');
 const navProjectsToggle = document.getElementById('nav-projects-toggle');
 const navProjectsCount = document.getElementById('nav-projects-count');
 const navProjectsActivity = document.getElementById('nav-projects-activity');
-const navMainActivity = document.getElementById('nav-main-activity');
 const navProjectsList = document.getElementById('nav-projects-list');
 const projectInstances = new Map();
 const projectPaintRequests = new Map();
@@ -539,11 +538,8 @@ function setActivityOwnerName(owner, baseName, summary) {
 
 function patchProjectActivityMarkers(activityIndex = projectActivityIndex) {
     setActivityMarker(navProjectsActivity, activityIndex.aggregate);
-    setActivityMarker(navMainActivity, activityIndex.direct);
     const unread = navProjectsCount?.title;
     setActivityOwnerName(navProjectsToggle, unread ? `Projects · ${unread}` : 'Projects', activityIndex.aggregate);
-    const main = document.querySelector('[data-nav-page="chat"]');
-    setActivityOwnerName(main, 'Main Ouroboros chat', activityIndex.direct);
     const buttons = new Map(
         [...(navProjectsList?.querySelectorAll('[data-project-id]') || [])]
             .map((button) => [String(button.dataset.projectId || ''), button]),

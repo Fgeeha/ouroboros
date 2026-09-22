@@ -52,12 +52,12 @@ test('waits are amber facts and resumed questions are not waits', () => {
     assert.match(mixed.label, /Waiting for access/);
     assert.deepEqual(summarizeProjectActivities([question]), {
         state: 'waiting', motion: false, waiting: true,
-        label: 'Waiting for your answer', key: 'waiting|Waiting for your answer',
+        label: 'Waiting for your answer',
     });
     assert.equal(summarizeProjectActivities([resumed]).waiting, false);
 });
 
-test('project and Main summaries include direct conversations and managed roots once', () => {
+test('project summaries include direct conversations and managed roots, excluding unbound work', () => {
     const rows = [
         activity({ activity_id: 'direct', project_id: 'p', phase: 'thinking' }),
         activity({ activity_id: 'managed', project_id: 'p', kind: 'managed_task', phase: 'queued' }),
@@ -70,7 +70,7 @@ test('project and Main summaries include direct conversations and managed roots 
     assert.equal(index.byProject.get('p').motion, true);
     assert.match(index.byProject.get('p').label, /Thinking/);
     assert.match(index.byProject.get('p').label, /Working/);
-    assert.equal(index.direct.motion, true);
+    assert.equal(buildProjectActivityIndex([activity({ chat_id: 0 })]).aggregate.motion, false);
     assert.equal(index.aggregate.motion, true);
 });
 
@@ -117,7 +117,7 @@ test('a partial census marks only omissions unknown and does not mutate producer
 });
 
 test('complete needs an array and literal true readiness before it can clear absences', () => {
-    const rows = new Map([['one', activity({ activity_id: 'one' })]]);
+    const rows = new Map([['one', activity({ activity_id: 'one', project_id: 'p' })]]);
     for (const data of [
         {}, { active_chat_activities_complete: true, supervisor_ready: true },
         { active_chat_activities: [], active_chat_activities_complete: true, supervisor_ready: false },
@@ -125,7 +125,7 @@ test('complete needs an array and literal true readiness before it can clear abs
     ]) {
         const next = reconcileProjectActivityCensus(rows, data);
         assert.equal(next.rows.size, 1);
-        assert.equal(buildProjectActivityIndex([...next.rows.values()]).direct.state, 'unknown');
+        assert.equal(buildProjectActivityIndex([...next.rows.values()]).byProject.get('p').state, 'unknown');
     }
 });
 
@@ -146,3 +146,5 @@ test('model waits use the existing current-attempt rule and questions end on the
     row.required_question.wait_ended_at = '2026-09-22T00:00:00Z';
     assert.equal(summarizeProjectActivities([row]).motion, true);
 });
+
+test('budget-paused work is a stationary wait, not a queue', () => { const s=summarizeProjectActivities([activity({phase:'budget_paused'})]); assert.equal(s.state,'waiting'); assert.equal(s.motion,false); assert.equal(s.label,'Paused'); });

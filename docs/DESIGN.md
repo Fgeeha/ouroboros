@@ -337,19 +337,26 @@ not move them into the migrated set in section 8.
 
 ### Sidebar activity dots
 
-Project and Main navigation rows may carry the existing three 4px working dots
+Project navigation rows may carry the existing three 4px working dots
 (`chat-live-typing`, 3px gap) for the live `active_chat_activities` census.
 `Working`, `Thinking` and `Finalizing` are the only moving states, using the
-existing 1.4s bounce rhythm; `Queued` and budget-paused work stay static
-neutral. Confirmed model access waits and required owner questions are static
-amber, with `resumed` questions no longer waiting. A wait on the same producer
-row suppresses its working motion; an independent working row keeps motion, and
-the row's accessible name states both facts. Unknown or unconfirmed census
-state stays static and explicitly unavailable. The collapsed Projects header
-carries the aggregate dots, and an activity repaint preserves the existing row
-and menu nodes. The dots are separate from unread dots and never carry a
-counter, percent or text animation. Reduced-motion clients receive the same
-state without the bounce.
+existing 1.4s bounce rhythm; `Queued` and budget-paused work stay static at a
+quieter step. Confirmed model access waits and required owner questions are
+static amber, with `resumed` questions no longer waiting. A wait on the same
+producer row suppresses its working motion; an independent working row keeps
+motion, and the row's accessible name states both facts. Unknown or unconfirmed
+census state stays static and explicitly unavailable. The dots take the row's
+own foreground, like the status-sentence dot, so they never out-shout the title
+and follow its hover and selected ink; the wait is the one hue, and no row
+paints them in a saturated project colour of its own. In a Project row the dots
+and the unread dot each own a reserved trailing column, so both sit at one x
+across rows whether or not the other is present, whatever the name length, and
+while the sibling kebab is hovered, focused or has its menu open; a deleting
+row draws only `Deleting…` and keeps its census fact in the accessible name.
+The collapsed Projects header carries the aggregate dots beside its label, and
+an activity repaint preserves the existing row and menu nodes. The dots are
+separate from unread dots and never carry a counter, percent or text
+animation. Reduced-motion clients receive the same state without the bounce.
 
 ### References and actions
 
