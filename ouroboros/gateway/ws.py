@@ -296,7 +296,15 @@ async def _dispatch_extension_message(
         }))
         return True
     try:
-        result = handler(msg) if callable(handler) else None
+        # Mirror the HTTP dispatcher: a synchronous in-process handler (and its
+        # synchronous barrier wait) runs off the ASGI loop, so one skill's
+        # blocking callback never stalls unrelated HTTP and WebSocket work.
+        if not callable(handler):
+            result = None
+        elif inspect.iscoroutinefunction(handler):
+            result = await handler(msg)
+        else:
+            result = await asyncio.to_thread(handler, msg)
         if inspect.iscoroutine(result):
             result = await result
         if result is not None:

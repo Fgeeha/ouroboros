@@ -366,7 +366,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── endpoint_index.py ← `HTTP_ENDPOINTS` index (re-exported by contracts.py); routers own the Route objects
       │   ├── schema.py, task_list_scan.py ← The executable gateway contract — JSON Schema derived from the TypedDicts, validating ingress — and the stat-invalidated compact result facts shared by list ordering, SSE discovery and Main routing
       │   ├── router.py        ← Starlette route collector for /api/* and /ws (§4)
-      │   ├── ws.py            ← WS manager, extension WS dispatch, broadcast (§4 WebSocket protocol)
+      │   ├── ws.py            ← WS manager, extension WS dispatch (a synchronous in-process handler runs in a worker thread like the HTTP dispatcher, so one skill's blocking callback never stalls the ASGI loop), broadcast (§4 WebSocket protocol)
       │   ├── state.py         ← /api/health + /api/state
       │   ├── tasks.py         ← Headless task create/list/get/cancel/events; cancel accepts `stop_policy` (empty = immediate; `finalize_then_cancel` → 202 + open intent → supervisor/owner_stop.py; unknown → 400)
       │   ├── task_events.py   ← Task-event SSE endpoint: legacy GET ranks plus read-only POST v2 physical-chain cursors (§3 History reads and the SSE v2 transport)
