@@ -33,7 +33,8 @@ test('receipt words: durable and already delivered say nothing, every other word
 import { createProjectHandoffs } from '../modules/project_handoff.js';
 class Element {
     constructor() { this.children = []; this.dataset = {}; this.className = ''; this.hidden = false;
-        this.classList = { add: value => { this.className += ` ${value}`; } }; }
+        this.classList = { add: value => { this.className += ` ${value}`; },
+            remove: value => { this.className = this.className.split(' ').filter(c => c && c !== value).join(' '); } }; }
     append(...nodes) { this.children.push(...nodes); }
     replaceChildren(...nodes) { this.children = nodes; }
     setAttribute() {}
@@ -123,6 +124,47 @@ test('an ordinary message reconciles only itself; the feed is scanned when an an
         assert.equal(h.scans(), before, 'a Started row is projected against the rows map, not the feed');
         for (let i = 0; i < 5; i++) h.controller.snapshot(census());
         assert.equal(h.scans(), before, 'a steady census tick scans nothing');
+    } finally { h.done(); }
+});
+test('two converted cards of one owner message share an identity and both stay visible', () => {
+    // A direct turn and the root it promoted share the origin-based handoff id;
+    // converting both must never hide the card the owner just clicked.
+    const h = setup(async () => null);
+    try {
+        const first = h.mount('t1direct', 'origin', { kind: 'card' });
+        const second = h.mount('t2promoted', 'origin', { kind: 'card' });
+        assert.equal(second.anchor, second.node);
+        assert.equal(first.node.hidden, false); assert.equal(second.node.hidden, false);
+        const receipt = h.mount('t1direct', 'origin', { kind: 'receipt' });
+        assert.equal(receipt.node.hidden, true, 'the durable receipt folds under a visible card');
+        h.controller.snapshot(census([{ activity_id: 't2promoted', phase: 'working' }]));
+        assert.equal(second.node.children[0].children[0].textContent, 'Working');
+        assert.equal(first.node.children[0].children[0].textContent, 'Activity unconfirmed', 'each card paints its own subject');
+        h.nodes.delete(first.node); h.controller.snapshot(census());
+        assert.equal(receipt.node.hidden, true, 'a surviving card keeps representing the transfer');
+        h.nodes.delete(second.node); h.controller.snapshot(census());
+        assert.equal(receipt.node.hidden, false, 'the receipt takes over only when no card remains');
+    } finally { h.done(); }
+});
+test('a promoted shadow keeps the followed retry as its subject instead of cycling', async () => {
+    const h = setup(async id => id === 't' ? { status: 'interrupted', superseded_by: 'r' } : { status: 'running' });
+    try {
+        const card = h.mount('t', 'h', { kind: 'card' });
+        const receipt = h.mount('t', 'h', { kind: 'receipt' });
+        h.controller.snapshot(census()); await flush(); await flush();
+        h.nodes.delete(card.node);
+        h.controller.snapshot(census([{ activity_id: 'r', phase: 'working' }]));
+        assert.equal(receipt.node.children[0].children[0].textContent, 'Working');
+    } finally { h.done(); }
+});
+test('a durable receipt arriving later clears the card\'s not-saved mark', () => {
+    const h = setup(async () => null);
+    try {
+        const card = h.mount('t', 'h', { kind: 'card', receipt: 'unavailable' });
+        assert.equal(card.node.dataset.receipt, 'unavailable');
+        h.mount('t', 'h', { kind: 'receipt' });
+        assert.equal(card.node.dataset.receipt, undefined);
+        assert.doesNotMatch(card.node.className, /project-handoff--unsaved/);
     } finally { h.done(); }
 });
 test('a converted card with a non-durable receipt is marked, a durable one is not', () => {

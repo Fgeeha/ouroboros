@@ -33,18 +33,20 @@ export function handoffPhase(activity, detail, connected = true) {
         : { text: 'Activity unconfirmed', className: 'neutral' };
 }
 
-// One anchor per handoff identity. Two node kinds can carry it: the converted
-// live card (`card`, the request's own position) and the durable receipt row
-// (`receipt`). The card outranks the receipt whatever order they arrive in, an
-// earlier node outranks a later one of the same kind, and every outranked node
-// stays hidden in `row.shadows` so evicting the anchor restores the next one
-// instead of dropping the transfer from the feed.
+// Anchors per handoff identity. Two node kinds carry one: a converted live card
+// (`card`, at the request's own position; several roots of ONE owner message may
+// each convert, and every one of them stays a visible card — a card is never a
+// shadow) and the durable receipt row (`receipt`, at most one visible per
+// identity). A receipt is folded under the first visible card of its identity, or
+// under the earlier receipt, and every folded node stays in `shadows` so an
+// evicted anchor hands over instead of dropping the transfer from the feed.
 export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
-    const rows = new Map();
+    const rows = new Map();  // key: `card:<taskId>` or the receipt's handoff id
     let connected = true, destroyed = false, complete = false;
     let activities = new Map();
     const inFeed = node => feed.contains(node);
-    const current = row => !destroyed && inFeed(row.node) && rows.get(row.id) === row;
+    const current = row => !destroyed && inFeed(row.node) && rows.get(row.key) === row;
+    const visibleAnchor = id => [...rows.values()].find(row => row.id === id && inFeed(row.node));
     const matching = (taskId, projectId) => [...rows.values()].find(row =>
         row.projectId === projectId && row.subjects.has(taskId) && inFeed(row.node));
     function paint(row) {
@@ -63,17 +65,31 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
         const actions = note.parentElement?.querySelector('.msg-routing-actions');
         if (actions) actions.hidden = represented;
     }
-    // A promoted shadow keeps its own painted heading; its subjects merge back.
+    // A durable receipt row folded under a card proves the transfer is in Main
+    // history: the card's "not saved" mark, if any, was about exactly that gap.
+    function fold(shadow, under) {
+        shadow.node.hidden = true;
+        under.shadows.push(shadow);
+        for (const taskId of shadow.subjects) under.subjects.add(taskId);
+        if (shadow.kind === 'receipt' && under.node.dataset.receipt) {
+            delete under.node.dataset.receipt;
+            under.node.classList.remove('project-handoff--unsaved');
+        }
+    }
+    // An evicted anchor hands its shadows to a surviving anchor of the same
+    // identity, else the first still-mounted shadow takes over — keeping the
+    // CURRENT liveness subject (a followed retry), never the shadow's older one.
     function promote(row) {
-        while (row.shadows.length) {
-            const next = row.shadows.shift();
+        rows.delete(row.key);
+        const survivor = visibleAnchor(row.id);
+        for (const next of row.shadows) {
+            if (survivor) { fold(next, survivor); continue; }
             if (!inFeed(next.node)) continue;
             next.node.hidden = false;
-            rows.set(row.id, { ...next, subjects: new Set([...row.subjects, ...next.subjects]),
-                shadows: row.shadows, detail: row.detail, epoch: row.epoch + 1, pending: false, checked: false });
+            rows.set(next.key, { ...next, subjects: new Set([...row.subjects, ...next.subjects]),
+                shadows: [], detail: row.detail, taskId: row.taskId, epoch: row.epoch + 1, pending: false, checked: false });
             return true;
         }
-        rows.delete(row.id);
         return true;
     }
     function sweep() {
@@ -107,7 +123,8 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
                 && (detail?.original_task_id === taskId || detail?.retry_lineage?.some(item => item.task_id === taskId));
             const successor = String((effectiveRetry ? detail.task_id : '') || detail?.superseded_by || detail?.retry_task_id || '');
             if (successor && successor !== taskId) {
-                if (row.subjects.has(successor)) return; // malformed cyclic lineage stays unknown
+                if (row.followed.has(successor)) return; // malformed cyclic lineage stays unknown
+                row.followed.add(successor);
                 row.subjects.add(successor);
                 row.taskId = successor;
                 row.checked = false;
@@ -125,6 +142,9 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
     function mount(node, { taskId, projectId, projectName, title, handoffId, kind = 'receipt', receipt = '' }) {
         if (!taskId || !projectId || destroyed) return node;
         const id = handoffId || `legacy:${JSON.stringify([taskId, projectId])}`;
+        sweep();
+        const anchor = visibleAnchor(id);
+        if (anchor && anchor.node === node) { anchor.subjects.add(taskId); return node; }
         node.dataset.projectId = projectId;
         node.dataset.handoffId = id;
         node.dataset.systemType = 'project_handoff';
@@ -133,6 +153,7 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
         const line = document.createElement('div');
         line.className = 'project-handoff-heading';
         const status = document.createElement('span');
+        status.setAttribute('role', 'status');
         const name = document.createElement('span');
         name.className = 'project-handoff-title';
         name.textContent = title || projectName || 'Project';
@@ -145,29 +166,25 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
             node.classList.add('project-handoff--unsaved');
         }
         body.replaceChildren(line, projectReference({ id: projectId, name: projectName }, { layout: 'inline', taskId }));
-        const row = { id, node, status, kind, taskId, projectId, subjects: new Set([taskId]),
-            shadows: [], detail: null, pending: false, checked: false, epoch: 0 };
-        const prior = rows.get(id);
-        if (prior && inFeed(prior.node) && prior.node !== node) {
+        const row = { key: kind === 'card' ? `card:${taskId}` : id, id, node, status, kind, taskId, projectId,
+            subjects: new Set([taskId]), followed: new Set(), shadows: [], detail: null, pending: false, checked: false, epoch: 0 };
+        if (kind === 'receipt' && anchor) {
             // Duplicate delivery is not evidence that a differently named
-            // execution supersedes its subject: one anchor, the rest shadowed.
-            if (kind === 'card' && prior.kind !== 'card') {
-                node.hidden = false;
-                prior.node.hidden = true;
-                rows.set(id, { ...row, subjects: new Set([...prior.subjects, taskId]),
-                    shadows: [prior, ...prior.shadows], detail: prior.detail });
-                paint(rows.get(id));
-                return node;
-            }
-            node.hidden = true;
-            prior.subjects.add(taskId);
-            prior.shadows.push(row);
-            return prior.node;
+            // execution supersedes its subject: one receipt, the rest shadowed.
+            fold(row, anchor);
+            return anchor.node;
         }
-        rows.set(id, row);
+        rows.set(row.key, row);
+        if (kind === 'card' && anchor?.kind === 'receipt') {
+            rows.delete(anchor.key);
+            fold(anchor, row);
+            row.detail = anchor.detail;
+        }
         paint(row);
-        // addMessage appends after mounting; the normal reconcile/snapshot path
-        // resolves it once the feed owns the node.
+        // A card is already in the feed when it converts: the rows it now
+        // represents (Started, routing) fold at once. addMessage appends a
+        // receipt after mounting; its own reconcile follows the insert.
+        if (kind === 'card' && inFeed(node)) reconcile();
         return node;
     }
     function snapshot(data) {
@@ -183,7 +200,7 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
         activities = incoming;
         // An evicted anchor is the only reason the feed-wide projections move on a
         // census tick; a steady feed repaints its rows and nothing else.
-        mutate(() => { if (sweep()) reconcile(); for (const row of rows.values()) paint(row); });
+        if (rows.size) mutate(() => { if (sweep()) reconcile(); for (const row of rows.values()) paint(row); });
         for (const row of rows.values()) resolve(row);
     }
     return { mount, reconcile, snapshot,
@@ -192,7 +209,7 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
                 connected = value;
                 for (const row of rows.values()) { row.epoch++; row.checked = false; }
             }
-            mutate(() => { for (const row of rows.values()) paint(row); });
+            if (rows.size) mutate(() => { for (const row of rows.values()) paint(row); });
         },
         destroy() { destroyed = true; rows.clear(); activities.clear(); },
     };

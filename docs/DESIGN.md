@@ -646,9 +646,9 @@ The anchor names the work, projects its observed phase and ends with the shared
 Project reference. It uses Project colour, not a warning treatment. Binding alone
 means neither Working nor Done; unavailable activity stays explicitly unconfirmed.
 A manually converted card opens its room; an agent-created handoff does not steal
-focus. One anchor per transfer: the converted card itself when it is on screen, the
-durable receipt row otherwise — whichever arrives second is folded, never a live card,
-and the folded one returns when the anchor leaves the feed. Matching Started and routing
+focus. A converted card is always visible — two cards of one owner message both stay —
+and the durable receipt row shows only when no card carries the transfer; a folded
+receipt returns when its card leaves the feed. Matching Started and routing
 references fold visually into that anchor only while it is mounted; their durable
 records remain, including their plain-text presentation to non-browser consumers.
 A converted card whose Main receipt is not durable keeps a dashed border and a plain
