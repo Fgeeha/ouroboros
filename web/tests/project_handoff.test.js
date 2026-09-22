@@ -146,6 +146,19 @@ test('two converted cards of one owner message share an identity and both stay v
         assert.equal(receipt.node.hidden, false, 'the receipt takes over only when no card remains');
     } finally { h.done(); }
 });
+test('every folded receipt survives two evictions: the shadow chain is inherited, not cut', () => {
+    const h = setup(async () => null);
+    try {
+        const r1 = h.mount('t', 'h', { kind: 'receipt' });
+        const r2 = h.mount('t', 'h', { kind: 'receipt' });
+        const card = h.mount('t', 'h', { kind: 'card' });
+        assert.equal(r1.node.hidden, true); assert.equal(r2.node.hidden, true);
+        h.nodes.delete(card.node); h.controller.reconcile();
+        assert.equal(r1.node.hidden, false); assert.equal(r2.node.hidden, true);
+        h.nodes.delete(r1.node); h.controller.reconcile();
+        assert.equal(r2.node.hidden, false, 'the second duplicate receipt still carries the transfer');
+    } finally { h.done(); }
+});
 test('a promoted shadow keeps the followed retry as its subject instead of cycling', async () => {
     const h = setup(async id => id === 't' ? { status: 'interrupted', superseded_by: 'r' } : { status: 'running' });
     try {

@@ -69,7 +69,7 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
     // history: the card's "not saved" mark, if any, was about exactly that gap.
     function fold(shadow, under) {
         shadow.node.hidden = true;
-        under.shadows.push(shadow);
+        under.shadows.push(shadow, ...shadow.shadows.splice(0));
         for (const taskId of shadow.subjects) under.subjects.add(taskId);
         if (shadow.kind === 'receipt' && under.node.dataset.receipt) {
             delete under.node.dataset.receipt;
@@ -87,7 +87,8 @@ export function createProjectHandoffs({ feed, fetchDetail, mutate }) {
             if (!inFeed(next.node)) continue;
             next.node.hidden = false;
             rows.set(next.key, { ...next, subjects: new Set([...row.subjects, ...next.subjects]),
-                shadows: [], detail: row.detail, taskId: row.taskId, epoch: row.epoch + 1, pending: false, checked: false });
+                shadows: row.shadows.filter(other => other !== next), detail: row.detail, taskId: row.taskId,
+                epoch: row.epoch + 1, pending: false, checked: false });
             return true;
         }
         return true;
