@@ -295,6 +295,9 @@ class ReviewActorRecord:
     failure_code: str = ""
     reset_at: str = ""
     http_status: Optional[int] = None
+    # What the engine REPORTED about the failed run, bounded and redacted at the gateway
+    # (``run_failure_cause``); "" when nothing was reported. Opaque: shown, never branched on.
+    reported_cause: str = ""
     parse_status: str = ""
     semantic_verdict: str = ""
     provider: str = ""
@@ -347,4 +350,4 @@ HARDNESS_LABEL_ONLY = "label_only"              # recorded on the objective axis
 HARDNESS_HARD_GATE = "hard_gate"                # blocking commit/scope immune gate (unchanged)
 
 
-TYPED_FAILURE_FACT_KEYS = ("failure_code", "reset_at", "http_status", "transport_status")
+TYPED_FAILURE_FACT_KEYS = ("failure_code", "reset_at", "http_status", "transport_status", "reported_cause")

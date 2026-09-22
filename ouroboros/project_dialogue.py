@@ -735,13 +735,13 @@ TASK_CAUSE_PHRASES = {
     # clean_pass_obligations_closed carry no sentence); an accepted decision with a sentence states its cause.
     "previous_revision_accepted": "The reviewers approved an earlier version of this answer; the current version was not re-reviewed.",
     "admission_close_unconfirmed": "Reviewers approved this answer; the supervisor did not confirm that task admission was closed.",
-    "author_stop": "Main stopped with unfinished work; no review approval was granted.",
-    "review_outcome_received": "Main received the review outcome or recorded limitation.",
-    "author_finish": "The answer was delivered on Main's own judgement; the reviewers had not signed it off.",
-    "review_degraded": "No reviewer verdict was established for this answer.",
-    "infra_failure": "A review infrastructure failure prevented a settled verdict.",
-    "dialogue_terminal": "The reviewers and Main could not agree, and both positions were kept.",
-    "improvement_capsule": "The reviewers asked for one more pass and Main was given their notes.",
+    "author_stop": "Ouroboros stopped with unfinished work; no review approval was granted.",
+    "review_outcome_received": "Ouroboros received the reviewers' outcome and finished on that.",
+    "author_finish": "Ouroboros delivered this answer on its own judgement; the reviewers had not signed it off.",
+    "review_degraded": "The reviewers did not reach a verdict on this answer.",
+    "infra_failure": "The review could not run because of an infrastructure failure, so there is no verdict.",
+    "dialogue_terminal": "The reviewers and Ouroboros could not agree, and both positions were kept.",
+    "improvement_capsule": "The reviewers asked for one more pass and Ouroboros was given their notes.",
     "fence_reopen_failed": "The requested extra pass could not be started, so the answer stands as it was.",
     "review_cycles_exhausted": "The task used up its review rounds before the answer was signed off.",
     "open_obligations": "The answer was delivered with reviewer requests still open.",
@@ -765,14 +765,28 @@ TASK_CAUSE_PHRASES = {
     "acceptance_bypassed_context_overflow": "The task outgrew its context before the answer could be reviewed.",
     "acceptance_bypassed_children_unabsorbed": "Some sub-tasks had not been folded in, so the answer was never reviewed.",
     # Execution reason codes, carried verbatim from the card's own old table.
-    "plan_review_advisory": "Plan review never closed; the work continued under advisory enforcement",
+    # The plan review's outcome CLASS at delivery (outcome_axes.execution.plan_review,
+    # review_projection): one sentence per class; plan_review_advisory serves a
+    # legacy row that recorded the open review without a class.
+    "plan_review_unanswered": "Only some of the plan reviewers answered; the work went on with their notes.",
+    "plan_review_none_answered": "None of the plan reviewers answered; the work went on without their notes.",
+    "plan_review_answered_open": "The plan reviewers answered, but the review was never closed; the work went on with their notes.",
+    "plan_review_advisory": "The plan review was never closed; the work went on with what the reviewers said.",
     "plan_review_awaiting": "Not every plan reviewer had answered when the task ended.",
+    "plan_review_quorum_unreachable": "Too few plan reviewers could answer, so the work was held.",
     "host_child_status_suffix": "A child task had not settled when the answer was delivered",
-    "invalid_delivery_control_after_repair": "The delivery control object was still malformed after repair",
+    "invalid_delivery_control_after_repair": "Ouroboros's final delivery instruction could not be read even after repair, so the answer stands as delivered.",
     "budget_exhausted": "The task ran out of budget before it could finish cleanly",
-    "delivery_control_degraded": "Delivery finished in a degraded control state",
+    "delivery_control_degraded": "Ouroboros's final delivery instruction could not be applied, so the answer stands as delivered.",
     "authoring_handover_incomplete": "The replacement model stopped before resuming tool work.",
     "delegated_custody_unreconciled": "Some delegated work was never reconciled.",
+    # The one non-reason-code key: the task-result FIELD terminal_plan_review_open
+    # (task_finalization.terminal_result_fields), a standing limitation of the
+    # answer rather than the thing that ended the task.
+    "terminal_plan_review_open": "The plan review was still open when this answer was delivered",
+    "child_results_deferred": "Some sub-task results were deferred instead of being folded into this answer",
+    "tool_failure": "A tool this task used failed and nothing recovered it",
+    "task_exception": "The task stopped on an internal error",
 }
 
 
@@ -1136,6 +1150,11 @@ def _append_terminal_task_projection(
             "outcome_axes": effective.get("outcome_axes") or event.get("outcome_axes") or {},
             "reason_code": reason, "result_ref": result_ref,
             "text": text,
+            # The rendered cause, beside the raw code: the transports with no task card
+            # (Telegram's text bridge today) state the same sentence the card states,
+            # without a second rendering of TASK_CAUSE_PHRASES. Absent when there is no
+            # cause — an always-written empty key is a claim of its own.
+            **({"reason_detail": verdict} if verdict else {}),
         }
         if isinstance(effective.get("model_execution"), dict):
             row["model_execution"] = dict(effective["model_execution"])
@@ -1273,15 +1292,74 @@ def _custody_debt_reason(reason: str, result: Dict[str, Any], event: Dict[str, A
     return execution_reason, (WARN_DELEGATED_CUSTODY_UNRECONCILED if debt else "")
 
 
-def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
-    """One TERMINATED host clause for BOTH lifecycle rows.
+# The open-review classes that state a standing limitation (never the merely awaited case).
+PLAN_REVIEW_OPEN_CLASSES = frozenset({"plan_review_unanswered", "plan_review_none_answered", "plan_review_answered_open"})
 
-    A host row must not present an unaccepted claim as the whole story: a
-    non-accepted decision speaks through the owner sentence of its own typed
-    reason, otherwise the execution reason speaks. The stored reviewer
-    rationale never reaches the row — it stays in the card, the task result and
-    Logs, which is the complete text this pointer resolves to. The Python twin
-    of ``taskReasonDetail``; callers add no punctuation.
+
+def _plan_review_key(result: Dict[str, Any], event: Dict[str, Any], fallback: str) -> str:
+    """``plan_review_<class>`` when ``execution.plan_review`` names a class with a
+    sentence, else the caller's fallback. The twin of ``planReviewKey``."""
+    for source in (result, event):
+        axes = source.get("outcome_axes") if isinstance(source.get("outcome_axes"), dict) else {}
+        execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+        key = f"plan_review_{str(execution.get('plan_review') or '')}"
+        if key in TASK_CAUSE_PHRASES:
+            return key
+    return fallback
+
+
+def _terminal_limitations(result: Dict[str, Any], event: Dict[str, Any], reason: str,
+                          *, held: bool = False) -> List[str]:
+    """Standing limitations of the delivered answer, from facts already stored:
+    deferred children, and a plan review still open at delivery. The plan clause
+    is stated when the record carries the ``terminal_plan_review_open`` flag OR
+    names an open-review class on ``execution.plan_review`` (the class rides the
+    live event and the replayed row where the result-only flag does not); the
+    class chooses the wording, and without one ``plan_review_advisory`` speaks
+    when that is the recorded reason (so the join states it once). A HELD task
+    states the hold as its primary cause and never a limitation of work that
+    went on. The twin of ``terminalLimitations``."""
+    deferred, flagged = False, False
+    for source in (result, event):
+        axes = source.get("outcome_axes") if isinstance(source.get("outcome_axes"), dict) else {}
+        objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else {}
+        execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+        deferred = deferred or str(objective.get("deferred_count") or "0").strip() not in {"0", ""}
+        flagged = flagged or source.get("terminal_plan_review_open") is True or (
+            f"plan_review_{execution.get('plan_review') or ''}" in PLAN_REVIEW_OPEN_CLASSES)
+    flagged = flagged and not held
+    plan_key = reason if reason == "plan_review_advisory" else "terminal_plan_review_open"
+    return [TASK_CAUSE_PHRASES["child_results_deferred"] if deferred else "",
+            TASK_CAUSE_PHRASES[_plan_review_key(result, event, plan_key)] if flagged else ""]
+
+
+def _join_cause_clauses(clauses: List[str]) -> str:
+    """One line, one clause per distinct fact, separated by a middle dot.
+
+    A clause that is not last drops its own full stop so the line reads as one
+    statement rather than a row of stubs. The browser twin is joinCauseClauses.
+    """
+    kept: List[str] = []
+    for clause in clauses:
+        if clause and clause not in kept:
+            kept.append(clause)
+    return " · ".join(c[:-1] if index < len(kept) - 1 and c.endswith(".") else c
+                      for index, c in enumerate(kept))
+
+
+def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
+    """Every simultaneous cause this record holds, as ONE terminated host clause.
+
+    The primary cause is what ENDED the task. A deferred child, a plan review
+    still open at delivery and an unreconciled custody debt are standing
+    limitations of the SAME answer, so they are stated BESIDE it instead of
+    replacing it or being replaced by it: a card that can show one cause has to
+    choose, and choosing is why the host had to write the second fact as chat
+    prose. Nothing here ranks or folds; equivalent clauses state themselves once.
+    A held task (a blocking plan exit) speaks through its objective's own reason,
+    so it never reads "the work went on". The stored reviewer rationale never
+    reaches the row — it stays in the card, the task result and Logs. The Python
+    twin of ``taskReasonDetail``; callers add no punctuation.
     """
     from ouroboros.outcomes import (
         ACCEPTANCE_ACCEPTED, REASON_FINAL_MESSAGE, REASON_OWNER_REQUESTED_FINALIZATION, plan_review_awaiting,
@@ -1289,39 +1367,45 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
 
     decision: Dict[str, Any] = {}
     veto: Dict[str, Any] = {}
+    objective: Dict[str, Any] = {}
     for source in (event, result):
         axes = source.get("outcome_axes") if isinstance(source.get("outcome_axes"), dict) else {}
-        objective = axes.get("objective") or {}
-        if isinstance(objective, dict) and isinstance(objective.get("receipt_veto"), dict):
+        objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else objective
+        if isinstance(objective.get("receipt_veto"), dict):
             veto = objective["receipt_veto"]
         for holder in (source.get("review_status"), axes.get("review")):
             if isinstance(holder, dict) and isinstance(holder.get("acceptance_decision"), dict):
                 decision = holder["acceptance_decision"]
     status = str(decision.get("status") or "").strip()
     cause = str(decision.get("reason") or "")
-    reason = str(result.get("reason_code") or event.get("reason_code") or "")
-    if (reason != REASON_OWNER_REQUESTED_FINALIZATION and status
-            and (status != ACCEPTANCE_ACCEPTED or cause in TASK_CAUSE_PHRASES)
-            and outcome_phase(result, event) in {"done", "warn"}):
+    raw_reason = str(result.get("reason_code") or event.get("reason_code") or "")
+    phase = outcome_phase(result, event)
+    # Resolved once for every branch: the custody debt is a standing limitation
+    # of the same answer, not a property of the branch that happened to fire.
+    reason, custody = _custody_debt_reason(raw_reason, result, event)
+    held = phase == "error" and str(objective.get("source") or "").startswith("plan_review_")
+    if raw_reason == REASON_OWNER_REQUESTED_FINALIZATION:
+        clause = ""  # an owner-requested stop is a success and carries its own marker
+    elif (status and (status != ACCEPTANCE_ACCEPTED or cause in TASK_CAUSE_PHRASES)
+            and phase in {"done", "warn"}):
         clause = TASK_CAUSE_PHRASES.get(cause, cause)
-    elif reason in {REASON_OWNER_REQUESTED_FINALIZATION, REASON_FINAL_MESSAGE, ""}:
-        awaited = reason != REASON_OWNER_REQUESTED_FINALIZATION and plan_review_awaiting(event, result)
-        return TASK_CAUSE_PHRASES["plan_review_awaiting"] if awaited and outcome_phase(result, event) == "done" else ""
+    elif held:
+        # A task HELD by a blocking plan review states the objective's own reason.
+        clause = TASK_CAUSE_PHRASES.get(str(objective.get("reason") or ""), str(objective.get("reason") or ""))
+    elif raw_reason in {REASON_FINAL_MESSAGE, ""}:
+        clause = (TASK_CAUSE_PHRASES["plan_review_awaiting"]
+                  if plan_review_awaiting(event, result) and phase == "done" else "")
     else:
-        # A healed debt is never restored here. The objective warning the
-        # overlay froze keeps the headline and the refresh may not rewrite it,
-        # but naming the code again would state a debt the same record shows as
-        # empty. The debt is a warning BESIDE the rail cause, and a row with
-        # neither states no cause and leaves the headline to its own axis.
-        reason, custody = _custody_debt_reason(reason, result, event)
+        # A healed debt is never restored here: naming the code again would
+        # state a debt the same record shows as empty. The recorded open-review
+        # reason speaks through the wave's class when the record names one.
         detail = veto.get("detail") if veto.get("reason") == reason else ""
+        key = _plan_review_key(result, event, reason) if reason == "plan_review_advisory" else reason
         clause = (" ".join(strip_markdown(str(detail)).split()) if detail
-                  else TASK_CAUSE_PHRASES.get(reason, reason))
-        if clause and custody:
-            clause += f" ({TASK_CAUSE_PHRASES.get(custody, custody)})"
-        elif custody:
-            clause = TASK_CAUSE_PHRASES.get(custody, custody)
-    return clause if not clause or clause.endswith((".", "!", "?", "…", ")")) else clause + "."
+                  else TASK_CAUSE_PHRASES.get(key, key))
+    line = _join_cause_clauses([clause, *_terminal_limitations(result, event, reason, held=held),
+                                TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
+    return line if not line or line.endswith((".", "!", "?", "…", ")")) else line + "."
 
 
 def _run_lives_in_its_project(

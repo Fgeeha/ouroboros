@@ -99,9 +99,15 @@ def _actor_outcome(actor: dict, slot_class: str = "") -> str:
     if actor.get("ok"):
         return "ok"
     code = str(actor.get("failure_code") or "")
+    reset = str(actor.get("reset_at") or "")
+    cause = str(actor.get("reported_cause") or "")
+    if cause:
+        # The engine's reported sentence, quoted, in place of its retry coach: the mind
+        # reads typed facts (code, reset, model, the words), never ``nextActions``.
+        return (f"FAILED[{code or 'none'}]" + (f" (resets {reset})" if reset else "")
+                + f' — model={actor.get("model")}; reported cause: "{cause}"')
     if not code:
         return "FAILED: " + str(actor.get("error"))
-    reset = str(actor.get("reset_at") or "")
     return (f"FAILED[{code}]" + (f" (resets {reset})" if reset else "")
             + ": " + str(actor.get("error")))
 
@@ -136,8 +142,9 @@ def _degraded_replay_note(wave: dict, *, paid_available: bool = True) -> str:
 # and the custody-pending contract.
 _BLOCKING_HOLDS = "Blocking enforcement: the review must close before the work starts"
 _ADVISORY_PROCEEDS = (
-    "Advisory enforcement: you may proceed with the review OPEN; the host discloses "
-    "that loudly in the task result."
+    "Advisory enforcement: you may proceed with the review OPEN; the open review "
+    "stays typed in this task's state and result either way, and your own final "
+    "answer is where it is said in words."
 )
 
 
@@ -219,6 +226,11 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
             "Answers that settle after this task ends are kept in the durable record and do not "
             "close this wave: only a collecting call reads them into it. "
         )
+        answered, total = len(census["answered"]), census["configured"]
+        if total and answered < total:  # ONE typed count line from the census; omitted once every slot answered
+            dead = [f"{len(rows)} {label}" for label, rows in
+                    (("did not answer", census["failed"]), ("not sent", census["skipped"])) if rows]
+            text += f"Reviewers: {answered} of {total} answered{'; ' + ', '.join(dead) if dead else ''}. "
         unreachable = bool(wave.get("quorum_unreachable"))  # typed window-spent lanes: no awaited answer restores the quorum
         if unreachable:
             text += _quorum_unreachable_fact(wave)
@@ -444,7 +456,12 @@ def _render_wave(
     gaps = {"awaiting": census["awaiting"],
             ("settled late" if historical_feedback is not None else "not collected yet"): census["uncollected"]}
     hidden = tuple(f"slot_unparseable:{row.get('slot_id')}:" for rows in gaps.values() for row in rows)
-    reasons = [str(r) for r in wave.get("reasons") or [] if not str(r).startswith(hidden)]
+    # A failed slot with a reported cause shows the engine's sentence in place of its error
+    # prose (a display substitution keyed on slot_id; the stored reason stays whole).
+    causes = {f"slot_unparseable:{a.get('slot_id')}:": str(a.get("reported_cause"))
+              for a in wave.get("actors") or [] if a.get("reported_cause") and not a.get("ok")}
+    reasons = [next((key + cause for key, cause in causes.items() if str(r).startswith(key)), str(r))
+               for r in wave.get("reasons") or [] if not str(r).startswith(hidden)]
     reasons += [f"{label}: " + ", ".join(str(row.get("slot_id")) for row in rows) for label, rows in gaps.items() if rows]
     lines += [
         "", "### Aggregate: " + (f"no verdict — held open as {aggregate}" if wave.get("custody_pending") else aggregate)

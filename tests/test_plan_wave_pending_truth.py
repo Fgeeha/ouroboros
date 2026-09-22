@@ -140,22 +140,23 @@ def test_progress_line_states_the_gap_for_each_open_branch():
     assert _line(_wave([_ok("s1"), _pending("s2"), _pending("s3")])) == (
         "📐 Plan review so far: 1 of 3 reviewers answered.")
     assert _line(_wave([_ok("s1"), _failed("s2"), _skipped("s3"), _pending("s4")]), cap=None) == (
-        "📐 Plan review so far: 1 of 4 reviewers answered, 1 failed (run_failed), 1 not dispatched.")
+        "📐 Plan review so far: 1 of 4 reviewers answered, 1 didn't answer, 1 not sent.")
     # Nobody answered, but the roster is not only planned waits: the line never claims all were sent to.
     assert _line(_wave([_pending("s1"), _pending("s2"), _skipped("s3")]), cycles_paid=0) == (
-        "📐 Plan review so far: 0 of 3 reviewers answered, 1 not dispatched.")
+        "📐 Plan review so far: 0 of 3 reviewers answered, 1 not sent.")
+    # The raw custody state stays on the Reviews row; the line only counts the unresolved.
     assert _line(_wave([_ok("s1"), _pending("s2", "in_flight"), _pending("s3", "custody_lost")])) == (
-        "📐 Plan review: 1 of 3 reviewers answered; 2 unresolved (in_flight, custody_lost) — no verdict.")
+        "📐 Plan review: 1 of 3 reviewers answered; 2 unresolved — no verdict.")
     late = _wave([_ok("s1"), _pending("s2"), _pending("s3")], pending=False,
                  historical_supplements=[_supplement("s2"), _supplement("s3", "settled")])
-    # A settled slot may have settled as a failure: until collected it is "settled", never "answered".
-    assert _line(late) == "📐 Plan review so far: 1 of 3 reviewers answered, 2 settled but not collected yet."
+    # A settled slot may have settled as a failure: until collected it is "finished", never "answered".
+    assert _line(late) == "📐 Plan review so far: 1 of 3 reviewers answered, 2 finished but not collected yet."
     # A plain in-flight line carries no paid-cycle and no declared-effort tail: the verdict line does.
     assert _line(_wave([_pending("s1")], reviewer_effort="high"), cycles_paid=0) == (
         "📐 Plan review: sent to 1 reviewer, none has answered yet.")
     # A roster of one keeps the singular in every sentence of the family.
     assert _line(_wave([_pending("s1", "in_flight")])) == (
-        "📐 Plan review: 0 of 1 reviewer answered; 1 unresolved (in_flight) — no verdict.")
+        "📐 Plan review: 0 of 1 reviewer answered; 1 unresolved — no verdict.")
     assert _line(_wave([_ok("s1"), _pending("s2")], reviewer_effort="high")) == (
         "📐 Plan review so far: 1 of 2 reviewers answered.")
 
@@ -170,7 +171,8 @@ def test_an_open_line_carries_no_verdict_no_finding_count_and_no_failure_word_fo
     for text in open_lines:  # no verdict, no finding count, no machine enum of a planned wait, no verdict-line tail
         for word in ("DEGRADED", "parseable", "untrusted", "blocking", "note", "need_evidence", "slot reasons",
                      "Pending dispatch", "failed", "late result pending", "pending_dispatch", "plan_task",
-                     "cycles paid", "declared reviewer effort", "waiting"):
+                     "cycles paid", "declared reviewer effort", "waiting", "run_failed", "in_flight",
+                     "custody_lost", "settled", "not dispatched"):
             assert word not in text
         assert "\n" not in text and text.index("answered") < 80  # decisive words lead the row
 
@@ -178,13 +180,13 @@ def test_an_open_line_carries_no_verdict_no_finding_count_and_no_failure_word_fo
 def test_an_unresolved_slot_is_never_worded_as_waiting_and_a_waiting_slot_never_as_unresolved():
     unresolved = _line(_wave([_ok("s1"), _pending("s2"), _pending("s3", "custody_lost")]))
     # Beside an unresolved slot an awaited one is counted apart — awaited, never unresolved, never "waiting".
-    assert unresolved == "📐 Plan review: 1 of 3 reviewers answered, 1 awaited; 1 unresolved (custody_lost) — no verdict."
-    for wait_word in ("waiting", "so far", "yet", "pending_dispatch"):  # an exceptional state is never a planned wait
+    assert unresolved == "📐 Plan review: 1 of 3 reviewers answered, 1 awaited; 1 unresolved — no verdict."
+    for wait_word in ("waiting", "so far", "yet", "pending_dispatch", "custody_lost"):  # an exceptional state is never a planned wait
         assert wait_word not in unresolved
     mixed = _line(_wave([_pending("s1"), _failed("s2"), _skipped("s3"), _pending("s4", "in_flight"), _pending("s5")],
                         historical_supplements=[_supplement("s5")]))
-    assert mixed == ("📐 Plan review: 0 of 5 reviewers answered, 1 awaited, 1 settled but not collected yet, "
-                     "1 failed (run_failed), 1 not dispatched; 1 unresolved (in_flight) — no verdict.")
+    assert mixed == ("📐 Plan review: 0 of 5 reviewers answered, 1 awaited, 1 finished but not collected yet, "
+                     "1 didn't answer, 1 not sent; 1 unresolved — no verdict.")
     waiting = _line(_wave([_ok("s1"), _pending("s2")]))
     assert "unresolved" not in waiting and "no verdict" not in waiting and waiting.startswith("📐 Plan review so far: ")
 
@@ -197,38 +199,67 @@ def test_a_real_failure_is_still_named_while_others_are_awaited_and_awaiting_is_
     assert plan_slot_reasons(wave, failed_only=True) == "run_failed; transport died"
     assert "Pending dispatch" not in plan_slot_reasons(wave)
     line = _line(wave)
-    assert "2 failed (run_failed; transport died), 1 not dispatched" in line
+    assert "2 didn't answer, 1 not sent" in line and "run_failed" not in line and "transport died" not in line
     # The guard's other direction: with the same rows settled as failures, every reason is named.
     for row in wave["actors"]:
         row.update(operation_state="settled", late_result_pending=False)
     assert plan_slot_reasons(wave) == f"{PENDING_ERROR}; run_failed; transport died; subscription_window_exhausted"
 
 
-def test_settled_aggregates_render_byte_identically():
-    counts = {"parseable": 3, "configured": 3, "blocking": 2, "note": 1, "need_evidence": 4}
+def _settled_family_lines():
+    """Every verdict-line shape of a fully collected wave, as (line, expected)."""
+    counts = {"parseable": 3, "configured": 3, "blocking": 0, "note": 0, "need_evidence": 0}
     actors = [_ok("s1"), _ok("s2"), _ok("s3")]
-    for aggregate in ("GREEN", "REVIEW_REQUIRED", "REVISE_PLAN"):
-        expected = f"📐 Plan review: {aggregate} — 2 blocking / 1 note / 4 need_evidence; cycles paid 2/3"
-        assert plan_wave_progress_line(aggregate, counts, cycles_paid=2, cap=3) == expected
-        assert plan_wave_progress_line(aggregate, counts, cycles_paid=2, cap=3,
-                                       wave={"actors": actors, "custody_pending": False}) == expected
-    real = _wave([_ok("s1"), _failed("s2", "run_failed"), _failed("s3", "", "transport died"), _skipped("s4")],
-                 pending=False, reviewer_effort="high")
-    assert _line(real, cap=None) == (
-        "📐 Plan review: DEGRADED (1/4 parseable reviewers; counts are untrusted) — 0 blocking / 0 note / "
-        "0 need_evidence; cycles paid 1; slot reasons: run_failed; transport died; "
-        "subscription_window_exhausted; declared reviewer effort high")
-    # A custody-pending wave whose roster carries no typed custody keeps the verdict form and its legacy tail.
+    partial = {"configured": 3, "parseable": 1, "note": 4, "blocking": 0, "need_evidence": 0}
+    yield (plan_wave_progress_line("GREEN", counts, cycles_paid=2, cap=3),
+           "📐 Plan review: all 3 reviewers answered — no findings.")
+    yield (plan_wave_progress_line("GREEN", counts, cycles_paid=2, cap=3, wave={"actors": actors, "custody_pending": False}),
+           "📐 Plan review: all 3 reviewers answered — no findings.")
+    yield (plan_wave_progress_line("REVIEW_REQUIRED", {**counts, "note": 2}, cycles_paid=2, cap=3),
+           "📐 Plan review: all 3 reviewers answered — 2 notes, nothing blocking.")
+    yield (plan_wave_progress_line("REVIEW_REQUIRED", {**counts, "note": 2, "need_evidence": 1}, cycles_paid=2, cap=3),
+           "📐 Plan review: all 3 reviewers answered — 1 ask for evidence, 2 notes, nothing blocking.")
+    yield (plan_wave_progress_line("REVISE_PLAN", {**counts, "blocking": 2, "note": 1}, cycles_paid=2, cap=3),
+           "📐 Plan review: all 3 reviewers answered — 2 blocking findings, 1 note.")
+    # The owner target: a wave whose reviewers died at the vendor still states who answered and what they said.
+    yield (_line(_wave([_ok("s1"), _failed("s2", "run_failed"), _failed("s3", "", "transport died")],
+                       pending=False, reviewer_effort="high", counts=partial), cap=None),
+           "📐 Plan review: 1 of 3 reviewers answered — 4 notes, nothing blocking.")
+    yield (_line(_wave([_ok("s1"), _failed("s2", "run_failed"), _skipped("s3")], pending=False, counts=partial)),
+           "📐 Plan review: 1 of 3 reviewers answered, 1 not sent — 4 notes, nothing blocking.")
+    yield (_line(_wave([_failed("s1"), _failed("s2"), _skipped("s3")], pending=False)),
+           "📐 Plan review: none of the 3 reviewers answered, 1 not sent.")
+    yield (_line(_wave([_ok("s1")], pending=False, counts={"configured": 1, "parseable": 1, "blocking": 0, "note": 0, "need_evidence": 0})),
+           "📐 Plan review: the reviewer answered — no findings.")
+    yield (_line(_wave([_failed("s1")], pending=False)), "📐 Plan review: the reviewer didn't answer.")
+    # A custody-pending wave whose roster carries no typed custody keeps the verdict form and says a result is owed.
     untyped = {"actors": [{"slot_id": "s1", "ok": False, "error": "transport died"}], "custody_pending": True,
                "reviewer_effort": "high"}
-    assert plan_wave_progress_line("DEGRADED", {**counts, "parseable": 0, "configured": 1}, cycles_paid=1, cap=2,
-                                   wave=untyped) == (
-        "📐 Plan review: DEGRADED (0/1 parseable reviewers; counts are untrusted) — 2 blocking / 1 note / "
-        "4 need_evidence; cycles paid 1/2; slot reasons: transport died; late result pending (reviewer slots "
-        "still in flight, not yet collected); declared reviewer effort high")
-    # A wave of typed $0 refusals keeps its own line, reasons included.
-    assert plan_no_dispatch_line(_wave([_skipped("s1")], pending=False)) == (
-        "📐 Plan review: no new reviewer cycle dispatched: subscription_window_exhausted")
+    yield (plan_wave_progress_line("DEGRADED", {**counts, "parseable": 0, "configured": 1, "note": 1}, cycles_paid=1, cap=2, wave=untyped),
+           "📐 Plan review: none of the 1 reviewers answered; a reviewer's answer is still on its way.")
+    # A wave of typed $0 refusals keeps its own line: how many were not sent, and the earliest reset when known.
+    yield (plan_no_dispatch_line(_wave([_skipped("s1")], pending=False)),
+           "📐 Plan review: no reviewer could take the plan — 1 not sent.")
+    yield (plan_no_dispatch_line({**_wave([_skipped("s1"), _skipped("s2")], pending=False), "earliest_reset": "2030-01-02T00:00:00Z"}),
+           "📐 Plan review: no reviewer could take the plan — 2 not sent, earliest window reset 2030-01-02T00:00:00Z.")
+
+
+def test_settled_waves_render_one_plain_family():
+    for line, expected in _settled_family_lines():
+        assert line == expected  # the counts are always stated: k of n, all n, none, or the one reviewer
+
+
+def test_no_verdict_line_carries_an_internal_token():
+    """Over every family row the harness produces, no verdict token, arithmetic tail,
+    paid-cycle count, per-slot reason or machine enum reaches the owner (both directions:
+    ``test_settled_waves_render_one_plain_family`` pins that the counts ARE still named)."""
+    for line, _expected in _settled_family_lines():
+        assert line.startswith("📐 Plan review: ") and "\n" not in line
+        for token in ("DEGRADED", "GREEN", "REVISE_PLAN", "REVIEW_REQUIRED", "parseable", "untrusted", "cycles paid",
+                      "slot reasons", "run_failed", "PLAN_REVIEW_", "need_evidence", "transport died",
+                      "subscription_window_exhausted", "late result pending", "declared reviewer effort",
+                      "not dispatched", "settled", " / "):
+            assert token not in line, (token, line)
 
 
 def test_the_wave_line_has_news_unless_the_roster_is_only_planned_waits():
@@ -280,6 +311,14 @@ def test_actor_rows_word_a_gap_as_a_gap_and_a_failure_as_a_failure():
              "error": "window spent"}
     assert _actor_outcome(typed) == "FAILED[subscription_window_exhausted] (resets 2026-01-01T00:00:00Z): window spent"
     assert _actor_outcome(_skipped("s1")).startswith("FAILED[subscription_window_exhausted]: health_skip")
+    # A row that carries the engine's reported sentence quotes it in place of the error prose.
+    words = "Selected model is at capacity. Please try a different model."
+    dead = {"ok": False, "failure_code": "run_failed", "model": "codex=gpt-6-astra", "reported_cause": words,
+            "error": 'delegated review session run-e23 ended failed: {"nextActions": ["Retry the run"]}'}
+    assert _actor_outcome(dead) == f'FAILED[run_failed] — model=codex=gpt-6-astra; reported cause: "{words}"'
+    assert _actor_outcome({**dead, "failure_code": "", "reset_at": "2030-01-01T00:00:00Z"}) == (
+        f'FAILED[none] (resets 2030-01-01T00:00:00Z) — model=codex=gpt-6-astra; reported cause: "{words}"')
+    assert _actor_outcome({**dead, "reported_cause": ""}) == f"FAILED[run_failed]: {dead['error']}"  # no words: today's bytes
 
 
 @pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
@@ -319,12 +358,30 @@ def test_the_custody_paragraph_states_facts_and_never_a_replay_recipe_or_an_exit
         assert text.endswith("Blocking enforcement: the review must close before the work starts.")
         assert "Advisory enforcement" not in text
     else:
-        assert text.endswith("Advisory enforcement: you may proceed with the review OPEN; the host "
-                             "discloses that loudly in the task result.")
-        assert "Blocking enforcement" not in text
+        assert text.endswith("Advisory enforcement: you may proceed with the review OPEN; the open review "
+                             "stays typed in this task's state and result either way, and your own final "
+                             "answer is where it is said in words.")
+        assert "Blocking enforcement" not in text and "host discloses" not in text
     for forbidden in ("fresh panel", "RELEASED", "schedule_followup", "paid reviewer", "cycle cap is reached",
                       "DEGRADED: parseable reviewer verdicts", "A changed spec may start"):
         assert forbidden not in text
+
+
+def test_the_custody_paragraph_counts_the_reviewers_that_did_not_answer():
+    """One typed count line from the slot census (the same source the gate decision reads),
+    with the dead buckets named; absent once every slot answered."""
+    mixed = _next_step(_wave([_ok("s1"), _failed("s2"), _skipped("s3"), _pending("s4")]),
+                       enforcement="advisory", cap=3, cycles_paid=1)
+    assert "Reviewers: 1 of 4 answered; 1 did not answer, 1 not sent. " in mixed
+    assert mixed.count("Reviewers:") == 1 and "run_failed" not in mixed
+    awaited = _next_step(_wave([_ok("s1"), _pending("s2"), _pending("s3")]), enforcement="blocking", cap=3, cycles_paid=1)
+    assert "Reviewers: 1 of 3 answered. " in awaited and "did not answer" not in awaited
+    # Other direction: every slot answered (an untyped custody-pending roster) — no count line at all.
+    answered = _next_step({**_wave([_ok("s1"), _ok("s2")]), "custody_pending": True},
+                          enforcement="advisory", cap=3, cycles_paid=1)
+    assert "Reviewers:" not in answered
+    assert "Reviewers:" not in _next_step(_wave([_ok("s1"), _failed("s2")], pending=False),
+                                          enforcement="advisory", cap=3, cycles_paid=1)  # a settled wave has its own paragraph
 
 
 def test_an_unresolved_wave_and_a_structurally_unreachable_one_state_their_own_facts():
@@ -342,7 +399,7 @@ def test_an_unresolved_wave_and_a_structurally_unreachable_one_state_their_own_f
     assert "finalization is RELEASED even while a slot is awaited" in text and "still in flight" in text
     assert "schedule_followup" not in text and text.rstrip().endswith("implementation still held.")
     advisory = _next_step(dead, enforcement="advisory", cap=3, cycles_paid=0)
-    assert "RELEASED" not in advisory and advisory.endswith("discloses that loudly in the task result.")
+    assert "RELEASED" not in advisory and advisory.endswith("your own final answer is where it is said in words.")
     assert "STRUCTURALLY" not in _next_step(_wave([_pending("s1")]), enforcement="blocking", cap=3, cycles_paid=0)
 
 
@@ -441,7 +498,7 @@ def test_a_fully_awaiting_wave_keeps_the_fail_closed_floor_and_every_line_tells_
     assert not (_state(harness)["current_attempt"] or {}).get("author_subject")
     # TRUTH: a paid dispatch has its own line, and a fresh roster of planned waits adds no wave-state
     # line under it (the dispatch line and the per-slot started rows already said it); the text names no failure.
-    assert at_dispatch == ["📐 Plan review: sending the plan to 3 reviewers (cycle 1/2, blocking)…"]
+    assert at_dispatch == ["📐 Plan review: sending the plan to 3 reviewers (round 1 of 2, blocking)…"]
     assert harness.progress[0] == at_dispatch[0]
     assert first.count("· NO ANSWER YET (pending_dispatch)") == 3 and "FAILED" not in first
     assert "0 of 3 reviewer(s) have answered" in first and "awaiting: s1, s2, s3." in first
@@ -455,7 +512,7 @@ def test_a_fully_awaiting_wave_keeps_the_fail_closed_floor_and_every_line_tells_
         "📐 Plan review: sent to 3 reviewers, none has answered yet."]
     assert _control(early) == {"outcome": "DEGRADED", "closed": False}
     panel["s1"].release.set()
-    assert _wait_until(lambda: any("[s1]: finished;" in line for line in harness.progress))
+    assert _wait_until(lambda: any("m/a answered" in line for line in harness.progress))
     mark = len(harness.progress)
     partial = pr._handle_plan_task(ctx, **collect)
     emitted = [line for line in harness.progress[mark:] if line.startswith("📐")]
@@ -467,7 +524,7 @@ def test_a_fully_awaiting_wave_keeps_the_fail_closed_floor_and_every_line_tells_
     # FLOOR: two clean answers meet the arithmetic quorum, and the wave still may not read GREEN
     # while the third slot can land a blocker — it stays the open DEGRADED placeholder.
     panel["s2"].release.set()
-    assert _wait_until(lambda: any("[s2]: finished;" in line for line in harness.progress))
+    assert _wait_until(lambda: any("m/b answered" in line for line in harness.progress))
     quorum = pr._handle_plan_task(ctx, **collect)
     held = _state(harness)["waves"][-1]
     assert (held["aggregate"], held["closed"], held["custody_pending"]) == ("DEGRADED", False, True)
@@ -483,7 +540,7 @@ def test_a_fully_awaiting_wave_keeps_the_fail_closed_floor_and_every_line_tells_
     assert _control(final) == {"outcome": "GREEN", "closed": True}
     assert [line for line in harness.progress[mark:] if line.startswith("📐")] == [
         "📐 Plan review: checking for reviewer answers…",
-        "📐 Plan review: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"]
+        "📐 Plan review: all 3 reviewers answered — no findings."]
     # ONE family: every 📐 line of the whole card opens with the same words.
     assert all(line.startswith("📐 Plan review") for line in harness.progress if line.startswith("📐"))
 
@@ -503,8 +560,8 @@ def test_a_fresh_dispatch_with_an_immediate_refusal_prints_the_wave_line_and_kee
     assert wave["actors_degraded"] == ["s1", "s2", "s3"] and _control(first) == {"outcome": "DEGRADED", "closed": False}
     # A lane refused at $0 is news the dispatch line could not carry in full: the wave line is printed at once.
     assert [line for line in harness.progress if line.startswith("📐")] == [
-        "📐 Plan review: sending the plan to 2 reviewers (cycle 1/2, blocking); 1 lane skipped at $0…",
-        "📐 Plan review so far: 0 of 3 reviewers answered, 1 not dispatched."]
+        "📐 Plan review: sending the plan to 2 reviewers (round 1 of 2, blocking); 1 lane skipped at $0…",
+        "📐 Plan review so far: 0 of 3 reviewers answered, 1 not sent."]
 
 
 def test_a_dispatch_that_reaches_no_lane_never_says_the_plan_is_being_sent(harness, panel, monkeypatch):
@@ -516,7 +573,7 @@ def test_a_dispatch_that_reaches_no_lane_never_says_the_plan_is_being_sent(harne
     _call(harness.make_ctx())
     assert sum(e.execute_calls for e in panel.values()) == 0
     first = [line for line in harness.progress if line.startswith("📐")][0]
-    assert first == "📐 Plan review: no reviewer lane can take the plan (cycle 1/2, blocking); 3 lanes skipped at $0."
+    assert first == "📐 Plan review: no reviewer lane can take the plan (round 1 of 2, blocking); 3 lanes skipped at $0."
     assert "sending" not in first
 
 
@@ -525,9 +582,9 @@ def test_every_owner_line_of_the_organ_opens_with_the_one_prefix(harness, monkey
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "unlimited")
     system_target = {**DECK_SPEC, "affected_paths": [str(harness.system / "ouroboros" / "loop.py")]}
     _call(harness.make_ctx(task_id="task-c"), spec=system_target)
-    assert harness.progress == [  # no cap prints a bare cycle; a constitutional plan says so inside the parentheses
-        "📐 Plan review: sending the plan to 3 reviewers (cycle 1, blocking, constitutional)…",
-        "📐 Plan review: REVIEW_REQUIRED — 0 blocking / 1 note / 0 need_evidence; cycles paid 1"]
+    assert harness.progress == [  # no cap prints a bare round; a constitutional plan says so inside the parentheses
+        "📐 Plan review: sending the plan to 3 reviewers (round 1, blocking, constitutional)…",
+        "📐 Plan review: all 3 reviewers answered — 1 note, nothing blocking."]
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
     harness.progress.clear()
     ctx = harness.make_ctx()
@@ -537,10 +594,10 @@ def test_every_owner_line_of_the_organ_opens_with_the_one_prefix(harness, monkey
         "items": [{"finding_id": "s1:n1", "decision": "accept", "rationale": "will do"}]})
     _call(ctx, spec={**DECK_SPEC, "in_scope": ["a 6-slide deck"]})  # a revised envelope at the spent cap
     assert harness.progress == [
-        "📐 Plan review: sending the plan to 3 reviewers (cycle 1/1, blocking)…",
-        "📐 Plan review: REVIEW_REQUIRED — 0 blocking / 1 note / 0 need_evidence; cycles paid 1/1",
-        "📐 Plan review: disposition recorded — closed (0 open finding id(s); no reviewer call, no cycle).",
-        "📐 Plan review: PLAN_REVIEW_CYCLES_EXHAUSTED — 1/1 paid cycles spent (blocking)."]
+        "📐 Plan review: sending the plan to 3 reviewers (round 1 of 1, blocking)…",
+        "📐 Plan review: all 3 reviewers answered — 1 note, nothing blocking.",
+        "📐 Plan review: findings answered — review closed.",
+        "📐 Plan review: no review rounds left — 1 of 1 used (blocking)."]
 
 
 def test_an_identical_envelope_over_an_uncollected_wave_says_it_collects_and_sends_nothing(harness, panel):
@@ -555,7 +612,7 @@ def test_an_identical_envelope_over_an_uncollected_wave_says_it_collects_and_sen
     resumed = _call(ctx)  # the identical envelope only reconciles the recorded wave
     lines = [line for line in harness.progress[mark:] if line.startswith("📐")]
     assert lines == ["📐 Plan review: checking for reviewer answers…",
-                     "📐 Plan review: GREEN — 0 blocking / 0 note / 0 need_evidence; cycles paid 1/2"]
+                     "📐 Plan review: all 3 reviewers answered — no findings."]
     assert _control(resumed) == {"outcome": "GREEN", "closed": True}
     assert sum(e.execute_calls for e in panel.values()) == 3  # nothing was re-sent
 

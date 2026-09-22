@@ -693,7 +693,6 @@ def build_completed_result_event(
     note = unreconciled_runs_note(runs).lstrip("\n")
     if note and any(run not in custody for run in runs):
         custody = "\n\n".join(part for part in (note, custody) if part)
-    base_notice = str((stored or {}).get("terminal_host_notice") or "")
     event = {
         "type": "send_message",
         "chat_id": chat_id,
@@ -702,7 +701,6 @@ def build_completed_result_event(
         # A re-delivered copy that drops markdown renders as a different message.
         "format": "markdown",
         "delivery_id": delivery_id_for(tid, core_text),
-        **({"terminal_host_notice": base_notice} if base_notice else {}),
         **({"terminal_custody_notice": custody} if custody else {}),
     }
     return project_terminal_result_event(

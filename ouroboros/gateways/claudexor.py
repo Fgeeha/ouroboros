@@ -100,6 +100,10 @@ class ClaudexorUnavailable(RuntimeError):
     a preserved fact for the typed error seam, not a client action framework.
     """
 
+    # What the engine REPORTED about a failed run ("" = nothing reported); set only by
+    # ``run_failure_error``. An opaque fact: carried and shown, never branched on.
+    reported_cause = ""
+
     def __init__(self, code: str, message: str, *, status_code: int = 0,
                  required_actions: tuple[str, ...] = (), observation_timeout: bool = False,
                  observation_reason: str = "") -> None:
@@ -132,6 +136,37 @@ class ClaudexorSubscriptionWindowExhausted(ClaudexorUnavailable):
                  code: str = "subscription_window_exhausted") -> None:
         super().__init__(code, message, status_code=status_code)
         self.reset_at = str(reset_at or "")
+
+
+REPORTED_CAUSE_CHARS = 512  # strict bound of the record field, omission marker included
+
+
+def run_failure_cause(failure: Any) -> str:
+    """What the engine REPORTED about a failed run (``failure.safeMessage``), whitespace-
+    collapsed, secret-redacted and strictly bounded; "" when it reported nothing. An OPAQUE
+    fact: stored and displayed, never parsed or branched on (BIBLE P5) — presence is the
+    only test a caller may make."""
+    from ouroboros.utils import sanitize_tool_result_for_log, truncate_within_limit
+
+    words = (failure if isinstance(failure, dict) else {}).get("safeMessage")
+    return truncate_within_limit(
+        sanitize_tool_result_for_log(" ".join(str(words or "").split())), REPORTED_CAUSE_CHARS)
+
+
+def run_failure_error(run_id: str, run_state: str, failure: Any) -> ClaudexorUnavailable:
+    """The typed refusal for a delegated review run that did not succeed. A null engine code
+    keeps the host-derived ``run_<state>`` code: a STATE fact, never a cause — the cause the
+    engine reported rides beside it as ``reported_cause``."""
+    failure = failure if isinstance(failure, dict) else {}
+    message = (f"delegated review session {run_id} ended {run_state or 'unknown'}"
+               + (f": {json.dumps(failure, ensure_ascii=False)}" if failure else ""))
+    code = str(failure.get("code") or "")
+    exc = (ClaudexorSubscriptionWindowExhausted(
+               message, reset_at=str(failure.get("resetsAt") or ""), code=code)
+           if code in WINDOW_EXHAUSTED_CODES
+           else ClaudexorUnavailable(code or f"run_{run_state or 'unknown'}", message))
+    exc.reported_cause = run_failure_cause(failure)
+    return exc
 
 
 @dataclass(frozen=True)
@@ -1360,4 +1395,6 @@ __all__ = [
     "final_attempt_facts",
     "operator_home",
     "pending_interactions",
+    "run_failure_cause",
+    "run_failure_error",
 ]
