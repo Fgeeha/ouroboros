@@ -21,7 +21,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # queue_schedules.py and names Observe's argument-level narrowing on the
     # consciousness_authority.py row; upstream had already filled the previous
     # headroom with the handoff and sidebar-activity rows landing in the same window.
-    "docs/architecture/01-high-level-architecture.md": 162200,
+    # +400: two new module rows (focus.py, room_consolidation.py) in the tree map.
+    "docs/architecture/01-high-level-architecture.md": 162600,
     "docs/architecture/02-startup-onboarding-flow.md": 15517,
     # 97435 -> 99500: the notification owner is a new subsystem of this chapter
     # (its module, its client-level subscription, its room gate and its disclosed
