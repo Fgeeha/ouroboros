@@ -20,10 +20,20 @@ _PYTEST_DATA_DIR = None
 _PYTEST_ROOT = None
 # Empty in an explicit live-DATA run, which installs no disposable defaults.
 _PYTEST_DEFAULTS: dict = {}
+# The retained short root of scripts/safe_test.py; each pytest controller claims a
+# fresh basetemp beneath it in pytest_configure. Empty for bare pytest.
+#
+# Every pytest process of a run under it — controller, xdist worker, a nested run
+# that inherits this environment — creates its session root as a SIBLING directly
+# beneath it and redirects its temp directory into that root. Bare pytest keeps the
+# invoking temp directory instead: no launcher vouches for a short parent there, and
+# a root made beneath an inherited, already redirected TMPDIR would add one level per
+# process generation until socket paths pass the AF_UNIX limit (104 bytes on macOS).
+_SAFE_TEMP_ROOT = os.environ.get("OUROBOROS_TEST_TEMP_ROOT", "")
 
 
-# Repo root for a live-DATA run, which has no pytest data dir to hang it off. Created lazily
-# so the hermetic lane never leaves an unused temp dir behind (see pytest_sessionfinish).
+# Repo root for a live-DATA run, which has no pytest data dir to hang it off. Created lazily,
+# so the hermetic lane never creates an unused temp dir.
 _PYTEST_REPO_FALLBACK = None
 if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") != "1":
     _LIVE_DATA_ROOT = (
@@ -33,26 +43,33 @@ if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") != "1":
     )
     # Run the stdlib-only helper by path: no package/config import may precede
     # this boundary, including pytest plugins loaded from test modules.
-    _PYTEST_ROOT = pathlib.Path(tempfile.mkdtemp(prefix="ouroboros-pytest-"))
+    _PYTEST_ROOT = pathlib.Path(tempfile.mkdtemp(
+        prefix="p" if _SAFE_TEMP_ROOT else "ouroboros-pytest-", dir=_SAFE_TEMP_ROOT or None))
     _environment = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1]
                                     / "ouroboros" / "test_environment.py"))
     _PYTEST_DEFAULTS = _environment["isolated_environment"](
         _PYTEST_ROOT, _PYTEST_ROOT / "data" / "repo", source={},
     )
+    if not _SAFE_TEMP_ROOT:
+        for _key in ("TMPDIR", "TEMP", "TMP", "PYTEST_DEBUG_TEMPROOT"):
+            _PYTEST_DEFAULTS.pop(_key, None)
     # Bare pytest retains explicitly supplied lane/provider controls (integration
     # CI needs them). safe_test.py and preflight scrub the whole owner environment.
     # HOME is already disposable. Leave Deliverables home-derived so tests that
     # select their own HOME/user-files jail do not inherit an unrelated pin.
     _PYTEST_DEFAULTS["OUROBOROS_DELIVERABLES_ROOT"] = ""
-    # xdist supplies basetemp under the controller's temp root, alongside (not
-    # beneath) each worker's own session directory. Fence the common parent.
+    # xdist supplies basetemp under the controller's session tree, alongside (not
+    # beneath) each worker's own sibling root. Fence their common parent: the
+    # launcher's root under safe_test, the invoking temp directory otherwise.
     _PYTEST_DEFAULTS["GIT_CEILING_DIRECTORIES"] = str(_PYTEST_ROOT.parent)
     os.environ.update(_PYTEST_DEFAULTS)
     os.environ.pop("OUROBOROS_MANAGED_BY_LAUNCHER", None)
     os.environ.pop("OUROBOROS_MANAGED_REPO_DIR", None)
     os.environ["OUROBOROS_TEST_LIVE_DATA_ROOT"] = _LIVE_DATA_ROOT
     _PYTEST_DATA_DIR = pathlib.Path(os.environ["OUROBOROS_DATA_DIR"])
-    tempfile.tempdir = os.environ["TMPDIR"]
+    if _SAFE_TEMP_ROOT:
+        # pytest's capture already cached the inherited directory before this ran.
+        tempfile.tempdir = os.environ["TMPDIR"]
     sys.pycache_prefix = os.environ["PYTHONPYCACHEPREFIX"]
 
 import pytest
@@ -395,6 +412,63 @@ def _pin_lane_groups(items, shards: int) -> None:
 def pytest_configure(config):
     if _PYTEST_ROOT is not None:
         config.inicfg["cache_dir"] = str(_PYTEST_ROOT / "pytest-cache")
+    _guard_test_tree_deletion(config)
+
+
+def _guard_test_tree_deletion(config) -> None:
+    """pytest deletes temp trees on its own; none of it may happen under a live process.
+
+    Tests start servers, workers and git in tmp_path, and a test's exit does not prove
+    them gone. The "failed"/"none" retention policies delete tmp_path after passing
+    tests, and an explicit --basetemp is emptied before the session starts. pytest's
+    OWN numbered basetemp is never used either: its exit hook deletes earlier
+    sessions' trees and, with tmp_path_retention_count=0, the current one — whatever
+    the policy says — so every controller, bare or not, claims a fresh explicit one.
+    """
+    policy = config.getini("tmp_path_retention_policy")
+    if policy != "all":
+        raise pytest.UsageError(
+            f"tmp_path_retention_policy={policy!r} would delete test trees whose processes "
+            "were never proven gone; this suite requires 'all'")
+    if hasattr(config, "workerinput"):
+        return  # xdist hands each worker a fresh basetemp beneath the controller's.
+    if config.option.basetemp is None:
+        config.option.basetemp = _claim_fresh_basetemp(_basetemp_parent())
+        return
+    basetemp = config.option.basetemp
+    if os.path.isdir(basetemp) and os.listdir(basetemp):
+        raise pytest.UsageError(
+            f"--basetemp {basetemp} already holds a previous run, which pytest would delete "
+            "before its processes are proven gone; pass a fresh, never-used path")
+
+
+def _basetemp_parent() -> pathlib.Path:
+    """The launcher's root, else this process's own fresh session root.
+
+    A live-DATA run has no session root; it gets a fresh directory of its own.
+    """
+    if _SAFE_TEMP_ROOT:
+        return pathlib.Path(_SAFE_TEMP_ROOT)
+    if _PYTEST_ROOT is not None:
+        return _PYTEST_ROOT
+    return pathlib.Path(tempfile.mkdtemp(prefix="ouroboros-pytest-"))
+
+
+def _claim_fresh_basetemp(root: pathlib.Path) -> str:
+    """One never-used basetemp per pytest invocation, short enough for socket paths.
+
+    The exclusive mkdir of ``b<N>`` is the claim: a later or concurrent session
+    (run_tests.py's second pass, a nested run) takes the next number. pytest gets
+    a NOT-yet-existing child, so it never has an existing tree to empty.
+    """
+    for index in range(10_000):
+        claim = root / f"b{index}"
+        try:
+            claim.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        return str(claim / "t")
+    raise pytest.UsageError(f"no free basetemp claim beneath {root}")
 
 
 def pytest_sessionstart(session):  # noqa: ARG001
@@ -438,11 +512,10 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     workeroutput = getattr(session.config, "workeroutput", None)
     if workeroutput is not None:  # xdist worker: hand the leak list to the controller
         workeroutput["thread_leaks"] = list(_THREAD_LEAKS)
-    # Per-process temp data dir (unique mkdtemp per controller/worker) — clean on EVERY process.
-    if _PYTEST_DATA_DIR is not None:
-        shutil.rmtree(_PYTEST_ROOT or _PYTEST_DATA_DIR, ignore_errors=True)
-    if _PYTEST_REPO_FALLBACK is not None:
-        shutil.rmtree(_PYTEST_REPO_FALLBACK, ignore_errors=True)
+    # The per-process session tree (unique mkdtemp per controller/worker) is RETAINED,
+    # never deleted here: a finished session does not prove that every process its
+    # tests started is gone, and nothing at this layer can prove it. The terminal
+    # summary names the tree; cleanup belongs to whoever later proves the run idle.
 
 
 def pytest_unconfigure(config):  # noqa: ARG001
@@ -883,6 +956,13 @@ def pytest_terminal_summary(terminalreporter):
             f"{len(_THREAD_LEAKS)} test(s): {tests}")
     else:
         terminalreporter.write_line("thread hygiene: no leaked threads")
+    retained = [str(path) for path in (_PYTEST_ROOT, _PYTEST_REPO_FALLBACK) if path is not None]
+    basetemp = getattr(getattr(terminalreporter.config, "_tmp_path_factory", None), "_basetemp", None)
+    if basetemp is not None and not any(pathlib.Path(basetemp).is_relative_to(path) for path in retained):
+        retained.append(str(basetemp))
+    if retained:
+        terminalreporter.write_line("test session trees retained (never deleted in-session): "
+                                    + ", ".join(retained))
 
 
 # Pre-v5.15 conftest exported four fixtures (``make_git_repo``, ``tool_context``,

@@ -24,11 +24,16 @@ from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET, _emit_ws_frame
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
 
 
-def _fixture_python() -> str:
+def _fixture_interpreter() -> str:
     """Use the real Windows interpreter, bypassing the venv PID redirector."""
     if os.name == "nt":
         return str(getattr(sys, "_base_executable", sys.executable))
     return sys.executable
+
+
+def _fixture_python() -> str:
+    """Launch target; Settings may wrap it."""
+    return _fixture_interpreter()
 
 
 def _open_review_checkpoint(card, *, open_card=True):
@@ -244,9 +249,8 @@ def _run_docker_ui_assertions(url: str) -> None:
 def direct_server_with_data(tmp_path):
     if os.environ.get("OUROBOROS_RUN_UI_SMOKE") != "1":
         pytest.skip("set OUROBOROS_RUN_UI_SMOKE=1 to run browser UI smoke")
-    require_candidate_interpreter()
     checkout = tmp_path / "repo"
-    # Per-copy static and VERSION bytes prove serving/import origin on every boot.
+    # Static/VERSION sentinels prove each boot's origin.
     with candidate_checkout(pathlib.Path(REPO_ROOT), checkout, origin_proof=True) as candidate, \
             MockLLMServer() as llm:
         port = _free_port()
@@ -274,6 +278,8 @@ def direct_server_with_data(tmp_path):
             site = pathlib.Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages"
             if site.is_dir():
                 env["PYTHONPATH"] = os.pathsep.join([str(site), env.get("PYTHONPATH", "")])
+        # Probe the actual child, not the parent venv.
+        require_candidate_interpreter(_fixture_interpreter(), env, checkout)
         url = f"http://127.0.0.1:{port}"
         active_proc = active_container = None
 
@@ -289,27 +295,31 @@ def direct_server_with_data(tmp_path):
                     try:
                         proc.wait(timeout=10)
                     except subprocess.TimeoutExpired:
-                        pass  # The container below also owns surviving descendants.
+                        pass  # Reap descendants below.
             finally:
                 try:
-                    # Parent exit never proves the entire incarnation is gone.
+                    # Parent exit alone is insufficient.
                     error = container.reap()
                 finally:
                     container.close()
                 if error:
                     if proc is not None:
-                        proc.poll()  # Collect an exited parent without masking the reap failure.
+                        proc.poll()  # Preserve the reap failure.
                     raise RuntimeError(f"UI fixture process cleanup failed: {error}")
                 if proc is not None:
                     proc.wait(timeout=5)
+            # Only proven teardown releases the copy.
+            candidate.release()
 
         def start_server() -> None:
             nonlocal active_proc, active_container
             from ouroboros.process_containment import ProcessContainer
 
-            # Reap consumes the token/Job: every restart needs fresh containment.
+            # Reap consumes custody: restart needs a new container.
             verify_checkout(checkout, candidate)
             active_container = ProcessContainer()
+            # Pin before spawn.
+            candidate.hold()
             active_proc = active_container.spawn(
                 [_fixture_python(), "server.py"],
                 cwd=checkout,
@@ -330,11 +340,10 @@ def direct_server_with_data(tmp_path):
             yield {
                 "url": url, "data_dir": data_dir, "restart_server": restart_server,
                 "repo_dir": checkout, "candidate_identity": candidate.identity,
-                # Proof bytes let consumers recheck static and Python origin.
+                # Static and Python origin proof.
                 "candidate_sentinel": candidate.sentinel_bytes,
                 "candidate_version": candidate.version_text,
-                # A seed that must survive into the next boot (queue snapshot, state files) has to
-                # land while no server runs: the main loop persists its own snapshot every tick.
+                # Seed only while stopped: live ticks overwrite snapshots.
                 "stop_server": stop_server, "start_server": start_server,
             }
         finally:

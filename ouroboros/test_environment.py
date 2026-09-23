@@ -38,6 +38,34 @@ def scrub_environment(source, *, keep=()) -> dict[str, str]:
                                   or key in projected or key in {"NODE_OPTIONS", "VIRTUAL_ENV"})}
 
 
+# A disposable tree whose processes were not PROVEN gone keeps this file at its
+# top. Every enclosing cleanup layer (candidate checkout, pytest session root,
+# safe_test launcher) refuses to delete a tree that contains one: retention is
+# in place, so a surviving process never loses the directory it is writing into.
+RETENTION_MARKER = "OUROBOROS_RETAINED.txt"
+
+
+def retain_tree(root, reason: str) -> bool:
+    """Mark ``root`` retained; False when the marker itself could not be written."""
+    try:
+        with (Path(root) / RETENTION_MARKER).open("a", encoding="utf-8") as stream:
+            stream.write(reason.rstrip() + "\n")
+    except OSError:
+        return False
+    return True
+
+
+def retention_markers(root) -> list[Path]:
+    """Markers beneath ``root``. A subtree that cannot be walked counts as one."""
+    found: list[Path] = []
+    for directory, _dirs, files in os.walk(
+            root, followlinks=False,
+            onerror=lambda error: found.append(Path(error.filename or root))):
+        if RETENTION_MARKER in files:
+            found.append(Path(directory) / RETENTION_MARKER)
+    return found
+
+
 def isolated_environment(root: Path, repo: Path, *, source=None, keep=(), create=True) -> dict[str, str]:
     """Create all writable defaults beneath a caller-owned disposable directory."""
     root, repo = Path(root).resolve(), Path(repo).resolve()

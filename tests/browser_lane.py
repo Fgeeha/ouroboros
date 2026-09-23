@@ -5,8 +5,15 @@ marker lane must be collected, the declared engines must launch BEFORE the first
 test, every collected node must reach a terminal outcome, and the only tolerated
 skips are the reviewed platform gates registered below — each one recorded by
 node id and reason in the run summary, so tolerated never means invisible.
+
+Completeness is judged against the test modules on disk, not only against what
+was collected: `--ignore`, `--ignore-glob`, `--last-failed` file skipping or an
+overridden collection setting drop modules BEFORE any marker comparison could
+see them, so those controls are refused and every module must be collected.
 """
+import fnmatch
 import os
+from pathlib import Path
 import re
 
 import pytest
@@ -18,10 +25,22 @@ import pytest
 # match is reported as UI_BROWSER_PLATFORM_SKIP with the reason the test gave.
 PLATFORM_SKIPS = (
     ("tests/test_settings_restart_browser.py", r"POSIX test launcher"),
+    # The same POSIX launcher, for exactly this case: its `[direct]` sibling runs everywhere.
+    ("tests/test_ui_candidate_server.py::"
+     "test_real_server_uses_disposable_candidate_and_keeps_identity_through_restart[settings]",
+     r"POSIX test launcher"),
     ("tests/test_chat_history_recovery_browser.py",
      r"POSIX archive permissions|identity bypasses unreadable-file permissions"),
     ("tests/test_widget_stream_download_ui.py", r"native Qt probe is explicitly selected"),
 )
+
+# Controls that narrow collection itself. Post-collection deselection is caught by
+# the marker comparison too; these are refused by name so the error says why.
+_NARROWING_OPTIONS = {"ignore": "--ignore", "ignore_glob": "--ignore-glob",
+                      "deselect": "--deselect", "keyword": "-k", "lf": "--last-failed",
+                      "stepwise": "--stepwise"}
+_COLLECTION_INI = {"python_files", "python_classes", "python_functions", "testpaths",
+                   "norecursedirs"}
 
 
 def pytest_addoption(parser):
@@ -79,12 +98,61 @@ class LaneReconciliation:
         return sorted(self.required - self.executed)
 
 
+class CollectedModules:
+    """The test modules this process actually imported, and those skipped whole."""
+
+    def __init__(self):
+        self.collected = set()
+        self.skipped = {}
+
+    def pytest_collectreport(self, report):
+        if report.nodeid.endswith(".py"):
+            if report.skipped:
+                self.skipped[report.nodeid] = _skip_reason(report)
+            else:
+                self.collected.add(report.nodeid)
+
+
 def _reconciliation(config):
     return config.pluginmanager.get_plugin("ui_browser_lane_reconciliation")
 
 
+def _module_files(config) -> set:
+    """What the committed collection settings select beneath tests/ on disk."""
+    root = Path(config.rootpath)
+    patterns, skipped_dirs = config.getini("python_files"), config.getini("norecursedirs")
+    found = set()
+    for directory, dirs, files in os.walk(root / "tests"):
+        dirs[:] = [name for name in dirs if name != "__pycache__"
+                   and not any(fnmatch.fnmatch(name, pattern) for pattern in skipped_dirs)]
+        found.update((Path(directory) / name).relative_to(root).as_posix() for name in files
+                     if any(fnmatch.fnmatch(name, pattern) for pattern in patterns))
+    return found
+
+
+def _collection_gaps(config) -> list:
+    """Why the collected modules are not the whole lane; empty when they are."""
+    option = config.option
+    gaps = [flag for name, flag in _NARROWING_OPTIONS.items() if getattr(option, name, None)]
+    gaps += ["-o " + entry.split("=", 1)[0].strip()
+             for entry in (getattr(option, "override_ini", None) or [])
+             if entry.split("=", 1)[0].strip() in _COLLECTION_INI]
+    modules = config.pluginmanager.get_plugin("ui_browser_collected_modules")
+    if modules is None:
+        return gaps + ["module collection was not observed"]
+    gaps += [f"skipped {nodeid}: {reason}" for nodeid, reason in sorted(modules.skipped.items())]
+    missing = sorted(_module_files(config) - modules.collected - set(modules.skipped))
+    if missing:
+        gaps.append(f"never collected ({len(missing)}): " + ", ".join(missing[:10]))
+    return gaps
+
+
 def pytest_configure(config):
-    if _required(config) and not hasattr(config, "workerinput"):
+    if not _required(config):
+        return
+    # Every collecting process tracks its modules; under xdist that is each worker.
+    config.pluginmanager.register(CollectedModules(), "ui_browser_collected_modules")
+    if not hasattr(config, "workerinput"):
         config.pluginmanager.register(LaneReconciliation(()), "ui_browser_lane_reconciliation")
 
 
@@ -94,6 +162,9 @@ def pytest_collection_modifyitems(config, items):
     yield
     if not _required(config):
         return
+    gaps = _collection_gaps(config)
+    if gaps:
+        raise pytest.UsageError("UI_BROWSER_INCOMPLETE: collection narrowed — " + "; ".join(gaps))
     actual = {item.nodeid for item in items}
     if not expected or actual != expected or config.args != ["tests/"]:
         raise pytest.UsageError("UI_BROWSER_INCOMPLETE: require tests/ and the complete -m ui_browser lane")

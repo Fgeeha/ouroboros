@@ -19,11 +19,12 @@ on:
 permissions:
   contents: read
 
-# One browser run per branch tip: a superseded push cancels its own lane rather
-# than queueing runner time for a commit that is no longer the branch state.
-concurrency:
-  group: ui-browser-push-${{ github.ref }}
-  cancel-in-progress: true
+# Deliberately NO concurrency group. Each run skips browsers only when ITS OWN
+# `before..sha` range is documentation-only, so a later docs-only push cannot
+# vouch for an earlier code push. Cancelling in-progress runs — or replacing a
+# pending one, which a group does even without `cancel-in-progress` — would let
+# that docs-only tip end green while the code it follows was never exercised.
+# Every push keeps its own complete lane; overlapping runs cost runner time only.
 
 jobs:
   ui-smoke:

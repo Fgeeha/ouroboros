@@ -10,6 +10,11 @@ A fixture that must PROVE what a server ran asks for `origin_proof=True`: the
 copy then carries two bytes nothing else has — a per-checkout static sentinel and
 a per-checkout VERSION suffix — so a served response identifies THIS checkout
 rather than merely agreeing with HEAD or with the state we wrote it from.
+
+Deletion needs proof, not an exit: a holder calls `hold()` before it starts a
+process from the copy and `release()` only once that process tree is PROVEN gone.
+Teardown with an unreleased hold, or with a retention marker beneath the copy,
+keeps the tree in place and marks it for every enclosing cleanup layer.
 """
 from __future__ import annotations
 
@@ -22,7 +27,10 @@ from pathlib import Path
 import secrets
 import stat
 import subprocess
+import sys
 import urllib.request
+
+from ouroboros.test_environment import retain_tree, retention_markers
 
 
 # Served from the candidate's own web/ directory, and read back through the
@@ -36,20 +44,43 @@ class CandidateError(RuntimeError):
     pass
 
 
-def require_candidate_interpreter():
-    """A dependency-only venv cannot supply deleted candidate code via site hooks."""
-    from importlib.metadata import distributions
-    import site
+# Runs in the EXACT interpreter, environment and working directory a candidate
+# server gets. Every import root except the working directory is searched: site
+# directories, .pth additions and PYTHONPATH — the Windows fixture hands the base
+# interpreter the venv's site-packages that way.
+_INTERPRETER_PROBE = """
+import importlib.metadata as metadata, importlib.util, json, os, sys
+here = os.path.realpath(os.getcwd())
+paths = [entry for entry in sys.path if entry and os.path.realpath(entry) != here]
+installed = sorted({str(dist.locate_file("")) for dist in metadata.distributions(path=paths)
+                    if (dist.metadata["Name"] or "").lower() == "ouroboros"})
+spec = importlib.util.find_spec("ouroboros")
+print(json.dumps({"installed": installed, "origin": (spec.origin or "") if spec else ""}))
+"""
 
-    # Ignore build metadata in the current source directory; inspect installed
-    # distributions in the interpreter's site directories, including editables.
-    if not any(dist.metadata["Name"] == "ouroboros"
-               for dist in distributions(path=site.getsitepackages())):
-        return
-    raise CandidateError(
-        "CANDIDATE_UNSUPPORTED installed ouroboros: use a dependency-only venv "
-        "(uv sync --no-install-project) to prevent imports from another checkout"
-    )
+
+def require_candidate_interpreter(python=None, env=None, checkout=None):
+    """The interpreter that RUNS the candidate cannot reach Ouroboros from anywhere else.
+
+    Probed as that executable with the environment and working directory the server
+    gets: on Windows the fixture launches the BASE interpreter (the venv launcher
+    would hand back another PID), whose own site-packages this venv cannot vouch
+    for. With a checkout, `ouroboros` must also resolve inside it.
+    """
+    result = subprocess.run([python or sys.executable, "-c", _INTERPRETER_PROBE], cwd=checkout,
+                            env=env, capture_output=True, text=True, timeout=120)
+    if result.returncode:
+        raise CandidateError(f"CANDIDATE_UNSUPPORTED interpreter probe failed: {result.stderr[-2000:]}")
+    facts = json.loads(result.stdout.strip().splitlines()[-1])
+    if facts["installed"]:
+        raise CandidateError(
+            "CANDIDATE_UNSUPPORTED installed ouroboros at " + ", ".join(facts["installed"])
+            + ": use a dependency-only venv (uv sync --no-install-project) to prevent "
+            "imports from another checkout")
+    origin = Path(facts["origin"] or os.sep).resolve()
+    if checkout is not None and not origin.is_relative_to(Path(checkout).resolve()):
+        raise CandidateError("CANDIDATE_UNSUPPORTED ouroboros resolves outside the checkout: "
+                             + (facts["origin"] or "not importable"))
 
 
 def _fetch(url, timeout=5):
@@ -194,7 +225,20 @@ class CandidateCheckout:
     """The selected source bytes plus the per-checkout proof bytes written over them."""
 
     state: CandidateState
+    path: Path
     overlay: dict = field(default_factory=dict)
+    # Processes started from this copy that have not yet been PROVEN gone.
+    unproven: int = 0
+
+    def hold(self) -> None:
+        """Before a process starts from the copy: its teardown now needs proof."""
+        self.unproven += 1
+
+    def release(self) -> None:
+        """After the holder proved that process tree gone (clean reap, parent collected)."""
+        if self.unproven <= 0:
+            raise CandidateError("CANDIDATE_CUSTODY: release without a matching hold")
+        self.unproven -= 1
 
     @property
     def identity(self) -> str:
@@ -319,8 +363,8 @@ def candidate_checkout(source: Path, target: Path, *, origin_proof: bool = False
         if ignored.returncode:
             raise CandidateError("CANDIDATE_UNSUPPORTED: destination inside source must be ignored")
     before = observe_candidate(source)
-    checkout = CandidateCheckout(before, _origin_proof_overlay(before) if origin_proof else {})
-    assembled = False
+    checkout = CandidateCheckout(before, target, _origin_proof_overlay(before) if origin_proof else {})
+    assembled = body_failed = False
     try:
         _copy_candidate(source, target, before)
         # Written only into the copy: the source keeps the bytes we observed.
@@ -331,15 +375,42 @@ def candidate_checkout(source: Path, target: Path, *, origin_proof: bool = False
         verify_checkout(target, checkout)
         assembled = True
         yield checkout
+    except GeneratorExit:
+        raise  # An owner closing its fixture generator: ordinary teardown, not a failure.
+    except BaseException:
+        body_failed = True
+        raise
     finally:
         try:
             _verify_source(source, before, "during browser verification")
             if assembled:
                 verify_checkout(target, checkout)
         finally:
-            if target.exists():
-                from ouroboros.subagent_worktrees import _force_rmtree
+            _retire_checkout(target, checkout, body_failed)
 
-                _force_rmtree(target)  # Also handles Windows read-only Git objects.
-                if target.exists():
-                    raise CandidateError(f"CANDIDATE_CLEANUP_FAILED: {target}")
+
+def _retire_checkout(target: Path, checkout: CandidateCheckout, body_failed: bool) -> None:
+    """Delete the copy only when nothing started from it can still be running."""
+    if not target.exists():
+        return
+    reasons = []
+    if checkout.unproven:
+        reasons.append(f"{checkout.unproven} process tree(s) started from this checkout "
+                       "were never proven gone")
+    markers = retention_markers(target)
+    if markers:
+        reasons.append("retention marker(s) beneath: " + ", ".join(map(str, markers[:3])))
+    if reasons:
+        reason = "; ".join(reasons)
+        retain_tree(target, reason)
+        message = f"CANDIDATE_RETAINED {target}: {reason}"
+        if body_failed:
+            # The failure already propagating names the cause; keep it, disclose this.
+            print(message, file=sys.stderr, flush=True)
+            return
+        raise CandidateError(message)
+    from ouroboros.subagent_worktrees import _force_rmtree
+
+    _force_rmtree(target)  # Also handles Windows read-only Git objects.
+    if target.exists():
+        raise CandidateError(f"CANDIDATE_CLEANUP_FAILED: {target}")

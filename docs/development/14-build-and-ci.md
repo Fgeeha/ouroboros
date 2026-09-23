@@ -51,7 +51,7 @@ OUROBOROS_RUN_UI_SMOKE=1 OUROBOROS_EXPECT_BROWSER_ENGINES=chromium,webkit \
 empty collection, a missing engine, a collected case that never reached a
 terminal outcome, and any skip outside the reviewed platform registry in
 `tests/browser_lane.py` each fail the run, and a registered platform skip is
-reported with its node and reason. `--temp-parent` places the disposable tree and is refused inside the checkout: a nested root is not disposable, because git and snapshot operations started in it resolve back into the source working tree. The same stdlib
+reported with its node and reason. `--temp-parent` (`/tmp` on macOS: short socket paths) is refused inside any Git checkout, where git resolves; neither launcher nor pytest session deletes its tree (`SAFE_TEST_RETAINED <path>`). The same stdlib
 `ouroboros/test_environment.py` owns the data, settings, app, HOME, projects,
 worktrees, Deliverables, cache and userbase defaults for pytest, preflight and
 their server children — including a child that passes `env=None` — while roots a
@@ -60,11 +60,11 @@ provider/lane controls for integration CI; launcher and preflight scrub them.
 Under that marker `supervisor/git_ops_reset.py` installs no dependencies for ANY
 caller; production unchanged. C locale/Git ceilings stabilize probes; pytest Deliverables follows synthetic HOME. Not an OS sandbox.
 
-`tests/candidate_checkout.py` owns the UI fixture's independent checkout: tracked
+`tests/candidate_checkout.py` owns shared UI and keyless wait/repair checkouts: tracked
 worktree bytes plus non-ignored new files — staged, unstaged, deleted, executable
 and binary alike. It preserves the source HEAD, branch and raw index, verifies
 source identity before and after capture and at teardown, and verifies the copy
-before each server incarnation and at exit. Ignored artifacts and empty
+before each server incarnation and at exit, kept unless all reaped. Ignored artifacts and empty
 directories are outside the contract; symlinks, special files, gitlinks,
 sparse/assume-unchanged, split and unmerged indexes fail explicitly. Two complete
 observations plus per-read metadata checks detect concurrent edits — no lock, no
@@ -75,7 +75,7 @@ the bound PID, that the served static tree is this copy, and that `/api/health`'
 `runtime_version` came from Python imported from it, so a server answering with
 HEAD's bytes or another checkout's cannot pass. An interpreter carrying an
 installed `ouroboros` distribution is refused explicitly. Owners:
-`test_candidate_checkout`, `test_test_environment`, `test_ui_fixture_lifecycle`,
+`test_candidate_checkout`, `test_candidate_checkout_consumers`, `test_test_environment`, `test_ui_fixture_lifecycle`,
 `test_ui_candidate_server`, `test_browser_ci_scope`.
 
 ### The commit gate mirrors the CI split

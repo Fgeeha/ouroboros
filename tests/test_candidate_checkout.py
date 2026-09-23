@@ -18,17 +18,31 @@ def test_ready_flag_does_not_hide_failed_supervisor():
             candidate.require_running_supervisor(state)
 
 
-def test_installed_project_cannot_supply_code_missing_from_candidate(monkeypatch):
-    from importlib import metadata
-    from types import SimpleNamespace
+def test_installed_project_cannot_supply_code_missing_from_candidate(tmp_path):
+    """The LAUNCHED interpreter's import roots decide, not this process's venv."""
+    import sys
 
-    monkeypatch.setattr(metadata, "distributions", lambda **kwargs: [
-        SimpleNamespace(metadata={"Name": "ouroboros"})])
+    checkout = tmp_path / "checkout"
+    (checkout / "ouroboros").mkdir(parents=True)
+    (checkout / "ouroboros" / "__init__.py").write_text("", encoding="utf-8")
+    env = dict(os.environ)
+    candidate.require_candidate_interpreter(sys.executable, env, checkout)
+    # A distribution only the child sees — as the Windows base interpreter's own
+    # site-packages would be, or an editable install reached through PYTHONPATH.
+    site = tmp_path / "base-site" / "ouroboros-9.9.dist-info"
+    site.mkdir(parents=True)
+    (site / "METADATA").write_text("Metadata-Version: 2.1\nName: ouroboros\nVersion: 9.9\n",
+                                   encoding="utf-8")
     with pytest.raises(candidate.CandidateError, match="--no-install-project"):
-        candidate.require_candidate_interpreter()
-
-    monkeypatch.setattr(metadata, "distributions", lambda **kwargs: [])
-    candidate.require_candidate_interpreter()
+        candidate.require_candidate_interpreter(sys.executable, {**env, "PYTHONPATH": str(site.parent)},
+                                                checkout)
+    elsewhere = tmp_path / "elsewhere"
+    (elsewhere / "ouroboros").mkdir(parents=True)
+    (elsewhere / "ouroboros" / "__init__.py").write_text("", encoding="utf-8")
+    (tmp_path / "bare").mkdir()
+    with pytest.raises(candidate.CandidateError, match="outside the checkout"):
+        candidate.require_candidate_interpreter(sys.executable, {**env, "PYTHONPATH": str(elsewhere)},
+                                                tmp_path / "bare")
 
 
 def git(repo, *args):
@@ -49,6 +63,42 @@ def source(tmp_path):
     git(repo, "add", ".")
     git(repo, "commit", "-m", "synthetic test baseline")
     return repo
+
+
+def test_unproven_process_or_inner_marker_retains_the_copy_in_place(source, tmp_path):
+    """Deletion needs a proven-gone holder; retention is marked for enclosing layers."""
+    from ouroboros.test_environment import RETENTION_MARKER, retain_tree
+
+    proven = tmp_path / "proven"
+    with candidate.candidate_checkout(source, proven) as copy:
+        copy.hold()
+        copy.release()  # The holder proved its process tree gone.
+    assert not proven.exists()
+
+    held = tmp_path / "held"
+    with pytest.raises(candidate.CandidateError, match="CANDIDATE_RETAINED.*never proven gone"):
+        with candidate.candidate_checkout(source, held) as copy:
+            copy.hold()  # Started, never proven gone: an ordinary exit is no proof.
+    assert "never proven gone" in (held / RETENTION_MARKER).read_text(encoding="utf-8")
+
+    failing = tmp_path / "failing"
+    with pytest.raises(RuntimeError, match="reap failed"):
+        with candidate.candidate_checkout(source, failing) as copy:
+            copy.hold()
+            raise RuntimeError("reap failed")  # The original failure stays the error.
+    assert (failing / RETENTION_MARKER).is_file()
+
+    nested = tmp_path / "nested"
+    with pytest.raises(candidate.CandidateError, match="retention marker"):
+        with candidate.candidate_checkout(source, nested) as copy:
+            (nested / "server-data").mkdir()
+            retain_tree(nested / "server-data", "inner layer could not prove its tree gone")
+    assert (nested / "server-data" / RETENTION_MARKER).is_file()
+
+    with candidate.candidate_checkout(source, tmp_path / "unmatched") as copy:
+        with pytest.raises(candidate.CandidateError, match="release without a matching hold"):
+            copy.release()
+    assert not (tmp_path / "unmatched").exists()
 
 
 def test_staged_unstaged_new_binary_deleted_and_executable_bytes_survive(source, tmp_path):

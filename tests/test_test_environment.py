@@ -151,3 +151,178 @@ def test_safe_test_refuses_a_disposable_root_inside_the_checkout(tmp_path):
                               cwd=REPO, text=True, capture_output=True, timeout=120)
     assert accepted.returncode == 0, accepted.stderr
     assert "boundary ran" in accepted.stdout
+
+    # Any enclosing checkout is the same hazard, not only this one.
+    outer = tmp_path / "outer-checkout"
+    subprocess.run(["git", "init", str(outer)], check=True, capture_output=True)
+    (outer / "nested").mkdir()
+    before = sorted(path.name for path in (outer / "nested").iterdir())
+    refused = subprocess.run(launcher + ["--temp-parent", str(outer / "nested"), "--"] + probe,
+                             cwd=REPO, text=True, capture_output=True, timeout=120)
+    assert refused.returncode == 2, refused.stdout
+    assert "must not be inside a Git working tree" in refused.stderr
+    assert sorted(path.name for path in (outer / "nested").iterdir()) == before == []
+
+
+def test_safe_test_retains_its_new_root_and_keeps_the_command_status(tmp_path):
+    """Exit is no proof that descendants are gone: the launcher never deletes its tree."""
+    launcher = [sys.executable, "-I", "-S", str(REPO / "scripts" / "safe_test.py")]
+    probe = [sys.executable, "-c", "import os, pathlib, sys; "
+             "pathlib.Path(os.environ['HOME'], 'probe').write_text('kept'); "
+             "print(os.environ['OUROBOROS_TEST_TEMP_ROOT']); sys.exit(7)"]
+    result = subprocess.run(launcher + ["--temp-parent", str(tmp_path), "--"] + probe,
+                            cwd=REPO, text=True, capture_output=True, timeout=120)
+    assert result.returncode == 7, result.stderr  # The command's own status, retention is not failure.
+    retained = [line.split(" ", 1)[1] for line in result.stderr.splitlines()
+                if line.startswith("SAFE_TEST_RETAINED ")]
+    assert len(retained) == 1, result.stderr
+    root = Path(retained[0])
+    assert root.parent == tmp_path.resolve() and root.name.startswith("ob-")
+    assert (root / "home" / "probe").read_text() == "kept"
+    # Handed down so each pytest controller claims its own basetemp beneath it.
+    assert Path(result.stdout.splitlines()[-1]) == root
+
+
+def _live_conftest():
+    return next(module for module in list(sys.modules.values())
+                if getattr(module, "__file__", "")
+                and Path(module.__file__).as_posix().endswith("tests/conftest.py")
+                and hasattr(module, "_guard_test_tree_deletion"))
+
+
+def _pytest_config(tmp_path, *, policy="all", basetemp=None, worker=False):
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(getini=lambda name: policy, option=SimpleNamespace(basetemp=basetemp))
+    if worker:
+        config.workerinput = {"workerid": "gw0"}
+    return config
+
+
+def test_pytest_is_refused_any_deletion_of_test_trees(tmp_path, monkeypatch):
+    conftest = _live_conftest()
+    monkeypatch.setattr(conftest, "_SAFE_TEMP_ROOT", "")
+    with pytest.raises(pytest.UsageError, match="tmp_path_retention_policy"):
+        conftest._guard_test_tree_deletion(_pytest_config(tmp_path, policy="failed"))
+    previous = tmp_path / "previous-basetemp"
+    (previous / "test_x0").mkdir(parents=True)
+    with pytest.raises(pytest.UsageError, match="fresh, never-used path"):
+        conftest._guard_test_tree_deletion(_pytest_config(tmp_path, basetemp=str(previous)))
+    assert (previous / "test_x0").is_dir()
+    conftest._guard_test_tree_deletion(_pytest_config(tmp_path, basetemp=str(tmp_path / "fresh")))
+    # Bare pytest claims one too, beneath its own fresh session root: pytest's numbered
+    # basetemp would be subject to tmp_path_retention_count cleanup at exit.
+    session_root = tmp_path / "session-root"
+    session_root.mkdir()
+    monkeypatch.setattr(conftest, "_PYTEST_ROOT", session_root)
+    bare = _pytest_config(tmp_path)
+    conftest._guard_test_tree_deletion(bare)
+    assert bare.option.basetemp == str(session_root / "b0" / "t")
+    # Every controller under the launcher claims its own never-used basetemp.
+    launcher_root = tmp_path / "launcher-root"
+    launcher_root.mkdir()
+    monkeypatch.setattr(conftest, "_SAFE_TEMP_ROOT", str(launcher_root))
+    first, second = _pytest_config(tmp_path), _pytest_config(tmp_path)
+    conftest._guard_test_tree_deletion(first)
+    conftest._guard_test_tree_deletion(second)
+    assert first.option.basetemp == str(launcher_root / "b0" / "t")
+    assert second.option.basetemp == str(launcher_root / "b1" / "t")
+    assert not Path(first.option.basetemp).exists()  # pytest creates it; nothing to empty
+    worker = _pytest_config(tmp_path, worker=True)
+    conftest._guard_test_tree_deletion(worker)
+    assert worker.option.basetemp is None
+
+
+def test_two_sequential_pytest_sessions_under_one_launcher_root_never_share_a_basetemp(tmp_path):
+    """scripts/run_tests.py --sequential runs two pytest processes with the SAME env."""
+    import os
+
+    launcher_root = tmp_path / "launcher-root"
+    launcher_root.mkdir()
+    env = {**os.environ, "OUROBOROS_TEST_TEMP_ROOT": str(launcher_root)}
+    node = "tests/test_test_environment.py::test_git_discovery_cannot_escape_to_an_ancestor_checkout"
+    basetemps = []
+    for _pass in range(2):
+        result = subprocess.run([sys.executable, "-m", "pytest", node, "-o", "addopts=", "-q"],
+                                cwd=REPO, env=env, text=True, capture_output=True, timeout=300)
+        assert result.returncode == 0, result.stdout + result.stderr
+        line = next(row for row in result.stdout.splitlines() if row.startswith("test session trees retained"))
+        basetemps.append(Path(line.rsplit(", ", 1)[-1]))
+    assert basetemps == [launcher_root / "b0" / "t", launcher_root / "b1" / "t"]
+    # The second session neither reused nor emptied the first one's tree.
+    for basetemp in basetemps:
+        assert any(basetemp.iterdir()), basetemp
+
+
+_NODE = "tests/test_test_environment.py::test_git_discovery_cannot_escape_to_an_ancestor_checkout"
+
+_SESSION_PROBE = """
+import json, os, pathlib, tempfile
+
+def pytest_sessionstart(session):
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "controller")
+    record = {"tmpdir": os.environ.get("TMPDIR", ""), "gettempdir": tempfile.gettempdir(),
+              "session_root": str(pathlib.Path(os.environ["OUROBOROS_DATA_DIR"]).parent)}
+    pathlib.Path(os.environ["SESSION_PROBE_OUT"], worker + ".json").write_text(json.dumps(record))
+"""
+
+
+def _nested_env(**overrides):
+    import os
+
+    env = {key: value for key, value in os.environ.items() if key != "OUROBOROS_TEST_TEMP_ROOT"}
+    env.update(overrides)
+    return env
+
+
+@pytest.mark.parametrize("mode", ["launcher", "bare"])
+def test_every_pytest_process_takes_a_short_sibling_session_root(tmp_path, mode):
+    """A real xdist run: workers inherit the controller's TMPDIR, yet none nests beneath it."""
+    pytest.importorskip("xdist")
+    probe, out, parent = tmp_path / "probe", tmp_path / "out", tmp_path / "parent"
+    for path in (probe, out, parent):
+        path.mkdir()
+    (probe / "session_probe.py").write_text(_SESSION_PROBE, encoding="utf-8")
+    # Under the launcher its root is the parent; bare pytest keeps an explicitly chosen TMPDIR.
+    selected = {"OUROBOROS_TEST_TEMP_ROOT": str(parent)} if mode == "launcher" else {"TMPDIR": str(parent)}
+    env = _nested_env(PYTHONPATH=str(probe), SESSION_PROBE_OUT=str(out), **selected)
+    result = subprocess.run([sys.executable, "-m", "pytest", _NODE, "-o", "addopts=", "-q",
+                             "-n", "2", "-p", "session_probe"],
+                            cwd=REPO, env=env, text=True, capture_output=True, timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
+    records = {path.stem: json.loads(path.read_text(encoding="utf-8")) for path in out.glob("*.json")}
+    assert set(records) == {"controller", "gw0", "gw1"}, records
+    roots = {Path(record["session_root"]) for record in records.values()}
+    assert len(roots) == 3 and {root.parent for root in roots} == {parent}, roots
+    for record in records.values():
+        expected = str(Path(record["session_root"]) / "tmp") if mode == "launcher" else str(parent)
+        assert record["tmpdir"] == record["gettempdir"] == expected, record
+        assert len(record["tmpdir"]) <= len(str(parent)) + len("/p12345678/tmp"), record
+
+
+def test_bare_pytest_with_zero_retention_count_keeps_its_session_tree(tmp_path):
+    """pytest's numbered basetemp would delete the CURRENT session tree at exit here."""
+    result = subprocess.run([sys.executable, "-m", "pytest", _NODE, "-o", "addopts=", "-q",
+                             "-o", "tmp_path_retention_count=0"],
+                            cwd=REPO, env=_nested_env(TMPDIR=str(tmp_path)),
+                            text=True, capture_output=True, timeout=300)
+    assert result.returncode == 0, result.stdout + result.stderr
+    line = next(row for row in result.stdout.splitlines() if row.startswith("test session trees retained"))
+    root = Path(line.split(": ", 1)[1].split(", ")[0])
+    assert root.parent == tmp_path, line
+    kept = root / "b0" / "t"
+    assert kept.is_dir() and any(kept.iterdir()), sorted(root.rglob("*"))[:20]
+
+
+def test_session_finish_retains_the_session_tree(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    conftest = _live_conftest()
+    session_root = tmp_path / "session-root"
+    (session_root / "data").mkdir(parents=True)
+    monkeypatch.setattr(conftest, "_PYTEST_ROOT", session_root)
+    monkeypatch.setattr(conftest, "_PYTEST_DATA_DIR", session_root / "data")
+    monkeypatch.setattr(conftest, "_mock_pollution_files", lambda root: set())
+    session = SimpleNamespace(config=SimpleNamespace(_ouroboros_initial_mock_pollution=set()), exitstatus=0)
+    conftest.pytest_sessionfinish(session, 0)
+    assert (session_root / "data").is_dir() and session.exitstatus == 0

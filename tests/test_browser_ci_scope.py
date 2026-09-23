@@ -66,6 +66,19 @@ def test_one_browser_lane_serves_pull_requests_manual_tags_and_ouroboros_pushes(
     assert push["jobs"]["ui-smoke"]["uses"] == caller["uses"]
 
 
+def test_a_later_docs_only_push_cannot_supersede_an_untested_code_push():
+    """Push A changes code, push B (A..B) only docs. B's lane skips browsers for B's own
+    range, so A's lane must finish: a concurrency group would cancel it (in progress) or
+    replace it (pending), leaving B green over code no browser ever ran."""
+    push, _ = _workflow("ui-browser-push.yml")
+    groups = [push.get("concurrency")] + [job.get("concurrency") for job in push["jobs"].values()]
+    assert groups == [None] * len(groups), groups
+    shared, _ = _workflow("ui-browser.yml")
+    assert all(job.get("concurrency") is None for job in [shared, *shared["jobs"].values()])
+    code_push, docs_push = ["server.py", "README.md"], ["README.md"]
+    assert documentation_only(docs_push) and not documentation_only(code_push)
+
+
 def _item(name, marked=True):
     return SimpleNamespace(nodeid=name,
                            get_closest_marker=lambda marker: marked and marker == "ui_browser")
@@ -75,6 +88,9 @@ class _Config(SimpleNamespace):
     def getoption(self, _name):
         return True
 
+    def getini(self, name):
+        return {"python_files": ["test_*.py"], "norecursedirs": [".*", "venv"]}[name]
+
 
 def _config(**kwargs):
     plugins = {}
@@ -82,8 +98,84 @@ def _config(**kwargs):
         get_plugin=plugins.get,
         register=lambda plugin, name: plugins.__setitem__(name, plugin),
     )
-    return _Config(args=["tests/"], pluginmanager=manager,
-                   option=SimpleNamespace(collectonly=False), **kwargs)
+    kwargs.setdefault("option", SimpleNamespace(collectonly=False))
+    # No tests/ beneath this root: only the explicitly reported modules exist.
+    kwargs.setdefault("rootpath", Path(__file__).parent / "no-such-lane-root")
+    return _Config(args=["tests/"], pluginmanager=manager, **kwargs)
+
+
+def _guard(config, items):
+    hook = browser_lane.pytest_collection_modifyitems(config, items)
+    next(hook)
+    return hook
+
+
+@pytest.mark.parametrize("narrowing", [
+    {"ignore": ["tests/test_skill_publish_browser.py"]}, {"ignore_glob": ["*publish*"]},
+    {"lf": True}, {"deselect": ["tests/test_x.py::one"]}, {"keyword": "publish"},
+    {"override_ini": ["python_files=test_ui_*.py"]}, {"override_ini": ["norecursedirs=tests"]},
+])
+def test_collection_guard_refuses_controls_that_narrow_collection(narrowing):
+    config = _config(option=SimpleNamespace(collectonly=False, **narrowing))
+    browser_lane.pytest_configure(config)
+    # The dropped modules never reach `items`, so the marker comparison alone agrees.
+    hook = _guard(config, [_item("first")])
+    with pytest.raises(pytest.UsageError, match="UI_BROWSER_INCOMPLETE: collection narrowed"):
+        next(hook)
+
+
+def test_collection_guard_accounts_for_every_module_on_disk(tmp_path):
+    for name in ("tests/test_a.py", "tests/nested/test_b.py", "tests/helper.py",
+                 "tests/.cache/test_hidden.py"):
+        (tmp_path / name).parent.mkdir(parents=True, exist_ok=True)
+        (tmp_path / name).write_text("", encoding="utf-8")
+    config = _config(rootpath=tmp_path)
+    browser_lane.pytest_configure(config)
+    modules = config.pluginmanager.get_plugin("ui_browser_collected_modules")
+    for nodeid in ("tests", "tests/test_a.py"):
+        modules.pytest_collectreport(SimpleNamespace(nodeid=nodeid, skipped=False))
+    with pytest.raises(pytest.UsageError, match=r"never collected \(1\): tests/nested/test_b\.py"):
+        next(_guard(config, [_item("tests/test_a.py::one")]))
+    modules.pytest_collectreport(SimpleNamespace(nodeid="tests/nested/test_b.py", skipped=False))
+    with pytest.raises(StopIteration):
+        next(_guard(config, [_item("tests/test_a.py::one")]))
+
+    skipped = _config(rootpath=tmp_path)
+    browser_lane.pytest_configure(skipped)
+    modules = skipped.pluginmanager.get_plugin("ui_browser_collected_modules")
+    modules.pytest_collectreport(SimpleNamespace(nodeid="tests/test_a.py", skipped=False))
+    modules.pytest_collectreport(SimpleNamespace(
+        nodeid="tests/nested/test_b.py", skipped=True,
+        longrepr=("tests/nested/test_b.py", 1, "Skipped: could not import 'optional'")))
+    with pytest.raises(pytest.UsageError, match=r"skipped tests/nested/test_b\.py: .*optional"):
+        next(_guard(skipped, [_item("tests/test_a.py::one")]))
+
+
+def test_windows_settings_launcher_skip_is_registered_for_its_exact_case_only():
+    case = ("tests/test_ui_candidate_server.py::"
+            "test_real_server_uses_disposable_candidate_and_keeps_identity_through_restart")
+    reason = "Skipped: POSIX test launcher; production browser behavior is shared"
+    assert browser_lane.permitted_skip(case + "[settings]", reason)
+    assert not browser_lane.permitted_skip(case + "[direct]", reason), "direct still runs on Windows"
+    assert not browser_lane.permitted_skip(
+        "tests/test_ui_candidate_server.py::test_concurrent_servers_keep_distinct_roots_and_owner_sentinels",
+        reason)
+    assert not browser_lane.permitted_skip(case + "[settings]", "Skipped: no browser executable")
+
+
+def test_native_qt_opt_in_skip_precedes_optional_desktop_imports(tmp_path, monkeypatch):
+    import sys
+
+    from tests import test_widget_stream_download_ui as widget
+
+    monkeypatch.delenv("PYWEBVIEW_GUI", raising=False)
+    # The browser lane installs no desktop extra: both imports are unavailable there.
+    monkeypatch.setitem(sys.modules, "webview", None)
+    monkeypatch.setitem(sys.modules, "qtpy", None)
+    with pytest.raises(pytest.skip.Exception) as skipped:
+        widget.test_native_widget_exports(None, tmp_path, monkeypatch)
+    assert browser_lane.permitted_skip(
+        "tests/test_widget_stream_download_ui.py::test_native_widget_exports", str(skipped.value))
 
 
 @pytest.mark.parametrize("partial", [False, True])
