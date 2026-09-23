@@ -94,7 +94,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # FOCUS_SOURCE_UNRESOLVED) and a settled root's focus is dropped — new
     # contract facts of the cross-focus paragraph, not a restatement; +250 for
     # the digest-selected historical read and the reader admission rule.
-    "docs/architecture/06-agent-core.md": 295650,
+    # 295650 -> 297250: document the new diagnostic-only source/coverage contract,
+    # unavailable evidence and no-effects ordering without removing review/custody rules.
+    "docs/architecture/06-agent-core.md": 297250,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     # 19287 -> 20560 (#1215): three contracts the chapter had no older text for — the
@@ -124,7 +126,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 7764 -> 8600 (#1195): the fresh selected-subject + immutable peer projection
     # execution check (`skill_peer_inventory.py`, `skill_conflicts.py`) replaces
     # whole-inventory hashing; the chapter had no description of that seam to swap out.
-    "docs/architecture/13-external-skills-layer.md": 8600,
+    # Dispatcher producer/annotation separation and its retained-source lifetime.
+    "docs/architecture/13-external-skills-layer.md": 9500,
     "docs/development/01-role-and-authority.md": 2437,
     "docs/development/02-naming-and-boundaries.md": 36372,
     # 22873 -> 23100: one new invariant (notifications ring for live events

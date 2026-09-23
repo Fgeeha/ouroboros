@@ -310,8 +310,8 @@ def _run_block_consolidation(
     for i in range(chunks_to_process):
         chunk = new_entries[i * BLOCK_SIZE : (i + 1) * BLOCK_SIZE]
         # The host partitions by the actual chat id BEFORE any model call: each
-        # room is summarized from its own exact chronological bytes and no call
-        # ever mixes rooms; the identity of every section is a host fact.
+        # room's episodic summary uses its own chronological bytes; cumulative
+        # knowledge can span rooms. Each section's identity is a host fact.
         rooms = room_consolidation.partition_entries(chunk, room_resolver)
         first_ts = str(chunk[0].get("ts", "unknown"))
         last_ts = str(chunk[-1].get("ts", "unknown"))
@@ -675,10 +675,15 @@ class KnowledgeReadContext:
 
 KNOWLEDGE_MAINTENANCE_PROMPT = """
 You may use knowledge_list and knowledge_read to understand existing notes before
-nominating a durable revision. Keep the original episode below as evidence, read
-the complete CURRENT note before replacing it, and preserve its sources, uncertainty,
-unknown metadata and useful links. A new observation may correct an old interpretation;
-do not merely repeat fragments. New topics may be created without a prior read.
+nominating a durable revision. An episodic summary describes only its supplied source;
+a knowledge note is cumulative understanding, grounded in the complete CURRENT note
+you read in this operation together with the new episode. Absence from this episode
+does not refute prior knowledge; an earlier episode cutoff does not undo later known
+events. Preserve useful established facts, sources, uncertainty, unknown metadata and
+links. Correct, remove or reorganize stale or unsupported understanding when the
+evidence warrants it; memory is revisable, not append-only. Read the whole current
+note before replacing it, rather than merely repeating fragments. New topics may be
+created without a prior read.
 Understanding of the people involved — preferences, recurring reactions, shared history,
 tentative interpretations with their source — is ordinary knowledge to nominate in global scope;
 a pattern across several moments is worth more than one; revise the existing note rather than minting a rule,

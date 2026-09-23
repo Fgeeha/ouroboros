@@ -813,20 +813,16 @@ async def _api_presence_work(request: Request) -> JSONResponse:
         if status not in {"completed", "failed", "cancelled"}:
             return JSONResponse({"ok": True, "status": "pending", "work_ref": work_ref,
                                  "delivery_reporting_version": presence.get("delivery_reporting_version", 0)}, status_code=202)
-        outcome = str(metadata.get("presence_outcome") or "message")
-        if outcome not in {"message", "silent", "tool_delivered", "deferred"}:
-            outcome = "message"
+        from ouroboros.presence_runner import presence_result_from_stored
+
+        result = presence_result_from_stored(stored, work_ref)
         return JSONResponse({
             "ok": True,
             "status": status,
-            "outcome": outcome,
-            "text": (
-                str(metadata.get("presence_result_text") or stored.get("result") or "")
-                if outcome in {"message", "deferred"}
-                else ""
-            ),
+            "outcome": result.outcome,
+            "text": result.text,
             "work_ref": work_ref,
-            "delivery_reporting_version": presence.get("delivery_reporting_version", 0),
+            "delivery_reporting_version": result.delivery_reporting_version,
         })
     except Exception as exc:
         code = str(getattr(exc, "code", ""))
