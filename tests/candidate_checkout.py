@@ -57,6 +57,11 @@ def _fetch(url, timeout=5):
         return response.read()
 
 
+def require_running_supervisor(state):
+    if state.get("supervisor_error") or not state.get("supervisor_ready") or not state.get("workers_total"):
+        raise CandidateError(f"CANDIDATE_SERVER_UNAVAILABLE: {state.get('supervisor_error') or 'no worker pool'}")
+
+
 def assert_served_candidate(url, checkout, data_dir, pid, candidate):
     """Bind a healthy server to its owned PID, this checkout's bytes and its Python.
 
@@ -74,6 +79,7 @@ def assert_served_candidate(url, checkout, data_dir, pid, candidate):
     from ouroboros.server_process import read_service_bindings
 
     binding = read_service_bindings(data_dir)["main"]
+    require_running_supervisor(json.loads(_fetch(url + "/api/state")))
     assert binding["pid"] == pid, "health answered by a different server process"
     assert url == f"http://127.0.0.1:{binding['port']}"
     for relative, route in (("web/index.html", "/"),

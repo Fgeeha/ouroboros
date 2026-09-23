@@ -10,6 +10,14 @@ from tests import candidate_checkout as candidate
 pytestmark = pytest.mark.serial
 
 
+def test_ready_flag_does_not_hide_failed_supervisor():
+    candidate.require_running_supervisor({"supervisor_ready": True, "workers_total": 1})
+    for state in ({"supervisor_ready": True, "workers_total": 0},
+                  {"supervisor_ready": True, "workers_total": 1, "supervisor_error": "init failed"}):
+        with pytest.raises(candidate.CandidateError, match="CANDIDATE_SERVER_UNAVAILABLE"):
+            candidate.require_running_supervisor(state)
+
+
 def test_installed_project_cannot_supply_code_missing_from_candidate(monkeypatch):
     from importlib import metadata
     from types import SimpleNamespace
