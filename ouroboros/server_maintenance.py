@@ -84,6 +84,11 @@ def _run_cancel_delivery_ref_sweep(drive_root: pathlib.Path) -> None:
         except Exception:
             log.debug("Cancel-intent watchdog sweep failed", exc_info=True)
         try:
+            from ouroboros.terminal_projection import reconcile_terminal_projections
+            reconcile_terminal_projections(drive_root)
+        except Exception:
+            log.warning("Terminal projection reconciliation deferred", exc_info=True)
+        try:
             from supervisor.terminal_delivery import replay_pending_deliveries
             replay_pending_deliveries(drive_root)
         except Exception:

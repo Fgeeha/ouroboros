@@ -922,6 +922,18 @@ def write_task_result(
             log.debug("Blocked status regression %s -> %s for task %s",
                       existing.get("status"), projected_status, task_id)
             return None
+        # Only this accepted transition can originate terminal delivery debt.
+        # Enrichment/replica fields cannot adopt historical terminal rows or
+        # erase provenance persisted before the separate readiness write.
+        projected_fields.pop("canonical_terminal_projection_origin", None)
+        if projected_status in _TRULY_TERMINAL_STATUSES and existing_status not in _TRULY_TERMINAL_STATUSES:
+            merged = {**existing, **projected_fields}
+            if resolve_task_lineage(task_id, metadata=merged.get("metadata"), **{
+                key: merged.get(key) for key in (
+                    "root_task_id", "parent_task_id", "delegation_role", "original_task_id", "timeout_retry_from",
+                )
+            })["is_root_task"]:
+                projected_fields["canonical_terminal_projection_origin"] = "terminal_transition"
         now = utc_now_iso()
         # ABI-3 write seam: the merge BASE is the existing row normalized onto
         # the honest cost names (its own legacy spelling wins its own pair,

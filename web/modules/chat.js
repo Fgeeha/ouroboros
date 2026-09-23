@@ -1001,8 +1001,9 @@ export function createChatInstance({
             const anchored = markReviewAnchor(record);
             if (record.cancelPendingPolicy) return anchored;
             record.finalizingHold = true;
+            const desired = desiredLiveCardPhase(record);
             const phased = setLiveCardPhase(
-                record, 'working', 'Finalizing…', 'chat-live-phase working finalizing',
+                record, desired.phase, desired.text, desired.className, desired.secondary,
             );
             return Boolean(anchored || phased);
         });
@@ -1073,6 +1074,7 @@ export function createChatInstance({
                 if (restoredPhase) {
                     changed = setLiveCardPhase(
                         record, restoredPhase.phase, restoredPhase.text, restoredPhase.className,
+                        restoredPhase.secondary,
                     ) || changed;
                 }
                 return changed;
@@ -1297,6 +1299,7 @@ export function createChatInstance({
                 <div class="chat-live-summary">
                     <div class="chat-live-summary-main">
                         <span class="chat-live-phase working" data-live-phase role="status" aria-live="polite" aria-atomic="true" aria-label="${options.isSubagent ? 'Subagent' : 'Task'} status: Working">Working</span>
+                        <span class="chat-live-phase-secondary" data-live-phase-secondary hidden></span>
                         <div class="chat-live-typing" data-live-typing aria-hidden="true">
                             <span></span><span></span><span></span>
                         </div>
@@ -1725,23 +1728,19 @@ export function createChatInstance({
             : (record.lastHumanHeadline
                 || (record.updates > 1 ? record.titleEl.textContent : '')
                 || 'Working...');
-        const activePhase = record.finished
-            ? (summary.phase || 'done')
-            : (shouldPromote ? (summary.phase || 'working') : (record.phaseEl.dataset.phase || 'working'));
-
-        const desiredPhase = desiredLiveCardPhase(record, activePhase);
-        setLiveCardPhase(record, desiredPhase.phase, desiredPhase.text, desiredPhase.className);
+        // #1110: a task-scope frame's observed outcome is the chip under the hold; a failed tool call is diagnostics, never the task's outcome.
+        if (summary.observedOutcome && !record.finished) record.observedOutcome = summary.observedOutcome;
+        const desiredPhase = desiredLiveCardPhase(record, record.finished ? summary.phase || 'done' : '');
+        setLiveCardPhase(record, desiredPhase.phase, desiredPhase.text, desiredPhase.className,
+            desiredPhase.secondary);
         // A coined project name takes the title slot (the activity headline stays in the
         // timeline); a child's title is its lineage identity; a block without work
         // (open attention, a bare non-Done ending) carries no title; otherwise the
         // activity headline.
-        // A Failed outcome reported during the finalizing hold keeps the title slot: the chip says
-        // only "Finalizing…" then, so narration must not be the one thing that hides the failure.
-        if (shouldPromote && !record.finished && taskPresentation(summary.phase).headline === 'Failed') record.failedHeadline = headline;
         const title = record.suggestedName || (record.isSubagent ? childTitle(record)
             : !blockHasWork(record) ? ''
                 : (record.finished ? record.lastHumanHeadline || 'Task activity'
-                    : record.failedHeadline || record.lastHumanHeadline || activeHeadline));
+                    : record.lastHumanHeadline || activeHeadline));
         if (record.titleEl.textContent !== title) record.titleEl.textContent = title;
         // The collapsed line is a compact projection; the full activity stays in the
         // expanded timeline. Every card, a child's included, takes activity only from

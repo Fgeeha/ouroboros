@@ -264,6 +264,15 @@ def _provider_unavailable_result(
     # round record (a granted transport-death repeat, no usable response since) leaves an attempt
     # unresolved and outranks the wait terminal, which in turn outranks the overflow salvage.
     record = isinstance(ctx.accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict)
+    # The UNKNOWN-OUTCOME predicate, spelled exactly as the two seams that already
+    # own it: `provider_no_call_source` (the no-resend decision) and
+    # `provider_terminal_fallback_text` (the owner sentence). The durable source
+    # asked only for the round record, so an episode whose attempt was interrupted
+    # in flight — no record, sticky kind `provider_outcome_unknown` — told the owner
+    # its outcome was unknown while stamping `transport_unavailable_no_resend` on the
+    # trace (#869). One question, one answer, on all three surfaces.
+    unknown_outcome = record or str(
+        ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown"
     is_transport_wait = wait_cause == "transport_unavailable"
     is_context_overflow = kind == "context_overflow" and not (record or is_transport_wait)
     is_deadline_exhausted = kind == "deadline_exhausted" or str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "deadline_exhausted"
@@ -315,7 +324,7 @@ def _provider_unavailable_result(
         ctx.accumulated_usage.update(execution_status=RESULT_INFRA_FAILED, reason_code="provider_unavailable")
         text, usage, llm_trace = _forced_fallback_result(
             ctx, llm_trace, fallback, reason_code="provider_unavailable",
-            source="provider_outcome_unknown_no_resend" if record else "transport_unavailable_no_resend",
+            source="provider_outcome_unknown_no_resend" if unknown_outcome else "transport_unavailable_no_resend",
         )
         if usage.get("reason_code") == "provider_unavailable":
             usage["execution_status"] = RESULT_INFRA_FAILED

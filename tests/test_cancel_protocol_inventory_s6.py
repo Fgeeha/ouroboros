@@ -76,7 +76,14 @@ TERMINAL_WRITERS = {
     ('ouroboros/mutation_attribution.py::capture_mutation_baseline', 'status'): 'dynamic',
     ('ouroboros/mutation_attribution.py::record_terminal_mutation_candidates', 'status'): 'dynamic',
     ('ouroboros/post_task_checkpoint.py::set_root_post_task_checkpoint', 'str(existing.get("status") or task.get("status") or STATUS_COMPLETED)'): 'terminal',
-    ('ouroboros/project_dialogue.py::_append_terminal_task_projection', 'status'): 'dynamic',
+    # #1154: the compare-and-clear of a settled terminal-projection obligation.
+    # It preserves the record's CURRENT status inside the projector and publishes
+    # no lifecycle transition of its own; the status argument is only the
+    # primitive's required placeholder.
+    ('ouroboros/terminal_projection.py::_prepare', 'stored["status"]'): 'dynamic',
+    ('ouroboros/terminal_projection.py::_append_project', 'stored["status"]'): 'dynamic',
+    ('ouroboros/terminal_projection.py::append_terminal_projection', 'status'): 'dynamic',
+    ('ouroboros/terminal_projection.py::clear_terminal_projection_obligation', 'str(expected.get("status") or "completed")'): 'terminal',
     ('ouroboros/project_naming.py::spawn_turn_namer._work', 'status'): 'dynamic',
     ('ouroboros/project_dialogue.py::persist_continuation_narrative', 'requested_status'): 'dynamic',
     # The locked field projector preserves the existing status, including a

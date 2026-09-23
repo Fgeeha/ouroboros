@@ -896,7 +896,7 @@ def _collect_chat_rows(
             _copy_task_summary_metadata(rec, entry)
             # Lineage, the origin label, and the host's card placement (card_row /
             # card_row_id) — a stored key is replayed verbatim, an absent one is omitted.
-            for field in (*SUBAGENT_MESSAGE_FIELDS, "initiator", "card_row", "card_row_id"):
+            for field in (*SUBAGENT_MESSAGE_FIELDS, "initiator", "card_row", "card_row_id", "narration"):
                 if field in entry:
                     rec[field] = entry[field]
             combined.append(rec)
