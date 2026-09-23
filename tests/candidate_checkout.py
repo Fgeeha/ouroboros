@@ -216,8 +216,15 @@ class CandidateState:
 
     @property
     def content_identity(self) -> str:
-        """Branch-free: a clone names its own branch, so a copy can never match it."""
-        return _content_digest(self.head, self.index, self.files)
+        """Branch-free and stat-free: what a copy of this state must still be.
+
+        A clone names its own branch, and a process started from the copy may run
+        `git status`, which rewrites the index file's cached stat data without
+        changing one staged entry. The staged ENTRIES (mode, object, stage, path)
+        are the index content this identity binds; the raw bytes are copied
+        verbatim but compared only by the source-drift check.
+        """
+        return _content_digest(self.head, self.entries, self.files)
 
 
 @dataclass
@@ -246,7 +253,7 @@ class CandidateCheckout:
 
     @property
     def checkout_identity(self) -> str:
-        return _content_digest(self.state.head, self.state.index,
+        return _content_digest(self.state.head, self.state.entries,
                                {**self.state.files, **self.overlay})
 
     @property
@@ -332,10 +339,27 @@ def _copy_candidate(source: Path, target: Path, state: CandidateState) -> None:
             path.chmod(mode)
 
 
+def _changed_paths(before: dict, after: dict) -> list:
+    """Names whose content or mode differ; stat signatures are deliberately ignored."""
+    return sorted(name for name in before.keys() | after.keys()
+                  if (before.get(name) or (None,))[:2] != (after.get(name) or (None,))[:2])
+
+
 def verify_checkout(target: Path, checkout: CandidateCheckout) -> None:
-    """Check executable/file identity before each boot and after final teardown."""
-    if observe_candidate(target).content_identity != checkout.checkout_identity:
-        raise CandidateError("CANDIDATE_CHANGED: fixture checkout differs from selected bytes/index/HEAD")
+    """Check executable/file identity before each boot and after final teardown.
+
+    The error names what moved: a process started from the copy that writes
+    beside its own code (caches, logs, a stray artifact) is the ordinary cause,
+    and the path list is what tells that apart from a genuine source edit.
+    """
+    after = observe_candidate(target)
+    if after.content_identity == checkout.checkout_identity:
+        return
+    expected = {**checkout.state.files, **{name: value + (None,) for name, value in checkout.overlay.items()}}
+    fields = [key for key in ("head", "entries") if getattr(checkout.state, key) != getattr(after, key)]
+    paths = _changed_paths(expected, after.files)
+    raise CandidateError("CANDIDATE_CHANGED: fixture checkout differs from selected bytes/index/HEAD: "
+                         f"metadata={fields!r}, paths={paths[:10]!r} ({len(paths)} total)")
 
 
 def _verify_source(source: Path, before: CandidateState, phase: str):

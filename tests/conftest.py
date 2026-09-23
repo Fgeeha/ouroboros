@@ -436,9 +436,12 @@ def _guard_test_tree_deletion(config) -> None:
         config.option.basetemp = _claim_fresh_basetemp(_basetemp_parent())
         return
     basetemp = config.option.basetemp
-    if os.path.isdir(basetemp) and os.listdir(basetemp):
+    if os.path.lexists(basetemp):
+        # pytest empties ANY existing explicit basetemp before the session starts. An
+        # EMPTY directory is no proof either: it can still be a surviving process's
+        # working directory, and emptiness says nothing about that process.
         raise pytest.UsageError(
-            f"--basetemp {basetemp} already holds a previous run, which pytest would delete "
+            f"--basetemp {basetemp} already exists, and pytest would delete it "
             "before its processes are proven gone; pass a fresh, never-used path")
 
 

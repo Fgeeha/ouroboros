@@ -19,14 +19,32 @@ def test_ready_flag_does_not_hide_failed_supervisor():
 
 
 def test_installed_project_cannot_supply_code_missing_from_candidate(tmp_path):
-    """The LAUNCHED interpreter's import roots decide, not this process's venv."""
+    """The LAUNCHED interpreter's import roots decide, not this process's venv.
+
+    The positive branch runs in a fresh dependency-only environment (a bare venv
+    made from this interpreter, stdlib only), because the venv running THIS test
+    may legitimately carry an editable `ouroboros` install (`uv sync` without
+    `--no-install-project`, as the ordinary CI action does) — exactly what the
+    probe must refuse for a candidate server, and no evidence about the probe.
+    """
     import sys
+    import venv
 
     checkout = tmp_path / "checkout"
     (checkout / "ouroboros").mkdir(parents=True)
     (checkout / "ouroboros" / "__init__.py").write_text("", encoding="utf-8")
-    env = dict(os.environ)
-    candidate.require_candidate_interpreter(sys.executable, env, checkout)
+    venv.EnvBuilder(with_pip=False, symlinks=os.name != "nt").create(tmp_path / "bare-venv")
+    scripts = "Scripts" if os.name == "nt" else "bin"
+    python = str(tmp_path / "bare-venv" / scripts / ("python.exe" if os.name == "nt" else "python"))
+    env = {key: value for key, value in os.environ.items() if key not in {"PYTHONPATH", "PYTHONHOME"}}
+    env["PYTHONNOUSERSITE"] = "1"
+    candidate.require_candidate_interpreter(python, env, checkout)
+    if sys.executable != python:
+        # Whether or not THIS venv installed the project, the probe answers from the child.
+        try:
+            candidate.require_candidate_interpreter(sys.executable, env, checkout)
+        except candidate.CandidateError as exc:
+            assert "--no-install-project" in str(exc)
     # A distribution only the child sees — as the Windows base interpreter's own
     # site-packages would be, or an editable install reached through PYTHONPATH.
     site = tmp_path / "base-site" / "ouroboros-9.9.dist-info"
@@ -34,19 +52,19 @@ def test_installed_project_cannot_supply_code_missing_from_candidate(tmp_path):
     (site / "METADATA").write_text("Metadata-Version: 2.1\nName: ouroboros\nVersion: 9.9\n",
                                    encoding="utf-8")
     with pytest.raises(candidate.CandidateError, match="--no-install-project"):
-        candidate.require_candidate_interpreter(sys.executable, {**env, "PYTHONPATH": str(site.parent)},
-                                                checkout)
+        candidate.require_candidate_interpreter(python, {**env, "PYTHONPATH": str(site.parent)}, checkout)
     elsewhere = tmp_path / "elsewhere"
     (elsewhere / "ouroboros").mkdir(parents=True)
     (elsewhere / "ouroboros" / "__init__.py").write_text("", encoding="utf-8")
     (tmp_path / "bare").mkdir()
     with pytest.raises(candidate.CandidateError, match="outside the checkout"):
-        candidate.require_candidate_interpreter(sys.executable, {**env, "PYTHONPATH": str(elsewhere)},
+        candidate.require_candidate_interpreter(python, {**env, "PYTHONPATH": str(elsewhere)},
                                                 tmp_path / "bare")
 
 
-def git(repo, *args):
-    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True).stdout
+def git(repo, *args, input=None, env=None):
+    return subprocess.run(["git", *args], cwd=repo, check=True, capture_output=True,
+                          input=input, env=env).stdout
 
 
 @pytest.fixture
@@ -155,6 +173,36 @@ def test_split_index_is_refused(source, tmp_path):
     with pytest.raises(candidate.CandidateError, match="split index"):
         with candidate.candidate_checkout(source, tmp_path / "checkout"):
             pytest.fail("unsupported index was accepted")
+
+
+def test_git_status_inside_the_copy_is_not_drift_but_a_staged_change_is(source, tmp_path):
+    """A served process runs `git status`; that rewrites index stat data, not the candidate."""
+    (source / "edited").write_bytes(b"staged\n")
+    git(source, "add", "edited")
+    checkout = tmp_path / "checkout"
+    with candidate.candidate_checkout(source, checkout) as captured:
+        raw_index = (checkout / ".git" / "index").read_bytes()
+        # Same bytes, new mtime: exactly what a served process sees after touching
+        # its own tree; `git status` then rewrites the cached stat data in the index.
+        os.utime(checkout / "edited", ns=(1_000_000_000_000_000_000, 1_000_000_000_000_000_000))
+        # The launcher hands tests GIT_OPTIONAL_LOCKS=0; a served process runs with
+        # Git's default, which takes the lock and writes the refreshed index.
+        plain = {key: value for key, value in os.environ.items() if key != "GIT_OPTIONAL_LOCKS"}
+        git(checkout, "status", "--porcelain", env=plain)
+        git(checkout, "update-index", "--really-refresh", env=plain)
+        assert (checkout / ".git" / "index").read_bytes() != raw_index, "fixture did not exercise the refresh"
+        candidate.verify_checkout(checkout, captured)
+        git(checkout, "update-index", "--add", "--cacheinfo", "100644",
+            git(checkout, "hash-object", "-w", "--stdin", input=b"other\n").strip().decode(), "edited")
+        with pytest.raises(candidate.CandidateError, match=r"metadata=\['entries'\]"):
+            candidate.verify_checkout(checkout, captured)
+        (checkout / "edited").write_bytes(b"content drift\n")
+        with pytest.raises(candidate.CandidateError, match=r"paths=\['edited'\]"):
+            candidate.verify_checkout(checkout, captured)
+        git(checkout, "reset", "--quiet", "--", "edited")
+        git(checkout, "update-index", "--add", "--cacheinfo", "100644",
+            git(checkout, "hash-object", "--stdin", input=b"staged\n").strip().decode(), "edited")
+        (checkout / "edited").write_bytes(b"staged\n")
 
 
 @pytest.mark.parametrize("mutation", ["source", "checkout"])

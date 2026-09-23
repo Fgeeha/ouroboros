@@ -14,6 +14,10 @@ permissions:
 jobs:
   ui-smoke:
     runs-on: ubuntu-latest
+    # A bound, because ci.yml's release chain needs this job: the complete lane
+    # ran in about 51 minutes on a workstation, and a hung engine must end as a
+    # red run rather than an open one.
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:

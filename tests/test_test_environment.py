@@ -209,6 +209,13 @@ def test_pytest_is_refused_any_deletion_of_test_trees(tmp_path, monkeypatch):
     with pytest.raises(pytest.UsageError, match="fresh, never-used path"):
         conftest._guard_test_tree_deletion(_pytest_config(tmp_path, basetemp=str(previous)))
     assert (previous / "test_x0").is_dir()
+    # An EMPTY existing directory is refused too: pytest's rm_rf runs on any existing
+    # explicit basetemp, and emptiness never proves the process that owns it is gone.
+    empty = tmp_path / "empty-basetemp"
+    empty.mkdir()
+    with pytest.raises(pytest.UsageError, match="already exists"):
+        conftest._guard_test_tree_deletion(_pytest_config(tmp_path, basetemp=str(empty)))
+    assert empty.is_dir()
     conftest._guard_test_tree_deletion(_pytest_config(tmp_path, basetemp=str(tmp_path / "fresh")))
     # Bare pytest claims one too, beneath its own fresh session root: pytest's numbered
     # basetemp would be subject to tmp_path_retention_count cleanup at exit.
