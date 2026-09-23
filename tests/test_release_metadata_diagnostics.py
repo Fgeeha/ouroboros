@@ -89,11 +89,11 @@ def test_sm1_committed_crlf_export_preserves_carrier_lines(candidate):
     from devtools.e2e_live.scenarios import _git_show, release_carriers_desync_at
     repo = candidate.repo_dir
     _git(repo, "config", "core.autocrlf", "false")
-    for name, text in _release().items():
+    for name, text in _release("1.2.4").items():
         (repo / name).write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "CRLF carriers")
-    assert _git_show(repo, "HEAD", "uv.lock") == _release()["uv.lock"]
+    assert _git_show(repo, "HEAD", "uv.lock") == _release("1.2.4")["uv.lock"]
     assert release_carriers_desync_at(repo, "HEAD") == ""
 
 
