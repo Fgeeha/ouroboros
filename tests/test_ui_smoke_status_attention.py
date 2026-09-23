@@ -327,7 +327,10 @@ def test_task_status_stays_factual_in_main_and_project_chat(
         # This synthetic code has no producer phrase. Unknown reasons remain
         # visible verbatim; hiding them would discard the only available cause.
         assert "provider_route_failed" in failed.locator(
-            ":scope > [data-live-summary-button]"
+            ":scope > [data-live-summary-button] [data-live-activity]"
+        ).inner_text()
+        assert "provider_route_failed" not in failed.locator(
+            ":scope > [data-live-summary-button] [data-live-title]"
         ).inner_text()
 
         status = scope.locator(status_selector)

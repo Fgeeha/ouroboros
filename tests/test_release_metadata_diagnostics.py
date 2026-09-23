@@ -85,6 +85,18 @@ def test_crlf_carriers_have_same_text_semantics_in_index_and_worktree(candidate)
         assert result["status"] == "clean", result
 
 
+def test_sm1_committed_crlf_export_preserves_carrier_lines(candidate):
+    from devtools.e2e_live.scenarios import _git_show, release_carriers_desync_at
+    repo = candidate.repo_dir
+    _git(repo, "config", "core.autocrlf", "false")
+    for name, text in _release().items():
+        (repo / name).write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "CRLF carriers")
+    assert _git_show(repo, "HEAD", "uv.lock") == _release()["uv.lock"]
+    assert release_carriers_desync_at(repo, "HEAD") == ""
+
+
 def test_unicode_worktree_discovery_is_not_locale_decoded(candidate):
     repo = candidate.repo_dir
     _git(repo, "config", "core.quotepath", "false")
@@ -239,7 +251,7 @@ def test_git_discovery_failure_is_never_clean(candidate, monkeypatch, source):
 
     def fail_discovery(argv, **kwargs):
         if "status" in argv or "diff" in argv:
-            return subprocess.CompletedProcess(argv, 128, stdout="", stderr="fixture failed")
+            return subprocess.CompletedProcess(argv, 128, stdout=b"", stderr=b"fixture failed")
         return real(argv, **kwargs)
 
     # The real run(check=True) raises for index discovery; emulate that contract.
