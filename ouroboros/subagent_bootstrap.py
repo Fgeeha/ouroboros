@@ -84,14 +84,11 @@ def _startup_refusal_definite(payload: Mapping[str, Any]) -> bool:
     )
 
 
-# The typed facts a refused snapshot provision carries (`delegate_shared.lock_busy_facts`):
-# they ride the refusal payload, the $0 terminal and the START_FAILED row unchanged.
-_REFUSAL_FACT_KEYS = ("cause", "holder", "waited_sec", "retryable", "retry_hint")
-
-
 def refusal_facts(payload: Mapping[str, Any]) -> Dict[str, Any]:
     """The producer's typed refusal facts present on ``payload`` (never a handle)."""
-    return {key: payload[key] for key in _REFUSAL_FACT_KEYS if key in payload}
+    from ouroboros.delegate_shared import REFUSAL_FACT_KEYS
+
+    return {key: payload[key] for key in REFUSAL_FACT_KEYS if key in payload}
 
 
 def _record_startup_refusal(

@@ -97,10 +97,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the digest-selected historical read and the reader admission rule.
     # 295650 -> 297250: document the new diagnostic-only source/coverage contract,
     # unavailable evidence and no-effects ordering without removing review/custody rules.
-    # 297250 -> 299000: the private-snapshot paragraph now states the worktree ops
+    # 297250 -> 299500: the private-snapshot paragraph now states the worktree ops
     # lock's scope (issue #1241: shared metadata only, row-then-ref order, batched
     # binary verdict, typed busy refusal) — rationale-layer text BIBLE P6 requires.
-    "docs/architecture/06-agent-core.md": 299000,
+    "docs/architecture/06-agent-core.md": 299500,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,

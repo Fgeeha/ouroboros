@@ -135,6 +135,11 @@ def _fail(tool: str, code: str, detail: str, **extra: Any) -> ToolResult:
     return delegate_result(payload)
 
 
+# The typed facts a refused snapshot provision may carry; the same keys ride the
+# refusal payload, the $0 terminal, the availability row and the START_FAILED row.
+REFUSAL_FACT_KEYS = ("cause", "holder", "waited_sec", "retryable", "retry_hint")
+
+
 def lock_busy_facts(exc: BaseException) -> Dict[str, Any]:
     """Typed facts when a HELD worktree ops lock refused a snapshot provision (#1241):
     who holds it and for what (``subagent_worktrees.WorktreeOpsLockBusy``), so the

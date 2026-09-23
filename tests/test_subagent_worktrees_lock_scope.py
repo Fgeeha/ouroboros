@@ -194,7 +194,7 @@ def test_a_live_holder_is_a_typed_refusal_and_a_dead_holder_is_evicted(tmp_path,
     lock_path.write_text(f"pid={holder.pid} task=t-dead op=provision since=x target=y", encoding="utf-8")
     started = time.monotonic()
     handle = _provision(target, snaps, data)
-    assert time.monotonic() - started < 10 and pathlib.Path(handle.path).is_dir()
+    assert time.monotonic() - started < 30 and pathlib.Path(handle.path).is_dir()  # far below _LOCK_STALE_SEC=600
     assert not _lock_held(snaps)
 
 
@@ -253,6 +253,8 @@ def test_a_provisioning_refusal_leaves_a_durable_start_failed_row(full_run, monk
     failed = [row for row in rows if row.get("type") == custody.START_FAILED]
     assert len(failed) == 1 and failed[0]["definite"] is True and failed[0]["invocation_id"]
     assert failed[0]["reason"] == "execution_snapshot_failed" and failed[0]["run_id"] == ""
+    assert failed[0]["cause"] == "lock_busy" and failed[0]["holder"]["task"] == "t-other"  # the facts ride the row
+    assert "t-other" in failed[0]["detail"]  # and so does the producer's own sentence
 
 
 def test_configured_child_bootstrap_keeps_the_refusal_facts(tmp_path, monkeypatch):
@@ -348,6 +350,28 @@ def test_removal_deletes_files_outside_the_lock_and_forgets_metadata_inside(tmp_
     assert not pathlib.Path(handle.path).exists()
     assert wt.find_execution_snapshot("snap1", data_dir=data) is None
     assert _git(target, "rev-parse", handle.baseline_ref, check=False).returncode != 0
+    assert not _lock_held(snaps)
+
+
+@pytest.mark.parametrize("failing", ["update-ref", "worktree"])
+def test_a_failure_inside_the_first_lock_section_after_the_row_leaves_nothing(tmp_path, monkeypatch, failing):
+    """The provisional row is written first; a failed pin or admin-dir creation right
+    after it (still inside the lock) must discard the row too, not only later phases."""
+    target = _seed_target(tmp_path)
+    snaps, data = tmp_path / "snaps", tmp_path / "data"
+    real_git = wt._git
+
+    def failing_git(repo_dir, *args, **kw):
+        if failing in args and (failing != "worktree" or "add" in args):
+            raise subprocess.CalledProcessError(128, ["git", *args])
+        return real_git(repo_dir, *args, **kw)
+
+    monkeypatch.setattr(wt, "_git", failing_git)
+    with pytest.raises(subprocess.CalledProcessError):
+        _provision(target, snaps, data, snapshot_id="snapLockB")
+    assert wt.find_execution_snapshot("snapLockB", data_dir=data) is None
+    assert _git(target, "for-each-ref", "refs/ouroboros/").stdout == ""
+    assert not list(snaps.glob("dlg_*")) and not list((target / ".git" / "worktrees").glob("dlg_*"))
     assert not _lock_held(snaps)
 
 

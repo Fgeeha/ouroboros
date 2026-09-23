@@ -715,7 +715,8 @@ def _settle_refused_provision(ctx: ToolContext, gateway: Any, refusal: ToolResul
     _retire_orphaned_registration(
         ctx, gateway, "", definite_refusal=True, invocation_id=invocation_id,
         reason=str(payload.get("reason") or "execution_snapshot_failed"),
-        history_facts={**(history_facts or {}), **refusal_facts(payload)})
+        history_facts={**(history_facts or {}), **refusal_facts(payload),
+                       "detail": str(payload.get("detail") or "")})
 
 
 def _snapshot_facts(handle: Any) -> Dict[str, Any]:

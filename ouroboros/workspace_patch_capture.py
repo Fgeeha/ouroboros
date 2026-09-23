@@ -138,9 +138,9 @@ def write_workspace_patch_artifacts(
     except Exception:
         scratch_sha_by_rel = {}
         scratch_sha_by_abs = {}
-    # git's binary verdict for the whole inventory in ONE process (#1241); the loop
-    # below keeps its per-file order and reads the verdict instead of spawning
-    # ``git diff --numstat`` per file.
+    # git's binary verdict for the whole inventory in one process (two when empty
+    # files need their attribute verdict; #1241); the loop below keeps its per-file
+    # order and reads the verdict instead of spawning ``git diff --numstat`` per file.
     binary_verdicts = untracked_binary_verdicts(root, binary_verdict_candidates(root, untracked), warnings=diagnostics)
     for rel in untracked:
         _want_sha = scratch_sha_by_rel.get(rel) or scratch_sha_by_abs.get(os.path.normcase(str((root / rel).resolve(strict=False))))
@@ -724,9 +724,11 @@ def binary_verdict_candidates(root: pathlib.Path, rels: Sequence[str]) -> List[s
             info = os.lstat(root / rel)
         except OSError:
             continue
-        if not stat.S_ISREG(info.st_mode) or info.st_size > _PATCH_MAX_UNTRACKED_FILE_BYTES:
+        if not stat.S_ISREG(info.st_mode):
             continue
-        if not unrestricted and pem_private_key_reason(root, rel):
+        if not unrestricted and pem_private_key_reason(root, rel):  # PEM before the size cap, as the predicate orders them
+            continue
+        if info.st_size > _PATCH_MAX_UNTRACKED_FILE_BYTES:
             continue
         out.append(rel)
     return out

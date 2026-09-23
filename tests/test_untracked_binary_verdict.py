@@ -39,14 +39,14 @@ def _fixture_repo(root: pathlib.Path) -> tuple[pathlib.Path, list[str]]:
     files = {
         "plain.dat": b"hello\n",             # -diff attribute: binary whatever the bytes
         "plain.bin": b"hello\n",             # binary macro
-        "nul.txt": b"x\0y",                  # diff set: text despite the NUL
-        "nul.md": b"x\0y",                   # unspecified: NUL in the first 8000 bytes
+        "withnul.txt": b"x\0y",                  # diff set: text despite the NUL
+        "withnul.md": b"x\0y",                   # unspecified: NUL in the first 8000 bytes
         "late.md": b"a" * 9000 + b"\0",      # NUL past git's probe: text
         "edge7999.md": b"a" * 7999 + b"\0",  # NUL at offset 7999: binary
         "edge8000.md": b"a" * 8000 + b"\0",  # NUL at offset 8000: text
         "nonul.drv": b"hello\n",             # driver with binary=true and no NUL: binary
-        "nul.drt": b"x\0y",                  # driver with binary=false and a NUL: text
-        "nul.lfs": b"x\0y",                  # clean filter strips the NUL: text
+        "withnul.drt": b"x\0y",                  # driver with binary=false and a NUL: text
+        "withnul.lfs": b"x\0y",                  # clean filter strips the NUL: text
         "text.u16": "hi\n".encode("utf-16"),  # working-tree encoding: text
         "empty.md": b"",
         "empty.dat": b"",                    # empty AND -diff: binary by attribute (grok triad finding)
@@ -60,11 +60,12 @@ def _fixture_repo(root: pathlib.Path) -> tuple[pathlib.Path, list[str]]:
         files["new\nline.md"] = b"nl\n"  # a newline in the name survives -z
     for name, data in files.items():
         (repo / name).write_bytes(data)
-    try:  # a non-UTF-8 byte round-trips through fsencode; APFS and NTFS refuse such names
-        (repo / os.fsdecode(b"caf\xe9.md")).write_bytes(b"latin\n")
-        files[os.fsdecode(b"caf\xe9.md")] = b"latin\n"
-    except OSError:
-        pass
+    if os.name != "nt":  # Windows decodes names with surrogatepass and would raise before any OSError
+        try:  # a non-UTF-8 byte round-trips through fsencode; APFS refuses such names, ext4 accepts them
+            (repo / os.fsdecode(b"caf\xe9.md")).write_bytes(b"latin\n")
+            files[os.fsdecode(b"caf\xe9.md")] = b"latin\n"
+        except OSError:
+            pass
     os.symlink("target.bin2", repo / "link_to_bin")
     os.symlink("nowhere", repo / "dangling")
     rels = sorted(files) + ["link_to_bin", "dangling"]
@@ -92,7 +93,7 @@ def test_batch_verdict_matches_git_for_every_path_class(tmp_path):
     assert verdicts is not None and warnings == []
     assert {rel: verdicts.get(rel, False) for rel in rels} == oracle
     # The classes that a NUL sniff or an attribute lookup alone would get wrong.
-    assert verdicts["nonul.drv"] and not verdicts["nul.drt"] and not verdicts["nul.lfs"] and not verdicts["text.u16"]
+    assert verdicts["nonul.drv"] and not verdicts["withnul.drt"] and not verdicts["withnul.lfs"] and not verdicts["text.u16"]
     assert verdicts["edge7999.md"] and not verdicts["edge8000.md"]
     assert verdicts["empty.dat"] and verdicts["empty.bin"] and verdicts["empty.drv"]
     assert not verdicts["empty.drt"] and not verdicts["empty.md"]
@@ -149,7 +150,7 @@ def test_vetoed_and_oversized_files_never_reach_git(tmp_path, monkeypatch):
 
     assert manifest["status"] == "ready_with_changes", manifest["errors"]
     assert ".env" not in batched and "big.md" not in batched and "junk.pyc" not in batched
-    assert "plain.dat" in batched and "nul.md" in batched
+    assert "plain.dat" in batched and "withnul.md" in batched
     assert not (repo / "observed-filter-input").exists(), "an excluded file's bytes reached a clean filter"
     reasons = {row["path"]: row["reason"] for row in manifest["untracked_excluded"]}
     assert "size cap" in reasons["big.md"] and "junk" in reasons["junk.pyc"]
@@ -169,7 +170,7 @@ def test_a_failed_batch_falls_back_to_the_per_file_verdict_with_a_warning(tmp_pa
     assert capture.untracked_binary_verdicts(repo, rels, warnings=warnings) is None
     assert warnings and warnings[0]["reason"] == "binary_verdict_batch_unavailable"
     # ``None`` keeps git's per-file verdict: the same answer, one process per file.
-    for rel in ("plain.dat", "nul.drt", "late.md"):
+    for rel in ("plain.dat", "withnul.drt", "late.md"):
         reason = capture.untracked_capture_veto_reason(repo, rel, binary_verdicts=None)
         assert (reason == "binary file") == _oracle(repo, rel), rel
     assert capture.untracked_binary_verdicts(repo, [], warnings=warnings) == {}
