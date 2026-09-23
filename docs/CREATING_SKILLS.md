@@ -753,8 +753,11 @@ message/deferred body retains the later model-answer path. Native inline turns
 return their persisted result before optional post-task cognition; transport
 outbox custody still owns actual delivery.
 If a parent fails after work was scheduled, its handoff remains deferred with
-the current failure text, so the adapter retains the late result's custody;
-this does not turn the failed parent into successful execution.
+the work reference and any current model-authored reply. Host diagnostics and
+status notices stay in the owner task; an empty deferred body sends nothing but
+still requires polling. Cached and late results preserve that empty body rather
+than substituting the task diagnostic. This does not turn failure into success.
+Ordinary implicit replies and genuine authored best-effort answers remain valid.
 
 `GET /identity` advertises `presence_delivery_version: 1` on supporting hosts.
 Only then request `delivery_reporting_version: 1` alongside `binding_id` and

@@ -478,20 +478,10 @@ def _parse_review_json(raw: str) -> Optional[list]:
     return extract_json_array(raw, normalize=True)
 
 
-def _git_show_staged(repo_dir, path: str) -> str:
-    """Return staged index content via ``git show :PATH`` or ``""``."""
-    import subprocess
-    try:
-        result = subprocess.run(
-            ["git", "show", f":{path}"],
-            cwd=str(repo_dir),
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-        return result.stdout if result.returncode == 0 else ""
-    except Exception:
-        return ""
+def _git_show_staged(repo_dir, path: str) -> Optional[str]:
+    """Return indexed text (None only for absence); propagate failed reads."""
+    from ouroboros.commit_admission import read_release_file
+    return read_release_file(repo_dir, path, source="index")
 
 
 def _preflight_check(commit_message: str, staged_files: str,
@@ -508,7 +498,6 @@ def _preflight_check(commit_message: str, staged_files: str,
     the semantic checklist: docs/CHECKLISTS.md item 6 (tests_affected) and
     item 8 (version_bump).
     """
-    import re
     import string as _string
 
     # Accept either name-status lines ("A  path") or plain filenames.
@@ -537,17 +526,13 @@ def _preflight_check(commit_message: str, staged_files: str,
     active_staged = {path for status, path in file_status if status != "D"}
     # Added/Copied count as new modules; renames do not.
     new_files = {path for status, path in file_status if status in ("A", "C")}
-    version_staged = "VERSION" in active_staged
-
-    # VERSION staged but README missing.
-    if version_staged and "README.md" not in active_staged:
-        return (
-            "⚠️ PREFLIGHT_BLOCKED: Staged diff is incomplete — fix before review.\n"
-            "  Missing from staged: README.md (badge + changelog)\n"
-            f"  Currently staged: {', '.join(sorted(staged_set)) or '(none)'}\n\n"
-            "Stage all related files together. Use write_file for all files first,\n"
-            "then commit_reviewed to stage and commit everything in one diff."
-        )
+    from ouroboros.commit_admission import release_metadata_diagnostics, format_release_metadata_preflight
+    release_error = format_release_metadata_preflight(release_metadata_diagnostics(
+        repo_dir, sorted(active_staged), source="index",
+        read_text=lambda path: _git_show_staged(repo_dir, path),
+    ))
+    if release_error:
+        return release_error
 
     # The version-reference and tests-required lexical heuristics were removed
     # here (false blocks: a "conversion" commit told to bump VERSION; a
@@ -579,74 +564,6 @@ def _preflight_check(commit_message: str, staged_files: str,
             f"  New files: {new_logic_files[:5]}\n"
             f"  Currently staged: {', '.join(sorted(staged_set)) or '(none)'}"
         )
-
-    # VERSION changes must keep staged version carriers synchronized.
-    if version_staged:
-        try:
-            from ouroboros.tools.release_sync import (
-                is_release_version,
-                version_carrier_desyncs,
-            )
-            version_str = _git_show_staged(repo_dir, "VERSION").strip()
-            if is_release_version(version_str):
-                desync = version_carrier_desyncs(
-                    version_str,
-                    pyproject_text=_git_show_staged(repo_dir, "pyproject.toml"),
-                    uv_lock_text=_git_show_staged(repo_dir, "uv.lock"),
-                    web_package_text=_git_show_staged(repo_dir, "web/package.json"),
-                    web_package_lock_text=_git_show_staged(repo_dir, "web/package-lock.json"),
-                    readme_text=_git_show_staged(repo_dir, "README.md"),
-                    arch_text=_git_show_staged(repo_dir, "docs/ARCHITECTURE.md"),
-                    api_types_text=_git_show_staged(repo_dir, "web/modules/api_types.js"),
-                    download_readme_text=_git_show_staged(repo_dir, "README.md"),
-                    site_install_text=_git_show_staged(repo_dir, "site/install/index.html"),
-                    docs_install_text=_git_show_staged(repo_dir, "docs/install/index.html"),
-                    detailed=True,
-                )
-                if desync:
-                    return (
-                        f"⚠️ PREFLIGHT_BLOCKED: VERSION file says {version_str} but "
-                        "the following staged files have a different version value:\n"
-                        + "".join(f"  - {d}\n" for d in desync)
-                        + "Update all version references to match VERSION before committing.\n"
-                        f"  Currently staged: {', '.join(sorted(staged_set)) or '(none)'}"
-                    )
-        except Exception:
-            pass  # Non-fatal: LLM reviewers handle version sync
-
-    # VERSION changes need a staged README changelog row, and the staged README
-    # must respect P9 history limits.
-    if version_staged:
-        try:
-            from ouroboros.tools.release_sync import is_release_version
-            version_str = _git_show_staged(repo_dir, "VERSION").strip()
-            if is_release_version(version_str):
-                readme_text = _git_show_staged(repo_dir, "README.md")
-                if readme_text and not re.search(r'\|\s*' + re.escape(version_str) + r'\s*\|', readme_text):
-                    return (
-                        f"⚠️ PREFLIGHT_BLOCKED: VERSION is {version_str} but README.md "
-                        "changelog has no table row for this version.\n"
-                        "  Add a changelog entry in the Version History table in README.md.\n"
-                        f"  Currently staged: {', '.join(sorted(staged_set)) or '(none)'}"
-                    )
-        except Exception:
-            pass  # Non-fatal
-        try:
-            readme_staged = _git_show_staged(repo_dir, "README.md")
-            if readme_staged:
-                from ouroboros.tools.release_sync import check_history_limit
-                limit_warnings = check_history_limit(readme_staged)
-                if limit_warnings:
-                    return (
-                        "⚠️ PREFLIGHT_BLOCKED: README.md Version History exceeds BIBLE.md P9 limits.\n"
-                        + "".join(f"  - {w}\n" for w in limit_warnings)
-                        + "  Trim the oldest entry in the over-limit category before committing.\n"
-                        + "  Quick check: python -c \"from ouroboros.tools.release_sync import "
-                        "check_history_limit; print(check_history_limit(open('README.md').read()))\"\n"
-                        + f"  Currently staged: {', '.join(sorted(staged_set)) or '(none)'}"
-                    )
-        except Exception:
-            pass  # Non-fatal: LLM reviewers handle P9 limits as advisory fallback
 
     # conftest.py must not contain collectable module-level tests.
     conftest_files = [f for f in active_staged if pathlib.Path(f).name == "conftest.py"]
@@ -1048,7 +965,10 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
 
     preflight_err = _preflight_check(commit_message, preflight_staged, target_repo)
     if preflight_err:
-        ctx._last_review_block_reason = "preflight"
+        from ouroboros.commit_admission import preflight_evidence_unavailable
+        ctx._last_review_block_reason = (
+            "infra_failure" if preflight_evidence_unavailable(preflight_err) else "preflight"
+        )
         result = _handle_review_block_or_warning(
             ctx, blocking_review, preflight_err,
             "Review enforcement=Advisory: preflight warning did not block commit. ",

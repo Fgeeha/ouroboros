@@ -59,7 +59,12 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 106400 -> 106600 (#1195 merge of 32d8dfc6): the base's settings_catalog.js
     # paragraph (#1214, +319 bytes) landed in the same window; both additions stand,
     # neither displaces the other's text.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 106600,
+    # 106600 -> 107000 (truthful-cards batch): the chapter gains one new owner
+    # paragraph (`terminal_projection.py`, #1154) and the checkpoint/cancellation
+    # vocabulary (#931/#1061); the touched descriptions were REPLACED and
+    # compressed (net chapter growth is under the added owner's paragraph size),
+    # and the merged #1236 base already sat 5 bytes under the previous budget.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 107000,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
@@ -94,7 +99,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # FOCUS_SOURCE_UNRESOLVED) and a settled root's focus is dropped — new
     # contract facts of the cross-focus paragraph, not a restatement; +250 for
     # the digest-selected historical read and the reader admission rule.
-    "docs/architecture/06-agent-core.md": 295650,
+    # 295650 -> 297250: document the new diagnostic-only source/coverage contract,
+    # unavailable evidence and no-effects ordering without removing review/custody rules.
+    "docs/architecture/06-agent-core.md": 297250,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
@@ -119,7 +126,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 7764 -> 8600 (#1195): the fresh selected-subject + immutable peer projection
     # execution check (`skill_peer_inventory.py`, `skill_conflicts.py`) replaces
     # whole-inventory hashing; the chapter had no description of that seam to swap out.
-    "docs/architecture/13-external-skills-layer.md": 8600,
+    # Dispatcher producer/annotation separation and its retained-source lifetime.
+    "docs/architecture/13-external-skills-layer.md": 9500,
     "docs/development/01-role-and-authority.md": 2437,
     "docs/development/02-naming-and-boundaries.md": 36372,
     # 22873 -> 23100: one new invariant (notifications ring for live events
