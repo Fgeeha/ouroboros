@@ -8,6 +8,7 @@ import functools
 import os
 import pathlib
 import shutil
+import runpy
 import subprocess
 import sys
 import tempfile
@@ -15,11 +16,45 @@ import threading
 import time
 import zlib
 
+_PYTEST_DATA_DIR = None
+_PYTEST_ROOT = None
+# Empty in an explicit live-DATA run, which installs no disposable defaults.
+_PYTEST_DEFAULTS: dict = {}
+
+
+# Repo root for a live-DATA run, which has no pytest data dir to hang it off. Created lazily
+# so the hermetic lane never leaves an unused temp dir behind (see pytest_sessionfinish).
+_PYTEST_REPO_FALLBACK = None
+if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") != "1":
+    _LIVE_DATA_ROOT = (
+        os.environ.get("OUROBOROS_TEST_LIVE_DATA_ROOT")
+        or os.environ.get("OUROBOROS_DATA_DIR")
+        or str(pathlib.Path.home() / "Ouroboros" / "data")
+    )
+    # Run the stdlib-only helper by path: no package/config import may precede
+    # this boundary, including pytest plugins loaded from test modules.
+    _PYTEST_ROOT = pathlib.Path(tempfile.mkdtemp(prefix="ouroboros-pytest-"))
+    _environment = runpy.run_path(str(pathlib.Path(__file__).resolve().parents[1]
+                                    / "ouroboros" / "test_environment.py"))
+    _PYTEST_DEFAULTS = _environment["isolated_environment"](
+        _PYTEST_ROOT, _PYTEST_ROOT / "data" / "repo", source={},
+    )
+    # Bare pytest retains explicitly supplied lane/provider controls (integration
+    # CI needs them). safe_test.py and preflight scrub the whole owner environment.
+    # HOME is already disposable. Leave Deliverables home-derived so tests that
+    # select their own HOME/user-files jail do not inherit an unrelated pin.
+    _PYTEST_DEFAULTS["OUROBOROS_DELIVERABLES_ROOT"] = ""
+    os.environ.update(_PYTEST_DEFAULTS)
+    os.environ.pop("OUROBOROS_MANAGED_BY_LAUNCHER", None)
+    os.environ.pop("OUROBOROS_MANAGED_REPO_DIR", None)
+    os.environ["OUROBOROS_TEST_LIVE_DATA_ROOT"] = _LIVE_DATA_ROOT
+    _PYTEST_DATA_DIR = pathlib.Path(os.environ["OUROBOROS_DATA_DIR"])
+    tempfile.tempdir = os.environ["TMPDIR"]
+    sys.pycache_prefix = os.environ["PYTHONPYCACHEPREFIX"]
+
 import pytest
 pytest.register_assert_rewrite("tests.ui_media_delivery_smoke")
-
-
-_PYTEST_DATA_DIR = None
+pytest_plugins = ["tests.browser_lane"]
 
 
 @pytest.fixture
@@ -97,47 +132,30 @@ def pytest_testnodedown(node, error):
         for path in sorted(trace_dir.glob("*.log")):
             print(f"\npreflight diagnostic {path.name}:\n{path.read_text(encoding='utf-8')}")
 
-
-# Repo root for a live-DATA run, which has no pytest data dir to hang it off. Created lazily
-# so the hermetic lane never leaves an unused temp dir behind (see pytest_sessionfinish).
-_PYTEST_REPO_FALLBACK = None
-if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") != "1":
-    _LIVE_DATA_ROOT = (
-        os.environ.get("OUROBOROS_TEST_LIVE_DATA_ROOT")
-        or os.environ.get("OUROBOROS_DATA_DIR")
-        or str(pathlib.Path.home() / "Ouroboros" / "data")
-    )
-    _PYTEST_DATA_DIR = pathlib.Path(tempfile.mkdtemp(prefix="ouroboros-pytest-data-"))
-    os.environ["OUROBOROS_PYTEST_ACTIVE"] = "1"
-    os.environ["OUROBOROS_TEST_LIVE_DATA_ROOT"] = _LIVE_DATA_ROOT
-    os.environ["OUROBOROS_DATA_DIR"] = str(_PYTEST_DATA_DIR)
-    os.environ["OUROBOROS_SETTINGS_PATH"] = str(_PYTEST_DATA_DIR / "settings.json")
-    # Conftest-WIDE bench-runs isolation. devtools benchmark tests invoke
-    # run_*.main(), whose run_root() defaults to the real <repo>/../bench_runs
-    # when OUROBOROS_BENCH_RUNS_ROOT is unset — leaking timestamped run dirs and
-    # ouroboros_task_body.json stubs into the operator's bench_runs/ (the
-    # programbench/swe_bench_pro pollution). A file-local autouse fixture only
-    # covered one module; pinning it here covers every test.
-    os.environ["OUROBOROS_BENCH_RUNS_ROOT"] = str(_PYTEST_DATA_DIR / "bench_runs")
-
-
 _ORIGINAL_POPEN_INIT = subprocess.Popen.__init__
-_PYTEST_CHILD_DATA_DIR = os.environ.get("OUROBOROS_DATA_DIR", "")
 _PYTEST_CHILD_LIVE_ROOT = os.environ.get("OUROBOROS_TEST_LIVE_DATA_ROOT", "")
-_PYTEST_CHILD_BENCH_ROOT = os.environ.get("OUROBOROS_BENCH_RUNS_ROOT", "")
 _PYTEST_POPEN_PATCHED = False
 
 
 def _isolated_child_env(value) -> dict:
     child_env = dict(value)
-    if not child_env.get("OUROBOROS_DATA_DIR"):
-        child_env["OUROBOROS_DATA_DIR"] = _PYTEST_CHILD_DATA_DIR
-    if not child_env.get("OUROBOROS_SETTINGS_PATH"):
+    synthetic_home = (child_env.get("HOME") or child_env.get("USERPROFILE"))
+    synthetic_home = synthetic_home and synthetic_home != _PYTEST_DEFAULTS["HOME"]
+    home_defaults = {"HOME", "USERPROFILE", "OUROBOROS_APP_ROOT", "OUROBOROS_REPO_DIR",
+                     "OUROBOROS_SUBAGENT_PROJECTS_ROOT", "OUROBOROS_SUBAGENT_WORKTREE_ROOT",
+                     "OUROBOROS_DELIVERABLES_ROOT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"}
+    empty_controls = {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "PYTHONUTF8",
+                      "PYTHONIOENCODING", "PYTHONNOUSERSITE"}
+    for key, default_value in _PYTEST_DEFAULTS.items():
+        if synthetic_home and key in home_defaults:
+            continue  # A test explicitly selected its own synthetic HOME semantics.
+        if key not in child_env or (not child_env[key] and key not in empty_controls):
+            child_env[key] = default_value
+    if not value.get("OUROBOROS_SETTINGS_PATH"):
         child_env["OUROBOROS_SETTINGS_PATH"] = str(
-            pathlib.Path(child_env["OUROBOROS_DATA_DIR"]) / "settings.json"
-        )
-    if _PYTEST_CHILD_BENCH_ROOT and not child_env.get("OUROBOROS_BENCH_RUNS_ROOT"):
-        child_env["OUROBOROS_BENCH_RUNS_ROOT"] = _PYTEST_CHILD_BENCH_ROOT
+            pathlib.Path(child_env["OUROBOROS_DATA_DIR"]) / "settings.json")
+    child_env.pop("OUROBOROS_MANAGED_BY_LAUNCHER", None)
+    child_env.pop("OUROBOROS_MANAGED_REPO_DIR", None)
     child_env["OUROBOROS_PYTEST_ACTIVE"] = "1"
     child_env["OUROBOROS_TEST_LIVE_DATA_ROOT"] = _PYTEST_CHILD_LIVE_ROOT
     return child_env
@@ -152,10 +170,10 @@ def _install_pytest_child_isolation() -> None:
     @functools.wraps(_ORIGINAL_POPEN_INIT)
     def isolated_init(self, *args, **kwargs):
         positional = list(args)
-        if len(positional) > 10 and positional[10] is not None:
-            positional[10] = _isolated_child_env(positional[10])
-        elif kwargs.get("env") is not None:
-            kwargs["env"] = _isolated_child_env(kwargs["env"])
+        if len(positional) > 10:
+            positional[10] = _isolated_child_env(os.environ if positional[10] is None else positional[10])
+        else:
+            kwargs["env"] = _isolated_child_env(os.environ if kwargs.get("env") is None else kwargs["env"])
         return _ORIGINAL_POPEN_INIT(self, *positional, **kwargs)
 
     subprocess.Popen.__init__ = isolated_init
@@ -368,6 +386,12 @@ def _pin_lane_groups(items, shards: int) -> None:
     items.sort(key=lambda item: item.get_closest_marker("serial") is None)
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_configure(config):
+    if _PYTEST_ROOT is not None:
+        config.inicfg["cache_dir"] = str(_PYTEST_ROOT / "pytest-cache")
+
+
 def pytest_sessionstart(session):  # noqa: ARG001
     _bind_pytest_runtime_roots()
     _install_pytest_child_isolation()
@@ -411,7 +435,7 @@ def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
         workeroutput["thread_leaks"] = list(_THREAD_LEAKS)
     # Per-process temp data dir (unique mkdtemp per controller/worker) — clean on EVERY process.
     if _PYTEST_DATA_DIR is not None:
-        shutil.rmtree(_PYTEST_DATA_DIR, ignore_errors=True)
+        shutil.rmtree(_PYTEST_ROOT or _PYTEST_DATA_DIR, ignore_errors=True)
     if _PYTEST_REPO_FALLBACK is not None:
         shutil.rmtree(_PYTEST_REPO_FALLBACK, ignore_errors=True)
 

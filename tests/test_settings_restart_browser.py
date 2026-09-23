@@ -34,7 +34,7 @@ def settings_server(request, tmp_path, monkeypatch):
         '''), encoding="utf-8")
     bootstrap.write_text(textwrap.dedent(f'''\
         import pathlib, runpy, subprocess, sys
-        sys.path.insert(0, {smoke.REPO_ROOT!r})
+        sys.path.insert(0, str(pathlib.Path.cwd()))
         from ouroboros.local_model import LocalModelManager
         LocalModelManager.download_model = lambda self, source, filename: str(pathlib.Path({str(tmp_path)!r}) / filename)
         original_popen, original_run = subprocess.Popen, subprocess.run
@@ -49,7 +49,7 @@ def settings_server(request, tmp_path, monkeypatch):
             return original_run(command, **kwargs)
         subprocess.Popen, subprocess.run = Popen, run
         sys.argv = sys.argv[1:]
-        runpy.run_path({str(pathlib.Path(smoke.REPO_ROOT) / 'server.py')!r}, run_name="__main__")
+        runpy.run_path(str(pathlib.Path.cwd() / 'server.py'), run_name="__main__")
         '''), encoding="utf-8")
     launcher = tmp_path / "python-fixture"
     launcher.write_text(f'#!/bin/sh\nexec "{sys.executable}" "{bootstrap}" "$@"\n', encoding="utf-8")

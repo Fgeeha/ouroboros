@@ -176,6 +176,8 @@ def fixture_probe(tmp_path, monkeypatch):
     monkeypatch.setattr(ui, "MockLLMServer", lambda: nullcontext(
         SimpleNamespace(base_url="http://127.0.0.1:9/v1")
     ))
+    monkeypatch.setattr(ui, "_assert_served_candidate", lambda *args: None)
+    monkeypatch.setattr(ui, "require_candidate_interpreter", lambda: None)
     monkeypatch.setattr(ui, "_free_port", lambda: 27991)  # no port is actually bound
     monkeypatch.setattr(ui, "_wait_health", health)
     monkeypatch.setattr(ui, "_wait_supervisor_ready", supervisor)
@@ -326,6 +328,8 @@ def test_ui_fixture_preserves_reap_diagnostic_when_parent_survives(tmp_path, mon
     waits, closed = [], []
 
     class UnstoppedProcess:
+        pid = 12345  # Synthetic identity; the served-candidate probe is stubbed below.
+
         def poll(self):
             return None
 
@@ -351,6 +355,8 @@ def test_ui_fixture_preserves_reap_diagnostic_when_parent_survives(tmp_path, mon
     monkeypatch.setenv("OUROBOROS_RUN_UI_SMOKE", "1")
     monkeypatch.setattr(pc, "ProcessContainer", FailedContainer)
     monkeypatch.setattr(ui, "MockLLMServer", lambda: nullcontext(SimpleNamespace(base_url="http://127.0.0.1:9")))
+    monkeypatch.setattr(ui, "_assert_served_candidate", lambda *args: None)
+    monkeypatch.setattr(ui, "require_candidate_interpreter", lambda: None)
     monkeypatch.setattr(ui, "_free_port", lambda: 27991)
     monkeypatch.setattr(ui, "_wait_health", lambda _: None)
     monkeypatch.setattr(ui, "_wait_supervisor_ready", lambda _: None)

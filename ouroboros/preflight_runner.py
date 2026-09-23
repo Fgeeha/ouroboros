@@ -19,7 +19,6 @@ from typing import NamedTuple, Optional, Sequence
 # candidate's web/tests/*.test.js — see ouroboros/preflight_node.py. Imported
 # by name so tests/operators can stub `preflight_runner.run_node_tests`.
 from ouroboros.preflight_node import run_node_tests
-from ouroboros.settings_defaults import settings_env_keys
 
 
 DEFAULT_PYTEST_ARGS = ["tests/", "-q", "--tb=line", "--no-header"]
@@ -574,55 +573,15 @@ def _observed_worker_ids(temp_root: pathlib.Path) -> set:
         return set()
 
 
-def _preflight_env(temp_root: pathlib.Path, repo_worktree: pathlib.Path) -> dict:
-    env = dict(os.environ)
-    # The candidate suite must not inherit live runtime behaviour or credentials.
-    # A disposable data/settings/repo triple is injected below; every other
-    # OUROBOROS_* value is owner/runtime state, not test wiring. Keeping those
-    # values made a supposedly hermetic preflight depend on the operator's live
-    # safety/review/mode settings and could also expose prefixed secrets to a
-    # self-written test.
-    secret_suffixes = ("_API_KEY", "_TOKEN", "_PASSWORD", "_CREDENTIALS", "_SECRET")
-    # Every key config.apply_settings_to_env projects from settings.json is the
-    # same owner state under a name the prefix/suffix rules miss (provider base
-    # URLs, USE_LOCAL_*, LOCAL_MODEL_*, MCP_*, GITHUB_REPO, TOTAL_BUDGET): the
-    # suite routes on OPENAI_COMPATIBLE_BASE_URL alone. Derived, not hand-listed.
-    projected = frozenset(settings_env_keys())
-    for key in list(env):
-        if (
-            key.startswith("OUROBOROS_")
-            or key.endswith(secret_suffixes)
-            or key in projected
-            or key.startswith("GH_")
-            # Externally supplied pytest/xdist controls are dropped WHOLESALE
-            # rather than by name, because every one of them can weaken the pass
-            # while the argv still reads like a full parallel run:
-            # PYTEST_XDIST_AUTO_NUM_WORKERS decides what `-n auto` resolves to,
-            # PYTEST_ADDOPTS can append `-p no:xdist` or its own `-m`,
-            # PYTEST_PLUGINS / PYTEST_DISABLE_PLUGIN_AUTOLOAD decide whether the
-            # verified plugins load at all, and PYTEST_XDIST_WORKER /
-            # PYTEST_XDIST_TESTRUNUID / PYTEST_CURRENT_TEST leak the OUTER run's
-            # identity into the nested one. A green pass under any of those is
-            # indistinguishable from a green pass under the real gate.
-            or key.startswith("PYTEST_")
-        ):
-            env.pop(key, None)
+def _preflight_env(temp_root: pathlib.Path, repo_worktree: pathlib.Path, *, create=True) -> dict:
+    from ouroboros.test_environment import isolated_environment
+
     temp_root = pathlib.Path(temp_root).resolve(strict=False)
-    repo_worktree = pathlib.Path(repo_worktree).resolve(strict=False)
-    data_dir = (temp_root / "data").resolve(strict=False)
-    env["OUROBOROS_DATA_DIR"] = str(data_dir)
-    env["OUROBOROS_SETTINGS_PATH"] = str(data_dir / "settings.json")
-    env["OUROBOROS_REPO_DIR"] = str(repo_worktree)
-    env["PYTHONPYCACHEPREFIX"] = str((temp_root / "pycache").resolve(strict=False))
-    # Keep pytest's numbered-directory cleanup out of other runs' temp trees.
-    env["PYTEST_DEBUG_TEMPROOT"] = str(temp_root)
+    env = isolated_environment(temp_root, repo_worktree, create=create)
     # PREPENDED, so `-p ouroboros_preflight_probe` resolves to the gate's own
     # worker-count plugin and not to anything the candidate tree or the
     # operator's PYTHONPATH happens to shadow it with.
-    inherited_path = env.get("PYTHONPATH", "")
-    env["PYTHONPATH"] = str(_probe_dir(temp_root)) + (
-        os.pathsep + inherited_path if inherited_path else ""
-    )
+    env["PYTHONPATH"] = str(_probe_dir(temp_root))
     # Re-injected AFTER the scrub, so `-n auto` resolves to a count this process
     # chose rather than one the operator environment happened to carry. Inert for
     # the serial/legacy passes, which pass no `-n` at all.

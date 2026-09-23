@@ -533,7 +533,7 @@ def test_projected_settings_keys_never_reach_the_candidate_suite(tmp_path, monke
 
     monkeypatch.setenv(key, "owner-runtime-state")
     env = _preflight_env(tmp_path / "root", tmp_path / "root" / "repo")
-    assert key not in env, f"{key} leaked into the candidate suite"
+    assert env.get(key) != "owner-runtime-state", f"{key} leaked into the candidate suite"
 
 
 def test_the_gate_pins_the_worker_count_it_verified(tmp_path, monkeypatch):
@@ -567,7 +567,7 @@ def test_the_worker_probe_is_prepended_to_pythonpath(tmp_path, monkeypatch):
     assert entries[0] == str(pr._probe_dir(root.resolve(strict=False))), (
         "the gate's probe dir is shadowable"
     )
-    assert "/inherited/first" in entries, "the inherited PYTHONPATH was discarded, not prepended to"
+    assert "/inherited/first" not in entries, "an owner import path leaked into the candidate"
 
     module = pr._install_worker_probe(root)
     assert module.startswith(pr._WORKER_PROBE_MODULE + "_"), module
