@@ -58,7 +58,7 @@ their server children — including a child that passes `env=None` — while roo
 test chose explicitly survive. Bare pytest keeps explicitly supplied
 provider/lane controls for integration CI; launcher and preflight scrub them.
 Under that marker `supervisor/git_ops_reset.py` installs no dependencies for ANY
-caller, leaving production policy unchanged. The boundary also selects a stable C locale and a Git discovery ceiling at its disposable root. `workspace_admission.has_git_metadata` shares that ceiling-aware ancestor check with subagent admission and ordinary-folder output capture: foreign ancestors do not turn test folders into repositories, while broken metadata inside the boundary still refuses. Pytest leaves Deliverables home-derived under its disposable HOME so tests selecting their own HOME or user-files jail retain their semantics. None of this is an OS sandbox.
+caller; production unchanged. C locale/Git ceilings stabilize probes; pytest Deliverables follows synthetic HOME. Not an OS sandbox.
 
 `tests/candidate_checkout.py` owns the UI fixture's independent checkout: tracked
 worktree bytes plus non-ignored new files — staged, unstaged, deleted, executable

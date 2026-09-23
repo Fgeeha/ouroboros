@@ -150,6 +150,8 @@ def _isolated_child_env(value) -> dict:
     empty_controls = {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "PYTHONUTF8",
                       "PYTHONIOENCODING", "PYTHONNOUSERSITE"}
     for key, default_value in _PYTEST_DEFAULTS.items():
+        if key == "PYTHONDONTWRITEBYTECODE" and key not in child_env and "PYTHONPYCACHEPREFIX" in child_env:
+            continue  # Explicit cache selection may intentionally exercise bytecode writes.
         if synthetic_home and key in home_defaults:
             continue  # A test explicitly selected its own synthetic HOME semantics.
         if key not in child_env or (not child_env[key] and key not in empty_controls):
