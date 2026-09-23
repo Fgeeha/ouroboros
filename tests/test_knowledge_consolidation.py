@@ -35,9 +35,9 @@ class MemoryLLM:
     def chat(self, **kwargs):
         self.calls.append(deepcopy(kwargs))
         if kwargs["messages"][0]["content"].startswith("Compare this draft memory"):
-            # The correction answers with the checked memory text and carries the
-            # draft's nomination block through the same source check (the
-            # corrected block is the one released).
+            if kwargs["messages"][-1]["role"] != "tool":
+                return {"content": "", "tool_calls": [_call()]}, {"cost": 0.01}
+            # Corrected existing-note replacements require this operation's read.
             prompt = kwargs["messages"][0]["content"]
             block = prompt.split("## Draft memory", 1)[1].split("\n\n", 1)[0] if "## Draft memory" in prompt else ""
             nominations = block[block.index("KNOWLEDGE_ENTRIES_JSON:"):] if "KNOWLEDGE_ENTRIES_JSON:" in block else ""
@@ -143,7 +143,7 @@ def test_dialogue_consolidation_retains_nominations_and_commits_shared_note(tmp_
     llm = MemoryLLM(answer)
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path, task_id="dialogue-memory")
     usage = c.consolidate(chat, blocks, meta, llm, knowledge_context=ctx)
-    assert usage["cost"] == pytest.approx(0.05)  # read, draft answer, correction
+    assert usage["cost"] == pytest.approx(0.06)  # draft read/answer, correction read/answer
     block = json.loads(blocks.read_text())[0]
     assert "KNOWLEDGE_ENTRIES_JSON" not in block["content"]
     assert block["rooms"][0]["content"] == "Checked interpretation."
