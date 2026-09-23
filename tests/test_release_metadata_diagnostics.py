@@ -351,3 +351,21 @@ def test_author_formatter_also_preserves_non_release_staged_checks(candidate, pa
     _git(candidate.repo_dir, "add", ".")
     result = bind_author_commit_candidate(candidate, "candidate", {"fingerprint": "current"})
     assert expected in result
+
+
+@pytest.mark.parametrize("message,reason", [
+    ("⚠️ PREFLIGHT_UNAVAILABLE: index evidence unavailable", "infra_failure"),
+    ("⚠️ PREFLIGHT_BLOCKED: malformed carrier", "preflight"),
+])
+def test_author_stage_cycle_preserves_preflight_failure_kind(candidate, monkeypatch, message, reason):
+    from ouroboros.tools import commit_gate, git_review_cycle
+
+    facade = git_review_cycle._git()
+    candidate._author_commit_source = object()
+    monkeypatch.setattr(facade, "_stage_candidate_for_review", lambda *a, **kw: ([], [], None))
+    monkeypatch.setattr(facade, "protected_paths_in", lambda paths: [])
+    monkeypatch.setattr(facade, "_current_runtime_mode", lambda: "pro")
+    monkeypatch.setattr(facade, "_fingerprint_staged_diff", lambda repo: {"ok": True})
+    monkeypatch.setattr(commit_gate, "bind_author_commit_candidate", lambda *a: message)
+    result = git_review_cycle._run_reviewed_stage_cycle(candidate, "release", 0.0)
+    assert result == {"status": "blocked", "message": message, "block_reason": reason}

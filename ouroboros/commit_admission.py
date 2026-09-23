@@ -184,6 +184,21 @@ def format_release_metadata_preflight(report: dict) -> Optional[str]:
             + "".join(f"  - Unavailable: {message}\n" for message in report["unavailable"]))
 
 
+def preflight_evidence_unavailable(message: Optional[str]) -> bool:
+    """Whether a preflight message reports unavailable evidence, not a candidate defect.
+
+    The two admission gates need that split (an unreadable source is an infra
+    failure, a bad carrier is the candidate's). Ask the one tool-result
+    classifier for the code the agent will see, so neither gate grows a second
+    private reading of the same warning text.
+    """
+    from ouroboros.tools.tool_result import LegacyTextResultAdapter
+
+    return bool(message) and LegacyTextResultAdapter.from_text(
+        "preflight_review", message,
+    ).status == "unavailable"
+
+
 def release_metadata_preflight(
     repo_dir: pathlib.Path, commit_message: str, paths: list[str] | None,
     *, source: str = "worktree",

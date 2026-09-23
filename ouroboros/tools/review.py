@@ -965,7 +965,10 @@ def _prepare_unified_review(ctx: ToolContext, commit_message: str,
 
     preflight_err = _preflight_check(commit_message, preflight_staged, target_repo)
     if preflight_err:
-        ctx._last_review_block_reason = ("infra_failure" if preflight_err.startswith("⚠️ PREFLIGHT_UNAVAILABLE:") else "preflight")
+        from ouroboros.commit_admission import preflight_evidence_unavailable
+        ctx._last_review_block_reason = (
+            "infra_failure" if preflight_evidence_unavailable(preflight_err) else "preflight"
+        )
         result = _handle_review_block_or_warning(
             ctx, blocking_review, preflight_err,
             "Review enforcement=Advisory: preflight warning did not block commit. ",

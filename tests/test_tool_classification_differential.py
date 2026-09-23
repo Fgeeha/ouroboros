@@ -381,6 +381,12 @@ CURRENT_PRODUCER_CONTRACTS = {
     "SCOPE_UNCONFIRMED": (True, "tool_reported_failure"),
     "TOOL_ERROR": (True, "error"),
     "native:TOOL_REPORTED_FAILURE:TOOL_ERROR": (True, "tool_reported_failure"),
+    # Release admission split its one PREFLIGHT_BLOCKED text in two: a source it
+    # could not read is unavailable evidence, not a candidate defect. The new
+    # identifier reaches its text through the `code` variable, so it is declared
+    # in the corpus' interpolated list and answered live here — the retired pair
+    # never saw a tree that emitted it.
+    "PREFLIGHT_UNAVAILABLE": (True, "unavailable"),
 }
 
 

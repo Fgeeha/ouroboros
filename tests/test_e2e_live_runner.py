@@ -1114,6 +1114,11 @@ def test_sm1_stub_bumps_the_release_carriers_through_the_sync_ssot(tmp_path):
     bumped = carriers["VERSION"].strip()
     assert scenarios.version_is_bumped(seed, bumped) and f"| {bumped} |" in carriers["README.md"]
     root = tmp_path / "carriers"
+    root.mkdir()
+    # The gate under test is release admission on a Git worktree: it reads the
+    # candidate's own change scope from Git, so the carrier set is materialized
+    # in a real (disposable) worktree rather than a bare directory.
+    subprocess.run(["git", "init", "-q"], cwd=str(root), check=True)
     for rel in sorted(CARRIER_SPAN_PATHS):
         if (REPO_ROOT / rel).is_file():
             (root / rel).parent.mkdir(parents=True, exist_ok=True)

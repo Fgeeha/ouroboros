@@ -1016,7 +1016,8 @@ def _advisory_pre_sdk_gate(
     release_preflight_err = (_release_metadata_preflight(repo_dir, commit_message, paths, source="index")
                              if prepared else _release_metadata_preflight(repo_dir, commit_message, paths))
     if release_preflight_err:
-        unavailable = release_preflight_err.startswith("⚠️ PREFLIGHT_UNAVAILABLE:")
+        from ouroboros.commit_admission import preflight_evidence_unavailable
+        unavailable = preflight_evidence_unavailable(release_preflight_err)
         status = "error" if unavailable else "preflight_blocked"
         ctx.emit_progress_fn(release_preflight_err)
         _persist_preflight_record(
