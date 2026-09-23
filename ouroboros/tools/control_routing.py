@@ -20,6 +20,7 @@ from ouroboros.tools.control_events import (
     _emit_and_wait_for_routing,
     _promotion_pool_disabled_from_snapshot,
 )
+from ouroboros.tool_access_paths import canonical_data_root
 from ouroboros.tools.registry import ToolContext
 from ouroboros.utils import append_jsonl, utc_now_iso
 
@@ -287,7 +288,7 @@ def _effective_scope_note(ctx: ToolContext, project_id: str) -> str:
     try:
         from ouroboros.projects_registry import get_project
 
-        name = str((get_project(Path(ctx.drive_root), pid) or {}).get("name") or "").strip()
+        name = str((get_project(canonical_data_root(ctx), pid) or {}).get("name") or "").strip()
     except Exception:
         log.debug("promote: effective project name lookup failed", exc_info=True)
     return f" in project '{name}' ({pid})" if name and name != pid else f" in project '{pid}'"
@@ -585,10 +586,12 @@ def _second_project_note(ctx: ToolContext, already_bound: str, effective_pid: st
 
 def _list_projects(ctx: ToolContext, limit: int = 50) -> str:
     """Enumerate the owner's projects (id, name, recency) so the one mind can
-    decide whether a main-chat message belongs to an existing project."""
+    decide whether a main-chat message belongs to an existing project. The registry
+    lives on the CANONICAL data root: a forked execution drive never carries
+    ``state/projects.json``, so reading the task's own drive answered "no projects"."""
     try:
         from ouroboros.projects_registry import projects_summary
-        rows = projects_summary(Path(ctx.drive_root), limit=max(1, min(int(limit or 50), 200)))
+        rows = projects_summary(canonical_data_root(ctx), limit=max(1, min(int(limit or 50), 200)))
     except Exception as exc:
         return f"⚠️ PROJECTS_ERROR: {type(exc).__name__}: {exc}"
     if not rows:
@@ -646,7 +649,7 @@ def _route_to_project(
     predecessor_home = str(predecessor_event.pop("predecessor_project_id", "") or "")
     requested_pid = str(project_id or "").strip()
     pid = sanitize_project_id(requested_pid) if requested_pid and explicit_project_id_ok(requested_pid) else ""
-    proj = get_project(Path(ctx.drive_root), pid) if pid else None
+    proj = get_project(canonical_data_root(ctx), pid) if pid else None
     failure = (
         "target_unspecified" if not requested_pid
         else "invalid_project_id" if not pid
