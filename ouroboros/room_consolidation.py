@@ -120,8 +120,8 @@ def correction_prompt(
     room_label = json.dumps(str(room_label), ensure_ascii=False)
     knowledge_check = ("If the draft has a `KNOWLEDGE_ENTRIES_JSON:` block, check those cumulative updates "
                        "against each complete current note you read YOURSELF and this episode. The draft is a "
-                       "proposal, not a source. Return corrected nominations for the same topics after the "
-                       "episodic memory, or drop them. Unsupported episode claims must not survive in a note; "
+                       "proposal, not a source. After the episodic memory, return only draft-nominated topics "
+                       "(including proposed new notes), or drop them. Unsupported episode claims must not survive in a note; "
                        "independently established knowledge may remain without becoming an event or approval "
                        "in this episode.\n" + knowledge_instruction if knowledge_instruction else "")
     return f"""Compare this draft memory of Ouroboros against its complete source and return the corrected memory.
