@@ -131,8 +131,8 @@ def release_metadata_diagnostics(
             touched.update(changed_worktree_paths(repo_dir, paths=paths, strict=True))
         elif read_text is None:
             result = subprocess.run(
-                ["git", "diff", "--cached", "--name-only", "--diff-filter=d", "-z"]
-                + (["--", *paths] if paths else []), cwd=str(repo_dir),
+                ["git", "--no-optional-locks", "diff", "--cached", "--name-only", "--diff-filter=d", "-z"],
+                cwd=str(repo_dir),
                 capture_output=True, encoding="utf-8", timeout=10, check=True,
             )
             touched.update(filter(None, result.stdout.split("\0")))

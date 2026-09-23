@@ -1091,7 +1091,8 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
             "Or bypass: commit_reviewed(commit_message='...', skip_advisory_review=True) (audited)."
         )
 
-    if matching_run and matching_run.status == "preflight_blocked":
+    if matching_run and (matching_run.status == "preflight_blocked" or
+                         matching_run.reason_kind == "release_metadata_unavailable"):
         preflight_detail = (matching_run.raw_result or "").strip()
         # H4 (capinv-447): the status is shared by several deterministic checks;
         # name the problem class only when the typed cause is recorded.
@@ -1099,6 +1100,7 @@ def _check_advisory_freshness(ctx: ToolContext, commit_message: str,
         cause = {
             "syntax": "The advisory delivery was skipped because a staged `.py` file has a SyntaxError.",
             "release_metadata": "The advisory delivery was skipped because the deterministic release metadata preflight failed.",
+            "release_metadata_unavailable": "Release metadata evidence could not be read; this is not a reviewer verdict or proof of a changed snapshot.",
         }.get(reason_kind, "The advisory delivery was skipped by a deterministic preflight check (exact cause below).")
         return (
             f"⚠️ ADVISORY_PRE_REVIEW_REQUIRED: Last advisory run for this snapshot "

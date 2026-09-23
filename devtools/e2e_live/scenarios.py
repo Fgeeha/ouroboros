@@ -488,6 +488,8 @@ def release_carriers_desync_at(clone: pathlib.Path, rev: str) -> str:
 
     with tempfile.TemporaryDirectory(prefix="sm1_carriers_") as tmp:
         root = pathlib.Path(tmp)
+        # Admission reads Git change scope; the export needs its own disposable repository.
+        subprocess.run(["git", "init", "-q"], cwd=str(root), check=True, capture_output=True)
         for rel in sorted(CARRIER_SPAN_PATHS):
             text = _git_show(clone, rev, rel)
             if text:

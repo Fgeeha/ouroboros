@@ -819,7 +819,8 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
 
     if not effective_is_fresh:
         status = str(getattr(latest, "status", "") or "")
-        if latest and status in {"tests_preflight_blocked", "preflight_blocked"} and not stale_from_edit:
+        if latest and not stale_from_edit and (status in {"tests_preflight_blocked", "preflight_blocked"} or
+                                              latest.reason_kind == "release_metadata_unavailable"):
             if status == "tests_preflight_blocked":
                 problem = "test preflight: pytest failed before the paid critic call"
                 fix = "Fix the failing tests and re-run preflight_review. Use preflight_review(skip_tests=True) only for intentional WIP code."
@@ -831,8 +832,11 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
                 if reason_kind == "syntax":
                     problem = "syntax preflight: a staged .py file has a SyntaxError"
                     fix = "See raw_result for file:line:msg, fix it, and re-run preflight_review."
+                elif reason_kind == "release_metadata_unavailable":
+                    problem = "unavailable release metadata evidence, not a candidate verdict"
+                    fix = "Restore access to the sources named in raw_result and re-run preflight_review."
                 elif reason_kind == "release_metadata":
-                    problem = "release metadata preflight: inspect all findings with preflight_review(deterministic_only=True, source=worktree or index)"
+                    problem = "release metadata preflight: inspect all findings with preflight_review(commit_message='...', deterministic_only=True, source='worktree' or 'index')"
                     fix = "See raw_result for the exact carrier mismatch, fix it, and re-run preflight_review."
                 else:
                     problem = "a deterministic preflight check (see raw_result for the exact cause)"

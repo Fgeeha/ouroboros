@@ -369,3 +369,12 @@ def test_author_stage_cycle_preserves_preflight_failure_kind(candidate, monkeypa
     monkeypatch.setattr(commit_gate, "bind_author_commit_candidate", lambda *a: message)
     result = git_review_cycle._run_reviewed_stage_cycle(candidate, "release", 0.0)
     assert result == {"status": "blocked", "message": message, "block_reason": reason}
+
+
+def test_index_checks_the_whole_staged_candidate_even_with_narrow_paths(candidate):
+    repo = candidate.repo_dir
+    _write(repo, _release("1.2.4"))
+    _git(repo, "add", ".")
+    report = admission.release_metadata_diagnostics(repo, ["VERSION"], source="index")
+    assert report["status"] == "clean"
+    assert report["findings"] == []
