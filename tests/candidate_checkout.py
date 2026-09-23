@@ -207,6 +207,7 @@ class CandidateState:
     index: bytes
     status: bytes
     entries: bytes
+    staged_diff: bytes
     files: dict
 
     @property
@@ -221,10 +222,11 @@ class CandidateState:
         A clone names its own branch, and a process started from the copy may run
         `git status`, which rewrites the index file's cached stat data without
         changing one staged entry. The staged ENTRIES (mode, object, stage, path)
-        are the index content this identity binds; the raw bytes are copied
+        and the staged diff (which distinguishes intent-to-add from an empty
+        staged blob) are the index content this identity binds; raw bytes are copied
         verbatim but compared only by the source-drift check.
         """
-        return _content_digest(self.head, self.entries, self.files)
+        return _content_digest(self.head, self.entries, self.files, prefix=self.staged_diff)
 
 
 @dataclass
@@ -254,7 +256,7 @@ class CandidateCheckout:
     @property
     def checkout_identity(self) -> str:
         return _content_digest(self.state.head, self.state.entries,
-                               {**self.state.files, **self.overlay})
+                               {**self.state.files, **self.overlay}, prefix=self.state.staged_diff)
 
     @property
     def sentinel_bytes(self) -> bytes:
@@ -305,11 +307,13 @@ def observe_candidate(repo: Path) -> CandidateState:
         index_path = repo / index_path
     index = index_path.read_bytes()
     status = _git(repo, "status", "--porcelain=v1", "-z", "--untracked-files=all")
+    staged_diff = _git(repo, "diff", "--cached", "--raw", "-z", "--no-abbrev",
+                       "--no-renames", "--no-ext-diff", "--ita-invisible-in-index", "HEAD", "--")
     names = _names(_git(repo, "ls-tree", "-r", "--name-only", "-z", "HEAD"))
     names |= _names(_git(repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard"))
     names |= _filesystem_names(repo)
     files = {name: _read(repo, name) for name in sorted(names)}
-    return CandidateState(head, branch, index, status, entries, files)
+    return CandidateState(head, branch, index, status, entries, staged_diff, files)
 
 
 def _copy_candidate(source: Path, target: Path, state: CandidateState) -> None:
@@ -356,7 +360,7 @@ def verify_checkout(target: Path, checkout: CandidateCheckout) -> None:
     if after.content_identity == checkout.checkout_identity:
         return
     expected = {**checkout.state.files, **{name: value + (None,) for name, value in checkout.overlay.items()}}
-    fields = [key for key in ("head", "entries") if getattr(checkout.state, key) != getattr(after, key)]
+    fields = [key for key in ("head", "entries", "staged_diff") if getattr(checkout.state, key) != getattr(after, key)]
     paths = _changed_paths(expected, after.files)
     raise CandidateError("CANDIDATE_CHANGED: fixture checkout differs from selected bytes/index/HEAD: "
                          f"metadata={fields!r}, paths={paths[:10]!r} ({len(paths)} total)")

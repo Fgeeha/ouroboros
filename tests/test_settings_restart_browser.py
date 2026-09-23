@@ -152,7 +152,9 @@ def test_pending_survives_reconnect_draft_and_restart_request(settings_server, e
             expect(page.locator('#btn-restart-now')).to_be_visible()
             page.locator('#settings-restart-status').scroll_into_view_if_needed()
             page.screenshot(path=str(evidence / f'settings-host-source-unknown-{engine}.png'))
-            page.unroute('**/api/settings', old_launcher_metadata)
+            # Reconnect refresh may still be inside fetch/fulfill: drain it
+            # before removing interception, rather than continuing its route twice.
+            page.unroute_all(behavior='wait')
             fill_value('#s-workers', 1)
             fill_value('#s-server-host', '127.0.0.1')
             save()

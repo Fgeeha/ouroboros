@@ -58,14 +58,14 @@ their server children — including a child that passes `env=None` — while roo
 test chose explicitly survive. Bare pytest keeps explicitly supplied
 provider/lane controls for integration CI; launcher and preflight scrub them.
 Under that marker `supervisor/git_ops_reset.py` installs no dependencies for ANY
-caller; production unchanged. C locale/Git ceilings stabilize probes; pytest Deliverables follows synthetic HOME. Not an OS sandbox.
+caller; production unchanged. C locale/Git ceilings stabilize probes; pytest Deliverables follows synthetic HOME. `MAC_CHROMIUM_TMPDIR` shares the disposable temp root: macOS Chromium ignores `TMPDIR` for initial download staging. Not an OS sandbox.
 
 `tests/candidate_checkout.py` owns shared UI and keyless wait/repair checkouts: tracked
 worktree bytes plus non-ignored new files — staged, unstaged, deleted, executable
 and binary alike. It preserves the source HEAD, branch and raw index, verifies
 source identity before and after capture and at teardown, and verifies the copy
 before each server incarnation and at exit, kept unless all reaped. The copy's
-identity binds HEAD, the staged ENTRIES and every file's bytes and mode — not the
+identity binds HEAD, staged entries and their diff (including intent-to-add), and every file's bytes and mode — not the
 raw index bytes: a served process runs `git status`, which rewrites the index's
 cached stat data without moving one staged entry, and the error names the
 metadata field or paths that did move. Ignored artifacts and empty

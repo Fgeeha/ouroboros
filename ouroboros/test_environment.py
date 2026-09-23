@@ -83,6 +83,8 @@ def isolated_environment(root: Path, repo: Path, *, source=None, keep=(), create
         "XDG_DATA_HOME": root / "xdg-data", "XDG_STATE_HOME": root / "xdg-state",
         "APPDATA": root / "config", "LOCALAPPDATA": root / "cache",
         "TMPDIR": root / "tmp", "TEMP": root / "tmp", "TMP": root / "tmp",
+        # Chromium on macOS ignores TMPDIR for initial download staging.
+        "MAC_CHROMIUM_TMPDIR": root / "tmp",
         "PYTEST_DEBUG_TEMPROOT": root / "tmp",
         "UV_CACHE_DIR": root / "cache" / "uv",
         "UV_PYTHON_INSTALL_DIR": root / "python",

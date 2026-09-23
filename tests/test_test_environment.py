@@ -25,6 +25,13 @@ def test_static_settings_scrub_covers_runtime_vocabulary():
     assert set(settings_env_keys()) <= settings_keys()
 
 
+def test_chromium_download_staging_uses_disposable_temp(tmp_path):
+    env = isolated_environment(tmp_path, REPO, source={"MAC_CHROMIUM_TMPDIR": "/owner-temp"})
+    assert env["MAC_CHROMIUM_TMPDIR"] == env["TMPDIR"]
+    assert Path(env["MAC_CHROMIUM_TMPDIR"]).is_relative_to(tmp_path)
+    assert Path(env["MAC_CHROMIUM_TMPDIR"]).is_dir()
+
+
 _WRITE_ROOTS = """
 import json, os, pathlib
 from ouroboros import config
@@ -238,6 +245,17 @@ def test_pytest_is_refused_any_deletion_of_test_trees(tmp_path, monkeypatch):
     worker = _pytest_config(tmp_path, worker=True)
     conftest._guard_test_tree_deletion(worker)
     assert worker.option.basetemp is None
+
+
+def test_basetemp_dotdot_cannot_delete_an_existing_tree(tmp_path):
+    retained = tmp_path / "retained"
+    retained.mkdir()
+    sentinel = retained / "sentinel"
+    sentinel.write_bytes(b"keep")
+    spelling = tmp_path / "nonexistent" / ".." / "retained"
+    with pytest.raises(pytest.UsageError, match="already exists"):
+        _live_conftest()._guard_test_tree_deletion(_pytest_config(tmp_path, basetemp=str(spelling)))
+    assert sentinel.read_bytes() == b"keep"
 
 
 def test_two_sequential_pytest_sessions_under_one_launcher_root_never_share_a_basetemp(tmp_path):

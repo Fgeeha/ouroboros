@@ -435,7 +435,7 @@ def _guard_test_tree_deletion(config) -> None:
     if config.option.basetemp is None:
         config.option.basetemp = _claim_fresh_basetemp(_basetemp_parent())
         return
-    basetemp = config.option.basetemp
+    basetemp = os.path.abspath(config.option.basetemp)  # Same lexical normalization as pytest.
     if os.path.lexists(basetemp):
         # pytest empties ANY existing explicit basetemp before the session starts. An
         # EMPTY directory is no proof either: it can still be a surviving process's

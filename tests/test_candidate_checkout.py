@@ -168,6 +168,22 @@ def test_empty_index_after_staged_deletions_is_preserved(source, tmp_path):
         assert all(value is None for value in captured.state.files.values())
 
 
+def test_empty_intent_to_add_transition_invalidates_copy(source, tmp_path):
+    (source / "intent").write_bytes(b"")
+    git(source, "add", "-N", "intent")
+    before = candidate.observe_candidate(source)
+    target = tmp_path / "checkout"
+    with pytest.raises(candidate.CandidateError, match="CANDIDATE_CHANGED"):
+        with candidate.candidate_checkout(source, target) as captured:
+            candidate.verify_checkout(target, captured)
+            git(target, "add", "intent")
+            after = candidate.observe_candidate(target)
+            assert before.entries == after.entries  # Blob, mode, path and stage are identical.
+            assert before.status != after.status  # Staging intent is not.
+            candidate.verify_checkout(target, captured)
+    assert candidate.observe_candidate(source) == before
+
+
 def test_split_index_is_refused(source, tmp_path):
     git(source, "update-index", "--split-index")
     with pytest.raises(candidate.CandidateError, match="split index"):
@@ -194,7 +210,7 @@ def test_git_status_inside_the_copy_is_not_drift_but_a_staged_change_is(source, 
         candidate.verify_checkout(checkout, captured)
         git(checkout, "update-index", "--add", "--cacheinfo", "100644",
             git(checkout, "hash-object", "-w", "--stdin", input=b"other\n").strip().decode(), "edited")
-        with pytest.raises(candidate.CandidateError, match=r"metadata=\['entries'\]"):
+        with pytest.raises(candidate.CandidateError, match=r"metadata=\['entries', 'staged_diff'\]"):
             candidate.verify_checkout(checkout, captured)
         (checkout / "edited").write_bytes(b"content drift\n")
         with pytest.raises(candidate.CandidateError, match=r"paths=\['edited'\]"):
