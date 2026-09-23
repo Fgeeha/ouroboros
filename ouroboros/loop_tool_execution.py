@@ -397,11 +397,13 @@ def _persist_truncated_tool_source(
     tool_call_id: str,
     result: Any,
     tool_args: Optional[Dict[str, Any]] = None,
+    *,
+    force: bool = False,
 ) -> Dict[str, Any]:
     """Write a generic over-limit result to this actor's existing artifact root."""
 
     text = str(result)
-    if (
+    if not force and (
         _should_skip_tool_result_truncation(tool_name, tool_args)
         or len(text) <= _tool_result_limit(tool_name)
     ):
@@ -732,6 +734,9 @@ def _execute_single_tool(
                 "round_id": correlation.get("round_id"),
                 "args": args,
                 "result": result,
+                **({"producer_result": tool_result.producer_text,
+                    "host_annotations": list(tool_result.host_annotations)}
+                   if tool_result.producer_text is not None else {}),
                 "tool_ok": tool_ok,
                 "semantic_ok": not is_error,
                 "result_meta": result_meta,
@@ -1311,7 +1316,8 @@ def _maybe_auto_attach_image(
     typed = exec_result.get("tool_result")
     if isinstance(typed, ToolResult) and typed.code == "TOOL_REPORTED_FAILURE":
         return
-    raw = exec_result.get("result")
+    raw = (typed.producer_text if isinstance(typed, ToolResult)
+           and typed.producer_text is not None else exec_result.get("result"))
     if not isinstance(raw, str) or '"auto_attach_image"' not in raw:
         return
     observation = None
@@ -1402,6 +1408,25 @@ def process_tool_results(
             tool_args=exec_result.get("tool_args"),
             source_ref=result_source_ref,
         )
+        typed = exec_result.get("tool_result")
+        producer_ref = {}
+        if isinstance(typed, ToolResult) and typed.producer_text is not None:
+            if ctx is not None:
+                producer_ref = _persist_truncated_tool_source(
+                    ctx, fn_name, str(exec_result["tool_call_id"]) + ".producer",
+                    typed.producer_text, force=True,
+                )
+            # The complete annotated source above remains review evidence. This
+            # separate source is for parsers; neither bytes nor notes live in meta.
+            if result_partial and typed.host_annotations:
+                truncated_result += "\n\n" + "\n\n".join(typed.host_annotations)
+            truncated_result += (
+                "\nPRODUCER_RESULT_SOURCE_JSON=" + json.dumps(producer_ref, ensure_ascii=False)
+                + "\nUnannotated tool data for programmatic reading; host notes and outcome still apply."
+                if producer_ref else
+                "\nPRODUCER_RESULT_SOURCE_UNAVAILABLE=true"
+                "\nHost notes remain in the result; no clean producer file was retained."
+            )
 
         messages.append({
             "role": "tool",
@@ -1448,6 +1473,9 @@ def process_tool_results(
                 ),
             } if result_partial else {}),
             **(exec_result.get("result_meta") or {}),
+            **({"producer_source_ref": producer_ref,
+                "host_annotations": list(typed.host_annotations)}
+               if isinstance(typed, ToolResult) and typed.producer_text is not None else {}),
         })
         if fn_name == "task_acceptance_review" and not is_error:
             raw = str(exec_result.get("result") or "")
