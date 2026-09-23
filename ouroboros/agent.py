@@ -46,6 +46,7 @@ from ouroboros.agent_startup_checks import (
 from ouroboros.agent_task_pipeline import (
     emit_task_results, build_review_context,
 )
+from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE
 from ouroboros.task_results import STATUS_RUNNING, write_task_result
 from ouroboros.contracts.task_constraint import normalize_task_constraint
 from ouroboros.consciousness_authority import apply_consciousness_authority
@@ -86,7 +87,7 @@ def _authority_source_terminal(refusal: Dict[str, Any]):
     ).strip()
     usage = {
         "execution_status": "infra_failed", "reason_code": "authority_source_unavailable",
-        "authority_source_unavailable": refusal,
+        "authority_source_unavailable": refusal, "terminal_origin": TERMINAL_ORIGIN_HOST_NOTICE,
     }
     return text, usage, {"reasoning_notes": ["authority_source_unavailable"], "tool_calls": []}
 
@@ -104,7 +105,8 @@ def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, dri
     llm_trace = captured_trace if isinstance(captured_trace, dict) else {
         "reasoning_notes": [], "tool_calls": [], "loop_evidence_unavailable": True,
     }
-    usage.update(execution_status="infra_failed", reason_code="task_exception")
+    usage.update(execution_status="infra_failed", reason_code="task_exception",
+                 terminal_origin=TERMINAL_ORIGIN_HOST_NOTICE)
     text = f"⚠️ Error during processing: {type(exc).__name__}: {exc}"
     append_jsonl(drive_logs / "events.jsonl", {
         "ts": utc_now_iso(), "type": "task_error", "task_id": task.get("id"),
@@ -1020,6 +1022,10 @@ class OuroborosAgent:
             )
             if not isinstance(text, str) or (not text.strip() and not intentional_empty):
                 text = "⚠️ Model returned an empty response. Try rephrasing your request."
+                usage["terminal_origin"] = TERMINAL_ORIGIN_HOST_NOTICE
+                usage.pop("presence_completion_outcome", None)
+                if ctx is not None:
+                    ctx._presence_completion_accepted = False
 
             # A task that scoped ITSELF mid-run (ensure_project_scope) set the scope on
             # ctx, but persistence/finalization read the task dict — sync it back so the
@@ -1087,6 +1093,7 @@ class OuroborosAgent:
             usage = {
                 "execution_status": "failed",
                 "reason_code": "budget_exhausted",
+                "terminal_origin": TERMINAL_ORIGIN_HOST_NOTICE,
                 "resource_limit": resource_limit,
             }
             llm_trace = {

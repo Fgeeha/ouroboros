@@ -365,8 +365,8 @@ def test_nominations_come_from_the_corrected_response_not_the_draft():
         lambda draft, part, note: rc.correction_prompt(draft, part, room_label="Main", scope="block r", continuation_note=note),
     )
     assert content == "corrected memory"
-    # The draft's block reaches the correction under the same source check...
+    # The draft's proposed block reaches the correction...
     assert "KNOWLEDGE_ENTRIES_JSON" in prompts[1][1] and "owner approved" in prompts[1][1]
     # ...and only the corrected block is released: the draft's topic with the
-    # corrected content, never a topic the correction invented without a read.
+    # corrected content, never an additional topic outside this correction's scope.
     assert [(e["topic"], e["content"]) for e in usage["_knowledge_entries"]] == [("leak", "owner asked")]

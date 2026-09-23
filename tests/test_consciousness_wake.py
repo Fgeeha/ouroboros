@@ -90,6 +90,38 @@ def test_events_list_settled_tasks_open_cards_and_owner_messages_since_the_last_
     assert wake.wake_events(tmp_path / "missing", since=since, now=T0) == []
 
 
+@pytest.mark.parametrize("status, origin", [("failed", "host_notice"), ("cancelled", ""),
+                                           ("completed", "host_notice"), ("failed", "model_final")])
+def test_failed_inline_presence_is_visible_on_regular_wake_without_reviving_owner_turns(tmp_path, status, origin):
+    from ouroboros.presence_runner import _build_task
+    from ouroboros.task_results import write_task_result
+    from tests.test_presence_runner import _admission, _event
+
+    task = _build_task(_admission(), _event(), drive_root=tmp_path, staged_files=())
+    assert task["_is_direct_chat"] is True
+    metadata = {**task["metadata"], "presence_outcome": "deferred", "presence_result_text": "",
+                "presence_work_ref": "still-running-child"}
+    write_task_result(tmp_path, task["id"], status, _is_direct_chat=True, metadata=metadata,
+                      terminal_origin=origin, result="Host diagnostic remains available in the task.")
+    _result(tmp_path, "owner-failed", ts=T0, direct=True, status="failed")
+    _result(tmp_path, "successful-presence", ts=T0, direct=True)
+    path = tmp_path / "task_results" / "successful-presence.json"
+    successful = json.loads(path.read_text(encoding="utf-8"))
+    successful.update(metadata={"presence": {}, "presence_outcome": "message"}, terminal_origin="model_final")
+    path.write_text(json.dumps(successful), encoding="utf-8")
+
+    lines = wake.wake_events(tmp_path, since=0, now=T0, reason="heartbeat")
+    fact = next(line for line in lines if line.startswith(f"- task {task['id']} "))
+    assert f" {status}" in fact and "Presence outcome=deferred" in fact
+    assert "get_task_result" in fact and "deferred work=still-running-child" in fact
+    assert not any("owner-failed" in line or "successful-presence" in line for line in lines)
+    assert not any(task["id"] in line for line in wake.wake_events(
+        tmp_path, since=0, now=T0, reason="heartbeat", exclude_task_id=task["id"]))
+    metadata["initiator"] = "consciousness"
+    write_task_result(tmp_path, task["id"], status, _is_direct_chat=True, metadata=metadata, terminal_origin=origin)
+    assert not any(task["id"] in line for line in wake.wake_events(tmp_path, since=0, now=T0, reason="heartbeat"))
+
+
 def test_project_digest_pins_human_project_and_related_task_before_cards(tmp_path):
     since = T0 - 3600
     (tmp_path / "state").mkdir()
