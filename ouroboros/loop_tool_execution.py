@@ -15,6 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
+from ouroboros import budget_pause
 from ouroboros.config import (
     NESTED_SETTLEMENT_MARGIN_SEC,
     get_finalization_grace_sec,
@@ -113,29 +114,37 @@ def _attach_late_tool_settlement(
     """Close the cognitive lease when a timed-out worker finally settles."""
     tool_ctx = getattr(tools, "_ctx", None)
     event_queue = getattr(tool_ctx, "event_queue", None)
+    # Claim the quiescence row BEFORE attaching: a budget pause may not release
+    # the native worker while this callback is still producing effects, and
+    # ``future.done()`` is not callback-complete (#1196).
+    release_quiescence = budget_pause.hold_tool_settlement(tool_ctx, tool_call_id)
 
     def _settled(_future: Any) -> None:
-        if on_settled is not None:
-            try:
-                on_settled()
-            except Exception:
-                log.debug("Late tool cleanup failed", exc_info=True)
-        emit_cognitive_operation_event(
-            event_queue,
-            task_id=task_id,
-            operation_id=tool_call_id,
-            phase="finished",
-            kind="tool",
-            task_attempt=getattr(tool_ctx, "task_attempt", None),
-            execution_id=str(correlation.get("execution_id") or ""),
-            round_id=str(correlation.get("round_id") or ""),
-            tool=str(correlation.get("tool") or ""),
-        )
+        try:
+            if on_settled is not None:
+                try:
+                    on_settled()
+                except Exception:
+                    log.debug("Late tool cleanup failed", exc_info=True)
+            emit_cognitive_operation_event(
+                event_queue,
+                task_id=task_id,
+                operation_id=tool_call_id,
+                phase="finished",
+                kind="tool",
+                task_attempt=getattr(tool_ctx, "task_attempt", None),
+                execution_id=str(correlation.get("execution_id") or ""),
+                round_id=str(correlation.get("round_id") or ""),
+                tool=str(correlation.get("tool") or ""),
+            )
+        finally:
+            release_quiescence()
 
     try:
         future.add_done_callback(_settled)
     except Exception:
         log.debug("Failed to attach late tool settlement callback", exc_info=True)
+        release_quiescence()
 
 
 def _tool_correlation(tools: ToolRegistry) -> Dict[str, Any]:
@@ -1001,6 +1010,7 @@ def _execute_with_timeout(
             future = stateful_executor.submit(
                 _execute_browser_tool_bound, tools, tc, drive_logs, task_id, submit_generation,
             )
+        budget_pause.register_tool_future(tool_ctx, tool_call_id, fn_name, future)
         try:
             result = future_result(future, timeout_sec)
             result_meta = result.get("result_meta") or {}
@@ -1075,6 +1085,9 @@ def _execute_with_timeout(
     else:
         with abandoned_on_timeout(timeout_sec, bounded=not is_reviewed_mutative) as submit:
             future = submit(_execute_single_tool, tools, tc, drive_logs, task_id)
+            # Registered before the wait, so a call abandoned at its timeout is
+            # already visible to budget-pause quiescence (#1196).
+            budget_pause.register_tool_future(tool_ctx, tool_call_id, fn_name, future)
             try:
                 result = future.result() if is_reviewed_mutative else future_result(future, timeout_sec)
                 result_meta = result.get("result_meta") or {}

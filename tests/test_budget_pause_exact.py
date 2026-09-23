@@ -3,6 +3,12 @@
 Static authoring note: these tests were WRITTEN against the candidate but NOT
 RUN by their author (no runtime imports were permitted in that lane); the
 parent's isolated harness is the first execution.
+
+The pausing half is a HOLD, not a fallback: once the dispatch fence closes the
+task stays fenced and nonterminal until its producers are quiescent and its
+continuation is stored. These tests therefore drive the hold with a stubbed
+``_hold_control_reason`` (the task's existing control rail) rather than waiting
+on a real clock, and pin a shortened ``_HOLD_POLL_SEC``.
 """
 
 from __future__ import annotations
@@ -48,7 +54,7 @@ def _loop_ctx(root, task_id="pause-task", *, direct=False, attempt=1):
         _cost_ceiling=None, model_wait_context=None, context_fit_plan=None,
         _owner_directives=[], _delivery_candidate=None, _accumulated_usage={},
         task_metadata={}, active_model="m", active_effort="high", active_use_local=False,
-        active_context_mode="max",
+        active_context_mode="max", event_queue=None,
     )
     messages = [
         {"role": "user", "content": "do it"},
@@ -67,19 +73,33 @@ def _loop_ctx(root, task_id="pause-task", *, direct=False, attempt=1):
     return ctx, limit_ctx
 
 
-def _pause(tmp_path, monkeypatch, *, task_id="pause-task", rail=None, scope="global"):
+def _controls(*reasons):
+    """A ``_hold_control_reason`` stub: these reasons in order, then silence."""
+    remaining = list(reasons)
+    return lambda _ctx: remaining.pop(0) if remaining else ""
+
+
+def _fast_hold(monkeypatch, budget_pause):
+    """Poll fast and leave the task's controls quiet unless a test says otherwise."""
+    monkeypatch.setattr(budget_pause, "_HOLD_POLL_SEC", 0.01)
+    monkeypatch.setattr(budget_pause, "_hold_control_reason", lambda _ctx: "")
+
+
+def _pause(tmp_path, monkeypatch, *, task_id="pause-task", rail=None, scope="global",
+           root_task_id=None):
     from ouroboros import budget_pause
 
     rail = rail or budget_pause.RAIL_GLOBAL_EXHAUSTED
     _running_row(tmp_path, task_id)
     ctx, limit_ctx = _loop_ctx(tmp_path, task_id)
-    monkeypatch.setattr(budget_pause, "_drain_bound_sec", lambda: 5.0)  # the existing operation bound, pinned
+    ctx.root_task_id = root_task_id or task_id
+    _fast_hold(monkeypatch, budget_pause)
     monkeypatch.setattr(budget_pause, "observe_external_runs", lambda _ctx, request_stop=True: {
         "runs": [{"run_id": "run-1", "state": "stop_requested", "stop_outcome": "requested"}],
         "observed_at": time.time(), "custody_read": "ok", "coverage_basis": "test"})
     with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
         budget_pause.request_pause(limit_ctx, rail=rail, scope=scope, reason_text="money gone",
-                                   root_task_id=task_id)
+                                   root_task_id=root_task_id or task_id)
     return ctx, limit_ctx, raised.value.pause
 
 
@@ -139,15 +159,181 @@ def test_pause_writes_source_and_row_before_raising_and_closes_fence(tmp_path, m
         budget_pause.end_dispatch_fence(ctx.task_id)
 
 
-def test_pause_record_failure_falls_back_to_terminal_rail_and_reopens_fence(tmp_path, monkeypatch):
+def test_storage_failure_keeps_a_fenced_nonterminal_hold_and_buys_no_model_call(tmp_path, monkeypatch):
+    """A write that fails is a RETAINED hold, never a claimed pause and never
+    the old paid terminal rail: the fence stays closed and the task keeps its
+    worker until its own control ends the hold."""
+    from ouroboros import budget_pause, utils
+    from ouroboros.model_wait import ModelWaitInterrupted
+
+    _running_row(tmp_path, "hold-store")
+    ctx, limit_ctx = _loop_ctx(tmp_path, "hold-store")
+    monkeypatch.setattr(utils, "update_json_locked",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("read-only file system")))
+    published = []
+    monkeypatch.setattr(budget_pause, "_publish_hold", lambda _c, row: published.append(row))
+    monkeypatch.setattr(budget_pause, "_HOLD_POLL_SEC", 0.01)
+    monkeypatch.setattr(budget_pause, "_hold_control_reason", _controls("", "", "cancelled"))
+    with pytest.raises(ModelWaitInterrupted):
+        budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GRACEFUL_CEILING,
+                                   scope="root", reason_text="x")
+    usage = limit_ctx.accumulated_usage
+    assert usage["exact_pause_unavailable"] == "hold_ended_by_control"
+    assert usage["budget_pause_hold"]["hold_reason"] == budget_pause.HOLD_PAUSE_RECORD_UNWRITABLE
+    assert "read-only file system" in usage["budget_pause_hold"]["error"]
+    assert usage["budget_pause_hold"]["ended_by"] == "cancelled"
+    # The hold was owner-visible while it lasted, and announced once per reason
+    # (a poll interval is not a ledger cadence), then closed explicitly.
+    still_held = [row for row in published if row["state"] == budget_pause.STATE_PAUSING]
+    assert [row["hold_reason"] for row in still_held] == [budget_pause.HOLD_PAUSE_RECORD_UNWRITABLE]
+    assert published[-1]["state"] == "hold_ended" and published[-1]["ended_by"] == "cancelled"
+    # No pause was claimed, no wrap-up was bought, and the fence never reopened.
+    assert "budget_pause" not in usage and usage.get("reason_code") == "budget_exhausted"
+    assert budget_pause.dispatch_fenced("hold-store")
+    budget_pause.end_dispatch_fence("hold-store")
+
+
+def test_stop_during_a_hold_ends_it_through_the_existing_control_rail(tmp_path, monkeypatch):
+    from ouroboros import budget_pause
+    from ouroboros.model_wait import ModelWaitInterrupted
+
+    _running_row(tmp_path, "hold-stop")
+    ctx, limit_ctx = _loop_ctx(tmp_path, "hold-stop")
+    monkeypatch.setattr(budget_pause, "_HOLD_POLL_SEC", 0.01)
+    monkeypatch.setattr(budget_pause, "local_producer_observation",
+                        lambda _c, timeout_sec: {"quiescent": False, "review_attempts": {},
+                                                 "tool_futures": {}})
+    monkeypatch.setattr(budget_pause, "_hold_control_reason", _controls("", "", "cancelled"))
+    with pytest.raises(ModelWaitInterrupted) as raised:
+        budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
+                                   scope="global", reason_text="x")
+    assert raised.value.control_reason == "cancelled"
+    # The pausing row opened; the control closed it as abandoned rather than
+    # leaving a half-written pause claiming to be durable.
+    row = budget_pause.budget_pause_row(tmp_path, "hold-stop")
+    assert row["state"] == budget_pause.STATE_ABANDONED
+    assert row["abandon_reason"] == "hold_ended_by_control:cancelled"
+    assert budget_pause.has_budget_pause_checkpoint(tmp_path, "hold-stop", 1) is False
+    assert budget_pause.dispatch_fenced("hold-stop")  # no fence reopen
+    budget_pause.end_dispatch_fence("hold-stop")
+
+
+def test_hold_controls_are_the_existing_ones_and_a_finalize_request_is_not_one(tmp_path, monkeypatch):
+    """The hold borrows the task's own control rail and invents none: Stop,
+    Panic, an explicit deadline and the finite lifetime end it; 'finalize now'
+    and a closed wait do not abort a pause the fence already committed to."""
+    from ouroboros import budget_pause, cancel_intents, model_wait
+
+    ctx, _limit = _loop_ctx(tmp_path, "controls-1")
+    monkeypatch.setattr(cancel_intents, "cancel_pending", lambda *_a, **_k: False)
+    monkeypatch.setattr(model_wait, "current_model_wait",
+                        lambda: SimpleNamespace(control_reason=lambda: "finalize_requested"))
+    assert budget_pause._hold_control_reason(ctx) == ""
+    monkeypatch.setattr(model_wait, "current_model_wait",
+                        lambda: SimpleNamespace(control_reason=lambda: "absolute_ceiling"))
+    assert budget_pause._hold_control_reason(ctx) == "absolute_ceiling"
+    # No bound wait: the owner-stop flags the restore gate reads answer instead.
+    monkeypatch.setattr(model_wait, "current_model_wait", lambda: None)
+    assert budget_pause._hold_control_reason(ctx) == ""
+    (tmp_path / "state").mkdir(exist_ok=True)
+    (tmp_path / "state" / "panic_stop.flag").write_text("panic")
+    assert budget_pause._hold_control_reason(ctx) == "panic"
+
+
+def test_pending_review_attempt_blocks_release_then_pauses_once_it_settles(tmp_path, monkeypatch):
+    """Quiescence is the release gate, not a refusal: the task holds while an
+    already-sent review attempt is open and pauses exactly when it settles."""
+    from ouroboros import budget_pause, review_custody as rc
+
+    _running_row(tmp_path, "busy-1")
+    ctx, limit_ctx = _loop_ctx(tmp_path, "busy-1")
+    monkeypatch.setattr(budget_pause, "_HOLD_POLL_SEC", 0.01)
+    monkeypatch.setattr(budget_pause, "observe_external_runs", lambda _c, request_stop=True: {
+        "runs": [], "observed_at": time.time(), "custody_read": "ok", "coverage_basis": "test"})
+    holds = []
+    monkeypatch.setattr(budget_pause, "_publish_hold", lambda _c, row: holds.append(row))
+    open_attempt = rc.ActiveReviewAttempt(key="k", operation_id="op-open", wave_key="task_acceptance|busy-1|r")
+    with rc._ACTIVE_LOCK:
+        rc._ACTIVE["busy-k"] = open_attempt
+    # The attempt settles through its OWN custody path after the first hold.
+    monkeypatch.setattr(budget_pause, "_hold_control_reason",
+                        lambda _ctx: (open_attempt.event.set() if holds else None) or "")
+    try:
+        with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
+            budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
+                                       scope="global", reason_text="x")
+    finally:
+        with rc._ACTIVE_LOCK:
+            rc._ACTIVE.pop("busy-k", None)
+        budget_pause.end_dispatch_fence("busy-1")
+    assert holds[0]["hold_reason"] == budget_pause.HOLD_PRODUCERS_UNSETTLED
+    assert holds[0]["unsettled"]["review_attempts"][0]["operation_id"] == "op-open"
+    assert holds[0]["state"] == budget_pause.STATE_PAUSING  # nonterminal throughout
+    # The row was never abandoned: the same pause id carries through to the row.
+    row = budget_pause.budget_pause_row(tmp_path, "busy-1")
+    assert row["state"] == budget_pause.STATE_PAUSING and row["source_ref"]
+    assert row["pause_id"] == raised.value.pause["pause_id"]
+    assert "budget_pause_hold" not in limit_ctx.accumulated_usage
+
+
+def test_timed_out_tool_future_blocks_release_until_its_settlement_callback_finishes(tmp_path):
+    """``future.done()`` is not callback-complete: a call abandoned at its own
+    timeout keeps the task unquiescent until the late settlement callback that
+    owns its effects has finished."""
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
     from ouroboros import budget_pause
 
-    ctx, limit_ctx = _loop_ctx(tmp_path)  # no task result row -> set_budget_pause fails
-    monkeypatch.setattr(budget_pause, "observe_external_runs", lambda _c, request_stop=True: {"runs": [], "custody_read": "ok"})
-    assert budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GRACEFUL_CEILING,
-                                      scope="root", reason_text="x") is None
-    assert limit_ctx.accumulated_usage["exact_pause_unavailable"] == "pause_record_failed"
-    assert not budget_pause.dispatch_fenced(ctx.task_id)
+    ctx, _limit = _loop_ctx(tmp_path, "tool-1")
+    gate = threading.Event()
+    executor = ThreadPoolExecutor(max_workers=1)
+    try:
+        future = executor.submit(gate.wait, 5.0)
+        budget_pause.register_tool_future(ctx, "call_slow", "run_command", future)
+        drain = budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.05)
+        assert drain["drained"] is False
+        assert drain["unsettled"] == [{"operation_id": "call_slow", "tool": "run_command",
+                                       "state": "running"}]
+        # The timeout path claims the row BEFORE the worker settles.
+        release = budget_pause.hold_tool_settlement(ctx, "call_slow")
+        gate.set()
+        assert future.result(timeout=5.0) is True
+        assert budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.05)["drained"] is False
+        release()
+        settled = budget_pause.drain_local_tool_futures(ctx, timeout_sec=1.0)
+        assert settled["drained"] is True
+        assert settled["settled"] == [{"operation_id": "call_slow", "tool": "run_command"}]
+    finally:
+        gate.set()
+        executor.shutdown(wait=True)
+        budget_pause.forget_tool_scope(ctx)
+
+
+def test_tool_future_quiescence_is_scoped_to_one_attempt_and_prunes_itself(tmp_path):
+    from concurrent.futures import Future
+
+    from ouroboros import budget_pause
+
+    ctx, _limit = _loop_ctx(tmp_path, "tool-2", attempt=1)
+    later, _l = _loop_ctx(tmp_path, "tool-2", attempt=2)
+    done = Future()
+    done.set_result("x")
+    try:
+        budget_pause.register_tool_future(ctx, "call_a", "read_file", done)
+        assert budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.1)["drained"] is True
+        # A later attempt never inherits a previous attempt's observations.
+        assert budget_pause.drain_local_tool_futures(later, timeout_sec=0.0) == {
+            "drained": True, "registry": "ok", "settled": [], "unsettled": []}
+        # A settled, unheld row is pruned by the next registration.
+        second = Future()
+        second.set_result("y")
+        budget_pause.register_tool_future(ctx, "call_b", "read_file", second)
+        assert [row["operation_id"] for row in
+                budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.1)["settled"]] == ["call_b"]
+    finally:
+        budget_pause.forget_tool_scope(ctx)
+        budget_pause.forget_tool_scope(later)
 
 
 def test_unreadable_external_custody_is_held_as_unknown_not_clean(tmp_path, monkeypatch):
@@ -160,50 +346,36 @@ def test_unreadable_external_custody_is_held_as_unknown_not_clean(tmp_path, monk
     assert "boom" in observed["error"]
 
 
-def test_unsettled_local_producer_refuses_the_exact_pause(tmp_path, monkeypatch):
-    """Quiescence is a GATE: an attempt still open at the existing bound means no
-    exact pause (nothing may be adopted after release); the terminal rail takes over."""
-    from ouroboros import budget_pause, review_custody as rc
-
-    _running_row(tmp_path, "busy-1")
-    ctx, limit_ctx = _loop_ctx(tmp_path, "busy-1")
-    monkeypatch.setattr(budget_pause, "_drain_bound_sec", lambda: 0.05)
-    open_attempt = rc.ActiveReviewAttempt(key="k", operation_id="op-open", wave_key="task_acceptance|busy-1|r")
-    with rc._ACTIVE_LOCK:
-        rc._ACTIVE["busy-k"] = open_attempt
-    try:
-        assert budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
-                                          scope="global", reason_text="x") is None
-    finally:
-        with rc._ACTIVE_LOCK:
-            rc._ACTIVE.pop("busy-k", None)
-    assert limit_ctx.accumulated_usage["exact_pause_unavailable"] == "local_producers_unsettled"
-    assert limit_ctx.accumulated_usage["exact_pause_unsettled_attempts"][0]["operation_id"] == "op-open"
-    assert not budget_pause.dispatch_fenced("busy-1")
-    row = budget_pause.budget_pause_row(tmp_path, "busy-1")
-    assert row["state"] == budget_pause.STATE_ABANDONED and row["abandon_reason"] == "local_producers_unsettled"
-    # An abandoned row is not a live checkpoint: it neither parks nor fences a retry.
-    assert budget_pause.has_budget_pause_checkpoint(tmp_path, "busy-1", 1) is False
-
-
-def test_pausing_row_exists_before_the_drain_and_fences_crash_retry(tmp_path, monkeypatch):
+def test_pausing_row_exists_before_any_wait_and_fences_crash_retry(tmp_path, monkeypatch):
+    """The durable ``pausing`` row opens BEFORE the task waits on anything, so a
+    death while it is still settling meets the crash-retry fence, not a replay."""
     from ouroboros import budget_pause
+    from ouroboros.model_wait import ModelWaitInterrupted
 
     _running_row(tmp_path, "drain-1")
     ctx, limit_ctx = _loop_ctx(tmp_path, "drain-1")
+    monkeypatch.setattr(budget_pause, "_HOLD_POLL_SEC", 0.01)
     seen = {}
 
-    def _observe_during_drain(_ctx):
+    def _observe_during_hold(_ctx, *, timeout_sec):
         seen["row"] = budget_pause.budget_pause_row(tmp_path, "drain-1")
-        raise RuntimeError("simulated death during the drain")
+        raise RuntimeError("simulated death while settling")
 
-    monkeypatch.setattr(budget_pause, "local_producer_observation", _observe_during_drain)
-    assert budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
-                                      scope="global", reason_text="x") is None
+    monkeypatch.setattr(budget_pause, "local_producer_observation", _observe_during_hold)
+    monkeypatch.setattr(budget_pause, "_hold_control_reason", _controls("", "", "panic"))
+    with pytest.raises(ModelWaitInterrupted):
+        budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
+                                   scope="global", reason_text="x")
     assert seen["row"]["state"] == budget_pause.STATE_PAUSING and seen["row"]["source_ref"] is None
+    # An observation that RAISED proves nothing about quiescence: it holds.
+    held = limit_ctx.accumulated_usage["budget_pause_hold"]
+    assert held["hold_reason"] == budget_pause.HOLD_PRODUCERS_UNSETTLED
+    assert "simulated death" in held["unsettled"]["observation_error"]
+    budget_pause.end_dispatch_fence("drain-1")
     # While that row was live (no source yet) the crash-retry fence already held;
     # an unreadable record fails closed the same way.
-    monkeypatch.setattr(budget_pause, "budget_pause_row", lambda *_a: (_ for _ in ()).throw(OSError("unreadable")))
+    monkeypatch.setattr(budget_pause, "budget_pause_row",
+                        lambda *_a: (_ for _ in ()).throw(OSError("unreadable")))
     assert budget_pause.has_budget_pause_checkpoint(tmp_path, "drain-1", 1) is True
 
 
@@ -330,9 +502,13 @@ def _parked(tmp_path, monkeypatch, *, task_id="pause-task", scope="global", root
     from ouroboros import budget_pause
     from supervisor import queue, workers
 
-    ctx, _limit, pause = _pause(tmp_path, monkeypatch, task_id=task_id, scope=scope)
+    # ONE lineage: the durable row, its queue marker and the pending task row all
+    # name the same root, or a descendant's resume cannot see its paused root.
+    ctx, _limit, pause = _pause(tmp_path, monkeypatch, task_id=task_id, scope=scope,
+                                root_task_id=root_task_id or task_id)
     budget_pause.end_dispatch_fence(task_id)
     row = budget_pause.budget_pause_row(tmp_path, task_id)
+    assert row["root_task_id"] == (root_task_id or task_id)
     marker = budget_pause.exact_pause_marker(row, default_root=root_task_id or task_id)
     if scope == "root":
         from supervisor.events_budget import _set_root_budget_pause_locked
@@ -397,10 +573,14 @@ def test_root_resume_mints_single_use_grant_and_only_makes_children_eligible(tmp
     assert "_budget_pause" in child and "_budget_pause_resume" not in child
     # Second grant for the same pause is refused (single use).
     workers.PENDING.remove(root)
-    workers.PENDING.append({**root, "_budget_pause": handoff["pause"]})
-    workers.PENDING[-1].pop("_budget_pause_resume", None)
+    stale_root = {**root, "_budget_pause": handoff["pause"]}
+    stale_root.pop("_budget_pause_resume", None)
+    workers.PENDING.append(stale_root)
     assert queue.resume_budget_paused_task("root-2")["error"] == "resume_already_granted"
-    # Now the child may be selected explicitly (Q9).
+    # Now the child may be selected explicitly (Q9) — under the root that was
+    # actually resumed, not the stale parked copy above.
+    workers.PENDING.remove(stale_root)
+    workers.PENDING.append(root)
     assert queue.resume_budget_paused_task("child-2")["ok"] is True
 
 
