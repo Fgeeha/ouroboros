@@ -74,6 +74,24 @@ def candidate(tmp_path, monkeypatch):
                            emit_progress_fn=lambda *_: None)
 
 
+def test_crlf_carriers_have_same_text_semantics_in_index_and_worktree(candidate):
+    repo = candidate.repo_dir
+    _git(repo, "config", "core.autocrlf", "false")
+    for name, text in _release("1.2.4").items():
+        (repo / name).write_bytes(text.replace("\n", "\r\n").encode("utf-8"))
+    _git(repo, "add", ".")
+    for source in ("worktree", "index"):
+        result = admission.release_metadata_diagnostics(repo, ["VERSION"], source=source)
+        assert result["status"] == "clean", result
+
+
+def test_unicode_worktree_discovery_is_not_locale_decoded(candidate):
+    repo = candidate.repo_dir
+    _git(repo, "config", "core.quotepath", "false")
+    (repo / "А.py").write_text("value = 1\n", encoding="utf-8")
+    assert "А.py" in admission.changed_worktree_paths(repo, strict=True)
+
+
 def _broken(repo):
     files = _release("1.2.4")
     files["README.md"] = _release()["README.md"] + "".join(
@@ -208,8 +226,8 @@ def test_index_read_failure_and_unmerged_entries_are_unavailable(candidate):
     _git(repo, "add", ".")
     blob = _git(repo, "rev-parse", ":pyproject.toml")
     # Install an unmerged optional carrier in this disposable fixture index.
-    subprocess.run(["git", "update-index", "--index-info"], cwd=repo, check=True, text=True,
-                   input=f"0 {'0' * 40}\tpyproject.toml\n100644 {blob} 1\tpyproject.toml\n100644 {blob} 2\tpyproject.toml\n")
+    subprocess.run(["git", "update-index", "--index-info"], cwd=repo, check=True,
+                   input=(f"0 {'0' * 40}\tpyproject.toml\n100644 {blob} 1\tpyproject.toml\n100644 {blob} 2\tpyproject.toml\n").encode("utf-8"))
     report = _diagnose(candidate, "index")
     assert report["status"] == "unavailable"
     assert any("pyproject.toml" in item for item in report["unavailable"])
