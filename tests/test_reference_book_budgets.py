@@ -72,7 +72,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # displace; two neighbouring sentences were compressed by 168 bytes first.
     # +300: the queue snapshot and the supervisor focus event carry the root's
     # bounded authored focus (cross-focus awareness).
-    "docs/architecture/05-supervisor-loop.md": 30900,
+    # 30900 -> 31700 (#1196): the exact-continuation `_budget_pause` marker, its grant
+    # carrier and the separate paused-interval carrier are new snapshot/assignment
+    # facts the chapter lacked; nothing older describes them.
+    "docs/architecture/05-supervisor-loop.md": 31700,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
@@ -96,7 +99,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the digest-selected historical read and the reader admission rule.
     # 295650 -> 297250: document the new diagnostic-only source/coverage contract,
     # unavailable evidence and no-effects ordering without removing review/custody rules.
-    "docs/architecture/06-agent-core.md": 297250,
+    # 297250 -> 301400 (#1196): the exact budget pause is a new mechanism of the budget
+    # section (fence order, drain, external stop requests, program counter, park, grant,
+    # revoke, Q9/Q10 rules); the wrap-up rails it sits beside keep their own text.
+    "docs/architecture/06-agent-core.md": 301400,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,

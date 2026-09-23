@@ -27,10 +27,8 @@ from ouroboros.provider_models import compute_direct_review_models_fallback, fal
 from ouroboros.secret_masking import strip_masked_secrets
 from ouroboros.runtime_mode_policy import runtime_mode_at_least
 from ouroboros.settings_defaults import (
-    CLAUDEXOR_STARTUP_WAIT_SEC,  # noqa: F401
-    CLAUDEXOR_STARTUP_POLL_SEC,  # noqa: F401
-    CLAUDEXOR_ADMISSION_WAIT_SEC,  # noqa: F401
-    CLAUDEXOR_ADMISSION_POLL_SEC,  # noqa: F401
+    CLAUDEXOR_STARTUP_WAIT_SEC, CLAUDEXOR_STARTUP_POLL_SEC,  # noqa: F401
+    CLAUDEXOR_ADMISSION_WAIT_SEC, CLAUDEXOR_ADMISSION_POLL_SEC,  # noqa: F401
     ENDPOINT_AUTHORED_SETTINGS,  # noqa: F401
     FINALIZATION_GRACE_DEFAULT_SEC,  # noqa: F401
     OPENROUTER_DEFAULTS,  # noqa: F401
@@ -48,8 +46,8 @@ from ouroboros.settings_defaults import (
     settings_env_keys,  # noqa: F401
 )
 from ouroboros.settings_scales import (
-    EFFORT_SCALE,  # noqa: F401
-    PROMPT_CACHE_TTL_SCALE,  # noqa: F401
+    EFFORT_SCALE, OPTIONAL_BOUND_LEGACY, UNLIMITED,  # noqa: F401
+    PROMPT_CACHE_TTL_SCALE, coerce_optional_bound, defaults_for_settings_document,  # noqa: F401
     VALID_RUNTIME_MODES,  # noqa: F401
     VALID_SAFETY_MODES,  # noqa: F401
     _RUNTIME_MODE_RANK,  # noqa: F401
@@ -113,9 +111,8 @@ from ouroboros.runtime_limits import (
     CLAUDEXOR_OPERATOR_STOP_TIMEOUT_SEC,  # noqa: F401
     CLAUDEXOR_STOP_EXIT_WAIT_SEC,  # noqa: F401
     DELEGATE_WAIT_CEILING_SEC,  # noqa: F401
-    DELEGATE_WAIT_WINDOW_MAX_SEC,  # noqa: F401
-    MAX_ACTIVE_SUBAGENTS_HARD_CAP,  # noqa: F401
-    MAX_SUBAGENT_DEPTH_HARD_CAP,  # noqa: F401
+    DELEGATE_WAIT_WINDOW_MAX_SEC, OPERATION_WINDOW_FALLBACK_SEC,  # noqa: F401
+    MAX_ACTIVE_SUBAGENTS_HARD_CAP, MAX_SUBAGENT_DEPTH_HARD_CAP,  # noqa: F401
     WAKE_DEFAULT_SEC, USAGE_LEDGER_FOLD_MIN_AGE_SEC,  # noqa: F401
     _bounded_positive_int_setting,  # noqa: F401
     _clamped_number_setting,  # noqa: F401
@@ -148,7 +145,7 @@ from ouroboros.runtime_limits import (
     get_safety_max_tokens,  # noqa: F401
     get_search_code_wall_sec,  # noqa: F401
     get_supervisor_liveness_deadline_sec,  # noqa: F401
-    get_task_abs_ceiling_sec,  # noqa: F401
+    get_task_abs_ceiling_sec, get_max_rounds, operation_window_sec,  # noqa: F401
     get_task_idle_timeout_sec,  # noqa: F401
     get_vision_caption_timeout_sec,  # noqa: F401
     get_update_letter_timeout_sec,  # noqa: F401
@@ -682,6 +679,8 @@ def _coerce_setting_value(key: str, value):
         return normalize_update_channel(value)
     if key == "OUROBOROS_CONTEXT_MODE":
         return normalize_context_mode(value)
+    if key in OPTIONAL_BOUND_LEGACY:  # "unlimited" or a positive int; a typo is finite
+        return coerce_optional_bound(key, value)
     # Trim so whitespace-only config is not treated as a configured skills repo.
     if key == "OUROBOROS_SKILLS_REPO_PATH":
         return str(value or "").strip()
@@ -843,7 +842,8 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
             guard_live_write=_guard_live_settings_write,
         )
         loaded = normalize_settings_raw(raw)
-    settings = dict(SETTINGS_DEFAULTS)
+    # An existing (even unreadable) document keeps the optional bounds it ran under.
+    settings = defaults_for_settings_document(raw is not None or SETTINGS_PATH.exists())
     settings.update(loaded)
     for key in SETTINGS_DEFAULTS:
         raw_env = os.environ.get(key)
@@ -852,7 +852,7 @@ def load_settings_lock_held(*, _settings_lock_held: bool = True) -> dict:
         if key == "OUROBOROS_RETURN_REASONING" and raw_env == "":
             settings[key] = ""
             continue
-        if raw_env == "":
+        if raw_env == "" and key not in OPTIONAL_BOUND_LEGACY:
             continue
         if key in loaded and settings.get(key) not in {None, ""}:
             continue

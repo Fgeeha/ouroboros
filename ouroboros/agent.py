@@ -29,6 +29,7 @@ from ouroboros.utils import (
     truncate_for_log,
     utc_now_iso,
 )
+from ouroboros.budget_pause import BudgetPauseRequested
 from ouroboros.usage_accounting import BudgetExceeded
 from ouroboros.llm import LLMClient
 from ouroboros.tools import ToolRegistry
@@ -661,8 +662,12 @@ class OuroborosAgent:
         ctx.task_started_at = self._task_started_ts
         ctx.owner_wait_callback = getattr(self, "owner_wait_callback", None)
         ctx.owner_wait_resume = task.get("_owner_wait_resume")
+        ctx.budget_pause_resume = task.get("_budget_pause_resume")
         from ouroboros.owner_wait import load_owner_wait
         saved_wait = load_owner_wait(ctx)  # Runtime/ContextFit must disclose the original ceiling.
+        if not saved_wait and ctx.budget_pause_resume:
+            from ouroboros.budget_pause import load_budget_pause
+            saved_wait = load_budget_pause(ctx)  # same-ID budget continuation (#1196)
         if saved_wait and ctx.model_wait_context is not None:
             ctx.model_wait_context.restore_continuation(
                 saved_wait.get("model_wait") or {}, started_at=ctx.task_started_at)
@@ -859,7 +864,8 @@ class OuroborosAgent:
 
     def _handle_task_scoped(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
         self._busy = True
-        start_time = float((task.get("_owner_wait_resume") or {}).get("started_at") or time.time())
+        _continuation = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or {}
+        start_time = float(_continuation.get("started_at") or time.time())
         self._task_started_ts = start_time
         self._last_progress_ts = start_time
         self._pending_events = []
@@ -988,7 +994,7 @@ class OuroborosAgent:
                         initial_effort=initial_effort,
                         drive_root=self.env.drive_root,
                     )
-                except BudgetExceeded:
+                except (BudgetExceeded, BudgetPauseRequested):
                     raise
                 except Exception as e:
                     from ouroboros.cancel_intents import STOP_POLICY_IMMEDIATE, active_intent, stop_policy
@@ -1040,6 +1046,16 @@ class OuroborosAgent:
                 ctx=ctx,
                 event_queue=self._event_queue,
             )
+            return list(self._pending_events)
+
+        except BudgetPauseRequested as exc:
+            # The durable pause row already exists (the loop raised only after
+            # writing it). Supervisor owns the queue transition; no task_done,
+            # no result text, no Main final: the SAME task id stays pending
+            # under its exact continuation until an explicit owner Resume.
+            from ouroboros.budget_pause import pause_event
+
+            self._pending_events.append(pause_event(task, exc.pause))
             return list(self._pending_events)
 
         except BudgetExceeded as exc:

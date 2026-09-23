@@ -64,6 +64,9 @@ from ouroboros.config import SETTINGS_DEFAULTS
 from ouroboros.outcomes import REASON_REVIEW_CYCLES_EXHAUSTED  # noqa: F401 — re-export
 from ouroboros.utils import append_jsonl, emit_log_event, utc_now_iso
 from ouroboros.config import runtime_setting
+# The canonical "no cap" token (the UI's ∞ saves it), its aliases and the strict parser are the
+# ONE optional-bound vocabulary in ``settings_scales``, shared with the task round/lifetime limits.
+from ouroboros.settings_scales import UNLIMITED, parse_positive_or_unlimited
 
 log = logging.getLogger(__name__)
 
@@ -71,12 +74,6 @@ REVIEW_MAX_CYCLES_KEY = "OUROBOROS_REVIEW_MAX_CYCLES"
 # Deprecated alias (task acceptance only). Kept as a settings key so an explicit
 # owner customization keeps binding; removal is a separate owner decision.
 ACCEPTANCE_PASSES_LEGACY_KEY = "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"
-# Canonical persisted token for "no cap"; the UI's ∞ choice saves this string.
-UNLIMITED = "unlimited"
-# "none" is deliberately NOT an alias: it reads as "no cycles" as easily as "no cap".
-UNLIMITED_ALIASES = frozenset({UNLIMITED, "inf", "∞"})
-# Legacy passes clamp, unchanged from the former config.py getter.
-
 _WARNED: set = set()
 
 
@@ -92,15 +89,7 @@ def parse_review_max_cycles(raw: Any) -> Optional[int]:
 
     Raises ``ValueError`` for anything else (empty, zero, negative, non-integer,
     unknown word) so callers decide between fail-closed default and 400."""
-    text = str(raw if raw is not None else "").strip().lower()
-    if text in UNLIMITED_ALIASES:
-        return None
-    if not text:
-        raise ValueError("empty review-cycle cap")
-    value = int(text)  # ValueError on non-integer text (incl. "true"/"1.5")
-    if value < 1:
-        raise ValueError(f"review-cycle cap must be a positive integer, got {value}")
-    return value
+    return parse_positive_or_unlimited(raw)
 
 
 def is_valid_review_max_cycles(raw: Any) -> bool:

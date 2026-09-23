@@ -8,6 +8,7 @@ that keeps its descendants out of the queue.
 from __future__ import annotations
 
 import logging
+import pathlib
 import time
 import uuid
 from typing import Any, Dict
@@ -199,9 +200,19 @@ def _set_root_budget_pause_locked(root_task_id: str, pause: Dict[str, Any]) -> D
 
 
 def _handle_budget_pause(evt: Dict[str, Any], ctx: Any) -> None:
-    """Move a zero-dispatch task back to the same durable queue generation."""
+    """Move a paused task back to the same durable queue generation.
+
+    Two shapes share this seam: the historical replay-safe ZERO-dispatch pause
+    and the exact continuation (#1196), whose worker wrote a durable
+    ``budget_pause`` row before unwinding. The exact shape is validated against
+    THAT row, never against the event's prose.
+    """
     task_id = str(evt.get("task_id") or "")
     pause = evt.get("resource_limit") if isinstance(evt.get("resource_limit"), dict) else {}
+    exact = bool(pause.get("exact_continuation")) and isinstance(pause.get("checkpoint"), dict)
+    if exact:
+        install_exact_budget_pause(ctx, task_id, pause["checkpoint"], evt=evt)
+        return
     if (
         not task_id
         or not bool(pause.get("replay_safe"))
@@ -262,6 +273,144 @@ def _handle_budget_pause(evt: Dict[str, Any], ctx: Any) -> None:
         ctx.bridge.push_log(event)
     except Exception:
         log.warning("Failed to forward budget pause to Activity", exc_info=True)
+
+
+def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any], *,
+                               evt: Dict[str, Any] | None = None,
+                               source: str = "worker_event") -> Dict[str, Any]:
+    """Park the SAME task id under its exact continuation: RUNNING -> PENDING.
+
+    Order: durable row must already say ``pausing`` for this pause_id/attempt
+    (the worker wrote it before raising) -> queue transition -> snapshot ->
+    row ``paused``. A snapshot that cannot be persisted leaves the row at
+    ``pausing``: the pause is real (the source exists) but not confirmed, and
+    the next persisted snapshot or a restore completes it — never a fake
+    ``paused``. Also the crash-during-pausing completion path (``source``
+    names it), which is why nothing here reads the worker's event body.
+    """
+    from ouroboros.budget_pause import (
+        STATE_PAUSED, STATE_PAUSING, budget_pause_row, exact_pause_marker, set_budget_pause,
+    )
+    from supervisor import queue as queue_mod
+    from supervisor.queue import _queue_lock
+
+    evt = evt or {}
+    # The event-loop ctx and the reaper's pool module expose the same queue
+    # state; the snapshot/sort seams fall back to the queue module's own.
+    sort_pending = getattr(ctx, "sort_pending", None) or queue_mod.sort_pending
+    persist_snapshot = getattr(ctx, "persist_queue_snapshot", None) or queue_mod.persist_queue_snapshot
+    pause_id = str(checkpoint.get("pause_id") or "")
+    if not task_id or not pause_id:
+        raise ValueError("exact budget pause requires task_id and pause_id")
+    with _queue_lock:
+        meta = ctx.RUNNING.get(task_id)
+        task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else None
+        if task is None:
+            raise RuntimeError(f"budget-paused task is not running: {task_id}")
+        result_root = pathlib.Path(task.get("budget_drive_root") or ctx.DRIVE_ROOT)
+        row = budget_pause_row(result_root, task_id)
+        attempt = int(meta.get("attempt") or task.get("_attempt") or 1)
+        if (row.get("pause_id") != pause_id or row.get("state") not in {STATE_PAUSING, STATE_PAUSED}
+                or int(row.get("task_attempt") or 0) != attempt or not row.get("source_ref")):
+            raise ValueError(f"exact budget pause {pause_id} has no live durable row for attempt {attempt}")
+        marker = exact_pause_marker(row, default_root=str(task.get("root_task_id") or task_id))
+        if marker["scope"] == "root":
+            fence = _set_root_budget_pause_locked(marker["root_task_id"], marker)
+            marker = {**marker, "fence_id": fence["fence_id"]}
+        ctx.RUNNING.pop(task_id, None)
+        paused_task = dict(task)
+        paused_task["_budget_pause"] = marker
+        if not any(str(item.get("id") or "") == task_id for item in ctx.PENDING):
+            ctx.PENDING.append(paused_task)
+            sort_pending()
+        worker_id = evt.get("worker_id") if evt else meta.get("worker_id")
+        if worker_id in ctx.WORKERS and ctx.WORKERS[worker_id].busy_task_id == task_id:
+            ctx.WORKERS[worker_id].busy_task_id = None
+    persisted = persist_snapshot(reason="budget_pause_exact_continuation")
+    if persisted:
+        try:
+            set_budget_pause(result_root, task_id, {**row, "state": STATE_PAUSED,
+                                                     "paused_confirmed_at": time.time(),
+                                                     "pause_source": source},
+                             expected_pause_id=pause_id)
+        except Exception:
+            log.warning("Exact budget pause row for %s stays 'pausing'", task_id, exc_info=True)
+    else:
+        log.error("Exact budget pause for %s parked in memory but its snapshot was not persisted; "
+                  "the durable row stays 'pausing' until a later snapshot confirms it", task_id)
+    try:
+        write_task_result(
+            result_root, task_id, STATUS_SCHEDULED,
+            reason_code="budget_paused", resource_limit=marker,
+            result=("Task paused exactly at a completed boundary (budget). Cumulative spend, rounds "
+                    "and execution time are retained; an explicit owner Resume continues the same task."),
+        )
+    except Exception:
+        log.warning("Failed to persist exact budget pause status for %s", task_id, exc_info=True)
+    event = {
+        "ts": (evt or {}).get("ts", utc_now_iso()),
+        "type": "budget_scope_paused",
+        "task_id": task_id,
+        "task_type": (evt or {}).get("task_type") or task.get("type"),
+        "owner_visible": True,
+        "toast_once": f"{task_id}:budget-paused:{pause_id}",
+        "pause_source": source,
+        **{key: value for key, value in marker.items() if key != "checkpoint"},
+        "pause_id": pause_id,
+        "external_runs": [
+            {k: run.get(k) for k in ("run_id", "state", "stop_outcome")}
+            for run in ((row.get("external_runs") or {}).get("runs") or []) if isinstance(run, dict)
+        ],
+    }
+    _address_task_event({task_id: meta} if isinstance(meta, dict) else None, ctx.DRIVE_ROOT, event)
+    append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", event)
+    try:
+        bridge = getattr(ctx, "bridge", None)
+        if bridge is not None:
+            bridge.push_log(event)
+    except Exception:
+        log.warning("Failed to forward exact budget pause to Activity", exc_info=True)
+    return marker
+
+
+def _handle_budget_resume_child(evt: Dict[str, Any], ctx: Any) -> None:
+    """Owner Q9: a resumed root's model SELECTS one budget-paused child to continue.
+
+    The requester must be the live parent/root of the target (its tree, not any
+    tree); the grant itself goes through the ONE resume seam, so every typed
+    refusal (money, cancel intent, deadline, lifetime, root still paused) is the
+    same the owner would receive. The outcome is recorded as an event the
+    requesting task can read back; nothing is auto-fanned-out.
+    """
+    from supervisor.queue import _queue_lock
+    from supervisor.queue_transitions import resume_budget_paused_task
+
+    task_id = str(evt.get("task_id") or "").strip()
+    requester = str(evt.get("requested_by") or "").strip()
+    with _queue_lock:
+        target = next((row for row in ctx.PENDING if str(row.get("id") or "") == task_id), None)
+        lineage_ok = bool(
+            target is not None and requester
+            and requester in (str(target.get("parent_task_id") or ""), str(target.get("root_task_id") or ""))
+        )
+    if not lineage_ok:
+        outcome: Dict[str, Any] = {"ok": False, "error": "not_a_budget_paused_descendant"}
+    else:
+        outcome = resume_budget_paused_task(task_id)
+    event = {
+        "ts": evt.get("ts", utc_now_iso()),
+        "type": "budget_resume_child_outcome",
+        "task_id": task_id,
+        "requested_by": requester,
+        "reason": str(evt.get("reason") or "")[:500],
+        **{key: value for key, value in outcome.items() if key != "task_id"},
+    }
+    _address_ctx(ctx, event)
+    append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", event)
+    try:
+        ctx.bridge.push_log(event)
+    except Exception:
+        log.debug("Failed to forward child resume outcome to Activity", exc_info=True)
 
 
 def _handle_budget_root_fence(evt: Dict[str, Any], ctx: Any) -> None:

@@ -572,7 +572,7 @@ def _run_retrieving_review(
     resolved for the row (its own target when the caller names none)."""
     from dataclasses import asdict
 
-    from ouroboros.config import get_finalization_grace_sec, get_task_abs_ceiling_sec
+    from ouroboros.config import get_finalization_grace_sec, get_task_abs_ceiling_sec, operation_window_sec
     from ouroboros.deadline_utils import review_operation_timeout_sec
     from ouroboros.observability import persist_call
     from ouroboros.review_execution import ReviewAssignment, _review_route_executor
@@ -610,12 +610,12 @@ def _run_retrieving_review(
         policy=policy,
         deadline_at=deadline_at,
     )
-    # The logical window: the task's absolute ceiling narrowed by the owner
-    # deadline — the same clock the coordinator gives a slot; without it the
-    # native episode would run with no window at all and a session would fall
-    # to the transport's own defaults.
+    # The logical window: the task's operation window (its finite absolute lifetime,
+    # else the operation fallback) narrowed by the owner deadline — the same clock the
+    # coordinator gives a slot; without it the native episode would run with no window
+    # at all and a session would fall to the transport's own defaults.
     window = review_operation_timeout_sec(
-        float(get_task_abs_ceiling_sec()),
+        operation_window_sec(get_task_abs_ceiling_sec()),
         route="agent_session" if row.is_session else "api_chat",
         deadline_at=deadline_at, reserve_sec=get_finalization_grace_sec(),
     )

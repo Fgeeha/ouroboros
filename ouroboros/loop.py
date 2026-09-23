@@ -72,6 +72,7 @@ from ouroboros.loop_transport import (
     transport_wait_step as _transport_wait_step,
 )
 from ouroboros.pricing import estimate_cost_optional  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
+from ouroboros.budget_pause import load_budget_pause, resume_paused_loop
 from ouroboros.owner_wait import load_owner_wait, resume_native_loop, wait_after_tools
 
 log = logging.getLogger(__name__)
@@ -368,16 +369,14 @@ def _apply_runtime_overrides(
     return active_model, active_use_local, active_effort
 
 
-def _resolve_loop_max_rounds(ctx: Any = None) -> int:
-    from ouroboros.config import SETTINGS_DEFAULTS
+def _resolve_loop_max_rounds(ctx: Any = None) -> Optional[int]:
+    """The round limit that binds first: the configured total (``None`` = no limit) and a
+    Presence turn's own finite inline cap. ``None`` means no round limit at all."""
+    from ouroboros.config import get_max_rounds
 
-    default = int(SETTINGS_DEFAULTS["OUROBOROS_MAX_ROUNDS"])
-    try:
-        configured = max(1, int(runtime_setting("OUROBOROS_MAX_ROUNDS", str(default))))
-    except (ValueError, TypeError):
-        log.warning("Invalid OUROBOROS_MAX_ROUNDS, defaulting to %s", default)
-        configured = default
-    return min(configured, int(getattr(ctx, "inline_max_rounds", configured)))
+    inline = getattr(ctx, "inline_max_rounds", None)
+    bounds = [int(b) for b in (get_max_rounds(), inline) if b is not None]
+    return min(bounds) if bounds else None
 
 
 def _record_transcript_prefix(ctx, messages, round_idx, accumulated_usage,
@@ -450,7 +449,8 @@ def run_llm_loop(
     invalidate_task_cache_splits(task_id or getattr(ctx, "task_id", ""))  # rebuilt attempt = new prefix
     max_retries = 3
     saved = load_owner_wait(ctx)
-    if not saved:
+    saved_pause = load_budget_pause(ctx) if not saved else {}
+    if not saved and not saved_pause:
         accumulated_usage["initial_model_request"] = {
             "model": active_model, "use_local": active_use_local,
         }
@@ -462,7 +462,8 @@ def run_llm_loop(
     from ouroboros.tools import tool_discovery as _td
     _td.set_registry(tools)
 
-    tool_schemas = saved["tool_schemas"] if saved else initial_tool_schemas(tools, context_mode=active_context_mode)
+    continuation = saved or saved_pause
+    tool_schemas = continuation["tool_schemas"] if continuation else initial_tool_schemas(tools, context_mode=active_context_mode)
     tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(
         tools, tool_schemas, messages, context_mode=active_context_mode
     )
@@ -483,6 +484,18 @@ def run_llm_loop(
             active_model, active_effort, active_use_local, active_context_mode, round_idx, context_fit_plan = resume_native_loop(
                 tools, saved, messages, llm_trace, accumulated_usage, _owner_msg_seen)
         pending_tool_budget, pending_tool_calls = bool(saved), None
+        if saved_pause:
+            # Same-ID exact continuation after an owner Resume (#1196): the
+            # saved cognition comes back (nothing is re-executed by the host;
+            # an interrupted batch's unanswered calls are closed as execution-
+            # unknown), then the ordinary budget tail decides with the
+            # refreshed threshold.
+            (active_model, active_effort, active_use_local, active_context_mode,
+             round_idx, context_fit_plan) = resume_paused_loop(
+                tools, saved_pause, messages, llm_trace, accumulated_usage, _owner_msg_seen,
+                budget_remaining_usd=budget_remaining_usd)
+            cost_ceiling = _resolve_task_cost_ceiling(tools._ctx, budget_remaining_usd)
+            pending_tool_budget = True
         while True:
             if free_redial or pending_tool_budget:
                 free_redial = False  # Tool tails and transport waits retain their logical round.
@@ -520,7 +533,7 @@ def run_llm_loop(
                 active_use_local, MAX_ROUNDS, drive_root=drive_root, llm_trace=llm_trace,
                 incoming_messages=incoming_messages, owner_msg_seen=_owner_msg_seen, tool_schemas=tool_schemas)
             _finalize_limit_ctx(limit_ctx, tools, llm_trace)
-            if round_idx > MAX_ROUNDS:
+            if MAX_ROUNDS is not None and round_idx > MAX_ROUNDS:
                 # Live hold: a paid [ROUND_LIMIT] dial would be a resend (no wake receipt) — no-call unknown terminal.
                 if _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id,
                     detail="round_limit") == "active":

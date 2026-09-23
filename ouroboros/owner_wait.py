@@ -70,21 +70,21 @@ def _wait_bound_fields(ctx: Any) -> dict:
             "wait_max_minutes": int(getattr(ctx, "_owner_wait_max_minutes", 0) or 0)}
 
 
-def checkpoint_owner_wait(ctx: Any, messages: list, trace: dict, usage: dict,
-                          round_idx: int, tool_schemas: list, seen: set,
-                          *, review_binding: str = "") -> dict:
-    """Capture only the live loop's continuation values, never Python handles."""
-    wait_id = uuid.uuid4().hex
+def continuation_state(ctx: Any, messages: list, trace: dict, usage: dict,
+                       round_idx: int, tool_schemas: list, seen: set) -> dict:
+    """The loop's exact continuation values, never Python handles.
+
+    ONE serializer for every same-ID continuation (owner wait, acceptance park,
+    budget pause): the carried fields are the loop's cognition — transcript,
+    trace, usage, route, delivery candidate, acceptance identities, owner
+    directives — so a second serializer could only drift from this one.
+    """
     candidate = getattr(ctx, "_delivery_candidate", None)
     cost_ceiling = getattr(ctx, "_cost_ceiling", None)
     model_wait = getattr(ctx, "model_wait_context", None)
     model_state = model_wait.continuation_state() if model_wait is not None else {}
-    state = {
+    return {
         "task_id": ctx.task_id, "task_attempt": int(ctx.task_attempt or 1),
-        "wait_id": wait_id, "quiz_id": getattr(ctx, "_owner_wait_requested", ""),
-        **_wait_bound_fields(ctx),
-        "reason": "review" if review_binding else "owner",
-        "review_binding": review_binding,
         "messages": messages, "trace": trace, "usage": usage,
         "cost_ceiling": asdict(cost_ceiling) if cost_ceiling is not None else None,
         "model_wait": model_state,
@@ -109,10 +109,30 @@ def checkpoint_owner_wait(ctx: Any, messages: list, trace: dict, usage: dict,
             "_task_acceptance_reviewed_subject": str(getattr(ctx, "_task_acceptance_reviewed_subject", "")),
         },
     }
+
+
+def store_continuation_source(ctx: Any, state: dict, source_id: str) -> dict:
+    """Persist one continuation state through the existing actor source store."""
     root = pathlib.Path(ctx.budget_drive_root or ctx.drive_root)
-    source = store_actor_source_bytes(root, ctx.task_id, category="context_checkpoints",
-                                     source_id="owner-wait-" + wait_id,
-                                     data=json.dumps(state, ensure_ascii=False).encode(), extension="json")
+    return store_actor_source_bytes(root, ctx.task_id, category="context_checkpoints",
+                                    source_id=source_id,
+                                    data=json.dumps(state, ensure_ascii=False).encode(), extension="json")
+
+
+def checkpoint_owner_wait(ctx: Any, messages: list, trace: dict, usage: dict,
+                          round_idx: int, tool_schemas: list, seen: set,
+                          *, review_binding: str = "") -> dict:
+    """Capture only the live loop's continuation values, never Python handles."""
+    wait_id = uuid.uuid4().hex
+    state = {
+        **continuation_state(ctx, messages, trace, usage, round_idx, tool_schemas, seen),
+        "wait_id": wait_id, "quiz_id": getattr(ctx, "_owner_wait_requested", ""),
+        **_wait_bound_fields(ctx),
+        "reason": "review" if review_binding else "owner",
+        "review_binding": review_binding,
+    }
+    source = store_continuation_source(ctx, state, "owner-wait-" + wait_id)
+    model_state = state.get("model_wait") or {}
     return {
         "wait_id": wait_id, "quiz_id": getattr(ctx, "_owner_wait_requested", ""),
         **_wait_bound_fields(ctx),
@@ -182,7 +202,8 @@ def restore_owner_wait_allowed(root: Any, task: dict) -> bool:
         return False
     started = float(handoff.get("started_at") or 0)
     now = time.time()
-    if started and now - started - quota_waited_seconds(wait, now) >= get_task_abs_ceiling_sec():
+    ceiling = get_task_abs_ceiling_sec()  # None = no lifetime bound to have outlived
+    if started and ceiling is not None and now - started - quota_waited_seconds(wait, now) >= ceiling:
         return False
     read_actor_source_bytes(root, task_id, wait["source_ref"])
     return True
@@ -356,11 +377,12 @@ def wait_after_tools(ctx: Any, messages: list, trace: dict, usage: dict,
     ctx._owner_wait_max_minutes = 0
 
 
-def resume_native_loop(tools: Any, state: dict, messages: list, trace: dict,
-                       usage: dict, seen: set) -> tuple:
-    """Restore the selected cold continuation and await its ordinary input grant."""
+def restore_continuation_state(tools: Any, state: dict, messages: list, trace: dict,
+                               usage: dict, seen: set) -> None:
+    """Rebind the saved cognition onto the live loop objects (shared by every
+    same-ID continuation). Python handles (browser, executors, services) are
+    NOT restored: they died with the previous process and stay invalidated."""
     from ouroboros.loop_delivery import DeliveryCandidate
-    from ouroboros.loop import _rebind_context_fit_plan, get_context_mode
 
     ctx = tools._ctx
     messages[:] = state["messages"]
@@ -373,23 +395,37 @@ def resume_native_loop(tools: Any, state: dict, messages: list, trace: dict,
         setattr(ctx, key, value)
     candidate = state.get("delivery_candidate")
     ctx._delivery_candidate = DeliveryCandidate(**candidate) if candidate else None
-    cold_checkpoint = ctx.owner_wait_resume
-    outcome = ctx.owner_wait_callback(ctx, cold_checkpoint)
-    ctx.owner_wait_resume = None
+
+
+def rebind_restored_route(tools: Any, state: dict, messages: list) -> tuple:
+    """Rebind the restored route's context-fit plan; returns ``(plan, mode)``."""
+    from ouroboros.loop import _rebind_context_fit_plan, get_context_mode
     from ouroboros.model_slots import task_model_binding
 
+    ctx = tools._ctx
     model_wait = getattr(ctx, "model_wait_context", None)
     role, account = task_model_binding(
         {"model_role": state.get("context_model_role"), "task_metadata": ctx.task_metadata},
         context_fit_plan=ctx.context_fit_plan,
         overrides=model_wait.overrides if model_wait is not None else None,
     )
-    plan, mode = _rebind_context_fit_plan(
+    return _rebind_context_fit_plan(
         ctx.context_fit_plan, tools, messages, model=ctx.active_model,
         use_local=ctx.active_use_local, preferred_mode=get_context_mode(),
         tool_schemas=state["tool_schemas"],
         model_role=role, model_route={}, credential_profile_id=account,
     )
+
+
+def resume_native_loop(tools: Any, state: dict, messages: list, trace: dict,
+                       usage: dict, seen: set) -> tuple:
+    """Restore the selected cold continuation and await its ordinary input grant."""
+    ctx = tools._ctx
+    restore_continuation_state(tools, state, messages, trace, usage, seen)
+    cold_checkpoint = ctx.owner_wait_resume
+    outcome = ctx.owner_wait_callback(ctx, cold_checkpoint)
+    ctx.owner_wait_resume = None
+    plan, mode = rebind_restored_route(tools, state, messages)
     messages.append({"role": "user", "content": (
         "[SYSTEM NOTICE]\nThis task continued from its saved owner wait after a planned restart. "
         "Prior tool results remain recorded; do not repeat completed effects. "

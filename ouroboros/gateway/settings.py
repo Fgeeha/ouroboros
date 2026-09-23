@@ -1200,6 +1200,17 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
             if raw_cycles:
                 body = dict(body)
                 body[REVIEW_MAX_CYCLES_KEY] = normalize_review_max_cycles(raw_cycles)
+        # Optional task bounds (round limit, absolute lifetime): the same vocabulary, but a
+        # blank, zero or malformed value is refused rather than read as "no limit" or as a
+        # silent default; a valid value persists as an int or the canonical "unlimited".
+        from ouroboros.settings_scales import OPTIONAL_BOUND_LEGACY, UNLIMITED, parse_positive_or_unlimited
+        for bound_key in (key for key in OPTIONAL_BOUND_LEGACY if key in body):
+            try:
+                bound = parse_positive_or_unlimited(body.get(bound_key))
+            except (TypeError, ValueError):
+                return unsaved_error(f"{bound_key} must be a positive integer or 'unlimited'.", 400)
+            body = dict(body)
+            body[bound_key] = UNLIMITED if bound is None else bound
         # Available-subagents roster first (S4 atomicity): reviewer
         # references must validate against the roster THIS save produces —
         # not the stale process env (see the check helper below).

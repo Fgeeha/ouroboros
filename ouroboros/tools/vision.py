@@ -184,12 +184,12 @@ def _vision_query_with_timeout(client: Any, *, model_role: str = "vision",
 
 
 def _vision_execution_window() -> float:
-    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.config import get_task_abs_ceiling_sec, operation_window_sec
 
     context = current_model_wait()
     remaining = context.execution_window_remaining() if context else None
-    # An owner without an absolute clock still bounds this individual image.
-    return float(get_task_abs_ceiling_sec()) if remaining is None else remaining
+    # An owner (or task) without an absolute clock still bounds this individual image.
+    return operation_window_sec(get_task_abs_ceiling_sec()) if remaining is None else remaining
 
 
 def _vision_tool_timeout(ctx: Any, tool_args: dict | None) -> float:

@@ -13,6 +13,7 @@ import queue
 
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple
+from ouroboros import budget_pause
 from ouroboros import task_pacing
 from ouroboros.loop_transport import TransportWaitEpisode, end_episode_budget as _end_episode_budget
 from ouroboros.tools.registry import ToolRegistry
@@ -73,6 +74,9 @@ def _check_budget_limits(
                 candidate=None,
             )
             return _loop()._compose_delivery_suffix(finish_reason, suffix), accumulated_usage, trace
+        # After real work the exhaustion is an exact PAUSE (#1196), not a wrap-up call.
+        budget_pause.request_pause(ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED, scope="global",
+                                   reason_text=finish_reason)
         return _loop()._forced_final_answer(
             ctx,
             prompt=(
@@ -138,6 +142,9 @@ def _check_budget_limits(
             if wrapup_fits is False:
                 accumulated_usage["cost_stop_spend_basis"] = spend_basis
                 accumulated_usage["cost_stop_rail"] = "wrapup_reservation_last_fit"
+                budget_pause.request_pause(
+                    ctx, rail=budget_pause.RAIL_WRAPUP_LAST_FIT, scope=_pause_scope(cost_ceiling),
+                    reason_text=task_pacing.wrapup_unaffordable_text(deciding, cost_ceiling, global_remaining))
                 return _loop()._forced_fallback_result(
                     ctx, trace, task_pacing.wrapup_unaffordable_text(deciding, cost_ceiling, global_remaining),
                     "budget_exhausted", source="budget_wrapup_unaffordable",
@@ -147,6 +154,8 @@ def _check_budget_limits(
             ) is False:
                 accumulated_usage["cost_stop_spend_basis"] = spend_basis
                 accumulated_usage["cost_stop_rail"] = "wrapup_reservation_last_fit"
+                budget_pause.request_pause(ctx, rail=budget_pause.RAIL_WRAPUP_LAST_FIT,
+                                           scope=_pause_scope(cost_ceiling), reason_text=finish_reason)
                 return _loop()._forced_final_answer(
                     ctx, prompt=priced_prompt, _prompt_prepared=True,
                     fallback_text=finish_reason, reason_code="budget_exhausted",
@@ -177,6 +186,8 @@ def _check_budget_limits(
             "Budget exhausted."
         )
         accumulated_usage["cost_stop_spend_basis"] = spend_basis
+        budget_pause.request_pause(ctx, rail=budget_pause.RAIL_GRACEFUL_CEILING,
+                                   scope=_pause_scope(cost_ceiling), reason_text=finish_reason)
         return _loop()._forced_final_answer(
             ctx,
             prompt=f"[BUDGET LIMIT] {finish_reason} {_loop()._FORCED_BEST_EFFORT_TAIL}",
@@ -184,6 +195,12 @@ def _check_budget_limits(
             reason_code="budget_exhausted",
         )
     return None
+
+
+def _pause_scope(cost_ceiling: Optional["task_pacing.CostCeiling"]) -> str:
+    """A tree-capped ceiling is the ROOT's money (its fence covers the tree);
+    a global-share ceiling is global money."""
+    return "root" if cost_ceiling is not None and cost_ceiling.root_cap_usd is not None else "global"
 
 
 def _resolve_task_cost_ceiling(
@@ -264,6 +281,10 @@ def _soft_land_exhausted_ceiling(
         f"Per-task tree cap {cap_text} leaves no working room above the "
         f"wrap-up planning margin ({margin_text}). Budget exhausted."
     )
+    if limit_ctx.round_idx > 1:
+        # Work exists: pause exactly instead of pricing a wrap-up call.
+        budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_SOFT_LAND, scope="root",
+                                   reason_text=soft_land_reason)
     trace = limit_ctx.llm_trace if isinstance(limit_ctx.llm_trace, dict) else {}
     priced_prompt = _loop()._prepare_forced_prompt(
         limit_ctx, f"[BUDGET LIMIT] {soft_land_reason} {_loop()._FORCED_BEST_EFFORT_TAIL}", trace,
@@ -414,6 +435,16 @@ def _handle_budget_exceeded(
     }
     if replay_safe:
         raise exc
+    if limit_ctx is not None:
+        # A refused dispatch after real work: exact pause (#1196). Ineligible
+        # actors fall through to the terminal projection below, loudly.
+        limit_ctx.tools = ctx.tools
+        limit_ctx.llm_trace = ctx.llm_trace
+        budget_pause.request_pause(
+            limit_ctx, rail=budget_pause.RAIL_DISPATCH_REFUSED, scope=scope,
+            reason_text=str(exc), root_task_id=resource_limit["root_task_id"])
+        resource_limit["exact_pause_unavailable"] = str(
+            ctx.accumulated_usage.get("exact_pause_unavailable") or "")
     ctx.accumulated_usage["execution_status"] = "failed"
     ctx.accumulated_usage["reason_code"] = "budget_exhausted"
     ctx.accumulated_usage["resource_limit"] = resource_limit
@@ -545,6 +576,12 @@ def _cleanup_loop_resources(
     ctx.tools._ctx._delivery_candidate = None
     ctx.tools._ctx._delivery_control_required = False
     if ctx.drive_root is None or not ctx.task_id:
+        return
+    if getattr(ctx.tools._ctx, "_budget_pausing", False):
+        # The task is NOT terminal: its delegated runs stay under its custody
+        # (observed and stop-requested on the durable pause row); the periodic
+        # sweep keeps covering them. A terminal reconciliation here would
+        # misstate a nonterminal task as ended.
         return
     try:
         from ouroboros.delegate_custody import custody_root, release_task_runs

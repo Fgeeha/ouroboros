@@ -258,9 +258,9 @@ def _task_hard_bound_reached(q: Any, task_id: str, *, now: float) -> bool:
         deadline_ts = float(q._task_deadline_ts(task) or 0.0)
         if deadline_ts and now >= deadline_ts:
             return True
-        if started_at > 0:
-            absolute_ceiling = float(q.get_task_abs_ceiling_sec())
-            return max(0.0, now - started_at) >= absolute_ceiling
+        absolute_ceiling = q.get_task_abs_ceiling_sec()  # None = no lifetime bound
+        if started_at > 0 and absolute_ceiling is not None:
+            return max(0.0, now - started_at) >= float(absolute_ceiling)
         return False
     except Exception:
         # Unreadable hard-bound authority is not permission to extend a task.

@@ -559,7 +559,7 @@ Presentation: the Linux browser fallback checks `DISPLAY`/`WAYLAND_DISPLAY` befo
 
 Extension children, delegated runtimes, services, the local model, and companions all sit beneath these roles: every long-lived process enters the custody ledger or a process group. Disclosed residual: shutdown admission is not atomic with publishing a spawned child (a signal can land between `Popen` and the record) — tracked, not a reason for a second launcher.
 
-Standalone `preflight_review` and its `advisory_review` alias use a finite outer settlement envelope: resolved hermetic test budget plus `max(task absolute ceiling, LLM transport bound + finalization grace)` plus finalization grace, following the existing plan-review wrapper. Inner test, critic, owner deadline and cancellation rules remain separate; `commit_reviewed` retains its existing terminal-wait behavior when calling the same preflight handler.
+Standalone `preflight_review` and its `advisory_review` alias use a finite outer settlement envelope: resolved hermetic test budget plus `max(task operation window, LLM transport bound + finalization grace)` plus finalization grace, following the existing plan-review wrapper. Inner test, critic, owner deadline and cancellation rules remain separate; `commit_reviewed` retains its existing terminal-wait behavior when calling the same preflight handler.
 
 #### Android host (experimental)
 

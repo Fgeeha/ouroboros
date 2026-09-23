@@ -872,6 +872,16 @@ def run_delegated_review_session(
             if schema_asked:
                 run_request["outputSchema"] = output_schema
         if not run_id:
+            from ouroboros.budget_pause import dispatch_fenced
+
+            if dispatch_fenced(task_id):
+                # Observation-only while the owning task pauses (#1196): a
+                # fresh start AND a pending-invocation replay are both a new
+                # POST. The invocation row stays pending for the resumed task.
+                raise ReviewRouteUnavailable(
+                    "the owning task is entering an exact budget pause; no delegated "
+                    "review is started or re-posted while it pauses",
+                    code="budget_pausing_no_send")
             if (not recovering and owner_deadline_at and owner_deadline_exhausted(
                 deadline_at=owner_deadline_at, reserve_sec=get_finalization_grace_sec())):
                 raise _deadline_exhausted_error()

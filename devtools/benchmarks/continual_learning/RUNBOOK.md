@@ -27,9 +27,10 @@ Field-tested configuration and operational hazards from the 2026-07-20 full 1-se
   REMOTE pre-dispatch transport outage. That class (`transport_unavailable`, $0 released
   attempts) now waits and redials at the round level. CLB solve tasks carry no
   `deadline_at` and the waiting itself spends $0, so the binding rail here is the
-  supervisor's absolute per-attempt ceiling (`OUROBOROS_TASK_ABS_CEILING_SEC`, default 6h),
-  not a deadline or budget rail: a dead egress holds the task up to that ceiling instead of
-  failing it after the burst. The wait is visible as durable `network_wait` events in the
+  supervisor's absolute per-attempt ceiling (`OUROBOROS_TASK_ABS_CEILING_SEC` when set; the
+  runtime ships `unlimited`, and then the wait's own 6h operation window from episode entry
+  binds), not a deadline or budget rail: a dead egress holds the task up to that bound
+  instead of failing it after the burst. The wait is visible as durable `network_wait` events in the
   isolated server's `events.jsonl`. Note: idle-rail survival via waiting progress notes
   requires a real chat thread; headless tasks without a `chat_id` keep the idle rail
   (reaper) as an additional bound on the wait. A transport death AFTER dispatch (the

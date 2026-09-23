@@ -722,8 +722,11 @@ class ActiveChatActivity(ActiveDirectTurn):
 
     Direct/ephemeral registry turns (the ``active_direct_turns`` rows) plus ROOT
     managed queue tasks as ``kind="managed_task"`` with ``phase`` ``queued`` |
-    ``budget_paused`` (zero-dispatch member awaiting an explicit resume — never
-    plain "queued") | ``working`` | ``finalizing`` (answer stored, post-task
+    ``budget_paused`` (a budget-paused member — zero-dispatch or an exact
+    mid-run continuation — awaiting an explicit owner Resume; never plain
+    "queued") | ``budget_pausing`` (RUNNING, writing its exact pause record:
+    no new dispatch, not yet released; additive, #1196) | ``working`` |
+    ``finalizing`` (answer stored, post-task
     synthesis open); a direct row whose live wait owner could not be read is
     ``phase="unknown"``. Same shape as ``ActiveDirectTurn`` so one reducer hydrates
     both (managed rows: empty ``client_message_id``). ``required_question_unavailable``:

@@ -417,7 +417,7 @@ class _RoundLimitContext:
     accumulated_usage: Dict[str, Any]
     task_type: str
     active_use_local: bool
-    max_rounds: int
+    max_rounds: Optional[int]  # None = no round limit (the round gate never fires)
     deadline_ts: Optional[float] = None
     # Drive root for durable salvage (latest_llm_response_text) on the provider-death
     # path; optional so existing positional construction stays valid.

@@ -317,6 +317,19 @@ def _managed_task_finalizing(drive_root: Any, task_id: str) -> bool:
     return bool(_task_activity_facts(drive_root, task_id).get("finalizing"))
 
 
+def _managed_task_budget_pausing(drive_root: Any, row: Dict[str, Any], task_id: str) -> bool:
+    """A RUNNING task writing its exact budget pause (#1196): the durable
+    ``budget_pause`` row is the only truth of that window; never raises."""
+    try:
+        from ouroboros.budget_pause import STATE_PAUSING, budget_pause_row
+
+        pause = budget_pause_row(pathlib.Path(row.get("budget_drive_root") or drive_root), task_id)
+        return bool(pause and pause.get("state") == STATE_PAUSING
+                    and int(pause.get("task_attempt") or 0) == int(row.get("_attempt") or 1))
+    except Exception:
+        return False
+
+
 def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *, direct_turns=None, availability=None) -> list:
     """Direct turns plus ROOT managed queue tasks as ONE activity list.
 
@@ -396,7 +409,12 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 activities.append(_activity(task_id, row, phase, _epoch_or_zero(row.get("queued_at"))))
         for task_id, row, started_at in running_rows:
             if task_id and _is_root(task_id, row):
-                phase = "finalizing" if _managed_task_finalizing(drive_root, task_id) else "working"
+                # #1196: a RUNNING root whose durable budget_pause row says
+                # "pausing" is neither working nor paused yet — additive phase.
+                if _managed_task_budget_pausing(drive_root, row, task_id):
+                    phase = "budget_pausing"
+                else:
+                    phase = "finalizing" if _managed_task_finalizing(drive_root, task_id) else "working"
                 activities.append(_activity(task_id, row, phase, started_at))
         from ouroboros.post_task_checkpoint import post_task_model_waits
         visible = {row["activity_id"]: row for row in activities}

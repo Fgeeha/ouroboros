@@ -187,6 +187,22 @@ class BudgetExceeded(UsageAccountingError):
         self.root_task_id = str(root_task_id or "")
 
 
+class DispatchFenced(BudgetExceeded):
+    """Raised before dispatch while the task is entering an exact budget pause.
+
+    A ``BudgetExceeded`` so every existing catcher treats it as the monetary
+    stop it is; ``limit_scope="pausing"`` names the fence. Nothing sent after
+    the fence closed can outrun the pause checkpoint (#1196).
+    """
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__(
+            f"model dispatch fenced: task {task_id} is entering an exact budget pause",
+            limit_scope="pausing",
+        )
+        self.task_id = str(task_id or "")
+
+
 class PhysicalAttemptLimitExceeded(UsageAccountingError):
     """Raised before a provider send would exceed the caller's actor-local rail."""
 
@@ -843,6 +859,12 @@ def _candidate_request_fields(request: AttemptRequest) -> Dict[str, Any]:
 def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
     """Atomically check global/root limits and append a ``reserved`` record."""
     request, scope = _merge_scope(request)
+    from ouroboros.budget_pause import dispatch_fenced
+
+    if dispatch_fenced(scope.task_id):
+        # Process-local pause fence: no NEW send (loop, tool, reviewer, verdict
+        # extraction) under a task that is writing its exact pause checkpoint.
+        raise DispatchFenced(scope.task_id)
     root = _drive_root(scope.drive_root)
     root_fence = _active_root_budget_fence(root, scope.root_task_id)
     if root_fence is not None:

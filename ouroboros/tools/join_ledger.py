@@ -610,6 +610,49 @@ def _override_delegation_constraint(ctx: ToolContext, constraint_id: str, reason
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"⚠️ override_delegation_constraint: failed to record override for {cid}.")))
 
 
+def _resume_child_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
+    """Owner Q9 (#1196): explicitly select ONE budget-paused descendant to continue.
+
+    The request rides the existing worker->supervisor control channel; the
+    supervisor validates lineage and grants through the ONE resume seam, and
+    records the typed outcome as a ``budget_resume_child_outcome`` event. This
+    tool therefore reports a REQUEST, never a completed resume.
+    """
+    try:
+        tid = validate_task_id(task_id)
+    except ValueError as exc:
+        return f"⚠️ TOOL_ARG_ERROR (resume_child_task): {exc}"
+    reason_text = _clip(" ".join(str(reason or "").split()), 500)
+    status_drive_root = _status_drive_root(ctx)
+    own = _is_own_child(ctx, status_drive_root, tid)
+    requester = str(getattr(ctx, "task_id", "") or "")
+    if not own:
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
+            f"⚠️ resume_child_task: {tid} is not a child of this task — only your own "
+            "budget-paused descendants can be selected for continuation.")))
+    from ouroboros.tools.control import _emit_control_event
+
+    emitted = _emit_control_event(ctx, {
+        "type": "budget_resume_child",
+        "task_id": tid,
+        "requested_by": requester,
+        "reason": reason_text,
+        "ts": utc_now_iso(),
+    })
+    _record_child_decision_beacon(
+        ctx, tid, f"selected budget-paused child {tid} for continuation" + (f": {reason_text}" if reason_text else ""),
+    )
+    note = " (live)" if emitted == "live" else " (deferred to round end)"
+    return (
+        f"Resume requested for {tid}{note}. This is a REQUEST: the supervisor validates money, "
+        "Stop/cancel intent, deadline, finite lifetime and the child's checkpoint through the same "
+        "seam the owner's Resume uses, then records a budget_resume_child_outcome event. When granted, "
+        "the child's status changes from paused to scheduled under its SAME task id; a refusal "
+        "(budget_still_exhausted, cancel_intent_active, deadline_passed, lifetime_exhausted, "
+        "root_still_paused, pause_record_missing, ...) leaves it paused. Check with peek_task."
+    )
+
+
 def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     try:
         tid = validate_task_id(task_id)
@@ -732,6 +775,21 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
 
 def get_tools() -> list[ToolEntry]:
     return [
+        ToolEntry("resume_child_task", {
+            "name": "resume_child_task",
+            "description": "Owner Q9 (#1196): after YOUR OWN task was resumed from a budget pause, "
+                           "select ONE of your budget-paused descendants to continue under its same task id. "
+                           "Nothing resumes automatically and no fan-out happens: you name each child you still "
+                           "need, with a reason. The supervisor validates money, Stop/cancel intent, deadline and "
+                           "finite lifetime through the same seam the owner's Resume uses; the typed outcome is "
+                           "recorded as a budget_resume_child_outcome event and the child's status changes from "
+                           "paused to scheduled when granted. Cancelled, completed or otherwise-stopped children "
+                           "are never revived; a child under a root that is itself still paused is refused.",
+            "parameters": {"type": "object", "properties": {
+                "task_id": {"type": "string"},
+                "reason": {"type": "string", "default": "", "description": "Why this child is still needed (recorded)."},
+            }, "required": ["task_id"]},
+        }, _resume_child_task),
         ToolEntry("cancel_task", {
             "name": "cancel_task",
             "description": "Request cancellation of a running/scheduled task by ID (durable intent; "

@@ -1352,7 +1352,14 @@ async def api_task_cancel(request: Request) -> JSONResponse:
 
 
 async def api_task_resume(request: Request) -> JSONResponse:
-    """Resume only a replay-safe task paused before its first model dispatch."""
+    """Explicit owner Resume of a budget-paused task.
+
+    A replay-safe zero-dispatch row is released; an exact mid-run continuation
+    (#1196) receives ONE single-use grant and continues under the same task id.
+    Every refusal is typed: money still exhausted, a live cancel intent, a
+    passed deadline, an exhausted finite lifetime, a root that is itself still
+    paused, or a missing/unreadable checkpoint all leave the task paused.
+    """
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
     except ValueError as exc:
@@ -1368,6 +1375,12 @@ async def api_task_resume(request: Request) -> JSONResponse:
     error = str(result.get("error") or "resume_refused")
     status = 409 if error in {
         "task_not_budget_paused", "replay_unsafe", "root_budget_fence_missing",
+        # exact-continuation refusals (#1196): the task stays paused
+        "budget_still_exhausted", "root_hard_cap_exhausted", "cancel_intent_active",
+        "deadline_passed", "lifetime_exhausted", "root_still_paused", "resume_already_granted",
+        "restart_no_resume", "pause_record_missing", "pause_source_unreadable",
+        "pause_record_unreadable", "grant_not_recorded", "snapshot_not_persisted",
+        "monetary_authority_unavailable", "cancellation_authority_unavailable", "task_terminal",
     } else 404
     return json_error(error, status, task_id=task_id, **({"action": result["action"]} if result.get("action") else {}))
 

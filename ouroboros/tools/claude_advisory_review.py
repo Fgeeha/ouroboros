@@ -1465,11 +1465,14 @@ def _preflight_tool_timeout_sec() -> float:
     Tests precede the critic. Cover their resolved total plus the existing
     task/transport envelope; do not create or replace the critic's own deadline.
     """
-    from ouroboros.config import get_llm_transport_read_timeout_sec, get_task_abs_ceiling_sec
+    from ouroboros.config import (
+        get_llm_transport_read_timeout_sec, get_task_abs_ceiling_sec, operation_window_sec,
+    )
     from ouroboros.preflight_runner import _resolve_preflight_timeout
 
     grace = get_finalization_grace_sec()
-    review_envelope = max(get_task_abs_ceiling_sec(), get_llm_transport_read_timeout_sec() + grace)
+    review_envelope = max(operation_window_sec(get_task_abs_ceiling_sec()),
+                          get_llm_transport_read_timeout_sec() + grace)
     return _resolve_preflight_timeout() + review_envelope + grace
 
 

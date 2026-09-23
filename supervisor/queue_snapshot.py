@@ -158,6 +158,7 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "_budget_pause": t.get("_budget_pause"), "budget_resumed_at": t.get("budget_resumed_at"), "_terminalization_retry": t.get("_terminalization_retry"),
                 "_cancel_intent_authority_hold": t.get("_cancel_intent_authority_hold"),
                 "_owner_wait_resume": t.get("_owner_wait_resume"),
+                "_budget_pause_resume": t.get("_budget_pause_resume"),
             },
         })
     running_rows = []
@@ -167,13 +168,16 @@ def persist_queue_snapshot(reason: str = "") -> bool:
         task = meta.get("task") if isinstance(meta, dict) else {}
         started = float(meta.get("started_at") or 0.0) if isinstance(meta, dict) else 0.0
         hb = float(meta.get("last_heartbeat_at") or 0.0) if isinstance(meta, dict) else 0.0
+        paused_sec = float(meta.get("budget_paused_sec") or 0.0) if isinstance(meta, dict) else 0.0
         running_rows.append({
             "id": task_id, "type": task.get("type"), "priority": task.get("priority"),
             "attempt": meta.get("attempt"), "worker_id": meta.get("worker_id"),
             "owner_wait": meta.get("owner_wait"), "started_at": started,
             "runtime_sec": round(max(0.0, now - started), 2) if started > 0 else 0.0,
             "quota_wait_sec": quota_waited_seconds(meta, now),
-            "execution_sec": max(0.0, now - started - quota_waited_seconds(meta, now)) if started > 0 else 0.0,
+            "budget_paused_sec": paused_sec,
+            "execution_sec": (max(0.0, now - started - quota_waited_seconds(meta, now) - paused_sec)
+                              if started > 0 else 0.0),
             "heartbeat_lag_sec": round(max(0.0, now - hb), 2) if hb > 0 else None,
             "soft_sent": bool(meta.get("soft_sent")), "task": task,
         })
@@ -411,11 +415,24 @@ def restore_pending_from_snapshot(
             if isinstance(row, dict) and isinstance(row.get("task"), dict)
         ]
         from ouroboros.owner_wait import restore_owner_wait_allowed
+        from ouroboros.budget_pause import restore_budget_pause_allowed
+        from supervisor.queue_transitions import revoke_exact_budget_resume
 
+        for task in snapshot_pending:
+            # A grant that never reached a worker before this restart is not
+            # carried into the new generation: it returns to its exact pause
+            # and the owner re-issues Resume (no dispatch across a restart the
+            # grant did not see; the row's single-use identity stays honest).
+            if isinstance(task.get("_budget_pause_resume"), dict):
+                revoke_exact_budget_resume(task, "restart_before_dispatch")
         snapshot_pending = [
             task for task in snapshot_pending
             if (not task.get("_owner_wait_resume") and not stale)
             or (task.get("_owner_wait_resume") and restore_owner_wait_allowed(_queue().DRIVE_ROOT, task))
+            # An exact budget pause is retained WITHOUT waking, whatever the
+            # snapshot's age: the durable row and readable source authorize the
+            # locator; nothing dispatches it until an explicit owner Resume.
+            or (stale and restore_budget_pause_allowed(_queue().DRIVE_ROOT, task))
         ]
         # The pre-restart RUNNING rows are read HERE, before the stale gate: this
         # is the last moment the list exists, and a stale snapshot is exactly the

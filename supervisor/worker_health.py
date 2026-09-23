@@ -278,6 +278,41 @@ def recover_confirmed_dead_worker(job: dict) -> None:
                 _respawn_after_reap(queue, _pool(), job["worker_id"], expected_worker=w)
 
 
+def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task: dict,
+                                             task_id: str, attempt: int) -> bool:
+    """Worker death DURING durable budget pausing: finish the park, retry nothing.
+
+    The pause row and its source were written before the worker unwound; the
+    dead process took every local producer with it, so the durable rows are
+    the complete view and the SAME task id returns to PENDING under its exact
+    continuation (#1196). This is non-admission of the crash-retry path for
+    exactly this window — a checkpointed task must never be replayed — not a
+    general crash recovery: any other crash keeps its ordinary custody path.
+    """
+    from ouroboros.budget_pause import STATE_PAUSED, STATE_PAUSING, budget_pause_row
+    from supervisor.events_budget import install_exact_budget_pause
+
+    result_root = pathlib.Path(task.get("budget_drive_root") or root)
+    try:
+        row = budget_pause_row(result_root, task_id)
+    except Exception:
+        return False
+    if not (row and row.get("state") in {STATE_PAUSING, STATE_PAUSED}
+            and int(row.get("task_attempt") or 0) == int(attempt) and row.get("source_ref")):
+        return False
+    with _queue_lock:
+        if not _dead_job_is_current(job):
+            return False
+    try:
+        install_exact_budget_pause(_pool(), task_id, {"pause_id": row.get("pause_id")},
+                                   source="worker_death_during_pausing")
+    except Exception:
+        log.error("Exact budget pause of %s could not be completed after worker death; "
+                  "leaving the row for the next reconciliation", task_id, exc_info=True)
+        return False
+    return True
+
+
 def _recover_crashed_task_without_terminal(job: dict, queue: Any) -> None:
     """The previous crash outcome/retry policy, running on the existing reaper."""
     from supervisor.worker_owner_wait import has_owner_wait_checkpoint
@@ -301,8 +336,17 @@ def _recover_crashed_task_without_terminal(job: dict, queue: Any) -> None:
         0,
     )
     attempt = int(task.get("_attempt") or 1)
+    if _complete_exact_budget_pause_after_death(job, root, task, task_id, attempt):
+        return
+    from ouroboros.budget_pause import has_budget_pause_checkpoint
+
+    # A `pausing` row without a checkpoint yet (death during the drain), or an
+    # UNREADABLE pause record, fences the ordinary retry exactly like an
+    # owner-wait checkpoint: completed work is never replayed (#1196).
+    budget_pausing = has_budget_pause_checkpoint(
+        pathlib.Path(task.get("budget_drive_root") or root), task_id, attempt)
     replay_unsafe = (not getattr(w, "active_capacity", True)
-                     or has_owner_wait_checkpoint(meta, attempt))
+                     or has_owner_wait_checkpoint(meta, attempt) or budget_pausing)
     # Reconstruct cost/rounds from durable llm_usage for any
     # abnormal-termination rollup below (worker died pre-finalize,
     # so the event would otherwise carry zeros).
@@ -315,7 +359,14 @@ def _recover_crashed_task_without_terminal(job: dict, queue: Any) -> None:
     if (is_crash_signal or attempt > _pool().QUEUE_MAX_RETRIES
           or replay_unsafe):
         deep = task_type == "deep_self_review"
-        if replay_unsafe:
+        if budget_pausing:
+            result_text = (
+                "Worker process died while entering a budget pause before its continuation "
+                "checkpoint existed (or the pause record is unreadable). Completed actions were "
+                "not retried; no exact continuation is available for this attempt."
+            )
+            reason_code = "worker_crash_budget_pausing"
+        elif replay_unsafe:
             result_text = (
                 "Worker process died after an owner-wait checkpoint. The continuation "
                 "source is retained; completed actions were not retried."

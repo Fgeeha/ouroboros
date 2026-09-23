@@ -214,6 +214,15 @@ def assign_tasks() -> None:
                     continue
                 if task.get("_owner_wait_resume"):
                     continue  # Restore the checkpoint; the loop still owns its budget stop.
+                if isinstance(task.get("_budget_pause_resume"), dict):
+                    # Money vanished between the grant and this dispatch: the
+                    # single-use grant returns to its exact pause, never to a
+                    # pre-dispatch replay or a terminal.
+                    from supervisor.queue_transitions import revoke_exact_budget_resume
+
+                    revoke_exact_budget_resume(task, "budget_exhausted_before_dispatch")
+                    queue.persist_queue_snapshot(reason="budget_exact_resume_revoked")
+                    continue
                 task_id = str(task.get("id") or "")
                 cost_fields = _pool().reconstruct_task_cost(
                     task_id, fields=True,
@@ -337,7 +346,9 @@ def assign_tasks() -> None:
                     if isinstance(candidate.get("_budget_pause"), dict):
                         continue
                     root_task_id = str(candidate.get("root_task_id") or "").strip()
-                    if root_task_id in queue.BUDGET_ROOT_FENCES and not candidate.get("_owner_wait_resume"):
+                    if (root_task_id in queue.BUDGET_ROOT_FENCES
+                            and not candidate.get("_owner_wait_resume")
+                            and not candidate.get("_budget_pause_resume")):
                         continue
                     if str(candidate.get("type") or "") == "evolution" and remaining < EVOLUTION_BUDGET_RESERVE:
                         continue
@@ -383,13 +394,17 @@ def assign_tasks() -> None:
                 w.busy_task_id = task["id"]
                 w.in_q.put(task)
                 now_ts = time.time()
-                resume = task.get("_owner_wait_resume") or {}
+                resume = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or {}
                 _pool().RUNNING[task["id"]] = {
                     "task": dict(task), "worker_id": w.wid,
                     "started_at": float(resume.get("started_at") or now_ts), "last_heartbeat_at": now_ts,
                     "last_progress_at": now_ts,
                     **({"model_wait_quota_clock": dict(resume["model_wait_quota_clock"])}
                        if resume.get("model_wait_quota_clock") else {}),
+                    # Separate paused-interval carrier (#1196): the original
+                    # started_at is untouched; lifetime rails subtract this.
+                    **({"budget_paused_sec": float(resume["paused_duration_sec"] or 0.0)}
+                       if resume.get("paused_duration_sec") else {}),
                     "soft_sent": False, "attempt": int(task.get("_attempt") or 1),
                 }
                 task_type = str(task.get("type") or "")

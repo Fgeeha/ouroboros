@@ -227,7 +227,12 @@ def budget_pause_fact(task, fences=None):
 
 
 def resume_budget_paused_task(task_id: str) -> Dict[str, Any]:
-    """Explicitly resume one zero-dispatch task and, if needed, its root latch."""
+    """Explicitly resume one budget-paused task and, if needed, its root latch.
+
+    A replay-safe ZERO-dispatch row is released as before. An EXACT
+    continuation row (#1196) receives one single-use grant instead
+    (``grant_exact_budget_resume``); it is never re-run from scratch.
+    """
     q = _queue_module()
     task_id = str(task_id or "").strip()
     if not task_id:
@@ -237,6 +242,8 @@ def resume_budget_paused_task(task_id: str) -> Dict[str, Any]:
         if task is None:
             return {"ok": False, "error": "task_not_pending"}
         pause = task.get("_budget_pause") if isinstance(task.get("_budget_pause"), dict) else None
+        if pause and pause.get("exact_continuation"):
+            return grant_exact_budget_resume(task, pause)
         if not pause:
             # A root marker blocks every already-pending sibling without
             # copying pause state onto each task.  An explicit resume request
@@ -348,6 +355,226 @@ def resume_budget_paused_task(task_id: str) -> Dict[str, Any]:
         },
     )
     return {"ok": True, "task_id": task_id, "same_generation": True}
+
+
+def _root_budget_paused_locked(q: Any, root_task_id: str, *, except_task_id: str = "") -> bool:
+    """Whether the ROOT of a tree is itself still budget-paused (queue lock held).
+
+    Owner Q9: a root's Resume makes its own budget-paused descendants ELIGIBLE;
+    a descendant cannot be resumed under a root that is still paused.
+    """
+    root_task_id = str(root_task_id or "")
+    if not root_task_id or root_task_id == except_task_id:
+        return False
+    for row in q.PENDING:
+        if str(row.get("id") or "") == root_task_id and isinstance(row.get("_budget_pause"), dict):
+            return True
+    return False
+
+
+def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any]) -> Dict[str, Any]:
+    """Validate money / Stop / deadline / finite lifetime / checkpoint, then mint ONE grant.
+
+    Called with the queue lock held. The paused interval is carried as its own
+    ``paused_duration_sec`` (the original ``started_at`` is never moved; the
+    quota clock is not a pause clock). Refusals are typed and leave the task
+    paused: money still exhausted needs an owner increase (Q3/Q7/Q10), a live
+    cancel intent or a passed deadline or an exhausted finite lifetime is not
+    continued, a missing or unreadable source refuses (a stale locator revives
+    nothing). Direct actors never reach here (they were never queued).
+    """
+    import time
+    import uuid
+
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.budget_pause import (
+        LIVE_PAUSE_STATES, STATE_RESUME_GRANTED, set_budget_pause,
+    )
+    from ouroboros.cancel_intents import has_active_intent
+    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.deadline_utils import parse_deadline_ts, utc_now
+    from ouroboros.model_wait import quota_waited_seconds
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+    from supervisor.state import budget_remaining
+
+    q = _queue_module()
+    task_id = str(task.get("id") or "")
+    checkpoint = pause.get("checkpoint") if isinstance(pause.get("checkpoint"), dict) else {}
+    pause_id = str(checkpoint.get("pause_id") or "")
+    result_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+    if any((pathlib.Path(q.DRIVE_ROOT) / "state" / name).exists()
+           for name in ("owner_restart_no_resume.flag", "panic_stop.flag")):
+        return {"ok": False, "error": "restart_no_resume", "action": "wait_or_cancel"}
+    try:
+        result_row = load_task_result(result_root, task_id, strict=True) or {}
+    except Exception:
+        return {"ok": False, "error": "pause_record_unreadable", "action": "cancel_or_new_run"}
+    row = result_row.get("budget_pause") if isinstance(result_row.get("budget_pause"), dict) else {}
+    if result_row.get("status") in _TRULY_TERMINAL_STATUSES:
+        return {"ok": False, "error": "task_terminal"}
+    if (not row or row.get("pause_id") != pause_id or row.get("state") not in LIVE_PAUSE_STATES
+            or not row.get("source_ref")):
+        return {"ok": False, "error": "pause_record_missing", "action": "cancel_or_new_run"}
+    if row.get("state") == STATE_RESUME_GRANTED and not (row.get("grant") or {}).get("revoked_at"):
+        return {"ok": False, "error": "resume_already_granted",
+                "grant_id": (row.get("grant") or {}).get("grant_id")}
+    try:
+        read_actor_source_bytes(result_root, task_id, row["source_ref"])
+    except Exception:
+        return {"ok": False, "error": "pause_source_unreadable", "action": "cancel_or_new_run"}
+    external = row.get("external_runs") if isinstance(row.get("external_runs"), dict) else {}
+    if external.get("custody_read") != "ok":
+        # The pause could not read its delegated custody: UNKNOWN is held, not
+        # cleared. Re-read now (observation only — no stop is requested from the
+        # supervisor); refuse while it stays unreadable.
+        try:
+            from ouroboros import delegate_custody as custody
+
+            held = [run for run in custody.replay(pathlib.Path(q.DRIVE_ROOT)).values()
+                    if str(getattr(run, "task_id", "") or "") == task_id and not getattr(run, "settled", True)]
+            external = {
+                "runs": [{"run_id": str(getattr(run, "run_id", "") or ""), "route": str(getattr(run, "route", "") or ""),
+                          "state": "running", "stop_outcome": "not_requested_at_grant",
+                          "cost_coverage": "unproven_preterminal", "stop_policy": "request_stop"}
+                         for run in held],
+                "observed_at": time.time(), "custody_read": "ok",
+                "coverage_basis": "reobserved_at_grant_after_pause_read_failure",
+            }
+            row = {**row, "external_runs": external}
+        except Exception as exc:
+            return {"ok": False, "error": "external_custody_unreadable", "detail": f"{type(exc).__name__}: {str(exc)[:200]}"}
+    try:
+        if has_active_intent(pathlib.Path(q.DRIVE_ROOT), task_id, strict=True):
+            return {"ok": False, "error": "cancel_intent_active"}
+    except Exception:
+        return {"ok": False, "error": "cancellation_authority_unavailable"}
+    deadline = parse_deadline_ts(task.get("deadline_at") or (task.get("task_contract") or {}).get("deadline_at"))
+    if deadline is not None and deadline <= utc_now():
+        return {"ok": False, "error": "deadline_passed"}
+    now = time.time()
+    started = float(row.get("started_at") or checkpoint.get("started_at") or 0.0)
+    paused_at = float(row.get("paused_at") or checkpoint.get("paused_at") or now)
+    prior_paused = float(row.get("paused_duration_sec") or 0.0)
+    quota_waited = quota_waited_seconds(
+        {"model_wait_quota_clock": row.get("model_wait_quota_clock") or {}}, paused_at)
+    executed_sec = max(0.0, paused_at - started - quota_waited - prior_paused) if started else 0.0
+    ceiling = get_task_abs_ceiling_sec()  # None = unlimited lifetime; 0 = exhausted
+    if ceiling is not None and started and executed_sec >= float(ceiling):
+        return {"ok": False, "error": "lifetime_exhausted", "executed_sec": round(executed_sec, 1)}
+    try:
+        remaining = budget_remaining(q.load_state(), strict=True, allow_stale=True)
+    except Exception:
+        return {"ok": False, "error": "monetary_authority_unavailable"}
+    if remaining <= 0:
+        return {"ok": False, "error": "budget_still_exhausted", "action": "increase_budget_then_resume"}
+    root_task_id = str(pause.get("root_task_id") or task.get("root_task_id") or task_id)
+    if str(pause.get("scope") or "") == "root":
+        try:
+            from ouroboros.usage_accounting import refresh_root_accounting
+
+            tree = refresh_root_accounting(result_root, root_task_id, max_age_sec=0.0) or {}
+            limit = tree.get("limit_usd")
+            if (limit is not None and tree.get("accounted_usd") is not None
+                    and float(tree["accounted_usd"]) >= float(limit) - 1e-9):
+                return {"ok": False, "error": "root_hard_cap_exhausted",
+                        "action": "increase_budget_then_resume"}
+        except Exception:
+            log.debug("Root accounting unavailable at exact resume for %s", task_id, exc_info=True)
+    if _root_budget_paused_locked(q, root_task_id, except_task_id=task_id):
+        return {"ok": False, "error": "root_still_paused", "root_task_id": root_task_id,
+                "action": "resume_root_first"}
+    grant = {
+        "grant_id": uuid.uuid4().hex, "granted_at": utc_now_iso(), "granted_at_ts": now,
+        "single_use": True, "paused_duration_sec": prior_paused + max(0.0, now - paused_at),
+        "executed_sec_before_pause": round(executed_sec, 3),
+        "refresh_planning_threshold": str(row.get("rail") or "") in {
+            "graceful_ceiling", "wrapup_last_fit", "soft_land"},
+    }
+    prior_pause = dict(pause)
+    try:
+        set_budget_pause(result_root, task_id, {**row, "state": STATE_RESUME_GRANTED, "grant": grant},
+                         expected_pause_id=pause_id)
+    except Exception as exc:
+        return {"ok": False, "error": "grant_not_recorded", "detail": str(exc)[:200]}
+    task.pop("_budget_pause", None)
+    task["_budget_pause_resume"] = {
+        **checkpoint, "grant_id": grant["grant_id"], "granted_at": grant["granted_at"],
+        "paused_duration_sec": grant["paused_duration_sec"], "pause": prior_pause,
+    }
+    task["budget_resumed_at"] = grant["granted_at"]
+    fence = q.BUDGET_ROOT_FENCES.get(root_task_id)
+    fence_released = False
+    if (task_id == root_task_id and isinstance(fence, dict) and str(fence.get("fence_id") or "")
+            == str(prior_pause.get("fence_id") or fence.get("fence_id"))):
+        # The root's own Resume lifts its admission latch: exact-continuation
+        # descendants keep their OWN `_budget_pause` rows and are only ELIGIBLE
+        # now; the model selects each through this same control (Q9).
+        q.BUDGET_ROOT_FENCES.pop(root_task_id, None)
+        fence_released = True
+    if not q.persist_queue_snapshot(reason="budget_exact_resume_granted"):
+        task.pop("_budget_pause_resume", None)
+        task["_budget_pause"] = prior_pause
+        if fence_released:
+            q.BUDGET_ROOT_FENCES[root_task_id] = fence
+        try:
+            set_budget_pause(result_root, task_id, row, expected_pause_id=pause_id)
+        except Exception:
+            log.warning("Exact resume grant rollback remains unpersisted for %s", task_id, exc_info=True)
+        return {"ok": False, "error": "snapshot_not_persisted"}
+    try:
+        from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+
+        write_task_result(
+            result_root, task_id, STATUS_SCHEDULED, reason_code="",
+            resource_limit={**prior_pause, "status": "resume_granted", "resumed_at": grant["granted_at"],
+                            "grant_id": grant["grant_id"], "auto_resume": False},
+        )
+    except Exception:
+        log.debug("Failed to project exact budget resume for %s", task_id, exc_info=True)
+    eligible = [str(r.get("id") or "") for r in q.PENDING
+                if isinstance(r.get("_budget_pause"), dict) and r["_budget_pause"].get("exact_continuation")
+                and str(r.get("root_task_id") or "") == root_task_id and str(r.get("id") or "") != task_id]
+    q.append_jsonl(
+        q.DRIVE_ROOT / "logs" / "events.jsonl",
+        {"ts": utc_now_iso(), "type": "budget_task_explicitly_resumed", "task_id": task_id,
+         "root_task_id": root_task_id, "same_generation": True, "exact_continuation": True,
+         "grant_id": grant["grant_id"], "paused_duration_sec": grant["paused_duration_sec"],
+         "eligible_descendants": eligible if task_id == root_task_id else []},
+    )
+    return {"ok": True, "task_id": task_id, "root_task_id": root_task_id, "exact_continuation": True,
+            "grant_id": grant["grant_id"], "paused_duration_sec": round(grant["paused_duration_sec"], 1),
+            "eligible_descendants": eligible if task_id == root_task_id else []}
+
+
+def revoke_exact_budget_resume(task: Dict[str, Any], reason: str) -> bool:
+    """Return a granted-but-undispatched task to its exact pause (queue lock held).
+
+    Money can vanish between the grant and the dispatch (a sibling spent it);
+    the grant is single-use and must not be dispatched into a refused send.
+    """
+    from ouroboros.budget_pause import STATE_PAUSED, budget_pause_row, set_budget_pause
+
+    q = _queue_module()
+    handoff = task.get("_budget_pause_resume") if isinstance(task.get("_budget_pause_resume"), dict) else None
+    if not handoff or not isinstance(handoff.get("pause"), dict):
+        return False
+    task_id = str(task.get("id") or "")
+    result_root = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+    try:
+        row = budget_pause_row(result_root, task_id)
+        grant = dict(row.get("grant") or {})
+        grant.update(revoked_at=utc_now_iso(), revoke_reason=str(reason or ""))
+        set_budget_pause(result_root, task_id, {**row, "state": STATE_PAUSED, "grant": grant},
+                         expected_pause_id=str(row.get("pause_id") or ""))
+    except Exception:
+        log.warning("Exact resume grant revocation not recorded for %s", task_id, exc_info=True)
+        return False
+    task["_budget_pause"] = dict(handoff["pause"])
+    task.pop("_budget_pause_resume", None)
+    q.append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl",
+                   {"ts": utc_now_iso(), "type": "budget_resume_grant_revoked", "task_id": task_id,
+                    "reason": str(reason or ""), "grant_id": grant.get("grant_id")})
+    return True
 
 
 def _live_project_task_ids(

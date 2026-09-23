@@ -784,12 +784,14 @@ def _bounded_max_seconds(ctx: ToolContext, requested: Optional[int]) -> int:
     # has already passed. Omitting `maxSeconds` — the old behavior — handed the run
     # Claudexor's 7-day schema bound; the cap is damage limitation, and custody (the
     # durable start row plus reconciliation) is what actually stops an orphan.
-    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.config import get_task_abs_ceiling_sec, operation_window_sec
 
-    # Claudexor bounds maxSeconds at 7 days (control.ts `.max(604_800)`), and the task
-    # ceiling clamps only from BELOW — an owner who raises it past a week would make
-    # every deadline-less start send an out-of-schema value.
-    return min(_CLAUDEXOR_MAX_SECONDS, int(get_task_abs_ceiling_sec()))
+    # The task's operation window: its finite absolute lifetime, else the finite operation
+    # fallback (a task without a lifetime bound never sends an unbounded run). Claudexor
+    # bounds maxSeconds at 7 days (control.ts `.max(604_800)`), and the task ceiling clamps
+    # only from BELOW — an owner who raises it past a week would make every deadline-less
+    # start send an out-of-schema value.
+    return min(_CLAUDEXOR_MAX_SECONDS, int(operation_window_sec(get_task_abs_ceiling_sec())))
 
 
 def _halt_breached_run(ctx: ToolContext, gateway: Any, entry: _RunCustody,
@@ -1161,7 +1163,7 @@ def _published_entry(core: Any) -> Any:
 
 
 def get_tools() -> List[ToolEntry]:
-    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.config import get_task_abs_ceiling_sec, operation_window_sec
 
     return [
         ToolEntry("delegate_start", {
@@ -1290,7 +1292,7 @@ def get_tools() -> List[ToolEntry]:
                 "checkpoint_reason": {"type": "string", "description":
                     "Why one proactive inspection is worth a model call. No repeating cadence."},
             }},
-        }, _published_entry(_delegate_wait_entry), timeout_sec=get_task_abs_ceiling_sec() + 120),
+        }, _published_entry(_delegate_wait_entry), timeout_sec=operation_window_sec(get_task_abs_ceiling_sec()) + 120),
         ToolEntry("delegate_cancel", {
             "name": "delegate_cancel",
             "description": (

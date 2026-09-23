@@ -271,11 +271,15 @@ class TaskModelWait:
                 for key, row in self.waits.items()}}
 
     def execution_window_remaining(self) -> float | None:
-        """A custom live owner supplies its own clock; None invents no deadline."""
+        """A custom live owner supplies its own clock and a task without an absolute
+        lifetime has none; None invents no deadline, and 0.0 means the window is spent."""
         if self.owner_control is not None:
             return None
         from ouroboros.config import get_task_abs_ceiling_sec
-        return max(0.0, get_task_abs_ceiling_sec() - (time.monotonic() - self.started_monotonic - self.paused_seconds()))
+        ceiling = get_task_abs_ceiling_sec()
+        if ceiling is None:
+            return None
+        return max(0.0, ceiling - (time.monotonic() - self.started_monotonic - self.paused_seconds()))
 
     def quota_clock_snapshot(self) -> dict:
         """The same task-wide clock fact for live publication and continuation."""
@@ -369,7 +373,8 @@ class TaskModelWait:
         if self.owner_control is not None:
             return self.owner_control()
         elapsed = time.monotonic() - self.started_monotonic - self.paused_seconds()
-        if elapsed >= get_task_abs_ceiling_sec():
+        ceiling = get_task_abs_ceiling_sec()
+        if ceiling is not None and elapsed >= ceiling:
             return "absolute_ceiling"
         # The loop owns delivery. A private seen copy leaves that ownership
         # intact and excludes an already-drained or superseded stop control.

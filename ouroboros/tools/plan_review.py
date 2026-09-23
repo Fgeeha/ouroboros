@@ -40,6 +40,7 @@ from ouroboros.config import (
     get_llm_transport_read_timeout_sec,
     get_review_enforcement,
     get_task_abs_ceiling_sec,
+    operation_window_sec,
 )
 from ouroboros.review_cycles import emit_review_cycles_exhausted, review_max_cycles
 from ouroboros.task_results import (
@@ -114,11 +115,12 @@ def _plan_review_wrapper_timeout_sec() -> float:
     return float(get_llm_transport_read_timeout_sec() + get_finalization_grace_sec())
 
 def _plan_task_tool_timeout_sec() -> float:
-    # ``agent_session`` reviewers inherit the task's existing absolute
-    # lifetime, which is deliberately much longer than an API transport read.
-    # The outer ToolEntry must cover either route plus one finalization grace
-    # window; it is a settlement envelope, never a cognition cutoff.
-    return max(_plan_review_wrapper_timeout_sec(), float(get_task_abs_ceiling_sec())) + get_finalization_grace_sec()
+    # ``agent_session`` reviewers inherit the task's operation window (its finite
+    # absolute lifetime, else the operation fallback), which is deliberately much
+    # longer than an API transport read. The outer ToolEntry must cover either route
+    # plus one finalization grace window; it is a settlement envelope, never a cognition cutoff.
+    return (max(_plan_review_wrapper_timeout_sec(), operation_window_sec(get_task_abs_ceiling_sec()))
+            + get_finalization_grace_sec())
 
 @dataclass(frozen=True)
 class _PlanRequest:

@@ -468,11 +468,16 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     bare = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
     bare.task_id = "t-a"
     bare.task_metadata = {"root_task_id": "t-a"}          # no deadline_at at all
-    # The cap is the EXISTING task ceiling SSOT, not a second hardcoded one: a 1h guess
-    # would have truncated a headless/benchmark run that legitimately has no deadline.
-    from ouroboros.config import get_task_abs_ceiling_sec
+    # The cap is the EXISTING operation-window SSOT, not a second hardcoded one: a 1h guess
+    # would have truncated a headless/benchmark run that legitimately has no deadline. A
+    # task without a lifetime bound (the shipped default) still sends a FINITE cap.
+    from ouroboros.config import OPERATION_WINDOW_FALLBACK_SEC, get_task_abs_ceiling_sec
 
-    assert delegate._bounded_max_seconds(bare, None) == int(get_task_abs_ceiling_sec())
+    assert get_task_abs_ceiling_sec() is None
+    assert delegate._bounded_max_seconds(bare, None) == OPERATION_WINDOW_FALLBACK_SEC
+    # A finite configured lifetime is the window itself.
+    monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "7200")
+    assert delegate._bounded_max_seconds(bare, None) == 7200
 
     # ...but never past Claudexor's own schema bound. The task ceiling clamps only from
     # BELOW, so an owner who raises it past a week would make every deadline-less start
