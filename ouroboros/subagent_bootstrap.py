@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Dict, Mapping, Optional
 
 from ouroboros.subagent_history import snapshot_handle
 from ouroboros.subagent_work_order import compile_external_work_order
@@ -84,10 +84,23 @@ def _startup_refusal_definite(payload: Mapping[str, Any]) -> bool:
     )
 
 
+# The typed facts a refused snapshot provision carries (`delegate_shared.lock_busy_facts`):
+# they ride the refusal payload, the $0 terminal and the START_FAILED row unchanged.
+_REFUSAL_FACT_KEYS = ("cause", "holder", "waited_sec", "retryable", "retry_hint")
+
+
+def refusal_facts(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """The producer's typed refusal facts present on ``payload`` (never a handle)."""
+    return {key: payload[key] for key in _REFUSAL_FACT_KEYS if key in payload}
+
+
 def _record_startup_refusal(
     ctx: Any, task: Mapping[str, Any], *, reason: str, reset_at: str = "",
+    detail: str = "", facts: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """Stash the typed unrun refusal for the caller's zero-spend terminal."""
+    """Stash the typed unrun refusal for the caller's zero-spend terminal — with
+    the producer's detail and facts (a busy lock's holder), so the parent-facing
+    outcome says WHY instead of a bare reason code."""
 
     from ouroboros.subagent_runtime import current_subagent_alternatives
     from ouroboros.utils import utc_now_iso
@@ -100,6 +113,8 @@ def _record_startup_refusal(
         "reason": str(reason or "configured_session_unavailable"),
         "reset_at": str(reset_at or ""),
         "requested": "harness",
+        "detail": str(detail or ""),
+        **dict(facts or {}),
     }
     availability = dict(task.get("subagent_availability") or {}) if isinstance(
         task.get("subagent_availability"), dict) else {}
@@ -108,6 +123,8 @@ def _record_startup_refusal(
         "status": "unavailable",
         "reason": str(reason or "configured_session_unavailable"),
         "reset_at": str(reset_at or ""),
+        "detail": str(detail or ""),
+        **dict(facts or {}),
         "alternatives": alternatives,
         "host_fallback": False,
         "route_kind": "agent_session",
@@ -245,6 +262,8 @@ def _pre_start_leaf(
             ctx, task,
             reason=str(payload.get("reason") or ""),
             reset_at=str(payload.get("reset_at") or ""),
+            detail=str(payload.get("detail") or ""),
+            facts=refusal_facts(payload),
         )
         return ""
     # Everything else — started_uncustodied, fence refusals raced in by the

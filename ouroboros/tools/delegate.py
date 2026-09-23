@@ -709,11 +709,13 @@ def _settle_refused_provision(ctx: ToolContext, gateway: Any, refusal: ToolResul
     invocation durably (START_FAILED), so the refusal exists outside this process —
     the incident's bootstrap refusals left no row at all (#1241)."""
     from ouroboros.delegate_shared import delegate_payload
+    from ouroboros.subagent_bootstrap import refusal_facts
 
+    payload = delegate_payload(refusal)
     _retire_orphaned_registration(
         ctx, gateway, "", definite_refusal=True, invocation_id=invocation_id,
-        reason=str(delegate_payload(refusal).get("reason") or "execution_snapshot_failed"),
-        history_facts=history_facts)
+        reason=str(payload.get("reason") or "execution_snapshot_failed"),
+        history_facts={**(history_facts or {}), **refusal_facts(payload)})
 
 
 def _snapshot_facts(handle: Any) -> Dict[str, Any]:

@@ -42,8 +42,14 @@ def _provision(target, snaps, data, snapshot_id="snap1", task_id="t1"):
 def _phase_spies(monkeypatch, snaps):
     """Record whether the lock was held when each phase ran."""
     seen: dict = {}
-    real_verdicts, real_copy, real_git, real_save = (
-        capture.untracked_binary_verdicts, artifacts.copy_artifact_file, wt._git, wt._save_registry)
+    real_verdicts, real_copy, real_git, real_git_env, real_save = (
+        capture.untracked_binary_verdicts, artifacts.copy_artifact_file, wt._git, wt._git_env, wt._save_registry)
+
+    def spy_git_env(repo_dir, *args, **kw):  # baseline staging goes through _git_env, not _git
+        for marker in ("update-index", "write-tree", "commit-tree"):
+            if marker in args:
+                seen[marker] = _lock_held(snaps)
+        return real_git_env(repo_dir, *args, **kw)
 
     def spy_verdicts(root, rels, **kw):
         seen["classify"] = _lock_held(snaps)
@@ -66,6 +72,7 @@ def _phase_spies(monkeypatch, snaps):
     monkeypatch.setattr(capture, "untracked_binary_verdicts", spy_verdicts)
     monkeypatch.setattr(artifacts, "copy_artifact_file", spy_copy)
     monkeypatch.setattr(wt, "_git", spy_git)
+    monkeypatch.setattr(wt, "_git_env", spy_git_env)
     monkeypatch.setattr(wt, "_save_registry", spy_save)
     return seen
 
@@ -78,6 +85,7 @@ def test_tree_walk_runs_outside_the_lock_and_shared_metadata_inside(tmp_path, mo
     handle = _provision(target, snaps, data)
 
     assert seen["classify"] is False and seen["copy"] is False and seen["reset"] is False
+    assert seen["update-index"] is False and seen["write-tree"] is False and seen["commit-tree"] is False
     assert seen["update-ref"] is True and seen["worktree_add"] is True
     assert seen["save_registry"] == [True, True]  # provisional row, then the final row
     assert not _lock_held(snaps)
@@ -174,7 +182,7 @@ def test_a_live_holder_is_a_typed_refusal_and_a_dead_holder_is_evicted(tmp_path,
     busy = info.value
     assert busy.holder == {"pid": str(holder.pid), "task": "t-holder", "op": "provision",
                            "since": "2026-09-24T00:00:00Z", "target": "/tmp/with space"}
-    assert busy.waited_sec >= 0.5 and "t-holder" in str(busy)
+    assert busy.waited_sec > 0 and "t-holder" in str(busy)
     # Nothing was registered, pinned or checked out for the refused attempt.
     assert wt.find_execution_snapshot("snap1", data_dir=data) is None
     assert _git(target, "for-each-ref", "refs/ouroboros/").stdout == ""
@@ -245,6 +253,76 @@ def test_a_provisioning_refusal_leaves_a_durable_start_failed_row(full_run, monk
     failed = [row for row in rows if row.get("type") == custody.START_FAILED]
     assert len(failed) == 1 and failed[0]["definite"] is True and failed[0]["invocation_id"]
     assert failed[0]["reason"] == "execution_snapshot_failed" and failed[0]["run_id"] == ""
+
+
+def test_configured_child_bootstrap_keeps_the_refusal_facts(tmp_path, monkeypatch):
+    """The host pre-start of a configured leaf (the incident's first refusal) ends the
+    child at $0 AND keeps the producer's facts: the $0 terminal names the lock holder,
+    the availability row and the acceptance evidence carry the detail."""
+    from ouroboros import subagent_bootstrap, subagent_runtime
+    from ouroboros.agent_dispatch import executor_blocked_outcome
+    from ouroboros.delegate_shared import _fail, lock_busy_facts
+    from ouroboros.subagents import SubagentExecutorResolution
+
+    busy = wt.WorktreeOpsLockBusy(tmp_path / "lock", 120.0, {"pid": "4242", "task": "t-other", "op": "provision"})
+    refusal = _fail("delegate_start", "execution_snapshot_failed",
+                    f"A private execution snapshot could not be provisioned ({busy}).",
+                    definitely_unrun=True, **lock_busy_facts(busy))
+    monkeypatch.setattr(subagent_runtime, "delegate_start_entry", lambda ctx, prompt, **kw: refusal)
+    monkeypatch.setattr(subagent_runtime, "current_subagent_alternatives", lambda selected: [])
+
+    class _Ctx:
+        task_id = "t-child"
+
+    ctx = _Ctx()
+    task = {"configured_subagent": {"selected_subagent_id": "codex=gpt-6-astra/xhigh"}}
+    wake = subagent_bootstrap._pre_start_leaf(ctx, task, {})
+
+    assert wake == ""  # a definite refusal: the child ends unrun at $0, no model round
+    stash = ctx._configured_startup_refusal
+    assert stash["reason"] == "execution_snapshot_failed" and stash["cause"] == "lock_busy"
+    assert stash["holder"]["task"] == "t-other" and "t-other" in stash["detail"]
+    availability = task["subagent_availability"]
+    assert availability["status"] == "unavailable" and availability["holder"]["pid"] == "4242"
+    text, usage = executor_blocked_outcome(
+        SubagentExecutorResolution(requested="harness", executor="blocked", reason=stash["reason"]),
+        availability=availability)
+    assert "t-other" in text and usage["reason_code"] == "subagent_executor_unavailable"
+
+
+def test_acting_worktree_add_and_remove_keep_tree_work_outside_the_lock(tmp_path, monkeypatch):
+    """The acting self_worktree lane follows the same split: admin dir + branch under
+    the lock, the checkout populated and deleted outside it."""
+    target = _seed_target(tmp_path)
+    snaps, data = tmp_path / "snaps", tmp_path / "data"
+    seen: dict = {}
+    real_git, real_rmtree = wt._git, wt._force_rmtree
+
+    def spy_git(repo_dir, *args, **kw):
+        if "worktree" in args and "add" in args:
+            seen["worktree_add"] = (_lock_held(snaps), "--no-checkout" in args)
+        if "reset" in args:
+            seen["reset"] = _lock_held(snaps)
+        return real_git(repo_dir, *args, **kw)
+
+    def spy_rmtree(path):
+        seen["rmtree"] = _lock_held(snaps)
+        return real_rmtree(path)
+
+    monkeypatch.setattr(wt, "_git", spy_git)
+    monkeypatch.setattr(wt, "_force_rmtree", spy_rmtree)
+    handle = wt.provision_worktree(repo_dir=target, task_id="acting1", worktree_root=snaps, data_dir=data)
+    assert seen["worktree_add"] == (True, True) and seen["reset"] is False
+    assert (pathlib.Path(handle.path) / "tracked.txt").read_text(encoding="utf-8") == "one\n"  # HEAD content
+    assert _git(target, "rev-parse", "--verify", handle.branch).returncode == 0
+    assert any(row.get("task_id") == "acting1" for row in wt.list_worktrees(data_dir=data))
+
+    assert wt.remove_worktree(task_id="acting1", worktree_root=snaps, data_dir=data)
+    assert seen["rmtree"] is False
+    assert not pathlib.Path(handle.path).exists()
+    assert _git(target, "rev-parse", "--verify", handle.branch, check=False).returncode != 0
+    assert not any(row.get("task_id") == "acting1" for row in wt.list_worktrees(data_dir=data))
+    assert not _lock_held(snaps)
 
 
 def test_removal_deletes_files_outside_the_lock_and_forgets_metadata_inside(tmp_path, monkeypatch):
@@ -322,6 +400,12 @@ def test_populate_matches_worktree_add_and_runs_no_target_hook(tmp_path, monkeyp
     (hooks / "post-checkout").chmod(0o755)
     _git(target, "config", "core.hooksPath", str(hooks))
     snaps, data = tmp_path / "snaps", tmp_path / "data"
+    # Positive control: the hook DOES fire on a plain `worktree add`, so its absence
+    # below is the populate path's doing, not a dead fixture.
+    control = tmp_path / "control-wt"
+    _git(target, "-c", "submodule.recurse=false", "worktree", "add", "--detach", str(control), "HEAD")
+    assert (control / ".hook_ran").exists()
+    _git(target, "worktree", "remove", "--force", str(control))
 
     handle = _provision(target, snaps, data)
 

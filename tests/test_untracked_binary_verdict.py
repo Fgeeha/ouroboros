@@ -49,12 +49,22 @@ def _fixture_repo(root: pathlib.Path) -> tuple[pathlib.Path, list[str]]:
         "nul.lfs": b"x\0y",                  # clean filter strips the NUL: text
         "text.u16": "hi\n".encode("utf-16"),  # working-tree encoding: text
         "empty.md": b"",
+        "empty.dat": b"",                    # empty AND -diff: binary by attribute (grok triad finding)
+        "empty.bin": b"",                    # empty AND the binary macro
+        "empty.drv": b"",                    # empty AND a binary=true driver
+        "empty.drt": b"",                    # empty AND a binary=false driver: text
         "target.bin2": b"x\0y",
-        "new\nline.md": b"nl\n",             # a newline in the name survives -z
         "vanish.md": b"gone\n",
     }
+    if os.name != "nt":  # illegal in Win32 file names; the -z path is a POSIX fact
+        files["new\nline.md"] = b"nl\n"  # a newline in the name survives -z
     for name, data in files.items():
         (repo / name).write_bytes(data)
+    try:  # a non-UTF-8 byte round-trips through fsencode; APFS and NTFS refuse such names
+        (repo / os.fsdecode(b"caf\xe9.md")).write_bytes(b"latin\n")
+        files[os.fsdecode(b"caf\xe9.md")] = b"latin\n"
+    except OSError:
+        pass
     os.symlink("target.bin2", repo / "link_to_bin")
     os.symlink("nowhere", repo / "dangling")
     rels = sorted(files) + ["link_to_bin", "dangling"]
@@ -84,10 +94,12 @@ def test_batch_verdict_matches_git_for_every_path_class(tmp_path):
     # The classes that a NUL sniff or an attribute lookup alone would get wrong.
     assert verdicts["nonul.drv"] and not verdicts["nul.drt"] and not verdicts["nul.lfs"] and not verdicts["text.u16"]
     assert verdicts["edge7999.md"] and not verdicts["edge8000.md"]
+    assert verdicts["empty.dat"] and verdicts["empty.bin"] and verdicts["empty.drv"]
+    assert not verdicts["empty.drt"] and not verdicts["empty.md"]
     assert "link_to_bin" not in verdicts and "dangling" not in verdicts  # symlinks: text, never followed
-    # Only the empty blob entered the target's object database: no content was hashed.
+    # Only the two staging blobs (empty and "\n") entered the target's object database.
     objects = _git(repo, "count-objects").stdout.decode()
-    assert objects.startswith("4 objects"), objects
+    assert objects.startswith("5 objects"), objects
 
 
 def test_capture_asks_one_process_and_never_one_per_file(tmp_path, monkeypatch):
@@ -105,10 +117,42 @@ def test_capture_asks_one_process_and_never_one_per_file(tmp_path, monkeypatch):
     assert manifest["status"] == "ready_with_changes", manifest["errors"]
     numstat_calls = [c for c in calls if "--no-index" in c and "--numstat" in c]
     assert numstat_calls == [], "the per-file --no-index --numstat spawn is back"
-    assert sum(1 for c in calls if c[:2] == ["git", "diff"] and "--numstat" in c) == 1
+    assert sum(1 for c in calls if c[:2] == ["git", "diff"] and "--numstat" in c) == 2  # inventory + empty-file pass
     excluded = {row["path"]: row["reason"] for row in manifest["untracked_excluded"]}
     expected_binary = {rel for rel in rels if _oracle(repo, rel)}
     assert {rel for rel, reason in excluded.items() if reason == "binary file"} == expected_binary
+
+
+def test_vetoed_and_oversized_files_never_reach_git(tmp_path, monkeypatch):
+    """The batch runs git's clean filters and encodings; the per-file predicate never
+    asked git about a dotenv secret, a junk artifact or an over-cap file, so the
+    batch must not either (scope review, gpt-6-astra)."""
+    repo, _rels = _fixture_repo(tmp_path)
+    _git(repo, "config", "filter.observe.clean", "tee observed-filter-input")
+    (repo / ".gitattributes").write_text(".env filter=observe\n", encoding="utf-8")
+    _git(repo, "add", ".gitattributes")
+    _git(repo, "commit", "-qm", "observe")
+    (repo / ".env").write_text("SYNTHETIC_SECRET=fixture\n", encoding="utf-8")
+    (repo / "big.md").write_text("x" * 300, encoding="utf-8")
+    (repo / "junk.pyc").write_bytes(b"\x00junk")
+    monkeypatch.setattr(capture, "_PATCH_MAX_UNTRACKED_FILE_BYTES", 100)
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "standard")
+    batched: list = []
+    real = capture.untracked_binary_verdicts
+
+    def spy(root, rels, **kw):
+        batched.extend(rels)
+        return real(root, rels, **kw)
+
+    monkeypatch.setattr(capture, "untracked_binary_verdicts", spy)
+    _artifacts, manifest = capture.write_workspace_patch_artifacts(repo, tmp_path / "artifacts", task={})
+
+    assert manifest["status"] == "ready_with_changes", manifest["errors"]
+    assert ".env" not in batched and "big.md" not in batched and "junk.pyc" not in batched
+    assert "plain.dat" in batched and "nul.md" in batched
+    assert not (repo / "observed-filter-input").exists(), "an excluded file's bytes reached a clean filter"
+    reasons = {row["path"]: row["reason"] for row in manifest["untracked_excluded"]}
+    assert "size cap" in reasons["big.md"] and "junk" in reasons["junk.pyc"]
 
 
 def test_a_failed_batch_falls_back_to_the_per_file_verdict_with_a_warning(tmp_path, monkeypatch):
@@ -129,3 +173,8 @@ def test_a_failed_batch_falls_back_to_the_per_file_verdict_with_a_warning(tmp_pa
         reason = capture.untracked_capture_veto_reason(repo, rel, binary_verdicts=None)
         assert (reason == "binary file") == _oracle(repo, rel), rel
     assert capture.untracked_binary_verdicts(repo, [], warnings=warnings) == {}
+    # Scratch-index allocation is inside the same guarded lifecycle.
+    monkeypatch.setattr(capture.tempfile, "mkstemp", lambda **kw: (_ for _ in ()).throw(OSError("no tmp")))
+    warnings.clear()
+    assert capture.untracked_binary_verdicts(repo, rels, warnings=warnings) is None
+    assert warnings[0]["reason"] == "binary_verdict_batch_unavailable" and "no tmp" in warnings[0]["detail"]

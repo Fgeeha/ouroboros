@@ -205,11 +205,12 @@ def _lock_holder(lock_path: Path) -> Dict[str, str]:
 
 
 @contextlib.contextmanager
-def _ops_lock(root: Path, *, op: str, task_id: str = "", target: str = ""):
+def _ops_lock(root: Path, *, op: str, task_id: str = "", target: str = "",
+              timeout_sec: Optional[float] = None):
     """Serialize SHARED-METADATA mutations in-process (threading.Lock) and across
     processes via the portable file-lock SSOT (platform_layer).
 
-    Held for milliseconds plus one registry read-modify-write — never for a tree
+    Held for milliseconds plus a registry read-modify-write — never for a tree
     walk (#1241). The holder names itself in the lock file, ``pid=`` first: the
     owner-aware stale check reads it, so a SIGKILLed holder is evicted at once
     instead of blacking out every waiter for ``_LOCK_STALE_SEC``; a live holder
@@ -221,8 +222,8 @@ def _ops_lock(root: Path, *, op: str, task_id: str = "", target: str = ""):
     with _inproc_lock:
         started = time.monotonic()
         fd = acquire_exclusive_file_lock(
-            lock_path, timeout_sec=_LOCK_TIMEOUT_SEC, stale_sec=_LOCK_STALE_SEC,
-            metadata=metadata, owner_aware_stale=True)
+            lock_path, timeout_sec=_LOCK_TIMEOUT_SEC if timeout_sec is None else timeout_sec,
+            stale_sec=_LOCK_STALE_SEC, metadata=metadata, owner_aware_stale=True)
         if fd is None:
             raise WorktreeOpsLockBusy(lock_path, time.monotonic() - started, _lock_holder(lock_path))
         try:
@@ -315,17 +316,19 @@ def _unregister_snapshot(snapshot_id: str, data_dir: Optional[Any], op: str) -> 
 
 
 def _discard_snapshot_checkout(target: Path, wt_path: Path, ref: str, snapshot_id: str, *,
-                               root: Path, data_dir: Optional[Any], task_id: str) -> None:
-    """Undo a Git execution snapshot once its row and pin exist: the checkout's
+                               root: Path, data_dir: Optional[Any], task_id: str,
+                               lock_wait_sec: Optional[float] = None) -> None:
+    """Undo a Git execution snapshot once its row and pin may exist: the checkout's
     files go first, OUTSIDE the lock (a 1.8 GB tree takes minutes), then one short
     section forgets the admin dir, unpins the baseline and drops the row — the
     postcondition ``tests/test_snapshot_file_inputs.py`` asserts (no row, no ref,
     no ``dlg_*`` directory). Best-effort: the startup GC reconciles what a crash
-    leaves."""
+    leaves. ``lock_wait_sec`` shortens the wait when the failure WAS a busy lock:
+    the same holder is still there, and the typed refusal must not wait twice."""
     if _is_within(wt_path, root) and wt_path.exists():
         _force_rmtree(wt_path)
     try:
-        with _ops_lock(root, op="discard", task_id=task_id, target=str(target)):
+        with _ops_lock(root, op="discard", task_id=task_id, target=str(target), timeout_sec=lock_wait_sec):
             _git_quiet(target, "worktree", "prune")
             _git_quiet(target, "update-ref", "-d", ref)
             _unregister_snapshot(snapshot_id, data_dir, "discard_execution_snapshot")
@@ -366,18 +369,23 @@ def provision_worktree(
     root = _resolve_root(worktree_root)
     _assert_root_isolated(root, repo_dir, _data_dir(data_dir))
     safe_task = _safe_name(task_id)
+    wt_path = (root / safe_task).resolve()
+    branch = f"{_BRANCH_PREFIX}{safe_task}"
+    # A stale checkout left by a crashed run is plain files: deleted OUTSIDE the
+    # lock (#1241); its admin dir and branch are replaced under it.
+    if _is_within(wt_path, root) and wt_path.exists():
+        _force_rmtree(wt_path)
     with _ops_lock(root, op="worktree", task_id=str(task_id or ""), target=str(repo_dir)):
         if base_sha:
             _git(repo_dir, "rev-parse", "--verify", f"{base_sha}^{{commit}}")
             base_sha = _git(repo_dir, "rev-parse", base_sha).stdout.strip()
         else:
             base_sha = _git(repo_dir, "rev-parse", "HEAD").stdout.strip()
-        wt_path = (root / safe_task).resolve()
-        branch = f"{_BRANCH_PREFIX}{safe_task}"
-        # Clear any stale checkout/branch left by a crashed run.
-        _remove_paths(repo_dir, wt_path, branch, allowed_root=root)
+        _git_quiet(repo_dir, "worktree", "prune")
+        _git_quiet(repo_dir, "branch", "-D", branch)
         wt_path.parent.mkdir(parents=True, exist_ok=True)
-        _git(repo_dir, "worktree", "add", "--force", "-b", branch, str(wt_path), base_sha)
+        # Admin dir + branch under the lock; the checkout itself is populated below.
+        _git(repo_dir, "worktree", "add", "--no-checkout", "--force", "-b", branch, str(wt_path), base_sha)
         handle = WorktreeHandle(
             task_id=str(task_id),
             path=str(wt_path),
@@ -402,7 +410,17 @@ def provision_worktree(
             # on every retry, without bound.
             _remove_paths(repo_dir, wt_path, branch, allowed_root=root)
             raise
-        return handle
+    try:
+        # Populate OUTSIDE the lock: what `worktree add` runs internally (no
+        # submodule recursion, no post-checkout hook of the body).
+        _git(wt_path, "reset", "--hard", "--quiet", "--no-recurse-submodules")
+    except Exception:
+        try:
+            remove_worktree(path=str(wt_path), worktree_root=root, data_dir=data_dir)
+        except Exception:
+            log.warning("Failed to discard acting worktree %s after a populate failure", wt_path, exc_info=True)
+        raise
+    return handle
 
 
 def provision_genesis_project(
@@ -575,7 +593,8 @@ def provision_execution_snapshot(
     populating and copying run OUTSIDE it, so a huge untracked inventory delays
     only its own task instead of refusing every other mutating start.
     """
-    from ouroboros.workspace_patch_capture import untracked_binary_verdicts, untracked_capture_veto_reason
+    from ouroboros.workspace_patch_capture import (
+        binary_verdict_candidates, untracked_binary_verdicts, untracked_capture_veto_reason)
 
     target = Path(target_root).resolve()
     if not (target / ".git").exists():
@@ -635,7 +654,8 @@ def provision_execution_snapshot(
         file_inputs: List[str] = []
         capture_warnings: List[Dict[str, Any]] = []
         # git's binary verdict for the whole inventory in ONE process (#1241).
-        binary_verdicts = untracked_binary_verdicts(target, untracked, warnings=capture_warnings)
+        binary_verdicts = untracked_binary_verdicts(
+            target, binary_verdict_candidates(target, untracked), warnings=capture_warnings)
         from ouroboros.workspace_file_outputs import _side
         for rel in untracked:
             candidate = target / rel
@@ -690,16 +710,19 @@ def provision_execution_snapshot(
         manifest_digest=manifest_digest, target_head=target_head, created_at=time.time(),
         entry_count=entry_count, excluded_untracked=tuple(excluded),
         untracked_baseline=untracked_baseline, capture_warnings=tuple(capture_warnings))
-    with _ops_lock(root, op="provision", task_id=task, target=str(target)):
-        # Row FIRST, then the pin, then the admin dir: a crash after any of these
-        # leaves a REGISTERED snapshot custody never opened, which the startup GC
-        # removes (checkout, ref, row). A pin without a row would be invisible.
-        _git_quiet(target, "worktree", "prune")
-        _register_snapshot(ExecutionSnapshotHandle(**fields), excluded, data_dir)
-        _git(target, "update-ref", baseline_ref, baseline_sha)
-        wt_path.parent.mkdir(parents=True, exist_ok=True)
-        _git(target, "worktree", "add", "--detach", "--no-checkout", str(wt_path), baseline_sha)
     try:
+        with _ops_lock(root, op="provision", task_id=task, target=str(target)):
+            # Row FIRST, then the pin, then the admin dir: a crash after any of these
+            # leaves a REGISTERED snapshot custody never opened, which the startup GC
+            # removes (checkout, ref, row). A pin without a row would be invisible.
+            # The provisional row is LIGHT (no per-file maps): the GC needs only
+            # path, ref and snapshot id, and the maps are O(files) to serialize.
+            _git_quiet(target, "worktree", "prune")
+            _register_snapshot(ExecutionSnapshotHandle(**{**fields, "untracked_baseline": {},
+                                                        "excluded_untracked": ()}), [], data_dir)
+            _git(target, "update-ref", baseline_ref, baseline_sha)
+            wt_path.parent.mkdir(parents=True, exist_ok=True)
+            _git(target, "worktree", "add", "--detach", "--no-checkout", str(wt_path), baseline_sha)
         # Populate outside the lock: the same reset git's own `worktree add` runs
         # (no submodule recursion) — minus the target's post-checkout hook.
         _git(wt_path, "reset", "--hard", "--quiet", "--no-recurse-submodules")
@@ -733,8 +756,9 @@ def provision_execution_snapshot(
             "file_baseline": file_baseline, "provisioning_sec": round(time.monotonic() - started, 3)})
         with _ops_lock(root, op="provision", task_id=task, target=str(target)):
             _register_snapshot(handle, excluded, data_dir)
-    except Exception:
-        _discard_snapshot_checkout(target, wt_path, baseline_ref, snap, root=root, data_dir=data_dir, task_id=task)
+    except Exception as exc:
+        _discard_snapshot_checkout(target, wt_path, baseline_ref, snap, root=root, data_dir=data_dir, task_id=task,
+                                   lock_wait_sec=5.0 if isinstance(exc, WorktreeOpsLockBusy) else None)
         raise
     return handle
 
@@ -1134,21 +1158,25 @@ def remove_worktree(
             match = entry
             break
     root = _resolve_root(worktree_root)
-    with _ops_lock(root, op="remove_worktree", task_id=str(task_id or "")):
-        if match is not None:
-            _remove_paths(Path(match.get("repo_dir") or "."), Path(match.get("path") or ""), match.get("branch") or "", allowed_root=root)
-            survivors = [
-                e for e in _load_registry(data_dir, strict=True, op="remove_worktree")
-                if e.get("path") != match.get("path")
-            ]
-            _save_registry(survivors, data_dir)
-            return True
+    if match is None:
         # Unregistered path: best-effort directory removal, but ONLY inside the
-        # configured worktree root (never an arbitrary path supplied by a caller).
+        # configured worktree root (never an arbitrary path supplied by a caller);
+        # no shared metadata is involved, so no lock.
         if want_path and Path(want_path).exists() and _is_within(Path(want_path), root):
             _force_rmtree(Path(want_path))
             return True
-    return False
+        return False
+    wt_path = Path(match.get("path") or "")
+    if str(wt_path).strip() and _is_within(wt_path, root) and wt_path.exists():
+        _force_rmtree(wt_path)  # the checkout's files go first, OUTSIDE the lock (#1241)
+    with _ops_lock(root, op="remove_worktree", task_id=str(task_id or "")):
+        _remove_paths(Path(match.get("repo_dir") or "."), wt_path, match.get("branch") or "", allowed_root=root)
+        survivors = [
+            e for e in _load_registry(data_dir, strict=True, op="remove_worktree")
+            if e.get("path") != match.get("path")
+        ]
+        _save_registry(survivors, data_dir)
+    return True
 
 
 def prune_orphans(

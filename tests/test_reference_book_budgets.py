@@ -26,7 +26,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # extension_isolated_deps.py barrier and the widget_list.js request seam land
     # beside the handoff/schedule rows the base added; none displaces older text.
     # +400 (#1213): two new module rows (focus.py, room_consolidation.py) in the tree map.
-    "docs/architecture/01-high-level-architecture.md": 164800,
+    # 164800 -> raised for the subagent_worktrees module-map row (issue #1241 lock scope).
+    "docs/architecture/01-high-level-architecture.md": 165000,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -96,10 +97,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the digest-selected historical read and the reader admission rule.
     # 295650 -> 297250: document the new diagnostic-only source/coverage contract,
     # unavailable evidence and no-effects ordering without removing review/custody rules.
-    # 297250 -> 298400: the private-snapshot paragraph now states the worktree ops
+    # 297250 -> 299000: the private-snapshot paragraph now states the worktree ops
     # lock's scope (issue #1241: shared metadata only, row-then-ref order, batched
     # binary verdict, typed busy refusal) — rationale-layer text BIBLE P6 requires.
-    "docs/architecture/06-agent-core.md": 298400,
+    "docs/architecture/06-agent-core.md": 299000,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
@@ -142,9 +143,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # never does; a pre-check's refusal takes the exact read). The one sentence it touches
     # (the lock's caller wait) is replaced; the rest is a rule the chapter lacked, and the
     # chapter had 5 bytes left. Sized to the text: 5 bytes of margin.
-    # 94520 -> 94650: the delegated-lane bullet names the worktree ops lock rule
+    # 94520 -> 94900: the delegated-lane bullet names the worktree ops lock rule
     # (issue #1241: no tree walk or per-file git process under the lock).
-    "docs/development/06-rules-by-change-class.md": 94650,
+    "docs/development/06-rules-by-change-class.md": 94900,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,

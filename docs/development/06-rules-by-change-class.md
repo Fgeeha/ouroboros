@@ -326,7 +326,9 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   staged-never-committed) is unchanged
   (`tests/test_delegated_run_isolation_orphans.py`). A copy failure or a
   source change against the baseline leaves no registered snapshot or pinned
-  ref; no tree walk or per-file git process runs under the worktree ops lock
+  ref; on the delegated snapshot and payload paths no tree walk or per-file git
+  process runs under the worktree ops lock — the acting `self_worktree`
+  checkout/delete still does, bounded by the body's own size
   (`tests/test_snapshot_file_inputs.py`, `tests/test_subagent_worktrees_lock_scope.py`).
 - Outcome honesty: a delegating parent must not produce a clean no-tool final
   answer while direct children run undecided — one bounded absorption
