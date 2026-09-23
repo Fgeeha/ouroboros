@@ -96,7 +96,12 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the digest-selected historical read and the reader admission rule.
     # 295650 -> 297250: document the new diagnostic-only source/coverage contract,
     # unavailable evidence and no-effects ordering without removing review/custody rules.
-    "docs/architecture/06-agent-core.md": 297250,
+    # 297250 -> 298100: the predecessor door is a predicate on the root, never on the
+    # caller's room or the landing project (the disclosed landing note replaces the
+    # one-clause pointer to §10); the registry read of the routing verbs on a forked
+    # execution drive and the predecessor's task files as a lineage read are new facts
+    # of the paragraphs they extend. The base sat exactly at the previous budget.
+    "docs/architecture/06-agent-core.md": 298100,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
@@ -114,7 +119,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # residual sentence of the off-thread invariant; the rule itself has no older text.
     # +200 (2026-09-22): invariant 10 names the process-local fingerprint memos
     # and their fallback rule; the base sat 23 bytes under the previous budget.
-    "docs/architecture/10-key-invariants.md": 21300,
+    # 21300 -> 21700: invariant 27 states the door as a predicate on the root (any actor
+    # holding a routing verb, any project, a disclosed landing) with the reason the
+    # room comparison protected nothing; the earlier one-clause form is replaced, and
+    # the base sat 34 bytes under the previous budget.
+    "docs/architecture/10-key-invariants.md": 21700,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
     # +400 (#1213): Presence turns are named as actors without cross-focus catalogue or focus authority.
     "docs/architecture/12-host-service-companions-and-chat-ids.md": 11400,

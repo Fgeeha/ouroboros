@@ -37,7 +37,7 @@ def _predecessor_selector_error(value: Any, tool_name: str) -> str:
     if value is _MISSING_PREDECESSOR_SELECTOR or value is None:
         return (
             f"⚠️ TOOL_ARG_ERROR ({tool_name}): predecessor_task_id is required; "
-            "pass an empty string for fresh work or the host-listed result id to continue it"
+            "pass an empty string for fresh work or the id of a finished root result to continue it"
         )
     return ""
 
@@ -109,18 +109,17 @@ def _host_listed_predecessors(metadata: Dict[str, Any]) -> list:
     return rows
 
 
-def _predecessor_door_refusal(
-    ctx: ToolContext, result: Dict[str, Any], listed: bool,
-) -> str:
-    """Why this readable result may NOT be continued from here, or ``""``.
+def _predecessor_door_refusal(result: Dict[str, Any]) -> str:
+    """Why this readable result may NOT be continued, or ``""``.
 
-    The door is a PREDICATE, not membership of a bounded list: same project, a
-    ROOT, a readable result, not live. The list is a hint - a window that fits
-    16 rows became a ceiling saying "exactly one result is addressable", so a
-    room could not name its own interrupted root and promoted again instead,
-    minting the duplicate root the night ended with. Outside a room there is no
-    project to compare against, and an absent project is not a match: there the
-    host's own list still decides.
+    The door is a PREDICATE on the root itself - a ROOT, a readable result, not
+    live - never on where the caller sits or where the work lands: the pointer it
+    withholds is rebuilt from the task id alone, the successor inherits DATA (its
+    ceiling, origin and contract come from the caller and admission), and the
+    same successor was always reachable through a fresh root in the predecessor's
+    own project. The host list stays a hint (a window that fits 16 rows is not a
+    ceiling); a landing outside the predecessor's project is disclosed in the
+    receipt, never refused.
     """
     from ouroboros.routing_wait import is_emitted_admission_stub
     from ouroboros.server_routing_context import _is_child_result
@@ -140,13 +139,17 @@ def _predecessor_door_refusal(
             f"the selected predecessor is still live (status {status or 'unknown'}); "
             "steer_task continues a live root, and promoting it would start a second one"
         )
-    room = _inherited_project_scope(ctx)
-    if not listed and not (room and room == str(result.get("project_id") or "")):
-        return (
-            "predecessor_task_id is not an addressable result in the host routing "
-            "manifest, and it is not a finished root task of this room's project"
-        )
     return ""
+
+
+def _foreign_predecessor_note(predecessor_id: str, home: str, landed: str) -> str:
+    """The continuation landed outside its predecessor's project: say so once in the
+    receipt, like the second-project note - a disclosed free choice, never a refusal."""
+    if not predecessor_id or str(home or "") == str(landed or ""):
+        return ""
+    where = f"project '{home}'" if home else "the main chat"
+    here = f"project '{landed}'" if landed else "the main chat"
+    return f" Note: predecessor {predecessor_id} belongs to {where}; this continuation runs in {here} (your choice)."
 
 
 def _attach_predecessor_authority_from_metadata(
@@ -169,7 +172,7 @@ def _attach_predecessor_authority_from_metadata(
     result = load_effective_task_result(status_root, selected_id, materialize_artifacts=False)
     if not isinstance(result, dict) or not result:
         return "the selected predecessor task result is missing or unreadable"
-    refusal = _predecessor_door_refusal(ctx, result, listed is not None)
+    refusal = _predecessor_door_refusal(result)
     if refusal:
         return refusal
     if listed is not None:
@@ -186,6 +189,9 @@ def _attach_predecessor_authority_from_metadata(
     if valid_task_result_authority_source(source, selected_id):
         evt["predecessor_task_id"] = selected_id
         evt["predecessor_authority_source"] = dict(source)
+        # Render-only fact for the receipt's landing note; the caller pops it
+        # before emission, so the event carries nothing the supervisor never reads.
+        evt["predecessor_project_id"] = str(result.get("project_id") or "")
     else:
         return "the selected predecessor has no readable authority source"
     return ""
@@ -464,6 +470,7 @@ def _promote_chat_to_task(
             "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (promote_chat_to_task): "
             + predecessor_error
         )
+    predecessor_home = str(evt.pop("predecessor_project_id", "") or "")
     _attach_client_surface(ctx, evt)
     _attach_unmet_obligation(ctx, evt)
     already_bound = _durable_project_of_request(ctx)
@@ -483,6 +490,7 @@ def _promote_chat_to_task(
             "Use wait_task/get_task_result if its result "
             "is needed in this conversation."
             + _second_project_note(ctx, already_bound, effective_pid)
+            + _foreign_predecessor_note(str(evt.get("predecessor_task_id") or ""), predecessor_home, effective_pid)
             + _obligation_moved_note(ctx, tid, confirmation.get("force_plan_transfer"))
         )
         return _finish_swarm_handoff(ctx, evt, response, status="scheduled")
@@ -635,6 +643,7 @@ def _route_to_project(
     )
     if predecessor_error:
         return "⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project): " + predecessor_error
+    predecessor_home = str(predecessor_event.pop("predecessor_project_id", "") or "")
     requested_pid = str(project_id or "").strip()
     pid = sanitize_project_id(requested_pid) if requested_pid and explicit_project_id_ok(requested_pid) else ""
     proj = get_project(Path(ctx.drive_root), pid) if pid else None
@@ -753,6 +762,7 @@ def _route_to_project(
         response = (
             f"✉️ Routed to project '{name}' ({pid}) as task {tid}; admission is durably "
             f"scheduled ({mode}). I'll continue there; this chat stays free for you."
+            + _foreign_predecessor_note(str(evt.get("predecessor_task_id") or ""), predecessor_home, pid)
             + _obligation_moved_note(ctx, tid, receipt.get("force_plan_transfer"))
         )
         return _finish_swarm_handoff(ctx, evt, response, status="scheduled")

@@ -251,11 +251,11 @@ def _project_routing_manifest(ctx: Any, project_id: str) -> Dict[str, Any]:
     facts that separate the two choices - a finished root is promote's predecessor,
     a live one is ``steer_task``.
 
-    A hint, never the door: promote's predicate admits an older root of the same
-    project too (ch. 10), so this window may be bounded without deciding what the
-    room can continue. Until it existed a room saw exactly ONE candidate, the
-    registry pointer, so a room whose pointer had moved could not name its own
-    interrupted root at all.
+    A hint, never the door: promote's predicate admits any settled root, listed
+    or not, of any project (ch. 10), so this window may be bounded without
+    deciding what the room can continue. Until it existed a room saw exactly ONE
+    candidate, the registry pointer, so a room whose pointer had moved could not
+    name its own interrupted root at all.
     """
     finals, omissions = _recent_root_results(ctx, project_id)
     active = [
