@@ -44,6 +44,9 @@ if os.environ.get("OUROBOROS_ALLOW_LIVE_DATA_TESTS") != "1":
     # HOME is already disposable. Leave Deliverables home-derived so tests that
     # select their own HOME/user-files jail do not inherit an unrelated pin.
     _PYTEST_DEFAULTS["OUROBOROS_DELIVERABLES_ROOT"] = ""
+    # xdist supplies basetemp under the controller's temp root, alongside (not
+    # beneath) each worker's own session directory. Fence the common parent.
+    _PYTEST_DEFAULTS["GIT_CEILING_DIRECTORIES"] = str(_PYTEST_ROOT.parent)
     os.environ.update(_PYTEST_DEFAULTS)
     os.environ.pop("OUROBOROS_MANAGED_BY_LAUNCHER", None)
     os.environ.pop("OUROBOROS_MANAGED_REPO_DIR", None)
