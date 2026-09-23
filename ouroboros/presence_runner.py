@@ -15,10 +15,6 @@ from ouroboros.artifacts import stage_task_attachments
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.presence_admission import PresenceAdmission
 from ouroboros.presence_authority import presence_ceiling_payload
-from ouroboros.task_finalization import (
-    HOST_AUTHORED_TERMINAL_ORIGINS, TERMINAL_ORIGIN_MODEL_FINAL,
-    provider_terminal_body, terminal_notice_text,
-)
 from ouroboros.task_results import load_task_result
 from ouroboros.utils import append_jsonl, read_json_dict, utc_now_iso
 
@@ -65,6 +61,8 @@ class PresenceTurnResult:
 
 def _presence_delivery(outcome: str, text: str, terminal_origin: str, *, legacy: bool = False) -> tuple[str, str]:
     """Project speech from producer facts, never from its wording or task status."""
+    from ouroboros.task_finalization import HOST_AUTHORED_TERMINAL_ORIGINS, TERMINAL_ORIGIN_MODEL_FINAL
+
     if outcome not in {"message", "silent", "tool_delivered", "deferred"}:
         outcome = "message"
     if outcome not in {"message", "deferred"}:
@@ -79,6 +77,8 @@ def _presence_delivery(outcome: str, text: str, terminal_origin: str, *, legacy:
 
 def presence_result_from_stored(stored: Mapping[str, Any], task_id: str) -> PresenceTurnResult:
     """One replay projection for cached turns and completed delegated work."""
+    from ouroboros.task_finalization import TERMINAL_ORIGIN_MODEL_FINAL, provider_terminal_body, terminal_notice_text
+
     metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
     text = metadata["presence_result_text"] if "presence_result_text" in metadata else stored.get("result")
     origin = str(stored.get("terminal_origin") or "")
