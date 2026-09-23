@@ -219,3 +219,34 @@ def test_native_host_replacement_resets_authorship_and_keeps_diagnostic(tmp_path
     else:
         assert stored["status"] == "failed"
         assert stored["reason_code"] == ("task_exception" if case == "exception" else "budget_exhausted")
+
+
+@pytest.mark.parametrize("admission", ["scheduled", "unconfirmed", "rejected"])
+def test_empty_deferred_final_keeps_only_confirmed_child_polling(tmp_path, monkeypatch, native_agent, admission):
+    from ouroboros.tools.control_routing import _finish_swarm_handoff
+
+    agent, ctx = native_agent
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    ctx.task_contract = {"capability_ceiling": presence_ceiling_payload(_admission().capability_ceiling)}
+    ctx.task_metadata = {"presence": {"binding_id": "test-binding"}}
+    ctx.is_direct_chat = True
+    _finish_swarm_handoff(ctx, {"task_id": "managed-child"}, "Admission receipt", status=admission)
+    agent.llm = SimpleNamespace(default_model=lambda: "test-model")
+    replies, calls = iter([_call("deferred", ""), {"content": ""}]), []
+
+    def respond(*_a, **_kw):
+        calls.append(1)
+        return next(replies), 0.0
+
+    monkeypatch.setattr(loop, "call_llm_with_retry", respond)
+    events = agent._handle_task_scoped({"id": "empty-deferred", "chat_id": 7, "type": "presence",
+        "_presence_turn": True, "_is_direct_chat": True, "_skip_post_task_synthesis": True, "text": "Go",
+        "metadata": {"presence": {"binding_id": "test-binding"}}})
+    result = next(row for row in events if row["type"] == "presence_result")
+    stored, cached = load_task_result(tmp_path, "empty-deferred"), _cached_result(tmp_path, "empty-deferred")
+    assert len(calls) == 2 and ctx._presence_completion_accepted is False
+    assert stored["terminal_origin"] == "host_notice" and "empty response" in stored["result"]
+    assert stored["status"] == "completed"  # the existing lifecycle does not release child custody
+    assert result["outcome"] == cached.outcome == ("deferred" if admission == "scheduled" else "silent")
+    assert result["work_ref"] == cached.work_ref == ("managed-child" if admission == "scheduled" else "")
+    assert result["text"] == cached.text == ""

@@ -101,6 +101,7 @@ def presence_result_from_stored(stored: Mapping[str, Any], task_id: str) -> Pres
 def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, terminal_origin: str = "",
                                 retain_scheduled_handoff: bool = False) -> dict[str, Any]:
     """Freeze typed delivery metadata before the ordinary durable result write."""
+    from ouroboros.task_finalization import HOST_AUTHORED_TERMINAL_ORIGINS
 
     completion = getattr(ctx, "_presence_completion", None)
     completion = completion if (
@@ -116,8 +117,8 @@ def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, te
     )
     if outcome == "deferred" and not work_ref:
         outcome = "message"
-    if retain_scheduled_handoff and work_ref:
-        # A failed/forced parent still owes an already admitted child's result.
+    if work_ref and (retain_scheduled_handoff or terminal_origin in HOST_AUTHORED_TERMINAL_ORIGINS):
+        # A failed/forced or host-replaced final still owes an admitted child's result.
         # Transports poll only deferred outcomes, even when no reply was authored.
         outcome = "deferred"
     outcome, result_text = _presence_delivery(outcome, str(text or ""), terminal_origin)
