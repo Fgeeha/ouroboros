@@ -119,10 +119,11 @@ _PROMOTE_CHAT_DESCRIPTION = (
     "task). `project_id` starts the new task in an existing project. If your task "
     "carries a planning obligation (Swarm force_plan) that no plan review has met, the "
     "obligation moves to the new task and your own further work here is unplanned. "
-    "When this new task continues one specific finished ROOT result (from the host "
-    "manifest, recent_tasks or get_task_result — any project, the list is a hint), pass its "
-    "internal id as `predecessor_task_id`; pass an empty string for fresh work. A delegated "
-    "child, a live root (steer_task instead) or a pending promote is refused. "
+    "When this new task continues one specific settled result (completed, failed or "
+    "cancelled; from the host manifest, recent_tasks or get_task_result — any project, the "
+    "list is a hint; a helper's result is continued with its root named), pass its internal "
+    "id as `predecessor_task_id`; pass an empty string for fresh work. A live root "
+    "(steer_task instead) or a pending promote is refused. "
     "`workspace_root` points at a working folder. A project-scoped task inherits "
     "the project's working folder as its ACTIVE WORKSPACE by default (its file/"
     "shell/git tools operate there, not on the Ouroboros repo); pass "
@@ -168,7 +169,7 @@ def get_tools() -> List[ToolEntry]:
                     "workspace_root": {"type": "string", "description": "Optional absolute working-folder path (validated at admission as an ordinary folder or Git worktree root outside the Ouroboros repo/data). Git-specific operations require a Git worktree; ordinary file and process work is supported directly in a validated folder. When omitted for a project-scoped task, the project's registered working_dir is used by default. Leave empty to work in Ouroboros's own repository (the Main default).", "default": ""},
                     "workspace": {"type": "string", "description": "Pass 'none' to opt OUT of the project room's default working folder (a folder-less task in a folder-ful project). Leave empty otherwise.", "default": ""},
                     "source": {"type": "string", "description": "Attach or clone the project's working folder in ONE move: a git URL (https://... or git@host:path — cloned server-side into the projects root; private repos fail typed auth_required) or an existing folder path (validated attach). The folder is registered on the project (provenance + trusted_at) and becomes this task's active workspace. Use for 'help me debug this GitHub repo / this folder' asks.", "default": ""},
-                    "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the id of a finished ROOT result (any project; the host list is a hint) to continue it. A child result, a live root or a pending promote is refused."},
+                    "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the id of a settled result (completed, failed or cancelled; any project, the host list is a hint; a helper's result is continued with its root named) to continue it. A live root or a pending promote is refused."},
                 },
                 "required": ["objective", "predecessor_task_id"],
             },
@@ -218,15 +219,15 @@ def get_tools() -> List[ToolEntry]:
                 "CALL THIS TOOL with project_id='' and the owner's message: it emits the typed "
                 "needs_manual_target acknowledgement with host-validated task options and New task "
                 "in Project; prose alone cannot emit that typed choice. For brand-new work that is not yet a project, "
-                "use promote_chat_to_task instead. When continuing one finished ROOT result (any "
-                "project; the host list is a hint), pass its internal `predecessor_task_id`; pass an "
-                "empty string for fresh work. Returns a visible routing receipt."
+                "use promote_chat_to_task instead. When continuing one settled result (any project; "
+                "the host list is a hint), pass its internal `predecessor_task_id`; pass an empty "
+                "string for fresh work. Returns a visible routing receipt."
             ),
             "parameters": {"type": "object", "properties": {
                 "project_id": {"type": "string", "default": "", "description": "Target project id (filesystem-clean; see list_projects), or empty to emit typed needs_manual_target."},
                 "message": {"type": "string", "description": "The owner message / work to route into the project."},
                 "reason": {"type": "string", "default": "", "description": "Optional short why-this-project note (provenance)."},
-                "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the id of a finished ROOT result (any project; the host list is a hint) to continue it. A child result, a live root or a pending promote is refused."},
+                "predecessor_task_id": {"type": "string", "description": "Required explicit selector: pass an empty string for fresh work, or the id of a settled result (completed, failed or cancelled; any project, the host list is a hint; a helper's result is continued with its root named) to continue it. A live root or a pending promote is refused."},
                 "candidates": {"type": "array", "items": {"type": "string"}, "description": "Optional, ONLY with project_id='': the task/project ids you consider plausible, in preference order. The typed picker shows them first; ids not in the host-built option list are ignored."},
             }, "required": ["message", "predecessor_task_id"]},
         }, _route_to_project),

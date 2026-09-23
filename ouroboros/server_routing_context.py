@@ -171,9 +171,10 @@ def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
 def _is_child_result(facts: Dict[str, Any]) -> bool:
     """A result that is NOT an owner root: it has a parent, or the subagent role.
 
-    ONE predicate for both readers of that fact - the manifest window that skips
-    children (owner decision batch 3, answer 6b=A) and the promote door, which
-    refuses them by the same rule. Reads a memoized fact row or a full result row.
+    ONE predicate for every reader of that fact - the manifest window that skips
+    children (owner decision batch 3, answer 6b=A), the pointer stamp that only a
+    root moves, and the promote receipt, which continues a named child with its
+    root disclosed. Reads a memoized fact row or a full result row.
     """
     return bool(str(facts.get("parent_task_id") or "").strip()) or str(
         facts.get("delegation_role") or "") == "subagent"
@@ -544,8 +545,8 @@ def main_lane_routing_metadata(ctx: Any, chat_id: int) -> Dict[str, Any]:
     Exactly what an owner turn in the same chat is handed — the Main routing manifest
     and this chat's addressable roots — minus what is bound to an owner message (there
     is none). One seam over the owner path, so a wake can never drift from what the
-    host says is addressable: without the manifest every predecessor the wake names is
-    refused as "not addressable" and it cannot continue prior work at all.
+    host shows an owner turn: the manifest is the hint both decide from, while the
+    door judges the named result itself, listed or not.
     """
     facts = _decision_turn_metadata(ctx, int(chat_id or 0), "", {})
     return dict(facts) if isinstance(facts, dict) else {}

@@ -6,9 +6,9 @@ itself and was refused `AUTHORITY_SOURCE_UNAVAILABLE`, and the retry without a
 predecessor minted a duplicate root. Later a coordinator task named the settled
 roots of five other projects, each to be continued inside its own project, and
 was refused seven times because the door compared the predecessor's project with
-the CALLER's room. The list is a HINT; the door is a predicate on the root
-itself: a root, a readable result, not live - never where the caller sits or
-where the work lands. A landing outside the predecessor's project is disclosed.
+the CALLER's room. The list is a HINT; the door is a predicate on the result
+itself: settled and readable - never where the caller sits, where the work lands
+or whether it is a root's or a helper's; those facts are disclosed in the receipt.
 """
 
 from __future__ import annotations
@@ -161,13 +161,15 @@ def test_a_room_root_older_than_the_list_is_addressable_all_the_same(tmp_path, m
     }
 
 
-def test_a_child_result_is_never_the_continuation_and_the_host_stops_offering_it(tmp_path):
-    """A pointer stamped by a child before this release still names a child: the
-    host offers the ROOT instead, and the door refuses the child if the model names
-    it all the same, saying where the work is reachable (I29 stays closed)."""
+def test_a_helpers_result_is_continued_with_its_root_named_and_never_offered(tmp_path, monkeypatch):
+    """A pointer stamped by a child before only roots stamped it still names a child:
+    the host offers the ROOT (the hint stays roots-only, owner decision 6b=A) and heals
+    the pointer, while a helper's result the model names on purpose is continued -
+    the receipt says whose helper it was and where its root is."""
     import server
     from ouroboros.projects_registry import create_project
     from ouroboros.task_results import write_task_result
+    from ouroboros.tools.control_routing import _promote_chat_to_task
     from ouroboros.tools.project_journal import record_project_last_result
 
     project = create_project(tmp_path, "racer", name="Racer")
@@ -187,11 +189,32 @@ def test_a_child_result_is_never_the_continuation_and_the_host_stops_offering_it
             metadata["project_routing_manifest"]["final_results"]] == ["racer-root"]
 
     evt: dict = {}
-    refusal = _door(_room_ctx(tmp_path, metadata), "racer-child", evt)
-    assert "delegated child result" in refusal and "root" in refusal
-    assert evt == {}
-    assert _door(_room_ctx(tmp_path, metadata), "racer-root") == ""
+    assert _door(_room_ctx(tmp_path, metadata), "racer-child", evt) == ""
+    assert evt["predecessor_task_id"] == "racer-child"
+    assert evt["predecessor_facts"] == {"project_id": "racer", "root_task_id": "racer-root"}
+    root_evt: dict = {}
+    assert _door(_room_ctx(tmp_path, metadata), "racer-root", root_evt) == ""
+    assert root_evt["predecessor_facts"]["root_task_id"] == ""  # a root names no root
 
+    _confirm(monkeypatch, effective_project_id="racer")
+    ctx = _room_ctx(tmp_path, metadata)
+    out = _promote_chat_to_task(ctx, "Continue the helper's work", workspace="none",
+                                predecessor_task_id="racer-child")
+    assert out.startswith("OK: task"), out
+    assert "Note: predecessor racer-child is a delegated helper's result; its root is racer-root." in out
+    assert "belongs to" not in out  # same project: nothing else to disclose
+
+
+def test_a_failed_root_is_a_settled_predecessor(tmp_path):
+    """Settled means completed, failed or cancelled: the coordinator's first refused
+    predecessor had failed at its absolute ceiling and was still the work to continue."""
+    from ouroboros.task_results import write_task_result
+
+    write_task_result(tmp_path, "tower-failed", "failed", project_id="tower",
+                      objective="ran out of ceiling", reason_code="absolute_ceiling")
+    evt: dict = {}
+    assert _door(_room_ctx(tmp_path, {}, project_id="racer"), "tower-failed", evt) == ""
+    assert evt["predecessor_authority_source"]["arguments"] == {"task_id": "tower-failed", "include_authority": True}
 
 def test_another_projects_root_is_continued_from_this_room_and_the_hint_stays_room_local(tmp_path):
     """The room's manifest lists only its own roots - a hint - while the door judges the
@@ -212,7 +235,7 @@ def test_another_projects_root_is_continued_from_this_room_and_the_hint_stays_ro
     assert _door(_room_ctx(tmp_path, metadata), "tower-root", evt) == ""
     assert evt["predecessor_task_id"] == "tower-root"
     assert evt["predecessor_authority_source"] == _TOWER_POINTER
-    assert evt["predecessor_project_id"] == "tower"
+    assert evt["predecessor_facts"] == {"project_id": "tower", "root_task_id": ""}
 
 
 def test_a_pooled_task_continues_another_rooms_root_into_that_room_in_one_hop(tmp_path, monkeypatch):
@@ -238,7 +261,7 @@ def test_a_pooled_task_continues_another_rooms_root_into_that_room_in_one_hop(tm
     assert evt["project_id"] == "tower"
     assert evt["predecessor_task_id"] == "tower-root"
     assert evt["predecessor_authority_source"] == _TOWER_POINTER
-    assert "predecessor_project_id" not in evt
+    assert "predecessor_facts" not in evt
 
     routed = _room_ctx(tmp_path, metadata, project_id="coord")
     out = _route_to_project(routed, "tower", "continue the tower work", predecessor_task_id="tower-root")
@@ -247,7 +270,7 @@ def test_a_pooled_task_continues_another_rooms_root_into_that_room_in_one_hop(tm
     [evt] = routed.pending_events
     assert evt["predecessor_task_id"] == "tower-root"
     assert evt["predecessor_authority_source"] == _TOWER_POINTER
-    assert "predecessor_project_id" not in evt
+    assert "predecessor_facts" not in evt
 
 
 def test_a_landing_outside_the_predecessors_project_is_disclosed_once(tmp_path, monkeypatch):
@@ -290,7 +313,7 @@ def test_a_main_root_is_continued_from_a_room_and_its_home_is_named(tmp_path, mo
 
     evt: dict = {}
     assert _door(_room_ctx(tmp_path, {}, project_id="racer"), "main-root", evt) == ""
-    assert evt["predecessor_task_id"] == "main-root" and evt["predecessor_project_id"] == ""
+    assert evt["predecessor_task_id"] == "main-root" and evt["predecessor_facts"]["project_id"] == ""
 
     _confirm(monkeypatch, effective_project_id="racer")
     ctx = _room_ctx(tmp_path, {}, project_id="racer")
