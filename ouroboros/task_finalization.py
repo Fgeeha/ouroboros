@@ -45,8 +45,8 @@ TERMINAL_ORIGIN_MODEL_FINAL = "model_final"
 TERMINAL_ORIGIN_HOST_SALVAGE = "host_salvage"
 # A terminal text the HOST wrote alone (a budget rejection, a round-limit rail
 # with nothing to deliver, a scheduled swarm handoff). It is not salvage: its
-# own words ARE the answer, so they are published verbatim on every transport
-# instead of being replaced by the outage receipt.
+# own words remain an owner-facing System diagnostic. Presence never turns
+# host-authored text into external speech.
 TERMINAL_ORIGIN_HOST_NOTICE = "host_notice"
 HOST_AUTHORED_TERMINAL_ORIGINS = frozenset({
     TERMINAL_ORIGIN_HOST_SALVAGE, TERMINAL_ORIGIN_HOST_NOTICE,

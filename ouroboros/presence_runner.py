@@ -15,6 +15,10 @@ from ouroboros.artifacts import stage_task_attachments
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.presence_admission import PresenceAdmission
 from ouroboros.presence_authority import presence_ceiling_payload
+from ouroboros.task_finalization import (
+    HOST_AUTHORED_TERMINAL_ORIGINS, TERMINAL_ORIGIN_MODEL_FINAL,
+    provider_terminal_body, terminal_notice_text,
+)
 from ouroboros.task_results import load_task_result
 from ouroboros.utils import append_jsonl, read_json_dict, utc_now_iso
 
@@ -59,7 +63,42 @@ class PresenceTurnResult:
     delivery_reporting_version: int = 0
 
 
-def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, provider_notice: str = "",
+def _presence_delivery(outcome: str, text: str, terminal_origin: str, *, legacy: bool = False) -> tuple[str, str]:
+    """Project speech from producer facts, never from its wording or task status."""
+    if outcome not in {"message", "silent", "tool_delivered", "deferred"}:
+        outcome = "message"
+    if outcome not in {"message", "deferred"}:
+        return outcome, ""
+    # Unknown origin remains explicit stored-row compatibility, not evidence
+    # authorizing new speech. Even an old frozen body cannot override known host provenance.
+    authored = terminal_origin == TERMINAL_ORIGIN_MODEL_FINAL
+    if not authored and not (legacy and terminal_origin not in HOST_AUTHORED_TERMINAL_ORIGINS):
+        return ("deferred" if outcome == "deferred" else "silent"), ""
+    return outcome, text
+
+
+def presence_result_from_stored(stored: Mapping[str, Any], task_id: str) -> PresenceTurnResult:
+    """One replay projection for cached turns and completed delegated work."""
+    metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
+    text = metadata["presence_result_text"] if "presence_result_text" in metadata else stored.get("result")
+    origin = str(stored.get("terminal_origin") or "")
+    if origin == TERMINAL_ORIGIN_MODEL_FINAL and text and "result" in stored:
+        raw, notice = str(stored["result"] or ""), terminal_notice_text(stored)
+        # Undo only the recorded host composition. Older explicit reply bodies
+        # could differ from the raw final; neither they nor deliberate emptiness are guessed away.
+        if notice and text == provider_terminal_body(raw, notice):
+            text = raw
+    outcome, text = _presence_delivery(
+        str(metadata.get("presence_outcome") or "message"), str(text or ""), origin, legacy=True,
+    )
+    return PresenceTurnResult(
+        outcome=outcome, text=text, task_id=task_id,
+        work_ref=str(metadata.get("presence_work_ref") or ""),
+        delivery_reporting_version=int((metadata.get("presence") or {}).get("delivery_reporting_version") == 1),
+    )
+
+
+def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, terminal_origin: str = "",
                                 retain_scheduled_handoff: bool = False) -> dict[str, Any]:
     """Freeze typed delivery metadata before the ordinary durable result write."""
 
@@ -68,8 +107,6 @@ def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, pr
         isinstance(completion, dict) and getattr(ctx, "_presence_completion_accepted", False)
     ) else {}
     outcome = str(completion.get("outcome") or "message").strip()
-    if outcome not in {"message", "silent", "tool_delivered", "deferred"}:
-        outcome = "message"
     handoff = getattr(ctx, "_swarm_handoff_attempt", None)
     handoff = handoff if isinstance(handoff, dict) else {}
     work_ref = (
@@ -81,17 +118,12 @@ def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, pr
         outcome = "message"
     if retain_scheduled_handoff and work_ref:
         # A failed/forced parent still owes an already admitted child's result.
-        # Transports poll only deferred outcomes; the current body remains true.
+        # Transports poll only deferred outcomes, even when no reply was authored.
         outcome = "deferred"
-    result_text = str(text or "")
-    if outcome in {"message", "deferred"} and provider_notice:
-        from ouroboros.task_finalization import provider_terminal_body
-
-        result_text = provider_terminal_body(result_text, provider_notice)
+    outcome, result_text = _presence_delivery(outcome, str(text or ""), terminal_origin)
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     metadata["presence_outcome"] = outcome
-    if outcome in {"message", "deferred"}:
-        metadata["presence_result_text"] = result_text
+    metadata["presence_result_text"] = result_text
     if work_ref:
         metadata["presence_work_ref"] = work_ref
     task["metadata"] = metadata
@@ -99,7 +131,7 @@ def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, pr
         "type": "presence_result",
         "task_id": str(task.get("id") or ""),
         "outcome": outcome,
-        "text": result_text if outcome in {"message", "deferred"} else "",
+        "text": result_text,
         "work_ref": work_ref,
         "ts": utc_now_iso(),
     }
@@ -219,21 +251,7 @@ def _cached_result(drive_root: Path, task_id: str) -> PresenceTurnResult | None:
     stored = load_task_result(drive_root, task_id) or {}
     if str(stored.get("status") or "") not in {"completed", "failed"}:
         return None
-    metadata = stored.get("metadata") if isinstance(stored.get("metadata"), dict) else {}
-    outcome = str(metadata.get("presence_outcome") or "message")
-    if outcome not in {"message", "silent", "tool_delivered", "deferred"}:
-        outcome = "message"
-    return PresenceTurnResult(
-        outcome=outcome,
-        text=(
-            str(metadata.get("presence_result_text") or stored.get("result") or "")
-            if outcome in {"message", "deferred"}
-            else ""
-        ),
-        task_id=task_id,
-        work_ref=str(metadata.get("presence_work_ref") or ""),
-        delivery_reporting_version=int((metadata.get("presence") or {}).get("delivery_reporting_version") == 1),
-    )
+    return presence_result_from_stored(stored, task_id)
 
 
 def _log_dialogue(

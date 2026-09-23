@@ -561,7 +561,7 @@ def emit_task_results(
         send_event["progress_meta"] = dict(_message_meta)
     send_event = prepare_terminal_send_event(env.drive_root, task, text, usage, send_event, presence=_presence)
     pending_events.append(build_presence_result_event(
-        task, text, ctx, provider_notice=terminal_notice_text(usage),
+        task, text, ctx, terminal_origin=str(usage.get("terminal_origin") or ""),
         retain_scheduled_handoff=failed_or_forced,
     ) if _presence else send_event)
     duration_sec = round(time.time() - start_time, 3)
