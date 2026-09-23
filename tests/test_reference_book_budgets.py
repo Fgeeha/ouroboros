@@ -96,7 +96,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the digest-selected historical read and the reader admission rule.
     # 295650 -> 297250: document the new diagnostic-only source/coverage contract,
     # unavailable evidence and no-effects ordering without removing review/custody rules.
-    "docs/architecture/06-agent-core.md": 297250,
+    # 297250 -> 298400: the private-snapshot paragraph now states the worktree ops
+    # lock's scope (issue #1241: shared metadata only, row-then-ref order, batched
+    # binary verdict, typed busy refusal) — rationale-layer text BIBLE P6 requires.
+    "docs/architecture/06-agent-core.md": 298400,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
@@ -139,7 +142,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # never does; a pre-check's refusal takes the exact read). The one sentence it touches
     # (the lock's caller wait) is replaced; the rest is a rule the chapter lacked, and the
     # chapter had 5 bytes left. Sized to the text: 5 bytes of margin.
-    "docs/development/06-rules-by-change-class.md": 94520,
+    # 94520 -> 94650: the delegated-lane bullet names the worktree ops lock rule
+    # (issue #1241: no tree walk or per-file git process under the lock).
+    "docs/development/06-rules-by-change-class.md": 94650,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,
