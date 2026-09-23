@@ -121,7 +121,8 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 7764 -> 8600 (#1195): the fresh selected-subject + immutable peer projection
     # execution check (`skill_peer_inventory.py`, `skill_conflicts.py`) replaces
     # whole-inventory hashing; the chapter had no description of that seam to swap out.
-    "docs/architecture/13-external-skills-layer.md": 8600,
+    # Dispatcher producer/annotation separation and its retained-source lifetime.
+    "docs/architecture/13-external-skills-layer.md": 9500,
     "docs/development/01-role-and-authority.md": 2437,
     "docs/development/02-naming-and-boundaries.md": 36372,
     # 22873 -> 23100: one new invariant (notifications ring for live events

@@ -5,9 +5,10 @@ exact chronological source, and every successful summary unit is compared once
 against the same complete bytes it was written from before anything is kept.
 The host owns room identity: it partitions by the actual ``chat_id`` before any
 model call, stamps the typed ``rooms`` sections and their deterministic
-Markdown projection, and never parses generated text for labels. Cross-room
-facts never share a model call, an era regroups the same recorded room across
-blocks, and a legacy record without sections stays one explicitly
+Markdown projection, and never parses generated text for labels. Episodic
+claims stay grounded in that room's source; cumulative knowledge revisions
+also require the correcting operation's own complete current-note read.
+An era regroups the same recorded room across blocks, and a legacy record stays one explicitly
 unknown-provenance section. The Light transport (route, fit, retained sources,
 typed failures) stays with ``consolidator.py``; this module receives it as one
 ``call`` function.
@@ -96,7 +97,7 @@ def room_draft_prompt(
     return f"""{knowledge_instruction}You are the memory consolidator of Ouroboros, a self-modifying AI agent.
 Write the episodic memory of one room's messages inside the dialogue block {block_range_text}.
 Room: {room_label}. This room contributed {message_count} messages; other rooms of the block are written separately and the host assembles them.
-The source may be one contiguous part of the room; summarize only the supplied part.
+The source may be one contiguous part of the room; the episodic summary covers only the supplied part. Existing knowledge may inform a cumulative note update, but must not become an event or approval in this episode.
 
 ## Rules
 1. No block or room headers; the host writes them. Start with the memory itself.
@@ -114,16 +115,22 @@ The source may be one contiguous part of the room; summarize only the supplied p
 
 def correction_prompt(
     draft: str, source: str, *, room_label: str, scope: str,
-    identity_text: str = "", continuation_note: str = "",
+    identity_text: str = "", continuation_note: str = "", knowledge_instruction: str = "",
 ) -> str:
     room_label = json.dumps(str(room_label), ensure_ascii=False)
+    knowledge_check = ("If the draft has a `KNOWLEDGE_ENTRIES_JSON:` block, check those cumulative updates "
+                       "against each complete current note you read YOURSELF and this episode. The draft is a "
+                       "proposal, not a source. After the episodic memory, return only draft-nominated topics "
+                       "(including proposed new notes), or drop them. Unsupported episode claims must not survive in a note; "
+                       "independently established knowledge may remain without becoming an event or approval "
+                       "in this episode.\n" + knowledge_instruction if knowledge_instruction else "")
     return f"""Compare this draft memory of Ouroboros against its complete source and return the corrected memory.
-Scope: {scope}; room: {room_label}. The draft was written from exactly this source; the host assembles rooms and headers separately.
+Scope: {scope}; room: {room_label}. The source below is complete for this episodic summary, not for cumulative knowledge; the host assembles rooms and headers separately.
 Check sentence by sentence. Fix misattributed actors or approvals; decisions moved between rooms, tasks or people; invented, dropped or altered budgets, deadlines, checkpoints, boundaries and obligations; completion, review, verification or publication the source does not show; anything called approved that the source shows proposed, asked or rejected.
 Keep the first-person Ouroboros voice, quotes, task_ids and everything the draft got right; adapt length to the content.
 {FIDELITY_RULES}
 Return only the corrected memory text: no headers, commentary or diff. If the draft is already faithful, return it unchanged.
-If the draft ends with a `KNOWLEDGE_ENTRIES_JSON:` block, it is subject to the same check: return it after the corrected memory with the same shape, dropping or fixing every entry the source does not support; a claim the correction removed from the memory must not survive as an entry.
+{knowledge_check}
 {_identity_section(identity_text)}
 {continuation_note}## Draft memory
 {draft}
@@ -194,8 +201,8 @@ def summarize_source(
     response withholds the whole source. A real refusal lowers the same route's
     byte limit for remaining parts and the next cycle. Knowledge nominations
     are released only from the CORRECTED response: the draft's trailing block
-    travels into the correction under the same source check, so a false claim
-    the correction removed from the memory cannot survive as a durable entry.
+    travels into the correction, where cumulative revisions use its own note
+    reads alongside the episode rather than inheriting the draft's read credit.
     """
     pending, summaries, usages = [(0, len(text))], [], []
     entries: List[Dict[str, Any]] = []
@@ -228,7 +235,7 @@ def summarize_source(
     while pending:
         start, end = pending.pop()
         part, note = text[start:end], source_continuation_note(spans, start, end)
-        draft, usage, draft_knowledge = call(draft_prompt(part, note), "Room summary", fixed_prompt=draft_prompt("", note),
+        draft, usage, _draft_knowledge = call(draft_prompt(part, note), "Room summary", fixed_prompt=draft_prompt("", note),
                                              input_limit=input_limit, call_type="memory_consolidation")
         usages.append(usage)
         if draft.strip():
@@ -241,10 +248,9 @@ def summarize_source(
                 # only with its corrected text: a draft whose correction failed
                 # (and was then split) never entered the block, and a draft
                 # nomination the correction dropped was never source-checked.
-                # The corrected block may DROP or FIX the draft's entries, never add
-                # topics: only the draft call read the notes it nominates against, so
-                # its recorded reads attest exactly those topics' revisions, and an
-                # entry the correction invented has no read behind it.
+                # Keep this correction scoped to the draft's nominated topics.
+                # Only its OWN complete reads can authorize existing-note updates;
+                # draft read credit says nothing about the correction's evidence.
                 from ouroboros.reflection import _extract_trailing_json
 
                 _, draft_raw = _extract_trailing_json(draft, "KNOWLEDGE_ENTRIES_JSON:")
@@ -253,8 +259,7 @@ def summarize_source(
                 corrected, raw = _extract_trailing_json(corrected, "KNOWLEDGE_ENTRIES_JSON:")
                 kept = [e for e in (raw if isinstance(raw, list) else []) if isinstance(e, dict)
                         and (str(e.get("topic") or ""), str(e.get("scope") or "")) in draft_topics]
-                binder = draft_knowledge if draft_knowledge is not None else knowledge
-                entries.extend(binder.bind_entries(kept) if binder is not None and kept else [])
+                entries.extend(knowledge.bind_entries(kept) if knowledge is not None and kept else [])
                 summaries.append(corrected.strip())
                 continue
         failure = usage["_consolidation_errors"][-1]
@@ -302,7 +307,8 @@ def summarize_block(
 
         def correct(draft_text: str, part: str, note: str, room: RoomSource = room) -> str:
             return correction_prompt(draft_text, part, room_label=room.label, scope=f"dialogue block {range_text}",
-                                     identity_text=identity_text, continuation_note=note)
+                                     identity_text=identity_text, continuation_note=note,
+                                     knowledge_instruction=knowledge_instruction)
 
         content, usage = summarize_source(call, room.text, room.spans, draft, correct,
                                           input_limit=input_limit, on_refusal=on_refusal)
