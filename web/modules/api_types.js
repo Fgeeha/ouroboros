@@ -430,7 +430,14 @@
  *   transport/parse hole, never "zero findings". panels[].late_settlement
  *   ({note, reviewed_revision: "earlier"|"delivered", settled_after_terminal})
  *   is the host-composed sentence of a panel that settled after its task ended;
- *   the Reviews group prints the note verbatim.
+ *   the Reviews group prints the note verbatim. `acceptance_incident`
+ *   ({incident_id, status: "failed"|"resolved", stage, attempts, source_known,
+ *   feedback_delivered, failure_kind?, failure_detail?, retry?, prior_incidents?})
+ *   is the host's own LOCAL acceptance-preparation failure — published even when
+ *   there is no panel at all, keyed by its stable incident id, with the REAL host
+ *   attempt count; absent when no preparation ever failed. The Reviews group is
+ *   its only carrier (no card row, no toast); a `resolved` status clears the
+ *   active warning and keeps the row as history.
  * @property {boolean=} worker_saturation_warning
  * @property {string=} source
  * @property {string=} sender_label
@@ -1494,7 +1501,7 @@ export const MAX_QUIZ_OPTIONS = 6;
 // REFUSES a longer comment (it is delivered verbatim, never truncated), so
 // the card must not offer to send one.
 export const MAX_DECISION_COMMENT = 2000;
-export const GATEWAY_CONTRACT_VERSION = '7.4.5';
+export const GATEWAY_CONTRACT_VERSION = '7.4.7';
 
 /**
  * @typedef {Object} ChatHistoryPosition
