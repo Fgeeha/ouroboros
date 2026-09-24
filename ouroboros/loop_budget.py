@@ -100,6 +100,14 @@ def _check_budget_limits(
     prompt_estimate = int(accumulated_usage.get("_context_prompt_estimate") or 0)
     global_remaining = _wrapup_global_remaining() if prompt_estimate > 0 and not ctx.active_use_local else None
     wrapup_fits = None
+    # Owner Q10 (#1196): after an explicit Resume of a GRACEFUL pause the
+    # last-fit rail no longer demands room for TWO reservations. The owner's
+    # Resume spent exactly that early margin, so the one call that fits in the
+    # already-authorized remainder is admitted instead of re-pausing on the
+    # very number that paused the task; the ledger fence at the full cap still
+    # arbitrates every send. A stop that needs no wrap-up room at all
+    # (``wrapup_fits is False``) is unchanged.
+    last_fit_relaxed = _last_fit_relaxed(ctx)
     if prompt_estimate > 0 and (global_remaining is not None or (cost_ceiling.root_cap_usd is not None and deciding is not None)):
         finish_reason = task_pacing.wrapup_last_fit_text(deciding, cost_ceiling, global_remaining)
         forced_prompt = f"[BUDGET LIMIT] {finish_reason} {_loop()._FORCED_BEST_EFFORT_TAIL}"
@@ -109,7 +117,7 @@ def _check_budget_limits(
                         global_remaining_usd=global_remaining)
         wrapup_args = dict(**request_args, **balances)
         wrapup_fits = task_pacing.wrapup_reservation_fits(**wrapup_args)
-        two_fit = task_pacing.wrapup_reservation_fits(**wrapup_args, reservation_count=2) if wrapup_fits is True else None
+        two_fit = _second_reservation_fits(ctx, wrapup_args, wrapup_fits, relaxed=last_fit_relaxed)
         server_web = _loop()._server_web_allowed_by_task(getattr(getattr(ctx, "tools", None), "_ctx", None))
         if wrapup_fits is False or two_fit is False or (
             wrapup_fits is True and messages_carry_native_images(ctx.messages)
@@ -126,7 +134,7 @@ def _check_budget_limits(
             )
             wrapup_args = dict(request=probe, **balances)
             wrapup_fits = task_pacing.wrapup_reservation_fits(**wrapup_args)
-            two_fit = task_pacing.wrapup_reservation_fits(**wrapup_args, reservation_count=2) if wrapup_fits is True else None
+            two_fit = _second_reservation_fits(ctx, wrapup_args, wrapup_fits, relaxed=last_fit_relaxed)
         if wrapup_fits is False or two_fit is False:
             # The exact probe confirmed a stop: finalize services and prepare the
             # candidate that will be dispatched (forced augmentations included).
@@ -149,8 +157,8 @@ def _check_budget_limits(
                     ctx, trace, task_pacing.wrapup_unaffordable_text(deciding, cost_ceiling, global_remaining),
                     "budget_exhausted", source="budget_wrapup_unaffordable",
                 )
-            if wrapup_fits is True and task_pacing.wrapup_reservation_fits(
-                **wrapup_args, reservation_count=2,
+            if wrapup_fits is True and _second_reservation_fits(
+                ctx, wrapup_args, wrapup_fits, relaxed=last_fit_relaxed,
             ) is False:
                 accumulated_usage["cost_stop_spend_basis"] = spend_basis
                 accumulated_usage["cost_stop_rail"] = "wrapup_reservation_last_fit"
@@ -195,6 +203,32 @@ def _check_budget_limits(
             reason_code="budget_exhausted",
         )
     return None
+
+
+def _last_fit_relaxed(ctx: "_RoundLimitContext") -> bool:
+    """Whether the resumed loop's explicit owner Resume relaxed the last-fit rail (Q10)."""
+    tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
+    return bool(getattr(tool_ctx, "_budget_resume_last_fit_relaxed", False))
+
+
+def _second_reservation_fits(ctx: "_RoundLimitContext", wrapup_args: Dict[str, Any],
+                             wrapup_fits: Optional[bool], *, relaxed: bool) -> Optional[bool]:
+    """The two-reservation (last-fit) probe, or ``None`` when it does not decide.
+
+    Priced only while ONE reservation fits (otherwise the harder stop already
+    decides). Under the Q10 relaxation the probe still runs, so the admitted
+    early call is DISCLOSED on the usage record, but it no longer stops the
+    task: the one affordable call is placed and the ledger fence keeps binding.
+    """
+    if wrapup_fits is not True:
+        return None
+    second = task_pacing.wrapup_reservation_fits(**wrapup_args, reservation_count=2)
+    if relaxed and second is False:
+        ctx.accumulated_usage["budget_resume_last_fit_admitted"] = {
+            "round_idx": int(ctx.round_idx), "reservations_affordable": 1,
+            "basis": "owner_resume_relaxed_last_fit"}
+        return None
+    return second
 
 
 def _pause_scope(cost_ceiling: Optional["task_pacing.CostCeiling"]) -> str:
@@ -557,6 +591,13 @@ def _cleanup_loop_resources(
     """Release attempt-scoped executors, services, and delegated runs."""
     if ctx.trace_ctx is not None:
         ctx.trace_ctx._execution_trace = ctx.previous_execution_trace
+    # This attempt's tool-future quiescence rows end with it (#1196): a pause
+    # only got here after they settled, and any other exit is on the task's own
+    # control rail; the registry prunes nothing across attempts by itself.
+    try:
+        budget_pause.forget_tool_scope(ctx.tools._ctx)
+    except Exception:
+        log.debug("Tool-future registry scope could not be dropped", exc_info=True)
     if stateful_executor:
         try:
             from ouroboros.tools.browser import cleanup_browser

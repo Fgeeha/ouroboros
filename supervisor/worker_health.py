@@ -288,8 +288,23 @@ def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task
     continuation (#1196). This is non-admission of the crash-retry path for
     exactly this window — a checkpointed task must never be replayed — not a
     general crash recovery: any other crash keeps its ordinary custody path.
+
+    A worker that died holding an UNCONSUMED Resume grant belongs to the same
+    window (#1196, F4): the grant was minted but nothing consumed it — the loop
+    writes ``consumed_at`` before any new effect, and a refused continuation
+    load (a source that went unreadable, a grant a newer writer superseded)
+    kills the worker exactly here. The saved pause is not lost to a terminal
+    crash: the grant this dead process can no longer consume is revoked under
+    its own identity and the SAME task id is parked back on its exact pause for
+    the owner to Resume again. A CONSUMED grant is never reopened — that task
+    ran on, and its death takes terminal crash custody without ordinary retry.
     """
-    from ouroboros.budget_pause import STATE_PAUSED, STATE_PAUSING, budget_pause_row
+    from ouroboros.budget_pause import (
+        STATE_PAUSED,
+        STATE_PAUSING,
+        STATE_RESUME_GRANTED,
+        budget_pause_row,
+    )
     from supervisor.events_budget import install_exact_budget_pause
 
     result_root = pathlib.Path(task.get("budget_drive_root") or root)
@@ -297,19 +312,67 @@ def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task
         row = budget_pause_row(result_root, task_id)
     except Exception:
         return False
-    if not (row and row.get("state") in {STATE_PAUSING, STATE_PAUSED}
+    state = str(row.get("state") or "") if row else ""
+    if not (row and state in {STATE_PAUSING, STATE_PAUSED, STATE_RESUME_GRANTED}
             and int(row.get("task_attempt") or 0) == int(attempt) and row.get("source_ref")):
         return False
+    source = "worker_death_during_pausing"
     with _queue_lock:
         if not _dead_job_is_current(job):
             return False
+        if state == STATE_RESUME_GRANTED:
+            grant = row.get("grant") if isinstance(row.get("grant"), dict) else {}
+            if grant.get("consumed_at"):
+                return False  # the loop consumed it and ran on: ordinary custody
+            from supervisor.budget_resume import revoke_exact_budget_resume
+            from supervisor.events_budget import BUDGET_HOLD_KEY
+            from ouroboros.budget_pause import exact_pause_marker
+
+            task.setdefault("_budget_pause_resume", {
+                "pause_id": row.get("pause_id"), "grant_id": grant.get("grant_id"),
+                "pause": exact_pause_marker(row, default_root=str(task.get("root_task_id") or task_id)),
+            })
+            if not revoke_exact_budget_resume(task, "worker_death_before_consumption"):
+                if task.get("_budget_pause_consumed"):
+                    return False  # a concurrent consumption keeps crash custody, never re-arms
+                # Revocation failure is a nonterminal hold, never a crash retry
+                # or terminal. Preserve exact source and grant identity even if
+                # neither the result store nor the snapshot is writable.
+                held = dict(task)
+                held.setdefault("_budget_pause", exact_pause_marker(row, default_root=task_id))
+                hold = held.get(BUDGET_HOLD_KEY)
+                if not isinstance(hold, dict):
+                    from supervisor.events_budget import HOLD_REVOCATION_UNWRITTEN, hold_budget_row
+
+                    hold = hold_budget_row(held, reason=HOLD_REVOCATION_UNWRITTEN,
+                                          extra={"pause_id": row.get("pause_id"), "grant_id": grant.get("grant_id")})
+                _pool().RUNNING.pop(task_id, None)
+                if not any(item.get("id") == task_id for item in _pool().PENDING):
+                    _pool().PENDING.append(held)
+                from supervisor import queue
+
+                queue.sort_pending()
+                hold["snapshot_persisted"] = False
+                try:
+                    hold["snapshot_persisted"] = bool(queue.persist_queue_snapshot(reason="dead_worker_budget_hold"))
+                except Exception:
+                    log.error("Budget hold snapshot failed for %s", task_id, exc_info=True)
+                log.warning("Dead worker %s retained in nonterminal hold; snapshot persisted=%s",
+                            task_id, hold["snapshot_persisted"])
+                return True
+            running = _pool().RUNNING.get(task_id)
+            if isinstance(running, dict) and isinstance(running.get("task"), dict):
+                running["task"].pop("_budget_pause_resume", None)
+            source = "worker_death_before_grant_consumed"
     try:
         install_exact_budget_pause(_pool(), task_id, {"pause_id": row.get("pause_id")},
-                                   source="worker_death_during_pausing")
+                                   source=source)
     except Exception:
         log.error("Exact budget pause of %s could not be completed after worker death; "
                   "leaving the row for the next reconciliation", task_id, exc_info=True)
-        return False
+        from supervisor.task_reaper import TerminalFileRecoveryPending
+
+        raise TerminalFileRecoveryPending("exact budget pause parking remains pending")
     return True
 
 
@@ -361,9 +424,9 @@ def _recover_crashed_task_without_terminal(job: dict, queue: Any) -> None:
         deep = task_type == "deep_self_review"
         if budget_pausing:
             result_text = (
-                "Worker process died while entering a budget pause before its continuation "
-                "checkpoint existed (or the pause record is unreadable). Completed actions were "
-                "not retried; no exact continuation is available for this attempt."
+                "Worker process died with budget-continuation evidence. The checkpoint was "
+                "incomplete, unreadable, or already consumed. Completed actions were not retried; "
+                "no exact continuation is available for this attempt."
             )
             reason_code = "worker_crash_budget_pausing"
         elif replay_unsafe:

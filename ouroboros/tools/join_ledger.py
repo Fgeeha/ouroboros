@@ -400,10 +400,11 @@ def _status_drive_root(ctx: ToolContext) -> Path:
     return Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
 
 
-def _is_own_child(ctx: ToolContext, status_drive_root: Path, tid: str) -> bool:
+def _is_own_child(ctx: ToolContext, status_drive_root: Path, tid: str, *, root_tree: bool = False) -> bool:
     """True if ``tid`` is a DIRECT child of the CURRENT task (D#7 safety): a parent
     decision may only describe the caller's OWN children, never an unrelated parent's
-    join ledger. Fail-CLOSED — any error returns False."""
+    join ledger. Resume alone may also select the caller's root tree, using
+    stored lineage rather than a supplied root id. Fail-CLOSED on any error."""
     try:
         from ouroboros.task_status import find_child_tasks
 
@@ -412,7 +413,8 @@ def _is_own_child(ctx: ToolContext, status_drive_root: Path, tid: str) -> bool:
         if not my_id or not tid:
             return False
         children = find_child_tasks(
-            Path(status_drive_root), parent_task_id=my_id, root_task_id="", exclude_task_id=my_id
+            Path(status_drive_root), parent_task_id=my_id, root_task_id=my_id if root_tree else "",
+            exclude_task_id=my_id, materialize_artifacts=False,
         )
         return any(str(c.get("task_id") or c.get("id") or "") == tid for c in children)
     except Exception:
@@ -611,7 +613,7 @@ def _override_delegation_constraint(ctx: ToolContext, constraint_id: str, reason
 
 
 def _resume_child_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
-    """Owner Q9 (#1196): explicitly select ONE budget-paused descendant to continue.
+    """Owner Q9: select ONE paused root descendant or intermediate parent's direct child.
 
     The request rides the existing worker->supervisor control channel; the
     supervisor validates lineage and grants through the ONE resume seam, and
@@ -624,7 +626,7 @@ def _resume_child_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
         return f"⚠️ TOOL_ARG_ERROR (resume_child_task): {exc}"
     reason_text = _clip(" ".join(str(reason or "").split()), 500)
     status_drive_root = _status_drive_root(ctx)
-    own = _is_own_child(ctx, status_drive_root, tid)
+    own = _is_own_child(ctx, status_drive_root, tid, root_tree=True)
     requester = str(getattr(ctx, "task_id", "") or "")
     if not own:
         return _publish_tool_result(ctx, ToolResult(status="blocked", code="ACCESS_BLOCKED", text=(
@@ -777,8 +779,9 @@ def get_tools() -> list[ToolEntry]:
     return [
         ToolEntry("resume_child_task", {
             "name": "resume_child_task",
-            "description": "Owner Q9 (#1196): after YOUR OWN task was resumed from a budget pause, "
-                           "select ONE of your budget-paused descendants to continue under its same task id. "
+            "description": "After the owner resumes your root from a budget pause, select ONE paused task: "
+                           "a root may select any of its descendants; an intermediate parent may select its "
+                           "own direct children. Continuation keeps the same task id. "
                            "Nothing resumes automatically and no fan-out happens: you name each child you still "
                            "need, with a reason. The supervisor validates money, Stop/cancel intent, deadline and "
                            "finite lifetime through the same seam the owner's Resume uses; the typed outcome is "

@@ -13,6 +13,7 @@ import logging
 from typing import Any
 
 from ouroboros.owner_wait import set_owner_wait
+from ouroboros.utils import append_jsonl, utc_now_iso
 from supervisor.queue import _queue_lock
 from supervisor.worker_pool_lifecycle import (
     _serialized_worker_lifecycle, _spawn_worker_slot, kill_worker_tree, retire_worker,
@@ -33,6 +34,51 @@ def has_owner_wait_checkpoint(meta: dict, task_attempt: int) -> bool:
         task.get("_owner_wait_resume") if isinstance(task, dict) else None)
     return (isinstance(wait, dict) and wait.get("task_attempt") == task_attempt
             and bool(wait.get("source_ref")))
+
+
+def retire_consumed_budget_carrier(drive_root: Any, task_id: str, task: Any) -> str:
+    """Drop a SPENT exact-budget-resume handoff from one queue row; returns its id.
+
+    The loop writes ``consumed_at`` on the durable grant — a compare-and-set on
+    the pause, the state and the grant it was handed — BEFORE any new effect, so
+    a queue row still carrying that handoff is only a stale carrier of work that
+    ran on. Left there, the next planned restart reads the row as a consumed
+    grant and drops it, taking the NEWER owner-wait continuation parked on the
+    same row with it (#1196, F3). Cumulative account fields are untouched: the
+    paused interval rides the owner-wait checkpoint and ``budget_resumed_at``
+    stays on the row. A grant that is NOT consumed is left exactly where it is —
+    the restart path still has to revoke it — and an unreadable pause record
+    proves nothing, so it retires nothing.
+    """
+    import pathlib
+
+    from ouroboros.budget_pause import STATE_RESUMED, budget_pause_row
+
+    handoff = task.get("_budget_pause_resume") if isinstance(task, dict) else None
+    if not isinstance(handoff, dict) or not str(handoff.get("grant_id") or ""):
+        return ""
+    root = pathlib.Path(task.get("budget_drive_root") or drive_root)
+    try:
+        row = budget_pause_row(root, task_id)
+    except Exception:
+        log.debug("Budget carrier retirement could not read the pause row for %s", task_id, exc_info=True)
+        return ""
+    grant = row.get("grant") if isinstance(row.get("grant"), dict) else {}
+    grant_id = str(grant.get("grant_id") or "")
+    if grant_id != str(handoff.get("grant_id") or ""):
+        return ""
+    if not (grant.get("consumed_at") or str(row.get("state") or "") == STATE_RESUMED):
+        return ""
+    task.pop("_budget_pause_resume", None)
+    try:
+        append_jsonl(pathlib.Path(drive_root) / "logs" / "events.jsonl",
+                     {"ts": utc_now_iso(), "type": "budget_resume_carrier_retired",
+                      "task_id": task_id, "grant_id": grant_id,
+                      "pause_id": str(row.get("pause_id") or ""),
+                      "consumed_at": grant.get("consumed_at"), "reason": "owner_wait_park"})
+    except Exception:
+        log.debug("Failed to record budget carrier retirement for %s", task_id, exc_info=True)
+    return grant_id
 
 
 def _command(worker: Any, task_id: str, wait: dict, phase: str, **extra: Any) -> None:
@@ -84,6 +130,10 @@ def handle_owner_wait(event: dict, ctx: Any) -> None:
         try:
             wait = set_owner_wait(ctx.DRIVE_ROOT, task_id, wait)
             meta["owner_wait"] = wait
+            # This park is the supervisor's proof that the task ran on past any
+            # exact budget grant it was dispatched with: a spent carrier is
+            # retired here, never carried into the snapshot beside this wait.
+            retire_consumed_budget_carrier(ctx.DRIVE_ROOT, task_id, meta.get("task"))
             worker.active_capacity = False
             if not queue.persist_queue_snapshot(reason="owner_wait_parked"):
                 raise RuntimeError("owner wait queue snapshot was not persisted")

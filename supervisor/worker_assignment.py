@@ -13,6 +13,7 @@ import pathlib
 import time
 from typing import Any, Dict
 
+from supervisor.events_budget import budget_fence_selected, budget_hold_fact
 from supervisor.queue import _queue_lock
 
 
@@ -31,6 +32,20 @@ def _pool():
 
 
 log = logging.getLogger(__name__)
+
+
+def _direct_actor_still_registered(task_id: str) -> bool:
+    """Whether the in-process direct actor that paused ``task_id`` still holds its
+    registry entry. A parked direct turn releases the entry as its last act; a
+    grant dispatched before that would put a pooled worker beside a live actor
+    under the SAME id (#1196). Unreadable registry state fences (never admits)."""
+    try:
+        from supervisor.active_activity import get_direct_activity_registry
+
+        return get_direct_activity_registry().get(str(task_id or "")) is not None
+    except Exception:
+        log.debug("Direct activity registry unreadable during assignment", exc_info=True)
+        return True
 
 
 def _evolution_assignment_error(task: Dict[str, Any]) -> str:
@@ -212,6 +227,8 @@ def assign_tasks() -> None:
                     continue
                 if isinstance(task.get("_budget_pause"), dict):
                     continue
+                if budget_hold_fact(task) is not None:
+                    continue  # Held, not paused: no second pause row over the hold.
                 if task.get("_owner_wait_resume"):
                     continue  # Restore the checkpoint; the loop still owns its budget stop.
                 if isinstance(task.get("_budget_pause_resume"), dict):
@@ -345,10 +362,34 @@ def assign_tasks() -> None:
                         continue
                     if isinstance(candidate.get("_budget_pause"), dict):
                         continue
+                    if budget_hold_fact(candidate) is not None:
+                        # A durable budget hold (#1196): a sibling whose paused
+                        # root's fence was lifted without an explicit selection,
+                        # an unrestorable continuation, or a grant whose
+                        # revocation could not be written. Never assignable
+                        # until the selection is recorded on the row.
+                        continue
+                    if (candidate.get("_is_direct_chat")
+                            and _direct_actor_still_registered(str(candidate.get("id") or ""))):
+                        # The direct actor that parked this id has not released
+                        # its registry entry yet: no second live actor for one id.
+                        continue
                     root_task_id = str(candidate.get("root_task_id") or "").strip()
+                    from supervisor.events_budget import budget_resume_dispatch_allowed
+
+                    if not budget_resume_dispatch_allowed(queue, candidate):
+                        from supervisor.budget_resume import revoke_exact_budget_resume
+
+                        revoke_exact_budget_resume(candidate, "root_resume_generation_stale")
+                        queue.persist_queue_snapshot(reason="stale_child_resume_held")
+                        continue
                     if (root_task_id in queue.BUDGET_ROOT_FENCES
                             and not candidate.get("_owner_wait_resume")
-                            and not candidate.get("_budget_pause_resume")):
+                            and not candidate.get("_budget_pause_resume")
+                            # One member explicitly selected against THIS fence
+                            # is admitted; the latch stays up for the rest (Q9).
+                            and not budget_fence_selected(
+                                candidate, queue.BUDGET_ROOT_FENCES.get(root_task_id))):
                         continue
                     if str(candidate.get("type") or "") == "evolution" and remaining < EVOLUTION_BUDGET_RESERVE:
                         continue

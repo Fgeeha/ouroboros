@@ -33,7 +33,7 @@ import logging
 import time
 import uuid
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Dict, List, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple, NamedTuple
 
 from ouroboros import delegate_custody as custody
 from ouroboros import delegate_progress as progress
@@ -324,10 +324,35 @@ def _processing_start_request(request, actor, gateway, route):
                      "reason": "submitted" if "processingPreference" in request else "processing_not_submitted"}
 
 
+def _start_argument_refusal(ctx: ToolContext, text: str, selector_root: str, retry_of: Any,
+                            bucket: Any, skill_name: Any, continue_from: Any) -> Tuple[str, Optional[ToolResult]]:
+    """``(continuation_token, refusal)``: every refusal a start's ARGUMENTS earn before
+    the daemon is touched, in their historical order. Each is a definite no-run: an
+    empty prompt, a malformed exact-resource selector, a deadline already behind the
+    nanny (``definitely_unrun`` = the producer's own no-run verdict, P2), and the
+    continuation selector shapes one call cannot combine."""
+    from ouroboros.delegate_continuation import selector_refusal
+
+    if not text.strip():
+        return "", _fail("delegate_start", "empty_prompt", "prompt is required")
+    refusal = _payload_selector_refusal(selector_root, retry_of, bucket, skill_name)
+    if refusal:
+        return "", refusal
+    if deadline_expired(ctx):
+        return "", _fail(
+            "delegate_start", "task_deadline_expired",
+            "This task's deadline has already passed, so a delegated run started now "
+            "would outlive it by design. Finalize with what you have — do not start "
+            "new work a deadline has already closed.", definitely_unrun=True,
+        )
+    return selector_refusal(continue_from, retry_of, selector_root)
+
+
 def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = None,
                     retry_of: Optional[str] = None, root: Optional[str] = None,
                     bucket: Optional[str] = None, skill_name: Optional[str] = None,
                     directory_strategy: Optional[str] = None, scope_paths: Optional[list] = None,
+                    continue_from: Optional[str] = None,
                     _resolved_binding: Any = None,
                     _canonical_work_order_fingerprint: str = "",
                     _work_order_source_request: Any = None,
@@ -338,27 +363,26 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     from ouroboros.subagents import delegated_execution_workspace_root, resolve_subagent_executor, route_health
 
     text = str(prompt or "")
-    if not text.strip():
-        return _fail("delegate_start", "empty_prompt", "prompt is required")
     selector_root = str(root or "").strip()
-    selector_refusal = _payload_selector_refusal(selector_root, retry_of, bucket, skill_name)
-    if selector_refusal:
-        return selector_refusal
-    if deadline_expired(ctx):
-        # EXPIRED pre-daemon; definitely_unrun = the producer's own no-run verdict (P2).
-        return _fail(
-            "delegate_start", "task_deadline_expired",
-            "This task's deadline has already passed, so a delegated run started now "
-            "would outlive it by design. Finalize with what you have — do not start "
-            "new work a deadline has already closed.", definitely_unrun=True,
-        )
+    continuation_token, argument_refusal = _start_argument_refusal(
+        ctx, text, selector_root, retry_of, bucket, skill_name, continue_from)
+    if argument_refusal:
+        return argument_refusal
+    seconds_basis = ""
+    if not str(retry_of or "").strip():
+        # Decided BEFORE the daemon is touched: a spent lifetime or a sub-second
+        # deadline is a definite no-run, and the basis rides both custody rows.
+        bound = bounded_max_seconds(ctx, max_seconds)
+        if bound.refusal_code:
+            return _fail("delegate_start", bound.refusal_code, bound.refusal_detail, definitely_unrun=True)
+        seconds_basis = bound.basis
 
     drive = custody.custody_root(ctx)
     owned_project_id, project_persistent = "", False
     invocation_id = snapshot_id = baseline_sha = target_root = authority_source = ""
     binding_fingerprint = ""
     processing_info: Dict[str, Any] = {}
-    resource_ref, directory_options = {}, {}
+    resource_ref, directory_options, continuation = {}, {}, {}
     retry_token = str(retry_of or "").strip()
     source_binding = prepare_work_order_start_binding(
         ctx, drive, retry_token, _canonical_work_order_fingerprint, text,
@@ -387,6 +411,9 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
          project_persistent, seconds, snapshot_id, target_root, baseline_sha,
          authority_source, resource_ref, processing_info, binding_fingerprint) = binding
         invocation_id = retry_token
+        # A replay presents the recorded body byte-identically, so its cap
+        # basis is the recorded one too — never re-derived from today's clocks.
+        seconds_basis = str((custody.invocation_record(drive, retry_token) or {}).get("max_seconds_basis") or "")
         if directory_strategy is not None or scope_paths is not None:
             return _fail("delegate_start", "retry_selector_conflict",
                          "A retry replays its recorded directory strategy and scope; omit new geometry arguments.")
@@ -453,6 +480,16 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                     return root_error
             invocation_id = custody.new_invocation_id()
             root = record_auth["target_root"]
+            if continuation_token:  # #1196: gated from durable custody, before any snapshot exists
+                from ouroboros.delegate_continuation import start_binding
+
+                continuation, continuation_block, refusal = start_binding(
+                    ctx, drive, continuation_token, actor=actor, route=route, authority=authority,
+                    target_root=str(record_auth.get("target_root") or ""),
+                    canonical_work_order_fingerprint=str(_canonical_work_order_fingerprint or ""))
+                if refusal:
+                    return refusal
+                instructions += continuation_block
             if authority.access in SESSION_ACCESS_PROFILES:
                 target_root = record_auth["target_root"]
                 authority_source = record_auth["source"]
@@ -494,7 +531,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 project_persistent = True
             if authority.access == "full":
                 gateway.ensure_full_access(scope_root)
-            seconds = _bounded_max_seconds(ctx, max_seconds)
+            seconds = bound.seconds
             request_body = _start_request(ctx, route, authority, scope_root, text,
                                           seconds, instructions, execution_root,
                                           **({"directory_options": directory_options} if directory_options else {}))
@@ -510,7 +547,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             actor_ctx=ctx, enforce_actor_idle=not recovering,
             run_id="", task_id=str(getattr(ctx, "task_id", "") or ""),
             idempotency_key=key, invocation_id=invocation_id,
-            max_seconds=seconds, request=request_body, project_id=project_id,
+            max_seconds=seconds, max_seconds_basis=seconds_basis, request=request_body, project_id=project_id,
             project_owned=bool(owned_project_id), project_persistent=project_persistent, route=route.route_id,
             root_task_id=str(lineage.get("root_task_id") or ""), parent_task_id=str(lineage.get("parent_task_id") or ""),
             snapshot_id=snapshot_id, execution_root=(root if snapshot_id or resource_ref.get("strategy") == "direct" else ""),
@@ -598,6 +635,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         drive, run_id, ctx, route, authority,
         key=key, access=access, root=root, seconds=seconds,
         invocation_id=invocation_id, project_id=project_id,
+        continuation_of=str(continuation.get("continuation_of") or ""),
         project_owned=bool(owned_project_id), project_persistent=project_persistent,
         selected_subagent_id=selected_subagent_id,
         config_fingerprint=config_fingerprint, work_order_fingerprint=work_order_fingerprint,
@@ -608,6 +646,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         authority_source=authority_source, resource_ref=resource_ref, processing=processing_info,
         capture_mode=("engine_directory" if resource_ref.get("workspace_kind") == "directory" else
                       _CAPTURE_DELEGATED_SNAPSHOT if snapshot_id else ""),
+        max_seconds_basis=seconds_basis,
     )
     from ouroboros.tools.control import maybe_emit_delegated_run_fanout
     maybe_emit_delegated_run_fanout(ctx, run_id=run_id, route_id=route.route_id, objective=text, durable=durable)
@@ -618,13 +657,16 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                             baseline_sha=baseline_sha,
                             resource_ref=resource_ref,
                             processing=processing_info,
+                            continuation=continuation,
+                            max_seconds=seconds, max_seconds_basis=seconds_basis,
                             engine_version=str(getattr(gateway, "engine_version", "") or ""))
 
 
 def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: str,
                      authority: "DelegatedRunShape", root: str, *, durable: bool,
                      recovering: bool, invocation_id: str, snapshot_id: str, target_root: str,
-                     baseline_sha: str, engine_version: str = "", resource_ref=None, processing=None) -> ToolResult:
+                     baseline_sha: str, engine_version: str = "", resource_ref=None, processing=None,
+                     continuation=None, max_seconds: int = 0, max_seconds_basis: str = "") -> ToolResult:
     """The one author of delegate_start's started result (note + payload).
 
     The AUTHORITY guidance and the CUSTODY warning are independent facts about the same
@@ -671,12 +713,21 @@ def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: st
         "root": root,
         "custody_durable": durable,
         "invocation_id": str(invocation_id or ""),
+        # The cap and HOW it was decided (#1196): only a `requested` cap's expiry
+        # is a finite-leaf expiry a later continue_from may follow.
+        "max_seconds": int(max_seconds or 0),
+        "max_seconds_basis": str(max_seconds_basis or ""),
         "note": note,
     }
     if not durable:
         payload["pending_invocation_id"] = str(invocation_id or "")
     if processing:
         payload["processing"] = processing
+    if continuation:
+        # The binding facts, stated where the nanny reads them: which settled run
+        # this continues, its confirmed cause, its explicit disposition, and that
+        # NO session state was transferred (#1196).
+        payload["continuation"] = dict(continuation)
     if snapshot_id:
         # The C1 binding, stated where the nanny can read it: the run edits the
         # EXECUTION snapshot; the authority target receives nothing until apply.
@@ -760,38 +811,126 @@ def _retire_orphaned_registration(ctx: ToolContext, gateway: Any, project_id: st
             "project_retention_reason": "start_outcome_unknown_run_may_exist"}
 
 
-def _bounded_max_seconds(ctx: ToolContext, requested: Optional[int]) -> int:
-    """Narrow-only: the delegated run may never outlive the nanny's own deadline.
+class MaxSecondsBound(NamedTuple):
+    """One decided ``maxSeconds``: the seconds, HOW they were decided
+    (``delegate_registration_policy.CAP_BASIS_*``), or the typed refusal."""
 
-    A caller must ask ``deadline_expired`` FIRST: an expired deadline cannot produce an
-    honest bound at all, and this function's fallback is for a nanny that has NO
-    deadline, never for one whose deadline is behind it.
+    seconds: int
+    basis: str
+    refusal_code: str = ""
+    refusal_detail: str = ""
+
+
+def _lifetime_remaining_sec(ctx: ToolContext) -> Optional[float]:
+    """Seconds of the task's FINITE lifetime still unspent, or ``None`` (unlimited).
+
+    Cumulative EXECUTION time decides, never a reset clock: the live model-wait
+    owner's window (elapsed minus the quota union minus the budget-paused
+    carrier) when this task's is bound, else the same arithmetic over the
+    original ``task_started_at`` and the paused carrier the resume handed over
+    (quota waits unknown here count as execution — the narrower direction).
+    No recorded start uses the operation-bounded ceiling; a failed clock read
+    raises for a typed unknown-lifetime refusal, never a fresh finite window.
     """
-    from ouroboros.deadline_utils import deadline_remaining_sec
+    from ouroboros.config import get_task_abs_ceiling_sec
 
-    remaining = int(max(0.0, deadline_remaining_sec(ctx)))
+    ceiling = get_task_abs_ceiling_sec()
+    if ceiling is None:
+        return None
     try:
-        asked = int(requested) if requested is not None else 0
+        from ouroboros.model_wait import current_model_wait, execution_elapsed_seconds
+
+        waiter = current_model_wait()
+        if (waiter is not None
+                and str(getattr(waiter, "task_id", "") or "") == str(getattr(ctx, "task_id", "") or "")):
+            remaining = waiter.execution_window_remaining()
+            if remaining is not None:
+                return float(remaining)
+        started = getattr(ctx, "task_started_at", None)
+        if started:
+            paused = getattr(ctx, "_budget_paused_sec", None)
+            if paused is None:
+                paused = (getattr(ctx, "budget_pause_resume", None) or {}).get("paused_duration_sec")
+            executed = execution_elapsed_seconds(
+                {"started_at": float(started), "budget_paused_sec": float(paused or 0.0),
+                 "model_wait_quota_clock": {}}, time.time())
+            return max(0.0, float(ceiling) - executed)
+    except Exception as exc:
+        raise ValueError("task_lifetime_unknown") from exc
+    return float(ceiling)
+
+
+def bounded_max_seconds(ctx: ToolContext, requested: Optional[int]) -> MaxSecondsBound:
+    """Narrow-only: the delegated run may never outlive the nanny's own deadline
+    or its finite lifetime, and the decision is RECORDED beside the number.
+
+    A caller must ask ``deadline_expired`` FIRST: an expired deadline cannot
+    produce an honest bound at all. Less than one second of deadline or of
+    lifetime is refused typed (``task_deadline_too_close`` /
+    ``task_lifetime_exhausted``): ``int()`` would truncate it to 0, which the
+    fallback branch read as "no bound" and answered with hours of delegated
+    work. An explicit ask is ``requested`` unless the deadline, the lifetime or
+    the engine's schema bound narrowed it (each named); an omitted ask derives
+    from the tighter of deadline and lifetime, else the operation window.
+    """
+    from ouroboros.config import operation_window_sec
+    from ouroboros.deadline_utils import deadline_remaining_sec, has_deadline
+    from ouroboros.delegate_registration_policy import (
+        CAP_BASIS_DEADLINE_DERIVED, CAP_BASIS_LIFETIME_DERIVED, CAP_BASIS_OPERATION_WINDOW,
+        CAP_BASIS_REQUESTED, CAP_BASIS_REQUESTED_CLAMPED_DEADLINE, CAP_BASIS_REQUESTED_CLAMPED_LIFETIME,
+        CAP_BASIS_REQUESTED_CLAMPED_SCHEMA,
+    )
+
+    try:
+        asked = max(0, int(requested)) if requested is not None else 0
     except (TypeError, ValueError):
         asked = 0
-    candidates = [value for value in (asked, remaining) if value > 0]
+    deadline_left: Optional[float] = None
+    if has_deadline(ctx):
+        deadline_left = float(deadline_remaining_sec(ctx))
+        if deadline_left < 1.0:
+            return MaxSecondsBound(0, "", "task_deadline_too_close",
+                                   "Less than one second of this task's deadline remains: no delegated run "
+                                   "can be started under it. Finalize with what you have.")
+    try:
+        lifetime_left = _lifetime_remaining_sec(ctx)
+    except ValueError:
+        return MaxSecondsBound(0, "", "task_lifetime_unknown",
+                               "This task's remaining finite lifetime could not be established; no delegated run started.")
+    if lifetime_left is not None and lifetime_left < 1.0:
+        return MaxSecondsBound(0, "", "task_lifetime_exhausted",
+                               "This task's finite lifetime is spent (cumulative execution time, the "
+                               "paused interval excluded): no delegated run can be started. Finalize.")
+    if asked > 0:
+        seconds, basis = asked, CAP_BASIS_REQUESTED
+        if deadline_left is not None and int(deadline_left) < seconds:
+            seconds, basis = int(deadline_left), CAP_BASIS_REQUESTED_CLAMPED_DEADLINE
+        if lifetime_left is not None and int(lifetime_left) < seconds:
+            seconds, basis = int(lifetime_left), CAP_BASIS_REQUESTED_CLAMPED_LIFETIME
+        if seconds > _CLAUDEXOR_MAX_SECONDS:
+            # Clamp HERE too, not only on the fallback below: `max_seconds` is a model-supplied
+            # tool argument with no maximum in its schema (control.ts `.max(604_800)`).
+            seconds, basis = _CLAUDEXOR_MAX_SECONDS, CAP_BASIS_REQUESTED_CLAMPED_SCHEMA
+        return MaxSecondsBound(max(1, seconds), basis)
+    candidates = []
+    if deadline_left is not None:
+        candidates.append((int(deadline_left), CAP_BASIS_DEADLINE_DERIVED))
+    if lifetime_left is not None:
+        candidates.append((int(lifetime_left), CAP_BASIS_LIFETIME_DERIVED))
     if candidates:
-        # Clamp HERE too, not only on the fallback below: `max_seconds` is a model-supplied
-        # tool argument with no maximum in its schema, so an explicit ask sailed past the
-        # bound the fallback branch was careful about — the same defect, one branch over.
-        return min(_CLAUDEXOR_MAX_SECONDS, min(candidates))
-    # No positive bound is knowable: either the nanny has no deadline, or its deadline
-    # has already passed. Omitting `maxSeconds` — the old behavior — handed the run
-    # Claudexor's 7-day schema bound; the cap is damage limitation, and custody (the
+        seconds, basis = min(candidates, key=lambda item: item[0])
+        return MaxSecondsBound(max(1, min(_CLAUDEXOR_MAX_SECONDS, seconds)), basis)
+    # Neither a deadline nor a finite lifetime: the finite operation window.
+    # Omitting `maxSeconds` — the old behavior — handed the run Claudexor's
+    # 7-day schema bound; the cap is damage limitation, and custody (the
     # durable start row plus reconciliation) is what actually stops an orphan.
-    from ouroboros.config import get_task_abs_ceiling_sec, operation_window_sec
+    return MaxSecondsBound(min(_CLAUDEXOR_MAX_SECONDS, int(operation_window_sec(None))), CAP_BASIS_OPERATION_WINDOW)
 
-    # The task's operation window: its finite absolute lifetime, else the finite operation
-    # fallback (a task without a lifetime bound never sends an unbounded run). Claudexor
-    # bounds maxSeconds at 7 days (control.ts `.max(604_800)`), and the task ceiling clamps
-    # only from BELOW — an owner who raises it past a week would make every deadline-less
-    # start send an out-of-schema value.
-    return min(_CLAUDEXOR_MAX_SECONDS, int(operation_window_sec(get_task_abs_ceiling_sec())))
+
+def _bounded_max_seconds(ctx: ToolContext, requested: Optional[int]) -> int:
+    """The seconds of ``bounded_max_seconds`` (0 on a typed refusal) — the
+    historical integer view the tests and the wait clamp still address."""
+    return bounded_max_seconds(ctx, requested).seconds
 
 
 def _halt_breached_run(ctx: ToolContext, gateway: Any, entry: _RunCustody,
@@ -1206,7 +1345,9 @@ def get_tools() -> List[ToolEntry]:
                 "fresh start requires subagent_id. In a configured session the host already STARTED the exact "
                 "leaf before your first round (the startup receipt carries its run id): never start a duplicate — "
                 "supervise it; a replacement delegate_start(prompt='') is legal only after verified cancellation/"
-                "terminal settlement or a typed refusal proving no run exists. Recovery retries use retry_of without a new selector."
+                "terminal settlement or a typed refusal proving no run exists. Recovery retries use retry_of without a new selector. "
+                "A run the engine cancelled at its wall-clock cap is continued explicitly with continue_from once its "
+                "result is read and its patch disposed (see that argument)."
                 " This ordinary call requests no extra Claudexor review panel; new ordinary "
                 "runs on engine 3.9.8+ default to no panel. The started receipt names the serving "
                 "engine_version; an older engine or a recovered historical run may retain its "
@@ -1247,6 +1388,15 @@ def get_tools() -> List[ToolEntry]:
                     "tight cap for what feels like a quick edit. While delegate_wait shows "
                     "an advancing cursor the run is WORKING, and it enforces this cap "
                     "itself — cancelling a progressing run discards the whole run's spend."},
+                "continue_from": {"type": "string", "description":
+                    "EXPLICIT continuation of ONE of your own settled runs that the engine cancelled "
+                    "at its wall-clock cap (delegate_wait terminal: state=cancelled, "
+                    "outcome_facts.reason=wall_clock_exceeded). Admitted only after that run's result "
+                    "was read and its captured patch explicitly applied or rejected, on the same "
+                    "actor/route and the same workspace authority; refused typed for any other ending "
+                    "(deadline, Stop/Panic, failure, unknown). Starts a NEW run with a NEW cap: put the "
+                    "REMAINING work in prompt — the prior result and disposition are your evidence of "
+                    "what is done; nothing of the old session is transferred. Never combine with retry_of."},
                 "retry_of": {"type": "string", "description":
                     "EXPLICIT retry token: the pending_invocation_id from a start whose "
                     "outcome was unknown (transport failure, lost response). Replays THAT "

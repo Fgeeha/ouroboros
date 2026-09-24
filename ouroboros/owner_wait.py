@@ -142,6 +142,10 @@ def checkpoint_owner_wait(ctx: Any, messages: list, trace: dict, usage: dict,
         "execution_drive_root": str(ctx.drive_root),
         "started_at": getattr(ctx, "task_started_at", None),
         "model_wait_quota_clock": model_state.get("quota_clock", {}),
+        # The SAME two carriers every finite-lifetime reader subtracts: the quota
+        # union above and the budget-paused interval (#1196, F5). Without it the
+        # row's own lifetime check would count a pause as execution.
+        "budget_paused_sec": float(model_state.get("budget_paused_sec") or 0.0),
     }
 
 
@@ -176,7 +180,7 @@ def restore_owner_wait_allowed(root: Any, task: dict) -> bool:
     from ouroboros.deadline_utils import parse_deadline_ts, utc_now
     from ouroboros.delegate_recovery import _ack_direct_exec_successor, _read_restart_transaction
     from ouroboros.config import get_task_abs_ceiling_sec
-    from ouroboros.model_wait import quota_waited_seconds
+    from ouroboros.model_wait import execution_elapsed_seconds
     import time
 
     handoff = task.get("_owner_wait_resume")
@@ -200,10 +204,23 @@ def restore_owner_wait_allowed(root: Any, task: dict) -> bool:
     deadline = parse_deadline_ts(task.get("deadline_at") or (task.get("task_contract") or {}).get("deadline_at"))
     if deadline is not None and deadline <= utc_now():
         return False
-    started = float(handoff.get("started_at") or 0)
+    started = float(handoff.get("started_at") or wait.get("started_at") or 0)
     now = time.time()
     ceiling = get_task_abs_ceiling_sec()  # None = no lifetime bound to have outlived
-    if started and ceiling is not None and now - started - quota_waited_seconds(wait, now) >= ceiling:
+    # ONE shared clock (``model_wait.execution_elapsed_seconds``): wall time minus
+    # the quota union minus the budget-paused carrier. A task that was paused and
+    # then parked in an owner wait must not have that paused time charged to its
+    # finite lifetime by this reader alone (#1196, F5).
+    # The durable row is the authority whenever it carries the field (0.0 included);
+    # the handoff is the fallback for a row written before it existed.
+    paused_carrier = wait.get("budget_paused_sec")
+    if paused_carrier is None:
+        paused_carrier = handoff.get("budget_paused_sec") or 0.0
+    executed = execution_elapsed_seconds(
+        {"started_at": started,
+         "model_wait_quota_clock": wait.get("model_wait_quota_clock") or {},
+         "budget_paused_sec": paused_carrier}, now)
+    if started and ceiling is not None and executed >= ceiling:
         return False
     read_actor_source_bytes(root, task_id, wait["source_ref"])
     return True

@@ -108,6 +108,7 @@ BAND_PATHS = {
     "devtools/benchmarks/terminal_bench/run_tb.py": None,
     "ouroboros/agent.py": "Subagent message identity now lives in a shared helper; keep agent.py below the giant-file threshold rather than re-expanding it.",
     "ouroboros/agent_task_pipeline.py": "Shrank INTO the band from 1599 lines: the post-task synthesis family moved byte-preserving into ouroboros/post_task_synthesis.py (D01 lane); no new content was added.",
+    "ouroboros/budget_pause.py": "Entered the band from 990 lines (#1196): the direct-turn pause, the typed restore refusal beside the boolean gate and the authoritative Q10 refresh belong with the one pause/resume owner they extend; the supervisor-side grant lifecycle moved out to supervisor/budget_resume.py instead of growing here.",
     "ouroboros/cancel_intents.py": "Entered the band from 929 lines: reciprocal timeout-retry lineage validation and physical-leaf/logical-root aliasing stay with the durable cancel-intent mutation authority so Stop-now hardens the same request across retry races.",
     "ouroboros/capability_evidence.py": "Grew INTO the band by the #284 fix: a fresh exact-model density witness may honestly undercut the cold floor \u2014 evidence logic belongs beside the witness store it reads.",
     "ouroboros/claudexor_daemon.py": "Installation daemon lifecycle owns marker and authenticated endpoint stop authority, confirmed self-started handles, and duplicate-start refusal; process signal and ledger mechanics remain in process_custody. No new lifecycle store or scheduler.",

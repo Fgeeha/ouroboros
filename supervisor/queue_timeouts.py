@@ -16,7 +16,8 @@ import uuid
 from typing import Any, Dict
 
 from supervisor.cognitive_operations import _active_operation_progressing
-from supervisor.task_model_wait import model_waiting, quota_waited_seconds
+from ouroboros.model_wait import execution_elapsed_seconds
+from supervisor.task_model_wait import model_waiting
 from supervisor.task_reaper import (
     resolve_grace_episode_for_spared_task as _resolve_grace_episode_for_spared_task,
 )
@@ -205,8 +206,7 @@ def _enforce_task_timeouts_locked(
         last_hb = float(meta.get("last_heartbeat_at") or started_at)
         # Execution time = wall clock minus quota waits minus the SEPARATE
         # budget-paused interval (#1196); started_at itself is never moved.
-        runtime_sec = max(0.0, now - started_at - quota_waited_seconds(meta, now)
-                          - float(meta.get("budget_paused_sec") or 0.0))
+        runtime_sec = execution_elapsed_seconds(meta, now)
         hb_lag_sec = max(0.0, now - last_hb)
         hb_stale = hb_lag_sec >= _queue().HEARTBEAT_STALE_SEC
         _wid = meta.get("worker_id")

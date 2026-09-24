@@ -669,8 +669,14 @@ class OuroborosAgent:
             from ouroboros.budget_pause import load_budget_pause
             saved_wait = load_budget_pause(ctx)  # same-ID budget continuation (#1196)
         if saved_wait and ctx.model_wait_context is not None:
+            # started_at stays the ORIGINAL start; the granted paused interval is
+            # the separate carrier the finite lifetime subtracts (#1196). A budget
+            # grant supplies the CURRENT cumulative value; an owner-wait restart
+            # of a previously paused task has none to supply, and the serializer's
+            # own saved carrier is used instead (``restore_continuation``, F5).
             ctx.model_wait_context.restore_continuation(
-                saved_wait.get("model_wait") or {}, started_at=ctx.task_started_at)
+                saved_wait.get("model_wait") or {}, started_at=ctx.task_started_at,
+                budget_paused_sec=(ctx.budget_pause_resume or {}).get("paused_duration_sec"))
 
         if self._event_queue is not None:
             # Optional runtime seam consumed by loop.py.  Unit/direct contexts

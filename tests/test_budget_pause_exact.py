@@ -121,14 +121,101 @@ def test_unanswered_tool_calls_are_execution_unknown_not_replayed():
 
 # --------------------------------------------------------------------------- loop-side pause
 
-def test_direct_actor_is_excluded_loudly_and_fence_stays_open(tmp_path):
-    from ouroboros import budget_pause
+def _quiet_external(monkeypatch, budget_pause):
+    monkeypatch.setattr(budget_pause, "observe_external_runs", lambda _ctx, request_stop=True: {
+        "runs": [], "observed_at": time.time(), "custody_read": "ok", "coverage_basis": "test"})
 
-    ctx, limit_ctx = _loop_ctx(tmp_path, direct=True)
-    assert budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
-                                      scope="global", reason_text="x") is None
-    assert limit_ctx.accumulated_usage["exact_pause_unavailable"] == "direct_actor"
-    assert not budget_pause.dispatch_fenced(ctx.task_id)
+
+def test_direct_actor_pauses_under_its_own_task_id_and_its_event_carries_its_record(tmp_path, monkeypatch):
+    """A direct owner-chat turn is ELIGIBLE (#1196): it never had an admission-written
+    RUNNING row, so the pause writes one first; its event carries the turn's own
+    record (minus inline image bytes) because RUNNING is not its carrier."""
+    from ouroboros import budget_pause
+    from ouroboros.task_results import load_task_result
+
+    ctx, limit_ctx = _loop_ctx(tmp_path, "direct-1", direct=True)
+    ctx.current_chat_id = 42
+    _fast_hold(monkeypatch, budget_pause)
+    _quiet_external(monkeypatch, budget_pause)
+    assert budget_pause.pause_ineligibility(ctx) == ""
+    with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
+        budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
+                                   scope="global", reason_text="x")
+    budget_pause.end_dispatch_fence("direct-1")
+    row = load_task_result(tmp_path, "direct-1", strict=True)
+    assert row["_is_direct_chat"] is True and row["chat_id"] == 42
+    assert row["budget_pause"]["is_direct_chat"] is True and row["budget_pause"]["source_ref"]
+    task = {"id": "direct-1", "type": "task", "chat_id": 42, "text": "hello", "_is_direct_chat": True,
+            "image_base64": "AAAA", "origin_message_ref": {"chat_id": 42}, "metadata": {"k": "v"}}
+    event = budget_pause.pause_event(task, raised.value.pause)
+    assert event["_is_direct_chat"] is True and event["resource_limit"]["exact_continuation"] is True
+    carried = event["task"]
+    assert carried["id"] == "direct-1" and carried["_is_direct_chat"] is True
+    assert "image_base64" not in carried and carried["origin_message_ref"] == {"chat_id": 42}
+    assert carried["metadata"] == {"k": "v"} and carried["_attempt"] == 1 and carried["depth"] == 0
+    # A pooled task's event carries no record: RUNNING is its carrier.
+    assert "task" not in budget_pause.pause_event({"id": "direct-1", "type": "task"}, raised.value.pause)
+    # A context with no continuation owner at all is still excluded, loudly.
+    ctx.owner_wait_callback = None
+    assert budget_pause.pause_ineligibility(ctx) == "no_continuation_owner"
+
+
+def test_direct_turn_pause_event_parks_the_carried_record_in_pending(tmp_path, monkeypatch):
+    """The supervisor parks a direct turn from its OWN record: same task id, lane fact
+    kept, queue-order facts minted, snapshot persisted, census phase paused."""
+    from ouroboros import budget_pause
+    from supervisor.events import _handle_budget_pause
+    from supervisor.queue_transitions import budget_pause_fact
+
+    queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    ctx, limit_ctx = _loop_ctx(tmp_path, "direct-2", direct=True)
+    ctx.current_chat_id = 7
+    _fast_hold(monkeypatch, budget_pause)
+    _quiet_external(monkeypatch, budget_pause)
+    with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
+        budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
+                                   scope="global", reason_text="x")
+    budget_pause.end_dispatch_fence("direct-2")
+    task = {"id": "direct-2", "type": "task", "chat_id": 7, "text": "hello", "_is_direct_chat": True,
+            "metadata": {"origin_message_ref": {"chat_id": 7}}}
+    persisted, pushed = [], []
+    sctx = _supervisor_ctx(tmp_path, workers, queue, persisted, pushed)
+    assert workers.RUNNING == {}  # a direct turn is never in RUNNING
+    _handle_budget_pause(budget_pause.pause_event(task, raised.value.pause), sctx)
+    parked = workers.PENDING[0]
+    assert parked["id"] == "direct-2" and parked["_is_direct_chat"] is True
+    assert parked["_budget_pause"]["exact_continuation"] is True
+    assert parked["_queue_seq"] and parked["queued_at"] and "priority" in parked
+    assert budget_pause_fact(parked)["exact_continuation"] is True
+    assert budget_pause.budget_pause_row(tmp_path, "direct-2")["state"] == budget_pause.STATE_PAUSED
+    assert persisted == ["budget_pause_exact_continuation"]
+    assert pushed[0]["type"] == "budget_scope_paused" and pushed[0]["task_id"] == "direct-2"
+    # The snapshot keeps the lane fact, so a restart restores the same direct row.
+    queue.persist_queue_snapshot(reason="test")
+    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    assert snap["pending"][0]["task"]["_is_direct_chat"] is True
+    # The census reads it as a paused DIRECT activity under the same id.
+    from ouroboros.gateway import state as gw_state
+
+    rows = gw_state._chat_activities_snapshot_safe(tmp_path, direct_turns=[])
+    assert [(r["activity_id"], r["kind"], r["phase"]) for r in rows if r["activity_id"] == "direct-2"] == [
+        ("direct-2", "direct_chat", "budget_paused")]
+    # An event without the record cannot park a turn that is not running.
+    bare = budget_pause.pause_event({"id": "direct-2", "type": "task"}, raised.value.pause)
+    workers.PENDING[:] = []
+    with pytest.raises(RuntimeError):
+        _handle_budget_pause(bare, sctx)
+
+
+def test_task_event_addressing_stamps_the_direct_lane_fact_from_the_running_row(tmp_path):
+    """A resumed direct turn runs on a pooled worker: its frames keep the lane fact."""
+    from supervisor.log_addressing import address_task_event
+
+    running = {"d-1": {"task": {"id": "d-1", "chat_id": 5, "_is_direct_chat": True}}}
+    payload = address_task_event(running, tmp_path, {"task_id": "d-1", "type": "tool_call_started"})
+    assert payload["_is_direct_chat"] is True and payload["chat_id"] == 5
+    managed = address_task_event({"m-1": {"task": {"id": "m-1", "chat_id": 5}}}, tmp_path, {"task_id": "m-1"})
+    assert "_is_direct_chat" not in managed
 
 
 def test_pause_writes_source_and_row_before_raising_and_closes_fence(tmp_path, monkeypatch):
@@ -279,7 +366,12 @@ def test_pending_review_attempt_blocks_release_then_pauses_once_it_settles(tmp_p
 def test_timed_out_tool_future_blocks_release_until_its_settlement_callback_finishes(tmp_path):
     """``future.done()`` is not callback-complete: a call abandoned at its own
     timeout keeps the task unquiescent until the late settlement callback that
-    owns its effects has finished."""
+    owns its effects has finished.
+
+    The registering OWNER pins the row until it releases, so the instant between
+    the caller's own timeout and its ``hold_tool_settlement`` claim can never
+    read as settled-and-unheld: the claim is taken while the pin still holds.
+    """
     import threading
     from concurrent.futures import ThreadPoolExecutor
 
@@ -290,15 +382,18 @@ def test_timed_out_tool_future_blocks_release_until_its_settlement_callback_fini
     executor = ThreadPoolExecutor(max_workers=1)
     try:
         future = executor.submit(gate.wait, 5.0)
-        budget_pause.register_tool_future(ctx, "call_slow", "run_command", future)
+        owner_release = budget_pause.register_tool_future(ctx, "call_slow", "run_command", future)
         drain = budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.05)
         assert drain["drained"] is False
         assert drain["unsettled"] == [{"operation_id": "call_slow", "tool": "run_command",
                                        "state": "running"}]
-        # The timeout path claims the row BEFORE the worker settles.
+        # The timeout path claims the row BEFORE the worker settles, while the
+        # registering owner still pins it; only then does the owner hand over.
         release = budget_pause.hold_tool_settlement(ctx, "call_slow")
+        owner_release()
         gate.set()
         assert future.result(timeout=5.0) is True
+        # ``done()`` is true now, but the late callback still owns the effects.
         assert budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.05)["drained"] is False
         release()
         settled = budget_pause.drain_local_tool_futures(ctx, timeout_sec=1.0)
@@ -307,6 +402,44 @@ def test_timed_out_tool_future_blocks_release_until_its_settlement_callback_fini
     finally:
         gate.set()
         executor.shutdown(wait=True)
+        budget_pause.forget_tool_scope(ctx)
+
+
+def test_neither_half_of_the_settlement_protocol_alone_is_quiescence(tmp_path):
+    """Negative: an owner release over a still-running future is not quiescence, and a
+    registration interleaved with a finished-but-unreleased row never prunes it into
+    false quiescence."""
+    from concurrent.futures import Future
+
+    from ouroboros import budget_pause
+
+    ctx, _limit = _loop_ctx(tmp_path, "tool-3")
+    try:
+        running = Future()
+        owner_running = budget_pause.register_tool_future(ctx, "call_running", "run_command", running)
+        # The owner is done deciding, but the future has NOT finished: not quiescent.
+        owner_running()
+        assert budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.02)["unsettled"] == [
+            {"operation_id": "call_running", "tool": "run_command", "state": "running"}]
+        running.set_result("late")
+        assert budget_pause.drain_local_tool_futures(ctx, timeout_sec=1.0)["drained"] is True
+        # A FINISHED future whose owner has not released is unsettled, and the next
+        # registration must prune only the released row, never the pinned one.
+        pinned = Future()
+        pinned.set_result("x")
+        budget_pause.register_tool_future(ctx, "call_pinned", "read_file", pinned)  # pin kept
+        third = Future()
+        third.set_result("y")
+        owner_third = budget_pause.register_tool_future(ctx, "call_third", "read_file", third)
+        drain = budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.02)
+        assert drain["drained"] is False
+        assert sorted(row["operation_id"] for row in drain["unsettled"]) == ["call_pinned", "call_third"]
+        owner_third()
+        drain = budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.5)
+        assert drain["drained"] is False
+        assert [row["operation_id"] for row in drain["unsettled"]] == ["call_pinned"]
+        assert [row["operation_id"] for row in drain["settled"]] == ["call_third"]
+    finally:
         budget_pause.forget_tool_scope(ctx)
 
 
@@ -320,17 +453,21 @@ def test_tool_future_quiescence_is_scoped_to_one_attempt_and_prunes_itself(tmp_p
     done = Future()
     done.set_result("x")
     try:
-        budget_pause.register_tool_future(ctx, "call_a", "read_file", done)
-        assert budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.1)["drained"] is True
+        release_a = budget_pause.register_tool_future(ctx, "call_a", "read_file", done)
+        # Finished, but the registering owner still pins it: not yet settled.
+        assert budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.05)["drained"] is False
+        release_a()
+        assert budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.5)["drained"] is True
         # A later attempt never inherits a previous attempt's observations.
         assert budget_pause.drain_local_tool_futures(later, timeout_sec=0.0) == {
             "drained": True, "registry": "ok", "settled": [], "unsettled": []}
-        # A settled, unheld row is pruned by the next registration.
+        # A settled, unheld AND released row is pruned by the next registration.
         second = Future()
         second.set_result("y")
-        budget_pause.register_tool_future(ctx, "call_b", "read_file", second)
+        release_b = budget_pause.register_tool_future(ctx, "call_b", "read_file", second)
+        release_b()
         assert [row["operation_id"] for row in
-                budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.1)["settled"]] == ["call_b"]
+                budget_pause.drain_local_tool_futures(ctx, timeout_sec=0.5)["settled"]] == ["call_b"]
     finally:
         budget_pause.forget_tool_scope(ctx)
         budget_pause.forget_tool_scope(later)
@@ -395,8 +532,6 @@ def test_light_extraction_is_not_dispatched_under_the_fence(monkeypatch):
 
 
 def test_local_review_drain_lists_unsettled_attempts_without_settling_them():
-    import threading
-
     from ouroboros import budget_pause, review_custody as rc
 
     settled = rc.ActiveReviewAttempt(key="triad|t9|r", operation_id="op-settled", wave_key="task_acceptance|t9|r")
@@ -460,6 +595,55 @@ def test_exact_pause_event_parks_same_task_id_and_confirms_row(tmp_path, monkeyp
     assert budget_pause_fact(workers.PENDING[0])["exact_continuation"] is True
 
 
+def test_late_park_confirmation_never_regresses_a_live_grant(tmp_path, monkeypatch):
+    """F1: the park confirmation is a compare-and-set on the pause AND its state.
+
+    The park's row reading is taken before the queue transition; a writer that
+    moved the row on in between (an owner Resume granting it) must not be
+    overwritten by a late ``paused`` carrying the stale grant-less row, and the
+    owner-facing projection must not be rewritten to say paused either. The
+    supervisor publishes the anomaly as itself instead of a false pause.
+    """
+    from ouroboros import budget_pause
+    from ouroboros.task_results import load_task_result
+    from supervisor.events import _handle_budget_pause
+
+    queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    ctx, _limit, pause = _pause(tmp_path, monkeypatch, task_id="late-1")
+    budget_pause.end_dispatch_fence("late-1")
+    task = {"id": "late-1", "type": "task", "chat_id": 0, "root_task_id": "late-1", "_attempt": 1}
+    workers.RUNNING["late-1"] = {"task": task, "worker_id": 0, "attempt": 1}
+    workers.WORKERS[0] = SimpleNamespace(busy_task_id="late-1")
+    row = budget_pause.budget_pause_row(tmp_path, "late-1")
+    grant = {"grant_id": "g-live", "single_use": True, "generation": 1}
+    persisted, pushed = [], []
+    sctx = _supervisor_ctx(tmp_path, workers, queue, persisted, pushed)
+
+    def _snapshot_then_grant(reason=""):
+        # A writer this queue lock does not cover moves the row on mid-park.
+        budget_pause.set_budget_pause(
+            tmp_path, "late-1", {**row, "state": budget_pause.STATE_RESUME_GRANTED,
+                                 "grant": grant, "resume_generation": 1},
+            expected_pause_id=str(row["pause_id"]))
+        persisted.append(reason)
+        return True
+
+    sctx.persist_queue_snapshot = _snapshot_then_grant
+    _handle_budget_pause({**budget_pause.pause_event(task, pause), "worker_id": 0}, sctx)
+
+    # The park itself still happened: the SAME task id is parked, never dropped.
+    assert workers.RUNNING == {} and workers.PENDING[0]["id"] == "late-1"
+    after = budget_pause.budget_pause_row(tmp_path, "late-1")
+    assert after["state"] == budget_pause.STATE_RESUME_GRANTED
+    assert after["grant"]["grant_id"] == "g-live"  # the live grant is intact
+    assert "paused_confirmed_at" not in after
+    assert pushed[-1]["type"] == "budget_pause_park_superseded"
+    assert pushed[-1]["owner_visible"] is False and "toast_once" not in pushed[-1]
+    assert pushed[-1]["park_state"] == budget_pause.STATE_RESUME_GRANTED
+    # The owner-facing status projection belongs to the newer writer, not to us.
+    assert load_task_result(tmp_path, "late-1", strict=True).get("reason_code") != "budget_paused"
+
+
 def test_exact_pause_event_without_durable_row_is_refused(tmp_path, monkeypatch):
     from supervisor.events import _handle_budget_pause
 
@@ -496,11 +680,81 @@ def test_worker_death_during_pausing_completes_the_park_not_a_retry(tmp_path, mo
     assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, ctx.task_id, 2) is False
 
 
+def test_worker_death_holding_an_unconsumed_grant_reparks_instead_of_terminalizing(tmp_path, monkeypatch):
+    """F4: a grant nothing consumed is revoked and the SAME task id returns to its
+    exact pause. The loop writes ``consumed_at`` before any new effect, so an
+    unconsumed grant proves the continuation never started — a refused
+    continuation load kills the worker exactly here, and the saved pause must
+    survive it. A CONSUMED grant is ordinary crash custody and never reopened."""
+    from ouroboros import budget_pause
+    from supervisor import worker_health
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    task, _row = _parked(tmp_path, monkeypatch, task_id="death-1")
+    assert queue.resume_budget_paused_task("death-1")["ok"] is True
+    grant_id = task["_budget_pause_resume"]["grant_id"]
+    # Dispatched, then the worker dies before the loop could consume the grant.
+    workers.PENDING.remove(task)
+    meta = {"task": task, "worker_id": 0, "attempt": 1}
+    workers.RUNNING["death-1"] = meta
+    workers.WORKERS[0] = SimpleNamespace(busy_task_id="death-1")
+    monkeypatch.setattr(worker_health, "_dead_job_is_current", lambda job: True)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
+    job = {"worker": workers.WORKERS[0], "task_id": "death-1", "task": dict(task), "meta": meta,
+           "worker_id": 0, "exitcode": 1, "drive_root": str(tmp_path)}
+    assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, "death-1", 1) is True
+    assert workers.RUNNING == {}
+    parked = workers.PENDING[0]
+    assert parked["id"] == "death-1" and parked["_budget_pause"]["exact_continuation"] is True
+    assert "_budget_pause_resume" not in parked  # the spent handoff left with the park
+    row = budget_pause.budget_pause_row(tmp_path, "death-1")
+    assert row["state"] == budget_pause.STATE_PAUSED
+    assert row["grant"]["grant_id"] == grant_id
+    assert row["grant"]["revoke_reason"] == "worker_death_before_consumption"
+    assert row["pause_source"] == "worker_death_before_grant_consumed"
+    # The owner may Resume the same id again; the dead grant is dead for good.
+    ctx, _limit = _loop_ctx(tmp_path, "death-1")
+    with pytest.raises(ValueError):
+        budget_pause.load_budget_pause(ctx, {"pause_id": row["pause_id"], "grant_id": grant_id})
+    assert queue.resume_budget_paused_task("death-1")["ok"] is True
+
+
+def test_worker_death_after_a_consumed_grant_is_not_reopened(tmp_path, monkeypatch):
+    """The other half of F4: a consumed grant means the task RAN. Its death keeps
+    the ordinary custody path — the pause is not re-armed over running work."""
+    from ouroboros import budget_pause
+    from supervisor import worker_health
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    task, _row = _parked(tmp_path, monkeypatch, task_id="death-2")
+    assert queue.resume_budget_paused_task("death-2")["ok"] is True
+    granted = budget_pause.budget_pause_row(tmp_path, "death-2")
+    consumed = {**dict(granted["grant"]), "consumed_at": time.time()}
+    budget_pause.set_budget_pause(
+        tmp_path, "death-2", {**granted, "state": budget_pause.STATE_RESUMED, "grant": consumed},
+        expected_pause_id=str(granted["pause_id"]),
+        expected_state=budget_pause.STATE_RESUME_GRANTED,
+        expected_grant_id=str(granted["grant"]["grant_id"]))
+    workers.PENDING.remove(task)
+    meta = {"task": task, "worker_id": 0, "attempt": 1}
+    workers.RUNNING["death-2"] = meta
+    workers.WORKERS[0] = SimpleNamespace(busy_task_id="death-2")
+    monkeypatch.setattr(worker_health, "_dead_job_is_current", lambda job: True)
+    job = {"worker": workers.WORKERS[0], "task_id": "death-2", "task": dict(task), "meta": meta,
+           "worker_id": 0, "exitcode": 1, "drive_root": str(tmp_path)}
+    assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, "death-2", 1) is False
+    assert "death-2" in workers.RUNNING and workers.PENDING == []
+    after = budget_pause.budget_pause_row(tmp_path, "death-2")
+    assert after["state"] == budget_pause.STATE_RESUMED and not after["grant"].get("revoked_at")
+
+
 # --------------------------------------------------------------------------- supervisor: resume
 
 def _parked(tmp_path, monkeypatch, *, task_id="pause-task", scope="global", root_task_id=None, extra=None):
     from ouroboros import budget_pause
-    from supervisor import queue, workers
+    from supervisor import workers
 
     # ONE lineage: the durable row, its queue marker and the pending task row all
     # name the same root, or a descendant's resume cannot see its paused root.
@@ -534,7 +788,6 @@ def test_resume_refuses_while_money_is_still_exhausted(tmp_path, monkeypatch):
 def test_resume_refuses_cancel_intent_and_paused_root(tmp_path, monkeypatch):
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
-    import supervisor.queue_transitions as qt
 
     task, _row = _parked(tmp_path, monkeypatch)
     monkeypatch.setattr("ouroboros.cancel_intents.has_active_intent", lambda *_a, **_k: True)
@@ -592,6 +845,7 @@ def test_grant_is_revoked_when_money_vanishes_before_dispatch(tmp_path, monkeypa
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
     task, _row = _parked(tmp_path, monkeypatch, task_id="revoke-1")
     assert queue.resume_budget_paused_task("revoke-1")["ok"] is True
+    assert task["_budget_pause_resume"]["grant_generation"] == 1
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 0.0)
     sent = []
     workers.WORKERS[0] = SimpleNamespace(wid=0, busy_task_id=None, reaping=False,
@@ -603,6 +857,10 @@ def test_grant_is_revoked_when_money_vanishes_before_dispatch(tmp_path, monkeypa
     row = budget_pause.budget_pause_row(tmp_path, "revoke-1")
     assert row["state"] == budget_pause.STATE_PAUSED and row["grant"]["revoke_reason"] == "budget_exhausted_before_dispatch"
     assert revoke_exact_budget_resume(task, "again") is False  # nothing granted now
+    # A stale copy of the revoked handoff can never revive the continuation.
+    ctx, _limit = _loop_ctx(tmp_path, "revoke-1")
+    with pytest.raises(ValueError):
+        budget_pause.load_budget_pause(ctx, {"pause_id": row["pause_id"], "grant_id": row["grant"]["grant_id"]})
 
 
 def test_granted_task_dispatches_with_original_started_at_and_paused_carrier(tmp_path, monkeypatch):
@@ -671,13 +929,54 @@ def test_resume_consumes_grant_restores_cognition_and_never_reexecutes(tmp_path,
     # The unanswered call is closed as UNKNOWN, not re-run, not declared un-run.
     unknown = [m for m in messages if m.get("role") == "tool" and m.get("tool_call_id") == "call_b"]
     assert len(unknown) == 1 and "UNKNOWN" in unknown[0]["content"] and "NOT re-executed" in unknown[0]["content"]
-    assert "budget pause" in messages[-1]["content"] and "run-1" in messages[-1]["content"]
+    notice = messages[-1]["content"]
+    assert "budget pause" in notice
+    # Custody is re-observed FRESH at the grant (owner Q8) and that reading rides the
+    # row: the disclosure names it, never the pause-time summary. This drive holds no
+    # delegated run at Resume time, so the pause row's stale "run-1" must NOT resurface.
+    assert "Delegated runs this task holds (re-observed at this Resume):\n- none" in notice
+    assert "run-1" not in notice
+    assert "never start a second writer" in notice
+    fresh = budget_pause.budget_pause_row(tmp_path, "loop-1")["external_runs"]
+    assert fresh["custody_read"] == "ok" and fresh["runs"] == []
     consumed = budget_pause.budget_pause_row(tmp_path, "loop-1")
     assert consumed["state"] == budget_pause.STATE_RESUMED and consumed["grant"]["consumed_at"]
     assert not budget_pause.dispatch_fenced("loop-1")
+    # A hard rail keeps both wrap-up reservations; only a graceful rail relaxes (Q10).
+    assert ctx._budget_resume_last_fit_relaxed is False
+    assert usage["budget_pause_resume"]["last_fit_relaxed"] is False
+    assert usage["budget_pause_resume"]["grant_generation"] == 1
     # The grant is single-use: a second load refuses.
     with pytest.raises(ValueError):
         budget_pause.load_budget_pause(ctx, handoff)
+
+
+def test_resume_labels_a_pause_time_run_list_as_not_re_observed(tmp_path, monkeypatch):
+    """The other branch of the same disclosure: when the row carries no fresh reading,
+    the checkpoint's pause-time copy is disclosed and NAMED as un-re-observed history —
+    a stale list must never read as a current one."""
+    from ouroboros import budget_pause, owner_wait
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    task, row = _parked(tmp_path, monkeypatch, task_id="loop-2")
+    assert queue.resume_budget_paused_task("loop-2")["ok"] is True
+    ctx, _limit = _loop_ctx(tmp_path, "loop-2")
+    ctx.budget_pause_resume = task["_budget_pause_resume"]
+    state_blob = budget_pause.load_budget_pause(ctx)
+    # Drop the grant's fresh observation, keeping the checkpoint's pause-time copy.
+    state_blob["_pause_row"] = {k: v for k, v in state_blob["_pause_row"].items()
+                               if k != "external_runs"}
+    state_blob["external_runs"] = {"runs": [{"run_id": "run-1", "state": "stop_requested",
+                                            "stop_outcome": "requested"}]}
+    monkeypatch.setattr(owner_wait, "rebind_restored_route", lambda *_a, **_k: (None, "max"))
+    messages = []
+    budget_pause.resume_paused_loop(SimpleNamespace(_ctx=ctx), state_blob, messages, {}, {}, set(),
+                                   budget_remaining_usd=5.0)
+    notice = messages[-1]["content"]
+    assert "(as recorded at the pause, NOT re-observed)" in notice
+    assert "run-1: stop_requested" in notice
+    assert "never start a second writer" in notice
 
 
 def test_load_refuses_foreign_or_missing_grant(tmp_path, monkeypatch):
@@ -697,16 +996,73 @@ def test_graceful_rail_refreshes_planning_threshold_within_authorized_money(tmp_
     ctx._cost_ceiling = task_pacing.CostCeiling(state="active", ceiling_usd=7.0, root_cap_usd=10.0,
                                                 planning_margin_usd=3.0, basis="root_cap_minus_margin")
     ctx._accumulated_usage = {"cost": 8.0}
-    monkeypatch.setattr(loop_budget, "_loop_tree_accounting", lambda **_k: {"accounted_usd": 8.0})
+    # Every number is read from the AUTHORITATIVE ledger at Resume time: a fresh
+    # wallet observation and a fresh, undegraded root-accounting read.
+    monkeypatch.setattr(loop_budget, "_wrapup_global_remaining", lambda: 100.0)
+    monkeypatch.setattr(loop_budget, "_loop_tree_accounting",
+                        lambda **_k: {"accounted_usd": 8.0, "age_sec": 0.0})
     monkeypatch.setattr(task_pacing, "resolve_budget_profile", lambda _c: {"cost_hard_stop_pct": 50})
     disclosure = budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0)
     assert disclosure["refreshed"] is True
+    # The wallet is the ledger projection, never the dispatch-time number.
+    assert disclosure["wallet_basis"] == "ledger_projection"
+    assert disclosure["global_remaining_usd"] == 100.0
+    # This tree read carries no cap of its own, so the start-of-task cap stands and
+    # its provenance is disclosed rather than assumed.
+    assert disclosure["root_cap_usd"] == 10.0 and disclosure["root_cap_basis"] == "start_of_task"
     # min(cap - spent = 2, 50% of global remaining = 50) added on top of spend: no immediate re-pause.
     assert ctx._cost_ceiling.ceiling_usd == pytest.approx(10.0)
     assert ctx._cost_ceiling.root_cap_usd == 10.0 and ctx._cost_ceiling.basis.startswith("owner_resume_refresh")
+    # The hard tree cap is untouched by the refresh: spend AT the cap leaves no
+    # authorized room, and the owner's explicit act cannot invent any.
     ctx._accumulated_usage = {"cost": 10.0}
-    monkeypatch.setattr(loop_budget, "_loop_tree_accounting", lambda **_k: {"accounted_usd": 10.0})
-    assert budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0)["refreshed"] is False
+    monkeypatch.setattr(loop_budget, "_loop_tree_accounting",
+                        lambda **_k: {"accounted_usd": 10.0, "age_sec": 0.0})
+    spent = budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0)
+    assert spent["refreshed"] is False and spent["reason"] == "no_authorized_room"
+
+
+def test_threshold_refresh_refuses_every_unknown_or_stale_money_fact(tmp_path, monkeypatch):
+    """Negative (owner Q10): unknown money is NOT room. A wallet the ledger cannot
+    answer, a degraded or stale tree read and unknown tree spend each REFUSE the
+    refresh, and the dispatch-time number is only ever DISCLOSED, never spent."""
+    from ouroboros import budget_pause, loop_budget, task_pacing
+
+    ctx, _limit = _loop_ctx(tmp_path)
+
+    def _ceiling():
+        return task_pacing.CostCeiling(state="active", ceiling_usd=7.0, root_cap_usd=10.0,
+                                       planning_margin_usd=3.0, basis="root_cap_minus_margin")
+
+    monkeypatch.setattr(task_pacing, "resolve_budget_profile", lambda _c: {"cost_hard_stop_pct": 50})
+    # No ceiling at all: there is no threshold to move.
+    ctx._cost_ceiling = None
+    assert budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0) == {
+        "refreshed": False, "reason": "no_ceiling"}
+    # The ledger cannot answer the wallet: the dispatch-time value is DISCLOSED only.
+    ctx._cost_ceiling = _ceiling()
+    ctx._accumulated_usage = {"cost": 8.0}
+    monkeypatch.setattr(loop_budget, "_wrapup_global_remaining", lambda: None)
+    monkeypatch.setattr(loop_budget, "_loop_tree_accounting",
+                        lambda **_k: {"accounted_usd": 8.0, "age_sec": 0.0})
+    assert budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0) == {
+        "refreshed": False, "reason": "wallet_unavailable", "wallet_basis": "ledger_unavailable",
+        "dispatch_time_remaining_usd": 100.0}
+    assert ctx._cost_ceiling.ceiling_usd == 7.0  # the paused threshold is untouched
+    # With a fresh wallet, every unusable TREE read still refuses.
+    monkeypatch.setattr(loop_budget, "_wrapup_global_remaining", lambda: 100.0)
+    for tree, reason in (
+        (None, "tree_spend_unavailable"),
+        ({"accounted_usd": 8.0, "age_sec": 0.0, "integrity_degraded": True}, "tree_accounting_degraded"),
+        ({"accounted_usd": 8.0, "age_sec": budget_pause._FRESH_TREE_MAX_AGE_SEC + 1.0},
+         "tree_accounting_stale"),
+        ({"accounted_usd": None, "age_sec": 0.0}, "tree_spend_unknown"),
+    ):
+        ctx._cost_ceiling = _ceiling()
+        monkeypatch.setattr(loop_budget, "_loop_tree_accounting", lambda _t=tree, **_k: _t)
+        refused = budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0)
+        assert refused["refreshed"] is False and refused["reason"] == reason
+        assert ctx._cost_ceiling.ceiling_usd == 7.0
 
 
 # --------------------------------------------------------------------------- gateway / UI facts
@@ -728,7 +1084,7 @@ def test_resume_child_tool_only_targets_own_children(monkeypatch):
 
     ctx = SimpleNamespace(task_id="parent-1", task_metadata={})
     monkeypatch.setattr(join_ledger, "_status_drive_root", lambda _c: pathlib.Path("/tmp"))
-    monkeypatch.setattr(join_ledger, "_is_own_child", lambda _c, _r, tid: tid == "child-x")
+    monkeypatch.setattr(join_ledger, "_is_own_child", lambda _c, _r, tid, **_kw: tid == "child-x")
     monkeypatch.setattr(join_ledger, "_publish_tool_result", lambda _c, result: result.text)
     monkeypatch.setattr(join_ledger, "_record_child_decision_beacon", lambda *_a, **_k: None)
     emitted = []
@@ -738,3 +1094,51 @@ def test_resume_child_tool_only_targets_own_children(monkeypatch):
     text = join_ledger._resume_child_task(ctx, "child-x", "still needed")
     assert "Resume requested" in text and "REQUEST" in text
     assert emitted[0]["type"] == "budget_resume_child" and emitted[0]["requested_by"] == "parent-1"
+
+
+def test_resume_child_task_is_policy_covered_and_exposed_beside_its_own_family():
+    """F7: the Q9 selection verb was registered but named nowhere else — it fell
+    through to the default LLM safety check, was invisible in the round-one
+    envelope and to delegated children (who must select their OWN paused
+    children), and was not withheld from a consciousness wake at Observe, which
+    may not start work. It is declared beside ``cancel_task``, the verb whose
+    authority it mirrors; the supervisor still re-checks lineage and the root's
+    live grant, so no owner authority is widened."""
+    from ouroboros import safety
+    from ouroboros import tool_capabilities as caps
+    from ouroboros.consciousness_authority import disabled_tools_for
+    from ouroboros.tools import join_ledger
+
+    assert any(entry.name == "resume_child_task" for entry in join_ledger.get_tools())
+    assert safety.TOOL_POLICY["resume_child_task"] == safety.POLICY_SKIP
+    for names in (caps.CORE_TOOL_NAMES, caps.LOCAL_READONLY_SUBAGENT_TOOL_NAMES,
+                  caps.ACTING_SUBAGENT_TOOL_NAMES):
+        assert "cancel_task" in names  # the family it belongs to
+        assert "resume_child_task" in names
+    # It STARTS work, so an Observe-level wake does without it (В10').
+    assert "resume_child_task" in caps.OBSERVE_WORLD_MUTATION_TOOLS
+    assert "resume_child_task" in disabled_tools_for("observe")
+    assert "resume_child_task" not in disabled_tools_for("full")
+
+
+def _repo_file(*parts):
+    return pathlib.Path(__file__).resolve().parents[1].joinpath(*parts).read_text()
+
+
+def test_activity_rows_show_a_held_budget_row_as_paused_not_queued():
+    """Scope note (static pin; the browser check is the parent's): a row whose root
+    fence was lifted carries an unselected HOLD and nothing will dispatch it, so
+    listing it as plain "queued" promises work that cannot start."""
+    source = _repo_file("web", "modules", "activity.js")
+    assert "_budget_pause_hold" in source and "heldRow" in source
+    assert "|| heldRow(t)" in source  # consulted by the pending-row pause predicate
+
+
+def test_runbook_does_not_promise_a_managed_outage_window_the_runtime_has_no_rail_for():
+    """F8: with no deadline and an unlimited absolute ceiling, a managed task's
+    transport-outage episode has NO window of its own — the 6h operation-window
+    fallback belongs to other operations. The runbook names the optional rails an
+    operator can set instead of promising a timeout that does not exist."""
+    source = _repo_file("devtools", "benchmarks", "continual_learning", "RUNBOOK.md")
+    assert "6h operation window from episode entry" not in source
+    assert "OUROBOROS_TASK_ABS_CEILING_SEC" in source and "idle reaper" in source

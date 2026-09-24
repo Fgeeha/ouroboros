@@ -1358,7 +1358,12 @@ async def api_task_resume(request: Request) -> JSONResponse:
     (#1196) receives ONE single-use grant and continues under the same task id.
     Every refusal is typed: money still exhausted, a live cancel intent, a
     passed deadline, an exhausted finite lifetime, a root that is itself still
-    paused, or a missing/unreadable checkpoint all leave the task paused.
+    paused, or a missing/unreadable checkpoint all leave the task paused. A row
+    HELD beside its pause (an unrestorable source at restart, an unwritten
+    revocation, an acceptance fence at restore) is granted by the same call once
+    its durable authority validates again; a fence-lifted zero-dispatch sibling
+    is released by this same call as an explicit selection. A paused direct
+    owner-chat turn is resumed here too, under its own task id.
     """
     try:
         task_id = validate_task_id(request.path_params.get("task_id"))
@@ -1381,6 +1386,13 @@ async def api_task_resume(request: Request) -> JSONResponse:
         "restart_no_resume", "pause_record_missing", "pause_source_unreadable",
         "pause_record_unreadable", "grant_not_recorded", "snapshot_not_persisted",
         "monetary_authority_unavailable", "cancellation_authority_unavailable", "task_terminal",
+        # holds and root-grant refusals (#1196, owner Q9): the row stays paused/held
+        "root_resume_grant_missing", "root_resume_generation_stale", "root_replay_unsafe",
+        "root_accounting_unavailable", "root_accounting_degraded", "external_custody_unreadable",
+        "accounting_unavailable", "resume_grant_revocation_unwritten",
+        # fresh custody at grant (#1196, owner Q8): a delegated run not proven
+        # terminal keeps the task paused; a marker/attempt drift is typed too
+        "external_runs_unsettled", "pause_attempt_mismatch",
     } else 404
     return json_error(error, status, task_id=task_id, **({"action": result["action"]} if result.get("action") else {}))
 

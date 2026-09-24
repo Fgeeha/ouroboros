@@ -1010,7 +1010,10 @@ def _execute_with_timeout(
             future = stateful_executor.submit(
                 _execute_browser_tool_bound, tools, tc, drive_logs, task_id, submit_generation,
             )
-        budget_pause.register_tool_future(tool_ctx, tool_call_id, fn_name, future)
+        # The registration PINS settlement ownership until this call's own
+        # handling is over (result in time, or the late hold claimed below):
+        # released in the finally, after either branch (#1196).
+        release_tool_custody = budget_pause.register_tool_future(tool_ctx, tool_call_id, fn_name, future)
         try:
             result = future_result(future, timeout_sec)
             result_meta = result.get("result_meta") or {}
@@ -1082,12 +1085,15 @@ def _execute_with_timeout(
                 "timeout_sec": timeout_sec,
             }, correlation, tool_call_id=tool_call_id))
             return timeout_result
+        finally:
+            release_tool_custody()
     else:
         with abandoned_on_timeout(timeout_sec, bounded=not is_reviewed_mutative) as submit:
             future = submit(_execute_single_tool, tools, tc, drive_logs, task_id)
             # Registered before the wait, so a call abandoned at its timeout is
-            # already visible to budget-pause quiescence (#1196).
-            budget_pause.register_tool_future(tool_ctx, tool_call_id, fn_name, future)
+            # already visible to budget-pause quiescence (#1196); ownership is
+            # pinned until the finally below, after any late hold was claimed.
+            release_tool_custody = budget_pause.register_tool_future(tool_ctx, tool_call_id, fn_name, future)
             try:
                 result = future.result() if is_reviewed_mutative else future_result(future, timeout_sec)
                 result_meta = result.get("result_meta") or {}
@@ -1157,6 +1163,8 @@ def _execute_with_timeout(
                         "timeout_sec": timeout_sec,
                     }, correlation, tool_call_id=tool_call_id))
                     return timeout_result
+            finally:
+                release_tool_custody()
 
 
 _PARALLEL_SAFE_TOOLS: frozenset[str] = READ_ONLY_PARALLEL_TOOLS | PARALLEL_SAFE_ENQUEUE_TOOLS

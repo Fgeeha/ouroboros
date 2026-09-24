@@ -26,7 +26,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # extension_isolated_deps.py barrier and the widget_list.js request seam land
     # beside the handoff/schedule rows the base added; none displaces older text.
     # +400 (#1213): two new module rows (focus.py, room_consolidation.py) in the tree map.
-    "docs/architecture/01-high-level-architecture.md": 164800,
+    # 164800 -> 165300 (#1196): two new owner modules gain their map rows
+    # (supervisor/budget_resume.py, ouroboros/delegate_continuation.py).
+    "docs/architecture/01-high-level-architecture.md": 165300,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -59,7 +61,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 106400 -> 106600 (#1195 merge of 32d8dfc6): the base's settings_catalog.js
     # paragraph (#1214, +319 bytes) landed in the same window; both additions stand,
     # neither displaces the other's text.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 106600,
+    # 106600 -> 106800 (#1196): a paused direct turn reports the managed census
+    # phases; the phase sentence is extended, nothing older describes it.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 106800,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
@@ -75,7 +79,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 30900 -> 31700 (#1196): the exact-continuation `_budget_pause` marker, its grant
     # carrier and the separate paused-interval carrier are new snapshot/assignment
     # facts the chapter lacked; nothing older describes them.
-    "docs/architecture/05-supervisor-loop.md": 31700,
+    # 31700 -> 32200 (#1196): restart parking of a completed pause, the typed
+    # restore/acceptance holds and the parked direct turn replace the restore
+    # sentence they grew from.
+    "docs/architecture/05-supervisor-loop.md": 32200,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
@@ -102,7 +109,14 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 297250 -> 301400 (#1196): the exact budget pause is a new mechanism of the budget
     # section (fence order, drain, external stop requests, program counter, park, grant,
     # revoke, Q9/Q10 rules); the wrap-up rails it sits beside keep their own text.
-    "docs/architecture/06-agent-core.md": 301400,
+    # 301400 -> 304500 (#1196, continued): the base sat 680 bytes OVER the previous
+    # budget (the slice-1 pause paragraph landed without raising it). The pause
+    # paragraph is REPLACED and grows ~1130 bytes for mechanisms it lacked (the
+    # direct-turn pause, the durable holds, the generation-bound grant, the
+    # restart park, the Q10 last-fit relaxation); the wall-clock continuation of a
+    # delegated leaf (+~1000) is a new seam of the delegation section with no
+    # older text to displace; the delegate_start argument sentence grows by one clause.
+    "docs/architecture/06-agent-core.md": 304500,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,

@@ -152,6 +152,8 @@ class RunCustody:
     ledger_recorded: bool = False
     settled: bool = False
     terminal_state: str = ""  # SETTLED row's state, replayed (empty pre-existing/CLOSED_ABSENT)
+    terminal_reason: str = ""  # #1196: engine ``outcomeFacts.reason`` replayed from SETTLED ("" = none)
+    continuation_of: str = ""  # #1196: the settled run this one explicitly continued (``continue_from``)
     containment_disclosed: bool = False  # written once; a re-poll must not re-find
     unread_disclosed: bool = False  # settled-never-read omission named durably
     # Staged-output half of the terminal story (D7). ``output_artifact``:
@@ -530,6 +532,7 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         # emitted it before SETTLED, so replay is unaffected).
         custody.ledger_recorded = custody.settled = True
         custody.terminal_state = str(row.get("state") or "") or custody.terminal_state
+        custody.terminal_reason = str(row.get("outcome_reason") or "") or custody.terminal_reason
     elif kind == CLOSED_ABSENT:
         # Closed, not settled: custody is over, the run leaves ``open_runs``.
         # The registration survives independently (wholesale clearing here was
@@ -713,6 +716,22 @@ def run_timing(drive_root: Any, run_id: str) -> Tuple[str, int]:
     return started_ts, max_seconds
 
 
+def run_cap_basis(drive_root: Any, run_id: str) -> str:
+    """How a run's ``maxSeconds`` was decided, from its durable STARTED row
+    (``delegate_registration_policy.CAP_BASIS_*``); "" when the run is unknown
+    or the row predates the field — an absent basis stays absent (#1196)."""
+    rid = str(run_id or "").strip()
+    if not rid:
+        return ""
+    for row in custody_rows(drive_root):
+        if str(row.get("run_id") or "") != rid or str(row.get("type") or "") != STARTED:
+            continue
+        basis = str(row.get("max_seconds_basis") or "")
+        if basis:
+            return basis
+    return ""
+
+
 def idempotency_key(*parts: Any) -> str:
     """A deterministic IDENTITY for one logical start — the lookup key, not the wire key.
 
@@ -810,6 +829,10 @@ def invocation_record(drive_root: Any, invocation_id: str, *,
                 "work_order_coverage": str(row.get("work_order_coverage") or ""),
                 "authority_fingerprint": str(row.get("authority_fingerprint") or ""),
                 "processing": copy.deepcopy(row.get("processing")) if isinstance(row.get("processing"), dict) else {},
+                # #1196: the cap and HOW it was decided replay with the body a
+                # retry re-POSTs, so the replayed STARTED row keeps the same basis.
+                "max_seconds": int(row.get("max_seconds") or 0) if str(row.get("max_seconds") or "").lstrip("-").isdigit() else 0,
+                "max_seconds_basis": str(row.get("max_seconds_basis") or ""),
                 "work_order_source_request": (
                     copy.deepcopy(row.get("work_order_source_request"))
                     if isinstance(row.get("work_order_source_request"), dict) else {}
@@ -1048,9 +1071,12 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
     # ENGINE's own code ("" = it gave none) and the words it reported (opaque, never
     # branched on). A succeeded row is byte-identical to before.
     failure = summary.get("failure") if isinstance(summary.get("failure"), dict) else {}
+    outcome_facts = summary.get("outcomeFacts") if isinstance(summary.get("outcomeFacts"), dict) else {}
     failure_facts = {} if str(summary.get("state") or "") in SUCCEEDED_STATES else {
         "requested_model": custody.model, "failure_code": str(failure.get("code") or ""),
-        "reported_cause": run_failure_cause(failure)}
+        "reported_cause": run_failure_cause(failure),
+        # Engine TYPED reason (``wall_clock_exceeded`` = maxSeconds expiry): the continuation gate's one fact.
+        "outcome_reason": str(outcome_facts.get("reason") or "")}
     # Claudexor reports CASH in `spendUsd`, EXACTNESS in `spendEstimated`. A run
     # is only free when the amount is really zero AND really settled: expired
     # sessions, bill-by-construction routes and auth fallbacks all charge, and
@@ -1466,6 +1492,7 @@ __all__ = [
     "reconcile_task_runs",
     "retire_project",
     "review_owned_source",
+    "run_cap_basis",
     "run_timing",
     "settle_run",
     "settled_output_unread",

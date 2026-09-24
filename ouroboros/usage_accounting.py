@@ -104,6 +104,8 @@ def _stash_root_accounting(
     accounted_usd: Optional[float],
     root_limit_usd: Optional[float],
     reservation: Optional[Dict[str, Any]] = None,
+    *,
+    integrity_degraded: bool = False,
 ) -> None:
     """Refresh the process-local root snapshot. ``reservation`` is the identity
     of a row this call has just APPENDED (attempt id, task, category, review
@@ -130,6 +132,10 @@ def _stash_root_accounting(
         _ROOT_ACCOUNTING_TELEMETRY[root_task_id] = {
             "accounted_usd": None if accounted_usd is None else float(accounted_usd),
             "root_limit_usd": None if root_limit_usd is None else float(root_limit_usd),
+            # The projection's own integrity verdict rides the snapshot (#1196): a
+            # money decision (the exact-pause grant, the Q10 refresh) refuses a
+            # degraded tree instead of reading its number as room.
+            "integrity_degraded": bool(integrity_degraded),
             "updated_monotonic": now,
             "reservations": kept,
         }
@@ -172,6 +178,7 @@ def refresh_root_accounting(
             root_task_id,
             _number(projection.get("accounted_usd")),
             _number(projection.get("limit_usd")),
+            integrity_degraded=bool(projection.get("integrity_degraded")),
         )
         return last_root_accounting(root_task_id)
     except Exception:

@@ -728,7 +728,10 @@ class ActiveChatActivity(ActiveDirectTurn):
     no new dispatch, not yet released; additive, #1196) | ``working`` |
     ``finalizing`` (answer stored, post-task
     synthesis open); a direct row whose live wait owner could not be read is
-    ``phase="unknown"``. Same shape as ``ActiveDirectTurn`` so one reducer hydrates
+    ``phase="unknown"``; a direct turn paused on a budget rail (#1196) is parked under
+    its SAME id and reports the managed phases as ``kind="direct_chat"`` (``budget_paused``,
+    then ``working``/``finalizing`` on a pooled worker after an explicit Resume). Same shape
+    as ``ActiveDirectTurn`` so one reducer hydrates
     both (managed rows: empty ``client_message_id``). ``required_question_unavailable``:
     a recorded owner-question wait whose detail could not be resolved — possibly blocked.
     """

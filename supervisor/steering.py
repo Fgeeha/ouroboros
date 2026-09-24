@@ -216,18 +216,21 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
                 direct_active = task is not None
     except Exception:
         direct_active = False
+    queue_resident = False
     if not direct_active:
         running = getattr(ctx, "RUNNING", None)
         meta = running.get(target) if isinstance(running, dict) else None
         task = meta.get("task") if isinstance(meta, dict) and isinstance(meta.get("task"), dict) else (
             meta if isinstance(meta, dict) else None
         )
+        queue_resident = isinstance(task, dict)
     if not isinstance(task, dict):
         pending = getattr(ctx, "PENDING", [])
         task = next(
             (row for row in list(pending or []) if isinstance(row, dict) and str(row.get("id") or "") == target),
             None,
         )
+        queue_resident = isinstance(task, dict)
 
     target_label = ""
     if isinstance(task, dict):
@@ -256,7 +259,11 @@ def _handle_steer_task(evt: Dict[str, Any], ctx: Any) -> None:
     # the two apart afterwards either.
     if not isinstance(task, dict):
         refusal = "target_unknown"
-    elif not (direct_active or not task.get("_is_direct_chat")):
+    elif task.get("_is_direct_chat") and not direct_active and not queue_resident:
+        # A direct turn that is neither a live in-process actor nor a queue row.
+        # A direct turn parked under its exact budget pause, or resumed on a
+        # pooled worker under the SAME id (#1196), is a queue row: the owner's
+        # follow-up reaches that actor's mailbox, never a second direct turn.
         refusal = "direct_chat_turn"
     elif str(task.get("delegation_role") or "") == "subagent":
         refusal = "subagent_target"
