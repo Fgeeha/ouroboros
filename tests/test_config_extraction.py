@@ -77,6 +77,8 @@ _MOVED_OWNERS = {
     "WORKER_READY_MAX_ATTEMPTS": runtime_limits,
     "EXTENSION_STREAM_CHUNK_BYTES": runtime_limits,
     "EXTENSION_CHILD_CLEANUP_GRACE_SEC": runtime_limits,
+    "LAUNCHER_STOP_GRACE_SEC": runtime_limits,
+    "SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC": runtime_limits,
     "NESTED_SETTLEMENT_MARGIN_SEC": runtime_limits,
     "NETWORK_WAIT_NOTE_INTERVAL_SEC": runtime_limits,
     "NETWORK_WAIT_BACKOFF_START_SEC": runtime_limits,

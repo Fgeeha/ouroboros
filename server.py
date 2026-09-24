@@ -45,6 +45,9 @@ from ouroboros.server_process import (  # noqa: F401
     _request_restart_exit,
     _restart_requested,
     _supervisor_stop,
+    _exit_signalled,
+    _SignalStopServer,
+    _embedded_uvicorn_server,
     log,
 )
 from ouroboros.server_routing_context import (  # noqa: F401
@@ -199,6 +202,7 @@ def _restart_current_process(host: str, port: int) -> None:
     )
 
 from ouroboros.config import (
+    SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC,
     SETTINGS_DEFAULTS,
     SettingsIntegrityError,
     load_settings, save_settings, verify_settings_integrity,
@@ -267,16 +271,33 @@ def _start_supervisor_if_needed(settings: dict) -> bool:
         return False
     if _supervisor_thread and _supervisor_thread.is_alive():
         return False
+    if _exit_signalled.is_set():
+        return False  # the process is exiting: no revival behind the teardown
     _supervisor_error = None
     _supervisor_stop.clear()  # in-process revival after a teardown-stopped generation
     _supervisor_thread = threading.Thread(
-        target=_run_supervisor,
+        target=_supervisor_generation,
         args=(settings,),
         daemon=True,
         name="supervisor-main",
     )
     _supervisor_thread.start()
     return True
+
+
+def _supervisor_generation(settings: dict) -> None:
+    """Thread body: re-check the exit latch, then run one supervisor generation.
+
+    Admission (`_start_supervisor_if_needed`) and this thread start are separate steps,
+    so a settings save can pass the latch check a moment before SIGTERM; a generation
+    that starts anyway must end here, before its startup kill/spawn would run behind
+    the teardown's `kill_workers` (#1142).
+    """
+    global _supervisor_thread
+    if _exit_signalled.is_set():
+        _supervisor_thread = None
+        return
+    _run_supervisor(settings)
 
 
 def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
@@ -763,7 +784,7 @@ def _run_supervisor(settings: dict) -> None:
     _loop_liveness = [time.monotonic(), {}, time.thread_time(), None]  # slots: server_liveness.py
     _watchdog_stop = threading.Event()  # per-generation: stops the watchdog when THIS loop exits
     _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
-    while not _restart_requested.is_set() and not _supervisor_stop.is_set():
+    while not _restart_requested.is_set() and not _supervisor_stop.is_set() and not _exit_signalled.is_set():
         try:
             _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "events", new_tick=True), time.monotonic()
             rotate_chat_log_if_needed(DATA_DIR)
@@ -845,7 +866,7 @@ def _run_supervisor(settings: dict) -> None:
             time.sleep(0.5)
 
         except Exception as exc:
-            if _supervisor_stop.is_set() or _restart_requested.is_set():
+            if _supervisor_stop.is_set() or _restart_requested.is_set() or _exit_signalled.is_set():
                 # A shutdown-torn Manager proxy is not a supervisor crash.
                 log.info("Supervisor loop exiting on shutdown: %s", exc)
                 break
@@ -1250,7 +1271,8 @@ async def lifespan(app):
     except Exception:
         log.warning("Project registry boot reconcile failed", exc_info=True)
 
-    _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
+    if not _exit_signalled.is_set():
+        _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
     if has_startup_ready_provider(settings):
         _start_supervisor_if_needed(settings)
     else:
@@ -1308,7 +1330,7 @@ async def lifespan(app):
             port=host_port,
             log_level="warning",
         )
-        host_service_server = uvicorn.Server(host_service_config)
+        host_service_server = _embedded_uvicorn_server(host_service_config)
         host_service_task = asyncio.create_task(
             host_service_server.serve(sockets=[host_socket]),
             name="host-service-api",
@@ -1635,8 +1657,11 @@ def main() -> int:
         log_level="warning",
         ws_ping_interval=20,
         ws_ping_timeout=20,
+        # Bound the open HTTP/WS drain so the lifespan teardown (terminal custody) starts inside
+        # the launcher's stop budget instead of leaving terminalization to the next boot (#1142).
+        timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC,
     )
-    server = uvicorn.Server(config)
+    server = _SignalStopServer(config)
     _uvicorn_exited = threading.Event()
 
     def _check_restart():
