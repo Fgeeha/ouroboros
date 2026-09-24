@@ -379,3 +379,38 @@ def test_uncertain_receipts_make_the_prior_count_a_floor(tmp_path):
     assert attempt == {"delivered_count": 1, "delivered": ["Early part"], "uncertain_count": 1}
     section = build_presence_context_section(tmp_path, calls[0]["metadata"]["presence"])
     assert 'delivered at least 1 message(s): "Early part"; 1 more part(s) may have landed' in section
+
+
+def test_a_refused_part_is_no_longer_uncertain(tmp_path):
+    """A timed-out part the provider later refused is neither delivered nor possibly landed."""
+    task_id = _task_id(_admission(), _event())
+    chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
+    for state in ("uncertain", "failed"):
+        append_jsonl(chat, {"type": "presence_delivery", "direction": "system", "chat_id": 7, "text": "Maybe part",
+                            "task_id": task_id, "transport": {"delivery": {
+                                "state": state, "delivery_id": "send:late", "part_id": "0"}}})
+    calls: list = []
+    run_presence_turn(**_v1_kwargs(tmp_path, calls))
+    attempt = calls[0]["metadata"]["presence"]["previous_attempt"]
+    assert attempt == {"delivered_count": 1, "delivered": ["Early part"], "uncertain_count": 0}
+    assert "may have landed" not in build_presence_context_section(tmp_path, calls[0]["metadata"]["presence"])
+
+
+def test_an_attempt_that_died_before_its_running_write_still_logs_the_message_once(tmp_path):
+    """Only the inbound row survives such a death; the retry must not repeat the correspondent."""
+    calls: list = []
+    kwargs = _v1_kwargs(tmp_path, calls)
+    agents = [None, _answering_agent(calls, "Real answer", tmp_path)]
+
+    def factory(**_kw):
+        agent = agents.pop(0)
+        if agent is None:
+            raise RuntimeError("worker died before the running write")
+        return agent
+
+    with pytest.raises(RuntimeError):
+        run_presence_turn(**{**kwargs, "agent_factory": factory})
+    first = run_presence_turn(**{**kwargs, "agent_factory": factory})
+    assert first.text == "Real answer" and "previous_attempt" not in calls[0]["metadata"]["presence"]
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["direction"] for row in rows if row.get("task_id") == first.task_id].count("in") == 1

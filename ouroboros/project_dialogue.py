@@ -1138,9 +1138,11 @@ def _append_terminal_task_projection(
         if excerpt:
             text += f" {excerpt}"
         result_ref = {"kind": "task_result", "task_id": tid, "reader": "get_task_result"}
+        from ouroboros.dialogue_provenance import presence_provenance_fields
         row = {
             "ts": str(event.get("ts") or effective.get("ts") or utc_now_iso()),
             "direction": "system", "type": "task_summary", "summary_kind": summary_kind,
+            **presence_provenance_fields({**task, **effective}),  # a presence room labels its terminal row too
             "summary_id": summary_id, "task_id": tid,
             "parent_task_id": parent_id, "root_task_id": root_id,
             "project_id": project_id,

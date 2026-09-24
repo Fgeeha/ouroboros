@@ -1,12 +1,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import pathlib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
-
-import pytest
 
 
 from ouroboros.presence_admission import PresenceAdmission
@@ -421,36 +420,61 @@ def test_previous_turn_shows_what_a_transport_tool_delivered(tmp_path):
 
 
 def test_previous_turn_pointer_is_rebuilt_by_the_replay_of_a_turn_that_lost_it(tmp_path, monkeypatch):
-    """A turn lost between its terminal write and its pointer write: the retry replays and repairs the pointer."""
+    """A turn killed between its terminal write and its pointer write: the retry replays and repairs the pointer."""
     from ouroboros import presence_runner
     from ouroboros.presence_bindings import conversation_key
     from ouroboros.presence_runner import _previous_turn_path
-    from ouroboros.task_results import load_task_result
 
     room = _previous_turn_path(tmp_path, conversation_key("telegram", "bot-1", "room-1", "topic-1"))
-    older = _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Old answer"})
-    real_write, failures = presence_runner.atomic_write_json, []
+    older = _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Old answer"}, version=1)
+    real_write, skipped = presence_runner._write_previous_turn, []
 
-    def flaky_pointer_write(path, payload):
-        if pathlib.Path(path) == room and not failures:
-            failures.append(path)
-            raise OSError("disk full")
-        real_write(path, payload)
+    def killed_before_pointer_write(*args, **kwargs):  # the process died right after the terminal write
+        if not skipped:
+            skipped.append(args[2])  # (drive_root, conversation_key, task_id, ...)
+            return None
+        real_write(*args, **kwargs)
 
-    monkeypatch.setattr(presence_runner, "atomic_write_json", flaky_pointer_write)
-    with pytest.raises(OSError):
-        _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "New answer"})
+    monkeypatch.setattr(presence_runner, "_write_previous_turn", killed_before_pointer_write)
+    _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "New answer"}, version=1)
     lost = json.loads(room.read_text(encoding="utf-8"))
-    assert lost["task_id"] == older.task_id  # the durable row completed, the pointer did not follow
+    assert lost["task_id"] == older.task_id and skipped  # the durable row completed, the pointer did not follow
     captured: list = []
-    replay = _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "Must not run"}, captured=captured)
+    replay = _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "Must not run"}, version=1, captured=captured)
     assert replay.text == "New answer" and captured == []  # a cached replay, no execution
     repaired = json.loads(room.read_text(encoding="utf-8"))
-    assert (repaired["task_id"], repaired["message"], repaired["delivery"]) == (replay.task_id, "New answer", "unknown")
-    assert repaired["finished_at"] == load_task_result(tmp_path, replay.task_id)["ts"]
-    _pointer_turn(tmp_path, "e3", {"outcome": "silent", "text": ""}, captured=captured)
+    assert (repaired["task_id"], repaired["message"], repaired["delivery"]) == (replay.task_id, "New answer", "authored")
+    assert repaired["finished_at"] > lost["finished_at"]  # completion order, from the durable row's stamp
+    _pointer_turn(tmp_path, "e3", {"outcome": "silent", "text": ""}, version=1, captured=captured)
     assert captured[-1]["metadata"]["presence"]["previous_turn"]["task_id"] == replay.task_id
     newest = room.read_bytes()
     # The older turn's replay finds a newer pointer and leaves it alone.
-    assert _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Must not run"}, captured=captured) == older
+    assert _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Must not run"}, version=1,
+                         captured=captured) == older
     assert room.read_bytes() == newest and len(captured) == 1
+
+
+def test_pointer_write_failure_does_not_fail_an_answered_turn(tmp_path, monkeypatch, caplog):
+    """The pointer is a projection: a full disk under it never turns a delivered answer into a 400."""
+    from ouroboros import presence_runner
+    from ouroboros.presence_bindings import conversation_key
+    from ouroboros.presence_runner import _previous_turn_path
+
+    room = _previous_turn_path(tmp_path, conversation_key("telegram", "bot-1", "room-1", "topic-1"))
+    real_write = presence_runner.atomic_write_json
+
+    def full_disk(path, payload):
+        if pathlib.Path(path) == room:
+            raise OSError("disk full")
+        real_write(path, payload)
+
+    monkeypatch.setattr(presence_runner, "atomic_write_json", full_disk)
+    with caplog.at_level(logging.WARNING, logger="ouroboros.presence_runner"):
+        answered = _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Still delivered"})
+    assert answered.text == "Still delivered" and not room.exists()
+    assert any("previous-turn pointer not written" in record.getMessage() for record in caplog.records)
+    monkeypatch.setattr(presence_runner, "atomic_write_json", real_write)
+    captured: list = []
+    _pointer_turn(tmp_path, "e2", {"outcome": "silent", "text": ""}, captured=captured)
+    assert "previous_turn" not in captured[0]["metadata"]["presence"]  # the gap is a gap, not an invented fact
+    assert json.loads(room.read_text(encoding="utf-8"))["task_id"] != answered.task_id

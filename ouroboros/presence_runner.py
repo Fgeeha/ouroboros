@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 import threading
 import time
@@ -24,6 +25,8 @@ from ouroboros.task_results import (
     reopen_reconciled_presence_placeholder,
 )
 from ouroboros.utils import append_jsonl, atomic_write_json, iter_jsonl_objects, read_json_dict, utc_now_iso
+
+log = logging.getLogger(__name__)
 
 
 class PresenceTurnError(ValueError):
@@ -303,10 +306,12 @@ def _receipt(row: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _uncertain_parts(rows: Sequence[Mapping[str, Any]]) -> int:
-    """Parts the provider never confirmed nor refused (a timed-out send may have landed)."""
-    keys = {(str(r.get("delivery_id")), str(r.get("part_id"))) for r in map(_receipt, rows) if r.get("state") == "uncertain"}
-    return len(keys - {(str(r.get("delivery_id")), str(r.get("part_id")))
-                       for r in map(_receipt, rows) if r.get("state") in {"delivered", "accepted"}})
+    """Parts whose latest receipt is ``uncertain``: neither confirmed nor refused, so they may have landed."""
+    latest: dict[tuple[str, str], str] = {}
+    for receipt in map(_receipt, rows):
+        if receipt.get("state"):
+            latest[(str(receipt.get("delivery_id")), str(receipt.get("part_id")))] = str(receipt["state"])
+    return sum(1 for state in latest.values() if state == "uncertain")
 
 
 def _previous_turn_path(drive_root: Path, conversation_key: str) -> Path:
@@ -322,11 +327,16 @@ def _read_previous_turn(drive_root: Path, conversation_key: str) -> dict[str, An
 
 def _write_previous_turn(drive_root: Path, conversation_key: str, task_id: str, *, outcome: str, message: str,
                          sends: Sequence[str], work_ref: str, finished_at: str, delivery: str) -> None:
-    atomic_write_json(_previous_turn_path(drive_root, conversation_key), {
-        "conversation_key": conversation_key, "task_id": task_id, "outcome": outcome, "message": message,
-        "transport_sends": [text for text in sends if text], "work_ref": work_ref,
-        "finished_at": finished_at, "delivery": delivery,
-    })
+    """Best effort: the pointer is a projection, and a turn that already answered is not failed over it."""
+    try:
+        atomic_write_json(_previous_turn_path(drive_root, conversation_key), {
+            "conversation_key": conversation_key, "task_id": task_id, "outcome": outcome, "message": message,
+            "transport_sends": [text for text in sends if text], "work_ref": work_ref,
+            "finished_at": finished_at, "delivery": delivery,
+        })
+    except OSError:
+        log.warning("presence previous-turn pointer not written for %s (task %s); the next replay of this turn "
+                    "rebuilds it", conversation_key, task_id, exc_info=True)
 
 
 def _pointer_behind(drive_root: Path, conversation_key: str, task_id: str) -> bool:
@@ -348,7 +358,14 @@ def _repair_previous_turn(drive_root: Path, conversation_key: str, task_id: str)
     sends = _confirmed_sends(_live_task_rows(drive_root, task_id)) if replay.delivery_reporting_version else []
     _write_previous_turn(drive_root, conversation_key, task_id, outcome=replay.outcome, message=replay.text,
                          sends=sends or [], work_ref=replay.work_ref, finished_at=str(stored.get("ts") or ""),
-                         delivery="confirmed" if sends else "unknown")
+                         delivery=_delivery_state(replay.delivery_reporting_version, sends, replay.text))
+
+
+def _delivery_state(reporting_version: int, sends: Sequence[str] | None, text: str) -> str:
+    """One rule for the live write and the repair: a v1 receipt arrives only after the turn returns."""
+    if not reporting_version or sends is None or not (sends or text):
+        return "unknown"  # v0 never confirms; None = this turn's receipts left the live generation
+    return "confirmed" if sends else "authored"
 
 
 def _log_dialogue(
@@ -559,7 +576,7 @@ def run_presence_turn(
         stored = load_task_result(Path(drive_root), task_id) or {}
         lost_attempt = is_reconciled_presence_placeholder(stored) or str(stored.get("status") or "") in {
             STATUS_RUNNING, STATUS_INTERRUPTED}
-        prior_rows = _live_task_rows(Path(drive_root), task_id) if lost_attempt else []
+        prior_rows = _live_task_rows(Path(drive_root), task_id)  # an attempt that died before its running write left only these
         task = _build_task(
             admission,
             event,
@@ -570,7 +587,7 @@ def run_presence_turn(
         )
         chat_id = int(task["chat_id"])
         actor_id = _stable_numeric_id("presence-actor-log", str(task.get("actor_id") or ""))
-        if not any(row.get("direction") == "in" for row in prior_rows):  # the lost attempt already logged it
+        if not any(row.get("direction") == "in" for row in prior_rows):  # an earlier attempt already logged it
             _log_dialogue(
                 Path(drive_root),
                 direction="in",
@@ -616,15 +633,13 @@ def run_presence_turn(
                 task=task,
                 task_id=task_id,
             )
-        # Still under the conversation lock; cached replays return before execute() and
-        # never write, so an older replay cannot overwrite the newest executed turn.
+        # Still under the conversation lock. A replay writes only through _repair_previous_turn, under
+        # this same lock, and it leaves a pointer that names a newer turn alone.
         sends = _confirmed_sends(_live_task_rows(Path(drive_root), task_id)) if event.delivery_reporting_version else []
-        delivery = "unknown"  # also when a mid-turn rotation hid this turn's receipts (sends is None)
-        if sends is not None and event.delivery_reporting_version and (sends or result.text):
-            delivery = "confirmed" if sends else "authored"  # the v1 reply's receipt arrives after this return
         _write_previous_turn(Path(drive_root), event.conversation_key, task_id, outcome=result.outcome,
                              message=str(row.get("message") or result.text), sends=sends or [],
-                             work_ref=result.work_ref, finished_at=utc_now_iso(), delivery=delivery)
+                             work_ref=result.work_ref, finished_at=utc_now_iso(),
+                             delivery=_delivery_state(event.delivery_reporting_version, sends, result.text))
         return result
 
     return (gate or _configured_gate(Path(drive_root))).run(event.conversation_key, execute)

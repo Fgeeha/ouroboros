@@ -400,3 +400,31 @@ def test_presence_rows_of_one_room_share_one_label_from_transport_facts():
     assert resolver.label({"chat_id": weird_chat, "transport": {**base, "conversation_id": "x]y[z"}}) == (
         f"Presence telegram x y z [chat_id={weird_chat}]"
     )
+
+
+def test_terminal_projection_row_of_a_presence_turn_carries_the_room_facts(tmp_path):
+    """The canonical terminal summary of a presence turn labels its room like every other row of it."""
+    from ouroboros.presence_bindings import conversation_key
+    from ouroboros.presence_runner import _stable_numeric_id
+    from ouroboros.project_dialogue import append_terminal_task_projection
+    from ouroboros.task_results import write_task_result
+
+    chat_id = _stable_numeric_id("presence-conversation", conversation_key("telegram", "900", "-100", ""))
+    event = {"provider": "telegram", "account_id": "900", "conversation_id": "-100", "thread_id": "",
+             "source_event_id": "telegram:900:1", "conversation_key": "telegram:900:-100:0", "actor": {"id": "u1"}}
+    write_task_result(tmp_path, "presence-turn-1", "completed", result="Done", terminal_origin="model_final",
+                      metadata={"source": "presence", "presence": {"binding_id": "1" * 32, "event": event}})
+    stored = __import__("ouroboros.task_results", fromlist=["load_task_result"]).load_task_result(tmp_path, "presence-turn-1")
+    assert append_terminal_task_projection(tmp_path, "presence-turn-1", {"id": "presence-turn-1", "chat_id": chat_id},
+                                           stored, {"status": "completed", "chat_id": chat_id})
+    row = next(json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+               if json.loads(line).get("type") == "task_summary")
+    assert row["presence_provenance"]["conversation_id"] == "-100"
+    assert RoomLabelResolver(projects=[]).label(row) == f"Presence telegram -100 [chat_id={chat_id}]"
+    # A non-presence terminal row carries no presence facts at all.
+    write_task_result(tmp_path, "plain-task", "completed", result="Done")
+    plain = __import__("ouroboros.task_results", fromlist=["load_task_result"]).load_task_result(tmp_path, "plain-task")
+    assert append_terminal_task_projection(tmp_path, "plain-task", {"id": "plain-task", "chat_id": 5}, plain,
+                                           {"status": "completed", "chat_id": 5})
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert "presence_provenance" not in next(r for r in rows if r.get("task_id") == "plain-task")
