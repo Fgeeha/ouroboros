@@ -401,9 +401,10 @@ class _EventsTailIndex:
         return self._worker_boot
 
 
-def _still_orphan_at_write(task_id: str):
+def _still_orphan_at_write(task_id: str, applied: List[bool]):
     """Projector for the reconciler's terminal write: the decision was taken outside the row lock, so
-    a presence retry that went live meanwhile, or a row that already moved on, cancels the write."""
+    a presence retry that went live meanwhile, or a row that already moved on (requeued, settled by
+    another writer), cancels the write. ``applied`` receives True only when the write went through."""
 
     def _project(existing: Dict[str, Any], fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         from ouroboros.presence_runner import presence_turn_is_live
@@ -412,6 +413,7 @@ def _still_orphan_at_write(task_id: str):
             return None
         if str(existing.get("status") or "").lower() not in {STATUS_RUNNING, STATUS_INTERRUPTED}:
             return None
+        applied.append(True)
         return fields
 
     return _project
@@ -655,10 +657,11 @@ def reconcile_orphaned_running_tasks(
             if effective.get(key) is not None
         }
         try:
-            written = write_task_result(root, task_id, status=eff_status,
-                                        _field_projector=_still_orphan_at_write(task_id), **persist_fields) or {}
-            if str(written.get("status") or "").lower() in {STATUS_RUNNING, STATUS_INTERRUPTED}:
-                continue  # a retry registered between the effective read and this write: not an orphan any more
+            applied: List[bool] = []
+            write_task_result(root, task_id, status=eff_status,
+                              _field_projector=_still_orphan_at_write(task_id, applied), **persist_fields)
+            if not applied:
+                continue  # the row moved on between the effective read and this write: nothing was settled here
             healed += 1
         except Exception:
             continue

@@ -406,7 +406,7 @@ def _log_dialogue(
     from ouroboros.dialogue_provenance import presence_provenance_from_task
 
     state = read_json_dict(drive_root / "state" / "state.json") or {}
-    append_jsonl(
+    written = append_jsonl(
         drive_root / "logs" / "chat.jsonl",
         {
             "ts": utc_now_iso(),
@@ -435,6 +435,10 @@ def _log_dialogue(
             "task_id": task_id,
         },
     )
+    if direction == "in" and written is False:
+        # A re-run of a lost attempt relies on the inbound row having landed (it never re-logs), so
+        # a turn whose row cannot be written fails here, before the model runs; the transport retries.
+        raise PresenceTurnError("chat_log_unwritable", "chat")
 
 
 def _build_task(

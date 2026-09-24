@@ -487,3 +487,45 @@ def test_reconciler_skips_a_row_whose_retry_went_live_after_the_decision(tmp_pat
             presence_runner._LIVE_PRESENCE_TASKS.discard(task_id)
     healed, row = _sweep(tmp_path, monkeypatch, task_id, seed=False)
     assert healed == 1 and row["status"] == STATUS_FAILED and row["status_reconciled_from"] == STATUS_RUNNING
+
+
+def test_reconciler_settles_nothing_when_the_row_was_requeued_after_the_decision(tmp_path, monkeypatch):
+    """A row requeued (scheduled) between the decision and the write is neither healed nor cleaned up."""
+    from ouroboros import owner_quiz, task_status
+
+    task_id = "presence-requeued"
+    real_effective, cleanups = task_status.load_effective_task_result, []
+
+    def effective_then_requeue(root, tid, *args, **kwargs):
+        effective = real_effective(root, tid, *args, **kwargs)
+        if tid == task_id:
+            write_task_result(tmp_path, task_id, "scheduled", result="New authority")
+        return effective
+
+    monkeypatch.setattr(task_status, "load_effective_task_result", effective_then_requeue)
+    monkeypatch.setattr(owner_quiz, "reconcile_terminal", lambda root, tid: cleanups.append(tid))
+    healed, row = _sweep(tmp_path, monkeypatch, task_id)
+    assert (healed, row["status"], row["result"], cleanups) == (0, "scheduled", "New authority", [])
+    # The same sweep over a genuine orphan still heals and still runs the terminal cleanup.
+    monkeypatch.setattr(task_status, "load_effective_task_result", real_effective)
+    healed, row = _sweep(tmp_path, monkeypatch, "presence-orphan")
+    assert (healed, row["status"], cleanups) == (1, STATUS_FAILED, ["presence-orphan"])
+
+
+def test_an_unwritable_inbound_row_fails_the_turn_before_the_model_runs(tmp_path, monkeypatch):
+    """The no-re-log rule assumes the inbound row landed; a failed append is a failed turn, then a retry logs it."""
+    from ouroboros import presence_runner
+    from ouroboros.presence_runner import PresenceTurnError
+
+    calls: list = []
+    kwargs = _v1_kwargs(tmp_path, calls)
+    real_append = presence_runner.append_jsonl
+    monkeypatch.setattr(presence_runner, "append_jsonl", lambda path, row: False)
+    with pytest.raises(PresenceTurnError) as raised:
+        run_presence_turn(**kwargs)
+    assert raised.value.code == "chat_log_unwritable" and calls == []
+    assert load_task_result(tmp_path, _task_id(_admission(), kwargs["event"])) is None  # no lost attempt to inherit
+    monkeypatch.setattr(presence_runner, "append_jsonl", real_append)
+    first = run_presence_turn(**kwargs)
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert first.text == "Real answer" and [r["direction"] for r in rows if r.get("task_id") == first.task_id] == ["in"]

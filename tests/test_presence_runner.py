@@ -319,7 +319,7 @@ def test_presence_turn_is_live_for_liveness_readers_but_never_an_owner_target(mo
 
 
 def _pointer_turn(tmp_path, event_id, row, *, thread="topic-1", version=0, captured=None, during=None,
-                  status="completed"):
+                  status="completed", terminal_origin="model_final"):
     """One executed turn with a durable terminal row, as the real pipeline leaves it."""
     from dataclasses import replace
 
@@ -337,7 +337,7 @@ def _pointer_turn(tmp_path, event_id, row, *, thread="topic-1", version=0, captu
             if during is not None:
                 during(task)
             write_task_result(tmp_path, task["id"], status, result=row.get("text", ""),
-                              terminal_origin="model_final", metadata={
+                              terminal_origin=terminal_origin, metadata={
                                   **task["metadata"], "presence_outcome": row["outcome"],
                                   "presence_result_text": row.get("text", ""),
                                   "presence_work_ref": row.get("work_ref", "")})
@@ -526,3 +526,23 @@ def test_pointer_write_failure_does_not_fail_an_answered_turn(tmp_path, monkeypa
     _pointer_turn(tmp_path, "e2", {"outcome": "silent", "text": ""}, captured=captured)
     assert "previous_turn" not in captured[0]["metadata"]["presence"]  # the gap is a gap, not an invented fact
     assert json.loads(room.read_text(encoding="utf-8"))["task_id"] != answered.task_id
+
+
+@pytest.mark.parametrize("origin", ["", "host_notice", "host_salvage"])
+def test_a_host_authored_failure_never_repairs_the_pointer(tmp_path, monkeypatch, origin):
+    """A failed row the host wrote (no reply of the model's own) replays silent and is not a turn to point at."""
+    from ouroboros import presence_runner
+    from ouroboros.presence_bindings import conversation_key
+    from ouroboros.presence_runner import _previous_turn_path
+
+    room = _previous_turn_path(tmp_path, conversation_key("telegram", "bot-1", "room-1", "topic-1"))
+    older = _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Old answer"}, version=1)
+    before = room.read_bytes()
+    monkeypatch.setattr(presence_runner, "_write_previous_turn", lambda *a, **k: None)  # killed before the write
+    _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "Host text"}, version=1, status="failed",
+                  terminal_origin=origin)
+    monkeypatch.undo()
+    captured: list = []
+    replay = _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "Must not run"}, version=1, captured=captured)
+    assert (replay.outcome, replay.text, captured) == ("silent", "", [])  # cached silence, no execution
+    assert room.read_bytes() == before and json.loads(before)["task_id"] == older.task_id
