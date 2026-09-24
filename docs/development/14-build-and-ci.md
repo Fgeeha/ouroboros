@@ -1,6 +1,6 @@
 # Build & CI
 
-This chapter owns the build and test topology: the dependency-lock change procedure, the seven opt-in pytest marker lanes, the parallel and serial split CI actually runs, the hermetic commit gate that mirrors that split in a disposable checkout, and the GitHub Actions secret-gating shape. It exists because the gate's verdict has to be reproducible and un-weakenable by the candidate it is judging.
+This chapter maps dependency locks, opt-in pytest lanes, CI's parallel/serial split, its hermetic commit-gate mirror, and Actions secret gating. The gate must be reproducible and independent of the candidate.
 
 ### Python dependency locks
 
@@ -30,13 +30,10 @@ CI runs the default suite in parallel — `python -m pytest tests/` with `-m "no
 
 ### Safe local verification and dirty browser candidates
 
-Before importing the application or running tests on an operator machine, go
-through the stdlib boundary launcher: it statically checks the environment
-helper's imports, scrubs owner settings, credentials and import/process
-overrides, and prints the roots it selected before Python starts. Dependencies
-come from a dependency-only venv, never the owner's interpreter; omitting the
-editable project is what stops a copied candidate importing deleted modules from
-the source checkout:
+Before application imports or local tests, use the stdlib boundary launcher. It
+checks the helper's imports, scrubs owner configuration and credentials, and
+prints isolated roots before Python starts. Use a dependency-only venv: an
+editable project could import deleted modules from the source checkout:
 
 ```bash
 uv sync --locked --extra browser --group dev --no-install-project
@@ -47,11 +44,9 @@ OUROBOROS_RUN_UI_SMOKE=1 OUROBOROS_EXPECT_BROWSER_ENGINES=chromium,webkit \
   python -I -S scripts/safe_test.py -- .venv/bin/python -m pytest tests/ -m ui_browser --require-ui-browser
 ```
 
-`--require-ui-browser` is what makes that last exit status evidence: narrowed or
-empty collection, a missing engine, a collected case that never reached a
-terminal outcome, and any skip outside the reviewed platform registry in
-`tests/browser_lane.py` each fail the run, and a registered platform skip is
-reported with its node and reason. `--temp-parent` (`/tmp` on macOS: short socket paths) is refused inside any Git checkout, where git resolves; neither launcher nor pytest session deletes its tree (`SAFE_TEST_RETAINED <path>`). The same stdlib
+`--require-ui-browser` fails on narrowed/empty collection, missing engines,
+unsettled cases, or skips outside `tests/browser_lane.py`'s reviewed platform
+registry. Registered skips report their node and reason. `--temp-parent` (`/tmp` on macOS: short socket paths) is refused inside any Git checkout, where git resolves; neither launcher nor pytest session deletes its tree (`SAFE_TEST_RETAINED <path>`). The same stdlib
 `ouroboros/test_environment.py` owns the data, settings, app, HOME, projects,
 worktrees, Deliverables, cache and userbase defaults for pytest, preflight and
 their server children — including a child that passes `env=None` — while roots a

@@ -1306,12 +1306,12 @@ def test_the_hermetic_tree_is_deleted_only_after_every_lane_proved_its_teardown(
         if lane == "proven":
             assert result is None, result
             assert not temp_root.exists(), "a proven teardown leaked its disposable tree"
-            assert f"worktree {worktree}\n" not in registered, registered
+            assert f"worktree {worktree.as_posix()}\n" not in registered, registered
             return
         assert result is not None and result.startswith("⚠️ PRE_PUSH_TEST_ERROR"), result
         assert result.splitlines()[1].startswith(f"RETAINED (not deleted): {temp_root}"), result
         assert worktree.is_dir(), "the worktree was deleted under processes not proven gone"
-        assert f"worktree {worktree}\n" in registered, registered
+        assert f"worktree {worktree.as_posix()}\n" in registered, registered
         marker = (temp_root / RETENTION_MARKER).read_text(encoding="utf-8")
         assert marker.startswith("hermetic preflight: "), marker
         assert (unproven in marker) == lane.endswith("_reported"), marker
@@ -1326,7 +1326,7 @@ def test_the_retention_notice_precedes_the_body_and_stays_inside_the_budget():
     tree = pathlib.Path("/t/ouroboros-preflight-x/repo")
     assert _with_retention_notice("H\nbody", "", tree, 8000) == "H\nbody"
     kept = _with_retention_notice("H\n" + "b" * 9000, "unproven", tree, 400)
-    assert kept.startswith("H\nRETAINED (not deleted): /t/ouroboros-preflight-x,"), kept
+    assert kept.startswith(f"H\nRETAINED (not deleted): {tree.parent},"), kept
     assert len(kept) == 400
 
 

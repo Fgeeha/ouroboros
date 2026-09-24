@@ -1,6 +1,6 @@
 # 1. High-Level Architecture
 
-This chapter is the structural index of the running system: the module tree from the desktop launcher down through the supervisor to every core package, the gateway and CLI boundaries, the two-role process topology of launcher and server, the platform substrate their locks and fingerprints rest on, and the on-disk data layout. It exists so a reader can find the owner of any behaviour by name before reading its code, and so a renamed module or a moved durable file surfaces as a documentation change instead of silent drift. A tree row is an address — what the module does, the typed codes, events, state files and constants to grep for, and the section that owns its mechanism and rationale; a WHY stays in a row only where no section carries it.
+This chapter is the structural index of the running system: the module tree from the desktop launcher down through the supervisor to every core package, the gateway and CLI boundaries, the two-role process topology of launcher and server, the platform substrate their locks and fingerprints rest on, and the on-disk data layout. It locates behaviour owners and makes module/file moves explicit documentation changes. A tree row is an address — what the module does, the typed codes, events, state files and constants to grep for, and the section that owns its mechanism and rationale; a WHY stays in a row only where no section carries it.
 
 ```
 User

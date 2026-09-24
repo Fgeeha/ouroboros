@@ -182,8 +182,12 @@ def _read(root: Path, name: str):
     with path.open("rb") as stream:
         content = stream.read()
         after = os.fstat(stream.fileno())
-    signature = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
-    if signature(before) != signature(after) or signature(after) != signature(path.lstat()):
+    signature = lambda s: (s.st_dev, s.st_ino, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    named_after = path.lstat()
+    # Windows path stat adds execute bits by filename; fstat has no filename.
+    # Keep descriptor identity, but compare modes only between the two path stats.
+    if (signature(before) != signature(after) or signature(after) != signature(named_after)
+            or before.st_mode != named_after.st_mode):
         raise CandidateError(f"CANDIDATE_CHANGED while reading: {name!r}")
     return content, stat.S_IMODE(before.st_mode), signature(before)
 
@@ -273,13 +277,14 @@ def _origin_proof_overlay(state: CandidateState) -> dict:
     # projections, and a secret-shaped name gets it redacted out of review.
     marker = secrets.token_hex(16)
     version = state.files.get(VERSION_PATH)
-    if version is None or state.files.get("web/index.html") is None:
+    index = state.files.get("web/index.html")
+    if version is None or index is None:
         raise CandidateError(
             "CANDIDATE_UNSUPPORTED: the origin proof needs a candidate with VERSION and web/")
     # Build metadata, so every consumer that parses a version still parses this one.
     text = version[0].decode("utf-8").strip() + f"+candidate.{marker[:12]}\n"
     return {
-        SENTINEL_PATH: (f"ouroboros candidate checkout {marker}\n".encode("utf-8"), 0o644),
+        SENTINEL_PATH: (f"ouroboros candidate checkout {marker}\n".encode("utf-8"), index[1]),
         VERSION_PATH: (text.encode("utf-8"), version[1]),
     }
 

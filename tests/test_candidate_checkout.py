@@ -1,6 +1,8 @@
 """The browser candidate preserves dirty bytes and never writes the source Git state."""
 from concurrent.futures import ThreadPoolExecutor
 import os
+from pathlib import Path
+import stat
 import subprocess
 
 import pytest
@@ -315,3 +317,44 @@ def test_proof_bytes_removed_from_the_checkout_invalidate_success(source, tmp_pa
         with candidate.candidate_checkout(source, target, origin_proof=True):
             (target / candidate.SENTINEL_PATH).unlink()
     assert not target.exists()
+
+
+@pytest.mark.parametrize("suffix", [".cmd", ".bat", ".exe", ".com"])
+def test_path_execute_bits_do_not_change_handle_identity(source, monkeypatch, suffix):
+    real_lstat = Path.lstat
+
+    class NamedStat:
+        def __init__(self, observed):
+            self.observed = observed
+
+        def __getattr__(self, name):
+            return getattr(self.observed, name)
+
+        @property
+        def st_mode(self):
+            return self.observed.st_mode | 0o111
+
+    def path_lstat(path):
+        observed = real_lstat(path)
+        return NamedStat(observed) if path.suffix == suffix else observed
+
+    monkeypatch.setattr(Path, "lstat", path_lstat)
+    payload = b"@echo off\r\nexit /b 0\r\n"
+    name = "install" + suffix
+    (source / name).write_bytes(payload)
+    assert candidate._read(source, name)[0] == payload
+
+
+def test_origin_proof_uses_observable_sibling_mode(source, tmp_path, monkeypatch):
+    (source / "VERSION").write_bytes(b"9.9.9\n")
+    (source / "web").mkdir()
+    (source / "web" / "index.html").write_bytes(b"<!doctype html>\n")
+    for name, value in candidate.observe_candidate(source).files.items():
+        if value is not None:
+            os.chmod(source / name, 0o666)
+    real_chmod = Path.chmod
+    monkeypatch.setattr(Path, "chmod", lambda path, mode, **kw: real_chmod(
+        path, 0o666 if mode & stat.S_IWRITE else 0o444, **kw))
+    with candidate.candidate_checkout(source, tmp_path / "copy", origin_proof=True) as checkout:
+        for name, value in checkout.overlay.items():
+            assert candidate._read(checkout.path, name)[:2] == value

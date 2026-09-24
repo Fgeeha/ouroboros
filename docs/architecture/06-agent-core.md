@@ -1,6 +1,6 @@
 # 6. Agent Core
 
-This chapter maps execution and cognition inside a worker: task lifecycle, tools, context fitting, safety and runtime mode, reviews, delegated custody, planning, deep self-review, reflection, memory and project focus, skills, external tools and budgets. Pooled tasks and direct turns, including consciousness wakes, enter `OuroborosAgent`'s tool loop (`loop.py`); reviews and post-task operations use separate executors. Keeping these paths together makes their shared context, tool-authority and evidence contracts visible without treating them as one loop.
+This chapter maps execution and cognition inside a worker: task lifecycle, tools, context fitting, safety and runtime mode, reviews, delegated custody, planning, deep self-review, reflection, memory and project focus, skills, external tools and budgets. Pooled tasks and direct turns, including consciousness wakes, enter `OuroborosAgent`'s tool loop (`loop.py`); reviews and post-task operations use separate executors. Shared contracts do not make these paths one loop.
 
 ### Task lifecycle
 
