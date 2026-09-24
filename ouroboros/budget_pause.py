@@ -339,6 +339,7 @@ def observe_task_runs(root: Any, task_id: str, *, reason: str = "budget_resume_u
     ``custody_read=failed`` observation, never an empty (clean-looking) list.
     """
     runs: List[Any] = []
+    pending_rows: List[Dict[str, Any]] = []
     if not read_error:
         try:
             from ouroboros import delegate_custody as custody
@@ -357,14 +358,11 @@ def observe_task_runs(root: Any, task_id: str, *, reason: str = "budget_resume_u
 
             pending = [row for row in pending_invocations(pathlib.Path(root))
                        if str(row.get("task_id") or "") == mine]
-            if pending:
-                return {"runs": [{"run_id": "", "invocation_id": str(row.get("invocation_id") or ""),
-                                  "route": str(row.get("route") or ""),
-                                  "cost_coverage": "unproven_preterminal", "stop_policy": "reconcile_first",
-                                  "state": EXTERNAL_STOP_UNKNOWN, "stop_outcome": "pending_invocation_unbound",
-                                  "detail": ""} for row in pending],
-                        "observed_at": time.time(), "custody_read": "ok",
-                        "coverage_basis": "pending_invocations_unbound"}
+            pending_rows = [{"run_id": "", "invocation_id": str(row.get("invocation_id") or ""),
+                             "route": str(row.get("route") or ""),
+                             "cost_coverage": "unproven_preterminal", "stop_policy": "reconcile_first",
+                             "state": EXTERNAL_STOP_UNKNOWN, "stop_outcome": "pending_invocation_unbound",
+                             "detail": ""} for row in pending]
         except Exception as exc:
             log.warning("External custody rows unreadable for %s", task_id, exc_info=True)
             read_error = f"{type(exc).__name__}: {str(exc)[:200]}"
@@ -374,6 +372,9 @@ def observe_task_runs(root: Any, task_id: str, *, reason: str = "budget_resume_u
         return {"runs": [], "observed_at": time.time(), "custody_read": "failed",
                 "error": read_error, "coverage_basis": "custody_unreadable"}
     if not runs:
+        if pending_rows:
+            return {"runs": pending_rows, "observed_at": time.time(), "custody_read": "ok",
+                    "coverage_basis": "pending_invocations_unbound"}
         return {"runs": [], "observed_at": time.time(), "custody_read": "ok", "coverage_basis": "no_open_runs"}
     rows: List[Dict[str, Any]] = []
     try:
@@ -420,7 +421,8 @@ def observe_task_runs(root: Any, task_id: str, *, reason: str = "budget_resume_u
                 gateway.close()
             except Exception:
                 log.debug("Gateway close after pause stop requests failed", exc_info=True)
-    return {"runs": rows, "observed_at": time.time(), "custody_read": "ok",
+    # Open runs still get their stop requests; unbound invocations ride beside them.
+    return {"runs": rows + pending_rows, "observed_at": time.time(), "custody_read": "ok",
             "coverage_basis": "preterminal_subscription_coverage_unprovable"}
 
 
