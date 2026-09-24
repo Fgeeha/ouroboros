@@ -281,3 +281,83 @@ def test_host_retry_reruns_a_lost_turn_once_and_then_replays(tmp_path, monkeypat
     assert len(inbound) == 1  # the re-run does not log the correspondent's message twice
     replay = post()
     assert replay.status_code == 200 and replay.json() == first.json() and len(calls) == 2
+
+
+def _lost_v1_attempt(tmp_path, task_id, *, chat_id):
+    """A v1 attempt that logged its inbound row, delivered one part through a tool, then died."""
+    write_task_result(tmp_path, task_id, STATUS_RUNNING, result="Task is running.", ts="2026-05-28T00:00:00+00:00",
+                      metadata={"source": "presence", "presence": {"binding_id": "1" * 32, "delivery_reporting_version": 1}})
+    chat = tmp_path / "logs" / "chat.jsonl"
+    append_jsonl(chat, {"direction": "in", "chat_id": chat_id, "client_message_id": "telegram:bot-1:42",
+                        "text": "Hello", "task_id": task_id})
+    append_jsonl(chat, {"type": "presence_delivery", "direction": "out", "chat_id": chat_id, "text": "Early part",
+                        "task_id": task_id, "transport": {"delivery": {
+                            "state": "delivered", "delivery_id": "send:early", "part_id": "0"}}})
+    return chat
+
+
+def _v1_kwargs(tmp_path, calls, reply="Real answer", **overrides):
+    from dataclasses import replace
+
+    return dict(admission=_admission(), event=replace(_event(), delivery_reporting_version=1), repo_dir=tmp_path,
+                drive_root=tmp_path, agent_factory=lambda **_kw: _answering_agent(calls, reply, tmp_path),
+                gate=PresenceTurnGate(1), **overrides)
+
+
+def test_stale_running_row_is_a_lost_attempt_before_the_reconciler_runs(tmp_path):
+    """An adapter retry inside the reconciler's grace window still learns what the dead attempt sent."""
+    from dataclasses import replace
+
+    task_id = _task_id(_admission(), _event())
+    chat_id = 0
+    calls: list = []
+    kwargs = _v1_kwargs(tmp_path, calls)
+    fresh = run_presence_turn(**{**kwargs, "event": replace(kwargs["event"], source_event_id="telegram:bot-1:1")})
+    assert fresh.text == "Real answer" and "previous_attempt" not in calls[0]["metadata"]["presence"]
+    chat_id = calls[0]["chat_id"]
+    _lost_v1_attempt(tmp_path, task_id, chat_id=chat_id)
+    assert _cached_result(tmp_path, task_id) is None
+    first = run_presence_turn(**kwargs)
+    assert first.text == "Real answer" and [task["id"] for task in calls] == [calls[0]["id"], task_id]
+    assert calls[1]["metadata"]["presence"]["previous_attempt"] == {"delivered_count": 1, "delivered": ["Early part"]}
+    stored = load_task_result(tmp_path, task_id)
+    assert stored["status"] == STATUS_COMPLETED and "superseded_placeholder" not in stored  # nothing to reopen
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert sum(1 for row in rows if row.get("direction") == "in" and row.get("task_id") == task_id) == 1
+    assert run_presence_turn(**kwargs) == first and len(calls) == 2
+
+
+def test_rotation_between_the_lost_attempt_and_its_retry_makes_prior_sends_unknown(tmp_path):
+    """Receipts in a rotated archive are not counted as zero: the model is told the count is unknown."""
+    task_id = _task_id(_admission(), _event())
+    chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
+    (tmp_path / "archive").mkdir()
+    chat.rename(tmp_path / "archive" / "chat_20260528T000100.jsonl")  # the live generation rotated
+    calls: list = []
+    first = run_presence_turn(**_v1_kwargs(tmp_path, calls))
+    assert first.text == "Real answer" and len(calls) == 1
+    assert calls[0]["metadata"]["presence"]["previous_attempt"] == {"delivered_count": None, "delivered": None}
+    section = build_presence_context_section(tmp_path, calls[0]["metadata"]["presence"])
+    assert "whether it already sent anything is unknown" in section and "delivered 0 message" not in section
+    live = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()]
+    assert [row["direction"] for row in live if row.get("task_id") == task_id][:1] == ["in"]  # logged again (disclosed)
+
+
+def test_rejected_build_leaves_the_placeholder_for_the_next_retry(tmp_path, monkeypatch):
+    """The host mark moves aside only when the turn actually runs; a rejected build keeps it."""
+    from ouroboros.presence_runner import PresenceTurnError
+    from ouroboros.task_results import is_reconciled_presence_placeholder
+
+    task_id = _task_id(_admission(), _event())
+    _reconciled(tmp_path, monkeypatch, task_id)
+    calls: list = []
+    kwargs = dict(admission=_admission(), event=_event(), repo_dir=tmp_path, drive_root=tmp_path,
+                  agent_factory=lambda **_kw: _answering_agent(calls, "Real answer", tmp_path), gate=PresenceTurnGate(1))
+    with pytest.raises(PresenceTurnError):
+        run_presence_turn(**kwargs, staged_files=[tmp_path / "missing.png"])
+    stored = load_task_result(tmp_path, task_id)
+    assert is_reconciled_presence_placeholder(stored) and calls == []  # still the placeholder, not a phantom running row
+    first = run_presence_turn(**kwargs)
+    assert first.text == "Real answer" and "previous_attempt" in calls[0]["metadata"]["presence"]
+    stored = load_task_result(tmp_path, task_id)
+    assert stored["status"] == STATUS_COMPLETED and stored["superseded_placeholder"]["status"] == STATUS_FAILED

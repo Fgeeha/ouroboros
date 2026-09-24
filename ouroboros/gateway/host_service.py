@@ -686,12 +686,12 @@ async def _api_presence_turn(request: Request) -> JSONResponse:
         return _json_error(str(exc), 403)
     if not ctx.rate_limiter.allow(f"{skill_name}:presence"):
         return _json_error("rate limit exceeded", 429)
-    if not ctx._enter_inflight(f"{skill_name}:presence"):
-        return _json_error("too many in-flight presence requests", 429)
     from ouroboros.presence_admission import PresenceAdmissionError, admit_presence_turn
     from ouroboros.presence_bindings import conversation_key
     from ouroboros.presence_runner import PresenceTurnError, PresenceTurnEvent
 
+    if not ctx._enter_inflight(f"{skill_name}:presence"):
+        return _json_error("too many in-flight presence requests", 429)
     try:
         payload = await request.json()
         if not isinstance(payload, dict) or set(payload) - {

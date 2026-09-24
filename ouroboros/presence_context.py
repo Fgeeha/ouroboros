@@ -114,7 +114,7 @@ def build_presence_context_section(drive_root: Path, value: Any) -> str:
     if isinstance(attempt, Mapping):
         delivered = attempt.get("delivered")
         if not isinstance(delivered, list):
-            detail = "whether it already sent anything is unknown (this transport reports no delivery receipts)"
+            detail = "whether it already sent anything is unknown (no delivery receipts are readable for that attempt)"
         else:
             detail = f"it had already delivered {attempt.get('delivered_count')} message(s)" + (
                 ": " + " / ".join(json.dumps(str(text), ensure_ascii=False) for text in delivered) if delivered else "")

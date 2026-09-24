@@ -6,6 +6,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 
 from ouroboros.presence_admission import PresenceAdmission
 from ouroboros.presence_authority import (
@@ -416,3 +418,39 @@ def test_previous_turn_shows_what_a_transport_tool_delivered(tmp_path):
     sections = [build_presence_context_section(tmp_path, task["metadata"]["presence"]) for task in captured]
     assert 'delivery confirmed): "Schedule: Mon 10:00" / finish note "Sent the schedule".' in sections[0]
     assert "delivered via transport tool (content unrecorded)." in sections[2]
+
+
+def test_previous_turn_pointer_is_rebuilt_by_the_replay_of_a_turn_that_lost_it(tmp_path, monkeypatch):
+    """A turn lost between its terminal write and its pointer write: the retry replays and repairs the pointer."""
+    from ouroboros import presence_runner
+    from ouroboros.presence_bindings import conversation_key
+    from ouroboros.presence_runner import _previous_turn_path
+    from ouroboros.task_results import load_task_result
+
+    room = _previous_turn_path(tmp_path, conversation_key("telegram", "bot-1", "room-1", "topic-1"))
+    older = _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Old answer"})
+    real_write, failures = presence_runner.atomic_write_json, []
+
+    def flaky_pointer_write(path, payload):
+        if pathlib.Path(path) == room and not failures:
+            failures.append(path)
+            raise OSError("disk full")
+        real_write(path, payload)
+
+    monkeypatch.setattr(presence_runner, "atomic_write_json", flaky_pointer_write)
+    with pytest.raises(OSError):
+        _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "New answer"})
+    lost = json.loads(room.read_text(encoding="utf-8"))
+    assert lost["task_id"] == older.task_id  # the durable row completed, the pointer did not follow
+    captured: list = []
+    replay = _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "Must not run"}, captured=captured)
+    assert replay.text == "New answer" and captured == []  # a cached replay, no execution
+    repaired = json.loads(room.read_text(encoding="utf-8"))
+    assert (repaired["task_id"], repaired["message"], repaired["delivery"]) == (replay.task_id, "New answer", "unknown")
+    assert repaired["finished_at"] == load_task_result(tmp_path, replay.task_id)["ts"]
+    _pointer_turn(tmp_path, "e3", {"outcome": "silent", "text": ""}, captured=captured)
+    assert captured[-1]["metadata"]["presence"]["previous_turn"]["task_id"] == replay.task_id
+    newest = room.read_bytes()
+    # The older turn's replay finds a newer pointer and leaves it alone.
+    assert _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Must not run"}, captured=captured) == older
+    assert room.read_bytes() == newest and len(captured) == 1

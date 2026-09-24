@@ -16,6 +16,9 @@ from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.presence_admission import PresenceAdmission
 from ouroboros.presence_authority import presence_ceiling_payload
 from ouroboros.task_results import (
+    STATUS_COMPLETED,
+    STATUS_INTERRUPTED,
+    STATUS_RUNNING,
     is_reconciled_presence_placeholder,
     load_task_result,
     reopen_reconciled_presence_placeholder,
@@ -272,14 +275,24 @@ def _cached_result(drive_root: Path, task_id: str) -> PresenceTurnResult | None:
     return presence_result_from_stored(stored, task_id)
 
 
-def _confirmed_sends(drive_root: Path, task_id: str) -> list[str]:
-    """One text per confirmed part from this task's v1 receipts in the live chat generation."""
+def _live_task_rows(drive_root: Path, task_id: str) -> list[dict[str, Any]]:
+    """This task's rows in the live chat generation, in order; an attempt starts with its inbound row."""
+    return [row for row in iter_jsonl_objects(Path(drive_root) / "logs" / "chat.jsonl") if row.get("task_id") == task_id]
+
+
+def _confirmed_sends(rows: Sequence[Mapping[str, Any]]) -> list[str] | None:
+    """One text per confirmed v1 receipt among *rows*; None once the attempt's rows left the live generation.
+
+    An attempt's rows follow its inbound row, so that row in the live file means every receipt
+    is there too. Without it a rotated archive may hold receipts: the count is unknown, not zero.
+    """
+    if not any(row.get("direction") == "in" for row in rows):
+        return None
     parts: dict[tuple[str, str], str] = {}
-    for row in iter_jsonl_objects(Path(drive_root) / "logs" / "chat.jsonl"):
+    for row in rows:
         transport = row.get("transport") if isinstance(row.get("transport"), dict) else {}
         delivery = transport.get("delivery") if isinstance(transport.get("delivery"), dict) else {}
-        if (row.get("type") == "presence_delivery" and row.get("task_id") == task_id
-                and delivery.get("state") in {"delivered", "accepted"}):
+        if row.get("type") == "presence_delivery" and delivery.get("state") in {"delivered", "accepted"}:
             parts.setdefault((str(delivery.get("delivery_id")), str(delivery.get("part_id"))), str(row.get("text") or ""))
     return list(parts.values())
 
@@ -295,6 +308,37 @@ def _read_previous_turn(drive_root: Path, conversation_key: str) -> dict[str, An
     return row if row.get("conversation_key") == conversation_key else None
 
 
+def _write_previous_turn(drive_root: Path, conversation_key: str, task_id: str, *, outcome: str, message: str,
+                         sends: Sequence[str], work_ref: str, finished_at: str, delivery: str) -> None:
+    atomic_write_json(_previous_turn_path(drive_root, conversation_key), {
+        "conversation_key": conversation_key, "task_id": task_id, "outcome": outcome, "message": message,
+        "transport_sends": [text for text in sends if text], "work_ref": work_ref,
+        "finished_at": finished_at, "delivery": delivery,
+    })
+
+
+def _pointer_behind(drive_root: Path, conversation_key: str, task_id: str) -> bool:
+    """A completed turn whose pointer never landed (lost between its terminal write and the pointer write)."""
+    stored = load_task_result(drive_root, task_id) or {}
+    if str(stored.get("status") or "") != STATUS_COMPLETED:
+        return False
+    pointer = _read_previous_turn(drive_root, conversation_key)
+    return pointer is None or (
+        pointer.get("task_id") != task_id and str(pointer.get("finished_at") or "") <= str(stored.get("ts") or ""))
+
+
+def _repair_previous_turn(drive_root: Path, conversation_key: str, task_id: str) -> None:
+    """Rebuild the pointer from the durable row; the caller holds the conversation lock."""
+    if not _pointer_behind(drive_root, conversation_key, task_id):
+        return
+    stored = load_task_result(drive_root, task_id) or {}
+    replay = presence_result_from_stored(stored, task_id)
+    sends = _confirmed_sends(_live_task_rows(drive_root, task_id)) if replay.delivery_reporting_version else []
+    _write_previous_turn(drive_root, conversation_key, task_id, outcome=replay.outcome, message=replay.text,
+                         sends=sends or [], work_ref=replay.work_ref, finished_at=str(stored.get("ts") or ""),
+                         delivery="confirmed" if sends else "unknown")
+
+
 def _log_dialogue(
     drive_root: Path,
     *,
@@ -308,16 +352,9 @@ def _log_dialogue(
 ) -> None:
     from ouroboros.dialogue_provenance import presence_provenance_from_task
 
-    chat_path = drive_root / "logs" / "chat.jsonl"
-    if direction == "in" and any(
-        row.get("direction") == "in" and row.get("chat_id") == chat_id
-        and row.get("client_message_id") == event.source_event_id
-        for row in iter_jsonl_objects(chat_path)
-    ):
-        return  # a re-run of a host-lost turn: the correspondent's message is already in the room
     state = read_json_dict(drive_root / "state" / "state.json") or {}
     append_jsonl(
-        chat_path,
+        drive_root / "logs" / "chat.jsonl",
         {
             "ts": utc_now_iso(),
             "session_id": state.get("session_id"),
@@ -353,7 +390,8 @@ def _build_task(
     *,
     drive_root: Path,
     staged_files: Sequence[Path],
-    reopened: bool = False,
+    lost_attempt: bool = False,
+    prior_sends: Sequence[str] | None = None,
 ) -> dict[str, Any]:
     from ouroboros.config import runtime_setting
 
@@ -388,9 +426,9 @@ def _build_task(
     previous_turn = _read_previous_turn(drive_root, event.conversation_key)
     if previous_turn:
         presence_context["previous_turn"] = previous_turn
-    if reopened:
-        # A v0 transport reports no receipts, so what the lost attempt sent is unknown (None).
-        sent = _confirmed_sends(drive_root, task_id) if event.delivery_reporting_version else None
+    if lost_attempt:
+        # Unknown (None) when the transport reports no receipts or the attempt's rows left the live generation.
+        sent = prior_sends if event.delivery_reporting_version else None
         presence_context["previous_attempt"] = {
             "delivered_count": None if sent is None else len(sent),
             "delivered": None if sent is None else [text for text in sent if text],
@@ -484,12 +522,15 @@ def run_presence_turn(
 
     task_id = _task_id(admission, event)
     cached = _cached_result(Path(drive_root), task_id)
-    if cached is not None:
+    if cached is not None and not _pointer_behind(Path(drive_root), event.conversation_key, task_id):
         return cached
 
     def execute() -> PresenceTurnResult:
         second_cached = _cached_result(Path(drive_root), task_id)
         if second_cached is not None:
+            # A turn lost between its terminal write and its pointer write replays from the durable
+            # row; its pointer is rebuilt here, under the conversation lock, so no newer turn is undone.
+            _repair_previous_turn(Path(drive_root), event.conversation_key, task_id)
             return second_cached
         with _LIVE_LOCK:
             _LIVE_PRESENCE_TASKS.add(task_id)
@@ -500,27 +541,33 @@ def run_presence_turn(
                 _LIVE_PRESENCE_TASKS.discard(task_id)
 
     def _execute_live() -> PresenceTurnResult:
-        # Both locks are held: no other execution of this conversation can race the reopen.
-        reopened = reopen_reconciled_presence_placeholder(Path(drive_root), task_id)
+        # Both locks are held: no other execution of this conversation runs, so a running or
+        # interrupted row of this task (not yet reconciled) belongs to a lost attempt too.
+        stored = load_task_result(Path(drive_root), task_id) or {}
+        lost_attempt = is_reconciled_presence_placeholder(stored) or str(stored.get("status") or "") in {
+            STATUS_RUNNING, STATUS_INTERRUPTED}
+        prior_rows = _live_task_rows(Path(drive_root), task_id) if lost_attempt else []
         task = _build_task(
             admission,
             event,
             drive_root=Path(drive_root),
             staged_files=tuple(Path(item) for item in staged_files),
-            reopened=reopened,
+            lost_attempt=lost_attempt,
+            prior_sends=_confirmed_sends(prior_rows) if lost_attempt else None,
         )
         chat_id = int(task["chat_id"])
         actor_id = _stable_numeric_id("presence-actor-log", str(task.get("actor_id") or ""))
-        _log_dialogue(
-            Path(drive_root),
-            direction="in",
-            chat_id=chat_id,
-            user_id=actor_id,
-            text=event.text or task["text"],
-            event=event,
-            task=task,
-            task_id=task_id,
-        )
+        if not any(row.get("direction") == "in" for row in prior_rows):  # the lost attempt already logged it
+            _log_dialogue(
+                Path(drive_root),
+                direction="in",
+                chat_id=chat_id,
+                user_id=actor_id,
+                text=event.text or task["text"],
+                event=event,
+                task=task,
+                task_id=task_id,
+            )
         if agent_factory is None:
             from ouroboros.agent import make_agent
 
@@ -532,6 +579,8 @@ def run_presence_turn(
             drive_root=str(drive_root),
             event_queue=event_queue,
         )
+        # The host mark moves aside only now: a rejected build or a failed factory leaves it intact.
+        reopen_reconciled_presence_placeholder(Path(drive_root), task_id)
         events = agent.handle_task(task)
         row = next((item for item in events if item.get("type") == "presence_result"), None)
         if not isinstance(row, dict):
@@ -556,15 +605,13 @@ def run_presence_turn(
             )
         # Still under the conversation lock; cached replays return before execute() and
         # never write, so an older replay cannot overwrite the newest executed turn.
-        sends = _confirmed_sends(Path(drive_root), task_id) if event.delivery_reporting_version else []
-        delivery = "unknown"
-        if event.delivery_reporting_version and (sends or result.text):
+        sends = _confirmed_sends(_live_task_rows(Path(drive_root), task_id)) if event.delivery_reporting_version else []
+        delivery = "unknown"  # also when a mid-turn rotation hid this turn's receipts (sends is None)
+        if sends is not None and event.delivery_reporting_version and (sends or result.text):
             delivery = "confirmed" if sends else "authored"  # the v1 reply's receipt arrives after this return
-        atomic_write_json(_previous_turn_path(Path(drive_root), event.conversation_key), {
-            "conversation_key": event.conversation_key, "task_id": task_id, "outcome": result.outcome,
-            "message": str(row.get("message") or result.text), "transport_sends": [text for text in sends if text],
-            "work_ref": result.work_ref, "finished_at": utc_now_iso(), "delivery": delivery,
-        })
+        _write_previous_turn(Path(drive_root), event.conversation_key, task_id, outcome=result.outcome,
+                             message=str(row.get("message") or result.text), sends=sends or [],
+                             work_ref=result.work_ref, finished_at=utc_now_iso(), delivery=delivery)
         return result
 
     return (gate or _configured_gate(Path(drive_root))).run(event.conversation_key, execute)
