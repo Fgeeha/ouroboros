@@ -107,7 +107,8 @@ def _check_budget_limits(
     # very number that paused the task; the ledger fence at the full cap still
     # arbitrates every send. A stop that needs no wrap-up room at all
     # (``wrapup_fits is False``) is unchanged.
-    last_fit_relaxed = _last_fit_relaxed(ctx)
+    last_fit_relaxed = bool(getattr(getattr(getattr(ctx, "tools", None), "_ctx", None),
+                                    "_budget_resume_last_fit_relaxed", False))
     if prompt_estimate > 0 and (global_remaining is not None or (cost_ceiling.root_cap_usd is not None and deciding is not None)):
         finish_reason = task_pacing.wrapup_last_fit_text(deciding, cost_ceiling, global_remaining)
         forced_prompt = f"[BUDGET LIMIT] {finish_reason} {_loop()._FORCED_BEST_EFFORT_TAIL}"
@@ -205,12 +206,6 @@ def _check_budget_limits(
     return None
 
 
-def _last_fit_relaxed(ctx: "_RoundLimitContext") -> bool:
-    """Whether the resumed loop's explicit owner Resume relaxed the last-fit rail (Q10)."""
-    tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
-    return bool(getattr(tool_ctx, "_budget_resume_last_fit_relaxed", False))
-
-
 def _second_reservation_fits(ctx: "_RoundLimitContext", wrapup_args: Dict[str, Any],
                              wrapup_fits: Optional[bool], *, relaxed: bool) -> Optional[bool]:
     """The two-reservation (last-fit) probe, or ``None`` when it does not decide.
@@ -272,9 +267,13 @@ _TREE_ACCOUNTING_MAX_STALE_SEC = 120.0
 
 
 def _loop_tree_accounting(
-    *, refresh: bool, max_age_sec: float = 30.0,
+    *, refresh: bool, max_age_sec: float = 30.0, strict: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Return nullable, bounded-stale spend for the current task's root tree."""
+    """Return nullable, bounded-stale spend for the current task's root tree.
+
+    ``strict`` is the money reader's contract (``refresh_root_accounting``):
+    one fresh successful observation or ``None``, never the display cache.
+    """
     try:
         from ouroboros.usage_accounting import (
             current_usage_scope,
@@ -286,7 +285,8 @@ def _loop_tree_accounting(
         if scope is None or not scope.root_task_id:
             return None
         if refresh:
-            return refresh_root_accounting(scope.drive_root, scope.root_task_id, max_age_sec=max_age_sec)
+            return refresh_root_accounting(scope.drive_root, scope.root_task_id,
+                                           max_age_sec=max_age_sec, strict=strict)
         return last_root_accounting(scope.root_task_id)
     except Exception:
         log.debug("Tree accounting telemetry unavailable", exc_info=True)

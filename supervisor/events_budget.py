@@ -696,12 +696,16 @@ def hold_root_resume_descendants(q: Any, root_id: str, fence: dict, grant: dict)
 
     A fence-derived marker is not a checkpoint: convert it to a selection hold
     before removing its fence, or it would be stranded. Older exact child grants
-    are revoked and selected again under this root grant. Return hold/marker
-    changes for the Resume transaction's snapshot rollback; revocations stay safe.
+    are revoked and selected again under this root grant. A sibling still held
+    from an EARLIER Resume of this root (pauseA -> Resume -> pauseB -> Resume) is
+    re-bound to the live grant in the same pass, so it stays selectable instead
+    of refused forever as stale. Return ``(held, markers, rebound)``: the hold and
+    marker changes and the prior re-bound holds, for the Resume transaction's
+    snapshot rollback; revocations stay safe.
     """
     from supervisor.budget_resume import revoke_exact_budget_resume
 
-    held, markers = [], {}
+    held, markers, rebound = [], {}, {}
     for member in q.PENDING:
         member_id = str(member.get("id") or "")
         if not member_id or member_id == root_id or str(member.get("root_task_id") or "") != root_id:
@@ -712,7 +716,14 @@ def hold_root_resume_descendants(q: Any, root_id: str, fence: dict, grant: dict)
         fence_derived = bool(isinstance(pause, dict) and not pause.get("exact_continuation")
                              and pause.get("scope") == "root" and pause.get("root_task_id") == root_id
                              and pause.get("fence_id") == fence.get("fence_id"))
-        if (pause is not None and not fence_derived) or isinstance(member.get(BUDGET_HOLD_KEY), dict):
+        hold = member.get(BUDGET_HOLD_KEY) if isinstance(member.get(BUDGET_HOLD_KEY), dict) else None
+        if (hold is not None and not hold.get("selected") and str(hold.get("reason") or "") == HOLD_ROOT_FENCE_LIFTED
+                and str(hold.get("root_grant_id") or "") != grant["grant_id"]):
+            rebound[member_id] = dict(hold)
+            member[BUDGET_HOLD_KEY] = {**hold, "root_grant_id": grant["grant_id"],
+                                       "root_resume_generation": int(grant["generation"]),
+                                       "rebound_at": utc_now_iso()}
+        if (pause is not None and not fence_derived) or hold is not None:
             continue
         if fence_derived:
             markers[member_id] = member.pop("_budget_pause")
@@ -724,30 +735,7 @@ def hold_root_resume_descendants(q: Any, root_id: str, fence: dict, grant: dict)
                    **({"replaced_fence_marker": True} if fence_derived else {})},
             result_root=pathlib.Path(member.get("budget_drive_root") or q.DRIVE_ROOT))
         held.append(member_id)
-    rebound = refresh_root_grant_holds(q.PENDING, root_id, grant_id=grant["grant_id"], generation=grant["generation"])
     return held, markers, rebound
-
-
-def refresh_root_grant_holds(pending: Any, root_task_id: str, *, grant_id: str,
-                             generation: int) -> Dict[str, Dict[str, Any]]:
-    """Re-bind every unselected fence-lifted hold of ``root_task_id`` to its NEW grant.
-
-    A root that paused again and was resumed again carries a newer grant; a
-    sibling held from the earlier Resume must be selectable under the live one,
-    not refused forever as stale. Returns the prior holds keyed by task id for
-    rollback when the snapshot cannot be persisted.
-    """
-    prior: Dict[str, Dict[str, Any]] = {}
-    for member in pending:
-        hold = member.get(BUDGET_HOLD_KEY) if isinstance(member, dict) and isinstance(member.get(BUDGET_HOLD_KEY), dict) else None
-        if (hold is None or hold.get("selected") or str(hold.get("reason") or "") != HOLD_ROOT_FENCE_LIFTED
-                or str(hold.get("root_task_id") or member.get("root_task_id") or "") != root_task_id
-                or str(hold.get("root_grant_id") or "") == grant_id):
-            continue
-        prior[str(member.get("id") or "")] = dict(hold)
-        member[BUDGET_HOLD_KEY] = {**hold, "root_grant_id": grant_id, "root_resume_generation": int(generation),
-                                   "rebound_at": utc_now_iso()}
-    return prior
 
 
 def select_held_budget_row(q: Any, task: Dict[str, Any], hold: Dict[str, Any],

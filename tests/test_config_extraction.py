@@ -77,7 +77,6 @@ _ADDED_OWNERS = {
     "OPTIONAL_BOUND_LEGACY": settings_scales,
     "_WARNED_OPTIONAL_BOUNDS": settings_scales,
     "optional_bound_value": settings_scales,
-    "coerce_optional_bound": settings_scales,
     "defaults_for_settings_document": settings_scales,
     "_optional_bound_setting": runtime_limits,
     "get_max_rounds": runtime_limits,

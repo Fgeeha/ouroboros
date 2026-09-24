@@ -203,6 +203,15 @@ def test_gate_keeps_the_same_executor_and_workspace_authority(tmp_path):
     facts, code, _d = _gate(tmp_path, "run-shape", access="workspace_write", mode="agent", isolation="live",
                             target_root="/t")
     assert code == "" and facts["prior_target_root"] == "/t" and facts["prior_patch_disposition"] == "not_applicable"
+    # ...and its host block says the tree ALREADY holds its in-place work: a run that
+    # captured no patch because it wrote directly is not a read-only run.
+    assert facts["prior_access"] == "workspace_write"
+    in_place = continuation.continuation_instruction(facts)
+    assert "wrote DIRECTLY into the authority target" in in_place and "already contains" in in_place
+    assert "read-only" not in in_place
+    readonly_facts, code, _d = _gate(tmp_path, "run-actor", actor="actor-a")
+    assert code == "" and readonly_facts["prior_access"] == "readonly"
+    assert "(a read-only run)" in continuation.continuation_instruction(readonly_facts)
 
 
 def test_gate_admits_only_a_finite_leaf_cap_the_nanny_asked_for(tmp_path):

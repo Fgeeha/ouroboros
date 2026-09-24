@@ -51,17 +51,19 @@ def test_one_strict_vocabulary_shared_with_the_review_cycle_cap():
 
 
 def test_a_typo_is_the_finite_legacy_value_never_unlimited():
-    from ouroboros.settings_scales import OPTIONAL_BOUND_LEGACY, coerce_optional_bound, optional_bound_value
+    from ouroboros import config as cfg
+    from ouroboros.settings_scales import OPTIONAL_BOUND_LEGACY, optional_bound_value
 
     assert OPTIONAL_BOUND_LEGACY == {"OUROBOROS_MAX_ROUNDS": 200, "OUROBOROS_TASK_ABS_CEILING_SEC": 21600}
     for key in BOUNDS:
         legacy = OPTIONAL_BOUND_LEGACY[key]
         for bad in ("", None, 0, "0", -5, "abc", "1.5", True):
             assert optional_bound_value(key, bad) == legacy, (key, bad)
-            assert coerce_optional_bound(key, bad) == legacy, (key, bad)
-        assert coerce_optional_bound(key, "UNLIMITED") == "unlimited"
-        assert coerce_optional_bound(key, 10800.0) == 10800, "a harness-written integral float"
-        assert coerce_optional_bound(key, "900") == 900
+            assert cfg._coerce_setting_value(key, bad) == legacy, (key, bad)
+        # The settings-document spelling is the parent's one read seam: "unlimited" or a positive int.
+        assert cfg._coerce_setting_value(key, "UNLIMITED") == "unlimited"
+        assert cfg._coerce_setting_value(key, 10800.0) == 10800, "a harness-written integral float"
+        assert cfg._coerce_setting_value(key, "900") == 900
 
 
 def test_fresh_install_is_unlimited_and_an_existing_document_keeps_its_bounds(isolated_settings):

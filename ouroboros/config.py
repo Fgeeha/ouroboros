@@ -47,7 +47,7 @@ from ouroboros.settings_defaults import (
 )
 from ouroboros.settings_scales import (
     EFFORT_SCALE, OPTIONAL_BOUND_LEGACY, UNLIMITED,  # noqa: F401
-    PROMPT_CACHE_TTL_SCALE, coerce_optional_bound, defaults_for_settings_document,  # noqa: F401
+    PROMPT_CACHE_TTL_SCALE, defaults_for_settings_document, optional_bound_value,  # noqa: F401
     VALID_RUNTIME_MODES,  # noqa: F401
     VALID_SAFETY_MODES,  # noqa: F401
     _RUNTIME_MODE_RANK,  # noqa: F401
@@ -679,8 +679,9 @@ def _coerce_setting_value(key: str, value):
         return normalize_update_channel(value)
     if key == "OUROBOROS_CONTEXT_MODE":
         return normalize_context_mode(value)
-    if key in OPTIONAL_BOUND_LEGACY:  # "unlimited" or a positive int; a typo is finite
-        return coerce_optional_bound(key, value)
+    if key in OPTIONAL_BOUND_LEGACY:  # the document spelling: "unlimited" or a positive int; a typo is finite
+        bound = optional_bound_value(key, value)
+        return UNLIMITED if bound is None else bound
     # Trim so whitespace-only config is not treated as a configured skills repo.
     if key == "OUROBOROS_SKILLS_REPO_PATH":
         return str(value or "").strip()

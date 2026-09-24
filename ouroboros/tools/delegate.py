@@ -120,6 +120,7 @@ from ouroboros.delegate_shared import (  # noqa: F401
 # (same objects) because sibling code and the tests address it on THIS surface.
 # `_fail` is NOT re-imported from it — the one shared refusal author is
 # `delegate_shared._fail`, which delegate_integration itself imports.
+from ouroboros.delegate_continuation import start_binding
 from ouroboros.tools.delegate_integration import (  # noqa: F401
     _CAPTURE_DELEGATED_SNAPSHOT,
     _capture_block,
@@ -330,9 +331,9 @@ def _start_argument_refusal(ctx: ToolContext, text: str, selector_root: str, ret
     the daemon is touched, in their historical order. Each is a definite no-run: an
     empty prompt, a malformed exact-resource selector, a deadline already behind the
     nanny (``definitely_unrun`` = the producer's own no-run verdict, P2), and the
-    continuation selector shapes one call cannot combine."""
-    from ouroboros.delegate_continuation import selector_refusal
-
+    continuation selector shapes one call cannot combine: a retry replays an old
+    key byte-identically while a continuation is a NEW intention over a settled
+    run, and a skill-payload selector run keeps its own target semantics."""
     if not text.strip():
         return "", _fail("delegate_start", "empty_prompt", "prompt is required")
     refusal = _payload_selector_refusal(selector_root, retry_of, bucket, skill_name)
@@ -345,7 +346,16 @@ def _start_argument_refusal(ctx: ToolContext, text: str, selector_root: str, ret
             "would outlive it by design. Finalize with what you have — do not start "
             "new work a deadline has already closed.", definitely_unrun=True,
         )
-    return selector_refusal(continue_from, retry_of, selector_root)
+    token = str(continue_from or "").strip()
+    if token and str(retry_of or "").strip():
+        return token, _fail("delegate_start", "continuation_selector_conflict",
+                            "continue_from starts a NEW run bound to a settled predecessor; retry_of replays a "
+                            "pending invocation. Supply one of them.", definitely_unrun=True)
+    if token and str(selector_root or "").strip():
+        return token, _fail("delegate_start", "continuation_resource_conflict",
+                            "continue_from applies to ordinary workspace delegation only; a skill-payload "
+                            "selector run is started plain.", definitely_unrun=True)
+    return token, None
 
 
 def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = None,
@@ -481,8 +491,6 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             invocation_id = custody.new_invocation_id()
             root = record_auth["target_root"]
             if continuation_token:  # #1196: gated from durable custody, before any snapshot exists
-                from ouroboros.delegate_continuation import start_binding
-
                 continuation, continuation_block, refusal = start_binding(
                     ctx, drive, continuation_token, actor=actor, route=route, authority=authority,
                     target_root=str(record_auth.get("target_root") or ""),
@@ -947,12 +955,6 @@ def bounded_max_seconds(ctx: ToolContext, requested: Optional[int]) -> MaxSecond
     return MaxSecondsBound(min(_CLAUDEXOR_MAX_SECONDS, int(operation_window_sec(None))), CAP_BASIS_OPERATION_WINDOW)
 
 
-def _bounded_max_seconds(ctx: ToolContext, requested: Optional[int]) -> int:
-    """The seconds of ``bounded_max_seconds`` (0 on a typed refusal) — the
-    historical integer view the tests and the wait clamp still address."""
-    return bounded_max_seconds(ctx, requested).seconds
-
-
 def _halt_breached_run(ctx: ToolContext, gateway: Any, entry: _RunCustody,
                        breach: _Breach) -> str:
     """Stop a run the engine did not contain as asked, and say exactly what failed.
@@ -1015,7 +1017,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     18 rounds, 861k prompt tokens, for a run that was doing fine). Progress is the
     JOURNAL cursor, so SSE ``: ping`` keepalives cannot masquerade as it.
 
-    NARROW-ONLY, like ``_bounded_max_seconds``: the wait may not outlive the nanny's own
+    NARROW-ONLY, like ``bounded_max_seconds``: the wait may not outlive the nanny's own
     deadline, minus the finalization grace it needs to answer at all. This tool is absent
     from ``_DEADLINE_CLAMPED_TOOLS`` (its ToolEntry value IS its outer bound), so nothing
     upstream cuts it — measured, a 2100s window against ten seconds of remaining deadline

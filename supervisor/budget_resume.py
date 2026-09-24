@@ -25,17 +25,6 @@ from ouroboros.utils import utc_now_iso
 log = logging.getLogger(__name__)
 
 
-def _queue_module():
-    from supervisor import queue
-
-    return queue
-
-
-# A root-tree accounting snapshot older than this at grant time is the
-# refresher's stale fallback (the ledger could not answer now), not authority.
-_FRESH_ROOT_ACCOUNTING_MAX_AGE_SEC = 5.0
-
-
 def _root_budget_paused_locked(q: Any, root_task_id: str, *, except_task_id: str = "") -> bool:
     """Whether the ROOT of a tree is itself still budget-paused (queue lock held).
 
@@ -81,9 +70,9 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
         hold_budget_row, live_root_resume_grant, hold_root_resume_descendants,
         release_budget_hold,
     )
+    from supervisor import queue as q
     from supervisor.state import budget_remaining
 
-    q = _queue_module()
     task_id = str(task.get("id") or "")
     checkpoint = pause.get("checkpoint") if isinstance(pause.get("checkpoint"), dict) else {}
     pause_id = str(checkpoint.get("pause_id") or "")
@@ -211,15 +200,13 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
     if str(pause.get("scope") or "") == "root":
         from ouroboros.usage_accounting import refresh_root_accounting
 
-        tree = refresh_root_accounting(result_root, root_task_id, max_age_sec=0.0)
+        # ONE fresh successful ledger observation is this grant's monetary
+        # authority: the strict read never answers from the display cache, so
+        # a snapshot cached before a read that just failed cannot pose as room.
+        tree = refresh_root_accounting(result_root, root_task_id, strict=True)
         if not isinstance(tree, dict):
             # Unknown tree spend is not room: an unreadable ledger refuses typed.
             return {"ok": False, "error": "root_accounting_unavailable",
-                    "action": "retry_or_cancel"}
-        if float(tree.get("age_sec") or 0.0) > _FRESH_ROOT_ACCOUNTING_MAX_AGE_SEC:
-            # A stale fallback is not this grant's monetary authority.
-            return {"ok": False, "error": "root_accounting_unavailable",
-                    "tree_age_sec": round(float(tree.get("age_sec") or 0.0), 1),
                     "action": "retry_or_cancel"}
         if tree.get("integrity_degraded"):
             return {"ok": False, "error": "root_accounting_degraded",
@@ -379,8 +366,8 @@ def revoke_exact_budget_resume(task: Dict[str, Any], reason: str) -> bool:
         HOLD_GRANT_CONSUMED_STALE_ROW, HOLD_RECORD_UNREADABLE_AT_REVOKE, HOLD_RESTART_REVOCATION_UNWRITTEN,
         HOLD_REVOCATION_UNWRITTEN, HOLD_STALE_GRANT_SUPERSEDED, HOLD_MALFORMED_RESUME_IDENTITY, hold_budget_row,
     )
+    from supervisor import queue as q
 
-    q = _queue_module()
     handoff = task.get("_budget_pause_resume") if isinstance(task.get("_budget_pause_resume"), dict) else None
     if handoff is None:
         return False

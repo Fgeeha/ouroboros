@@ -39,13 +39,11 @@ def test_explicit_resume_relaxes_the_last_fit_two_reservation_rail(monkeypatch):
                         lambda **kw: calls.append(kw.get("reservation_count")) or False)
     relaxed = SimpleNamespace(tools=SimpleNamespace(_ctx=SimpleNamespace(_budget_resume_last_fit_relaxed=True)),
                               accumulated_usage={}, round_idx=5)
-    assert loop_budget._last_fit_relaxed(relaxed) is True
     assert loop_budget._second_reservation_fits(relaxed, {"x": 1}, True, relaxed=True) is None
     assert relaxed.accumulated_usage["budget_resume_last_fit_admitted"] == {
         "round_idx": 5, "reservations_affordable": 1, "basis": "owner_resume_relaxed_last_fit"}
     assert calls == [2]
     strict = SimpleNamespace(tools=SimpleNamespace(_ctx=SimpleNamespace()), accumulated_usage={}, round_idx=5)
-    assert loop_budget._last_fit_relaxed(strict) is False
     assert loop_budget._second_reservation_fits(strict, {"x": 1}, True, relaxed=False) is False
     assert "budget_resume_last_fit_admitted" not in strict.accumulated_usage
     # A harder stop (one reservation does not fit) already decides: no probe at all.
@@ -61,7 +59,7 @@ def test_restore_refusal_is_typed_and_a_panic_flag_is_a_resume_refusal_not_a_res
     assert budget_pause.budget_pause_restore_refusal(tmp_path, task) == ""
     (tmp_path / "state").mkdir(exist_ok=True)
     (tmp_path / "state" / "panic_stop.flag").write_text("panic")
-    assert budget_pause.restore_budget_pause_allowed(tmp_path, task) is True  # restorable; not dispatchable
+    assert budget_pause.budget_pause_restore_refusal(tmp_path, task) == ""  # restorable; not dispatchable
     assert queue.resume_budget_paused_task("typed-1")["error"] == "restart_no_resume"
     (tmp_path / "state" / "panic_stop.flag").unlink()
     assert budget_pause.budget_pause_restore_refusal(tmp_path, {"id": "typed-1"}) == budget_pause.RESTORE_REFUSAL_NOT_EXACT

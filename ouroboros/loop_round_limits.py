@@ -611,6 +611,11 @@ def _handle_model_wait_control(
     from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait
 
     reason = error.control_reason
+    # Routed ONCE: whatever this rail re-raises is final for the loop (the
+    # supervisor owns a Stop's settlement); the loop's outer handler, which
+    # catches a hold's interruption raised outside the model call, must not
+    # hand the same error back here.
+    error.control_rails_seen = True
     if reason not in {"cancelled", "finalize_requested", "deadline", "execution_deadline", "absolute_ceiling"}:
         raise error
     owner = current_model_wait()
@@ -618,7 +623,9 @@ def _handle_model_wait_control(
     intent = active_intent(root, ctx.task_id) if root is not None else None
     hard_stop = isinstance(intent, dict) and stop_policy(intent) == STOP_POLICY_IMMEDIATE
     if hard_stop and owner is not None and owner.worker_slot_held:
-        raise ModelWaitInterrupted("cancelled", role=error.model_role, cause=error) from error
+        final = ModelWaitInterrupted("cancelled", role=error.model_role, cause=error)
+        final.control_rails_seen = True
+        raise final from error
 
     controls = _drain_incoming_messages(
         ctx.messages, ctx.incoming_messages or queue.Queue(), ctx.drive_root,

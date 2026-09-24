@@ -320,3 +320,103 @@ def test_direct_actor_releases_local_fence_after_parking_same_id(tmp_path, monke
         assert queue.resume_budget_paused_task("direct")["ok"]
     finally:
         budget_pause.end_dispatch_fence("direct")
+
+
+def test_direct_actor_releases_local_fence_even_when_the_inline_park_fails(tmp_path, monkeypatch):
+    """Negative twin of the inline park: when the in-process park raises, the pause
+    event takes the ordinary supervisor path (never lost) AND the turn's local
+    dispatch fence is still released — the actor has unwound, and a fence left
+    closed in the supervisor process would refuse the resumed turn's sends."""
+    from ouroboros import budget_pause
+    from supervisor import events_budget, message_bus, worker_chat_lane
+    from tests.test_budget_pause_exact import _fast_hold, _quiet_external
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 5.0)
+    ctx, limit = _loop_ctx(tmp_path, "direct-fb", direct=True)
+    ctx.current_chat_id = 7
+    _fast_hold(monkeypatch, budget_pause)
+    _quiet_external(monkeypatch, budget_pause)
+    with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
+        budget_pause.request_pause(limit, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
+                                   scope="global", reason_text="budget")
+    task = {"id": "direct-fb", "type": "task", "chat_id": 7, "text": "work",
+            "project_id": "fixture", "_is_direct_chat": True}
+    events, released = [], []
+    monkeypatch.setattr(workers, "get_event_q", lambda: SimpleNamespace(put=events.append))
+    monkeypatch.setattr(message_bus, "get_bridge", lambda: SimpleNamespace(push_log=lambda _evt: None))
+    monkeypatch.setattr(events_budget, "install_exact_budget_pause",
+                        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("queue lock unavailable")))
+    agent = SimpleNamespace(handle_task=lambda _task: [budget_pause.pause_event(task, raised.value.pause)])
+    assert budget_pause.dispatch_fenced("direct-fb")
+    try:
+        assert worker_chat_lane._execute_chat_task({"task": task, "agent": agent, "chat_id": 7,
+                                                    "registry": SimpleNamespace(unregister=released.append)})
+        assert released == ["direct-fb"] and not budget_pause.dispatch_fenced("direct-fb")
+        # The pause was not parked here, so its event reached the ordinary path intact.
+        assert [e["type"] for e in events] == ["budget_pause"] and events[0]["_is_direct_chat"] is True
+        assert workers.PENDING == []
+    finally:
+        budget_pause.end_dispatch_fence("direct-fb")
+
+
+def _bare_loop(tmp_path, monkeypatch):
+    """The lightest real ``run_llm_loop`` driver: a bare registry, review off, no model."""
+    from ouroboros import loop as loop_mod
+    from ouroboros.tools.registry import ToolRegistry
+
+    monkeypatch.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    monkeypatch.setattr(loop_mod, "call_llm_with_retry",
+                        lambda *_a, **_k: pytest.fail("a control-ended hold buys no model call"))
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    return loop_mod, registry
+
+
+def _run(loop_mod, registry, tmp_path, task_id):
+    import queue as queue_mod
+
+    return loop_mod.run_llm_loop(
+        messages=[{"role": "user", "content": "go"}], tools=registry,
+        llm=SimpleNamespace(default_model=lambda: "test-model"), drive_logs=tmp_path,
+        emit_progress=lambda _text, *, incident=None: None, incoming_messages=queue_mod.Queue(),
+        task_id=task_id, drive_root=tmp_path)
+
+
+def test_hold_ended_by_deadline_outside_the_model_call_is_a_truthful_terminal(tmp_path, monkeypatch):
+    """A budget-pause HOLD ended by the task's own deadline raises ``ModelWaitInterrupted``
+    from the budget tails, OUTSIDE the model-call try. The loop rejoins the same
+    control rails a live wait uses — a no-call ``deadline_local`` terminal — instead
+    of surfacing a generic task exception (``infra_failed``/``task_exception``)."""
+    from ouroboros.model_wait import ModelWaitInterrupted
+
+    loop_mod, registry = _bare_loop(tmp_path, monkeypatch)
+    # The pre-round exit (soft landing -> request_pause -> hold) is where the hold lives.
+    monkeypatch.setattr(loop_mod, "_maybe_early_finalize",
+                        lambda *_a, **_k: (_ for _ in ()).throw(ModelWaitInterrupted("deadline")))
+    text, usage, trace = _run(loop_mod, registry, tmp_path, "hold-deadline")
+    assert usage["execution_status"] == "failed" and usage["reason_code"] == "deadline_local"
+    assert trace["forced_finalization"]["control_reason"] == "deadline"
+    assert isinstance(text, str) and text
+
+
+def test_an_interruption_the_model_call_rail_already_routed_is_not_routed_twice(tmp_path, monkeypatch):
+    """The outer rail is for holds only: a Stop the model-call handler re-raised (the
+    supervisor owns its settlement) keeps propagating with its evidence, and the
+    control handler runs exactly once for it."""
+    from ouroboros.model_wait import ModelWaitInterrupted
+
+    loop_mod, registry = _bare_loop(tmp_path, monkeypatch)
+    monkeypatch.setattr(loop_mod, "_call_round_model",
+                        lambda _call: (_ for _ in ()).throw(ModelWaitInterrupted("cancelled")))
+    real = loop_mod._handle_model_wait_control
+    routed = []
+
+    def counting(ctx, error, **kw):
+        routed.append(error.control_reason)
+        return real(ctx, error, **kw)
+
+    monkeypatch.setattr(loop_mod, "_handle_model_wait_control", counting)
+    with pytest.raises(ModelWaitInterrupted) as raised:
+        _run(loop_mod, registry, tmp_path, "stop-once")
+    assert routed == ["cancelled"] and raised.value.control_rails_seen is True
+    assert isinstance(getattr(raised.value, "_ouroboros_loop_usage", None), dict)

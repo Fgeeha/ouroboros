@@ -731,6 +731,22 @@ def run_llm_loop(
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="budget")
         return _handle_budget_exceeded(
             exc, exit_ctx, limit_ctx=limit_ctx, episode=transport_wait)
+    except ModelWaitInterrupted as error:
+        # A budget-pause HOLD ended by the task's own controls (Stop/Panic/deadline/
+        # lifetime) raises OUTSIDE the model-call try above: the budget tails run
+        # between calls. It rejoins the SAME control rails a live model wait uses
+        # (a truthful deadline/stop terminal, no paid call), never the generic task
+        # exception. An interruption those rails already routed once (the model-call
+        # handler re-raises Stop for the supervisor's settlement) keeps its evidence.
+        controlled = None
+        if limit_ctx is not None and not getattr(error, "control_rails_seen", False):
+            controlled = _handle_model_wait_control(limit_ctx, error, transport_episode=transport_wait)
+        if controlled is None:
+            exit_ctx.attach_exception_evidence(error)
+            raise
+        text, accumulated_usage, forced_trace = controlled
+        _merge_finalization_trace(llm_trace, forced_trace)
+        return text, accumulated_usage, llm_trace
     except Exception as exc:
         exit_ctx.attach_exception_evidence(exc)
         raise

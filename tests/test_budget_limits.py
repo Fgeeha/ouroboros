@@ -759,6 +759,34 @@ class TestRootAccountingTelemetry:
         entry = usage_accounting.refresh_root_accounting(tmp_path, "root-t-3")
         assert entry is not None and entry["accounted_usd"] == 3.0
 
+    def test_strict_read_never_answers_from_the_cache(self, tmp_path, monkeypatch):
+        """Money readers (#1196): a snapshot cached a moment ago is not an
+        observation of the ledger NOW. A failed strict read returns None even
+        beside a fresh cache; a successful one returns the fresh numbers and
+        refreshes the display cache; the display reader keeps its fallback."""
+        from ouroboros import usage_accounting
+
+        usage_accounting._stash_root_accounting("root-strict", 3.0, 10.0)
+        assert usage_accounting.last_root_accounting("root-strict")["age_sec"] < 1.0
+
+        def _boom(*a, **k):
+            raise RuntimeError("ledger unavailable")
+
+        monkeypatch.setattr(usage_accounting, "usage_projection", _boom)
+        # Negative: the 0-age cache is exactly what a strict reader must NOT get.
+        assert usage_accounting.refresh_root_accounting(tmp_path, "root-strict", strict=True) is None
+        assert usage_accounting.refresh_root_accounting(tmp_path, "root-strict", max_age_sec=30.0,
+                                                        strict=True) is None
+        # The display reader still falls back to the last snapshot, never to $0.
+        display = usage_accounting.refresh_root_accounting(tmp_path, "root-strict", max_age_sec=0.0)
+        assert display is not None and display["accounted_usd"] == 3.0
+        # Positive: a fresh successful read is the observation, and it refreshes the cache.
+        monkeypatch.setattr(usage_accounting, "usage_projection",
+                            lambda *a, **k: {"accounted_usd": 4.5, "limit_usd": 10.0})
+        fresh = usage_accounting.refresh_root_accounting(tmp_path, "root-strict", strict=True)
+        assert fresh["accounted_usd"] == 4.5 and fresh["age_sec"] < 1.0
+        assert usage_accounting.last_root_accounting("root-strict")["accounted_usd"] == 4.5
+
     def test_reserve_attempt_piggybacks_tree_sum(self, tmp_path):
         """The stash is a byproduct of the existing in-lock computation — no new
         ledger read path (the e4a87344 starvation constraint)."""

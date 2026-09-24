@@ -152,12 +152,22 @@ def refresh_root_accounting(
     root_task_id: str,
     *,
     max_age_sec: float = 0.0,
+    strict: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Refresh a stale root snapshot; on failure return stale/None, never fake $0."""
+    """Refresh a stale root snapshot; on failure return stale/None, never fake $0.
+
+    A DISPLAY reader (``strict=False``) may take the age-bounded cache and, when
+    the ledger cannot answer now, the last snapshot it did answer with. A MONEY
+    reader (``strict=True``: the exact-pause grant, the Q10 threshold refresh)
+    gets ONE fresh successful observation or ``None``: a snapshot cached before
+    a read that just failed is unknown spend, not room, and this is the one
+    place that rule lives (#1196). The successful read still refreshes the
+    display cache.
+    """
     root_task_id = str(root_task_id or "").strip()
     if not root_task_id:
         return None
-    cached = last_root_accounting(root_task_id)
+    cached = None if strict else last_root_accounting(root_task_id)
     if cached is not None and max_age_sec > 0 and cached["age_sec"] <= max_age_sec:
         return cached
     try:
@@ -189,13 +199,6 @@ class DispatchFenced(BudgetExceeded):
     stop it is; ``limit_scope="pausing"`` names the fence. Nothing sent after
     the fence closed can outrun the pause checkpoint (#1196).
     """
-
-    def __init__(self, task_id: str) -> None:
-        super().__init__(
-            f"model dispatch fenced: task {task_id} is entering an exact budget pause",
-            limit_scope="pausing",
-        )
-        self.task_id = str(task_id or "")
 
 
 class PhysicalAttemptLimitExceeded(UsageAccountingError):
@@ -859,7 +862,9 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
     if dispatch_fenced(scope.task_id):
         # Process-local pause fence: no NEW send (loop, tool, reviewer, verdict
         # extraction) under a task that is writing its exact pause checkpoint.
-        raise DispatchFenced(scope.task_id)
+        raise DispatchFenced(
+            f"model dispatch fenced: task {scope.task_id} is entering an exact budget pause",
+            limit_scope="pausing", root_task_id=scope.root_task_id)
     root = _drive_root(scope.drive_root)
     root_fence = _active_root_budget_fence(root, scope.root_task_id)
     if root_fence is not None:

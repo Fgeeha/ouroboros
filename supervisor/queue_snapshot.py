@@ -425,15 +425,6 @@ def _refuse_restore_invalid_fences(snapshot_pending: list, *, budget: bool = Fal
     return len(retained)
 
 
-def _hold_acceptance_fenced_pause(task: dict) -> dict:
-    """An acceptance fence over the root holds a saved mid-run pause; it never cancels it."""
-    from supervisor.events_budget import HOLD_ROOT_ACCEPTANCE_FENCED, hold_restored_budget_pause
-
-    return hold_restored_budget_pause(
-        dict(task), _queue().DRIVE_ROOT, reason=HOLD_ROOT_ACCEPTANCE_FENCED,
-        detail="the root entered acceptance review; the saved pause is retained, not cancelled")
-
-
 def _append_held_pending_row(task: dict) -> None:
     """Append one proven-revivable held row to PENDING with queue-order facts (lock held)."""
     if "_queue_seq" not in task:
@@ -766,7 +757,11 @@ def restore_pending_from_snapshot(
                 # #1196: an acceptance fence over the root cancels NOTHING that was
                 # paused mid-run: retained under a typed hold, the ordinary revival
                 # checks below still apply, and the row is appended directly.
-                task = _hold_acceptance_fenced_pause(task)
+                from supervisor.events_budget import HOLD_ROOT_ACCEPTANCE_FENCED, hold_restored_budget_pause
+
+                task = hold_restored_budget_pause(
+                    dict(task), _queue().DRIVE_ROOT, reason=HOLD_ROOT_ACCEPTANCE_FENCED,
+                    detail="the root entered acceptance review; the saved pause is retained, not cancelled")
                 acceptance_held.append(str(task.get("id") or ""))
             elif _descends_from(task, fenced_roots, pending_by_id):
                 task_id = str(task.get("id") or "")

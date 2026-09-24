@@ -217,12 +217,6 @@ def optional_bound_value(key: str, raw: Any) -> Optional[int]:
         return fallback
 
 
-def coerce_optional_bound(key: str, raw: Any) -> Any:
-    """The settings-document spelling of one optional bound: ``"unlimited"`` or a positive int."""
-    value = optional_bound_value(key, raw)
-    return UNLIMITED if value is None else value
-
-
 def defaults_for_settings_document(document_present: bool) -> dict:
     """The defaults a reader merges under the settings document: the shipped values, with each
     optional bound's finite legacy value while a document exists (``OPTIONAL_BOUND_LEGACY``).

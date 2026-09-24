@@ -490,7 +490,10 @@ def _park_direct_budget_pause_inline(task: Dict[str, Any], events: Any) -> list:
     (``events_budget.install_exact_budget_pause``) against the same queue
     state, under the queue lock, and drops the event from the hand-off. A park
     that fails leaves the event on the ordinary path (typed, logged), never a
-    silently lost pause. Every other event passes through unchanged.
+    silently lost pause. Either way the turn's LOCAL dispatch fence is released:
+    the actor has unwound and the durable row (parked here or by the supervisor
+    loop) owns the hold, so a fence left closed in this process would refuse the
+    resumed turn's sends under the same id. Every other event passes through unchanged.
     """
     remaining: list = []
     for event in list(events or []):
@@ -515,9 +518,6 @@ def _park_direct_budget_pause_inline(task: Dict[str, Any], events: Any) -> list:
                 bridge=get_bridge(),
             )
             install_exact_budget_pause(shim, task_id, checkpoint, evt=event, source="direct_turn_inline_park")
-            from ouroboros.budget_pause import end_dispatch_fence
-
-            end_dispatch_fence(task_id)  # quiescent actor unwound; PENDING now owns the dispatch hold
             append_jsonl(
                 pool.DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {"ts": utc_now_iso(), "type": "direct_turn_budget_pause_parked_inline",
@@ -528,6 +528,10 @@ def _park_direct_budget_pause_inline(task: Dict[str, Any], events: Any) -> list:
             log.error("Direct turn %s could not be parked inline; its pause event takes the ordinary path",
                       task_id, exc_info=True)
             remaining.append(event)
+        finally:
+            from ouroboros.budget_pause import end_dispatch_fence
+
+            end_dispatch_fence(task_id)  # quiescent actor unwound; the durable row owns the dispatch hold
     return remaining
 
 

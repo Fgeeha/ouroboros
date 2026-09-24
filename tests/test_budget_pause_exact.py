@@ -280,6 +280,50 @@ def test_storage_failure_keeps_a_fenced_nonterminal_hold_and_buys_no_model_call(
     budget_pause.end_dispatch_fence("hold-store")
 
 
+def test_failed_checkpoint_publication_retries_the_prepared_snapshot_not_a_rebuild(tmp_path, monkeypatch):
+    """A publication that fails after quiescence is retried with the SAME prepared
+    snapshot: custody is observed (stops requested) and the source stored ONCE, not
+    once per poll. A producer going live again discards that snapshot, so the next
+    quiescence re-observes custody before the pause is published."""
+    from ouroboros import budget_pause, owner_wait
+
+    _running_row(tmp_path, "hold-retry")
+    ctx, limit_ctx = _loop_ctx(tmp_path, "hold-retry")
+    monkeypatch.setattr(budget_pause, "_HOLD_POLL_SEC", 0.01)
+    monkeypatch.setattr(budget_pause, "_hold_control_reason", lambda _c: "")
+    observed, stored = [], []
+    monkeypatch.setattr(budget_pause, "observe_external_runs", lambda _c, request_stop=True: observed.append(1) or {
+        "runs": [{"run_id": "run-1", "state": "stop_requested", "stop_outcome": "requested"}],
+        "observed_at": time.time(), "custody_read": "ok", "coverage_basis": "test"})
+    real_store = owner_wait.store_continuation_source
+    monkeypatch.setattr(owner_wait, "store_continuation_source",
+                        lambda *a, **k: stored.append(1) or real_store(*a, **k))
+    quiescence = iter([True, True, True, False, True])  # settled, settled, settled, live again, settled
+    monkeypatch.setattr(budget_pause, "local_producer_observation",
+                        lambda _c, timeout_sec: {"quiescent": next(quiescence, True), "review_attempts": {},
+                                                 "tool_futures": {}})
+    real_set = budget_pause.set_budget_pause
+    failures = {"left": 3}
+
+    def flaky_publish(root, task_id, row, **kw):
+        if kw.get("expected_pause_id") and row.get("source_ref") and failures["left"] > 0:
+            failures["left"] -= 1
+            raise OSError("disk full")
+        return real_set(root, task_id, row, **kw)
+
+    monkeypatch.setattr(budget_pause, "set_budget_pause", flaky_publish)
+    with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
+        budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
+                                   scope="global", reason_text="x")
+    # Three failed publications reused one prepared snapshot; the unsettled
+    # interlude forced exactly one fresh observation before the durable pause.
+    assert observed == [1, 1] and stored == [1, 1]
+    assert failures["left"] == 0 and raised.value.pause["state"] == budget_pause.STATE_PAUSING
+    assert budget_pause.budget_pause_row(tmp_path, "hold-retry")["source_ref"] == raised.value.pause["source_ref"]
+    assert "budget_pause_hold" not in limit_ctx.accumulated_usage
+    budget_pause.end_dispatch_fence("hold-retry")
+
+
 def test_stop_during_a_hold_ends_it_through_the_existing_control_rail(tmp_path, monkeypatch):
     from ouroboros import budget_pause
     from ouroboros.model_wait import ModelWaitInterrupted
@@ -476,11 +520,17 @@ def test_tool_future_quiescence_is_scoped_to_one_attempt_and_prunes_itself(tmp_p
 def test_unreadable_external_custody_is_held_as_unknown_not_clean(tmp_path, monkeypatch):
     from ouroboros import budget_pause
 
+    from ouroboros import delegate_custody as custody
+
     ctx, _limit = _loop_ctx(tmp_path)
-    monkeypatch.setattr(budget_pause, "_external_run_rows", lambda _c: ([], "OSError: boom"))
+    monkeypatch.setattr(custody, "custody_root", lambda _c: (_ for _ in ()).throw(OSError("boom")))
     observed = budget_pause.observe_external_runs(ctx)
     assert observed["custody_read"] == "failed" and observed["runs"] == []
     assert "boom" in observed["error"]
+    # The supervisor-side twin shares the body: a replay that fails is the same typed fact.
+    monkeypatch.setattr(custody, "replay", lambda _r: (_ for _ in ()).throw(OSError("rows torn")))
+    grant_side = budget_pause.observe_task_runs(tmp_path, ctx.task_id)
+    assert grant_side["custody_read"] == "failed" and "rows torn" in grant_side["error"]
 
 
 def test_pausing_row_exists_before_any_wait_and_fences_crash_retry(tmp_path, monkeypatch):
@@ -837,6 +887,30 @@ def test_root_resume_mints_single_use_grant_and_only_makes_children_eligible(tmp
     assert queue.resume_budget_paused_task("child-2")["ok"] is True
 
 
+def test_root_grant_refuses_a_cached_tree_snapshot_and_admits_a_fresh_read(tmp_path, monkeypatch):
+    """Negative then positive: a ROOT-scope grant reads the tree ledger NOW. A
+    0-age cached snapshot beside a read that just failed refuses typed
+    (``root_accounting_unavailable``); a working ledger admits, and spend at
+    the actual root cap still refuses (``root_hard_cap_exhausted``)."""
+    from ouroboros import usage_accounting
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    task, _row = _parked(tmp_path, monkeypatch, task_id="strict-root", scope="root")
+    usage_accounting._stash_root_accounting("strict-root", 1.0, 10.0)
+    monkeypatch.setattr(usage_accounting, "usage_projection",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("ledger unavailable")))
+    refused = queue.resume_budget_paused_task("strict-root")
+    assert refused["error"] == "root_accounting_unavailable" and refused["action"] == "retry_or_cancel"
+    assert "_budget_pause" in task and "_budget_pause_resume" not in task
+    monkeypatch.setattr(usage_accounting, "usage_projection",
+                        lambda *_a, **_k: {"accounted_usd": 10.0, "limit_usd": 10.0})
+    assert queue.resume_budget_paused_task("strict-root")["error"] == "root_hard_cap_exhausted"
+    monkeypatch.setattr(usage_accounting, "usage_projection",
+                        lambda *_a, **_k: {"accounted_usd": 1.0, "limit_usd": 10.0})
+    assert queue.resume_budget_paused_task("strict-root")["ok"] is True
+
+
 def test_grant_is_revoked_when_money_vanishes_before_dispatch(tmp_path, monkeypatch):
     from ouroboros import budget_pause
     from supervisor.queue_transitions import revoke_exact_budget_resume
@@ -1054,8 +1128,6 @@ def test_threshold_refresh_refuses_every_unknown_or_stale_money_fact(tmp_path, m
     for tree, reason in (
         (None, "tree_spend_unavailable"),
         ({"accounted_usd": 8.0, "age_sec": 0.0, "integrity_degraded": True}, "tree_accounting_degraded"),
-        ({"accounted_usd": 8.0, "age_sec": budget_pause._FRESH_TREE_MAX_AGE_SEC + 1.0},
-         "tree_accounting_stale"),
         ({"accounted_usd": None, "age_sec": 0.0}, "tree_spend_unknown"),
     ):
         ctx._cost_ceiling = _ceiling()
@@ -1063,6 +1135,34 @@ def test_threshold_refresh_refuses_every_unknown_or_stale_money_fact(tmp_path, m
         refused = budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0)
         assert refused["refreshed"] is False and refused["reason"] == reason
         assert ctx._cost_ceiling.ceiling_usd == 7.0
+
+
+def test_threshold_refresh_reads_the_ledger_now_never_a_cached_snapshot(tmp_path, monkeypatch):
+    """Negative then positive (owner Q10): the tree read is STRICT. A root snapshot
+    cached a moment ago (an earlier display refresh, a reservation) is not room
+    when the ledger cannot answer NOW; the same call with a working ledger reads
+    the fresh number and moves the threshold within it."""
+    from ouroboros import budget_pause, loop_budget, task_pacing, usage_accounting
+    from ouroboros.usage_accounting import UsageScope, usage_scope
+
+    ctx, _limit = _loop_ctx(tmp_path)
+    ctx._cost_ceiling = task_pacing.CostCeiling(state="active", ceiling_usd=7.0, root_cap_usd=10.0,
+                                                planning_margin_usd=3.0, basis="root_cap_minus_margin")
+    ctx._accumulated_usage = {"cost": 8.0}
+    monkeypatch.setattr(task_pacing, "resolve_budget_profile", lambda _c: {"cost_hard_stop_pct": 50})
+    monkeypatch.setattr(loop_budget, "_wrapup_global_remaining", lambda: 100.0)
+    usage_accounting._stash_root_accounting("q10-root", 8.0, 10.0)  # fresh, 0-age display cache
+    monkeypatch.setattr(usage_accounting, "usage_projection",
+                        lambda *_a, **_k: (_ for _ in ()).throw(OSError("ledger unavailable")))
+    with usage_scope(UsageScope(drive_root=tmp_path, task_id="q10-task", root_task_id="q10-root")):
+        refused = budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0)
+        assert refused == {"refreshed": False, "reason": "tree_spend_unavailable", "wallet_basis": "ledger_projection"}
+        assert ctx._cost_ceiling.ceiling_usd == 7.0
+        monkeypatch.setattr(usage_accounting, "usage_projection",
+                            lambda *_a, **_k: {"accounted_usd": 8.0, "limit_usd": 10.0})
+        granted = budget_pause._refresh_planning_threshold(ctx, budget_remaining_usd=100.0)
+    assert granted["refreshed"] is True and granted["root_cap_basis"] == "root_accounting"
+    assert ctx._cost_ceiling.ceiling_usd == pytest.approx(10.0)
 
 
 # --------------------------------------------------------------------------- gateway / UI facts

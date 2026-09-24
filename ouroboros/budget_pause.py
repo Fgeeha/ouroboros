@@ -35,7 +35,7 @@ soft landing, a refused dispatch) no longer spends a wrap-up call and ends as
    ``budget_pause`` with ``exact_continuation=True``; the supervisor moves the
    SAME task id back to PENDING under a ``_budget_pause`` marker (no worker,
    no slot), writes state ``paused``, and keeps it there across restarts
-   without waking it (``restore_budget_pause_allowed``).
+   without waking it (``budget_pause_restore_refusal``).
 
 Resume is an explicit OWNER act (owner Q7/Q10): raising a budget wakes
 nobody. ``queue_transitions.resume_budget_paused_task`` validates money,
@@ -355,35 +355,28 @@ def resume_point(messages: List[Dict[str, Any]], round_idx: int) -> Dict[str, An
 
 # --- external custody (owner Q8) ---------------------------------------------------
 
-def _task_run_rows(root: Any, task_id: str) -> tuple[List[Any], str]:
-    """``(unsettled runs held by task_id on this custody root, read_error)``: an
-    unreadable custody store is a typed failure, never an empty (clean-looking) list."""
-    try:
-        from ouroboros import delegate_custody as custody
+def observe_task_runs(root: Any, task_id: str, *, request_stop: bool = True,
+                      reason: str = "budget_resume_uncovered_cost",
+                      read_error: str = "") -> Dict[str, Any]:
+    """The ONE observer body behind the loop-side pause and the supervisor-side grant.
 
-        mine = str(task_id or "")
-        return [run for run in custody.replay(pathlib.Path(root)).values()
-                if str(getattr(run, "task_id", "") or "") == mine and not getattr(run, "settled", True)], ""
-    except Exception as exc:
-        log.warning("External custody rows unreadable for %s", task_id, exc_info=True)
-        return [], f"{type(exc).__name__}: {str(exc)[:200]}"
+    A FRESH custody read for ``task_id`` on ``root`` (never a pause row's saved
+    summary), requesting a stop for every run still open — its remaining cost
+    is uncovered/unknown while it runs — and recording the typed outcome. An
+    unreadable custody store (``read_error``, or the replay failing here) is a
+    typed ``custody_read=failed`` observation, never an empty (clean-looking) list.
+    """
+    runs: List[Any] = []
+    if not read_error:
+        try:
+            from ouroboros import delegate_custody as custody
 
-
-def _external_run_rows(ctx: Any) -> tuple[List[Any], str]:
-    """The loop-side reader: this context's custody root and task id."""
-    try:
-        from ouroboros import delegate_custody as custody
-
-        root = custody.custody_root(ctx)
-    except Exception as exc:
-        log.warning("External custody root unresolvable at budget pause", exc_info=True)
-        return [], f"{type(exc).__name__}: {str(exc)[:200]}"
-    return _task_run_rows(root, str(ctx.task_id))
-
-
-def _observe_runs(root: Any, task_id: str, runs: List[Any], read_error: str, *,
-                  request_stop: bool, reason: str) -> Dict[str, Any]:
-    """The ONE observer body behind the loop-side pause and the supervisor-side grant."""
+            mine = str(task_id or "")
+            runs = [run for run in custody.replay(pathlib.Path(root)).values()
+                    if str(getattr(run, "task_id", "") or "") == mine and not getattr(run, "settled", True)]
+        except Exception as exc:
+            log.warning("External custody rows unreadable for %s", task_id, exc_info=True)
+            read_error = f"{type(exc).__name__}: {str(exc)[:200]}"
     if read_error:
         # Held as UNKNOWN on the pause row: the grant re-reads custody and
         # refuses while it stays unreadable (never "no runs").
@@ -450,26 +443,19 @@ def observe_external_runs(ctx: Any, *, request_stop: bool = True) -> Dict[str, A
     Q8 branch for UNPROVEN coverage applies to every open run: a stop is
     requested through the verified cancel seam and its typed outcome recorded.
     ``requested`` and ``unknown`` are NOT death: the run stays under this
-    task's custody and no second writer may be started over it.
+    task's custody and no second writer may be started over it. The loop-side
+    reader resolves this context's custody root, then shares the one body.
     """
-    runs, read_error = _external_run_rows(ctx)
-    root = ""
-    if not read_error:
+    root, read_error = "", ""
+    try:
         from ouroboros import delegate_custody as custody
 
         root = custody.custody_root(ctx)
-    return _observe_runs(root, str(ctx.task_id), runs, read_error, request_stop=request_stop,
-                         reason="budget_pause_uncovered_cost")
-
-
-def observe_task_runs(root: Any, task_id: str, *, request_stop: bool = True,
-                      reason: str = "budget_resume_uncovered_cost") -> Dict[str, Any]:
-    """The supervisor-side twin of ``observe_external_runs``: a FRESH custody read
-    for ``task_id`` on ``root`` at grant time (never the pause row's saved
-    summary), requesting a stop for every run still open — its remaining cost
-    is uncovered/unknown while it runs — and recording the typed outcome."""
-    runs, read_error = _task_run_rows(root, task_id)
-    return _observe_runs(root, str(task_id), runs, read_error, request_stop=request_stop, reason=reason)
+    except Exception as exc:
+        log.warning("External custody root unresolvable at budget pause", exc_info=True)
+        read_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+    return observe_task_runs(root, str(ctx.task_id), request_stop=request_stop,
+                             reason="budget_pause_uncovered_cost", read_error=read_error)
 
 
 def unsettled_external_runs(observation: Dict[str, Any]) -> List[Dict[str, Any]]:
@@ -625,6 +611,8 @@ _HOLD_POLL_SEC = 0.5
 HOLD_PRODUCERS_UNSETTLED = "local_producers_unsettled"
 HOLD_PAUSE_RECORD_UNWRITABLE = "pause_record_unwritable"
 HOLD_CHECKPOINT_UNWRITABLE = "continuation_source_unwritable"
+# A ``pausing`` row the task's own controls ended before it became a pause.
+STATE_ABANDONED = "abandoned"
 
 
 def _hold_row(reason: str, *, exc: Optional[BaseException] = None,
@@ -798,7 +786,12 @@ def request_pause(limit_ctx: Any, *, rail: str, scope: str, reason_text: str,
     # One monotonic generation per pause of this task (pauseA=1, pauseB=2, ...):
     # every grant, handoff and revocation names the generation beside the pause
     # id, so a carrier from an earlier pause can never read as the current one.
-    generation = _next_pause_generation(root, task_id)
+    # An unreadable row yields generation 1 with no claim about the past: the
+    # seed write below meets the same fault and HOLDS.
+    try:
+        generation = int(budget_pause_row(root, task_id).get("pause_generation") or 0) + 1
+    except Exception:
+        generation = 1
     setattr(ctx, "_budget_pause_generation", generation)
     # Durable "pausing" FIRST (before any wait), so a death while the task is
     # still settling meets the crash-retry fence instead of a replay.
@@ -810,16 +803,25 @@ def request_pause(limit_ctx: Any, *, rail: str, scope: str, reason_text: str,
             "replay_safe": False, "auto_resume": False}
     row: Dict[str, Any] = {}
     hold: Dict[str, Any] = {}
+    prepared: Optional[Dict[str, Any]] = None
     published = ""
     opened = False
     while True:
         control = _hold_control_reason(ctx)
         if control:
             # The owner's own control, not a monetary decision. No durable pause
-            # was reached, so the opened row is closed as abandoned and the task
-            # leaves on its existing control rail. The fence stays CLOSED: a
-            # stopped task does not buy a wrap-up call out of this path.
-            _abandon_pausing_row(root, task_id, pause_id, f"hold_ended_by_control:{control}", hold)
+            # was reached, so the opened row is closed as abandoned (typed, never
+            # silent) and the task leaves on its existing control rail. The fence
+            # stays CLOSED: a stopped task does not buy a wrap-up call out of this path.
+            try:
+                current = budget_pause_row(root, task_id)
+                if current.get("pause_id") == pause_id:
+                    set_budget_pause(root, task_id, {**current, "state": STATE_ABANDONED,
+                                                     "abandon_reason": f"hold_ended_by_control:{control}",
+                                                     "abandon_detail": hold, "abandoned_at": time.time()},
+                                     expected_pause_id=pause_id)
+            except Exception:
+                log.warning("Abandoned pausing row for %s could not be closed", task_id, exc_info=True)
             setattr(ctx, "_budget_pausing", False)
             usage["exact_pause_unavailable"] = "hold_ended_by_control"
             usage["budget_pause_hold"] = {**hold, "ended_by": control}
@@ -842,13 +844,21 @@ def request_pause(limit_ctx: Any, *, rail: str, scope: str, reason_text: str,
                 # An observation that raised proves nothing about quiescence.
                 local = {"quiescent": False, "observation_error": f"{type(exc).__name__}: {exc}"}
             if not local.get("quiescent"):
+                # A snapshot prepared under an earlier quiescence is stale once a
+                # producer is live again: the next quiescence re-observes custody.
+                prepared = None
                 hold = _hold_row(HOLD_PRODUCERS_UNSETTLED, detail=local)
             else:
                 try:
-                    row = _exact_continuation_row(
-                        limit_ctx, ctx, pause_id=pause_id, rail=rail, scope=scope,
-                        reason_text=reason_text, root_task_id=root_task_id, local=local)
-                    set_budget_pause(root, task_id, row, expected_pause_id=pause_id)
+                    if prepared is None:
+                        prepared = _exact_continuation_row(
+                            limit_ctx, ctx, pause_id=pause_id, rail=rail, scope=scope,
+                            reason_text=reason_text, root_task_id=root_task_id, local=local)
+                    # A publication that failed is retried with the SAME prepared
+                    # snapshot: its custody stop requests and its stored source are
+                    # one observation, not one per poll.
+                    set_budget_pause(root, task_id, prepared, expected_pause_id=pause_id)
+                    row = prepared
                     break
                 except Exception as exc:
                     hold = _hold_row(HOLD_CHECKPOINT_UNWRITABLE, exc=exc)
@@ -866,23 +876,6 @@ def request_pause(limit_ctx: Any, *, rail: str, scope: str, reason_text: str,
     usage["execution_status"] = "paused"
     usage["budget_pause"] = {key: row[key] for key in ("pause_id", "rail", "scope", "paused_at", "resume_point")}
     raise BudgetPauseRequested(row)
-
-
-STATE_ABANDONED = "abandoned"
-
-
-def _next_pause_generation(root: pathlib.Path, task_id: str) -> int:
-    """The generation of the pause about to open: one past the row's last one.
-
-    An unreadable row yields generation 1 with no claim about the past — the
-    seed write that follows meets the same fault and HOLDS, so nothing is
-    numbered over a record nobody could read.
-    """
-    try:
-        prior = budget_pause_row(root, task_id)
-    except Exception:
-        return 1
-    return int(prior.get("pause_generation") or 0) + 1
 
 
 def _ensure_pausable_result_row(root: pathlib.Path, ctx: Any) -> None:
@@ -910,23 +903,6 @@ def _ensure_pausable_result_row(root: pathlib.Path, ctx: Any) -> None:
         )
     except Exception:
         log.debug("Pausable result row for %s could not be written ahead of the seed", task_id, exc_info=True)
-
-
-def _abandon_pausing_row(root: Any, task_id: str, pause_id: str, reason: str,
-                         detail: Dict[str, Any]) -> None:
-    """Close an opened ``pausing`` row that will not become a pause (typed, never silent).
-
-    Reached only when the task's own controls ended the hold: a monetary rail
-    no longer abandons a pause it has already committed to.
-    """
-    try:
-        current = budget_pause_row(root, task_id)
-        if current.get("pause_id") == pause_id:
-            set_budget_pause(root, task_id, {**current, "state": STATE_ABANDONED, "abandon_reason": reason,
-                                             "abandon_detail": detail, "abandoned_at": time.time()},
-                             expected_pause_id=pause_id)
-    except Exception:
-        log.warning("Abandoned pausing row for %s could not be closed", task_id, exc_info=True)
 
 
 # Fields of a direct turn's task record that never travel in its pause event:
@@ -1039,11 +1015,6 @@ def load_budget_pause(ctx: Any, handoff: Optional[Dict[str, Any]] = None) -> Dic
     return {**state, "_pause_row": dict(current)}
 
 
-# A root-tree snapshot older than this at refresh time is a STALE fallback the
-# accounting refresher returned because the ledger could not answer now.
-_FRESH_TREE_MAX_AGE_SEC = 5.0
-
-
 def _refresh_planning_threshold(ctx: Any, budget_remaining_usd: Optional[float],
                                 usage: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Owner Q10: after an explicit Resume of a GRACEFUL stop, the planning
@@ -1056,8 +1027,10 @@ def _refresh_planning_threshold(ctx: Any, budget_remaining_usd: Optional[float],
     from the usage projection, the tree's cumulative spend and its ACTUAL
     root cap from a fresh root-accounting read (an owner may have raised the
     cap while the task was paused), the task's own cumulative cost from the
-    restored usage. A wallet the ledger cannot answer, a degraded or stale
-    tree read, or unknown spend REFUSES the refresh (the dispatch-time
+    restored usage. A wallet the ledger cannot answer, a degraded tree read
+    or one the ledger could not answer NOW (the strict read never answers
+    from the display cache, so a snapshot cached before a failed read is not
+    room), or unknown spend REFUSES the refresh (the dispatch-time
     ``budget_remaining_usd`` is disclosed, never used as room): unknown money
     is not room.
     """
@@ -1075,7 +1048,7 @@ def _refresh_planning_threshold(ctx: Any, budget_remaining_usd: Optional[float],
     if fresh is None:
         return {"refreshed": False, "reason": "wallet_unavailable", "wallet_basis": "ledger_unavailable",
                 "dispatch_time_remaining_usd": budget_remaining_usd}
-    tree = _loop_tree_accounting(refresh=True, max_age_sec=0.0)
+    tree = _loop_tree_accounting(refresh=True, max_age_sec=0.0, strict=True)
     tree = tree if isinstance(tree, dict) else None
     tree_cap = tree.get("root_limit_usd") if tree else None
     tree_capped = old.root_cap_usd is not None or tree_cap is not None
@@ -1086,9 +1059,6 @@ def _refresh_planning_threshold(ctx: Any, budget_remaining_usd: Optional[float],
             return {"refreshed": False, "reason": "tree_spend_unavailable", "wallet_basis": "ledger_projection"}
         if tree.get("integrity_degraded"):
             return {"refreshed": False, "reason": "tree_accounting_degraded", "wallet_basis": "ledger_projection"}
-        if float(tree.get("age_sec") or 0.0) > _FRESH_TREE_MAX_AGE_SEC:
-            return {"refreshed": False, "reason": "tree_accounting_stale",
-                    "tree_age_sec": round(float(tree.get("age_sec") or 0.0), 1), "wallet_basis": "ledger_projection"}
         if tree.get("accounted_usd") is None:
             return {"refreshed": False, "reason": "tree_spend_unknown", "wallet_basis": "ledger_projection"}
         if tree_cap is not None:
@@ -1280,7 +1250,3 @@ def budget_pause_restore_refusal(root: Any, task: Dict[str, Any]) -> str:
         return RESTORE_REFUSAL_SOURCE_UNREADABLE
     return ""
 
-
-def restore_budget_pause_allowed(root: Any, task: Dict[str, Any]) -> bool:
-    """Boolean view of ``budget_pause_restore_refusal`` for callers that only gate."""
-    return budget_pause_restore_refusal(root, task) == ""

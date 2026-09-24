@@ -476,25 +476,29 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
     from ouroboros.config import OPERATION_WINDOW_FALLBACK_SEC, get_task_abs_ceiling_sec
 
     assert get_task_abs_ceiling_sec() is None
-    assert delegate._bounded_max_seconds(bare, None) == OPERATION_WINDOW_FALLBACK_SEC
+
+    def _seconds(context, requested):
+        return delegate.bounded_max_seconds(context, requested).seconds
+
+    assert _seconds(bare, None) == OPERATION_WINDOW_FALLBACK_SEC
     # A finite configured lifetime is the window itself.
     monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "7200")
-    assert delegate._bounded_max_seconds(bare, None) == 7200
+    assert _seconds(bare, None) == 7200
 
     # ...but never past Claudexor's own schema bound. The task ceiling clamps only from
     # BELOW, so an owner who raises it past a week would make every deadline-less start
     # send an out-of-schema value and get a 400 instead of a run.
     monkeypatch.setenv("OUROBOROS_TASK_ABS_CEILING_SEC", "1000000")
-    assert delegate._bounded_max_seconds(bare, None) == delegate._CLAUDEXOR_MAX_SECONDS
+    assert _seconds(bare, None) == delegate._CLAUDEXOR_MAX_SECONDS
 
     # ...and an EXPLICIT ask is clamped by the same bound. `max_seconds` is a
     # model-supplied tool argument with no maximum in its schema, so clamping only the
     # fallback branch left the ask itself able to sail past it — the same defect, one
     # branch over from the one that was fixed.
-    assert delegate._bounded_max_seconds(bare, 1_000_000) == delegate._CLAUDEXOR_MAX_SECONDS
-    assert delegate._bounded_max_seconds(bare, 120) == 120
+    assert _seconds(bare, 1_000_000) == delegate._CLAUDEXOR_MAX_SECONDS
+    assert _seconds(bare, 120) == 120
     # An explicit narrower ask still wins — the cap is a floor for the unknown case only.
-    assert delegate._bounded_max_seconds(bare, 120) == 120
+    assert _seconds(bare, 120) == 120
 
     # 3. P34P1.8: an EXPIRED deadline is NOT the same fact as having none.
     #    `deadline_remaining_sec` answers 0.0 for both, so the fallback above handed an
@@ -515,7 +519,7 @@ def test_the_guards_that_protect_a_delegated_run_fail_closed(tmp_path, monkeypat
                           "deadline_at": (utc_now() + datetime.timedelta(hours=1)).isoformat()}
     assert delegate.deadline_expired(live) is False
     # ...and the live deadline still NARROWS the bound, as it always did.
-    assert 0 < delegate._bounded_max_seconds(live, None) <= 3600
+    assert 0 < _seconds(live, None) <= 3600
 
     # The refusal is at the START, before the daemon is touched: nothing spent, nothing
     # registered, and the reason names the honest next move.

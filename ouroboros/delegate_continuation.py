@@ -215,6 +215,7 @@ def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any
         "prior_cap_basis": cap_basis,
         "prior_patch_disposition": entry.patch_disposed or ("not_applicable" if not _needs_disposition(entry) else ""),
         "prior_target_root": entry.target_root,
+        "prior_access": entry.access,
         "prior_baseline_sha": entry.baseline_sha,
         "prior_output": output,
         "prior_invocation_id": entry.invocation_id,
@@ -238,8 +239,14 @@ def continuation_instruction(facts: Dict[str, Any]) -> str:
     elif disposition == "rejected":
         tree_line = ("Its captured changes were explicitly REJECTED: the tree you start from does NOT contain "
                      "them, and only the assignment in the prompt says what is still wanted.")
-    else:
+    elif str(facts.get("prior_access") or "readonly") == "readonly":
         tree_line = "It captured no changes to dispose of (a read-only run)."
+    else:
+        # A mutating run with nothing to dispose wrote IN PLACE (a direct
+        # directory strategy, a session without an execution snapshot): its
+        # effects are already on the target, not absent.
+        tree_line = ("It wrote DIRECTLY into the authority target with no captured patch: the tree you "
+                     "start from already contains whatever it changed. Do not redo or re-apply that work.")
     cap = facts.get("prior_max_seconds")
     cap_line = f" after its {int(cap)}s wall-clock cap" if cap else " at its wall-clock cap"
     return (
@@ -251,27 +258,6 @@ def continuation_instruction(facts: Dict[str, Any]) -> str:
         "and never re-apply what was applied. This run has its own wall-clock cap; finish the remaining work "
         "or report exactly what remains."
     )
-
-
-def selector_refusal(continue_from: Any, retry_of: Any, selector_root: str) -> Tuple[str, Optional[Any]]:
-    """``(continuation_token, refusal)``: the argument shapes a continuation cannot share.
-
-    A retry replays an old key byte-identically; a continuation is a NEW
-    intention over a settled run — one call cannot be both. A skill-payload
-    selector run keeps its own target semantics and is started plain.
-    """
-    from ouroboros.delegate_shared import _fail
-
-    token = str(continue_from or "").strip()
-    if token and str(retry_of or "").strip():
-        return token, _fail("delegate_start", "continuation_selector_conflict",
-                            "continue_from starts a NEW run bound to a settled predecessor; retry_of replays a "
-                            "pending invocation. Supply one of them.", definitely_unrun=True)
-    if token and str(selector_root or "").strip():
-        return token, _fail("delegate_start", "continuation_resource_conflict",
-                            "continue_from applies to ordinary workspace delegation only; a skill-payload "
-                            "selector run is started plain.", definitely_unrun=True)
-    return token, None
 
 
 def start_binding(ctx: Any, drive: Any, token: str, *, actor: Dict[str, Any], route: Any,
@@ -299,6 +285,5 @@ __all__ = [
     "CONTINUATION_TERMINAL_STATE",
     "bind_continuation",
     "continuation_instruction",
-    "selector_refusal",
     "start_binding",
 ]
