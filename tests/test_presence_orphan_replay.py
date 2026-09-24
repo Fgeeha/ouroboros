@@ -580,10 +580,20 @@ def test_a_presence_placeholder_owes_no_terminal_projection_but_its_rerun_does(t
     re-run's own completion originates the room's terminal row, even when a stale marker was inherited."""
     from ouroboros.terminal_projection import reconcile_terminal_projections
 
+    from ouroboros.terminal_projection import SETTLEMENT_NONE, settle_terminal_projection
+
     task_id = _task_id(_admission(), _event())
     _reconciled(tmp_path, monkeypatch, task_id)
     assert reconcile_terminal_projections(tmp_path) == 0  # nothing owed for a placeholder
     chat = tmp_path / "logs" / "chat.jsonl"
+    rows = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()] if chat.exists() else []
+    assert not [row for row in rows if row.get("type") == "task_summary"]
+    # An install on the previous release already recorded readiness for the placeholder (its chat append
+    # failed): the direct settlement path, as startup recovery calls it, must not publish it either.
+    write_task_result(tmp_path, task_id, STATUS_FAILED, canonical_terminal_projection_ready={
+        "summary_id": f"task-terminal:{task_id}", "token": "stale", "attempt": {}, "task_done_ts": "2026-05-28T00:00:05+00:00",
+        "chat_id": 7})
+    assert settle_terminal_projection(tmp_path, task_id) == SETTLEMENT_NONE
     rows = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()] if chat.exists() else []
     assert not [row for row in rows if row.get("type") == "task_summary"]
     # An install that ran the sweep before this rule left a failed marker on the placeholder.
@@ -595,7 +605,7 @@ def test_a_presence_placeholder_owes_no_terminal_projection_but_its_rerun_does(t
                               gate=PresenceTurnGate(1))
     stored = load_task_result(tmp_path, task_id)
     assert first.text == "Real answer" and stored["status"] == STATUS_COMPLETED
-    assert "canonical_terminal_projection" in stored["superseded_placeholder"]  # moved aside with the mark
+    assert {"canonical_terminal_projection", "canonical_terminal_projection_ready"} <= set(stored["superseded_placeholder"])
     assert reconcile_terminal_projections(tmp_path) == 1  # the re-run's completion owes and gets its row
     rows = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()]
     summaries = [row for row in rows if row.get("type") == "task_summary" and row.get("task_id") == task_id]

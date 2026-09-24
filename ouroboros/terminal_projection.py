@@ -27,9 +27,11 @@ SETTLEMENT_NONE, SETTLEMENT_DEFERRED, SETTLEMENT_SETTLED = "none", "deferred", "
 
 
 def _settled(row: dict) -> bool:
+    """Settled for publication: a host-reconciled presence placeholder is not a result (the event
+    re-runs), so it owes no terminal projection even when an earlier release already recorded readiness."""
     from ouroboros.task_status import SETTLED_STATUSES
 
-    return row.get("status") in SETTLED_STATUSES
+    return row.get("status") in SETTLED_STATUSES and not is_reconciled_presence_placeholder(row)
 
 
 def _lineage(tid: str, row: dict) -> dict:
@@ -80,8 +82,8 @@ def _publication_lock(root: Any, tid: str):
 def _prepare(root: Any, tid: str, task: dict, event: dict) -> dict:
     """Durably record readiness from canonical terminal authority, before IO."""
     def prepare(current: dict, _patch: dict):
-        if not _settled(current) or is_reconciled_presence_placeholder(current):
-            return None  # a host-reconciled presence placeholder is not a result: the event re-runs
+        if not _settled(current):
+            return None
         effective = {**task, **current}
         if not _lineage(tid, effective)["is_root_task"]:
             return None
@@ -265,7 +267,8 @@ def settle_terminal_projection(drive_root: Any, task_id: str, *, task: dict | No
             if not acquired:
                 return SETTLEMENT_DEFERRED
             stored = _prepare(drive_root, tid, task or {}, event or {})
-            if not isinstance(stored.get("canonical_terminal_projection_ready"), dict):
+            if (not isinstance(stored.get("canonical_terminal_projection_ready"), dict)
+                    or is_reconciled_presence_placeholder(stored)):  # readiness an earlier release recorded
                 return SETTLEMENT_NONE
             if (_open(stored) or not _settled(stored)
                     or not _files_ready(drive_root, tid, {**(task or {}), **stored})):
@@ -313,7 +316,7 @@ def reconcile_terminal_projections(drive_root: Any) -> int:
     for path in sorted(task_results_dir(drive_root, create=False).glob("*.json")):
         try:
             row = load_task_result(drive_root, path.stem, strict=True)
-            if not row or not _settled(row) or is_reconciled_presence_placeholder(row):
+            if not row or not _settled(row):
                 continue
             ready = row.get("canonical_terminal_projection_ready")
             if (not isinstance(ready, dict)
