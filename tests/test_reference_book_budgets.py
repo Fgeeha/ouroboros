@@ -166,7 +166,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/architecture/10-key-invariants.md": 21700,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
     # +400 (#1213): Presence turns are named as actors without cross-focus catalogue or focus authority.
-    "docs/architecture/12-host-service-companions-and-chat-ids.md": 11400,
+    # 11400 -> 12500: presence PR0 adds rules the chapter lacked, one sentence each (unified
+    # conversation key, placeholder re-run and its lost-attempt facts, presence-local liveness,
+    # previous-turn pointer and its replay repair, split in-flight budgets, silent orphaned work,
+    # presence room label); the base sat 2 bytes under.
+    "docs/architecture/12-host-service-companions-and-chat-ids.md": 12500,
     # 7764 -> 8600 (#1195): the fresh selected-subject + immutable peer projection
     # execution check (`skill_peer_inventory.py`, `skill_conflicts.py`) replaces
     # whole-inventory hashing; the chapter had no description of that seam to swap out.
