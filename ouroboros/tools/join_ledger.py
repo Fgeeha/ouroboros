@@ -48,13 +48,26 @@ _ARTIFACT_IDENTITY_FIELDS = (
 )
 
 
-def _stable_artifact_identities(result: Dict[str, Any]) -> list[Dict[str, Any]]:
-    """Return stable artifact identities without volatile paths/timestamps."""
+def _child_result_sha256(result: Dict[str, Any]) -> str:
+    """Hash the exact semantic child result consumed by a parent decision.
 
+    Cost, timestamps, queue diagnostics, and parent-decision fields are omitted by
+    construction. A content/status/artifact change therefore invalidates a prior
+    disposition, while accounting or coordination telemetry does not. The host
+    notice is part of the parent's consumed result, separate from model-answer
+    identity; its absence preserves the historical hash exactly.
+    """
+
+    semantic_result = result
+    bundle = (
+        semantic_result.get("artifact_bundle")
+        if isinstance(semantic_result.get("artifact_bundle"), dict)
+        else {}
+    )
+    # Stable artifact identities without volatile paths/timestamps.
     candidates: list[Any] = []
-    if isinstance(result.get("artifacts"), list):
-        candidates.extend(result.get("artifacts") or [])
-    bundle = result.get("artifact_bundle") if isinstance(result.get("artifact_bundle"), dict) else {}
+    if isinstance(semantic_result.get("artifacts"), list):
+        candidates.extend(semantic_result.get("artifacts") or [])
     if isinstance(bundle.get("artifacts"), list):
         candidates.extend(bundle.get("artifacts") or [])
     identities: list[Dict[str, Any]] = []
@@ -78,39 +91,20 @@ def _stable_artifact_identities(result: Dict[str, Any]) -> list[Dict[str, Any]]:
                 identity["name"] = Path(raw_path).name
         if not identity:
             continue
-        encoded = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
-        if encoded in seen:
+        encoded_identity = json.dumps(identity, ensure_ascii=False, sort_keys=True, default=str)
+        if encoded_identity in seen:
             continue
-        seen.add(encoded)
+        seen.add(encoded_identity)
         identities.append(identity)
-    return sorted(
-        identities,
-        key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
-    )
-
-
-def _child_result_sha256(result: Dict[str, Any]) -> str:
-    """Hash the exact semantic child result consumed by a parent decision.
-
-    Cost, timestamps, queue diagnostics, and parent-decision fields are omitted by
-    construction. A content/status/artifact change therefore invalidates a prior
-    disposition, while accounting or coordination telemetry does not. The host
-    notice is part of the parent's consumed result, separate from model-answer
-    identity; its absence preserves the historical hash exactly.
-    """
-
-    semantic_result = result
-    bundle = (
-        semantic_result.get("artifact_bundle")
-        if isinstance(semantic_result.get("artifact_bundle"), dict)
-        else {}
-    )
     payload = {
         "status": str(semantic_result.get("status") or ""),
         "result": semantic_result.get("result"),
         "trace_summary": semantic_result.get("trace_summary"),
         "artifact_status": str(semantic_result.get("artifact_status") or bundle.get("status") or ""),
-        "artifacts": _stable_artifact_identities(semantic_result),
+        "artifacts": sorted(
+            identities,
+            key=lambda item: json.dumps(item, ensure_ascii=False, sort_keys=True, default=str),
+        ),
     }
     from ouroboros.task_finalization import terminal_host_notice_text
 

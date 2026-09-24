@@ -416,14 +416,6 @@ def _claim_physical_dispatch(attempt_id: str = "") -> None:
             state.claimed_ids.add(attempt_id)
 
 
-def _release_physical_dispatch_claim(attempt_id: str) -> None:
-    """Return only this context's positively never-sent claim, at most once."""
-    state = _PHYSICAL_LIMIT.get()
-    if state is not None:
-        with state.lock:
-            if attempt_id in state.claimed_ids:
-                state.claimed_ids.remove(attempt_id)
-                state.used -= 1
 def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     bound = _CURRENT_SCOPE.get() or UsageScope()
     limit_owner = request if request.global_limit_usd is not None else bound
@@ -672,13 +664,6 @@ def _per_slot(value: Any, count: int) -> list:
     return [value] * count
 
 
-def _submitted_mode_for_preference(preference: Any) -> str:
-    """Project a captured preference onto the provider-neutral reservation mode."""
-    return {"standard": "default", "fast": "priority", "economy": "flex"}.get(
-        str(preference or "").strip().lower(), ""
-    )
-
-
 def review_wave_admission(
     drive_root: pathlib.Path | str | None = None,
     *,
@@ -777,7 +762,9 @@ def review_wave_admission(
                         max_completion_tokens=max(0, int(outputs[index] or 0)),
                         task_id=str(task_id or ""),
                         processing_preference=str(seat_processing[index] or ""),
-                        submitted_processing_mode=_submitted_mode_for_preference(seat_processing[index]),
+                        # The captured preference projected onto the provider-neutral reservation mode.
+                        submitted_processing_mode={"standard": "default", "fast": "priority", "economy": "flex"}.get(
+                            str(seat_processing[index] or "").strip().lower(), ""),
                     )
                 )
             result["slot_bounds"].append(None if bound is None else round(float(bound), 6))
@@ -803,34 +790,6 @@ def _global_limit(request: AttemptRequest) -> float:
     return float("inf") if configured is None else max(0.0, configured)
 
 
-def _active_root_budget_fence(root: pathlib.Path, root_task_id: str) -> Optional[Dict[str, Any]]:
-    """Read the queue's atomic durable root-dispatch fence, if present."""
-    root_task_id = str(root_task_id or "").strip()
-    if not root_task_id:
-        return None
-    snapshot_path = root / "state" / "queue_snapshot.json"
-    if not snapshot_path.exists():
-        return None
-    try:
-        snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        raise UsageAccountingError(
-            f"root budget fence authority unavailable: {snapshot_path}"
-        ) from exc
-    rows = snapshot.get("budget_root_fences", []) if isinstance(snapshot, dict) else None
-    if not isinstance(rows, list):
-        raise UsageAccountingError(f"invalid root budget fence authority: {snapshot_path}")
-    for row in rows:
-        if not isinstance(row, dict):
-            raise UsageAccountingError(f"invalid root budget fence row: {snapshot_path}")
-        if (
-            str(row.get("root_task_id") or "") == root_task_id
-            and str(row.get("status") or "") in {"active", "paused"}
-        ):
-            return row
-    return None
-
-
 _CANDIDATE_ROW_FIELDS = (
     "candidate_raw_sha256", "candidate_raw_size_bytes", "candidate_context_sha256",
     "candidate_context_size_bytes", "candidate_measurement_kind", "physical_context",
@@ -839,19 +798,6 @@ _CANDIDATE_ROW_FIELDS = (
 )
 
 
-def _candidate_request_fields(request: AttemptRequest) -> Dict[str, Any]:
-    return {
-        "candidate_raw_sha256": request.candidate_raw_sha256,
-        "candidate_raw_size_bytes": request.candidate_raw_size_bytes,
-        "candidate_context_sha256": request.candidate_context_sha256,
-        "candidate_context_size_bytes": request.candidate_context_size_bytes,
-        "candidate_measurement_kind": request.candidate_measurement_kind,
-        "physical_context": asdict(request.physical_context) if request.physical_context else None,
-        **({"processing_preference": request.processing_preference,
-            "submitted_processing_mode": request.submitted_processing_mode,
-            "processing_basis": copy.deepcopy(request.processing_basis)}
-           if request.processing_preference or request.submitted_processing_mode or request.processing_basis else {}),
-    }
 def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
     """Atomically check global/root limits and append a ``reserved`` record."""
     request, scope = _merge_scope(request)
@@ -864,13 +810,28 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
             f"model dispatch fenced: task {scope.task_id} is entering an exact budget pause",
             limit_scope="pausing", root_task_id=scope.root_task_id)
     root = _drive_root(scope.drive_root)
-    root_fence = _active_root_budget_fence(root, scope.root_task_id)
-    if root_fence is not None:
-        raise BudgetExceeded(
-            f"root model dispatch paused pending explicit resume for {scope.root_task_id}",
-            limit_scope="root",
-            root_task_id=scope.root_task_id,
-        )
+    # The queue's atomic durable root-dispatch fence, read from its snapshot:
+    # a fenced root refuses every send until an explicit resume.
+    root_task_id = str(scope.root_task_id or "").strip()
+    snapshot_path = root / "state" / "queue_snapshot.json"
+    if root_task_id and snapshot_path.exists():
+        try:
+            snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+        except Exception as exc:
+            raise UsageAccountingError(f"root budget fence authority unavailable: {snapshot_path}") from exc
+        rows = snapshot.get("budget_root_fences", []) if isinstance(snapshot, dict) else None
+        if not isinstance(rows, list):
+            raise UsageAccountingError(f"invalid root budget fence authority: {snapshot_path}")
+        for row in rows:
+            if not isinstance(row, dict):
+                raise UsageAccountingError(f"invalid root budget fence row: {snapshot_path}")
+            if (str(row.get("root_task_id") or "") == root_task_id
+                    and str(row.get("status") or "") in {"active", "paused"}):
+                raise BudgetExceeded(
+                    f"root model dispatch paused pending explicit resume for {scope.root_task_id}",
+                    limit_scope="root",
+                    root_task_id=scope.root_task_id,
+                )
     ensure_legacy_imported(root)
     # IMPORTANT: live catalog I/O belongs before ``with _locked(root)`` below — the lock protects only the atomic budget read/check/append transaction.
     bound = _reservation_cost(request)
@@ -947,7 +908,17 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     "global_limit_source": scope.global_limit_source or "settings_budget_resolver",
                     "global_limit_revision": scope.global_limit_revision,
                     "root_limit_usd": scope.root_limit_usd,
-                    **_candidate_request_fields(request),
+                    "candidate_raw_sha256": request.candidate_raw_sha256,
+                    "candidate_raw_size_bytes": request.candidate_raw_size_bytes,
+                    "candidate_context_sha256": request.candidate_context_sha256,
+                    "candidate_context_size_bytes": request.candidate_context_size_bytes,
+                    "candidate_measurement_kind": request.candidate_measurement_kind,
+                    "physical_context": asdict(request.physical_context) if request.physical_context else None,
+                    **({"processing_preference": request.processing_preference,
+                        "submitted_processing_mode": request.submitted_processing_mode,
+                        "processing_basis": copy.deepcopy(request.processing_basis)}
+                       if request.processing_preference or request.submitted_processing_mode
+                       or request.processing_basis else {}),
                 }
             ],
         )
@@ -1349,7 +1320,13 @@ def _is_tos_rejection(exc: BaseException) -> bool:
 def _terminalize_failed_attempt(reservation: AttemptReservation, exc: BaseException) -> str:
     """Route a raised provider send to its honest terminal ledger state."""
     if release_pre_dispatch_attempt(reservation, exc):
-        _release_physical_dispatch_claim(reservation.attempt_id)
+        # Return only this context's positively never-sent physical claim, at most once.
+        state = _PHYSICAL_LIMIT.get()
+        if state is not None:
+            with state.lock:
+                if reservation.attempt_id in state.claimed_ids:
+                    state.claimed_ids.remove(reservation.attempt_id)
+                    state.used -= 1
         return "released"
     provider = str(reservation.provider or "").strip().lower()
     stream_usage = getattr(exc, "stream_usage", None)

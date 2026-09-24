@@ -355,7 +355,21 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
         paused_task = dict(task)
         paused_task["_budget_pause"] = marker
         if direct_turn:
-            stamp_direct_queue_row(paused_task, queue_mod)
+            # The direct lane never enqueued this row, so it lacks the sequence,
+            # priority and ``queued_at`` that ``enqueue_task`` would have given
+            # it; the sort key and the census phase need them (queue lock held).
+            counter = getattr(queue_mod, "QUEUE_SEQ_COUNTER_REF", None)
+            if isinstance(counter, dict) and "_queue_seq" not in paused_task:
+                counter["value"] = int(counter.get("value") or 0) + 1
+                paused_task["_queue_seq"] = counter["value"]
+            if "priority" not in paused_task:
+                try:
+                    paused_task["priority"] = queue_mod.coerce_queue_order(
+                        None, queue_mod._task_priority(str(paused_task.get("type") or "task")))
+                except Exception:
+                    paused_task["priority"] = 1
+            paused_task.setdefault("queued_at", utc_now_iso())
+            paused_task["_is_direct_chat"] = True
         if not any(str(item.get("id") or "") == task_id for item in ctx.PENDING):
             ctx.PENDING.append(paused_task)
             sort_pending()
@@ -380,7 +394,20 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
             except Exception:
                 log.warning("Exact budget pause row for %s was not confirmed 'paused'",
                             task_id, exc_info=True)
-                superseded = _pause_row_superseded(result_root, task_id, pause_id)
+                # A write that failed transiently leaves the row at ``pausing`` for
+                # THIS pause id — real, merely unconfirmed, and still this park's
+                # to project. A row that names another pause, or is no longer
+                # live, belongs to a newer writer and is never written over.
+                try:
+                    latest = budget_pause_row(result_root, task_id)
+                except Exception:
+                    superseded = "pause_record_unreadable"
+                else:
+                    latest_state = str(latest.get("state") or "")
+                    if str(latest.get("pause_id") or "") != pause_id:
+                        superseded = "pause_identity_changed"
+                    elif latest_state not in {STATE_PAUSING, STATE_PAUSED}:
+                        superseded = latest_state or "pause_record_missing"
         else:
             log.error("Exact budget pause for %s parked in memory but its snapshot was not persisted; "
                       "the durable row stays 'pausing' until a later snapshot confirms it", task_id)
@@ -427,26 +454,6 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
         except Exception:
             log.warning("Failed to forward exact budget pause to Activity", exc_info=True)
     return marker
-
-
-def _pause_row_superseded(result_root: pathlib.Path, task_id: str, pause_id: str) -> str:
-    """Why a park confirmation may NOT be published, or "" when it is only late.
-
-    A write that failed transiently leaves the row at ``pausing`` for THIS pause
-    id — the pause is real, merely unconfirmed, and the ordinary projection
-    still belongs to it. A row that names another pause, carries a grant, or is
-    no longer live belongs to a newer writer and is never written over.
-    """
-    from ouroboros.budget_pause import STATE_PAUSED, STATE_PAUSING, budget_pause_row
-
-    try:
-        row = budget_pause_row(result_root, task_id)
-    except Exception:
-        return "pause_record_unreadable"
-    if str(row.get("pause_id") or "") != str(pause_id):
-        return "pause_identity_changed"
-    state = str(row.get("state") or "")
-    return "" if state in {STATE_PAUSING, STATE_PAUSED} else (state or "pause_record_missing")
 
 
 def _handle_budget_resume_child(evt: Dict[str, Any], ctx: Any) -> None:
@@ -556,27 +563,6 @@ HOLD_GRANT_CONSUMED_STALE_ROW = "stale_queue_row_grant_consumed"
 # for ordinary rows; a saved exact pause is retained under this hold instead.
 HOLD_INVALID_ACCEPTANCE_FENCE_SNAPSHOT = HOLD_RESTORE_REFUSED_PREFIX + "invalid_acceptance_fence_snapshot"
 HOLD_INVALID_BUDGET_FENCE_SNAPSHOT = HOLD_RESTORE_REFUSED_PREFIX + "invalid_budget_fence_snapshot"
-
-
-def stamp_direct_queue_row(task: Dict[str, Any], queue_mod: Any) -> None:
-    """Give a parked direct turn the queue-order facts ``enqueue_task`` would have.
-
-    The direct lane never enqueued it, so the row has no sequence, priority or
-    ``queued_at``; without them the sort key and the census phase have nothing
-    to read. Called with the queue lock held.
-    """
-    counter = getattr(queue_mod, "QUEUE_SEQ_COUNTER_REF", None)
-    if isinstance(counter, dict) and "_queue_seq" not in task:
-        counter["value"] = int(counter.get("value") or 0) + 1
-        task["_queue_seq"] = counter["value"]
-    if "priority" not in task:
-        try:
-            task["priority"] = queue_mod.coerce_queue_order(
-                None, queue_mod._task_priority(str(task.get("type") or "task")))
-        except Exception:
-            task["priority"] = 1
-    task.setdefault("queued_at", utc_now_iso())
-    task["_is_direct_chat"] = True
 
 
 def budget_hold_fact(task) -> Optional[Dict[str, Any]]:

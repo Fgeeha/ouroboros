@@ -77,12 +77,6 @@ REFUSAL_WORK_ORDER_UNBOUND = "continuation_work_order_unbound"
 REFUSAL_WORK_ORDER_MISMATCH = "continuation_work_order_mismatch"
 
 
-def _needs_disposition(entry: custody.RunCustody) -> bool:
-    """Whether the prior run's work reaches the tree only through an explicit disposition."""
-    ref = entry.resource_ref if isinstance(entry.resource_ref, dict) else {}
-    return bool(entry.snapshot_id or (ref.get("workspace_kind") == "directory" and ref.get("strategy") == "copy"))
-
-
 def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any], route: Any,
                       authority: Any, target_root: str,
                       canonical_work_order_fingerprint: str = "") -> Tuple[Dict[str, Any], str, str]:
@@ -154,7 +148,12 @@ def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any
         return {}, REFUSAL_APPLY_AMBIGUOUS, (
             f"Run {rid} has a pending apply intent with no disposition: the tree MAY already carry its patch. "
             "Resolve it through integrate_delegated_patch(acknowledge_ambiguous=true) before continuing.")
-    if _needs_disposition(entry) and not entry.patch_disposed:
+    # The prior run's work reaches the tree only through an explicit disposition
+    # when it was captured: an execution snapshot, or a copied directory workspace.
+    ref = entry.resource_ref if isinstance(entry.resource_ref, dict) else {}
+    needs_disposition = bool(entry.snapshot_id or (
+        ref.get("workspace_kind") == "directory" and ref.get("strategy") == "copy"))
+    if needs_disposition and not entry.patch_disposed:
         return {}, REFUSAL_PATCH_UNDISPOSED, (
             f"Run {rid}'s captured changes have no explicit disposition yet. Apply or reject them with "
             "integrate_delegated_patch(run_id=...) first, so the continuation knows what the tree contains "
@@ -213,7 +212,7 @@ def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any
         "prior_started_at": started_ts,
         "prior_max_seconds": int(prior_max_seconds or 0) or None,
         "prior_cap_basis": cap_basis,
-        "prior_patch_disposition": entry.patch_disposed or ("not_applicable" if not _needs_disposition(entry) else ""),
+        "prior_patch_disposition": entry.patch_disposed or ("not_applicable" if not needs_disposition else ""),
         "prior_target_root": entry.target_root,
         "prior_access": entry.access,
         "prior_baseline_sha": entry.baseline_sha,

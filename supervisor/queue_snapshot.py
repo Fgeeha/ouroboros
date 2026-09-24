@@ -291,7 +291,7 @@ def _exact_pause_row(task: Any) -> bool:
 
 
 def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stale: bool,
-                             parked_direct: Optional[list] = None) -> tuple:
+                             direct_caught: "list[str]" = ()) -> tuple:
     """Which snapshot rows survive the restore, and the RUNNING rows parked beside them.
 
     A grant that never reached a worker before this restart is not carried into
@@ -301,22 +301,51 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
     carrier of work that ran on, so it is not retained at all and is fenced as
     the running work it names (its id is returned third). A RUNNING row whose
     durable pause was already complete is parked, never fenced; so is a direct
-    root the stop caught in that state (``parked_direct``). An exact budget
-    pause is retained WITHOUT waking whatever the snapshot's age — a corrupt,
-    missing or refused source becomes a typed, visible HOLD beside its marker,
-    never a dropped or cancelled task. An owner-wait handoff needs its
-    acknowledged restart transaction; every other row needs a fresh snapshot.
+    root the stop caught (``direct_caught``) in that state: a direct turn is
+    never a RUNNING row, so the roster is the only place the stop names it, and
+    handing such an id to the shutdown cancel fence would cancel a saved pause
+    (#1196). Its queue record is rebuilt from the durable result the pause
+    wrote (chat, lane fact, origin, metadata, attempt) and parked through the
+    same path a RUNNING row takes; a turn with no complete pause (no row, no
+    source, another attempt) stays on the fence path. An exact budget pause is
+    retained WITHOUT waking whatever the snapshot's age — a corrupt, missing or
+    refused source becomes a typed, visible HOLD beside its marker, never a
+    dropped or cancelled task. An owner-wait handoff needs its acknowledged
+    restart transaction; every other row needs a fresh snapshot.
     Returns ``(retained_rows, parked_rows, consumed_task_ids)``.
     """
-    from ouroboros.budget_pause import budget_pause_restore_refusal
+    from ouroboros.budget_pause import budget_pause_restore_refusal, budget_pause_row
     from ouroboros.owner_wait import restore_owner_wait_allowed
+    from ouroboros.task_results import load_task_result
     from supervisor.events_budget import HOLD_RESTORE_REFUSED_PREFIX, hold_restored_budget_pause
     from supervisor.queue_transitions import revoke_exact_budget_resume
 
     for task in snapshot_pending:
         if isinstance(task.get("_budget_pause_resume"), dict):
             revoke_exact_budget_resume(task, "restart_before_dispatch")
-    parked = _park_pausing_running_rows(running_rows, snapshot_pending) + list(parked_direct or [])
+    direct_rows: list = []
+    for task_id in direct_caught:
+        task_id = str(task_id or "")
+        if not task_id:
+            continue
+        try:
+            stored = load_task_result(_queue().DRIVE_ROOT, task_id, strict=True) or {}
+            pause = budget_pause_row(_queue().DRIVE_ROOT, task_id)
+        except Exception:
+            continue
+        if not (stored and pause and pause.get("source_ref") and pause.get("is_direct_chat")):
+            continue
+        attempt = int(pause.get("task_attempt") or 1)
+        record: dict = {
+            "id": task_id, "type": "task", "chat_id": stored.get("chat_id"), "_is_direct_chat": True,
+            "_attempt": attempt, "root_task_id": task_id, "depth": 0,
+        }
+        for key in ("origin_message_ref", "origin_message_text", "metadata", "project_id",
+                    "task_contract", "title", "text", "budget_drive_root"):
+            if stored.get(key) not in (None, ""):
+                record[key] = stored[key]
+        direct_rows.append({"task": record, "attempt": attempt})
+    parked = _park_pausing_running_rows(list(running_rows) + direct_rows, snapshot_pending)
     retained = []
     consumed: list = []
     for task in list(snapshot_pending) + parked:
@@ -519,44 +548,6 @@ def _park_pausing_running_rows(running_rows: list, snapshot_pending: list) -> li
     return parked
 
 
-def _park_direct_root_pauses(task_ids: list, snapshot_pending: list) -> list:
-    """Direct roots the stop caught whose EXACT pause was already complete on disk.
-
-    A direct turn is never a RUNNING row, so the roster is the only place the
-    stop names it; handing such an id to the shutdown cancel fence would
-    cancel a saved pause (#1196). Its queue record is rebuilt from the durable
-    result the pause wrote (chat, lane fact, origin, metadata, attempt) and
-    parked through the same path a RUNNING row takes; a turn with no complete
-    pause (no row, no source, another attempt) stays on the fence path.
-    """
-    from ouroboros.budget_pause import budget_pause_row
-    from ouroboros.task_results import load_task_result
-
-    rows: list = []
-    for task_id in task_ids:
-        task_id = str(task_id or "")
-        if not task_id:
-            continue
-        try:
-            stored = load_task_result(_queue().DRIVE_ROOT, task_id, strict=True) or {}
-            pause = budget_pause_row(_queue().DRIVE_ROOT, task_id)
-        except Exception:
-            continue
-        if not (stored and pause and pause.get("source_ref") and pause.get("is_direct_chat")):
-            continue
-        attempt = int(pause.get("task_attempt") or 1)
-        record: dict = {
-            "id": task_id, "type": "task", "chat_id": stored.get("chat_id"), "_is_direct_chat": True,
-            "_attempt": attempt, "root_task_id": task_id, "depth": 0,
-        }
-        for key in ("origin_message_ref", "origin_message_text", "metadata", "project_id",
-                    "task_contract", "title", "text", "budget_drive_root"):
-            if stored.get(key) not in (None, ""):
-                record[key] = stored[key]
-        rows.append({"task": record, "attempt": attempt})
-    return _park_pausing_running_rows(rows, snapshot_pending)
-
-
 def _descends_from(task: Any, roots: "set[str]", pending_by_id: dict) -> bool:
     """Whether this row's lineage reaches ANY of ``roots``.
 
@@ -712,9 +703,8 @@ def restore_pending_from_snapshot(
         pending_ids = {str(task.get("id") or "") for task in snapshot_pending}
         direct_caught = [task_id for task_id in direct_roots.get("task_ids") or []
                          if task_id not in live_direct and task_id not in pending_ids]
-        parked_direct = _park_direct_root_pauses(direct_caught, snapshot_pending)
         snapshot_pending, parked_pausing, consumed_rows = _retain_snapshot_pending(
-            snapshot_pending, running_rows, stale=stale, parked_direct=parked_direct)
+            snapshot_pending, running_rows, stale=stale, direct_caught=direct_caught)
         fenced_running = _fence_snapshot_running_rows(
             running_rows
             + [{"id": task_id} for task_id in direct_caught]

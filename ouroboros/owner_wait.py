@@ -226,19 +226,6 @@ def restore_owner_wait_allowed(root: Any, task: dict) -> bool:
     return True
 
 
-def _wait_deadline(checkpoint: dict) -> Any:
-    """The bound's absolute instant, or None when the wait is unbounded."""
-    from ouroboros.deadline_utils import parse_deadline_ts
-
-    return parse_deadline_ts((checkpoint or {}).get("wait_deadline_at"))
-
-
-def _bound_expired(deadline: Any) -> bool:
-    from ouroboros.deadline_utils import utc_now
-
-    return deadline is not None and utc_now() >= deadline
-
-
 def worker_owner_wait(wid: int, in_q: Any, out_q: Any, ctx: Any,
                       checkpoint: dict) -> str:
     """Keep the original task process asleep until the pool grants capacity.
@@ -252,6 +239,8 @@ def worker_owner_wait(wid: int, in_q: Any, out_q: Any, ctx: Any,
     """
     import os
 
+    from ouroboros.deadline_utils import parse_deadline_ts, utc_now
+
     identity = {"type": "owner_wait", "worker_id": wid, "pid": os.getpid(),
                 "task_id": ctx.task_id, "task_attempt": int(ctx.task_attempt or 1),
                 "wait_id": checkpoint["wait_id"]}
@@ -262,7 +251,8 @@ def worker_owner_wait(wid: int, in_q: Any, out_q: Any, ctx: Any,
         del ctx.pending_events[0]
     out_q.put({**identity, "phase": "park", "checkpoint": checkpoint})
     peek = OwnerMailboxPeek()
-    deadline = _wait_deadline(checkpoint)
+    # The bound's absolute instant; None = an unbounded wait.
+    deadline = parse_deadline_ts((checkpoint or {}).get("wait_deadline_at"))
     parked = resume_requested = False
     outcome = "owner_input"
     while True:
@@ -285,7 +275,7 @@ def worker_owner_wait(wid: int, in_q: Any, out_q: Any, ctx: Any,
                     set(getattr(ctx, "_loop_mailbox_seen_ids", set())), ctx.task_attempt or 1):
                 out_q.put({**identity, "phase": "resume"})
                 resume_requested = True
-            elif _bound_expired(deadline):
+            elif deadline is not None and utc_now() >= deadline:
                 outcome = "timeout"
                 out_q.put({**identity, "phase": "resume", "resume_reason": outcome})
                 resume_requested = True
@@ -300,6 +290,8 @@ def direct_owner_wait(ctx: Any, checkpoint: dict) -> str:
     An optional bound releases the loop only AFTER those controls are consulted,
     so Stop, the task deadline and the absolute ceiling keep precedence.
     """
+    from ouroboros.deadline_utils import parse_deadline_ts, utc_now
+
     control = ctx.model_wait_context
     root = pathlib.Path(ctx.budget_drive_root or ctx.drive_root)
     while ctx.pending_events:
@@ -307,12 +299,12 @@ def direct_owner_wait(ctx: Any, checkpoint: dict) -> str:
         del ctx.pending_events[0]
     wait = set_owner_wait(root, ctx.task_id, {**checkpoint, "state": "waiting"})
     peek = OwnerMailboxPeek()
-    deadline = _wait_deadline(checkpoint)
+    deadline = parse_deadline_ts((checkpoint or {}).get("wait_deadline_at"))  # None = unbounded
     outcome = "owner_input"
     while not control.control_reason() and not peek.pending(
             pathlib.Path(ctx.drive_root), ctx.task_id,
             set(getattr(ctx, "_loop_mailbox_seen_ids", set())), ctx.task_attempt or 1):
-        if _bound_expired(deadline):
+        if deadline is not None and utc_now() >= deadline:
             outcome = "timeout"
             break
         time.sleep(1.0)

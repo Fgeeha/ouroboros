@@ -20,7 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_budget_pause_exact import (  # noqa: F401 -- shared fixtures of the exact-pause suite
+from tests._budget_pause_exact_helpers import (  # noqa: F401 -- shared fixtures of the exact-pause suite
     _install_queue,
     _loop_ctx,
     _parked,

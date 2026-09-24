@@ -89,6 +89,9 @@ def _check_budget_limits(
         )
     if cost_ceiling is None or cost_ceiling.state != task_pacing.COST_CEILING_ACTIVE:
         return None
+    # A tree-capped ceiling is the ROOT's money (its fence covers the tree); a
+    # global-share ceiling is global money.
+    pause_scope = "root" if cost_ceiling.root_cap_usd is not None else "global"
     tree_info = _loop()._loop_tree_accounting(refresh=True, max_age_sec=_loop()._TREE_ACCOUNTING_MAX_STALE_SEC)
     tree_cost = tree_info.get("accounted_usd") if isinstance(tree_info, dict) else None
     deciding, spend_basis = task_pacing.resolve_deciding_spend(
@@ -152,7 +155,7 @@ def _check_budget_limits(
                 accumulated_usage["cost_stop_spend_basis"] = spend_basis
                 accumulated_usage["cost_stop_rail"] = "wrapup_reservation_last_fit"
                 budget_pause.request_pause(
-                    ctx, rail=budget_pause.RAIL_WRAPUP_LAST_FIT, scope=_pause_scope(cost_ceiling),
+                    ctx, rail=budget_pause.RAIL_WRAPUP_LAST_FIT, scope=pause_scope,
                     reason_text=task_pacing.wrapup_unaffordable_text(deciding, cost_ceiling, global_remaining))
                 return _loop()._forced_fallback_result(
                     ctx, trace, task_pacing.wrapup_unaffordable_text(deciding, cost_ceiling, global_remaining),
@@ -164,7 +167,7 @@ def _check_budget_limits(
                 accumulated_usage["cost_stop_spend_basis"] = spend_basis
                 accumulated_usage["cost_stop_rail"] = "wrapup_reservation_last_fit"
                 budget_pause.request_pause(ctx, rail=budget_pause.RAIL_WRAPUP_LAST_FIT,
-                                           scope=_pause_scope(cost_ceiling), reason_text=finish_reason)
+                                           scope=pause_scope, reason_text=finish_reason)
                 return _loop()._forced_final_answer(
                     ctx, prompt=priced_prompt, _prompt_prepared=True,
                     fallback_text=finish_reason, reason_code="budget_exhausted",
@@ -196,7 +199,7 @@ def _check_budget_limits(
         )
         accumulated_usage["cost_stop_spend_basis"] = spend_basis
         budget_pause.request_pause(ctx, rail=budget_pause.RAIL_GRACEFUL_CEILING,
-                                   scope=_pause_scope(cost_ceiling), reason_text=finish_reason)
+                                   scope=pause_scope, reason_text=finish_reason)
         return _loop()._forced_final_answer(
             ctx,
             prompt=f"[BUDGET LIMIT] {finish_reason} {_loop()._FORCED_BEST_EFFORT_TAIL}",
@@ -224,12 +227,6 @@ def _second_reservation_fits(ctx: "_RoundLimitContext", wrapup_args: Dict[str, A
             "basis": "owner_resume_relaxed_last_fit"}
         return None
     return second
-
-
-def _pause_scope(cost_ceiling: Optional["task_pacing.CostCeiling"]) -> str:
-    """A tree-capped ceiling is the ROOT's money (its fence covers the tree);
-    a global-share ceiling is global money."""
-    return "root" if cost_ceiling is not None and cost_ceiling.root_cap_usd is not None else "global"
 
 
 def _resolve_task_cost_ceiling(

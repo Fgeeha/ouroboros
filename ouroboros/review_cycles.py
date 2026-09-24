@@ -77,13 +77,6 @@ ACCEPTANCE_PASSES_LEGACY_KEY = "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"
 _WARNED: set = set()
 
 
-def _warn_once(tag: str, message: str) -> None:
-    if tag in _WARNED:
-        return
-    _WARNED.add(tag)
-    log.warning(message)
-
-
 def parse_review_max_cycles(raw: Any) -> Optional[int]:
     """Strict parser: positive-integer text → int; an unlimited alias → None.
 
@@ -125,11 +118,12 @@ def review_max_cycles() -> Optional[int]:
     try:
         return parse_review_max_cycles(raw)
     except (TypeError, ValueError):
-        _warn_once(
-            f"invalid:{raw!r}",
-            f"{REVIEW_MAX_CYCLES_KEY}={raw!r} is not a positive integer or "
-            f"'unlimited'; using the shipped default {default_text} (bounded).",
-        )
+        if f"invalid:{raw!r}" not in _WARNED:
+            _WARNED.add(f"invalid:{raw!r}")
+            log.warning(
+                f"{REVIEW_MAX_CYCLES_KEY}={raw!r} is not a positive integer or "
+                f"'unlimited'; using the shipped default {default_text} (bounded).",
+            )
         return default_review_max_cycles()
 
 

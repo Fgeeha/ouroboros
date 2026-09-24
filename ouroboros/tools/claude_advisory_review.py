@@ -345,25 +345,6 @@ def _advisory_review_diff(
     return _get_staged_diff(repo_dir, paths=paths), paths, None, False
 
 
-def _prompt_oversize_skip_warning(prompt_chars: int, managed: bool) -> str:
-    """The 1.6M prompt gate's non-blocking skip text. ``managed=True`` (the
-    diff under review is a managed resolution delta) drops the split advice —
-    a managed merge stages the whole two-parent tree by contract — and states
-    what is actually possible instead."""
-    tokens_approx = max(1, prompt_chars // 4)
-    remedy = (
-        f"A managed update merge {_MANAGED_SKIP_NOTE}; the "
-        "skip is audited and non-blocking."
-        if managed else "Consider splitting the commit."
-    )
-    return (
-        f"⚠️ ADVISORY_SKIPPED: advisory prompt too large "
-        f"({prompt_chars:,} chars, ~{tokens_approx:,} tokens > "
-        f"{_ADVISORY_PROMPT_MAX_CHARS:,} char limit). "
-        f"Advisory review skipped — non-blocking. {remedy}"
-    )
-
-
 def _api_window_skip_warning(model: str, prompt: str, managed: bool, slot=None) -> str:
     """The api route's admission verdict against its REAL window, or ``""`` to proceed.
 
@@ -436,26 +417,6 @@ def _overflow_failure_text(*texts: object) -> bool:
     )
 
 
-def _overflow_skip_warning(route: str, prompt_chars: int, failure_head: str) -> str:
-    """Typed non-blocking skip for a provider/harness context-window rejection.
-
-    ``reason=context_window_exceeded``, carrying the delivery route and the
-    measured prompt size. No host-side retry or split — advisory is fail-open
-    by design; the pre-dispatch gates own prevention, this path owns honesty
-    (previously this failure was misfiled as a crashed harness inviting a
-    doomed retry of the identical oversize prompt)."""
-    tokens_approx = max(1, (int(prompt_chars) + 3) // 4)
-    head = " ".join(str(failure_head or "").split())
-    head = (head[:200] + "…") if len(head) > 200 else head
-    return (
-        "⚠️ ADVISORY_SKIPPED: context_window_exceeded — the advisory prompt "
-        f"exceeded the {route} route's context window at dispatch "
-        f"({prompt_chars:,} chars, ~{tokens_approx:,} estimated tokens). "
-        "Advisory review skipped — non-blocking and audited; no host-side retry "
-        f"or split. Provider signal: {head}"
-    )
-
-
 def _stamp_advisory_skip_meta(ctx: ToolContext, meta: Optional[dict], skip_reason: str) -> None:
     """Record a typed advisory skip on the ctx meta snapshot (best-effort).
 
@@ -492,7 +453,21 @@ def _predispatch_size_skip(
     if prompt_chars > _ADVISORY_PROMPT_MAX_CHARS:
         log.warning("Advisory skipped — prompt too large: %d chars", prompt_chars)
         _stamp_advisory_skip_meta(ctx, None, "prompt_ceiling_exceeded")
-        return [], _prompt_oversize_skip_warning(prompt_chars, managed), model, prompt_chars
+        # The 1.6M prompt gate's non-blocking skip text. ``managed`` (the diff under
+        # review is a managed resolution delta) drops the split advice — a managed
+        # merge stages the whole two-parent tree by contract — and states what is
+        # actually possible instead.
+        remedy = (
+            f"A managed update merge {_MANAGED_SKIP_NOTE}; the "
+            "skip is audited and non-blocking."
+            if managed else "Consider splitting the commit."
+        )
+        return [], (
+            f"⚠️ ADVISORY_SKIPPED: advisory prompt too large "
+            f"({prompt_chars:,} chars, ~{max(1, prompt_chars // 4):,} tokens > "
+            f"{_ADVISORY_PROMPT_MAX_CHARS:,} char limit). "
+            f"Advisory review skipped — non-blocking. {remedy}"
+        ), model, prompt_chars
     if delegated_route:
         return None
     window_skip = _api_window_skip_warning(model, prompt, managed, slot=slot)
@@ -553,7 +528,21 @@ def _maybe_overflow_skip(
         route_name, verb, prompt_chars,
     )
     _stamp_advisory_skip_meta(ctx, meta, "context_window_exceeded")
-    return [], _overflow_skip_warning(route_name, prompt_chars, str(failure or "")), model, prompt_chars
+    # Typed non-blocking skip (``reason=context_window_exceeded``) carrying the
+    # delivery route and the measured prompt size. No host-side retry or split —
+    # advisory is fail-open by design; the pre-dispatch gates own prevention, this
+    # path owns honesty (previously this failure was misfiled as a crashed harness
+    # inviting a doomed retry of the identical oversize prompt).
+    tokens_approx = max(1, (int(prompt_chars) + 3) // 4)
+    head = " ".join(str(failure or "").split())
+    head = (head[:200] + "…") if len(head) > 200 else head
+    return [], (
+        "⚠️ ADVISORY_SKIPPED: context_window_exceeded — the advisory prompt "
+        f"exceeded the {route_name} route's context window at dispatch "
+        f"({prompt_chars:,} chars, ~{tokens_approx:,} estimated tokens). "
+        "Advisory review skipped — non-blocking and audited; no host-side retry "
+        f"or split. Provider signal: {head}"
+    ), model, prompt_chars
 
 
 def run_advisory_critic(*args, **kwargs):
@@ -568,21 +557,6 @@ def run_advisory_critic(*args, **kwargs):
 
 
 # -- Audit logging --
-
-def _audit_bypass(ctx: ToolContext, snapshot_hash: str, commit_message: str,
-                  bypass_reason: str, task_id: str) -> None:
-    try:
-        append_jsonl(ctx.drive_logs() / "events.jsonl", {
-            "ts": utc_now_iso(),
-            "type": "advisory_review_bypassed",
-            "snapshot_hash": snapshot_hash,
-            "commit_message": commit_message,  # full — no [:200] truncation
-            "bypass_reason": bypass_reason,
-            "task_id": task_id,
-        })
-    except Exception:
-        pass
-
 
 def _identical_diff_cap_note() -> str:
     """Schema-build-time NOTE about Max-Review-Cycles semantics on the commit
@@ -647,7 +621,17 @@ def _record_bypass(ctx: ToolContext, state: "AdvisoryReviewState", snapshot_hash
                    drive_root: pathlib.Path,
                    snapshot_paths: Optional[List[str]] = None) -> str:
     """Audit, record, and save a bypassed advisory run. Returns JSON response."""
-    _audit_bypass(ctx, snapshot_hash, commit_message, reason, task_id)
+    try:
+        append_jsonl(ctx.drive_logs() / "events.jsonl", {
+            "ts": utc_now_iso(),
+            "type": "advisory_review_bypassed",
+            "snapshot_hash": snapshot_hash,
+            "commit_message": commit_message,  # full — no [:200] truncation
+            "bypass_reason": reason,
+            "task_id": task_id,
+        })
+    except Exception:
+        pass
     repo_key = make_repo_key(pathlib.Path(ctx.repo_dir))
 
     def _mutate(bypass_state: "AdvisoryReviewState") -> None:

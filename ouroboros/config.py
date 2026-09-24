@@ -709,19 +709,6 @@ def verify_settings_integrity() -> str | None:
     return _settings_integrity.verify_settings_integrity(SETTINGS_PATH)
 
 
-def _seed_review_cycles_from_legacy_passes(loaded: dict) -> None:
-    """Migrate the retired acceptance-pass key into ``OUROBOROS_REVIEW_MAX_CYCLES`` (cycles =
-    passes + 1) at LOAD: a runtime "is it customized?" test cannot tell a deliberate "2" from
-    an untouched default, and left acceptance on the legacy number."""
-    legacy = loaded.pop("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", None)
-    try:
-        passes = int(str(legacy).strip()) if legacy is not None else 1
-    except (TypeError, ValueError):
-        return
-    if passes != 1 and "OUROBOROS_REVIEW_MAX_CYCLES" not in loaded:  # 1 = shipped legacy default
-        loaded["OUROBOROS_REVIEW_MAX_CYCLES"] = str(max(0, passes) + 1)
-
-
 log = logging.getLogger(__name__)
 
 # Dropped-retired-key sets this process has already reported (the notice in
@@ -776,7 +763,17 @@ def normalize_settings_raw(raw: dict) -> dict:
             loaded["OUROBOROS_GC_RETENTION_DAYS"] = seed
     for _legacy in LEGACY_RETENTION_KEYS:
         loaded.pop(_legacy, None)
-    _seed_review_cycles_from_legacy_passes(loaded)
+    # Migrate the retired acceptance-pass key into ``OUROBOROS_REVIEW_MAX_CYCLES``
+    # (cycles = passes + 1) at LOAD: a runtime "is it customized?" test cannot tell
+    # a deliberate "2" from an untouched default, and left acceptance on the
+    # legacy number. A malformed legacy value seeds nothing.
+    _legacy_passes = loaded.pop("OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES", None)
+    try:
+        _passes = int(str(_legacy_passes).strip()) if _legacy_passes is not None else 1
+    except (TypeError, ValueError):
+        _passes = 1  # 1 = shipped legacy default: nothing to seed
+    if _passes != 1 and "OUROBOROS_REVIEW_MAX_CYCLES" not in loaded:
+        loaded["OUROBOROS_REVIEW_MAX_CYCLES"] = str(max(0, _passes) + 1)
     dropped = tuple(key for key in RETIRED_SETTING_KEYS if key in loaded)
     for _retired in RETIRED_SETTING_KEYS:
         loaded.pop(_retired, None)

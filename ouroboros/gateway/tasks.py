@@ -944,7 +944,11 @@ def api_task_artifact(request: Request):
                 return Response(artifact_store.read_task_result_source_bytes(drive_root, result, name, source), media_type="application/json")
             except (OSError, ValueError, RuntimeError):
                 return json_error("task source is unavailable or does not match its recorded identity", 404)
-        artifact = registered if registered and registered.get("immutable") else _artifact_by_name(result, name) or registered
+        artifact = registered if registered and registered.get("immutable") else next(
+            (row for row in result.get("artifacts") or []
+             if isinstance(row, dict)
+             and str(row.get("name") or pathlib.Path(str(row.get("path") or "")).name) == name),
+            None) or registered
         if artifact is None:
             return json_error("artifact not found", 404, task_id=task_id, artifact=name)
         base = task_artifacts_dir(drive_root, task_id).resolve(strict=False)
@@ -1518,13 +1522,6 @@ def _render_attachment_lines(attachments: Any) -> str:
             f"{script_hint} [status=staged, ordinal={ordinal}]"
         )
     return "\n".join(lines)
-
-
-def _artifact_by_name(result: Dict[str, Any], name: str) -> Optional[Dict[str, Any]]:
-    for artifact in result.get("artifacts") or []:
-        if isinstance(artifact, dict) and str(artifact.get("name") or pathlib.Path(str(artifact.get("path") or "")).name) == name:
-            return artifact
-    return None
 
 
 def _queue_snapshot(drive_root: pathlib.Path) -> Dict[str, Any]:

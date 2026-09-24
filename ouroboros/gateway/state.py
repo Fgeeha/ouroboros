@@ -209,6 +209,22 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
     activities = _chat_activities_snapshot_safe(
         drive_root, task_bindings, direct_turns=direct_turns, availability=activity_availability,
     )
+    # Registered-project facts (never raise): the compact sidebar list, and the
+    # COMPLETE (uncapped, all-status) project chat_ids for the live WS fan-out
+    # isolation SSOT — distinct from the capped/filtered sidebar list, so
+    # isolation never lapses for projects beyond the summary limit or hidden rows.
+    try:
+        from ouroboros.projects_registry import projects_summary
+
+        projects = projects_summary(request_drive_root(request))
+    except Exception:
+        projects = []
+    try:
+        from ouroboros.projects_registry import reserved_project_chat_ids
+
+        project_chat_ids = sorted(reserved_project_chat_ids(request_drive_root(request)))
+    except Exception:
+        project_chat_ids = []
     return {
         "st": st,
         # Resolved here so the checkout file reads stay on the snapshot thread.
@@ -227,8 +243,8 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
         # on the worker thread with the rest of the snapshot, never on the event loop.
         "bg_state": (_describe_bg(request)(bool(st.get("bg_consciousness_enabled"))) if _describe_bg(request) else {}),
         "github_token_configured": bool(github_token_from_env_or_settings()),
-        "projects": _projects_summary_safe(request),
-        "project_chat_ids": _project_chat_ids_safe(request),
+        "projects": projects,
+        "project_chat_ids": project_chat_ids,
         "task_bindings": task_bindings,
         "active_direct_turns": direct_turns,
         "active_chat_activities": activities,
@@ -586,16 +602,6 @@ async def api_state(request: Request) -> JSONResponse:
         return json_exception(exc)
 
 
-def _projects_summary_safe(request: Request) -> list:
-    """Compact registered-projects list for the sidebar (never raises)."""
-    try:
-        from ouroboros.projects_registry import projects_summary
-
-        return projects_summary(request_drive_root(request))
-    except Exception:
-        return []
-
-
 def _task_bindings_safe(request: Request, *, availability=None) -> dict:
     """{task_id: {project_id, chat_id}} for tasks BOUND to a project. The frontend
     uses this to recognise a bound task card: it suppresses the stray "turn into
@@ -651,17 +657,6 @@ def _task_bindings_safe(request: Request, *, availability=None) -> dict:
     return bindings
 
 
-def _project_chat_ids_safe(request: Request) -> list:
-    """COMPLETE (uncapped, all-status) registered project chat_ids for the live
-    WS fan-out isolation SSOT — distinct from the capped/filtered sidebar list,
-    so isolation never lapses for projects beyond the summary limit or hidden
-    rows. Never raises."""
-    try:
-        from ouroboros.projects_registry import reserved_project_chat_ids
-
-        return sorted(reserved_project_chat_ids(request_drive_root(request)))
-    except Exception:
-        return []
 
 
 __all__ = ["api_health", "api_state"]

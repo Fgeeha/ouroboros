@@ -182,9 +182,9 @@ def tool_scope_key(ctx: Any) -> str:
 
 
 def _row_settled_locked(row: Dict[str, Any]) -> bool:
-    """Settled = the future finished, no late callback holds it, and the
-    registering owner has released it. Read with ``_TOOL_LOCK`` held."""
-    return bool(row.get("done")) and int(row.get("holds") or 0) <= 0 and not row.get("owner_open")
+    """Settled = the future finished and nobody holds it: neither a late
+    callback nor the registering owner's pin. Read with ``_TOOL_LOCK`` held."""
+    return bool(row.get("done")) and int(row.get("holds") or 0) <= 0
 
 
 def register_tool_future(ctx: Any, operation_id: str, tool: str, future: Any) -> Callable[[], None]:
@@ -200,7 +200,7 @@ def register_tool_future(ctx: Any, operation_id: str, tool: str, future: Any) ->
         return lambda: None
     row: Dict[str, Any] = {"operation_id": op, "tool": str(tool or ""),
                            "settled": threading.Event(), "holds": 0,
-                           "done": False, "observable": True, "owner_open": True}
+                           "done": False, "observable": True}
     scope = tool_scope_key(ctx)
     with _TOOL_LOCK:
         rows = _TOOL_FUTURES.setdefault(scope, {})
@@ -208,17 +208,14 @@ def register_tool_future(ctx: Any, operation_id: str, tool: str, future: Any) ->
         for op_id in [i for i, r in rows.items() if _row_settled_locked(r)]:
             rows.pop(op_id, None)
         rows[op] = row
+    # The owner's pin is the FIRST hold on the row, taken before the done
+    # callback is attached: a future that has already finished cannot settle
+    # (and be pruned) before the registering caller has decided about a late hold.
+    owner_release = hold_tool_settlement(ctx, op)
 
     def _done(_future: Any) -> None:
         with _TOOL_LOCK:
             row["done"] = True
-            settled = _row_settled_locked(row)
-        if settled:
-            row["settled"].set()
-
-    def _owner_release() -> None:
-        with _TOOL_LOCK:
-            row["owner_open"] = False
             settled = _row_settled_locked(row)
         if settled:
             row["settled"].set()
@@ -231,19 +228,20 @@ def register_tool_future(ctx: Any, operation_id: str, tool: str, future: Any) ->
         log.warning("Tool future %s cannot be observed for budget-pause quiescence", op, exc_info=True)
         with _TOOL_LOCK:
             row["observable"] = False
-    return _owner_release
+    return owner_release
 
 
 def hold_tool_settlement(ctx: Any, operation_id: str) -> Callable[[], None]:
-    """Claim a row for a late settlement callback; returns its release.
+    """Claim a row (the registering owner's pin, or a late settlement callback's
+    hold); returns its single-use release.
 
-    The caller attaches its callback AFTER claiming and calls the release as
+    A late caller attaches its callback AFTER claiming and calls the release as
     the callback's last act, so the registry reports the tool as settled only
     once that callback's own effects are over. The claim is taken while the
     registering owner still pins the row (it releases only after this claim),
     so a future that finished a moment earlier is still here to be claimed.
     An unregistered row returns a no-op: this registry never invents an
-    observation it does not hold.
+    observation it does not hold. Releasing twice is harmless.
     """
     op = str(operation_id or "")
     with _TOOL_LOCK:
@@ -252,9 +250,14 @@ def hold_tool_settlement(ctx: Any, operation_id: str) -> Callable[[], None]:
             return lambda: None
         row["holds"] += 1
         row["settled"].clear()
+    released = False
 
     def _release() -> None:
+        nonlocal released
         with _TOOL_LOCK:
+            if released:
+                return
+            released = True
             row["holds"] = max(0, int(row["holds"]) - 1)
             settled = _row_settled_locked(row)
         if settled:
@@ -782,7 +785,30 @@ def request_pause(limit_ctx: Any, *, rail: str, scope: str, reason_text: str,
     setattr(ctx, "_budget_pausing", True)
     pause_id = uuid.uuid4().hex
     root = pathlib.Path(ctx.budget_drive_root or ctx.drive_root)
-    _ensure_pausable_result_row(root, ctx)
+    # A direct owner-chat turn has no admission-written RUNNING row (the pool
+    # mirrors one at dispatch; the direct lane writes a stub only for a turn
+    # with an origin ref). The pause row is a projection ON the task result, so
+    # an absent row is written as a plain RUNNING row first — merge-write, never
+    # a replacement of an existing one. A failed write is not swallowed into a
+    # fake pause, and an unreadable row is not ours to guess: the seed write
+    # below meets the same fault and HOLDS.
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
+
+    try:
+        pausable_row = bool(load_task_result(root, task_id, strict=False))
+    except Exception:
+        pausable_row = True
+    if not pausable_row:
+        try:
+            chat_id = getattr(ctx, "current_chat_id", None)
+            write_task_result(
+                root, task_id, STATUS_RUNNING,
+                **({"chat_id": int(chat_id)} if chat_id not in (None, "") else {}),
+                _is_direct_chat=bool(getattr(ctx, "is_direct_chat", False)),
+                result="Task is pausing on its budget rail; its exact continuation is being stored.",
+            )
+        except Exception:
+            log.debug("Pausable result row for %s could not be written ahead of the seed", task_id, exc_info=True)
     # One monotonic generation per pause of this task (pauseA=1, pauseB=2, ...):
     # every grant, handoff and revocation names the generation beside the pause
     # id, so a carrier from an earlier pause can never read as the current one.
@@ -876,33 +902,6 @@ def request_pause(limit_ctx: Any, *, rail: str, scope: str, reason_text: str,
     usage["execution_status"] = "paused"
     usage["budget_pause"] = {key: row[key] for key in ("pause_id", "rail", "scope", "paused_at", "resume_point")}
     raise BudgetPauseRequested(row)
-
-
-def _ensure_pausable_result_row(root: pathlib.Path, ctx: Any) -> None:
-    """A direct owner-chat turn has no admission-written RUNNING row (the pool
-    mirrors one at dispatch; the direct lane writes a stub only for a turn with
-    an origin ref). The pause row is a projection ON the task result, so an
-    absent row is written as a plain RUNNING row first — merge-write, never a
-    replacement of an existing one. A failed write is not swallowed into a
-    fake pause: the seed write that follows meets the same fault and HOLDS."""
-    from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
-
-    task_id = str(ctx.task_id)
-    try:
-        if load_task_result(root, task_id, strict=False):
-            return
-    except Exception:
-        return  # an unreadable row is the seed write's typed hold, not ours to guess
-    try:
-        chat_id = getattr(ctx, "current_chat_id", None)
-        write_task_result(
-            root, task_id, STATUS_RUNNING,
-            **({"chat_id": int(chat_id)} if chat_id not in (None, "") else {}),
-            _is_direct_chat=bool(getattr(ctx, "is_direct_chat", False)),
-            result="Task is pausing on its budget rail; its exact continuation is being stored.",
-        )
-    except Exception:
-        log.debug("Pausable result row for %s could not be written ahead of the seed", task_id, exc_info=True)
 
 
 # Fields of a direct turn's task record that never travel in its pause event:

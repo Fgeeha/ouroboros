@@ -955,21 +955,6 @@ def _project_runs(drive_root: Any, custody: RunCustody) -> Optional[List[RunCust
     return [run for run in state.values() if run.project_id == custody.project_id and run.run_id]
 
 
-def _project_settled(drive_root: Any, custody: RunCustody) -> bool:
-    """Every run of the project is settled, per a complete view read NOW.
-
-    Re-read under the retirement lock right before a discharge row is appended,
-    because STARTED appends take no lock: a PROJECT_RETIRED replayed after a
-    sibling's STARTED strips that sibling's ownership. Nothing proven means no.
-    """
-    try:
-        rows = _project_runs(drive_root, custody)
-    except Exception:
-        log.warning("Discharge deferred: replay failed for %s", custody.run_id, exc_info=True)
-        return False
-    return bool(rows) and all(run.settled for run in rows)
-
-
 def _release_registration(drive_root: Any, custody: RunCustody, **facts: Any) -> None:
     """Our custody over the registration ends: the memo (every sibling, exactly as
     the replay clears them) and the durable row, ``facts`` naming why it was kept."""
@@ -1016,12 +1001,23 @@ def _retire_project_locked(drive_root: Any, gateway: Any, custody: RunCustody) -
             # is what tells a permanent refusal from one worth retrying.
             refusal = {"code": str(getattr(exc, "code", "") or ""),
                        "status": int(getattr(exc, "status_code", 0) or 0)}
-            if daemon_keeps_project(exc) and _project_settled(drive_root, custody):
-                # The #362 vocabulary — our custody ends, the engine keeps the
-                # project — under the engine's own code; never a deletion claim.
-                _release_registration(drive_root, custody, project_kept=True,
-                                      reason=PROJECT_HAS_THREADS, **refusal)
-                return
+            if daemon_keeps_project(exc):
+                # Discharge only when EVERY run of the project is settled per a
+                # complete view read NOW, under the retirement lock and right
+                # before the discharge row is appended: STARTED appends take no
+                # lock, so a PROJECT_RETIRED replayed after a sibling's STARTED
+                # would strip that sibling's ownership. Nothing proven means no.
+                try:
+                    settled_rows = _project_runs(drive_root, custody)
+                except Exception:
+                    log.warning("Discharge deferred: replay failed for %s", custody.run_id, exc_info=True)
+                    settled_rows = None
+                if settled_rows and all(run.settled for run in settled_rows):
+                    # The #362 vocabulary — our custody ends, the engine keeps the
+                    # project — under the engine's own code; never a deletion claim.
+                    _release_registration(drive_root, custody, project_kept=True,
+                                          reason=PROJECT_HAS_THREADS, **refusal)
+                    return
             emit(drive_root, PROJECT_RETIRE_FAILED, {"run_id": custody.run_id, "task_id": custody.task_id,
                                                      "project_id": custody.project_id,
                                                      "reason": str(exc)[:500], **refusal})

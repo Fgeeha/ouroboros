@@ -172,13 +172,6 @@ def _resume_allowed(task_id: str, meta: dict, worker: Any) -> bool:
     return (not intent or intent.get("stop_policy") == "finalize_then_cancel") and _pool().repo_writer_task_allowed(meta["task"])
 
 
-def _announce_wait_ended(task_id: str, quiz_id: str, chat_id: int) -> None:
-    """The bound closed and the pooled task resumed: one seam with the direct lane."""
-    from ouroboros.owner_wait import announce_wait_ended
-
-    announce_wait_ended(_pool().DRIVE_ROOT, task_id, quiz_id, chat_id)
-
-
 def _grant_resume(
     task_id: str, meta: dict, worker: Any, *, exhausted_replacement: Any = None,
 ) -> bool:
@@ -224,7 +217,11 @@ def _grant_resume(
             raise
         meta.pop("owner_wait_resume_requested", None)
         if str(resumed.get("resume_reason") or "") == "timeout" and str(resumed.get("quiz_id") or ""):
-            _announce_wait_ended(task_id, str(resumed["quiz_id"]), int((meta.get("task") or {}).get("chat_id") or 0))
+            # The bound closed and the pooled task resumed: one seam with the direct lane.
+            from ouroboros.owner_wait import announce_wait_ended
+
+            announce_wait_ended(_pool().DRIVE_ROOT, task_id, str(resumed["quiz_id"]),
+                                int((meta.get("task") or {}).get("chat_id") or 0))
         # A mailbox wake is the start of useful model work, not a new attempt.
         meta["last_progress_at"] = _pool().time.time()
         return True

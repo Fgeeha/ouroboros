@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_budget_pause_exact import _install_queue, _loop_ctx, _parked, _supervisor_ctx
+from tests._budget_pause_exact_helpers import _install_queue, _loop_ctx, _parked, _supervisor_ctx
 from tests.test_budget_pause_holds import _fenced_member, _idle_worker, _source_file
 
 pytestmark = pytest.mark.serial
@@ -293,7 +293,7 @@ def test_failed_finite_lifetime_read_refuses_delegation_without_reset(tmp_path, 
 def test_direct_actor_releases_local_fence_after_parking_same_id(tmp_path, monkeypatch):
     from ouroboros import budget_pause
     from supervisor import message_bus, worker_chat_lane
-    from tests.test_budget_pause_exact import _fast_hold, _quiet_external
+    from tests._budget_pause_exact_helpers import _fast_hold, _quiet_external
 
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 5.0)
@@ -329,7 +329,7 @@ def test_direct_actor_releases_local_fence_even_when_the_inline_park_fails(tmp_p
     closed in the supervisor process would refuse the resumed turn's sends."""
     from ouroboros import budget_pause
     from supervisor import events_budget, message_bus, worker_chat_lane
-    from tests.test_budget_pause_exact import _fast_hold, _quiet_external
+    from tests._budget_pause_exact_helpers import _fast_hold, _quiet_external
 
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 5.0)

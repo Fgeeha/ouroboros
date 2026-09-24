@@ -849,45 +849,6 @@ class MaxSecondsBound(NamedTuple):
     refusal_detail: str = ""
 
 
-def _lifetime_remaining_sec(ctx: ToolContext) -> Optional[float]:
-    """Seconds of the task's FINITE lifetime still unspent, or ``None`` (unlimited).
-
-    Cumulative EXECUTION time decides, never a reset clock: the live model-wait
-    owner's window (elapsed minus the quota union minus the budget-paused
-    carrier) when this task's is bound, else the same arithmetic over the
-    original ``task_started_at`` and the paused carrier the resume handed over
-    (quota waits unknown here count as execution — the narrower direction).
-    No recorded start uses the operation-bounded ceiling; a failed clock read
-    raises for a typed unknown-lifetime refusal, never a fresh finite window.
-    """
-    from ouroboros.config import get_task_abs_ceiling_sec
-
-    ceiling = get_task_abs_ceiling_sec()
-    if ceiling is None:
-        return None
-    try:
-        from ouroboros.model_wait import current_model_wait, execution_elapsed_seconds
-
-        waiter = current_model_wait()
-        if (waiter is not None
-                and str(getattr(waiter, "task_id", "") or "") == str(getattr(ctx, "task_id", "") or "")):
-            remaining = waiter.execution_window_remaining()
-            if remaining is not None:
-                return float(remaining)
-        started = getattr(ctx, "task_started_at", None)
-        if started:
-            paused = getattr(ctx, "_budget_paused_sec", None)
-            if paused is None:
-                paused = (getattr(ctx, "budget_pause_resume", None) or {}).get("paused_duration_sec")
-            executed = execution_elapsed_seconds(
-                {"started_at": float(started), "budget_paused_sec": float(paused or 0.0),
-                 "model_wait_quota_clock": {}}, time.time())
-            return max(0.0, float(ceiling) - executed)
-    except Exception as exc:
-        raise ValueError("task_lifetime_unknown") from exc
-    return float(ceiling)
-
-
 def bounded_max_seconds(ctx: ToolContext, requested: Optional[int]) -> MaxSecondsBound:
     """Narrow-only: the delegated run may never outlive the nanny's own deadline
     or its finite lifetime, and the decision is RECORDED beside the number.
@@ -901,7 +862,7 @@ def bounded_max_seconds(ctx: ToolContext, requested: Optional[int]) -> MaxSecond
     the engine's schema bound narrowed it (each named); an omitted ask derives
     from the tighter of deadline and lifetime, else the operation window.
     """
-    from ouroboros.config import operation_window_sec
+    from ouroboros.config import get_task_abs_ceiling_sec, operation_window_sec
     from ouroboros.deadline_utils import deadline_remaining_sec, has_deadline
     from ouroboros.delegate_registration_policy import (
         CAP_BASIS_DEADLINE_DERIVED, CAP_BASIS_LIFETIME_DERIVED, CAP_BASIS_OPERATION_WINDOW,
@@ -920,11 +881,40 @@ def bounded_max_seconds(ctx: ToolContext, requested: Optional[int]) -> MaxSecond
             return MaxSecondsBound(0, "", "task_deadline_too_close",
                                    "Less than one second of this task's deadline remains: no delegated run "
                                    "can be started under it. Finalize with what you have.")
-    try:
-        lifetime_left = _lifetime_remaining_sec(ctx)
-    except ValueError:
-        return MaxSecondsBound(0, "", "task_lifetime_unknown",
-                               "This task's remaining finite lifetime could not be established; no delegated run started.")
+    # Seconds of the task's FINITE lifetime still unspent (``None`` = unlimited).
+    # Cumulative EXECUTION time decides, never a reset clock: the live model-wait
+    # owner's window (elapsed minus the quota union minus the budget-paused
+    # carrier) when this task's is bound, else the same arithmetic over the
+    # original ``task_started_at`` and the paused carrier the resume handed over
+    # (quota waits unknown here count as execution — the narrower direction).
+    # No recorded start uses the operation-bounded ceiling; a failed clock read
+    # is a typed unknown-lifetime refusal, never a fresh finite window.
+    lifetime_left: Optional[float] = get_task_abs_ceiling_sec()
+    if lifetime_left is not None:
+        try:
+            from ouroboros.model_wait import current_model_wait, execution_elapsed_seconds
+
+            waiter = current_model_wait()
+            remaining = None
+            if (waiter is not None
+                    and str(getattr(waiter, "task_id", "") or "") == str(getattr(ctx, "task_id", "") or "")):
+                remaining = waiter.execution_window_remaining()
+            started = getattr(ctx, "task_started_at", None)
+            if remaining is not None:
+                lifetime_left = float(remaining)
+            elif started:
+                paused = getattr(ctx, "_budget_paused_sec", None)
+                if paused is None:
+                    paused = (getattr(ctx, "budget_pause_resume", None) or {}).get("paused_duration_sec")
+                executed = execution_elapsed_seconds(
+                    {"started_at": float(started), "budget_paused_sec": float(paused or 0.0),
+                     "model_wait_quota_clock": {}}, time.time())
+                lifetime_left = max(0.0, float(lifetime_left) - executed)
+            else:
+                lifetime_left = float(lifetime_left)
+        except Exception:
+            return MaxSecondsBound(0, "", "task_lifetime_unknown",
+                                   "This task's remaining finite lifetime could not be established; no delegated run started.")
     if lifetime_left is not None and lifetime_left < 1.0:
         return MaxSecondsBound(0, "", "task_lifetime_exhausted",
                                "This task's finite lifetime is spent (cumulative execution time, the "
@@ -1069,19 +1059,6 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     def read_window() -> float:
         return (float(window_within_deadline(ctx, int(_READ_TIMEOUT_SEC)))
                 if observation_only else deadline - time.monotonic())
-
-    def read_failure(exc: ClaudexorUnavailable) -> str:
-        if observation_only and exc.observation_timeout:
-            # The gateway's per-class reason, not the generic transport code: a
-            # read bound that expired against a live daemon is a quiet hole and
-            # nothing more, while a socket that carried no answer is the outage
-            # the owner is told about once per episode.
-            return json.dumps({
-                "status": "observation_pending", "run_id": rid,
-                "reason": exc.observation_reason or exc.code, "detail": str(exc),
-                "waited_sec": time.monotonic() - started,
-            })
-        return _fail("delegate_wait", exc.code, str(exc), run_id=rid).text
 
     borrowed = gateway is not None
 
@@ -1237,7 +1214,17 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 return _expired()   # unanswered AT expiry: expire on what is already held
             detail = fresh
     except ClaudexorUnavailable as exc:
-        return read_failure(exc)
+        if observation_only and exc.observation_timeout:
+            # The gateway's per-class reason, not the generic transport code: a
+            # read bound that expired against a live daemon is a quiet hole and
+            # nothing more, while a socket that carried no answer is the outage
+            # the owner is told about once per episode.
+            return json.dumps({
+                "status": "observation_pending", "run_id": rid,
+                "reason": exc.observation_reason or exc.code, "detail": str(exc),
+                "waited_sec": time.monotonic() - started,
+            })
+        return _fail("delegate_wait", exc.code, str(exc), run_id=rid).text
     finally:
         _emit_external_wait_lease(ctx, rid, 0.0, lease_id=_lease_id)
         if gateway is not None and not borrowed:

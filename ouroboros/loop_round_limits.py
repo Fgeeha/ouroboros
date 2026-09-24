@@ -264,48 +264,42 @@ def _run_round_compaction(
     folded into a rewrite, and precedes the acceptance observation and the seal."""
     from ouroboros.peer_roster import maybe_append_roster_note
 
-    messages, usage = _run_round_reclaim(messages, ctx)
-    maybe_append_roster_note(ctx.tools._ctx, messages, ctx.drive_root)
-    return messages, usage
-
-
-def _run_round_reclaim(
-    messages: List[Dict[str, Any]],
-    ctx: _CompactionRoundContext,
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Run only an explicit manual reclaim; Main fit owns automatic decisions."""
+    # Only an explicit manual reclaim runs here; Main fit owns automatic decisions.
+    usage: Optional[Dict[str, Any]] = None
     pending = getattr(ctx.tools._ctx, "_pending_compaction", None)
     selected_names = getattr(ctx.tools._ctx, "_pending_tool_schema_names", None)
     if pending is None and selected_names is None:
-        return messages, None
-    if isinstance(pending, dict) or pending is None:
-        return _run_authored_context_view(messages, ctx, pending, selected_names), None
-    ctx.tools._ctx._pending_compaction = None
-    rebuilt, receipt, usage = _loop().compact_tool_history_llm(
-        messages,
-        keep_recent=max(0, int(pending)),
-        drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
-        task_id=ctx.task_id,
-        negative_memo=reclaim_negative_memo(ctx.tools._ctx),
-        trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
-    )
-    _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
-        "checkpoint_kind": "context_reclaim_manual",
-        "round": ctx.round_idx,
-        "status": receipt.status,
-        "reclaimed_tokens": receipt.reclaimed_tokens,
-        "goal_reached": receipt.goal_reached,
-        "checkpoint_ref": receipt.checkpoint_ref,
-    })
-    if receipt.status in {"checkpoint_failed", "summarizer_failed", "binding_mismatch"}:
-        ctx.emit_progress(
-            f"⚠️ Context compaction kept the transcript unchanged ({receipt.status})."
+        pass
+    elif isinstance(pending, dict) or pending is None:
+        messages = _run_authored_context_view(messages, ctx, pending, selected_names)
+    else:
+        ctx.tools._ctx._pending_compaction = None
+        messages, receipt, usage = _loop().compact_tool_history_llm(
+            messages,
+            keep_recent=max(0, int(pending)),
+            drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
+            task_id=ctx.task_id,
+            negative_memo=reclaim_negative_memo(ctx.tools._ctx),
+            trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
         )
-    if receipt.status == "applied":
-        invalidate_task_cache_splits(ctx.task_id)
-        prune_reclaim_trace_refs(ctx.tools._ctx, rebuilt)
-        sanction_rewrite(ctx.tools._ctx, "compaction")
-    return rebuilt, usage
+        _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+            "checkpoint_kind": "context_reclaim_manual",
+            "round": ctx.round_idx,
+            "status": receipt.status,
+            "reclaimed_tokens": receipt.reclaimed_tokens,
+            "goal_reached": receipt.goal_reached,
+            "checkpoint_ref": receipt.checkpoint_ref,
+        })
+        if receipt.status in {"checkpoint_failed", "summarizer_failed", "binding_mismatch"}:
+            ctx.emit_progress(
+                f"⚠️ Context compaction kept the transcript unchanged ({receipt.status})."
+            )
+        if receipt.status == "applied":
+            invalidate_task_cache_splits(ctx.task_id)
+            prune_reclaim_trace_refs(ctx.tools._ctx, messages)
+            sanction_rewrite(ctx.tools._ctx, "compaction")
+    maybe_append_roster_note(ctx.tools._ctx, messages, ctx.drive_root)
+    return messages, usage
 
 
 def _run_authored_context_view(messages, ctx, pending, selected_names):

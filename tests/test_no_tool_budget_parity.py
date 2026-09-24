@@ -149,7 +149,7 @@ def test_preparation_failure_pauses_and_resumes_the_no_tool_tail(full_loop, monk
     from ouroboros import budget_pause, loop, loop_budget, loop_acceptance_review, owner_wait, usage_accounting
     from ouroboros.artifacts import read_actor_source_bytes
     from supervisor.events import _handle_budget_pause
-    from tests.test_budget_pause_exact import _install_queue, _supervisor_ctx
+    from tests._budget_pause_exact_helpers import _install_queue, _supervisor_ctx
 
     f = full_loop
     root, task_id = f.ctx.drive_root, f.ctx.task_id
@@ -225,7 +225,7 @@ def test_preparation_failure_pauses_and_resumes_the_no_tool_tail(full_loop, monk
 def test_eligible_monetary_stops_preserve_exact_continuation(tmp_path, monkeypatch, rail, completed_rounds):
     """A first batch is work; a soft threshold also pauses before any work."""
     from ouroboros import budget_pause, loop
-    from tests.test_budget_pause_exact import _loop_ctx, _running_row
+    from tests._budget_pause_exact_helpers import _loop_ctx, _running_row
 
     _running_row(tmp_path, "first-work")
     ctx, limit = _loop_ctx(tmp_path, "first-work")

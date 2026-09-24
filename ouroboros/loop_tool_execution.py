@@ -1473,10 +1473,16 @@ def process_tool_results(
                 ctx._tool_trace_refs = refs
             refs[str(exec_result["tool_call_id"])] = trace_ref
 
+        # Ensure args are JSON-serializable for trace logging.
+        try:
+            trace_args = json.loads(json.dumps(exec_result["args_for_log"], ensure_ascii=False, default=str))
+        except Exception:
+            log.debug("Failed to serialize args for trace logging", exc_info=True)
+            trace_args = {"_repr": repr(exec_result["args_for_log"])}
         llm_trace["tool_calls"].append({
             "tool": fn_name,
             "tool_call_id": exec_result["tool_call_id"],
-            "args": _safe_args(exec_result["args_for_log"]),
+            "args": trace_args,
             # Evidence-parity (v6.71.1): store the SAME view the agent saw
             # (per-tool TOOL_RESULT_LIMITS, head-truncated) rather than a hidden
             # 700-char head+tail copy. A decider (acceptance reviewer, reflection)
@@ -1583,10 +1589,3 @@ def process_tool_results(
     return error_count
 
 
-def _safe_args(v: Any) -> Any:
-    """Ensure args are JSON-serializable for trace logging."""
-    try:
-        return json.loads(json.dumps(v, ensure_ascii=False, default=str))
-    except Exception:
-        log.debug("Failed to serialize args for trace logging", exc_info=True)
-        return {"_repr": repr(v)}
