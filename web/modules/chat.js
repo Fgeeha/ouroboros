@@ -993,13 +993,14 @@ export function createChatInstance({
         );
     }
 
-    // Early final stays live while post-task synthesis runs.
-    function markLiveCardFinalizing(taskId = '') {
+    // Early outcome is not completion.
+    function markLiveCardFinalizing(taskId = '', fact = {}) {
         return withStableViewport(() => {
             const record = liveCardRecords.get(taskKey(taskId));
             if (!record || record.finished || !record.phaseEl) return false;
             const anchored = markReviewAnchor(record);
             if (record.cancelPendingPolicy) return anchored;
+            record.observedOutcome = taskTerminalSummary({ ...fact, task_phase: 'finalizing' }).observedOutcome || record.observedOutcome;
             record.finalizingHold = true;
             const desired = desiredLiveCardPhase(record);
             const phased = setLiveCardPhase(
@@ -2528,7 +2529,7 @@ export function createChatInstance({
                         // Progress-only/failed tasks still anchor at their first event.
                         insertCardIfNeeded(taskId);
                         // Open post-task checkpoint replays as "Finalizing…".
-                        if (msg.task_phase === 'finalizing') markLiveCardFinalizing(taskId);
+                        if (msg.task_phase === 'finalizing') markLiveCardFinalizing(taskId, msg);
                         continue;
                     }
                     if (msg.system_type === 'task_summary') continue;
@@ -2568,7 +2569,7 @@ export function createChatInstance({
                         insertCardIfNeeded(taskId);
                         // A replayed early final must not finalize the card.
                         if (msg.task_phase === 'finalizing') {
-                            markLiveCardFinalizing(taskId);
+                            markLiveCardFinalizing(taskId, msg);
                         } else if (!msg.historical_terminal || positiveTaskTerminalFact(msg)) {
                             const record = liveCardRecords.get(taskId);
                             finishLiveCard(taskId, msg.task_terminal_status ? taskTerminalPhase(msg) : replayTerminalPhase(record));
@@ -3784,7 +3785,7 @@ export function createChatInstance({
                 return Boolean(changed);
             }
             let changed = false;
-            if (finalizing) changed = markLiveCardFinalizing(explicitTaskId) || changed;
+            if (finalizing) changed = markLiveCardFinalizing(explicitTaskId, msg) || changed;
             else if (explicitTaskId && typedTerminal) {
                 changed = appendTaskSummaryToLiveCard(msg) || changed;
             }

@@ -429,8 +429,11 @@ def test_periodic_maintenance_retries_terminal_only_without_synthesis(project_ro
     assert settle_terminal_projection(project_root.root, 'root-1') == SETTLEMENT_DEFERRED
     assert not project_root.queued
     monkeypatch.setattr('supervisor.terminal_delivery.register_pending_delivery', real_register)
-    assert maintenance._CANCEL_INTENT_SWEEP_LOCK.acquire(blocking=False)
-    maintenance._run_cancel_delivery_ref_sweep(project_root.root)
+    monkeypatch.setattr(maintenance, 'DATA_DIR', project_root.root)
+    stop_checks = iter([False, True])
+    monkeypatch.setattr(maintenance, '_stop_requested', lambda *_a: next(stop_checks))
+    assert maintenance._CUSTODY_SWEEP_LOCK.acquire(blocking=False)
+    maintenance._run_periodic_custody_sweep()
     assert len(project_root.queued) == len(_project_rows(project_root.root, 'root-1')) == 1
     assert load_task_result(project_root.root, 'root-1')['canonical_terminal_projection']['main_disposition'] == 'owed'
 
@@ -488,3 +491,63 @@ def test_append_receipt_crash_dedupes_across_chat_rotation(project_root, monkeyp
     archived = [json.loads(line) for line in (project_root.root / 'archive/chat_20260923.jsonl').read_text().splitlines()]
     assert len([row for row in archived if row.get('summary_id') == 'task-terminal:root-1']) == 1
     assert len(project_root.queued) == 1
+
+
+@pytest.mark.parametrize('artifact_status', ['pending', 'finalizing'])
+def test_artifact_finalization_holds_project_and_main(project_root, artifact_status):
+    task = {**project_root.task, 'workspace_root': str(project_root.root / 'workspace')}
+    _store(project_root.root, workspace_root=task['workspace_root'], artifact_status=artifact_status)
+    assert settle_terminal_projection(project_root.root, 'root-1', task=task) == SETTLEMENT_DEFERRED
+    assert not _project_rows(project_root.root, 'root-1')
+    assert not project_root.queued
+    _store(project_root.root, workspace_root=task['workspace_root'], artifact_status='failed',
+           artifact_bundle={'status': 'failed'}, outcome_axes={'artifacts': {'status': 'failed'}})
+    assert settle_terminal_projection(project_root.root, 'root-1', task=task) == SETTLEMENT_SETTLED
+    assert len(_project_rows(project_root.root, 'root-1')) == 1
+    assert _project_rows(project_root.root, 'root-1')[0]['outcome'] == 'Failed'
+    assert len(project_root.queued) == 1
+    assert settle_terminal_projection(project_root.root, 'root-1', task=task) == SETTLEMENT_NONE
+
+
+def test_terminal_timestamp_enrichment_does_not_remint(project_root):
+    _store(project_root.root)
+    assert settle_terminal_projection(project_root.root, 'root-1', task=project_root.task) == SETTLEMENT_SETTLED
+    before = load_task_result(project_root.root, 'root-1')['canonical_terminal_projection']
+    _store(project_root.root, ts='2099-01-01T00:00:00Z')
+    assert settle_terminal_projection(project_root.root, 'root-1', task=project_root.task) == SETTLEMENT_NONE
+    assert load_task_result(project_root.root, 'root-1')['canonical_terminal_projection'] == before
+    assert len(_project_rows(project_root.root, 'root-1')) == 1
+    assert len(project_root.queued) == 1
+
+
+def test_canonical_cancel_keeps_existing_artifact_readiness_exception(project_root):
+    write_task_result(project_root.root, 'root-1', 'cancelled', root_task_id='root-1',
+        project_id='launch', workspace_root=str(project_root.root/'workspace'),
+        artifact_status='pending', result='Cancelled by custody')
+    assert settle_terminal_projection(project_root.root, 'root-1') == SETTLEMENT_SETTLED
+    assert _project_rows(project_root.root, 'root-1')[0]['outcome'] == 'Cancelled'
+
+
+def test_split_root_uses_stored_adoption_facts_without_task_argument(project_root):
+    child = project_root.root/'child-drive'
+    _store(project_root.root, child_drive_root=str(child),
+           workspace_root=str(project_root.root/'workspace'), artifact_status='ready_with_changes')
+    assert settle_terminal_projection(project_root.root, 'root-1') == SETTLEMENT_DEFERRED
+    assert not _project_rows(project_root.root, 'root-1')
+    _store(project_root.root, headless_child_drive_root=str(child),
+           child_ref_promotion={'schema_version': 1, 'status': 'complete'})
+    assert settle_terminal_projection(project_root.root, 'root-1') == SETTLEMENT_SETTLED
+    assert len(_project_rows(project_root.root, 'root-1')) == 1
+
+
+def test_child_append_does_not_scan_root_recovery_history(tmp_path, monkeypatch):
+    def forbidden(*_a):
+        raise AssertionError('child entered root history recovery')
+    monkeypatch.setattr('ouroboros.terminal_projection._already_in_chat', forbidden)
+    child = {'id': 'child', 'parent_task_id': 'root', 'root_task_id': 'root',
+             'delegation_role': 'subagent', 'chat_id': 1}
+    stored = write_task_result(tmp_path, 'child', 'completed', parent_task_id='root',
+                               root_task_id='root', delegation_role='subagent')
+    assert append_terminal_task_projection(tmp_path, 'child', child, stored, DONE)
+    assert not append_terminal_task_projection(tmp_path, 'child', child, stored, DONE)
+    assert len(_project_rows(tmp_path, 'child')) == 1

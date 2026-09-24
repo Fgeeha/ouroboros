@@ -281,7 +281,7 @@ def _get_tool_timeout(
 # per-call/run_command machinery and the deadline milestones own those.
 _DEADLINE_CLAMPED_TOOLS = frozenset({
     "web_search", "browse_page", "browser_action", "youtube_transcript",
-    "wait_task", "wait_tasks", "plan_task", "task_acceptance_review",
+    "wait_task", "wait_tasks", "await_messages", "plan_task", "task_acceptance_review",
     "analyze_screenshot", "vlm_query",
 })
 
@@ -1497,6 +1497,12 @@ def process_tool_results(
                     )
                     if deferred_to_host:
                         llm_trace.setdefault("acceptance_evidence_calls", []).append(parsed)
+                        if isinstance(parsed.get("acceptance_retry"), dict):
+                            # One explicit, source-bound retry of a disclosed local
+                            # preparation failure. Duplicate deliveries are idempotent.
+                            from ouroboros.acceptance_preparation import record_retry_intent
+
+                            record_retry_intent(llm_trace, parsed["acceptance_retry"], ctx)
                         if ctx is not None:
                             ctx._acceptance_request_pending = {
                                 **(parsed.get("request") or {}),

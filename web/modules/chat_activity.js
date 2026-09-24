@@ -596,10 +596,12 @@ export function taskCostProjection(payload = {}, rawTs = '') {
     if (!meta.length) return null;
     const unavailable = payload.cost_accounting_status === 'unavailable' || payload.cost_presentation === null;
     const presentation = payload.cost_presentation;
+    const legacyRollup = payload.cost_presentation === null && (
+        payload.accounted_upper_bound_usd_with_children !== undefined || payload.cost_usd_with_children !== undefined);
     return {
         meta,
         ts: rawTimestampEpoch(rawTs),
-        ...(presentation?.scope ? { scope: presentation.scope } : {}),
+        ...(presentation?.scope ? { scope: presentation.scope } : legacyRollup ? { scope: 'rollup' } : {}),
         // Only a SETTLED ledger value is final. "unavailable" is an honest
         // unknown, not a settled truth: marking it final let one transient
         // ledger-read failure outrank every later real reading. The scoped
@@ -628,6 +630,8 @@ export function mergeStickyCostMeta(previous, next) {
     if (!previous || !Array.isArray(previous.meta) || !previous.meta.length) return next;
     if (previous.scope === 'root_tree' && next.scope !== 'root_tree') return previous;
     if (next.scope === 'root_tree' && previous.scope !== 'root_tree') return next;
+    if (previous.scope === 'rollup' && next.scope === 'own') return previous;
+    if (next.scope === 'rollup' && previous.scope === 'own') return next;
     // Rank: unavailable < pending < final. An `unavailable` snapshot is sticky (a
     // costless frame must not erase it) but must NOT outrank a later HONEST reading:
     // one transient ledger-read failure would otherwise pin the card to "cost

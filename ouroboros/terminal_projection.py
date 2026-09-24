@@ -42,13 +42,21 @@ def _attempt(row: dict) -> dict:
     # An obligation token distinguishes two publications even when old records
     # lack attempt metadata. These facts additionally fence same-id retries.
     metadata = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
-    return {**{key: row.get(key) for key in ("task_attempt", "_attempt", "started_at", "ts")},
+    return {**{key: row.get(key) for key in ("task_attempt", "_attempt", "started_at")},
             "metadata_attempt": metadata.get("attempt"), "metadata_task_attempt": metadata.get("task_attempt")}
 
 
 def _witness(row: dict) -> dict:
     return {"attempt": _attempt(row), "status": row.get("status"),
-            "checkpoint": row.get("root_phase_checkpoint")}
+            "checkpoint": row.get("root_phase_checkpoint"),
+            "artifact_status": row.get("artifact_status"),
+            "artifact_bundle": row.get("artifact_bundle")}
+
+
+def _files_ready(root: Any, tid: str, row: dict) -> bool:
+    from ouroboros.headless import terminal_task_files_ready
+
+    return terminal_task_files_ready(pathlib.Path(root), {**row, "id": tid}, row)
 
 
 def _open(row: dict) -> bool:
@@ -177,11 +185,11 @@ def _append_project(root: Any, tid: str, task: dict, event: dict) -> bool:
     marker = stored.get("canonical_terminal_projection")
     if isinstance(marker, dict) and (not ready or marker.get("token") == ready.get("token")):
         return False
-    if is_root and (not ready or _open(stored)):
+    if is_root and (not ready or _open(stored) or not _files_ready(root, tid, effective)):
         return False
     row = _project_row(tid, effective, {key: event[key] for key in ("ts", "chat_id") if key in event}, ready)
     appended = False
-    if not _already_in_chat(root, row):
+    if not is_root or not _already_in_chat(root, row):
         appended = dialogue.append_canonical_task_summary(root, row)
         if not appended:
             return False
@@ -228,6 +236,7 @@ def clear_terminal_projection_obligation(root: Any, tid: str, expected: dict, di
                 or current.get("canonical_terminal_projection_ready") != ready
                 or marker != expected.get("canonical_terminal_projection")
                 or _witness(current) != _witness(expected) or _open(current)
+                or not _files_ready(root, tid, current)
                 or marker.get("token") != ready.get("token")):
             return None
         cleared = True
@@ -253,7 +262,8 @@ def settle_terminal_projection(drive_root: Any, task_id: str, *, task: dict | No
             stored = _prepare(drive_root, tid, task or {}, event or {})
             if not isinstance(stored.get("canonical_terminal_projection_ready"), dict):
                 return SETTLEMENT_NONE
-            if _open(stored) or not _settled(stored):
+            if (_open(stored) or not _settled(stored)
+                    or not _files_ready(drive_root, tid, {**(task or {}), **stored})):
                 return SETTLEMENT_DEFERRED
             _append_project(drive_root, tid, task or {}, event or {})
             # IO may have advanced canonical state. Render Main from the NEW
@@ -263,7 +273,8 @@ def settle_terminal_projection(drive_root: Any, task_id: str, *, task: dict | No
             marker = stored.get("canonical_terminal_projection")
             if (not isinstance(ready, dict) or not isinstance(marker, dict)
                     or marker.get("token") != ready.get("token") or _open(stored)
-                    or not _settled(stored)):
+                    or not _settled(stored)
+                    or not _files_ready(drive_root, tid, {**(task or {}), **stored})):
                 return SETTLEMENT_DEFERRED
             effective = {**(task or {}), **stored, "id": tid}
             done = {**(event or {}), **stored, "ts": ready["task_done_ts"], "chat_id": ready["chat_id"]}

@@ -581,7 +581,7 @@ def _annotate_terminal_task_truth(
                 # window still holds, so its harness chip needs no "Load older".
                 message.update(terminal_receipt_by_task.get(task_id) or {})
             is_summary = str(message.get("system_type") or "") == "task_summary"
-            if is_summary or (
+            if is_summary or (not message.get("is_progress") and message.get("task_terminal_status")) or (
                 task_id not in summary_task_ids
                 and latest_progress_by_task.get(task_id) is message
             ):

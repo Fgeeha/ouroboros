@@ -310,3 +310,21 @@ def test_first_terminal_root_frame_preserves_money_on_tree_failure(monkeypatch):
                         lambda *_a, **_kw: (_ for _ in ()).throw(OSError('unreadable tree')))
     output = with_task_cost_presentation(original, {'id': 'root', '_skip_post_task_synthesis': True}, '.')
     assert output == {**original, 'cost_presentation': None}
+
+
+@pytest.mark.parametrize('rollup, swarm, keeps_own', [
+    (4.25, {}, False),          # a legacy foreign subtree total: own zero may not stand for it
+    (0, {'subagent_count': 2}, False),  # the child fanned out; its own mirror is not the subtree
+    (0, {}, True),              # a leaf's pipeline mirror of its own bound carries no second scope
+    (None, {}, True),
+])
+def test_nested_rollup_scope_rule(tmp_path, monkeypatch, rollup, swarm, keeps_own):
+    from supervisor.events_task_done import _authoritative_terminal_cost
+    own = {'cost_accounting_status': 'available', 'accounted_upper_bound_usd': 0,
+           'cost_final': True, 'cost_presentation': {'scope': 'own', 'tracked_amount': 0}}
+    monkeypatch.setattr('supervisor.state.reconstruct_task_cost', lambda *_a, **_kw: dict(own))
+    result = _authoritative_terminal_cost('child', {'parent_task_id': 'root', 'root_task_id': 'root'},
+        {'accounted_upper_bound_usd_with_children': rollup, 'swarm_efficiency': swarm}, {}, tmp_path)
+    assert result['accounted_upper_bound_usd_with_children'] == rollup
+    assert result['cost_presentation'] == (own['cost_presentation'] if keeps_own else None)
+    assert result['accounted_upper_bound_usd'] == 0

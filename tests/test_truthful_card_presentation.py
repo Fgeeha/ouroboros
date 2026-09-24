@@ -152,3 +152,29 @@ def test_cancel_cause_is_bounded_by_unicode_characters():
     assert _completion_verdict({"status": "cancelled", "cancel_origin": {
         "reason": "🙂" * 200,
     }}, {}) == "🙂" * 159 + "…"
+
+
+def test_settled_early_speech_keeps_canonical_warning_axes(tmp_path):
+    from ouroboros.gateway.history import _assemble_history_response
+    from ouroboros.task_finalization import stamp_root_final_phase
+    from ouroboros.task_results import write_task_result
+    from ouroboros.utils import append_jsonl
+    from supervisor.message_bus import log_chat
+
+    axes = {'execution': {'status': 'degraded'}}
+    event = {'progress_meta': {'outcome_axes': axes}}
+    stamp_root_final_phase(event, {}, post_task_open=True, terminal_status='completed')
+    log_chat('out', 1, 1, 'Retained early answer', task_id='early',
+             message_meta=event['progress_meta'], drive_root=tmp_path)
+    write_task_result(tmp_path, 'early', 'completed', outcome_axes=axes,
+                      root_phase_checkpoint={'post_task_synthesis': 'completed'})
+    append_jsonl(tmp_path/'logs/progress.jsonl', {'task_id': 'early', 'chat_id': 1,
+        'content': 'Working', 'ts': '2026-09-23T10:00:00Z'})
+    append_jsonl(tmp_path/'logs/chat.jsonl', {'task_id': 'early', 'chat_id': 1,
+        'direction': 'system', 'type': 'task_summary', 'text': 'Summary',
+        'ts': '2026-09-23T10:00:01Z'})
+    messages = json.loads(_assemble_history_response(tmp_path, 1, 50, 200))['messages']
+    speech = next(row for row in messages if row.get('text') == 'Retained early answer')
+    assert speech['task_terminal_status'] == 'completed'
+    assert speech['outcome_axes']['execution']['status'] == 'degraded'
+    assert speech['outcome_phase'] == 'warn'

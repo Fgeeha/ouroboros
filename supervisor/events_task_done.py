@@ -180,9 +180,20 @@ def _authoritative_terminal_cost(
         present, rollup = resolve_cost_pair(
             result, "accounted_upper_bound_usd_with_children", "cost_usd_with_children")
         if not present:
-            _, rollup = resolve_cost_pair(
+            present, rollup = resolve_cost_pair(
                 evt, "accounted_upper_bound_usd_with_children", "cost_usd_with_children")
-        projection["accounted_upper_bound_usd_with_children"] = rollup
+        if present:
+            projection["accounted_upper_bound_usd_with_children"] = rollup
+            # A child pipeline mirrors its OWN bound into the rollup key (it never
+            # walks descendants), so for a leaf that mirror carries no second
+            # scope and the own facts stand. A child that ran descendants, or a
+            # rollup that differs from the own bound, is a subtree without
+            # same-scope row facts: an own carrier must not replace it.
+            swarm = result.get("swarm_efficiency")
+            fanned_out = isinstance(swarm, dict) and int(swarm.get("subagent_count") or 0) > 0
+            own_bound = projection.get("accounted_upper_bound_usd")
+            if fanned_out or (rollup is not None and rollup != own_bound):
+                projection["cost_presentation"] = None
         projection["cost_with_children_partial"] = bool(
             result.get("cost_with_children_partial", evt.get("cost_with_children_partial", True))
         )

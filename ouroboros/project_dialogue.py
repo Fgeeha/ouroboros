@@ -18,6 +18,7 @@ import pathlib
 import uuid
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
+from ouroboros.acceptance_preparation import incident_cause_clauses
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_SALVAGE
 from ouroboros.utils import append_jsonl, iter_jsonl_objects, jsonl_append_lock_path, replace_atomic, strip_markdown, utc_now_iso
@@ -740,6 +741,7 @@ TASK_CAUSE_PHRASES = {
     "author_finish": "Ouroboros delivered this answer on its own judgement; the reviewers had not signed it off.",
     "review_degraded": "The reviewers did not reach a verdict on this answer.",
     "infra_failure": "The review could not run because of an infrastructure failure, so there is no verdict.",
+    "acceptance_preparation_failed": "Ouroboros could not assemble the evidence for this answer's review, so this preparation attempt dispatched no new reviewers; the work itself is kept.",
     "dialogue_terminal": "The reviewers and Ouroboros could not agree, and both positions were kept.",
     "improvement_capsule": "The reviewers asked for one more pass and Ouroboros was given their notes.",
     "fence_reopen_failed": "The requested extra pass could not be started, so the answer stands as it was.",
@@ -1301,7 +1303,8 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
         key = _plan_review_key(result, event, reason) if reason == "plan_review_advisory" else reason
         clause = (" ".join(strip_markdown(str(detail)).split()) if detail
                   else TASK_CAUSE_PHRASES.get(key, key))
-    line = _join_cause_clauses([clause, *_terminal_limitations(result, event, reason, held=held),
+    line = _join_cause_clauses([clause, *incident_cause_clauses(decision, reason, TASK_CAUSE_PHRASES),
+                                *_terminal_limitations(result, event, reason, held=held),
                                 TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
     return line if not line or line.endswith((".", "!", "?", "…", ")")) else line + "."
 

@@ -660,6 +660,7 @@ def emit_task_results(
     # used to buffer the send with no delivery_id and no owed registration
     # at all. Seam + dedup: ouroboros/task_finalization.py.
     if _root_outbox and not _presence:
+        send_event.setdefault("progress_meta", {}).update(outcome_axes=outcome_axes, reason_code=reason_code)
         stamp_root_final_phase(  # the stamp names the SAME word the durable row below settles to
             send_event, task, terminal_status=_durable_terminal_status(env, task, execution_status),
             post_task_open=not task.get("_skip_post_task_synthesis") and not _root_post_task_already_completed(env, task),

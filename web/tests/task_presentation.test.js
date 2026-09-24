@@ -510,3 +510,26 @@ test('#1110 inert history cannot retain a floating Finalizing chip', () => {
     setInertCardPresentation(record, false);
     assert.equal(record.phaseSecondaryEl.hidden, false);
 });
+
+
+test('ordinary early-final handler consumes producer status without ending lifecycle', () => {
+    const body = chatSource.slice(chatSource.indexOf('    function markLiveCardFinalizing('),
+        chatSource.indexOf('    // Durable cancel state wins', chatSource.indexOf('    function markLiveCardFinalizing(')));
+    for (const [fact, expected] of [
+        [{ task_terminal_status: 'failed' }, 'error'],
+        [{ task_terminal_status: 'completed', outcome_axes: { execution: { status: 'degraded' } } }, 'warn'],
+        [{}, 'working'],
+        [{ type: 'tool_error', status: 'running' }, 'working'],
+    ]) {
+        const record = { phaseEl: {}, title: 'Stable task name', finished: false };
+        const handler = new Function('liveCardRecords', 'taskKey', 'withStableViewport',
+            'markReviewAnchor', 'taskTerminalSummary', 'desiredLiveCardPhase', 'setLiveCardPhase',
+            `${body}; return markLiveCardFinalizing;`)(new Map([['t', record]]), x => x, fn => fn(),
+            () => false, taskTerminalSummary, desiredLiveCardPhase, () => true);
+        handler('t', { ...fact, task_phase: 'finalizing' });
+        assert.equal(desiredLiveCardPhase(record).phase, expected);
+        assert.equal(record.finalizingHold, true);
+        assert.equal(record.finished, false);
+        assert.equal(record.title, 'Stable task name');
+    }
+});

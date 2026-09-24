@@ -26,7 +26,12 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # extension_isolated_deps.py barrier and the widget_list.js request seam land
     # beside the handoff/schedule rows the base added; none displaces older text.
     # +400 (#1213): two new module rows (focus.py, room_consolidation.py) in the tree map.
-    "docs/architecture/01-high-level-architecture.md": 164800,
+    # +500 (#1222-#1224): three module rows for the new leaves
+    # (acceptance_preparation.py, acceptance_retrieving.py, repo_diff_capture.py)
+    # and what each owns; none displaces older text.
+    # +200 (issue #1241): the subagent_worktrees module-map row states the lock scope
+    # (measured 165470 on the merged chapter).
+    "docs/architecture/01-high-level-architecture.md": 165500,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -101,7 +106,23 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the digest-selected historical read and the reader admission rule.
     # 295650 -> 297250: document the new diagnostic-only source/coverage contract,
     # unavailable evidence and no-effects ordering without removing review/custody rules.
-    "docs/architecture/06-agent-core.md": 297250,
+    # 297250 -> 303900 (#1222-#1224; measured 303813 on the merged chapter): three mechanisms this chapter had no text for.
+    # The single acceptance repository BYTES capture (file-backed spool under a real
+    # subprocess timeout, streamed private retention, redaction before any cut) with its
+    # two non-interchangeable identities and typed gaps; the LOCAL pre-binding
+    # preparation incident (semantic material identity without the owner transcript,
+    # the source-bytes identity, one exposure per real attempt bound to that attempt,
+    # the repeat guard ahead of every fallible pre-binding step, the informed author
+    # path that needs neither a working builder nor a fingerprint, the one-use
+    # source-bound retry with spent keys, the stage separation, and the existing
+    # review-projection carrier that makes it visible); and the unified
+    # spend-and-continue budget tail, which replaces only the half-sentence "checks the
+    # axis only after tool-call rounds".
+    # 303900 -> 306000 (issue #1241; measured 305853 on the merged chapter): the
+    # private-snapshot paragraph now states the worktree ops lock's scope (shared
+    # metadata only, row-then-ref order, batched binary verdict, typed busy refusal)
+    # — rationale-layer text BIBLE P6 requires.
+    "docs/architecture/06-agent-core.md": 306000,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
@@ -144,7 +165,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # never does; a pre-check's refusal takes the exact read). The one sentence it touches
     # (the lock's caller wait) is replaced; the rest is a rule the chapter lacked, and the
     # chapter had 5 bytes left. Sized to the text: 5 bytes of margin.
-    "docs/development/06-rules-by-change-class.md": 94520,
+    # 94520 -> 94900: the delegated-lane bullet names the worktree ops lock rule
+    # (issue #1241: no tree walk or per-file git process under the lock).
+    "docs/development/06-rules-by-change-class.md": 94900,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,

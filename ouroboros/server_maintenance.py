@@ -84,11 +84,6 @@ def _run_cancel_delivery_ref_sweep(drive_root: pathlib.Path) -> None:
         except Exception:
             log.debug("Cancel-intent watchdog sweep failed", exc_info=True)
         try:
-            from ouroboros.terminal_projection import reconcile_terminal_projections
-            reconcile_terminal_projections(drive_root)
-        except Exception:
-            log.warning("Terminal projection reconciliation deferred", exc_info=True)
-        try:
             from supervisor.terminal_delivery import replay_pending_deliveries
             replay_pending_deliveries(drive_root)
         except Exception:
@@ -271,6 +266,13 @@ def _run_periodic_custody_sweep(stop_event: Any = None, latch: Any = None) -> No
     set, and the generation is re-read before every mutation.
     """
     try:
+        try:
+            if _stop_requested(stop_event):
+                return
+            from ouroboros.terminal_projection import reconcile_terminal_projections
+            reconcile_terminal_projections(DATA_DIR)
+        except Exception:
+            log.warning("Terminal projection reconciliation deferred", exc_info=True)
         try:
             # Issue #844: release the owned-daemon start latch in ITS OWN try, ahead of
             # the reap, so a raising reap can never pin it; retry once — only when THIS
