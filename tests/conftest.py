@@ -164,8 +164,7 @@ def _isolated_child_env(value) -> dict:
     home_defaults = {"HOME", "USERPROFILE", "OUROBOROS_APP_ROOT", "OUROBOROS_REPO_DIR",
                      "OUROBOROS_SUBAGENT_PROJECTS_ROOT", "OUROBOROS_SUBAGENT_WORKTREE_ROOT",
                      "OUROBOROS_DELIVERABLES_ROOT", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM"}
-    empty_controls = {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "PYTHONUTF8",
-                      "PYTHONIOENCODING", "PYTHONNOUSERSITE"}
+    empty_controls = {"PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX", "PYTHONNOUSERSITE"}
     for key, default_value in _PYTEST_DEFAULTS.items():
         if key == "PYTHONDONTWRITEBYTECODE" and key not in child_env and "PYTHONPYCACHEPREFIX" in child_env:
             continue  # Explicit cache selection may intentionally exercise bytecode writes.

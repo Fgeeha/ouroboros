@@ -99,7 +99,9 @@ def isolated_environment(root: Path, repo: Path, *, source=None, keep=(), create
         "OUROBOROS_SETTINGS_PATH": str(root / "data" / "settings.json"),
         "OUROBOROS_PYTEST_ACTIVE": "1",
         "PYTHONNOUSERSITE": "1", "PYTHONDONTWRITEBYTECODE": "1",
-        "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8", "LC_ALL": "C", "LANG": "C",
+        # No PYTHONUTF8 / PYTHONIOENCODING: forcing UTF-8 mode on every test and
+        # commit-gate child would hide the cp1252 bugs Windows CI exists to catch.
+        "LC_ALL": "C", "LANG": "C",
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_OPTIONAL_LOCKS": "0", "GIT_CEILING_DIRECTORIES": str(root),
         "PIP_REQUIRE_VIRTUALENV": "true",

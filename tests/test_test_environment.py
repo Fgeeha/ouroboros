@@ -25,6 +25,14 @@ def test_static_settings_scrub_covers_runtime_vocabulary():
     assert set(settings_env_keys()) <= settings_keys()
 
 
+def test_isolation_keeps_the_platform_default_text_encoding(tmp_path):
+    """UTF-8 mode forced onto every child would hide the cp1252 bugs Windows CI
+    catches; isolation is about roots, never about the interpreter's encoding."""
+    env = isolated_environment(tmp_path, REPO, source={})
+    assert "PYTHONUTF8" not in env and "PYTHONIOENCODING" not in env
+    assert "PYTHONUTF8" not in _preflight_env(tmp_path / "data", tmp_path / "repo")
+
+
 def test_chromium_download_staging_uses_disposable_temp(tmp_path):
     env = isolated_environment(tmp_path, REPO, source={"MAC_CHROMIUM_TMPDIR": "/owner-temp"})
     assert env["MAC_CHROMIUM_TMPDIR"] == env["TMPDIR"]
