@@ -596,20 +596,29 @@ def budget_fence_selected(task: Any, fence: Any) -> bool:
 
 
 def budget_resume_dispatch_allowed(q: Any, task: Dict[str, Any]) -> bool:
-    """An exact child selection belongs to the CURRENT root grant and fence only."""
+    """A child selection belongs to the CURRENT root grant and fence only.
+
+    Both carriers are revalidated at dispatch: an exact grant handoff and a
+    zero-dispatch hold selection alike name the root grant they were selected
+    under, so a root that is pausing or paused again (with or without a new
+    fence) admits neither on its old selection (#1196, owner Q9).
+    """
     handoff = task.get("_budget_pause_resume")
-    if not isinstance(handoff, dict):
+    hold = task.get(BUDGET_HOLD_KEY) if isinstance(task.get(BUDGET_HOLD_KEY), dict) else None
+    exact = isinstance(handoff, dict)
+    carrier = handoff if exact else (hold if hold is not None and hold.get("selected") else None)
+    if carrier is None:
         return True
     root_id = str(task.get("root_task_id") or task.get("id") or "")
     fence_id = str((q.BUDGET_ROOT_FENCES.get(root_id) or {}).get("fence_id") or "")
-    if fence_id != str(handoff.get("root_fence_id") or ""):
+    if fence_id != str(carrier.get("root_fence_id" if exact else "fence_id") or ""):
         return False
     if root_id == str(task.get("id") or ""):
         return True
     root_grant = live_root_resume_grant(q, root_id, pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT))
-    return bool(handoff.get("selected_by") == "owner" and not handoff.get("root_grant_id") and not root_grant
-                or root_grant and handoff.get("root_grant_id") == root_grant["grant_id"]
-                and handoff.get("root_resume_generation") == root_grant["generation"])
+    return bool(carrier.get("selected_by") == "owner" and not carrier.get("root_grant_id") and not root_grant
+                or root_grant and carrier.get("root_grant_id") == root_grant["grant_id"]
+                and int(carrier.get("root_resume_generation") or 0) == int(root_grant["generation"]))
 
 
 def hold_budget_row(task: Dict[str, Any], *, reason: str, detail: str = "",
@@ -738,8 +747,8 @@ def select_held_budget_row(q: Any, task: Dict[str, Any], hold: Dict[str, Any],
     root_task_id = str(hold.get("root_task_id") or task.get("root_task_id") or task_id)
     if hold.get("reason") not in {HOLD_ROOT_FENCE_LIFTED, HOLD_ROOT_FENCE_MEMBER_SELECTION}:
         return {"ok": False, "error": str(hold.get("reason") or "budget_hold_unresolved")}
-    if selected_by:
-        root_grant = live_root_resume_grant(q, root_task_id, result_root)
+    root_grant = live_root_resume_grant(q, root_task_id, result_root) if task_id != root_task_id else {}
+    if selected_by and task_id != root_task_id:
         if not root_grant:
             return {"ok": False, "error": "root_resume_grant_missing",
                     "root_task_id": root_task_id, "action": "resume_root_first"}
@@ -755,6 +764,11 @@ def select_held_budget_row(q: Any, task: Dict[str, Any], hold: Dict[str, Any],
                  "selected_by": str(selected_by or "owner")}
     if task_id == root_task_id:
         selection.update(root_grant_id=uuid.uuid4().hex, root_resume_generation=1)
+    elif root_grant:
+        # The selection names the root grant it was made under, so dispatch can
+        # recheck it exactly like an exact grant handoff (budget_resume_dispatch_allowed).
+        selection.update(root_grant_id=root_grant["grant_id"],
+                         root_resume_generation=int(root_grant["generation"]))
     prior_pause = task.pop("_budget_pause", None)
     task[BUDGET_HOLD_KEY] = selection
     if not q.persist_queue_snapshot(reason="budget_hold_selected"):

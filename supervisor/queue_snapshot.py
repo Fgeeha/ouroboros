@@ -671,9 +671,18 @@ def restore_pending_from_snapshot(
             return 0
         ts = str(snap.get("ts") or "")
         ts_unix = _queue().parse_iso_to_ts(ts)
+        # Timestamp validity and freshness gate ORDINARY rows only (#1196): a
+        # readable snapshot whose stamp is missing or malformed is treated as
+        # stale, so an identifiable exact pause or an acknowledged owner-wait
+        # handoff is still retained under its own durable authority instead of
+        # vanishing (a Resume would then answer task_not_pending over an intact checkpoint).
         if ts_unix is None:
-            return 0
-        stale = (time.time() - ts_unix) > max_age_sec
+            _queue().append_jsonl(
+                _queue().DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                {"ts": utc_now_iso(), "type": "queue_restore_snapshot_timestamp_invalid",
+                 "snapshot_ts": ts[:64], "action": "treated_as_stale"},
+            )
+        stale = ts_unix is None or (time.time() - ts_unix) > max_age_sec
         from ouroboros.task_results import (
             _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED, STATUS_CANCELLED,
             load_task_result, write_task_result,

@@ -558,3 +558,74 @@ def test_an_unwritten_grant_rollback_holds_the_row_instead_of_granting_forever(t
     assert second["released_hold"] == HOLD_REVOCATION_UNWRITTEN
     row = budget_pause.budget_pause_row(tmp_path, "f6-1")
     assert row["grant"]["grant_id"] == second["grant_id"] and row["resume_generation"] == 2
+
+
+def test_a_root_selected_against_its_retained_fence_reserves_while_siblings_stay_refused(tmp_path, monkeypatch):
+    """#1196 review finding 3: a legacy zero-dispatch root Resume records the
+    selection but keeps the root latch, and ``reserve_attempt`` used to refuse
+    EVERY reservation under that fence — Resume "succeeded", the worker's first
+    send hit the fence, and the root re-paused without a model call. Reservation
+    admission now honours the selection recorded against the exact fence; the
+    unselected siblings are still refused at the same gate (owner Q9)."""
+    from ouroboros import usage_accounting as accounting
+    from supervisor.events_budget import _set_root_budget_pause_locked
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    root = _fenced_member(workers, "root-r", "root-r")
+    root.pop("parent_task_id")
+    _fenced_member(workers, "sib-r", "root-r")
+    fence = _set_root_budget_pause_locked("root-r", {})
+    assert queue.resume_budget_paused_task("root-r")["ok"] is True
+    sent = []
+    _idle_worker(workers, sent)
+    workers.assign_tasks()
+    assert [task["id"] for task in sent] == ["root-r"]
+    assert queue.BUDGET_ROOT_FENCES["root-r"]["fence_id"] == fence["fence_id"]  # latch retained
+
+    def _reserve(task_id):
+        with accounting.usage_scope(accounting.UsageScope(
+                drive_root=tmp_path, task_id=task_id, root_task_id="root-r", global_limit_usd=100.0)):
+            return accounting.reserve_attempt(accounting.AttemptRequest(
+                model="fixture", provider="openai", reservation_usd=1.0))
+
+    assert _reserve("root-r").attempt_id  # the selected row's first send is admitted
+    with pytest.raises(accounting.BudgetExceeded) as refused:
+        _reserve("sib-r")
+    assert refused.value.limit_scope == "root"
+    # A selection recorded against an OLDER fence generation is no key to a new latch.
+    queue.BUDGET_ROOT_FENCES["root-r"] = {**fence, "fence_id": "fence-next"}
+    queue.persist_queue_snapshot(reason="test")
+    with pytest.raises(accounting.BudgetExceeded):
+        _reserve("root-r")
+
+
+def test_owner_wait_restart_assignment_and_the_cold_loop_keep_the_budget_paused_carrier(tmp_path, monkeypatch):
+    """#1196 review finding 5: after a budget Resume an owner-wait checkpoint
+    stores ``budget_paused_sec`` but assignment read only ``paused_duration_sec``,
+    so after a planned restart the RUNNING row charged the old pause as execution;
+    the cold owner-wait restore also left ``ctx._budget_paused_sec`` unset. One
+    shared reader (``model_wait.budget_paused_seconds``) serves either handoff."""
+    from ouroboros import owner_wait
+
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    started = time.time() - 1000.0
+    workers.PENDING.append({
+        "id": "wait-6", "type": "task", "chat_id": 0, "_attempt": 1,
+        "_owner_wait_resume": {"wait_id": "w6", "restart_transaction_id": "tx-6", "started_at": started,
+                               "budget_paused_sec": 600.0, "model_wait_quota_clock": {}},
+    })
+    sent = []
+    _idle_worker(workers, sent)
+    workers.assign_tasks()
+    assert [task["id"] for task in sent] == ["wait-6"]
+    meta = workers.RUNNING["wait-6"]
+    assert meta["started_at"] == pytest.approx(started) and meta["budget_paused_sec"] == 600.0
+
+    ctx, _limit = _loop_ctx(tmp_path, "wait-6")
+    state_blob = {"messages": [], "trace": {}, "usage": {}, "seen": [], "owner_directives": [],
+                  "route": {}, "delivery": {}, "acceptance": {}, "delivery_candidate": None,
+                  "model_wait": {"budget_paused_sec": 600.0}}
+    owner_wait.restore_continuation_state(SimpleNamespace(_ctx=ctx), state_blob, [], {}, {}, set())
+    assert ctx._budget_paused_sec == 600.0

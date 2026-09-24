@@ -420,3 +420,58 @@ def test_an_interruption_the_model_call_rail_already_routed_is_not_routed_twice(
         _run(loop_mod, registry, tmp_path, "stop-once")
     assert routed == ["cancelled"] and raised.value.control_rails_seen is True
     assert isinstance(getattr(raised.value, "_ouroboros_loop_usage", None), dict)
+
+
+def test_a_zero_dispatch_selection_is_rechecked_against_the_live_root_grant_at_dispatch(tmp_path, monkeypatch):
+    """#1196 review finding 4: a child carrying a SELECTED ``_budget_pause_hold``
+    (no exact grant handoff) returned True from ``budget_resume_dispatch_allowed``
+    immediately, so after a global-scope re-pause of its root — which raises no
+    new fence — it dispatched on the old selection. Both carriers are now bound
+    to the root grant they were selected under; a stale one returns to an
+    UNSELECTED hold and is re-bound and re-selectable under the next root Resume."""
+    queue, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 5.0)
+    root, _ = _parked(tmp_path, monkeypatch, task_id="root", scope="root")
+    sibling = _fenced_member(workers, "sibling", "root")
+    first = queue.resume_budget_paused_task("root")
+    assert first["ok"] and queue.resume_budget_paused_task("sibling", selected_by="root")["ok"]
+    assert sibling["_budget_pause_hold"]["selected"] is True
+    assert sibling["_budget_pause_hold"]["root_grant_id"] == first["grant_id"]
+    workers.PENDING.remove(root)  # the root ran on, then paused AGAIN under global scope: no new fence
+    _parked(tmp_path, monkeypatch, task_id="root", scope="global")
+    assert "root" not in queue.BUDGET_ROOT_FENCES
+    sent = []
+    _idle_worker(workers, sent)
+    workers.assign_tasks()
+    assert sent == [] and sibling["_budget_pause_hold"]["selected"] is False
+    assert sibling["_budget_pause_hold"]["detail"] == "root_resume_generation_stale"
+    second = queue.resume_budget_paused_task("root")
+    assert second["ok"] and second["grant_id"] != first["grant_id"]
+    workers.assign_tasks()
+    assert [task["id"] for task in sent] == ["root"]  # the root Resume made the sibling eligible only
+    assert queue.resume_budget_paused_task("sibling", selected_by="root")["ok"]
+    workers.WORKERS[0].busy_task_id = None
+    workers.assign_tasks()
+    assert [task["id"] for task in sent] == ["root", "sibling"]
+    assert sent[-1]["_budget_pause_hold"]["root_grant_id"] == second["grant_id"]
+
+
+def test_a_hold_ended_by_control_inside_the_refused_dispatch_rail_is_a_truthful_terminal(tmp_path, monkeypatch):
+    """#1196 review finding 7: ``_handle_budget_exceeded`` runs INSIDE the loop's
+    ``except BudgetExceeded`` clause; a hold it entered through ``request_pause``
+    that a deadline ended raised ``ModelWaitInterrupted`` past the sibling
+    ``except Exception`` and reached task_exception. It now rejoins the common
+    control rails: a no-call ``deadline_local`` terminal, no model call."""
+    from ouroboros import budget_pause, usage_accounting
+    from ouroboros.model_wait import ModelWaitInterrupted
+
+    loop_mod, registry = _bare_loop(tmp_path, monkeypatch)
+    monkeypatch.setattr(loop_mod, "_call_round_model", lambda _call: (_ for _ in ()).throw(
+        usage_accounting.BudgetExceeded("global model budget exhausted", limit_scope="global")))
+    monkeypatch.setattr(usage_accounting, "usage_breakdown", lambda *_a, **_k: {"physical_calls": 3})
+    monkeypatch.setattr(budget_pause, "request_pause",
+                        lambda *_a, **_k: (_ for _ in ()).throw(ModelWaitInterrupted("deadline")))
+    text, usage, trace = _run(loop_mod, registry, tmp_path, "hold-budget-rail")
+    assert usage["execution_status"] == "failed" and usage["reason_code"] == "deadline_local"
+    assert trace["forced_finalization"]["control_reason"] == "deadline"
+    assert isinstance(text, str) and text

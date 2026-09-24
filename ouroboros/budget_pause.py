@@ -614,6 +614,9 @@ _HOLD_POLL_SEC = 0.5
 HOLD_PRODUCERS_UNSETTLED = "local_producers_unsettled"
 HOLD_PAUSE_RECORD_UNWRITABLE = "pause_record_unwritable"
 HOLD_CHECKPOINT_UNWRITABLE = "continuation_source_unwritable"
+# A Resume whose grant consumption could not be published: the grant and the
+# checkpoint stay exactly as the durable row carries them; the task HOLDS.
+HOLD_GRANT_CONSUMPTION_UNWRITABLE = "resume_grant_consumption_unwritable"
 # A ``pausing`` row the task's own controls ended before it became a pause.
 STATE_ABANDONED = "abandoned"
 
@@ -1117,14 +1120,55 @@ def resume_paused_loop(tools: Any, state: Dict[str, Any], messages: list, trace:
     root = pathlib.Path(ctx.budget_drive_root or ctx.drive_root)
     grant = dict(row.get("grant") or {})
     grant["consumed_at"] = time.time()
-    # Compare-and-set on the exact pause, state and grant this worker was
-    # handed: a grant revoked or superseded between the dispatch and this
-    # write refuses here instead of consuming a grant that is no longer live.
-    set_budget_pause(root, ctx.task_id, {**row, "state": STATE_RESUMED, "grant": grant,
-                                         "resumed_at": grant["consumed_at"]},
-                     expected_pause_id=str(row.get("pause_id") or ""),
-                     expected_state=STATE_RESUME_GRANTED,
-                     expected_grant_id=str(grant.get("grant_id") or ""))
+    consumed = {**row, "state": STATE_RESUMED, "grant": grant, "resumed_at": grant["consumed_at"]}
+    published = ""
+    while True:
+        # Compare-and-set on the exact pause, state and grant this worker was
+        # handed: a grant revoked or superseded between the dispatch and this
+        # write refuses here instead of consuming a grant that is no longer live.
+        try:
+            set_budget_pause(root, ctx.task_id, consumed,
+                             expected_pause_id=str(row.get("pause_id") or ""),
+                             expected_state=STATE_RESUME_GRANTED,
+                             expected_grant_id=str(grant.get("grant_id") or ""))
+            break
+        except Exception as exc:
+            # A consumption that cannot be published is never a paid terminal
+            # (#1196): the worker HOLDS, typed and nonterminal, retrying the SAME
+            # publication so the grant and checkpoint identities stay exactly as
+            # the durable row carries them. A row the durable authority already
+            # returned to a live pause (a revocation landed first) re-parks under
+            # it: there is no grant to consume and nothing to run on.
+            try:
+                current = budget_pause_row(root, ctx.task_id)
+            except Exception:
+                current = {}
+            if (current.get("pause_id") == row.get("pause_id")
+                    and current.get("state") in {STATE_PAUSING, STATE_PAUSED}
+                    and int(current.get("task_attempt") or 0) == int(ctx.task_attempt or 1)
+                    and current.get("source_ref")):
+                usage.pop("budget_pause_hold", None)
+                raise BudgetPauseRequested(current) from exc
+            hold = _hold_row(HOLD_GRANT_CONSUMPTION_UNWRITABLE, exc=exc)
+            usage["budget_pause_hold"] = dict(hold)
+            if str(hold.get("error") or "") != published:
+                published = str(hold.get("error") or "")
+                log.warning("Budget resume for %s is HELD (nonterminal): grant consumption unpublished %s",
+                            ctx.task_id, published)
+                _publish_hold(ctx, {"pause_id": row.get("pause_id"), "rail": row.get("rail"),
+                                    "state": STATE_RESUME_GRANTED, **hold})
+            control = _hold_control_reason(ctx)
+            if control:
+                usage["exact_pause_unavailable"] = "hold_ended_by_control"
+                usage["budget_pause_hold"] = {**hold, "ended_by": control}
+                _publish_hold(ctx, {"pause_id": row.get("pause_id"), "rail": row.get("rail"),
+                                    "state": "hold_ended", "hold_reason": hold["hold_reason"],
+                                    "ended_by": control})
+                from ouroboros.model_wait import ModelWaitInterrupted
+
+                raise ModelWaitInterrupted(control) from exc
+            time.sleep(_HOLD_POLL_SEC)
+    usage.pop("budget_pause_hold", None)
     ctx._budget_paused_sec = float(grant.get("paused_duration_sec") or row.get("paused_duration_sec") or 0.0)
     ctx.budget_pause_resume = None
     setattr(ctx, "_budget_pause_generation", int(row.get("pause_generation") or 0))

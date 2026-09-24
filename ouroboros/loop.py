@@ -478,9 +478,7 @@ def run_llm_loop(
 
     continuation = saved or saved_pause
     tool_schemas = continuation["tool_schemas"] if continuation else initial_tool_schemas(tools, context_mode=active_context_mode)
-    tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(
-        tools, tool_schemas, messages, context_mode=active_context_mode
-    )
+    tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(tools, tool_schemas, messages, context_mode=active_context_mode)
     ctx.event_queue, ctx.task_id, ctx.messages = event_queue, task_id, messages
     stateful_executor = StatefulToolExecutor()
     exit_ctx = _LoopExitContext(
@@ -729,8 +727,10 @@ def run_llm_loop(
             pending_tool_budget, pending_tool_calls = True, tool_calls
     except BudgetExceeded as exc:
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="budget")
-        return _handle_budget_exceeded(
-            exc, exit_ctx, limit_ctx=limit_ctx, episode=transport_wait)
+        try:
+            return _handle_budget_exceeded(exc, exit_ctx, limit_ctx=limit_ctx, episode=transport_wait)
+        except ModelWaitInterrupted as interrupted:  # a refused-dispatch HOLD ended by control: the sibling clause below never sees it
+            return _loop_exit_after_exception(interrupted, limit_ctx, exit_ctx, llm_trace, transport_wait)
     except Exception as exc:
         # A budget-pause HOLD ended by control rejoins the model-wait rails; else re-raise with evidence.
         return _loop_exit_after_exception(exc, limit_ctx, exit_ctx, llm_trace, transport_wait)

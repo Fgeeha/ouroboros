@@ -825,8 +825,23 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
         for row in rows:
             if not isinstance(row, dict):
                 raise UsageAccountingError(f"invalid root budget fence row: {snapshot_path}")
-            if (str(row.get("root_task_id") or "") == root_task_id
-                    and str(row.get("status") or "") in {"active", "paused"}):
+            if (str(row.get("root_task_id") or "") != root_task_id
+                    or str(row.get("status") or "") not in {"active", "paused"}):
+                continue
+            # ONE member explicitly selected against THIS fence generation is
+            # admitted (owner Q9, #1196): the queue recorded that selection on
+            # the row itself, and the latch still refuses every unselected member.
+            fence_id = str(row.get("fence_id") or "")
+            selected = False
+            for bucket in ("running", "pending"):
+                for entry in (snapshot.get(bucket) or []) if isinstance(snapshot, dict) else []:
+                    member = entry.get("task") if isinstance(entry, dict) else None
+                    if not isinstance(member, dict) or str(member.get("id") or "") != scope.task_id:
+                        continue
+                    hold = member.get("_budget_pause_hold")
+                    selected = bool(fence_id and isinstance(hold, dict) and hold.get("selected")
+                                    and str(hold.get("fence_id") or "") == fence_id)
+            if not selected:
                 raise BudgetExceeded(
                     f"root model dispatch paused pending explicit resume for {scope.root_task_id}",
                     limit_scope="root",

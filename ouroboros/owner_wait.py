@@ -393,6 +393,8 @@ def restore_continuation_state(tools: Any, state: dict, messages: list, trace: d
     NOT restored: they died with the previous process and stay invalidated."""
     from ouroboros.loop_delivery import DeliveryCandidate
 
+    from ouroboros.model_wait import budget_paused_seconds
+
     ctx = tools._ctx
     messages[:] = state["messages"]
     trace.update(state["trace"])
@@ -400,6 +402,11 @@ def restore_continuation_state(tools: Any, state: dict, messages: list, trace: d
     seen.update(state["seen"])
     ctx._loop_mailbox_seen_ids = seen
     ctx._owner_directives = state["owner_directives"]
+    # The cumulative budget-paused carrier rides EVERY same-ID continuation
+    # (#1196, F5): a cold owner-wait restore of a task that had been budget
+    # paused keeps it, so a later pause row and the delegate clock start from
+    # the same cumulative value; a budget grant overrides it with its own.
+    ctx._budget_paused_sec = budget_paused_seconds(state.get("model_wait") or {})
     for key, value in {**state["route"], **state["delivery"], **state["acceptance"]}.items():
         setattr(ctx, key, value)
     candidate = state.get("delivery_candidate")

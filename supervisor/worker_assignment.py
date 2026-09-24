@@ -13,6 +13,7 @@ import pathlib
 import time
 from typing import Any, Dict
 
+from ouroboros.model_wait import budget_paused_seconds
 from supervisor.events_budget import budget_fence_selected, budget_hold_fact
 from supervisor.queue import _queue_lock
 
@@ -378,9 +379,27 @@ def assign_tasks() -> None:
                     from supervisor.events_budget import budget_resume_dispatch_allowed
 
                     if not budget_resume_dispatch_allowed(queue, candidate):
-                        from supervisor.budget_resume import revoke_exact_budget_resume
+                        if isinstance(candidate.get("_budget_pause_resume"), dict):
+                            from supervisor.budget_resume import revoke_exact_budget_resume
 
-                        revoke_exact_budget_resume(candidate, "root_resume_generation_stale")
+                            revoke_exact_budget_resume(candidate, "root_resume_generation_stale")
+                        else:
+                            # A zero-dispatch selection whose root grant or fence is
+                            # no longer live returns to an UNSELECTED hold (#1196, Q9):
+                            # the row keeps its hold identity, drops the dead grant
+                            # binding, and the next selection records the live one.
+                            from supervisor.events_budget import (
+                                BUDGET_HOLD_KEY, HOLD_ROOT_FENCE_LIFTED, hold_budget_row,
+                            )
+
+                            stale = candidate.get(BUDGET_HOLD_KEY) or {}
+                            hold_budget_row(
+                                candidate, reason=str(stale.get("reason") or HOLD_ROOT_FENCE_LIFTED),
+                                detail="root_resume_generation_stale",
+                                extra={**{key: stale[key] for key in ("root_task_id", "fence_id")
+                                          if key in stale},
+                                       "stale_root_grant_id": str(stale.get("root_grant_id") or "")},
+                                result_root=pathlib.Path(candidate.get("budget_drive_root") or _pool().DRIVE_ROOT))
                         queue.persist_queue_snapshot(reason="stale_child_resume_held")
                         continue
                     if (root_task_id in queue.BUDGET_ROOT_FENCES
@@ -443,9 +462,11 @@ def assign_tasks() -> None:
                     **({"model_wait_quota_clock": dict(resume["model_wait_quota_clock"])}
                        if resume.get("model_wait_quota_clock") else {}),
                     # Separate paused-interval carrier (#1196): the original
-                    # started_at is untouched; lifetime rails subtract this.
-                    **({"budget_paused_sec": float(resume["paused_duration_sec"] or 0.0)}
-                       if resume.get("paused_duration_sec") else {}),
+                    # started_at is untouched; lifetime rails subtract this. ONE
+                    # reader for either handoff: a budget grant names it
+                    # ``paused_duration_sec``, an owner-wait restart ``budget_paused_sec``.
+                    **({"budget_paused_sec": budget_paused_seconds(resume)}
+                       if budget_paused_seconds(resume) > 0 else {}),
                     "soft_sent": False, "attempt": int(task.get("_attempt") or 1),
                 }
                 task_type = str(task.get("type") or "")

@@ -627,3 +627,112 @@ def test_runbook_does_not_promise_a_managed_outage_window_the_runtime_has_no_rai
     source = _repo_file("devtools", "benchmarks", "continual_learning", "RUNBOOK.md")
     assert "6h operation window from episode entry" not in source
     assert "OUROBOROS_TASK_ABS_CEILING_SEC" in source and "idle reaper" in source
+
+
+# --------------------------------------------------------------------------- consumption publication holds
+
+def _granted_loop(tmp_path, monkeypatch, task_id):
+    from ouroboros import budget_pause, owner_wait
+
+    queue, state, _workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
+    task, row = _parked(tmp_path, monkeypatch, task_id=task_id)
+    assert queue.resume_budget_paused_task(task_id)["ok"] is True
+    ctx, _limit = _loop_ctx(tmp_path, task_id)
+    ctx.budget_pause_resume = task["_budget_pause_resume"]
+    state_blob = budget_pause.load_budget_pause(ctx)
+    monkeypatch.setattr(owner_wait, "rebind_restored_route", lambda *_a, **_k: (None, "max"))
+    return budget_pause, ctx, state_blob, row
+
+
+def test_failed_grant_consumption_publication_holds_then_consumes_never_terminalizes(tmp_path, monkeypatch):
+    """#1196 review finding 2: a raise from the state=resumed/consumed_at write used
+    to leave ``resume_paused_loop`` on the generic loop exception path and end in
+    FAILED (``_task_exception_terminal``). A publication that fails HOLDS — typed,
+    nonterminal, retrying the SAME compare-and-set — and consumes once it lands."""
+    budget_pause, ctx, state_blob, _row = _granted_loop(tmp_path, monkeypatch, "consume-hold")
+    real = budget_pause.set_budget_pause
+    failures = {"left": 2}
+
+    def flaky(*args, **kwargs):
+        if failures["left"] > 0:
+            failures["left"] -= 1
+            raise OSError("disk full")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(budget_pause, "set_budget_pause", flaky)
+    published = []
+    monkeypatch.setattr(budget_pause, "_publish_hold", lambda _ctx, hold: published.append(dict(hold)))
+    usage = {}
+    budget_pause.resume_paused_loop(SimpleNamespace(_ctx=ctx), state_blob, [], {}, usage, set(),
+                                   budget_remaining_usd=5.0)
+    consumed = budget_pause.budget_pause_row(tmp_path, "consume-hold")
+    assert consumed["state"] == budget_pause.STATE_RESUMED and consumed["grant"]["consumed_at"]
+    assert "budget_pause_hold" not in usage and "execution_status" not in usage
+    assert [hold["hold_reason"] for hold in published] == [budget_pause.HOLD_GRANT_CONSUMPTION_UNWRITABLE]
+    assert published[0]["state"] == budget_pause.STATE_RESUME_GRANTED and "OSError" in published[0]["error"]
+
+
+def test_grant_consumption_hold_ended_by_control_retains_the_grant_and_checkpoint(tmp_path, monkeypatch):
+    from ouroboros.model_wait import ModelWaitInterrupted
+    from tests._budget_pause_exact_helpers import _controls
+
+    budget_pause, ctx, state_blob, row = _granted_loop(tmp_path, monkeypatch, "consume-stop")
+
+    def unwritable(*_args, **_kwargs):
+        raise OSError("read-only drive")
+
+    monkeypatch.setattr(budget_pause, "set_budget_pause", unwritable)
+    monkeypatch.setattr(budget_pause, "_hold_control_reason", _controls("", "deadline"))
+    usage = {}
+    with pytest.raises(ModelWaitInterrupted) as raised:
+        budget_pause.resume_paused_loop(SimpleNamespace(_ctx=ctx), state_blob, [], {}, usage, set(),
+                                       budget_remaining_usd=5.0)
+    assert raised.value.control_reason == "deadline"
+    durable = budget_pause.budget_pause_row(tmp_path, "consume-stop")
+    grant = state_blob["_pause_row"]["grant"]
+    # Grant and checkpoint identities are exactly what the row carried: nothing consumed, nothing rewritten.
+    assert durable["state"] == budget_pause.STATE_RESUME_GRANTED
+    assert durable["grant"]["grant_id"] == grant["grant_id"] and not durable["grant"].get("consumed_at")
+    assert durable["source_ref"] == row["source_ref"] and durable["pause_id"] == row["pause_id"]
+    assert usage["budget_pause_hold"]["hold_reason"] == budget_pause.HOLD_GRANT_CONSUMPTION_UNWRITABLE
+    assert usage["budget_pause_hold"]["ended_by"] == "deadline"
+    assert usage["exact_pause_unavailable"] == "hold_ended_by_control"
+
+
+def test_grant_consumption_over_a_revoked_grant_reparks_under_the_live_pause(tmp_path, monkeypatch):
+    budget_pause, ctx, state_blob, row = _granted_loop(tmp_path, monkeypatch, "consume-revoked")
+    live = budget_pause.budget_pause_row(tmp_path, "consume-revoked")
+    budget_pause.set_budget_pause(tmp_path, "consume-revoked", {
+        **live, "state": budget_pause.STATE_PAUSED, "grant": {**live["grant"], "revoked_at": time.time()}})
+    usage = {}
+    with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
+        budget_pause.resume_paused_loop(SimpleNamespace(_ctx=ctx), state_blob, [], {}, usage, set(),
+                                       budget_remaining_usd=5.0)
+    assert raised.value.pause["pause_id"] == row["pause_id"]
+    assert raised.value.pause["state"] == budget_pause.STATE_PAUSED and "budget_pause_hold" not in usage
+
+
+@pytest.mark.parametrize("stamp", ["", "not-a-timestamp"])
+def test_paused_row_survives_a_snapshot_with_an_invalid_timestamp_while_ordinary_rows_do_not(
+        tmp_path, monkeypatch, stamp):
+    """#1196 review finding 6: a readable snapshot with valid paused rows but a
+    missing/invalid ``ts`` returned zero before ``_retain_snapshot_pending`` ran,
+    so no paused carrier was restored and Resume answered task_not_pending over
+    an intact durable checkpoint. Timestamp validity gates ORDINARY rows only."""
+    queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    _parked(tmp_path, monkeypatch, task_id="ts-paused")
+    workers.PENDING.append({"id": "ts-ordinary", "type": "task", "chat_id": 0, "_attempt": 1, "text": "x"})
+    queue.persist_queue_snapshot(reason="test")
+    workers.PENDING[:] = []
+    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    if stamp:
+        snap["ts"] = stamp
+    else:
+        snap.pop("ts", None)
+    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap))
+    assert queue.restore_pending_from_snapshot() == 1
+    assert [task["id"] for task in workers.PENDING] == ["ts-paused"]
+    assert workers.PENDING[0]["_budget_pause"]["exact_continuation"] is True  # retained, not woken
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "supervisor.jsonl").read_text().splitlines()]
+    assert any(row["type"] == "queue_restore_snapshot_timestamp_invalid" for row in rows)
