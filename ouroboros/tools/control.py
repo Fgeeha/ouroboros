@@ -132,9 +132,56 @@ _PROMOTE_CHAT_DESCRIPTION = (
 )
 
 
+_SCHEDULE_SUBAGENT_DESCRIPTION = (
+    "Schedule a live subagent (a child of Ouroboros). Returns task_id for later retrieval. "
+    "DEFAULT is READ-ONLY: the child inspects local repo/data/history plus web/browser and "
+    "returns findings (it cannot write local state, commit, enable tools, or run "
+    "shell/review/runtime/skills). Set write_surface to spawn a MUTATIVE (acting) child that "
+    "writes on the selected surface. You remain the sole committer of the live Ouroboros body. "
+    "self_worktree is an isolated git worktree of THIS repo: apply its workspace.patch with "
+    "integrate_subagent_patch for parallel self-modification / best-of-N. Native children on "
+    "external_workspace write directly to the SHARED external project directory (write_root or "
+    "the parent workspace); integrate_subagent_patch verifies the files already there without reapplying. "
+    "genesis (a from-scratch new project — game/site/app/new Ouroboros — auto-provisioned as a fresh "
+    "empty git repo under the durable projects root; the project directory IS the deliverable, not "
+    "integrated into this repo). "
+    "An installed skill payload under data/ is NOT a write_surface (runtime data is never one, by "
+    "design): mutate it YOURSELF via delegate_start(subagent_id=..., prompt=..., root='skill_payload', bucket=..., skill_name=...) "
+    "— a child cannot open a payload delegation — and schedule children only as read-only "
+    "designers/reviewers for that work. "
+    "COOPERATIVE MULTI-BUILDER vs GENESIS: when SEVERAL builder children must contribute to ONE new "
+    "deliverable together, give each write_surface=external_workspace and OMIT write_root — the host "
+    "mints ONE shared git tree the whole subagent tree writes into cooperatively (deeper descendants "
+    "inherit it), and you verify their combined files with integrate_subagent_patch. Use genesis only when EACH child "
+    "should own its OWN standalone durable repo (e.g. best-of-N separate builds). "
+    "Harness-delegated work uses a private snapshot; integrate_delegated_patch handles that separate patch. "
+    "Mutative children cannot commit, enable tools or write cognitive memory. Cyber-effective "
+    "children inherit selected review, skill and runtime tools; explicit task restrictions remain. Nested delegation "
+    "is allowed within configured depth/cap limits — use delegation_intent / may_mutate / "
+    "may_fan_out to tell a child to recurse further, so a 'maximum subagents / grandchildren' "
+    "request propagates structurally instead of collapsing into one flat layer. "
+    "BURST + ABSORB: when several children are INDEPENDENT, emit them in ONE batch (parallel "
+    "schedule_subagent calls in the same round) so they run concurrently, then absorb with "
+    "wait_tasks(any_terminal) — handling whichever finishes first — instead of scheduling and "
+    "blocking on them one at a time with serial wait_task calls — on cache-write-priced "
+    "routes each sibling launched before the first sibling's first response pays its own full "
+    "prefix write, so burst buys latency and spacing buys cash; your call. "
+    "INDEPENDENT VERIFIER: to check a finished deliverable without builder bias, spawn a "
+    "read-only child with memory_mode=empty whose objective carries ONLY the deliverable "
+    "location + the task's acceptance criteria (NOT your own probes/assumptions) and have it "
+    "verify through the task's own interface. "
+    "EXCHANGE OF ADDRESSED TURNS: to make children participants whose position is not "
+    "their whole participation, state the rules in objective/constraints (what is interim, "
+    "whom to address, what ends participation); a native child reaches you or a sibling with "
+    "forward_to_worker and waits with await_messages, and its final answer ends its "
+    "participation; a session (delegate_start) continues in the SAME session through "
+    "delegate_answer when it can ask mid-run, else a later turn is a NEW run. Always retrieve "
+    "the handoff with get_task_result, wait_task, or wait_tasks before relying on its results."
+)
+
+
 def get_tools() -> List[ToolEntry]:
     from ouroboros.config import EFFORT_SCALE
-
     return [
         ToolEntry("set_tool_timeout", {
             "name": "set_tool_timeout",
@@ -249,46 +296,7 @@ def get_tools() -> List[ToolEntry]:
         }, _steer_task),
         ToolEntry("schedule_subagent", {
             "name": "schedule_subagent",
-            "description": (
-                "Schedule a live subagent (a child of Ouroboros). Returns task_id for later retrieval. "
-                "DEFAULT is READ-ONLY: the child inspects local repo/data/history plus web/browser and "
-                "returns findings (it cannot write local state, commit, enable tools, or run "
-                "shell/review/runtime/skills). Set write_surface to spawn a MUTATIVE (acting) child that "
-                "writes on the selected surface. You remain the sole committer of the live Ouroboros body. "
-                "self_worktree is an isolated git worktree of THIS repo: apply its workspace.patch with "
-                "integrate_subagent_patch for parallel self-modification / best-of-N. Native children on "
-                "external_workspace write directly to the SHARED external project directory (write_root or "
-                "the parent workspace); integrate_subagent_patch verifies the files already there without reapplying. "
-                "genesis (a from-scratch new project — game/site/app/new Ouroboros — auto-provisioned as a fresh "
-                "empty git repo under the durable projects root; the project directory IS the deliverable, not "
-                "integrated into this repo). "
-                "An installed skill payload under data/ is NOT a write_surface (runtime data is never one, by "
-                "design): mutate it YOURSELF via delegate_start(subagent_id=..., prompt=..., root='skill_payload', bucket=..., skill_name=...) "
-                "— a child cannot open a payload delegation — and schedule children only as read-only "
-                "designers/reviewers for that work. "
-                "COOPERATIVE MULTI-BUILDER vs GENESIS: when SEVERAL builder children must contribute to ONE new "
-                "deliverable together, give each write_surface=external_workspace and OMIT write_root — the host "
-                "mints ONE shared git tree the whole subagent tree writes into cooperatively (deeper descendants "
-                "inherit it), and you verify their combined files with integrate_subagent_patch. Use genesis only when EACH child "
-                "should own its OWN standalone durable repo (e.g. best-of-N separate builds). "
-                "Harness-delegated work uses a private snapshot; integrate_delegated_patch handles that separate patch. "
-                "Mutative children cannot commit, enable tools or write cognitive memory. Cyber-effective "
-                "children inherit selected review, skill and runtime tools; explicit task restrictions remain. Nested delegation "
-                "is allowed within configured depth/cap limits — use delegation_intent / may_mutate / "
-                "may_fan_out to tell a child to recurse further, so a 'maximum subagents / grandchildren' "
-                "request propagates structurally instead of collapsing into one flat layer. "
-                "BURST + ABSORB: when several children are INDEPENDENT, emit them in ONE batch (parallel "
-                "schedule_subagent calls in the same round) so they run concurrently, then absorb with "
-                "wait_tasks(any_terminal) — handling whichever finishes first — instead of scheduling and "
-                "blocking on them one at a time with serial wait_task calls — on cache-write-priced "
-                "routes each sibling launched before the first sibling's first response pays its own full "
-                "prefix write, so burst buys latency and spacing buys cash; your call. "
-                "INDEPENDENT VERIFIER: to check a finished deliverable without builder bias, spawn a "
-                "read-only child with memory_mode=empty whose objective carries ONLY the deliverable "
-                "location + the task's acceptance criteria (NOT your own probes/assumptions) and have it "
-                "verify through the task's own interface. Always retrieve "
-                "the handoff with get_task_result, wait_task, or wait_tasks before relying on its results."
-            ),
+            "description": _SCHEDULE_SUBAGENT_DESCRIPTION,
             "parameters": {
                 "type": "object",
                 # DERIVED, not restated: schedule_subagent_properties() is the single source
@@ -431,6 +439,7 @@ def get_tools() -> List[ToolEntry]:
                 "mode": {"type": "string", "enum": ["all_terminal", "any_terminal"], "default": "all_terminal"},
             }},
         }, _wait_for_tasks, timeout_sec=7200),
+        await_messages_entry(),
     ]
 
 
@@ -510,7 +519,9 @@ from ouroboros.tools.control_task_results import (  # noqa: E402, F401 -- intent
     _UNMINTED_WAIT_GRACE_SEC,
     _WAIT_TASK_CLAMP_SEC,
     _WAIT_TASKS_CLAMP_SEC,
+    _await_messages,
     _children_roster_projection,
+    await_messages_entry,
     _count_live_sibling_children,
     _get_task_result,
     _subtask_outcome_summary,

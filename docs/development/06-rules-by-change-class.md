@@ -326,7 +326,10 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   staged-never-committed) is unchanged
   (`tests/test_delegated_run_isolation_orphans.py`). A copy failure or a
   source change against the baseline leaves no registered snapshot or pinned
-  ref (`tests/test_snapshot_file_inputs.py`).
+  ref; no tree walk or per-file git process runs under the worktree ops lock on
+  the delegated snapshot, payload and acting `self_worktree` paths (boot-time
+  `prune_orphans` and genesis excepted)
+  (`tests/test_snapshot_file_inputs.py`, `tests/test_subagent_worktrees_lock_scope.py`).
 - Outcome honesty: a delegating parent must not produce a clean no-tool final
   answer while direct children run undecided — one bounded absorption
   reminder, then best-effort (`children_unabsorbed`); the delivery candidate
@@ -365,12 +368,12 @@ The imperatives:
   child-drive merge or terminality logic in gateways/tools. Task waits use
   `SETTLED_STATUSES` and structured facts plus queue-heartbeat freshness —
   never keyword matching.
-- `wait_task` and `wait_tasks` also peek the waiting actor's own mailbox (its
-  execution drive, not its budget root) through the existing transport-wait
-  reader: both waits disclose early return for pending mail without ACK or stopping
+- `wait_task`, `wait_tasks` and `await_messages` peek the waiting actor's own
+  mailbox (its execution drive, not its budget root) through the transport-wait
+  reader: the waits disclose early return for pending mail without ACK or stopping
   children; the round-top drain delivers and acknowledges it. One
   episode may retain only a PROVED empty mailbox (fingerprints compared before
-  and after the full reader); a read failure or torn data is never proof and
+  and after the reader); a read failure or torn data is never proof and
   is never cached; no TTL and no ACK in peek.
 - Terminal quiz reconciliation closes the paired wait even if the answer
   arrived before worker capacity was granted; keep the answer and source
