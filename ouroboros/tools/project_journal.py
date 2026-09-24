@@ -280,9 +280,8 @@ def record_task_finalization(
     if is_root:
         # The pointer answers "continue from here" for the ROOM, so only a ROOT may
         # stamp it: a child finalizing after its root moved the room's single
-        # candidate onto work no owner ever addressed, and the room was then left
-        # naming a result the promote door refuses (the mirror below is root-only
-        # for the same reason).
+        # candidate onto work no owner ever addressed - a helper the hint never
+        # offers (the mirror below is root-only for the same reason).
         record_project_last_result(project_id, tid, drive_root)
     try:
         _record_work_location(project_id, task)
