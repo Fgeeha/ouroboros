@@ -483,6 +483,7 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     monetary total: every core-mediated provider attempt has already been
     persisted by the transport wrapper.  This prevents logical usage events,
     retries, and review aggregation from charging the same attempt twice.
+    The persisted projection carries totals only; the per-root map is never written.
     """
     def _to_float(v: Any, default: float = 0.0) -> float:
         try:
@@ -534,13 +535,12 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
         projection_snapshot = breakdown.pop("_usage_projection", None)
         if total_limit > 0 and isinstance(projection_snapshot, dict):
             from ouroboros._usage_rows import _with_limit
-            roots = projection_snapshot.pop("by_root", None)
+            # Totals only (issue #1002): per-root money is a ledger render nothing reads back from here.
+            projection_snapshot.pop("by_root", None)
             projection = _with_limit(projection_snapshot, total_limit)
-            if roots is not None:
-                projection["by_root"] = roots
         else:
             projection = (
-                usage_projection(DRIVE_ROOT, global_limit_usd=total_limit, allow_stale=True)
+                usage_projection(DRIVE_ROOT, global_limit_usd=total_limit, include_roots=False, allow_stale=True)
                 if total_limit > 0
                 else {key: breakdown.get(key) for key in (
                 "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",

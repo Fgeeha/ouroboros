@@ -86,7 +86,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # bounded authored focus (cross-focus awareness).
     # 30900 -> 31150 (issue #1142): the crash counter's shutdown exemption names WHERE the stop
     # event is set (the uvicorn signal handler, then the lifespan teardown) and why both are needed.
-    "docs/architecture/05-supervisor-loop.md": 31150,
+    # 31150 -> 31300 (issue #1002): the budget-projection paragraph states what the persisted
+    # projection carries (totals only) and where per-root money lives; the chapter had no
+    # sentence about the shape of the persisted projection to replace.
+    "docs/architecture/05-supervisor-loop.md": 31300,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is

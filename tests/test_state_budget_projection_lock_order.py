@@ -351,3 +351,84 @@ def test_corrupt_ledger_header_is_unknown_not_zero(tmp_path):
 
     assert state.load_state()["spent_usd"] == 7.0
     assert state.load_state()["usage_ledger_high_water_seq"] == [1, 3]
+
+
+def _settle_root(root, root_task_id: str, cost: float = 0.5) -> None:
+    import ouroboros.usage_accounting as accounting
+
+    hold = accounting.reserve_attempt(accounting.AttemptRequest(
+        model="test/model", provider="test", drive_root=root,
+        task_id=f"task-{root_task_id}", root_task_id=root_task_id, reservation_usd=cost,
+    ))
+    accounting.mark_dispatched(hold)
+    accounting.settle_attempt(hold, {"prompt_tokens": 1}, cost_usd=cost, cost_final=True)
+
+
+@pytest.mark.serial
+def test_state_projection_omits_by_root_and_its_size_does_not_scale_with_roots(tmp_path, monkeypatch):
+    """(issue #1002) state.json persists totals only; per-root money never lands there."""
+    from supervisor import state
+    import ouroboros.usage_accounting as accounting
+
+    state.init(tmp_path, total_budget_limit=1000.0)
+    monkeypatch.setattr(state, "check_openrouter_ground_truth", lambda: None)
+    _settle_root(tmp_path, "root-000")
+    assert state.update_budget_from_usage({}) is True
+    bytes_one = state.STATE_PATH.read_bytes()
+    for index in range(1, 200):
+        _settle_root(tmp_path, f"root-{index:03d}")
+    assert state.update_budget_from_usage({}) is True
+    bytes_many = state.STATE_PATH.read_bytes()
+
+    stored = json.loads(bytes_many.decode("utf-8"))
+    assert "by_root" not in stored["usage_accounting"]
+    ledger = accounting.usage_projection(tmp_path, global_limit_usd=1000.0)
+    assert stored["usage_accounting"]["accounted_usd"] == ledger["accounted_usd"] == 100.0
+    assert stored["usage_accounting"]["limit_usd"] == 1000.0
+    assert abs(len(bytes_many) - len(bytes_one)) < 512, (len(bytes_one), len(bytes_many))
+
+
+@pytest.mark.serial
+def test_per_root_money_is_still_served_from_the_ledger_after_the_slim_write(tmp_path, monkeypatch):
+    from supervisor import state
+    import ouroboros.usage_accounting as accounting
+
+    state.init(tmp_path, total_budget_limit=1000.0)
+    monkeypatch.setattr(state, "check_openrouter_ground_truth", lambda: None)
+    roots = [f"root-{index:03d}" for index in range(200)]
+    for index, root in enumerate(roots):
+        _settle_root(tmp_path, root, cost=0.01 + index * 0.001)
+    assert state.update_budget_from_usage({}) is True
+    assert "by_root" not in state.load_state()["usage_accounting"]
+
+    by_root = accounting.usage_projection(tmp_path, global_limit_usd=1000.0)["by_root"]
+    assert sorted(by_root) == roots
+    for root in (roots[0], roots[77], roots[-1]):
+        expected = accounting.usage_breakdown(tmp_path, root_task_id=root)["accounted_usd"]
+        assert by_root[root]["accounted_usd"] == expected == round(0.01 + roots.index(root) * 0.001, 6)
+
+
+@pytest.mark.serial
+def test_fallback_projection_branch_is_slim(tmp_path, monkeypatch):
+    """A snapshot without ``_usage_projection`` renders the projection itself, still totals only."""
+    from supervisor import state
+    import ouroboros.usage_accounting as accounting
+
+    state.init(tmp_path, total_budget_limit=5.0)
+    _settle_root(tmp_path, "root-a")
+    seen = []
+    real_projection = accounting.usage_projection
+
+    def spy(root, **kwargs):
+        seen.append(dict(kwargs))
+        return real_projection(root, **kwargs)
+
+    monkeypatch.setattr(accounting, "usage_breakdown", lambda *_a, **_k: _breakdown(0.5, 3))
+    monkeypatch.setattr(accounting, "usage_projection", spy)
+
+    assert state.update_budget_from_usage({}) is True
+
+    assert seen == [{"global_limit_usd": 5.0, "include_roots": False, "allow_stale": True}]
+    stored = state.load_state()["usage_accounting"]
+    assert "by_root" not in stored
+    assert stored["accounted_usd"] == 0.5 and stored["limit_usd"] == 5.0
