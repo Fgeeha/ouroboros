@@ -151,6 +151,7 @@ def test_blocked_session_bootstrap_terminals_unrun_with_alternatives(monkeypatch
         "reason": "subscription_window_exhausted",
         "reset_at": "2030-01-01T00:00:00Z",
         "requested": "harness",
+        "detail": "",  # a blocked route carries no producer sentence; a refused provision does (#1241)
     }
     availability = task["subagent_availability"]
     assert {key: availability[key] for key in (
