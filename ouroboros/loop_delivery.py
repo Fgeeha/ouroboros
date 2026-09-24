@@ -246,6 +246,8 @@ def apply_delivery_subject_decision(
     revision, fingerprint = _loop()._delivery_evidence_state(tools, ctx, llm_trace)
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if isinstance(candidate, DeliveryCandidate):
+        if not fingerprint:
+            _loop()._supersede_delivery_acceptance_binding(tools, llm_trace, candidate, reason="delivery_subject_unverifiable")
         candidate.effective_criteria = tools._ctx._delivery_effective_criteria
         candidate.material_tool_indices = tools._ctx._delivery_material_tool_indices
         candidate.owner_source_sha256 = source
@@ -328,7 +330,6 @@ def delivery_evidence_fingerprint(
         default=str,
     ).encode("utf-8")).hexdigest()
 
-
 def observed_delivery_evidence(tool_ctx: Any, llm_trace: Dict[str, Any], **bounds: Any) -> str:
     """The ONE fallible evidence read, typed: an uncomputable fingerprint is
     UNKNOWN (``""``), never an exception after an answer exists and never
@@ -338,7 +339,6 @@ def observed_delivery_evidence(tool_ctx: Any, llm_trace: Dict[str, Any], **bound
     except Exception:
         log.debug("delivery evidence fingerprint unavailable; typed unknown", exc_info=True)
         return ""
-
 
 def _delivery_evidence_state(tools: ToolRegistry, ctx: _RoundLimitContext, llm_trace: Dict[str, Any]) -> tuple[int, str]:
     """Track the shared answer-invalidating evidence fingerprint (every retention,
@@ -624,6 +624,8 @@ def _current_delivery_candidate(
     if _loop()._task_acceptance_owner_generation_changed(ctx.tools._ctx):
         return None
     if candidate.acceptance_binding.get("authoritative") is True:
+        if not candidate.evidence_fingerprint:
+            return None  # Unknown equality cannot validate a prior approval.
         current_binding = _delivery_acceptance_binding(ctx.tools, llm_trace, candidate.content_sha256)
         if not current_binding.get("authoritative") or any(
             current_binding.get(key) != candidate.acceptance_binding.get(key)

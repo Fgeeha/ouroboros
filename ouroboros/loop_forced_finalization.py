@@ -171,6 +171,7 @@ def _record_forced_finalization(
         "current_evidence_revision": current_revision,
         "evidence_current": bool(
             candidate is not None
+            and bool(current_fingerprint) and not binding.get("stale_evidence")
             and candidate.evidence_fingerprint == current_fingerprint
         ),
         "acceptance_status": str(binding.get("acceptance_status") or "unaccepted"),

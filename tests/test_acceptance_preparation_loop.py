@@ -775,3 +775,39 @@ def test_a_forced_exit_over_an_unreadable_fingerprint_preserves_the_answer_as_un
     assert preserved.acceptance_binding["authoritative"] is False
     assert preserved.acceptance_binding["stale_evidence"] is True
     assert trace["delivery_candidate"]["evidence_current"] is False
+
+
+@pytest.mark.parametrize("criteria", ["original requirements", "changed requirements"])
+def test_forced_keep_cannot_rebind_authoritative_approval_to_unknown(tmp_path, monkeypatch, criteria):
+    """An acknowledged subject on forced keep must not borrow the earlier PASS
+    when the fingerprint is unreadable, even with unchanged answer bytes."""
+    from ouroboros import loop, loop_delivery as delivery
+    from ouroboros.loop_forced_finalization import _resolve_forced_delivery_control
+    import ouroboros.loop_acceptance as acceptance
+
+    trace = {"tool_calls": [], "reasoning_notes": []}
+    registry, ctx = _delivery_ctx(tmp_path, trace)
+    registry._ctx._delivery_effective_criteria = "original requirements"
+    monkeypatch.setattr(delivery, "delivery_evidence_fingerprint", lambda *_a, **_k: "known")
+    candidate = loop._replace_delivery_candidate(registry, ctx, trace, "complete answer", control="candidate")
+    binding = {"authoritative": True, "acceptance_status": "accepted", "panel_id": "paid", "binding_hash": "paid-binding"}
+    candidate.acceptance_binding = dict(binding)
+    trace["review_runs"] = [{"authority": "host_root", "candidate_hash": candidate.content_sha256,
+        "panel_id": "paid", "binding_hash": "paid-binding", "aggregate_signal": "PASS"}]
+    trace["review_decision"] = dict(binding)
+    registry._ctx._task_acceptance_reviewed = True
+    registry._ctx._delivery_control_required = True
+    monkeypatch.setattr(acceptance, "acknowledge_acceptance_observation", lambda *_a, **_k: True)
+    _raise_fingerprint(monkeypatch)
+    control = json.dumps({"delivery_control": "keep", "acceptance_subject": {
+        "owner_source_sha256": "observed-owner", "effective_criteria": criteria}})
+    text, reason, retained, replaced = _resolve_forced_delivery_control(registry._ctx, control, ctx=ctx, llm_trace=trace)
+    assert text == "complete answer" and retained and not replaced and not reason
+    assert candidate.evidence_fingerprint == ""
+    assert candidate.acceptance_binding["authoritative"] is False
+    assert trace["review_runs"][0]["aggregate_signal"] == "PASS"  # history not rewritten
+    assert trace["review_runs"][0]["superseded_by_revision"] is True
+    assert trace["delivery_candidate"]["evidence_current"] is False
+    # Defence at the current-candidate reader, even against a malformed binding.
+    candidate.acceptance_binding = dict(binding)
+    assert loop._current_delivery_candidate(ctx, trace) is None
