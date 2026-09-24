@@ -105,6 +105,10 @@ _RESERVED_METADATA_KEYS = frozenset({
     "executor_ref",
     "workspace_executor",
     "project_id",
+    # The owner door's stamp (read as ``run_origin.owner_ingress`` by the corpus
+    # label and the routing issuer) belongs to owner routing, never to a caller.
+    "origin_message_ref",
+    "origin_suppressed",
 })
 
 

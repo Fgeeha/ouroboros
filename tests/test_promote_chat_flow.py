@@ -2346,8 +2346,9 @@ def test_steer_task_tool_emits_event_with_target_and_client_id(tmp_path):
     events = []
     ctx = types.SimpleNamespace(
         pending_events=events, event_queue=None, current_chat_id=1,
-        drive_root=tmp_path,
-        task_metadata={"client_message_id": "cm-42"},
+        drive_root=tmp_path, is_direct_chat=True,
+        task_metadata={"client_message_id": "cm-42",
+                       "origin_message_ref": {"chat_id": 1, "client_message_id": "cm-42"}},
     )
     out = _steer_task(ctx, "abc12345", "also add the benchmarks slide")
     assert out.startswith("⚠️ STEER_UNCONFIRMED")
@@ -2375,9 +2376,11 @@ def test_steer_task_uses_exact_ingress_owner_text(tmp_path):
         event_queue=None,
         current_chat_id=1,
         drive_root=tmp_path,
+        is_direct_chat=True,
         task_metadata={
             "client_message_id": "cm-exact",
             "origin_message_text": exact,
+            "origin_message_ref": {"chat_id": 1, "client_message_id": "cm-exact"},
         },
     )
 
@@ -2399,8 +2402,10 @@ def test_main_steer_can_address_project_bound_root_from_host_manifest(tmp_path, 
         event_queue=None,
         current_chat_id=1,
         drive_root=tmp_path,
+        is_direct_chat=True,
         task_metadata={
             "client_message_id": "main-42",
+            "origin_message_ref": {"chat_id": 1, "client_message_id": "main-42"},
             "routing_contract": {"source_lane": "main"},
         },
     )
@@ -2461,8 +2466,10 @@ def test_busy_direct_main_root_is_manifested_and_steerable_without_promotion(tmp
         event_queue=None,
         current_chat_id=1,
         drive_root=tmp_path,
+        is_direct_chat=True,
         task_metadata={
             "client_message_id": "followup-1",
+            "origin_message_ref": {"chat_id": 1, "client_message_id": "followup-1"},
             "routing_contract": metadata["routing_contract"],
         },
     )

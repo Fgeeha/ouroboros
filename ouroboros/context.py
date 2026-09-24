@@ -861,9 +861,18 @@ def _format_recent_reflections(entries: List[Dict[str, Any]], limit: int = 10) -
 
         lines = [f"### {header}"]
 
+        # A run's first text is not its goal: the recorded origin says whose it was,
+        # and it renders even when the text is empty (empty is not "not recorded").
+        origin = ((entry.get("review_evidence") or {}).get("task_inputs") or {}).get("run_origin")
+        presence = origin.get("presence") if isinstance(origin, dict) and isinstance(origin.get("presence"), dict) else {}
+        lines.append("- Origin: " + (", ".join(
+            [f"owner_ingress={origin.get('owner_ingress')}"]
+            + [f"{key}={origin[key]}" for key in ("task_type", "source", "initiator", "text_author") if origin.get(key)]
+            + [f"{key}={presence[key]}" for key in ("provider", "conversation_id") if presence.get(key)]
+        ) if isinstance(origin, dict) else "not recorded"))
         goal = str(entry.get("goal", "")).strip()
         if goal:
-            lines.append(f"- Goal: {goal}")
+            lines.append(f"- Initial text: {goal}")
 
         markers = [str(m).strip() for m in (entry.get("key_markers") or []) if str(m).strip()]
         if markers:
