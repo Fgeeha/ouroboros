@@ -528,6 +528,8 @@ def test_s28_native_peers_exchange_addressed_turns_and_the_planner_receives_sele
 
             # (d)+(e) a contribution is not the end of participation: the awaited reply was
             # injected (server-level event carrying the RELATION) BEFORE the recipient's terminal.
+            assert wait_until(lambda: any(str(row.get("task_id")) == parent_id
+                                         for row in oracle.events("task_done")), 60)
             events = oracle.events()
             def _index(pred):
                 return next(i for i, row in enumerate(events) if pred(row))
