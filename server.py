@@ -199,6 +199,7 @@ def _restart_current_process(host: str, port: int) -> None:
     )
 
 from ouroboros.config import (
+    SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC,
     SETTINGS_DEFAULTS,
     SettingsIntegrityError,
     load_settings, save_settings, verify_settings_integrity,
@@ -1596,6 +1597,23 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
     except Exception:
         pass
 
+class _SignalStopServer(uvicorn.Server):
+    """uvicorn.Server whose SIGTERM/SIGINT handler stops the supervisor loop AT THE SIGNAL.
+
+    The launcher's stop may SIGTERM the whole server process group, so the multiprocessing
+    Manager and pooled workers can be gone before uvicorn's drain reaches the lifespan
+    teardown (#1142). Setting the stop event here, not only in the lifespan ``finally``,
+    makes the loop leave its tick and keeps a torn-Manager BrokenPipe from counting as a
+    supervisor crash — the false "Supervisor loop died" owner alarm. A restart request
+    (``should_exit`` without a signal) is unchanged: ``_restart_requested`` already ends
+    the loop, and the lifespan ``finally`` still sets the event on every path.
+    """
+
+    def handle_exit(self, sig: int, frame) -> None:
+        _supervisor_stop.set()
+        super().handle_exit(sig, frame)
+
+
 def main() -> int:
     # A benchmark-owned child may receive an integrity pin from its parent.
     # Verify the exact bytes before even resolving the saved bind host; a
@@ -1635,8 +1653,11 @@ def main() -> int:
         log_level="warning",
         ws_ping_interval=20,
         ws_ping_timeout=20,
+        # Bound the open HTTP/WS drain so the lifespan teardown (terminal custody) starts inside
+        # the launcher's stop budget instead of leaving terminalization to the next boot (#1142).
+        timeout_graceful_shutdown=SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC,
     )
-    server = uvicorn.Server(config)
+    server = _SignalStopServer(config)
     _uvicorn_exited = threading.Event()
 
     def _check_restart():

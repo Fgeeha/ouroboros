@@ -77,7 +77,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # displace; two neighbouring sentences were compressed by 168 bytes first.
     # +300: the queue snapshot and the supervisor focus event carry the root's
     # bounded authored focus (cross-focus awareness).
-    "docs/architecture/05-supervisor-loop.md": 30900,
+    # 30900 -> 31150 (issue #1142): the crash counter's shutdown exemption names WHERE the stop
+    # event is set (the uvicorn signal handler, then the lifespan teardown) and why both are needed.
+    "docs/architecture/05-supervisor-loop.md": 31150,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
@@ -130,7 +132,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
-    "docs/architecture/09-shutdown-and-process-cleanup.md": 12405,
+    # 12405 -> 13600 (issue #1142): the ordinary-close paragraph gains the mechanism the chapter had
+    # no text for — graceful stop signals the server PID only, the server half (stop event at the
+    # signal, bounded uvicorn drain) is self-sufficient against an old group-SIGTERM launcher.
+    "docs/architecture/09-shutdown-and-process-cleanup.md": 13600,
     # 17655 -> 20400: the supervisor-reliability sprint adds eight invariants the chapter lacked
     # (typed permanent engine refusal, interrupted parent, stalled-loop facts, source-ack
     # pre-check, host-owed round, reviewer tool bound, off-thread custody, fence transport) —
