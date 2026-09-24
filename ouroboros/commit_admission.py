@@ -320,7 +320,7 @@ def preflight_test_workload(
     from ouroboros.preflight_node import candidate_node_tests, resolve_node
 
     base = pathlib.Path(tempfile.gettempdir()) / "ouroboros-preflight-contract"
-    env = pr._preflight_env(base, base / "repo")
+    env = pr._preflight_env(base, base / "repo", create=False)
     environment = hashlib.sha256(json.dumps(env, sort_keys=True).encode()).hexdigest()
     python = agent_python or os.environ.get("OUROBOROS_AGENT_PYTHON") or sys.executable or "python3"
     specs = pr._preflight_pass_specs(pytest_args) if passes is None else passes

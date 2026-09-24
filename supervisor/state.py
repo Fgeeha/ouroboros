@@ -786,10 +786,15 @@ def reconstruct_task_cost(
             "cost_final": True, "reserved_usd": 0.0,
             "unresolved_upper_bound_usd": 0.0, "unknown_unmetered": 0,
             "non_final_rows": 0,
+            # No task was named, so no ledger bucket was summed: there is nothing
+            # for a carrier to explain (#498), and None says exactly that.
+            "cost_presentation": None,
         }
     else:
         try:
-            from ouroboros.cost_projection import honest_accounted_amount
+            from ouroboros.cost_projection import (
+                COST_SCOPE_OWN, build_cost_presentation, honest_accounted_amount,
+            )
             from ouroboros.usage_accounting import ensure_legacy_imported, usage_breakdown
 
             authority_root = pathlib.Path(drive_root) if drive_root is not None else DRIVE_ROOT
@@ -821,12 +826,15 @@ def reconstruct_task_cost(
                 # The disclosed CAUSE of cost_final=false, carried with the flag.
                 "non_final_rows": int(bucket.get("non_final_rows") or 0),
                 "ledger_integrity_degraded": bool(bucket.get("integrity_degraded")),
+                # #498: the same bucket's own explanation of its own amount.
+                "cost_presentation": build_cost_presentation(bucket, scope=COST_SCOPE_OWN),
             }
         except Exception:
             log.error("Failed to reconstruct ledger task cost for %s", task_id, exc_info=True)
             projection = {
                 "cost_accounting_status": "unavailable", "cost_final": False,
                 "cost_accounting_error": "ledger_unavailable",
+                "cost_presentation": None,
                 "accounted_upper_bound_usd": None, "total_rounds": None,
                 "prompt_tokens": None, "completion_tokens": None,
                 "reserved_usd": None, "unresolved_upper_bound_usd": None,

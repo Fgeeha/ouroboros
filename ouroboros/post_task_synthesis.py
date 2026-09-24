@@ -444,11 +444,13 @@ def _pre_synthesis_usage_snapshot(
     })
     try:
         from ouroboros.usage_accounting import usage_breakdown
+        from ouroboros.cost_projection import COST_SCOPE_ROOT_TREE, build_cost_presentation
 
         logical_root_id = str(task.get("root_task_id") or task_id)
         subtree = usage_breakdown(budget_root, root_task_id=logical_root_id)
         snapshot.update({
             "accounted_upper_bound_usd_with_children": round(float(subtree["accounted_usd"]), 6),
+            "cost_presentation": build_cost_presentation(subtree, scope=COST_SCOPE_ROOT_TREE),
             "reserved_usd": round(float(subtree["reserved_usd"]), 6),
             "unresolved_upper_bound_usd": round(
                 float(subtree["unresolved_upper_bound_usd"]), 6
@@ -472,6 +474,7 @@ def _pre_synthesis_usage_snapshot(
             "unknown_unmetered": None,
             "ledger_integrity": "unavailable",
             "cost_accounting_status": "unavailable",
+            "cost_presentation": None,
         })
     return snapshot
 
