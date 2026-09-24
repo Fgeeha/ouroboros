@@ -500,8 +500,10 @@ test('#498 exact live subtotal cannot freeze a still-running root heartbeat', ()
         accounting_open: true, has_unpriced: true, has_rows: true } }, '2026-09-23T00:01:00Z');
     assert.equal(exact.final, false);
     assert.deepEqual(mergeStickyCostMeta(exact, next).meta, ['Tracked: up to $0.30', 'some steps have no price']);
+    // A null carrier beside a readable ledger is an UNKNOWN amount (owner
+    // vocabulary), never the unreadable-ledger phrase.
     assert.deepEqual(taskCostMeta({ accounted_upper_bound_usd: 0, cost_final: true,
-        cost_presentation: null }), ['cost unavailable']);
+        cost_presentation: null }), ['Cost unknown']);
 });
 
 test('#498 legacy unknown price never becomes sticky-final', () => {
@@ -518,6 +520,9 @@ test('unknown legacy descendant rollup cannot retain a narrower own zero', () =>
     const own = taskCostProjection({cost_final:true, cost_presentation:{scope:'own', tracked_amount:0,
         tracked_final:true, accounting_open:false, has_rows:true, has_unpriced:false}}, '2026-09-24T00:00:00Z');
     const rollup = taskCostProjection({cost_presentation:null, accounted_upper_bound_usd_with_children:null}, '2026-09-24T00:01:00Z');
-    assert.deepEqual(mergeStickyCostMeta(own, rollup).meta, ['cost unavailable']);
-    assert.deepEqual(mergeStickyCostMeta(rollup, own).meta, ['cost unavailable']);
+    assert.deepEqual(mergeStickyCostMeta(own, rollup).meta, ['Cost unknown']);
+    assert.deepEqual(mergeStickyCostMeta(rollup, own).meta, ['Cost unknown']);
+    // The unreadable-ledger phrase is reserved for the status flag.
+    assert.deepEqual(taskCostMeta({ cost_accounting_status: 'unavailable', cost_presentation: null }),
+        ['cost unavailable']);
 });

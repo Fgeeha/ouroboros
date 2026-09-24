@@ -551,8 +551,15 @@ export function taskCostMeta(payload = {}) {
         'reserved_usd', 'unresolved_upper_bound_usd', 'unknown_unmetered',
     ].some(has);
     if (!hasAccountingEvidence) return [];
-    if (payload.cost_accounting_status === 'unavailable'
-        || (has('cost_presentation') && payload.cost_presentation === null)) return ['cost unavailable'];
+    if (payload.cost_accounting_status === 'unavailable') return ['cost unavailable'];
+    // #498: a producer that had a readable ledger but NO same-scope facts for
+    // this frame (a nested child's foreign subtree rollup) sends an explicit
+    // null carrier. That amount is unknown to this card, not unreadable: the
+    // owner vocabulary for an unknown amount is "Cost unknown" (DESIGN), while
+    // "cost unavailable" stays reserved for a ledger that could not be read.
+    // The projection below still ranks it `unavailable` so a narrower own zero
+    // cannot outrank it (mergeStickyCostMeta).
+    if (has('cost_presentation') && payload.cost_presentation === null) return ['Cost unknown'];
 
     // #498: the producer's own carrier wins, because it was built from the exact
     // ledger bucket it describes. The derivation below stays for legacy frames
