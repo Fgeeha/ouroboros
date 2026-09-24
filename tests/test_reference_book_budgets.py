@@ -122,7 +122,16 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # private-snapshot paragraph now states the worktree ops lock's scope (shared
     # metadata only, row-then-ref order, batched binary verdict, typed busy refusal)
     # — rationale-layer text BIBLE P6 requires.
-    "docs/architecture/06-agent-core.md": 306000,
+    # 306000 -> 306800: the predecessor door is a predicate on the result, never on the
+    # caller's room, the landing project or the root/helper distinction (the disclosed
+    # notes replace the one-clause pointer to §10); the registry read of the routing
+    # verbs on a forked execution drive and the predecessor's task files as a lineage
+    # read are new facts of the paragraphs they extend. The merged base sat 147 bytes
+    # under the previous budget.
+    # 306800 -> 307100 (#1247 fix-forward; measured 306832 on the merged chapter): the
+    # populate sentence names the post-copy stat re-record that keeps a CRLF-converting
+    # checkout clean.
+    "docs/architecture/06-agent-core.md": 307100,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
@@ -140,7 +149,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # residual sentence of the off-thread invariant; the rule itself has no older text.
     # +200 (2026-09-22): invariant 10 names the process-local fingerprint memos
     # and their fallback rule; the base sat 23 bytes under the previous budget.
-    "docs/architecture/10-key-invariants.md": 21300,
+    # 21300 -> 21700: invariant 27 states the door as a predicate on the root (any actor
+    # holding a routing verb, any project, a disclosed landing) with the reason the
+    # room comparison protected nothing; the earlier one-clause form is replaced, and
+    # the base sat 34 bytes under the previous budget.
+    "docs/architecture/10-key-invariants.md": 21700,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
     # +400 (#1213): Presence turns are named as actors without cross-focus catalogue or focus authority.
     "docs/architecture/12-host-service-companions-and-chat-ids.md": 11400,

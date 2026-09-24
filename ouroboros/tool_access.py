@@ -106,8 +106,8 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
     lane = str(effective_lane or "").strip()
     if lane:
         bits.append(f"model_lane={lane}")
-    lineage = (" (task_drive/artifact_store: its own, its parent's and its root task's files,"
-               " never a sibling's)" if "task_drive" in read_roots else "")
+    lineage = (" (task_drive/artifact_store: its own, its parent's, its root task's and, when its"
+               " contract names one, its predecessor's files, never a sibling's)" if "task_drive" in read_roots else "")
     return (
         "child capabilities — " + " · ".join(bits)
         + f"\nreadable={', '.join(read_roots) or 'none'}{lineage}"
@@ -116,20 +116,22 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
 
 
 def lineage_task_ids(ctx: Any) -> tuple[str, ...]:
-    """Task ids whose ``task_drive``/``artifact_store`` this actor may READ: its own,
-    then ``parent_task_id`` and ``root_task_id`` from its own lineage fields (T4=A,
-    #1105) — never a sibling's, nothing found by walking the disk, malformed ids dropped."""
-    meta = getattr(ctx, "task_metadata", None)
-    meta = meta if isinstance(meta, dict) else {}
+    """Task ids whose ``task_drive``/``artifact_store`` this actor may READ: its own, its parent's
+    and its root's (own lineage fields, T4=A #1105) and the ONE predecessor its contract names
+    (``task_contract.predecessor_authority.source.task_id``, one hop, #1232; a child carrying the
+    envelope reads it too) — never a sibling's, nothing found by walking the disk, malformed ids dropped."""
+    meta, contract = (v if isinstance(v, dict) else {} for v in (
+        getattr(ctx, "task_metadata", None), getattr(ctx, "task_contract", None)))
+    authority = (contract or meta).get("predecessor_authority")
+    source = authority.get("source") if isinstance(authority, dict) else None
     ids = [task_id_for_artifacts(ctx)]
-    for key in ("parent_task_id", "root_task_id"):
+    for raw in (meta.get("parent_task_id"), meta.get("root_task_id"),
+                source.get("task_id") if isinstance(source, dict) else None):
         try:
-            candidate = validate_task_id(meta.get(key))
+            ids.append(validate_task_id(raw))
         except ValueError:
             continue
-        if candidate not in ids:
-            ids.append(candidate)
-    return tuple(ids)
+    return tuple(dict.fromkeys(ids))
 
 
 def _task_root_drives(ctx: Any) -> list[pathlib.Path]:

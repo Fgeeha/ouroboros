@@ -24,6 +24,38 @@ def _ctx(tmp_path, events=None, *, task_metadata=None, **overrides):
     return types.SimpleNamespace(**values)
 
 
+def test_a_task_on_a_forked_drive_reads_the_registry_from_the_canonical_root(tmp_path, monkeypatch):
+    """A promoted task with a workspace runs on a forked execution drive that never
+    carries ``state/projects.json``; the routing verbs read the registry through the
+    canonical data root, so such a task lists, routes into and names the owner's
+    projects. A context without a canonical root still reads its own drive."""
+    from ouroboros.tools.control_routing import _effective_scope_note, _promote_chat_to_task
+
+    create_project(tmp_path, "racer", name="Racer")
+    child = tmp_path / "state" / "headless_tasks" / "fork-1" / "data"
+    child.mkdir(parents=True)
+    forked = _ctx(child, task_metadata={"budget_drive_root": str(tmp_path)}, budget_drive_root=str(tmp_path))
+
+    assert "racer — Racer" in _list_projects(forked)
+    out = _route_to_project(forked, "racer", "continue the engine tuning", predecessor_task_id="")
+    assert out.startswith("⚠️ ROUTE_UNCONFIRMED:"), out
+    assert forked.pending_events[0]["project_id"] == "racer"
+    assert _effective_scope_note(forked, "racer") == " in project 'Racer' (racer)"
+
+    monkeypatch.setattr(
+        "ouroboros.tools.control_events._wait_for_promotion_admission",
+        lambda *_a, **_k: {"status": "scheduled", "effective_project_id": "racer"},
+    )
+    promoted = _ctx(child, task_metadata={"budget_drive_root": str(tmp_path)}, budget_drive_root=str(tmp_path))
+    out = _promote_chat_to_task(promoted, "tune the engine", project_id="racer", workspace="none", predecessor_task_id="")
+    assert out.startswith("OK: task") and "in project 'Racer' (racer)" in out, out
+
+    # The quiet direction: no canonical root at all means the task's own drive is the registry.
+    own_drive = _ctx(child)
+    assert _list_projects(own_drive).startswith("No projects yet")
+    assert "target_not_found" in _route_to_project(own_drive, "racer", "msg", predecessor_task_id="")
+
+
 def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
     create_project(tmp_path, "racer", name="Racer")
     # The origin identity is captured at INGRESS and rides task_metadata by
