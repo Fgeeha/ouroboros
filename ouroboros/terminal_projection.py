@@ -17,7 +17,9 @@ from contextlib import contextmanager
 from typing import Any
 
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
-from ouroboros.task_results import load_task_result, resolve_task_lineage, task_result_path, write_task_result
+from ouroboros.task_results import (
+    is_reconciled_presence_placeholder, load_task_result, resolve_task_lineage, task_result_path, write_task_result,
+)
 from ouroboros.utils import jsonl_chain_handles, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -78,8 +80,8 @@ def _publication_lock(root: Any, tid: str):
 def _prepare(root: Any, tid: str, task: dict, event: dict) -> dict:
     """Durably record readiness from canonical terminal authority, before IO."""
     def prepare(current: dict, _patch: dict):
-        if not _settled(current):
-            return None
+        if not _settled(current) or is_reconciled_presence_placeholder(current):
+            return None  # a host-reconciled presence placeholder is not a result: the event re-runs
         effective = {**task, **current}
         if not _lineage(tid, effective)["is_root_task"]:
             return None
@@ -311,7 +313,7 @@ def reconcile_terminal_projections(drive_root: Any) -> int:
     for path in sorted(task_results_dir(drive_root, create=False).glob("*.json")):
         try:
             row = load_task_result(drive_root, path.stem, strict=True)
-            if not row or not _settled(row):
+            if not row or not _settled(row) or is_reconciled_presence_placeholder(row):
                 continue
             ready = row.get("canonical_terminal_projection_ready")
             if (not isinstance(ready, dict)

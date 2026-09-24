@@ -693,13 +693,19 @@ def is_reconciled_presence_placeholder(row: Dict[str, Any]) -> bool:
 def reopen_reconciled_presence_placeholder(drive_root: Any, task_id: str) -> bool:
     """Return a placeholder to ``running`` for its re-run; the host mark moves to ``superseded_placeholder``."""
     path, reopened = task_result_path(drive_root, task_id), []
-    cleared = {"reason_code", "outcome_axes", "artifact_status", "artifact_bundle", "result", "status_reconciled_from"}
+    # The terminal-projection bookkeeping of the placeholder's failed transition goes with it: the
+    # re-run's own terminal transition must originate its own room row, never inherit a failed one.
+    projection = ("canonical_terminal_projection", "canonical_terminal_projection_ready",
+                  "canonical_terminal_projection_origin")
+    cleared = {"reason_code", "outcome_axes", "artifact_status", "artifact_bundle", "result",
+               "status_reconciled_from", *projection}
 
     def _reopen(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if not is_reconciled_presence_placeholder(existing):
             return None
         require_writable_task_result_schema(existing, path)
-        mark = {key: existing.get(key) for key in ("status", "reason_code", "status_reconciled_from", "ts")}
+        mark = {key: existing.get(key) for key in ("status", "reason_code", "status_reconciled_from", "ts", *projection)
+                if key in existing}
         reopened.append(utc_now_iso())
         return stamp_task_result_schema({
             **{key: value for key, value in existing.items() if key not in cleared},

@@ -394,7 +394,8 @@ def _log_dialogue(
     state = read_json_dict(drive_root / "state" / "state.json") or {}
     written = append_jsonl(
         drive_root / "logs" / "chat.jsonl",
-        {
+        ensure_record_boundary=(direction == "in"),  # a re-run never re-logs: this row must be parseable
+        obj={
             "ts": utc_now_iso(),
             "session_id": state.get("session_id"),
             "direction": direction,
@@ -606,6 +607,14 @@ def run_presence_turn(
         stored = load_task_result(Path(drive_root), task_id) or {}
         lost_attempt = is_reconciled_presence_placeholder(stored) or str(stored.get("status") or "") in {
             STATUS_RUNNING, STATUS_INTERRUPTED}
+        def chat_generation() -> tuple[int, int] | None:  # rotation renames the live file: a new inode
+            try:
+                stat = os.stat(Path(drive_root) / "logs" / "chat.jsonl")
+            except OSError:
+                return None
+            return (stat.st_dev, stat.st_ino)
+
+        generation = chat_generation()  # the live file this execution's rows land in, read before the rows
         prior_rows = _live_task_rows(Path(drive_root), task_id, event.conversation_key)
         task = _build_task(
             admission,
@@ -632,14 +641,8 @@ def run_presence_turn(
                 task=task,
                 task_id=task_id,
             )
-        def chat_generation() -> tuple[int, int] | None:  # rotation renames the live file: a new inode
-            try:
-                stat = os.stat(Path(drive_root) / "logs" / "chat.jsonl")
-            except OSError:
-                return None
-            return (stat.st_dev, stat.st_ino)
-
-        generation = chat_generation()  # the live file this execution's receipts land in
+        if generation is None:  # the inbound log just created the live file: that is this execution's generation
+            generation = chat_generation()
         if agent_factory is None:
             from ouroboros.agent import make_agent
 

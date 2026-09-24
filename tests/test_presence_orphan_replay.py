@@ -87,9 +87,11 @@ def test_reopen_moves_the_host_mark_aside_exactly_once(tmp_path, monkeypatch, st
     assert reopened["superseded_placeholder"] == {
         "status": STATUS_FAILED, "reason_code": row["reason_code"], "status_reconciled_from": status,
         "ts": row["ts"], "result": row["result"][-500:],
+        # the failed transition's terminal-projection provenance goes aside with the mark
+        "canonical_terminal_projection_origin": "terminal_transition",
     }
     for cleared in ("reason_code", "outcome_axes", "artifact_status", "artifact_bundle", "result",
-                    "status_reconciled_from"):
+                    "status_reconciled_from", "canonical_terminal_projection_origin"):
         assert cleared not in reopened
     # A running row is no placeholder: the transition cannot fire twice.
     before = task_result_path(tmp_path, "orphan-turn").read_bytes()
@@ -520,7 +522,7 @@ def test_an_unwritable_inbound_row_fails_the_turn_before_the_model_runs(tmp_path
     calls: list = []
     kwargs = _v1_kwargs(tmp_path, calls)
     real_append = presence_runner.append_jsonl
-    monkeypatch.setattr(presence_runner, "append_jsonl", lambda path, row: False)
+    monkeypatch.setattr(presence_runner, "append_jsonl", lambda path, obj=None, **_kw: False)
     with pytest.raises(PresenceTurnError) as raised:
         run_presence_turn(**kwargs)
     assert raised.value.code == "chat_log_unwritable" and calls == []
@@ -553,6 +555,7 @@ def test_a_retry_after_a_rotation_still_knows_its_own_sends(tmp_path):
     chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
     (tmp_path / "archive").mkdir()
     chat.rename(tmp_path / "archive" / "chat_20260528T000100.jsonl")
+    chat.touch()  # the rotator leaves a fresh live generation behind, as in production
     calls: list = []
     kwargs = _v1_kwargs(tmp_path, calls)
     run_presence_turn(**{**kwargs, "agent_factory": lambda **_kw: _sending_agent(calls, "Real answer", tmp_path, part="Retry part")})
@@ -570,3 +573,35 @@ def test_a_rotation_during_the_turn_leaves_its_sends_unknown(tmp_path):
         calls, "Real answer", tmp_path, part="Mid part", rotate_first=True)})
     pointer = _read_previous_turn(tmp_path, kwargs["event"].conversation_key)
     assert (pointer["transport_sends"], pointer["delivery"]) == ([], "unknown")
+
+
+def test_a_presence_placeholder_owes_no_terminal_projection_but_its_rerun_does(tmp_path, monkeypatch):
+    """The target's terminal-projection sweep must not post the placeholder's failure into the room; the
+    re-run's own completion originates the room's terminal row, even when a stale marker was inherited."""
+    from ouroboros.terminal_projection import reconcile_terminal_projections
+
+    task_id = _task_id(_admission(), _event())
+    _reconciled(tmp_path, monkeypatch, task_id)
+    assert reconcile_terminal_projections(tmp_path) == 0  # nothing owed for a placeholder
+    chat = tmp_path / "logs" / "chat.jsonl"
+    rows = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()] if chat.exists() else []
+    assert not [row for row in rows if row.get("type") == "task_summary"]
+    # An install that ran the sweep before this rule left a failed marker on the placeholder.
+    write_task_result(tmp_path, task_id, STATUS_FAILED, canonical_terminal_projection={
+        "summary_id": f"task-terminal:{task_id}", "summary_kind": "terminal_root_projection", "attempt": {}})
+    calls: list = []
+    first = run_presence_turn(admission=_admission(), event=_event(), repo_dir=tmp_path, drive_root=tmp_path,
+                              agent_factory=lambda **_kw: _answering_agent(calls, "Real answer", tmp_path),
+                              gate=PresenceTurnGate(1))
+    stored = load_task_result(tmp_path, task_id)
+    assert first.text == "Real answer" and stored["status"] == STATUS_COMPLETED
+    assert "canonical_terminal_projection" in stored["superseded_placeholder"]  # moved aside with the mark
+    assert reconcile_terminal_projections(tmp_path) == 1  # the re-run's completion owes and gets its row
+    rows = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()]
+    summaries = [row for row in rows if row.get("type") == "task_summary" and row.get("task_id") == task_id]
+    assert [row["status"] for row in summaries] == ["completed"] and summaries[0]["presence_provenance"]["provider"] == "telegram"
+    # An ordinary orphaned root (no presence identity) still gets its failed terminal row.
+    _sweep(tmp_path, monkeypatch, "plain-orphan", metadata={"source": "chat"})
+    assert reconcile_terminal_projections(tmp_path) == 1
+    rows = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()]
+    assert [row["status"] for row in rows if row.get("type") == "task_summary" and row.get("task_id") == "plain-orphan"] == ["failed"]
