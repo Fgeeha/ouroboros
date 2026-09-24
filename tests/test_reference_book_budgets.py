@@ -123,7 +123,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # verbs on a forked execution drive and the predecessor's task files as a lineage
     # read are new facts of the paragraphs they extend. The merged base sat 147 bytes
     # under the previous budget.
-    "docs/architecture/06-agent-core.md": 306800,
+    # 306800 -> 307100 (#1247 fix-forward; measured 306832 on the merged chapter): the
+    # populate sentence names the post-copy stat re-record that keeps a CRLF-converting
+    # checkout clean.
+    "docs/architecture/06-agent-core.md": 307100,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
