@@ -22,7 +22,7 @@ import time
 import pytest
 
 from ouroboros import artifacts, subagent_worktrees as wt, workspace_patch_capture as capture
-from ouroboros.platform_layer import _lock_identity
+from ouroboros.platform_layer import _lock_identity, pid_is_alive
 from tests._delegated_transport_shared import _owned_gateway_uses_each_test_transport  # noqa: F401
 from tests.test_delegated_full_access import full_run  # noqa: F401
 from tests.test_delegated_run_isolation import _git, _nanny_ctx, _seed_target
@@ -147,32 +147,49 @@ def test_a_parked_provision_does_not_block_another(tmp_path, monkeypatch, same_t
 
 
 _HOLDER = """
-import os, pathlib, sys, time
-sys.path.insert(0, sys.argv[3])
+import os, pathlib, sys
+sys.path.insert(0, sys.argv[2])
 from ouroboros.platform_layer import acquire_exclusive_file_lock
 fd = acquire_exclusive_file_lock(
     pathlib.Path(sys.argv[1]), timeout_sec=5, stale_sec=600,
     metadata=f"pid={os.getpid()} task=t-holder op=provision since=2026-09-24T00:00:00Z target=/tmp/with space")
 assert fd is not None
-print("HELD", flush=True)
-time.sleep(float(sys.argv[2]))
+print("HELD", os.getpid(), flush=True)
+sys.stdin.readline()  # hold until the test closes our stdin (or kills us)
 """
 
 
-def _hold_lock(snaps: pathlib.Path, seconds: float) -> subprocess.Popen:
+def _hold_lock(snaps: pathlib.Path) -> "tuple[subprocess.Popen, int]":
+    """A live lock holder in another process; returns it with the pid the holder
+    itself wrote into the lock (on Windows a venv ``python.exe`` is a launcher whose
+    CHILD is the interpreter, so ``proc.pid`` is not that pid)."""
     snaps.mkdir(parents=True, exist_ok=True)
     proc = subprocess.Popen(
-        [sys.executable, "-c", _HOLDER, str(snaps / wt._LOCK_NAME), str(seconds), str(REPO)],
-        stdout=subprocess.PIPE, text=True)
-    assert proc.stdout.readline().strip() == "HELD"
-    return proc
+        [sys.executable, "-c", _HOLDER, str(snaps / wt._LOCK_NAME), str(REPO)],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    banner = proc.stdout.readline().split()
+    assert banner[:1] == ["HELD"], banner
+    return proc, int(banner[1])
+
+
+def _release_holder(proc: subprocess.Popen, holder_pid: int) -> None:
+    proc.kill()
+    proc.stdin.close()  # the interpreter behind a launcher exits on EOF too
+    proc.wait()
+    # Wait for the HOLDER (not only the launcher) to be gone: it may still hold
+    # the OS-level lock for a moment after EOF, and the dead-holder phase below
+    # rewrites the lock file by hand.
+    deadline = time.monotonic() + 10
+    while pid_is_alive(holder_pid) and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not pid_is_alive(holder_pid)
 
 
 def test_a_live_holder_is_a_typed_refusal_and_a_dead_holder_is_evicted(tmp_path, monkeypatch):
     target = _seed_target(tmp_path)
     snaps, data = tmp_path / "snaps", tmp_path / "data"
     monkeypatch.setattr(wt, "_LOCK_TIMEOUT_SEC", 0.5)
-    holder = _hold_lock(snaps, 30)
+    holder, holder_pid = _hold_lock(snaps)
     try:
         started = time.monotonic()
         with pytest.raises(wt.WorktreeOpsLockBusy) as info:
@@ -181,10 +198,9 @@ def test_a_live_holder_is_a_typed_refusal_and_a_dead_holder_is_evicted(tmp_path,
         # refusal arrives after the one wait, not after a second discard wait.
         assert time.monotonic() - started < 3
     finally:
-        holder.kill()
-        holder.wait()
+        _release_holder(holder, holder_pid)
     busy = info.value
-    assert busy.holder == {"pid": str(holder.pid), "task": "t-holder", "op": "provision",
+    assert busy.holder == {"pid": str(holder_pid), "task": "t-holder", "op": "provision",
                            "since": "2026-09-24T00:00:00Z", "target": "/tmp/with space"}
     assert busy.waited_sec > 0 and "t-holder" in str(busy)
     # Nothing was registered, pinned or checked out for the refused attempt.
@@ -423,11 +439,20 @@ def test_a_failure_after_the_provisional_row_leaves_nothing_and_a_crash_is_gc_re
     assert not list(snaps.glob("dlg_*"))
 
 
-def test_populate_matches_worktree_add_and_runs_no_target_hook(tmp_path, monkeypatch):
+@pytest.mark.parametrize("autocrlf", [False, True])
+def test_populate_matches_worktree_add_and_runs_no_target_hook(tmp_path, monkeypatch, autocrlf):
     """``worktree add --no-checkout`` + ``reset --hard --no-recurse-submodules`` is what
     git's own ``worktree add`` runs — a target with ``submodule.recurse=true`` must
     still snapshot — minus the target's post-checkout hook, which no longer executes
-    project-authored code at provision."""
+    project-authored code at provision. Under ``core.autocrlf=true`` (Git for
+    Windows' default) the checkout writes CRLF and the raw-bytes copy restores the
+    source's LF, so the copied entries' stat must be re-recorded or every such file
+    reads as modified in the child's ``git status`` (CI on windows-latest, #1247)."""
+    # Both legs pin the setting explicitly: on windows-latest the system config
+    # already says true, so an unset "False" leg would not be the working side.
+    config = tmp_path / "gitconfig"
+    config.write_text(f"[core]\n\tautocrlf = {'true' if autocrlf else 'false'}\n", encoding="utf-8")
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(config))
     sub = tmp_path / "sub"
     sub.mkdir()
     _git(sub, "init", "-q")
@@ -457,6 +482,7 @@ def test_populate_matches_worktree_add_and_runs_no_target_hook(tmp_path, monkeyp
     assert (exec_root / "vendored").is_dir() and (exec_root / "tracked.txt").read_text(encoding="utf-8") == "one\ntwo\n"
     assert not (exec_root / ".hook_ran").exists() and not (target / ".hook_ran").exists()
     assert _git(exec_root, "status", "--porcelain").stdout == ""
+    assert (exec_root / ".gitmodules").read_bytes() == (target / ".gitmodules").read_bytes()
     assert "160000" in _git(exec_root, "ls-files", "-s", "vendored").stdout
 
     # The guard: without --no-recurse-submodules the populate fails on this target.
@@ -483,7 +509,7 @@ def test_snapshot_facts_ride_the_start_receipt_as_disclosure_only(tmp_path):
     assert _snapshot_facts(None) == {}
     # Facts, not a threshold: no runtime module consumes them to refuse or truncate.
     consumers = sorted(
-        str(path.relative_to(REPO)) for path in (REPO / "ouroboros").rglob("*.py")
+        path.relative_to(REPO).as_posix() for path in (REPO / "ouroboros").rglob("*.py")
         if "provisioning_sec" in path.read_text(encoding="utf-8"))
     assert consumers == ["ouroboros/subagent_worktrees.py", "ouroboros/tools/delegate.py",
                          "ouroboros/tools/delegate_integration.py"]
