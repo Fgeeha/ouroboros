@@ -935,3 +935,184 @@ def test_s31_direct_chat_turn_pauses_under_its_own_id_and_owner_resume_completes
             assert len(_task_done_rows(oracle, task_id)) == 1
         finally:
             server.stop()
+
+
+# ===========================================================================
+# S32 — the pause survives the physical epoch: graceful SIGTERM -> boot -> paused -> Resume.
+# ===========================================================================
+
+S32_FINAL = "S32_FINAL: the paused task finished after the restart and its Resume."
+
+
+def _boot_restore_rows(oracle: ArtifactOracle) -> list:
+    return oracle.supervisor_rows("queue_restored_from_snapshot")
+
+
+@pytest.mark.integration
+@pytest.mark.serial
+def test_s32_exact_pause_survives_a_graceful_server_restart_and_resumes_after_it(
+        e2e_clone, tmp_path_factory):
+    """Owner contract (#1196): an exact budget pause survives a physical epoch.
+
+    The lifespan teardown of a graceful SIGTERM settles interrupted RUNNING work
+    as ``cancelled`` (``server_shutdown``) and drains PENDING; the paused carrier is
+    NOT that work. Generation A pauses the root and is stopped gracefully: the
+    ``server_shutdown`` row proves the teardown's custody step ran, and the task
+    leaves the epoch untouched — no task_done, no cancel, the same ``paused`` row,
+    the PENDING ``_budget_pause`` carrier still in the final snapshot, no further
+    model round. Generation B (same clone, data root and stub) must park the SAME
+    id again from that snapshot, unheld and un-dispatched: census ``budget_paused``,
+    public detail ``scheduled``/``budget_paused`` (never ``running``), Resume still
+    the typed 409 while the ledger is exhausted. Only the owner's Resume after the
+    increase continues and completes the same id with cumulative rounds and spend.
+    """
+    require_lane(LANE_MOCK)
+    from ouroboros.budget_pause import REASON_CODE, STATE_PAUSED, STATE_RESUMED, STATUS_PAUSED_EXACT
+    from ouroboros.task_results import STATUS_SCHEDULED
+    from supervisor.events_budget import budget_hold_fact
+
+    root = tmp_path_factory.mktemp("s32")
+    script = [dict(KEEPALIVE_STEP) for _ in range(S30_SCRIPT_STEPS)]
+    with PricedStubModel(script, cost_usd=S30_CALL_COST, final_answer=S32_FINAL) as stub:
+        settings = keyless_settings(
+            stub, TOTAL_BUDGET=S30_TOTAL_BUDGET, OUROBOROS_PER_TASK_COST_USD=S30_PER_TASK_CAP)
+
+        # ---------------------------------------------------------------
+        # Generation A: pause, then a GRACEFUL stop (SIGTERM to the tree).
+        # ---------------------------------------------------------------
+        server = start_server(e2e_clone, root, settings)
+        oracle = ArtifactOracle(server.data_root)
+        try:
+            task_id, paused = _submit_and_pause(server, oracle)
+            pause_id = str(paused.get("pause_id") or "")
+            assert _HEX32_RE.match(pause_id), paused
+            agent_rounds_at_pause = _agent_rounds(stub)
+            assert wait_until(
+                lambda: (_managed_activity(server, task_id) or {}).get("phase") == "budget_paused", 30), (
+                _managed_activity(server, task_id))
+            carrier = _pending_carrier(oracle, task_id)
+            assert carrier and isinstance(carrier.get("_budget_pause"), dict), carrier
+            budget_root = pathlib.Path(str(carrier.get("budget_drive_root") or server.data_root))
+            ledger_at_pause = _ledger_bucket(budget_root, task_id)
+            assert ledger_at_pause["physical_calls"] == int(paused.get("physical_calls") or 0) >= 2, (
+                ledger_at_pause, paused.get("physical_calls"))
+        finally:
+            server.stop()
+
+        # The teardown's custody step RAN (the server_shutdown row is written after
+        # kill_workers) and the pause was not what it settled.
+        shutdown_rows = oracle.supervisor_rows("server_shutdown")
+        assert shutdown_rows and shutdown_rows[-1].get("cause") == "external_signal", shutdown_rows
+        cleanup_rows = oracle.supervisor_rows("zombie_prevention_cleanup")
+        settled_by_shutdown = {
+            tid for row in cleanup_rows
+            for tid in list(row.get("drained_pending") or []) + list(row.get("orphaned_running") or [])
+        }
+        assert task_id not in settled_by_shutdown, cleanup_rows
+        assert any(task_id in (row.get("retained_budget_paused") or []) for row in cleanup_rows), cleanup_rows
+        after_stop = oracle.task_result(task_id)
+        assert after_stop.get("status") == STATUS_SCHEDULED, after_stop.get("status")
+        assert after_stop.get("reason_code") == REASON_CODE, after_stop.get("reason_code")
+        assert (after_stop.get("budget_pause") or {}).get("state") == STATE_PAUSED, after_stop.get("budget_pause")
+        assert (after_stop.get("budget_pause") or {}).get("pause_id") == pause_id, after_stop.get("budget_pause")
+        assert "grant" not in (after_stop.get("budget_pause") or {}), after_stop.get("budget_pause")
+        assert _task_done_rows(oracle, task_id) == [], _task_done_rows(oracle, task_id)
+        assert task_id not in oracle.running_ids(), oracle.queue_snapshot().get("running")
+        carrier = _pending_carrier(oracle, task_id)
+        assert carrier and ((carrier.get("_budget_pause") or {}).get("checkpoint") or {}).get("pause_id") == pause_id, (
+            carrier)
+        assert not carrier.get("_budget_pause_hold") and not carrier.get("_budget_pause_resume"), carrier
+        assert _agent_rounds(stub) == agent_rounds_at_pause, stub.kinds()
+        assert _bodies_carrying(stub, RESUME_NOTICE_MARKER) == []
+        assert _bodies_carrying(stub, FORCED_WRAPUP_MARKER) == []
+        restores_before = len(_boot_restore_rows(oracle))
+
+        # ---------------------------------------------------------------
+        # Generation B: same clone, data root and stub; the boot re-parks the id.
+        # ---------------------------------------------------------------
+        server = start_server(e2e_clone, root, settings)
+        try:
+            oracle = ArtifactOracle(server.data_root)
+            restore = wait_until(
+                lambda: (_boot_restore_rows(oracle)[restores_before:] or None), 60)
+            assert restore, "generation B wrote no queue_restored_from_snapshot row"
+            assert int(restore[-1].get("restored_pending") or 0) >= 1, restore[-1]
+            assert task_id not in (restore[-1].get("pending_parent_interrupted") or []), restore[-1]
+            assert task_id not in (restore[-1].get("terminalized_running") or []), restore[-1]
+            carrier = wait_until(
+                lambda: (_pending_carrier(oracle, task_id)
+                         if isinstance((_pending_carrier(oracle, task_id) or {}).get("_budget_pause"), dict)
+                         else None), 60)
+            assert carrier, oracle.queue_snapshot()
+            assert ((carrier.get("_budget_pause") or {}).get("checkpoint") or {}).get("pause_id") == pause_id, carrier
+            assert budget_hold_fact(carrier) is None, carrier  # restorable: unheld
+            assert not carrier.get("_budget_pause_resume"), carrier
+            assert task_id not in oracle.running_ids(), oracle.queue_snapshot().get("running")
+            rebooted = oracle.task_result(task_id)
+            assert rebooted.get("status") == STATUS_SCHEDULED and rebooted.get("reason_code") == REASON_CODE, (
+                rebooted.get("status"), rebooted.get("reason_code"))
+            assert (rebooted.get("budget_pause") or {}).get("state") == STATE_PAUSED, rebooted.get("budget_pause")
+            assert (rebooted.get("budget_pause") or {}).get("pause_id") == pause_id, rebooted.get("budget_pause")
+            assert _task_done_rows(oracle, task_id) == []
+            activity = wait_until(
+                lambda: (_managed_activity(server, task_id)
+                         if (_managed_activity(server, task_id) or {}).get("phase") == "budget_paused"
+                         else None), 60)
+            assert activity and activity.get("kind") == "managed_task", _managed_activity(server, task_id)
+            # The public status plane agrees with the authority across the epoch.
+            detail = _detail(server, task_id)
+            assert detail.get("status") == STATUS_SCHEDULED, detail.get("status")
+            assert detail.get("reason_code") == REASON_CODE, detail.get("reason_code")
+            assert (detail.get("resource_limit") or {}).get("status") == STATUS_PAUSED_EXACT, detail.get("resource_limit")
+            assert int(detail.get("total_rounds") or 0) == ledger_at_pause["physical_calls"], (
+                detail.get("total_rounds"), ledger_at_pause)
+            assert task_id not in _running_task_ids(server)
+            # Still exhausted (the ledger crossed the epoch too): the typed refusal, no grant.
+            refused = _resume(server, task_id)
+            assert refused.get("status") == 409, refused
+            assert (refused.get("body") or {}).get("error") == "budget_still_exhausted", refused
+            assert "grant" not in _pause_row(oracle, task_id), _pause_row(oracle, task_id)
+            assert _agent_rounds(stub) == agent_rounds_at_pause, stub.kinds()
+
+            # The owner's Resume after the increase: ONE grant, the same id completes.
+            saved = _api_status(server.base_url, "POST", "/api/settings",
+                                {"TOTAL_BUDGET": S30_RAISED_BUDGET}, timeout=120)
+            assert saved.get("status") == 200, saved
+            assert wait_until(
+                lambda: float(_settings_on_disk(server).get("TOTAL_BUDGET") or 0) == S30_RAISED_BUDGET, 30)
+            granted = _resume(server, task_id)
+            assert granted.get("status") == 200, granted
+            grant_body = granted.get("body") or {}
+            assert grant_body.get("ok") is True and grant_body.get("exact_continuation") is True, grant_body
+            grant_id = str(grant_body.get("grant_id") or "")
+            assert _HEX32_RE.match(grant_id) and int(grant_body.get("grant_generation") or 0) == 1, grant_body
+            consumed = wait_until(
+                lambda: (_pause_row(oracle, task_id)
+                         if _pause_row(oracle, task_id).get("state") == STATE_RESUMED else None), 180)
+            assert consumed and consumed.get("pause_id") == pause_id, _pause_row(oracle, task_id)
+            assert (consumed.get("grant") or {}).get("grant_id") == grant_id, consumed.get("grant")
+            assert (consumed.get("grant") or {}).get("consumed_at"), consumed.get("grant")
+            stored = wait_durable_result(oracle, task_id, timeout=600)
+            assert stored.get("status") == "completed", stored
+            assert "S32_FINAL" in str(stored.get("result") or ""), stored.get("result")
+            done_rows = wait_until(lambda: _task_done_rows(oracle, task_id) or None, 60)
+            assert done_rows and len(done_rows) == 1 and done_rows[0].get("status") == "completed", done_rows
+            assert len(_events_for(oracle, "budget_task_explicitly_resumed", task_id)) == 1
+            resumed_bodies = _bodies_carrying(stub, RESUME_NOTICE_MARKER)
+            assert resumed_bodies, "no model round carried the resume notice: the task did not continue"
+            prior_batches = sum(
+                1 for m in resumed_bodies[0].get("messages") or []
+                if isinstance(m, dict) and m.get("role") == "assistant" and m.get("tool_calls"))
+            assert prior_batches >= agent_rounds_at_pause, (prior_batches, agent_rounds_at_pause)
+            assert _bodies_carrying(stub, FORCED_WRAPUP_MARKER) == []
+            assert stub.script_consumed() and _agent_rounds(stub) == S30_SCRIPT_STEPS, stub.kinds()
+            ledger_done = _ledger_bucket(budget_root, task_id)
+            assert ledger_done["physical_calls"] > ledger_at_pause["physical_calls"], (ledger_at_pause, ledger_done)
+            assert ledger_done["accounted_usd"] >= ledger_at_pause["accounted_usd"] + S30_CALL_COST, (
+                ledger_at_pause, ledger_done)
+            assert int(stored.get("total_rounds") or 0) > ledger_at_pause["physical_calls"], (
+                stored.get("total_rounds"), ledger_at_pause)
+            assert wait_until(lambda: _pending_carrier(oracle, task_id) is None
+                              and _managed_activity(server, task_id) is None, 60)
+        finally:
+            server.stop()

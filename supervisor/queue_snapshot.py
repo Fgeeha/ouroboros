@@ -880,7 +880,7 @@ def restore_pending_from_snapshot(
                 if skip_revival:
                     skipped_terminal += 1
                     continue
-                if str(task.get("parent_task_id") or "") and _descends_from(
+                if str(task.get("parent_task_id") or "") and not _exact_pause_row(task) and _descends_from(
                     task, interrupted, pending_by_id
                 ):
                     # #1104: a planned shutdown already refuses to start these
@@ -891,7 +891,8 @@ def restore_pending_from_snapshot(
                     # takes the SAME shutdown-custody marker the planned path
                     # writes: the boot's own kill step settles it with a
                     # ledger-reconstructed cost and publishes its task_done. Rows
-                    # without a parent — roots, schedules, evolution — never match.
+                    # without a parent — roots, schedules, evolution — never match;
+                    # nor does an exact mid-run pause (#1196: saved work, not unstarted).
                     task = dict(task)
                     task["_terminalization_retry"] = {
                         "reason": "Parent task was interrupted before this child started.",

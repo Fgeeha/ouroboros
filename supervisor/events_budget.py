@@ -413,13 +413,21 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
                       "the durable row stays 'pausing' until a later snapshot confirms it", task_id)
         if not superseded:
             # A row this park no longer owns keeps whatever the newer writer
-            # projected: a resumed task must never read as paused again.
+            # projected: a resumed task must never read as paused again. The
+            # projection carries the ledger-derived cumulative cost planes (the
+            # same ``reconstruct_task_cost`` projection every terminal write
+            # takes), so the public detail of a paused task reads its rounds and
+            # spend from the authority, never from a worker's pre-pause mirror.
             try:
+                from supervisor.state import reconstruct_task_cost
+
+                cost_fields = reconstruct_task_cost(task_id, fields=True, drive_root=result_root)
                 write_task_result(
                     result_root, task_id, STATUS_SCHEDULED,
                     reason_code="budget_paused", resource_limit=marker,
                     result=("Task paused exactly at a completed boundary (budget). Cumulative spend, rounds "
                             "and execution time are retained; an explicit owner Resume continues the same task."),
+                    **(cost_fields if cost_fields.get("cost_accounting_status") == "available" else {}),
                 )
             except Exception:
                 log.warning("Failed to persist exact budget pause status for %s", task_id, exc_info=True)

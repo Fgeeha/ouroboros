@@ -736,3 +736,185 @@ def test_paused_row_survives_a_snapshot_with_an_invalid_timestamp_while_ordinary
     assert workers.PENDING[0]["_budget_pause"]["exact_continuation"] is True  # retained, not woken
     rows = [json.loads(line) for line in (tmp_path / "logs" / "supervisor.jsonl").read_text().splitlines()]
     assert any(row["type"] == "queue_restore_snapshot_timestamp_invalid" for row in rows)
+
+
+# --------------------------------------------------------------------------- public status plane
+
+def test_public_status_of_a_paused_forked_root_is_the_pause_not_the_replicas_running(tmp_path, monkeypatch):
+    """S30's public red (#1196): a forked root's worker mirror (its child drive's
+    ``running`` row, blank cost planes) was overlaid on the canonical ``scheduled``
+    row, and the queue merge preferred ``running`` over the PENDING carrier. The
+    canonical row carrying a LIVE pause owns its lifecycle and accounting planes
+    (the park writes the ledger-derived cost fields onto it), and a PENDING row
+    parked under a ``_budget_pause`` marker is never ``running``."""
+    from ouroboros import budget_pause
+    from ouroboros.task_results import STATUS_RUNNING, STATUS_SCHEDULED, load_task_result, write_task_result
+    from ouroboros.task_status import load_effective_task_result
+    from supervisor.events import _handle_budget_pause
+
+    queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    child_drive = tmp_path / "state" / "headless_tasks" / "forked-1" / "data"
+    # The canonical row of a forked root names its child drive (agent.py binds it at start).
+    write_task_result(tmp_path, "forked-1", STATUS_RUNNING, child_drive_root=str(child_drive),
+                      budget_drive_root=str(tmp_path), result="Task is running.")
+    _ctx, _limit, pause = _pause(tmp_path, monkeypatch, task_id="forked-1")
+    budget_pause.end_dispatch_fence("forked-1")
+    task = {"id": "forked-1", "type": "task", "chat_id": 0, "root_task_id": "forked-1", "_attempt": 1,
+            "budget_drive_root": str(tmp_path), "child_drive_root": str(child_drive)}
+    workers.RUNNING["forked-1"] = {"task": task, "worker_id": 0, "attempt": 1}
+    workers.WORKERS[0] = SimpleNamespace(busy_task_id="forked-1")
+    sctx = _supervisor_ctx(tmp_path, workers, queue, [], [])
+    sctx.persist_queue_snapshot = queue.persist_queue_snapshot  # the REAL snapshot: the reader opens it
+    _handle_budget_pause({**budget_pause.pause_event(task, pause), "worker_id": 0}, sctx)
+    workers.WORKERS.clear()
+    # The worker's pre-pause mirror on the child drive: still ``running``, blank cost planes.
+    write_task_result(child_drive, "forked-1", STATUS_RUNNING, result="Task is running.",
+                      total_rounds=None, accounted_upper_bound_usd=None)
+    authority = load_task_result(tmp_path, "forked-1")
+    assert authority["status"] == STATUS_SCHEDULED and authority["reason_code"] == budget_pause.REASON_CODE
+    # Written at the park from the ledger: an int, never the mirror's None.
+    assert authority["total_rounds"] == 0 and authority["cost_accounting_status"] == "available"
+    assert load_task_result(child_drive, "forked-1")["status"] == STATUS_RUNNING  # the mirror IS stale
+    for materialize in (False, True):
+        effective = load_effective_task_result(tmp_path, "forked-1", materialize_artifacts=materialize)
+        assert effective["status"] == STATUS_SCHEDULED, (materialize, effective["status"])
+        assert effective["reason_code"] == budget_pause.REASON_CODE
+        assert effective["resource_limit"]["status"] == budget_pause.STATUS_PAUSED_EXACT
+        assert effective["total_rounds"] == 0 and effective["cost_accounting_status"] == "available"
+        assert effective["budget_pause"]["state"] == budget_pause.STATE_PAUSED
+        assert "paused exactly" in effective["result"]
+    # The queue merge alone (the window between the persisted snapshot and the
+    # status write, or a stale ``running`` authority mirror): the PENDING carrier
+    # under its ``_budget_pause`` marker is not running.
+    write_task_result(tmp_path, "forked-1", STATUS_RUNNING)  # forward progress, not a blocked regression
+    assert load_task_result(tmp_path, "forked-1")["status"] == STATUS_RUNNING
+    assert load_effective_task_result(tmp_path, "forked-1", materialize_artifacts=False)["status"] == STATUS_SCHEDULED
+    # Terminal still wins over the carrier, as before.
+    from ouroboros.task_status import _merge_queue_status
+
+    assert _merge_queue_status("completed", "scheduled", workers.PENDING[0]) == "completed"
+    assert _merge_queue_status("running", "scheduled", {"id": "plain"}) == "running"  # the requeue race, unchanged
+
+
+# --------------------------------------------------------------------------- shutdown: the pause survives the epoch
+
+SERVER_SHUTDOWN_REASON = ("Server shut down (external stop/restart signal) before this task "
+                          "finished; the task was interrupted, not a worker crash.")
+
+
+def _shutdown_pool(workers, monkeypatch):
+    """Bind the pool's terminal ``task_done`` bus to a list (no real event queue)."""
+    events: list = []
+    monkeypatch.setattr(workers, "_EVENT_Q_SHUTDOWN", False, raising=False)
+    monkeypatch.setattr(workers, "get_event_q", lambda: SimpleNamespace(put=events.append), raising=False)
+    return events
+
+
+def test_graceful_shutdown_leaves_an_exact_pause_carrier_and_its_row_untouched(tmp_path, monkeypatch):
+    """The lifespan teardown's ``kill_workers`` (no ``preserve_pending`` outside a
+    managed update) drains PENDING and cancels every row as interrupted work. An
+    exact mid-run pause is saved work of the same id, not interrupted work: its
+    carrier stays PENDING with its marker, its durable row stays ``paused``, no
+    task_done is published, the final snapshot still carries it, and the next
+    boot parks the same id again, unheld (#1196: a pause survives the epoch)."""
+    from ouroboros import budget_pause
+    from ouroboros.task_results import STATUS_CANCELLED, STATUS_SCHEDULED, load_task_result, write_task_result
+    from supervisor.events_budget import budget_hold_fact
+
+    queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    events = _shutdown_pool(workers, monkeypatch)
+    carrier, _row = _parked(tmp_path, monkeypatch, task_id="epoch-paused")
+    write_task_result(tmp_path, "epoch-paused", STATUS_SCHEDULED, reason_code=budget_pause.REASON_CODE)
+    write_task_result(tmp_path, "epoch-plain", STATUS_SCHEDULED)
+    workers.PENDING.append({"id": "epoch-plain", "type": "task", "chat_id": 0, "_attempt": 1, "text": "x"})
+
+    workers.kill_workers(force=True, terminal_status="cancelled", result_reason=SERVER_SHUTDOWN_REASON)
+
+    assert [row["id"] for row in workers.PENDING] == ["epoch-paused"]
+    kept = workers.PENDING[0]
+    assert kept["_budget_pause"]["exact_continuation"] is True and not kept.get("_terminalization_retry")
+    row = load_task_result(tmp_path, "epoch-paused")
+    assert row["status"] == STATUS_SCHEDULED and row["budget_pause"]["state"] == budget_pause.STATE_PAUSED
+    assert row["budget_pause"]["pause_id"] == carrier["_budget_pause"]["checkpoint"]["pause_id"]
+    assert [e["task_id"] for e in events if e.get("type") == "task_done"] == ["epoch-plain"]
+    assert load_task_result(tmp_path, "epoch-plain")["status"] == STATUS_CANCELLED
+    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    assert [r["id"] for r in snap["pending"]] == ["epoch-paused"] and snap["running"] == []
+    assert snap["pending"][0]["task"]["_budget_pause"]["exact_continuation"] is True
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "supervisor.jsonl").read_text().splitlines()]
+    cleanup = [r for r in rows if r["type"] == "zombie_prevention_cleanup"][-1]
+    assert cleanup["drained_pending"] == ["epoch-plain"] and cleanup["retained_budget_paused"] == ["epoch-paused"]
+    # The next boot: the restore re-validates the durable authority and parks the same id, unheld.
+    workers.PENDING[:] = []
+    assert queue.restore_pending_from_snapshot() == 1
+    restored = workers.PENDING[0]
+    assert restored["id"] == "epoch-paused" and restored["_budget_pause"]["exact_continuation"] is True
+    assert budget_hold_fact(restored) is None
+    assert load_task_result(tmp_path, "epoch-paused")["budget_pause"]["state"] == budget_pause.STATE_PAUSED
+
+
+def test_planned_shutdown_keeps_a_paused_child_of_an_interrupted_root_and_drops_its_unstarted_sibling(
+        tmp_path, monkeypatch):
+    """``kill_workers(preserve_pending=True)`` cancels the never-started children of
+    an interrupted root (``pending_parent_interrupted``). A child parked under its
+    exact pause is saved work, not a child that did not start: it stays."""
+    from ouroboros import budget_pause
+    from ouroboros.task_results import STATUS_CANCELLED, STATUS_RUNNING, STATUS_SCHEDULED, load_task_result, write_task_result
+
+    queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    events = _shutdown_pool(workers, monkeypatch)
+    write_task_result(tmp_path, "root-live", STATUS_RUNNING, chat_id=0)
+    workers.RUNNING["root-live"] = {"task": {"id": "root-live", "type": "task", "chat_id": 0,
+                                             "root_task_id": "root-live"}, "worker_id": 0, "attempt": 1}
+    _parked(tmp_path, monkeypatch, task_id="child-paused", root_task_id="root-live",
+            extra={"parent_task_id": "root-live", "delegation_role": "subagent"})
+    write_task_result(tmp_path, "child-fresh", STATUS_SCHEDULED, chat_id=0)
+    workers.PENDING.append({"id": "child-fresh", "type": "task", "chat_id": 0, "_attempt": 1, "text": "x",
+                            "parent_task_id": "root-live", "root_task_id": "root-live"})
+
+    workers.kill_workers(force=True, terminal_status="cancelled", result_reason=SERVER_SHUTDOWN_REASON,
+                         preserve_pending=True)
+
+    assert [row["id"] for row in workers.PENDING] == ["child-paused"]
+    assert workers.PENDING[0]["_budget_pause"]["exact_continuation"] is True
+    assert not workers.PENDING[0].get("_terminalization_retry")
+    assert load_task_result(tmp_path, "root-live")["status"] == STATUS_CANCELLED
+    assert load_task_result(tmp_path, "child-fresh")["status"] == STATUS_CANCELLED
+    assert load_task_result(tmp_path, "child-paused")["budget_pause"]["state"] == budget_pause.STATE_PAUSED
+    assert sorted(e["task_id"] for e in events if e.get("type") == "task_done") == ["child-fresh", "root-live"]
+
+
+def test_unplanned_stop_restore_keeps_a_paused_child_of_a_fenced_root_and_marks_its_unstarted_sibling(
+        tmp_path, monkeypatch):
+    """The unplanned door (#1104): restore fences the snapshot's RUNNING root and
+    hands its never-started PENDING children the ``pending_parent_interrupted``
+    marker. The paused child keeps its exact marker instead, unmarked and unheld."""
+    from ouroboros.task_results import STATUS_RUNNING, write_task_result
+    from supervisor.events_budget import budget_hold_fact
+
+    queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    write_task_result(tmp_path, "root-live", STATUS_RUNNING, chat_id=0)
+    _parked(tmp_path, monkeypatch, task_id="child-paused", root_task_id="root-live",
+            extra={"parent_task_id": "root-live", "delegation_role": "subagent"})
+    write_task_result(tmp_path, "child-fresh", "scheduled", chat_id=0)
+    workers.PENDING.append({"id": "child-fresh", "type": "task", "chat_id": 0, "_attempt": 1, "text": "x",
+                            "parent_task_id": "root-live", "root_task_id": "root-live"})
+    queue.persist_queue_snapshot(reason="test")
+    snap = json.loads(queue.QUEUE_SNAPSHOT_PATH.read_text())
+    snap["running"] = [{"id": "root-live", "task": {"id": "root-live", "chat_id": 0}}]
+    queue.QUEUE_SNAPSHOT_PATH.write_text(json.dumps(snap))
+    workers.PENDING[:] = []
+
+    fenced: list = []
+    assert queue.restore_pending_from_snapshot(terminalized=fenced) == 1
+    assert fenced == ["root-live"]
+    by_id = {str(row["id"]): row for row in workers.PENDING}
+    assert set(by_id) == {"child-paused", "child-fresh"}
+    assert by_id["child-fresh"]["_terminalization_retry"]["trigger"] == "pending_parent_interrupted"
+    paused = by_id["child-paused"]
+    assert paused["_budget_pause"]["exact_continuation"] is True
+    # (the snapshot whitelist round-trips the key as None; a marker is a dict)
+    assert not paused.get("_terminalization_retry") and budget_hold_fact(paused) is None
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "supervisor.jsonl").read_text().splitlines()]
+    restored = [row for row in rows if row["type"] == "queue_restored_from_snapshot"][-1]
+    assert restored["pending_parent_interrupted"] == ["child-fresh"]
