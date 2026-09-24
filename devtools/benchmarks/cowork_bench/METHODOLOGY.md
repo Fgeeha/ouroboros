@@ -152,6 +152,41 @@ with remaining work are permitted; settled successes and genuine failures
 from every ancestor are skipped, never repeated for best-of selection. Any final
 scoring overlay must retain provenance to the original attempts.
 
+Every ledger row, whatever its execution outcome, carries the official
+evaluator's receipt: the exact `eval_res.json` path, byte count and SHA-256,
+the literal verdict and a bounded cause. The launcher never writes or re-runs
+that file, never copies it into the receipt, and never infers a verdict from
+runner output. As before, only a scored row also keeps the parsed evaluator
+result in its details. `official_eval_status` is `completed` only for a literal JSON boolean.
+`declined` means `pass: null` that exactly matches the evaluator's status gate
+text, with its linked `traj_log.json` recording a non-success status. Any other
+null is `unknown`. A missing or non-boolean `pass` is `invalid`. An I/O,
+UTF-8, JSON or non-object failure is `unreadable`. No file is `unreported`, not
+proof that the evaluator never ran. Only a successful agent phase with a
+literal boolean is scored. `false` with evaluator output remains a genuine
+verdict. Any other result there stays an infrastructure row, never
+`bool(value)`. A verdict on an agent- or infrastructure-failed row is disclosed
+by the ledger and audit but never promoted into the score. The shared ledger
+default is `unreported`; `not_run` appears only when an adapter asserts it.
+The audit's `official_pass` reports the literal receipt verdict independently
+of the unchanged execution/scoring classification. Runtime stop disclosure is
+read only from the summary-named exported task result whose embedded identity
+matches; missing or mismatched sources remain explicit gaps, never a glob-selected
+neighbour's outcome.
+
+Ledgers written before this revision recorded `not_run` for every row without
+a completed verdict, including rows where the evaluator ran and declined at its
+status gate. The planning report dated 2026-09-24 records a prior SHA-256 match
+between reconstructed gate receipts and the `audit_eval_sha256` values in
+`combined-index-20260922T102550Z.jsonl` for all 22 affected `agent_failed` rows:
+14 `deadline_local` and 8 `wall_clock_timeout`. This implementation did not
+re-read those historical receipts or establish their current availability;
+the prior hash comparison is not a fresh file-access check. The planning report
+also records that the tasks' PostgreSQL state was destroyed, so historical
+re-evaluation is unavailable. No historical index or score is rewritten and no
+checker is rerun. For new receipts, the gate link is a fixed path plus exact gate
+text; the evaluator records no hash of the log it read.
+
 Phase-aware mounts omit the task's evaluator and ground-truth workspace from the
 agent's task view. Ouroboros settings and provider credentials remain outside the
 shared dump directory; the run-local credential file is mode 0600 and is cleared
