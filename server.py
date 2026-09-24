@@ -274,13 +274,28 @@ def _start_supervisor_if_needed(settings: dict) -> bool:
     _supervisor_error = None
     _supervisor_stop.clear()  # in-process revival after a teardown-stopped generation
     _supervisor_thread = threading.Thread(
-        target=_run_supervisor,
+        target=_supervisor_generation,
         args=(settings,),
         daemon=True,
         name="supervisor-main",
     )
     _supervisor_thread.start()
     return True
+
+
+def _supervisor_generation(settings: dict) -> None:
+    """Thread body: re-check the exit latch, then run one supervisor generation.
+
+    Admission (`_start_supervisor_if_needed`) and this thread start are separate steps,
+    so a settings save can pass the latch check a moment before SIGTERM; a generation
+    that starts anyway must end here, before its startup kill/spawn would run behind
+    the teardown's `kill_workers` (#1142).
+    """
+    global _supervisor_thread
+    if _exit_signalled.is_set():
+        _supervisor_thread = None
+        return
+    _run_supervisor(settings)
 
 
 def _process_bridge_updates(bridge, offset: int, ctx: Any) -> int:
@@ -767,7 +782,7 @@ def _run_supervisor(settings: dict) -> None:
     _loop_liveness = [time.monotonic(), {}, time.thread_time(), None]  # slots: server_liveness.py
     _watchdog_stop = threading.Event()  # per-generation: stops the watchdog when THIS loop exits
     _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
-    while not _restart_requested.is_set() and not _supervisor_stop.is_set():
+    while not _restart_requested.is_set() and not _supervisor_stop.is_set() and not _exit_signalled.is_set():
         try:
             _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "events", new_tick=True), time.monotonic()
             rotate_chat_log_if_needed(DATA_DIR)
@@ -849,7 +864,7 @@ def _run_supervisor(settings: dict) -> None:
             time.sleep(0.5)
 
         except Exception as exc:
-            if _supervisor_stop.is_set() or _restart_requested.is_set():
+            if _supervisor_stop.is_set() or _restart_requested.is_set() or _exit_signalled.is_set():
                 # A shutdown-torn Manager proxy is not a supervisor crash.
                 log.info("Supervisor loop exiting on shutdown: %s", exc)
                 break

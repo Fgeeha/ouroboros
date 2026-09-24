@@ -87,6 +87,22 @@ def test_a_settings_save_landing_after_the_signal_cannot_revive_the_supervisor(m
         server._supervisor_stop.clear()
 
 
+def test_a_generation_admitted_just_before_the_signal_never_runs(monkeypatch):
+    """Admission and thread start are separate steps, so a save can pass the latch check a
+    moment before SIGTERM; the generation must then end before its startup kill/spawn."""
+    import server
+
+    touched: list = []
+    monkeypatch.setattr(server, "_apply_settings_to_env", lambda _s: touched.append("init"))
+    server._exit_signalled.set()
+    try:
+        server._supervisor_generation({"OPENROUTER_API_KEY": "k"})
+    finally:
+        server._exit_signalled.clear()
+    assert touched == []
+    assert server._supervisor_thread is None
+
+
 def test_main_server_bounds_the_graceful_drain_from_the_shared_constant():
     import inspect
 

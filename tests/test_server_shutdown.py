@@ -871,6 +871,6 @@ def test_supervisor_revival_clears_a_stale_stop_flag(monkeypatch):
     try:
         assert server._start_supervisor_if_needed({}) is True
         assert server._supervisor_stop.is_set() is False
-        assert started == [server._run_supervisor]
+        assert started == [server._supervisor_generation]  # the latch-checking thread body (#1142)
     finally:
         server._supervisor_stop.clear()
