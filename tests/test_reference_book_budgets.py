@@ -29,7 +29,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # +500 (#1222-#1224): three module rows for the new leaves
     # (acceptance_preparation.py, acceptance_retrieving.py, repo_diff_capture.py)
     # and what each owns; none displaces older text.
-    "docs/architecture/01-high-level-architecture.md": 165300,
+    # +200 (issue #1241): the subagent_worktrees module-map row states the lock scope
+    # (measured 165470 on the merged chapter).
+    "docs/architecture/01-high-level-architecture.md": 165500,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -111,7 +113,20 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # review-projection carrier that makes it visible); and the unified
     # spend-and-continue budget tail, which replaces only the half-sentence "checks the
     # axis only after tool-call rounds".
-    "docs/architecture/06-agent-core.md": 303900,
+    # 303900 -> 306000 (issue #1241; measured 305853 on the merged chapter): the
+    # private-snapshot paragraph now states the worktree ops lock's scope (shared
+    # metadata only, row-then-ref order, batched binary verdict, typed busy refusal)
+    # — rationale-layer text BIBLE P6 requires.
+    # 306000 -> 306800: the predecessor door is a predicate on the result, never on the
+    # caller's room, the landing project or the root/helper distinction (the disclosed
+    # notes replace the one-clause pointer to §10); the registry read of the routing
+    # verbs on a forked execution drive and the predecessor's task files as a lineage
+    # read are new facts of the paragraphs they extend. The merged base sat 147 bytes
+    # under the previous budget.
+    # 306800 -> 307100 (#1247 fix-forward; measured 306832 on the merged chapter): the
+    # populate sentence names the post-copy stat re-record that keeps a CRLF-converting
+    # checkout clean.
+    "docs/architecture/06-agent-core.md": 307100,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     # 19287 -> 20560 (#1215): three contracts the chapter had no older text for — the
@@ -134,7 +149,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # residual sentence of the off-thread invariant; the rule itself has no older text.
     # +200 (2026-09-22): invariant 10 names the process-local fingerprint memos
     # and their fallback rule; the base sat 23 bytes under the previous budget.
-    "docs/architecture/10-key-invariants.md": 21300,
+    # 21300 -> 21700: invariant 27 states the door as a predicate on the root (any actor
+    # holding a routing verb, any project, a disclosed landing) with the reason the
+    # room comparison protected nothing; the earlier one-clause form is replaced, and
+    # the base sat 34 bytes under the previous budget.
+    "docs/architecture/10-key-invariants.md": 21700,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
     # +400 (#1213): Presence turns are named as actors without cross-focus catalogue or focus authority.
     "docs/architecture/12-host-service-companions-and-chat-ids.md": 11400,
@@ -159,7 +178,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # never does; a pre-check's refusal takes the exact read). The one sentence it touches
     # (the lock's caller wait) is replaced; the rest is a rule the chapter lacked, and the
     # chapter had 5 bytes left. Sized to the text: 5 bytes of margin.
-    "docs/development/06-rules-by-change-class.md": 94520,
+    # 94520 -> 94900: the delegated-lane bullet names the worktree ops lock rule
+    # (issue #1241: no tree walk or per-file git process under the lock).
+    "docs/development/06-rules-by-change-class.md": 94900,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,

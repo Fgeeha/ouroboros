@@ -119,6 +119,12 @@ SCENARIOS = {
     # on an event-gated model hold (ModelGate), never a timed race.
     "S26": ("direct-chat owner stop: an in-flight direct turn is addressable (running list + activity snapshot), stop-now mid-round answers the typed 'still live' with the cooperative control armed ONCE (a repeat is idempotent), the turn ends at its next step with ZERO further model rounds under the owner-stop reason, the chat concludes, custody settles already_settled against the turn's own terminal, and a later stop is the typed 404", LANE_MOCK),
     "S27": ("ordinary Main/Project capability: real stdio MCP reads and writes, correct built-in room target, and a second native turn completes while the first model call is held", LANE_MOCK),
+    # Serial addressed turns (owner 2026-09-23 21:12: the GENERAL capability of
+    # continuable addressed participant turns, native children and session agents,
+    # with an explicit end of participation; planning the first consumer). Stub
+    # models prove the HOST wiring only — never a live model's or vendor's quality.
+    "S28": ("serial addressed turns, NATIVE: A->B->A peer contributions through forward_to_worker + await_messages (a contribution does not end participation; FINAL only after the awaited reply), selected originals addressed to the planning parent and present in its plan evidence, sibling-only originals absent", LANE_MOCK),
+    "S29": ("serial addressed turns, SESSION: one fake-engine run pauses twice; a native child's original is relayed byte-exact through delegate_answer free_text, the run resumes in the SAME session (continuation=same_session on every waiting payload, the re-wait included) and echoes the exact bytes; the codex-shaped input_required terminal names continuation=new_physical_run and is continued by a NEW start", LANE_MOCK),
 }
 
 MOCK_SLUG = "openai-compatible::mock-model"
@@ -525,9 +531,17 @@ class LoopbackModelServer:
                     outer.gate(body)
                 if outer.latency_sec:
                     time.sleep(outer.latency_sec)
-                return self._send(outer._completion(body), stream=bool(body.get("stream")))
+                try:
+                    completion = outer._completion(body)
+                except Exception as exc:  # a scenario-script bug must fail LOUDLY, never hang the client
+                    import traceback
 
-            def _send(self, payload, *, stream=False):
+                    sys.stderr.write("LoopbackModelServer: scenario step raised\n" + traceback.format_exc())
+                    return self._send({"error": {"message": f"scenario step raised {type(exc).__name__}: {exc}",
+                                                 "type": "e2e_script_error"}}, status=500)
+                return self._send(completion, stream=bool(body.get("stream")))
+
+            def _send(self, payload, *, stream=False, status=200):
                 content_type = "application/json"
                 if stream:
                     content_type = "text/event-stream"
@@ -547,7 +561,7 @@ class LoopbackModelServer:
                             + "data: [DONE]\n\n").encode("utf-8")
                 else:
                     data = json.dumps(payload).encode("utf-8")
-                self.send_response(200)
+                self.send_response(status)
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(len(data)))
                 self.end_headers()
@@ -660,6 +674,23 @@ def default_slot_binder(body: dict) -> str:
     return str(body.get("model") or "")
 
 
+class HeldStep:
+    """Marker a CALLABLE ReplayModel step returns to serve ``step`` now and be
+    consulted AGAIN on the next call of the same (lineage, slot).
+
+    The attempt ordinal does not advance, so a wait that must repeat a
+    timing-dependent number of times (until a mailbox delivery is visible in the
+    transcript) keeps ONE fixture row instead of guessing the count — the
+    ReplayModel twin of the wave-3a ``_Again`` hold for the scripted stub.
+    ``assert_consumed()`` still requires the held row to have been served.
+    """
+
+    __slots__ = ("step",)
+
+    def __init__(self, step: dict) -> None:
+        self.step = step
+
+
 class ReplayModel(LoopbackModelServer):
     """Loopback model whose every non-review answer is BOUND to (lineage, slot, attempt).
 
@@ -733,6 +764,9 @@ class ReplayModel(LoopbackModelServer):
         self.consumed.append(key)
         if callable(step):
             step = step(body)
+            if isinstance(step, HeldStep):
+                self._attempts[(lineage, slot)] = attempt - 1  # consult this row again
+                step = step.step
         if "message" in step:
             return "replay", dict(step["message"])
         if "final" in step:

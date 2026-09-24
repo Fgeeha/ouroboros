@@ -474,6 +474,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                                      definitely_unrun=True)
                     snapshot, snap_error = _provision_snapshot(ctx, drive, target_root, invocation_id)
                 if snap_error:
+                    _settle_refused_provision(ctx, gateway, snap_error, invocation_id, history_facts)
                     return snap_error
                 if snapshot is not None:
                     snapshot_id, baseline_sha, root = snapshot.snapshot_id, snapshot.baseline_sha, snapshot.path
@@ -618,13 +619,15 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                             baseline_sha=baseline_sha,
                             resource_ref=resource_ref,
                             processing=processing_info,
-                            engine_version=str(getattr(gateway, "engine_version", "") or ""))
+                            engine_version=str(getattr(gateway, "engine_version", "") or ""),
+                            snapshot_facts=_snapshot_facts(snapshot))
 
 
 def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: str,
                      authority: "DelegatedRunShape", root: str, *, durable: bool,
                      recovering: bool, invocation_id: str, snapshot_id: str, target_root: str,
-                     baseline_sha: str, engine_version: str = "", resource_ref=None, processing=None) -> ToolResult:
+                     baseline_sha: str, engine_version: str = "", resource_ref=None, processing=None,
+                     snapshot_facts=None) -> ToolResult:
     """The one author of delegate_start's started result (note + payload).
 
     The AUTHORITY guidance and the CUSTODY warning are independent facts about the same
@@ -677,6 +680,8 @@ def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: st
         payload["pending_invocation_id"] = str(invocation_id or "")
     if processing:
         payload["processing"] = processing
+    if snapshot_facts:
+        payload["snapshot"] = snapshot_facts
     if snapshot_id:
         # The C1 binding, stated where the nanny can read it: the run edits the
         # EXECUTION snapshot; the authority target receives nothing until apply.
@@ -696,6 +701,34 @@ def _started_payload(handle: Dict[str, Any], run_id: str, route: Any, access: st
             + "Use delegate_wait for its complete file manifest and result. Copy results use integrate_delegated_patch for apply or reject."
         )
     return delegate_result(payload)
+
+
+def _settle_refused_provision(ctx: ToolContext, gateway: Any, refusal: ToolResult,
+                              invocation_id: str, history_facts: Optional[dict]) -> None:
+    """A pre-POST provisioning refusal (no start row, no run) still settles its
+    invocation durably (START_FAILED), so the refusal exists outside this process —
+    the incident's bootstrap refusals left no row at all (#1241)."""
+    from ouroboros.delegate_shared import delegate_payload
+    from ouroboros.subagent_bootstrap import refusal_facts
+
+    payload = delegate_payload(refusal)
+    _retire_orphaned_registration(
+        ctx, gateway, "", definite_refusal=True, invocation_id=invocation_id,
+        reason=str(payload.get("reason") or "execution_snapshot_failed"),
+        history_facts={**(history_facts or {}), **refusal_facts(payload),
+                       "detail": str(payload.get("detail") or "")})
+
+
+def _snapshot_facts(handle: Any) -> Dict[str, Any]:
+    """Disclosure on the start receipt: how big the private snapshot is and how long
+    it took to provision (#1241). Facts only — nothing refuses or truncates on them."""
+    if handle is None:
+        return {}
+    file_baseline = getattr(handle, "file_baseline", {}) or {}
+    return {"entries": int(getattr(handle, "entry_count", 0) or 0),
+            "untracked_files": len(getattr(handle, "untracked_baseline", {}) or {}) + len(file_baseline),
+            "file_input_bytes": sum(int(item.get("size", 0) or 0) for item in file_baseline.values()),
+            "provisioning_sec": float(getattr(handle, "provisioning_sec", 0.0) or 0.0)}
 
 
 def _retire_orphaned_registration(ctx: ToolContext, gateway: Any, project_id: str, *,
@@ -1276,7 +1309,11 @@ def get_tools() -> List[ToolEntry]:
                 "truncated): answer it with delegate_answer, or raise it with the "
                 "escalate verb (parent-first) and keep waiting (a question with a "
                 "timeout_at benign-declines "
-                "at the engine timeout; timeout_at=null waits until answered). A "
+                "at the engine timeout; timeout_at=null waits until answered); the "
+                "payload's continuation=same_session fact means an answer (free_text "
+                "included, e.g. a peer's original you relay) resumes THIS session, each "
+                "resumed turn a paid round, while an input_required terminal names "
+                "continuation=new_physical_run. A "
                 "large terminal result is delivered as a bounded preview plus an "
                 "artifact: read output_delivery and finish reading the artifact before "
                 "you rely on it."

@@ -19,6 +19,7 @@ Every credential literal here is synthetic and assembled at runtime.
 from __future__ import annotations
 
 import os
+import stat
 import subprocess as sp
 from types import SimpleNamespace as NS
 
@@ -146,6 +147,7 @@ def test_a_bounded_capture_keeps_the_bytes_it_could_not_hold_in_memory(tmp_path)
     """Bounded MEMORY is not permission to shorten the truth: the section past
     the ceiling stays on the private spool, the cut is disclosed with the real
     total, and the retention streams the WHOLE source."""
+    from ouroboros.observability import posix_private_modes_supported
     from ouroboros.repo_diff_capture import (
         capture_repo_diff, read_private_capture, retain_private_capture,
     )
@@ -163,14 +165,19 @@ def test_a_bounded_capture_keeps_the_bytes_it_could_not_hold_in_memory(tmp_path)
     assert len(capture.section("tracked")) <= 4096
     assert capture.raw_size >= truncation[0]["total_bytes"]
     spooled = dict(capture.spool)["tracked"]
-    assert os.path.exists(spooled) and (os.stat(spooled).st_mode & 0o077) == 0
+    assert os.path.isfile(spooled)
+    # Windows stat modes do not describe ACL privacy; retain the POSIX check
+    # where it is meaningful without skipping byte retention on Windows.
+    if posix_private_modes_supported():
+        assert (os.stat(spooled).st_mode & 0o077) == 0
 
     private = retain_private_capture(tmp_path, capture)
     assert private["access"] == "host_private" and private["raw_bytes"] == capture.raw_size
     assert not os.path.exists(spooled)               # released once retained
     raw = read_private_capture(tmp_path, private)
     assert len(raw) == capture.raw_size and raw.count(b"v39999 = 39999") == 1
-    assert (os.stat(private["blob_ref"]["path"]).st_mode & 0o077) == 0
+    if posix_private_modes_supported():
+        assert (os.stat(private["blob_ref"]["path"]).st_mode & 0o077) == 0
 
 
 def test_a_retention_that_cannot_happen_is_disclosed_never_implied(tmp_path, monkeypatch):
@@ -446,7 +453,12 @@ def test_git_failure_is_never_guessed_to_be_unborn(tmp_path, monkeypatch, failur
         (repo / ".git" / branch).write_text("not an object id\n")
     elif failure == "missing_object":
         head = sp.check_output(["git", "rev-parse", "HEAD"], cwd=repo).decode().strip()
-        (repo / ".git" / "objects" / head[:2] / head[2:]).unlink()
+        obj = repo / ".git" / "objects" / head[:2] / head[2:]
+        # Git's loose objects are read-only; Windows requires clearing that
+        # attribute before this fixture can deliberately remove its own object.
+        obj.chmod(obj.stat().st_mode | stat.S_IWRITE)
+        obj.unlink()
+        assert not obj.exists()
     elif failure == "detached_missing":
         (repo / ".git" / "HEAD").write_text("f" * 40 + "\n")
     else:
