@@ -794,6 +794,60 @@ def test_public_status_of_a_paused_forked_root_is_the_pause_not_the_replicas_run
 
     assert _merge_queue_status("completed", "scheduled", workers.PENDING[0]) == "completed"
     assert _merge_queue_status("running", "scheduled", {"id": "plain"}) == "running"  # the requeue race, unchanged
+    # Astra run-e0bb1ca3487c A2/A3: only a TYPED marker (bool exact_continuation)
+    # is a pause; {} or a truthy string is malformed metadata, not a pause.
+    for malformed in ({"_budget_pause": {}}, {"_budget_pause": {"exact_continuation": "false"}},
+                      {"_budget_pause": "paused"}):
+        assert _merge_queue_status("running", "scheduled", {"id": "x", **malformed}) == "running", malformed
+    assert _merge_queue_status("running", "scheduled", {"id": "x", "_budget_pause": {"exact_continuation": False}}) == "scheduled"
+    from supervisor.queue_snapshot import _exact_pause_row
+
+    assert _exact_pause_row({"_budget_pause": {"exact_continuation": True}})
+    assert not _exact_pause_row({"_budget_pause": {"exact_continuation": "false"}})
+    assert not _exact_pause_row({"_budget_pause": {"exact_continuation": 1}})
+    # Astra C1: a replica that already reached a TERMINAL status is the child's
+    # real outcome; a canonical pause the copyback has not yet cleared never
+    # hides it (only the stale nonterminal ``running`` mirror yields).
+    write_task_result(tmp_path, "forked-1", STATUS_SCHEDULED, reason_code=budget_pause.REASON_CODE)
+    write_task_result(child_drive, "forked-1", "completed", result="FINAL ANSWER: done", error="")
+    effective = load_effective_task_result(tmp_path, "forked-1", materialize_artifacts=False)
+    assert effective["status"] == "completed" and effective["result"] == "FINAL ANSWER: done"
+
+
+def test_park_publishes_an_unavailable_cost_projection_over_stale_amounts(tmp_path, monkeypatch):
+    """Astra run-e0bb1ca3487c A4: a failed ledger reconstruction returns the
+    explicit unavailable projection; the park publishes it too, so an older
+    ``available`` amount cannot survive the failed refresh merged in."""
+    from ouroboros import budget_pause
+    from ouroboros.task_results import STATUS_RUNNING, load_task_result, write_task_result
+    from supervisor import events_budget
+    from supervisor.events import _handle_budget_pause
+
+    queue, _state, workers = _install_queue(tmp_path, monkeypatch)
+    write_task_result(tmp_path, "stale-1", STATUS_RUNNING, budget_drive_root=str(tmp_path),
+                      accounted_upper_bound_usd=7.5, total_rounds=9, cost_accounting_status="available")
+    _ctx, _limit, pause = _pause(tmp_path, monkeypatch, task_id="stale-1")
+    budget_pause.end_dispatch_fence("stale-1")
+    from supervisor import state as sup_state
+
+    def _broken(task_id, fields=False, drive_root=None):
+        assert fields
+        return {"cost_accounting_status": "unavailable", "cost_final": False,
+                "cost_accounting_error": "ledger_unavailable", "accounted_upper_bound_usd": None,
+                "total_rounds": None, "ledger_integrity_degraded": True}
+
+    monkeypatch.setattr(sup_state, "reconstruct_task_cost", _broken)
+    task = {"id": "stale-1", "type": "task", "chat_id": 0, "root_task_id": "stale-1", "_attempt": 1,
+            "budget_drive_root": str(tmp_path)}
+    workers.RUNNING["stale-1"] = {"task": task, "worker_id": 0, "attempt": 1}
+    workers.WORKERS[0] = SimpleNamespace(busy_task_id="stale-1")
+    sctx = _supervisor_ctx(tmp_path, workers, queue, [], [])
+    _handle_budget_pause({**budget_pause.pause_event(task, pause), "worker_id": 0}, sctx)
+    workers.WORKERS.clear()
+    row = load_task_result(tmp_path, "stale-1")
+    assert row["reason_code"] == budget_pause.REASON_CODE, events_budget
+    assert row["cost_accounting_status"] == "unavailable"
+    assert row["accounted_upper_bound_usd"] is None and row["total_rounds"] is None
 
 
 # --------------------------------------------------------------------------- shutdown: the pause survives the epoch

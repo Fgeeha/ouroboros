@@ -287,7 +287,10 @@ def _fence_snapshot_running_rows(rows: Any, *, restored_ids: "set[str]") -> "lis
 def _exact_pause_row(task: Any) -> bool:
     """Whether this snapshot row is an EXACT mid-run budget pause locator (#1196)."""
     pause = task.get("_budget_pause") if isinstance(task, dict) else None
-    return isinstance(pause, dict) and bool(pause.get("exact_continuation"))
+    # Typed: the marker writers stamp a boolean; a truthy string or an
+    # otherwise malformed marker is NOT a saved pause and keeps ordinary
+    # drain/parent-interrupted settlement (Astra run-e0bb1ca3487c A1).
+    return isinstance(pause, dict) and pause.get("exact_continuation") is True
 
 
 def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stale: bool,

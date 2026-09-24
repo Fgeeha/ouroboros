@@ -427,7 +427,10 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
                     reason_code="budget_paused", resource_limit=marker,
                     result=("Task paused exactly at a completed boundary (budget). Cumulative spend, rounds "
                             "and execution time are retained; an explicit owner Resume continues the same task."),
-                    **(cost_fields if cost_fields.get("cost_accounting_status") == "available" else {}),
+                    # An unavailable projection is published too: it carries the
+                    # explicit unknown state that must replace any stale amount
+                    # write_task_result would otherwise keep merged in.
+                    **cost_fields,
                 )
             except Exception:
                 log.warning("Failed to persist exact budget pause status for %s", task_id, exc_info=True)
