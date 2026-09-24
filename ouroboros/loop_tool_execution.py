@@ -281,7 +281,7 @@ def _get_tool_timeout(
 # per-call/run_command machinery and the deadline milestones own those.
 _DEADLINE_CLAMPED_TOOLS = frozenset({
     "web_search", "browse_page", "browser_action", "youtube_transcript",
-    "wait_task", "wait_tasks", "plan_task", "task_acceptance_review",
+    "wait_task", "wait_tasks", "await_messages", "plan_task", "task_acceptance_review",
     "analyze_screenshot", "vlm_query",
 })
 
