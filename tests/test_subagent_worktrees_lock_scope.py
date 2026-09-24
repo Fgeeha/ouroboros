@@ -174,8 +174,12 @@ def test_a_live_holder_is_a_typed_refusal_and_a_dead_holder_is_evicted(tmp_path,
     monkeypatch.setattr(wt, "_LOCK_TIMEOUT_SEC", 0.5)
     holder = _hold_lock(snaps, 30)
     try:
+        started = time.monotonic()
         with pytest.raises(wt.WorktreeOpsLockBusy) as info:
             _provision(target, snaps, data)
+        # A busy FIRST section registered nothing, so nothing is discarded: the typed
+        # refusal arrives after the one wait, not after a second discard wait.
+        assert time.monotonic() - started < 3
     finally:
         holder.kill()
         holder.wait()
@@ -325,6 +329,22 @@ def test_acting_worktree_add_and_remove_keep_tree_work_outside_the_lock(tmp_path
     assert _git(target, "rev-parse", "--verify", handle.branch, check=False).returncode != 0
     assert not any(row.get("task_id") == "acting1" for row in wt.list_worktrees(data_dir=data))
     assert not _lock_held(snaps)
+
+
+def test_a_row_naming_the_snapshot_root_itself_deletes_nothing(tmp_path):
+    """The registry is durable state; a malformed row whose path IS the root must not
+    wipe every live sibling snapshot (the root holds them all)."""
+    target = _seed_target(tmp_path)
+    snaps, data = tmp_path / "snaps", tmp_path / "data"
+    keep = _provision(target, snaps, data, snapshot_id="keep")
+    rows = wt._load_registry(data)
+    rows.append({**rows[0], "snapshot_id": "bad", "path": str(snaps.resolve())})
+    wt._save_registry(rows, data)
+    assert wt.remove_execution_snapshot("bad", worktree_root=snaps, data_dir=data)
+    assert pathlib.Path(keep.path).is_dir() and wt.find_execution_snapshot("keep", data_dir=data) is not None
+    assert wt.find_execution_snapshot("bad", data_dir=data) is None
+    assert not wt._deletable(snaps, snaps) and not wt._deletable(pathlib.Path("/"), snaps)
+    assert wt._deletable(pathlib.Path(keep.path), snaps)
 
 
 def test_removal_deletes_files_outside_the_lock_and_forgets_metadata_inside(tmp_path, monkeypatch):

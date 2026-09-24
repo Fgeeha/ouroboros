@@ -268,11 +268,17 @@ def _git(repo_dir: Path, *args: str, check: bool = True,
 
 
 def _deletable(path: Path, root: Path) -> bool:
-    """A checkout path this module may delete: non-empty, not a root spelling, strictly
-    inside the worktree root — the same refusal ``_remove_paths`` applies, because the
-    registry is durable state and a malformed row must never name an arbitrary path."""
+    """A checkout path this module may delete: non-empty, not a root spelling, and
+    STRICTLY inside the worktree root (the root itself holds every live snapshot) —
+    the registry is durable state and a malformed row must never name an arbitrary
+    path. One guard for every delete this module performs."""
     text = str(path).strip()
-    return bool(text) and text not in (".", "/", "//") and _is_within(path, root)
+    if not text or text in (".", "/", "//"):
+        return False
+    try:
+        return path.resolve() != Path(root).resolve() and _is_within(path, root)
+    except OSError:
+        return False
 
 
 def _git_quiet(repo_dir: Path, *args: str) -> None:
@@ -291,10 +297,7 @@ def _remove_paths(repo_dir: Path, wt_path: Path, branch: str, *, allowed_root: O
     entry must never cause deletion of an arbitrary filesystem path.
     """
     wt_path = Path(wt_path)
-    wt_text = str(wt_path).strip()
-    if allowed_root is not None and (
-        not wt_text or wt_text in (".", "/", "//") or not _is_within(wt_path, Path(allowed_root))
-    ):
+    if allowed_root is not None and not _deletable(wt_path, Path(allowed_root)):
         return
     _git_quiet(repo_dir, "worktree", "remove", "--force", str(wt_path))
     if wt_path.exists():
@@ -1008,7 +1011,7 @@ def provision_payload_snapshot(
     wt_path = (root / f"dlgp_{_safe_name(task_id)}_{safe_snap[:16]}").resolve()
     _load_registry(data_dir, strict=True, op="provision_payload_snapshot")  # refuse before the copy
     root.mkdir(parents=True, exist_ok=True)
-    if wt_path.exists():
+    if _deletable(wt_path, root) and wt_path.exists():
         _force_rmtree(wt_path)  # idempotent re-provision of the SAME snapshot id
     source_hash = payload_content_hash(target)
     env = isolated_git_env()
