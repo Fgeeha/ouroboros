@@ -291,27 +291,24 @@ def _confirmed_sends(rows: Sequence[Mapping[str, Any]]) -> list[str] | None:
     """
     if not any(row.get("direction") == "in" for row in rows):
         return None
-    parts: dict[tuple[str, str], str] = {}
+    return [text for state, text in _latest_receipts(rows).values() if state in {"delivered", "accepted"}]
+
+
+def _latest_receipts(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[str, str], tuple[str, str]]:
+    """The latest receipt state and text per (delivery_id, part_id); a later receipt settles an earlier one."""
+    latest: dict[tuple[str, str], tuple[str, str]] = {}
     for row in rows:
-        delivery = _receipt(row)
-        if delivery.get("state") in {"delivered", "accepted"}:
-            parts.setdefault((str(delivery.get("delivery_id")), str(delivery.get("part_id"))), str(row.get("text") or ""))
-    return list(parts.values())
-
-
-def _receipt(row: Mapping[str, Any]) -> Mapping[str, Any]:
-    transport = row.get("transport") if isinstance(row.get("transport"), Mapping) else {}
-    delivery = transport.get("delivery") if isinstance(transport.get("delivery"), Mapping) else {}
-    return delivery if row.get("type") == "presence_delivery" else {}
+        transport = row.get("transport") if isinstance(row.get("transport"), Mapping) else {}
+        delivery = transport.get("delivery") if isinstance(transport.get("delivery"), Mapping) else {}
+        if row.get("type") == "presence_delivery" and delivery.get("state"):
+            latest[(str(delivery.get("delivery_id")), str(delivery.get("part_id")))] = (
+                str(delivery["state"]), str(row.get("text") or ""))
+    return latest
 
 
 def _uncertain_parts(rows: Sequence[Mapping[str, Any]]) -> int:
     """Parts whose latest receipt is ``uncertain``: neither confirmed nor refused, so they may have landed."""
-    latest: dict[tuple[str, str], str] = {}
-    for receipt in map(_receipt, rows):
-        if receipt.get("state"):
-            latest[(str(receipt.get("delivery_id")), str(receipt.get("part_id")))] = str(receipt["state"])
-    return sum(1 for state in latest.values() if state == "uncertain")
+    return sum(1 for state, _text in _latest_receipts(rows).values() if state == "uncertain")
 
 
 def _previous_turn_path(drive_root: Path, conversation_key: str) -> Path:

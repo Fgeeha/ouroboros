@@ -414,3 +414,16 @@ def test_an_attempt_that_died_before_its_running_write_still_logs_the_message_on
     assert first.text == "Real answer" and "previous_attempt" not in calls[0]["metadata"]["presence"]
     rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
     assert [row["direction"] for row in rows if row.get("task_id") == first.task_id].count("in") == 1
+
+
+def test_a_confirmed_part_later_refused_is_not_delivered(tmp_path):
+    """One latest-state rule for confirmed and uncertain parts alike."""
+    task_id = _task_id(_admission(), _event())
+    chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
+    append_jsonl(chat, {"type": "presence_delivery", "direction": "system", "chat_id": 7, "text": "Early part",
+                        "task_id": task_id, "transport": {"delivery": {
+                            "state": "failed", "delivery_id": "send:early", "part_id": "0"}}})
+    calls: list = []
+    run_presence_turn(**_v1_kwargs(tmp_path, calls))
+    assert calls[0]["metadata"]["presence"]["previous_attempt"] == {
+        "delivered_count": 0, "delivered": [], "uncertain_count": 0}
