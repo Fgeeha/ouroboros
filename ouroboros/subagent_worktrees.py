@@ -11,8 +11,9 @@ Mutations of SHARED metadata — a target's ``.git/worktrees`` (add/prune), its
 ``refs/ouroboros/delegated/*`` pins and the registry file — are serialized by a
 portable cross-process lock (the existing repo git lock is drive-root scoped,
 not ``.git`` scoped). Tree-proportional work never runs under it (#1241):
-listing, classifying, hashing, populating, copying and deleting a snapshot's
-files happen outside the lock, so one huge inventory delays only its own task.
+listing, classifying, hashing, populating, copying (and re-recording the copied
+bytes' stat) and deleting a snapshot's files happen outside the lock, so one
+huge inventory delays only its own task.
 """
 
 from __future__ import annotations
@@ -602,8 +603,9 @@ def provision_execution_snapshot(
     the baseline and create the worktree's admin dir — row FIRST, so everything
     after it is nameable by the startup GC — and once to finalize the row.
     Listing, classifying (one git process for every binary verdict), hashing,
-    populating and copying run OUTSIDE it, so a huge untracked inventory delays
-    only its own task instead of refusing every other mutating start.
+    populating, copying and the one ``update-index`` that re-records the copied
+    bytes' stat run OUTSIDE it, so a huge untracked inventory delays only its
+    own task instead of refusing every other mutating start.
     """
     from ouroboros.workspace_patch_capture import (
         binary_verdict_candidates, untracked_binary_verdicts, untracked_capture_veto_reason)
@@ -747,6 +749,7 @@ def provision_execution_snapshot(
         # source's actual working bytes, not checkout's CRLF/smudge rewrite.
         # Read the existing tree inventory so deletions, links and gitlinks
         # keep Git's semantics and excluded paths can never enter the copy.
+        copied: List[bytes] = []
         for item in manifest_raw.split(b"\0"):
             metadata, separator, raw_path = item.partition(b"\t")
             if separator and metadata.split()[0] in (b"100644", b"100755"):
@@ -755,6 +758,17 @@ def provision_execution_snapshot(
                 if original.is_symlink():
                     raise OSError(f"snapshot input changed from a regular file: {relative}")
                 copy_artifact_file(original, wt_path / relative)
+                copied.append(raw_path)
+        # The checkout recorded each entry's stat for the bytes IT wrote; a
+        # CRLF/smudge rewrite (core.autocrlf=true is Git for Windows' default)
+        # then differs in size from the copied source bytes, and git trusts a size
+        # mismatch as a modification without re-hashing — every such file would
+        # read as modified in the child's `git status` for the run's whole life.
+        # One update-index re-hashes the copied bytes through the same clean
+        # filters the baseline used (identical blob) and re-records their stat.
+        if copied:
+            _git_env(wt_path, "update-index", "-z", "--stdin", env=dict(os.environ),
+                     input_bytes=b"\0".join(copied) + b"\0")
         # A concurrent source edit must not appear as the child's work.
         # Use the same Git representation as ordinary patch capture, once
         # for the whole tree, before the separately tracked file inputs.
