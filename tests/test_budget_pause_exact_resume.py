@@ -261,16 +261,14 @@ def test_root_resume_mints_single_use_grant_and_only_makes_children_eligible(tmp
     assert row["state"] == budget_pause.STATE_RESUME_GRANTED and row["grant"]["single_use"] is True
     # The child stayed paused: eligibility is not release.
     assert "_budget_pause" in child and "_budget_pause_resume" not in child
-    # Second grant for the same pause is refused (single use).
-    workers.PENDING.remove(root)
-    stale_root = {**root, "_budget_pause": handoff["pause"]}
-    stale_root.pop("_budget_pause_resume", None)
-    workers.PENDING.append(stale_root)
-    assert queue.resume_budget_paused_task("root-2")["error"] == "resume_already_granted"
-    # Now the child may be selected explicitly (Q9) — under the root that was
-    # actually resumed, not the stale parked copy above.
-    workers.PENDING.remove(stale_root)
-    workers.PENDING.append(root)
+    # Second grant for the same pause is refused while a queue carrier holds it
+    # (single use). A stale carrier WITHOUT the handoff (crash between the durable
+    # grant and the snapshot) is the orphan case, covered in
+    # tests/test_budget_pause_astra_a882.py: it is revoked and re-granted.
+    second = queue.resume_budget_paused_task("root-2")
+    assert second["ok"] is False and second["error"] == "task_not_budget_paused"
+    assert budget_pause.budget_pause_row(tmp_path, "root-2")["grant"]["grant_id"] == granted["grant_id"]
+    # Now the child may be selected explicitly (Q9) under the resumed root.
     assert queue.resume_budget_paused_task("child-2")["ok"] is True
 
 
