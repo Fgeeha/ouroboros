@@ -469,6 +469,7 @@ def test_the_public_wait_is_event_only_and_its_outer_bound_matches_task_lifetime
         DELEGATE_WAIT_WINDOW_MAX_SEC,
         get_delegate_wait_max_sec,
         get_task_abs_ceiling_sec,
+        operation_window_sec,
     )
     from ouroboros.delegate_progress import EXTERNAL_WAIT_LEASE_CEILING_SEC
     from ouroboros.loop_tool_execution import _DEADLINE_CLAMPED_TOOLS, _PER_CALL_TIMEOUT_TOOLS
@@ -476,7 +477,7 @@ def test_the_public_wait_is_event_only_and_its_outer_bound_matches_task_lifetime
 
     entry = next(e for e in get_tools() if e.schema["name"] == "delegate_wait")
     assert "wait_sec" not in entry.schema["parameters"]["properties"]
-    assert entry.timeout_sec == get_task_abs_ceiling_sec() + 120
+    assert entry.timeout_sec == operation_window_sec(get_task_abs_ceiling_sec()) + 120
     assert DELEGATE_WAIT_WINDOW_MAX_SEC < DELEGATE_WAIT_CEILING_SEC < EXTERNAL_WAIT_LEASE_CEILING_SEC
     assert (DELEGATE_WAIT_WINDOW_MAX_SEC, DELEGATE_WAIT_CEILING_SEC,
             EXTERNAL_WAIT_LEASE_CEILING_SEC) == (1800, 2100, 2400)
