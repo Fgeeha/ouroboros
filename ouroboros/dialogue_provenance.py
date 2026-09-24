@@ -84,7 +84,10 @@ def run_origin(record: Mapping[str, Any] | None) -> dict[str, Any]:
     """
     source = _mapping(record)
     metadata = _mapping(source.get("metadata"))
-    ref = metadata.get("origin_message_ref")
+    # The door's ref rides a persisted record at top level (the promote handler
+    # writes it there; the loop copies it into the live metadata) and the live
+    # context in metadata: one reader accepts both shapes.
+    ref = metadata.get("origin_message_ref") or source.get("origin_message_ref")
     origin: dict[str, Any] = {
         "task_type": _text(source.get("type")),
         "owner_ingress": bool(metadata.get("origin_suppressed") or (isinstance(ref, Mapping) and ref)),

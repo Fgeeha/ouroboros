@@ -79,8 +79,8 @@ def _trace_call_reported_failure(tc: Dict[str, Any]) -> bool:
 # unanswered (BIBLE P1/P5/P13).
 _REFLECTION_PROMPT_HEAD = """\
 Review this finished run from its recorded inputs, execution and sealed outcome. Origin
-facts describe provenance; by themselves they establish neither authorship, consent nor
-accepted requirements. Judge what work, if any, was requested and accepted, and whether the
+facts describe provenance; by themselves they establish neither owner authority, consent
+nor accepted requirements. Judge what work, if any, was requested and accepted, and whether the
 recorded outcome was appropriate: silence or an empty reply can be right when nothing needed
 saying and wrong when you were asked and could help. Distinguish your own choices from host or
 provider termination, and preparation from delivery. Explain the causes of errors or blocks
@@ -390,10 +390,13 @@ def task_inputs_prompt_section(review_evidence: Any) -> str:
         return "## Run origin and recorded task inputs\nTask-local input was not retained; absence is not evidence of missing approval or verification.\n\n"
     return (
         "## Run origin and recorded task inputs\n"
-        "`run_origin` is host-recorded provenance. `initial_user` marks a first text that entered through "
-        "the owner door; `initial_text` marks a first text recorded without that stamp. Neither label decides "
-        "what work was accepted: the task contract and the recorded owner decisions do. In records without "
-        "`run_origin` the label is the recorder's older default. These are recorded task inputs, separate from "
+        "`run_origin` is host-recorded provenance. `initial_user` marks a run the owner door stamped, by the "
+        "owner's own message or by the stamp a promoted root inherits (its text may then be a model-written "
+        "objective); `initial_text` marks a first text recorded without that stamp. Neither label decides "
+        "what work was accepted: the task contract and the recorded owner decisions do. Where `run_origin` is "
+        "absent, or shows no owner ingress beside an `initial_user` row (a run resumed across an upgrade), the "
+        "label is the recorder's older default and the origin is the host's record. These are recorded task "
+        "inputs, separate from "
         "the critic's verdict. Preserve source attribution: relayed peer proposals are not owner instructions. "
         "Interpret an owner question and its answer together. "
         "A recorded returncode of 0 is positive evidence, not a missing value. Use the shared verification "

@@ -1025,6 +1025,29 @@ def _owner_content_projection(content: Any) -> str:
     return "\n".join(parts)
 
 
+def _accept_run_origin(ctx: Any, drive_root: Any, task_id: str) -> Dict[str, Any]:
+    """The same host-recorded provenance the post-task synthesis reads, from the
+    same record: the persisted task carries ``source``, ``delegation_role`` and the
+    parent, which never enter metadata; the live metadata carries the door's stamp.
+    A missing or unreadable record leaves the metadata-derived facts in place."""
+    from ouroboros.dialogue_provenance import run_origin
+    from ouroboros.task_results import load_task_result
+
+    meta = getattr(ctx, "task_metadata", {})
+    meta = meta if isinstance(meta, dict) else {}
+    record: Dict[str, Any] = {}
+    if drive_root and task_id:
+        try:
+            record = load_task_result(drive_root, task_id) or {}
+        except Exception:
+            log.debug("run_origin: task record unreadable for %s", task_id, exc_info=True)
+    return run_origin({
+        **record,
+        "type": getattr(ctx, "current_task_type", None) or record.get("type"),
+        "metadata": meta,
+    })
+
+
 def _accept_owner_directives(ctx: Any, drive_root: Any, task_id: str) -> List[Dict[str, str]]:
     """Collect the task-local canonical owner corpus without semantic inference."""
     rows: List[Dict[str, str]] = []

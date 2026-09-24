@@ -308,3 +308,92 @@ def test_transcript_fallback_only_without_a_collector_and_never_as_owner(tmp_pat
     assert "initial_user" not in json.dumps(rows)
     projected = _owner_content_projection([{"type": "image_url", "image_url": "data:x"}])
     assert projected.startswith("[image ref sha256:") and "owner" not in projected
+
+
+# --- the door's stamps ride a promoted root; the reviewers read the same record ------
+
+@pytest.mark.parametrize("stamp", ["logged-ref", "suppressed-log", "none"])
+def test_the_promote_handler_carries_either_door_stamp_onto_the_root(tmp_path, tmp_path_factory, monkeypatch, stamp):
+    """The owner door writes one of two stamps on a promote event: the logged
+    message's ref, or the designed absence of one (a message it never logged).
+    The root inherits whichever it got, so ``run_origin`` reads owner ingress from
+    the promoted record the way the direct turn reads it; an event that carries
+    neither (a wake, a Presence turn, a headless promote) inherits nothing."""
+    import supervisor.workers as workers
+    from ouroboros.dialogue_provenance import run_origin
+    from ouroboros.project_dialogue import build_owner_message_ref
+    from ouroboros.projects_registry import create_project
+    from supervisor.events import _handle_promote_chat_to_task
+
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    # The genesis workspace root must sit beside, not under, the runtime data root.
+    monkeypatch.setenv("OUROBOROS_SUBAGENT_PROJECTS_ROOT", str(tmp_path_factory.mktemp("projects_root")))
+    create_project(tmp_path, "racer", name="Racer")
+    ref = build_owner_message_ref(chat_id=1, client_message_id="cm-1", ts="2026-09-24T00:00:00+00:00",
+                                  text="Repair the skill")
+    pending = []
+    handler_ctx = SimpleNamespace(
+        DRIVE_ROOT=tmp_path, WORKERS={0: SimpleNamespace()}, PENDING=pending, bridge=None,
+        append_jsonl=lambda *_a, **_k: None, persist_queue_snapshot=lambda **_k: True,
+        enqueue_task=lambda task: pending.append(dict(task)) or pending[-1],
+        load_state=lambda: {"owner_chat_id": 1},
+    )
+    event = {"type": "promote_chat_to_task", "task_id": f"root-{stamp}", "routing_token": "tok-1",
+             "objective": "Repair the skill", "chat_id": 1, "client_message_id": "cm-1",
+             "project_id": "racer", "routed_from_main": True, "host_initiated": True}
+    if stamp == "logged-ref":
+        event.update(source_ref=dict(ref), source_text="Repair the skill")
+    elif stamp == "suppressed-log":
+        event["origin_suppressed"] = True
+
+    outcome = _handle_promote_chat_to_task(event, handler_ctx)
+
+    assert outcome["status"] == "scheduled", outcome
+    [task] = pending
+    origin = run_origin(task)
+    assert origin["owner_ingress"] is (stamp != "none")
+    assert origin["source"] == "promote_chat_to_task" and origin["delegation_role"] == "root"
+    assert (task.get("origin_message_ref"), (task.get("metadata") or {}).get("origin_suppressed")) == {
+        "logged-ref": (ref, None), "suppressed-log": (None, True), "none": (None, None),
+    }[stamp]
+
+
+def test_the_acceptance_packet_reads_the_origin_from_the_persisted_record(tmp_path):
+    """The acceptance reviewer and the post-task synthesis read one origin: the
+    packet folds the persisted task record (``source``, ``delegation_role``, the
+    parent) under the live metadata, and a missing record still leaves the
+    metadata-derived facts in the packet."""
+    from ouroboros.review_evidence import build_task_acceptance_evidence
+
+    results = tmp_path / "task_results"
+    results.mkdir()
+    (results / "acc.json").write_text(json.dumps({
+        "_schema_version": 1, "task_id": "acc", "status": "running", "type": "task",
+        "source": "promote_chat_to_task", "delegation_role": "root", "parent_task_id": "",
+    }), encoding="utf-8")
+    ctx = SimpleNamespace(task_contract={}, task_metadata={"origin_message_ref": dict(OWNER_REF)},
+                          drive_root=str(tmp_path), task_id="acc", repo_dir=str(tmp_path))
+
+    ev = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=tmp_path, task_id="acc")
+    assert ev["__provenance__"]["run_origin"] == "host_attested"
+    assert (ev["run_origin"]["owner_ingress"], ev["run_origin"]["source"], ev["run_origin"]["delegation_role"]) == (
+        True, "promote_chat_to_task", "root")
+
+    ctx.task_id = "absent"
+    ev = build_task_acceptance_evidence(ctx, llm_trace={"tool_calls": []}, drive_root=tmp_path, task_id="absent")
+    assert ev["run_origin"]["owner_ingress"] is True and "source" not in ev["run_origin"]
+
+
+@pytest.mark.parametrize("label", ["initial_user", "initial_text"])
+def test_the_safety_check_sees_the_corpus_label_it_is_asked_to_weigh(label):
+    """Safety prints the retained corpus with its labels: the supervisor can tell a
+    row the owner door stamped from a run's unattributed initial text without the
+    host deciding consent for it."""
+    from ouroboros.safety import _build_check_prompt
+
+    ctx = SimpleNamespace(task_id="t-1", project_id="", task_contract={}, task_constraint=None,
+                          _owner_directives=[{"source": label, "content": "run the migration"}])
+    prompt = _build_check_prompt("shell", {"cmd": "ls"}, ctx=ctx)
+    assert f'"source": "{label}"' in prompt and "run the migration" in prompt
+    other = "initial_text" if label == "initial_user" else "initial_user"
+    assert f'"source": "{other}"' not in prompt

@@ -228,9 +228,7 @@ def build_task_acceptance_evidence(
     receipts = read_context_verification_receipts(ctx, task_id, fallback_root=drive_root) if task_id else []
     # The same host-recorded provenance the post-task synthesis reads: the reviewer
     # learns whether the owner door stamped this run before it weighs the corpus.
-    from ouroboros.dialogue_provenance import run_origin
-
-    ev["run_origin"] = run_origin({"type": getattr(ctx, "current_task_type", None), "metadata": meta})
+    ev["run_origin"] = _accept_run_origin(ctx, drive_root, task_id)
     prov["run_origin"] = "host_attested"
     owner_directives = _accept_owner_directives(ctx, drive_root, task_id)
     if owner_directives:
@@ -1139,6 +1137,7 @@ from ouroboros.review_evidence_sections import (  # noqa: E402, F401 -- intentio
     _accept_obligation_row,
     _accept_owner_directives,
     _accept_protected_set,
+    _accept_run_origin,
     _accept_receipt_exhibits,
     _accept_redact_cap,
     _accept_task_contract,
