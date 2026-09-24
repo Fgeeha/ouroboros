@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import pathlib
+from functools import partial
 import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -401,22 +402,19 @@ class _EventsTailIndex:
         return self._worker_boot
 
 
-def _still_orphan_at_write(task_id: str, applied: List[bool]):
-    """Projector for the reconciler's terminal write: the decision was taken outside the row lock, so
-    a presence retry that went live meanwhile, or a row that already moved on (requeued, settled by
-    another writer), cancels the write. ``applied`` receives True only when the write went through."""
+def _still_orphan_at_write(task_id: str, applied: List[bool], existing: Dict[str, Any],
+                           fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Projector for the reconciler's terminal write (bound with ``partial``): the decision was taken
+    outside the row lock, so a presence retry that went live meanwhile, or a row that already moved on
+    (requeued, settled by another writer), cancels the write. ``applied`` gets True only on a real write."""
+    from ouroboros.presence_runner import presence_turn_is_live
 
-    def _project(existing: Dict[str, Any], fields: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        from ouroboros.presence_runner import presence_turn_is_live
-
-        if presence_turn_is_live(task_id):
-            return None
-        if str(existing.get("status") or "").lower() not in {STATUS_RUNNING, STATUS_INTERRUPTED}:
-            return None
-        applied.append(True)
-        return fields
-
-    return _project
+    if presence_turn_is_live(task_id):
+        return None
+    if str(existing.get("status") or "").lower() not in {STATUS_RUNNING, STATUS_INTERRUPTED}:
+        return None
+    applied.append(True)
+    return fields
 
 
 def _is_stale_orphan_running_task(
@@ -659,7 +657,7 @@ def reconcile_orphaned_running_tasks(
         try:
             applied: List[bool] = []
             write_task_result(root, task_id, status=eff_status,
-                              _field_projector=_still_orphan_at_write(task_id, applied), **persist_fields)
+                              _field_projector=partial(_still_orphan_at_write, task_id, applied), **persist_fields)
             if not applied:
                 continue  # the row moved on between the effective read and this write: nothing was settled here
             healed += 1

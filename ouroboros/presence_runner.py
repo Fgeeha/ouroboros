@@ -296,56 +296,30 @@ def _live_task_rows(drive_root: Path, task_id: str, conversation_key: str) -> li
     return rows
 
 
-def _confirmed_sends(rows: Sequence[Mapping[str, Any]]) -> list[str] | None:
-    """One text per confirmed v1 receipt among *rows*; None once the attempt's rows left the live generation.
+def _turn_sends(rows: Sequence[Mapping[str, Any]], own_start: int = 0,
+                same_generation: bool = False) -> tuple[list[str] | None, int]:
+    """``(confirmed v1 sends or None, parts whose latest receipt is uncertain)`` among *rows*.
 
-    An attempt's rows follow its inbound row, so that row in the live file means every receipt
-    is there too. Without it a rotated archive may hold receipts: the count is unknown, not zero.
-    """
-    if not any(row.get("direction") == "in" for row in rows):
-        return None
-    return [text for state, text in _latest_receipts(rows).values() if state in {"delivered", "accepted"}]
-
-
-def _chat_generation(drive_root: Path) -> tuple[int, int] | None:
-    """Identity of the live chat.jsonl (device, inode); rotation renames it, so a change means rotation."""
-    try:
-        stat = os.stat(Path(drive_root) / "logs" / "chat.jsonl")
-    except OSError:
-        return None
-    return (stat.st_dev, stat.st_ino)
-
-
-def _turn_sends(rows: Sequence[Mapping[str, Any]], own_start: int, same_generation: bool) -> list[str] | None:
-    """Confirmed sends for the pointer of the execution that just finished.
-
-    The whole task's receipts count when its inbound row is still live; otherwise (a lost attempt
-    whose rows rotated away, never re-logged) this execution's own rows, which all landed in the
-    generation that was live when it started, are complete on their own. A rotation during the
-    execution leaves the count unknown.
+    A later receipt for a part settles an earlier one. An attempt's rows follow its inbound row, so
+    that row in the live file means every receipt is there too and the whole task counts. Without
+    it a rotated archive may hold receipts: the sends are unknown (None), not zero, unless the
+    caller vouches that this execution's own rows (``own_start`` onwards) all landed in the
+    generation that was live when it started (``same_generation``); a rotation during the execution
+    leaves them unknown. Uncertain parts are neither confirmed nor refused, so they may have landed.
     """
     if any(row.get("direction") == "in" for row in rows):
-        return _confirmed_sends(rows)
-    if not same_generation:
-        return None
-    return [text for state, text in _latest_receipts(rows[own_start:]).values() if state in {"delivered", "accepted"}]
-
-
-def _latest_receipts(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[str, str], tuple[str, str]]:
-    """The latest receipt state and text per (delivery_id, part_id); a later receipt settles an earlier one."""
+        own_start = 0
+    elif not same_generation:
+        return None, 0
     latest: dict[tuple[str, str], tuple[str, str]] = {}
-    for row in rows:
+    for row in rows[own_start:]:
         transport = row.get("transport") if isinstance(row.get("transport"), Mapping) else {}
         delivery = transport.get("delivery") if isinstance(transport.get("delivery"), Mapping) else {}
         if row.get("type") == "presence_delivery" and delivery.get("state"):
             latest[(str(delivery.get("delivery_id")), str(delivery.get("part_id")))] = (
                 str(delivery["state"]), str(row.get("text") or ""))
-    return latest
-
-
-def _uncertain_parts(rows: Sequence[Mapping[str, Any]]) -> int:
-    """Parts whose latest receipt is ``uncertain``: neither confirmed nor refused, so they may have landed."""
-    return sum(1 for state, _text in _latest_receipts(rows).values() if state == "uncertain")
+    return ([text for state, text in latest.values() if state in {"delivered", "accepted"}],
+            sum(1 for state, _text in latest.values() if state == "uncertain"))
 
 
 def _previous_turn_path(drive_root: Path, conversation_key: str) -> Path:
@@ -389,18 +363,6 @@ def _pointer_behind(drive_root: Path, conversation_key: str, task_id: str) -> bo
     pointer = _read_previous_turn(drive_root, conversation_key)
     return pointer is None or (
         pointer.get("task_id") != task_id and str(pointer.get("finished_at") or "") <= str(stored.get("ts") or ""))
-
-
-def _repair_previous_turn(drive_root: Path, conversation_key: str, task_id: str) -> None:
-    """Rebuild the pointer from the durable row; the caller holds the conversation lock."""
-    if not _pointer_behind(drive_root, conversation_key, task_id):
-        return
-    stored = load_task_result(drive_root, task_id) or {}
-    replay = presence_result_from_stored(stored, task_id)
-    sends = _confirmed_sends(_live_task_rows(drive_root, task_id, conversation_key)) if replay.delivery_reporting_version else []
-    _write_previous_turn(drive_root, conversation_key, task_id, outcome=replay.outcome, message=replay.text,
-                         sends=sends or [], work_ref=replay.work_ref, finished_at=str(stored.get("ts") or ""),
-                         delivery=_delivery_state(replay.delivery_reporting_version, sends, replay.text))
 
 
 def _delivery_state(reporting_version: int, sends: Sequence[str] | None, text: str) -> str:
@@ -517,11 +479,11 @@ def _build_task(
         presence_context["previous_turn"] = previous_turn
     if lost_attempt:
         # Unknown (None) when the transport reports no receipts or the attempt's rows left the live generation.
-        sent = _confirmed_sends(prior_rows) if event.delivery_reporting_version else None
+        sent, uncertain = _turn_sends(prior_rows) if event.delivery_reporting_version else (None, 0)
         presence_context["previous_attempt"] = {
             "delivered_count": None if sent is None else len(sent),
             "delivered": None if sent is None else [text for text in sent if text],
-            "uncertain_count": 0 if sent is None else _uncertain_parts(prior_rows),
+            "uncertain_count": uncertain,
         }
     metadata: dict[str, Any] = {
         "source": "presence",
@@ -620,7 +582,15 @@ def run_presence_turn(
         if second_cached is not None:
             # A turn lost between its terminal write and its pointer write replays from the durable
             # row; its pointer is rebuilt here, under the conversation lock, so no newer turn is undone.
-            _repair_previous_turn(Path(drive_root), event.conversation_key, task_id)
+            if _pointer_behind(Path(drive_root), event.conversation_key, task_id):
+                stored = load_task_result(Path(drive_root), task_id) or {}
+                sends = (_turn_sends(_live_task_rows(Path(drive_root), task_id, event.conversation_key))[0]
+                         if second_cached.delivery_reporting_version else [])
+                _write_previous_turn(Path(drive_root), event.conversation_key, task_id, outcome=second_cached.outcome,
+                                     message=second_cached.text, sends=sends or [], work_ref=second_cached.work_ref,
+                                     finished_at=str(stored.get("ts") or ""),
+                                     delivery=_delivery_state(second_cached.delivery_reporting_version, sends,
+                                                              second_cached.text))
             return second_cached
         with _LIVE_LOCK:
             _LIVE_PRESENCE_TASKS.add(task_id)
@@ -662,7 +632,14 @@ def run_presence_turn(
                 task=task,
                 task_id=task_id,
             )
-        generation = _chat_generation(Path(drive_root))  # the live file this execution's receipts land in
+        def chat_generation() -> tuple[int, int] | None:  # rotation renames the live file: a new inode
+            try:
+                stat = os.stat(Path(drive_root) / "logs" / "chat.jsonl")
+            except OSError:
+                return None
+            return (stat.st_dev, stat.st_ino)
+
+        generation = chat_generation()  # the live file this execution's receipts land in
         if agent_factory is None:
             from ouroboros.agent import make_agent
 
@@ -698,13 +675,12 @@ def run_presence_turn(
                 task=task,
                 task_id=task_id,
             )
-        # Still under the conversation lock. A replay writes only through _repair_previous_turn, under
+        # Still under the conversation lock. A replay writes only through the cached-replay repair, under
         # this same lock, and it leaves a pointer that names a newer turn alone.
         sends: list[str] | None = []
         if event.delivery_reporting_version:
-            after = _chat_generation(Path(drive_root))
             sends = _turn_sends(_live_task_rows(Path(drive_root), task_id, event.conversation_key), own_start,
-                                same_generation=generation is None or after == generation)
+                                same_generation=generation is None or chat_generation() == generation)[0]
         _write_previous_turn(Path(drive_root), event.conversation_key, task_id, outcome=result.outcome,
                              message=str(row.get("message") or result.text), sends=sends or [],
                              work_ref=result.work_ref, finished_at=utc_now_iso(),
