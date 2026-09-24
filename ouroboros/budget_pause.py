@@ -344,8 +344,27 @@ def observe_task_runs(root: Any, task_id: str, *, reason: str = "budget_resume_u
             from ouroboros import delegate_custody as custody
 
             mine = str(task_id or "")
+            # The memo silently falls back to a lenient read that skips an
+            # unreadable segment; probe the chain first so hidden custody is
+            # UNKNOWN, never "no open runs" (Astra run-a882315dbcd7 #2).
+            if custody.custody_log_unreadable(pathlib.Path(root)):
+                raise OSError("custody_log_unreadable")
             runs = [run for run in custody.replay(pathlib.Path(root)).values()
                     if str(getattr(run, "task_id", "") or "") == mine and not getattr(run, "settled", True)]
+            # A START_REQUESTED whose response was lost has no run id yet but may
+            # be a live remote writer: unknown custody, never absence (#3).
+            from ouroboros.delegate_pending import pending_invocations
+
+            pending = [row for row in pending_invocations(pathlib.Path(root))
+                       if str(row.get("task_id") or "") == mine]
+            if pending:
+                return {"runs": [{"run_id": "", "invocation_id": str(row.get("invocation_id") or ""),
+                                  "route": str(row.get("route") or ""),
+                                  "cost_coverage": "unproven_preterminal", "stop_policy": "reconcile_first",
+                                  "state": EXTERNAL_STOP_UNKNOWN, "stop_outcome": "pending_invocation_unbound",
+                                  "detail": ""} for row in pending],
+                        "observed_at": time.time(), "custody_read": "ok",
+                        "coverage_basis": "pending_invocations_unbound"}
         except Exception as exc:
             log.warning("External custody rows unreadable for %s", task_id, exc_info=True)
             read_error = f"{type(exc).__name__}: {str(exc)[:200]}"

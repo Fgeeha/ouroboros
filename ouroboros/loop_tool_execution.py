@@ -1253,6 +1253,7 @@ def handle_tool_calls(
                 for idx, tc in enumerate(tool_calls)
             }
             results = [None] * len(tool_calls)
+            batch_raised = True
             for future in as_completed(future_to_index):
                 idx = future_to_index[future]
                 try:
@@ -1290,8 +1291,13 @@ def handle_tool_calls(
                         },
                         "tool_result": tool_result,
                     }
+            batch_raised = False
         finally:
-            executor.shutdown(wait=False, cancel_futures=True)
+            # A batch leaving on an exception (BudgetExceeded) must not strand an
+            # already-running wrapper that has not yet registered its inner future
+            # with budget-pause quiescence: cancel the queued ones, WAIT for the
+            # started ones (each bounded by its own tool timeout) (#1196, Astra #4).
+            executor.shutdown(wait=batch_raised, cancel_futures=True)
 
     return process_tool_results(results, messages, llm_trace, emit_progress, tools=tools)
 

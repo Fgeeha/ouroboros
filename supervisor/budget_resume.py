@@ -48,7 +48,7 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
     from ouroboros.model_wait import execution_elapsed_seconds
     from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
     from supervisor.events_budget import (
-        BUDGET_HOLD_KEY, HOLD_RESTART_REVOCATION_UNWRITTEN, HOLD_REVOCATION_UNWRITTEN, HOLD_MALFORMED_RESUME_IDENTITY,
+        BUDGET_HOLD_KEY, HOLD_REVOCATION_UNWRITTEN, HOLD_MALFORMED_RESUME_IDENTITY,
         hold_budget_row, live_root_resume_grant, hold_root_resume_descendants,
     )
     from supervisor import queue as q
@@ -98,12 +98,12 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
     if "grant" in row and not str(live_grant.get("grant_id") or "").strip():
         return {"ok": False, "error": "malformed_grant_identity"}
     if row.get("state") == STATE_RESUME_GRANTED and not live_grant.get("revoked_at"):
-        # Orphaned = a hold names this undispatched grant with no handoff left: revoke it first.
+        # Orphaned = no queue carrier holds this undispatched grant any more. That
+        # covers a typed revocation hold AND a crash between the durable grant and
+        # the snapshot (restore saw only `_budget_pause`), which would otherwise
+        # answer resume_already_granted forever (Astra run-a882315dbcd7 #1).
         orphaned = bool(
-            hold and not hold.get("selected")
-            and str(hold.get("reason") or "") in {HOLD_REVOCATION_UNWRITTEN, HOLD_RESTART_REVOCATION_UNWRITTEN}
-            and str(hold.get("grant_id") or "") == str(live_grant.get("grant_id") or "")
-            and not any(isinstance(item.get("_budget_pause_resume"), dict)
+            not any(isinstance(item.get("_budget_pause_resume"), dict)
                         and str(item["_budget_pause_resume"].get("grant_id") or "") == str(live_grant.get("grant_id") or "")
                         for item in list(q.PENDING) + [m.get("task") for m in q.RUNNING.values() if isinstance(m, dict)]
                         if isinstance(item, dict))
@@ -112,7 +112,8 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
             return {"ok": False, "error": "resume_already_granted",
                     "grant_id": live_grant.get("grant_id")}
         revoked = {**live_grant, "revoked_at": utc_now_iso(),
-                   "revoke_reason": f"deferred:{hold.get('reason')}:{str(hold.get('detail') or '')[:120]}"}
+                   "revoke_reason": (f"deferred:{hold.get('reason')}:{str(hold.get('detail') or '')[:120]}"
+                                     if hold else "orphaned_grant_without_carrier")}
         try:
             set_budget_pause(result_root, task_id, {**row, "state": STATE_PAUSED, "grant": revoked},
                              expected_pause_id=pause_id, expected_state=STATE_RESUME_GRANTED,
