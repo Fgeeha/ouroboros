@@ -131,9 +131,13 @@ def _queue_root(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("drained_owner", [None, "owner-followup", ""], ids=["standalone", "owner-id", "legacy-no-id"])
 @pytest.mark.parametrize("project_sender", [False, True])
+@pytest.mark.parametrize("root_shape", ["headless", "promoted"])
 def test_a_pooled_root_steer_is_written_as_its_own_words_and_supersedes_nothing(
-    tmp_path, target_lane, drained_owner, project_sender,
+    tmp_path, target_lane, drained_owner, project_sender, root_shape,
 ):
+    """``promoted`` is the common geometry: the root inherited the owner door's stamp
+    and client id from the message that promoted it (ancestry, by value) but is not
+    a direct turn, so it still speaks as a task; ``headless`` carries no stamp at all."""
     import supervisor.queue as queue_mod
     from ouroboros.loop_messages import _initialize_owner_directives, owner_source_sha256
     from ouroboros.loop_round_limits import _drain_incoming_messages
@@ -150,7 +154,11 @@ def test_a_pooled_root_steer_is_written_as_its_own_words_and_supersedes_nothing(
         acks=acks, notices=notices,
     )
     chat_id = create_project(tmp_path, "source", name="Source")["chat_id"] if project_sender else 1
-    ctx = _wire(_pooled_root_ctx(tmp_path, chat_id=chat_id), supervisor, emitted)
+    inherited = {
+        "client_message_id": "cm-origin",
+        "origin_message_ref": {"chat_id": 1, "client_message_id": "cm-origin", "ts": "t", "text_sha256": "x" * 64},
+    } if root_shape == "promoted" else {}
+    ctx = _wire(_pooled_root_ctx(tmp_path, chat_id=chat_id, metadata=inherited), supervisor, emitted)
     if drained_owner is not None:
         _drain_owner_followup(tmp_path, ctx, client_message_id=drained_owner)
 
