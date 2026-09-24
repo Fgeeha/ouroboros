@@ -136,7 +136,12 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/architecture/06-agent-core.md": 307100,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
-    "docs/architecture/08-git-branching-ci-and-build.md": 19287,
+    # 19287 -> 20560 (#1215): three contracts the chapter had no older text for — the
+    # ONE reusable browser lane and the two triggers that share it (the unfiltered
+    # `ouroboros` push included), the per-checkout static/VERSION provenance a boot
+    # and a restart prove, and the scrubbed roots plus the single dependency-sync
+    # chokepoint. The `ui-smoke` row it replaces was rewritten, not appended to.
+    "docs/architecture/08-git-branching-ci-and-build.md": 20560,
     # 12405 -> 14400 (issue #1142): the ordinary-close paragraph gains the mechanism the chapter had
     # no text for — graceful stop signals the server PID only, the server half (stop event at the
     # signal, bounded uvicorn drain) is self-sufficient against an old group-SIGTERM launcher.
@@ -199,7 +204,13 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/development/12-mcp-client-integration.md": 3313,
     "docs/development/13-gateway-boundary-pattern.md": 2228,
     # 14958 -> 16100: release proof now records diagnostic signing/attestation side effects, authority asymmetry, and fail-closed prerequisites.
-    "docs/development/14-build-and-ci.md": 16100,
+    # 16100 -> 19350 (#1215): the safe-launch recipe an operator must copy exactly,
+    # and the dirty-candidate contract (supported and refused inputs, proof bytes,
+    # required-lane guards). Compressed first and the guard description deduplicated
+    # against the lane bullet; what remains is a mechanism the chapter lacked, so it
+    # cannot replace older text. 3283 -> 2969 bytes of section after that pass, plus
+    # the `--temp-parent` refusal clause (a nested disposable root is not disposable).
+    "docs/development/14-build-and-ci.md": 19500,
 }
 
 
