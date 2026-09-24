@@ -320,8 +320,8 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
     from ouroboros.budget_pause import budget_pause_restore_refusal, budget_pause_row
     from ouroboros.owner_wait import restore_owner_wait_allowed
     from ouroboros.task_results import load_task_result
+    from supervisor.budget_resume import revoke_exact_budget_resume
     from supervisor.events_budget import HOLD_RESTORE_REFUSED_PREFIX, hold_restored_budget_pause
-    from supervisor.queue_transitions import revoke_exact_budget_resume
 
     for task in snapshot_pending:
         if isinstance(task.get("_budget_pause_resume"), dict):

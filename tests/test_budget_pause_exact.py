@@ -28,7 +28,7 @@ from tests._budget_pause_exact_helpers import (
 
 # --------------------------------------------------------------------------- program counter
 
-def test_unanswered_tool_calls_are_execution_unknown_not_replayed():
+def test_unanswered_tool_calls_are_execution_unknown_not_replayed(tmp_path, monkeypatch):
     from ouroboros import budget_pause
 
     messages = [
@@ -36,10 +36,24 @@ def test_unanswered_tool_calls_are_execution_unknown_not_replayed():
         {"role": "tool", "tool_call_id": "b", "content": "ok"},
     ]
     assert budget_pause.pending_tool_call_ids(messages) == ["a", "c"]
-    point = budget_pause.resume_point(messages, 7)
-    assert point["phase"] == "partial_tool_batch_unknown"
+    assert budget_pause.pending_tool_call_ids([{"role": "assistant", "content": "hi"}]) == []
+    # The program counter the pause row carries: unanswered calls of the last
+    # batch are EXECUTION-UNKNOWN (never re-executed); a batch with none is a boundary.
+    ctx, _limit, pause = _pause(tmp_path, monkeypatch)
+    budget_pause.end_dispatch_fence(ctx.task_id)
+    point = pause["resume_point"]
+    assert point["round_idx"] == 4 and point["phase"] == "partial_tool_batch_unknown"
+    assert point["unanswered_tool_call_ids"] == ["call_b"]
     assert point["unanswered_policy"] == "not_re_executed_execution_unknown"
-    assert budget_pause.resume_point([{"role": "assistant", "content": "hi"}], 1)["phase"] == "boundary"
+    _running_row(tmp_path, "boundary-1")
+    _ctx, limit_ctx = _loop_ctx(tmp_path, "boundary-1")
+    limit_ctx.messages.append({"role": "tool", "tool_call_id": "call_b", "content": "done b"})
+    with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
+        budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
+                                   scope="global", reason_text="x")
+    budget_pause.end_dispatch_fence("boundary-1")
+    point = raised.value.pause["resume_point"]
+    assert point["phase"] == "boundary" and point["unanswered_tool_call_ids"] == []
 
 
 # --------------------------------------------------------------------------- loop-side pause
@@ -55,7 +69,7 @@ def test_direct_actor_pauses_under_its_own_task_id_and_its_event_carries_its_rec
     ctx.current_chat_id = 42
     _fast_hold(monkeypatch, budget_pause)
     _quiet_external(monkeypatch, budget_pause)
-    assert budget_pause.pause_ineligibility(ctx) == ""
+    # Eligible: the pause below raises instead of returning ``exact_pause_unavailable``.
     with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
         budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
                                    scope="global", reason_text="x")
@@ -73,9 +87,12 @@ def test_direct_actor_pauses_under_its_own_task_id_and_its_event_carries_its_rec
     assert carried["metadata"] == {"k": "v"} and carried["_attempt"] == 1 and carried["depth"] == 0
     # A pooled task's event carries no record: RUNNING is its carrier.
     assert "task" not in budget_pause.pause_event({"id": "direct-1", "type": "task"}, raised.value.pause)
-    # A context with no continuation owner at all is still excluded, loudly.
+    # A context with no continuation owner at all is still excluded, loudly: the
+    # pause returns without fencing and names the reason on the usage row.
     ctx.owner_wait_callback = None
-    assert budget_pause.pause_ineligibility(ctx) == "no_continuation_owner"
+    assert budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
+                                      scope="global", reason_text="x") is None
+    assert limit_ctx.accumulated_usage["exact_pause_unavailable"] == "no_continuation_owner"
 
 
 def test_direct_turn_pause_event_parks_the_carried_record_in_pending(tmp_path, monkeypatch):
@@ -210,7 +227,7 @@ def test_failed_checkpoint_publication_retries_the_prepared_snapshot_not_a_rebui
     monkeypatch.setattr(budget_pause, "_HOLD_POLL_SEC", 0.01)
     monkeypatch.setattr(budget_pause, "_hold_control_reason", lambda _c: "")
     observed, stored = [], []
-    monkeypatch.setattr(budget_pause, "observe_external_runs", lambda _c, request_stop=True: observed.append(1) or {
+    monkeypatch.setattr(budget_pause, "observe_task_runs", lambda _root, _task_id, **_kw: observed.append(1) or {
         "runs": [{"run_id": "run-1", "state": "stop_requested", "stop_outcome": "requested"}],
         "observed_at": time.time(), "custody_read": "ok", "coverage_basis": "test"})
     real_store = owner_wait.store_continuation_source
@@ -262,7 +279,12 @@ def test_stop_during_a_hold_ends_it_through_the_existing_control_rail(tmp_path, 
     row = budget_pause.budget_pause_row(tmp_path, "hold-stop")
     assert row["state"] == budget_pause.STATE_ABANDONED
     assert row["abandon_reason"] == "hold_ended_by_control:cancelled"
-    assert budget_pause.has_budget_pause_checkpoint(tmp_path, "hold-stop", 1) is False
+    # An abandoned row is no pause/consumption evidence: the reaper's one row
+    # read neither parks the id nor fences the ordinary crash retry.
+    from supervisor import worker_health
+
+    assert worker_health._complete_exact_budget_pause_after_death(
+        {}, tmp_path, {"id": "hold-stop"}, "hold-stop", 1) == (False, False)
     assert budget_pause.dispatch_fenced("hold-stop")  # no fence reopen
     budget_pause.end_dispatch_fence("hold-stop")
 
@@ -297,8 +319,7 @@ def test_pending_review_attempt_blocks_release_then_pauses_once_it_settles(tmp_p
     _running_row(tmp_path, "busy-1")
     ctx, limit_ctx = _loop_ctx(tmp_path, "busy-1")
     monkeypatch.setattr(budget_pause, "_HOLD_POLL_SEC", 0.01)
-    monkeypatch.setattr(budget_pause, "observe_external_runs", lambda _c, request_stop=True: {
-        "runs": [], "observed_at": time.time(), "custody_read": "ok", "coverage_basis": "test"})
+    _quiet_external(monkeypatch, budget_pause)
     holds = []
     monkeypatch.setattr(budget_pause, "_publish_hold", lambda _c, row: holds.append(row))
     open_attempt = rc.ActiveReviewAttempt(key="k", operation_id="op-open", wave_key="task_acceptance|busy-1|r")
@@ -440,9 +461,17 @@ def test_unreadable_external_custody_is_held_as_unknown_not_clean(tmp_path, monk
 
     from ouroboros import delegate_custody as custody
 
-    ctx, _limit = _loop_ctx(tmp_path)
+    _running_row(tmp_path, "custody-1")
+    ctx, limit_ctx = _loop_ctx(tmp_path, "custody-1")
+    _fast_hold(monkeypatch, budget_pause)
+    # The loop side resolves THIS context's custody root; one it cannot resolve
+    # is held on the pause row as UNKNOWN, never as "no runs".
     monkeypatch.setattr(custody, "custody_root", lambda _c: (_ for _ in ()).throw(OSError("boom")))
-    observed = budget_pause.observe_external_runs(ctx)
+    with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
+        budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_GLOBAL_EXHAUSTED,
+                                   scope="global", reason_text="x")
+    budget_pause.end_dispatch_fence("custody-1")
+    observed = raised.value.pause["external_runs"]
     assert observed["custody_read"] == "failed" and observed["runs"] == []
     assert "boom" in observed["error"]
     # The supervisor-side twin shares the body: a replay that fails is the same typed fact.
@@ -478,10 +507,14 @@ def test_pausing_row_exists_before_any_wait_and_fences_crash_retry(tmp_path, mon
     assert "simulated death" in held["unsettled"]["observation_error"]
     budget_pause.end_dispatch_fence("drain-1")
     # While that row was live (no source yet) the crash-retry fence already held;
-    # an unreadable record fails closed the same way.
+    # an unreadable record fails closed the same way: the reaper's one row read
+    # parks nothing and fences the retry.
+    from supervisor import worker_health
+
     monkeypatch.setattr(budget_pause, "budget_pause_row",
                         lambda *_a: (_ for _ in ()).throw(OSError("unreadable")))
-    assert budget_pause.has_budget_pause_checkpoint(tmp_path, "drain-1", 1) is True
+    assert worker_health._complete_exact_budget_pause_after_death(
+        {}, tmp_path, {"id": "drain-1"}, "drain-1", 1) == (False, True)
 
 
 def test_light_extraction_is_not_dispatched_under_the_fence(monkeypatch):

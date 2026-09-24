@@ -314,8 +314,7 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
     check above still decides; the record only supplies the queue row.
     """
     from ouroboros.budget_pause import (
-        STATE_PAUSED, STATE_PAUSING, budget_pause_row, exact_pause_marker, parkable_direct_task,
-        set_budget_pause,
+        STATE_PAUSED, STATE_PAUSING, budget_pause_row, exact_pause_marker, set_budget_pause,
     )
     from supervisor import queue as queue_mod
     from supervisor.queue import _queue_lock
@@ -335,8 +334,9 @@ def install_exact_budget_pause(ctx: Any, task_id: str, checkpoint: Dict[str, Any
         if task is None and evt.get("_is_direct_chat") and isinstance(evt.get("task"), dict) \
                 and str(evt["task"].get("id") or "") == task_id:
             # A direct turn ends its live actor on the way out (no second live
-            # actor for this id); the queue row is minted from its own record.
-            task = parkable_direct_task(evt["task"])
+            # actor for this id); the queue row is minted from its own record,
+            # already projected by ``pause_event`` (``parkable_direct_task``).
+            task = dict(evt["task"])
             meta = {"task": task, "attempt": int(task.get("_attempt") or 1), "worker_id": None}
             direct_turn = True
         if task is None:
@@ -680,21 +680,6 @@ def hold_restored_budget_pause(task: Dict[str, Any], drive_root: Any, *, reason:
         result_root=pathlib.Path(task.get("budget_drive_root") or drive_root),
     )
     return task
-
-
-def release_budget_hold(task: Dict[str, Any], *, released_by: str, reason: str) -> Optional[Dict[str, Any]]:
-    """Mark a hold RELEASED in place; returns the prior hold for rollback, or ``None``.
-
-    Reached only from the exact grant, which has just re-validated the pause's
-    durable authority: the hold's own facts are kept on the row (``selected``
-    flips, nothing is erased) so the release stays auditable.
-    """
-    hold = task.get(BUDGET_HOLD_KEY) if isinstance(task.get(BUDGET_HOLD_KEY), dict) else None
-    if hold is None or hold.get("selected"):
-        return None
-    task[BUDGET_HOLD_KEY] = {**hold, "selected": True, "selected_at": utc_now_iso(),
-                             "selected_by": str(released_by or "owner"), "released_reason": str(reason or "")}
-    return hold
 
 
 def hold_root_resume_descendants(q: Any, root_id: str, fence: dict, grant: dict) -> tuple:

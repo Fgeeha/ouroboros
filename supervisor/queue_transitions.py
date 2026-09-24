@@ -1148,10 +1148,10 @@ def reconcile_terminal_task_projections(drive_root, task_id: str) -> None:
 
 
 # The exact-continuation grant lifecycle (#1196) lives in its own owner module;
-# re-exported here because assignment, restore and the tests address these
-# names on THIS surface (the same shape ``supervisor.queue`` uses for this file).
-from supervisor.budget_resume import (  # noqa: E402, F401 -- intentional public re-exports
-    _root_budget_paused_locked,
+# ``grant_exact_budget_resume`` is used above, and ``revoke_exact_budget_resume``
+# is still addressed on THIS surface by ``worker_assignment`` (the same shape
+# ``supervisor.queue`` uses for this file).
+from supervisor.budget_resume import (  # noqa: E402, F401 -- intentional public re-export
     grant_exact_budget_resume,
     revoke_exact_budget_resume,
 )

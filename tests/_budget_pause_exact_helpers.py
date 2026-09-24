@@ -84,18 +84,30 @@ def _pause(tmp_path, monkeypatch, *, task_id="pause-task", rail=None, scope="glo
     ctx, limit_ctx = _loop_ctx(tmp_path, task_id)
     ctx.root_task_id = root_task_id or task_id
     _fast_hold(monkeypatch, budget_pause)
-    monkeypatch.setattr(budget_pause, "observe_external_runs", lambda _ctx, request_stop=True: {
-        "runs": [{"run_id": "run-1", "state": "stop_requested", "stop_outcome": "requested"}],
-        "observed_at": time.time(), "custody_read": "ok", "coverage_basis": "test"})
+    _mock_pause_observation(monkeypatch, budget_pause, [
+        {"run_id": "run-1", "state": "stop_requested", "stop_outcome": "requested"}])
     with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
         budget_pause.request_pause(limit_ctx, rail=rail, scope=scope, reason_text="money gone",
                                    root_task_id=root_task_id or task_id)
     return ctx, limit_ctx, raised.value.pause
 
 
+def _mock_pause_observation(monkeypatch, budget_pause, runs):
+    """Stub the LOOP-side custody observation only (the pause names its own
+    ``reason``); the grant side keeps re-reading custody through the real body."""
+    real_observe = budget_pause.observe_task_runs
+
+    def observe(root, task_id, **kw):
+        if kw.get("reason") != "budget_pause_uncovered_cost":
+            return real_observe(root, task_id, **kw)
+        return {"runs": list(runs), "observed_at": time.time(), "custody_read": "ok",
+                "coverage_basis": "test"}
+
+    monkeypatch.setattr(budget_pause, "observe_task_runs", observe)
+
+
 def _quiet_external(monkeypatch, budget_pause):
-    monkeypatch.setattr(budget_pause, "observe_external_runs", lambda _ctx, request_stop=True: {
-        "runs": [], "observed_at": time.time(), "custody_read": "ok", "coverage_basis": "test"})
+    _mock_pause_observation(monkeypatch, budget_pause, [])
 
 
 def _supervisor_ctx(tmp_path, workers, queue, persisted, pushed):

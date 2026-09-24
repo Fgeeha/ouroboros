@@ -132,11 +132,12 @@ def test_worker_death_during_pausing_completes_the_park_not_a_retry(tmp_path, mo
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
     job = {"worker": workers.WORKERS[0], "task_id": ctx.task_id, "task": task, "meta": meta,
            "worker_id": 0, "exitcode": 1, "drive_root": str(tmp_path)}
-    assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, ctx.task_id, 1) is True
+    assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, ctx.task_id, 1) == (True, True)
     assert workers.RUNNING == {} and workers.PENDING[0]["_budget_pause"]["exact_continuation"] is True
     assert budget_pause.budget_pause_row(tmp_path, ctx.task_id)["pause_source"] == "worker_death_during_pausing"
-    # A different attempt (a retry that never saw the checkpoint) is not adopted.
-    assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, ctx.task_id, 2) is False
+    # A different attempt (a retry that never saw the checkpoint) is neither
+    # adopted nor fenced by this attempt's evidence.
+    assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, ctx.task_id, 2) == (False, False)
 
 
 def test_worker_death_holding_an_unconsumed_grant_reparks_instead_of_terminalizing(tmp_path, monkeypatch):
@@ -162,7 +163,7 @@ def test_worker_death_holding_an_unconsumed_grant_reparks_instead_of_terminalizi
     monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
     job = {"worker": workers.WORKERS[0], "task_id": "death-1", "task": dict(task), "meta": meta,
            "worker_id": 0, "exitcode": 1, "drive_root": str(tmp_path)}
-    assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, "death-1", 1) is True
+    assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, "death-1", 1) == (True, True)
     assert workers.RUNNING == {}
     parked = workers.PENDING[0]
     assert parked["id"] == "death-1" and parked["_budget_pause"]["exact_continuation"] is True
@@ -203,7 +204,8 @@ def test_worker_death_after_a_consumed_grant_is_not_reopened(tmp_path, monkeypat
     monkeypatch.setattr(worker_health, "_dead_job_is_current", lambda job: True)
     job = {"worker": workers.WORKERS[0], "task_id": "death-2", "task": dict(task), "meta": meta,
            "worker_id": 0, "exitcode": 1, "drive_root": str(tmp_path)}
-    assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, "death-2", 1) is False
+    # Not re-armed, but the consumed grant still fences the ordinary crash retry.
+    assert worker_health._complete_exact_budget_pause_after_death(job, tmp_path, task, "death-2", 1) == (False, True)
     assert "death-2" in workers.RUNNING and workers.PENDING == []
     after = budget_pause.budget_pause_row(tmp_path, "death-2")
     assert after["state"] == budget_pause.STATE_RESUMED and not after["grant"].get("revoked_at")
@@ -298,7 +300,7 @@ def test_root_grant_refuses_a_cached_tree_snapshot_and_admits_a_fresh_read(tmp_p
 
 def test_grant_is_revoked_when_money_vanishes_before_dispatch(tmp_path, monkeypatch):
     from ouroboros import budget_pause
-    from supervisor.queue_transitions import revoke_exact_budget_resume
+    from supervisor.budget_resume import revoke_exact_budget_resume
 
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)

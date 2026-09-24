@@ -279,8 +279,15 @@ def recover_confirmed_dead_worker(job: dict) -> None:
 
 
 def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task: dict,
-                                             task_id: str, attempt: int) -> bool:
+                                             task_id: str, attempt: int) -> tuple[bool, bool]:
     """Worker death DURING durable budget pausing: finish the park, retry nothing.
+
+    Returns ``(parked, fenced)`` from ONE read of the durable pause row:
+    ``parked`` when the SAME task id was returned to its exact pause here, and
+    ``fenced`` when pause/consumption evidence for THIS attempt (a live pause,
+    a resumed row, a consumed grant — a ``pausing`` row without a source yet
+    included) forbids the ordinary crash retry. Fail-closed: an UNREADABLE
+    record cannot authorize a retry either.
 
     The pause row and its source were written before the worker unwound; the
     dead process took every local producer with it, so the durable rows are
@@ -300,10 +307,7 @@ def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task
     ran on, and its death takes terminal crash custody without ordinary retry.
     """
     from ouroboros.budget_pause import (
-        STATE_PAUSED,
-        STATE_PAUSING,
-        STATE_RESUME_GRANTED,
-        budget_pause_row,
+        LIVE_PAUSE_STATES, STATE_RESUME_GRANTED, STATE_RESUMED, budget_pause_row,
     )
     from supervisor.events_budget import install_exact_budget_pause
 
@@ -311,19 +315,20 @@ def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task
     try:
         row = budget_pause_row(result_root, task_id)
     except Exception:
-        return False
+        return False, True
     state = str(row.get("state") or "") if row else ""
-    if not (row and state in {STATE_PAUSING, STATE_PAUSED, STATE_RESUME_GRANTED}
-            and int(row.get("task_attempt") or 0) == int(attempt) and row.get("source_ref")):
-        return False
+    grant = row.get("grant") if isinstance(row.get("grant"), dict) else {}
+    fenced = bool(row and (state in LIVE_PAUSE_STATES or state == STATE_RESUMED or grant.get("consumed_at"))
+                  and int(row.get("task_attempt") or 0) == int(attempt))
+    if not (fenced and state in LIVE_PAUSE_STATES and row.get("source_ref")):
+        return False, fenced
     source = "worker_death_during_pausing"
     with _queue_lock:
         if not _dead_job_is_current(job):
-            return False
+            return False, fenced
         if state == STATE_RESUME_GRANTED:
-            grant = row.get("grant") if isinstance(row.get("grant"), dict) else {}
             if grant.get("consumed_at"):
-                return False  # the loop consumed it and ran on: ordinary custody
+                return False, fenced  # the loop consumed it and ran on: ordinary custody
             from supervisor.budget_resume import revoke_exact_budget_resume
             from supervisor.events_budget import BUDGET_HOLD_KEY
             from ouroboros.budget_pause import exact_pause_marker
@@ -334,7 +339,7 @@ def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task
             })
             if not revoke_exact_budget_resume(task, "worker_death_before_consumption"):
                 if task.get("_budget_pause_consumed"):
-                    return False  # a concurrent consumption keeps crash custody, never re-arms
+                    return False, fenced  # a concurrent consumption keeps crash custody, never re-arms
                 # Revocation failure is a nonterminal hold, never a crash retry
                 # or terminal. Preserve exact source and grant identity even if
                 # neither the result store nor the snapshot is writable.
@@ -359,7 +364,7 @@ def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task
                     log.error("Budget hold snapshot failed for %s", task_id, exc_info=True)
                 log.warning("Dead worker %s retained in nonterminal hold; snapshot persisted=%s",
                             task_id, hold["snapshot_persisted"])
-                return True
+                return True, fenced
             running = _pool().RUNNING.get(task_id)
             if isinstance(running, dict) and isinstance(running.get("task"), dict):
                 running["task"].pop("_budget_pause_resume", None)
@@ -373,7 +378,7 @@ def _complete_exact_budget_pause_after_death(job: dict, root: pathlib.Path, task
         from supervisor.task_reaper import TerminalFileRecoveryPending
 
         raise TerminalFileRecoveryPending("exact budget pause parking remains pending")
-    return True
+    return True, fenced
 
 
 def _recover_crashed_task_without_terminal(job: dict, queue: Any) -> None:
@@ -399,15 +404,12 @@ def _recover_crashed_task_without_terminal(job: dict, queue: Any) -> None:
         0,
     )
     attempt = int(task.get("_attempt") or 1)
-    if _complete_exact_budget_pause_after_death(job, root, task, task_id, attempt):
-        return
-    from ouroboros.budget_pause import has_budget_pause_checkpoint
-
     # A `pausing` row without a checkpoint yet (death during the drain), or an
     # UNREADABLE pause record, fences the ordinary retry exactly like an
     # owner-wait checkpoint: completed work is never replayed (#1196).
-    budget_pausing = has_budget_pause_checkpoint(
-        pathlib.Path(task.get("budget_drive_root") or root), task_id, attempt)
+    parked, budget_pausing = _complete_exact_budget_pause_after_death(job, root, task, task_id, attempt)
+    if parked:
+        return
     replay_unsafe = (not getattr(w, "active_capacity", True)
                      or has_owner_wait_checkpoint(meta, attempt) or budget_pausing)
     # Reconstruct cost/rounds from durable llm_usage for any

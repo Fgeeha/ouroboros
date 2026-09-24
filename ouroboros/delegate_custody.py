@@ -716,22 +716,6 @@ def run_timing(drive_root: Any, run_id: str) -> Tuple[str, int]:
     return started_ts, max_seconds
 
 
-def run_cap_basis(drive_root: Any, run_id: str) -> str:
-    """How a run's ``maxSeconds`` was decided, from its durable STARTED row
-    (``delegate_registration_policy.CAP_BASIS_*``); "" when the run is unknown
-    or the row predates the field — an absent basis stays absent (#1196)."""
-    rid = str(run_id or "").strip()
-    if not rid:
-        return ""
-    for row in custody_rows(drive_root):
-        if str(row.get("run_id") or "") != rid or str(row.get("type") or "") != STARTED:
-            continue
-        basis = str(row.get("max_seconds_basis") or "")
-        if basis:
-            return basis
-    return ""
-
-
 def idempotency_key(*parts: Any) -> str:
     """A deterministic IDENTITY for one logical start — the lookup key, not the wire key.
 
@@ -1488,7 +1472,6 @@ __all__ = [
     "reconcile_task_runs",
     "retire_project",
     "review_owned_source",
-    "run_cap_basis",
     "run_timing",
     "settle_run",
     "settled_output_unread",

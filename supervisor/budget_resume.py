@@ -25,40 +25,22 @@ from ouroboros.utils import utc_now_iso
 log = logging.getLogger(__name__)
 
 
-def _root_budget_paused_locked(q: Any, root_task_id: str, *, except_task_id: str = "") -> bool:
-    """Whether the ROOT of a tree is itself still budget-paused (queue lock held).
-
-    Owner Q9: a root's Resume makes its own budget-paused descendants ELIGIBLE;
-    a descendant cannot be resumed under a root that is still paused.
-    """
-    root_task_id = str(root_task_id or "")
-    if not root_task_id or root_task_id == except_task_id:
-        return False
-    for row in q.PENDING:
-        if str(row.get("id") or "") == root_task_id and isinstance(row.get("_budget_pause"), dict):
-            return True
-    return False
-
-
 def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
                               *, selected_by: str = "",
                               external: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Mint ONE pause/generation-bound grant under the queue lock.
 
-    Refuse unknown/stale money, exhausted wallets, Stop, deadline, finite lifetime,
-    unreadable checkpoint or unsettled custody. The queue marker is a locator:
-    refresh it from a newer durable pause, never trust its stale identity.
-    ``paused_duration_sec`` carries the paused interval without moving the
-    original ``started_at`` or resetting the quota clock. ``external`` is THIS
-    grant's fresh custody observation, otherwise read here: request stops for
-    uncovered live runs; unknown/requested stops cannot license a second writer.
-    Model ``selected_by`` needs its root's live owner-derived grant (Q9).
-    Direct actors use the same seam after parking under their own id.
+    Refuse unknown/stale money, exhausted wallets, Stop, deadline, finite
+    lifetime, an unreadable checkpoint or unsettled custody; a stale queue
+    locator is refreshed from the durable pause, never trusted. ``paused_duration_sec``
+    carries the paused interval without moving ``started_at`` or resetting the
+    quota clock. ``external`` is THIS grant's fresh custody observation (else read
+    here); a model ``selected_by`` needs its root's live owner-derived grant (Q9).
     """
     from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.budget_pause import (
-        LIVE_PAUSE_STATES, STATE_PAUSED, STATE_RESUME_GRANTED, exact_pause_marker,
-        observe_task_runs, set_budget_pause, unsettled_external_runs,
+        EXTERNAL_STOP_CONFIRMED, LIVE_PAUSE_STATES, STATE_PAUSED, STATE_RESUME_GRANTED,
+        exact_pause_marker, observe_task_runs, set_budget_pause,
     )
     from ouroboros.cancel_intents import has_active_intent
     from ouroboros.config import get_task_abs_ceiling_sec
@@ -68,7 +50,6 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
     from supervisor.events_budget import (
         BUDGET_HOLD_KEY, HOLD_RESTART_REVOCATION_UNWRITTEN, HOLD_REVOCATION_UNWRITTEN, HOLD_MALFORMED_RESUME_IDENTITY,
         hold_budget_row, live_root_resume_grant, hold_root_resume_descendants,
-        release_budget_hold,
     )
     from supervisor import queue as q
     from supervisor.state import budget_remaining
@@ -107,8 +88,7 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
             or not row.get("source_ref")):
         return {"ok": False, "error": "pause_record_missing", "action": "cancel_or_new_run"}
     if int(row.get("task_attempt") or 0) != int(task.get("_attempt") or 1):
-        # The queue row would dispatch another attempt than the one the
-        # checkpoint belongs to; the loop would refuse the grant on arrival.
+        # Another attempt than the checkpoint's: the loop would refuse the grant on arrival.
         return {"ok": False, "error": "pause_attempt_mismatch", "action": "cancel_or_new_run",
                 "row_attempt": int(row.get("task_attempt") or 0), "queue_attempt": int(task.get("_attempt") or 1)}
     hold = task.get(BUDGET_HOLD_KEY) if isinstance(task.get(BUDGET_HOLD_KEY), dict) else {}
@@ -118,8 +98,7 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
     if "grant" in row and not str(live_grant.get("grant_id") or "").strip():
         return {"ok": False, "error": "malformed_grant_identity"}
     if row.get("state") == STATE_RESUME_GRANTED and not live_grant.get("revoked_at"):
-        # Only a hold naming this undispatched grant, with no remaining handoff,
-        # proves it orphaned. Write its deferred revocation before minting again.
+        # Orphaned = a hold names this undispatched grant with no handoff left: revoke it first.
         orphaned = bool(
             hold and not hold.get("selected")
             and str(hold.get("reason") or "") in {HOLD_REVOCATION_UNWRITTEN, HOLD_RESTART_REVOCATION_UNWRITTEN}
@@ -146,14 +125,15 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
         read_actor_source_bytes(result_root, task_id, row["source_ref"])
     except Exception:
         return {"ok": False, "error": "pause_source_unreadable", "action": "cancel_or_new_run"}
-    # The caller observed custody outside the queue lock; absent that observation,
-    # read it now. Preserve unknown/requested stops as refusals, never an empty set.
+    # Custody observed outside the queue lock by the caller, else read now.
     if not isinstance(external, dict):
         external = observe_task_runs(result_root, task_id, reason="budget_resume_uncovered_cost")
     if external.get("custody_read") != "ok":
         return {"ok": False, "error": "external_custody_unreadable",
                 "detail": str(external.get("error") or ""), "action": "retry_or_cancel"}
-    unsettled = unsettled_external_runs(external)
+    # ``stop_confirmed`` is the only terminal fact; every other run stays under custody.
+    unsettled = [run for run in (external.get("runs") or [])
+                 if isinstance(run, dict) and str(run.get("state") or "") != EXTERNAL_STOP_CONFIRMED]
     if unsettled:
         try:
             set_budget_pause(result_root, task_id, {**row, "external_runs": external},
@@ -200,9 +180,8 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
     if str(pause.get("scope") or "") == "root":
         from ouroboros.usage_accounting import refresh_root_accounting
 
-        # ONE fresh successful ledger observation is this grant's monetary
-        # authority: the strict read never answers from the display cache, so
-        # a snapshot cached before a read that just failed cannot pose as room.
+        # ONE fresh strict ledger read is this grant's monetary authority: it never
+        # answers from the display cache, so a stale snapshot cannot pose as room.
         tree = refresh_root_accounting(result_root, root_task_id, strict=True)
         if not isinstance(tree, dict):
             # Unknown tree spend is not room: an unreadable ledger refuses typed.
@@ -219,7 +198,10 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
             if float(accounted) >= float(limit) - 1e-9:
                 return {"ok": False, "error": "root_hard_cap_exhausted",
                         "action": "increase_budget_then_resume"}
-    if _root_budget_paused_locked(q, root_task_id, except_task_id=task_id):
+    # Owner Q9: a descendant cannot be resumed under a root that is itself still paused.
+    if root_task_id != task_id and any(
+            str(item.get("id") or "") == root_task_id and isinstance(item.get("_budget_pause"), dict)
+            for item in q.PENDING):
         return {"ok": False, "error": "root_still_paused", "root_task_id": root_task_id,
                 "action": "resume_root_first"}
     # A later Resume raises the generation; older grants cannot become live again.
@@ -240,8 +222,7 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
     }
     prior_pause = dict(pause)
     try:
-        # CAS against the state this grant was validated on: a concurrent
-        # writer (a late revocation, another grant) refuses here, typed.
+        # CAS on the validated state: a concurrent writer refuses here, typed.
         set_budget_pause(result_root, task_id,
                          {**row, "state": STATE_RESUME_GRANTED, "grant": grant,
                           "resume_generation": generation},
@@ -257,8 +238,12 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
         **{key: grant[key] for key in ("selected_by", "root_grant_id", "root_resume_generation", "root_fence_id")},
     }
     task["budget_resumed_at"] = grant["granted_at"]
-    # Release a restore/revocation hold only after re-validating its durable authority.
-    released_hold = release_budget_hold(task, released_by=grant["selected_by"], reason="exact_resume_granted")
+    # Release a re-validated restore/revocation hold in place (``selected`` flips,
+    # nothing is erased); the prior hold is kept for the snapshot rollback below.
+    released_hold = hold if hold and not hold.get("selected") else None
+    if released_hold is not None:
+        task[BUDGET_HOLD_KEY] = {**released_hold, "selected": True, "selected_at": utc_now_iso(),
+                                 "selected_by": grant["selected_by"], "released_reason": "exact_resume_granted"}
     fence = q.BUDGET_ROOT_FENCES.get(root_task_id)
     fence_released = False
     held_siblings: List[str] = []
@@ -266,9 +251,8 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
     rebound_holds: Dict[str, Dict[str, Any]] = {}
     if (task_id == root_task_id and isinstance(fence, dict) and str(fence.get("fence_id") or "")
             == str(prior_pause.get("fence_id") or fence.get("fence_id"))):
-        # The root's own Resume lifts its admission latch: exact-continuation
-        # descendants keep their OWN `_budget_pause` rows and are only ELIGIBLE
-        # now; the model selects each through this same control (Q9).
+        # The root's own Resume lifts its admission latch: exact descendants keep
+        # their OWN `_budget_pause` rows and are only ELIGIBLE; the model selects each (Q9).
         q.BUDGET_ROOT_FENCES.pop(root_task_id, None)
         fence_released = True
         held_siblings, released_markers, rebound_holds = hold_root_resume_descendants(q, root_task_id, fence, grant)
@@ -295,8 +279,8 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
         except Exception as rollback_error:
             detail = str(rollback_error)[:120]
             log.warning("Exact resume grant rollback remains unpersisted for %s", task_id, exc_info=True)
-        # The rollback failed: retain this orphaned grant's identity in the existing
-        # hold so the next Resume can write its deferred revocation before minting.
+        # Rollback failed: the hold keeps this orphaned grant's identity so the
+        # next Resume writes its deferred revocation before minting.
         hold_budget_row(
             task, reason=HOLD_REVOCATION_UNWRITTEN,
             detail=f"snapshot_not_persisted:{detail}",

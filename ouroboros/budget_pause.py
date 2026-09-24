@@ -199,8 +199,7 @@ def register_tool_future(ctx: Any, operation_id: str, tool: str, future: Any) ->
     if future is None or not op or not str(getattr(ctx, "task_id", "") or ""):
         return lambda: None
     row: Dict[str, Any] = {"operation_id": op, "tool": str(tool or ""),
-                           "settled": threading.Event(), "holds": 0,
-                           "done": False, "observable": True}
+                           "settled": threading.Event(), "holds": 0, "done": False}
     scope = tool_scope_key(ctx)
     with _TOOL_LOCK:
         rows = _TOOL_FUTURES.setdefault(scope, {})
@@ -220,14 +219,10 @@ def register_tool_future(ctx: Any, operation_id: str, tool: str, future: Any) ->
         if settled:
             row["settled"].set()
 
-    try:
-        future.add_done_callback(_done)
-    except Exception:
-        # A row this registry cannot observe is UNKNOWN, not quiescent: it never
-        # settles, so the pause holds on it instead of releasing blind.
-        log.warning("Tool future %s cannot be observed for budget-pause quiescence", op, exc_info=True)
-        with _TOOL_LOCK:
-            row["observable"] = False
+    # Both producers register a ``concurrent.futures.Future`` (the stateful and
+    # the abandoned-on-timeout executors): attaching the callback never raises,
+    # and an already-finished future runs ``_done`` inline.
+    future.add_done_callback(_done)
     return owner_release
 
 
@@ -289,33 +284,14 @@ def drain_local_tool_futures(ctx: Any, *, timeout_sec: float) -> Dict[str, Any]:
     for row in rows:
         fact = {"operation_id": row["operation_id"], "tool": row["tool"]}
         remaining = max(0.0, deadline - time.monotonic())
-        if row["observable"] and row["settled"].wait(remaining):
+        if row["settled"].wait(remaining):
             settled.append(fact)
         else:
-            unsettled.append({**fact, "state": "running" if row["observable"] else "unobservable"})
+            unsettled.append({**fact, "state": "running"})
     return {"drained": not unsettled, "registry": "ok", "settled": settled, "unsettled": unsettled}
 
 
-# --- eligibility and program counter ---------------------------------------------
-
-def pause_ineligibility(ctx: Any) -> str:
-    """Empty when an exact pause is possible; otherwise the typed reason.
-
-    The reason is recorded on the terminal ``resource_limit`` so a context
-    without a continuation owner, a task id or a durable root is excluded
-    LOUDLY. A direct owner-chat actor is ELIGIBLE: its continuation owner is
-    the queue carrier the supervisor parks its task record in (the direct lane
-    binds ``direct_owner_wait`` as its wait callback, the same seam a pooled
-    worker binds ``worker_owner_wait`` to).
-    """
-    if not callable(getattr(ctx, "owner_wait_callback", None)):
-        return "no_continuation_owner"
-    if not str(getattr(ctx, "task_id", "") or ""):
-        return "no_task_id"
-    if not (getattr(ctx, "budget_drive_root", None) or getattr(ctx, "drive_root", None)):
-        return "no_durable_root"
-    return ""
-
+# --- program counter ---------------------------------------------------------------
 
 def pending_tool_call_ids(messages: List[Dict[str, Any]]) -> List[str]:
     """Tool calls of the LAST assistant batch that have no recorded result.
@@ -346,28 +322,21 @@ def pending_tool_call_ids(messages: List[Dict[str, Any]]) -> List[str]:
     return [call_id for call_id in wanted if call_id not in answered]
 
 
-def resume_point(messages: List[Dict[str, Any]], round_idx: int) -> Dict[str, Any]:
-    pending = pending_tool_call_ids(messages)
-    return {
-        "round_idx": int(round_idx),
-        "phase": "partial_tool_batch_unknown" if pending else "boundary",
-        "unanswered_tool_call_ids": pending,
-        "unanswered_policy": "not_re_executed_execution_unknown",
-    }
-
-
 # --- external custody (owner Q8) ---------------------------------------------------
 
-def observe_task_runs(root: Any, task_id: str, *, request_stop: bool = True,
-                      reason: str = "budget_resume_uncovered_cost",
+def observe_task_runs(root: Any, task_id: str, *, reason: str = "budget_resume_uncovered_cost",
                       read_error: str = "") -> Dict[str, Any]:
     """The ONE observer body behind the loop-side pause and the supervisor-side grant.
 
     A FRESH custody read for ``task_id`` on ``root`` (never a pause row's saved
-    summary), requesting a stop for every run still open — its remaining cost
-    is uncovered/unknown while it runs — and recording the typed outcome. An
-    unreadable custody store (``read_error``, or the replay failing here) is a
-    typed ``custody_read=failed`` observation, never an empty (clean-looking) list.
+    summary), requesting a stop for every run still open — pre-terminal
+    subscription cost coverage cannot be proved from the ledger (owner Q8), so
+    its remaining cost is uncovered/unknown while it runs — and recording the
+    typed outcome through the verified cancel seam. ``requested`` and
+    ``unknown`` are NOT death: the run stays under this task's custody and no
+    second writer may be started over it. An unreadable custody store
+    (``read_error`` from the caller, or the replay failing here) is a typed
+    ``custody_read=failed`` observation, never an empty (clean-looking) list.
     """
     runs: List[Any] = []
     if not read_error:
@@ -388,16 +357,14 @@ def observe_task_runs(root: Any, task_id: str, *, request_stop: bool = True,
     if not runs:
         return {"runs": [], "observed_at": time.time(), "custody_read": "ok", "coverage_basis": "no_open_runs"}
     rows: List[Dict[str, Any]] = []
-    gateway = None
-    if request_stop:
-        try:
-            from ouroboros.gateways.claudexor import ClaudexorGateway
+    try:
+        from ouroboros.gateways.claudexor import ClaudexorGateway
 
-            gateway = ClaudexorGateway()
-            gateway.handshake()
-        except Exception as exc:
-            log.warning("Budget pause cannot reach the harness gateway to request stops: %s", exc)
-            gateway = None
+        gateway = ClaudexorGateway()
+        gateway.handshake()
+    except Exception as exc:
+        log.warning("Budget pause cannot reach the harness gateway to request stops: %s", exc)
+        gateway = None
     try:
         from ouroboros import delegate_custody as custody
 
@@ -436,41 +403,6 @@ def observe_task_runs(root: Any, task_id: str, *, request_stop: bool = True,
                 log.debug("Gateway close after pause stop requests failed", exc_info=True)
     return {"runs": rows, "observed_at": time.time(), "custody_read": "ok",
             "coverage_basis": "preterminal_subscription_coverage_unprovable"}
-
-
-def observe_external_runs(ctx: Any, *, request_stop: bool = True) -> Dict[str, Any]:
-    """Observe every unsettled delegated run this task holds; request stops.
-
-    Pre-terminal subscription cost coverage cannot be proved from the ledger
-    (the reservation of one call never covers a whole session), so the owner's
-    Q8 branch for UNPROVEN coverage applies to every open run: a stop is
-    requested through the verified cancel seam and its typed outcome recorded.
-    ``requested`` and ``unknown`` are NOT death: the run stays under this
-    task's custody and no second writer may be started over it. The loop-side
-    reader resolves this context's custody root, then shares the one body.
-    """
-    root, read_error = "", ""
-    try:
-        from ouroboros import delegate_custody as custody
-
-        root = custody.custody_root(ctx)
-    except Exception as exc:
-        log.warning("External custody root unresolvable at budget pause", exc_info=True)
-        read_error = f"{type(exc).__name__}: {str(exc)[:200]}"
-    return observe_task_runs(root, str(ctx.task_id), request_stop=request_stop,
-                             reason="budget_pause_uncovered_cost", read_error=read_error)
-
-
-def unsettled_external_runs(observation: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """The runs of one observation that are NOT proven terminal.
-
-    ``stop_confirmed`` is the only terminal fact (a verified receipt, a
-    settlement, or the daemon answering absent); running, requested and
-    unknown all leave the run under custody, where a second writer may not be
-    started over it.
-    """
-    return [run for run in (observation.get("runs") or [])
-            if isinstance(run, dict) and str(run.get("state") or "") != EXTERNAL_STOP_CONFIRMED]
 
 
 def drain_local_review_attempts(task_id: str, *, timeout_sec: float) -> Dict[str, Any]:
@@ -529,11 +461,6 @@ def local_producer_observation(ctx: Any, *, timeout_sec: float) -> Dict[str, Any
         "tool_futures": tool_futures,
         "quiescent": bool(review.get("drained")) and review.get("registry") == "ok"
                      and bool(tool_futures.get("drained")),
-        "acceptance_pending": str(getattr(ctx, "_task_acceptance_pending", "") or ""),
-        "acceptance_reviewed_subject": str(getattr(ctx, "_task_acceptance_reviewed_subject", "") or ""),
-        "note": ("sends started before the fence settle through their own custody, and a tool "
-                 "future settles only once its late settlement callback has finished; nothing "
-                 "was re-sent, extracted, settled or refunded during pausing"),
     }
 
 
@@ -586,22 +513,6 @@ def budget_pause_row(root: Any, task_id: str) -> Dict[str, Any]:
     row = load_task_result(pathlib.Path(root), str(task_id), strict=True) or {}
     pause = row.get("budget_pause")
     return dict(pause) if isinstance(pause, dict) else {}
-
-
-def has_budget_pause_checkpoint(root: Any, task_id: str, task_attempt: int) -> bool:
-    """Pause/consumption evidence for THIS attempt: crash retry must not replay it.
-
-    Fail-closed: an UNREADABLE record cannot authorize an ordinary retry, and a
-    ``pausing`` row without a source yet (death during a hold) still fences the
-    retry — the work up to that point is not re-run.
-    """
-    try:
-        pause = budget_pause_row(root, task_id)
-    except Exception:
-        return True
-    return bool(pause and (pause.get("state") in LIVE_PAUSE_STATES
-                          or pause.get("state") == STATE_RESUMED or (pause.get("grant") or {}).get("consumed_at"))
-                and int(pause.get("task_attempt") or 0) == int(task_attempt))
 
 
 # --- the pause itself -----------------------------------------------------------------
@@ -707,12 +618,28 @@ def _exact_continuation_row(limit_ctx: Any, ctx: Any, *, pause_id: str, rail: st
     from ouroboros.owner_wait import continuation_state, store_continuation_source
 
     usage = limit_ctx.accumulated_usage
-    external = observe_external_runs(ctx)
+    # Owner Q8, loop side: resolve THIS context's custody root, then share the
+    # one observer body with the grant. A root that cannot be resolved is the
+    # same typed ``custody_read=failed`` fact as an unreadable store.
+    root, read_error = "", ""
+    try:
+        from ouroboros import delegate_custody as custody
+
+        root = custody.custody_root(ctx)
+    except Exception as exc:
+        log.warning("External custody root unresolvable at budget pause", exc_info=True)
+        read_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+    external = observe_task_runs(root, str(ctx.task_id), reason="budget_pause_uncovered_cost",
+                                 read_error=read_error)
     messages = limit_ctx.messages
     trace = limit_ctx.llm_trace if isinstance(limit_ctx.llm_trace, dict) else {}
     seen = set(limit_ctx.owner_msg_seen or ())
-    point = resume_point(messages, limit_ctx.round_idx)
-    point["budget_tail"] = getattr(limit_ctx, "budget_tail", "tool")
+    pending = pending_tool_call_ids(messages)
+    point = {"round_idx": int(limit_ctx.round_idx),
+             "phase": "partial_tool_batch_unknown" if pending else "boundary",
+             "unanswered_tool_call_ids": pending,
+             "unanswered_policy": "not_re_executed_execution_unknown",
+             "budget_tail": getattr(limit_ctx, "budget_tail", "tool")}
     # The rail already stamped its terminal projection on the live usage, and a
     # hold leaves its own transient row there; neither may travel into the
     # resumed loop's eventual honest terminal.
@@ -778,7 +705,17 @@ def request_pause(limit_ctx: Any, *, rail: str, scope: str, reason_text: str,
     ctx = getattr(tools, "_ctx", None)
     if ctx is None or rail not in RAILS:
         return None
-    ineligible = pause_ineligibility(ctx)
+    # A context without a continuation owner, a task id or a durable root is
+    # excluded LOUDLY: the typed reason lands on the terminal ``resource_limit``.
+    # A direct owner-chat actor IS eligible — its continuation owner is the queue
+    # carrier the supervisor parks its record in (the direct lane binds
+    # ``direct_owner_wait`` to the same wait seam a pooled worker binds
+    # ``worker_owner_wait`` to).
+    ineligible = ("no_continuation_owner" if not callable(getattr(ctx, "owner_wait_callback", None))
+                  else "no_task_id" if not str(getattr(ctx, "task_id", "") or "")
+                  else "no_durable_root" if not (getattr(ctx, "budget_drive_root", None)
+                                                 or getattr(ctx, "drive_root", None))
+                  else "")
     usage = limit_ctx.accumulated_usage
     if ineligible:
         usage["exact_pause_unavailable"] = ineligible

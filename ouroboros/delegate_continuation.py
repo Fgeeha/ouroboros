@@ -119,7 +119,12 @@ def bind_continuation(ctx: Any, drive: Any, run_id: str, *, actor: Dict[str, Any
             f"maxSeconds expiry ({CONTINUATION_CAUSE}). An owner deadline, Stop or Panic, a user cancel or a "
             "failure is not continued through this seam.")
     started_ts, prior_max_seconds = custody.run_timing(drive, rid)
-    cap_basis = custody.run_cap_basis(drive, rid)
+    # How the cap was decided (``delegate_registration_policy.CAP_BASIS_*``), from
+    # the same durable STARTED row; "" when the row predates the field — an
+    # absent basis stays absent (#1196).
+    cap_basis = next((str(row.get("max_seconds_basis") or "") for row in custody.custody_rows(drive)
+                      if str(row.get("run_id") or "") == rid and str(row.get("type") or "") == custody.STARTED
+                      and row.get("max_seconds_basis")), "")
     if not cap_basis:
         return {}, REFUSAL_CAP_BASIS_UNKNOWN, (
             f"Run {rid}'s STARTED row records no basis for its maxSeconds cap, so its expiry cannot be told "

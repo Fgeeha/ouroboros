@@ -119,8 +119,8 @@ def test_orphaned_unwritten_revocation_is_written_by_the_next_resume_before_a_ne
     handoff leaves with the hold, so that grant is never dispatched); the next
     Resume writes the deferred revocation, then mints generation 2."""
     from ouroboros import budget_pause
+    from supervisor.budget_resume import revoke_exact_budget_resume
     from supervisor.events_budget import budget_hold_fact
-    from supervisor.queue_transitions import revoke_exact_budget_resume
 
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
@@ -434,26 +434,35 @@ def test_root_resume_holds_a_fence_bound_child_marker_instead_of_stranding_it(tm
 
 
 def test_a_consumed_carrier_never_drops_a_newer_owner_wait_continuation(tmp_path, monkeypatch):
-    """F3: a spent exact-resume handoff is retired when the supervisor's own park
-    event proves the durable grant was consumed. A stale carrier that reaches a
-    restore beside a NEWER owner-wait handoff is retired there too — fencing the
-    row as "consumed" would drop a valid planned-restart continuation."""
+    """F3: a spent exact-resume handoff that reaches a revocation (a restore, lost
+    money, a new root fence) beside a NEWER owner-wait handoff is retired by the
+    revocation seam once the durable grant reads as consumed — fencing the row as
+    "consumed" would drop a valid planned-restart continuation. An UNCONSUMED
+    grant is never merely retired: it is revoked under its own identity and the
+    SAME id returns to its exact pause."""
     from ouroboros import budget_pause, owner_wait
+    from supervisor.budget_resume import revoke_exact_budget_resume
     from supervisor.events_budget import budget_hold_fact
-    from supervisor.worker_owner_wait import retire_consumed_budget_carrier
 
     queue, state, workers = _install_queue(tmp_path, monkeypatch)
     monkeypatch.setattr(state, "budget_remaining", lambda _st, **_k: 5.0)
     task, _row = _parked(tmp_path, monkeypatch, task_id="wait-3")
     assert queue.resume_budget_paused_task("wait-3")["ok"] is True
+    first_grant = str(task["_budget_pause_resume"]["grant_id"])
+
+    # An UNCONSUMED grant is revoked, not retired: the restart's revocation
+    # re-parks the SAME id under its exact marker.
+    assert revoke_exact_budget_resume(task, "restart_before_dispatch") is True
+    assert "_budget_pause_resume" not in task and task["_budget_pause"]["exact_continuation"] is True
+    revoked = budget_pause.budget_pause_row(tmp_path, "wait-3")
+    assert revoked["state"] == budget_pause.STATE_PAUSED and revoked["grant"]["grant_id"] == first_grant
+    assert revoked["grant"]["revoke_reason"] == "restart_before_dispatch"
+
+    assert queue.resume_budget_paused_task("wait-3")["ok"] is True
     carrier = dict(task["_budget_pause_resume"])
     granted = budget_pause.budget_pause_row(tmp_path, "wait-3")
     grant_id = str(granted["grant"]["grant_id"])
-
-    # An UNCONSUMED grant is left exactly where it is: the restart must revoke it.
-    assert retire_consumed_budget_carrier(tmp_path, "wait-3", task) == ""
-    assert task["_budget_pause_resume"]["grant_id"] == grant_id
-
+    assert grant_id != first_grant
     consumed = {**dict(granted["grant"]), "consumed_at": time.time()}
     budget_pause.set_budget_pause(
         tmp_path, "wait-3", {**granted, "state": budget_pause.STATE_RESUMED, "grant": consumed},
@@ -462,8 +471,12 @@ def test_a_consumed_carrier_never_drops_a_newer_owner_wait_continuation(tmp_path
     task["_owner_wait_resume"] = {"wait_id": "w-3", "restart_transaction_id": "tx-3",
                                   "task_attempt": 1, "source_ref": {"path": "owner-wait.json"},
                                   "started_at": time.time() - 10.0}
-    assert retire_consumed_budget_carrier(tmp_path, "wait-3", task) == grant_id
+    # The spent carrier is retired beside the newer owner-wait handoff: no hold,
+    # no re-minted marker, the durable RESUMED row untouched.
+    assert revoke_exact_budget_resume(task, "restart_before_dispatch") is False
     assert "_budget_pause_resume" not in task and task["_owner_wait_resume"]["wait_id"] == "w-3"
+    assert "_budget_pause" not in task and "_budget_pause_consumed" not in task
+    assert budget_hold_fact(task) is None
 
     # A snapshot taken BEFORE that retirement still restores the owner wait.
     task["_budget_pause_resume"] = carrier
