@@ -249,10 +249,10 @@ def _cancel_state_facts(ctx: Any, task_id: str) -> Dict[str, Any]:
 def _project_routing_manifest(ctx: Any, project_id: str) -> Dict[str, Any]:
     """The room's bounded HINT for a "continue this work" decision: the project's
     recent ROOT results and the roots still live in it, each with the small typed
-    facts that separate the two choices - a finished root is promote's predecessor,
+    facts that separate the two choices - a settled root is promote's predecessor,
     a live one is ``steer_task``.
 
-    A hint, never the door: promote's predicate admits any settled root, listed
+    A hint, never the door: promote's predicate admits any settled result, listed
     or not, of any project (ch. 10), so this window may be bounded without
     deciding what the room can continue. Until it existed a room saw exactly ONE
     candidate, the registry pointer, so a room whose pointer had moved could not
@@ -281,7 +281,7 @@ def _not_a_root_result(row: Dict[str, Any]) -> bool:
 
 def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str, Any]]:
     """Newest ROOT task result bound to ``project_id`` (a child's is never the room's
-    continuation: the promote door refuses it, ``_is_child_result``) WITHOUT replaying the whole
+    last-result pointer: the hint offers roots only, ``_is_child_result``) WITHOUT replaying the whole
     store (DEVELOPMENT "Projection over replay"). The registry row's durable
     ``last_task_result_id`` pointer (stamped at project-task finalization) is
     read FIRST — one direct file fetch, immune to how many newer foreign

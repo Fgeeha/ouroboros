@@ -459,7 +459,7 @@ def test_only_a_root_finalization_moves_the_projects_pointer(tmp_path):
 def test_the_self_heal_scan_never_offers_or_stamps_a_child(tmp_path):
     """The lookup's fallback scan is the pointer's SECOND writer: with no pointer
     yet and a child as the project's newest result, it answers with the newest ROOT
-    and stamps that, never the child the door would refuse."""
+    and stamps that, never the child the hint does not offer."""
     import os
 
     import server

@@ -38,7 +38,7 @@ def _predecessor_selector_error(value: Any, tool_name: str) -> str:
     if value is _MISSING_PREDECESSOR_SELECTOR or value is None:
         return (
             f"⚠️ TOOL_ARG_ERROR ({tool_name}): predecessor_task_id is required; "
-            "pass an empty string for fresh work or the id of a finished root result to continue it"
+            "pass an empty string for fresh work or the id of a settled result to continue it"
         )
     return ""
 
@@ -126,7 +126,7 @@ def _predecessor_door_refusal(result: Dict[str, Any]) -> str:
     status = str(result.get("status") or "")
     if is_emitted_admission_stub(result):
         return ("the selected predecessor is a promote whose admission is still pending, not a "
-                "result; read get_task_result on it, and name a finished root instead")
+                "result; read get_task_result on it, and name a settled result instead")
     if status not in SETTLED_STATUSES:
         return (
             f"the selected predecessor is still live (status {status or 'unknown'}); "
