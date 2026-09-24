@@ -565,8 +565,8 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # 290 -> 291: the retained focus source (``task_results/artifacts/*/source_handles/
 # context_checkpoints``, ``ouroboros/task_finalization.py``'s digest glob) is the
 # one new durable plane of cross-focus awareness; it has its own row in section 2.
-# Test-environment package caches are disposable, not new live data stores.
-EXPECTED_SCAN_PATHS = 293
+# Test-environment caches are disposable; upstream also adds the streamed blob temp name.
+EXPECTED_SCAN_PATHS = 294
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts
