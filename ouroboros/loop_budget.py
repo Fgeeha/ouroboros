@@ -758,6 +758,29 @@ def _finish_tool_round_budget(
     return text, usage, ctx.llm_trace
 
 
+def _finish_no_tool_round_budget(
+    ctx: _RoundLimitContext, budget_remaining_usd: Optional[float],
+    cost_ceiling: "task_pacing.CostCeiling",
+) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
+    """The SAME budget decision after a no-tool round that did not finish.
+
+    A round whose answer was not accepted continues to spend, whether or not it
+    called tools — but only the tool tail ever reached `_check_budget_limits`,
+    so a task that kept re-answering under review feedback could run past the
+    ceiling untouched (#1223). This is the tool tail's own comparison and
+    nothing else: no metered-baseline bookkeeping (no tools ran) and no
+    `_prepare_post_tool_budget_context`, whose delivery-control arming belongs
+    to a tool batch's effects. The current delivery candidate is untouched, so a
+    budget exit still wraps up the answer the round produced.
+    """
+    result = _loop()._check_budget_limits(ctx, budget_remaining_usd, cost_ceiling=cost_ceiling)
+    if result is None:
+        return None
+    text, usage, trace = result
+    _loop()._merge_finalization_trace(ctx.llm_trace, trace)
+    return text, usage, ctx.llm_trace
+
+
 def _prepare_post_tool_budget_context(
     tools: ToolRegistry,
     limit_ctx: _RoundLimitContext,
@@ -766,7 +789,11 @@ def _prepare_post_tool_budget_context(
     active_use_local: bool,
     active_effort: str,
 ) -> None:
-    """Refresh candidate evidence and the actual route before budget wrap-up."""
+    """Refresh candidate evidence and the actual route before budget wrap-up.
+
+    The evidence read is the typed one (`_delivery_evidence_state`): an
+    unreadable fingerprint is UNKNOWN, so a retained answer is never lost here.
+    """
 
     candidate = getattr(tools._ctx, "_delivery_candidate", None)
     if isinstance(candidate, _loop().DeliveryCandidate):

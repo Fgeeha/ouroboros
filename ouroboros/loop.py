@@ -408,6 +408,35 @@ def _record_transcript_prefix(ctx, messages, round_idx, accumulated_usage,
         accumulated_usage["prompt_prefix_breaks"] = int(accumulated_usage.get("prompt_prefix_breaks") or 0) + 1
 
 
+def _reset_turn_state(ctx: Any) -> None:
+    """Clear the per-turn state this turn owns; nothing durable is touched."""
+    ctx._presence_completion, ctx._presence_completion_accepted = None, False
+    ctx._delivery_candidate, ctx._delivery_candidate_revision, ctx._delivery_control_required = None, 0, False
+    ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
+    ctx.model_turn_state, ctx._authoring_handover, ctx._pending_model_wait_handover = ModelTurnState(), None, None
+
+
+def _initial_round_route(ctx: Any, llm: LLMClient, initial_effort: str) -> tuple:
+    """The route this turn opens on: model, effort, local flag and context modes.
+
+    Unknown routes get one honest call; no synthetic short-window capacity, so a
+    fit plan is adopted only while it still answers the preferred mode.
+    """
+    task_model_override = str(getattr(ctx, "task_model_override", "") or "").strip()
+    local_override = getattr(ctx, "task_use_local_override", None)
+    preferred_mode = get_context_mode()
+    context_fit_plan = getattr(ctx, "context_fit_plan", None)
+    if (context_fit_plan is not None
+            and str(getattr(context_fit_plan, "preferred_mode", "")) == preferred_mode):
+        active_context_mode = str(getattr(context_fit_plan, "initial_mode", "") or preferred_mode)
+    else:
+        active_context_mode = preferred_mode
+    return (task_model_override or llm.default_model(), initial_effort,
+            (bool(local_override) if local_override is not None else
+             runtime_setting("USE_LOCAL_MAIN", "").lower() in ("true", "1")),
+            preferred_mode, active_context_mode, context_fit_plan)
+
+
 def run_llm_loop(
     messages: List[Dict[str, Any]],
     tools: ToolRegistry,
@@ -424,25 +453,10 @@ def run_llm_loop(
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Run the tool loop."""
     ctx = tools._ctx
-    ctx._presence_completion, ctx._presence_completion_accepted = None, False
-    ctx._delivery_candidate, ctx._delivery_candidate_revision, ctx._delivery_control_required = None, 0, False
-    ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
-    ctx.model_turn_state, ctx._authoring_handover, ctx._pending_model_wait_handover = ModelTurnState(), None, None
+    _reset_turn_state(ctx)
     _initialize_owner_directives(ctx, messages)
-    task_model_override = str(getattr(ctx, "task_model_override", "") or "").strip()
-    active_model = task_model_override or llm.default_model()
-    active_effort = initial_effort
-    local_override = getattr(ctx, "task_use_local_override", None)
-    active_use_local = (bool(local_override) if local_override is not None else
-                        runtime_setting("USE_LOCAL_MAIN", "").lower() in ("true", "1"))
-    # Unknown routes get one honest call; no synthetic short-window capacity.
-    _preferred_context_mode = get_context_mode()
-    context_fit_plan = getattr(ctx, "context_fit_plan", None)
-    if (context_fit_plan is not None
-            and str(getattr(context_fit_plan, "preferred_mode", "")) == _preferred_context_mode):
-        active_context_mode = str(getattr(context_fit_plan, "initial_mode", "") or _preferred_context_mode)
-    else:
-        active_context_mode = _preferred_context_mode
+    (active_model, active_effort, active_use_local, _preferred_context_mode, active_context_mode,
+     context_fit_plan) = _initial_round_route(ctx, llm, initial_effort)
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {"_task_attempt": getattr(ctx, "task_attempt", None)}
     ctx._accumulated_usage = accumulated_usage
@@ -483,7 +497,8 @@ def run_llm_loop(
         if saved:
             active_model, active_effort, active_use_local, active_context_mode, round_idx, context_fit_plan = resume_native_loop(
                 tools, saved, messages, llm_trace, accumulated_usage, _owner_msg_seen)
-        pending_tool_budget, pending_tool_calls = bool(saved), None
+        # Both continuing tool tails and unfinished no-tool rounds owe budget checks.
+        pending_tool_budget, pending_tool_calls, pending_no_tool_budget = bool(saved), None, False
         if saved_pause:
             # Same-ID exact continuation after an owner Resume (#1196): the
             # saved cognition comes back (nothing is re-executed by the host;
@@ -578,6 +593,12 @@ def run_llm_loop(
                 if final_result is not None:
                     return final_result
                 continue
+
+            if pending_no_tool_budget:
+                pending_no_tool_budget = False
+                budget_result = _finish_no_tool_round_budget(limit_ctx, budget_remaining_usd, cost_ceiling)
+                if budget_result is not None:
+                    return budget_result
 
             if (transport_wait is not None and transport_wait.wait_cause == "provider_outcome_unknown"
                     and not _continue_unknown_transport(transport_wait, llm=llm, tools=tools, messages=messages,
@@ -693,6 +714,10 @@ def run_llm_loop(
             if not tool_calls:
                 final_result = _finalize_loop_candidate(content, limit_ctx, tools, emit_progress)
                 if final_result is None:
+                    # Unfinished: the loop continues and keeps spending, so it
+                    # rejoins the SAME budget tail a tool round does. A ready
+                    # answer returns above and buys no extra wrap-up.
+                    pending_no_tool_budget = True
                     continue
                 return final_result
 
@@ -852,6 +877,7 @@ from ouroboros.loop_model_call import (  # noqa: E402, F401 -- intentional publi
     _call_round_model,
 )
 from ouroboros.loop_budget import (  # noqa: E402, F401 -- intentional public re-exports
+    _finish_no_tool_round_budget,
     _finish_tool_round_budget,
     _check_budget_limits,
     _resolve_task_cost_ceiling,

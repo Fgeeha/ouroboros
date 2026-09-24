@@ -1,5 +1,6 @@
 import { accountedUpperBound, accountedUpperBoundWithChildren, formatUsd4, joinMarkdownHeadings } from './utils.js';
 import { harnessPresentation } from './harness_presentation.js';
+import { acceptanceIncidentClauses } from './acceptance_incident_presentation.js';
 import {
     classifyReviewLifecycle,
     classifyReviewLifecyclePointer,
@@ -420,6 +421,7 @@ const TASK_CAUSE_PHRASES = {
     author_finish: "Ouroboros delivered this answer on its own judgement; the reviewers had not signed it off.",
     review_degraded: "The reviewers did not reach a verdict on this answer.",
     infra_failure: "The review could not run because of an infrastructure failure, so there is no verdict.",
+    acceptance_preparation_failed: "Ouroboros could not assemble the evidence for this answer's review, so this preparation attempt dispatched no new reviewers; the work itself is kept.",
     dialogue_terminal: "The reviewers and Ouroboros could not agree, and both positions were kept.",
     improvement_capsule: "The reviewers asked for one more pass and Ouroboros was given their notes.",
     fence_reopen_failed: "The requested extra pass could not be started, so the answer stands as it was.",
@@ -587,7 +589,8 @@ export function taskReasonDetail(evt) {
             ? String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')
             : taskReasonPhrase(reason === 'plan_review_advisory' ? planReviewKey(record, reason) : reason);
     }
-    return joinCauseClauses([clause, ...terminalLimitations(record, reason, held), custody ? taskReasonPhrase(custody) : '']);
+    return joinCauseClauses([clause, ...acceptanceIncidentClauses(decision, reason, TASK_CAUSE_PHRASES),
+        ...terminalLimitations(record, reason, held), custody ? taskReasonPhrase(custody) : '']);
 }
 
 // S3 (HQ1): the ONE shared projection of a typed owner_hurry event for the

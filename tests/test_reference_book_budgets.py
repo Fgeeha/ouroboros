@@ -26,8 +26,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # extension_isolated_deps.py barrier and the widget_list.js request seam land
     # beside the handoff/schedule rows the base added; none displaces older text.
     # +400 (#1213): two new module rows (focus.py, room_consolidation.py) in the tree map.
-    # 164800 -> 165300 (#1196): two new owner modules gain their map rows
-    # (supervisor/budget_resume.py, ouroboros/delegate_continuation.py).
+    # +500 (#1222-#1224): three module rows for the new leaves
+    # (acceptance_preparation.py, acceptance_retrieving.py, repo_diff_capture.py)
+    # and what each owns; none displaces older text.
     "docs/architecture/01-high-level-architecture.md": 165300,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
@@ -106,17 +107,19 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the digest-selected historical read and the reader admission rule.
     # 295650 -> 297250: document the new diagnostic-only source/coverage contract,
     # unavailable evidence and no-effects ordering without removing review/custody rules.
-    # 297250 -> 301400 (#1196): the exact budget pause is a new mechanism of the budget
-    # section (fence order, drain, external stop requests, program counter, park, grant,
-    # revoke, Q9/Q10 rules); the wrap-up rails it sits beside keep their own text.
-    # 301400 -> 304500 (#1196, continued): the base sat 680 bytes OVER the previous
-    # budget (the slice-1 pause paragraph landed without raising it). The pause
-    # paragraph is REPLACED and grows ~1130 bytes for mechanisms it lacked (the
-    # direct-turn pause, the durable holds, the generation-bound grant, the
-    # restart park, the Q10 last-fit relaxation); the wall-clock continuation of a
-    # delegated leaf (+~1000) is a new seam of the delegation section with no
-    # older text to displace; the delegate_start argument sentence grows by one clause.
-    "docs/architecture/06-agent-core.md": 304500,
+    # 297250 -> 303900 (#1222-#1224; measured 303813 on the merged chapter): three mechanisms this chapter had no text for.
+    # The single acceptance repository BYTES capture (file-backed spool under a real
+    # subprocess timeout, streamed private retention, redaction before any cut) with its
+    # two non-interchangeable identities and typed gaps; the LOCAL pre-binding
+    # preparation incident (semantic material identity without the owner transcript,
+    # the source-bytes identity, one exposure per real attempt bound to that attempt,
+    # the repeat guard ahead of every fallible pre-binding step, the informed author
+    # path that needs neither a working builder nor a fingerprint, the one-use
+    # source-bound retry with spent keys, the stage separation, and the existing
+    # review-projection carrier that makes it visible); and the unified
+    # spend-and-continue budget tail, which replaces only the half-sentence "checks the
+    # axis only after tool-call rounds".
+    "docs/architecture/06-agent-core.md": 303900,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     "docs/architecture/08-git-branching-ci-and-build.md": 19287,
