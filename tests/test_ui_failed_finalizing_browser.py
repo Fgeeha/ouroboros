@@ -10,8 +10,6 @@ line of the production prompt), so synthesis is provably open while the
 browser looks. Nothing is timed: every wait is an event or a bounded DOM poll.
 """
 import json
-import os
-from pathlib import Path
 
 import pytest
 
@@ -162,7 +160,9 @@ def test_failed_root_reads_failed_then_finalizing(wait_clone, tmp_path, monkeypa
     monkeypatch.setattr(KeylessIsolatedServer, "_env", lambda server: {
         **original_env(server), "HOME": str(fake_home), "USERPROFILE": str(fake_home),
         "XDG_CONFIG_HOME": str(fake_home / ".config")})
-    shots = Path(os.environ.get("OUROBOROS_BROWSER_EVIDENCE_OUT") or tmp_path / "screenshots")
+    # Evidence stays inside the test's own temp root; an explicit out-dir is opt-in
+    # only and must itself be a temp-root path, so the test never writes elsewhere.
+    shots = tmp_path / "screenshots"
     shots.mkdir(parents=True, exist_ok=True)
     gate = ModelGate(lambda body: SUMMARY_MARKER in body_text(body) and MARKER in body_text(body), timeout=300)
     facts = {}
