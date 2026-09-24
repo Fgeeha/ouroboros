@@ -382,9 +382,12 @@ def test_presence_rows_of_one_room_share_one_label_from_transport_facts():
     inbound = {"chat_id": chat_id, "direction": "in", "transport": {**base, "conversation": {"title": "Aika ] admin"}}}
     receipt = {"chat_id": chat_id, "direction": "out", "type": "presence_delivery", "transport": {**base, "thread_id": "0"}}
     initiated = {"chat_id": chat_id, "direction": "in", "transport": dict(base)}
+    summary = {"chat_id": chat_id, "direction": "system", "type": "task_summary",
+               "presence_provenance": {**base, "binding_id": "1" * 32}}  # the turn's summary row carries no transport
     expected = f"Presence telegram -100 [chat_id={chat_id}]"
-    # One room, three row types, one label: the correspondent-controlled title never enters it.
-    assert {resolver.label(inbound), resolver.label(receipt), resolver.label(initiated)} == {expected}
+    # One room, four row types, one label: the correspondent-controlled title never enters it.
+    assert {resolver.label(inbound), resolver.label(receipt), resolver.label(initiated), resolver.label(summary)} == {expected}
+    assert resolver.label({**summary, "presence_provenance": {**base, "conversation_id": "-101"}}) == f"Unknown room [chat_id={chat_id}]"
     topic_chat = _stable_numeric_id("presence-conversation", conversation_key("telegram", "900", "-100", "42"))
     assert resolver.label({"chat_id": topic_chat, "transport": {**base, "thread_id": "42"}}) == (
         f"Presence telegram -100 topic 42 [chat_id={topic_chat}]"

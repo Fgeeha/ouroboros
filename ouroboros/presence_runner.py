@@ -290,11 +290,23 @@ def _confirmed_sends(rows: Sequence[Mapping[str, Any]]) -> list[str] | None:
         return None
     parts: dict[tuple[str, str], str] = {}
     for row in rows:
-        transport = row.get("transport") if isinstance(row.get("transport"), dict) else {}
-        delivery = transport.get("delivery") if isinstance(transport.get("delivery"), dict) else {}
-        if row.get("type") == "presence_delivery" and delivery.get("state") in {"delivered", "accepted"}:
+        delivery = _receipt(row)
+        if delivery.get("state") in {"delivered", "accepted"}:
             parts.setdefault((str(delivery.get("delivery_id")), str(delivery.get("part_id"))), str(row.get("text") or ""))
     return list(parts.values())
+
+
+def _receipt(row: Mapping[str, Any]) -> Mapping[str, Any]:
+    transport = row.get("transport") if isinstance(row.get("transport"), Mapping) else {}
+    delivery = transport.get("delivery") if isinstance(transport.get("delivery"), Mapping) else {}
+    return delivery if row.get("type") == "presence_delivery" else {}
+
+
+def _uncertain_parts(rows: Sequence[Mapping[str, Any]]) -> int:
+    """Parts the provider never confirmed nor refused (a timed-out send may have landed)."""
+    keys = {(str(r.get("delivery_id")), str(r.get("part_id"))) for r in map(_receipt, rows) if r.get("state") == "uncertain"}
+    return len(keys - {(str(r.get("delivery_id")), str(r.get("part_id")))
+                       for r in map(_receipt, rows) if r.get("state") in {"delivered", "accepted"}})
 
 
 def _previous_turn_path(drive_root: Path, conversation_key: str) -> Path:
@@ -391,7 +403,7 @@ def _build_task(
     drive_root: Path,
     staged_files: Sequence[Path],
     lost_attempt: bool = False,
-    prior_sends: Sequence[str] | None = None,
+    prior_rows: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     from ouroboros.config import runtime_setting
 
@@ -428,10 +440,11 @@ def _build_task(
         presence_context["previous_turn"] = previous_turn
     if lost_attempt:
         # Unknown (None) when the transport reports no receipts or the attempt's rows left the live generation.
-        sent = prior_sends if event.delivery_reporting_version else None
+        sent = _confirmed_sends(prior_rows) if event.delivery_reporting_version else None
         presence_context["previous_attempt"] = {
             "delivered_count": None if sent is None else len(sent),
             "delivered": None if sent is None else [text for text in sent if text],
+            "uncertain_count": 0 if sent is None else _uncertain_parts(prior_rows),
         }
     metadata: dict[str, Any] = {
         "source": "presence",
@@ -553,7 +566,7 @@ def run_presence_turn(
             drive_root=Path(drive_root),
             staged_files=tuple(Path(item) for item in staged_files),
             lost_attempt=lost_attempt,
-            prior_sends=_confirmed_sends(prior_rows) if lost_attempt else None,
+            prior_rows=prior_rows,
         )
         chat_id = int(task["chat_id"])
         actor_id = _stable_numeric_id("presence-actor-log", str(task.get("actor_id") or ""))

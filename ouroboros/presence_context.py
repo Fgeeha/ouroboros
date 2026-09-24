@@ -116,8 +116,10 @@ def build_presence_context_section(drive_root: Path, value: Any) -> str:
         if not isinstance(delivered, list):
             detail = "whether it already sent anything is unknown (no delivery receipts are readable for that attempt)"
         else:
-            detail = f"it had already delivered {attempt.get('delivered_count')} message(s)" + (
-                ": " + " / ".join(json.dumps(str(text), ensure_ascii=False) for text in delivered) if delivered else "")
+            uncertain = int(attempt.get("uncertain_count") or 0)
+            detail = f"it had already delivered {'at least ' if uncertain else ''}{attempt.get('delivered_count')} message(s)" + (
+                ": " + " / ".join(json.dumps(str(text), ensure_ascii=False) for text in delivered) if delivered else "") + (
+                f"; {uncertain} more part(s) may have landed (the provider never confirmed them)" if uncertain else "")
         parts.append(
             "## Previous attempt of this same event (host-authored facts)\n\n"
             f"The host lost an earlier attempt of this event before it finished; {detail}. "

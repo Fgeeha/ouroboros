@@ -207,13 +207,18 @@ class RoomLabelResolver:
 
     @staticmethod
     def _presence_label(entry: Mapping[str, Any], chat_id: int) -> str:
-        """Name a presence room only by transport facts that re-derive this exact chat id."""
+        """Name a presence room only by transport facts that re-derive this exact chat id.
+
+        Inbound, initiated and receipt rows carry ``transport``; a turn's summary row carries the
+        same facts as ``presence_provenance``. One room, one label, whichever row opens a block.
+        """
         from ouroboros.presence_bindings import conversation_key
         from ouroboros.presence_runner import _stable_numeric_id
 
-        transport = entry.get("transport") if isinstance(entry.get("transport"), Mapping) else {}
+        facts = next((entry[key] for key in ("transport", "presence_provenance")
+                      if isinstance(entry.get(key), Mapping)), {})
         provider, account, conversation, thread = (
-            str(transport.get(key) or "") for key in ("provider", "account_id", "conversation_id", "thread_id"))
+            str(facts.get(key) or "") for key in ("provider", "account_id", "conversation_id", "thread_id"))
         if not (provider and conversation) or _stable_numeric_id(
                 "presence-conversation", conversation_key(provider, account, conversation, thread)) != chat_id:
             return ""

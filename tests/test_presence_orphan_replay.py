@@ -173,7 +173,7 @@ def test_reconciled_turn_is_not_cached_and_its_rerun_persists(tmp_path, monkeypa
     assert stored["superseded_placeholder"]["reason_code"] == "orphaned_running_after_worker_restart"
     # A v0 transport reports no receipts: what the lost attempt sent is unknown, and the model is told so.
     attempt = calls[0]["metadata"]["presence"]["previous_attempt"]
-    assert attempt == {"delivered_count": None, "delivered": None}
+    assert attempt == {"delivered_count": None, "delivered": None, "uncertain_count": 0}
     section = build_presence_context_section(tmp_path, calls[0]["metadata"]["presence"])
     assert "whether it already sent anything is unknown" in section
     # The persisted answer is now the cached result: a further retry does not re-run.
@@ -270,7 +270,8 @@ def test_host_retry_reruns_a_lost_turn_once_and_then_replays(tmp_path, monkeypat
     first = post()
     assert first.status_code == 200 and first.json()["text"] == "Real answer" and first.json()["turn_ref"] == task_id
     assert sweeps == [0] and len(calls) == 2
-    assert calls[1]["metadata"]["presence"]["previous_attempt"] == {"delivered_count": 1, "delivered": ["Early part"]}
+    assert calls[1]["metadata"]["presence"]["previous_attempt"] == {
+        "delivered_count": 1, "delivered": ["Early part"], "uncertain_count": 0}
     section = build_presence_context_section(tmp_path, calls[1]["metadata"]["presence"])
     assert 'already delivered 1 message(s): "Early part"' in section
     stored = load_task_result(tmp_path, task_id)
@@ -319,7 +320,8 @@ def test_stale_running_row_is_a_lost_attempt_before_the_reconciler_runs(tmp_path
     assert _cached_result(tmp_path, task_id) is None
     first = run_presence_turn(**kwargs)
     assert first.text == "Real answer" and [task["id"] for task in calls] == [calls[0]["id"], task_id]
-    assert calls[1]["metadata"]["presence"]["previous_attempt"] == {"delivered_count": 1, "delivered": ["Early part"]}
+    assert calls[1]["metadata"]["presence"]["previous_attempt"] == {
+        "delivered_count": 1, "delivered": ["Early part"], "uncertain_count": 0}
     stored = load_task_result(tmp_path, task_id)
     assert stored["status"] == STATUS_COMPLETED and "superseded_placeholder" not in stored  # nothing to reopen
     rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
@@ -336,7 +338,8 @@ def test_rotation_between_the_lost_attempt_and_its_retry_makes_prior_sends_unkno
     calls: list = []
     first = run_presence_turn(**_v1_kwargs(tmp_path, calls))
     assert first.text == "Real answer" and len(calls) == 1
-    assert calls[0]["metadata"]["presence"]["previous_attempt"] == {"delivered_count": None, "delivered": None}
+    assert calls[0]["metadata"]["presence"]["previous_attempt"] == {
+        "delivered_count": None, "delivered": None, "uncertain_count": 0}
     section = build_presence_context_section(tmp_path, calls[0]["metadata"]["presence"])
     assert "whether it already sent anything is unknown" in section and "delivered 0 message" not in section
     live = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()]
@@ -361,3 +364,18 @@ def test_rejected_build_leaves_the_placeholder_for_the_next_retry(tmp_path, monk
     assert first.text == "Real answer" and "previous_attempt" in calls[0]["metadata"]["presence"]
     stored = load_task_result(tmp_path, task_id)
     assert stored["status"] == STATUS_COMPLETED and stored["superseded_placeholder"]["status"] == STATUS_FAILED
+
+
+def test_uncertain_receipts_make_the_prior_count_a_floor(tmp_path):
+    """A timed-out send the provider never confirmed is neither counted nor forgotten."""
+    task_id = _task_id(_admission(), _event())
+    chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
+    append_jsonl(chat, {"type": "presence_delivery", "direction": "system", "chat_id": 7, "text": "Maybe part",
+                        "task_id": task_id, "transport": {"delivery": {
+                            "state": "uncertain", "delivery_id": "send:late", "part_id": "0"}}})
+    calls: list = []
+    run_presence_turn(**_v1_kwargs(tmp_path, calls))
+    attempt = calls[0]["metadata"]["presence"]["previous_attempt"]
+    assert attempt == {"delivered_count": 1, "delivered": ["Early part"], "uncertain_count": 1}
+    section = build_presence_context_section(tmp_path, calls[0]["metadata"]["presence"])
+    assert 'delivered at least 1 message(s): "Early part"; 1 more part(s) may have landed' in section
