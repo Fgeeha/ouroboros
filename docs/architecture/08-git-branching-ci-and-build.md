@@ -58,4 +58,6 @@ Public installer naming and links ride the same projection: `release_sync.py::RE
 
 Docker runs the web and server runtime without PyWebView. The image binds `0.0.0.0` and sets no network password by default: a missing password only warns, and `NetworkAuthGate` permits requests when no password is configured — publishing the container port without setting `OUROBOROS_NETWORK_PASSWORD` therefore exposes the owner surface. Set the password (or keep the port unpublished); packaging adds no stronger boundary of its own.
 
+The root `.dockerignore` filters `COPY . .`: secrets, host virtualenvs, `node_modules`, caches and runtime/review/operator state stay out of image layers; `.git`, `tests/` and sources stay in, because CI runs pytest inside the image.
+
 ---

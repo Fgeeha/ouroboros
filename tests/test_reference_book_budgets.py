@@ -145,7 +145,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # `ouroboros` push included), the per-checkout static/VERSION provenance a boot
     # and a restart prove, and the scrubbed roots plus the single dependency-sync
     # chokepoint. The `ui-smoke` row it replaces was rewritten, not appended to.
-    "docs/architecture/08-git-branching-ci-and-build.md": 20560,
+    # 20560 -> 20800 (PR #1255; measured 20768): the Docker subsection maps the new root
+    # .dockerignore (what it keeps out of image layers and why .git/tests/ must stay in),
+    # a config BIBLE P6 requires on the map.
+    "docs/architecture/08-git-branching-ci-and-build.md": 20800,
     # 12405 -> 14400 (issue #1142): the ordinary-close paragraph gains the mechanism the chapter had
     # no text for — graceful stop signals the server PID only, the server half (stop event at the
     # signal, bounded uvicorn drain) is self-sufficient against an old group-SIGTERM launcher.
@@ -170,7 +173,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/architecture/10-key-invariants.md": 21700,
     "docs/architecture/11-frozen-contracts-v1.md": 24194,
     # +400 (#1213): Presence turns are named as actors without cross-focus catalogue or focus authority.
-    "docs/architecture/12-host-service-companions-and-chat-ids.md": 11400,
+    # 11400 -> 12500: presence PR0 adds rules the chapter lacked, one sentence each (unified
+    # conversation key, placeholder re-run and its lost-attempt facts, presence-local liveness,
+    # previous-turn pointer and its replay repair, split in-flight budgets, silent orphaned work,
+    # presence room label); the base sat 2 bytes under.
+    "docs/architecture/12-host-service-companions-and-chat-ids.md": 12500,
     # 7764 -> 8600 (#1195): the fresh selected-subject + immutable peer projection
     # execution check (`skill_peer_inventory.py`, `skill_conflicts.py`) replaces
     # whole-inventory hashing; the chapter had no description of that seam to swap out.

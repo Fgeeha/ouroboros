@@ -511,6 +511,38 @@ class TestBuildWindowsPs1:
 # Dockerfile  (Docker / web runtime)
 # ---------------------------------------------------------------------------
 
+class TestDockerignore:
+    """The root .dockerignore owns the build context of Dockerfile's COPY . .
+
+    Both halves matter: private local state must stay out of image layers,
+    and the paths CI needs inside the image (Git history, tests, sources)
+    must stay in."""
+
+    def _patterns(self):
+        lines = _read(".dockerignore").splitlines()
+        return {ln.strip() for ln in lines if ln.strip() and not ln.lstrip().startswith("#")}
+
+    def test_private_state_is_excluded(self):
+        patterns = self._patterns()
+        required = {
+            "**/.env", "**/.env.*", "**/*.key", "**/*.pem",
+            ".venv/", "venv/", "env/", "/data/",
+            "/.review-drive/", "/.claudexor/", "/.adversarial-review/",
+        }
+        missing = sorted(required - patterns)
+        assert not missing, f".dockerignore must exclude private local state: {missing}"
+
+    def test_ci_needed_paths_stay_in_context(self):
+        patterns = self._patterns()
+        for kept in (".git", "tests", "ouroboros", "web", "prompts", "docs",
+                     "supervisor", "pyproject.toml", "uv.lock", "server.py"):
+            for spelling in (kept, kept + "/", "/" + kept, "/" + kept + "/", "**/" + kept):
+                assert spelling not in patterns, (
+                    f".dockerignore must not exclude {kept}: CI runs pytest inside the image"
+                )
+        assert "*" not in patterns and "**" not in patterns
+
+
 class TestDockerfile:
     """Dockerfile must install Playwright Chromium/WebKit binaries so browser tools work
     out of the box in the container without additional setup."""

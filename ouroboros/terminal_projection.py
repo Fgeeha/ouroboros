@@ -17,7 +17,9 @@ from contextlib import contextmanager
 from typing import Any
 
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
-from ouroboros.task_results import load_task_result, resolve_task_lineage, task_result_path, write_task_result
+from ouroboros.task_results import (
+    is_reconciled_presence_placeholder, load_task_result, resolve_task_lineage, task_result_path, write_task_result,
+)
 from ouroboros.utils import jsonl_chain_handles, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -25,9 +27,11 @@ SETTLEMENT_NONE, SETTLEMENT_DEFERRED, SETTLEMENT_SETTLED = "none", "deferred", "
 
 
 def _settled(row: dict) -> bool:
+    """Settled for publication: a host-reconciled presence placeholder is not a result (the event
+    re-runs), so it owes no terminal projection even when an earlier release already recorded readiness."""
     from ouroboros.task_status import SETTLED_STATUSES
 
-    return row.get("status") in SETTLED_STATUSES
+    return row.get("status") in SETTLED_STATUSES and not is_reconciled_presence_placeholder(row)
 
 
 def _lineage(tid: str, row: dict) -> dict:
@@ -130,9 +134,12 @@ def _project_row(tid: str, row: dict, event: dict, ready: dict) -> dict:
     verdict = dialogue._completion_verdict(row, event)
     excerpt = dialogue._completion_excerpt(row, chat_id=chat_id, salvage_only=True)
     text += "".join(f" {part}" for part in (verdict, excerpt) if part)
+    from ouroboros.dialogue_provenance import presence_provenance_fields
+
     result = {
         "ts": str(ready.get("task_done_ts") or event.get("ts") or row.get("ts") or utc_now_iso()),
         "direction": "system", "type": "task_summary",
+        **presence_provenance_fields(row),  # a presence room labels its terminal row like every other row
         "summary_id": f"task-terminal:{tid}",
         "summary_kind": "terminal_root_projection" if is_root else "terminal_result_projection",
         "task_id": tid, "parent_task_id": parent, "root_task_id": lineage["root_task_id"],
@@ -260,7 +267,8 @@ def settle_terminal_projection(drive_root: Any, task_id: str, *, task: dict | No
             if not acquired:
                 return SETTLEMENT_DEFERRED
             stored = _prepare(drive_root, tid, task or {}, event or {})
-            if not isinstance(stored.get("canonical_terminal_projection_ready"), dict):
+            if (not isinstance(stored.get("canonical_terminal_projection_ready"), dict)
+                    or is_reconciled_presence_placeholder(stored)):  # readiness an earlier release recorded
                 return SETTLEMENT_NONE
             if (_open(stored) or not _settled(stored)
                     or not _files_ready(drive_root, tid, {**(task or {}), **stored})):
