@@ -64,7 +64,12 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 106400 -> 106600 (#1195 merge of 32d8dfc6): the base's settings_catalog.js
     # paragraph (#1214, +319 bytes) landed in the same window; both additions stand,
     # neither displaces the other's text.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 106600,
+    # 106600 -> 107000 (truthful-cards batch): the chapter gains one new owner
+    # paragraph (`terminal_projection.py`, #1154) and the checkpoint/cancellation
+    # vocabulary (#931/#1061); the touched descriptions were REPLACED and
+    # compressed (net chapter growth is under the added owner's paragraph size),
+    # and the merged #1236 base already sat 5 bytes under the previous budget.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 107000,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict

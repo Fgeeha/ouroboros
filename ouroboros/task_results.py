@@ -627,22 +627,11 @@ def resolve_task_lineage(
     resolved_role = _field(delegation_role, "delegation_role").lower()
     resolved_original_id = _field(original_task_id, "original_task_id")
     resolved_retry_from = _field(timeout_retry_from, "timeout_retry_from")
-    is_regular_root = bool(
-        resolved_task_id
-        and resolved_root_id == resolved_task_id
-        and not resolved_parent_id
-        and resolved_role != "subagent"
-    )
-    is_retry_root = bool(
-        resolved_task_id
-        and resolved_root_id
-        and resolved_root_id != resolved_task_id
-        and not resolved_parent_id
-        and resolved_role == "root"
-        and resolved_original_id
-        and resolved_original_id == resolved_retry_from
-        and resolved_original_id != resolved_task_id
-    )
+    is_regular_root = bool(resolved_task_id and resolved_root_id == resolved_task_id
+                           and not resolved_parent_id and resolved_role != "subagent")
+    is_retry_root = bool(resolved_task_id and resolved_root_id and resolved_root_id != resolved_task_id
+                         and not resolved_parent_id and resolved_role == "root" and resolved_original_id
+                         and resolved_original_id == resolved_retry_from and resolved_original_id != resolved_task_id)
     return {
         "task_id": resolved_task_id,
         "root_task_id": resolved_root_id,
@@ -890,6 +879,16 @@ def write_task_result(
             log.debug("Blocked status regression %s -> %s for task %s",
                       existing.get("status"), projected_status, task_id)
             return None
+        # Only this accepted transition can originate terminal delivery debt:
+        # enrichment/replica fields cannot adopt historical terminal rows or
+        # erase provenance persisted before the separate readiness write.
+        projected_fields.pop("canonical_terminal_projection_origin", None)
+        if projected_status in _TRULY_TERMINAL_STATUSES and existing_status not in _TRULY_TERMINAL_STATUSES:
+            merged = {**existing, **projected_fields}
+            lineage_keys = ("root_task_id", "parent_task_id", "delegation_role", "original_task_id", "timeout_retry_from")
+            if resolve_task_lineage(task_id, metadata=merged.get("metadata"),
+                                    **{key: merged.get(key) for key in lineage_keys})["is_root_task"]:
+                projected_fields["canonical_terminal_projection_origin"] = "terminal_transition"
         now = utc_now_iso()
         # ABI-3 write seam: the merge BASE is the existing row normalized onto
         # the honest cost names (its own legacy spelling wins its own pair,
