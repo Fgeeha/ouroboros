@@ -66,15 +66,19 @@ def _previous_turn_line(previous: Mapping[str, Any]) -> str:
     body = " / ".join(said) or "nothing sent"
     work = ""
     if previous.get("work_ref"):
-        status = str(previous.get("work_status") or "unknown")
-        if status == "completed":
-            result = str(previous.get("work_result") or "").strip()
-            work = f" Its deferred work (task {previous.get('work_ref')}) completed" + (
-                f" and answered: {json.dumps(result, ensure_ascii=False)}." if result else " silently.")
+        status, ref = str(previous.get("work_status") or "absent"), previous.get("work_ref")
+        result, record = (str(previous.get(key) or "").strip() for key in ("work_result", "work_record"))
+        if status == "completed" and result:
+            work = f" Its deferred work (task {ref}) completed and answered: {json.dumps(result, ensure_ascii=False)}."
+        elif status == "completed":  # a host-authored terminal is never spoken; the model may still read it
+            work = f" Its deferred work (task {ref}) completed silently" + (
+                f"; the host recorded an undelivered result: {json.dumps(record, ensure_ascii=False)}." if record else ".")
         elif status in {"failed", "cancelled", "rejected_duplicate"}:
-            work = f" Its deferred work (task {previous.get('work_ref')}) ended {status}."
+            work = f" Its deferred work (task {ref}) ended {status}."
+        elif status == "absent":
+            work = f" Its deferred work (task {ref}) has no task row."
         else:
-            work = f" Work continues as task {previous.get('work_ref')} (status {status})."
+            work = f" Work continues as task {ref} (status {status})."
     return (f"Previous turn in this conversation (task {previous.get('task_id')}, finished {finished}, "
             f"outcome {previous.get('outcome')}, delivery {previous.get('delivery') or 'unknown'}): {body}.{work}")
 

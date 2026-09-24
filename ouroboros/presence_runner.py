@@ -458,11 +458,13 @@ def _build_task(
     previous_turn = _read_previous_turn(drive_root, event.conversation_key)
     if previous_turn:
         if previous_turn.get("work_ref"):  # the deferred child's fate is read from its canonical row, never stored
-            child = load_task_result(drive_root, str(previous_turn["work_ref"])) or {}
+            work_ref = str(previous_turn["work_ref"])
+            child = load_task_result(drive_root, work_ref) or {}
             status = str(child.get("status") or "")
-            previous_turn = {**previous_turn, "work_status": status or "unknown", "work_result": (
-                presence_result_from_stored(child, str(previous_turn["work_ref"])).text
-                if status == STATUS_COMPLETED else "")}
+            answered = presence_result_from_stored(child, work_ref).text if status == STATUS_COMPLETED else ""
+            record = str(child.get("result") or "") if status == STATUS_COMPLETED and not answered else ""
+            previous_turn = {**previous_turn, "work_status": status or "absent", "work_result": answered,
+                             "work_record": record[:300] + (" …(truncated)" if len(record) > 300 else "")}
         presence_context["previous_turn"] = previous_turn
     if lost_attempt:
         # Unknown (None) when the transport reports no receipts or the attempt's rows left the live generation.

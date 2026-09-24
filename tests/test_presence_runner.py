@@ -363,7 +363,7 @@ def test_previous_turn_pointer_names_message_deferred_and_silent_turns(tmp_path)
     assert "Previous turn" not in sections[0]
     assert f"Previous turn in this conversation (task {first.task_id}, finished " in sections[1]
     assert 'UTC, outcome message, delivery unknown): "Hi there".' in sections[1]
-    assert '"On it". Work continues as task presence-work-9 (status unknown).' in sections[2]
+    assert '"On it". Its deferred work (task presence-work-9) has no task row.' in sections[2]
     assert "outcome silent, delivery unknown): nothing sent." in sections[3]
 
 
@@ -449,8 +449,17 @@ def test_previous_turn_reports_the_fate_of_its_deferred_work(tmp_path):
     _pointer_turn(tmp_path, "e5", {"outcome": "deferred", "text": "Trying", "work_ref": "presence-work-3"})
     write_task_result(tmp_path, "presence-work-3", "failed", result="boom", metadata={"source": "presence"})
     _pointer_turn(tmp_path, "e6", {"outcome": "silent", "text": ""}, captured=captured)
-    assert "Its deferred work (task presence-work-3) ended failed." in build_presence_context_section(
-        tmp_path, captured[-1]["metadata"]["presence"])
+    section = build_presence_context_section(tmp_path, captured[-1]["metadata"]["presence"])
+    assert "Its deferred work (task presence-work-3) ended failed." in section and "boom" not in section
+    # A host-authored terminal (salvage) is never spoken to the correspondent, but the record is shown.
+    _pointer_turn(tmp_path, "e7", {"outcome": "deferred", "text": "Digging", "work_ref": "presence-work-4"})
+    write_task_result(tmp_path, "presence-work-4", "completed", result="Salvaged: " + "x" * 400,
+                      terminal_origin="host_salvage", metadata={"source": "presence"})
+    _pointer_turn(tmp_path, "e8", {"outcome": "silent", "text": ""}, captured=captured)
+    previous = captured[-1]["metadata"]["presence"]["previous_turn"]
+    assert previous["work_result"] == "" and previous["work_record"].endswith(" …(truncated)")
+    section = build_presence_context_section(tmp_path, captured[-1]["metadata"]["presence"])
+    assert "completed silently; the host recorded an undelivered result: \"Salvaged: xxx" in section
 
 
 def test_previous_turn_pointer_is_rebuilt_by_the_replay_of_a_turn_that_lost_it(tmp_path, monkeypatch):
