@@ -50,6 +50,41 @@ def test_signal_handler_stops_the_supervisor_loop_at_the_signal():
         assert instance.force_exit is False
     finally:
         server._supervisor_stop.clear()
+        server._exit_signalled.clear()
+
+
+def test_embedded_host_service_server_never_takes_the_process_signal_handlers():
+    """`Server.serve()` on the main thread installs the process handlers and forwards a
+    captured signal to the previous owner only after IT has drained: an embedded server
+    would hold SIGTERM behind its own unbounded drain. The Host Service must not."""
+    import uvicorn
+
+    import server
+
+    embedded = server._embedded_uvicorn_server(uvicorn.Config(lambda scope, receive, send: None))
+    before = signal.getsignal(signal.SIGTERM)
+    with embedded.capture_signals():
+        assert signal.getsignal(signal.SIGTERM) is before
+    assert signal.getsignal(signal.SIGTERM) is before
+    plain = uvicorn.Server(uvicorn.Config(lambda scope, receive, send: None))
+    assert type(plain).capture_signals is not embedded.capture_signals  # the override is instance-local
+
+
+def test_a_settings_save_landing_after_the_signal_cannot_revive_the_supervisor(monkeypatch):
+    """The stop event is revivable state (crash revival, a fresh lifespan); the exit latch is not."""
+    import server
+
+    monkeypatch.setattr(server, "has_startup_ready_provider", lambda _settings: True)
+    monkeypatch.setattr(server, "_supervisor_thread", None)
+    server._supervisor_stop.set()
+    server._exit_signalled.set()
+    try:
+        assert server._start_supervisor_if_needed({"OPENROUTER_API_KEY": "k"}) is False
+        assert server._supervisor_stop.is_set(), "revival cleared the teardown's stop event"
+        assert server._supervisor_thread is None
+    finally:
+        server._exit_signalled.clear()
+        server._supervisor_stop.clear()
 
 
 def test_main_server_bounds_the_graceful_drain_from_the_shared_constant():
@@ -83,7 +118,7 @@ def test_launcher_graceful_phase_signals_only_the_server_pid(monkeypatch):
     monkeypatch.setattr(launcher, "IS_WINDOWS", False)
     monkeypatch.setattr(launcher, "_agent_proc", Process())
     monkeypatch.setattr(launcher, "_agent_job", None)
-    monkeypatch.setattr(launcher.os, "killpg", lambda *a, **k: calls.append("killpg"))
+    monkeypatch.setattr(launcher.os, "killpg", lambda *a, **k: calls.append("killpg"), raising=False)
     monkeypatch.setattr(launcher, "kill_process_tree", lambda proc, **kw: calls.append("kill_tree"))
     monkeypatch.setattr(launcher, "_cleanup_recorded_server_group_for_pid", lambda *a: None)
     launcher.stop_agent()
@@ -103,7 +138,10 @@ def _wait_json(url: str, key: str, timeout_sec: float) -> None:
     while time.time() < deadline:
         try:
             with urllib.request.urlopen(url, timeout=2) as resp:  # noqa: S310 - local test server
-                if json.loads(resp.read().decode("utf-8")).get(key) is True:
+                payload = json.loads(resp.read().decode("utf-8"))
+                if payload.get("supervisor_error"):
+                    raise RuntimeError(f"supervisor failed to initialize: {payload['supervisor_error']}")
+                if payload.get(key) is True:
                     return
         except Exception as exc:  # pragma: no cover - diagnostic only
             last = str(exc)
@@ -186,8 +224,11 @@ def test_group_sigterm_reaches_terminal_custody_without_a_false_supervisor_alarm
                 pass
         if proc.poll() is None:
             proc.kill()
-        error = container.reap()
-        container.close()
+        try:
+            error = container.reap()
+        finally:
+            container.close()
+        proc.wait(timeout=10)  # collect the direct child; reap() skips zombies by design
         assert not error, error
 
     # uvicorn re-raises the captured SIGTERM once the lifespan has completed, so a clean

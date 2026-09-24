@@ -31,6 +31,10 @@ _restart_requested = threading.Event()
 # the shutdown itself never counts as a loop crash (no false "died after 3
 # consecutive crashes" alarm on a graceful window close / SIGTERM).
 _supervisor_stop = threading.Event()
+# Set by the main uvicorn server's signal handler (server._SignalStopServer): the
+# PROCESS is exiting. Unlike ``_supervisor_stop`` it is never cleared — a settings
+# save that lands mid-teardown must not revive a supervisor generation (#1142).
+_exit_signalled = threading.Event()
 
 
 # Set only when the OWNER asked for the restart (the chat Restart button, and the

@@ -45,6 +45,7 @@ from ouroboros.server_process import (  # noqa: F401
     _request_restart_exit,
     _restart_requested,
     _supervisor_stop,
+    _exit_signalled,
     log,
 )
 from ouroboros.server_routing_context import (  # noqa: F401
@@ -268,6 +269,8 @@ def _start_supervisor_if_needed(settings: dict) -> bool:
         return False
     if _supervisor_thread and _supervisor_thread.is_alive():
         return False
+    if _exit_signalled.is_set():
+        return False  # the process is exiting: no revival behind the teardown
     _supervisor_error = None
     _supervisor_stop.clear()  # in-process revival after a teardown-stopped generation
     _supervisor_thread = threading.Thread(
@@ -1190,7 +1193,7 @@ routes = [
     Mount("/static", app=NoCacheStaticFiles(directory=str(web_dir)), name="static"),
 ]
 
-from contextlib import ExitStack, asynccontextmanager, suppress
+from contextlib import ExitStack, asynccontextmanager, nullcontext, suppress
 
 
 @asynccontextmanager
@@ -1251,7 +1254,8 @@ async def lifespan(app):
     except Exception:
         log.warning("Project registry boot reconcile failed", exc_info=True)
 
-    _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
+    if not _exit_signalled.is_set():
+        _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
     if has_startup_ready_provider(settings):
         _start_supervisor_if_needed(settings)
     else:
@@ -1309,7 +1313,7 @@ async def lifespan(app):
             port=host_port,
             log_level="warning",
         )
-        host_service_server = uvicorn.Server(host_service_config)
+        host_service_server = _embedded_uvicorn_server(host_service_config)
         host_service_task = asyncio.create_task(
             host_service_server.serve(sockets=[host_socket]),
             name="host-service-api",
@@ -1610,8 +1614,24 @@ class _SignalStopServer(uvicorn.Server):
     """
 
     def handle_exit(self, sig: int, frame) -> None:
+        _exit_signalled.set()
         _supervisor_stop.set()
         super().handle_exit(sig, frame)
+
+
+def _embedded_uvicorn_server(config: "uvicorn.Config") -> "uvicorn.Server":
+    """A uvicorn.Server hosted INSIDE the main server's event loop (the Host Service).
+
+    ``Server.serve()`` installs the process signal handlers whenever it runs on the main
+    thread and forwards a captured signal to the previous handler only after it has
+    finished — so an embedded server would take SIGTERM away from ``_SignalStopServer``
+    and hold it behind its own unbounded drain (#1142). The instance-level
+    ``nullcontext`` keeps the main server the one signal owner; the lifespan teardown
+    still stops this server through ``should_exit``.
+    """
+    server = uvicorn.Server(config)
+    server.capture_signals = nullcontext  # type: ignore[method-assign]
+    return server
 
 
 def main() -> int:
