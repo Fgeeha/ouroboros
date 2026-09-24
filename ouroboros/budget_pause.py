@@ -350,13 +350,14 @@ def observe_task_runs(root: Any, task_id: str, *, reason: str = "budget_resume_u
             # UNKNOWN, never "no open runs" (Astra run-a882315dbcd7 #2).
             if custody.custody_log_unreadable(pathlib.Path(root)):
                 raise OSError("custody_log_unreadable")
-            from ouroboros.delegate_custody_memo import malformed_custody_lines_mentioning
+            from ouroboros.delegate_custody_memo import custody_rows_with_integrity
 
             # ONE snapshot feeds both projections: a START_REQUESTED that becomes
-            # STARTED between two reads must land in one of them (Astra 6fe5 #1).
-            snapshot = list(custody.custody_rows(pathlib.Path(root)))
-            # An unparseable custody line naming this task may hide its request.
-            malformed = malformed_custody_lines_mentioning(pathlib.Path(root), mine)
+            # STARTED between two reads must land in one of them (Astra 6fe5 #1),
+            # and its integrity is judged on that same read. An unparseable custody
+            # line naming this task may hide its request.
+            rows_read, malformed = custody_rows_with_integrity(pathlib.Path(root), mine)
+            snapshot = list(rows_read)
             if malformed is None or malformed:
                 raise OSError(f"custody_rows_incomplete:{'unknown' if malformed is None else malformed}")
             runs = [run for run in custody.replay(pathlib.Path(root), rows=snapshot).values()

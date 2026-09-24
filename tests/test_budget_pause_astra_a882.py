@@ -327,8 +327,11 @@ def test_both_custody_projections_come_from_one_snapshot(tmp_path, monkeypatch):
 
     snapshot = [{"type": custody.START_REQUESTED, "invocation_id": "inv-x", "task_id": "snap-1"}]
     seen = {}
+    from ouroboros import delegate_custody_memo
+
     monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: False)
-    monkeypatch.setattr(custody, "custody_rows", lambda _root: tuple(snapshot))
+    monkeypatch.setattr(delegate_custody_memo, "custody_rows_with_integrity",
+                        lambda _root, _needle: (tuple(snapshot), 0))
 
     def _replay(_root, rows=None):
         seen["replay"] = rows
@@ -363,3 +366,31 @@ def test_a_malformed_custody_line_naming_the_task_is_unknown_custody(tmp_path):
     # Another task is not blocked by this task's torn line.
     other = budget_pause.observe_task_runs(tmp_path, "someone-else")
     assert other["custody_read"] == "ok" and other["coverage_basis"] == "no_open_runs"
+
+
+def test_a_huge_torn_prefix_cannot_truncate_the_task_id_away(tmp_path):
+    """Astra 2bc1 #1: a >64 KiB torn unrelated prefix with this task's
+    START_REQUESTED joined after it must still count as this task's malformed line."""
+    import json
+
+    from ouroboros import budget_pause
+    from ouroboros import delegate_custody as custody
+
+    start = json.dumps({"type": custody.START_REQUESTED, "invocation_id": "inv-big",
+                        "task_id": "big-1"}).encode()
+    prefix = b'{"type": "delegate_run_note", "blob": "' + b"x" * 200_000
+    _write_event_log(tmp_path, [prefix, start + b"\n"])
+    observed = budget_pause.observe_task_runs(tmp_path, "big-1")
+    assert observed["custody_read"] == "failed"
+
+
+def test_a_bypassed_refresh_in_the_same_read_is_unknown(tmp_path, monkeypatch):
+    """Astra 2bc1 #2: when the one refresh that produced the rows bypassed the memo
+    (lenient read), the observer cannot prove absence from those rows."""
+    from ouroboros import budget_pause
+    from ouroboros import delegate_custody_memo
+
+    _write_event_log(tmp_path, [b""])
+    monkeypatch.setattr(delegate_custody_memo, "_refresh", lambda _root: (None, ()))
+    observed = budget_pause.observe_task_runs(tmp_path, "bypass-1")
+    assert observed["custody_read"] == "failed" and "unknown" in observed["error"]

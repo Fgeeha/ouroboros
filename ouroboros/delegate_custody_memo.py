@@ -99,6 +99,7 @@ class _ChainMemo:
     # consult it instead of trusting the silent skip (#1196, Astra 6fe5 #2).
     malformed_marker_lines: List[bytes] = field(default_factory=list)
     malformed_overflow: bool = False
+    malformed_bytes: int = 0
     # (generation, folded state) for ``folded_state``; cloned on every return.
     state_cache: Optional[Tuple[int, Any]] = None
 
@@ -263,28 +264,36 @@ def _fold_segment(
 
 
 _MALFORMED_KEEP = 200
+_MALFORMED_BYTES_KEEP = 8 * 1024 * 1024
 
 
 def _remember_malformed(memo: _ChainMemo, raw: bytes) -> None:
-    if len(memo.malformed_marker_lines) >= _MALFORMED_KEEP:
+    # WHOLE lines only: a truncated copy could drop the one id a reader needs
+    # (a START_REQUESTED joined after a huge torn prefix). Past the bound the
+    # record is unknown, never a shorter proof of absence (Astra 2bc1 #1).
+    if (len(memo.malformed_marker_lines) >= _MALFORMED_KEEP
+            or memo.malformed_bytes + len(raw) > _MALFORMED_BYTES_KEEP):
         memo.malformed_overflow = True
         return
-    memo.malformed_marker_lines.append(bytes(raw[:65536]))
+    memo.malformed_marker_lines.append(bytes(raw))
+    memo.malformed_bytes += len(raw)
 
 
-def malformed_custody_lines_mentioning(drive_root: Any, needle: str) -> Optional[int]:
-    """How many unparseable custody-marked lines mention ``needle``; None = unknown.
+def custody_rows_with_integrity(drive_root: Any, needle: str) -> Tuple[Tuple[Dict[str, Any], ...], Optional[int]]:
+    """ONE refresh: the rows AND how many unparseable custody lines mention ``needle``.
 
-    None when the memo was bypassed (lenient read, nothing recorded) or the
-    bounded record overflowed: an absence proof cannot be built from that.
+    The count is None when that same refresh bypassed the memo (lenient read,
+    nothing recorded) or the bounded record overflowed: no absence proof can be
+    built from it. Rows and integrity come from the same read, so a check can
+    never certify a different traversal than the one it judges (Astra 2bc1 #2).
     """
     key = _key(_custody().event_log_path(drive_root))
     token = str(needle or "").encode("utf-8")
     with _lock_for(key):
-        memo, _rows = _refresh(drive_root)
+        memo, rows = _refresh(drive_root)
         if memo is None or memo.malformed_overflow:
-            return None
-        return sum(1 for raw in memo.malformed_marker_lines if token and token in raw)
+            return rows, None
+        return rows, sum(1 for raw in memo.malformed_marker_lines if token and token in raw)
 
 
 def _advance(memo: _ChainMemo, chain: List[Tuple[pathlib.Path, os.stat_result, bool]]) -> None:
