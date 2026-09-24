@@ -935,22 +935,33 @@ def test_a_wake_starts_fresh_work_with_no_predecessor_and_needs_no_manifest(tmp_
     assert "predecessor_task_id" not in promoted.pending_events[0]
 
 
-def test_a_wake_without_the_manifest_still_refuses_an_unaddressable_predecessor(tmp_path):
-    """The typed refusal is unchanged; only the facts the wake is given are new."""
+def test_a_wake_without_the_manifest_continues_a_settled_root_and_still_refuses_a_live_one(tmp_path):
+    """The door judges the root, not the facts a wake was handed: with no manifest at all
+    a wake continues a settled root on both verbs (the pointer is rebuilt from the durable
+    result and equals the one the manifest would have shown), while a live root keeps its
+    typed refusal toward steer_task and emits nothing."""
     from ouroboros.projects_registry import create_project
     from ouroboros.tools.control_routing import _promote_chat_to_task, _route_to_project
 
     create_project(tmp_path, "racer", name="Racer")
-    _addressable_result(tmp_path)
+    preview = _addressable_result(tmp_path)
 
     routed = _wake_routing_ctx(tmp_path)
     out = _route_to_project(routed, "racer", "Continue the racer", predecessor_task_id="racer-old")
-    assert out.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project)")
-    assert "not an addressable result in the host routing manifest" in out
-    assert routed.pending_events == []
+    assert out.startswith("⚠️ ROUTE_UNCONFIRMED"), out
+    [route_evt] = routed.pending_events
+    assert route_evt["predecessor_authority_source"] == preview["authority_source"]
 
     promoted = _wake_routing_ctx(tmp_path)
-    refused = _promote_chat_to_task(promoted, "Finish the racer", workspace="none",
-                                    predecessor_task_id="racer-old")
-    assert refused.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE (promote_chat_to_task)")
-    assert promoted.pending_events == []
+    _promote_chat_to_task(promoted, "Finish the racer", workspace="none", predecessor_task_id="racer-old")
+    [promote_evt] = promoted.pending_events
+    assert promote_evt["predecessor_task_id"] == "racer-old"
+    assert promote_evt["initiator"] == "consciousness"
+
+    (tmp_path / "task_results" / "racer-live.json").write_text(json.dumps({
+        "_schema_version": 1, "task_id": "racer-live", "status": "running", "project_id": "racer",
+    }), encoding="utf-8")
+    refused = _wake_routing_ctx(tmp_path)
+    out = _route_to_project(refused, "racer", "Continue the racer", predecessor_task_id="racer-live")
+    assert out.startswith("⚠️ AUTHORITY_SOURCE_UNAVAILABLE (route_to_project)") and "steer_task" in out
+    assert refused.pending_events == []
