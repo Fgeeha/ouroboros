@@ -30,7 +30,8 @@ def test_isolation_keeps_the_platform_default_text_encoding(tmp_path):
     catches; isolation is about roots, never about the interpreter's encoding."""
     env = isolated_environment(tmp_path, REPO, source={})
     assert "PYTHONUTF8" not in env and "PYTHONIOENCODING" not in env
-    assert "PYTHONUTF8" not in _preflight_env(tmp_path / "data", tmp_path / "repo")
+    gate = _preflight_env(tmp_path / "data", tmp_path / "repo")
+    assert "PYTHONUTF8" not in gate and "PYTHONIOENCODING" not in gate
 
 
 def test_chromium_download_staging_uses_disposable_temp(tmp_path):
