@@ -1021,7 +1021,7 @@ def _owner_content_projection(content: Any) -> str:
             raw = block.get("image_url") or block.get("source") or ""
             digest = hashlib.sha256(str(raw).encode("utf-8")).hexdigest()[:16]
             caption = str(block.get("_caption") or block.get("caption") or "").strip()
-            parts.append(f"[owner image ref sha256:{digest}{'; caption=' + caption if caption else ''}]")
+            parts.append(f"[image ref sha256:{digest}{'; caption=' + caption if caption else ''}]")
     return "\n".join(parts)
 
 
@@ -1059,9 +1059,12 @@ def _accept_owner_directives(ctx: Any, drive_root: Any, task_id: str) -> List[Di
                 )
 
     messages = getattr(ctx, "messages", None)
-    # The task-local collector is canonical when present; transcript parsing is
-    # only a compatibility fallback, avoiding two physical copies of each turn.
-    if not rows and isinstance(messages, list):
+    # The task-local collector is canonical when PRESENT, even when its rows project
+    # to nothing; transcript parsing is only a compatibility fallback for a context
+    # that never recorded one, avoiding two physical copies of each turn. The
+    # fallback labels state what they are — a transcript position, or a host
+    # marker found in the text — never owner authority.
+    if not isinstance(recorded, list) and isinstance(messages, list):
         first_user = True
         for index, message in enumerate(messages):
             if not isinstance(message, dict) or str(message.get("role") or "") != "user":
@@ -1069,10 +1072,10 @@ def _accept_owner_directives(ctx: Any, drive_root: Any, task_id: str) -> List[Di
             content = message.get("content")
             rendered = _owner_content_projection(content)
             if first_user:
-                add("initial_user_transcript", content, f"transcript:{index}")
+                add("initial_text_transcript", content, f"transcript:{index}")
                 first_user = False
             elif "[Message from my human]:" in rendered:
-                add("owner_transcript", content, f"transcript:{index}")
+                add("transcript_marked_owner", content, f"transcript:{index}")
 
     if drive_root is not None and task_id:
         try:

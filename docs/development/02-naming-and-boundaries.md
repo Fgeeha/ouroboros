@@ -331,6 +331,21 @@ post-drain growth check that supersedes a paid acceptance panel, and the
 acceptance premises stay the owner's (`tests/test_task_authored_messages.py`;
 ARCHITECTURE §6 "Owner routing verbs").
 
+### The owner corpus archives inputs; the owner door's stamp is the only authority
+
+The first user turn of every run is recorded in the owner corpus so that acceptance,
+Safety and the post-task synthesis read the same physical archive, but its label states
+only what the host knows: `initial_user` when owner routing stamped the run
+(`metadata.origin_message_ref` or `origin_suppressed`, which a promoted root inherits by
+value), `initial_text` otherwise — a Presence event, a wake, a schedule, a follow-up, a
+child's work order, an unmarked context. `dialogue_provenance.run_origin` mints that fact
+once from typed fields (`owner_ingress`) beside the raw markers the producer recorded, and
+`_routing_issuer` is its reader: an owner turn is a DIRECT turn the door stamped, never a
+lane, a client id (a Presence event carries the provider's event id) or an inherited stamp.
+The stamp is reserved on `/api/tasks` and schedule templates. Neither label decides what
+work was accepted — the task contract and the owner's recorded answers do — and a run recovered
+after a restart keeps its stored `task_inputs` but not its exact initial text.
+
 ### Anti-pattern: a chat id tested for truth
 
 A chat id is a VALUE, not a boolean: `HIDDEN_CHAT_ID` (0) is a REAL destination,
