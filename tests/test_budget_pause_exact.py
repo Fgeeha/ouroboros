@@ -475,7 +475,7 @@ def test_unreadable_external_custody_is_held_as_unknown_not_clean(tmp_path, monk
     assert observed["custody_read"] == "failed" and observed["runs"] == []
     assert "boom" in observed["error"]
     # The supervisor-side twin shares the body: a replay that fails is the same typed fact.
-    monkeypatch.setattr(custody, "replay", lambda _r: (_ for _ in ()).throw(OSError("rows torn")))
+    monkeypatch.setattr(custody, "replay", lambda _r, rows=None: (_ for _ in ()).throw(OSError("rows torn")))
     grant_side = budget_pause.observe_task_runs(tmp_path, ctx.task_id)
     assert grant_side["custody_read"] == "failed" and "rows torn" in grant_side["error"]
 

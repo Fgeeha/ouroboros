@@ -305,3 +305,61 @@ def test_a_parallel_batch_raising_usage_accounting_error_waits_for_already_start
         assert raised_at - started_at >= 0.4
     finally:
         b_done.wait(timeout=2.0)  # never leak the worker thread past the test
+
+
+# --- Astra run-6fe5bf761449 follow-ups: one snapshot, and malformed custody lines ----
+
+def _write_event_log(root, lines):
+    from ouroboros import delegate_custody as custody
+
+    path = custody.event_log_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"".join(lines))
+    return path
+
+
+def test_both_custody_projections_come_from_one_snapshot(tmp_path, monkeypatch):
+    """Astra 6fe5 #1: replay and pending_invocations must fold the SAME rows, so a
+    START_REQUESTED that becomes STARTED between two reads is seen by one of them."""
+    from ouroboros import budget_pause
+    from ouroboros import delegate_custody as custody
+    from ouroboros import delegate_pending
+
+    snapshot = [{"type": custody.START_REQUESTED, "invocation_id": "inv-x", "task_id": "snap-1"}]
+    seen = {}
+    monkeypatch.setattr(custody, "custody_log_unreadable", lambda _root: False)
+    monkeypatch.setattr(custody, "custody_rows", lambda _root: tuple(snapshot))
+
+    def _replay(_root, rows=None):
+        seen["replay"] = rows
+        return {}
+
+    def _pending(_root, rows=None):
+        seen["pending"] = rows
+        return [{"invocation_id": "inv-x", "task_id": "snap-1", "route": "codex"}]
+
+    monkeypatch.setattr(custody, "replay", _replay)
+    monkeypatch.setattr(delegate_pending, "pending_invocations", _pending)
+    observed = budget_pause.observe_task_runs(tmp_path, "snap-1")
+    assert seen["replay"] is not None and seen["replay"] == seen["pending"] == snapshot
+    assert observed["coverage_basis"] == "pending_invocations_unbound"
+
+
+def test_a_malformed_custody_line_naming_the_task_is_unknown_custody(tmp_path):
+    """Astra 6fe5 #2, on a REAL event log: a START_REQUESTED joined onto a torn
+    prefix is unparseable; the memo used to skip it silently and the observer then
+    proved "no open runs". Now it is an incomplete read, never absence."""
+    import json
+
+    from ouroboros import budget_pause
+    from ouroboros import delegate_custody as custody
+
+    start = json.dumps({"type": custody.START_REQUESTED, "invocation_id": "inv-torn",
+                        "task_id": "torn-1"}).encode()
+    _write_event_log(tmp_path, [b'{"type": "llm_round", "x": 1', start + b"\n"])
+    observed = budget_pause.observe_task_runs(tmp_path, "torn-1")
+    assert observed["custody_read"] == "failed"
+    assert "custody_rows_incomplete" in observed["error"]
+    # Another task is not blocked by this task's torn line.
+    other = budget_pause.observe_task_runs(tmp_path, "someone-else")
+    assert other["custody_read"] == "ok" and other["coverage_basis"] == "no_open_runs"

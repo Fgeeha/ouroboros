@@ -350,13 +350,22 @@ def observe_task_runs(root: Any, task_id: str, *, reason: str = "budget_resume_u
             # UNKNOWN, never "no open runs" (Astra run-a882315dbcd7 #2).
             if custody.custody_log_unreadable(pathlib.Path(root)):
                 raise OSError("custody_log_unreadable")
-            runs = [run for run in custody.replay(pathlib.Path(root)).values()
+            from ouroboros.delegate_custody_memo import malformed_custody_lines_mentioning
+
+            # ONE snapshot feeds both projections: a START_REQUESTED that becomes
+            # STARTED between two reads must land in one of them (Astra 6fe5 #1).
+            snapshot = list(custody.custody_rows(pathlib.Path(root)))
+            # An unparseable custody line naming this task may hide its request.
+            malformed = malformed_custody_lines_mentioning(pathlib.Path(root), mine)
+            if malformed is None or malformed:
+                raise OSError(f"custody_rows_incomplete:{'unknown' if malformed is None else malformed}")
+            runs = [run for run in custody.replay(pathlib.Path(root), rows=snapshot).values()
                     if str(getattr(run, "task_id", "") or "") == mine and not getattr(run, "settled", True)]
             # A START_REQUESTED whose response was lost has no run id yet but may
             # be a live remote writer: unknown custody, never absence (#3).
             from ouroboros.delegate_pending import pending_invocations
 
-            pending = [row for row in pending_invocations(pathlib.Path(root))
+            pending = [row for row in pending_invocations(pathlib.Path(root), rows=snapshot)
                        if str(row.get("task_id") or "") == mine]
             pending_rows = [{"run_id": "", "invocation_id": str(row.get("invocation_id") or ""),
                              "route": str(row.get("route") or ""),

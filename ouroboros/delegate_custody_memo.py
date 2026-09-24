@@ -94,6 +94,11 @@ class _ChainMemo:
     rows_view: Tuple[Dict[str, Any], ...] = ()
     generation: int = 0
     torn_archive_lines: int = 0
+    # Custody-marked lines the fold could NOT parse (bounded). A START_REQUESTED
+    # joined onto a torn prefix lands here; readers that must prove absence
+    # consult it instead of trusting the silent skip (#1196, Astra 6fe5 #2).
+    malformed_marker_lines: List[bytes] = field(default_factory=list)
+    malformed_overflow: bool = False
     # (generation, folded state) for ``folded_state``; cloned on every return.
     state_cache: Optional[Tuple[int, Any]] = None
 
@@ -228,6 +233,8 @@ def _fold_segment(
                     break  # a torn live tail completes on a later call
                 # An archive never completes its torn tail: consume it, count it.
                 memo.torn_archive_lines += 1
+                if marker in raw:
+                    _remember_malformed(memo, raw)
                 consumed += len(raw)
                 continue
             if inner:
@@ -240,8 +247,12 @@ def _fold_segment(
             try:
                 row = json.loads(raw.decode("utf-8", errors="replace"))
             except ValueError:
+                _remember_malformed(memo, raw)
                 continue
-            if isinstance(row, dict) and str(row.get("type") or "").startswith(_custody()._ROW_MARKER):
+            if not isinstance(row, dict):
+                _remember_malformed(memo, raw)
+                continue
+            if str(row.get("type") or "").startswith(_custody()._ROW_MARKER):
                 memo.rows.append(_compact_row(row, (stat.st_dev, stat.st_ino, offset, len(raw))))
         try:
             after = os.fstat(handle.fileno())
@@ -249,6 +260,31 @@ def _fold_segment(
             after = stat
     return _Segment(st_dev=stat.st_dev, st_ino=stat.st_ino, consumed=consumed, st_mtime_ns=after.st_mtime_ns,
                     prefix_sha256=hasher.hexdigest() if hasher is not None else "")
+
+
+_MALFORMED_KEEP = 200
+
+
+def _remember_malformed(memo: _ChainMemo, raw: bytes) -> None:
+    if len(memo.malformed_marker_lines) >= _MALFORMED_KEEP:
+        memo.malformed_overflow = True
+        return
+    memo.malformed_marker_lines.append(bytes(raw[:65536]))
+
+
+def malformed_custody_lines_mentioning(drive_root: Any, needle: str) -> Optional[int]:
+    """How many unparseable custody-marked lines mention ``needle``; None = unknown.
+
+    None when the memo was bypassed (lenient read, nothing recorded) or the
+    bounded record overflowed: an absence proof cannot be built from that.
+    """
+    key = _key(_custody().event_log_path(drive_root))
+    token = str(needle or "").encode("utf-8")
+    with _lock_for(key):
+        memo, _rows = _refresh(drive_root)
+        if memo is None or memo.malformed_overflow:
+            return None
+        return sum(1 for raw in memo.malformed_marker_lines if token and token in raw)
 
 
 def _advance(memo: _ChainMemo, chain: List[Tuple[pathlib.Path, os.stat_result, bool]]) -> None:
