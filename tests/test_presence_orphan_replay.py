@@ -529,3 +529,44 @@ def test_an_unwritable_inbound_row_fails_the_turn_before_the_model_runs(tmp_path
     first = run_presence_turn(**kwargs)
     rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
     assert first.text == "Real answer" and [r["direction"] for r in rows if r.get("task_id") == first.task_id] == ["in"]
+
+
+def _sending_agent(calls, reply, drive_root, *, part, rotate_first=False):
+    """A real-pipeline agent whose turn records one delivered receipt for this conversation mid-turn."""
+    def send(task):
+        chat = drive_root / "logs" / "chat.jsonl"
+        if rotate_first:  # the live generation rotates while the turn runs
+            (drive_root / "archive").mkdir(exist_ok=True)
+            chat.rename(drive_root / "archive" / "chat_20260528T000200.jsonl")
+        append_jsonl(chat, {"type": "presence_delivery", "direction": "out", "chat_id": task["chat_id"], "text": part,
+                            "task_id": task["id"], "transport": {"conversation_key": _event().conversation_key,
+                                                                 "delivery": {"state": "delivered", "delivery_id": f"send:{part}", "part_id": "0"}}})
+    return _answering_agent(calls, reply, drive_root, during=send)
+
+
+def test_a_retry_after_a_rotation_still_knows_its_own_sends(tmp_path):
+    """The lost attempt's archived sends stay unknown to the retry, but the retry's own receipts, which
+    all landed in the generation live when it started, are its pointer's confirmed sends."""
+    from ouroboros.presence_runner import _read_previous_turn
+
+    task_id = _task_id(_admission(), _event())
+    chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
+    (tmp_path / "archive").mkdir()
+    chat.rename(tmp_path / "archive" / "chat_20260528T000100.jsonl")
+    calls: list = []
+    kwargs = _v1_kwargs(tmp_path, calls)
+    run_presence_turn(**{**kwargs, "agent_factory": lambda **_kw: _sending_agent(calls, "Real answer", tmp_path, part="Retry part")})
+    assert calls[0]["metadata"]["presence"]["previous_attempt"]["delivered_count"] is None  # the archived send
+    pointer = _read_previous_turn(tmp_path, kwargs["event"].conversation_key)
+    assert (pointer["transport_sends"], pointer["delivery"]) == (["Retry part"], "partly confirmed")
+
+
+def test_a_rotation_during_the_turn_leaves_its_sends_unknown(tmp_path):
+    from ouroboros.presence_runner import _read_previous_turn
+
+    calls: list = []
+    kwargs = _v1_kwargs(tmp_path, calls)
+    run_presence_turn(**{**kwargs, "agent_factory": lambda **_kw: _sending_agent(
+        calls, "Real answer", tmp_path, part="Mid part", rotate_first=True)})
+    pointer = _read_previous_turn(tmp_path, kwargs["event"].conversation_key)
+    assert (pointer["transport_sends"], pointer["delivery"]) == ([], "unknown")

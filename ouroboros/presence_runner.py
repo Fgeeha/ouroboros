@@ -307,6 +307,30 @@ def _confirmed_sends(rows: Sequence[Mapping[str, Any]]) -> list[str] | None:
     return [text for state, text in _latest_receipts(rows).values() if state in {"delivered", "accepted"}]
 
 
+def _chat_generation(drive_root: Path) -> tuple[int, int] | None:
+    """Identity of the live chat.jsonl (device, inode); rotation renames it, so a change means rotation."""
+    try:
+        stat = os.stat(Path(drive_root) / "logs" / "chat.jsonl")
+    except OSError:
+        return None
+    return (stat.st_dev, stat.st_ino)
+
+
+def _turn_sends(rows: Sequence[Mapping[str, Any]], own_start: int, same_generation: bool) -> list[str] | None:
+    """Confirmed sends for the pointer of the execution that just finished.
+
+    The whole task's receipts count when its inbound row is still live; otherwise (a lost attempt
+    whose rows rotated away, never re-logged) this execution's own rows, which all landed in the
+    generation that was live when it started, are complete on their own. A rotation during the
+    execution leaves the count unknown.
+    """
+    if any(row.get("direction") == "in" for row in rows):
+        return _confirmed_sends(rows)
+    if not same_generation:
+        return None
+    return [text for state, text in _latest_receipts(rows[own_start:]).values() if state in {"delivered", "accepted"}]
+
+
 def _latest_receipts(rows: Sequence[Mapping[str, Any]]) -> dict[tuple[str, str], tuple[str, str]]:
     """The latest receipt state and text per (delivery_id, part_id); a later receipt settles an earlier one."""
     latest: dict[tuple[str, str], tuple[str, str]] = {}
@@ -623,6 +647,7 @@ def run_presence_turn(
         )
         chat_id = int(task["chat_id"])
         actor_id = _stable_numeric_id("presence-actor-log", str(task.get("actor_id") or ""))
+        own_start = len(prior_rows)
         # A lost attempt logged the message (here or in a rotated archive); an attempt that died before its
         # running write left only that row. Re-logging would also let a later retry mistake the fresh row
         # for complete receipt coverage, so the row is written only when no attempt has a trace at all.
@@ -637,6 +662,7 @@ def run_presence_turn(
                 task=task,
                 task_id=task_id,
             )
+        generation = _chat_generation(Path(drive_root))  # the live file this execution's receipts land in
         if agent_factory is None:
             from ouroboros.agent import make_agent
 
@@ -674,7 +700,11 @@ def run_presence_turn(
             )
         # Still under the conversation lock. A replay writes only through _repair_previous_turn, under
         # this same lock, and it leaves a pointer that names a newer turn alone.
-        sends = _confirmed_sends(_live_task_rows(Path(drive_root), task_id, event.conversation_key)) if event.delivery_reporting_version else []
+        sends: list[str] | None = []
+        if event.delivery_reporting_version:
+            after = _chat_generation(Path(drive_root))
+            sends = _turn_sends(_live_task_rows(Path(drive_root), task_id, event.conversation_key), own_start,
+                                same_generation=generation is None or after == generation)
         _write_previous_turn(Path(drive_root), event.conversation_key, task_id, outcome=result.outcome,
                              message=str(row.get("message") or result.text), sends=sends or [],
                              work_ref=result.work_ref, finished_at=utc_now_iso(),
