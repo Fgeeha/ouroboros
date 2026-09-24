@@ -14,6 +14,9 @@ from ouroboros.cost_projection import (
     normalize_task_result_cost_planes,
 )
 from ouroboros.utils import read_json_dict, update_json_locked, utc_now_iso
+# Read-side custody of a published review projection belongs with the projection
+# owner; the historical name stays resolvable through this module.
+from ouroboros.review_projection import merge_review_projection as merge_review_projection
 from ouroboros.review_records import validate_author_disposition
 
 log = logging.getLogger(__name__)
@@ -829,41 +832,6 @@ def list_task_results(
         results.append(data)
     _emit_quarantine_event(drive_root, quarantined)
     return results
-
-
-def merge_review_projection(previous: Any, incoming: Any) -> Any:
-    """Keep newer host publication facts when a delayed task snapshot arrives.
-
-    This is read-side custody, never review authority. Attempt identity comes
-    from the task; publication_revision only orders snapshots of the SAME
-    panel. Supersession cannot be reversed by a stale or replayed projection.
-    """
-    if not isinstance(previous, dict) or not isinstance(incoming, dict):
-        return incoming
-    old_rows, new_rows = previous.get("panels"), incoming.get("panels")
-    if not isinstance(old_rows, list) or not isinstance(new_rows, list):
-        return incoming
-    if not any(isinstance(row, dict) and row.get("publication_revision") for row in old_rows + new_rows):
-        return incoming  # unchanged legacy merge semantics
-    def rank(value: Dict[str, Any]) -> tuple:
-        return (bool(value.get("superseded")),
-                value.get("publication_revision") if type(value.get("publication_revision")) is int else 0)
-
-    merged: Dict[tuple, Dict[str, Any]] = {}
-    for index, row in enumerate(old_rows + new_rows):
-        if not isinstance(row, dict):
-            continue
-        key = (str(row.get("surface") or ""), str(row.get("task_attempt") or ""),
-               str(row.get("panel_id") or f"legacy:{index}"), row.get("panel_index"))
-        prior = merged.get(key)
-        if prior is None or rank(row) > rank(prior):
-            merged[key] = copy.deepcopy(row)
-    rows = list(merged.values())
-    rows.sort(key=lambda row: (
-        row.get("task_attempt") if type(row.get("task_attempt")) is int else 0,
-        row.get("panel_index") if type(row.get("panel_index")) is int else 0,
-    ))
-    return {**previous, **incoming, "panels": rows}
 
 
 def write_task_result(

@@ -13,7 +13,6 @@ import hashlib
 import json
 import logging
 import pathlib
-import subprocess
 from typing import Any, Dict, List
 
 from ouroboros.tool_capabilities import DEFAULT_TOOL_RESULT_LIMIT
@@ -36,12 +35,15 @@ def _ev():
     return review_evidence
 
 
-def collect_turn_diff(ctx: Any, *, limit: int = 20000, include_recent_commit: bool = False) -> str:
+def collect_turn_diff(
+    ctx: Any, *, limit: int = 20000, include_recent_commit: bool = False,
+    capture_meta: Any = None,
+) -> str:
     """Best-effort WORKING-TREE diff of the active workspace/repo for task-
     acceptance review evidence, so the reviewer can judge EVIDENCE INDEPENDENCE
     (which test/check files the agent itself wrote or modified). A structural
     fact derived from the repo, not message content (Bible P5). Returns "" when
-    no repo/diff exists; truncated with an explicit omission note.
+    no repo exists; bounded with an explicit omission note.
 
     This is ``git diff HEAD`` (uncommitted tracked changes) plus the names of
     untracked files — it is NOT a captured per-turn baseline. Without a baseline
@@ -50,7 +52,22 @@ def collect_turn_diff(ctx: Any, *, limit: int = 20000, include_recent_commit: bo
     instructed) is what distinguishes agent-authored-this-turn from
     pre-existing/grader-owned. When the caller proves a real current-turn commit
     (``include_recent_commit``, derived from a commit_reviewed status=ok signal),
-    that commit's patch is also appended so committed work is judged too."""
+    that commit's patch is also appended so committed work is judged too.
+
+    The repository is read ONCE, as bytes (``repo_diff_capture``): this bounded
+    preview and the exact source of the same round project the SAME capture, so
+    they cannot describe two different trees, and a non-UTF-8 hunk can no longer
+    kill the packet with a decode error. A capture that could not read the tree
+    projects its typed gap — never an empty, clean-looking diff.
+
+    ``capture_meta`` (optional dict) receives the round's capture and its typed
+    facts, so the caller can hand the SAME capture to the exact-source path
+    instead of reading the repository again; the capture is released here
+    whenever no exact source is owed, so no private spool outlives its use.
+    """
+    from ouroboros.repo_diff_capture import (
+        capture_disclosure, capture_repo_diff, repo_diff_projection,
+    )
 
     repo = None
     try:
@@ -60,29 +77,60 @@ def collect_turn_diff(ctx: Any, *, limit: int = 20000, include_recent_commit: bo
         repo = getattr(ctx, "repo_dir", None)
     if not repo:
         return ""
+    capture = capture_repo_diff(repo, include_recent_commit=include_recent_commit)
+    handed_off = False
+    try:
+        # The projection is decoded and redacted whole BEFORE its section bounds.
+        projection, decode_gaps = repo_diff_projection(
+            capture, section_limits={"tracked": limit, "untracked": 4000, "commit": limit},
+        )
+        disclosure = capture_disclosure(capture, decode_gaps)
+        exact_required = bool(
+            not disclosure["complete"] or len(projection) > limit
+            or "OMISSION NOTE: truncated at " in projection,
+        )
+        if not (isinstance(capture_meta, dict) and exact_required):
+            from ouroboros.repo_diff_capture import retain_private_capture
 
-    def _git(args: list) -> str:
-        try:
-            return subprocess.run(
-                ["git", *args], cwd=str(repo), capture_output=True, text=True, timeout=20
-            ).stdout or ""
-        except (subprocess.SubprocessError, OSError):
-            return ""
+            retained = retain_private_capture(getattr(ctx, "drive_root", None), capture)
+            disclosure["raw_retained"] = bool(retained.get("blob_ref"))
+            if retained.get("status") == "unavailable":
+                disclosure["raw_retention"] = {"status": "unavailable", "reason": "private capture retention failed"}
+        if isinstance(capture_meta, dict):
+            capture_meta["capture"] = capture
+            capture_meta["capture_disclosure"] = disclosure
+            capture_meta["exact_required"] = exact_required
+            if not capture.available:
+                capture_meta["issue"] = {
+                    "tool": "repo_diff", "status": "source_unavailable",
+                    "reason": "repo_diff_capture_unavailable", "source_ref": {},
+                    "gaps": disclosure["gaps"],
+                }
+            handed_off = exact_required
+        return projection
+    finally:
+        if not handed_off:
+            capture.release()
 
-    tracked = _git(["diff", "--no-ext-diff", "--no-textconv", "--no-color", "HEAD"])
-    diff = _ev().truncate_review_artifact(tracked, limit=limit)
-    untracked = _git(["ls-files", "--others", "--exclude-standard"]).strip()
-    if untracked:
-        untracked = _ev().truncate_review_artifact(untracked, limit=4000)
-        diff = f"{diff}\n# Untracked working-tree files (new, not yet committed; may include pre-existing untracked files):\n{untracked}\n"
-    if include_recent_commit:
-        commit = _git(["show", "--no-ext-diff", "--no-textconv", "--no-color", "--stat", "-p", "HEAD"]).strip()
-        if commit:
-            commit = _ev().truncate_review_artifact(commit, limit=limit)
-            diff = f"{diff}\n# Most recent commit (committed this turn):\n{commit}\n"
+
+def accept_agent_supplied_section(agent_evidence: Any) -> Dict[str, Any]:
+    """The bounded, REDACTED ``agent_supplied`` section of the acceptance packet.
+
+    The one normalization both the host builder and the root nomination use:
+    an agent-supplied ``repo_diff`` is demoted so it can never masquerade as
+    the host diff, and the whole dict is redacted (structural, key-aware)
+    because it is serialized into an external reviewer prompt. Never promoted
+    to host-fact status; the host builder re-bounds it under its own budget.
+    """
     from ouroboros.observability import redact_projection
 
-    return redact_projection(diff).value
+    if not isinstance(agent_evidence, dict) or not agent_evidence:
+        return {}
+    supplied = dict(agent_evidence)
+    if "repo_diff" in supplied:
+        supplied["agent_supplied_repo_diff"] = supplied.pop("repo_diff")
+    projected = redact_projection(supplied).value
+    return projected if isinstance(projected, dict) else {"raw_evidence": str(projected)}
 
 
 _ACCEPT_RESULT_CAP = DEFAULT_TOOL_RESULT_LIMIT  # per tool-call result/output

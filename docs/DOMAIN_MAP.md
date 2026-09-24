@@ -8,11 +8,11 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 
 | domain | name | modules | proposed |
 |---|---|---:|---:|
-| D01 | Agent core & main loop | 34 | 0 |
+| D01 | Agent core & main loop | 36 | 0 |
 | D02 | LLM client, routing & providers | 38 | 0 |
 | D03 | Context assembly, fit & compaction | 11 | 0 |
 | D04 | Tool execution: registry, access & typed results | 21 | 0 |
-| D05 | Tool surfaces: files, code, shell, media, external | 28 | 0 |
+| D05 | Tool surfaces: files, code, shell, media, external | 29 | 0 |
 | D06 | Review stack | 67 | 0 |
 | D07 | Delegation, subagents & Claudexor | 53 | 0 |
 | D08 | Supervisor: queue, workers, events & runtime control | 47 | 0 |
@@ -28,7 +28,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **566** | **0** |
+| **total** | | **569** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -182,6 +182,8 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 
 - `ouroboros/_outcome_receipts.py`
 - `ouroboros/_outcome_tool_errors.py`
+- `ouroboros/acceptance_preparation.py`
+- `ouroboros/acceptance_retrieving.py`
 - `ouroboros/acceptance_settlement.py`
 - `ouroboros/agent.py`
 - `ouroboros/agent_dispatch.py`
@@ -303,6 +305,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/code_search_rg.py`
 - `ouroboros/mcp_client.py`
 - `ouroboros/process_interpreters.py`
+- `ouroboros/repo_diff_capture.py`
 - `ouroboros/tools/browser.py`
 - `ouroboros/tools/core.py`
 - `ouroboros/tools/core_artifacts.py`
