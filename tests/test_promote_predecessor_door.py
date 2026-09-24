@@ -191,10 +191,11 @@ def test_a_helpers_result_is_continued_with_its_root_named_and_never_offered(tmp
     evt: dict = {}
     assert _door(_room_ctx(tmp_path, metadata), "racer-child", evt) == ""
     assert evt["predecessor_task_id"] == "racer-child"
-    assert evt["predecessor_facts"] == {"project_id": "racer", "root_task_id": "racer-root"}
+    assert evt["predecessor_facts"] == {"project_id": "racer", "helper": True,
+                                        "root_task_id": "racer-root", "parent_task_id": "racer-root"}
     root_evt: dict = {}
     assert _door(_room_ctx(tmp_path, metadata), "racer-root", root_evt) == ""
-    assert root_evt["predecessor_facts"]["root_task_id"] == ""  # a root names no root
+    assert root_evt["predecessor_facts"]["helper"] is False  # a root is nobody's helper
 
     _confirm(monkeypatch, effective_project_id="racer")
     ctx = _room_ctx(tmp_path, metadata)
@@ -203,6 +204,37 @@ def test_a_helpers_result_is_continued_with_its_root_named_and_never_offered(tmp
     assert out.startswith("OK: task"), out
     assert "Note: predecessor racer-child is a delegated helper's result; its root is racer-root." in out
     assert "belongs to" not in out  # same project: nothing else to disclose
+
+
+def test_a_helper_predecessor_is_named_on_the_route_verb_and_without_a_root_id(tmp_path, monkeypatch):
+    """The helper note rides both verbs and names what the helper's row knows: its root,
+    else its parent, else that the root is unknown - it never goes silent on a helper
+    whose row carries only the subagent role."""
+    from ouroboros.projects_registry import create_project
+    from ouroboros.task_results import write_task_result
+    from ouroboros.tools.control_routing import _promote_chat_to_task, _route_to_project
+
+    create_project(tmp_path, "racer", name="Racer")
+    write_task_result(tmp_path, "racer-child", "completed", project_id="racer", objective="helper work",
+                      parent_task_id="racer-root", root_task_id="racer-root", delegation_role="subagent")
+    write_task_result(tmp_path, "racer-nested", "completed", project_id="racer", objective="nested helper",
+                      parent_task_id="racer-child", delegation_role="subagent")
+    write_task_result(tmp_path, "racer-orphan", "completed", project_id="racer", objective="role only",
+                      delegation_role="subagent")
+    _confirm(monkeypatch, effective_project_id="racer")
+
+    routed = _room_ctx(tmp_path, {}, project_id="racer")
+    out = _route_to_project(routed, "racer", "continue the helper's work", predecessor_task_id="racer-child")
+    assert out.startswith("✉️ Routed to project 'Racer' (racer)"), out
+    assert "Note: predecessor racer-child is a delegated helper's result; its root is racer-root." in out
+
+    nested = _room_ctx(tmp_path, {}, project_id="racer")
+    out = _promote_chat_to_task(nested, "Continue the nested helper", workspace="none", predecessor_task_id="racer-nested")
+    assert "Note: predecessor racer-nested is a delegated helper's result; its parent is racer-child." in out
+
+    orphan = _room_ctx(tmp_path, {}, project_id="racer")
+    out = _promote_chat_to_task(orphan, "Continue the role-only helper", workspace="none", predecessor_task_id="racer-orphan")
+    assert "Note: predecessor racer-orphan is a delegated helper's result; its root is unknown." in out
 
 
 def test_a_failed_root_is_a_settled_predecessor(tmp_path):
@@ -235,7 +267,7 @@ def test_another_projects_root_is_continued_from_this_room_and_the_hint_stays_ro
     assert _door(_room_ctx(tmp_path, metadata), "tower-root", evt) == ""
     assert evt["predecessor_task_id"] == "tower-root"
     assert evt["predecessor_authority_source"] == _TOWER_POINTER
-    assert evt["predecessor_facts"] == {"project_id": "tower", "root_task_id": ""}
+    assert evt["predecessor_facts"] == {"project_id": "tower", "helper": False, "root_task_id": "", "parent_task_id": ""}
 
 
 def test_a_pooled_task_continues_another_rooms_root_into_that_room_in_one_hop(tmp_path, monkeypatch):

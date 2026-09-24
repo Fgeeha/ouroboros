@@ -136,13 +136,13 @@ def _predecessor_door_refusal(result: Dict[str, Any]) -> str:
 
 
 def _predecessor_notes(predecessor_id: str, facts: Dict[str, Any], landed: str) -> str:
-    """What the receipt says about the predecessor once, like the second-project note:
-    a helper's result names its root, and a landing outside the predecessor's project
-    names both - disclosed free choices, never refusals."""
+    """What the receipt says about the predecessor once, like the second-project note: a
+    helper's result names its root (or parent), a foreign landing names both projects."""
     if not predecessor_id:
         return ""
-    home, child_root = str(facts.get("project_id") or ""), str(facts.get("root_task_id") or "")
-    notes = f" Note: predecessor {predecessor_id} is a delegated helper's result; its root is {child_root}." if child_root else ""
+    home, root, parent = (str(facts.get(k) or "") for k in ("project_id", "root_task_id", "parent_task_id"))
+    lineage = f"its root is {root}" if root else (f"its parent is {parent}" if parent else "its root is unknown")
+    notes = f" Note: predecessor {predecessor_id} is a delegated helper's result; {lineage}." if facts.get("helper") else ""
     if home != str(landed or ""):
         where = f"project '{home}'" if home else "the main chat"
         here = f"project '{landed}'" if landed else "the main chat"
@@ -187,9 +187,9 @@ def _attach_predecessor_authority_from_metadata(
         # Render-only facts for the receipt's notes; the caller pops them before
         # emission, so the event carries nothing the supervisor never reads.
         evt["predecessor_facts"] = {
-            "project_id": str(result.get("project_id") or ""),
-            "root_task_id": str(result.get("root_task_id") or result.get("parent_task_id") or "")
-            if _is_child_result(result) else "",
+            "project_id": str(result.get("project_id") or ""), "helper": _is_child_result(result),
+            "root_task_id": str(result.get("root_task_id") or ""),
+            "parent_task_id": str(result.get("parent_task_id") or ""),
         }
     else:
         return "the selected predecessor has no readable authority source"
@@ -763,7 +763,8 @@ def _route_to_project(
         response = (
             f"✉️ Routed to project '{name}' ({pid}) as task {tid}; admission is durably "
             f"scheduled ({mode}). I'll continue there; this chat stays free for you."
-            + _predecessor_notes(str(evt.get("predecessor_task_id") or ""), predecessor_facts, pid)
+            + _predecessor_notes(str(evt.get("predecessor_task_id") or ""), predecessor_facts,
+                                 str(receipt.get("effective_project_id") or pid))
             + _obligation_moved_note(ctx, tid, receipt.get("force_plan_transfer"))
         )
         return _finish_swarm_handoff(ctx, evt, response, status="scheduled")

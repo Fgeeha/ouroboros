@@ -106,8 +106,8 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
     lane = str(effective_lane or "").strip()
     if lane:
         bits.append(f"model_lane={lane}")
-    lineage = (" (task_drive/artifact_store: its own, its parent's and its root task's files,"
-               " never a sibling's)" if "task_drive" in read_roots else "")
+    lineage = (" (task_drive/artifact_store: its own, its parent's, its root task's and, when its"
+               " contract names one, its predecessor's files, never a sibling's)" if "task_drive" in read_roots else "")
     return (
         "child capabilities — " + " · ".join(bits)
         + f"\nreadable={', '.join(read_roots) or 'none'}{lineage}"
