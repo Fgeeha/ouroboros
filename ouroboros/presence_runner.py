@@ -15,8 +15,12 @@ from ouroboros.artifacts import stage_task_attachments
 from ouroboros.contracts.task_contract import attach_task_contract
 from ouroboros.presence_admission import PresenceAdmission
 from ouroboros.presence_authority import presence_ceiling_payload
-from ouroboros.task_results import load_task_result
-from ouroboros.utils import append_jsonl, read_json_dict, utc_now_iso
+from ouroboros.task_results import (
+    is_reconciled_presence_placeholder,
+    load_task_result,
+    reopen_reconciled_presence_placeholder,
+)
+from ouroboros.utils import append_jsonl, atomic_write_json, iter_jsonl_objects, read_json_dict, utc_now_iso
 
 
 class PresenceTurnError(ValueError):
@@ -88,8 +92,11 @@ def presence_result_from_stored(stored: Mapping[str, Any], task_id: str) -> Pres
         # could differ from the raw final; neither they nor deliberate emptiness are guessed away.
         if notice and text == provider_terminal_body(raw, notice):
             text = raw
+    # Unknown-origin compatibility covers completed rows only: a failed row may
+    # carry host text (an orphan reconcile or exception notice), never a reply.
     outcome, text = _presence_delivery(
-        str(metadata.get("presence_outcome") or "message"), str(text or ""), origin, legacy=True,
+        str(metadata.get("presence_outcome") or "message"), str(text or ""), origin,
+        legacy=str(stored.get("status") or "") == "completed",
     )
     return PresenceTurnResult(
         outcome=outcome, text=text, task_id=task_id,
@@ -133,6 +140,8 @@ def build_presence_result_event(task: dict[str, Any], text: str, ctx: Any, *, te
         "task_id": str(task.get("id") or ""),
         "outcome": outcome,
         "text": result_text,
+        # The accepted presence_finish message; a tool_delivered note is context, never speech.
+        "message": result_text or (str(completion.get("message") or "") if outcome == "tool_delivered" else ""),
         "work_ref": work_ref,
         "ts": utc_now_iso(),
     }
@@ -220,6 +229,14 @@ class PresenceTurnGate:
 
 _GATES_LOCK = threading.Lock()
 _GATES: dict[tuple[str, int], PresenceTurnGate] = {}
+_LIVE_LOCK = threading.Lock()
+_LIVE_PRESENCE_TASKS: set[str] = set()
+
+
+def presence_turn_is_live(task_id: str) -> bool:
+    """Process-local liveness for the orphan reconciler; never an owner-addressable actor."""
+    with _LIVE_LOCK:
+        return str(task_id or "") in _LIVE_PRESENCE_TASKS
 
 
 def _configured_gate(drive_root: Path | None = None) -> PresenceTurnGate:
@@ -250,9 +267,32 @@ def _task_id(admission: PresenceAdmission, event: PresenceTurnEvent) -> str:
 
 def _cached_result(drive_root: Path, task_id: str) -> PresenceTurnResult | None:
     stored = load_task_result(drive_root, task_id) or {}
-    if str(stored.get("status") or "") not in {"completed", "failed"}:
-        return None
+    if str(stored.get("status") or "") not in {"completed", "failed"} or is_reconciled_presence_placeholder(stored):
+        return None  # a host-lost turn is not a result: the transport's retry runs it again
     return presence_result_from_stored(stored, task_id)
+
+
+def _confirmed_sends(drive_root: Path, task_id: str) -> list[str]:
+    """One text per confirmed part from this task's v1 receipts in the live chat generation."""
+    parts: dict[tuple[str, str], str] = {}
+    for row in iter_jsonl_objects(Path(drive_root) / "logs" / "chat.jsonl"):
+        transport = row.get("transport") if isinstance(row.get("transport"), dict) else {}
+        delivery = transport.get("delivery") if isinstance(transport.get("delivery"), dict) else {}
+        if (row.get("type") == "presence_delivery" and row.get("task_id") == task_id
+                and delivery.get("state") in {"delivered", "accepted"}):
+            parts.setdefault((str(delivery.get("delivery_id")), str(delivery.get("part_id"))), str(row.get("text") or ""))
+    return list(parts.values())
+
+
+def _previous_turn_path(drive_root: Path, conversation_key: str) -> Path:
+    digest = hashlib.sha256(conversation_key.encode("utf-8")).hexdigest()
+    return Path(drive_root) / "state" / "presence_turn_gate" / f"last-{digest}.json"
+
+
+def _read_previous_turn(drive_root: Path, conversation_key: str) -> dict[str, Any] | None:
+    """Last executed turn of this exact conversation; a rebuildable projection."""
+    row = read_json_dict(_previous_turn_path(drive_root, conversation_key)) or {}
+    return row if row.get("conversation_key") == conversation_key else None
 
 
 def _log_dialogue(
@@ -268,9 +308,16 @@ def _log_dialogue(
 ) -> None:
     from ouroboros.dialogue_provenance import presence_provenance_from_task
 
+    chat_path = drive_root / "logs" / "chat.jsonl"
+    if direction == "in" and any(
+        row.get("direction") == "in" and row.get("chat_id") == chat_id
+        and row.get("client_message_id") == event.source_event_id
+        for row in iter_jsonl_objects(chat_path)
+    ):
+        return  # a re-run of a host-lost turn: the correspondent's message is already in the room
     state = read_json_dict(drive_root / "state" / "state.json") or {}
     append_jsonl(
-        drive_root / "logs" / "chat.jsonl",
+        chat_path,
         {
             "ts": utc_now_iso(),
             "session_id": state.get("session_id"),
@@ -306,6 +353,7 @@ def _build_task(
     *,
     drive_root: Path,
     staged_files: Sequence[Path],
+    reopened: bool = False,
 ) -> dict[str, Any]:
     from ouroboros.config import runtime_setting
 
@@ -337,6 +385,16 @@ def _build_task(
             "destination": admission.destination.__dict__,
         },
     }
+    previous_turn = _read_previous_turn(drive_root, event.conversation_key)
+    if previous_turn:
+        presence_context["previous_turn"] = previous_turn
+    if reopened:
+        # A v0 transport reports no receipts, so what the lost attempt sent is unknown (None).
+        sent = _confirmed_sends(drive_root, task_id) if event.delivery_reporting_version else None
+        presence_context["previous_attempt"] = {
+            "delivered_count": None if sent is None else len(sent),
+            "delivered": None if sent is None else [text for text in sent if text],
+        }
     metadata: dict[str, Any] = {
         "source": "presence",
         "client_message_id": event.source_event_id,
@@ -433,11 +491,23 @@ def run_presence_turn(
         second_cached = _cached_result(Path(drive_root), task_id)
         if second_cached is not None:
             return second_cached
+        with _LIVE_LOCK:
+            _LIVE_PRESENCE_TASKS.add(task_id)
+        try:
+            return _execute_live()
+        finally:
+            with _LIVE_LOCK:
+                _LIVE_PRESENCE_TASKS.discard(task_id)
+
+    def _execute_live() -> PresenceTurnResult:
+        # Both locks are held: no other execution of this conversation can race the reopen.
+        reopened = reopen_reconciled_presence_placeholder(Path(drive_root), task_id)
         task = _build_task(
             admission,
             event,
             drive_root=Path(drive_root),
             staged_files=tuple(Path(item) for item in staged_files),
+            reopened=reopened,
         )
         chat_id = int(task["chat_id"])
         actor_id = _stable_numeric_id("presence-actor-log", str(task.get("actor_id") or ""))
@@ -484,6 +554,17 @@ def run_presence_turn(
                 task=task,
                 task_id=task_id,
             )
+        # Still under the conversation lock; cached replays return before execute() and
+        # never write, so an older replay cannot overwrite the newest executed turn.
+        sends = _confirmed_sends(Path(drive_root), task_id) if event.delivery_reporting_version else []
+        delivery = "unknown"
+        if event.delivery_reporting_version and (sends or result.text):
+            delivery = "confirmed" if sends else "authored"  # the v1 reply's receipt arrives after this return
+        atomic_write_json(_previous_turn_path(Path(drive_root), event.conversation_key), {
+            "conversation_key": event.conversation_key, "task_id": task_id, "outcome": result.outcome,
+            "message": str(row.get("message") or result.text), "transport_sends": [text for text in sends if text],
+            "work_ref": result.work_ref, "finished_at": utc_now_iso(), "delivery": delivery,
+        })
         return result
 
     return (gate or _configured_gate(Path(drive_root))).run(event.conversation_key, execute)
@@ -495,5 +576,6 @@ __all__ = [
     "PresenceTurnGate",
     "PresenceTurnResult",
     "build_presence_result_event",
+    "presence_turn_is_live",
     "run_presence_turn",
 ]

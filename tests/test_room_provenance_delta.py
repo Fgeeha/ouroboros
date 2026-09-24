@@ -370,3 +370,30 @@ def test_nominations_come_from_the_corrected_response_not_the_draft():
     # ...and only the corrected block is released: the draft's topic with the
     # corrected content, never an additional topic outside this correction's scope.
     assert [(e["topic"], e["content"]) for e in usage["_knowledge_entries"]] == [("leak", "owner asked")]
+
+
+def test_presence_rows_of_one_room_share_one_label_from_transport_facts():
+    from ouroboros.presence_bindings import conversation_key
+    from ouroboros.presence_runner import _stable_numeric_id
+
+    base = {"provider": "telegram", "account_id": "900", "conversation_id": "-100", "thread_id": ""}
+    chat_id = _stable_numeric_id("presence-conversation", conversation_key("telegram", "900", "-100", ""))
+    resolver = RoomLabelResolver(projects=[])
+    inbound = {"chat_id": chat_id, "direction": "in", "transport": {**base, "conversation": {"title": "Aika ] admin"}}}
+    receipt = {"chat_id": chat_id, "direction": "out", "type": "presence_delivery", "transport": {**base, "thread_id": "0"}}
+    initiated = {"chat_id": chat_id, "direction": "in", "transport": dict(base)}
+    expected = f"Presence telegram -100 [chat_id={chat_id}]"
+    # One room, three row types, one label: the correspondent-controlled title never enters it.
+    assert {resolver.label(inbound), resolver.label(receipt), resolver.label(initiated)} == {expected}
+    topic_chat = _stable_numeric_id("presence-conversation", conversation_key("telegram", "900", "-100", "42"))
+    assert resolver.label({"chat_id": topic_chat, "transport": {**base, "thread_id": "42"}}) == (
+        f"Presence telegram -100 topic 42 [chat_id={topic_chat}]"
+    )
+    # Transport facts that do not re-derive this exact chat id never name the room.
+    assert resolver.label({"chat_id": chat_id + 1, "transport": dict(base)}) == f"Unknown room [chat_id={chat_id + 1}]"
+    assert resolver.label({"chat_id": chat_id, "transport": {**base, "provider": ""}}) == f"Unknown room [chat_id={chat_id}]"
+    # Brackets in a provider fact can never break the [room=...] marker.
+    weird_chat = _stable_numeric_id("presence-conversation", conversation_key("telegram", "900", "x]y[z", ""))
+    assert resolver.label({"chat_id": weird_chat, "transport": {**base, "conversation_id": "x]y[z"}}) == (
+        f"Presence telegram x y z [chat_id={weird_chat}]"
+    )

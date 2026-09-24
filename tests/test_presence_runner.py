@@ -238,3 +238,181 @@ def test_presence_gate_serializes_same_conversation_across_instances(tmp_path):
     with ThreadPoolExecutor(max_workers=4) as pool:
         list(pool.map(run, range(4)))
     assert maximum == 1
+
+
+def test_presence_turn_is_live_for_liveness_readers_but_never_an_owner_target(monkeypatch, tmp_path):
+    """The presence-local live set shields a running turn from orphan reconcile; the owner
+    census (update drain, steer roots, /api/state, settings idle, wake gating) never sees it."""
+    from types import SimpleNamespace
+
+    from ouroboros import presence_runner
+    from ouroboros.consciousness import BackgroundConsciousness
+    from ouroboros.gateway.settings import _has_running_agent_tasks, _has_started_agent_tasks
+    from ouroboros.gateway.state import _direct_turns_snapshot_safe
+    from ouroboros.server_routing_context import _active_direct_roots
+    from ouroboros.task_status import _is_stale_orphan_running_task
+    from ouroboros.utils import append_jsonl
+    from supervisor import workers
+    from supervisor.active_activity import get_direct_activity_registry
+
+    monkeypatch.setattr(time, "time", lambda: 1_800_000_000.0)
+    monkeypatch.setattr(workers, "PENDING", [])
+    monkeypatch.setattr(workers, "RUNNING", {})
+    (tmp_path / "state").mkdir()
+    (tmp_path / "state" / "queue_snapshot.json").write_text(
+        '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}', encoding="utf-8")
+    append_jsonl(tmp_path / "logs" / "events.jsonl", {"ts": "2026-05-28T00:00:02+00:00", "type": "worker_boot"})
+    orphan_row = {"status": "running", "ts": "2026-05-28T00:00:00+00:00"}
+    registry = get_direct_activity_registry()
+    registry.clear()
+    mind = object.__new__(BackgroundConsciousness)
+    mind._last_wake_task_id = ""
+    main_actor = SimpleNamespace(
+        _owner_message_admission_lock=threading.Lock(), _busy=True, _current_task_id="main-turn",
+        _accepting_owner_messages=True, _current_task_metadata={}, _current_task_text="owner text",
+        _task_started_ts=1.0, _current_chat_id=1)
+    armed, seen = [], {}
+
+    def observe(task_id):
+        return {
+            "orphan": _is_stale_orphan_running_task(tmp_path, task_id, orphan_row),
+            "drain": workers.drain_repo_writers(timeout=0), "roots": [row["task_id"] for row in _active_direct_roots(None)],
+            "turns": [turn["id"] for turn in workers.direct_chat_turns()],
+            "state": [row["activity_id"] for row in _direct_turns_snapshot_safe()],
+            "busy": (_has_running_agent_tasks(), _has_started_agent_tasks()), "wakes": mind.live_turns(),
+        }
+
+    class Agent:  # shaped like a real native actor: only the absent census entry hides it
+        _owner_message_admission_lock = threading.Lock()
+        _busy = _accepting_owner_messages = True
+        _current_task_metadata, _current_task_text, _task_started_ts, _current_chat_id = {}, "hi", 1.0, 1
+
+        def handle_task(self, task):
+            self._current_task_id = task["id"]
+            seen.update(live=presence_runner.presence_turn_is_live(task["id"]), registered=registry.get(task["id"]),
+                        armed=workers.arm_direct_chat_turn(task["id"], armed.append), alone=observe(task["id"]))
+            registry.register("main-turn", 1, actor=main_actor)  # positive control: an owner turn IS census-visible
+            try:
+                seen["with_main"] = observe(task["id"])
+            finally:
+                registry.unregister("main-turn")
+            return [{"type": "presence_result", "outcome": "silent", "text": "", "work_ref": ""}]
+
+    try:
+        result = run_presence_turn(admission=_admission(), event=_event(), repo_dir=tmp_path, drive_root=tmp_path,
+                                   agent_factory=lambda **_kwargs: Agent(), gate=PresenceTurnGate(1))
+        assert seen["live"] is True and seen["registered"] is None and seen["armed"] is None and armed == []
+        assert seen["alone"] == {"orphan": False, "drain": [], "roots": [], "turns": [], "state": [],
+                                 "busy": (False, False), "wakes": ("", False)}
+        assert seen["with_main"] == {"orphan": False, "drain": ["main-turn"], "roots": ["main-turn"],
+                                     "turns": ["main-turn"], "state": ["main-turn"], "busy": (True, True),
+                                     "wakes": ("", True)}
+        # Once the turn returns the set is empty and the same orphan evidence reconciles.
+        assert presence_runner.presence_turn_is_live(result.task_id) is False
+        assert result.task_id not in presence_runner._LIVE_PRESENCE_TASKS
+        assert _is_stale_orphan_running_task(tmp_path, result.task_id, orphan_row) is True
+    finally:
+        registry.clear()
+
+
+def _pointer_turn(tmp_path, event_id, row, *, thread="topic-1", version=0, captured=None, during=None):
+    """One executed turn with a durable terminal row, as the real pipeline leaves it."""
+    from dataclasses import replace
+
+    from ouroboros.presence_bindings import conversation_key
+    from ouroboros.task_results import write_task_result
+
+    event = replace(_event(), source_event_id=event_id, thread_id=thread, delivery_reporting_version=version,
+                    conversation_key=conversation_key("telegram", "bot-1", "room-1", thread))
+
+    class Agent:
+        def handle_task(self, task):
+            if captured is not None:
+                captured.append(task)
+            write_task_result(tmp_path, task["id"], "running", metadata=task["metadata"])
+            if during is not None:
+                during(task)
+            write_task_result(tmp_path, task["id"], "completed", result=row.get("text", ""),
+                              terminal_origin="model_final", metadata={
+                                  **task["metadata"], "presence_outcome": row["outcome"],
+                                  "presence_result_text": row.get("text", ""),
+                                  "presence_work_ref": row.get("work_ref", "")})
+            return [{"type": "presence_result", "task_id": task["id"], **row}]
+
+    return run_presence_turn(admission=_admission(), event=event, repo_dir=tmp_path, drive_root=tmp_path,
+                             agent_factory=lambda **_kwargs: Agent(), gate=PresenceTurnGate(1))
+
+
+def test_previous_turn_pointer_names_message_deferred_and_silent_turns(tmp_path):
+    captured: list = []
+    first = _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Hi there", "message": "Hi there"},
+                          captured=captured)
+    _pointer_turn(tmp_path, "e2", {"outcome": "deferred", "text": "On it", "message": "On it",
+                                   "work_ref": "presence-work-9"}, captured=captured)
+    _pointer_turn(tmp_path, "e3", {"outcome": "silent", "text": "", "message": ""}, captured=captured)
+    _pointer_turn(tmp_path, "e4", {"outcome": "silent", "text": ""}, captured=captured)
+    contexts = [task["metadata"]["presence"] for task in captured]
+    assert "previous_turn" not in contexts[0]
+    previous = contexts[1]["previous_turn"]
+    assert (previous["task_id"], previous["outcome"], previous["message"], previous["delivery"]) == (
+        first.task_id, "message", "Hi there", "unknown")  # a v0 transport never confirms delivery
+    assert (contexts[2]["previous_turn"]["outcome"], contexts[2]["previous_turn"]["work_ref"]) == (
+        "deferred", "presence-work-9")
+    sections = [build_presence_context_section(tmp_path, context) for context in contexts]
+    assert "Previous turn" not in sections[0]
+    assert f"Previous turn in this conversation (task {first.task_id}, finished " in sections[1]
+    assert 'UTC, outcome message, delivery unknown): "Hi there".' in sections[1]
+    assert '"On it". Work continues as task presence-work-9.' in sections[2]
+    assert "outcome silent, delivery unknown): nothing sent." in sections[3]
+
+
+def test_previous_turn_is_per_conversation_and_never_rewritten_by_a_replay(tmp_path):
+    from ouroboros.presence_bindings import conversation_key
+    from ouroboros.presence_runner import _previous_turn_path
+
+    captured: list = []
+    older = _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Room reply"})
+    _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "Other"}, thread="topic-2", captured=captured)
+    assert "previous_turn" not in captured[-1]["metadata"]["presence"]  # another thread's pointer is not read
+    room = _previous_turn_path(tmp_path, conversation_key("telegram", "bot-1", "room-1", "topic-1"))
+    misplaced = _previous_turn_path(tmp_path, conversation_key("telegram", "bot-1", "room-1", "topic-3"))
+    misplaced.write_bytes(room.read_bytes())  # a pointer naming another conversation is ignored
+    _pointer_turn(tmp_path, "e3", {"outcome": "silent", "text": ""}, thread="topic-3", captured=captured)
+    assert "previous_turn" not in captured[-1]["metadata"]["presence"]
+    newer = _pointer_turn(tmp_path, "e4", {"outcome": "message", "text": "Newer"}, captured=captured)
+    assert captured[-1]["metadata"]["presence"]["previous_turn"]["task_id"] == older.task_id
+    pointer = room.read_bytes()
+    assert json.loads(pointer)["task_id"] == newer.task_id
+    # The older event's retry is a cached replay: no execution, and the newest pointer stays.
+    replay = _pointer_turn(tmp_path, "e1", {"outcome": "message", "text": "Must not run"}, captured=captured)
+    assert replay == older and len(captured) == 3 and room.read_bytes() == pointer
+
+
+def test_previous_turn_shows_what_a_transport_tool_delivered(tmp_path):
+    from ouroboros.presence_delivery import PresenceDeliveryRecorder
+
+    recorder = PresenceDeliveryRecorder(tmp_path)
+
+    def send(task):
+        recorder.record("telegram-bot", {
+            "schema_version": 1, "delivery_id": f"send:{task['id']}", "part_id": "0", "state": "delivered",
+            "provider": "telegram", "account_id": "bot-1", "conversation_id": "room-1", "thread_id": "topic-1",
+            "text": "Schedule: Mon 10:00", "format": "markdown", "message": {"provider_message_id": "7"},
+            "origin": {"kind": "tool", "task_id": task["id"]},
+        })
+
+    captured: list = []
+    _pointer_turn(tmp_path, "e1", {"outcome": "tool_delivered", "text": "", "message": "Sent the schedule"},
+                  version=1, during=send)
+    _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "Anything else?", "message": "Anything else?"},
+                  version=1, captured=captured)
+    _pointer_turn(tmp_path, "e3", {"outcome": "tool_delivered", "text": ""}, captured=captured)
+    _pointer_turn(tmp_path, "e4", {"outcome": "silent", "text": ""}, captured=captured)
+    delivered, authored, unrecorded = (task["metadata"]["presence"]["previous_turn"] for task in captured)
+    assert (delivered["transport_sends"], delivered["delivery"], delivered["message"]) == (
+        ["Schedule: Mon 10:00"], "confirmed", "Sent the schedule")
+    assert authored["delivery"] == "authored"  # a v1 reply's receipt arrives only after the turn returns
+    assert (unrecorded["transport_sends"], unrecorded["delivery"]) == ([], "unknown")
+    sections = [build_presence_context_section(tmp_path, task["metadata"]["presence"]) for task in captured]
+    assert 'delivery confirmed): "Schedule: Mon 10:00" / finish note "Sent the schedule".' in sections[0]
+    assert "delivered via transport tool (content unrecorded)." in sections[2]

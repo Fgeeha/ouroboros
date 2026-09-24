@@ -1,0 +1,283 @@
+"""An orphan-reconciled presence turn is neither spoken nor final: the retry answers it."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import time
+from types import SimpleNamespace
+
+import pytest
+from starlette.testclient import TestClient
+
+from ouroboros import agent_task_pipeline as pipeline
+from ouroboros.gateway.host_service import create_host_service_app
+from ouroboros.outcomes import infra_failed_axes
+from ouroboros.presence_context import build_presence_context_section
+from ouroboros.presence_runner import (
+    PresenceTurnGate,
+    _cached_result,
+    _task_id,
+    presence_result_from_stored,
+    run_presence_turn,
+)
+from ouroboros.task_results import (
+    STATUS_COMPLETED,
+    STATUS_FAILED,
+    STATUS_INTERRUPTED,
+    STATUS_RUNNING,
+    load_task_result,
+    reopen_reconciled_presence_placeholder,
+    task_result_path,
+    write_task_result,
+)
+from ouroboros.task_status import reconcile_orphaned_running_tasks
+from ouroboros.tools.presence import _finish_presence
+from ouroboros.utils import append_jsonl
+from tests.test_host_service_api import _seed_presence_behavior, _seed_token
+from tests.test_presence_runner import _admission, _event
+
+_PRESENCE_METADATA = {"source": "presence", "presence": {"binding_id": "1" * 32, "delivery_reporting_version": 0}}
+_NOW = 1_800_000_000.0  # 2027-01-15T08:00:00Z, the fresh queue snapshot's own time
+
+
+def _sweep(tmp_path, monkeypatch, task_id, status=STATUS_RUNNING, *, seed=True, boot="2026-05-28T00:00:02+00:00",
+           metadata=_PRESENCE_METADATA, **fields):
+    """The real reconciler: a stale row, a later worker boot, a fresh empty queue, one sweep."""
+    with monkeypatch.context() as patch:
+        patch.setattr(time, "time", lambda: _NOW)
+        if seed:
+            write_task_result(tmp_path, task_id, status, result="Task is running.",
+                              ts="2026-05-28T00:00:00+00:00", metadata=dict(metadata), **fields)
+        (tmp_path / "state").mkdir(exist_ok=True)
+        (tmp_path / "state" / "queue_snapshot.json").write_text(
+            '{"ts": "2027-01-15T08:00:00+00:00", "pending": [], "running": []}', encoding="utf-8")
+        events = tmp_path / "logs" / "events.jsonl"
+        append_jsonl(events, {"ts": "2026-05-28T00:00:01+00:00", "type": "llm_round", "task_id": task_id})
+        append_jsonl(events, {"ts": boot, "type": "worker_boot"})
+        healed = reconcile_orphaned_running_tasks(tmp_path)
+    return healed, load_task_result(tmp_path, task_id)
+
+
+def _reconciled(tmp_path, monkeypatch, task_id, status=STATUS_RUNNING, **kwargs):
+    healed, row = _sweep(tmp_path, monkeypatch, task_id, status, **kwargs)
+    assert healed == 1 and row["status"] == STATUS_FAILED and row["status_reconciled_from"] == status
+    assert row["reason_code"] == ("interrupted_retry_lost" if status == STATUS_INTERRUPTED
+                                  else "orphaned_running_after_worker_restart")
+    assert "TASK_ORPHAN_RECONCILED" in row["result"] and not row.get("terminal_origin")
+    return row
+
+
+def test_reconciled_turn_replays_silent_while_completed_legacy_row_still_speaks(tmp_path, monkeypatch):
+    row = _reconciled(tmp_path, monkeypatch, "orphan-turn")
+    replay = presence_result_from_stored(row, "orphan-turn")
+    assert replay.outcome == "silent" and replay.text == ""
+    assert _cached_result(tmp_path, "orphan-turn") is None
+    # The unknown-origin compatibility path itself survives for completed rows.
+    legacy = presence_result_from_stored({"status": "completed", "result": "Old reply", "metadata": {}}, "old")
+    assert legacy.outcome == "message" and legacy.text == "Old reply"
+
+
+@pytest.mark.parametrize("status", [STATUS_RUNNING, STATUS_INTERRUPTED])
+def test_reopen_moves_the_host_mark_aside_exactly_once(tmp_path, monkeypatch, status):
+    row = _reconciled(tmp_path, monkeypatch, "orphan-turn", status)
+    assert reopen_reconciled_presence_placeholder(tmp_path, "orphan-turn") is True
+    reopened = load_task_result(tmp_path, "orphan-turn")
+    assert reopened["status"] == STATUS_RUNNING and reopened["metadata"] == row["metadata"]
+    assert reopened["superseded_placeholder"] == {
+        "status": STATUS_FAILED, "reason_code": row["reason_code"], "status_reconciled_from": status,
+        "ts": row["ts"], "result": row["result"][-500:],
+    }
+    for cleared in ("reason_code", "outcome_axes", "artifact_status", "artifact_bundle", "result",
+                    "status_reconciled_from"):
+        assert cleared not in reopened
+    # A running row is no placeholder: the transition cannot fire twice.
+    before = task_result_path(tmp_path, "orphan-turn").read_bytes()
+    assert reopen_reconciled_presence_placeholder(tmp_path, "orphan-turn") is False
+    assert task_result_path(tmp_path, "orphan-turn").read_bytes() == before
+
+
+def _outcome_failure(tmp_path, monkeypatch):
+    healed, row = _sweep(tmp_path, monkeypatch, "axes-turn", reason_code="provider_unavailable",
+                         outcome_axes=infra_failed_axes("provider_unavailable"))
+    # task_status: a RUNNING row whose own axes already failed is marked from those axes.
+    assert healed == 1 and row["status"] == STATUS_FAILED and row["status_reconciled_from"] == STATUS_RUNNING
+    assert row["reason_code"] == "provider_unavailable" and "TASK_ORPHAN_RECONCILED" not in row["result"]
+    return "axes-turn"
+
+
+def _ordinary_failure(tmp_path, _monkeypatch):
+    write_task_result(tmp_path, "failed-turn", STATUS_FAILED, result="Authored partial reply",
+                      terminal_origin="model_final", reason_code="round_limit",
+                      metadata={**_PRESENCE_METADATA, "presence_outcome": "message"})
+    return "failed-turn"
+
+
+def _non_presence_orphan(tmp_path, monkeypatch):
+    _reconciled(tmp_path, monkeypatch, "ordinary-task", metadata={"source": "web"})
+    return "ordinary-task"
+
+
+@pytest.mark.parametrize("seed", [_outcome_failure, _ordinary_failure, _non_presence_orphan])
+def test_only_the_orphan_placeholder_of_a_presence_turn_reopens(tmp_path, monkeypatch, seed):
+    task_id = seed(tmp_path, monkeypatch)
+    before = task_result_path(tmp_path, task_id).read_bytes()
+    assert reopen_reconciled_presence_placeholder(tmp_path, task_id) is False
+    assert task_result_path(tmp_path, task_id).read_bytes() == before
+    if seed is not _non_presence_orphan:
+        assert _cached_result(tmp_path, task_id) is not None  # a real terminal replays
+    write_task_result(tmp_path, task_id, STATUS_COMPLETED, result="Late answer")
+    assert load_task_result(tmp_path, task_id)["status"] == STATUS_FAILED  # sticky terminal unchanged
+
+
+def _answering_agent(calls, reply, drive_root, *, during=None, lost=False):
+    """Real durable pipeline: the RUNNING start write, then the terminal write (or a lost worker)."""
+
+    class Agent:
+        def handle_task(self, task):
+            calls.append(task)
+            task["_skip_post_task_synthesis"] = True
+            write_task_result(drive_root, task["id"], STATUS_RUNNING, metadata=task["metadata"],
+                              result="Task is running.", ts="2026-05-28T00:00:00+00:00" if lost else "")
+            if during is not None:
+                during(task)
+            if lost:
+                raise RuntimeError("worker lost")
+            ctx = SimpleNamespace(task_contract=task["task_contract"], task_metadata=task["metadata"])
+            _finish_presence(ctx, "message", reply)
+            ctx._presence_completion_accepted = True
+            pending: list = []
+            pipeline.emit_task_results(
+                SimpleNamespace(drive_root=drive_root, repo_dir=drive_root), None, None, pending, task, reply,
+                {"terminal_origin": "model_final"}, {"tool_calls": [], "reasoning_notes": []}, 0.0,
+                drive_root / "logs", ctx=ctx,
+            )
+            return pending
+
+    return Agent()
+
+
+def test_reconciled_turn_is_not_cached_and_its_rerun_persists(tmp_path, monkeypatch):
+    task_id = _task_id(_admission(), _event())
+    _reconciled(tmp_path, monkeypatch, task_id)
+    assert _cached_result(tmp_path, task_id) is None
+    calls: list = []
+    kwargs = dict(admission=_admission(), event=_event(), repo_dir=tmp_path, drive_root=tmp_path,
+                  agent_factory=lambda **_kw: _answering_agent(calls, "Real answer", tmp_path),
+                  gate=PresenceTurnGate(1))
+    first = run_presence_turn(**kwargs)
+    assert [task["id"] for task in calls] == [task_id] and first.outcome == "message" and first.text == "Real answer"
+    stored = load_task_result(tmp_path, task_id)
+    assert stored["status"] == STATUS_COMPLETED and stored["terminal_origin"] == "model_final"
+    assert "status_reconciled_from" not in stored and "TASK_ORPHAN_RECONCILED" not in stored["result"]
+    assert stored["superseded_placeholder"]["reason_code"] == "orphaned_running_after_worker_restart"
+    # A v0 transport reports no receipts: what the lost attempt sent is unknown, and the model is told so.
+    attempt = calls[0]["metadata"]["presence"]["previous_attempt"]
+    assert attempt == {"delivered_count": None, "delivered": None}
+    section = build_presence_context_section(tmp_path, calls[0]["metadata"]["presence"])
+    assert "whether it already sent anything is unknown" in section
+    # The persisted answer is now the cached result: a further retry does not re-run.
+    assert run_presence_turn(**kwargs) == first and len(calls) == 1
+
+
+def test_reconciler_repersist_keeps_the_placeholder(tmp_path, monkeypatch):
+    row = _reconciled(tmp_path, monkeypatch, "orphan-turn")
+    write_task_result(tmp_path, "orphan-turn", STATUS_FAILED, result=row["result"],
+                      status_reconciled_from=row["status_reconciled_from"])
+    assert load_task_result(tmp_path, "orphan-turn")["status_reconciled_from"] == STATUS_RUNNING
+    assert _cached_result(tmp_path, "orphan-turn") is None
+
+
+def test_ordinary_failed_turn_still_replays_and_stays_failed(tmp_path):
+    task_id = _task_id(_admission(), _event())
+    write_task_result(tmp_path, task_id, STATUS_FAILED, result="Authored partial reply",
+                      terminal_origin="model_final", reason_code="round_limit",
+                      metadata={**_PRESENCE_METADATA, "presence_outcome": "message",
+                                "presence_result_text": "Authored partial reply"})
+    calls: list = []
+    result = run_presence_turn(admission=_admission(), event=_event(), repo_dir=tmp_path, drive_root=tmp_path,
+                               agent_factory=lambda **_kw: _answering_agent(calls, "New answer", tmp_path),
+                               gate=PresenceTurnGate(1))
+    assert calls == [] and result.outcome == "message" and result.text == "Authored partial reply"
+    write_task_result(tmp_path, task_id, STATUS_COMPLETED, result="New answer")
+    assert load_task_result(tmp_path, task_id)["status"] == STATUS_FAILED
+    # A failed row whose origin is unknown is host text, never a reply.
+    write_task_result(tmp_path, "unknown-origin", STATUS_FAILED, result="Error during processing",
+                      metadata=dict(_PRESENCE_METADATA))
+    assert presence_result_from_stored(load_task_result(tmp_path, "unknown-origin"), "unknown-origin").text == ""
+
+
+@pytest.mark.parametrize("origin", ["", "host_notice", "host_salvage"])
+def test_failed_deferred_turn_keeps_its_work_reference(tmp_path, origin):
+    write_task_result(tmp_path, "deferred-turn", STATUS_FAILED, result="Host diagnostic", terminal_origin=origin,
+                      metadata={**_PRESENCE_METADATA, "presence_outcome": "deferred",
+                                "presence_work_ref": "presence-work-1"})
+    replay = _cached_result(tmp_path, "deferred-turn")
+    assert (replay.outcome, replay.text, replay.work_ref) == ("deferred", "", "presence-work-1")
+
+
+def test_reconciled_non_presence_task_keeps_the_sticky_terminal(tmp_path, monkeypatch):
+    _reconciled(tmp_path, monkeypatch, "ordinary-task", metadata={"source": "web"})
+    write_task_result(tmp_path, "ordinary-task", STATUS_COMPLETED, result="Late answer")
+    row = load_task_result(tmp_path, "ordinary-task")
+    assert row["status"] == STATUS_FAILED and row["status_reconciled_from"] == STATUS_RUNNING
+
+
+def test_host_retry_reruns_a_lost_turn_once_and_then_replays(tmp_path, monkeypatch):
+    """Through POST /presence/turn: a lost v1 attempt, the reconciler, the re-run, a replay."""
+    _seed_token(tmp_path, skill="telegram-bot", token="presence-token",
+                permissions=["presence"], manifest_permissions=["presence"])
+    binding_id = _seed_presence_behavior(tmp_path)
+    task_id = "presence-" + hashlib.sha256(f"{binding_id}\0telegram:bot-1:42".encode("utf-8")).hexdigest()[:24]
+    agents: list = []
+
+    def run_real_presence(**kwargs):
+        return run_presence_turn(repo_dir=tmp_path, drive_root=tmp_path, agent_factory=lambda **_kw: agents.pop(0),
+                                 gate=PresenceTurnGate(1), **kwargs)
+
+    client = TestClient(create_host_service_app(tmp_path, presence_runner=run_real_presence))
+    recorder = client.app.state.host_service_context.presence_deliveries
+
+    def early_send(task):  # the lost attempt had already delivered one transport message
+        recorder.record("telegram-bot", {
+            "schema_version": 1, "delivery_id": "send:early", "part_id": "0", "state": "delivered",
+            "provider": "telegram", "account_id": "bot-1", "conversation_id": "room-1", "thread_id": "topic-1",
+            "text": "Early part", "format": "markdown", "message": {"provider_message_id": "501"},
+            "origin": {"kind": "tool", "task_id": task["id"], "source_event_id": "telegram:bot-1:42"},
+        })
+
+    def post():
+        return client.post("/presence/turn", headers={"X-Skill-Token": "presence-token"}, json={
+            "binding_id": binding_id, "delivery_reporting_version": 1, "event": {
+                "source_event_id": "telegram:bot-1:42", "provider": "telegram", "account_id": "bot-1",
+                "conversation_id": "room-1", "thread_id": "topic-1", "conversation_key": "ignored",
+                "actor": {"platform_actor_id": "user-7"}, "conversation": {}, "message": {"message_id": "42"},
+                "text": "Hello",
+            }})
+
+    calls: list = []
+    agents.append(_answering_agent(calls, "", tmp_path, during=early_send, lost=True))
+    assert post().status_code == 500 and load_task_result(tmp_path, task_id)["status"] == STATUS_RUNNING
+    _reconciled(tmp_path, monkeypatch, task_id, seed=False)
+
+    sweeps = []
+
+    def sweep_during_rerun(_task):  # stale by clock and by a later boot, but executing in this process
+        sweeps.append(_sweep(tmp_path, monkeypatch, task_id, seed=False, boot="2027-01-15T07:59:00+00:00")[0])
+        assert load_task_result(tmp_path, task_id)["status"] == STATUS_RUNNING
+
+    agents.append(_answering_agent(calls, "Real answer", tmp_path, during=sweep_during_rerun))
+    first = post()
+    assert first.status_code == 200 and first.json()["text"] == "Real answer" and first.json()["turn_ref"] == task_id
+    assert sweeps == [0] and len(calls) == 2
+    assert calls[1]["metadata"]["presence"]["previous_attempt"] == {"delivered_count": 1, "delivered": ["Early part"]}
+    section = build_presence_context_section(tmp_path, calls[1]["metadata"]["presence"])
+    assert 'already delivered 1 message(s): "Early part"' in section
+    stored = load_task_result(tmp_path, task_id)
+    assert stored["status"] == STATUS_COMPLETED and "status_reconciled_from" not in stored
+    assert stored["superseded_placeholder"]["status"] == STATUS_FAILED
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()]
+    inbound = [row for row in rows if row.get("direction") == "in" and row.get("client_message_id") == "telegram:bot-1:42"]
+    assert len(inbound) == 1  # the re-run does not log the correspondent's message twice
+    replay = post()
+    assert replay.status_code == 200 and replay.json() == first.json() and len(calls) == 2

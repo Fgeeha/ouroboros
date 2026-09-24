@@ -421,6 +421,15 @@ def _is_stale_orphan_running_task(
         # direct registry is not available.  Absence of that optional observation
         # is not itself evidence of liveness, so retain the existing pooled path.
         pass
+    try:
+        from ouroboros.presence_runner import presence_turn_is_live
+
+        # A presence turn executing in this process has no registry actor (owner
+        # routing never addresses a correspondent's turn) but is not an orphan.
+        if presence_turn_is_live(str(task_id or "")):
+            return False
+    except ImportError:
+        pass
     status = str(result.get("status") or "").lower()
     # ``interrupted`` is the transient pre-requeue marker (A.11): a record still
     # carrying it with no queued retry after a worker restart is the same orphan

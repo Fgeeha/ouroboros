@@ -203,7 +203,26 @@ class RoomLabelResolver:
             if name:
                 return f"Project {name} [chat_id={chat_id}]"
             return f"Project name unavailable [chat_id={chat_id}]"
-        return f"Unknown room [chat_id={chat_id}]"
+        return self._presence_label(entry, chat_id) or f"Unknown room [chat_id={chat_id}]"
+
+    @staticmethod
+    def _presence_label(entry: Mapping[str, Any], chat_id: int) -> str:
+        """Name a presence room only by transport facts that re-derive this exact chat id."""
+        from ouroboros.presence_bindings import conversation_key
+        from ouroboros.presence_runner import _stable_numeric_id
+
+        transport = entry.get("transport") if isinstance(entry.get("transport"), Mapping) else {}
+        provider, account, conversation, thread = (
+            str(transport.get(key) or "") for key in ("provider", "account_id", "conversation_id", "thread_id"))
+        if not (provider and conversation) or _stable_numeric_id(
+                "presence-conversation", conversation_key(provider, account, conversation, thread)) != chat_id:
+            return ""
+
+        def clean(value: str) -> str:
+            return " ".join(value.replace("[", " ").replace("]", " ").split())[:64]
+
+        topic = f" topic {clean(thread)}" if thread not in {"", "0"} else ""
+        return f"Presence {clean(provider)} {clean(conversation)}{topic} [chat_id={chat_id}]"
 
 
 def source_continuation_note(spans: list[tuple[int, int, str]], offset: int, part_end: int) -> str:
