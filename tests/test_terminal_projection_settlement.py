@@ -38,7 +38,7 @@ def _chat_rows(root: pathlib.Path):
     path = root / "logs" / "chat.jsonl"
     if not path.is_file():
         return []
-    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
 
 
 def _project_rows(root: pathlib.Path, task_id: str):
@@ -488,7 +488,7 @@ def test_append_receipt_crash_dedupes_across_chat_rotation(project_root, monkeyp
     monkeypatch.setattr(dialogue, 'append_canonical_task_summary', original)
     assert reconcile_terminal_projections(project_root.root) == 1
     assert _project_rows(project_root.root, 'root-1') == []
-    archived = [json.loads(line) for line in (project_root.root / 'archive/chat_20260923.jsonl').read_text().splitlines()]
+    archived = [json.loads(line) for line in (project_root.root / 'archive/chat_20260923.jsonl').read_text(encoding="utf-8").splitlines()]
     assert len([row for row in archived if row.get('summary_id') == 'task-terminal:root-1']) == 1
     assert len(project_root.queued) == 1
 

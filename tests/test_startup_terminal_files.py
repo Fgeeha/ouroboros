@@ -234,7 +234,7 @@ def test_failed_first_save_preserves_child_and_followup_attachment_through_prune
     assert recovered["recovered"] == ["saved"]
     assert load_task_result(root, "saved")["child_ref_promotion"]["pending_refs"] == []
     for row in manifest:
-        assert (task_artifact_dir_path(root, "saved") / row["relpath"]).read_text() == "accepted follow-up file"
+        assert (task_artifact_dir_path(root, "saved") / row["relpath"]).read_text(encoding="utf-8") == "accepted follow-up file"
 
 
 @pytest.mark.parametrize("pids", [None, {777}])

@@ -39,7 +39,7 @@ class TestHostNoteVoice:
         mb.send_with_budget(1, "startup notice", is_progress=True, task_id="t1",
                             role="system", system_type="startup_notice")
         rows = [json.loads(line) for line in
-                (tmp_path / "logs" / "progress.jsonl").read_text().splitlines()]
+                (tmp_path / "logs" / "progress.jsonl").read_text(encoding="utf-8").splitlines()]
         # ONE meta dict reaches the durable record and the live bridge.
         assert rows[-1]["narration"] is False
         assert sent[-1]["progress_meta"]["narration"] is False
@@ -79,7 +79,7 @@ class TestHostNoteVoice:
 
         mb, sent = self._bus(tmp_path, monkeypatch)
         mb.send_with_budget(1, "Host note", task_id="t1", role="system", system_type="host_progress")
-        rows = [json.loads(line) for line in (tmp_path / "logs/chat.jsonl").read_text().splitlines()]
+        rows = [json.loads(line) for line in (tmp_path / "logs/chat.jsonl").read_text(encoding="utf-8").splitlines()]
         assert rows[-1]["narration"] is sent[-1]["progress_meta"]["narration"] is False
         response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"chat_id": "1"})))
         replay = next(row for row in json.loads(response.body)["messages"] if row.get("text") == "Host note")
@@ -156,7 +156,7 @@ def test_cancel_cause_python_browser_fixture_parity():
     from pathlib import Path
     from ouroboros.project_dialogue import _completion_verdict
 
-    cases = json.loads((Path(__file__).parents[1] / "web/tests/fixtures/cancel_cause_parity.json").read_text())
+    cases = json.loads((Path(__file__).parents[1] / "web/tests/fixtures/cancel_cause_parity.json").read_text(encoding="utf-8"))
     for case in cases:
         assert _completion_verdict(case["record"], {}) == case["text"], case
 
