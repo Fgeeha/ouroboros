@@ -381,19 +381,22 @@ def test_uncertain_receipts_make_the_prior_count_a_floor(tmp_path):
     assert 'delivered at least 1 message(s): "Early part"; 1 more part(s) may have landed' in section
 
 
-def test_a_refused_part_is_no_longer_uncertain(tmp_path):
-    """A timed-out part the provider later refused is neither delivered nor possibly landed."""
+@pytest.mark.parametrize("states, uncertain", [(("uncertain", "failed"), 0), (("failed", "uncertain"), 1)])
+def test_a_part_settles_by_its_latest_receipt(tmp_path, states, uncertain):
+    """A timed-out part the provider later refused is neither delivered nor possibly landed; a refused
+    part whose retry timed out may have landed after all."""
     task_id = _task_id(_admission(), _event())
     chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
-    for state in ("uncertain", "failed"):
+    for state in states:
         append_jsonl(chat, {"type": "presence_delivery", "direction": "system", "chat_id": 7, "text": "Maybe part",
                             "task_id": task_id, "transport": {"delivery": {
                                 "state": state, "delivery_id": "send:late", "part_id": "0"}}})
     calls: list = []
     run_presence_turn(**_v1_kwargs(tmp_path, calls))
     attempt = calls[0]["metadata"]["presence"]["previous_attempt"]
-    assert attempt == {"delivered_count": 1, "delivered": ["Early part"], "uncertain_count": 0}
-    assert "may have landed" not in build_presence_context_section(tmp_path, calls[0]["metadata"]["presence"])
+    assert attempt == {"delivered_count": 1, "delivered": ["Early part"], "uncertain_count": uncertain}
+    section = build_presence_context_section(tmp_path, calls[0]["metadata"]["presence"])
+    assert ("may have landed" in section) is bool(uncertain)
 
 
 def test_an_attempt_that_died_before_its_running_write_still_logs_the_message_once(tmp_path):
