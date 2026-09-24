@@ -156,13 +156,11 @@ def refresh_root_accounting(
 ) -> Optional[Dict[str, Any]]:
     """Refresh a stale root snapshot; on failure return stale/None, never fake $0.
 
-    A DISPLAY reader (``strict=False``) may take the age-bounded cache and, when
-    the ledger cannot answer now, the last snapshot it did answer with. A MONEY
-    reader (``strict=True``: the exact-pause grant, the Q10 threshold refresh)
-    gets ONE fresh successful observation or ``None``: a snapshot cached before
-    a read that just failed is unknown spend, not room, and this is the one
-    place that rule lives (#1196). The successful read still refreshes the
-    display cache.
+    A DISPLAY reader (``strict=False``) may take the age-bounded cache, or the last
+    snapshot when the ledger cannot answer now. A MONEY reader (``strict=True``: the
+    exact-pause grant, the Q10 threshold refresh) gets ONE fresh successful observation
+    or ``None`` — a snapshot cached before a failed read is unknown spend, not room
+    (#1196, the one place that rule lives); a success still refreshes the cache.
     """
     root_task_id = str(root_task_id or "").strip()
     if not root_task_id:

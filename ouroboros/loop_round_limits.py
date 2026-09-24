@@ -598,6 +598,30 @@ def _handle_provider_unavailable(
     return text, usage, llm_trace
 
 
+def _loop_exit_after_exception(
+    exc: BaseException, ctx: Optional[_RoundLimitContext], exit_ctx: Any, llm_trace: Dict[str, Any],
+    transport_episode: Optional[TransportWaitEpisode],
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """The loop's outer exception exit: a budget-pause HOLD ended by the task's own
+    controls (Stop/Panic/deadline/lifetime) raises ``ModelWaitInterrupted`` OUTSIDE
+    the model-call try, and it rejoins the SAME control rails a live wait uses (a
+    truthful no-call deadline/stop terminal), never the generic task exception. An
+    interruption those rails already routed once (the model-call handler re-raises
+    Stop for the supervisor's settlement) and every other exception re-raise with
+    their loop evidence attached."""
+    from ouroboros.model_wait import ModelWaitInterrupted
+
+    controlled = None
+    if isinstance(exc, ModelWaitInterrupted) and ctx is not None and not getattr(exc, "control_rails_seen", False):
+        controlled = _handle_model_wait_control(ctx, exc, transport_episode=transport_episode)
+    if controlled is None:
+        exit_ctx.attach_exception_evidence(exc)
+        raise exc
+    text, accumulated_usage, forced_trace = controlled
+    _loop()._merge_finalization_trace(llm_trace, forced_trace)
+    return text, accumulated_usage, llm_trace
+
+
 def _handle_model_wait_control(
     ctx: _RoundLimitContext, error: Any, *, transport_episode: Optional[TransportWaitEpisode] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:

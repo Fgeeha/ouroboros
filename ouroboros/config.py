@@ -679,9 +679,8 @@ def _coerce_setting_value(key: str, value):
         return normalize_update_channel(value)
     if key == "OUROBOROS_CONTEXT_MODE":
         return normalize_context_mode(value)
-    if key in OPTIONAL_BOUND_LEGACY:  # the document spelling: "unlimited" or a positive int; a typo is finite
-        bound = optional_bound_value(key, value)
-        return UNLIMITED if bound is None else bound
+    if key in OPTIONAL_BOUND_LEGACY:  # document spelling: "unlimited" or a positive int; a typo is finite
+        return UNLIMITED if (bound := optional_bound_value(key, value)) is None else bound
     # Trim so whitespace-only config is not treated as a configured skills repo.
     if key == "OUROBOROS_SKILLS_REPO_PATH":
         return str(value or "").strip()
