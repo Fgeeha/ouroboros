@@ -68,6 +68,8 @@ _LARGE_CONTEXT_SECTION_CHARS = LARGE_CONTEXT_SECTION_CHARS
 
 
 def build_user_content(task: Dict[str, Any]) -> Any:
+    from ouroboros.presence_context import frame_presence_user_content
+
     text = task.get("text", "")
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
     if metadata.get("force_plan"):
@@ -98,7 +100,7 @@ def build_user_content(task: Dict[str, Any]) -> Any:
     attachment_image_blocks = _build_attachment_image_blocks(task)
 
     if not image_b64 and not attachment_image_blocks:
-        return text or "(empty message)"
+        return frame_presence_user_content(task, text or "(empty message)")
 
     if image_b64:
         # Backward-compat: the legacy single-image path (screenshots, desktop chat
@@ -118,7 +120,7 @@ def build_user_content(task: Dict[str, Any]) -> Any:
     else:
         content = [{"type": "text", "text": text or "(empty message)"}]
     content.extend(attachment_image_blocks)
-    return content
+    return frame_presence_user_content(task, content)
 
 
 def _build_attachment_image_blocks(task: Dict[str, Any]) -> List[Dict[str, Any]]:
