@@ -387,6 +387,10 @@ CURRENT_PRODUCER_CONTRACTS = {
     # in the corpus' interpolated list and answered live here — the retired pair
     # never saw a tree that emitted it.
     "PREFLIGHT_UNAVAILABLE": (True, "unavailable"),
+    # Peer admission adds current producers; the historical fixture stays intact.
+    "TASK_CANCEL_STATE_UNAVAILABLE": (True, "unavailable"),
+    "TASK_FORBIDDEN": (True, "blocked"),
+    "native:LEGACY_BLOCKED:TASK_FORBIDDEN": (True, "blocked"),
 }
 
 

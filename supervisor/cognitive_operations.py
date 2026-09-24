@@ -74,6 +74,16 @@ def _handle_cognitive_operation(evt: Dict[str, Any], ctx: Any) -> None:
                     return
                 if supplied and stored and supplied != stored:
                     return
+        if phase == "finished" and isinstance(row, dict) and row.get("kind") == "tool":
+            # A tool call that physically completed is this task's own work, like a
+            # completed model round (events_budget) or a narration line
+            # (events_chat_delivery): the lease that spared the idle rail while the
+            # call ran closes INTO a fresh progress stamp, so the round that follows
+            # starts inside a full idle window instead of inheriting the time spent
+            # in earlier tools. Stamped before the pop so no tick reads the task as
+            # both lease-less and stale. Deadline, absolute ceiling, budget and
+            # cancellation never consult this stamp.
+            meta["last_progress_at"] = time.time()
         active.pop(operation_id, None)
         if not active:
             meta.pop("active_operation_leases", None)

@@ -113,7 +113,7 @@ EXPECTED_TOOLS = [
     "send_user_message", "update_identity", "toggle_evolution",
     "toggle_consciousness",
     "set_next_wakeup", "switch_model", "get_task_result",
-    "wait_task", "wait_tasks", "tree_note", "tree_read",
+    "wait_task", "wait_tasks", "await_messages", "tree_note", "tree_read",
     "delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
     "read_file", "list_files", "write_file", "edit_text",
     "apply_patch", "edit_batch",

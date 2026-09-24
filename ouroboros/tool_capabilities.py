@@ -35,6 +35,9 @@ CORE_TOOL_NAMES: frozenset[str] = frozenset({
     "schedule_subagent", "manage_schedules", "integrate_subagent_patch", "compare_subagent_patches",
     "integrate_delegated_patch",
     "wait_task", "wait_tasks", "get_task_result",
+    # Serial addressed turns: wait for an unread mailbox entry without spending
+    # model rounds (slot held, clamped to the per-call ceiling, delivers nothing).
+    "await_messages",
     # D#7 soft-join child controls (siblings of steer_task): inspect/decide a child's fate
     # before finalizing (peek = pure read, discard = explicit abandon, cancel = real stop).
     "cancel_task", "peek_task", "discard_child_result", "override_delegation_constraint",
@@ -86,6 +89,7 @@ LOCAL_READONLY_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "vcs_status", "vcs_diff",
     "knowledge_read", "knowledge_list",
     "chat_history", "recent_tasks", "get_task_result", "wait_task", "wait_tasks",
+    "await_messages",
     "escalate",
     "forward_to_worker", "peek_task", "cancel_task", "discard_child_result",
     # A recursive parent selects its OWN budget-paused children (#1196, Q9); the
@@ -135,6 +139,7 @@ ACTING_SUBAGENT_TOOL_NAMES: frozenset[str] = frozenset({
     "start_service", "service_status", "service_logs", "stop_service",
     "integrate_subagent_patch", "compare_subagent_patches",
     "schedule_subagent", "wait_task", "wait_tasks", "get_task_result",
+    "await_messages",
     "escalate",
     "forward_to_worker", "peek_task", "cancel_task", "discard_child_result",
     "resume_child_task",
@@ -204,6 +209,7 @@ UNTRUNCATED_TOOL_RESULTS: frozenset[str] = frozenset({
     "get_task_result",
     "wait_task",
     "wait_tasks",
+    "await_messages",
 })
 
 # Cognitive artifacts must not be truncated.
