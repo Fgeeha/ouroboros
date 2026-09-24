@@ -60,6 +60,10 @@ from ouroboros.provider_models import (  # noqa: E402
     LEGACY_MODEL_SETTING_KEYS,
 )
 from ouroboros.tools.scope_review_contract import SCOPE_REQUIRED_ITEMS  # noqa: E402
+from tests.candidate_checkout import (  # noqa: E402
+    CandidateCheckout, CandidateError, assert_served_candidate,
+    require_candidate_interpreter, verify_checkout,
+)
 
 LANE_MOCK = "mock"
 
@@ -990,7 +994,17 @@ class KeylessIsolatedServer(IsolatedServer):
     servers authenticate from them). This lane's contract is the opposite: the ONLY
     provider config a scenario server may see is what the scenario's settings.json
     says, and that file only ever names the loopback stub.
+
+    Browser callers pass a CandidateCheckout to retain the dirty snapshot until
+    its contained process tree is proven gone. Plain Path callers keep the
+    mutable HEAD-clone contract used by self-modification E2E scenarios.
     """
+
+    def __init__(self, clone, *args, **kwargs):
+        self.candidate = clone if isinstance(clone, CandidateCheckout) else None
+        self._candidate_container = None
+        self._candidate_cleanup_error = ""
+        super().__init__(self.candidate.path if self.candidate else clone, *args, **kwargs)
 
     def _env(self) -> dict:
         env = super()._env()
@@ -998,6 +1012,69 @@ class KeylessIsolatedServer(IsolatedServer):
             if key in STRIPPED_PROVIDER_ENV_KEYS or key in PROXY_ENV_KEYS:
                 env.pop(key, None)
         return env
+
+    def start(self, ready_timeout: float = 180):
+        if self.candidate is None:
+            return super().start(ready_timeout)
+        from ouroboros.process_containment import ProcessContainer
+
+        if self._candidate_container is not None or self._candidate_cleanup_error:
+            raise CandidateError("CANDIDATE_CUSTODY: previous server tree was not released")
+        verify_checkout(self.clone, self.candidate)
+        self._patch_settings_ports()
+        env = self._env()
+        python = sys.executable
+        if os.name == "nt":
+            # As in the shared UI fixture, the base interpreter owns the serving
+            # PID; the venv launcher would return a different parent PID.
+            python = str(getattr(sys, "_base_executable", sys.executable))
+            site = pathlib.Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages"
+            if site.is_dir():
+                env["PYTHONPATH"] = os.pathsep.join([str(site), env.get("PYTHONPATH", "")])
+        require_candidate_interpreter(python, env, self.clone)
+        self._candidate_container = ProcessContainer()
+        self.candidate.hold()
+        self.proc = None
+        try:
+            self.proc = self._candidate_container.spawn(
+                [python, "server.py"], cwd=self.clone, env=env,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+            self._wait_ready(ready_timeout)
+            assert_served_candidate(self.base_url, self.clone, self.data_root,
+                                    self.proc.pid, self.candidate)
+        except BaseException:
+            self.stop()
+            raise
+        return self
+
+    def stop(self) -> None:
+        if self.candidate is None:
+            return super().stop()
+        if self._candidate_cleanup_error:
+            raise CandidateError(self._candidate_cleanup_error)
+        container, self._candidate_container = self._candidate_container, None
+        if container is None:
+            return
+        try:
+            try:
+                super().stop()
+            finally:
+                try:
+                    error = container.reap()
+                finally:
+                    container.close()
+                if error:
+                    raise CandidateError(f"CANDIDATE_RETAINED: process cleanup failed: {error}")
+                if self.proc is not None:
+                    self.proc.wait(timeout=5)
+        except BaseException as exc:
+            from ouroboros.test_environment import retain_tree
+
+            self._candidate_cleanup_error = f"CANDIDATE_RETAINED: {exc}"
+            retain_tree(self.data_root, self._candidate_cleanup_error)
+            raise
+        self.candidate.release()
 
 
 def keyless_reviewer_slots(*, advisory: bool = False) -> str:

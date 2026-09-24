@@ -7,6 +7,7 @@ TypedDicts document payloads, not runtime validation. Keep discriminating
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+from ouroboros.cost_projection import CostPresentation
 
 from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
 from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetTab, WidgetsResponse
@@ -227,6 +228,8 @@ class ChatOutbound(TypedDict):
     # amount computed over a degraded ledger reached every surface looking exactly
     # like one computed over a sound ledger.
     ledger_integrity_degraded: NotRequired[Optional[bool]]
+    # Closed shape owned by the cost producer; null means ledger unavailable.
+    cost_presentation: NotRequired[Optional[CostPresentation]]
     result: NotRequired[str]
     result_truncated: NotRequired[bool]  # P3: WS preview was capped; fetch full via task id
     trace_summary: NotRequired[str]
@@ -1480,6 +1483,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
 
 
 __all__ = [
+    "CostPresentation",
     "ChatInbound",
     "TaskConstraintInbound",
     "CommandInbound",

@@ -32,6 +32,12 @@ EXTERNAL_PLATFORM_UPDATE_TIMEOUT_SEC = 3600.0
 EXTENSION_STREAM_CHUNK_BYTES = 64 * 1024
 # Exit/pipe-drain grace after a response ends; never a response lifetime timer.
 EXTENSION_CHILD_CLEANUP_GRACE_SEC = 2
+# Ordinary close (#1142): the launcher waits this long for the server to exit before the group SIGKILL
+# fallback; uvicorn's graceful drain of open HTTP/WS tasks is bounded to the second value so the lifespan
+# teardown — the terminal-custody write `kill_workers` — starts well inside the first. The pair is one
+# budget, not two knobs: raise the drain only with the launcher wait (which ships with a release).
+LAUNCHER_STOP_GRACE_SEC = 10.0
+SERVER_GRACEFUL_SHUTDOWN_TIMEOUT_SEC = 3.0
 NESTED_SETTLEMENT_MARGIN_SEC = 30  # Structural ordering margin, not a cognition timeout.
 # Owner-note cadence while a task waits out a provider-connection outage; the effective interval is min(this, idle_timeout/2) so the notes also keep the idle rail alive.
 NETWORK_WAIT_NOTE_INTERVAL_SEC = 300

@@ -1,6 +1,16 @@
 /** Dependency-free JSDoc mirror of `ouroboros.gateway.contracts`. */
 
 /**
+ * @typedef {Object} CostPresentation
+ * @property {'own'|'root_tree'} scope
+ * @property {?number} tracked_amount
+ * @property {boolean} has_unpriced
+ * @property {boolean} tracked_final
+ * @property {boolean} accounting_open
+ * @property {boolean} has_rows
+ */
+
+/**
  * @typedef {Object} StateResponse
  * @property {number} uptime
  * @property {number} workers_alive
@@ -402,6 +412,11 @@
  *   v6.87.48: the count of OPEN ledger rows — the disclosed cause of `cost_final: false`,
  *   which can hold with every dollar bucket at zero (an estimated $0.00, or a dispatched
  *   row whose reservation is exactly zero).
+ * @property {?CostPresentation=} cost_presentation
+ *   #498: the facts that EXPLAIN the amount beside it, bound to the scope whose ledger
+ *   rows produced them (`own` or `root_tree`). `tracked_amount` is null unless a priced
+ *   or bounded row actually evidenced it, so an empty ledger and an all-unpriced one
+ *   never read as a measured zero. Null when the ledger could not be read.
  * @property {?boolean=} ledger_integrity_degraded
  *   C12: the ledger's INTEGRITY marker, produced by the cost authority all along but
  *   named in no carry list — an amount computed over a degraded ledger used to reach the
@@ -1501,7 +1516,7 @@ export const MAX_QUIZ_OPTIONS = 6;
 // REFUSES a longer comment (it is delivered verbatim, never truncated), so
 // the card must not offer to send one.
 export const MAX_DECISION_COMMENT = 2000;
-export const GATEWAY_CONTRACT_VERSION = '7.4.8';
+export const GATEWAY_CONTRACT_VERSION = '7.4.10';
 
 /**
  * @typedef {Object} ChatHistoryPosition
