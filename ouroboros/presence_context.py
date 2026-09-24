@@ -64,7 +64,17 @@ def _previous_turn_line(previous: Mapping[str, Any]) -> str:
     elif message and message not in sends:
         said.append(json.dumps(message, ensure_ascii=False))
     body = " / ".join(said) or "nothing sent"
-    work = f" Work continues as task {previous.get('work_ref')}." if previous.get("work_ref") else ""
+    work = ""
+    if previous.get("work_ref"):
+        status = str(previous.get("work_status") or "unknown")
+        if status == "completed":
+            result = str(previous.get("work_result") or "").strip()
+            work = f" Its deferred work (task {previous.get('work_ref')}) completed" + (
+                f" and answered: {json.dumps(result, ensure_ascii=False)}." if result else " silently.")
+        elif status in {"failed", "cancelled", "rejected_duplicate"}:
+            work = f" Its deferred work (task {previous.get('work_ref')}) ended {status}."
+        else:
+            work = f" Work continues as task {previous.get('work_ref')} (status {status})."
     return (f"Previous turn in this conversation (task {previous.get('task_id')}, finished {finished}, "
             f"outcome {previous.get('outcome')}, delivery {previous.get('delivery') or 'unknown'}): {body}.{work}")
 

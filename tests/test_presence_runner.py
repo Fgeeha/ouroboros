@@ -363,7 +363,7 @@ def test_previous_turn_pointer_names_message_deferred_and_silent_turns(tmp_path)
     assert "Previous turn" not in sections[0]
     assert f"Previous turn in this conversation (task {first.task_id}, finished " in sections[1]
     assert 'UTC, outcome message, delivery unknown): "Hi there".' in sections[1]
-    assert '"On it". Work continues as task presence-work-9.' in sections[2]
+    assert '"On it". Work continues as task presence-work-9 (status unknown).' in sections[2]
     assert "outcome silent, delivery unknown): nothing sent." in sections[3]
 
 
@@ -417,6 +417,40 @@ def test_previous_turn_shows_what_a_transport_tool_delivered(tmp_path):
     sections = [build_presence_context_section(tmp_path, task["metadata"]["presence"]) for task in captured]
     assert 'delivery confirmed): "Schedule: Mon 10:00" / finish note "Sent the schedule".' in sections[0]
     assert "delivered via transport tool (content unrecorded)." in sections[2]
+    # An early ack through a tool plus a final reply through the adapter: only the ack is confirmed so far.
+    _pointer_turn(tmp_path, "e5", {"outcome": "message", "text": "Final: 10:00", "message": "Final: 10:00"},
+                  version=1, during=send)
+    _pointer_turn(tmp_path, "e6", {"outcome": "silent", "text": ""}, version=1, captured=captured)
+    partly = captured[-1]["metadata"]["presence"]["previous_turn"]
+    assert (partly["transport_sends"], partly["message"], partly["delivery"]) == (
+        ["Schedule: Mon 10:00"], "Final: 10:00", "partly confirmed")
+    assert 'delivery partly confirmed): "Schedule: Mon 10:00" / "Final: 10:00".' in build_presence_context_section(
+        tmp_path, captured[-1]["metadata"]["presence"])
+
+
+def test_previous_turn_reports_the_fate_of_its_deferred_work(tmp_path):
+    """"Work continues" only while the child runs; a finished child's answer or failure is stated instead."""
+    from ouroboros.task_results import write_task_result
+
+    captured: list = []
+    _pointer_turn(tmp_path, "e1", {"outcome": "deferred", "text": "Looking into it", "work_ref": "presence-work-1"})
+    write_task_result(tmp_path, "presence-work-1", "running", metadata={"source": "presence"})
+    _pointer_turn(tmp_path, "e2", {"outcome": "silent", "text": ""}, captured=captured)
+    assert "Work continues as task presence-work-1 (status running)." in build_presence_context_section(
+        tmp_path, captured[-1]["metadata"]["presence"])
+    _pointer_turn(tmp_path, "e3", {"outcome": "deferred", "text": "On it", "work_ref": "presence-work-2"})
+    write_task_result(tmp_path, "presence-work-2", "completed", result="Report ready", terminal_origin="model_final",
+                      metadata={"source": "presence", "presence_outcome": "message", "presence_result_text": "Report ready"})
+    _pointer_turn(tmp_path, "e4", {"outcome": "silent", "text": ""}, captured=captured)
+    previous = captured[-1]["metadata"]["presence"]["previous_turn"]
+    assert (previous["work_status"], previous["work_result"]) == ("completed", "Report ready")
+    assert 'Its deferred work (task presence-work-2) completed and answered: "Report ready".' in (
+        build_presence_context_section(tmp_path, captured[-1]["metadata"]["presence"]))
+    _pointer_turn(tmp_path, "e5", {"outcome": "deferred", "text": "Trying", "work_ref": "presence-work-3"})
+    write_task_result(tmp_path, "presence-work-3", "failed", result="boom", metadata={"source": "presence"})
+    _pointer_turn(tmp_path, "e6", {"outcome": "silent", "text": ""}, captured=captured)
+    assert "Its deferred work (task presence-work-3) ended failed." in build_presence_context_section(
+        tmp_path, captured[-1]["metadata"]["presence"])
 
 
 def test_previous_turn_pointer_is_rebuilt_by_the_replay_of_a_turn_that_lost_it(tmp_path, monkeypatch):

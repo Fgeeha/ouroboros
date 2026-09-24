@@ -359,10 +359,16 @@ def _repair_previous_turn(drive_root: Path, conversation_key: str, task_id: str)
 
 
 def _delivery_state(reporting_version: int, sends: Sequence[str] | None, text: str) -> str:
-    """One rule for the live write and the repair: a v1 receipt arrives only after the turn returns."""
+    """One rule for the live write and the repair.
+
+    Tool sends confirm mid-turn; the adapter-delivered reply's receipt arrives only after the turn
+    returns, so a reply text that is not among the confirmed sends is at most partly confirmed.
+    """
     if not reporting_version or sends is None or not (sends or text):
         return "unknown"  # v0 never confirms; None = this turn's receipts left the live generation
-    return "confirmed" if sends else "authored"
+    if not sends:
+        return "authored"
+    return "confirmed" if not text or text in sends else "partly confirmed"
 
 
 def _log_dialogue(
@@ -451,6 +457,12 @@ def _build_task(
     }
     previous_turn = _read_previous_turn(drive_root, event.conversation_key)
     if previous_turn:
+        if previous_turn.get("work_ref"):  # the deferred child's fate is read from its canonical row, never stored
+            child = load_task_result(drive_root, str(previous_turn["work_ref"])) or {}
+            status = str(child.get("status") or "")
+            previous_turn = {**previous_turn, "work_status": status or "unknown", "work_result": (
+                presence_result_from_stored(child, str(previous_turn["work_ref"])).text
+                if status == STATUS_COMPLETED else "")}
         presence_context["previous_turn"] = previous_turn
     if lost_attempt:
         # Unknown (None) when the transport reports no receipts or the attempt's rows left the live generation.
