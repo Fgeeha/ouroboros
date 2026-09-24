@@ -18,6 +18,7 @@ from ouroboros.presence_admission import PresenceAdmission
 from ouroboros.presence_authority import presence_ceiling_payload
 from ouroboros.task_results import (
     STATUS_COMPLETED,
+    STATUS_FAILED,
     STATUS_INTERRUPTED,
     STATUS_RUNNING,
     is_reconciled_presence_placeholder,
@@ -278,9 +279,21 @@ def _cached_result(drive_root: Path, task_id: str) -> PresenceTurnResult | None:
     return presence_result_from_stored(stored, task_id)
 
 
-def _live_task_rows(drive_root: Path, task_id: str) -> list[dict[str, Any]]:
-    """This task's rows in the live chat generation, in order; an attempt starts with its inbound row."""
-    return [row for row in iter_jsonl_objects(Path(drive_root) / "logs" / "chat.jsonl") if row.get("task_id") == task_id]
+def _live_task_rows(drive_root: Path, task_id: str, conversation_key: str) -> list[dict[str, Any]]:
+    """This task's rows in the live chat generation, in order; an attempt starts with its inbound row.
+
+    A receipt addressed to another conversation (a tool send elsewhere) is not this conversation's
+    delivery, however similar its text, so only receipts carrying this key are kept.
+    """
+    rows = []
+    for row in iter_jsonl_objects(Path(drive_root) / "logs" / "chat.jsonl"):
+        if row.get("task_id") != task_id:
+            continue
+        transport = row.get("transport") if isinstance(row.get("transport"), Mapping) else {}
+        if row.get("type") == "presence_delivery" and str(transport.get("conversation_key") or "") != conversation_key:
+            continue
+        rows.append(row)
+    return rows
 
 
 def _confirmed_sends(rows: Sequence[Mapping[str, Any]]) -> list[str] | None:
@@ -337,9 +350,17 @@ def _write_previous_turn(drive_root: Path, conversation_key: str, task_id: str, 
 
 
 def _pointer_behind(drive_root: Path, conversation_key: str, task_id: str) -> bool:
-    """A completed turn whose pointer never landed (lost between its terminal write and the pointer write)."""
+    """A settled turn whose pointer never landed (lost between its terminal write and the pointer write).
+
+    Completed rows and authored failed rows (a model-final reply on a failed task) both replay speech;
+    a host placeholder and a host-authored failure never do, so they are not turns to point at.
+    """
+    from ouroboros.task_finalization import TERMINAL_ORIGIN_MODEL_FINAL
+
     stored = load_task_result(drive_root, task_id) or {}
-    if str(stored.get("status") or "") != STATUS_COMPLETED:
+    status = str(stored.get("status") or "")
+    if status != STATUS_COMPLETED and not (
+            status == STATUS_FAILED and str(stored.get("terminal_origin") or "") == TERMINAL_ORIGIN_MODEL_FINAL):
         return False
     pointer = _read_previous_turn(drive_root, conversation_key)
     return pointer is None or (
@@ -352,7 +373,7 @@ def _repair_previous_turn(drive_root: Path, conversation_key: str, task_id: str)
         return
     stored = load_task_result(drive_root, task_id) or {}
     replay = presence_result_from_stored(stored, task_id)
-    sends = _confirmed_sends(_live_task_rows(drive_root, task_id)) if replay.delivery_reporting_version else []
+    sends = _confirmed_sends(_live_task_rows(drive_root, task_id, conversation_key)) if replay.delivery_reporting_version else []
     _write_previous_turn(drive_root, conversation_key, task_id, outcome=replay.outcome, message=replay.text,
                          sends=sends or [], work_ref=replay.work_ref, finished_at=str(stored.get("ts") or ""),
                          delivery=_delivery_state(replay.delivery_reporting_version, sends, replay.text))
@@ -587,7 +608,7 @@ def run_presence_turn(
         stored = load_task_result(Path(drive_root), task_id) or {}
         lost_attempt = is_reconciled_presence_placeholder(stored) or str(stored.get("status") or "") in {
             STATUS_RUNNING, STATUS_INTERRUPTED}
-        prior_rows = _live_task_rows(Path(drive_root), task_id)  # an attempt that died before its running write left only these
+        prior_rows = _live_task_rows(Path(drive_root), task_id, event.conversation_key)
         task = _build_task(
             admission,
             event,
@@ -598,7 +619,10 @@ def run_presence_turn(
         )
         chat_id = int(task["chat_id"])
         actor_id = _stable_numeric_id("presence-actor-log", str(task.get("actor_id") or ""))
-        if not any(row.get("direction") == "in" for row in prior_rows):  # an earlier attempt already logged it
+        # A lost attempt logged the message (here or in a rotated archive); an attempt that died before its
+        # running write left only that row. Re-logging would also let a later retry mistake the fresh row
+        # for complete receipt coverage, so the row is written only when no attempt has a trace at all.
+        if not lost_attempt and not any(row.get("direction") == "in" for row in prior_rows):
             _log_dialogue(
                 Path(drive_root),
                 direction="in",
@@ -646,7 +670,7 @@ def run_presence_turn(
             )
         # Still under the conversation lock. A replay writes only through _repair_previous_turn, under
         # this same lock, and it leaves a pointer that names a newer turn alone.
-        sends = _confirmed_sends(_live_task_rows(Path(drive_root), task_id)) if event.delivery_reporting_version else []
+        sends = _confirmed_sends(_live_task_rows(Path(drive_root), task_id, event.conversation_key)) if event.delivery_reporting_version else []
         _write_previous_turn(Path(drive_root), event.conversation_key, task_id, outcome=result.outcome,
                              message=str(row.get("message") or result.text), sends=sends or [],
                              work_ref=result.work_ref, finished_at=utc_now_iso(),

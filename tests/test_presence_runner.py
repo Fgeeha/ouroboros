@@ -7,6 +7,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
+import pytest
+
 
 from ouroboros.presence_admission import PresenceAdmission
 from ouroboros.presence_authority import (
@@ -316,7 +318,8 @@ def test_presence_turn_is_live_for_liveness_readers_but_never_an_owner_target(mo
         registry.clear()
 
 
-def _pointer_turn(tmp_path, event_id, row, *, thread="topic-1", version=0, captured=None, during=None):
+def _pointer_turn(tmp_path, event_id, row, *, thread="topic-1", version=0, captured=None, during=None,
+                  status="completed"):
     """One executed turn with a durable terminal row, as the real pipeline leaves it."""
     from dataclasses import replace
 
@@ -333,7 +336,7 @@ def _pointer_turn(tmp_path, event_id, row, *, thread="topic-1", version=0, captu
             write_task_result(tmp_path, task["id"], "running", metadata=task["metadata"])
             if during is not None:
                 during(task)
-            write_task_result(tmp_path, task["id"], "completed", result=row.get("text", ""),
+            write_task_result(tmp_path, task["id"], status, result=row.get("text", ""),
                               terminal_origin="model_final", metadata={
                                   **task["metadata"], "presence_outcome": row["outcome"],
                                   "presence_result_text": row.get("text", ""),
@@ -462,8 +465,10 @@ def test_previous_turn_reports_the_fate_of_its_deferred_work(tmp_path):
     assert "completed silently; the host recorded an undelivered result: \"Salvaged: xxx" in section
 
 
-def test_previous_turn_pointer_is_rebuilt_by_the_replay_of_a_turn_that_lost_it(tmp_path, monkeypatch):
-    """A turn killed between its terminal write and its pointer write: the retry replays and repairs the pointer."""
+@pytest.mark.parametrize("status", ["completed", "failed"])
+def test_previous_turn_pointer_is_rebuilt_by_the_replay_of_a_turn_that_lost_it(tmp_path, monkeypatch, status):
+    """A turn killed between its terminal write and its pointer write: the retry replays and repairs the
+    pointer; an authored reply on a failed task is speech too and repairs the same way."""
     from ouroboros import presence_runner
     from ouroboros.presence_bindings import conversation_key
     from ouroboros.presence_runner import _previous_turn_path
@@ -479,7 +484,7 @@ def test_previous_turn_pointer_is_rebuilt_by_the_replay_of_a_turn_that_lost_it(t
         real_write(*args, **kwargs)
 
     monkeypatch.setattr(presence_runner, "_write_previous_turn", killed_before_pointer_write)
-    _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "New answer"}, version=1)
+    _pointer_turn(tmp_path, "e2", {"outcome": "message", "text": "New answer"}, version=1, status=status)
     lost = json.loads(room.read_text(encoding="utf-8"))
     assert lost["task_id"] == older.task_id and skipped  # the durable row completed, the pointer did not follow
     captured: list = []

@@ -292,7 +292,7 @@ def _lost_v1_attempt(tmp_path, task_id, *, chat_id):
     append_jsonl(chat, {"direction": "in", "chat_id": chat_id, "client_message_id": "telegram:bot-1:42",
                         "text": "Hello", "task_id": task_id})
     append_jsonl(chat, {"type": "presence_delivery", "direction": "out", "chat_id": chat_id, "text": "Early part",
-                        "task_id": task_id, "transport": {"delivery": {
+                        "task_id": task_id, "transport": {"conversation_key": _event().conversation_key, "delivery": {
                             "state": "delivered", "delivery_id": "send:early", "part_id": "0"}}})
     return chat
 
@@ -342,8 +342,25 @@ def test_rotation_between_the_lost_attempt_and_its_retry_makes_prior_sends_unkno
         "delivered_count": None, "delivered": None, "uncertain_count": 0}
     section = build_presence_context_section(tmp_path, calls[0]["metadata"]["presence"])
     assert "whether it already sent anything is unknown" in section and "delivered 0 message" not in section
-    live = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()]
-    assert [row["direction"] for row in live if row.get("task_id") == task_id][:1] == ["in"]  # logged again (disclosed)
+    live = [json.loads(line) for line in chat.read_text(encoding="utf-8").splitlines()] if chat.exists() else []
+    assert not [row for row in live if row.get("task_id") == task_id and row.get("direction") == "in"]  # never re-logged
+
+
+def test_a_second_death_after_the_rotation_keeps_the_count_unknown(tmp_path):
+    """The retry that follows a rotation must not leave a fresh inbound row that a later retry mistakes
+    for complete receipt coverage: the archived send stays unknown, never zero."""
+    task_id = _task_id(_admission(), _event())
+    chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
+    (tmp_path / "archive").mkdir()
+    chat.rename(tmp_path / "archive" / "chat_20260528T000100.jsonl")
+    calls: list = []
+    with pytest.raises(RuntimeError):  # retry A dies after its running write
+        run_presence_turn(**{**_v1_kwargs(tmp_path, calls),
+                             "agent_factory": lambda **_kw: _answering_agent(calls, "", tmp_path, lost=True)})
+    second = run_presence_turn(**_v1_kwargs(tmp_path, calls))  # retry B
+    assert second.text == "Real answer" and len(calls) == 2
+    assert [task["metadata"]["presence"]["previous_attempt"] for task in calls] == [
+        {"delivered_count": None, "delivered": None, "uncertain_count": 0}] * 2
 
 
 def test_rejected_build_leaves_the_placeholder_for_the_next_retry(tmp_path, monkeypatch):
@@ -371,7 +388,7 @@ def test_uncertain_receipts_make_the_prior_count_a_floor(tmp_path):
     task_id = _task_id(_admission(), _event())
     chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
     append_jsonl(chat, {"type": "presence_delivery", "direction": "system", "chat_id": 7, "text": "Maybe part",
-                        "task_id": task_id, "transport": {"delivery": {
+                        "task_id": task_id, "transport": {"conversation_key": _event().conversation_key, "delivery": {
                             "state": "uncertain", "delivery_id": "send:late", "part_id": "0"}}})
     calls: list = []
     run_presence_turn(**_v1_kwargs(tmp_path, calls))
@@ -389,7 +406,7 @@ def test_a_part_settles_by_its_latest_receipt(tmp_path, states, uncertain):
     chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
     for state in states:
         append_jsonl(chat, {"type": "presence_delivery", "direction": "system", "chat_id": 7, "text": "Maybe part",
-                            "task_id": task_id, "transport": {"delivery": {
+                            "task_id": task_id, "transport": {"conversation_key": _event().conversation_key, "delivery": {
                                 "state": state, "delivery_id": "send:late", "part_id": "0"}}})
     calls: list = []
     run_presence_turn(**_v1_kwargs(tmp_path, calls))
@@ -424,9 +441,49 @@ def test_a_confirmed_part_later_refused_is_not_delivered(tmp_path):
     task_id = _task_id(_admission(), _event())
     chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
     append_jsonl(chat, {"type": "presence_delivery", "direction": "system", "chat_id": 7, "text": "Early part",
-                        "task_id": task_id, "transport": {"delivery": {
+                        "task_id": task_id, "transport": {"conversation_key": _event().conversation_key, "delivery": {
                             "state": "failed", "delivery_id": "send:early", "part_id": "0"}}})
     calls: list = []
     run_presence_turn(**_v1_kwargs(tmp_path, calls))
     assert calls[0]["metadata"]["presence"]["previous_attempt"] == {
         "delivered_count": 0, "delivered": [], "uncertain_count": 0}
+
+
+def test_a_receipt_addressed_to_another_conversation_does_not_count(tmp_path):
+    """A tool send elsewhere with the same body is not this conversation's delivery."""
+    task_id = _task_id(_admission(), _event())
+    chat = _lost_v1_attempt(tmp_path, task_id, chat_id=7)
+    append_jsonl(chat, {"type": "presence_delivery", "direction": "out", "chat_id": 8, "text": "Early part",
+                        "task_id": task_id, "transport": {"conversation_key": "telegram:bot-1:other-room:0", "delivery": {
+                            "state": "delivered", "delivery_id": "send:elsewhere", "part_id": "0"}}})
+    calls: list = []
+    run_presence_turn(**_v1_kwargs(tmp_path, calls))
+    assert calls[0]["metadata"]["presence"]["previous_attempt"] == {
+        "delivered_count": 1, "delivered": ["Early part"], "uncertain_count": 0}
+
+
+def test_reconciler_skips_a_row_whose_retry_went_live_after_the_decision(tmp_path, monkeypatch):
+    """The orphan decision is taken outside the row lock; a presence retry that registered meanwhile
+    cancels the write, and the same sweep heals once nothing is live."""
+    from ouroboros import presence_runner, task_status
+
+    task_id = "presence-raced"
+    real_effective, order = task_status.load_effective_task_result, []
+
+    def effective_then_retry_registers(root, tid, *args, **kwargs):
+        effective = real_effective(root, tid, *args, **kwargs)
+        if tid == task_id and not order:  # the retry goes live right after the sweep decided
+            order.append("live")
+            with presence_runner._LIVE_LOCK:
+                presence_runner._LIVE_PRESENCE_TASKS.add(task_id)
+        return effective
+
+    monkeypatch.setattr(task_status, "load_effective_task_result", effective_then_retry_registers)
+    try:
+        healed, row = _sweep(tmp_path, monkeypatch, task_id)
+        assert (healed, row["status"], order) == (0, STATUS_RUNNING, ["live"])  # decision dropped, row untouched
+    finally:
+        with presence_runner._LIVE_LOCK:
+            presence_runner._LIVE_PRESENCE_TASKS.discard(task_id)
+    healed, row = _sweep(tmp_path, monkeypatch, task_id, seed=False)
+    assert healed == 1 and row["status"] == STATUS_FAILED and row["status_reconciled_from"] == STATUS_RUNNING
