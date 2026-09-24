@@ -46,6 +46,8 @@ from ouroboros.server_process import (  # noqa: F401
     _restart_requested,
     _supervisor_stop,
     _exit_signalled,
+    _SignalStopServer,
+    _embedded_uvicorn_server,
     log,
 )
 from ouroboros.server_routing_context import (  # noqa: F401
@@ -1208,7 +1210,7 @@ routes = [
     Mount("/static", app=NoCacheStaticFiles(directory=str(web_dir)), name="static"),
 ]
 
-from contextlib import ExitStack, asynccontextmanager, nullcontext, suppress
+from contextlib import ExitStack, asynccontextmanager, suppress
 
 
 @asynccontextmanager
@@ -1615,39 +1617,6 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
             kill_process_on_port(host_service_port())
     except Exception:
         pass
-
-class _SignalStopServer(uvicorn.Server):
-    """uvicorn.Server whose SIGTERM/SIGINT handler stops the supervisor loop AT THE SIGNAL.
-
-    The launcher's stop may SIGTERM the whole server process group, so the multiprocessing
-    Manager and pooled workers can be gone before uvicorn's drain reaches the lifespan
-    teardown (#1142). Setting the stop event here, not only in the lifespan ``finally``,
-    makes the loop leave its tick and keeps a torn-Manager BrokenPipe from counting as a
-    supervisor crash — the false "Supervisor loop died" owner alarm. A restart request
-    (``should_exit`` without a signal) is unchanged: ``_restart_requested`` already ends
-    the loop, and the lifespan ``finally`` still sets the event on every path.
-    """
-
-    def handle_exit(self, sig: int, frame) -> None:
-        _exit_signalled.set()
-        _supervisor_stop.set()
-        super().handle_exit(sig, frame)
-
-
-def _embedded_uvicorn_server(config: "uvicorn.Config") -> "uvicorn.Server":
-    """A uvicorn.Server hosted INSIDE the main server's event loop (the Host Service).
-
-    ``Server.serve()`` installs the process signal handlers whenever it runs on the main
-    thread and forwards a captured signal to the previous handler only after it has
-    finished — so an embedded server would take SIGTERM away from ``_SignalStopServer``
-    and hold it behind its own unbounded drain (#1142). The instance-level
-    ``nullcontext`` keeps the main server the one signal owner; the lifespan teardown
-    still stops this server through ``should_exit``.
-    """
-    server = uvicorn.Server(config)
-    server.capture_signals = nullcontext  # type: ignore[method-assign]
-    return server
-
 
 def main() -> int:
     # A benchmark-owned child may receive an integrity pin from its parent.
