@@ -718,6 +718,7 @@ def _exact_continuation_row(limit_ctx: Any, ctx: Any, *, pause_id: str, rail: st
     trace = limit_ctx.llm_trace if isinstance(limit_ctx.llm_trace, dict) else {}
     seen = set(limit_ctx.owner_msg_seen or ())
     point = resume_point(messages, limit_ctx.round_idx)
+    point["budget_tail"] = getattr(limit_ctx, "budget_tail", "tool")
     # The rail already stamped its terminal projection on the live usage, and a
     # hold leaves its own transient row there; neither may travel into the
     # resumed loop's eventual honest terminal.

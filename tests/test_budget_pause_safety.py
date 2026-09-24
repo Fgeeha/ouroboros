@@ -80,7 +80,7 @@ def test_legacy_root_resume_selects_only_root_then_one_child(tmp_path, monkeypat
     monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_k: 5.0)
     root = _fenced_member(workers, "root", "root")
     root.pop("parent_task_id")
-    child = _fenced_member(workers, "child", "root")
+    _fenced_member(workers, "child", "root")
     sibling = _fenced_member(workers, "sibling", "root")
     fence = _set_root_budget_pause_locked("root", {})
     if marker:

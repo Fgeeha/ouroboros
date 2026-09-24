@@ -62,9 +62,7 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 106400 -> 106600 (#1195 merge of 32d8dfc6): the base's settings_catalog.js
     # paragraph (#1214, +319 bytes) landed in the same window; both additions stand,
     # neither displaces the other's text.
-    # 106600 -> 106800 (#1196): a paused direct turn reports the managed census
-    # phases; the phase sentence is extended, nothing older describes it.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 106800,
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 106600,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
@@ -77,13 +75,7 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # displace; two neighbouring sentences were compressed by 168 bytes first.
     # +300: the queue snapshot and the supervisor focus event carry the root's
     # bounded authored focus (cross-focus awareness).
-    # 30900 -> 31700 (#1196): the exact-continuation `_budget_pause` marker, its grant
-    # carrier and the separate paused-interval carrier are new snapshot/assignment
-    # facts the chapter lacked; nothing older describes them.
-    # 31700 -> 32200 (#1196): restart parking of a completed pause, the typed
-    # restore/acceptance holds and the parked direct turn replace the restore
-    # sentence they grew from.
-    "docs/architecture/05-supervisor-loop.md": 32200,
+    "docs/architecture/05-supervisor-loop.md": 30900,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is

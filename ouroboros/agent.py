@@ -538,25 +538,11 @@ class OuroborosAgent:
 
         task_metadata = dict(task.get("metadata") or {}) if isinstance(task.get("metadata"), dict) else {}
         for key in (
-            "parent_task_id",
-            "root_task_id",
-            "session_id",
-            "actor_id",
-            "delegation_role",
-            "role",
-            "workspace_root",
-            "workspace_mode",
-            "memory_mode",
-            "drive_root",
-            "child_drive_root",
-            "budget_drive_root",
-            "root_cost_ceiling_usd",
-            "model_lane",
-            "requested_model_lane",
-            "effective_model_lane",
-            "model",
-            "use_local_model",
-            "requested_executor",
+            "parent_task_id", "root_task_id", "session_id", "actor_id", "delegation_role", "role",
+            "workspace_root", "workspace_mode", "memory_mode",
+            "drive_root", "child_drive_root", "budget_drive_root", "root_cost_ceiling_usd",
+            "model_lane", "requested_model_lane", "effective_model_lane",
+            "model", "use_local_model", "requested_executor",
             # `effective_executor`/`capability_delta` are deliberately NOT here: this
             # projection is only READ for `effective_model_lane` (grandchild
             # inheritance), the child learns its own reduction from the prompt and the

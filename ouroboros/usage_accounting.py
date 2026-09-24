@@ -29,24 +29,12 @@ from ouroboros._usage_response import (
 from ouroboros.review_dispatch import invoke_bound_api_review_paid_stamp
 from ouroboros.transport_custody import release_pre_dispatch_attempt
 from ouroboros.usage_ledger import (  # noqa: F401 — re-exported substrate
-    LEDGER_REL,
-    QUARANTINE_REL,
-    LedgerResumeState,
-    UsageAccountingError,
-    UsageLedgerCorrupt,
-    _append_bytes_fsync,
-    _append_rows_locked,
-    _drive_root,
-    _final_rows,
-    _ledger_resume_state,
-    _locked,
-    _named_lock,
-    _number,
-    _read_new_records_locked,
-    _read_records_locked,
-    _TERMINAL,
-    _validate_records,
-    _write_bytes_atomic_fsync,
+    LEDGER_REL, QUARANTINE_REL, LedgerResumeState,
+    UsageAccountingError, UsageLedgerCorrupt,
+    _append_bytes_fsync, _append_rows_locked,
+    _drive_root, _final_rows, _ledger_resume_state,
+    _locked, _named_lock, _number,
+    _read_new_records_locked, _read_records_locked, _TERMINAL, _validate_records, _write_bytes_atomic_fsync,
 )
 from ouroboros.utils import append_jsonl, atomic_write_json, utc_now_iso  # noqa: F401 -- the accounting module keeps its historical import surface for the L-C2 leaf
 from ouroboros._usage_rows import (  # noqa: F401  (re-exported substrate vocabulary)
@@ -1497,19 +1485,10 @@ def execute_physical_attempt(
     except BaseException as exc:
         if isinstance(exc, PhysicalAttemptLimitExceeded):
             _record_attempt_capture(
-                reservation,
-                request,
-                "released",
-                candidate_manifest_ref=manifest_ref,
-                exc=exc,
-            )
+                reservation, request, "released", candidate_manifest_ref=manifest_ref, exc=exc)
             raise
         failure = _pre_dispatch_failure(
-            reservation,
-            request,
-            exc,
-            candidate_manifest_ref=manifest_ref,
-        )
+            reservation, request, exc, candidate_manifest_ref=manifest_ref)
         if failure is exc:
             raise
         raise failure from exc
@@ -1567,19 +1546,10 @@ async def execute_physical_attempt_async(
     except BaseException as exc:
         if isinstance(exc, PhysicalAttemptLimitExceeded):
             _record_attempt_capture(
-                reservation,
-                request,
-                "released",
-                candidate_manifest_ref=manifest_ref,
-                exc=exc,
-            )
+                reservation, request, "released", candidate_manifest_ref=manifest_ref, exc=exc)
             raise
         failure = _pre_dispatch_failure(
-            reservation,
-            request,
-            exc,
-            candidate_manifest_ref=manifest_ref,
-        )
+            reservation, request, exc, candidate_manifest_ref=manifest_ref)
         if failure is exc:
             raise
         raise failure from exc

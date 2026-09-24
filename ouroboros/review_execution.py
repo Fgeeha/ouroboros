@@ -744,14 +744,11 @@ def run_delegated_review_session(
     custody_drive: Any,
     invocation: SessionInvocation,
 ) -> Dict[str, Any]:
-    """Start, watch, settle and collect one delegated read-only review.
-    This is every review surface's single session transport. It pins one
-    subscription harness, asks for schema only when the effective adapter can
-    carry it, stores the canonical start request before POST, and replays only
-    an explicit pending invocation token. A bound token joins its existing run;
-    reconcile-only mode never mints a replacement. The nanny owns verified
-    cancellation at ``timeout_sec`` and reads the full primary output before
-    settling through ``delegate_custody``.
+    """All reviews share this transport: pin one subscription harness, request
+    schema only if its effective adapter supports it, store the canonical body
+    before POST, and replay only an explicit pending token. Bound tokens join
+    existing runs; reconciliation never replaces them. The nanny verifies
+    cancellation at ``timeout_sec`` and reads full output before ``delegate_custody`` settlement.
     """
     from ouroboros import delegate_custody as custody
     from ouroboros.claudexor_daemon import ensure_owned_gateway

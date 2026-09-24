@@ -566,8 +566,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             facts = {key: value for key, value in claim_refusal.items()
                      if key not in {"reason", "detail"}}
             return _fail(
-                "delegate_start", reason, detail,
-                **facts,
+                "delegate_start", reason, detail, **facts,
                 **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent, history_facts=history_facts,
                     definite_refusal=True,
                     reason=reason, invocation_id=invocation_id, snapshot_id=snapshot_id,
@@ -580,21 +579,16 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 "NOT started: a run launched without its custody trail would be "
                 "unfindable if this worker died. Fix the drive/event log and retry.",
                 **({"definitely_unrun": True} if not recovering else {}), **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent, history_facts=history_facts,
-                                                definite_refusal=not recovering,
-                                                reason="start_request_row_unwritable",
-                                                invocation_id=invocation_id,
-                                                snapshot_id=("" if recovering else snapshot_id)))
+                    definite_refusal=not recovering, reason="start_request_row_unwritable",
+                    invocation_id=invocation_id, snapshot_id=("" if recovering else snapshot_id)))
         handle = gateway.start_run(request_body, idempotency_key=invocation_id)
         run_id = str(handle.get("runId") or handle.get("jobId") or "")
         if not run_id:
             return _fail("delegate_start", "queued_without_run_id",
                          f"Claudexor returned a queued handle without a run id: {handle!r}",
-                         pending_invocation_id=invocation_id,
-                         retry_hint=_RETRY_HINT,
+                         pending_invocation_id=invocation_id, retry_hint=_RETRY_HINT,
                          **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent, history_facts=history_facts,
-                                                         definite_refusal=False,
-                                                         reason="queued_without_run_id",
-                                                         invocation_id=invocation_id))
+                             definite_refusal=False, reason="queued_without_run_id", invocation_id=invocation_id))
     except ClaudexorUnavailable as exc:
         # A registration we created BEFORE the start must not outlive a failed start.
         # It used to be left behind with nothing anywhere naming its id.
@@ -611,10 +605,8 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                      **({"definitely_unrun": True} if not requested else {}),
                      reset_at=getattr(exc, "reset_at", ""), **pending,
                      **_retire_orphaned_registration(ctx, gateway, owned_project_id, project_persistent=project_persistent, history_facts=history_facts,
-                                                     definite_refusal=definite,
-                                                     reason=str(getattr(exc, "code", "")),
-                                                     invocation_id=invocation_id,
-                                                     snapshot_id=("" if recovering else snapshot_id)))
+                         definite_refusal=definite, reason=str(getattr(exc, "code", "")),
+                         invocation_id=invocation_id, snapshot_id=("" if recovering else snapshot_id)))
     except BaseException as exc:
         # EVERY pre-custody exit leaves a durable disposition, including the ones no
         # typed handler claims (a bug here, a timeout, a signal). NEVER retired: an
@@ -651,13 +643,9 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     from ouroboros.tools.control import maybe_emit_delegated_run_fanout
     maybe_emit_delegated_run_fanout(ctx, run_id=run_id, route_id=route.route_id, objective=text, durable=durable)
     return _started_payload(handle, run_id, route, access, authority, root,
-                            durable=durable, recovering=recovering,
-                            invocation_id=invocation_id,
-                            snapshot_id=snapshot_id, target_root=target_root,
-                            baseline_sha=baseline_sha,
-                            resource_ref=resource_ref,
-                            processing=processing_info,
-                            continuation=continuation,
+                            durable=durable, recovering=recovering, invocation_id=invocation_id,
+                            snapshot_id=snapshot_id, target_root=target_root, baseline_sha=baseline_sha,
+                            resource_ref=resource_ref, processing=processing_info, continuation=continuation,
                             max_seconds=seconds, max_seconds_basis=seconds_basis,
                             engine_version=str(getattr(gateway, "engine_version", "") or ""))
 

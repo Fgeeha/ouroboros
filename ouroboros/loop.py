@@ -500,17 +500,16 @@ def run_llm_loop(
         # Both continuing tool tails and unfinished no-tool rounds owe budget checks.
         pending_tool_budget, pending_tool_calls, pending_no_tool_budget = bool(saved), None, False
         if saved_pause:
-            # Same-ID exact continuation after an owner Resume (#1196): the
-            # saved cognition comes back (nothing is re-executed by the host;
-            # an interrupted batch's unanswered calls are closed as execution-
-            # unknown), then the ordinary budget tail decides with the
-            # refreshed threshold.
+            # Restore cognition under the same ID, closing unanswered calls as
+            # execution-unknown without replay. The shared budget tail checks
+            # the owner-refreshed threshold before any new model call.
             (active_model, active_effort, active_use_local, active_context_mode,
              round_idx, context_fit_plan) = resume_paused_loop(
                 tools, saved_pause, messages, llm_trace, accumulated_usage, _owner_msg_seen,
                 budget_remaining_usd=budget_remaining_usd)
             cost_ceiling = _resolve_task_cost_ceiling(tools._ctx, budget_remaining_usd)
-            pending_tool_budget = True
+            pending_no_tool_budget = saved_pause.get("resume_point", {}).get("budget_tail") == "no_tool"
+            pending_tool_budget, free_redial = not pending_no_tool_budget, pending_no_tool_budget
         while True:
             if free_redial or pending_tool_budget:
                 free_redial = False  # Tool tails and transport waits retain their logical round.
@@ -540,14 +539,14 @@ def run_llm_loop(
             ctx.active_effort = active_effort
             ctx.active_use_local = active_use_local
 
-            # One forced-wrap-up context per round: consumed by the round-limit
-            # path and supervisor finalize_now control path below.
+            # One context per round, shared by budget, round-limit and finalize_now rails.
             limit_ctx = _RoundLimitContext(
                 messages, llm, active_model, active_effort, max_retries, drive_logs,
-                task_id, round_idx, event_queue, accumulated_usage, task_type,
-                active_use_local, MAX_ROUNDS, drive_root=drive_root, llm_trace=llm_trace,
+                task_id, round_idx, event_queue, accumulated_usage, task_type, active_use_local, MAX_ROUNDS,
+                drive_root=drive_root, llm_trace=llm_trace,
                 incoming_messages=incoming_messages, owner_msg_seen=_owner_msg_seen, tool_schemas=tool_schemas)
             _finalize_limit_ctx(limit_ctx, tools, llm_trace)
+            limit_ctx.budget_tail = "tool" if pending_tool_budget else "no_tool"
             if MAX_ROUNDS is not None and round_idx > MAX_ROUNDS:
                 # Live hold: a paid [ROUND_LIMIT] dial would be a resend (no wake receipt) — no-call unknown terminal.
                 if _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id,
@@ -625,17 +624,13 @@ def run_llm_loop(
                 seal_task_transcript(messages)
 
                 model_call = _RoundModelCallContext(
-                        llm=llm, messages=messages, tools=tools, context_fit_plan=context_fit_plan,
-                        active_model=active_model, tool_schemas=tool_schemas,
-                        active_effort=active_effort, max_retries=max_retries,
-                        drive_logs=drive_logs, task_id=task_id, round_idx=round_idx,
-                        event_queue=event_queue,
-                        accumulated_usage=accumulated_usage,
-                        task_type=task_type,
-                        active_use_local=active_use_local,
-                        active_context_mode=active_context_mode,
-                        drive_root=drive_root, emit_progress=emit_progress,
-                    )
+                    llm=llm, messages=messages, tools=tools, context_fit_plan=context_fit_plan,
+                    active_model=active_model, tool_schemas=tool_schemas,
+                    active_effort=active_effort, max_retries=max_retries,
+                    drive_logs=drive_logs, task_id=task_id, round_idx=round_idx,
+                    event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
+                    active_use_local=active_use_local, active_context_mode=active_context_mode,
+                    drive_root=drive_root, emit_progress=emit_progress)
                 try:
                     msg, cost, active_context_mode = _call_round_model(model_call)
                 except ModelWaitInterrupted as error:
@@ -660,13 +655,8 @@ def run_llm_loop(
                 drive_logs=drive_logs, task_id=task_id, model=active_model, emit_progress=emit_progress)
             if msg is None and _fallback_chain_allowed(ctx, last_error_kind, transport_wait, accumulated_usage):
                 _episode_before_chain = transport_wait is not None
-                (
-                    msg,
-                    active_model,
-                    active_use_local,
-                    context_fit_plan,
-                    active_context_mode,
-                ) = _run_cross_model_fallback_chain(
+                (msg, active_model, active_use_local,
+                 context_fit_plan, active_context_mode) = _run_cross_model_fallback_chain(
                     llm=llm, ctx=ctx, tools=tools, messages=messages, active_model=active_model,
                     active_use_local=active_use_local, tool_schemas=tool_schemas, active_effort=active_effort,
                     max_retries=max_retries, drive_logs=drive_logs, task_id=task_id, round_idx=round_idx,
@@ -723,10 +713,10 @@ def run_llm_loop(
 
             if getattr(tools._ctx, "_skill_finalization_injected", False):
                 tools._ctx._skill_finalization_injected = False
-            assistant_msg = dict(msg)
-            assistant_msg.setdefault("role", "assistant")
+            assistant_msg = dict(msg, role=msg.get("role", "assistant"))
             messages.append(assistant_msg)
             _emit_round_progress(content, msg, emit_progress, llm_trace)
+            limit_ctx.budget_tail = "tool"
             handle_tool_calls(
                 tool_calls, tools, drive_logs, task_id, stateful_executor,
                 messages, llm_trace, emit_progress

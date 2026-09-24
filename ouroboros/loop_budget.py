@@ -59,7 +59,7 @@ def _check_budget_limits(
         finish_reason = "🚫 Task rejected. Total budget exhausted. Please increase TOTAL_BUDGET in settings."
         accumulated_usage["execution_status"] = "failed"
         accumulated_usage["reason_code"] = "budget_exhausted"
-        if ctx.round_idx <= 1:
+        if ctx.round_idx <= 1 and not accumulated_usage.get("rounds"):
             trace = ctx.llm_trace if isinstance(ctx.llm_trace, dict) else {}
             tool_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
             suffix = (
@@ -297,10 +297,9 @@ def _soft_land_exhausted_ceiling(
     limit_ctx: "_RoundLimitContext",
     cost_ceiling: "task_pacing.CostCeiling",
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
-    """Typed soft landing (v6.91): a root cap at or below the planning margin
-    wraps up BEFORE a work round through the same priced candidate as the
-    last-fit rail; an unaffordable wrap-up ends as budget_wrapup_unaffordable
-    instead of a fence pause. None when the ceiling is not exhausted."""
+    """Pause a root cap at/below the planning margin, even before its first
+    call: owner Resume may use already-authorized headroom. Only an actor
+    without exact continuation retains the priced legacy soft landing."""
     if cost_ceiling.state != task_pacing.COST_CEILING_EXHAUSTED_SOFT_LAND:
         return None
     cap_text = (
@@ -315,10 +314,8 @@ def _soft_land_exhausted_ceiling(
         f"Per-task tree cap {cap_text} leaves no working room above the "
         f"wrap-up planning margin ({margin_text}). Budget exhausted."
     )
-    if limit_ctx.round_idx > 1:
-        # Work exists: pause exactly instead of pricing a wrap-up call.
-        budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_SOFT_LAND, scope="root",
-                                   reason_text=soft_land_reason)
+    budget_pause.request_pause(limit_ctx, rail=budget_pause.RAIL_SOFT_LAND, scope="root",
+                               reason_text=soft_land_reason)
     trace = limit_ctx.llm_trace if isinstance(limit_ctx.llm_trace, dict) else {}
     priced_prompt = _loop()._prepare_forced_prompt(
         limit_ctx, f"[BUDGET LIMIT] {soft_land_reason} {_loop()._FORCED_BEST_EFFORT_TAIL}", trace,
@@ -771,8 +768,10 @@ def _finish_no_tool_round_budget(
     nothing else: no metered-baseline bookkeeping (no tools ran) and no
     `_prepare_post_tool_budget_context`, whose delivery-control arming belongs
     to a tool batch's effects. The current delivery candidate is untouched, so a
-    budget exit still wraps up the answer the round produced.
+    eligible budget exit checkpoints the answer the round produced. Its cold
+    continuation must return to this tail without tool-only control arming.
     """
+    ctx.budget_tail = "no_tool"
     result = _loop()._check_budget_limits(ctx, budget_remaining_usd, cost_ceiling=cost_ceiling)
     if result is None:
         return None
