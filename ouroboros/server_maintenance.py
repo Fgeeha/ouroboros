@@ -267,6 +267,13 @@ def _run_periodic_custody_sweep(stop_event: Any = None, latch: Any = None) -> No
     """
     try:
         try:
+            if _stop_requested(stop_event):
+                return
+            from ouroboros.terminal_projection import reconcile_terminal_projections
+            reconcile_terminal_projections(DATA_DIR)
+        except Exception:
+            log.warning("Terminal projection reconciliation deferred", exc_info=True)
+        try:
             # Issue #844: release the owned-daemon start latch in ITS OWN try, ahead of
             # the reap, so a raising reap can never pin it; retry once — only when THIS
             # sweep released a latch — on a short-lived thread, as warm_owned_daemon()
