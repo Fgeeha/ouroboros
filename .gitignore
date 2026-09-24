@@ -103,4 +103,6 @@ MagicMock/
 devtools/benchmarks/editbench/fixtures_v2/
 
 # Other
-.devcontainer
+# Anchored to the repo root, like /logs/ and /ocr_pages/ above.
+/.devcontainer
+/graphify-out
