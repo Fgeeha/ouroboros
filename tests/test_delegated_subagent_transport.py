@@ -330,8 +330,15 @@ def test_a_pool_heals_on_a_timer_only_when_the_engine_dated_it():
                   cx.run_failure_error("run-1", "failed", dated_failure)):
         assert isinstance(dated, cx.ClaudexorSubscriptionWindowExhausted)
         assert (dated.code, dated.reset_at) == ("credential_pool_exhausted", reset)
-    assert cx.run_failure_error("run-1", "failed", dated_failure).reported_cause == (
-        "every account is cooling down")
+    dated_run = cx.run_failure_error("run-1", "failed", dated_failure)
+    assert dated_run.reported_cause == "every account is cooling down"
+    # A dated pool heals on the same timer as a spent window, so it is SCHEDULED
+    # against its reset (not the short backoff) and keeps its own code as evidence.
+    dated_class = classify_llm_exception(dated_run)
+    assert (dated_class.kind, dated_class.retry_same_request) == (SUBSCRIPTION_WINDOW_EXHAUSTED, True)
+    assert dated_class.provider_code == "credential_pool_exhausted"
+    assert dated_class.reset_at == reset and dated_class.retry_after_sec is not None
+    assert dated_class.retry_after_sec > 60.0
 
     # Other direction: an absent, empty or null reset is structural: a plain refusal
     # under the SAME code, the engine's words still carried beside it.
