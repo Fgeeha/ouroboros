@@ -136,6 +136,21 @@ class TestChildWarnings:
         record = {"status": "completed", "outcome_axes": {"review": {"status": "degraded"}}}
         assert outcome_phase(record, {}) == "warn"
 
+    def test_a_completed_lifecycle_with_a_failed_outcome_never_reads_as_a_clean_completion(self):
+        # R2 (#1087): `_finished_with_warnings` answers only the warning question
+        # (False for `error`), so the chat line took ✅ from the lifecycle while the
+        # card folded the same record to Failed. The display helper speaks the phase.
+        from ouroboros.project_dialogue import outcome_phase
+        from supervisor.events_task_done import _completed_lifecycle_display
+
+        failed_review = {"status": "completed", "outcome_axes": {"review": {"status": "fail"}}}
+        assert outcome_phase(failed_review, {}) == "error"
+        assert _completed_lifecycle_display({"status": "completed"}, failed_review) == ("❌", "finished with a failed outcome")
+        warned = {"status": "completed", "outcome_axes": {"review": {"status": "degraded"}}}
+        assert _completed_lifecycle_display({"status": "completed"}, warned) == ("⚠️", "finished with warnings")
+        clean = {"status": "completed", "outcome_axes": {"execution": {"status": "ok"}}}
+        assert _completed_lifecycle_display(clean, clean) is None
+
 
 def test_cancel_cause_python_browser_fixture_parity():
     from pathlib import Path

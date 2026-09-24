@@ -1140,8 +1140,14 @@ export function taskTerminalSummary(evt = {}) {
     // Terminality and outcome knowledge are two facts (#1110): the lifecycle status
     // can settle while post-task finalization still runs. Painting the whole frame
     // 'error' put Failed where only a terminal frame may, so the title carried it.
-    const observedOutcome = OBSERVED_OUTCOME_STATUSES.has(
-        String(normalizeTaskTerminalRecord(evt)?.status || '').toLowerCase()) ? outcome : '';
+    // The stamp (`task_terminal_status`/`status`) is the producer's word; a row
+    // that carries only the canonical axes still knows its lifecycle, so a
+    // settled `outcome_axes.lifecycle.status` counts too (as taskOutcomeSeverity
+    // already reads it) — an unstamped finalizing replay of a Failed root must
+    // not hide the Failed behind "Finalizing…".
+    const record = normalizeTaskTerminalRecord(evt);
+    const knownStatus = String(record?.status || record?.outcome_axes?.lifecycle?.status || '').toLowerCase();
+    const observedOutcome = OBSERVED_OUTCOME_STATUSES.has(knownStatus) ? outcome : '';
     const presentation = taskPresentation(terminal ? outcome : 'working');
     const body = [taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : '', taskReasonDetail(evt)]
         .filter(Boolean).join('\n');

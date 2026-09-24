@@ -92,6 +92,30 @@ def _finished_with_warnings(
     return str(task_done_event.get("reason_code") or "") in _DEGRADED_TERMINAL_REASONS
 
 
+def _completed_lifecycle_display(
+    task_done_event: Dict[str, Any], result: Dict[str, Any] | None = None,
+) -> tuple[str, str] | None:
+    """Icon and verb for a `completed` lifecycle whose OUTCOME is not clean.
+
+    #1087: the card and Telegram fold the axes into one phase; the chat line
+    must speak the same word. A completed lifecycle can still end `error` (a
+    failed review, objective or artifacts), and `_finished_with_warnings`
+    deliberately answers False for that phase — so answering only "warnings"
+    let such a child read "✅ … completed". Returns None for a clean outcome.
+    Lifecycle-keyed fields (`subagent_event`, progress_meta `status`) are never
+    touched: only what the human line SAYS follows the phase.
+    """
+    from ouroboros.project_dialogue import outcome_phase
+
+    record = result if isinstance(result, dict) else {}
+    phase = outcome_phase(record, task_done_event)
+    if phase == "error":
+        return "❌", "finished with a failed outcome"
+    if _finished_with_warnings(task_done_event, record):
+        return "⚠️", "finished with warnings"
+    return None
+
+
 def _authoritative_terminal_cost(
     task_id: str, task: Dict[str, Any], result: Dict[str, Any], evt: Dict[str, Any], drive_root: pathlib.Path,
     *, breakdown: Dict[str, Any] | None = None,
@@ -381,10 +405,12 @@ def _finish_task_done_dispatch(
                 STATUS_INTERRUPTED: ("⏹️", STATUS_INTERRUPTED, STATUS_INTERRUPTED),
             }.get(status, ("ℹ️", status or "done", status or "finished"))
             icon, subagent_event, verb = status_display
-            if status == STATUS_COMPLETED and _finished_with_warnings(task_done_event, effective_result):
+            if status == STATUS_COMPLETED:
                 # Icon and verb only: `subagent_event` and progress_meta `status`
                 # stay the lifecycle values every card and Telegram consumer keys on.
-                icon, verb = "⚠️", "finished with warnings"
+                display = _completed_lifecycle_display(task_done_event, effective_result)
+                if display:
+                    icon, verb = display
             result_text = str(effective_result.get("result") or "")
             trace_text = str(effective_result.get("trace_summary") or "")
             constraint = effective_result.get("task_constraint")

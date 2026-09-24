@@ -247,6 +247,19 @@ test('#1110 an observed outcome owns the chip while Finalizing states itself bes
         status: 'failed', task_phase: 'finalizing',
     }).observedOutcome, 'error');
     assert.equal(taskTerminalSummary({ status: 'failed', task_phase: 'finalizing' }).terminal, false);
+    // R1 (#1110): a finalizing REPLAY row often carries no stamp — history merges
+    // the result's canonical axes, not `task_terminal_status`. The settled
+    // lifecycle inside those axes is the same knowledge: the Failed is painted,
+    // the hold stays secondary. A still-running lifecycle stays unobserved.
+    const unstampedFailed = taskTerminalSummary({
+        task_phase: 'finalizing', outcome_final: false, outcome_phase: 'error',
+        outcome_axes: { lifecycle: { status: 'failed' }, execution: { status: 'infra_failed', reason_code: 'provider_unavailable' } },
+    });
+    assert.equal(unstampedFailed.observedOutcome, 'error');
+    assert.equal(unstampedFailed.terminal, false);
+    assert.equal(taskTerminalSummary({
+        task_phase: 'finalizing', outcome_axes: { lifecycle: { status: 'running' } },
+    }).observedOutcome, undefined);
     // While unfinished the frame itself paints Working: the chip is the record's.
     assert.equal(taskTerminalSummary({ status: 'failed', task_phase: 'finalizing' }).phase, 'working');
     assert.equal(taskTerminalSummary({ status: 'running' }).observedOutcome, undefined);
