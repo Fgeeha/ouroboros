@@ -446,7 +446,12 @@ def test_task_status_stays_factual_in_main_and_project_chat(
 def test_history_replay_keeps_finalizing_and_finishes_bare_final(
     direct_server_with_data,
 ):
-    """Open summaries stay live; a keyed final without summary falls back to Done."""
+    """Open summaries stay live; a keyed final without summary falls back to Done.
+
+    #1110: a finalizing task whose lifecycle already settled paints that KNOWN
+    outcome as the chip and holds "Finalizing…" as the secondary fact — the card
+    stays unfinished until the settled task_done lands.
+    """
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
     from playwright.sync_api import sync_playwright
@@ -508,9 +513,15 @@ def test_history_replay_keeps_finalizing_and_finishes_bare_final(
                 done_card.wait_for(state="visible", timeout=10_000)
 
                 assert open_card.get_attribute("data-finished") == "0"
-                assert open_card.locator(".chat-live-phase").inner_text().strip() == "Finalizing…"
+                assert open_card.locator(".chat-live-phase").inner_text().strip() == "Done"
+                # The hold is the SECONDARY fact beside the outcome; the chip's accessible
+                # name states both (task_phase_chip.setLiveCardPhase). This replay card has
+                # no work rows, so its chip is hidden and the visible secondary is proven by
+                # tests/test_ui_failed_finalizing_browser.py on a real card with work.
+                assert open_card.locator(".chat-live-phase").get_attribute("aria-label") == "Task status: Done, Finalizing…"
                 assert done_card.get_attribute("data-finished") == "1"
                 assert done_card.locator(".chat-live-phase").inner_text().strip() == "Done"
+                assert "Finalizing" not in (done_card.locator(".chat-live-phase").get_attribute("aria-label") or "")
             finally:
                 browser.close()
     except PlaywrightError as exc:
