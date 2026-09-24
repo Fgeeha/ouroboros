@@ -320,7 +320,7 @@ Who is speaking through a routing act is ONE fact the host mints by value
 routing contract only chat turns carry, an empty client id, the event's chat id)
 and never give the model an argument for it. A consciousness wake-up runs on the
 direct lane but nobody typed it, so `is_direct_chat` does not make it an owner
-turn (`metadata.initiator == "consciousness"`: it speaks as a task). Draining an
+turn (no owner-door stamp: it speaks as a task). Draining an
 owner message keys the visible receipt without changing the issuer; genuine
 owner ingress retains its provenance. A task's own words travel as `KIND_TASK_MESSAGE` with provenance
 `independent_task`, never as `KIND_OWNER_TEXT`, and that value lands at three

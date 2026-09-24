@@ -82,7 +82,7 @@ def test_route_to_existing_project_emits_event_and_receipt(tmp_path):
         "text_sha256": "b" * 64,
     }
     events = []
-    ctx = _ctx(tmp_path, events, task_metadata={
+    ctx = _ctx(tmp_path, events, is_direct_chat=True, task_metadata={
         "client_message_id": "owner-route-1",
         "origin_message_ref": origin_ref,
         "origin_message_text": "continue the engine tuning",
