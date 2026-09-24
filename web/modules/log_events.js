@@ -458,6 +458,8 @@ const TASK_CAUSE_PHRASES = {
     host_child_status_suffix: "A child task had not settled when the answer was delivered",
     invalid_delivery_control_after_repair: "Ouroboros's final delivery instruction could not be read even after repair, so the answer stands as delivered.",
     budget_exhausted: "The task ran out of budget before it could finish cleanly",
+    // #869: the provider-death rail's terminal words (twin of project_dialogue.TASK_CAUSE_PHRASES).
+    provider_unavailable: "The model provider stopped answering, so the task could not finish",
     delivery_control_degraded: "Ouroboros's final delivery instruction could not be applied, so the answer stands as delivered.",
     authoring_handover_incomplete: "The replacement model stopped before resuming tool work.",
     delegated_custody_unreconciled: "Some delegated work was never reconciled.",
