@@ -3039,8 +3039,6 @@ def test_steer_refusal_names_the_room_when_the_task_belongs_to_another_chat(tmp_
     ({}, "target_unknown"),
     ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "delegation_role": "subagent",
                             "title": "Review"}}}, "subagent_target"),
-    ({"target-1": {"task": {"id": "target-1", "chat_id": 1, "_is_direct_chat": True,
-                            "title": "Chat"}}}, "direct_chat_turn"),
 ])
 def test_steer_refusal_keeps_a_distinct_reason_for_every_other_cause(
         tmp_path, monkeypatch, running, reason):
@@ -3054,6 +3052,29 @@ def test_steer_refusal_keeps_a_distinct_reason_for_every_other_cause(
     assert routing_refusal_cause("steer_task", "needs_manual_target", reason) in text
     assert "I'll" not in text and "Couldn't steer task" not in text
     assert kwargs == {"role": "system", "system_type": "steer_not_delivered", "task_id": "target-1"}
+
+
+def test_steer_reaches_a_queue_resident_direct_turn(tmp_path, monkeypatch):
+    """A direct turn resumed on a pooled worker under the SAME id after its exact
+    budget pause (#1196) is a RUNNING row: the owner's follow-up is delivered to
+    that actor's mailbox and is never refused as a finished direct reply."""
+    import supervisor.events as events_mod
+    from supervisor.steering import _handle_steer_task
+
+    receipts: list = []
+    monkeypatch.setattr(events_mod, "_emit_routing_receipt",
+                        lambda ctx, evt, **kwargs: receipts.append(kwargs) or {})
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, PENDING=[], get_chat_agent=lambda: None,
+        RUNNING={"target-1": {"task": {"id": "target-1", "chat_id": 1, "_is_direct_chat": True,
+                                       "title": "Chat"}}},
+        send_with_budget=lambda _chat_id, text, **kwargs: None,
+    )
+    _handle_steer_task({"target_task_id": "target-1", "message": "hurry up", "chat_id": 1}, ctx)
+
+    assert receipts, "a steer must leave a receipt"
+    assert receipts[-1].get("reason") != "direct_chat_turn"
+    assert receipts[-1].get("status") == "delivered"
 
 
 def test_the_steer_tool_renders_the_typed_reason_and_still_defaults_without_one(monkeypatch):

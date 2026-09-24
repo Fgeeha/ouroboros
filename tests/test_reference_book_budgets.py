@@ -133,7 +133,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 306800 -> 307100 (#1247 fix-forward; measured 306832 on the merged chapter): the
     # populate sentence names the post-copy stat re-record that keeps a CRLF-converting
     # checkout clean.
-    "docs/architecture/06-agent-core.md": 307100,
+    # 307100 -> 307800 (#1196, measured 307709): the exact budget pause / Resume owner
+    # table, the finite leaf continuation admission and the strict money read are the
+    # rationale layer of a new lifecycle; the Budget tracking prose they extend was
+    # compressed in the same diff rather than appended to.
+    "docs/architecture/06-agent-core.md": 307800,
     "docs/architecture/07-configuration.md": 36991,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     # 19287 -> 20560 (#1215): three contracts the chapter had no older text for — the
