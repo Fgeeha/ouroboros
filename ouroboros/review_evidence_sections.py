@@ -1028,8 +1028,9 @@ def _owner_content_projection(content: Any) -> str:
 def _accept_run_origin(ctx: Any, drive_root: Any, task_id: str) -> Dict[str, Any]:
     """The same host-recorded provenance the post-task synthesis reads, from the
     same record: the persisted task carries ``source``, ``delegation_role`` and the
-    parent, which never enter metadata; the live metadata carries the door's stamp.
-    A missing or unreadable record leaves the metadata-derived facts in place."""
+    parent as top-level fields; the live metadata (which the loop builds from the
+    record's metadata plus the door's stamp) is laid over the record's own. A
+    missing or unreadable record leaves the metadata-derived facts in place."""
     from ouroboros.dialogue_provenance import run_origin
     from ouroboros.task_results import load_task_result
 
@@ -1041,10 +1042,11 @@ def _accept_run_origin(ctx: Any, drive_root: Any, task_id: str) -> Dict[str, Any
             record = load_task_result(drive_root, task_id) or {}
         except Exception:
             log.debug("run_origin: task record unreadable for %s", task_id, exc_info=True)
+    stored = record.get("metadata") if isinstance(record.get("metadata"), dict) else {}
     return run_origin({
         **record,
         "type": getattr(ctx, "current_task_type", None) or record.get("type"),
-        "metadata": meta,
+        "metadata": {**stored, **meta},
     })
 
 

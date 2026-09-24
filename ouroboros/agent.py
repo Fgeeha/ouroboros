@@ -382,6 +382,9 @@ class OuroborosAgent:
                 session_id=task.get("session_id"),
                 actor_id=task.get("actor_id"),
                 delegation_role=task.get("delegation_role"),
+                # The producer's raw origin marker (promote_chat_to_task, presence_promote,
+                # api, ...): the acceptance packet reads run_origin from this record.
+                source=task.get("source"),
                 project_id=str(task.get("project_id") or ""),
                 role=task.get("role"),
                 description=task.get("description"),

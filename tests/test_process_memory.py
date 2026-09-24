@@ -388,7 +388,7 @@ class TestHelperFunctions:
         assert captured["cost_usd"] is None
 
     def test_generate_reflection_frames_a_clean_trace_in_the_one_prompt(self):
-        """generate_reflection picks the non-error prompt for a clean, high-round trace."""
+        """A clean, high-round trace is framed by the one prompt: no asserted non-triviality, no interrogation."""
         from ouroboros.reflection import generate_reflection
 
         captured = {}
@@ -422,7 +422,7 @@ class TestHelperFunctions:
         assert entry["reflection"] == "Friction was in repeated advisory runs."
 
     def test_generate_reflection_frames_an_error_trace_in_the_one_prompt(self):
-        """generate_reflection picks the error prompt when trace contains blocking markers."""
+        """A trace with blocking markers is framed by the same one prompt, root cause first."""
         from ouroboros.reflection import generate_reflection
 
         captured = {}
