@@ -72,7 +72,8 @@ WORKER_READY_MAX_ATTEMPTS = 3
 WORKER_READY_CEILING_SEC = 300.0
 
 # Supervisor loop events phase (structural constants, not env knobs). One pass drains at most
-# this many worker events or this many seconds before bridge intake runs, so a producer that
+# this many worker events, and stops once this many seconds have passed (checked between
+# handlers, so a running handler can overrun it), before bridge intake runs, so a producer that
 # keeps the queue non-empty can never hide an owner message; the remainder waits for the next
 # turn and a turn that hit its bound skips the idle sleep, so a backlog still drains at full speed.
 SUPERVISOR_EVENT_BATCH_MAX_EVENTS = 100

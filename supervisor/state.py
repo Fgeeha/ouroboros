@@ -484,8 +484,8 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     persisted by the transport wrapper.  This prevents logical usage events,
     retries, and review aggregation from charging the same attempt twice.
     The persisted projection carries totals only; the per-root map is never written.
-    The ledger read is the writer's slim snapshot (``usage_writer_snapshot``): only what
-    this function persists is rendered, once per supervisor loop turn (``server_liveness``).
+    The ledger read is the writer's slim snapshot (``usage_writer_snapshot``): only what this
+    function persists is rendered; the loop's llm_usage path writes once per turn, direct callers on call.
     """
     def _to_float(v: Any, default: float = 0.0) -> float:
         try:

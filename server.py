@@ -812,6 +812,7 @@ def _run_supervisor(settings: dict) -> None:
             )
 
             if _restart_requested.is_set():
+                flush_budget_projection(_event_ctx)  # this turn's drained llm_usage still reaches state.json
                 break
 
             # WS3: intake new bridge messages EARLY — before the heavy steps

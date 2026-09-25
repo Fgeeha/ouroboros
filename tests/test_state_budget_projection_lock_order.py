@@ -461,7 +461,7 @@ def _seed_mixed_ledger(root) -> None:
 
 @pytest.mark.serial
 def test_writer_snapshot_matches_the_full_breakdown_on_every_key_the_writer_reads(tmp_path, monkeypatch):
-    """T-C1: same rows, same marker, same money and the writer never pays the full render."""
+    """Same rows, same marker, same money and the writer never pays the full render."""
     from supervisor import state
     import ouroboros.usage_accounting as accounting
 
@@ -491,7 +491,7 @@ def test_writer_snapshot_matches_the_full_breakdown_on_every_key_the_writer_read
 
 @pytest.mark.serial
 def test_state_json_is_byte_identical_whether_written_from_the_full_or_the_slim_render(tmp_path, monkeypatch):
-    """T-C2: money exactness. Every persisted key is the same from either render."""
+    """Money exactness. Every persisted key is the same from either render."""
     from supervisor import state
     import ouroboros.usage_accounting as accounting
 

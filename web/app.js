@@ -684,9 +684,9 @@ document.getElementById('nav-projects-add')?.addEventListener('click', async (ev
     }
 });
 
-// Callers that must observe a read taken AFTER their own change force one
-// (coalesced behind an in-flight read); the boot prefetch, the socket-open
-// refresh and the periodic poll join whatever page-wide read is in flight.
+// Callers that must observe a read taken AFTER their own change (or after a
+// socket open) force one, coalesced behind an in-flight read; the boot prefetch
+// and the periodic poll join whatever page-wide read is in flight.
 async function refreshProjectsNav(force = true) {
     const request = await stateSnapshots.gate(force);
     if (!request) return;
@@ -832,7 +832,7 @@ apiFetch('/api/ui/preferences', { cache: 'no-store' })
 ws.on('open', () => {
     activitySocketDisconnected = false;
     stateSnapshots.fail(stateSnapshots.begin());
-    refreshProjectsNav(false);
+    refreshProjectsNav(true); // the in-flight read predates the socket: one coalesced post-open read
 });
 ws.on('close', () => {
     activitySocketDisconnected = true;

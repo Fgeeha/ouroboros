@@ -132,7 +132,7 @@ def test_flush_writes_once_when_dirty_and_clears_only_on_success(monkeypatch):
 
 
 def test_n_llm_usage_events_in_one_turn_produce_one_write_after_intake(monkeypatch, tmp_path):
-    """T-C3: N events in one drain -> one writer call, after bridge intake; the event
+    """N events in one drain -> one writer call, after bridge intake; the event
     rows carry ``deferred``."""
     import json
 

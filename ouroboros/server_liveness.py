@@ -107,8 +107,9 @@ def observe_worker_event_lag(liveness: list, evt: Any) -> None:
 
 def drain_worker_events(event_q: Any, ctx: Any, liveness: list, *, on_restart: Callable[..., Any]) -> bool:
     """One BOUNDED events pass of the supervisor loop: FIFO, at most
-    ``SUPERVISOR_EVENT_BATCH_MAX_EVENTS`` events or ``SUPERVISOR_EVENT_BATCH_MAX_SEC``
-    seconds, then the loop runs bridge intake. A ``restart_request`` goes to
+    ``SUPERVISOR_EVENT_BATCH_MAX_EVENTS`` events; the ``SUPERVISOR_EVENT_BATCH_MAX_SEC``
+    budget is checked between handlers (a handler already running finishes, so one
+    slow handler can overrun it), then the loop runs bridge intake. A ``restart_request`` goes to
     ``on_restart``; every other event is lag-observed and dispatched. The remainder
     stays queued for the next turn, so a producer that keeps the queue non-empty
     can never starve owner-message intake. Returns True when the pass stopped at
