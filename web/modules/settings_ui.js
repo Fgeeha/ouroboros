@@ -728,7 +728,7 @@ export function renderSettingsPage() {
                 <section class="settings-panel" data-settings-panel="appearance">
                     <div class="form-section">
                         <h3>Language</h3>
-                        <div class="settings-section-copy">Interface language of this browser. Applies immediately; strings without a translation stay English.</div>
+                        <div class="settings-section-copy">Interface language, saved with your UI preferences. Applies immediately; strings without a translation stay English.</div>
                         <div class="settings-effort-card">
                             <label>Interface Language</label>
                             <div class="ui-segment-group settings-effort-group" data-language-group role="group" aria-label="Interface Language">
