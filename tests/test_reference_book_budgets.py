@@ -89,7 +89,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 31150 -> 31300 (issue #1002): the budget-projection paragraph states what the persisted
     # projection carries (totals only) and where per-root money lives; the chapter had no
     # sentence about the shape of the persisted projection to replace.
-    "docs/architecture/05-supervisor-loop.md": 31300,
+    # 31300 -> 31500 (issue #1230): the reconciliation sentence states the two-read rule of
+    # task reconciliation (decide on a status-only read, materialize only the healed row)
+    # and the cadence stamp at pass end; the older clause it extends is kept, not duplicated.
+    "docs/architecture/05-supervisor-loop.md": 31500,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
