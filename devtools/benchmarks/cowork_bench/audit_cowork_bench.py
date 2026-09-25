@@ -105,6 +105,26 @@ def _number(value: Any) -> float | None:
     return number if math.isfinite(number) and number >= 0 else None
 
 
+def usage_tokens(record: dict[str, Any]) -> dict[str, int | None]:
+    """Token counts stated by one llm_usage record; ``None`` where it states none."""
+    usage = record.get("usage")
+    usage = usage if isinstance(usage, dict) else {}
+    counts = {key: _number(record.get(key, usage.get(key)))
+              for key in ("prompt_tokens", "completion_tokens", "cached_tokens")}
+    return {key: None if value is None else int(value) for key, value in counts.items()}
+
+
+def token_bearing(tokens: dict[str, int | None]) -> bool:
+    """Positive evidence of a model call; zero or unstated tokens prove nothing."""
+    return (tokens["prompt_tokens"] or 0) + (tokens["completion_tokens"] or 0) > 0
+
+
+def model_activity_observed(events: Path) -> bool:
+    """Whether a copied events log holds a token-bearing llm_usage record (first one wins)."""
+    return any(record.get("type") == "llm_usage" and token_bearing(usage_tokens(record))
+               for _line, record in _records(events, []))
+
+
 def _omission_count(value: Any) -> int:
     if isinstance(value, (list, dict)):
         return len(value)
@@ -138,16 +158,12 @@ def audit_task(task_dump: Path, ledger: dict[str, Any]) -> dict[str, Any]:
                 activity["usage_records"] += 1
                 usage = record.get("usage")
                 usage = usage if isinstance(usage, dict) else {}
-                token_values = {}
-                for key in ("prompt_tokens", "completion_tokens", "cached_tokens"):
-                    value = _number(record.get(key, usage.get(key)))
+                tokens = usage_tokens(record)
+                for key, value in tokens.items():
                     if value is None:
                         gaps.append({"source": source.name, "line": line, "reason": f"unknown_{key}"})
-                    token_values[key] = int(value or 0)
-                    activity[key] += token_values[key]
-                activity["nonempty_usage_records"] += int(
-                    token_values["prompt_tokens"] + token_values["completion_tokens"] > 0
-                )
+                    activity[key] += value or 0
+                activity["nonempty_usage_records"] += int(token_bearing(tokens))
                 cost = _number(record.get("cost", usage.get("cost")))
                 if cost is None or record.get("cost_known") is False:
                     unknown_cost += 1
