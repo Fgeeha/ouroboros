@@ -52,6 +52,8 @@ from devtools.benchmarks.cowork_bench.campaign import (
     key_usage,
     validate_usage,
 )
+from devtools.benchmarks.cowork_bench.eval_attempt import FLAG as DIAGNOSTIC_FLAG
+from devtools.benchmarks.cowork_bench.eval_attempt import attempt_facts
 from devtools.benchmarks.cowork_bench.official_receipt import read_linked_runtime_result, read_official_receipt
 from devtools.benchmarks.cowork_bench.resource_limits import LABEL_KEY, prepare_resource_env
 from ouroboros.platform_layer import kill_process_group_id, terminate_process_group_id
@@ -62,6 +64,8 @@ ENGINE = "ouroboros"
 PINNED_BENCH_COMMIT = "d943e75bc0fc8e3b27141979300cd8cbcd1e890d"
 DEFAULT_MODEL = "moonshotai/kimi-k3"
 CONTAINER_DIR = pathlib.Path(__file__).with_name("container")
+# Stdlib helpers the image copies beside the entrypoint (the eval phase imports them there).
+CONTAINER_HELPERS = tuple(pathlib.Path(__file__).with_name(name) for name in ("eval_attempt.py", "official_receipt.py"))
 SETTINGS_TEMPLATE = pathlib.Path(__file__).with_name("settings_base.json")
 CONFIG_NAME = "ouroboros_bench.json"
 SECRET_NAME = "ouroboros_bench.secret.json"
@@ -138,7 +142,13 @@ def bench_config(args: argparse.Namespace, settings: dict[str, Any]) -> dict[str
         "proxy_port": 8096,
         "server_port": 8765,
         "truncation_reason_codes": sorted(RUNTIME_TRUNCATION_REASON_CODES),
+        DIAGNOSTIC_FLAG: bool(args.diagnostic_eval_on_truncation),
     }
+
+
+def with_diagnostic_default(config: Any) -> Any:
+    """Runs recorded before the opt-in flag existed ran without it; nothing else is normalized."""
+    return {**config, DIAGNOSTIC_FLAG: False} if isinstance(config, dict) and DIAGNOSTIC_FLAG not in config else config
 
 
 def _git(path: pathlib.Path, *argv: str) -> str:
@@ -200,6 +210,8 @@ def build_image(args: argparse.Namespace, seed_head: str, bench_head: str, log_p
         )
         _git(context / "seed", "checkout", "--quiet", "--detach", seed_head)
         shutil.copy2(CONTAINER_DIR / "main_ouroboros.py", context / "main_ouroboros.py")
+        for helper in CONTAINER_HELPERS:
+            shutil.copy2(helper, context / helper.name)
         shutil.copy2(CONTAINER_DIR / "Dockerfile", context / "Dockerfile")
         command = [
             "docker", "build", "-t", args.image,
@@ -293,9 +305,19 @@ def ledger_row(task: str, task_dump: pathlib.Path, runner_row: dict[str, str],
     receipt, eval_res = read_official_receipt(task_dump)
     runtime_result, runtime_source = read_linked_runtime_result(task_dump, summary)
     official = receipt["official_eval_status"]
+    attempt = attempt_facts(task_dump)
+    if attempt.get("official_run") is False:
+        # This run's claimed attempt proved it never called the evaluator (for example a
+        # preserved unclaimed eval_res.json), so no file present there is its verdict.
+        official, eval_res = "not_run", None
+    elif attempt["state"] != "absent" and not attempt.get("file_matches_returned"):
+        # A claim-only, invalid or exceptional attempt cannot borrow an old file's PASS.
+        # Historical roots with no claim still use PR-A's independent receipt reader.
+        official = "unknown" if official in {"completed", "declined"} else official
+        eval_res = None
     paths = {"task_dump": str(task_dump)}
     details: dict[str, Any] = {"runner": runner_row, "adapter": summary, "official_receipt": receipt,
-                               "runtime_result_source": runtime_source}
+                               "official_attempt": attempt, "runtime_result_source": runtime_source}
     runtime = {"runtime_result": runtime_result}
     if runner_row.get("status") == "pg_fail":
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="infra_failed",
@@ -328,8 +350,8 @@ def ledger_row(task: str, task_dump: pathlib.Path, runner_row: dict[str, str],
     if eval_res is None:
         # No literal boolean verdict: never coerce a string/number `pass` into a score.
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="infra_failed",
-                               reason_code="missing_eval_result", output_paths=paths, details=details,
-                               official_eval_status=official, **runtime)
+                               reason_code="official_eval_not_run" if official == "not_run" else "missing_eval_result",
+                               output_paths=paths, details=details, official_eval_status=official, **runtime)
     passed = receipt["pass"]
     return task_result_row(
         benchmark=BENCHMARK, instance_id=task, status="passed" if passed else "failed",
@@ -369,7 +391,7 @@ def select_tasks(bench_dir: pathlib.Path, args: argparse.Namespace, config: dict
         visiting.add(root)
         previous = _load(root / "run_manifest.json")
         harness = previous.get("harness", {})
-        if (harness.get("applied_config") != config
+        if (with_diagnostic_default(harness.get("applied_config")) != with_diagnostic_default(config)
                 or previous.get("source", {}).get("head") != seed_head
                 or harness.get("bench", {}).get("head") != args.bench_commit
                 or not getattr(args, "image_id", "") or harness.get("image_id") != args.image_id):
@@ -716,6 +738,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--subagents", action="store_true", help="allow schedule_subagent (default: single agent)")
     parser.add_argument("--subagent-depth", type=int, default=3, help="only with --subagents")
     parser.add_argument("--per-task-cost-usd", type=float, default=25.0, help="in-container runaway guard")
+    parser.add_argument("--diagnostic-eval-on-truncation", action="store_true",
+                        help="audit-only residual-state checker rerun after a proven time/round/budget "
+                             "status-gate decline; never changes official verdicts (METHODOLOGY.md)")
     parser.add_argument("--budget-usd", type=float, default=150.0, help="additional spend limit for this invocation")
     parser.add_argument("--campaign-file", default="", help="required shared budget record for every paid invocation")
     parser.add_argument("--campaign-budget-usd", type=float, default=1000.0)
