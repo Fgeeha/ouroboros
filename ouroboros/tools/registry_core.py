@@ -937,28 +937,25 @@ class ToolRegistry:
                                       discovery="list_available_tools" in self.available_tools())
         return _replace_tool_result(reason, text="\n".join([reason.text, *guidance]))
 
-    def _mcp_name_miss(self, name: str) -> Optional[ToolResult]:
-        """The exact MCP catalog lookup that PRECEDES the paid safety check.
+    @staticmethod
+    def _mcp_dispatch_resolution(name: str):
+        """Pure on misses; a hit rechecks Settings before timeout/Safety/call."""
+        from ouroboros.mcp_client import (
+            ensure_configured_from_settings as ensure,
+            get_manager,
+        )
 
-        A callable name returns ``None`` and dispatch continues unchanged (safety,
-        exact arguments, one call); anything else is answered here without safety,
-        transport, refresh or a settings write.
-        """
-        try:
-            from ouroboros.mcp_client import (
-                ensure_configured_from_settings as _mcp_ensure_configured,
-                get_manager as _mcp_get_manager,
-            )
-
-            manager = _mcp_get_manager()
+        manager = get_manager()
+        resolution = manager.resolve_tool_name(name)
+        if resolution.status == "callable":
+            ensure(refresh=False)
             resolution = manager.resolve_tool_name(name)
-            if resolution.status == "callable":
-                # A miss is a pure read. A hit is about to execute, so first
-                # recheck current Settings: another process may have disabled
-                # MCP or revoked this server since the resident schemas were
-                # prepared. This must precede Safety and physical dispatch.
-                _mcp_ensure_configured(refresh=False)
-                resolution = manager.resolve_tool_name(name)
+        return resolution
+
+    def _mcp_name_miss(self, name: str) -> Optional[ToolResult]:
+        """Resolve before Safety; a miss runs no safety, transport or refresh."""
+        try:
+            resolution = self._mcp_dispatch_resolution(name)
         except Exception as exc:
             text = f"⚠️ TOOL_ERROR ({name}): MCP catalog lookup failed: {type(exc).__name__}: {exc}"
             return ToolResult(status="error", code="TOOL_ERROR", text=text)
@@ -993,6 +990,10 @@ class ToolRegistry:
             _mcp_is_name = None
         if _mcp_get_manager and _mcp_is_name and _mcp_is_name(name):
             try:
+                # The loop obtains the OUTER timeout before registry execution.
+                # Use the same hit-only Settings recheck as dispatch, or a
+                # changed valid timeout would be strangled by the old outer one.
+                self._mcp_dispatch_resolution(name)
                 return int(_mcp_get_manager().tool_timeout_sec()) + 3
             except Exception:
                 return 63

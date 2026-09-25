@@ -229,14 +229,18 @@ def name_miss_guidance(
         lines = [f"Currently callable in {namespace}{pairs}:", *rendered]
     if len(identity) == 1:
         match = identity[0]
-        lines.append(f"Naming-rule identity (exact; not called): {requested!r} corresponds to raw "
-                     f"MCP name {match['raw_name']!r}, callable as {match['name']}.")
+        hint = (f"Naming-rule identity (exact; not called): {requested!r} corresponds to raw "
+                f"MCP name {match['raw_name']!r}, callable as {match['name']}.")
+        lines.append(hint if sum(map(len, lines)) + len(hint) <= NAME_MISS_INLINE_CHARS
+                     else f"Naming-rule identity exists but exceeds the inline bound; inspect {select}.")
     elif len(identity) > NAME_MISS_INLINE_ROWS:
         lines.append(f"Naming-rule identity is ambiguous among {len(identity)} callable tools (not called); "
                      + (f"inspect {select}." if discovery else "a unique identity cannot be given."))
     elif identity:
-        lines.append(f"Naming-rule identity is ambiguous (not called): {requested!r} corresponds to "
-                     + "; ".join(f"{row['raw_name']!r} → {row['name']}" for row in identity) + ".")
+        hint = (f"Naming-rule identity is ambiguous (not called): {requested!r} corresponds to "
+                + "; ".join(f"{row['raw_name']!r} → {row['name']}" for row in identity) + ".")
+        lines.append(hint if sum(map(len, lines)) + len(hint) <= NAME_MISS_INLINE_CHARS
+                     else f"Naming-rule identity is ambiguous; inspect {select} for the {len(identity)} callable names.")
     return lines
 
 

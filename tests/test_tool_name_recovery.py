@@ -189,6 +189,24 @@ def test_exact_hit_rechecks_saved_settings_before_safety_or_dispatch(world, monk
     ]})
 
 
+def test_valid_hit_rechecks_timeout_before_the_loop_outer_deadline(world, monkeypatch):
+    registry, transport, safety = world
+    manager = mcp_client.get_manager()
+    wire = mcp_client.make_tool_name("canvas", CANVAS[0])
+    calls = []
+
+    def update_timeout(*, refresh=False):
+        calls.append(refresh)
+        manager._tool_timeout_sec = 600
+
+    monkeypatch.setattr(mcp_client, "ensure_configured_from_settings", update_timeout)
+    assert registry.get_timeout(wire) == 603
+    assert calls == [False] and transport.call_calls == [] and safety == []
+    assert registry.execute_result(wire, {}).status == "ok"
+    assert len(transport.call_calls) == 1 and len(safety) == 1
+    manager._tool_timeout_sec = 60
+
+
 def test_collision_omission_cannot_disclose_a_noncallable_name(world, monkeypatch):
     registry, transport, safety = world
     _bind_loop(registry)
@@ -356,6 +374,15 @@ def test_many_exact_ambiguities_stay_bounded():
     assert "13 currently callable tools" in text
     assert "ambiguous among 13 callable tools" in text
     assert "raw_0" not in text and "raw_12" not in text
+    assert 'list_available_tools(namespace="mcp_svc")' in text
+
+
+def test_one_oversized_raw_identity_never_bypasses_the_reply_bound():
+    from ouroboros.tool_policy import name_miss_guidance
+
+    rows = [{"name": "mcp_svc__x", "raw_name": "x" * 5000}]
+    text = "\n".join(name_miss_guidance("x", "mcp_svc", rows, discovery=True, identity=rows))
+    assert len(text) < 500 and "exceeds the inline bound" in text
     assert 'list_available_tools(namespace="mcp_svc")' in text
 
 
