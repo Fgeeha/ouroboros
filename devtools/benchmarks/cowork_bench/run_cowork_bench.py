@@ -45,6 +45,7 @@ from devtools.benchmarks.common.result_index import (
 from devtools.benchmarks.common.run_roots import assert_outside_repo, repo_root_from_devtools, run_root, timestamp_run_id
 from devtools.benchmarks.common.secrets import credential_fingerprint
 from devtools.benchmarks.cowork_bench.campaign import CampaignBudget, campaign_lock, key_usage, validate_usage
+from devtools.benchmarks.cowork_bench.official_receipt import read_linked_runtime_result, read_official_receipt
 from devtools.benchmarks.cowork_bench.resource_limits import LABEL_KEY, prepare_resource_env
 from ouroboros.platform_layer import kill_process_group_id, terminate_process_group_id
 from ouroboros.process_custody import spawn_supervised
@@ -258,35 +259,48 @@ def _load(path: pathlib.Path) -> dict[str, Any]:
 
 def ledger_row(task: str, task_dump: pathlib.Path, runner_row: dict[str, str]) -> dict[str, Any]:
     """One denominator-preserving row. The runner's exit code and CSV are NOT the status: the
-    adapter summary says how the agent phase ended and ``eval_res.json`` is the verdict."""
+    adapter summary says how the agent phase ended and ``eval_res.json`` is the verdict.
+
+    The official receipt is attached on EVERY branch, independently of that status: a
+    timed-out agent phase keeps the evaluator's own record instead of a claimed ``not_run``,
+    and only a literal boolean verdict on a successful agent phase is scored."""
     summary = _load(task_dump / "ouroboros_summary.json")
-    eval_res = _load(task_dump / "eval_res.json")
+    receipt, eval_res = read_official_receipt(task_dump)
+    runtime_result, runtime_source = read_linked_runtime_result(task_dump, summary)
+    official = receipt["official_eval_status"]
     paths = {"task_dump": str(task_dump)}
-    details = {"runner": runner_row, "adapter": summary}
+    details = {"runner": runner_row, "adapter": summary, "official_receipt": receipt,
+               "runtime_result_source": runtime_source}
+    runtime = {"runtime_result": runtime_result}
     if runner_row.get("status") == "pg_fail":
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="infra_failed",
-                               reason_code="pg_fail", output_paths=paths, details=details)
+                               reason_code="pg_fail", output_paths=paths, details=details,
+                               official_eval_status=official, **runtime)
     if not summary:
         status = "infra_failed" if runner_row else "not_attempted"
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status=status,
                                reason_code="missing_adapter_summary" if runner_row else "missing_result",
-                               output_paths=paths, details=details)
+                               output_paths=paths, details=details, official_eval_status=official, **runtime)
     reason = str(summary.get("reason_code") or "")
     if summary.get("infra_failed"):
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="infra_failed",
                                reason_code=reason or "infra_failed", output_paths=paths,
-                               error=str(summary.get("error") or ""), details=details)
+                               error=str(summary.get("error") or ""), details=details,
+                               official_eval_status=official, **runtime)
     if summary.get("bench_status") != "success":
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="agent_failed",
-                               reason_code=reason or "agent_not_finished", output_paths=paths, details=details)
-    if "pass" not in eval_res or eval_res.get("pass") is None:
+                               reason_code=reason or "agent_not_finished", output_paths=paths,
+                               details=details, official_eval_status=official, **runtime)
+    if eval_res is None:
+        # No literal boolean verdict: never coerce a string/number `pass` into a score.
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="infra_failed",
-                               reason_code="missing_eval_result", output_paths=paths, details=details)
-    passed = bool(eval_res.get("pass"))
+                               reason_code="missing_eval_result", output_paths=paths, details=details,
+                               official_eval_status=official, **runtime)
+    passed = receipt["pass"]
     return task_result_row(
         benchmark=BENCHMARK, instance_id=task, status="passed" if passed else "failed",
         reason_code="passed" if passed else "verifier_failed", official_eval_status="completed",
-        output_paths=paths, details={**details, "eval": eval_res},
+        output_paths=paths, details={**details, "eval": eval_res}, **runtime,
     )
 
 
