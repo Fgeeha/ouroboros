@@ -166,6 +166,42 @@ def test_name_miss_never_reloads_settings_or_reconfigures_mcp(world, monkeypatch
     assert safety == [] and transport.call_calls == []
 
 
+def test_exact_hit_rechecks_saved_settings_before_safety_or_dispatch(world, monkeypatch):
+    registry, transport, safety = world
+    manager = mcp_client.get_manager()
+    wire = mcp_client.make_tool_name("canvas", CANVAS[0])
+    observed = []
+
+    def disable_mcp(*, refresh=False):
+        observed.append(refresh)
+        manager.reconfigure({"MCP_ENABLED": False, "MCP_SERVERS": []})
+
+    monkeypatch.setattr(mcp_client, "ensure_configured_from_settings", disable_mcp)
+    result = registry.execute_result(wire, {"course_id": 12})
+    assert (result.status, result.code) == ("unavailable", "MCP_UNAVAILABLE")
+    assert observed == [False]  # only a catalog hit checks current saved authority
+    assert safety == [] and transport.call_calls == []
+    # Restore fixture configuration after exercising the revocation edge.
+    manager.reconfigure({"MCP_ENABLED": True, "MCP_TOOL_TIMEOUT_SEC": 60, "MCP_SERVERS": [
+        {"id": server, "enabled": server != "off", "transport": "streamable_http",
+         "url": "https://e.example/mcp", "allowed_tools": ["ok"] if server == "svc" else []}
+        for server in CATALOGS
+    ]})
+
+
+def test_collision_omission_cannot_disclose_a_noncallable_name(world, monkeypatch):
+    registry, transport, safety = world
+    _bind_loop(registry)
+    original = registry.capability_omissions
+    monkeypatch.setattr(registry, "capability_omissions", lambda: original() + [
+        {"surface": "mcp", "reason": "name_collision", "tools": ["mcp_svc__blocked"]},
+    ])
+    overview = registry.execute("list_available_tools", {})
+    assert "mcp_svc__blocked" not in overview
+    assert "name_collision (1 withheld tools (names not callable))" in overview
+    assert safety == [] and transport.call_calls == []
+
+
 @pytest.mark.parametrize(("requested", "raw"), [
     ("mcp_scholarly__search_arxiv", "search-arxiv"),  # lossy punctuation, digest omitted
     ("mcp_scholarly__search_google_schol", "search-google-scholar"),  # registered stem, digest omitted
@@ -300,6 +336,27 @@ def test_empty_selected_namespace_does_not_reveal_other_servers(world):
         assert "mcp_canvas" not in selected and "mcp_scholarly" not in selected
         assert "mcp_down" not in selected and "upstream refused" not in selected
     assert safety == [] and transport.call_calls == []
+
+
+def test_discovery_does_not_offer_resource_blocked_builtin_calls(world):
+    registry, transport, safety = world
+    registry._ctx.task_contract = {"allowed_resources": {"network": False, "web": False}}
+    _bind_loop(registry)
+    listing = registry.execute("list_available_tools", {"namespace": "builtin"})
+    assert "vcs_pull_ff" not in listing and "web_search" not in listing
+    assert "- read_file [loaded]" in listing
+    assert safety == [] and transport.call_calls == []
+
+
+def test_many_exact_ambiguities_stay_bounded():
+    from ouroboros.tool_policy import name_miss_guidance
+
+    rows = [{"name": f"mcp_svc__op_{i}", "raw_name": f"raw_{i}"} for i in range(13)]
+    text = "\n".join(name_miss_guidance("op", "mcp_svc", rows, discovery=True, identity=rows))
+    assert "13 currently callable tools" in text
+    assert "ambiguous among 13 callable tools" in text
+    assert "raw_0" not in text and "raw_12" not in text
+    assert 'list_available_tools(namespace="mcp_svc")' in text
 
 
 @pytest.mark.parametrize("mode", ["max", "low", "nano"])

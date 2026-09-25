@@ -164,6 +164,7 @@ BUILTIN_NAMESPACE = "builtin"
 # A name-miss answer lists the addressed namespace inline up to this many tools;
 # a larger one gets its count and the discovery call that lists it completely.
 NAME_MISS_INLINE_ROWS = 12
+NAME_MISS_INLINE_CHARS = 4000
 
 
 def tool_namespace(name: str) -> str:
@@ -219,16 +220,20 @@ def name_miss_guidance(
     if not rows:
         return [f"No tool in {namespace} is currently callable in this task"
                 + ("; list_available_tools shows the callable namespaces." if discovery else ".")]
-    if len(rows) > NAME_MISS_INLINE_ROWS:
+    rendered = catalog_row_lines(rows) if len(rows) <= NAME_MISS_INLINE_ROWS else []
+    if len(rows) > NAME_MISS_INLINE_ROWS or sum(map(len, rendered)) > NAME_MISS_INLINE_CHARS:
         lines = [f"{namespace} has {len(rows)} currently callable tools"
                  + (f"; {select} lists them all." if discovery else ".")]
     else:
         pairs = " (raw MCP name → callable name)" if namespace.startswith("mcp_") else ""
-        lines = [f"Currently callable in {namespace}{pairs}:", *catalog_row_lines(rows)]
+        lines = [f"Currently callable in {namespace}{pairs}:", *rendered]
     if len(identity) == 1:
         match = identity[0]
         lines.append(f"Naming-rule identity (exact; not called): {requested!r} corresponds to raw "
                      f"MCP name {match['raw_name']!r}, callable as {match['name']}.")
+    elif len(identity) > NAME_MISS_INLINE_ROWS:
+        lines.append(f"Naming-rule identity is ambiguous among {len(identity)} callable tools (not called); "
+                     + (f"inspect {select}." if discovery else "a unique identity cannot be given."))
     elif identity:
         lines.append(f"Naming-rule identity is ambiguous (not called): {requested!r} corresponds to "
                      + "; ".join(f"{row['raw_name']!r} → {row['name']}" for row in identity) + ".")

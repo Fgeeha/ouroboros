@@ -49,7 +49,9 @@ def _resident_names(ctx: Any, schemas: List[Dict[str, Any]], resident: Optional[
     return set(select_tool_schemas(schemas, context_mode=mode).chosen)
 
 
-def _catalog_omissions(omissions: List[Dict[str, Any]], namespace: str) -> List[Dict[str, Any]]:
+def _catalog_omissions(
+    omissions: List[Dict[str, Any]], namespace: str, callable_names: set[str],
+) -> List[Dict[str, Any]]:
     """Explain gaps without listing names that this actor cannot call.
 
     The general capability manifest legitimately names withheld tools, but a
@@ -58,18 +60,23 @@ def _catalog_omissions(omissions: List[Dict[str, Any]], namespace: str) -> List[
     """
     visible = []
     for item in omissions:
-        if item.get("reason") in {"disabled_by_contract", "missing_credential"}:
-            names = item.get("tools") or []
-            count = sum(not namespace or tool_namespace(str(name)) == namespace for name in names)
-            if count:
-                visible.append({"surface": item.get("surface"), "reason": item["reason"],
-                                "resource": f"{count} withheld tools (names not callable)"})
-            continue
+        names = item.get("tools")
+        if isinstance(names, list):
+            selected_names = [str(name) for name in names
+                              if not namespace or tool_namespace(str(name)) == namespace]
+            if not selected_names:
+                continue
+            allowed = [name for name in selected_names if name in callable_names]
+            item = {**item, "tools": allowed}
+            if len(allowed) != len(selected_names):
+                item["resource"] = f"{len(selected_names) - len(allowed)} withheld tools (names not callable)"
+            if not allowed and not item.get("resource"):
+                continue
         if namespace:
             if namespace.startswith("mcp_"):
-                if item.get("surface") != "mcp":
+                if item.get("surface") != "mcp" and item.get("reason") not in {"disabled_by_contract", "missing_credential"}:
                     continue
-                if not item.get("servers") and item.get("reason") != "resource_blocked":
+                if not item.get("servers") and not item.get("resource") and not item.get("tools"):
                     # A generic discovery exception has no server identity;
                     # do not ascribe it to the selected server.
                     continue
@@ -134,7 +141,7 @@ def list_available_tools(
             names = [row["name"] for row in groups.get(BUILTIN_NAMESPACE, []) if row["loaded"] is loaded_flag]
             if names:
                 lines.append(f"Built-in, {state}: " + ", ".join(names))
-    visible_omissions = _catalog_omissions(omissions, selected)
+    visible_omissions = _catalog_omissions(omissions, selected, set(callable_rows))
     if visible_omissions:
         lines.extend(_format_omissions(visible_omissions, header="\n" + CAPABILITY_OMISSION_HEADER))
     return "\n".join(lines)

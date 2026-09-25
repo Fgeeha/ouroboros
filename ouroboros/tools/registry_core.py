@@ -889,7 +889,11 @@ class ToolRegistry:
         left out, its failure being ``schemas()``'s recorded omission).
         """
         disabled = _disabled_tools(self._ctx)
-        rows: List[Dict[str, Any]] = [{"name": name} for name in self.available_tools()]
+        rows: List[Dict[str, Any]] = [
+            {"name": name} for name in self.available_tools()
+            if name not in registry_guards._WEB_TOOLS or _resource_allowed(self._ctx, "web")
+            if name != "vcs_pull_ff" or _resource_allowed(self._ctx, "network")
+        ]
         for surface in ("ext_", "mcp_"):
             if namespace and not namespace.startswith(surface) or not _resource_allowed(self._ctx, "network"):
                 continue
@@ -941,9 +945,20 @@ class ToolRegistry:
         transport, refresh or a settings write.
         """
         try:
-            from ouroboros.mcp_client import get_manager as _mcp_get_manager
+            from ouroboros.mcp_client import (
+                ensure_configured_from_settings as _mcp_ensure_configured,
+                get_manager as _mcp_get_manager,
+            )
 
-            resolution = _mcp_get_manager().resolve_tool_name(name)
+            manager = _mcp_get_manager()
+            resolution = manager.resolve_tool_name(name)
+            if resolution.status == "callable":
+                # A miss is a pure read. A hit is about to execute, so first
+                # recheck current Settings: another process may have disabled
+                # MCP or revoked this server since the resident schemas were
+                # prepared. This must precede Safety and physical dispatch.
+                _mcp_ensure_configured(refresh=False)
+                resolution = manager.resolve_tool_name(name)
         except Exception as exc:
             text = f"⚠️ TOOL_ERROR ({name}): MCP catalog lookup failed: {type(exc).__name__}: {exc}"
             return ToolResult(status="error", code="TOOL_ERROR", text=text)
