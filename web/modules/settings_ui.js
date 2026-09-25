@@ -739,6 +739,15 @@ export function renderSettingsPage() {
                     </div>
 
                     <div class="form-section">
+                        <h3>Reasoning</h3>
+                        <div class="settings-section-copy">The agent's reasoning is recorded either way; this only controls whether it is displayed. Logs repaint at once; chat rows already on screen change after a page reload.</div>
+                        <label class="local-toggle ui-field ui-field-inline" title="Display only: reasoning stays in the durable log, so turning this on also reveals it in past conversations.">
+                            <input type="checkbox" id="ui-show-reasoning" class="ui-checkbox" name="ui-show-reasoning">
+                            Show the agent's reasoning in chat and logs
+                        </label>
+                    </div>
+
+                    <div class="form-section">
                         <h3>Theme</h3>
                         <div class="settings-section-copy">
                             <code>System</code> follows this device's OS appearance and is the default for a new client.

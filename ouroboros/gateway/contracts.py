@@ -127,6 +127,7 @@ class ChatOutbound(TypedDict):
     # completed/failed/cancelled/rejected_duplicate, not an early answer.
     task_terminal_status: NotRequired[str]
     ephemeral_decision: NotRequired[bool]
+    reasoning: NotRequired[bool]  # display-reasoning frame: its own collapsed "Thinking" line
     tool_calls: NotRequired[int]
     rounds: NotRequired[int]
     suggested_name: NotRequired[str]
@@ -916,6 +917,7 @@ class UiPreferencesResponse(TypedDict):
     widget_start_mode: dict[str, Literal["auto", "manual", "retain"]]  # owner per-card launch-policy override
     nested_subagents_expanded: bool
     language: Literal["en", "ru"]  # UI overlay language (web/modules/i18n.js)
+    show_reasoning: bool  # reasoning rows in Chat and Logs; default off
     sidebar_width: int  # px; 0 = CSS default (resizable side sections, v6.33.0)
     project_panel_width: int  # px; 0 = CSS default
     project_seen_revision: dict[str, int]  # monotonic paint ACK per active Project
@@ -923,9 +925,7 @@ class UiPreferencesResponse(TypedDict):
 
 class GitLogResponse(TypedDict):
     commits: list[Dict[str, Any]]
-    # Tag rows: {tag, date, sha (peeled commit), message} — the mirror said
-    # ``list[str]`` while ``list_versions`` has always emitted dicts; corrected
-    # (behavioural documentation) in the 2026-08-31 updates redesign.
+    # Tag rows: {tag, date, sha (peeled commit), message} dicts from ``list_versions``.
     tags: list[Dict[str, Any]]
     branch: str
     sha: str

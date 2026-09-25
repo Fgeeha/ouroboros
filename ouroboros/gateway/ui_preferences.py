@@ -23,6 +23,11 @@ DEFAULT_UI_PREFERENCES: dict[str, Any] = {
     # UI language of the browser overlay (web/modules/i18n.js). English is the
     # authored source; "ru" turns the runtime translation overlay on.
     "language": "en",
+    # Display-only: whether the agent's reasoning rows are rendered in the chat
+    # timeline and the Logs tab. The backend keeps emitting and storing them
+    # either way (OUROBOROS_REASONING_SUMMARY is the separate backend switch),
+    # so turning this on reveals the recorded rows on history replay too.
+    "show_reasoning": False,
     # Resizable side sections (0 = use the CSS default). Clamped to sane ranges so
     # a stored value can never collapse or run away with the layout.
     "sidebar_width": 0,
@@ -128,6 +133,11 @@ def _normalize_preferences(
         if value not in _LANGUAGES:
             raise ValueError(f"language must be one of {list(_LANGUAGES)}")
         prefs["language"] = value
+    if "show_reasoning" in raw:
+        value = raw.get("show_reasoning")
+        if not isinstance(value, bool):
+            raise ValueError("show_reasoning must be a boolean")
+        prefs["show_reasoning"] = value
     if "sidebar_width" in raw:
         prefs["sidebar_width"] = _normalize_width(raw.get("sidebar_width"), _SIDEBAR_WIDTH_MIN, _SIDEBAR_WIDTH_MAX)
     if "project_panel_width" in raw:

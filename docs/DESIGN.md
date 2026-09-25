@@ -477,6 +477,12 @@ contract remains a documented exception, not a pattern for new notices.
   as its external executor. A child keeps one useful activity line visible;
   a root permits up to three. Empty activity reserves no band, and a duplicate
   title is not activity. Full narration and Reviews expand independently.
+  The agent's own reasoning is a collapsed `Thinking` timeline row (a
+  reasoning-stamped progress frame); it never becomes the summary line. That
+  row is opt-in and hidden by default: the `show_reasoning` UI preference
+  (Settings -> Appearance -> Reasoning) decides whether it renders in the chat
+  timeline and the Logs tab, while the frame stays recorded either way, so
+  turning the display on also reveals it on history replay.
   The root keeps primary title ink at weight 500, children secondary ink at
   400. Nested frames preserve real ancestry; their opaque secondary surface
   avoids accumulating translucent white tints at greater depth.
