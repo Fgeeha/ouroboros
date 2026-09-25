@@ -42,6 +42,7 @@ run-desktop: ## Run the desktop launcher (native window, falls back to browser)
 # ---------------------------------------------------------------------------
 
 test: ## Full local battery: node lane + default Python lanes in one xdist run
+test:
 	uv run --locked python scripts/run_tests.py
 
 test-v: ## Single-process verbose run (slow: the whole default suite)
