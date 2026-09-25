@@ -287,7 +287,7 @@ def _route_project_chat_to_running_task(
                     chat_id,
                     f"📎 Attachment staging report for {target_label or 'Task'}:\n"
                     f"{attachment_report}",
-                )
+                    role="system", system_type="attachment_notice")
             except Exception:
                 log.debug("Mailbox attachment report notice failed for %s", tid, exc_info=True)
         return tid
@@ -320,7 +320,7 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
         ctx.persist_queue_snapshot(reason="evolve_off")
         stop_lines, stop_incomplete = evolution_stop_report(stopped)
         for line in stop_lines:
-            ctx.send_with_budget(chat_id, line)
+            ctx.send_with_budget(chat_id, line, role="system", system_type="evolution_notice")
     except Exception:
         log.warning("Evolution stop transaction failed", exc_info=True)
         stop_incomplete = True
@@ -506,7 +506,7 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
                 ctx.send_with_budget(
                     chat_id,
                     f"✅ Repair task {task_id} was accepted and durably scheduled.",
-                )
+                    role="system", system_type="task_admission_notice")
             except Exception:
                 log.debug("Repair promotion success notification failed", exc_info=True)
         # A refusal is already told by the promote handler's typed System row
@@ -571,14 +571,14 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
 
         if not owner_conversation_admitted(chat_id):
             return
-        try:
-            remaining = budget_remaining(load_state(), strict=True)
+        try:  # bridge intake runs on the supervisor loop: same pre-check contract as assignment
+            remaining = budget_remaining(load_state(), strict=True, allow_stale=True)
         except Exception:
-            ctx.send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.")
+            ctx.send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", role="system", system_type="task_admission_notice")
             return
         if remaining <= 0:
             try:
-                ctx.send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.")
+                ctx.send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", role="system", system_type="task_admission_notice")
             except Exception:
                 pass
             return

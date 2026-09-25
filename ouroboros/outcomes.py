@@ -2,8 +2,8 @@
 
 Lifecycle, execution health, artifacts, review, and objective evaluation are
 separate axes. Tool errors remain evidence without degrading a delivered answer.
-Only LLM-first task acceptance review can establish objective success; neither
-final text nor absent tool errors can. Typed runtime evidence may conservatively
+Task acceptance or qualified Advisory author completion establishes objective
+success; neither final text nor absent tool errors can. Typed runtime evidence may conservatively
 degrade an otherwise ``not_evaluated`` objective.
 """
 
@@ -17,6 +17,15 @@ from hashlib import sha256
 from typing import Any, Dict, List, Optional
 
 from ouroboros import _outcome_receipts
+# The receipt projections below parameterize the reconciliation core and live
+# with it; these historical names stay resolvable through this module.
+from ouroboros._outcome_receipts import (  # explicit re-exports, one statement
+    latest_agent_defined_verification as latest_agent_defined_verification,
+    latest_unreconciled_failed_receipt as latest_unreconciled_failed_receipt,
+    latest_unreconciled_failed_verification as latest_unreconciled_failed_verification,
+    latest_unreconciled_masked_pass as latest_unreconciled_masked_pass,
+    latest_unreconciled_masked_verification as latest_unreconciled_masked_verification,
+)
 # Tool-call trace vocabulary + execution-axis classifier (leaf module). Re-exported
 # here so `from ouroboros.outcomes import _classify_tool_errors/_POLICY_DENIAL_STATUSES/...`
 # keeps resolving for every historical import site.
@@ -128,6 +137,7 @@ REASON_TASK_EXCEPTION = "task_exception"
 REASON_DEEP_SELF_REVIEW_UNAVAILABLE = "deep_self_review_unavailable"
 REASON_DEEP_SELF_REVIEW_ERROR = "deep_self_review_error"
 REASON_TOOL_FAILURE = "tool_failure"
+REASON_AUTHORING_HANDOVER_INCOMPLETE = "authoring_handover_incomplete"
 REASON_DELIVERY_CONTROL_DEGRADED = "delivery_control_degraded"
 REASON_CHILD_RESULTS_DEFERRED = "child_results_deferred"
 REASON_ACCEPTANCE_REVIEW_SKIPPED_DEADLINE_RESERVE = "review_skipped_deadline_reserve"
@@ -161,6 +171,13 @@ REASON_REVIEW_QUORUM_UNREACHABLE = "plan_review_quorum_unreachable"
 # never accepted and no further reviewer round will happen.
 REASON_IDENTICAL_ACCEPTANCE_REFUSED = "identical_acceptance_refused"
 
+# #1223: the host could not assemble the acceptance evidence LOCALLY, before any
+# reviewer existed. It is the host's own failure, not a reviewer verdict and not a
+# reviewer rework request — the objective stays best_effort, the work is retained,
+# and the owner-facing cause says exactly that. `acceptance_preparation` on the
+# decision carries the incident identity and the real host attempt count.
+REASON_ACCEPTANCE_PREPARATION_FAILED = "acceptance_preparation_failed"
+
 # The acceptance-decision reasons whose (finalized_unaccepted, reason) PAIR
 # terminalizes the objective axis BLOCKED. Value-keyed readers of the acceptance
 # decision live here: adding a terminal reason without adding it to the right key
@@ -168,6 +185,7 @@ REASON_IDENTICAL_ACCEPTANCE_REFUSED = "identical_acceptance_refused"
 _ACCEPTANCE_BLOCKED_TERMINAL_REASONS = frozenset({
     REASON_REVIEW_CYCLES_EXHAUSTED,
     REASON_IDENTICAL_ACCEPTANCE_REFUSED,
+    "author_stop",
 })
 
 # CLOSED mapping: forced-finalization rail (the loop's typed reason_code) -> typed
@@ -255,6 +273,7 @@ def _terminal_zero_run_receipt_present(receipts: List[Dict[str, Any]]) -> bool:
 # Historical name of the RED-reconciling statuses; the SSOT now lives next to the
 # reconciliation core it parameterizes (see `_outcome_receipts.RED_RECONCILING_STATUSES`).
 _RECEIPT_RED_RECONCILING_STATUSES = _outcome_receipts.RED_RECONCILING_STATUSES
+plan_review_awaiting = _outcome_receipts.plan_review_awaiting  # the task-row reader of `execution.plan_review`
 
 # Ledger entry statuses that do NOT count as a failure for ``summary.has_failures``.
 # SSOT: the receipt grounding statuses (pass/observed/declared) are folded in so a turn
@@ -338,73 +357,6 @@ def should_nudge_verification(
     return not verification_grounding_present(
         llm_trace, drive_root, task_id, receipts=receipts,
     )
-
-
-def latest_unreconciled_failed_receipt(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Pure core: the most recent RED receipt (``status=="fail"``) with NO later genuine
-    grounding receipt for the SAME verification (a passing run-kind check or an observed
-    artifact — see ``_RECEIPT_RED_RECONCILING_STATUSES``; a later ``declared`` does NOT
-    reconcile). Returns the failing receipt, or ``None``. Structural: the typed receipt
-    status decides pass/fail, and identity is ONE typed key: the ``criterion_id`` when
-    present, else the canonical ``check`` text, else the observed ``paths`` set (owner
-    Q28=B, content-ADDRESSING — never a semantic keyword gate). Kind AND value must match,
-    so a green of another check — or one that omits the id — no longer clears a red; a red
-    with NO key at all keeps the older any-later-green rule. Advisory, never a gate.
-    The NEWEST element of the OUTSTANDING SET (``_outcome_receipts.unreconciled_failed``)
-    — never a single latest-pointer, which a newer red would let erase an older still-red
-    one. Shared SSOT by the finalize nudge and the acceptance verification_summary so the
-    reconciliation rule lives in one place."""
-    return _outcome_receipts.latest_unreconciled_failed(receipts, _RECEIPT_RED_RECONCILING_STATUSES)
-
-
-def latest_unreconciled_failed_verification(
-    drive_root: Any, task_id: str,
-    *, receipts: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Disk-backed wrapper of ``latest_unreconciled_failed_receipt`` — reads the task's
-    durable receipts. Feeds the one-shot red-verification finalization nudge: finalizing over
-    your own host-attested red is a self-contradiction (Bible P3/P12), distinct from the
-    receipt_absent case."""
-    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
-    return latest_unreconciled_failed_receipt(rows)
-
-
-def latest_unreconciled_masked_pass(receipts: List[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Pure core (v6.52.2): the most recent PASS receipt whose check can MASK the real exit code
-    (``check_exit_masking`` flag from the verify sensor — e.g. ``... | tail``, ``|| true``), with
-    NO later CLEAN (non-masked) grounding receipt (a pass/observed whose check is not masked).
-    Returns the masked passing receipt, or ``None``. Identity is the ``criterion_id`` key when
-    the masked receipt carries one, else ANY clean grounding reconciles: its own text
-    identity is the MASKED command, which the remediation necessarily changes, so the red
-    path's check-text rule would be unclearable (``_outcome_receipts._reconciles_masked``).
-    The NEWEST element of the OUTSTANDING SET (``_outcome_receipts.unreconciled_masked``),
-    so a cleanly reconciled newer masked check no longer takes an older one with it.
-    FLAG-driven (typed receipt field); advisory only. Shared SSOT by the finalize nudge and
-    the acceptance verification_summary."""
-    return _outcome_receipts.latest_unreconciled_masked(receipts, _RECEIPT_RED_RECONCILING_STATUSES)
-
-
-def latest_unreconciled_masked_verification(
-    drive_root: Any, task_id: str,
-    *, receipts: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Disk-backed wrapper of ``latest_unreconciled_masked_pass`` — feeds the one-shot ADVISORY
-    masked-check finalization nudge (the agent may still finalize). Distinct from the red nudge:
-    that fires on a RED check; this fires on a green check whose exit code may be laundered."""
-    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
-    return latest_unreconciled_masked_pass(rows)
-
-
-def latest_agent_defined_verification(
-    drive_root: Any, task_id: str,
-    *, receipts: Optional[List[Dict[str, Any]]] = None,
-) -> Optional[Dict[str, Any]]:
-    """Newest verify receipt whose criterion was AGENT-DEFINED without a stated basis
-    (v6.54.4) — feeds the one-shot advisory criterion-provenance nudge: the check
-    passed, but the success criterion was synthesized by the agent, so the agent is
-    asked once to confirm it is equivalent to what the task actually requires."""
-    rows = receipts if isinstance(receipts, list) else read_verification_receipts(drive_root, task_id)
-    return _outcome_receipts.latest_agent_defined(rows)
 
 
 def apply_receipt_absent_flag(
@@ -607,32 +559,8 @@ def _aggregate_outcome_tier(tiers: List[str]) -> str:
     return OUTCOME_TIER_SOLVED if tiers else ""
 
 
-def _acceptance_decision_projection(acceptance_decision: Dict[str, Any]) -> Dict[str, Any]:
-    out = {
-        "status": str(acceptance_decision.get("status") or ""),
-        # v6.78.0: the typed reason carries the distinction the collapsed status no
-        # longer spells out (no-quorum vs FAIL-without-capsule vs obligations open
-        # vs capsule spent vs deadline skip). Historical records have no reason.
-        "reason": str(acceptance_decision.get("reason") or ""),
-        "source": str(acceptance_decision.get("source") or ""),
-        "rationale": str(acceptance_decision.get("rationale") or "")[:500],
-        "agent_disposition": str(acceptance_decision.get("agent_disposition") or ""),
-        "agent_rationale": str(acceptance_decision.get("agent_rationale") or "")[:500],
-    }
-    if acceptance_decision.get("reason") == "author_finish":
-        record = acceptance_decision.get("author_disposition")
-        if isinstance(record, dict):
-            out["author_disposition"] = dict(record)
-        else:
-            out["author_disposition"] = str(record or "")
-        out["author_rationale"] = str(acceptance_decision.get("author_rationale") or "")[:500]
-        out["reviewer_signal"] = str(acceptance_decision.get("reviewer_signal") or "")
-    # v6.54.4: dissent + obligations transparency (blocking review policy).
-    if acceptance_decision.get("dissent_noted"):
-        out["dissent_noted"] = True
-    if acceptance_decision.get("open_obligations"):
-        out["open_obligations"] = [str(x) for x in acceptance_decision.get("open_obligations") or []][:10]
-    return out
+from ouroboros.review_projection import AWAITING_PROJECTION  # noqa: E402 - the one word for an answer that has not arrived
+from ouroboros.review_projection import acceptance_decision_projection as _acceptance_decision_projection  # noqa: E402,F401
 
 
 def _trace_mapping(llm_trace: Dict[str, Any], key: str) -> Dict[str, Any]:
@@ -662,7 +590,7 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
             axis["superseded_run_count"] = len(selection.all_runs)
             axis["superseded_aggregate_signals"] = selection.superseded_aggregate_signals
         if acceptance_decision:
-            axis["acceptance_decision"] = _acceptance_decision_projection(acceptance_decision)
+            axis["acceptance_decision"] = _acceptance_decision_projection(acceptance_decision, str(review_decision.get("binding_hash") or ""))
         _obligations = [o for o in (llm_trace.get("acceptance_obligations") or []) if isinstance(o, dict)]
         if _obligations:
             axis["acceptance_obligations"] = _obligations[:20]
@@ -671,7 +599,8 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     if "FAIL" in signals:
         status = "fail"
     elif "DEGRADED" in signals or any(bool(run.get("degraded")) for run in runs):
-        status = "degraded"
+        # A panel that was only awaited holds no verdict yet: a gap, not a degraded review.
+        status = AWAITING_PROJECTION if _outcome_receipts.review_runs_only_awaited(runs) else "degraded"
     elif "PASS" in signals:
         status = "pass"
     else:
@@ -684,7 +613,7 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
         "aggregate_signals": signals,
     }
     tier = _aggregate_outcome_tier(_extract_outcome_tiers(runs))
-    if tier:
+    if tier and status != AWAITING_PROJECTION:  # a minority answer is not the panel's tier
         axis["outcome_tier"] = tier
     # Only applied host facts demote a valid non-clean PASS; legacy rows retain their projection.
     impacts = {str(run.get("enforcement_impact") or "") for run in runs
@@ -692,7 +621,7 @@ def _review_axis(llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     if impacts & {"degrades_completion", "requires_revision"}:
         axis["enforcement_impact"] = "degrades_completion"
     if acceptance_decision:
-        axis["acceptance_decision"] = _acceptance_decision_projection(acceptance_decision)
+        axis["acceptance_decision"] = _acceptance_decision_projection(acceptance_decision, str(review_decision.get("binding_hash") or ""))
     _obligations = [o for o in (llm_trace.get("acceptance_obligations") or []) if isinstance(o, dict)]
     if _obligations:
         axis["acceptance_obligations"] = _obligations[:20]
@@ -704,9 +633,19 @@ def _objective_axis(review: Dict[str, Any]) -> Dict[str, Any]:
     tier = str(review.get("outcome_tier") or "")
     decision = review.get("acceptance_decision") if isinstance(review.get("acceptance_decision"), dict) else {}
     _decision_reason = str(decision.get("reason") or "")
+    from ouroboros.review_records import validate_author_disposition
+
+    author = validate_author_disposition(decision.get("author_disposition"))
+    local_failure = (decision.get("acceptance_incident") or {}).get("status") == "failed"
+    if (not local_failure and _decision_reason == "author_finish" and author and author.get("enforcement") == "advisory"
+            and author.get("action", "finish") == "finish"):
+        return {"status": OBJECTIVE_PASS, "source": "author_acceptance", "review_status": status,
+                "outcome_tier": OUTCOME_TIER_SOLVED, "reason": "author_finish"}
     if (
         str(decision.get("status") or "") == ACCEPTANCE_FINALIZED_UNACCEPTED
-        and _decision_reason in _ACCEPTANCE_BLOCKED_TERMINAL_REASONS
+        and (_decision_reason in _ACCEPTANCE_BLOCKED_TERMINAL_REASONS
+             or (decision.get("enforcement") == "blocking" and _decision_reason in {
+                 "review_degraded", "infra_failure", REASON_ACCEPTANCE_PREPARATION_FAILED}))
     ):
         # D27: Required+Blocking acceptance whose shared cap is spent terminalizes
         # BLOCKED, whatever tier the last (failed) review proposed. A-material
@@ -859,7 +798,12 @@ def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
     objective = normalized.get("objective") if isinstance(normalized.get("objective"), dict) else {}
     objective_status = str(objective.get("status") or OBJECTIVE_NOT_EVALUATED)
     objective_source = str(objective.get("source") or "none")
-    if objective_status != OBJECTIVE_NOT_EVALUATED and objective_source != "task_acceptance_review":
+    author_current = (objective_source == "author_acceptance"
+                      and _objective_axis(normalized["review"]).get("source") == "author_acceptance")
+    plan_blocked = (objective_status == OBJECTIVE_FAIL and objective_source in {
+        "plan_review_cycles_exhausted", "plan_review_quorum_unreachable", "plan_review_author_stop"}
+        and objective.get("reason") in {REASON_REVIEW_CYCLES_EXHAUSTED, REASON_REVIEW_QUORUM_UNREACHABLE, "author_stop"})
+    if objective_status != OBJECTIVE_NOT_EVALUATED and objective_source != "task_acceptance_review" and not (author_current or plan_blocked):
         normalized["objective"] = {
             **objective,
             "status": OBJECTIVE_NOT_EVALUATED,
@@ -1003,6 +947,36 @@ def _loop_usage_snapshot(usage: Dict[str, Any], resource_limit: Dict[str, Any]) 
     }
 
 
+def _host_acceptance_failure_axes(
+    acceptance_decision: Dict[str, Any], llm_trace: Dict[str, Any], objective: Dict[str, Any],
+    execution_status: str, reason_code: str,
+) -> tuple:
+    """Degrade the axes a HOST-side acceptance failure owns, updating `objective` in place.
+
+    Two distinct host failures, neither a critic verdict: processing that failed
+    around real custody, and the LOCAL preparation that never reached a reviewer.
+    Stronger rail/stop/critic classifications and their causes are kept.
+    """
+    if acceptance_decision.get("origin") == "host_acceptance_processing":
+        # Host processing failed around real custody; it is no critic verdict.
+        if execution_status == EXECUTION_OK:
+            execution_status, reason_code = EXECUTION_DEGRADED, "infra_failure"
+        if objective.get("status") in {OBJECTIVE_PASS, OBJECTIVE_NOT_EVALUATED}:
+            objective.update(status=OBJECTIVE_DEGRADED, source="task_acceptance_review",
+                             reason="infra_failure")
+    incident = acceptance_decision.get("acceptance_incident") or _trace_mapping(llm_trace, "acceptance_preparation")
+    if incident.get("status") == "failed" and int(incident.get("attempts") or 0) > 0:
+        # Local preparation is no critic verdict, but cannot produce an ordinary Done.
+        if execution_status == EXECUTION_OK:
+            execution_status = EXECUTION_BEST_EFFORT
+            reason_code = REASON_ACCEPTANCE_PREPARATION_FAILED
+        if objective.get("status") in {OBJECTIVE_PASS, OBJECTIVE_NOT_EVALUATED}:
+            objective.update(status=OBJECTIVE_BEST_EFFORT, source="task_acceptance_preparation",
+                             reason=REASON_ACCEPTANCE_PREPARATION_FAILED,
+                             outcome_tier=OUTCOME_TIER_BEST_EFFORT)
+    return execution_status, reason_code
+
+
 def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict[str, Any]:
     """Return a typed LoopOutcome-compatible dict."""
     usage_status = str(usage.get("execution_status") or usage.get("result_status") or "").strip()
@@ -1100,6 +1074,13 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         execution_status = EXECUTION_FAILED
         reason_code = usage_reason or REASON_EMPTY_FINAL_TEXT
         failure = {"kind": "agent", "reason_code": reason_code}
+    elif (
+        (usage_status == EXECUTION_DEGRADED and usage_reason == REASON_AUTHORING_HANDOVER_INCOMPLETE)
+        or bool(llm_trace.get("authoring_handover_incomplete"))
+    ):
+        execution_status = EXECUTION_DEGRADED
+        reason_code = usage_reason or REASON_AUTHORING_HANDOVER_INCOMPLETE
+        failure = {"kind": "authoring_handover", "reason_code": reason_code}
     elif not text.strip() and usage.get("presence_completion_outcome") not in {"silent", "tool_delivered"}:
         execution_status = EXECUTION_FAILED
         reason_code = REASON_EMPTY_FINAL_TEXT
@@ -1152,12 +1133,14 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         }
     review = _review_axis(llm_trace)
     objective = _objective_axis(review)
+    execution_status, reason_code = _host_acceptance_failure_axes(
+        acceptance_decision, llm_trace, objective, execution_status, reason_code)
     plan_gate = _trace_mapping(llm_trace, "force_plan_decision")
     _plan_gate_status = str(plan_gate.get("status") or "")
-    if str(plan_gate.get("enforcement") or "") == "blocking" and (
+    if _plan_gate_status == "author_stopped" or (str(plan_gate.get("enforcement") or "") == "blocking" and (
         _plan_gate_status == "cycles_exhausted"
         or (_plan_gate_status == "open" and plan_gate.get("quorum_unreachable"))
-    ):
+    )):
         # D27: a blocking plan review whose cycle cap is spent never closed — the
         # task terminalizes BLOCKED, never best_effort. B2b extends the same honest
         # terminal to a structurally unreachable reviewer quorum (the agent CHOSE to
@@ -1165,10 +1148,10 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         _quorum_case = _plan_gate_status != "cycles_exhausted"
         objective.update({
             "status": OBJECTIVE_FAIL,
-            "source": ("plan_review_quorum_unreachable" if _quorum_case
+            "source": ("plan_review_author_stop" if _plan_gate_status == "author_stopped" else "plan_review_quorum_unreachable" if _quorum_case
                        else "plan_review_cycles_exhausted"),
             "outcome_tier": OUTCOME_TIER_BLOCKED,
-            "reason": (REASON_REVIEW_QUORUM_UNREACHABLE if _quorum_case
+            "reason": (str(plan_gate.get("review_capacity_reason") or "author_stop") if _plan_gate_status == "author_stopped" else REASON_REVIEW_QUORUM_UNREACHABLE if _quorum_case
                        else REASON_REVIEW_CYCLES_EXHAUSTED),
         })
     if deferred_child_count and objective.get("status") != OBJECTIVE_FAIL:
@@ -1246,6 +1229,8 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
             "reason_code": reason_code,
             "failure": failure,
             **({"resource_limit": resource_limit} if resource_limit else {}),
+            # The durable fact of a clean finish over a plan review that was only awaited.
+            **({"plan_review": AWAITING_PROJECTION} if execution_status == EXECUTION_OK and plan_gate.get("review_only_awaited") is True else ({"plan_review": plan_gate["plan_review_class"]} if plan_gate.get("plan_review_class") else {})),
             "recoveries": recovered_tool_errors[:20],
             "cosmetic_tool_errors": cosmetic_tool_errors[:20],
             "ignored_tool_errors": ignored_tool_errors[:20],
@@ -1288,6 +1273,8 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
 
 
 def collect_trace_refs(usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict[str, Any]:
+    # Keep received responses, including incomplete ones with unavailable capture.
+    # Sparse pre-response failures stay in usage/history and raw error events.
     refs: Dict[str, Any] = {}
     execution_id = str(usage.get("execution_id") or "").strip()
     if execution_id:
@@ -1299,7 +1286,7 @@ def collect_trace_refs(usage: Dict[str, Any], llm_trace: Dict[str, Any]) -> Dict
             "reported_model", "use_local", "usable_solve_response",
         )}
         for item in usage.get("llm_call_refs") or []
-        if isinstance(item, dict)
+        if isinstance(item, dict) and (not item.get("failure_code") or "response_ref" in item)
     ]
     if llm_refs:
         refs["llm_call_refs"] = llm_refs

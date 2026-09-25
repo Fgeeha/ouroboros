@@ -17,7 +17,7 @@ import json
 import logging
 import threading
 import time
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
 from ouroboros.config import DELEGATE_WAIT_CEILING_SEC
@@ -617,22 +617,7 @@ def emit(ctx: Any, run_id: str, advance: _Advance, *,
     try:
         observation = executor_observation(ctx, run_id, advance, detail, entry) if detail is not None else {}
         metadata = {"executor_observation": observation} if observation else {}
-        # The harness's `thinking` rows are the run's reasoning: they go out first as
-        # their own line stamped `progress_meta.reasoning`, so the chat card folds them
-        # into a collapsed "Thinking" entry; every other row keeps the untyped action
-        # line, which also carries the batch omission count and the actor observation.
-        thinking = [row for row in advance.events if row.get("textKind") == "thinking"]
-        actions = [row for row in advance.events if row.get("textKind") != "thinking"]
-        if thinking:
-            line = live_line(run_id, replace(advance, events=thinking, events_omitted=0))
-            try:
-                fn(line, meta={"reasoning": True}, **({} if actions or advance.events_omitted else metadata))
-            except TypeError:
-                # A single-argument ToolContext callable (the documented ABI) cannot take
-                # the stamp; the line still goes out and the action line below survives.
-                fn(line)
-        if actions or advance.events_omitted or not thinking:
-            fn(live_line(run_id, replace(advance, events=actions)), **metadata)
+        fn(live_line(run_id, advance), **metadata)
     except Exception:
         log.debug("delegated progress emit failed", exc_info=True)
 
@@ -673,6 +658,13 @@ def window_payload(
         "max_seconds": max_seconds,
         "waiting_on_user": waiting_on_user,
     }
+    if waiting_on_user:
+        # The re-wait of a question the model already saw rides the same flat route
+        # fact as the immediate waiting payload (whose note carries the cost clause;
+        # this payload is measured into a budget its own note already reserves).
+        from ouroboros.delegate_interactions import SAME_SESSION_CONTINUATION
+
+        payload["continuation"] = SAME_SESSION_CONTINUATION["continuation"]
     if not seen.advances:
         payload["reason"] = "non_terminal_and_no_new_session_events_within_wait_window"
         # A run PAUSED on its own question is not "stuck" (owner 7=A / F13): the

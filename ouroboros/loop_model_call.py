@@ -13,7 +13,7 @@ import pathlib
 import queue
 import time
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple
 from ouroboros import task_pacing
 from ouroboros.context_budget import ContextReclaimRequest
@@ -43,6 +43,57 @@ def _loop():
     return loop
 
 
+def _record_authoring_handover(
+    tool_ctx: Any,
+    *,
+    from_model: str,
+    to_model: str,
+    reason: str,
+    tool_calls_at_handover: int,
+) -> None:
+    """Record a host-driven authoring handover for the current loop.
+
+    A route change is not itself an error: the successor may continue normally.
+    It is, however, a typed fact that the next tool-less response must see as a
+    continuation when the predecessor already used tools.  Keep the fact on the
+    existing ToolContext/usage/trace seams; no second custody store is needed.
+    """
+    source = str(from_model or "").strip()
+    target = str(to_model or "").strip()
+    if not source or not target or source == target or tool_calls_at_handover < 1:
+        return
+    row = {
+        "from_model": source,
+        "to_model": target,
+        "reason": str(reason or "host_route_change"),
+        "tool_calls_at_handover": int(tool_calls_at_handover),
+        "recovery_prompted": False,
+        "status": "pending",
+    }
+    tool_ctx._authoring_handover = row
+    usage = getattr(tool_ctx, "_accumulated_usage", None)
+    if isinstance(usage, dict):
+        handovers = usage.setdefault("authoring_handovers", [])
+        if isinstance(handovers, list):
+            handovers.append(row)
+    trace = getattr(tool_ctx, "_execution_trace", None)
+    if isinstance(trace, dict):
+        trace.setdefault("route_handovers", []).append(row)
+
+
+def _pending_model_wait_handover(
+    tool_ctx: Any, *, from_model: str, to_model: str, tool_calls: int,
+) -> None:
+    """Hold one distinct wait-switch until its re-prepared send succeeds."""
+    if str(from_model or "") == str(to_model or ""):
+        return
+    pending = getattr(tool_ctx, "_pending_model_wait_handover", None)
+    tool_ctx._pending_model_wait_handover = (
+        pending[0] if pending else str(from_model or ""), str(to_model or ""),
+        pending[2] if pending else int(tool_calls),
+    )
+
+
 def _adopt_fallback_route(
     ctx: Any,
     tools: ToolRegistry,
@@ -54,6 +105,10 @@ def _adopt_fallback_route(
     active_context_mode: str,
     tool_schemas: List[Dict[str, Any]],
     accumulated_usage: Dict[str, Any],
+    *,
+    handover_from_model: str = "",
+    handover_reason: str = "fallback",
+    tool_calls_at_handover: Optional[int] = None,
 ) -> tuple:
     """Round-4 C1.1: adopt a SUCCESSFUL cross-family fallback as the active
     route for the rest of the loop. Otherwise a later round (esp. a tool
@@ -68,6 +123,18 @@ def _adopt_fallback_route(
     ctx.active_model = fallback_model
     ctx.active_use_local = fallback_use_local
     messages[:] = fallback_messages
+    trace = getattr(ctx, "_execution_trace", None)
+    trace_calls = trace.get("tool_calls") if isinstance(trace, dict) else []
+    _record_authoring_handover(
+        ctx,
+        from_model=handover_from_model,
+        to_model=fallback_model,
+        reason=handover_reason,
+        tool_calls_at_handover=(
+            len(trace_calls or [])
+            if tool_calls_at_handover is None else int(tool_calls_at_handover)
+        ),
+    )
     if context_fit_plan is not None:
         tools._ctx.context_fit_plan = context_fit_plan
         tools._ctx.messages = messages
@@ -213,6 +280,16 @@ def _run_cross_model_fallback_chain(
                 candidate_mode,
                 tool_schemas,
                 accumulated_usage,
+                # The predecessor author is the route whose round entered this
+                # fallback chain.  ``previous_model`` may name a candidate that
+                # failed before the successful candidate ever authored a turn.
+                handover_from_model=active_model,
+                handover_reason=reason or "fallback",
+                tool_calls_at_handover=len(
+                    ((getattr(tools._ctx, "_execution_trace", {})
+                      if isinstance(getattr(tools._ctx, "_execution_trace", {}), dict) else {})
+                     .get("tool_calls") or [])
+                ),
             )
             break
         tools._ctx.context_fit_plan = context_fit_plan
@@ -459,6 +536,29 @@ def _physical_context_for_fit(disposition: Any) -> PhysicalAttemptContext:
     )
 
 
+def _measure_main_context_view(plan, messages, schemas, mode, effort, round_id) -> dict:
+    """Measure an authored candidate without changing Main's dispatch policy.
+
+    Predictions inform the next ordinary reclaim/send; neither capacity nor
+    economy estimates veto a useful authored view. No route probe or model runs.
+    """
+    from ouroboros.context_fit import estimate_context_prompt_tokens, measure_main_fit
+    from ouroboros.loop_llm_call import MAIN_LOOP_MAX_TOKENS
+
+    if plan is None:
+        return {"accepted": True, "strict_bound_proven": False,
+                "estimated_input_tokens": estimate_context_prompt_tokens(messages, schemas, reasoning_effort=effort),
+                "response_reserve_tokens": MAIN_LOOP_MAX_TOKENS, "capacity_total_tokens": None,
+                "measurement_basis": "cold_estimate", "reason": "main_route_capacity_unknown"}
+    disposition = measure_main_fit(
+        plan, messages, schemas, profile=_main_context_profile(plan, mode),
+        rendered_mode=mode, round_id=round_id, reasoning_effort=effort,
+    )
+    return {"accepted": True, "strict_bound_proven": False,
+            "predicted_capacity_miss": disposition.predicted_capacity_miss,
+            **asdict(disposition.measurement)}
+
+
 def _fit_key(fit: Any) -> Tuple[str, str]:
     return (fit.measurement.route_fp, fit.measurement.round_id)
 
@@ -471,7 +571,10 @@ def _dispatch_round_model(
     candidate_predicate: Optional[Callable[[Any], Any]] = None,
 ) -> Tuple[Any, float]:
     from ouroboros.model_wait import current_model_wait
-    from ouroboros.loop_transport import emit_model_effort_mismatch, managed_transport_continuation, transport_repeat_stop_requested
+    from ouroboros.loop_transport import (
+        emit_model_effort_mismatch, emit_model_substitution,
+        managed_transport_continuation, transport_repeat_stop_requested,
+    )
     from ouroboros.owner_mailbox import OwnerMailboxPeek
 
     mailbox_peek = OwnerMailboxPeek()
@@ -487,6 +590,10 @@ def _dispatch_round_model(
     binding = (waiter.register_reprepare(role, lambda kwargs: _reprepare_waiting_main(ctx, kwargs))
                if waiter is not None else contextlib.nullcontext())
     previous_call = ctx.accumulated_usage.get("_last_llm_call_meta")
+    from ouroboros.acceptance_settlement import expose_acceptance_feedback
+
+    observe_feedback = lambda sent: expose_acceptance_feedback(
+        getattr(ctx.tools._ctx, "_execution_trace", {}), sent, str(ctx.task_id))
     with binding:
         result = _loop().call_llm_with_retry(
             ctx.llm, ctx.messages, ctx.active_model, ctx.tool_schemas,
@@ -507,7 +614,20 @@ def _dispatch_round_model(
             # The loop's own active-turn slot: a reprepared send keeps this exact
             # owner because the slot survives kwargs deep-copying by identity.
             model_turn_state=getattr(ctx.tools._ctx, "model_turn_state", None),
+            model_context_observer=observe_feedback,
         )
+    pending_wait_handover = getattr(ctx.tools._ctx, "_pending_model_wait_handover", None)
+    if pending_wait_handover is not None:
+        if result[0] is not None:
+            from_model, to_model, tool_count = pending_wait_handover
+            _record_authoring_handover(
+                ctx.tools._ctx,
+                from_model=from_model,
+                to_model=to_model,
+                reason="model_wait",
+                tool_calls_at_handover=tool_count,
+            )
+        ctx.tools._ctx._pending_model_wait_handover = None
     observed = ctx.accumulated_usage.get("_model_route")
     if (plan is not None and isinstance(observed, dict)
             and observed != getattr(plan, "model_route", {})):
@@ -520,6 +640,8 @@ def _dispatch_round_model(
             credential_profile_id=(waiter.overrides.get(role, {}).get("model_account_override") if waiter else None))
     emit_model_effort_mismatch(ctx.accumulated_usage, task_id=ctx.task_id,
                                emit_progress=getattr(ctx, "emit_progress", None))
+    emit_model_substitution(ctx.accumulated_usage, task_id=ctx.task_id,
+                            emit_progress=getattr(ctx, "emit_progress", None))
     call = ctx.accumulated_usage.get("_last_llm_call_meta")
     execution_id = ctx.accumulated_usage.get("execution_id")
     if (result[0] is not None and isinstance(call, dict) and call is not previous_call
@@ -536,9 +658,21 @@ def _reprepare_waiting_main(ctx: _RoundModelCallContext, kwargs: dict):
     from ouroboros.usage_accounting import current_physical_attempt_predicate, bind_physical_attempt_context
 
     model, use_local = kwargs["model"], kwargs.get("use_local", False)
+    previous_model = str(ctx.active_model or "")
     role = kwargs["model_role"]
     observed = kwargs.pop("_model_observed_route", None)
-    prepared = LLMClient.sanitize_reasoning_on_model_switch(kwargs["messages"], ctx.active_model, model)
+    native_reset = bool(observed and observed.pop("_native_reset", False))
+    # Waiting kwargs can contain a caption/off projection. Keep the canonical
+    # images, then build the newly selected route's physical view below.
+    prepared = LLMClient.sanitize_reasoning_on_model_switch(ctx.messages, ctx.active_model, model)
+    if native_reset:
+        from ouroboros.llm_messages import drop_source_native_messages, reset_native_messages
+
+        prepared, changed = reset_native_messages(
+            prepared, observed, source=observed.get("source"), model=observed.get("model"))
+        if not changed:
+            prepared, _ = drop_source_native_messages(
+                prepared, source=str(observed.get("source") or ""))
     ctx.messages[:] = prepared
     ctx.context_fit_plan, ctx.active_context_mode = _loop()._rebind_context_fit_plan(
         ctx.context_fit_plan, ctx.tools, ctx.messages, model=model, use_local=use_local,
@@ -548,13 +682,33 @@ def _reprepare_waiting_main(ctx: _RoundModelCallContext, kwargs: dict):
     ctx.active_model, ctx.active_use_local = model, use_local
     ctx.tools._ctx.active_model = model
     ctx.tools._ctx.active_use_local = use_local
+    trace = getattr(ctx.tools._ctx, "_execution_trace", {})
+    _pending_model_wait_handover(
+        ctx.tools._ctx,
+        from_model=previous_model,
+        to_model=str(model or ""),
+        tool_calls=len(trace.get("tool_calls") or []) if isinstance(trace, dict) else 0,
+    )
     disposition = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False)
     if disposition is not None and disposition.action == "reclaim_once":
         if _fit_key(disposition) not in _loop()._context_reclaim_passes(ctx.tools._ctx):
             with bind_physical_attempt_context(None):
                 _loop()._run_main_reclaim(ctx, disposition)
         disposition = _measure_after_reclaim(ctx)
-    kwargs["messages"] = ctx.messages
+    from ouroboros.loop_llm_call import _prepare_main_messages
+
+    # Any vision work belongs to this actual reprepare, outside both the Main
+    # fit probe and the failed attempt's physical precondition/measurement.
+    with bind_physical_attempt_context(None):
+        kwargs["messages"] = _prepare_main_messages(
+            ctx.messages, model=model, model_role=role,
+            model_account_override=kwargs.get("model_account_override"),
+            llm=ctx.llm, accumulated_usage=ctx.accumulated_usage,
+            drive_root=ctx.drive_root or ctx.drive_logs.parent, task_id=ctx.task_id,
+            event_queue=ctx.event_queue, use_local=use_local,
+            task_attempt=ctx.accumulated_usage.get("_task_attempt"),
+            deadline_ts=_loop()._task_deadline_epoch(ctx.tools),
+        )
     from ouroboros.llm_claudexor import cache_key_for_model
     from ouroboros.provider_models import provider_for_model
     kwargs["cache_affinity"] = "" if use_local else cache_key_for_model(model)

@@ -24,23 +24,48 @@ export function createHistoryControls(messagesDiv) {
     const note = doc.createElement('span');
     note.className = 'chat-load-older-note';
     root.append(button, note);
+    // The recent-window read is the chat's own request, not a pager page, so its
+    // in-flight and failed states are carried here and drawn by the same control
+    // (issue #1102: an empty feed under a green header read as a dead app, and a
+    // failed read looked identical to a slow one).
+    let recent = null;
+    const feedIsEmpty = () => Array.from(messagesDiv.children)
+        .every(node => node === root || node.classList.contains('typing-bubble'));
     return {
         olderButton: button,
+        // Only an EMPTY feed (or a failure already on screen) gets the loading
+        // state: an ordinary refresh never puts chrome over a painted transcript.
+        // Returns whether there is a state to draw, so a painted feed costs nothing.
+        beginRecent() {
+            if (recent?.error || feedIsEmpty()) recent = { loading: true };
+            return Boolean(recent);
+        },
+        // A failure is shown where the loading state was; elsewhere the reader
+        // keeps the transcript they have and the next sync reconciles it.
+        endRecent(error = null) { recent = error && recent ? { error } : null; },
+        recentFailed: () => Boolean(recent?.error),
         render(snapshot, windows) {
-            const error = snapshot.error;
+            const error = recent?.error || snapshot.error;
+            const hydrating = Boolean(recent?.loading);
+            const loading = hydrating || Boolean(snapshot.loading);
             const changedView = error?.body?.reason_code === 'history_view_changed';
-            const noteText = error ? String(error.message || error)
+            const noteText = hydrating ? ''
+                : recent?.error ? `Could not load messages: ${recent.error.message || recent.error}`
+                : error ? String(error.message || error)
                 : snapshot.olderExhausted ? 'Beginning of saved history' : '';
+            const buttonHidden = !error && !snapshot.canOlder && !hydrating;
             const fields = [
-                [button, { textContent: snapshot.loading ? 'Loading…'
+                [button, { textContent: loading ? 'Loading…'
                     : changedView ? 'Refresh history' : error ? 'Retry loading messages' : 'Load older messages',
-                    disabled: Boolean(snapshot.loading), hidden: !error && !snapshot.canOlder }],
+                    disabled: loading, hidden: buttonHidden }],
                 [note, { textContent: noteText, hidden: !noteText }],
+                [root, { hidden: buttonHidden && !noteText }],
             ];
             for (const [node, values] of fields) {
                 for (const [key, value] of Object.entries(values)) if (node[key] !== value) node[key] = value;
             }
-            if ((snapshot.initialized || error) && !root.isConnected) messagesDiv.prepend(root);
+            if (hydrating) root.setAttribute('aria-busy', 'true'); else root.removeAttribute('aria-busy');
+            if ((snapshot.initialized || error || hydrating) && !root.isConnected) messagesDiv.prepend(root);
             const hasGaps = [...windows].some(value => (value?.truncated_by || [])
                 .some(cause => !['quota', 'archive_floor', 'lineage_cap', 'page'].includes(cause)));
             return { complete: Boolean(snapshot.initialized && snapshot.olderExhausted

@@ -15,6 +15,8 @@ import threading
 import time
 from types import SimpleNamespace
 
+import pytest
+
 
 from tests.test_plan_review_engine import CLEAN, DECK_SPEC, _call, _control, _state
 from tests.test_plan_review_engine import harness as _engine_harness
@@ -36,6 +38,8 @@ def _custody_kwargs(tmp_path, *, surface, retry_key, slots, run_slot, ctx):
         surface=surface, goal="review", task_id="event-route", retry_key=retry_key,
         reconciliation_identity={"subject_hash": "f" * 64},
     )
+
+    ctx.task_id = request.task_id
 
     def error_actor(slot, error, operation_id="", operation_state="settled"):
         return ReviewActorRecord(
@@ -97,9 +101,9 @@ def test_drain_deadline_releases_pending_dispatch_rows_and_the_last_settlement_w
         assert _mailbox_entries(tmp_path, request.task_id) == []
         release["s1"].set()
         deadline = time.time() + 10
-        while len(progress) < 1 and time.time() < deadline:
+        while not any("m/a answered" in line for line in progress) and time.time() < deadline:
             time.sleep(0.01)
-        assert len(progress) == 1 and "reviewer slot s1 settled (ok)" in progress[0]
+        assert sum("m/a answered" in line and "reviewer" in line for line in progress) == 1
         assert _mailbox_entries(tmp_path, request.task_id) == []  # one slot still running
         release["s2"].set()
         while len(_mailbox_entries(tmp_path, request.task_id)) < 1 and time.time() < deadline:
@@ -169,7 +173,8 @@ def test_requests_without_a_drain_deadline_and_other_surfaces_are_untouched(tmp_
     assert request.drain_deadline is None
     [actor] = custody.run_custodied_review_slots(**kwargs)  # waits for the worker as before
     assert actor.status == "ok" and actor.operation_state == "settled"
-    assert not custody._RELEASED_WAVES and progress == []
+    assert not custody._RELEASED_WAVES
+    assert len(progress) == 2 and "reviewer m/a started" in progress[0] and "m/a answered" in progress[1]
     assert _mailbox_entries(tmp_path, request.task_id) == []
     # A non-plan surface released at a drain deadline gets pending rows but no frame.
     triad, triad_kwargs = _custody_kwargs(
@@ -185,7 +190,9 @@ def test_requests_without_a_drain_deadline_and_other_surfaces_are_untouched(tmp_
     deadline = time.time() + 5
     while custody._RELEASED_WAVES and time.time() < deadline:
         time.sleep(0.01)
-    assert _mailbox_entries(tmp_path, request.task_id) == [] and progress == []
+    assert _mailbox_entries(tmp_path, request.task_id) == []
+    # Every row is a reviewer row of its own surface; no plan frame reached the non-plan surface.
+    assert all(line.startswith(("Plan reviewer m/a ", "Commit reviewer m/a ")) for line in progress)
 
 
 class _HeldExecutor:
@@ -270,7 +277,8 @@ def test_fresh_dispatch_returns_at_the_barrier_and_the_resubmitted_envelope_coll
     state = _state(harness)
     assert state["cycles_paid"] == 1 and state["waves"][-1]["paid"] is True
     assert executor.execute_calls == 3
-    assert any("reviewer slot s1 settled (ok)" in line for line in harness.progress)
+    # The final mailbox frame can precede another slot's progress callback.
+    assert _wait_until(lambda: any("m/a answered" in line and "reviewer" in line for line in harness.progress))
 
 
 def test_barrier_wave_replaces_a_stale_paid_predecessor_and_pays_only_at_collection(tmp_path):
@@ -313,7 +321,7 @@ def test_in_flight_panels_count_toward_the_cycle_cap_at_dispatch(harness, monkey
         state = _state(harness)
         assert state["cycles_paid"] == 0  # committed, not yet proven paid: nothing is written as spent
         assert state["current_attempt"]["fingerprint"] == first_fp  # the in-flight wave stays current
-        assert not any(line.startswith("📐 plan_task: PLAN_REVIEW_CYCLES_EXHAUSTED") for line in harness.progress)
+        assert not any(line.startswith("📐 Plan review: no review rounds left") for line in harness.progress)
     finally:
         executor.release.set()
     assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)
@@ -373,7 +381,7 @@ def test_a_slot_settling_during_the_barrier_release_never_splits_the_wave_into_t
             # s1 settles right after its own row is minted, before s2's row exists.
             assert entered["s1"].wait(10)
             release["s1"].set()
-            assert _wait_until(lambda: any("reviewer slot s1 settled" in line for line in progress))
+            assert _wait_until(lambda: any("m/a wasn't sent" in line for line in progress))
         return actor
 
     monkeypatch.setattr(custody, "_late_or_timeout_actor", interleaved)
@@ -463,9 +471,57 @@ def test_the_open_wave_text_names_the_route_that_waits_for_the_settlement_frame(
     wave = _state(harness)["waves"][-1]
     fp = wave["request_fingerprint"]
     for text in (first, _next_step(wave, enforcement="blocking", cap=2, cycles_paid=0)):
-        assert "one or more paid reviewer operations are still in flight" in text
+        # "paid" is not claimed: a slot released at the barrier is $0 until its row proves the send.
+        assert "one or more reviewer operations are still in flight" in text and "paid reviewer" not in text
         assert ("The host writes ONE message into this task's mailbox when every released slot "
                 "settles: wait_task on this task's own id (wait_tasks while children run) "
                 "returns on it") in text
         assert f"plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}})" in text
         assert "schedule_followup" not in text  # a new root task cannot collect this wave
+
+
+@pytest.mark.parametrize("effort", ["low", "high", "none", "default"])
+@pytest.mark.parametrize("enforcement", ["blocking", "advisory"])
+def test_neutral_collection_uses_the_paid_wave_not_schema_filled_overrides(harness, monkeypatch, effort, enforcement):
+    """Real substrate and saved source: padded fields never buy or author a new wave."""
+    import copy
+    from ouroboros.tools import plan_review as pr
+    from ouroboros.tools.plan_review_artifacts import authority_wave
+
+    harness.state["enforcement"] = enforcement
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", enforcement)
+    executor = _install_real_substrate(monkeypatch)
+    ctx = harness.make_ctx()
+    try:
+        _call(ctx)
+        wave = _state(harness)["waves"][-1]
+        fingerprint = wave["request_fingerprint"]
+        exact = authority_wave(harness.drive, ctx.task_id, wave)
+        assert _wait_until(lambda: executor.execute_calls == 3)
+        for author in ({"disposition": "partial", "rationale": "Collect"},
+                       {"disposition": "deferred", "rationale": ""}):
+            payload = {"goal": "", "plan": "", "spec": {k: [] for k in DECK_SPEC},
+                "reviewer_effort": effort, "review_disposition": {"review_fingerprint": fingerprint,
+                "items": [], "author_action": "none", "author_disposition": author}}
+            original = copy.deepcopy(payload)
+            result = pr._handle_plan_task(ctx, **payload)
+            assert _control(result) == {"outcome": "DEGRADED", "closed": False}
+            pending = _state(harness)
+            assert pending["waves"][-1]["custody_pending"]
+            assert not pending["waves"][-1].get("author_disposition")
+            assert not pending["current_attempt"].get("author_subject")
+            assert payload == original and executor.execute_calls == 3
+        executor.release.set()
+        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) == 1)
+        result = pr._handle_plan_task(ctx, **payload)
+        assert _control(result) == {"outcome": "GREEN", "closed": True}
+        state = _state(harness)
+        collected = authority_wave(harness.drive, ctx.task_id, state["waves"][-1])
+        assert executor.execute_calls == 3 and state["cycles_paid"] == 1
+        assert len(state["waves"]) == 1 and collected["request_fingerprint"] == fingerprint
+        assert collected["reviewer_effort"] == exact["reviewer_effort"] == ""
+        assert collected["reviewer_config_fingerprint"] == exact["reviewer_config_fingerprint"]
+        assert not collected.get("author_disposition") and payload == original
+    finally:
+        executor.release.set()
+    assert _wait_until(lambda: len(_mailbox_entries(harness.drive, ctx.task_id)) == 1)

@@ -36,8 +36,9 @@ and official-hub payloads are freshly rechecked against the live catalog before
 attestation is persisted. Only the tri-model LLM phase is skipped; the verdict
 is marked `owner-attested` (distinct from an LLM-clean badge) and does not
 confer publication readiness. Choosing Publish may still start the ordinary
-managed publication task, but Ouroboros must complete a fresh full skill review
-before any outbound GitHub effect. Native, ClawHub, and unverified
+managed publication task, but attestation alone authorizes no outbound GitHub
+effect. Publication needs fresh critic authority or a later actual independent-review
+outcome acknowledged through qualified Advisory author finish (see Publishing). Native, ClawHub, and unverified
 OuroborosHub payloads are never attestable. The agent cannot self-attest (the
 marker is owner-state).
 
@@ -183,7 +184,10 @@ flowchart LR
     triad -- PASS --> deps
     deps --> enable[owner toggles enabled=true]
     enable --> execute[skill_exec / dispatch]
-    review -- FAIL/PREFLIGHT --> repair[Repair → re-review]
+    review -- feedback --> reaction[Author reaction]
+    reaction -- next permitted panel --> review
+    reaction -- Advisory finish + current preflight --> deps
+    review -- PREFLIGHT failure --> repair[Repair]
     repair --> review
 ```
 
@@ -193,13 +197,20 @@ flowchart LR
 - **Review** runs three reviewer models in parallel against the
   Skill Review Checklist (see [`docs/CHECKLISTS.md`](CHECKLISTS.md)).
   The review pack hashes every runtime-reachable file in the skill
-  directory; any later edit invalidates the executable verdict. `.self_authored.json`
+  directory; any later edit stales that critic verdict. `.self_authored.json`
   is provenance only; self-authored skills use the same tri-model review,
   grant, enable, and extension reload flow as other executable skills.
 - **Isolated deps** (pip / npm / uv / node) install into
   `data/skills/<bucket>/<name>/.ouroboros_env/`. Status is recorded
   in `data/state/skills/<name>/deps.json`.
-- **Enable** flips `enabled.json` after a fresh executable review + grants + deps. The
+  In-process extension scopes are non-reentrant: no-dependency handlers of
+  DIFFERENT skills share a read lease and overlap, the handlers of ONE skill
+  run one at a time (your callbacks stay sequential, as under the old
+  exclusive lock), and a dependency-bearing handler owns an exclusive lease
+  through import, handler waits and cleanup. The async form polls
+  cooperatively, so it never blocks the ASGI loop; nested scopes and
+  unwrapped child work remain unsupported rather than inheriting a lease.
+- **Enable** flips `enabled.json` after current executable-review authority + grants + deps. The
   Skills UI surfaces a toggle; agents can also call `toggle_skill`.
   A self-authored skill's first enablement can follow
   `OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS`; otherwise enabling requires the owner
@@ -610,13 +621,14 @@ follow the setting below; an explicitly authorized task toggle remains separate.
 
 `OUROBOROS_AUTO_GRANT_REVIEWED_SKILLS` is enabled by default as of v6.10.0; the
 owner may disable it in Settings → Behavior → Skills (desktop asks for native
-confirmation and web uses the owner endpoint). When enabled, a fresh executable
-review grants only the manifest-declared keys and host permissions for the
+confirmation and web uses the owner endpoint). When enabled, current executable
+review authority grants only the manifest-declared keys and host permissions for the
 current content hash. Under
 blocking enforcement, blocker reviews are not executable and do not auto-grant;
 under advisory enforcement, blocker findings may auto-grant only because that
-mode makes the review executable. Editing the skill still invalidates those
-grants.
+mode makes the review executable. Qualified current Advisory author acceptance
+uses the same gate even when the original critic state stays pending. Editing the
+skill still invalidates those grants.
 
 Official OuroborosHub skills have one extra review profile. If the installed
 payload, live catalog file list, and `.ouroboroshub.json` hashes all match
@@ -702,6 +714,11 @@ content-hash-bound skill token, and sends:
 - `GET /presence/work/{work_ref}?binding_id=...` to poll only late work created
   by the same owner binding.
 
+The nested fact maps may include optional provider evidence such as the agent's
+own account identity, explicit mention occurrences and the thread-root author.
+Keep unknowns and source meanings intact: neither a mention nor root authorship
+establishes the current addressee or an obligation to answer.
+
 The owner-created binding fixes the authenticated transport skill, behavior
 skill, origin scope, and exact proactive destination. The origin is either one
 exact conversation/thread or the explicit account-wide conversation id `*`;
@@ -729,8 +746,10 @@ Use the current event's exact conversation/thread for a reply; the binding's
 origin is an admission filter and its destination is the separate default for
 initiated contact. Selected transport tools may still address other intended
 conversations. The host projection names these roles under `communication`.
-A useful first or intermediate reply is an explicit transport-tool call while
-work continues. Assistant narration beside calls is only Working activity;
+A first or intermediate reply uses an explicit transport-tool call after choosing
+to contribute or undertake work for that conversation; observation alone owes no
+acknowledgement. Incoming content is framed as observed conversation, separately
+from an initiated cycle or an inherited work order. Assistant narration is only Working activity;
 `queued` does not establish delivery, and an early acknowledgement does not
 replace the substantive final result.
 
@@ -741,8 +760,11 @@ message/deferred body retains the later model-answer path. Native inline turns
 return their persisted result before optional post-task cognition; transport
 outbox custody still owns actual delivery.
 If a parent fails after work was scheduled, its handoff remains deferred with
-the current failure text, so the adapter retains the late result's custody;
-this does not turn the failed parent into successful execution.
+the work reference and any current model-authored reply. Host diagnostics and
+status notices stay in the owner task; an empty deferred body sends nothing but
+still requires polling. Cached and late results preserve that empty body rather
+than substituting the task diagnostic. This does not turn failure into success.
+Ordinary implicit replies and genuine authored best-effort answers remain valid.
 
 `GET /identity` advertises `presence_delivery_version: 1` on supporting hosts.
 Only then request `delivery_reporting_version: 1` alongside `binding_id` and
@@ -948,6 +970,7 @@ ui_tab:
     kind: module
     entry: widget.js
     start: manual                   # auto | manual | retain — see "Launch policy" below
+    appearance: host                # host | independent | fixed (author intent)
 ```
 
 The manifest declaration is checked during preflight and review; it does not
@@ -958,6 +981,7 @@ register the same surface in `plugin.py`:
 def register(api):
     api.register_ui_tab("editor", "Editor", render={
         "kind": "module", "entry": "widget.js", "start": "manual",
+        "appearance": "host",
     })
 ```
 
@@ -1034,6 +1058,27 @@ are the one exception — "What the frame may do" below). The bridge exposes:
   `api.send_ws_message(type, data)` — `type` is the short name you passed; the
   host strips its own namespace prefix. The first listener subscribes the frame,
   the last unsubscribe stops delivery, and other skills' events never reach it.
+
+- **`OuroborosWidget.onTheme(callback)`** is an optional resolved-palette
+  subscription for module widgets. The callback receives `light` or `dark`
+  through the nonce-bound parent bridge; `onTheme` returns an unsubscribe function.
+  The module applies the value itself, commonly with
+  `document.documentElement.dataset.theme = theme`; the host never injects CSS,
+  changes the child DOM or forces a remount. The first callback receives the
+  resolved value embedded in the frame's initial document, later changes arrive
+  on authenticated bridge messages derived from the host's `ouro:theme-changed`
+  event, and disposal releases the parent subscription. The first listener
+  normally sees the injected bootstrap value immediately, then the parent
+  confirms the current value asynchronously; after a prior unsubscribe, the
+  next listener waits for that confirmation instead of using stale bootstrap.
+  Route
+  iframes have no bridge. A module declaration may record
+  `render.appearance: host | independent | fixed` for author/reviewer intent:
+  `host` opts into the resolved bridge, `independent` leaves palette choice to
+  the author, and `fixed` names an intentionally stable visual world;
+  the declaration does not gate legacy modules or prove that the source repaints.
+  `appearance` is valid only inside a `kind: module` render; adding it to an
+  iframe or declarative render is a registration error rather than a theme claim.
 
 - **`OuroborosWidget.download(name, source)`** saves an existing `Blob`, a
   `data:` URL, or a URL under this skill's extension route prefix. It resolves
@@ -1410,6 +1455,11 @@ the authoritative SSOT — read it there once and consult it whenever you author
 or repair a skill instead of reading a paraphrase here. Review verdicts are
 `clean`, `warnings`, `blockers`, or `pending`; execution is decided by
 `review_gate.executable_review`.
+Advisory explicit author finish can accept unchanged or corrected bytes after
+feedback, or a returned terminal partial/unavailable review reference, with current
+deterministic preflight. It buys no second critic and retains the original hash,
+status and findings; pending work without feedback is not unavailable. Blocking
+requires fresh reviewer approval. See ARCHITECTURE §13 for the shared runtime gate.
 
 ## Reference skills
 
@@ -1445,8 +1495,9 @@ The preflight returns one of five states:
 
 - `ready` — the current snapshot is locally publication-ready; the managed task
   repeats the authoritative checks before any public effect.
-- `warnings` — only non-blocking redacted findings remain, and continuing
-  requires explicit confirmation.
+- `warnings` — redacted scanner warnings or qualified Advisory author acceptance
+  remain disclosed; original critic findings retain their actual severity.
+  Continuing requires explicit confirmation.
 - `needs_attention` — the content, version, or full review still needs work, but
   the ordinary managed publication task may start so Ouroboros can repair and
   re-review it.
@@ -1470,7 +1521,8 @@ Only literal Betterleaks `high` confidence blocks an outbound publication call.
 `medium`, `low`, missing, and unknown confidence remain redacted warnings. For
 an intentional provider-shaped fixture, Ouroboros may add Betterleaks's
 exact-line `betterleaks:allow` annotation. That byte edit makes the hash-bound
-skill review stale, so a fresh full `skill_review` is mandatory before retrying.
+critic review stale, so the current bytes need fresh critic authority or qualified
+Advisory author finish before retrying; scanner approval alone supplies neither.
 The audit pass records the suppressed exact line as an audited false positive.
 Remove or rotate a real credential instead of allowing it.
 

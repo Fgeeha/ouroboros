@@ -4,7 +4,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { hubListingRowFor, hubSyncVerdict } from '../modules/hub_sync.js';
+import { hubFactsPending, hubListingRowFor, hubSyncVerdict } from '../modules/hub_sync.js';
 
 const HASH_A = 'a'.repeat(64);
 const HASH_B = 'b'.repeat(64);
@@ -101,6 +101,12 @@ test('version comparison is string inequality only (no semver ordering)', () => 
         {},
     );
     assert.equal(verdict.action, 'update');
+});
+
+test('hubFactsPending: only an explicit null is "not known yet"', () => {
+    assert.equal(hubFactsPending([{ official_hub_verified: true }, { official_hub_verified: null }]), true);
+    assert.equal(hubFactsPending([{ official_hub_verified: false }, { name: 'external-row' }]), false);
+    assert.equal(hubFactsPending(undefined), false);
 });
 
 test('verified hub bucket -> published badge rides ONLY official_hub_verified===true', () => {

@@ -499,6 +499,10 @@ def _addressed_wakes(ctx: Any, state: dict[str, Any]) -> list[dict[str, Any]]:
             "provenance": str(entry.get("provenance") or "owner"),
             "source_task_id": str(entry.get("source_task_id") or ""),
             "relayed_from_task_id": str(entry.get("relayed_from_task_id") or ""),
+            # The peer relation the drain projected (sibling / parent): the sender's
+            # typed place, carried so a wake never signs a child or sibling as an
+            # ancestor or owner (the same fact the round-top prefix reads).
+            **({"relation": str(entry["relation"])} if str(entry.get("relation") or "") else {}),
             "text": str(entry.get("text") or ""),
             "ts": str(entry.get("ts") or ""),
         }
@@ -567,10 +571,14 @@ def _wake_event_summary(event: Any) -> dict[str, Any]:
         elif payload:
             summary["beacon"]["payload_available_in_full_source"] = True
         return summary
+    # Sender attribution (provenance, relayed-from identity, peer relation) rides the
+    # reduced projection too: a spilled wake must still say WHO wrote the text and
+    # in what place, or the model reads an addressed contribution as unsigned.
     summary = {
         key: event.get(key)
         for key in (
-            "type", "kind", "msg_id", "source_task_id", "child_task_id",
+            "type", "kind", "msg_id", "provenance", "source_task_id",
+            "relayed_from_task_id", "relation", "child_task_id",
             "status", "updated_at", "result_sha256",
         )
         if event.get(key) not in (None, "")
@@ -630,7 +638,8 @@ def _render_wake_payload(ctx: Any, payload: dict[str, Any]) -> ToolResult:
     # refusal too large to inline would read as a successful wait.
     envelope: dict[str, Any] = {
         key: (str(value)[:600] if isinstance(value, str) else value)
-        for key in ("status", "ok", "host_code", "run_id", "state", "last_seq", "reason")
+        for key in ("status", "ok", "host_code", "run_id", "state", "last_seq", "reason",
+                    "continuation", "continuation_note")
         if (value := payload.get(key)) not in (None, "")
     }
     envelope["supervision_wake_id"] = wake_id
@@ -674,6 +683,7 @@ def _render_wake_payload(ctx: Any, payload: dict[str, Any]) -> ToolResult:
             **({"ok": False, "host_code": str(payload.get("host_code") or "")}
                if payload.get("ok") is False else {}),
             "run_id": str(payload.get("run_id") or "")[:200],
+            **{key: payload[key] for key in ("continuation", "continuation_note") if key in payload},
             "supervision_wake_id": wake_id,
             "coordination_context": {"state": "available_in_full_wake_source"},
             "wake_delivery": envelope["wake_delivery"],
@@ -865,12 +875,24 @@ def supervised_wait(
 ) -> ToolResult:
     """Renew quiet windows internally and return only a meaningful wake batch."""
 
-    if (checkpoint_after_sec is None) != (not str(checkpoint_reason or "").strip()):
+    reason_text = str(checkpoint_reason or "").strip()
+    ignored_note = ""
+    if checkpoint_after_sec == 0 and not reason_text and not isinstance(checkpoint_after_sec, bool):
+        # The schema's empty pair asks for no checkpoint: the omitted path, said in the wake.
+        checkpoint_after_sec = None
+        from ouroboros.tools.arg_feedback import ignored_argument_note
+
+        ignored_note = ignored_argument_note(
+            "checkpoint_after_sec", 0, "with an empty checkpoint_reason it asks for no checkpoint")
+    if (checkpoint_after_sec is None) != (not reason_text):
         # The family's ONE refusal author, not a second literal envelope beside
         # it: this is an argument fault, and it is recorded as one.
+        missing = "checkpoint_after_sec" if checkpoint_after_sec is None else "checkpoint_reason"
         return _fail(
             "delegate_wait", "checkpoint_requires_time_and_reason",
-            "checkpoint_after_sec and non-empty checkpoint_reason must be supplied together.",
+            f"got checkpoint_after_sec={checkpoint_after_sec!r}, checkpoint_reason={reason_text!r}: "
+            f"{missing} is missing. Supply both for one proactive inspection, or omit both "
+            "(0 with an empty reason also means none).",
         )
     owns_transport = wait_once is None
     if wait_once is None:
@@ -988,6 +1010,8 @@ def supervised_wait(
                 if wakes:
                     payload["wake_events"] = wakes
                 payload["coordination_context"] = coordination_live_context(ctx)
+                if ignored_note:
+                    payload["ignored_arguments"] = [ignored_note]
                 wake_id = uuid.uuid4().hex
                 payload["supervision_wake_id"] = wake_id
                 state["status"] = "wake_pending"

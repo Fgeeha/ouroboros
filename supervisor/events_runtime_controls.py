@@ -59,7 +59,7 @@ def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
                     int(st["owner_chat_id"]),
                     "❌ Evolution promotion refused: the exact reviewed campaign claim "
                     f"is no longer valid ({authority.get('reason') or 'unknown'}).",
-                )
+                    role="system", system_type="promotion_notice")
             return
         try:
             dev_sha = sp.run(
@@ -75,7 +75,7 @@ def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
                     int(st["owner_chat_id"]),
                     "❌ Evolution promotion refused: the development branch no longer "
                     "matches the reviewed commit receipt.",
-                )
+                    role="system", system_type="promotion_notice")
             return
         # Promote the exact reviewed SHA (TOCTOU-safe: the dev branch may move
         # between the check above and the ref update inside promote_branch_exact).
@@ -102,7 +102,7 @@ def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
             ctx.send_with_budget(
                 int(st["owner_chat_id"]),
                 f"❌ Failed to promote to stable: {result.get('error') or 'unknown error'}",
-            )
+                role="system", system_type="promotion_notice")
         return
 
     st = ctx.load_state()
@@ -117,7 +117,7 @@ def _handle_promote_to_stable(evt: Dict[str, Any], ctx: Any) -> None:
         ctx.send_with_budget(
             int(st["owner_chat_id"]),
             f"✅ Promoted: {ctx.BRANCH_DEV} → {ctx.BRANCH_STABLE} ({new_sha[:8]}){remote_status}",
-        )
+            role="system", system_type="promotion_notice")
 
 
 def _handle_cancel_task(evt: Dict[str, Any], ctx: Any) -> None:
@@ -183,7 +183,7 @@ def _drive_cancel_task_event(evt: Dict[str, Any], ctx: Any) -> None:
         is_progress=True,
         task_id=display_task_id,
         progress_meta=incident_meta,
-    )
+        role="system", system_type="cancellation_notice")
 
 
 def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
@@ -214,7 +214,7 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
         if block:
             st = ctx.load_state()
             if st.get("owner_chat_id"):
-                ctx.send_with_budget(int(st["owner_chat_id"]), block)
+                ctx.send_with_budget(int(st["owner_chat_id"]), block, role="system", system_type="evolution_notice")
             return
         # GR4-6: an OWNER start clears the durable owner-stop flag BEFORE the
         # campaign is minted. The old order (campaign first, flag cleared in a
@@ -256,7 +256,7 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
                 ctx.send_with_budget(
                     int(st["owner_chat_id"]),
                     "🧬 Evolution stayed OFF: campaign state could not be created.",
-                )
+                    role="system", system_type="evolution_notice")
             return
     from supervisor.state import update_state
 
@@ -324,7 +324,7 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
     if st.get("owner_chat_id"):
         owner_chat = int(st["owner_chat_id"])
         for line in stop_lines:
-            ctx.send_with_budget(owner_chat, line)
+            ctx.send_with_budget(owner_chat, line, role="system", system_type="evolution_notice")
         if enabled:
             state_str = "ON"
         elif stop_incomplete:
@@ -334,7 +334,7 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
                          "/evolve start")
         else:
             state_str = "OFF — post-task auto-evolution also paused until /evolve start"
-        ctx.send_with_budget(owner_chat, f"🧬 Evolution: {state_str} (via agent tool)")
+        ctx.send_with_budget(owner_chat, f"🧬 Evolution: {state_str} (via agent tool)", role="system", system_type="evolution_notice")
 
 
 def _handle_toggle_consciousness(evt: Dict[str, Any], ctx: Any) -> None:
@@ -354,7 +354,7 @@ def _handle_toggle_consciousness(evt: Dict[str, Any], ctx: Any) -> None:
                   f"last outcome: {snapshot.get('last_wake_outcome') or 'none yet'}")
     st = ctx.load_state()
     if st.get("owner_chat_id"):
-        ctx.send_with_budget(int(st["owner_chat_id"]), f"🧠 {result}")
+        ctx.send_with_budget(int(st["owner_chat_id"]), f"🧠 {result}", role="system", system_type="consciousness_notice")
 
 
 def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:

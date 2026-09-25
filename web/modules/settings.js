@@ -1,4 +1,6 @@
-import { refreshModelCatalog } from './settings_catalog.js';
+import { refreshModelCatalog, watchAccountModelCatalog } from './settings_catalog.js';
+export { accountCatalogRefreshKey } from './settings_catalog.js';
+import { getNotifier } from './notifications.js';
 import { bindEffortSegments, syncEffortSegments, readCustomSecretDraft, collectCustomSecretDraft, paintSettingsFieldErrors, settingsWriteFailure } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
 import { applyMcpSettings, collectMcpSettings, initMcpSettings, validateMcpSettings } from './mcp_settings.js';
@@ -19,7 +21,6 @@ import { initHarnessAccounts } from './harness_accounts.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { PROVIDER_TEST_INPUTS, SECRET_KEYS, bindSecretInputs, bindSettingsTabs, renderSettingsPage } from './settings_ui.js';
 import { showToast } from './toast.js';
-import { bindThemeSegments } from './theme.js';
 import { escapeHtmlAttr as escapeHtml, formatDualVersion } from './utils.js';
 import { apiClient, apiFetch, cleanExtensionRoute, extensionRoutePath } from './api_client.js';
 import { claudexorStatus } from './claudexor_status_store.js';
@@ -27,8 +28,7 @@ import { createModelRolesEditor, modelRoleMap } from './model_roles.js';
 import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY } from './route_editor_primitives.js';
 import { collectSafeFieldValues, normalizeTone, renderSafeField, setInlineStatus, revealNewRow } from './ui_helpers.js';
 import { extensionActionStatus } from './extension_status_text.js';
-import { currentLanguage, setLanguage, storedLanguage } from './i18n.js';
-import { isReasoningVisible, REASONING_VISIBILITY_EVENT, setReasoningVisible } from './log_events.js';
+import { bindLanguageSegments } from './i18n.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
@@ -53,6 +53,8 @@ const INPUT_FIELDS = [
     ['s-evo-budget', 'OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD', '0'],
     ['s-consciousness-daily-usd', 'OUROBOROS_CONSCIOUSNESS_DAILY_USD', '20'],  // float: NUMBER_FIELDS would truncate 20.5 to 20
     ['s-evo-objective', 'OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE', ''],
+    // Optional task bounds: a positive integer or "unlimited" (SSOT: ouroboros/settings_scales.py); a blank is refused by the server.
+    ['s-max-rounds', 'OUROBOROS_MAX_ROUNDS', 'unlimited'], ['s-task-lifetime', 'OUROBOROS_TASK_ABS_CEILING_SEC', 'unlimited'],
 ];
 const VALUE_FIELDS = [
     // 6.3: Review / Scope Review efforts are per-slot rows in Agents → Review
@@ -443,41 +445,6 @@ export async function confirmAndSendRestart({ openConfirmDialog: confirmDialog, 
     return result?.status === 'sent' ? 'sent' : 'not_connected';
 }
 
-function bindLanguageSegments(page) {
-    const buttons = Array.from(page.querySelectorAll('[data-language-group] [data-language-value]'));
-    const sync = (lang) => buttons.forEach((button) => {
-        const on = button.dataset.languageValue === lang;
-        button.classList.toggle('active', on);
-        button.setAttribute('aria-pressed', String(on));
-    });
-    sync(currentLanguage() || storedLanguage());
-    window.addEventListener('ouro:language-changed', (event) => sync(event.detail?.language || 'en'));
-    buttons.forEach((button) => button.addEventListener('click', async () => {
-        const lang = button.dataset.languageValue;
-        if (lang === currentLanguage()) return;
-        await setLanguage(lang);
-        apiClient.saveUiPreferences({ language: lang }).catch(() => showToast('Language choice could not be saved.', 'error'));
-    }));
-}
-
-/** Settings -> Behavior display toggle for the agent's reasoning rows. Like the
-    theme control it applies + persists on its own and must never touch the
-    settings draft, so its change event stops before the page-level dirty
-    listener sees it. */
-function bindReasoningToggle(page) {
-    const box = page.querySelector('#ui-show-reasoning');
-    if (!box) return;
-    const sync = () => { box.checked = isReasoningVisible(); };
-    box.addEventListener('change', (event) => {
-        event.stopPropagation();
-        const show = setReasoningVisible(box.checked);
-        apiClient.saveUiPreferences({ show_reasoning: show })
-            .catch(() => showToast('Reasoning display choice could not be saved.', 'error'));
-    });
-    window.addEventListener(REASONING_VISIBILITY_EVENT, sync);
-    sync();
-}
-
 export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const page = document.createElement('div');
     page.id = 'page-settings';
@@ -493,12 +460,16 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const disposeSettingsTabs = bindSettingsTabs(page, { state });
     bindSecretInputs(page);
     bindEffortSegments(page);
-    // Theme and language are owner-local UI preferences, not part of the settings
-    // draft: each applies on click and persists on its own, never marking the page dirty.
-    bindThemeSegments(page);
-    bindLanguageSegments(page);
-    bindReasoningToggle(page);
-    const disposeLocalModel = bindLocalModelControls({ state });
+    // Appearance is client-local and injected after boot; never a server setting.
+    globalThis.ouroTheme?.mount();
+    // Notification preferences are client-local for the same reason; the module
+    // owns delegated handlers, so mounting only paints current state.
+    getNotifier().mountSettings(page);
+    // Language applies on click and persists on its own; it never marks the page dirty.
+    bindLanguageSegments(page, (language) => apiClient.saveUiPreferences({ language })
+        .catch(() => showToast('Language choice could not be saved.', 'error')));
+    const disposeLocalModel = bindLocalModelControls({ state,
+        onApplication: (local) => syncRestartState({ ...restartState, local_model: local }) });
     // Best-effort About version from /api/health.
     apiFetch('/api/health')
         .then((r) => (r.ok ? r.json() : Promise.reject(new Error(`HTTP ${r.status}`))))
@@ -514,6 +485,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     let settingsDirty = false;
     let draftRevision = 0;
     let loadSequence = 0;
+    let restartReadSequence = 0;
+    let restartState = { restart_required: false };
     let settingsSaving = false;
     let saveOutcomeUnknown = false;
     let validationAttempted = false;
@@ -546,6 +519,25 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     function syncProcessingPreference(settings) {
         setSubagentsProcessingPreference(settings[PROCESSING_PREFERENCE_KEY]);
         setReviewerProcessingPreference(settings[PROCESSING_PREFERENCE_KEY], modelRoleMap(settings[MODEL_PROCESSING_PREFERENCES_KEY]));
+    }
+
+    function syncRestartState(value) {
+        if (!value || typeof value.restart_required !== 'boolean') return;
+        restartState = value;
+        const restartAvailable = value.restart_required || value.restart_source_unknown_keys?.length > 0;
+        byId('btn-restart-now').hidden = !restartAvailable;
+        const text = [value.summary, value.local_model?.summary].filter(Boolean).join(' ');
+        const target = byId('settings-restart-status');
+        target.hidden = !text;
+        setInlineStatus(target, text, restartAvailable || value.local_model?.pending_keys?.length ? 'warn' : 'muted');
+    }
+
+    async function refreshRestartState() {
+        const sequence = ++restartReadSequence;
+        try {
+            const data = await apiClient.settings();
+            if (sequence === restartReadSequence) syncRestartState(data?._meta?.restart_state);
+        } catch { /* An unavailable read cannot clear a known pending change. */ }
     }
 
     function syncSettingsLoadState() {
@@ -801,6 +793,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
 
     async function loadSettings() {
         const sequence = ++loadSequence;
+        const restartSequence = ++restartReadSequence;
         const revision = draftRevision;
         const [data, extData] = await Promise.all([
             apiClient.settings(),
@@ -809,6 +802,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         if (!data || typeof data !== 'object' || Array.isArray(data) || data.error) {
             throw new Error(data?.error || 'The server did not return a settings document.');
         }
+        if (restartSequence === restartReadSequence) syncRestartState(data._meta?.restart_state);
         const sections = Array.isArray(extData?.live?.settings_sections)
             ? extData.live.settings_sections
             : [];
@@ -861,6 +855,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                     'warn'
                 );
             }
+            // Catalog readiness is independent of Settings GET completion:
+            // a superseding page-show load may still be waiting for its document.
+            // Arm after discovery so its settled Accounts snapshot stays quiet.
+            accountModelCatalog.arm();
         } catch (error) {
             if (reloadSequence !== loadSequence) return;
             settingsLoaded = false;
@@ -875,6 +873,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     async function refreshSettingsAfterExtensionChange(reason = 'skills changed') {
         if (extensionRefreshPending || settingsSaving || saveOutcomeUnknown) return;
         if (settingsDirty) {
+            await refreshRestartState();
             setStatus(`Settings changed externally (${reason}). Reload after saving or discarding your draft.`, 'warn');
             return;
         }
@@ -1124,8 +1123,16 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
     }
 
-    page.addEventListener('input', onSettingsEdited);
-    page.addEventListener('change', onSettingsEdited);
+    // Client-local blocks (appearance, notifications) live on the Appearance
+    // tab but never enter the /api/settings payload, so their controls must not
+    // make the server draft dirty — otherwise toggling one would ask the owner
+    // to discard "unsaved settings" that do not exist.
+    const onServerSettingEdited = (event) => {
+        if (event?.target?.closest?.('[data-notify-settings]')) return;
+        onSettingsEdited();
+    };
+    page.addEventListener('input', onServerSettingEdited);
+    page.addEventListener('change', onServerSettingEdited);
     page.addEventListener('click', (event) => {
         if (event.target.closest('[data-effort-value], .secret-clear, [data-row-secret-clear], [data-custom-secret-remove]')) {
             queueMicrotask(() => {
@@ -1159,9 +1166,20 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             refreshSettingsAfterExtensionChange(action);
         });
     }
+    // A confirmed Accounts facet is the existing status-store seam for login
+    // completion. It refreshes the catalog only on a changed/rehydrated account
+    // answer, while modelRoles.adoptCatalog keeps unsaved assignments intact.
+    const accountModelCatalog = watchAccountModelCatalog();
+    const disposeRestartReconnect = ws?.on?.('open', () => {
+        refreshRestartState();
+        if (settingsLoaded) void refreshModelCatalog();
+    });
 
     window.addEventListener('ouro:page-shown', (event) => {
-        if (event.detail?.page === 'settings') refreshSettingsAfterExtensionChange('settings page shown');
+        if (event.detail?.page === 'settings') {
+            refreshSettingsAfterExtensionChange('settings page shown');
+            if (settingsLoaded) void refreshModelCatalog();
+        }
     });
 
     const onModelCatalog = (event) => modelRoles.adoptCatalog(event.detail);
@@ -1175,6 +1193,9 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         disposeSettingsTabs();
         window.removeEventListener('beforeunload', beforeUnload);
         disposeLocalModel();
+        disposeRestartReconnect?.();
+        accountModelCatalog.dispose();
+        restartReadSequence += 1;
         baselineSettleDisposer?.();
         modelRoles.destroy();
         document.removeEventListener('settings-model-catalog:updated', onModelCatalog);
@@ -1258,10 +1279,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         await reloadSettingsWithFeedback();
     });
 
-    // #285: true from a restart-required save until the restart command is
-    // actually sent — keeps the Restart now affordance across later saves.
-    let restartPending = false;
-
     byId('btn-save-settings').addEventListener('click', async () => {
         if (settingsSaving || saveOutcomeUnknown) return;
         if (!settingsLoaded) {
@@ -1300,9 +1317,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         settingsSaving = true;
         setButtonBusy(saveButton, true);
         setStatus('Saving…', 'muted');
-        // A pending restart LATCHES: a later save that needs no restart must
-        // not hide the button while the process still runs the old config.
-        if (!restartPending) byId('btn-restart-now')?.setAttribute('hidden', '');
         let saved = false;
         try {
             const data = await apiClient.saveSettings(body);
@@ -1358,6 +1372,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             } else if (data.restart_required) {
                 statusMsg = 'Settings saved. Some changes require a restart to take effect';
                 statusType = 'warn';
+            } else if (data.restart_state?.summary || data.restart_state?.local_model?.summary) {
+                statusMsg = 'Settings saved';
             } else if (data.immediate_changed && data.next_task_changed) {
                 statusMsg = 'Settings saved. Some changes took effect immediately; others apply on the next task';
             } else if (data.immediate_changed) {
@@ -1411,10 +1427,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                 statusType = 'warn';
             }
             setStatus(statusMsg, statusType);
-            if (data.restart_required || runtimeModeResult?.restart_required) {
-                restartPending = true;
-            }
-            if (restartPending) byId('btn-restart-now')?.removeAttribute('hidden');
+            syncRestartState(data.restart_state);
+            await refreshRestartState();
             window.dispatchEvent(new CustomEvent('ouro:settings-updated', { detail: { reason: 'settings saved', source: 'settings' } }));
         } catch (e) {
             const receipt = e?.body || e?.payload;
@@ -1435,8 +1449,6 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     byId('btn-restart-now')?.addEventListener('click', async () => {
         const outcome = await confirmAndSendRestart({ openConfirmDialog, ws });
         if (outcome === 'sent') {
-            restartPending = false;
-            byId('btn-restart-now')?.setAttribute('hidden', '');
             setStatus('Restart requested. If the agent refuses, the reason appears in the main chat.', 'muted');
         } else if (outcome === 'not_connected') {
             setStatus('Not connected — the restart command was not sent.', 'warn');

@@ -135,7 +135,7 @@ def _drain_incoming_messages(
             break
 
     if drive_root is not None and task_id:
-        from ouroboros.owner_mailbox import KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_TASK_MESSAGE, PROVENANCE_INDEPENDENT_TASK, acknowledge_transcript_entry, deliver_quiz_answer, deliver_task_message, drain_owner_entries
+        from ouroboros.owner_mailbox import CONTEXT_ONLY_TASK_PROVENANCES, KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_TASK_MESSAGE, acknowledge_transcript_entry, deliver_quiz_answer, deliver_task_message, drain_owner_entries
 
         if owner_ctx:
             owner_ctx._loop_mailbox_seen_ids = _owner_msg_seen
@@ -170,7 +170,7 @@ def _drain_incoming_messages(
                 # owner's messages supersede a reviewed answer). The typed provenance
                 # and the sender id ride the row, the injected event and the ack.
                 provenance = str(entry.get("provenance") or "ancestor_task")
-                if provenance not in {"system", "descendant_task", PROVENANCE_INDEPENDENT_TASK}:
+                if provenance not in CONTEXT_ONLY_TASK_PROVENANCES:
                     _loop()._record_owner_directive(
                         owner_ctx, content=dmsg, msg_id=str(entry.get("msg_id") or ""),
                         source=("relayed_peer_message" if provenance == "peer_via_ancestor"
@@ -182,6 +182,8 @@ def _drain_incoming_messages(
                     entry, task_id, event_queue,
                     lambda text: _loop()._append_or_merge_user_message(messages, text, slot=owner_ctx),
                 )
+                if provenance == "system" and isinstance(entry.get("review_feedback"), dict) and messages:
+                    messages[-1].setdefault("review_feedback", []).append(dict(entry["review_feedback"]))
                 acknowledge_transcript_entry(drive_root, task_id, entry)
                 continue
             if kind == KIND_QUIZ_ANSWER:
@@ -262,48 +264,42 @@ def _run_round_compaction(
     folded into a rewrite, and precedes the acceptance observation and the seal."""
     from ouroboros.peer_roster import maybe_append_roster_note
 
-    messages, usage = _run_round_reclaim(messages, ctx)
-    maybe_append_roster_note(ctx.tools._ctx, messages, ctx.drive_root)
-    return messages, usage
-
-
-def _run_round_reclaim(
-    messages: List[Dict[str, Any]],
-    ctx: _CompactionRoundContext,
-) -> Tuple[List[Dict[str, Any]], Optional[Dict[str, Any]]]:
-    """Run only an explicit manual reclaim; Main fit owns automatic decisions."""
+    # Only an explicit manual reclaim runs here; Main fit owns automatic decisions.
+    usage: Optional[Dict[str, Any]] = None
     pending = getattr(ctx.tools._ctx, "_pending_compaction", None)
     selected_names = getattr(ctx.tools._ctx, "_pending_tool_schema_names", None)
     if pending is None and selected_names is None:
-        return messages, None
-    if isinstance(pending, dict) or pending is None:
-        return _run_authored_context_view(messages, ctx, pending, selected_names), None
-    ctx.tools._ctx._pending_compaction = None
-    rebuilt, receipt, usage = _loop().compact_tool_history_llm(
-        messages,
-        keep_recent=max(0, int(pending)),
-        drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
-        task_id=ctx.task_id,
-        negative_memo=reclaim_negative_memo(ctx.tools._ctx),
-        trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
-    )
-    _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
-        "checkpoint_kind": "context_reclaim_manual",
-        "round": ctx.round_idx,
-        "status": receipt.status,
-        "reclaimed_tokens": receipt.reclaimed_tokens,
-        "goal_reached": receipt.goal_reached,
-        "checkpoint_ref": receipt.checkpoint_ref,
-    })
-    if receipt.status in {"checkpoint_failed", "summarizer_failed", "binding_mismatch"}:
-        ctx.emit_progress(
-            f"⚠️ Context compaction kept the transcript unchanged ({receipt.status})."
+        pass
+    elif isinstance(pending, dict) or pending is None:
+        messages = _run_authored_context_view(messages, ctx, pending, selected_names)
+    else:
+        ctx.tools._ctx._pending_compaction = None
+        messages, receipt, usage = _loop().compact_tool_history_llm(
+            messages,
+            keep_recent=max(0, int(pending)),
+            drive_root=ctx.drive_root or pathlib.Path(ctx.drive_logs).parent,
+            task_id=ctx.task_id,
+            negative_memo=reclaim_negative_memo(ctx.tools._ctx),
+            trace_refs_by_tool_call_id=reclaim_trace_refs(ctx.tools._ctx),
         )
-    if receipt.status == "applied":
-        invalidate_task_cache_splits(ctx.task_id)
-        prune_reclaim_trace_refs(ctx.tools._ctx, rebuilt)
-        sanction_rewrite(ctx.tools._ctx, "compaction")
-    return rebuilt, usage
+        _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+            "checkpoint_kind": "context_reclaim_manual",
+            "round": ctx.round_idx,
+            "status": receipt.status,
+            "reclaimed_tokens": receipt.reclaimed_tokens,
+            "goal_reached": receipt.goal_reached,
+            "checkpoint_ref": receipt.checkpoint_ref,
+        })
+        if receipt.status in {"checkpoint_failed", "summarizer_failed", "binding_mismatch"}:
+            ctx.emit_progress(
+                f"⚠️ Context compaction kept the transcript unchanged ({receipt.status})."
+            )
+        if receipt.status == "applied":
+            invalidate_task_cache_splits(ctx.task_id)
+            prune_reclaim_trace_refs(ctx.tools._ctx, messages)
+            sanction_rewrite(ctx.tools._ctx, "compaction")
+    maybe_append_roster_note(ctx.tools._ctx, messages, ctx.drive_root)
+    return messages, usage
 
 
 def _run_authored_context_view(messages, ctx, pending, selected_names):
@@ -328,10 +324,11 @@ def _run_authored_context_view(messages, ctx, pending, selected_names):
                if selected_names is not None else list(current_tools))
     fit_candidate = ctx.fit_candidate
     if fit_candidate is None:
-        tool_ctx._pending_compaction = None
-        tool_ctx._pending_tool_schema_names = None
-        ctx.emit_progress("Context view kept unchanged: prospective physical fit is unavailable.")
-        return messages
+        # Main's applied route/mode already live on its tool context, including
+        # after a wait or fallback; do not carry a second routing snapshot here.
+        fit_candidate = lambda candidate, selected: _loop()._measure_main_context_view(
+            getattr(tool_ctx, "context_fit_plan", None), candidate, selected,
+            mode, getattr(tool_ctx, "active_effort", "medium"), str(ctx.round_idx))
     if pending is None:
         # Schema-only enablement uses the same candidate fit/publication. It
         # does not fabricate an authored note or rewrite existing history.
@@ -414,7 +411,7 @@ class _RoundLimitContext:
     accumulated_usage: Dict[str, Any]
     task_type: str
     active_use_local: bool
-    max_rounds: int
+    max_rounds: Optional[int]  # None = no round limit (the round gate never fires)
     deadline_ts: Optional[float] = None
     # Drive root for durable salvage (latest_llm_response_text) on the provider-death
     # path; optional so existing positional construction stays valid.
@@ -595,6 +592,30 @@ def _handle_provider_unavailable(
     return text, usage, llm_trace
 
 
+def _loop_exit_after_exception(
+    exc: BaseException, ctx: Optional[_RoundLimitContext], exit_ctx: Any, llm_trace: Dict[str, Any],
+    transport_episode: Optional[TransportWaitEpisode],
+) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
+    """The loop's outer exception exit: a budget-pause HOLD ended by the task's own
+    controls (Stop/Panic/deadline/lifetime) raises ``ModelWaitInterrupted`` OUTSIDE
+    the model-call try, and it rejoins the SAME control rails a live wait uses (a
+    truthful no-call deadline/stop terminal), never the generic task exception. An
+    interruption those rails already routed once (the model-call handler re-raises
+    Stop for the supervisor's settlement) and every other exception re-raise with
+    their loop evidence attached."""
+    from ouroboros.model_wait import ModelWaitInterrupted
+
+    controlled = None
+    if isinstance(exc, ModelWaitInterrupted) and ctx is not None and not getattr(exc, "control_rails_seen", False):
+        controlled = _handle_model_wait_control(ctx, exc, transport_episode=transport_episode)
+    if controlled is None:
+        exit_ctx.attach_exception_evidence(exc)
+        raise exc
+    text, accumulated_usage, forced_trace = controlled
+    _loop()._merge_finalization_trace(llm_trace, forced_trace)
+    return text, accumulated_usage, llm_trace
+
+
 def _handle_model_wait_control(
     ctx: _RoundLimitContext, error: Any, *, transport_episode: Optional[TransportWaitEpisode] = None,
 ) -> Optional[Tuple[str, Dict[str, Any], Dict[str, Any]]]:
@@ -608,6 +629,11 @@ def _handle_model_wait_control(
     from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait
 
     reason = error.control_reason
+    # Routed ONCE: whatever this rail re-raises is final for the loop (the
+    # supervisor owns a Stop's settlement); the loop's outer handler, which
+    # catches a hold's interruption raised outside the model call, must not
+    # hand the same error back here.
+    error.control_rails_seen = True
     if reason not in {"cancelled", "finalize_requested", "deadline", "execution_deadline", "absolute_ceiling"}:
         raise error
     owner = current_model_wait()
@@ -615,7 +641,9 @@ def _handle_model_wait_control(
     intent = active_intent(root, ctx.task_id) if root is not None else None
     hard_stop = isinstance(intent, dict) and stop_policy(intent) == STOP_POLICY_IMMEDIATE
     if hard_stop and owner is not None and owner.worker_slot_held:
-        raise ModelWaitInterrupted("cancelled", role=error.model_role, cause=error) from error
+        final = ModelWaitInterrupted("cancelled", role=error.model_role, cause=error)
+        final.control_rails_seen = True
+        raise final from error
 
     controls = _drain_incoming_messages(
         ctx.messages, ctx.incoming_messages or queue.Queue(), ctx.drive_root,

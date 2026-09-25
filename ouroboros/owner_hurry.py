@@ -34,6 +34,9 @@ import logging
 import pathlib
 from typing import Any, Callable, Dict, List, Optional
 
+from ouroboros.review_projection import (
+    PLAN_REVIEW_ANSWERED_OPEN, PLAN_REVIEW_NONE_ANSWERED, PLAN_REVIEW_UNANSWERED,
+)
 from ouroboros.utils import update_json_locked, utc_now_iso
 
 log = logging.getLogger(__name__)
@@ -454,6 +457,64 @@ def _plan_review_engaged(state: Any) -> bool:
                 or legacy.get("status") not in (None, "", "absent"))
 
 
+def plan_wave_only_awaited(wave: Any) -> bool:
+    """Whether the wave is open ONLY because reviewers had not answered yet.
+
+    Typed facts alone: every unanswered slot is a planned wait that carries no answer
+    (the census names no unresolved, uncollected, refused or failed slot), and the
+    recorded answers hold no verdict of their own beneath the stored placeholder. A
+    collected blocking or ``need_evidence`` finding keeps the wave open whatever the
+    awaited slots answer, and a quorum of answers that raised findings IS a critic
+    verdict the wait merely postpones — neither reads as a mere wait. A roster or a
+    quorum the typed facts cannot vouch for is never a mere wait either."""
+    from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
+
+    if not isinstance(wave, dict) or not wave.get("custody_pending"):
+        return False
+    roster, findings = wave.get("actors"), wave.get("findings") or []
+    census = plan_wave_slot_census(wave)
+    if (not isinstance(roster, list) or len(roster) != census["configured"] or not census["awaiting"]
+            or any(census[name] for name in ("unresolved", "uncollected", "skipped", "failed"))
+            or any(row.get("ok") or row.get("parsed") is not None or str(row.get("raw_text") or "").strip()
+                   for row in census["awaiting"])):
+        return False
+    counts = wave.get("counts") if isinstance(wave.get("counts"), dict) else {}
+    quorum = counts.get("quorum")
+    if (type(quorum) is not int or quorum <= 0 or not isinstance(findings, list)
+            or any(not isinstance(item, dict) or item.get("class") != "note" for item in findings)):
+        return False
+    return len(census["answered"]) < quorum or not findings
+
+
+def plan_review_class_facts(wave: Any, *, awaited: bool) -> Dict[str, Any]:
+    """The typed outcome CLASS of an OPEN plan wave at delivery, with its answer counts.
+
+    Closed vocabulary (``review_projection``): ``answered_open`` — every slot
+    answered and the verdict was not closed; ``unanswered`` — at least one slot
+    answered and at least one failed, was refused at $0, expired or was never
+    collected; ``none_answered`` — nobody answered and at least one slot failed, was refused
+    or is unresolved (an awaited sibling does not hide that). The
+    awaited case is ``review_only_awaited`` and carries no class; the counts ride in
+    every case for the mind's own reading of the gate."""
+    from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
+
+    census = plan_wave_slot_census(wave)
+    answered, configured = len(census["answered"]), int(census["configured"])
+    facts: Dict[str, Any] = {"reviewers_answered": answered, "reviewers_configured": configured}
+    silent = any(census[name] for name in ("failed", "skipped", "unresolved", "uncollected"))
+    if awaited or not configured:
+        return facts
+    if answered == configured:
+        facts["plan_review_class"] = PLAN_REVIEW_ANSWERED_OPEN
+    elif answered and silent:
+        facts["plan_review_class"] = PLAN_REVIEW_UNANSWERED
+    elif not answered and silent:
+        # Nobody answered and at least one reviewer failed, was refused or is unresolved:
+        # an awaited sibling does not turn that into "work went on with what they said".
+        facts["plan_review_class"] = PLAN_REVIEW_NONE_ANSWERED
+    return facts
+
+
 def force_plan_decision(
     ctx: Any, llm_trace: Dict[str, Any], *,
     hard_rail: str = "", enforcement: Optional[str] = None,
@@ -523,6 +584,16 @@ def force_plan_decision(
         # wave DEGRADED and open for exactly that reason), so the disclosure must
         # say a result is still owed instead of implying the panel is over.
         decision["review_late_result_pending"] = True
+        # An advisory release over a wave that is merely awaited is a gap, not a
+        # degradation: the disclosure stays loud and the task is not stamped for it.
+        # A rail, a spent cap and every blocking exit keep their own outcome.
+        if (decision.get("status") == "advisory_open" and not hard_rail
+                and not decision.get("review_capacity_reason") and plan_wave_only_awaited(wave)):
+            decision["review_only_awaited"] = True
+    if wave:
+        # The open wave's typed outcome class and its answer counts ride the decision
+        # into the delivery record (outcomes.derive_loop_outcome) and the forced prompt.
+        decision.update(plan_review_class_facts(wave, awaited=bool(decision.get("review_only_awaited"))))
     if hurry_armed and str(enforcement or "").lower() == "blocking":
         # Attribution only (task detail); this changes no global enforcement.
         decision["owner_hurry_local_advisory"] = True
@@ -628,6 +699,17 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
             "dispositions remain available; a disposition does not close blocking findings "
             "or a degraded wave. Existing in-flight custody can still settle."
         )
+    if decision.get("historical_critic"):
+        # The aggregate and its custody/degraded facts belong to the plan this author
+        # REVISED, so none of the outcome-keyed advice below applies to the current one:
+        # telling the agent to dispose "the latest fingerprint" would point it at a wave
+        # that cannot approve these bytes.
+        return (
+            f"{tag} Plan review is OPEN: the referenced critic reviewed the EARLIER plan "
+            f"({outcome or 'unavailable'}); the revised plan has no verdict of its own. Call "
+            "plan_task with the current goal, plan and spec to have it reviewed — a disposition "
+            "on the earlier wave cannot approve the revised plan. Implementation stays held."
+        )
     if decision.get("custody_pending"):
         return (
             f"{tag} Plan review is OPEN: reviewer work is still running or awaiting collection. "
@@ -679,17 +761,38 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
         return ""
     outcome = str(decision.get("outcome") or "")
     if decision.get("custody_pending") or decision.get("review_late_result_pending"):
-        outcome = f"{outcome or 'open'}; reviewer work is running or awaiting collection"
+        # No verdict exists yet: the stored aggregate only keeps the wave open, so its token is not shown as one.
+        outcome = "reviewer work is running or awaiting collection"
     elif decision.get("reviewer_slots_degraded"):
         outcome = f"{outcome or 'open'}; no parseable reviewer quorum"
+    # A historical critic's aggregate is EVIDENCE about the plan the author corrected,
+    # never this plan's own verdict: unlabelled, "(GREEN)" reads to the owner as
+    # approval of bytes no reviewer ever saw.
+    if decision.get("historical_critic") and outcome:
+        outcome = (f"referenced critic review of the earlier plan: {outcome}; "
+                   "the current plan has no verdict of its own")
     subject = "Blocking plan review" if decision.get("enforcement") == "blocking" else "Plan review"
     # The wave is still OPEN at finalization, so the verb says so: "remained"
-    # told the owner a panel had ended that nobody had closed. When a paid slot
-    # can still settle, the same sentence carries that typed fact.
+    # told the owner a panel had ended that nobody had closed. When a slot can
+    # still settle, the same sentence carries that typed fact — never as "paid":
+    # a slot released at the barrier is $0 until its settled row proves the send.
     late = (
-        " A paid reviewer slot can still settle, so a late result is still owed."
+        " A reviewer slot can still settle, so a late result is still owed."
         if decision.get("review_late_result_pending") else ""
     )
+    # The author's decision and the rail that forced finalization are BOTH true, and
+    # the rail is what explains why the task ended. Returning the author sentence first
+    # dropped "the cap is spent; the task ends blocked" whenever both applied, so the
+    # author clause now rides the rail's own sentence instead of replacing it.
+    author_note = ""
+    if decision.get("author_action"):
+        action = str(decision["author_action"])
+        result = ("the author stopped with unfinished work" if action == "stop" else
+                  "the current plan was accepted by its author under advisory enforcement"
+                  if decision.get("allow") and decision.get("enforcement") == "advisory" else
+                  "the revised author plan has no current critic approval")
+        author_note = (f" Plan author decision: {action}; {result}. "
+                       "The author decision does not close or replace the critic review.")
     if decision.get("status") == "rail_degraded":
         rail_reason = str(forced_reason or decision.get("reason") or "")
         detail = f" ({outcome})" if outcome else ""
@@ -697,13 +800,13 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
         rail = f"the task-wide rail `{rail_reason}`" if rail_reason else "a task-wide rail"
         return (
             f"\n\n⚠️ {subject} is open{detail}; {rail} required best-effort "
-            f"finalization.{late}"
+            f"finalization.{author_note}{late}"
         )
     if decision.get("status") == "cycles_exhausted" and decision.get("enforcement") == "blocking":
         return (
             f"\n\n⚠️ Blocking plan review stayed open ({outcome or 'open'}) with the review-cycle "
             f"cap spent ({decision.get('cycles_paid')} paid cycle(s)); the task ends blocked "
-            "with its evidence recorded; the planned work must not be treated as done."
+            f"with its evidence recorded; the planned work must not be treated as done.{author_note}"
         )
     if decision.get("quorum_unreachable") and decision.get("enforcement") == "blocking":
         # B2b: the agent chose the honest blocked terminal while the reviewer quorum
@@ -714,13 +817,20 @@ def plan_review_disclosure(decision: Dict[str, Any], forced_reason: str = "") ->
             "quorum structurally unreachable (typed window-exhausted reviewer lanes"
             + (f"; earliest recorded reset {reset}" if reset else "")
             + "); the task ends blocked with its evidence recorded; the planned work "
-            "must not be treated as done."
+            f"must not be treated as done.{author_note}"
         )
-    if decision.get("allow"):
+    # An author stop carries allow=True in EVERY enforcement, so the generic branch
+    # below would tell the owner "work proceeded under advisory enforcement" about a
+    # blocking stop that finished nothing. It falls to the author fallback instead.
+    if decision.get("allow") and decision.get("status") != "author_stopped":
         return (
             f"\n\n⚠️ Plan review is still open ({outcome or 'unavailable'}); work proceeded "
-            f"under the owner-selected advisory enforcement.{late}"
+            f"under the owner-selected advisory enforcement.{author_note}{late}"
         )
+    # Blocking, no rail, an author decision recorded: the decision is the only thing
+    # that happened and the owner still has to hear it, with the review's own state.
+    if author_note:
+        return f"\n\n⚠️ {subject} is open ({outcome or 'unavailable'}).{author_note}{late}"
     return ""
 
 

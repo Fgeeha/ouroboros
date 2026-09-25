@@ -41,7 +41,7 @@ function fixture(history = []) {
             isConnected: () => true, send() {} },
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
         updateUnreadBadge() {}, chatId: 1, idPrefix: 'chat', mountEl: env.mount,
-        stateSnapshots: { begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        stateSnapshots: { begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
     });
     const messages = document.byId.get('chat-messages');
@@ -99,7 +99,7 @@ test('a host-notes-only turn keeps its coined name and an empty activity line', 
     try {
         f.census(direct());
         f.emit({ content: NOTE, narration: false, suggested_name: NAME });
-        f.emit({ content: '📐 plan_task: wave 1 dispatched', narration: false });
+        f.emit({ content: '📐 Plan review: wave 1 dispatched', narration: false });
         assert.equal(f.rows().length, 2);
         assert.equal(f.title(), NAME);
         assert.equal(f.activity(), '', 'no host note ever reaches the collapsed line');
@@ -137,7 +137,7 @@ test('replay reads the voice exactly as live did', async () => {
     const opening = { role: 'user', text: 'fix the flake', ts: TS, chat_id: 1 };
     const f = fixture([opening,
         row({ text: NOTE, content: NOTE, narration: false, suggested_name: NAME }),
-        row({ text: '📐 plan_task: wave 1 dispatched', content: '📐 plan_task: wave 1 dispatched',
+        row({ text: '📐 Plan review: wave 1 dispatched', content: '📐 Plan review: wave 1 dispatched',
             narration: false, ts: '2026-09-16T12:00:02Z' })]);
     try {
         await f.instance.refreshHistory({ revision: 1 });
@@ -165,4 +165,42 @@ test('replay reads the voice exactly as live did', async () => {
         await h.instance.refreshHistory({ revision: 1 });
         assert.equal(h.activity(), 'Still working through it');
     } finally { h.close(); }
+});
+
+test('finalizing outcome overlay keeps narration as title while publishing phase and model', () => {
+    const f = fixture();
+    try {
+        f.census(direct());
+        f.emit({ content: '💬 still working', narration: true });
+        f.emit({ content: '💬 still working', narration: true, task_phase: 'finalizing',
+            outcome_final: false, outcome_axes: { execution: { status: 'ok' } },
+            model_execution: { source: 'usable_solve_response', used_model: 'actual-solver' } });
+        assert.equal(f.title(), 'still working');
+        assert.equal(f.card().querySelector('[data-live-phase]').textContent, 'Finalizing…');
+        assert.match(f.card().querySelector('[data-live-meta]').innerHTML, /Last solve response: actual-solver/);
+        f.emit({ is_progress: false, role: 'system', system_type: 'task_summary', content: 'Done.',
+            outcome_final: true, outcome_phase: 'done', outcome_axes: { execution: { status: 'ok' } } });
+        assert.equal(f.title(), 'still working');
+    } finally { f.close(); }
+});
+
+test('the collapsed line states the terminal cause, and a clean ending keeps the last narration', () => {
+    const f = fixture();
+    try {
+        f.census(direct());
+        f.emit({ content: '💬 reading the failing test first', narration: true, suggested_name: 'Flake hunt' });
+        assert.equal(f.activity(), 'reading the failing test first');
+        f.emit({ is_progress: false, role: 'system', system_type: 'task_summary', content: 'Done with warnings.',
+            outcome_final: true, outcome_phase: 'warn', reason_code: 'plan_review_advisory',
+            outcome_axes: { execution: { status: 'degraded', reason_code: 'plan_review_advisory', plan_review: 'unanswered' } } });
+        assert.equal(f.activity(), 'Only some of the plan reviewers answered; the work went on with their notes.');
+    } finally { f.close(); }
+    const g = fixture();
+    try {
+        g.census(direct());
+        g.emit({ content: '💬 reading the failing test first', narration: true, suggested_name: 'Flake hunt' });
+        g.emit({ is_progress: false, role: 'system', system_type: 'task_summary', content: 'Done.',
+            outcome_final: true, outcome_phase: 'done', outcome_axes: { execution: { status: 'ok' } } });
+        assert.equal(g.activity(), 'reading the failing test first');
+    } finally { g.close(); }
 });

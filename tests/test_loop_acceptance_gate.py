@@ -49,6 +49,48 @@ def _seed_acceptance_root(tmp_path, task_id: str, ctx: SimpleNamespace):
     return contract
 
 
+def _order_acceptance_feedback(fixture, monkeypatch, subject, order):
+    """Run a real panel either before host release or after its pending return."""
+    from ouroboros import loop, review_custody, review_substrate
+    from ouroboros.loop_acceptance_review import acceptance_run_pending
+
+    released = threading.Event()
+    completed_before = len(fixture.review_sends)
+    original_factory = review_substrate._review_route_executor
+    original_register = review_custody._register_released_roster
+    original_panel = loop._execute_task_acceptance_panel
+
+    def factory(assignment, **kwargs):
+        executor = original_factory(assignment, **kwargs)
+        if assignment.request.subject == subject and order == "pending":
+            execute = executor.execute
+            def held():
+                assert released.wait(10), "host did not release the pending panel"
+                return execute()
+            executor.execute = held
+        return executor
+
+    def register(request, *args, **kwargs):
+        if request.subject == subject and order == "ready":
+            fixture.release.set()
+            with fixture.condition:
+                assert fixture.condition.wait_for(
+                    lambda: fixture.settled_count > completed_before, timeout=10,
+                ), "review did not settle before host release"
+        return original_register(request, *args, **kwargs)
+
+    def panel(ctx):
+        result = original_panel(ctx)
+        if ctx.content == subject:
+            assert acceptance_run_pending(result) is (order == "pending")
+            released.set()
+        return result
+
+    monkeypatch.setattr(review_substrate, "_review_route_executor", factory)
+    monkeypatch.setattr(review_custody, "_register_released_roster", register)
+    monkeypatch.setattr(loop, "_execute_task_acceptance_panel", panel)
+
+
 def test_set_acceptance_decision_preserves_agent_stance():
     trace = {
         "acceptance_decision": {
@@ -87,7 +129,7 @@ def test_set_acceptance_decision_collapses_unknown_status_fail_closed():
 
     # Canonical status + typed reason passes through untouched.
     _set_acceptance_decision(trace, {"status": "accepted", "reason": "clean_pass"})
-    assert trace["acceptance_decision"] == {"status": "accepted", "reason": "clean_pass"}
+    assert trace["acceptance_decision"] == {"status": "accepted", "reason": "clean_pass", "enforcement": loop_mod.get_review_enforcement()}
     assert ACCEPTANCE_DECISION_STATUSES == (
         "accepted", "revision_requested", "finalized_unaccepted",
     )
@@ -97,7 +139,11 @@ def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason(
     """Table-driven guard over the WHOLE writer inventory (v6.78.0): every
     `_set_acceptance_decision` call site in loop.py must pass a canonical status
     constant and a reason from the closed set. Source-level so a new writer added
-    without a reason fails here instead of silently shipping an untyped decision."""
+    without a reason fails here instead of silently shipping an untyped decision.
+    A writer whose typed pair comes from the fact that decides it merges it by
+    name (`**forced_rail_panel_verdict(...)`: the forced rail records what the
+    panel it collected says); the scan follows that name into its own source and
+    holds every status and reason it can return to the same closed sets."""
     import pathlib
     import re
 
@@ -108,15 +154,17 @@ def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason(
     # cannot escape the guard by living in (or moving to) a leaf.
     loop_file = pathlib.Path(loop_mod.__file__)
     src = []
-    for path in [loop_file, *sorted(loop_file.parent.glob("loop_*.py"))]:
+    for path in [loop_file, *sorted(loop_file.parent.glob("loop_*.py")),
+                 loop_file.parent / "acceptance_settlement.py"]:
         src.extend(path.read_text(encoding="utf-8").splitlines())
     starts = [
         i for i, line in enumerate(src)
         if "_set_acceptance_decision(" in line and not line.lstrip().startswith("def ")
     ]
-    # The final writers cover an invalid forced-delivery subject and Cyber
-    # author-finality; neither manufactures a reviewer PASS.
-    assert len(starts) == 22, f"writer inventory changed: {len(starts)} call sites"
+    # Include the separate infrastructure-outcome handback; it requests an
+    # author response without manufacturing a critic capsule or reviewer PASS.
+    # ... and the final seal's `admission_close_unconfirmed` note (owner 2A) in the delivery leaf.
+    assert len(starts) == 23, f"writer inventory changed: {len(starts)} call sites"
     allowed_status = {
         "ACCEPTANCE_ACCEPTED", "ACCEPTANCE_REVISION_REQUESTED",
         "ACCEPTANCE_FINALIZED_UNACCEPTED",
@@ -134,12 +182,16 @@ def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason(
             name: value for name, value in vars(module).items()
             if name.startswith(("REASON_", "ACCEPTANCE_REASON_")) and isinstance(value, str)
         })
-    seen_expression_reasons = 0
+    # The closed set of merge helpers a writer may take its typed pair from.
+    merged_writers = {"forced_rail_panel_verdict"}
+    seen_expression_reasons = seen_merged_writers = 0
     for start in starts:
         block = "\n".join(src[start:start + 30])
         status = re.findall(r'"status": ([A-Z_]+)', block)
         assert status and status[0] in allowed_status, f"line {start + 1}: {block[:120]}"
-        assert '"reason"' in block, f"line {start + 1} has no typed reason"
+        merged = merged_writers & set(re.findall(r"\*\*([a-z_]+)\(", block))
+        seen_merged_writers += bool(merged)
+        assert '"reason"' in block or merged, f"line {start + 1} has no typed reason"
         for reason in re.findall(r'"reason": "([a-z_]+)"', block):
             assert reason in ACCEPTANCE_DECISION_REASONS, reason
         for name in re.findall(r'\b(REASON_[A-Z_]+|ACCEPTANCE_REASON_[A-Z_]+)\b', block):
@@ -148,9 +200,21 @@ def test_every_host_acceptance_writer_emits_a_canonical_status_and_typed_reason(
             seen_expression_reasons += 1
             assert reason_names[name] in ACCEPTANCE_DECISION_REASONS, name
     # The widened regex really does catch expression-valued reasons: the two
-    # `pass_reason if ... == REASON_REVIEW_CYCLES_EXHAUSTED` branches and the
+    # explicit author-stop REASON_REVIEW_CYCLES_EXHAUSTED branches and the
     # A-material `REASON_IDENTICAL_ACCEPTANCE_REFUSED` writer.
     assert seen_expression_reasons >= 3, seen_expression_reasons
+    # Follow the merged writer into its own source: the pair it returns is as
+    # closed as a literal one, and its only non-literal reason is the rail's own
+    # `ACCEPTANCE_BYPASS_REASON_BY_RAIL` token (already inside the closed set).
+    assert seen_merged_writers == len(merged_writers)
+    for helper in sorted(merged_writers):
+        body = "\n".join(src).split(f"def {helper}(")[1].split("\ndef ")[0]
+        assert re.findall(r'"reason": "([a-z_]+)"', body), helper
+        for reason in re.findall(r'"reason": "([a-z_]+)"', body):
+            assert reason in ACCEPTANCE_DECISION_REASONS, reason
+        assert re.findall(r'"reason": [a-z_]+', body) == ['"reason": rail_reason'], helper
+        for name in re.findall(r'"status": ([A-Z_]+)', body):
+            assert name in allowed_status, name
 
 def test_task_acceptance_review_tool_result_lifts_agent_decision_into_trace():
     from ouroboros.loop_tool_execution import process_tool_results
@@ -584,10 +648,10 @@ def test_task_acceptance_required_feeds_back_capsule(monkeypatch, tmp_path):
         tools=tools2, content="revised again", task_id="t-blocked-alt", task_type="task",
         llm_trace=trace3, drive_root=None, messages=messages3, emit_progress=lambda _m, *, incident=None: None,
     )
-    assert result3 is False                                       # capsule already spent -> finalize
-    assert len(messages3) == 2                                    # no second capsule injected
+    assert result3 is True  # each new outcome may reach its author, including the last paid cycle
+    assert "review_feedback" in messages3[-1]
     assert trace3["review_runs"][0]["aggregate_signal"] == "FAIL"  # final-deliverable verdict recorded
-    assert ctx2._task_acceptance_reviewed is True                # now terminal
+    assert ctx2._task_acceptance_reviewed is False
 
 def test_required_review_blocked_commit_does_not_surface_prior_head(monkeypatch, tmp_path):
     """T1 (v6.35.0): a REVIEW_BLOCKED/GIT_ERROR commit attempt is is_error=False but

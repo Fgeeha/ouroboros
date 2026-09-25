@@ -17,7 +17,8 @@
  * @property {string} location          physical bucket: external|clawhub|ouroboroshub|native|user_repo|''
  * @property {string} version            local manifest version
  * @property {string} content_hash       loader content hash of the local tree
- * @property {boolean} official_hub_verified byte-exact match with the live catalog (server fact)
+ * @property {boolean} official_hub_verified byte-exact match with the hub catalog (server fact; the raw
+ *   listing field is null while the server holds no fresh catalog view — see hubFactsPending)
  * @property {Object|null} published     publish receipt section (slug, version, content_hash, pr_number, pr_url, …)
  * @property {boolean} published_malformed  receipt exists on disk but is unreadable (server projects published=null)
  * @property {boolean} review_stale
@@ -61,6 +62,16 @@ export function hubListingRowFor(skill) {
         review_stale: skill.review_stale === true,
         identity_collision: skill.identity_collision === true,
     };
+}
+
+/**
+ * True while a listing carries a hub fact the server could not know yet:
+ * /api/extensions is a local read that never waits for the hub catalog, so
+ * `official_hub_verified` is null until a catalog read has landed. The caller
+ * re-reads the listing once after its own catalog read settles.
+ */
+export function hubFactsPending(skills) {
+    return Array.isArray(skills) && skills.some((skill) => skill?.official_hub_verified === null);
 }
 
 function listingLocation(skill) {

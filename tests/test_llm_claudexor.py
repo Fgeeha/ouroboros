@@ -516,30 +516,141 @@ def test_typed_subject_refusal_suppresses_next_auto_preference(setup):
 
 @pytest.mark.parametrize("change", [{"credentialProfileId": "account-b", "accountFingerprint": "fingerprint-b"},
                                      {"model": None}, {"source": "different-source"}])
-def test_native_reset_requires_actual_account_change_and_keeps_canonical_tools(setup, change):
+def test_native_reset_keeps_canonical_tools_and_only_claims_a_real_account_change(setup, change):
+    """A refused continuation is retried WITHOUT it, whatever the engine's reason.
+
+    The account reset is still the only repair that claims a new account: when
+    the refusal names the same account (an engine that binds a continuation to
+    the model which produced it, and answered with another one), the retry just
+    drops this source's continuations and says so with an empty new route.
+    """
     root, gateway, client = setup
     old = result()["message"]
     messages = [old, {"role": "tool", "tool_call_id": "a", "content": "result-a"},
                 {"role": "tool", "tool_call_id": "b", "content": "result-b"}]
     original = deepcopy(messages)
     changed = {**ROUTE, **change}
+    rerouted = bool(set(change) & {"credentialProfileId", "accountFingerprint"})
     gateway.results = [result(outcome="failed", route=changed, problem={"code": "invalid_continuation", "message": "different account"}), result(route=changed)]
     gateway.dispatch = ["not_started", "response_received"]
-    if not set(change) & {"credentialProfileId", "accountFingerprint"}:
-        with pytest.raises(transport.ClaudexorModelNotDispatched):
-            client.chat(messages, MODEL)
-        assert len(gateway.accepted_operations) == 1
-    else:
-        _, usage = client.chat(messages, MODEL)
-        assert len(usage["ledger_attempt_ids"]) == 2
-        assert gateway.creates[0] != gateway.creates[1]
-        resent = gateway.uploads[1][0]["messages"]
-        assert "nativeContinuation" not in resent[0]
-        assert resent[0]["tool_calls"] == original[0]["tool_calls"] and resent[1:] == original[1:]
-        assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released", "reserved", "dispatched", "settled"]
-        event = json.loads((root / "logs/events.jsonl").read_text().splitlines()[-1])
-        assert event["type"] == "native_continuation_reset" and "payload" not in json.dumps(event)
+    _, usage = client.chat(messages, MODEL)
+    assert len(usage["ledger_attempt_ids"]) == 2
+    assert gateway.creates[0] != gateway.creates[1]
+    resent = gateway.uploads[1][0]["messages"]
+    assert "nativeContinuation" not in resent[0]
+    assert resent[0]["tool_calls"] == original[0]["tool_calls"] and resent[1:] == original[1:]
+    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released", "reserved", "dispatched", "settled"]
+    event = json.loads((root / "logs/events.jsonl").read_text().splitlines()[-1])
+    assert event["type"] == "native_continuation_reset" and "payload" not in json.dumps(event)
+    assert event["routes"] == [{"old_route": ROUTE, "new_route": changed if rerouted else {}}]
     assert messages == original
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("with_message_token", [False, True])
+def test_native_reset_clears_both_surfaces_and_adopts_the_new_turn(
+    setup, turn_engine, asynchronous, with_message_token,
+):
+    root, gateway, client = setup
+    failure = result(outcome="failed", route=ROUTE,
+                     problem={"code": "invalid_continuation", "message": "same route refused"})
+    gateway.results = [failure, {**result(), "nativeContinuation": deepcopy(TURN)}, result()]
+    gateway.dispatch = ["not_started", "response_received", "response_received"]
+    slot = transport.ModelTurnState(deepcopy(EARLIER))
+    messages = ([result()["message"], {"role": "tool", "tool_call_id": "a", "content": "verified 🐍"}]
+                if with_message_token else [{"role": "user", "content": "hi"}])
+    original = deepcopy(messages)
+
+    def send():
+        if asynchronous:
+            return asyncio.run(client.chat_async(messages, MODEL, model_turn_state=slot))
+        return client.chat(messages, MODEL, model_turn_state=slot)
+
+    _, usage = send()
+    assert gateway.uploads[0][0]["nativeContinuation"] == EARLIER
+    resent = gateway.uploads[1][0]
+    assert "nativeContinuation" in resent and resent["nativeContinuation"] is None
+    assert all("nativeContinuation" not in message for message in resent["messages"])
+    expected = deepcopy(original)
+    for message in expected:
+        message.pop("nativeContinuation", None)
+    assert resent["messages"] == expected and messages == original
+    assert slot.envelope == TURN
+    ordinary = json.dumps(usage, default=str) + json.dumps(ledger(root))
+    ordinary += "".join(path.read_text(encoding="utf-8") for path in (root / "logs").glob("*.jsonl"))
+    for token in (EARLIER["payload"]["turnState"], TURN["payload"]["turnState"], "opaque+=="):
+        assert token not in ordinary
+    events = [json.loads(line) for line in (root / "logs/events.jsonl").read_text(encoding="utf-8").splitlines()]
+    resets = [event for event in events if event["type"] == "native_continuation_reset"]
+    assert len(resets) == 1 and resets[0]["surface"] == "top_level_turn_slot"
+    assert len(resets[0]["routes"]) == (2 if with_message_token else 1)
+    assert [row["state"] for row in ledger(root)] == [
+        "reserved", "dispatched", "released", "reserved", "dispatched", "settled"]
+    send()
+    assert gateway.uploads[2][0]["nativeContinuation"] == TURN
+    assert slot.envelope is None
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_dual_continuation_repair_is_bounded_to_one_retry(setup, turn_engine, asynchronous):
+    root, gateway, client = setup
+    failure = result(outcome="failed", problem={"code": "invalid_continuation", "message": "refused"})
+    gateway.results, gateway.dispatch = [failure, failure], ["not_started", "not_started"]
+    slot = transport.ModelTurnState(deepcopy(EARLIER))
+    messages = [result()["message"]]
+    original = deepcopy(messages)
+    with pytest.raises(transport.ClaudexorModelNotDispatched):
+        if asynchronous:
+            asyncio.run(client.chat_async(messages, MODEL, model_turn_state=slot))
+        else:
+            client.chat(messages, MODEL, model_turn_state=slot)
+    assert len(gateway.accepted_operations) == 2 and slot.envelope is None
+    assert messages == original
+    assert [row["state"] for row in ledger(root)] == ["reserved", "dispatched", "released"] * 2
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("dispatch", ["not_started", "unknown"])
+def test_unresolved_dual_continuation_refusal_preserves_the_slot(
+    setup, turn_engine, monkeypatch, asynchronous, dispatch,
+):
+    root, gateway, client = setup
+    failure = result(outcome="failed" if dispatch == "not_started" else "unknown",
+                     problem={"code": "invalid_continuation", "message": "refused"})
+    gateway.results, gateway.dispatch = [failure], [dispatch]
+    monkeypatch.setattr(ua, "release_pre_dispatch_attempt", lambda *_: False)
+    slot = transport.ModelTurnState(deepcopy(EARLIER))
+    messages = [result()["message"]]
+    original = deepcopy(messages)
+    with pytest.raises(transport.ClaudexorModelError) as raised:
+        if asynchronous:
+            asyncio.run(client.chat_async(messages, MODEL, model_turn_state=slot))
+        else:
+            client.chat(messages, MODEL, model_turn_state=slot)
+    assert raised.value.physical_attempt_capture.state == "unresolved"
+    assert len(gateway.accepted_operations) == 1
+    assert slot.envelope == EARLIER and messages == original
+    assert ledger(root)[-1]["state"] == "unresolved"
+    assert all("native_continuation_reset" not in path.read_text(encoding="utf-8")
+               for path in (root / "logs").glob("*.jsonl"))
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_legacy_schema_message_repair_never_clears_the_unoffered_turn_slot(setup, monkeypatch, asynchronous):
+    _root, gateway, client = setup
+    monkeypatch.setattr(transport, "owned_engine_version", lambda: "3.10.3")
+    failure = result(outcome="failed", problem={"code": "invalid_continuation", "message": "refused"})
+    gateway.results, gateway.dispatch = [failure, result()], ["not_started", "response_received"]
+    slot = transport.ModelTurnState(deepcopy(EARLIER))
+    messages = [result()["message"]]
+    if asynchronous:
+        asyncio.run(client.chat_async(messages, MODEL, model_turn_state=slot))
+    else:
+        client.chat(messages, MODEL, model_turn_state=slot)
+    assert len(gateway.accepted_operations) == 2
+    assert all("nativeContinuation" not in payload for payload, _key in gateway.uploads)
+    assert "nativeContinuation" not in gateway.uploads[-1][0]["messages"][0]
+    assert slot.envelope == EARLIER
 
 
 @pytest.mark.parametrize("error", [ClaudexorUnavailable("daemon_unreachable", "ACK reply lost"), RuntimeError("ACK parser failed")])
@@ -874,15 +985,19 @@ def test_gateway_raw_and_default_result_share_integrity_validation():
         gateway.get_model_result("op-0", expected_ref={**ref, "sizeBytes": len(raw) + 1}, raw_bytes=True)
 
 
-def test_missing_old_account_does_not_authorize_native_reset(setup):
-    _, gateway, client = setup
+def test_missing_old_account_drops_the_continuation_without_claiming_a_reset(setup):
+    root, gateway, client = setup
     message = result()["message"]
     message["nativeContinuation"]["route"] = {"source": "codex", "model": "exact-model"}
-    gateway.results = [result(outcome="failed", problem={"code": "invalid_continuation", "message": "missing binding"})]
-    gateway.dispatch = ["not_started"]
-    with pytest.raises(transport.ClaudexorModelNotDispatched):
-        client.chat([message], MODEL)
-    assert len(gateway.accepted_operations) == 1
+    gateway.results = [result(outcome="failed", problem={"code": "invalid_continuation", "message": "missing binding"}),
+                       result()]
+    gateway.dispatch = ["not_started", "response_received"]
+    client.chat([message], MODEL)
+    # No account identity was invented from an unbound continuation: the retry
+    # simply stops replaying it.
+    assert "nativeContinuation" not in gateway.uploads[1][0]["messages"][0]
+    event = json.loads((root / "logs/events.jsonl").read_text().splitlines()[-1])
+    assert event["routes"] == [{"old_route": {"source": "codex", "model": "exact-model"}, "new_route": {}}]
 
 
 def test_caller_control_before_create_proves_no_dispatch(setup):

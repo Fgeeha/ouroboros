@@ -24,8 +24,12 @@ MAX_FUNCTION_LINES = 300
 # Owner decision 2026-08-21: keep this only as a high-water alarm with ample
 # product headroom; module and per-function ratchets remain the primary gates.
 # Raised 2026-09-18 from 9500 after the count reached 9499 and the alarm had
-# turned into a hard gate.
-MAX_TOTAL_FUNCTIONS = 10000
+# turned into a hard gate. Raised 2026-09-24 from 10000 to 10500 (owner-approved
+# ≤10%, #1196): the budget-pause/exact-Resume lifecycle landed at 10027 after its
+# own single-caller inlines and an upstream base that grew ~42 functions in one
+# day; the remaining delta is decomposition, not duplication, so buying the gap
+# by merging load-bearing steps would read worse.
+MAX_TOTAL_FUNCTIONS = 10500
 
 SIZE_RATCHET_MANIFEST_PATH = "ouroboros/size_ratchet_manifest.py"
 
@@ -752,10 +756,11 @@ def _validate_manifest_candidate(
     *,
     manifest_path: str,
     include_staged: bool,
+    inventory: SizeRatchetInventory | None = None,
 ) -> list[str]:
     """Shared exactness + merge-aware transition core for live and in-memory candidates."""
     current = parse_size_ratchet_manifest(current_text)
-    inventory = collect_size_ratchet_inventory(root)
+    inventory = inventory if inventory is not None else collect_size_ratchet_inventory(root)
     errors = _manifest_inventory_errors(current, inventory)
 
     previous_text = resolve_committed_manifest_text(root, manifest_path=manifest_path)
@@ -796,6 +801,7 @@ def validate_size_ratchet(
     repo_dir: pathlib.Path,
     *,
     manifest_path: str = SIZE_RATCHET_MANIFEST_PATH,
+    inventory: SizeRatchetInventory | None = None,
 ) -> list[str]:
     """Validate live and staged candidates against the merge-aware committed authority.
 
@@ -811,7 +817,8 @@ def validate_size_ratchet(
     root = pathlib.Path(repo_dir).resolve()
     current_path = root.joinpath(*pathlib.PurePosixPath(manifest_path).parts)
     current_text = current_path.read_text(encoding="utf-8")
-    return _validate_manifest_candidate(root, current_text, manifest_path=manifest_path, include_staged=True)
+    return _validate_manifest_candidate(root, current_text, manifest_path=manifest_path,
+                                        include_staged=True, inventory=inventory)
 
 
 def validate_size_ratchet_candidate(
@@ -959,9 +966,53 @@ def _metrics_from_inventory(inventory: SizeRatchetInventory) -> Dict[str, Any]:
     }
 
 
-def compute_repo_complexity_metrics(repo_dir: pathlib.Path) -> Dict[str, Any]:
+def compute_repo_complexity_metrics(
+    repo_dir: pathlib.Path, *, inventory: SizeRatchetInventory | None = None,
+) -> Dict[str, Any]:
     """Compute health metrics from the same production inventory as the hard gate."""
-    return _metrics_from_inventory(collect_size_ratchet_inventory(repo_dir))
+    return _metrics_from_inventory(inventory if inventory is not None else collect_size_ratchet_inventory(repo_dir))
+
+
+def size_headroom_lines(
+    inventory: SizeRatchetInventory, *, paths: Iterable[str] | None = None, limit: int = 5,
+) -> list[str]:
+    """Informational capacity from the same inventory as validation, never a gate.
+
+    Show touched paths when supplied; otherwise show the closest ordinary
+    boundaries before registered debt, so giant legacy files cannot hide a
+    nearly-full ordinary module. Bounds are presentation only and disclosed.
+    """
+    selected = set(paths) if paths is not None else None
+    functions = len(inventory.functions)
+    lines = [f"Runtime functions: {functions}/{MAX_TOTAL_FUNCTIONS}; "
+             f"{MAX_TOTAL_FUNCTIONS - functions} remaining."]
+    modules = sorted(
+        (m for m in inventory.modules if selected is None or m.path in selected),
+        key=lambda m: (m.path in GIANT_PATHS or m.path in _CHECKED_IN_MANIFEST.byte_debt,
+                       min((MAX_MODULE_LINES - m.line_count) / MAX_MODULE_LINES,
+                           (MAX_MODULE_BYTES - m.utf8_bytes) / MAX_MODULE_BYTES), m.path),
+    )
+    for module in modules[:limit]:
+        line_note = ("registered line debt" if module.path in GIANT_PATHS
+                     else f"{MAX_MODULE_LINES - module.line_count} remaining")
+        byte_note = ("registered byte debt" if module.path in _CHECKED_IN_MANIFEST.byte_debt
+                     else f"{MAX_MODULE_BYTES - module.utf8_bytes} remaining")
+        lines.append(f"{module.path}: {module.line_count}/{MAX_MODULE_LINES} lines ({line_note}); "
+                     f"{module.utf8_bytes}/{MAX_MODULE_BYTES} UTF-8 bytes ({byte_note}).")
+    if len(modules) > limit:
+        lines.append(f"{len(modules) - limit} more modules omitted; codebase_health provides the overview.")
+    functions_by_size = sorted(
+        (f for f in inventory.functions if selected is None or f.path in selected),
+        key=lambda f: ((f.path, f.qualname) in FUNCTION_DEBT, -f.line_count, f.path, f.qualname),
+    )
+    for function in functions_by_size[:limit]:
+        note = ("registered function debt" if (function.path, function.qualname) in FUNCTION_DEBT
+                else f"{MAX_FUNCTION_LINES - function.line_count} remaining")
+        lines.append(f"{function.path}:{function.line_start} {function.qualname}: "
+                     f"{function.line_count}/{MAX_FUNCTION_LINES} lines ({note}).")
+    if len(functions_by_size) > limit:
+        lines.append(f"{len(functions_by_size) - limit} more functions omitted.")
+    return lines
 
 
 def compute_complexity_metrics(sections: List[Tuple[str, str]]) -> Dict[str, Any]:

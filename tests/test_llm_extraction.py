@@ -23,6 +23,7 @@ from ouroboros import (
     llm_probe,
     llm_routing,
     llm_stream,
+    llm_substitution,
 )
 from ouroboros.llm import LLMClient
 
@@ -33,6 +34,7 @@ _LEAVES = (
     llm_attempt,
     llm_capability_policy,
     llm_claudexor,
+    llm_substitution,
     llm_routing,
     llm_messages,
     llm_fallback,

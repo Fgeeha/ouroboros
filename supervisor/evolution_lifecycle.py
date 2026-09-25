@@ -117,7 +117,7 @@ def enqueue_evolution_task_if_needed() -> None:
         q.send_with_budget(
             int(owner_chat_id),
             "🧬 Evolution stayed off: the enable flag had no active campaign authority. Use /evolve start to begin a fresh campaign.",
-        )
+            role="system", system_type="evolution_notice")
         return
     active_tx = campaign.get("active_transaction") if isinstance(campaign.get("active_transaction"), dict) else {}
     if active_tx and (
@@ -133,7 +133,7 @@ def enqueue_evolution_task_if_needed() -> None:
     if block:
         q.pause_evolution_campaign("blocked in light runtime mode")
         q.disable_evolution_projection()
-        q.send_with_budget(int(owner_chat_id), block)
+        q.send_with_budget(int(owner_chat_id), block, role="system", system_type="evolution_notice")
         return
 
     consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
@@ -143,8 +143,8 @@ def enqueue_evolution_task_if_needed() -> None:
         q.send_with_budget(
             int(owner_chat_id),
             f"🧬⚠️ Evolution paused: {consecutive_failures} consecutive failures. "
-            f"Use /evolve start to resume after investigating the issue."
-        )
+            f"Use /evolve start to resume after investigating the issue.",
+            role="system", system_type="evolution_notice")
         return
 
     # BUG3: pause if the SAME objective has been re-proposed and no-op'd
@@ -173,12 +173,12 @@ def enqueue_evolution_task_if_needed() -> None:
             f"🧬⚠️ Evolution paused: the current objective ran {objective_repeats} reviewed "
             f"cycles WITHOUT ever being absorbed — it keeps getting re-proposed and never lands "
             f"(a self-maintenance loop, not progress). A plain resume won't help; use "
-            f"/evolve start with a DIFFERENT objective."
-        )
+            f"/evolve start with a DIFFERENT objective.",
+            role="system", system_type="evolution_notice")
         return
 
-    try:
-        remaining = q.budget_remaining(st, strict=True)
+    try:  # on the supervisor loop: ride the snapshot, decide the reserve refusal on the exact read
+        remaining = q.budget_remaining(st, strict=True, allow_stale=True, refuse_below=q.EVOLUTION_BUDGET_RESERVE)
     except Exception:
         log.error("Evolution scheduling deferred: cost accounting unavailable", exc_info=True)
         q.append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl", {
@@ -193,7 +193,7 @@ def enqueue_evolution_task_if_needed() -> None:
             int(owner_chat_id),
             f"💸 Evolution stopped: ${remaining:.2f} remaining "
             f"(reserve ${q.EVOLUTION_BUDGET_RESERVE:.0f} for conversations).",
-        )
+            role="system", system_type="evolution_notice")
         return
     cycle = int(st.get("evolution_cycle") or 0) + 1
     tid = uuid.uuid4().hex[:8]
@@ -203,7 +203,7 @@ def enqueue_evolution_task_if_needed() -> None:
         q.send_with_budget(
             int(owner_chat_id),
             "🧬 Evolution stayed off: the campaign changed before its next task could be attached. Start it again when ready.",
-        )
+            role="system", system_type="evolution_notice")
         return
     task = {
         "id": tid, "type": "evolution",
@@ -233,7 +233,7 @@ def enqueue_evolution_task_if_needed() -> None:
             int(owner_chat_id),
             f"🧬 Evolution paused: its next cycle was not admitted ({reason}{': ' + detail if detail else ''}). "
             "/evolve start resumes it.",
-        )
+            role="system", system_type="evolution_notice")
         return
 
     def _record_cycle(live: Dict[str, Any]) -> None:
@@ -718,6 +718,7 @@ def adopt_evolution_commit_intent(
 
 def record_evolution_commit(
     campaign_id: str, transaction_id: str, task_id: str, commit_sha: str,
+    *, triad_scope_status: str = "unknown", author_disposition: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """CAS the exact reviewed local commit into its still-authorized transaction."""
     from supervisor import state
@@ -758,7 +759,8 @@ def record_evolution_commit(
             tx.update({
                 "preflight_status": "passed",
                 "advisory_status": "fresh_or_bypassed",
-                "triad_scope_status": "passed",
+                "triad_scope_status": str(triad_scope_status or "unknown"),
+                **({"author_disposition": dict(author_disposition)} if author_disposition else {}),
                 "commit_sha": commit_sha,
                 "commit_receipt": dict(receipt),
                 "restart_required": True,
@@ -1424,7 +1426,7 @@ def notify_owner_cycle_outcome(campaign: Dict[str, Any], tx: Dict[str, Any]) -> 
             f"Objective: {obj_short or 'autonomous self-improvement'}\n"
             "No change was absorbed; the transaction was rolled back/closed to unblock the next cycle."
         )
-    send_with_budget(owner_chat_id, msg)
+    send_with_budget(owner_chat_id, msg, role="system", system_type="evolution_cycle_outcome")
 
 
 def clear_pending_owner_report(expected: Dict[str, Any]) -> bool:

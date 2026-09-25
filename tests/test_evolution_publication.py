@@ -566,7 +566,7 @@ def test_promote_to_stable_rechecks_evolution_claim_without_changing_normal_flow
         BRANCH_DEV="ouroboros",
         BRANCH_STABLE="ouroboros-stable",
         load_state=lambda: {"owner_chat_id": 1},
-        send_with_budget=lambda chat_id, message: sent.append(message),
+        send_with_budget=lambda chat_id, message, **kw: sent.append(message),
     )
     monkeypatch.setattr(
         evolution_lifecycle,

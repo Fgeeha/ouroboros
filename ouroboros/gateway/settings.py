@@ -64,16 +64,6 @@ log = logging.getLogger(__name__)
 DEFAULT_PORT = int(os.environ.get("OUROBOROS_SERVER_PORT", "8765"))
 
 
-def _get_lan_ip() -> str:
-    """Return LAN IP via UDP socket trick; no packet is sent."""
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect(("192.0.2.1", 80))  # RFC 5737 TEST-NET-1, no packet sent
-            return s.getsockname()[0]
-    except OSError:
-        return ""
-
-
 def _trust_nonlocal_bind_without_password_enabled() -> bool:
     raw = os.environ.get("OUROBOROS_TRUST_NONLOCAL_BIND_WITHOUT_PASSWORD", "")
     return str(raw or "").strip().lower() in {"1", "true", "yes", "on"}
@@ -96,7 +86,15 @@ def _build_network_meta(bind_host: str, bind_port: int) -> dict:
         }
     wildcard = bind_host in ("0.0.0.0", "")
     if wildcard:
-        lan_ip = "" if is_container_env() else _get_lan_ip()
+        lan_ip = ""
+        if not is_container_env():
+            # The LAN IP via the UDP socket trick; no packet is sent.
+            try:
+                with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                    s.connect(("192.0.2.1", 80))  # RFC 5737 TEST-NET-1, no packet sent
+                    lan_ip = s.getsockname()[0]
+            except OSError:
+                lan_ip = ""
     elif bind_host in ("::", "[::]"):
         # AF_INET startup cannot advertise an IPv6 wildcard LAN IP reliably.
         lan_ip = ""
@@ -209,6 +207,50 @@ def _build_policy_state(settings: Dict[str, Any]) -> dict:
     }
 
 
+def _build_restart_state(settings: Dict[str, Any]) -> dict:
+    """Compare saved intent with component-owned inputs, never os.environ."""
+    from ouroboros.config import get_runtime_mode, normalize_runtime_mode
+    from ouroboros.local_model import get_manager, local_model_settings
+    from ouroboros.server_process import applied_restart_settings, applied_server_host_source
+
+    applied = applied_restart_settings()
+    desired = {key: settings.get(key, _SETTINGS_DEFAULTS.get(key, ""))
+               for key in _RESTART_REQUIRED_KEYS if key not in local_model_settings({})}
+    applied["OUROBOROS_RUNTIME_MODE"] = get_runtime_mode()
+    desired["OUROBOROS_RUNTIME_MODE"] = normalize_runtime_mode(settings.get("OUROBOROS_RUNTIME_MODE"))
+    pending = []
+    for key, value in desired.items():
+        if key not in applied:
+            continue
+        actual = applied[key]
+        if key == "OUROBOROS_SKILLS_REPO_PATH":
+            value = str(pathlib.Path(str(value).strip()).expanduser()) if str(value).strip() else ""
+            actual = str(pathlib.Path(str(actual).strip()).expanduser()) if str(actual).strip() else ""
+        if str(value).strip() != str(actual).strip():
+            pending.append(key)
+    unknown = sorted(set(desired) - set(applied))
+    host_key = "OUROBOROS_SERVER_HOST"
+    host_source = applied_server_host_source(DATA_DIR)
+    source_unknown = []
+    host_summary = ""
+    if host_key in pending and host_source != "settings":
+        pending.remove(host_key)
+        if host_source in {"environment", "cli"}:
+            host_summary = " Saved server host differs from the running listener; launch configuration overrides this setting."
+        else:
+            source_unknown.append(host_key)
+            host_summary = (" Saved server host differs from the running listener. This launcher did not report "
+                            "whether a launch override controls the next start; Restart may apply the saved host.")
+    local = get_manager().settings_application(settings)
+    summary = f"Restart Ouroboros to apply {len(pending)} saved setting(s)." if pending else ""
+    if unknown:
+        summary += f" Application state is not reported for {len(unknown)} runtime setting(s)."
+    summary += host_summary
+    return {"restart_required": bool(pending), "restart_keys": sorted(pending),
+            "restart_source_unknown_keys": source_unknown, "unknown_keys": unknown,
+            "local_model": local, "summary": summary.strip()}
+
+
 def _rehydrate_mcp_servers_payload(incoming: Any, current: Any) -> list:
     if not isinstance(incoming, list):
         return []
@@ -244,17 +286,6 @@ from ouroboros.settings_scales import (
     IMMEDIATE_SETTINGS as _IMMEDIATE_KEYS,
     RESTART_REQUIRED_SETTINGS as _RESTART_REQUIRED_KEYS,
 )
-
-
-def _classify_settings_changes(
-    old: Dict[str, Any],
-    new: Dict[str, Any],
-) -> list:
-    """Return changed keys requiring process restart; others hot-reload next task."""
-    return [
-        k for k in _RESTART_REQUIRED_KEYS
-        if str(new.get(k, "") or "") != str(old.get(k, "") or "")
-    ]
 
 
 def _effect_buckets(all_changed: list) -> tuple:
@@ -506,21 +537,6 @@ def _api_owner_auto_grant_sync(request: Request, body: Any) -> JSONResponse:
     return JSONResponse({"ok": True, "enabled": enabled})
 
 
-def _provider_base_url(settings: Dict[str, Any], provider: str) -> str:
-    """The settings key a provider's base URL resolves through (shared by both routes)."""
-    if provider == "openai":
-        return str(settings.get("OPENAI_BASE_URL") or "")
-    if provider == "openai-compatible":
-        return str(settings.get("OPENAI_COMPATIBLE_BASE_URL") or "")
-    if provider == "cloudru":
-        return str(settings.get("CLOUDRU_FOUNDATION_MODELS_BASE_URL") or "")
-    if provider == "gigachat":
-        return str(settings.get("GIGACHAT_BASE_URL") or "")
-    if provider == "minimax":
-        return resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
-    return ""
-
-
 def _active_main_route(
     settings: Dict[str, Any],
     *,
@@ -537,7 +553,13 @@ def _active_main_route(
 
     model = str(model_override or settings.get("OUROBOROS_MODEL") or _config.SETTINGS_DEFAULTS.get("OUROBOROS_MODEL") or "").strip()
     provider = provider_for_model(model)
-    base_url = _provider_base_url(settings, provider)
+    # The settings key a provider's base URL resolves through.
+    base_url_key = {"openai": "OPENAI_BASE_URL", "openai-compatible": "OPENAI_COMPATIBLE_BASE_URL",
+                    "cloudru": "CLOUDRU_FOUNDATION_MODELS_BASE_URL", "gigachat": "GIGACHAT_BASE_URL"}.get(provider)
+    if provider == "minimax":
+        base_url = resolve_minimax_base_url(settings.get("MINIMAX_REGION") or "")
+    else:
+        base_url = str(settings.get(base_url_key) or "") if base_url_key else ""
     # CW7 (v6.34.0): honour the USE_LOCAL_MAIN routing setting — a local-routed main
     # lane must report provider='local' so the Max gate consults the local n_ctx
     # (Capability Evidence local-health) instead of the remote OUROBOROS_MODEL metadata.
@@ -875,6 +897,7 @@ async def api_settings_get(request: Request) -> JSONResponse:
     # not a second policy store.
     try:
         meta["policy_state"] = _build_policy_state(settings)
+        meta["restart_state"] = _build_restart_state(settings)
     except Exception:
         # A settings read must stay available even if an optional projection
         # helper is unavailable during startup.  The persisted values remain
@@ -918,10 +941,12 @@ async def api_onboarding(request: Request) -> Response:
     (b) made a page load the author of provider defaults the owner never saw.
     The save paths (POST /api/settings, POST /api/onboarding/complete, the
     desktop wizard bridge) keep the same normalization and persist it."""
+    from ouroboros.config import SETTINGS_PATH
+
     settings, _changed, _keys = apply_runtime_provider_defaults(load_settings())
     if has_startup_ready_provider(settings):
         return Response(status_code=204)
-    return HTMLResponse(build_onboarding_html(settings, host_mode="web"))
+    return HTMLResponse(build_onboarding_html(settings, host_mode="web", fresh_install=not SETTINGS_PATH.exists()))
 
 
 def _apply_settings_save_side_effects(
@@ -1164,18 +1189,35 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
             if raw_cycles:
                 body = dict(body)
                 body[REVIEW_MAX_CYCLES_KEY] = normalize_review_max_cycles(raw_cycles)
+        # Optional task bounds (round limit, absolute lifetime): the same vocabulary, but a
+        # blank, zero or malformed value is refused rather than read as "no limit" or as a
+        # silent default; a valid value persists as an int or the canonical "unlimited".
+        from ouroboros.settings_scales import OPTIONAL_BOUND_LEGACY, UNLIMITED, parse_positive_or_unlimited
+        for bound_key in (key for key in OPTIONAL_BOUND_LEGACY if key in body):
+            try:
+                bound = parse_positive_or_unlimited(body.get(bound_key))
+            except (TypeError, ValueError):
+                return unsaved_error(f"{bound_key} must be a positive integer or 'unlimited'.", 400)
+            body = dict(body)
+            body[bound_key] = UNLIMITED if bound is None else bound
         # Available-subagents roster first (S4 atomicity): reviewer
         # references must validate against the roster THIS save produces —
         # not the stale process env (see the check helper below).
         subagents_key = "OUROBOROS_SUBAGENTS"
         if subagents_key in body and body.get(subagents_key) not in (None, ""):
-            from ouroboros.configured_subagents import normalize_configured_subagents
+            from ouroboros.configured_subagents import (
+                normalize_configured_subagents, roster_save_error,
+            )
             try:
                 _subagents, canonical_subagents = normalize_configured_subagents(
                     body.get(subagents_key)
                 )
             except ValueError as exc:
                 return unsaved_error(str(exc), 400)
+            # Twins are refused only when THIS save changes the roster.
+            twin_error = roster_save_error(canonical_subagents, load_settings(), body)
+            if twin_error:
+                return unsaved_error(twin_error, 400)
             body = dict(body)
             body[subagents_key] = canonical_subagents
         # Reviewer-slot SSOT (6.1): 400 on malformed; save-time disclosure returned;
@@ -1242,10 +1284,8 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
             k for k in current
             if str(current.get(k, "") or "") != str(old_effective_settings.get(k, "") or "")
         ]
-        restart_keys = _classify_settings_changes(old_effective_settings, current)
         if runtime_changed:
             all_changed.append("OUROBOROS_RUNTIME_MODE")
-            restart_keys.append("OUROBOROS_RUNTIME_MODE")
 
         # Snapshot BEFORE the save lands: only a task already started at that
         # moment keeps the previous configuration. Measuring after the write
@@ -1355,9 +1395,11 @@ def _api_settings_post_locked(request: Request, body: Any) -> JSONResponse:
             resp["agent_task_running"] = True
         if not all_changed:
             resp["no_changes"] = True
-        if restart_keys:
+        restart_state = _build_restart_state(settings_to_save)
+        resp["restart_state"] = restart_state
+        if restart_state["restart_required"]:
             resp["restart_required"] = True
-            resp["restart_keys"] = restart_keys
+            resp["restart_keys"] = restart_state["restart_keys"]
         if immediate_changed:
             resp["immediate_changed"] = True
         if next_task_changed:

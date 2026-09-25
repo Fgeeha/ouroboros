@@ -15,6 +15,7 @@ const SETTINGS_TABS = [
     { value: 'models', label: 'Models' },
     { value: 'agents', label: 'Agents' },
     { value: 'behavior', label: 'Behavior' },
+    { value: 'appearance', label: 'Appearance' },
     { value: 'advanced', label: 'Advanced' },
     { value: 'about', label: 'About' },
 ];
@@ -397,35 +398,6 @@ export function renderSettingsPage() {
 
                 <section class="settings-panel" data-settings-panel="behavior">
                     <div class="form-section">
-                        <h3>Appearance</h3>
-                        <div class="settings-section-copy">Applies immediately and is saved on its own; the Save button below does not affect it.</div>
-                        <div class="settings-effort-card">
-                            <label id="s-theme-label">Theme</label>
-                            <div class="ui-segment-group settings-effort-group" data-theme-group role="group" aria-labelledby="s-theme-label">
-                                <button type="button" class="ui-segment settings-effort-btn" data-theme-value="dark">Dark</button>
-                                <button type="button" class="ui-segment settings-effort-btn" data-theme-value="light">Light</button>
-                            </div>
-                        </div>
-                        <div class="settings-section-copy">The agent's reasoning is recorded either way; this only controls whether it is displayed. Logs repaint at once; chat rows already on screen change after a page reload.</div>
-                        <label class="local-toggle ui-field ui-field-inline" title="Display only: reasoning stays in the durable log, so turning this on also reveals it in past conversations.">
-                            <input type="checkbox" id="ui-show-reasoning" class="ui-checkbox" name="ui-show-reasoning">
-                            Show the agent's reasoning in chat and logs
-                        </label>
-                    </div>
-
-                    <div class="form-section">
-                        <h3>Language</h3>
-                        <div class="settings-section-copy">Interface language of this browser. Applies immediately; strings without a translation stay English.</div>
-                        <div class="settings-effort-card">
-                            <label>Interface Language</label>
-                            <div class="ui-segment-group settings-effort-group" data-language-group role="group" aria-label="Interface Language">
-                                <button type="button" class="ui-segment settings-effort-btn" data-language-value="en">English</button>
-                                <button type="button" class="ui-segment settings-effort-btn" data-language-value="ru">Русский</button>
-                            </div>
-                        </div>
-                    </div>
-
-                    <div class="form-section">
                         <h3>Reasoning Effort</h3>
                         <div class="settings-section-copy">Controls how deeply the model thinks per task type. Higher effort = slower but more thorough.</div>
                         <div class="settings-effort-grid">
@@ -453,7 +425,7 @@ export function renderSettingsPage() {
 
                     <div class="form-section">
                         <h3>Task Result Review</h3>
-                        <div class="settings-section-copy">Auto and Required run the root-owned review panel for queued/headless work and substantive direct results. Pure conversation and routing controls are skipped; Required additionally enforces the selected Advisory or Blocking improvement policy.</div>
+                        <div class="settings-section-copy">Auto and Required run the root-owned review panel for queued/headless work and substantive direct results. Pure conversation and routing controls are skipped. Once review applies, both follow the selected Advisory or Blocking policy.</div>
                         <div class="settings-effort-card">
                             <label>Task Result Review</label>
                             <input id="s-task-review-mode" type="hidden" value="auto">
@@ -471,7 +443,7 @@ export function renderSettingsPage() {
 
                     <div class="form-section">
                         <h3>Max Review Cycles</h3>
-                        <div class="settings-section-copy">One shared cap on paid review cycles per task for plan review, task acceptance (improvement passes = cycles &minus; 1), the commit gate (paid triad+scope cycles per root task, shared across the whole task tree; an unchanged diff never buys a new review after a recorded verdict block regardless of this number &mdash; blocking enforcement refuses it for free, while a pure advisory line records no verdict blocks and its no-new-spend guarantee is the free replay after exhaustion, with a loud durable disclosure) and skill review (paid panel runs per root task or per manual snapshot; identical snapshots replay free). <code>&infin;</code> removes the cap; the task's own deadline, budget and lifecycle rails still bind.</div>
+                        <div class="settings-section-copy">Limits paid review waves, including dispatched technical failures: plan and task review per task, commit triad+scope per root task, and skill review per root task or manual snapshot. The last review still permits author corrections within ordinary task limits; explicit task-local author limits remain separate. Collection and exact replay are free. Advisory allows an explicit decision after receiving feedback or a disclosed unavailable result; Blocking still requires reviewer approval. <code>&infin;</code> removes the count cap, while deadlines, budgets and lifecycle limits still apply.</div>
                         <div class="settings-effort-card">
                             <label>Max Review Cycles</label>
                             <input id="s-review-max-cycles" type="hidden" value="2">
@@ -690,7 +662,7 @@ export function renderSettingsPage() {
                             <label>Consciousness Autonomy</label>
                             <input id="s-consciousness-autonomy" type="hidden" value="act">
                             ${renderSegmentedField({ target: 's-consciousness-autonomy', options: [{ value: 'observe', label: 'Observe' }, { value: 'act', label: 'Act' }, { value: 'full', label: 'Full' }] })}
-                            <div class="settings-inline-note"><strong>Observe:</strong> think, keep memory and knowledge, write to you &mdash; start nothing. <strong>Act (default):</strong> everything the runtime mode allows except editing Ouroboros's own code and prompts, evolution, restart and settings. <strong>Full:</strong> everything the runtime mode allows, evolution included.</div>
+                            <div class="settings-inline-note"><strong>Observe:</strong> research, internal memory and task/project notes, read-only research children it can also stop, schedule controls and replies to you; no shell, user-file, source, skill/settings or publication changes. <strong>Act (default):</strong> everything the runtime mode allows except editing Ouroboros's own code and prompts, evolution, restart and settings. <strong>Full:</strong> everything the runtime mode allows, evolution included.</div>
                         </div>
                         <div class="form-row">
                             <div class="form-field ui-field">
@@ -749,6 +721,84 @@ export function renderSettingsPage() {
                                 <input id="s-clawhub-registry-url" placeholder="https://clawhub.ai/api/v1" class="ui-control" name="s-clawhub-registry-url" type="text" aria-describedby="s-clawhub-registry-url-help">
                                 <div class="settings-inline-note ui-field-help" id="s-clawhub-registry-url-help">Override only for self-hosted mirrors. Hostname must be <code>clawhub.ai</code> or localhost.</div>
                             </div>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="settings-panel" data-settings-panel="appearance">
+                    <div class="form-section">
+                        <h3>Language</h3>
+                        <div class="settings-section-copy">Interface language, saved with your UI preferences. Applies immediately; strings without a translation stay English.</div>
+                        <div class="settings-effort-card">
+                            <label>Interface Language</label>
+                            <div class="ui-segment-group settings-effort-group" data-language-group role="group" aria-label="Interface Language">
+                                <button type="button" class="ui-segment settings-effort-btn" data-language-value="en">English</button>
+                                <button type="button" class="ui-segment settings-effort-btn" data-language-value="ru">Русский</button>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Theme</h3>
+                        <div class="settings-section-copy">
+                            <code>System</code> follows this device's OS appearance and is the default for a new client.
+                            <code>Light</code> and <code>Dark</code> pin the palette regardless of the OS.
+                            <br><strong>Per device, not per account:</strong> the choice is stored by this client alone
+                            (the desktop window and each browser keep their own), never sent to the server and never
+                            shared with other devices. Clearing this client's site data returns it to System.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="theme-choice-label" id="s-appearance-theme-label">Theme</label>
+                            <div data-theme-control aria-labelledby="s-appearance-theme-label"></div>
+                            <div class="settings-inline-note theme-status" data-theme-status role="status" aria-live="polite"></div>
+                        </div>
+                    </div>
+
+                    <div class="form-section" data-notify-settings>
+                        <h3>Notifications</h3>
+                        <div class="settings-section-copy">
+                            While this client is running, Ouroboros can pull you back to a question or a
+                            finished task. Notifications arrive whether or not this window has focus, and
+                            clicking one opens its source.
+                            <br><strong>Per device, not per account:</strong> like the theme above, these choices
+                            are stored by this client alone and never sent to the server.
+                            Where this system exposes no notifications, or permission is denied, alerts appear
+                            inside the app instead. Do Not Disturb and OS permissions still decide what you see.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="enabled">
+                                Enable notifications
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="needs_answer">
+                                A question or decision is waiting for you
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="task_done">
+                                A task finished or stopped
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="important">
+                                Messages Ouroboros sends you while it works
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="main_reply">
+                                Ordinary replies in Main
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="sound">
+                                Sound
+                            </label>
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-notify-pref="show_text">
+                                Show the message text (otherwise only the kind of event)
+                            </label>
+                            <div class="settings-toolbar">
+                                <button type="button" class="btn btn-default btn-sm" data-notify-test>Send a test notification</button>
+                            </div>
+                            <div class="settings-inline-note" data-notify-status role="status" aria-live="polite"></div>
+                            <div class="settings-inline-note" data-notify-attention-status role="status" aria-live="polite"></div>
                         </div>
                     </div>
                 </section>
@@ -846,11 +896,19 @@ export function renderSettingsPage() {
                              Agents → Delegation (D-10): they bound the agents,
                              not the process pool. Max Workers stays: it is
                              runtime worker processes, not an agent setting. -->
-                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
+                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the idle rail and the reaper; the per-task round and lifetime limits are optional — a positive number, or <code>unlimited</code> for none (the fresh-install default). Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
                         <div class="form-grid two">
                             <div class="form-field ui-field">
                                 <label for="s-workers">Max Workers</label>
                                 <input id="s-workers" type="number" min="1" max="50" value="10" class="ui-control" name="s-workers">
+                            </div>
+                            <div class="form-field ui-field">
+                                <label for="s-max-rounds">Max Rounds per Task</label>
+                                <input id="s-max-rounds" type="text" inputmode="numeric" value="unlimited" placeholder="unlimited" class="ui-control" name="s-max-rounds">
+                            </div>
+                            <div class="form-field ui-field">
+                                <label for="s-task-lifetime">Task Lifetime Limit (s)</label>
+                                <input id="s-task-lifetime" type="text" inputmode="numeric" value="unlimited" placeholder="unlimited" class="ui-control" name="s-task-lifetime">
                             </div>
                             <div class="form-field ui-field">
                                 <label for="s-presence-max-active">Concurrent Presence Conversations</label>
@@ -934,10 +992,11 @@ export function renderSettingsPage() {
                     <button type="button" class="btn btn-secondary" id="btn-reload-settings">Reload Settings</button>
                     <button class="btn btn-save" id="btn-save-settings">Save Settings</button>
                     <button type="button" class="btn btn-secondary" id="btn-restart-now" hidden
-                        title="Restart the agent process to apply the saved changes">Restart now</button>
+                        title="Restart the agent process">Restart now</button>
                 </div>
                 <div class="settings-footer-status">
                     <span id="settings-unsaved-indicator" class="settings-inline-status settings-unsaved-indicator" aria-hidden="true">Unsaved changes</span>
+                    <div id="settings-restart-status" class="settings-inline-status" role="status" aria-live="polite" hidden></div>
                     <div id="settings-status" class="settings-inline-status" role="status" aria-live="polite" aria-atomic="true"></div>
                 </div>
             </div>

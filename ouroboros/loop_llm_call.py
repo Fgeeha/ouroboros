@@ -1,10 +1,4 @@
-"""
-LLM call, retry, pricing, and usage-event logic for the main loop.
-
-Handles model pricing estimation, cost tracking, per-call retry with backoff,
-and real-time usage event emission.
-Extracted from loop.py to keep the main loop orchestrator focused.
-"""
+"""Main-loop provider calls: request observation, retries, pricing and usage events."""
 
 from __future__ import annotations
 
@@ -29,13 +23,14 @@ from ouroboros.deadline_utils import (
     main_transport_timeout_sec as _main_transport_timeout,
 )
 from ouroboros.llm import LLMClient, LocalContextTooLargeError, add_usage
-from ouroboros.llm_claudexor import cache_key_for_model, propagate_model_error
+from ouroboros.llm_claudexor import propagate_model_error
+from ouroboros.llm_substitution import same_route_refusal, stamp_substitutions
 from ouroboros.model_wait import propagate_model_control
 from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY, pop_custom_validation_receipts
 from ouroboros.llm_attempt import PROVIDER_POLICY_REFUSAL, _is_provider_policy_refusal  # typed-refusal contract owner
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
-from ouroboros.provider_models import provider_for_model
+from ouroboros.task_pacing import main_loop_wire_options
 from ouroboros.transport_custody import attempt_custody_event_fields, is_pre_dispatch_transport_failure, is_retryable_transport_death
 from ouroboros._usage_response import provider_cost_value as _provider_cost_value
 from ouroboros.usage_accounting import (
@@ -288,6 +283,7 @@ def _record_and_emit_empty_response(
         "_last_llm_error": _short_error_text(log_msg), "execution_status": status,
         "reason_code": reason, "_last_llm_error_kind": kind,
     })
+    accumulated_usage.get("_last_llm_call_meta", {}).update(failure_code=kind)
     return event_type, is_provider_glitch, permanent_body_error
 
 
@@ -435,6 +431,7 @@ class _LlmErrorContext:
     transport_death_retries: int = 0
     transport_reserve_sec: Optional[float] = None
     stop_retry_check: Optional[Callable[[], bool]] = None
+    requested_profile: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -635,7 +632,6 @@ def _exception_provider_values(exc: Exception) -> List[str]:
 
 
 def _exception_provider_code(exc: Exception, safe_error: str) -> str:
-    del safe_error
     values = _exception_provider_values(exc)
     for value in values:
         if value.lower() in _STRUCTURED_CONTEXT_OVERFLOW_CODES:
@@ -718,6 +714,7 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     if getattr(exc, "stream_rejected", False): return LlmErrorClassification("provider_error", False)  # complete wire judged unusable: a local verdict, never a same-model repeat
     if getattr(exc, "code", "") == "model_outcome_unknown":
         return LlmErrorClassification("provider_outcome_unknown", False)
+    if getattr(exc, "code", "") == "model_substituted": return LlmErrorClassification("model_substituted", False, 0, exc.code)  # a well-formed request the route answered with another model: chain-eligible, never cools the requested one
     if getattr(exc, "code", "") in {"unsupported_parameter", "invalid_continuation", "auth_changed", "model_unavailable"}:
         return LlmErrorClassification("bad_request", False, _exception_status_code(exc), exc.code)
     if getattr(exc, "code", "") == "auth_required":
@@ -725,13 +722,12 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
     if isinstance(exc, LocalContextTooLargeError):
         return LlmErrorClassification("context_overflow", False)
     # Structured fact, not a keyword scan (Bible P5): a transport that KNOWS its
-    # window is spent carries the typed code plus the reset instant.
-    if str(getattr(exc, "code", "") or "") == SUBSCRIPTION_WINDOW_EXHAUSTED:
-        reset_at = str(getattr(exc, "reset_at", "") or "")
-        return LlmErrorClassification(
-            SUBSCRIPTION_WINDOW_EXHAUSTED, True, _exception_status_code(exc),
-            "", seconds_until(reset_at), reset_at,
-        )
+    # window is spent carries the typed code plus the reset instant; a DATED credential
+    # pool heals on the same timer (its code stays as evidence), an undated one never gets here.
+    wcode, reset_at = str(getattr(exc, "code", "") or ""), str(getattr(exc, "reset_at", "") or "")
+    if wcode == SUBSCRIPTION_WINDOW_EXHAUSTED or (wcode == "credential_pool_exhausted" and reset_at):
+        return LlmErrorClassification(SUBSCRIPTION_WINDOW_EXHAUSTED, True, _exception_status_code(exc),
+                                      "" if wcode == SUBSCRIPTION_WINDOW_EXHAUSTED else wcode, seconds_until(reset_at), reset_at)
     status_code = _exception_status_code(exc)
     provider_code = _exception_provider_code(exc, safe)
     # Typed refusal (llm_attempt.ProviderPolicyRefusal): nothing upstream answered,
@@ -814,20 +810,15 @@ def classify_llm_exception(exc: Exception, safe_error: str = "") -> LlmErrorClas
 def _remember_llm_call(
     usage: Dict[str, Any],
     *,
-    llm_call_id: str,
-    execution_id: str,
-    round_id: str,
-    round_idx: int,
-    attempt: int,
-    model: str,
-    display_model: str,
-    provider: str,
+    llm_call_id: str, execution_id: str, round_id: str,
+    round_idx: int, attempt: int, model: str, display_model: str, provider: str,
     request_ref: Dict[str, Any],
     response_ref: Dict[str, Any],
     reported_model: Any = None,
     use_local: Optional[bool] = None,
+    requested_profile: Optional[str] = None, observed_route: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    call_meta = {
+    call_meta = {"ts": utc_now_iso(),
         "llm_call_id": llm_call_id,
         "execution_id": execution_id,
         "round_id": round_id,
@@ -840,6 +831,8 @@ def _remember_llm_call(
         "use_local": use_local,
         "request_ref": request_ref.get("manifest_ref") if request_ref else None,
         "response_ref": response_ref.get("manifest_ref") if response_ref else None,
+        "requested_profile": requested_profile,
+        "observed_route": dict(observed_route or {}),
     }
     usage["_last_llm_call_meta"] = call_meta
     usage.setdefault("llm_call_refs", []).append(call_meta)
@@ -943,10 +936,8 @@ def _record_llm_call_error(
             "route": dict(getattr(error, "route", {}) or {}), "outcome": "unknown",
             "request_ref": ctx.request_ref.get("manifest_ref") if ctx.request_ref else None,
         }
-        # The caller chooses this existing repeat rail. Ordinary managed tasks
-        # set it to zero: their transport episode requires upstream recovery
-        # before a marked NEW attempt. Other callers retain their bounded rail;
-        # grant before logging, and uncount a grant refused before dispatch.
+        # Ordinary managed tasks require upstream recovery before a new attempt;
+        # other callers retain their bounded repeat rail.
         if (
             is_retryable_transport_death(error)
             and repeats < ctx.transport_death_retries and ctx.attempt < ctx.transient_budget - 1
@@ -973,26 +964,30 @@ def _record_llm_call_error(
         "llm_call_id": ctx.llm_call_id, "round": ctx.round_idx, "attempt": ctx.attempt + 1,
         "model": ctx.model,
     }
-    # ONE error row (#355): a successful append's registered sink owns live
-    # delivery. Without that path, send the SAME evidence through the queue,
-    # preserving its identity for live/backfill dedupe. No llm_round_error
-    # sibling here; Background Consciousness keeps its own separate producer.
+    # The append sink owns delivery; queue fallback preserves the same identity.
+    # No llm_round_error sibling: Background Consciousness owns its separate producer.
     error_event = {
         "ts": utc_now_iso(), "type": "llm_api_error", **identity, "error": display_error,
         "error_kind": classification.kind, "retry_same_request": will_retry,
         "status_code": classification.status_code, "provider_code": classification.provider_code,
         "provider_message": provider_message,
+        "requested_profile": ((getattr(error, "usage", {}) or {}).get("claudexor") or {}).get("requested_profile", ctx.requested_profile),
+        "observed_route": dict(getattr(error, "route", {}) or {}),
         **custody_fields,
         **(ctx.context_fit_event_fields or {}),
         "request_ref": ctx.request_ref.get("manifest_ref") if ctx.request_ref else None,
     }
     if not append_jsonl(ctx.drive_logs / "events.jsonl", error_event) or not has_log_sink():
         emit_log_event(ctx.event_queue, error_event, log_label="LLM call error")
+    ctx.accumulated_usage.setdefault("llm_call_refs", []).append({
+        **{key: error_event[key] for key in ("ts", "llm_call_id", "model", "requested_profile", "observed_route")},
+        "failure_code": classification.kind, "reset_at": classification.reset_at,
+    })
     ctx.accumulated_usage.update(_last_llm_error=_short_error_text(display_error),
                                  _last_llm_error_kind=classification.kind, _last_llm_retry_same_request=will_retry)
     if classification.retry_after_sec is not None:
-        ctx.accumulated_usage["_last_llm_retry_after_sec"] = classification.retry_after_sec
-        ctx.accumulated_usage["_last_llm_reset_at"] = classification.reset_at
+        ctx.accumulated_usage.update(_last_llm_retry_after_sec=classification.retry_after_sec,
+                                     _last_llm_reset_at=classification.reset_at)
     else:
         ctx.accumulated_usage.pop("_last_llm_retry_after_sec", None)
         ctx.accumulated_usage.pop("_last_llm_reset_at", None)
@@ -1000,6 +995,7 @@ def _record_llm_call_error(
                        ("_last_llm_provider_code", classification.provider_code)):
         if value:
             ctx.accumulated_usage[key] = value
+    stamp_substitutions(ctx.accumulated_usage, error)
     ctx.accumulated_usage.update(execution_status="infra_failed", reason_code="llm_api_error")
     if classification.kind == "context_overflow":
         overflow_event_type = "local_context_overflow" if isinstance(error, LocalContextTooLargeError) else "remote_context_overflow"
@@ -1066,6 +1062,7 @@ def provider_no_call_source(accumulated_usage: Dict[str, Any], deadline_exhauste
     cleared only by a usable response) forbids the resend whatever the sticky kind."""
     if str(accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown" or isinstance(accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict):
         return "provider_outcome_unknown_no_resend", False
+    if same_route_refusal(accumulated_usage): return "same_route_refusal_no_resend", False  # a salvage call is the same request on the same route, and the accounts that refused it were just marked
     if not deadline_exhausted and bool(accumulated_usage.get(RETRY_WALL_EXHAUSTED_KEY)):
         return "retry_wall_exhausted_no_repay", True
     return "", False
@@ -1198,13 +1195,17 @@ def _send_main_candidate(
     deadline_ts: Optional[float],
     physical_context: Optional[PhysicalAttemptContext],
     candidate_predicate: Optional[Callable[[Any], Any]],
+    model_context_observer: Any = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     binding = (
         contextlib.nullcontext() if physical_context is None and candidate_predicate is None
         else bind_physical_attempt_context(physical_context, candidate_predicate=candidate_predicate)
     )
     with model_concurrency.model_call_slot(model, use_local, deadline_ts), binding:
-        return llm.chat(**kwargs)
+        result = llm.chat(**kwargs)
+        if callable(model_context_observer):
+            model_context_observer(kwargs["messages"])
+        return result
 
 
 def _take_custom_receipts(
@@ -1380,11 +1381,11 @@ def call_llm_with_retry(
                 "context_mode": getattr(physical_context, "rendered_mode", None),
                 "reasoning_effort": effort,
                 "max_tokens": MAIN_LOOP_MAX_TOKENS,
-                "stream": True, "caller_deadline_ts": (None if deadline_ts is None
+                **main_loop_wire_options(model, allow_server_web_search=allow_server_web_search,
+                                         bypass_response_cache=response_cache_bypass_requested),
+                "caller_deadline_ts": (None if deadline_ts is None
                     else float(deadline_ts) - float(transport_reserve_sec or 0.0)),
-                "use_local": use_local, "cache_affinity": cache_key_for_model(model),
-                "allow_server_web_search": bool(allow_server_web_search) and provider_for_model(model) != "claudexor",
-                "bypass_response_cache": response_cache_bypass_requested and provider_for_model(model) != "claudexor",
+                "use_local": use_local,
                 "timeout": _main_transport_timeout(model, deadline_ts, reserve_sec=transport_reserve_sec),
             }
             request_ref = persist_observed_call(
@@ -1427,11 +1428,11 @@ def call_llm_with_retry(
             _emit_main_llm_call_state(event_queue, call_identity, "started")
             msg, usage = _send_main_candidate(
                 llm, kwargs, model=model, use_local=use_local, deadline_ts=deadline_ts,
-                physical_context=physical_context, candidate_predicate=candidate_predicate if attempt == 0 else None,
+                physical_context=physical_context, candidate_predicate=candidate_predicate if attempt == 0 else None, model_context_observer=model_context_observer,
             )
             host_route = usage.get("model_role_route") or {}
             model, use_local = host_route.get("model", model), host_route.get("use_local", use_local)
-            accumulated_usage["_model_route"], accumulated_usage["_options"] = dict((usage.get("claudexor") or {}).get("route") or {}), ({key: (usage.get("claudexor") or {}).get(key) for key in ("requested_options", "applied_options", "options_honored", "route")} if usage.get("claudexor") else {})
+            accumulated_usage["_model_route"], accumulated_usage["_options"], accumulated_usage["_model_substitutions"] = dict((usage.get("claudexor") or {}).get("route") or {}), ({key: (usage.get("claudexor") or {}).get(key) for key in ("requested_options", "applied_options", "options_honored", "route")} if usage.get("claudexor") else {}), ((usage.get("claudexor") or {}).get("substituted") or [])
             context_fit_event_fields = _context_fit_event_fields(accumulated_usage) if physical_context is not None else {}
             _take_custom_receipts(usage, msg, accumulated_usage)
             for stale in ("_last_llm_error", "_last_llm_error_kind", "_last_llm_retry_same_request",
@@ -1465,16 +1466,13 @@ def call_llm_with_retry(
             )
             _remember_llm_call(
                 accumulated_usage,
-                llm_call_id=llm_call_id,
-                execution_id=execution_id,
-                round_id=round_id,
-                round_idx=round_idx,
-                attempt=attempt + 1,
-                model=model,
-                display_model=display_model,
-                provider=provider,
+                llm_call_id=llm_call_id, execution_id=execution_id, round_id=round_id,
+                round_idx=round_idx, attempt=attempt + 1, model=model,
+                display_model=display_model, provider=provider,
                 request_ref=request_ref,
                 response_ref=response_ref, reported_model=usage.get("resolved_model"), use_local=bool(use_local),
+                requested_profile=(usage.get("claudexor") or {}).get("requested_profile", host_route.get("credential_profile_id", model_account_override)),
+                observed_route=(usage.get("claudexor") or {}).get("route"),
             )
             category = task_type if task_type in ("evolution", "consciousness", "review", "summarize") else "task"
             emit_llm_usage_event(
@@ -1593,6 +1591,7 @@ def call_llm_with_retry(
                     max_retries=max_retries, transient_budget=transient_budget,
                     transport_death_retries=transport_death_retries, transport_reserve_sec=transport_reserve_sec,
                     stop_retry_check=stop_retry_check,
+                    requested_profile=host_route.get("credential_profile_id", model_account_override),
                 ),
                 call_identity,
             ):

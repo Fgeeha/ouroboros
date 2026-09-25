@@ -13,11 +13,20 @@ import pytest
 
 from ouroboros import consciousness as clock_module
 from ouroboros.consciousness import (
-    ARCHIVED_INBOX_REL, INTERVAL_STATE_KEY, LEGACY_INBOX_REL, NEXT_WAKE_STATE_KEY, BackgroundConsciousness,
+    ARCHIVED_INBOX_REL,
+    INTERVAL_STATE_KEY,
+    LAST_WAKE_STATE_KEY,
+    LEGACY_INBOX_REL,
+    NEXT_WAKE_STATE_KEY,
+    BackgroundConsciousness,
 )
 from supervisor.active_activity import get_direct_activity_registry
 
 T0 = 1_800_000_000.0
+
+
+def _iso(ts):
+    return clock_module._iso(ts)
 FLOOR, CEILING, DEFAULT = 900, 14400, 3300
 AVAILABLE = {"status": "available", "limit_usd": 20.0, "accounted_usd": 2.5, "remaining_usd": 17.5,
              "resets_at": "", "unknown_unmetered": 0}
@@ -55,7 +64,7 @@ def clock(monkeypatch, tmp_path):
         return dict(receipt)
 
     monkeypatch.setattr(workers, "handle_wake_direct", handle_wake_direct)
-    monkeypatch.setattr(clock_module, "allowance_window", lambda root, now=None: dict(AVAILABLE))
+    monkeypatch.setattr(clock_module, "allowance_window", lambda root, now=None, **_display_read: dict(AVAILABLE))
     monkeypatch.setattr(BackgroundConsciousness, "_running_roots", staticmethod(lambda: 1))
     get_direct_activity_registry().clear()
     clock = BackgroundConsciousness(tmp_path, tmp_path / "repo", lambda: store.get("owner_chat_id"), now=T0)
@@ -85,6 +94,35 @@ def test_boot_floor_never_wakes_in_the_first_second(clock):
     later = BackgroundConsciousness(clock.root, clock.root / "repo", lambda: 7, now=T0)
     assert later.next_wake_at == T0 + 5000
     assert later.enabled is True
+
+
+def test_boot_restores_the_previous_wake_boundary_for_context_since_window(clock):
+    clock.store[LAST_WAKE_STATE_KEY] = T0 - 3600
+    later = BackgroundConsciousness(clock.root, clock.root / "repo", lambda: 7, now=T0)
+    assert later.status_snapshot()["last_wake_at"].startswith("2027-")
+    assert later._last_wake_at == T0 - 3600
+
+
+def test_boot_discloses_invalid_wake_boundary_and_uses_process_start(caplog, clock):
+    for raw in ("not-a-timestamp", "NaN", "Infinity", T0 + 3600):
+        clock.store[LAST_WAKE_STATE_KEY] = raw
+        with caplog.at_level("WARNING"):
+            later = BackgroundConsciousness(clock.root, clock.root / "repo", lambda: 7, now=T0)
+        assert later._last_wake_at == 0.0
+    assert any("invalid persisted last wake boundary" in record.message for record in caplog.records)
+
+
+def test_restored_boundary_reaches_the_launched_wake_text(clock):
+    clock.store[LAST_WAKE_STATE_KEY] = T0 - 3600
+    (clock.root / "task_results").mkdir()
+    (clock.root / "task_results" / "settled.json").write_text(json.dumps({
+        "task_id": "settled", "status": "completed", "updated_at": _iso(T0 - 1800),
+        "ts": _iso(T0 - 1800), "description": "settled before restart", "_schema_version": 1,
+    }), encoding="utf-8")
+    later = BackgroundConsciousness(clock.root, clock.root / "repo", lambda: 7, now=T0)
+    assert later.tick(T0 + FLOOR + 1) == "launched"
+    assert "- task settled completed" in clock.launches[-1]["text"]
+    assert "no wake since this process started" not in clock.launches[-1]["text"]
 
 
 def test_legacy_inbox_is_archived_once_without_being_read(clock):
@@ -127,7 +165,7 @@ def test_a_live_wake_or_owner_turn_defers_the_wake(clock):
 
 def test_allowance_unknown_skips_with_a_typed_status_and_the_floor(clock, monkeypatch):
     monkeypatch.setattr(clock_module, "allowance_window",
-                        lambda root, now=None: {"status": "allowance_unknown", "error": "OSError: ledger"})
+                        lambda root, now=None, **_display_read: {"status": "allowance_unknown", "error": "OSError: ledger"})
     now = T0 + FLOOR + 1
     assert clock.clock.tick(now) == "skipped:allowance_unknown"
     assert clock.clock.next_wake_at == now + FLOOR
@@ -142,13 +180,13 @@ def test_allowance_exhausted_skips_until_the_window_frees(clock, monkeypatch):
     from ouroboros.deadline_utils import parse_deadline_ts
 
     resets_at = "2027-02-01T00:00:00+00:00"
-    monkeypatch.setattr(clock_module, "allowance_window", lambda root, now=None: {
+    monkeypatch.setattr(clock_module, "allowance_window", lambda root, now=None, **_display_read: {
         **AVAILABLE, "status": "exhausted", "accounted_usd": 21.0, "remaining_usd": 0.0, "resets_at": resets_at})
     assert clock.clock.tick(T0 + FLOOR + 1) == "skipped:allowance_exhausted"
     assert clock.clock.next_wake_at == parse_deadline_ts(resets_at).timestamp()
     assert clock.clock.status_snapshot()["last_wake_outcome"] == "skipped:allowance_exhausted"
     # A reset instant already in the past (or none: DAILY_USD=0) still waits at least the floor.
-    monkeypatch.setattr(clock_module, "allowance_window", lambda root, now=None: {
+    monkeypatch.setattr(clock_module, "allowance_window", lambda root, now=None, **_display_read: {
         **AVAILABLE, "status": "exhausted", "resets_at": ""})
     clock.clock._next_wake_at = T0
     assert clock.clock.tick(T0 + 5) == "skipped:allowance_exhausted"
@@ -190,6 +228,12 @@ def test_launch_starts_an_ordinary_main_turn_with_the_wake_envelope(clock):
     assert snapshot["last_wake_task_id"] == "wake0001" and snapshot["last_wake_outcome"] == "running"
     started = [row for row in _events(clock.root) if row["type"] == "consciousness_wake_started"]
     assert started and started[0]["task_id"] == "wake0001" and started[0]["wake_reason"] == "heartbeat"
+
+
+def test_launch_text_carries_the_trigger_line(clock):
+    clock.clock.notify("task_finished:done:completed")
+    assert clock.clock.tick(T0 + FLOOR + 1) == "launched"
+    assert "- wake cause: task done finished (completed)" in clock.launches[-1]["text"]
 
 
 def test_launch_carries_the_main_lane_routing_facts_an_owner_turn_gets(clock):
@@ -246,7 +290,7 @@ def test_less_than_one_planned_turn_left_is_exhausted(clock, monkeypatch):
     from ouroboros.task_pacing import COST_PLANNING_MARGIN_USD
 
     thin = dict(AVAILABLE, remaining_usd=COST_PLANNING_MARGIN_USD, accounted_usd=20.0 - COST_PLANNING_MARGIN_USD)
-    monkeypatch.setattr(clock_module, "allowance_window", lambda root, now=None: dict(thin))
+    monkeypatch.setattr(clock_module, "allowance_window", lambda root, now=None, **_display_read: dict(thin))
     assert clock.clock.tick(T0 + FLOOR + 1) == "skipped:allowance_exhausted"
     assert clock.launches == []
     # On an exhausted day every root completion would otherwise pull the clock to "now" and cost a
@@ -343,6 +387,7 @@ def test_finish_schedules_the_chosen_interval_clamped(clock, monkeypatch):
     clock.store[INTERVAL_STATE_KEY] = 100  # below the floor
     finished("wake0001", True)
     assert clock.clock.next_wake_at == T0 + 5000 + FLOOR
+    assert clock.store[LAST_WAKE_STATE_KEY] == T0 + 5000
     snapshot = clock.clock.status_snapshot()
     assert snapshot["last_wake_outcome"] == "done" and snapshot["last_error"] == ""
     assert snapshot["last_wake_at"].startswith("2027-")
@@ -431,7 +476,7 @@ def test_project_digest_and_orphan_heal_reach_notify(monkeypatch, tmp_path):
     _handle_project_digest({"project_id": "p9", "task_id": "t9"}, ctx)
     # A digest of a tree consciousness started is its own news: never a wake reason.
     _handle_project_digest({"project_id": "p9", "task_id": "t10", "initiator": "consciousness"}, ctx)
-    assert reasons == ["project_digest:p9"]
+    assert reasons == ["project_digest:p9:t9"]
     monkeypatch.setattr("ouroboros.skill_review_runner.reconcile_stale_review_jobs", lambda root: None)
     monkeypatch.setattr("ouroboros.task_status.reconcile_orphaned_running_tasks", lambda root, **kw: 2)
     monkeypatch.setattr("ouroboros.projects_registry.reconcile_projects", lambda root: None)
@@ -481,6 +526,23 @@ def test_status_snapshot_carries_the_alarm_facts(clock):
     assert snapshot["next_wake_at"].startswith("2027-") and snapshot["last_wake_at"] == ""
     assert snapshot["spent_24h_usd"] == 2.5 and snapshot["daily_usd"] == 20.0
     assert snapshot["tasks_running"] == 1 and snapshot["max_tasks"] == 2 and snapshot["live_wake_task_id"] == ""
+
+
+def test_the_status_view_may_ride_a_snapshot_and_a_wake_admission_never_does(clock, monkeypatch):
+    """The status view shows money, so it may lag behind a contended ledger lock; the
+    wake ADMISSION spends it, so it reads exactly. One reader, two callers."""
+    reads: list = []
+
+    def window(root, now=None, **display_read):
+        reads.append(dict(display_read))
+        return dict(AVAILABLE)
+
+    monkeypatch.setattr(clock_module, "allowance_window", window)
+    clock.clock._allowance = (0.0, {})  # nothing cached: the view must read
+    clock.clock.status_snapshot()
+    assert reads == [{"allow_stale": True}]
+    clock.clock._allowance_view(T0, fresh=True)
+    assert reads[-1] == {"allow_stale": False}
 
 
 def test_start_after_a_long_off_period_never_announces_a_past_wake(clock, monkeypatch):

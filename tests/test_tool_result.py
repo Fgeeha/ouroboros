@@ -315,9 +315,13 @@ def test_extension_legacy_adapter_and_registry_liveness_are_distinct(
     assert registry_result == ToolResult(
         status="unavailable",
         code="EXTENSION_UNAVAILABLE",
-        # tip drift: compat aliases are callable but never advertised, so the
-        # unknown-tool inventory lists only public names.
-        text=f"⚠️ Unknown tool: {name}. Available: {', '.join(sorted(n for n, e in registry._entries.items() if not e.alias_for))}",
+        # #1262: the one name-miss composer states the dead extension and the
+        # addressed namespace's callable view, never the whole registry.
+        text=(
+            f"⚠️ Unknown tool: {name!r}: its extension is not live for this task right now. "
+            "Nothing was executed.\nNo tool in ext_4_demo is currently callable in this task; "
+            "list_available_tools shows the callable namespaces."
+        ),
         meta={"dynamic_provider": True},
     )
     assert calls == []
@@ -988,7 +992,8 @@ def test_loop_parallel_executor_crash_preserves_input_order_and_typed_trace(
         CODE_TOOLS = frozenset()
         # tip drift: handle_tool_calls drains the request-wire custom receipts
         # off the ctx, so the fake carries a real attribute surface.
-        _ctx = SimpleNamespace(_request_wire_custom_receipts=())
+        _ctx = SimpleNamespace(_request_wire_custom_receipts=(),
+                               _current_llm_call_meta={"round_id": "exec:round:10"})
 
         @staticmethod
         def get_timeout(_name):
@@ -1032,6 +1037,7 @@ def test_loop_parallel_executor_crash_preserves_input_order_and_typed_trace(
             "result": expected,
             "is_error": True,
             "trace_ref": None,
+            "round_id": "exec:round:10",
             "status": "executor_error",
             "tool_result_status": "error",
             "tool_result_code": "EXECUTOR_ERROR",

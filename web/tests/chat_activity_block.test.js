@@ -70,7 +70,7 @@ function fixture(history = []) {
             isConnected: () => true, send() {} },
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
         updateUnreadBadge() {}, chatId: 1, idPrefix: 'chat', mountEl: env.mount,
-        stateSnapshots: { begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        stateSnapshots: { begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
     });
     const messages = document.byId.get('chat-messages');
@@ -239,6 +239,62 @@ test('a managed Swarm root keeps the task card with Turn into project; an origin
         assert.ok(f.card('bound-root'));
         assert.equal(f.card('bound-root').querySelector('[data-turn-into-project]'), null);
     } finally { delete globalThis.window.__ouroTaskBindings; f.close(); }
+});
+
+test('lineage reclassifies a root-shaped shell: a child offers no conversion, whichever frame arrives first', () => {
+    // A child's own frame can outrun the frame that names its parent (a
+    // reconnecting socket, a partial window): the shell is minted root-shaped,
+    // with the conversion control. A child is never a convertible unit — it
+    // inherits its root's Project by lineage.
+    const lineage = { delegation_role: 'subagent', parent_task_id: TASK, root_task_id: TASK, subagent_role: 'researcher' };
+    const work = { task_id: 'kid-1', role: 'assistant', is_progress: true, content: 'Reading the registry.' };
+    const scheduled = { ...lineage, task_id: TASK, role: 'assistant', is_progress: true, content: 'scheduled',
+        subagent_event: 'scheduled', subagent_task_id: 'kid-1' };
+    // Lineage on a frame that renders nothing: no row, no lifecycle event.
+    const silent = { ...lineage, task_id: 'kid-1', role: 'assistant', is_progress: true, content: '' };
+    const ownRow = (card) => card.children.find((node) => node.classList.contains('chat-live-actions'));
+    // `rootFirst: false` — the child's frame is the first the client sees of the
+    // whole tree: the root has no actions row of its own yet.
+    for (const rootFirst of [true, false]) for (const order of [[work, scheduled], [scheduled, work], [work, silent]]) {
+        const f = fixture();
+        try {
+            f.census(managed());
+            if (rootFirst) f.emit('chat', { task_id: TASK, role: 'assistant', is_progress: true, content: 'Planning the swarm.' });
+            for (const row of order) f.emit('chat', row);
+            const kid = f.card('kid-1');
+            assert.ok(kid, 'the reclassified child stays in the transcript');
+            assert.equal(kid.dataset.subagent, '1');
+            assert.equal(kid.dataset.parentTaskId, TASK);
+            // Booleans, not nodes: a failed node comparison prints the whole stub graph.
+            assert.equal(Boolean(kid.querySelector('[data-turn-into-project]')), false, 'a child offers no conversion');
+            // The root's conversion sits on the root's OWN row, never on a row its child left behind.
+            assert.ok(ownRow(f.card())?.querySelector('[data-turn-into-project]'), 'the root keeps its conversion');
+        } finally { f.close(); }
+    }
+});
+
+test('a child frame that outruns the first history load leaves no root control inside the child card', async () => {
+    // Main opened mid-swarm: the child's tool frame lands before the history
+    // that holds the root's own row and the lineage.
+    const f = fixture([
+        { role: 'assistant', is_progress: true, text: 'Planning the swarm.', content: 'Planning the swarm.', task_id: TASK, ts: TS, chat_id: 1,
+            cancelable: true },
+        { role: 'assistant', is_progress: true, text: 'scheduled', content: 'scheduled', task_id: TASK, ts: '2026-09-15T12:00:01Z',
+            chat_id: 1, subagent_event: 'scheduled', subagent_task_id: 'kid-1', parent_task_id: TASK,
+            root_task_id: TASK, delegation_role: 'subagent', subagent_role: 'researcher' },
+    ]);
+    try {
+        f.census(managed());
+        f.log({ type: 'tool_call_started', task_id: 'kid-1', tool: 'read_file', tool_call_id: 'k1' });
+        await f.instance.refreshHistory({ revision: 1 });
+        const kid = f.card('kid-1');
+        assert.equal(kid.dataset.parentTaskId, TASK);
+        for (const control of ['[data-turn-into-project]', '[data-cancel-run]']) {
+            assert.equal(Boolean(kid.querySelector(control)), false, `no ${control} inside the child card`);
+        }
+        const own = f.card().children.find((node) => node.classList.contains('chat-live-actions'));
+        assert.ok(own?.querySelector('[data-turn-into-project]'), 'the root holds its conversion on its own row');
+    } finally { f.close(); }
 });
 
 test('a wake-up is an ordinary direct block: an empty frame mints nothing, a tool call mints the block', () => {
@@ -708,5 +764,27 @@ test('a child card folds its own tool calls live and takes no at-rest evidence r
             tool_call_counts: { read_file: 5 } });
         assert.equal(folded().length, 1, 'the at-rest fact belongs to the owning turn: a child takes no row from it');
         assert.doesNotMatch(folded()[0].innerHTML, /5 tool calls/);
+    } finally { f.close(); }
+});
+
+test('#931 a typed checkpoint is a real expanded row without stealing narration', () => {
+    const f = fixture();
+    try {
+        f.census(managed());
+        f.emit('chat', { task_id: TASK, role: 'assistant', is_progress: true,
+            narration: true, content: 'Reading the source' });
+        const card = f.card();
+        const title = card.querySelector('[data-live-title]').textContent;
+        f.log({ type: 'task_checkpoint', checkpoint_kind: 'context_view', round: 3 });
+        if (card.dataset.expanded !== '1') {
+            card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        }
+        assert.ok(f.rows().some((row) => row.innerHTML.includes('Context inspected')));
+        assert.equal(card.querySelector('[data-live-title]').textContent, title);
+        f.log({ type: 'task_checkpoint', checkpoint_kind: 'context_view', round: 3 });
+        assert.equal(f.rows().filter((row) => row.innerHTML.includes('Context inspected')).length, 1);
+        const count = f.rows().length;
+        f.log({ type: 'worker_starting', worker_id: 0 });
+        assert.equal(f.rows().length, count);
     } finally { f.close(); }
 });

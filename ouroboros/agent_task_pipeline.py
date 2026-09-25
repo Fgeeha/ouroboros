@@ -52,6 +52,7 @@ from ouroboros.post_task_checkpoint import (
     root_checkpoint_roots as _root_checkpoint_roots,
     root_post_task_already_completed as _root_post_task_already_completed,
     set_root_post_task_checkpoint as _set_root_post_task_checkpoint,
+    settle_terminal_projection as _settle_terminal_projection,
 )
 from ouroboros.skill_publish_result import apply_skill_publish_receipt_veto
 from ouroboros.task_finalization import (
@@ -306,7 +307,16 @@ def recover_pending_root_post_task_synthesis(
             continue
         checkpoint = stored.get("root_phase_checkpoint")
         phase = str(checkpoint.get("post_task_synthesis") or "") if isinstance(checkpoint, dict) else ""
-        if not task_id or not _post_task_synthesis_is_open(phase):
+        if not task_id:
+            continue
+        if not _post_task_synthesis_is_open(phase):
+            # #1154: a root whose synthesis already settled can still OWE its
+            # terminal projection — the process died between the obligation and
+            # the Project/Main effects, or Main's eligibility could not be
+            # established last pass. Replaying it here is pure bookkeeping on this
+            # existing startup scan: no model call, no new timer, no new store. It is not
+            # counted as a recovered synthesis, which is what this number means.
+            _settle_terminal_projection(root, task_id, task={**stored, "id": task_id})
             continue
         task = {**stored, "id": task_id, "root_task_id": str(stored.get("root_task_id") or task_id)}
         task.setdefault("budget_drive_root", str(root))
@@ -524,10 +534,11 @@ def emit_task_results(
     actor_fact, usage, llm_trace = actor_first_terminal_projection(ctx, task, usage, llm_trace, task.get("budget_drive_root") or getattr(env, "drive_root", None))
     loop_outcome = _derive_host_bound_loop_outcome(env, task, text, usage, llm_trace)
     receipt_root = pathlib.Path(str(getattr(env, "drive_root", None) or "."))
+    verification_receipts = task_verification_receipts(ctx, receipt_root, task)
     # Apply FR3 once so events and the durable result share the same flagged outcome.
     apply_receipt_absent_flag(
         loop_outcome, llm_trace, receipt_root, str(task.get("id") or ""),
-        expected_output=str(task.get("expected_output") or ""), receipts=task_verification_receipts(ctx, receipt_root, task),
+        expected_output=str(task.get("expected_output") or ""), receipts=verification_receipts,
     )
     outcome_axes = normalize_outcome_axes({"outcome_axes": loop_outcome.get("outcome_axes")})
     execution_status = str((outcome_axes.get("execution") or {}).get("status") or "")
@@ -560,7 +571,7 @@ def emit_task_results(
         send_event["progress_meta"] = dict(_message_meta)
     send_event = prepare_terminal_send_event(env.drive_root, task, text, usage, send_event, presence=_presence)
     pending_events.append(build_presence_result_event(
-        task, text, ctx, provider_notice=terminal_notice_text(usage),
+        task, text, ctx, terminal_origin=str(usage.get("terminal_origin") or ""),
         retain_scheduled_handoff=failed_or_forced,
     ) if _presence else send_event)
     duration_sec = round(time.time() - start_time, 3)
@@ -571,6 +582,9 @@ def emit_task_results(
             str(task.get("id") or ""), fields=True,
             drive_root=pathlib.Path(task.get("budget_drive_root") or env.drive_root),
         )
+        from ouroboros.cost_projection import with_task_cost_presentation
+
+        task_cost_fields = with_task_cost_presentation(task_cost_fields, task, env.drive_root)
     except Exception:
         log.error("Task cost authority unavailable at finalization", exc_info=True)
         task_cost_fields = {
@@ -580,6 +594,7 @@ def emit_task_results(
             "prompt_tokens": None, "completion_tokens": None,
             "reserved_usd": None, "unresolved_upper_bound_usd": None,
             "unknown_unmetered": None,
+            "cost_presentation": None,
         }
     # SSOT cost naming (C2/ABI-3): the honest names on every terminal frame
     # this pipeline emits; the seam also strips any legacy alias spelling.
@@ -629,6 +644,11 @@ def emit_task_results(
     except Exception:
         log.debug("Failed to collect review evidence", exc_info=True)
 
+    from ouroboros.post_task_synthesis import capture_task_inputs
+    review_evidence["task_inputs"] = capture_task_inputs(
+        ctx, task, task.get("budget_drive_root") or receipt_root, verification_receipts,
+    )
+
     # GR2-5 (§8-A2, ONE outbox for EVERY root) + GR3-5 (ordering closes the
     # persist→register crash window): the final answer enters the durable
     # outbox — the owed row embeds the full payload — immediately BEFORE
@@ -640,6 +660,7 @@ def emit_task_results(
     # used to buffer the send with no delivery_id and no owed registration
     # at all. Seam + dedup: ouroboros/task_finalization.py.
     if _root_outbox and not _presence:
+        send_event.setdefault("progress_meta", {}).update(outcome_axes=outcome_axes, reason_code=reason_code)
         stamp_root_final_phase(  # the stamp names the SAME word the durable row below settles to
             send_event, task, terminal_status=_durable_terminal_status(env, task, execution_status),
             post_task_open=not task.get("_skip_post_task_synthesis") and not _root_post_task_already_completed(env, task),
@@ -897,6 +918,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
         cost_fields = with_cost_aliases(cost_fields or {
             "cost_accounting_status": "unavailable", "cost_final": False,
             "cost_accounting_error": "ledger_projection_missing",
+            "cost_presentation": None,
             "accounted_upper_bound_usd": None, "total_rounds": None,
             "prompt_tokens": None, "completion_tokens": None,
             "reserved_usd": None, "unresolved_upper_bound_usd": None,
@@ -1076,6 +1098,12 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
         )
     except Exception as e:
         log.warning("Failed to store task result: %s", e)
+        return
+    try:
+        from ouroboros.subagent_history import record_task_execution
+        record_task_execution(task, usage, drive_root=task.get("budget_drive_root") or env.drive_root)
+    except Exception as e:
+        log.warning("Task result stored; subagent history unavailable: %s", e)
 
 
 def build_review_context(env: Any) -> str:

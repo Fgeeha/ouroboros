@@ -32,7 +32,7 @@ function fixture(t, initial = page([]), fetchPage = null) {
         ws: { on(type, handler) { handlers.set(type, handler); return () => handlers.delete(type); },
             isConnected: () => true, send() {} },
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
-        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+        updateUnreadBadge() {}, stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
         chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true,
     });
@@ -193,12 +193,14 @@ test('a replayed refusal receipt shows the host cause and a later scheduled rece
     assert.equal(note.textContent, cause);
     await f.refresh(page([{ ...message, chat_annotation: {
         action: 'promote_chat_to_task', status: 'scheduled', target: 'task-started', target_label: 'Investigation',
+        project_id: 'current-project', project_chat_id: 2,
     } }]));
     assert.equal(f.bubbles().filter((node) => node.dataset.historyId === 'chat:250').length, 1);
     assert.equal(f.bubbles().find((node) => node.dataset.historyId === 'chat:250'), bubble);
     assert.equal(bubble.querySelector('.msg-routing-annotation'), note);
     assert.equal(bubble.dataset.chatAnnotationStatus, 'scheduled');
     assert.equal(note.textContent, 'Started task · Investigation');
+    assert.equal(bubble.querySelector('.msg-routing-actions'), null, 'the current Project is already displayed');
 });
 
 test('two physical rows with identical timestamp and body remain two messages across refresh', async (t) => {

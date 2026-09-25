@@ -149,10 +149,12 @@ def _raw_base(catalog: Dict[str, Any], catalog_url: str) -> str:
     raise OuroborosHubError("catalog must include raw_base_url")
 
 
-# Display-plane catalog memo (§7.1a): ONLY gateway display reads pass
-# ``fresh=False``. install/adopt/update and the official-hub verifier always
-# call ``load_catalog()`` with the fresh default and never consume the memo;
-# every successful fetch refreshes it so display lags at most the TTL.
+# Display-plane catalog memo (§7.1a): ONLY gateway display reads consume it —
+# the catalog endpoint (``fresh=False``: refetches once expired) and the
+# ``/api/extensions`` listing + ``/manifest`` hint (``display_catalog_files``:
+# peeks, never fetches). install/adopt/update, the review profile and owner attestation
+# always call ``load_catalog()`` fresh; every successful fetch refreshes the
+# memo so display lags at most the TTL.
 _CATALOG_CACHE_TTL_SEC = 120.0
 _CATALOG_CACHE_LOCK = threading.Lock()
 _CATALOG_CACHE: Optional[tuple[float, Dict[str, Any]]] = None
@@ -206,6 +208,19 @@ def load_catalog(fresh: bool = True) -> Dict[str, Any]:
     catalog["raw_base_url"] = _raw_base(catalog, url)
     _catalog_cache_store(catalog)
     return catalog
+
+
+def display_catalog_files() -> Optional[Dict[str, Any]]:
+    """Catalog ``files`` by slug from the fresh display memo, ``None`` without
+    one. Never fetches, never raises: a local listing must not wait for the
+    network, and a malformed memo is "no view", not a failed listing."""
+    cached = _catalog_cache_get()
+    if cached is None:
+        return None
+    try:
+        return {item.slug: item.files for item in _summaries(cached)}
+    except Exception:  # any malformed row (skills not a list, scalar files, ...)
+        return None
 
 
 def _summaries(catalog: Dict[str, Any]) -> List[HubSkillSummary]:

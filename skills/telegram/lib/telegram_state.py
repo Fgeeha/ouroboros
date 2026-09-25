@@ -198,6 +198,34 @@ def _mirror_progress_enabled(settings: Dict[str, Any]) -> bool:
     return raw in ("on", "true", "1", "yes")
 
 
+def _child_row_held_for_root(api, event: Dict[str, Any]) -> bool:
+    """Whether a child's card-internal host row stays out of this chat for now.
+
+    The web renders such a row inside the child's card. Here the owner hears
+    about a child from its root, so the row is not sent while the root is
+    unfinished. Only typed lifecycle facts decide: the row's lineage, its card
+    placement or incident type, and the root's durable status. A root whose
+    status cannot be read counts as unfinished; a row naming no root is not held.
+    """
+    if str(event.get("delegation_role") or "").strip().lower() != "subagent":
+        return False
+    if not event.get("card_row") and str(event.get("system_type") or "") != "terminal_incident":
+        return False
+    root = str(event.get("root_task_id") or event.get("parent_task_id") or "").strip()
+    if not root:
+        return False
+    from ouroboros.task_results import task_result_path
+    from ouroboros.task_status import FINAL_STATUSES
+
+    try:
+        path = task_result_path(_data_dir(api), root, create=False)
+    except ValueError:
+        return False
+    stored = _read_json_file(path)
+    status = str(stored.get("status") or "").strip().lower() if isinstance(stored, dict) else ""
+    return status not in FINAL_STATUSES
+
+
 _SUBAGENT_ICONS = {
     "scheduled": "🔵", "running": "🟡", "update": "🟡", "progress": "🟡",
     "completed": "✅", "completed_warn": "⚠️", "failed": "❌",

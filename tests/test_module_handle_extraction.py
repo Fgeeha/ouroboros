@@ -91,7 +91,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     # tree did not bear it out, so the three invariants below were not running on
     # them. Sets are the tool-derived exact read sets on these bytes.
     "supervisor/queue_snapshot.py": ("supervisor/queue.py", "_queue", frozenset({
-        "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES", "DRIVE_ROOT", "PENDING",
+        "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES", "DRIVE_ROOT", "PENDING", "PRIOR_DIRECT_ROOTS",
         "QUEUE_SEQ_COUNTER_REF", "QUEUE_SNAPSHOT_PATH", "RUNNING", "_queue_lock",
         "append_jsonl", "atomic_write_text", "enqueue_task", "parse_iso_to_ts",
         "persist_queue_snapshot", "restore_invalid_depth_admission", "sort_pending",
@@ -122,6 +122,9 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         # Runtime707: health hands off recovery; the reaper owns storm/respawn.
         "DRIVE_ROOT", "QUEUE_MAX_RETRIES", "RUNNING", "WORKERS",
         "_LAST_SPAWN_TIME", "_SPAWN_GRACE_SEC", "_emit_task_done_terminal",
+        # #1196: completing a saved exact budget pause after a worker death re-parks
+        # the row into the pool's PENDING through the same handle.
+        "PENDING",
         "_ensure_workers_healthy_locked", "_reconcile_confirmed_dead_review_owner",
         "_worker_crash_storm_detected", "append_jsonl", "coerce_chat_identity",
         "disable_exhausted_worker_pool", "get_event_q", "load_state", "reconstruct_task_cost",
@@ -164,7 +167,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "write_text",
     })),
     "ouroboros/tools/git_review_cycle.py": ("ouroboros/tools/git.py", "_git", frozenset({
-        "IDENTICAL_DIFF_BLOCK_REASON", "_DOC_ONLY_EXTENSIONS", "_acquire_git_lock",
+        "_DOC_ONLY_EXTENSIONS", "_acquire_git_lock",
         "_advisory_and_tests_gate", "_aggregate_review_verdict",
         "_authorized_managed_update_resolver", "_check_overlapping_review_attempt",
         "_current_runtime_mode", "_ensure_gitignore", "_finalize_blocked_review",
@@ -283,7 +286,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     })),
     "ouroboros/loop_acceptance.py": ("ouroboros/loop.py", "_loop", frozenset({
         "_append_or_merge_user_message", "_end_task_acceptance_fence",
-        "_set_acceptance_decision", "_task_acceptance_eligible", "get_task_review_mode",
+        "_set_acceptance_decision", "_task_acceptance_eligible", "get_task_review_mode", "get_review_enforcement",
     })),
     "ouroboros/loop_acceptance_review.py": ("ouroboros/loop.py", "_loop", frozenset({
         "_append_or_merge_user_message", "_arm_delivery_control", "_begin_task_acceptance_fence",
@@ -334,7 +337,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_project_child_result_dispositions", "_publish_delivery_candidate",
         "_replace_delivery_candidate", "_resolve_delivery_control",
         "_run_task_acceptance_review_once", "_service_finalization_evidence",
-        "_supersede_delivery_acceptance_binding",
+        "_set_acceptance_decision", "_supersede_delivery_acceptance_binding",
         "_supersede_task_acceptance_for_evidence_change",
         "_supersede_task_acceptance_for_owner_followup",
         "_task_acceptance_owner_generation_changed",
@@ -347,6 +350,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_degrade_retained_delivery_candidate", "_delivery_evidence_state",
         "_delivery_replace_required", "_direct_child_results",
         "_drain_forced_owner_directives", "_drain_incoming_messages",
+        "_emit_checkpoint_event",
         "_end_task_acceptance_fence", "_finalize_forced_services",
         "_finalize_task_services", "_force_plan_decision",
         "_force_plan_disclosure", "_force_plan_reminder",
@@ -461,9 +465,13 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_emit_checkpoint_event", "_finalize_forced_services",
         "_forced_fallback_result", "_forced_final_answer",
         "_handle_forced_finalization", "_last_assistant_text", "_owner_marked_content",
+        "_measure_main_context_view",
         "_provider_unavailable_result", "_record_owner_directive",
         "_soft_land_exhausted_ceiling", "_task_deadline_epoch", "compact_tool_history_llm",
         "provider_no_call_source", "utc_now",
+        # #1196: a budget-pause HOLD ended by control rejoins the model-wait rails and
+        # merges its forced trace like every other controlled exit.
+        "_merge_finalization_trace",
     })),
 }
 

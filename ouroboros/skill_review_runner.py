@@ -476,6 +476,7 @@ def _append_interrupted_review_progress(
             "direction": "out",
             "chat_id": chat_id,
             "user_id": 0,
+            "role": "system", "system_type": "skill_lifecycle",
             "text": text,
             "content": text,
             "format": "",

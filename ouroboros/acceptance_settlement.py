@@ -8,17 +8,22 @@ Main moves on — so they live together:
 * the wave wakes Main at its own quorum and again when the last slot settles,
   and the wake carries each reviewer's own verdict
   (``announce_acceptance_settlement``);
-* a final answer delivered while that panel still runs neither buys a second
-  panel nor is refused one (``_deliver_under_running_panel``): Main waits — the
+* final delivery of a text-only rewrite under that panel's feedback buys no
+  second panel (``_deliver_under_running_panel``), whether feedback returned
+  ready or pending. Main waits for a pending panel — the
   default, and the only option under blocking enforcement — or consciously
   finishes; a panel that PASSED the earlier revision accepts the task and the
-  owner row says so (fork 1=B), while any other settled verdict hands the
+  owner row says so (fork 1=B), while a changed subject (criteria, material
+  evidence, owner source) or any other settled verdict hands the
   delivery to the ordinary acceptance path with the collected verdicts in its
   dialogue history;
 * a panel that settles after its task ended is collected at $0, republished on
   the task's own review projection with the host's own settlement note, and
   announced once in the task's room as one row of that card's Reviews group
-  (``attach_late_acceptance_settlement``); no model turn starts (fork 2=A).
+  (``attach_late_acceptance_settlement``); no model turn starts (fork 2=A);
+* a forced rail that ends the turn while the panel is still out collects it at
+  $0 before recording anything, so the rail's "never reviewed" reason is never
+  stamped over a panel that ran (``forced_rail_panel_verdict``).
 """
 from __future__ import annotations
 
@@ -154,9 +159,14 @@ def announce_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[str,
             attach_late_acceptance_settlement(usage_ctx, request, wave, result=row)
             return
         from ouroboros.owner_mailbox import write_task_message
-
+        trace = _settlement_trace(usage_ctx, str(getattr(request, "retry_key", "") or ""))
+        source = next(({"task_id": task_id, "run_index": index,
+                        "binding_hash": str(run.get("binding_hash") or "")}
+                       for index, run in enumerate((trace or {}).get("review_runs") or [])
+                       if run.get("authority") == "host_root"
+                       and (run.get("request") or {}).get("retry_key") == request.retry_key), None)
         write_task_message(pathlib.Path(usage_ctx.drive_root), acceptance_settlement_message(request, wave),
-                           task_id, source_task_id=task_id, provenance="system")
+                           task_id, source_task_id=task_id, provenance="system", review_feedback=source)
     except Exception:
         log.warning("Acceptance settlement delivery failed for %s", task_id, exc_info=True)
 
@@ -232,22 +242,24 @@ def acceptance_wait_chosen(tools_ctx: Any) -> bool:
 def _deliver_under_running_panel(ctx: Any, prior_run: Any) -> Optional[bool]:
     """A DELIVERY is not a nomination: it neither buys a panel nor is refused one.
 
-    The panel this turn already paid for keeps its custody and identity. While
-    it runs, Main waits (the default, and the only option under blocking
+    The paid panel keeps its identity whether it returned ready or pending.
+    While it runs, Main waits (the default and the only option under blocking
     enforcement) or consciously finishes. Once it has settled on the earlier
     revision: a PASS accepts the task on the reviewers' word and the owner row
     says so (fork 1=B); any other verdict is not a verdict on this answer, so the
     ordinary path decides — a new panel while the review cap allows, otherwise
     its typed capacity refusal — with the collected verdicts already in its
-    dialogue history. ``None`` means "not this case". While the panel is still
-    running, a rewritten answer buys a NEW panel only when Main nominates it
-    again (``_acceptance_review_only``).
+    dialogue history. ``None`` means "not this case": a changed subject is one
+    (the ordinary path reviews it), and while the panel is still running a
+    text-only rewrite buys a NEW panel only when Main nominates it again
+    (``_acceptance_review_only``).
     """
     from ouroboros import loop
     from ouroboros.loop_acceptance_review import (
         _end_acceptance_terminal, _finish_cyber_acceptance,
         _set_applied_host_acceptance_impact, acceptance_run_pending,
     )
+    from ouroboros.loop_delivery import delivery_subject_hash
     from ouroboros.loop_messages import owner_source_sha256
     from ouroboros.outcomes import ACCEPTANCE_ACCEPTED
 
@@ -256,7 +268,18 @@ def _deliver_under_running_panel(ctx: Any, prior_run: Any) -> Optional[bool]:
         return None
     run = panel_awaiting_this_turn(tools_ctx, ctx.llm_trace)
     if run is None:
-        return None
+        # Initial release may return a completed panel. Its delivered feedback
+        # belongs to this turn without pretending the operation is still pending.
+        run = next((row for row in reversed(ctx.llm_trace.get("review_runs") or [])
+                    if isinstance(row, dict) and row.get("authority") == "host_root"), None)
+        if (not run or not run.get("feedback_delivered")
+                or run.get("superseded_reason") != "delivery_candidate_replaced"):
+            return None
+    reviewed_text = (run.get("request") or {}).get("subject", "")
+    if run.get("subject_hash") != delivery_subject_hash(tools_ctx, ctx.llm_trace, reviewed_text):
+        return None  # A held rewrite may have acquired new material after supersession.
+    if run.get("superseded_by_revision") and run.get("superseded_reason") != "delivery_candidate_replaced":
+        return None  # The existing subject/effect owner already invalidated this feedback.
     # Older owner premises cannot authorize this delivery (owner rule 4=A).
     # The panel keeps its physical custody and still arrives as advice.
     reviewed_source = str(run.get("owner_source_sha256") or "")
@@ -291,6 +314,50 @@ def _deliver_under_running_panel(ctx: Any, prior_run: Any) -> Optional[bool]:
         "reviewers' word (the rewrite itself was not re-reviewed)."
     )
     return False
+
+
+def forced_rail_panel_verdict(tools_ctx: Any, llm_trace: Dict[str, Any], rail_reason: str) -> Dict[str, Any]:
+    """What a forced rail may honestly record about the panel its turn owns.
+
+    Every rail bypass reason says "the answer was never reviewed", so one may
+    be stamped only when no panel ran. The turn's own panel is collected at $0
+    first — the same free collection delivery performs — and then speaks for
+    itself: a clean PASS on the SAME subject accepts the answer on the
+    reviewers' word; reviewers who had not answered leave it unaccepted with
+    ``review_pending``, because an answer that has not arrived is a gap and
+    never a verdict; any other settled outcome leaves it unaccepted with no
+    verdict established. Returns the decision fields the recorder merges — the
+    existing acceptance vocabulary only, no reason is minted here.
+    """
+    from ouroboros.loop_acceptance_review import acceptance_run_pending
+    from ouroboros.loop_delivery import delivery_subject_hash
+    from ouroboros.loop_messages import owner_source_sha256
+    from ouroboros.outcomes import ACCEPTANCE_ACCEPTED
+    from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
+    from ouroboros.review_verdict import task_acceptance_is_clean
+
+    run = next((row for row in reversed(llm_trace.get("review_runs") or [])
+                if isinstance(row, dict) and row.get("authority") == "host_root"), None)
+    unreviewed = {"reason": rail_reason}  # the one way this helper says "this answer was never reviewed"
+    if run is None:
+        return unreviewed
+    if acceptance_run_pending(run):
+        try:
+            reconcile_pending_acceptance_runs({"review_runs": [run]}, usage_ctx=tools_ctx,
+                                              drive_root=pathlib.Path(tools_ctx.drive_root))
+        except Exception:
+            log.debug("a forced rail could not collect its own acceptance panel", exc_info=True)
+        if acceptance_run_pending(run):
+            return {"reason": "review_degraded", "review_pending": True}
+    reviewed_source = str(run.get("owner_source_sha256") or "")
+    if run.get("superseded_by_revision") or (reviewed_source and reviewed_source != str(owner_source_sha256(tools_ctx) or "")):
+        return unreviewed  # that panel judged an earlier revision or older owner premises
+    reviewed = (run.get("request") or {}).get("subject", "")
+    if (not task_acceptance_is_clean(SimpleNamespace(**run))
+            or run.get("subject_hash") != delivery_subject_hash(tools_ctx, llm_trace, reviewed)):
+        return {"reason": "review_degraded"}
+    return {"status": ACCEPTANCE_ACCEPTED, "reason": "clean_pass", "reviewer_signal": "PASS",
+            "reviewed_panel_id": str(run.get("panel_id") or "")}
 
 
 def _unsettled_head(run: Dict[str, Any]) -> str:
@@ -381,3 +448,46 @@ def attach_late_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[s
         # stays one row across live delivery, outbox replay and history.
         "progress_meta": {"card_row": "reviews", "card_row_id": f"acceptance-late:{retry_key}"},
     }, event_queue=getattr(usage_ctx, "event_queue", None)))
+
+
+def expose_acceptance_feedback(trace: Dict[str, Any], messages: list, task_id: str) -> None:
+    """Mark exact host feedback carried by a Main request that returned a response.
+
+    Queuing or appending a message alone never validates an author response.
+    """
+    if not isinstance(trace, dict):
+        return
+    runs = trace.get("review_runs") or []
+    for message in messages:
+        if not isinstance(message, dict):
+            continue
+        for source in message.get("review_feedback") or []:
+            if not isinstance(source, dict) or source.get("task_id") != task_id:
+                continue
+            outcome = trace.get("acceptance_review_outcome") or {}
+            # A local acceptance-preparation incident is identified by its own id
+            # AND attempt, not by a review binding it never had (the pre-binding
+            # hash is empty): a request that carried attempt 1 exposes nothing
+            # about a later attempt of the same incident.
+            incident_id = str(source.get("outcome_incident_id") or "")
+            if incident_id:
+                attempt = int(source.get("outcome_incident_attempt") or 0)
+                if (incident_id == str(outcome.get("incident_id") or "")
+                        and attempt == int(outcome.get("incident_attempt") or 0)):
+                    outcome["feedback_delivered"] = True
+                    record = trace.get("acceptance_preparation")
+                    if (isinstance(record, dict) and str(record.get("incident_id") or "") == incident_id
+                            and int(record.get("attempts") or 0) == attempt):
+                        record["feedback_delivered"] = True
+                        record["exposed_attempt"] = attempt
+                continue
+            if source.get("outcome_binding_hash") and source["outcome_binding_hash"] == outcome.get("binding_hash"):
+                outcome["feedback_delivered"] = True
+                continue
+            index = source.get("run_index")
+            if type(index) is not int or not 0 <= index < len(runs):
+                continue
+            run = runs[index]
+            if (isinstance(run, dict) and run.get("authority") == "host_root"
+                    and str(run.get("binding_hash") or "") == source.get("binding_hash", "")):
+                run["feedback_delivered"] = True

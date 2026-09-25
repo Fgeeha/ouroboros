@@ -72,6 +72,7 @@ from ouroboros.loop_transport import (
     transport_wait_step as _transport_wait_step,
 )
 from ouroboros.pricing import estimate_cost_optional  # noqa: F401 -- the loop module keeps its historical import surface for the L-B leaves
+from ouroboros.budget_pause import load_budget_pause, resume_paused_loop
 from ouroboros.owner_wait import load_owner_wait, resume_native_loop, wait_after_tools
 
 log = logging.getLogger(__name__)
@@ -104,14 +105,19 @@ def _finalize_loop_candidate(content, limit_ctx, tools, emit_progress, *, after_
         ):
             return None
         content = completion.get("message") or ""
+    spoken_before = transcript_growth_signature(limit_ctx.messages)
     result = _no_tool_final_answer(
         content, limit_ctx, limit_ctx.llm_trace, tools, limit_ctx.incoming_messages,
         limit_ctx.owner_msg_seen, emit_progress, **({"explicit_candidate": True} if after_tools else {}),
     )
     if result is None:
         ctx._presence_completion = None
-        wait_for_acceptance_feedback(tools, limit_ctx, limit_ctx.llm_trace,
-                                     limit_ctx.tool_schemas, limit_ctx.owner_msg_seen)
+        # A turn in which the host has just spoken to Main (a repair, a reminder,
+        # a drained follow-up) owes it a round; only a pass that appended nothing
+        # may park behind the panel (the wait's own re-offer comes after this).
+        if transcript_growth_signature(limit_ctx.messages) == spoken_before:
+            wait_for_acceptance_feedback(tools, limit_ctx, limit_ctx.llm_trace,
+                                         limit_ctx.tool_schemas, limit_ctx.owner_msg_seen)
     return result
 
 
@@ -146,79 +152,10 @@ from ouroboros.nanny_pacing import (
 
 
 def _setup_dynamic_tools(tools_registry, tool_schemas, messages, context_mode="max"):
-    """Attach list/enable tool handlers and mutate the active schema list."""
-    enabled_extra: set = set()
-    active_tool_names = {
-        name for schema in tool_schemas
-        if (name := str(schema.get("function", {}).get("name") or "").strip())
-    }
+    """Bind the one discovery implementation to this loop's resident schema list."""
+    from ouroboros.tools.tool_discovery import bind_resident_schemas
 
-    def _handle_list_tools(ctx=None, **kwargs):
-        omissions = (
-            tools_registry.capability_omissions()
-            if hasattr(tools_registry, "capability_omissions")
-            else []
-        )
-        non_core = [
-            t for t in list_non_core_tools(tools_registry, context_mode=context_mode)
-            if t["name"] not in active_tool_names
-        ]
-        if not non_core:
-            if not omissions:
-                return "All tools are already in your active set."
-            lines = ["All currently discovered tools are already in your active set.", ""]
-            lines.extend(format_capability_omissions(omissions))
-            return "\n".join(lines)
-        lines = [f"**{len(non_core)} additional tools available** (use `enable_tools` to activate):\n"]
-        for t in non_core:
-            lines.append(f"- **{t['name']}**: {t['description'][:120]}")
-        if omissions:
-            lines.extend(format_capability_omissions(
-                omissions, header="\n" + CAPABILITY_OMISSION_HEADER,
-            ))
-        return "\n".join(lines)
-
-    def _handle_enable_tools(ctx=None, tools: str = "", **kwargs):
-        names = [n.strip() for n in tools.split(",") if n.strip()]
-        enabled, hidden, not_found = [], [], []
-        for name in names:
-            schema = tools_registry.get_schema_by_name(name)
-            if schema and name not in active_tool_names:
-                tool_schemas.append(schema)
-                invalidate_task_cache_splits(getattr(ctx, "task_id", ""))
-                enabled_extra.add(name)
-                active_tool_names.add(name)
-                enabled.append(f"{name} (registered late)")
-            elif name in active_tool_names:
-                enabled.append(f"{name} (already active)")
-            else:
-                # A policy-filtered tool is distinct from an unknown name.
-                reason = (
-                    tools_registry.policy_hidden_reason(name)
-                    if hasattr(tools_registry, "policy_hidden_reason") else None
-                )
-                if reason:
-                    hidden.append(f"{name} — {reason}")
-                else:
-                    not_found.append(name)
-        parts = []
-        if enabled:
-            parts.append(
-                "✅ Tools are registered in the active capability envelope: "
-                + ", ".join(enabled)
-            )
-        if hidden:
-            parts.append(
-                "🚫 Hidden by policy (the tool exists but this task cannot use it): "
-                + "; ".join(hidden)
-            )
-        if not_found:
-            parts.append(f"❌ Not found: {', '.join(not_found)}")
-        return "\n".join(parts) if parts else "No tools specified."
-
-    tools_registry.override_handler("list_available_tools", _handle_list_tools)
-    tools_registry.override_handler("enable_tools", _handle_enable_tools)
-
+    enabled_extra = bind_resident_schemas(tools_registry, tool_schemas)
     non_core_count = len(list_non_core_tools(tools_registry, context_mode=context_mode))
     if non_core_count > 0:
         _append_or_merge_user_message(
@@ -259,6 +196,15 @@ def _provider_unavailable_result(
     # round record (a granted transport-death repeat, no usable response since) leaves an attempt
     # unresolved and outranks the wait terminal, which in turn outranks the overflow salvage.
     record = isinstance(ctx.accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict)
+    # The UNKNOWN-OUTCOME predicate, spelled exactly as the two seams that already
+    # own it: `provider_no_call_source` (the no-resend decision) and
+    # `provider_terminal_fallback_text` (the owner sentence). The durable source
+    # asked only for the round record, so an episode whose attempt was interrupted
+    # in flight — no record, sticky kind `provider_outcome_unknown` — told the owner
+    # its outcome was unknown while stamping `transport_unavailable_no_resend` on the
+    # trace (#869). One question, one answer, on all three surfaces.
+    unknown_outcome = record or str(
+        ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "provider_outcome_unknown"
     is_transport_wait = wait_cause == "transport_unavailable"
     is_context_overflow = kind == "context_overflow" and not (record or is_transport_wait)
     is_deadline_exhausted = kind == "deadline_exhausted" or str(ctx.accumulated_usage.get("_last_llm_error_kind") or "") == "deadline_exhausted"
@@ -310,7 +256,7 @@ def _provider_unavailable_result(
         ctx.accumulated_usage.update(execution_status=RESULT_INFRA_FAILED, reason_code="provider_unavailable")
         text, usage, llm_trace = _forced_fallback_result(
             ctx, llm_trace, fallback, reason_code="provider_unavailable",
-            source="provider_outcome_unknown_no_resend" if record else "transport_unavailable_no_resend",
+            source="provider_outcome_unknown_no_resend" if unknown_outcome else "transport_unavailable_no_resend",
         )
         if usage.get("reason_code") == "provider_unavailable":
             usage["execution_status"] = RESULT_INFRA_FAILED
@@ -363,21 +309,19 @@ def _apply_runtime_overrides(
     return active_model, active_use_local, active_effort
 
 
-def _resolve_loop_max_rounds(ctx: Any = None) -> int:
-    from ouroboros.config import SETTINGS_DEFAULTS
+def _resolve_loop_max_rounds(ctx: Any = None) -> Optional[int]:
+    """The round limit that binds first: the configured total (``None`` = no limit) and a
+    Presence turn's own finite inline cap. ``None`` means no round limit at all."""
+    from ouroboros.config import get_max_rounds
 
-    default = int(SETTINGS_DEFAULTS["OUROBOROS_MAX_ROUNDS"])
-    try:
-        configured = max(1, int(runtime_setting("OUROBOROS_MAX_ROUNDS", str(default))))
-    except (ValueError, TypeError):
-        log.warning("Invalid OUROBOROS_MAX_ROUNDS, defaulting to %s", default)
-        configured = default
-    return min(configured, int(getattr(ctx, "inline_max_rounds", configured)))
+    inline = getattr(ctx, "inline_max_rounds", None)
+    bounds = [int(b) for b in (get_max_rounds(), inline) if b is not None]
+    return min(bounds) if bounds else None
 
 
 def _record_transcript_prefix(ctx, messages, round_idx, accumulated_usage,
-                              event_queue, task_id, drive_logs) -> None:
-    """Record whether the transcript this round dispatched extends the previous one.
+                              event_queue, task_id, drive_logs, tool_schemas) -> None:
+    """Observe the usable Main source for prefix continuity and authored views.
 
     Called once per successful dispatch, after the model call and the fallback
     chain and before the assistant row is appended, so an in-call reclaim,
@@ -390,13 +334,47 @@ def _record_transcript_prefix(ctx, messages, round_idx, accumulated_usage,
     (``transcript_prefix.sanction_rewrite``); every other break (a context-fit
     reprojection after a real overflow, a replaced tail) is counted in
     ``prompt_prefix_breaks``.  It records and never blocks a send.
+    The same boundary owns the canonical compaction snapshot; physical
+    vision/provider projections remain in the existing request artifacts.
     """
+    from ouroboros.tools.compact_context import record_context_view
+
+    record_context_view(ctx, messages, tool_schemas)
     fact = _observe_transcript_send(ctx, messages, round_idx=round_idx)
     if not fact:
         return
     _emit_checkpoint_event(event_queue, task_id, drive_logs, fact)
     if not fact["sanctioned_by"]:
         accumulated_usage["prompt_prefix_breaks"] = int(accumulated_usage.get("prompt_prefix_breaks") or 0) + 1
+
+
+def _reset_turn_state(ctx: Any) -> None:
+    """Clear the per-turn state this turn owns; nothing durable is touched."""
+    ctx._presence_completion, ctx._presence_completion_accepted = None, False
+    ctx._delivery_candidate, ctx._delivery_candidate_revision, ctx._delivery_control_required = None, 0, False
+    ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
+    ctx.model_turn_state, ctx._authoring_handover, ctx._pending_model_wait_handover = ModelTurnState(), None, None
+
+
+def _initial_round_route(ctx: Any, llm: LLMClient, initial_effort: str) -> tuple:
+    """The route this turn opens on: model, effort, local flag and context modes.
+
+    Unknown routes get one honest call; no synthetic short-window capacity, so a
+    fit plan is adopted only while it still answers the preferred mode.
+    """
+    task_model_override = str(getattr(ctx, "task_model_override", "") or "").strip()
+    local_override = getattr(ctx, "task_use_local_override", None)
+    preferred_mode = get_context_mode()
+    context_fit_plan = getattr(ctx, "context_fit_plan", None)
+    if (context_fit_plan is not None
+            and str(getattr(context_fit_plan, "preferred_mode", "")) == preferred_mode):
+        active_context_mode = str(getattr(context_fit_plan, "initial_mode", "") or preferred_mode)
+    else:
+        active_context_mode = preferred_mode
+    return (task_model_override or llm.default_model(), initial_effort,
+            (bool(local_override) if local_override is not None else
+             runtime_setting("USE_LOCAL_MAIN", "").lower() in ("true", "1")),
+            preferred_mode, active_context_mode, context_fit_plan)
 
 
 def run_llm_loop(
@@ -415,32 +393,18 @@ def run_llm_loop(
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
     """Run the tool loop."""
     ctx = tools._ctx
-    ctx._presence_completion, ctx._presence_completion_accepted = None, False
-    ctx._delivery_candidate, ctx._delivery_candidate_revision, ctx._delivery_control_required = None, 0, False
-    ctx._delivery_evidence_revision, ctx._delivery_evidence_fingerprint = 0, ""
-    ctx.model_turn_state = ModelTurnState()  # one loop invocation is one active transport turn
+    _reset_turn_state(ctx)
     _initialize_owner_directives(ctx, messages)
-    task_model_override = str(getattr(ctx, "task_model_override", "") or "").strip()
-    active_model = task_model_override or llm.default_model()
-    active_effort = initial_effort
-    local_override = getattr(ctx, "task_use_local_override", None)
-    active_use_local = (bool(local_override) if local_override is not None else
-                        runtime_setting("USE_LOCAL_MAIN", "").lower() in ("true", "1"))
-    # Unknown routes get one honest call; no synthetic short-window capacity.
-    _preferred_context_mode = get_context_mode()
-    context_fit_plan = getattr(ctx, "context_fit_plan", None)
-    if (context_fit_plan is not None
-            and str(getattr(context_fit_plan, "preferred_mode", "")) == _preferred_context_mode):
-        active_context_mode = str(getattr(context_fit_plan, "initial_mode", "") or _preferred_context_mode)
-    else:
-        active_context_mode = _preferred_context_mode
+    (active_model, active_effort, active_use_local, _preferred_context_mode, active_context_mode,
+     context_fit_plan) = _initial_round_route(ctx, llm, initial_effort)
     llm_trace: Dict[str, Any] = {"reasoning_notes": [], "tool_calls": []}
     accumulated_usage: Dict[str, Any] = {"_task_attempt": getattr(ctx, "task_attempt", None)}
     ctx._accumulated_usage = accumulated_usage
     invalidate_task_cache_splits(task_id or getattr(ctx, "task_id", ""))  # rebuilt attempt = new prefix
     max_retries = 3
     saved = load_owner_wait(ctx)
-    if not saved:
+    saved_pause = load_budget_pause(ctx) if not saved else {}
+    if not saved and not saved_pause:
         accumulated_usage["initial_model_request"] = {
             "model": active_model, "use_local": active_use_local,
         }
@@ -449,13 +413,9 @@ def run_llm_loop(
         # A resumed/late-started tree member must see tree spend before its
         # first pacing surface, not a process-local empty stash.
         _loop_tree_accounting(refresh=True, max_age_sec=0.0)
-    from ouroboros.tools import tool_discovery as _td
-    _td.set_registry(tools)
-
-    tool_schemas = saved["tool_schemas"] if saved else initial_tool_schemas(tools, context_mode=active_context_mode)
-    tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(
-        tools, tool_schemas, messages, context_mode=active_context_mode
-    )
+    continuation = saved or saved_pause
+    tool_schemas = continuation["tool_schemas"] if continuation else initial_tool_schemas(tools, context_mode=active_context_mode)
+    tool_schemas, _enabled_extra_tools = _setup_dynamic_tools(tools, tool_schemas, messages, context_mode=active_context_mode)
     ctx.event_queue, ctx.task_id, ctx.messages = event_queue, task_id, messages
     stateful_executor = StatefulToolExecutor()
     exit_ctx = _LoopExitContext(
@@ -472,7 +432,19 @@ def run_llm_loop(
         if saved:
             active_model, active_effort, active_use_local, active_context_mode, round_idx, context_fit_plan = resume_native_loop(
                 tools, saved, messages, llm_trace, accumulated_usage, _owner_msg_seen)
-        pending_tool_budget, pending_tool_calls = bool(saved), None
+        # Both continuing tool tails and unfinished no-tool rounds owe budget checks.
+        pending_tool_budget, pending_tool_calls, pending_no_tool_budget = bool(saved), None, False
+        if saved_pause:
+            # Restore cognition under the same ID, closing unanswered calls as
+            # execution-unknown without replay. The shared budget tail checks
+            # the owner-refreshed threshold before any new model call.
+            (active_model, active_effort, active_use_local, active_context_mode,
+             round_idx, context_fit_plan) = resume_paused_loop(
+                tools, saved_pause, messages, llm_trace, accumulated_usage, _owner_msg_seen,
+                budget_remaining_usd=budget_remaining_usd)
+            cost_ceiling = _resolve_task_cost_ceiling(tools._ctx, budget_remaining_usd)
+            pending_no_tool_budget = saved_pause.get("resume_point", {}).get("budget_tail") == "no_tool"
+            pending_tool_budget, free_redial = not pending_no_tool_budget, pending_no_tool_budget
         while True:
             if free_redial or pending_tool_budget:
                 free_redial = False  # Tool tails and transport waits retain their logical round.
@@ -502,15 +474,15 @@ def run_llm_loop(
             ctx.active_effort = active_effort
             ctx.active_use_local = active_use_local
 
-            # One forced-wrap-up context per round: consumed by the round-limit
-            # path and supervisor finalize_now control path below.
+            # One context per round, shared by budget, round-limit and finalize_now rails.
             limit_ctx = _RoundLimitContext(
                 messages, llm, active_model, active_effort, max_retries, drive_logs,
-                task_id, round_idx, event_queue, accumulated_usage, task_type,
-                active_use_local, MAX_ROUNDS, drive_root=drive_root, llm_trace=llm_trace,
+                task_id, round_idx, event_queue, accumulated_usage, task_type, active_use_local, MAX_ROUNDS,
+                drive_root=drive_root, llm_trace=llm_trace,
                 incoming_messages=incoming_messages, owner_msg_seen=_owner_msg_seen, tool_schemas=tool_schemas)
             _finalize_limit_ctx(limit_ctx, tools, llm_trace)
-            if round_idx > MAX_ROUNDS:
+            limit_ctx.budget_tail = "tool" if pending_tool_budget else "no_tool"
+            if MAX_ROUNDS is not None and round_idx > MAX_ROUNDS:
                 # Live hold: a paid [ROUND_LIMIT] dial would be a resend (no wake receipt) — no-call unknown terminal.
                 if _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id,
                     detail="round_limit") == "active":
@@ -522,14 +494,14 @@ def run_llm_loop(
                 return text, accumulated_usage, llm_trace
 
             # Tuple, not a sum: an APPENDED short owner message must also read as new input (final-pair fable F1).
-            _pre_drain_sig = (len(messages), len(str(messages[-1].get("content") or "")))
+            _pre_drain_sig = transcript_growth_signature(messages)
             _controls = _drain_incoming_messages(
                 messages, incoming_messages, drive_root, task_id, event_queue,
                 _owner_msg_seen, owner_ctx=ctx)
             if _delegate_hold_step(
                     tools, controls=_controls, messages=messages, drive_logs=drive_logs,
                     task_id=task_id, emit_progress=emit_progress,
-                    new_input=(len(messages), len(str(messages[-1].get("content") or ""))) != _pre_drain_sig) == "terminal":
+                    new_input=transcript_growth_signature(messages) != _pre_drain_sig) == "terminal":
                 # The no-call decision reads the usage record, not the error_kind argument — stamp first.
                 accumulated_usage["_last_llm_error_kind"] = "provider_outcome_unknown"
                 text, accumulated_usage, forced_trace = _handle_provider_unavailable(
@@ -556,6 +528,12 @@ def run_llm_loop(
                     return final_result
                 continue
 
+            if pending_no_tool_budget:
+                pending_no_tool_budget = False
+                budget_result = _finish_no_tool_round_budget(limit_ctx, budget_remaining_usd, cost_ceiling)
+                if budget_result is not None:
+                    return budget_result
+
             if (transport_wait is not None and transport_wait.wait_cause == "provider_outcome_unknown"
                     and not _continue_unknown_transport(transport_wait, llm=llm, tools=tools, messages=messages,
                         accumulated_usage=accumulated_usage, drive_logs=drive_logs, task_id=task_id, model=active_model, emit_progress=emit_progress)):
@@ -564,14 +542,14 @@ def run_llm_loop(
                 _inject_round_checkpoints(
                     round_idx=round_idx, max_rounds=MAX_ROUNDS, messages=messages, accumulated_usage=accumulated_usage,
                     emit_progress=emit_progress, tools=tools, event_queue=event_queue, task_id=task_id,
-                    drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling)
+                    drive_logs=drive_logs, budget_remaining_usd=budget_remaining_usd, cost_ceiling=cost_ceiling, llm_trace=llm_trace)
 
                 messages, _compaction_usage = _run_round_compaction(
                     messages,
                     _CompactionRoundContext(
                         tools=tools, drive_root=drive_root, drive_logs=drive_logs,
                         task_id=task_id, round_idx=round_idx,
-                        event_queue=event_queue, emit_progress=emit_progress))
+                        event_queue=event_queue, emit_progress=emit_progress, tool_schemas=tool_schemas))
                 tools._ctx.messages = messages
                 limit_ctx.messages = messages  # WA2: provider-death finalize must salvage the COMPACTED transcript
                 if _compaction_usage:
@@ -581,17 +559,13 @@ def run_llm_loop(
                 seal_task_transcript(messages)
 
                 model_call = _RoundModelCallContext(
-                        llm=llm, messages=messages, tools=tools, context_fit_plan=context_fit_plan,
-                        active_model=active_model, tool_schemas=tool_schemas,
-                        active_effort=active_effort, max_retries=max_retries,
-                        drive_logs=drive_logs, task_id=task_id, round_idx=round_idx,
-                        event_queue=event_queue,
-                        accumulated_usage=accumulated_usage,
-                        task_type=task_type,
-                        active_use_local=active_use_local,
-                        active_context_mode=active_context_mode,
-                        drive_root=drive_root, emit_progress=emit_progress,
-                    )
+                    llm=llm, messages=messages, tools=tools, context_fit_plan=context_fit_plan,
+                    active_model=active_model, tool_schemas=tool_schemas,
+                    active_effort=active_effort, max_retries=max_retries,
+                    drive_logs=drive_logs, task_id=task_id, round_idx=round_idx,
+                    event_queue=event_queue, accumulated_usage=accumulated_usage, task_type=task_type,
+                    active_use_local=active_use_local, active_context_mode=active_context_mode,
+                    drive_root=drive_root, emit_progress=emit_progress)
                 try:
                     msg, cost, active_context_mode = _call_round_model(model_call)
                 except ModelWaitInterrupted as error:
@@ -616,13 +590,8 @@ def run_llm_loop(
                 drive_logs=drive_logs, task_id=task_id, model=active_model, emit_progress=emit_progress)
             if msg is None and _fallback_chain_allowed(ctx, last_error_kind, transport_wait, accumulated_usage):
                 _episode_before_chain = transport_wait is not None
-                (
-                    msg,
-                    active_model,
-                    active_use_local,
-                    context_fit_plan,
-                    active_context_mode,
-                ) = _run_cross_model_fallback_chain(
+                (msg, active_model, active_use_local,
+                 context_fit_plan, active_context_mode) = _run_cross_model_fallback_chain(
                     llm=llm, ctx=ctx, tools=tools, messages=messages, active_model=active_model,
                     active_use_local=active_use_local, tool_schemas=tool_schemas, active_effort=active_effort,
                     max_retries=max_retries, drive_logs=drive_logs, task_id=task_id, round_idx=round_idx,
@@ -658,7 +627,7 @@ def run_llm_loop(
                 _merge_finalization_trace(llm_trace, forced_trace)
                 return text, accumulated_usage, llm_trace
 
-            _record_transcript_prefix(tools._ctx, messages, round_idx, accumulated_usage, event_queue, task_id, drive_logs)
+            _record_transcript_prefix(tools._ctx, messages, round_idx, accumulated_usage, event_queue, task_id, drive_logs, tool_schemas)
             from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY
 
             tool_calls = msg.get("tool_calls") or []
@@ -670,15 +639,19 @@ def run_llm_loop(
             if not tool_calls:
                 final_result = _finalize_loop_candidate(content, limit_ctx, tools, emit_progress)
                 if final_result is None:
+                    # Unfinished: the loop continues and keeps spending, so it
+                    # rejoins the SAME budget tail a tool round does. A ready
+                    # answer returns above and buys no extra wrap-up.
+                    pending_no_tool_budget = True
                     continue
                 return final_result
 
             if getattr(tools._ctx, "_skill_finalization_injected", False):
                 tools._ctx._skill_finalization_injected = False
-            assistant_msg = dict(msg)
-            assistant_msg.setdefault("role", "assistant")
+            assistant_msg = dict(msg, role=msg.get("role", "assistant"))
             messages.append(assistant_msg)
             _emit_round_progress(content, msg, emit_progress, llm_trace)
+            limit_ctx.budget_tail = "tool"
             handle_tool_calls(
                 tool_calls, tools, drive_logs, task_id, stateful_executor,
                 messages, llm_trace, emit_progress
@@ -691,11 +664,13 @@ def run_llm_loop(
             pending_tool_budget, pending_tool_calls = True, tool_calls
     except BudgetExceeded as exc:
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="budget")
-        return _handle_budget_exceeded(
-            exc, exit_ctx, limit_ctx=limit_ctx, episode=transport_wait)
+        try:
+            return _handle_budget_exceeded(exc, exit_ctx, limit_ctx=limit_ctx, episode=transport_wait)
+        except ModelWaitInterrupted as interrupted:  # a refused-dispatch HOLD ended by control: the sibling clause below never sees it
+            return _loop_exit_after_exception(interrupted, limit_ctx, exit_ctx, llm_trace, transport_wait)
     except Exception as exc:
-        exit_ctx.attach_exception_evidence(exc)
-        raise
+        # A budget-pause HOLD ended by control rejoins the model-wait rails; else re-raise with evidence.
+        return _loop_exit_after_exception(exc, limit_ctx, exit_ctx, llm_trace, transport_wait)
     finally:
         _delegate_hold_close(tools, drive_logs=drive_logs, task_id=task_id, detail="loop_exit")
         _cleanup_loop_resources(stateful_executor, exit_ctx)
@@ -714,6 +689,7 @@ from ouroboros.loop_messages import (  # noqa: E402, F401 -- intentional public 
     _initialize_owner_directives,
     _visible_round_text,
     _emit_round_progress,
+    transcript_growth_signature,
 )
 from ouroboros.loop_acceptance import (  # noqa: E402, F401 -- intentional public re-exports
     _task_acceptance_eligible,
@@ -783,6 +759,7 @@ from ouroboros.loop_round_limits import (  # noqa: E402, F401 -- intentional pub
     _handle_owner_stop_finalization,
     _handle_provider_unavailable,
     _handle_model_wait_control,
+    _loop_exit_after_exception,
     _maybe_deadline_local_finalize,
     _maybe_early_finalize,
     _finalize_limit_ctx,
@@ -816,6 +793,7 @@ from ouroboros.loop_model_call import (  # noqa: E402, F401 -- intentional publi
     _main_context_profile,
     _remember_main_fit,
     _measure_round_main_fit,
+    _measure_main_context_view,
     _physical_context_for_fit,
     _dispatch_round_model,
     _run_main_reclaim,
@@ -827,6 +805,7 @@ from ouroboros.loop_model_call import (  # noqa: E402, F401 -- intentional publi
     _call_round_model,
 )
 from ouroboros.loop_budget import (  # noqa: E402, F401 -- intentional public re-exports
+    _finish_no_tool_round_budget,
     _finish_tool_round_budget,
     _check_budget_limits,
     _resolve_task_cost_ceiling,

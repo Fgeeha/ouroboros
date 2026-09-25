@@ -7,10 +7,17 @@ TypedDicts document payloads, not runtime validation. Keep discriminating
 from __future__ import annotations
 
 from typing import Any, Dict, List, Optional
+from ouroboros.cost_projection import CostPresentation
 
 from ouroboros.gateway.history_contracts import ChatHistoryResponse  # noqa: F401 -- public re-export
 from ouroboros.gateway.widgets import ExtensionLiveSnapshot, WidgetTab, WidgetsResponse
 from ouroboros.gateway.decision_contracts import DecisionRequest, DecisionResponse  # noqa: F401 -- public re-exports
+from ouroboros.gateway.schedule_contracts import (  # noqa: F401 -- public re-exports
+    ScheduleActionResponse,
+    ScheduledTasksResponse,
+    ScheduleDeleteResponse,
+    ScheduleUpsertResponse,
+)
 
 try:  # Python 3.11+
     from typing import Literal, NotRequired, Required, TypedDict  # type: ignore[attr-defined]
@@ -110,40 +117,39 @@ class ChatOutbound(TypedDict):
     is_progress: NotRequired[bool]
     task_id: NotRequired[str]
     origin_message_ref: NotRequired[Dict[str, Any]]
-    # X3: a repair receipt whose managed task id does not exist yet (the router
-    # mints it at promotion). Typed truth instead of an invented id.
+    # X3: a repair receipt whose managed task id the router mints only at promotion (typed truth, no invented id).
     task_id_pending: NotRequired[bool]
     # "finalizing" on a root's early final answer: the answer is delivered
     # while post-task synthesis still runs, so the frame is NOT the task's
     # terminal conclusion — task_done settles the card/turn.
     task_phase: NotRequired[str]
-    # Typed terminal fact on a frame that IS the turn's conclusion: stamped on
-    # direct/ephemeral finals (and the direct error branch) so the client's
-    # live gate settles the activity without waiting for a snapshot. One of
-    # completed/failed/cancelled/rejected_duplicate.
+    # Direct/ephemeral finals and errors settle client activity without a snapshot:
+    # completed/failed/cancelled/rejected_duplicate, not an early answer.
     task_terminal_status: NotRequired[str]
     ephemeral_decision: NotRequired[bool]
-    reasoning: NotRequired[bool]  # display-reasoning frame: its own collapsed "Thinking" line
     tool_calls: NotRequired[int]
     rounds: NotRequired[int]
     suggested_name: NotRequired[str]
     model_execution: NotRequired[Dict[str, Any]]
+    # Project question mirrored into Main as the Project's own form; the durable question stays in Project.
     quiz_id: NotRequired[str]
     quiz_state: NotRequired[str]
     project_chat_id: NotRequired[int]
     source_status: NotRequired[str]
     owner_wait_state: NotRequired[str]
-    # The complete Project-question pointer: question, option labels, recorded answer and wait facts.
     owner_wait_resume_reason: NotRequired[str]
     wait_for_answer: NotRequired[bool]
     wait_ended_at: NotRequired[str]
     question: NotRequired[str]
     options: NotRequired[List[str]]
+    option_details: NotRequired[List[str]]  # aligned with options; absent for a legacy label-only ask
+    stake: NotRequired[str]
+    assumption: NotRequired[str]
+    recommended_index: NotRequired[int]
     answered_index: NotRequired[int]
     comment: NotRequired[str]
     task_incident: NotRequired[str]
-    # A cancellation fault names the PHYSICAL task it could not settle when that
-    # differs from the displayed (logical) task id.
+    # A cancellation fault names the PHYSICAL task it could not settle when it differs from the logical task id.
     cancel_physical_task_id: NotRequired[str]
     toast_once: NotRequired[str]
     # #628: the incident's valence for the one-shot toast (warn/ok/error),
@@ -222,6 +228,8 @@ class ChatOutbound(TypedDict):
     # amount computed over a degraded ledger reached every surface looking exactly
     # like one computed over a sound ledger.
     ledger_integrity_degraded: NotRequired[Optional[bool]]
+    # Closed shape owned by the cost producer; null means ledger unavailable.
+    cost_presentation: NotRequired[Optional[CostPresentation]]
     result: NotRequired[str]
     result_truncated: NotRequired[bool]  # P3: WS preview was capped; fetch full via task id
     trace_summary: NotRequired[str]
@@ -240,17 +248,18 @@ class ChatOutbound(TypedDict):
     sender_session_id: NotRequired[str]
     client_message_id: NotRequired[str]
     transport: NotRequired[TransportMetadata]
-    # UI-only system annotation emitted by skill-repair visible commands.
+    # Typed message kind; role alone selects authorship (DESIGN: Chat authorship and System rows).
     system_type: NotRequired[str]
-    # A host-stamped placement fact for a task-keyed System row: "timeline" = a timeline item of the task's card,
-    # "reviews" = the card's Reviews group carries the fact (the row is still attached to the card); absent = an
-    # ordinary row. ``card_row_id`` is the row's stable identity across live delivery, outbox replay and history.
+    # Host-stamped placement of a task-keyed System row: "timeline" = a timeline item of the task's card, "reviews" =
+    # the card's Reviews group carries it (still attached); absent = ordinary. ``card_row_id`` is its stable identity.
     card_row: NotRequired[Literal["timeline", "reviews"]]
     card_row_id: NotRequired[str]
     # Event-time human presentation; raw task/project ids remain machine keys.
     target_label: NotRequired[str]
     project_id: NotRequired[str]
     project_name: NotRequired[str]
+    handoff_id: NotRequired[str]  # immutable origin/destination receipt identity
+    completion_answer: NotRequired[str]  # a Project root's model-authored final answer, mirrored into Main (DESIGN)
     # Present on some transport re-broadcast paths.
     chat_id: NotRequired[int]
     # Server-stamped when chat_id is a reserved Project thread: Main never
@@ -695,10 +704,9 @@ class EvolutionStateSnapshot(TypedDict):
 class ActiveDirectTurn(TypedDict):
     """An active in-process direct chat or ephemeral decision turn.
 
-    Snapshot rows in ``StateResponse.active_direct_turns``; the seven identity
-    and activity fields are always emitted by ``DirectActivityRegistry.snapshot()``
-    (empty-string for absent values), so the mirror marks them required.
-    A model_waits projection is optional and must be supplied by its live owner.
+    Rows of ``StateResponse.active_direct_turns``: ``DirectActivityRegistry.snapshot()``
+    always emits the seven identity/activity fields (empty string for absent values),
+    so the mirror marks them required; ``model_waits`` comes only from its live owner.
     """
 
     activity_id: str
@@ -715,17 +723,20 @@ class ActiveDirectTurn(TypedDict):
 class ActiveChatActivity(ActiveDirectTurn):
     """One in-flight chat activity in ``StateResponse.active_chat_activities``.
 
-    The combined snapshot: direct/ephemeral registry turns (same rows as
-    ``active_direct_turns``) plus ROOT managed queue tasks projected as
-    ``kind="managed_task"`` with ``phase`` ``queued`` | ``budget_paused``
-    (zero-dispatch member awaiting an explicit resume — never plain
-    "queued") | ``working`` | ``finalizing`` (final answer stored, post-task
-    synthesis still open).
-    Field shape mirrors ``ActiveDirectTurn`` so one client reducer hydrates
-    both; managed rows carry an empty ``client_message_id``.
+    Direct/ephemeral registry turns (the ``active_direct_turns`` rows) plus ROOT
+    managed queue tasks as ``kind="managed_task"`` with ``phase`` ``queued`` |
+    ``budget_paused`` (awaiting an explicit owner Resume; never plain "queued") |
+    ``budget_pausing`` (RUNNING, writing its exact pause record; #1196) | ``working`` |
+    ``finalizing`` (answer stored, post-task
+    synthesis open); a direct row whose live wait owner could not be read is
+    ``phase="unknown"``; a budget-paused direct turn (#1196) keeps its SAME id and
+    reports the managed phases as ``kind="direct_chat"``. Same shape as ``ActiveDirectTurn`` so one reducer hydrates
+    both (managed rows: empty ``client_message_id``). ``required_question_unavailable``:
+    a recorded owner-question wait whose detail could not be resolved — possibly blocked.
     """
 
     required_question: NotRequired[Dict[str, Any]]
+    required_question_unavailable: NotRequired[bool]
 
 
 class StateResponse(TypedDict):
@@ -825,6 +836,7 @@ class SettingsMeta(SettingsNetworkMeta, total=False):
     setup_contract: Dict[str, Any]
     available_subagents: AvailableSubagentsSettingsMeta
     policy_state: SettingsPolicyState
+    restart_state: Dict[str, Any]
 
 
 class SettingsSaveResponse(TypedDict, total=False):
@@ -832,6 +844,7 @@ class SettingsSaveResponse(TypedDict, total=False):
     no_changes: bool
     restart_required: bool
     restart_keys: list[str]
+    restart_state: Dict[str, Any]
     immediate_changed: bool
     next_task_changed: bool
     warnings: list[str]
@@ -902,9 +915,7 @@ class UiPreferencesResponse(TypedDict):
     widget_order: list[str]
     widget_start_mode: dict[str, Literal["auto", "manual", "retain"]]  # owner per-card launch-policy override
     nested_subagents_expanded: bool
-    theme: Literal["dark", "light"]  # applied before first paint (web/modules/theme.js)
     language: Literal["en", "ru"]  # UI overlay language (web/modules/i18n.js)
-    show_reasoning: bool  # reasoning rows in Chat and Logs; default off
     sidebar_width: int  # px; 0 = CSS default (resizable side sections, v6.33.0)
     project_panel_width: int  # px; 0 = CSS default
     project_seen_revision: dict[str, int]  # monotonic paint ACK per active Project
@@ -925,20 +936,6 @@ class EvolutionDataResponse(TypedDict):
     checkpoints: NotRequired[list[Dict[str, Any]]]
     generated_at: str
     cached: bool
-
-
-class ScheduledTasksResponse(TypedDict):
-    schema_version: int
-    tasks: list[Dict[str, Any]]
-
-
-class ScheduleUpsertResponse(TypedDict):
-    ok: bool
-    schedule: Dict[str, Any]
-
-
-class ScheduleDeleteResponse(TypedDict):
-    ok: bool
 
 
 class UploadResponse(TypedDict):
@@ -1006,6 +1003,7 @@ class LocalModelStatusResponse(TypedDict, total=False):
     port: int
     message: str
     error: str
+    settings_application: Dict[str, Any]
 
 
 class McpStatusResponse(TypedDict, total=False):
@@ -1488,6 +1486,7 @@ WS_MESSAGE_TYPES: tuple[str, ...] = (
 
 
 __all__ = [
+    "CostPresentation",
     "ChatInbound",
     "TaskConstraintInbound",
     "CommandInbound",
@@ -1557,6 +1556,7 @@ __all__ = [
     "ScheduledTasksResponse",
     "ScheduleUpsertResponse",
     "ScheduleDeleteResponse",
+    "ScheduleActionResponse",
     "UploadResponse",
     "ExtensionsIndexResponse",
     "ExtensionLiveSnapshot",

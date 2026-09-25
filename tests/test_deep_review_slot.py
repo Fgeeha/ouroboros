@@ -495,11 +495,13 @@ def test_session_row_runs_through_the_session_executor_with_the_report_contract(
     last = reviewer_slot_last_executions()[DEEP_REVIEW_SLOT_ID]
     assert last["effective"] == {"route": "agent_session:codex", "model": "gpt-5.6-sol", "verdict_method": "report"}
     assert last["requested"]["session_target"] == "codex=gpt-5.6-sol" and last["requested"]["profile_id"] == "koshak"
-    # Without an owner deadline the window is the task's absolute ceiling.
+    # Without an owner deadline the window is the task's operation window: its finite
+    # absolute lifetime, else the finite operation fallback (never an unbounded session).
     _FakeSessionExecutor.instances = []
-    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.config import get_task_abs_ceiling_sec, operation_window_sec
     run_deep_self_review(review_repo, review_drive, object(), lambda _m: None, slot=_session_row())
-    assert _FakeSessionExecutor.instances[0].assignment.slot.timeout_sec == float(get_task_abs_ceiling_sec())
+    assert _FakeSessionExecutor.instances[0].assignment.slot.timeout_sec == operation_window_sec(
+        get_task_abs_ceiling_sec())
 
 
 def test_retrieving_failure_is_typed_and_recorded_never_a_report(review_repo, review_drive, monkeypatch):
@@ -849,9 +851,9 @@ def test_native_read_extent_rides_the_receipts_and_drives_coverage(review_repo, 
     assert receipt["end_line"] < 1500 and receipt["eof"] is False
     tool_msg = [m for m in llm.calls[1]["messages"] if m.get("role") == "tool"][0]["content"]
     # Source labels begin at zero; receipt line addresses begin at one.
-    assert "RESULT TRUNCATED" in tool_msg
-    assert f"line {receipt['end_line'] - 1:05d} " + "b" * 60 + "\n" in tool_msg
-    assert f"line {receipt['end_line']:05d} " + "b" * 60 + "\n" not in tool_msg
+    body = tool_msg.split("\n⚠️ RESULT TRUNCATED", 1)[0]  # the notice opens with its OWN newline: judge the delivered body only
+    assert body != tool_msg and f"line {receipt['end_line'] - 1:05d} " + "b" * 60 + "\n" in body
+    assert f"line {receipt['end_line']:05d} " + "b" * 60 + "\n" not in body  # a cut on a line's last character is not that line complete
     assert "coverage=inspection.md:partial(" in text
 
 

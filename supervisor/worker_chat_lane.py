@@ -175,11 +175,11 @@ def _handle_chat_direct_locked(
     try:
         remaining = budget_remaining(load_state(), strict=True)
     except Exception:
-        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta)
+        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta, role="system", system_type="task_admission_notice")
         return
     if remaining <= 0:
         try:
-            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta)
+            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta, role="system", system_type="task_admission_notice")
         except Exception:
             pass
         return
@@ -353,7 +353,7 @@ def _admit_chat_task(
                     chat_id,
                     f"⚠️ Task not started: every attachment was rejected.\n{rendered}",
                     **_host_operation_failure(task_metadata),
-                )
+                    role="system", system_type="attachment_notice")
                 registry.unregister(task["id"])
                 return None
             from ouroboros.artifacts import attachment_manifest_projection
@@ -364,7 +364,7 @@ def _admit_chat_task(
                     chat_id,
                     "⚠️ Some declared attachments could not be staged; the task "
                     f"starts with the rest.\n{rendered}",
-                )
+                    role="system", system_type="attachment_notice")
             if manifest:
                 manifest = [dict(row) for row in manifest]
                 task["drive_root"] = str(_pool().DRIVE_ROOT)
@@ -464,7 +464,60 @@ def _execute_chat_task(admitted: Dict[str, Any]) -> bool:
             events = agent.handle_task(task)
         finally:
             agent._event_queue = prev_queue
-        for e in events:
+        # An exact budget pause of THIS turn is parked here, in-process and
+        # synchronously, while the registry entry below still owns the id (#1196).
+        # The turn's ``budget_pause`` event carries its own task record (a direct
+        # turn was never in RUNNING). Handing that event to the supervisor loop
+        # and unregistering the actor races: between the unregister and the park
+        # the SAME id is nowhere — not live, not queued — and a restart in that
+        # window fences a saved pause. The direct lane runs inside the supervisor
+        # process, so it parks the record itself through the ONE park owner
+        # (``events_budget.install_exact_budget_pause``) against the same queue
+        # state, under the queue lock, and drops the event from the hand-off. A
+        # park that fails leaves the event on the ordinary path (typed, logged),
+        # never a silently lost pause. Either way the turn's LOCAL dispatch fence
+        # is released: the actor has unwound and the durable row (parked here or
+        # by the supervisor loop) owns the hold, so a fence left closed in this
+        # process would refuse the resumed turn's sends under the same id. Every
+        # other event passes through unchanged.
+        remaining: list = []
+        for event in list(events or []):
+            checkpoint = ((event.get("resource_limit") or {}).get("checkpoint")
+                          if isinstance(event, dict) and isinstance(event.get("resource_limit"), dict) else None)
+            if not (isinstance(event, dict) and str(event.get("type") or "") == "budget_pause"
+                    and event.get("_is_direct_chat") and isinstance(checkpoint, dict)):
+                remaining.append(event)
+                continue
+            task_id = str(event.get("task_id") or task.get("id") or "")
+            try:
+                from types import SimpleNamespace
+
+                from supervisor import queue as queue_mod
+                from supervisor.events_budget import install_exact_budget_pause
+                from supervisor.message_bus import get_bridge
+
+                pool = _pool()
+                shim = SimpleNamespace(
+                    RUNNING=pool.RUNNING, PENDING=pool.PENDING, WORKERS=pool.WORKERS, DRIVE_ROOT=pool.DRIVE_ROOT,
+                    sort_pending=queue_mod.sort_pending, persist_queue_snapshot=queue_mod.persist_queue_snapshot,
+                    bridge=get_bridge(),
+                )
+                install_exact_budget_pause(shim, task_id, checkpoint, evt=event, source="direct_turn_inline_park")
+                append_jsonl(
+                    pool.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {"ts": utc_now_iso(), "type": "direct_turn_budget_pause_parked_inline",
+                     "task_id": task_id, "chat_id": event.get("chat_id"),
+                     "pause_id": str(checkpoint.get("pause_id") or "")},
+                )
+            except Exception:
+                log.error("Direct turn %s could not be parked inline; its pause event takes the ordinary path",
+                          task_id, exc_info=True)
+                remaining.append(event)
+            finally:
+                from ouroboros.budget_pause import end_dispatch_fence
+
+                end_dispatch_fence(task_id)  # quiescent actor unwound; the durable row owns the dispatch hold
+        for e in remaining:
             _pool().get_event_q().put(turn_queue.stamp(e))
         ok = True
     except Exception as e:
@@ -525,7 +578,7 @@ def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> Non
             err_msg,
             task_id=failed_task_id,
             progress_meta=progress_meta,
-        )
+            role="system", system_type="task_error")
     except Exception:
         log.debug("Suppressed exception", exc_info=True)
 

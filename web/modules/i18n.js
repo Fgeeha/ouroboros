@@ -68,7 +68,7 @@ export function translateString(text, dict, patterns) {
  * starts from the source string, never from a translation.
  */
 export function createTranslator({
-    dict = {}, patterns = [], excludeSelector = EXCLUDE_SELECTOR,
+    dict = {}, patterns = [], scoped = [], excludeSelector = EXCLUDE_SELECTOR,
     skipRoots = SKIP_ROOTS, userContent = USER_CONTENT,
 } = {}) {
     let observer = null;
@@ -79,12 +79,23 @@ export function createTranslator({
     const blocked = (el) => Boolean(roots && el.closest(roots));
     const excluded = (el) => blocked(el) || Boolean(excludeSelector && el.closest(excludeSelector));
 
+    /** `scoped` is [[selector, dict], ...]: the same English word can need a
+     *  different translation in one place ("Light" theme vs "Light" review lane). */
+    function tr(text, el) {
+        for (const [selector, scopedDict] of scoped) {
+            if (!el?.closest(selector)) continue;
+            const out = translateString(text, scopedDict);
+            if (out !== text) return out;
+        }
+        return translateString(text, dict, patterns);
+    }
+
     function applyTextNode(node) {
         const current = node.nodeValue;
         // Our own last output still in place → retranslate from the stored English;
         // anything else means the app rewrote the node, so that value is the source.
         const source = node.__ouroOut !== undefined && current === node.__ouroOut ? node.__ouroSrc : current;
-        const out = translateString(source, dict, patterns);
+        const out = tr(source, node.parentElement);
         if (out === source) {
             delete node.__ouroSrc;
             delete node.__ouroOut;
@@ -101,8 +112,8 @@ export function createTranslator({
         if (current === null) return;
         const key = ATTR_DATA_KEYS[attr];
         const saved = el.dataset[key];
-        const source = saved !== undefined && current === translateString(saved, dict, patterns) ? saved : current;
-        const out = translateString(source, dict, patterns);
+        const source = saved !== undefined && current === tr(saved, el) ? saved : current;
+        const out = tr(source, el);
         if (out === source) {
             delete el.dataset[key];
             if (current !== source) el.setAttribute(attr, source);
@@ -156,7 +167,7 @@ export function createTranslator({
                 // Same guard as the text path: only take back an attribute that still
                 // holds OUR translation, never one the app rewrote since.
                 const saved = el.dataset[key];
-                if (el.getAttribute(attr) === translateString(saved, dict, patterns)) el.setAttribute(attr, saved);
+                if (el.getAttribute(attr) === tr(saved, el)) el.setAttribute(attr, saved);
                 delete el.dataset[key];
             });
         }
@@ -247,7 +258,7 @@ async function applyLanguage(lang) {
     if (next === 'ru') {
         if (!translator) {
             const mod = await import('../i18n/ru.js');
-            translator = createTranslator({ dict: mod.ru, patterns: mod.ruPatterns });
+            translator = createTranslator({ dict: mod.ru, patterns: mod.ruPatterns, scoped: mod.ruScoped });
             // Calendar data for the few places that format dates in JS (chat_activity).
             months = mod.ruMonths;
         }
@@ -266,4 +277,22 @@ async function applyLanguage(lang) {
     }
     window.dispatchEvent(new CustomEvent('ouro:language-changed', { detail: { language: next } }));
     return next;
+}
+
+/** Wire a `[data-language-group]` segment control: apply on click, then `save(lang)`. */
+export function bindLanguageSegments(root, save) {
+    const buttons = Array.from(root.querySelectorAll('[data-language-group] [data-language-value]'));
+    const sync = (lang) => buttons.forEach((button) => {
+        const on = button.dataset.languageValue === lang;
+        button.classList.toggle('active', on);
+        button.setAttribute('aria-pressed', String(on));
+    });
+    sync(currentLang);
+    window.addEventListener('ouro:language-changed', (event) => sync(event.detail?.language || 'en'));
+    buttons.forEach((button) => button.addEventListener('click', async () => {
+        const lang = button.dataset.languageValue;
+        if (lang === currentLang) return;
+        await setLanguage(lang);
+        save(lang);
+    }));
 }

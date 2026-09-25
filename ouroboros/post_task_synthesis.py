@@ -71,8 +71,97 @@ def task_tool_metrics(llm_trace: dict) -> dict:
     return metrics
 
 
-def build_trace_summary(llm_trace: dict) -> str:
-    """Return a compact human-readable summary of tool calls and agent notes."""
+def capture_task_inputs(ctx: Any, task: dict, drive_root: Any, receipts: list) -> dict:
+    """Freeze the existing owner corpus and check receipts before actor cleanup."""
+    from ouroboros._outcome_receipts import verification_receipt_ledger_row
+    from ouroboros.observability import redact_projection
+    from ouroboros.review_evidence_sections import (
+        _accept_owner_directives, _accept_verification_summary,
+    )
+
+    task_id = str(task.get("id") or task.get("task_id") or "")
+    result: dict = {
+        "version": 1, "task_id": task_id,
+        "source_ref": {"kind": "task_result", "task_id": task_id, "reader": "get_task_result"},
+        "unavailable_sections": [],
+    }
+    try:
+        # The run's provenance comes first: the synthesis reads who started the run
+        # and whether the owner door stamped it before it reads the first text.
+        from ouroboros.dialogue_provenance import run_origin
+
+        metadata = getattr(ctx, "task_metadata", None)
+        result["run_origin"] = run_origin({
+            **task, "metadata": metadata if isinstance(metadata, dict) else task.get("metadata"),
+        })
+    except Exception:
+        result["unavailable_sections"].append("run_origin")
+        log.warning("Task run origin unavailable for synthesis: %s", task_id, exc_info=True)
+    try:
+        result["owner_requirements_and_decisions"] = _accept_owner_directives(ctx, drive_root, task_id)
+    except Exception:
+        result["unavailable_sections"].append("owner_requirements_and_decisions")
+        log.warning("Task owner input unavailable for synthesis: %s", task_id, exc_info=True)
+    try:
+        result["verification_summary"] = _accept_verification_summary(receipts)
+        result["verification_receipts"] = [
+            {"ts": row.get("ts"), **verification_receipt_ledger_row(row)}
+            for row in receipts if isinstance(row, dict)
+        ]
+    except Exception:
+        result["unavailable_sections"].append("verification_receipts")
+        log.warning("Task verification input unavailable for synthesis: %s", task_id, exc_info=True)
+    # Copy once into the normal durable completion package. Prompt workers must
+    # neither retain mutable actor objects nor re-read a later task's messages.
+    return json.loads(json.dumps(redact_projection(result).value, ensure_ascii=False, default=str))
+
+
+
+def _trace_round(tc: dict) -> int | None:
+    """Ordinal of the model round that issued this call (``…:round:<n>``); None when unrecorded."""
+    tail = str(tc.get("round_id") or "").rpartition(":round:")[2]
+    return int(tail) if tail.isdigit() else None
+
+
+def _fold_identical_calls(tool_calls: list) -> list[tuple[int, dict, int, int | None, int | None]]:
+    """Run-length fold of consecutive IDENTICAL calls: (first index, row, count, first round, last round).
+
+    Identity is equality of tool, RECORDED arguments, recorded status and delivered result —
+    arithmetic, not vocabulary — so a refusal returned as a plain string, a sleep loop and a
+    blind poll fold exactly like a typed error. Nothing is dropped: the count stays on the row.
+    Recorded is the load-bearing word, because these arguments already passed the log
+    sanitizer: an oversized string keeps its length and sha in the marker (two different
+    large payloads still differ) and a truncated list keeps its remaining count (so tails
+    of DIFFERENT length still differ), but two same-length tails with different content, a
+    structure past depth 3, and two different secrets (both ``*** REDACTED ***``) collapse
+    to a shape that compares equal and folds into one ``×2`` row. The returned row is the
+    group's FIRST call, whose trace_ref addresses that call's exact recorded projection.
+    """
+    folded: list[list] = []
+    previous = None
+    for index, tc in enumerate(tool_calls):
+        key = (tc.get("tool"), json.dumps(tc.get("args"), sort_keys=True, default=str, ensure_ascii=False),
+               str(tc.get("status") or ""), bool(tc.get("is_error")), str(tc.get("result") or ""))
+        if folded and key == previous:
+            folded[-1][2] += 1
+            folded[-1][4] = _trace_round(tc)
+        else:
+            folded.append([index, tc, 1, _trace_round(tc), _trace_round(tc)])
+        previous = key
+    return [tuple(item) for item in folded]
+
+
+def build_trace_summary(llm_trace: dict, *, all_calls: bool = False) -> str:
+    """Return a human-readable summary of tool calls and agent notes.
+
+    The default is the BOUNDED PREVIEW that is stored and shown (task card, parents,
+    children): two arguments per call, a positional window past thirty calls, a total
+    cut. ``all_calls=True`` is the post-task reflection's listing: every call in order
+    with every argument, identical consecutive calls folded into one ``×N`` row, the
+    first line of a failed or repeated call's result, no window and no total cut — a
+    decider must not adjudicate less of a call than the actor saw; its prompt is fitted
+    by the consolidation seam. Values stay width-bounded, with a disclosed omission.
+    """
     if llm_trace.get("loop_evidence_unavailable"):
         return "## Tool trace (call count unknown)\nThe failed loop supplied no verified execution trace."
     tool_calls = llm_trace.get("tool_calls", []) or []
@@ -85,6 +174,7 @@ def build_trace_summary(llm_trace: dict) -> str:
     # ignored read-only blocks. Self-learning (reflection reads this) must not be
     # poisoned by counting policy refusals or intentional probe exits as failures.
     from ouroboros.outcomes import _classify_tool_errors
+    from ouroboros.reflection import _trace_call_errored  # the ONE reading of "this call went wrong"
 
     _buckets = _classify_tool_errors(llm_trace)
     _unresolved = len(_buckets.get("unresolved") or [])
@@ -101,24 +191,35 @@ def build_trace_summary(llm_trace: dict) -> str:
         _breakdown_bits.append(f"{_cosmetic} cosmetic")
     if _ignored:
         _breakdown_bits.append(f"{_ignored} ignored")
+    if all_calls:
+        # One arithmetic fact the rows cannot show at a glance: rounds in which NO call returned ok.
+        rounds: dict[int, bool] = {}
+        for tc in tool_calls:
+            number = _trace_round(tc)
+            if number is not None:
+                rounds[number] = rounds.get(number, True) and _trace_call_errored(tc)
+        if any(rounds.values()):
+            _breakdown_bits.append(f"{sum(rounds.values())} of {len(rounds)} rounds had only non-ok results")
 
     lines: list[str] = [f"## Tool trace ({n} calls, {', '.join(_breakdown_bits)})"]
 
     if not tool_calls:
         lines.append("No tool calls.")
     else:
-        def _fmt_call(idx: int, tc: dict) -> str:
+        from ouroboros.observability import redact_projection
+
+        def _fmt_call(first: int, tc: dict, count: int, round_a: int | None, round_b: int | None) -> str:
             name = tc.get("tool", "unknown")
             args = tc.get("args", {})
             if isinstance(args, dict):
                 parts = []
                 arg_items = list(args.items())
-                for k, v in arg_items[:2]:
+                for k, v in (arg_items if all_calls else arg_items[:2]):
                     v_str = str(v)
                     if len(v_str) > 200:
                         v_str = _truncate_with_notice(v_str, 200).replace("\n", " ")
                     parts.append(f"{k}={v_str!r}")
-                if len(arg_items) > 2:
+                if not all_calls and len(arg_items) > 2:
                     parts.append(f"⚠️ OMISSION NOTE: {len(arg_items) - 2} more args omitted")
                 args_str = ", ".join(parts)
             else:
@@ -127,24 +228,35 @@ def build_trace_summary(llm_trace: dict) -> str:
                     args_str = _truncate_with_notice(args_str, 200).replace("\n", " ")
             facts = []
             status = str(tc.get("status") or "").strip()
-            if status and status != "ok":
+            if status:
                 facts.append(f"status={status}")
-            if tc.get("exit_code") not in (None, 0):
+            if tc.get("exit_code") is not None:
                 facts.append(f"exit_code={tc.get('exit_code')}")
             if tc.get("signal"):
                 facts.append(f"signal={tc.get('signal')}")
             fact_suffix = f" [{', '.join(facts)}]" if facts else ""
             suffix = " → ERROR" if tc.get("is_error") else ""
-            return f"{idx}. {name}({args_str}){fact_suffix}{suffix}"
+            index = f"{first + 1}" if count == 1 else f"{first + 1}–{first + count}"
+            if count > 1:
+                span = "" if round_a is None else f", rounds {round_a}–{round_b}" if round_b != round_a else f", round {round_a}"
+                suffix += f" ×{count} identical{span}"
+            if all_calls and (count > 1 or _trace_call_errored(tc)):
+                # The answer is what a later reader needs to tell a refusal from progress.
+                head = str(redact_projection(str(tc.get("result") or "")).value).strip().splitlines()[:1]
+                if head:
+                    suffix += " ← " + _truncate_with_notice(head[0], 200)
+            return f"{index}. {name}({args_str}){fact_suffix}{suffix}"
 
-        if n > 30:
+        if all_calls:
+            shown = [_fmt_call(*row) for row in _fold_identical_calls(tool_calls)]
+        elif n > 30:
             shown = (
-                [_fmt_call(i + 1, tool_calls[i]) for i in range(15)]
+                [_fmt_call(i, tool_calls[i], 1, None, None) for i in range(15)]
                 + [f"⚠️ OMISSION NOTE: {n - 30} middle tool calls omitted from trace summary."]
-                + [_fmt_call(n - 14 + i, tool_calls[n - 15 + i]) for i in range(15)]
+                + [_fmt_call(n - 15 + i, tool_calls[n - 15 + i], 1, None, None) for i in range(15)]
             )
         else:
-            shown = [_fmt_call(i + 1, tool_calls[i]) for i in range(n)]
+            shown = [_fmt_call(i, tool_calls[i], 1, None, None) for i in range(n)]
         lines.extend(shown)
 
     if notes:
@@ -152,7 +264,7 @@ def build_trace_summary(llm_trace: dict) -> str:
         lines.extend(f"- {note}" for note in notes)
 
     summary = "\n".join(lines)
-    if len(summary) > 4000:
+    if not all_calls and len(summary) > 4000:
         summary = _truncate_with_notice(summary, 4000)
     return summary
 
@@ -232,6 +344,40 @@ def _child_failure_classes(rows: Any) -> list:
     return sorted(classes)
 
 
+def _child_engine_facts(item: Dict[str, Any]) -> Dict[str, Any]:
+    """WHO ran a child and for how long, from the child's OWN stored record.
+
+    Facts only: the frozen ``configured_subagent`` snapshot names the engine the
+    way the catalog names a row, but from what actually ran (never the live
+    roster, which would relabel the past), so a lowered access or a legacy twin
+    can read differently from today's catalog. ``used_model`` is reported for an API child alone — a
+    session child's ``model_execution`` describes its nanny's rounds, not the
+    leaf. A duration needs both stamps: only the ordinary terminal write stamps
+    ``ts``, so a row whose ``ts`` does not follow its start yields none.
+    """
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.subagent_history import execution_identity, snapshot_handle
+
+    facts: Dict[str, Any] = {}
+    snapshot = item.get("configured_subagent")
+    if isinstance(snapshot, dict) and isinstance(snapshot.get("route"), dict):
+        identity = execution_identity(snapshot)
+        facts["engine"] = {
+            "subagent_id": snapshot_handle(snapshot), "kind": identity["kind"],
+            "target": identity["target_id"],
+            **{key: identity[key] for key in ("effort", "access") if identity.get(key)},
+        }
+        execution = item.get("model_execution")
+        if identity["kind"] == "api_model" and isinstance(execution, dict) and execution.get("used_model"):
+            facts["used_model"] = execution["used_model"]
+    started, finished = parse_deadline_ts(item.get("started_at")), parse_deadline_ts(item.get("ts"))
+    if started is not None:
+        facts["started_at"] = item["started_at"]
+        if finished is not None and finished > started:
+            facts["duration_sec"] = round((finished - started).total_seconds(), 1)
+    return facts
+
+
 def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> tuple:
     """Compact evidence from child/subagent results for parent experience review.
 
@@ -260,6 +406,7 @@ def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> t
                 "task_id": item.get("task_id") or item.get("id"),
                 "status": item.get("status"),
                 "role": item.get("role"),
+                **_child_engine_facts(item),
                 "outcome_axes": normalize_outcome_axes(item),
                 "accounted_upper_bound_usd": child_cost,
                 "trace_summary": _truncate_with_notice(item.get("trace_summary", ""), 800),
@@ -267,7 +414,17 @@ def _child_task_evidence(env: Any, task: Dict[str, Any], limit: int = 6000) -> t
             })
         if not rows:
             return "", []
-        return _truncate_with_notice(json.dumps(rows, ensure_ascii=False, indent=2), limit), rows
+        # Verbose rows overflow the cap after about three children, so a compact
+        # line per child leads: who ran what survives the truncation for ALL of them.
+        overview = [
+            {"task_id": row["task_id"], "role": row["role"], "status": row["status"],
+             **({"engine": row["engine"]["subagent_id"]} if "engine" in row else {}),
+             **({"duration_sec": row["duration_sec"]} if "duration_sec" in row else {}),
+             "accounted_upper_bound_usd": row["accounted_upper_bound_usd"]}
+            for row in rows
+        ]
+        text = json.dumps({"children_overview": overview, "children": rows}, ensure_ascii=False, indent=2)
+        return _truncate_with_notice(text, limit), rows
     except Exception:
         log.debug("Failed to collect child task evidence", exc_info=True)
         return "", []
@@ -299,11 +456,13 @@ def _pre_synthesis_usage_snapshot(
     })
     try:
         from ouroboros.usage_accounting import usage_breakdown
+        from ouroboros.cost_projection import COST_SCOPE_ROOT_TREE, build_cost_presentation
 
         logical_root_id = str(task.get("root_task_id") or task_id)
         subtree = usage_breakdown(budget_root, root_task_id=logical_root_id)
         snapshot.update({
             "accounted_upper_bound_usd_with_children": round(float(subtree["accounted_usd"]), 6),
+            "cost_presentation": build_cost_presentation(subtree, scope=COST_SCOPE_ROOT_TREE),
             "reserved_usd": round(float(subtree["reserved_usd"]), 6),
             "unresolved_upper_bound_usd": round(
                 float(subtree["unresolved_upper_bound_usd"]), 6
@@ -327,6 +486,7 @@ def _pre_synthesis_usage_snapshot(
             "unknown_unmetered": None,
             "ledger_integrity": "unavailable",
             "cost_accounting_status": "unavailable",
+            "cost_presentation": None,
         })
     return snapshot
 
@@ -348,7 +508,8 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
     try:
         from ouroboros.project_dialogue import append_authored_task_summary, completion_status_label, outcome_phase
         from ouroboros.projects_registry import project_thread_note_for_task
-        from ouroboros.consolidator import CONSOLIDATION_REASONING_EFFORT, _consolidation_route
+        from ouroboros.consolidator import _consolidation_route
+        from ouroboros.settings_scales import resolve_effort
         task_id = str(task.get("id") or "unknown")
         canonical_root = pathlib.Path(task.get("budget_drive_root") or drive_logs.parent)
         summary_id = f"task-narrative:{task_id}"
@@ -402,12 +563,15 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
             review_section = format_review_evidence_for_prompt(review_evidence or {}, max_chars=8000, acceptance_panels=review_projection.get("panels"))
         except Exception:
             review_section = "(review evidence unavailable)"
+        from ouroboros.reflection import task_inputs_prompt_section
+
         prompt = _TASK_SUMMARY_PROMPT.format(
             task_id=task_id, goal=goal or "(no goal text)",
             task_type=task.get("type", "user"), rounds="unknown" if rounds is None else rounds,
             cost_text=cost_text,
             usage_snapshot=_synthesis_usage_snapshot_text(usage),
             sealed_final=sealed_final_prompt_section(sealed_final),
+            task_inputs=task_inputs_prompt_section(review_evidence),
             trace_summary=trace,
             review_evidence=review_section,
         )
@@ -418,7 +582,7 @@ def _run_task_summary(env, llm, task, usage, llm_trace, drive_logs, review_evide
                                    call_type="task_summary", messages=[{"role": "user", "content": prompt}],
                                    model=summary_model,
                                    model_role="light",
-                                   reasoning_effort=CONSOLIDATION_REASONING_EFFORT,
+                                   reasoning_effort=resolve_effort("task"),  # the owner's Task / Chat level: one SSOT, no literal
                                    max_tokens=16384,
                                    use_local=summary_use_local)
             summary_text = (msg.get("content") or "").strip()
@@ -479,7 +643,8 @@ def _run_chat_consolidation(env, memory, llm, task, drive_logs):
                     task_id=str(_id or ""), project_id=str(task.get("project_id") or ""))
                 u = consolidate(chat_path=chat_path, blocks_path=blocks_path,
                                 meta_path=meta_path, llm_client=_llm, identity_text=_ident,
-                                knowledge_context=knowledge_context)
+                                knowledge_context=knowledge_context,
+                                room_registry_root=knowledge_context.budget_drive_root)
             if u:
                 # A run that produced no block and a run that never happened look the
                 # same in this stream without a written count; last_error_kind names the
@@ -559,7 +724,7 @@ def _run_reflection(env: Any, llm: Any, task: Dict[str, Any],
             cost_usd=synthesis_cost,
             child_failure_classes=child_classes,
         ):
-            trace_summary = build_trace_summary(llm_trace)
+            trace_summary = build_trace_summary(llm_trace, all_calls=True)
             try:
                 reflection_usage = dict(usage)
                 # Reflection's legacy durable cost_usd field now records this
@@ -607,13 +772,15 @@ If the task was non-trivial, end with a short meta-reflection section:
 - What friction, errors, or weak assumptions slowed the work?
 - What should Ouroboros change in its own process or prompts to avoid repeating that class of mistake?
 Keep the meta-reflection concrete and operational, not narrative.
-End with: "Details: progress.jsonl + tools.jsonl for task_id={task_id}"
+End with a task-scoped trace pointer: task_id={task_id}, task-events reader
+(CLI: ouroboros tasks watch {task_id} --jsonl). Do not guess flat log-file paths;
+the existing task reader merges this task's retained local, project and archived events.
 ## Task
-Goal: {goal}
+Initial text: {goal}
 Type: {task_type}
 Rounds: {rounds}, Cost: {cost_text}
 
-{usage_snapshot}{sealed_final}## Execution trace
+{usage_snapshot}{sealed_final}{task_inputs}## Execution trace
 {trace_summary}
 
 ## Structured review evidence

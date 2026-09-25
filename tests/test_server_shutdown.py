@@ -389,7 +389,7 @@ def test_main_normal_exit_does_not_run_emergency_cleanup(monkeypatch, tmp_path):
             return None
 
     monkeypatch.setattr(server, "load_settings", lambda: {"OUROBOROS_SERVER_HOST": "127.0.0.1"})
-    monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=0))
+    monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=0, host_explicit=False))
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
     monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", None)
     monkeypatch.setattr(server, "get_network_auth_startup_warning", lambda _host: "")
@@ -397,7 +397,7 @@ def test_main_normal_exit_does_not_run_emergency_cleanup(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "find_free_port", lambda _host, port: port)
     monkeypatch.setattr(server, "write_port_file", lambda *_a, **_k: None)
     monkeypatch.setattr(server.uvicorn, "Config", lambda *a, **k: object())
-    monkeypatch.setattr(server.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(server, "_SignalStopServer", FakeServer)  # the main() server seam (#1142)
     monkeypatch.setattr(server, "_emergency_process_cleanup", lambda: cleanup_calls.append("cleanup"))
     monkeypatch.setattr(server, "_event_loop", None)  # the watcher's close_all_ws hop needs no loop here
     server._restart_requested.clear()
@@ -427,7 +427,7 @@ def test_main_graceful_restart_cleanup_avoids_port_sweep(monkeypatch, tmp_path):
         pass
 
     monkeypatch.setattr(server, "load_settings", lambda: {"OUROBOROS_SERVER_HOST": "127.0.0.1"})
-    monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=0))
+    monkeypatch.setattr(server, "parse_server_args", lambda *_a, **_k: SimpleNamespace(host="127.0.0.1", port=0, host_explicit=False))
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
     monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", None)
     monkeypatch.setattr(server, "get_network_auth_startup_warning", lambda _host: "")
@@ -435,7 +435,7 @@ def test_main_graceful_restart_cleanup_avoids_port_sweep(monkeypatch, tmp_path):
     monkeypatch.setattr(server, "find_free_port", lambda _host, port: port)
     monkeypatch.setattr(server, "write_port_file", lambda *_a, **_k: None)
     monkeypatch.setattr(server.uvicorn, "Config", lambda *a, **k: object())
-    monkeypatch.setattr(server.uvicorn, "Server", FakeServer)
+    monkeypatch.setattr(server, "_SignalStopServer", FakeServer)  # the main() server seam (#1142)
     monkeypatch.setattr(server, "_LAUNCHER_MANAGED", True)
     monkeypatch.setattr(server, "_emergency_process_cleanup", lambda **kw: cleanup_calls.append(kw))
     monkeypatch.setattr(server.os, "_exit", lambda code: (_ for _ in ()).throw(ExitCalled(code)))
@@ -648,7 +648,9 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     noop = lambda *_a, **_k: None  # noqa: E731
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
     # Patch the module's bound name, not the process-wide time.sleep.
-    monkeypatch.setattr(server, "time", SimpleNamespace(sleep=noop, monotonic=time_mod.monotonic, time=time_mod.time))
+    monkeypatch.setattr(server, "time", SimpleNamespace(
+        sleep=noop, monotonic=time_mod.monotonic, time=time_mod.time,
+        thread_time=time_mod.thread_time))  # the loop samples its OWN thread's CPU per phase stamp
     monkeypatch.setattr(server, "_supervisor_stop", rec.stop)
     monkeypatch.setattr(server, "_restart_requested", rec.restart)
     monkeypatch.setattr(server, "_supervisor_ready", rec.ready)
@@ -662,6 +664,11 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     for name in (
         "_resume_interrupted_project_deletions", "_startup_prune_sweeps", "_startup_custody_sweep",
         "_startup_worktree_prune", "_prune_delegated_snapshots", "_periodic_supervisor_maintenance",
+        # Its own owner notice is another startup side effect, asserted by
+        # tests/test_retired_settings_chat_notice.py; here it would be a
+        # crash alert (this harness's send_with_budget double records every
+        # send, and the boot/crash assertions below own that list).
+        "_startup_retired_settings_notice",
     ):
         monkeypatch.setattr(server, name, noop)
     monkeypatch.setattr(server, "_start_supervisor_liveness_watchdog",
@@ -670,7 +677,7 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     monkeypatch.setattr(server, "_check_pending_restart_drain", lambda _ctx: True)
     monkeypatch.setattr(bus_mod, "init", noop)
     monkeypatch.setattr(bus_mod, "LocalChatBridge", _Bridge)
-    monkeypatch.setattr(bus_mod, "send_with_budget", lambda chat_id, text: rec.alerts.append((chat_id, text)))
+    monkeypatch.setattr(bus_mod, "send_with_budget", lambda chat_id, text, **kw: rec.alerts.append((chat_id, text)))
     monkeypatch.setattr("ouroboros.utils.set_log_sink", noop)
     monkeypatch.setattr(events_mod, "make_server_log_sink", lambda *_a, **_k: None)
     monkeypatch.setattr(events_mod, "dispatch_event", noop)
@@ -864,6 +871,6 @@ def test_supervisor_revival_clears_a_stale_stop_flag(monkeypatch):
     try:
         assert server._start_supervisor_if_needed({}) is True
         assert server._supervisor_stop.is_set() is False
-        assert started == [server._run_supervisor]
+        assert started == [server._supervisor_generation]  # the latch-checking thread body (#1142)
     finally:
         server._supervisor_stop.clear()

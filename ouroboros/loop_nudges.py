@@ -120,20 +120,48 @@ def _force_plan_disclosure(
     return plan_review_disclosure(decision, forced_reason)
 
 
-def _build_recent_tool_trace(messages: List[Dict[str, Any]], window: int = 15) -> str:
-    """Build a compact recent-tool trace for the self-check prompt."""
+def _build_recent_tool_trace(
+    messages: List[Dict[str, Any]], window: int = 15, llm_trace: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Build a compact recent-tool trace for the self-check prompt.
+
+    Each call carries its recorded outcome, and a failed one the first line of what the
+    tool answered: a list of calls alone asks "are you repeating yourself?" without the
+    one fact that says why. Facts only — what they mean stays with the model.
+
+    Built from ``llm_trace.tool_calls`` whenever it exists, so name, arguments and outcome
+    all come from ONE record. Joining the visible ``messages`` to the trace by call id
+    cannot be made sound: providers reuse ids (GigaChat answers ``call_0`` every round, the
+    local parser ``call_local_<i>``) and compaction removes whole units from anywhere — a
+    capsule replaces a prefix, ``_select_units`` leaves a zero-reclaim or memo-negative unit
+    in place, an authored view keeps an arbitrary set — so a surviving call took an evicted
+    namesake's error. Keying by id did that, and so did matching (id, tool) whenever both
+    calls were the SAME tool. Without a trace the messages still render, carrying no outcome
+    at all rather than a borrowed one.
+    """
+    from ouroboros.reflection import _trace_call_errored  # the ONE reading of "this call went wrong"
+
+    def _summary(name: str, args: Any) -> str:
+        if isinstance(args, dict):
+            args = json.dumps(args, sort_keys=True)
+        args_str = str(args or "")
+        return f"{name}({args_str[:80]})" if len(args_str) > 80 else f"{name}({args_str})"
+
+    rows = [row for row in ((llm_trace or {}).get("tool_calls") or []) if isinstance(row, dict)]
     all_calls: List[str] = []
-    for msg in messages:
-        if msg.get("role") == "assistant" and msg.get("tool_calls"):
-            for tc in msg["tool_calls"]:
-                fn = tc.get("function", {})
-                name = fn.get("name", "")
-                args = fn.get("arguments", "")
-                if isinstance(args, dict):
-                    args = json.dumps(args, sort_keys=True)
-                args_str = str(args)
-                summary = f"{name}({args_str[:80]})" if len(args_str) > 80 else f"{name}({args_str})"
-                all_calls.append(summary)
+    for row in rows:
+        status = str(row.get("status") or ("error" if row.get("is_error") else "ok"))
+        note = f" [{status}]"
+        if _trace_call_errored(row):
+            head = str(row.get("result") or "").strip().splitlines()[:1]
+            note += f" ← {head[0][:200]}" if head else ""
+        all_calls.append(_summary(str(row.get("tool") or ""), row.get("args")) + note)
+    if not rows:
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for tc in msg["tool_calls"]:
+                    fn = tc.get("function", {})
+                    all_calls.append(_summary(fn.get("name", ""), fn.get("arguments", "")))
     recent = all_calls[-window:] if all_calls else []
     if not recent:
         return ""
@@ -142,7 +170,7 @@ def _build_recent_tool_trace(messages: List[Dict[str, Any]], window: int = 15) -
 
 def _maybe_inject_self_check(
     round_idx: int,
-    max_rounds: int,
+    max_rounds: Optional[int],
     messages: List[Dict[str, Any]],
     accumulated_usage: Dict[str, Any],
     emit_progress: Callable[[str], None],
@@ -151,10 +179,13 @@ def _maybe_inject_self_check(
     task_id: str = "",
     drive_logs: Optional[pathlib.Path] = None,
     cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
+    llm_trace: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """Inject a normal user-turn self-check and emit one checkpoint event."""
+    """Inject a normal user-turn self-check and emit one checkpoint event. Without a round
+    limit (``max_rounds is None``) it names the rounds used and no invented remainder."""
     REMINDER_INTERVAL = 15
-    if round_idx <= 1 or round_idx % REMINDER_INTERVAL != 0 or round_idx >= max_rounds:
+    if (round_idx <= 1 or round_idx % REMINDER_INTERVAL != 0
+            or (max_rounds is not None and round_idx >= max_rounds)):
         return False
     # Non-incrementing round re-entries (e.g. free redials): one self-check per round.
     if accumulated_usage.get("_self_check_round") == round_idx:
@@ -185,12 +216,15 @@ def _maybe_inject_self_check(
         tree_cap = float(raw_cap) if raw_cap is not None else None
         tree_line = f"{rendered}\n"
 
-    tool_trace = _build_recent_tool_trace(messages)
+    tool_trace = _build_recent_tool_trace(messages, llm_trace=llm_trace)
 
+    round_text, remaining_text = f"round {round_idx}", ""
+    if max_rounds is not None:
+        round_text += f"/{max_rounds}"
+        remaining_text = f" | Rounds remaining: {max_rounds - round_idx}"
     reminder = (
-        f"[CHECKPOINT {checkpoint_num} — round {round_idx}/{max_rounds}]\n"
-        f"Context: ~{ctx_tokens} tokens | Cost so far: {cost_text} | "
-        f"Rounds remaining: {max_rounds - round_idx}\n"
+        f"[CHECKPOINT {checkpoint_num} — {round_text}]\n"
+        f"Context: ~{ctx_tokens} tokens | Cost so far: {cost_text}{remaining_text}\n"
         f"{tree_line}"
     )
     if tool_trace:
@@ -373,7 +407,7 @@ def _maybe_inject_nanny_economics_reminder(
 def _inject_round_checkpoints(
     *,
     round_idx: int,
-    max_rounds: int,
+    max_rounds: Optional[int],
     messages: List[Dict[str, Any]],
     accumulated_usage: Dict[str, Any],
     emit_progress: Callable[[str], None],
@@ -383,6 +417,7 @@ def _inject_round_checkpoints(
     drive_logs: Optional[pathlib.Path],
     budget_remaining_usd: Optional[float] = None,
     cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
+    llm_trace: Optional[Dict[str, Any]] = None,
 ) -> bool:
     """Inject the per-round self-check and the time-budget / intrinsic-pacing
     milestone AFTER owner messages, so the checkpoint is the LLM-call tail (a
@@ -391,7 +426,7 @@ def _inject_round_checkpoints(
     checkpoint = _maybe_inject_self_check(
         round_idx, max_rounds, messages, accumulated_usage, emit_progress,
         event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
-        cost_ceiling=cost_ceiling,
+        cost_ceiling=cost_ceiling, llm_trace=llm_trace,
     )
     time_budget = _maybe_inject_time_budget_milestone(
         messages, tools, event_queue=event_queue, task_id=task_id, drive_logs=drive_logs,
@@ -618,6 +653,52 @@ def _maybe_inject_finalization_nudges(
         emit_progress(note)
         llm_trace["reasoning_notes"].append(note)
         return True
+
+    # A host-driven route change hands an already-active authoring turn to a
+    # new model.  The successor sees the canonical transcript, but without this
+    # typed reminder its first short status response can look like an ordinary
+    # final.  One recovery round is bounded by the existing loop/deadline/budget
+    # rails; a second tool-less response is retained with a degraded execution
+    # fact rather than silently painting a clean Done.
+    handover = (getattr(tools._ctx, "_authoring_handover", None)
+                or llm_trace.get("authoring_handover_incomplete"))
+    if isinstance(handover, dict):
+        baseline = int(handover.get("tool_calls_at_handover") or 0)
+        current = len(llm_trace.get("tool_calls") or [])
+        if current > baseline:
+            handover["status"] = "recovered"
+            incomplete = llm_trace.pop("authoring_handover_incomplete", None)
+            if isinstance(incomplete, dict):
+                incomplete["status"] = "recovered"
+            tools._ctx._authoring_handover = None
+            usage = getattr(tools._ctx, "_accumulated_usage", {})
+            if usage.get("reason_code") == "authoring_handover_incomplete":
+                usage.pop("execution_status", None)
+                usage.pop("reason_code", None)
+        elif baseline > 0 and content and str(content).strip():
+            if not bool(handover.get("recovery_prompted")):
+                handover["recovery_prompted"] = True
+                from_model = str(handover.get("from_model") or "the previous model")
+                to_model = str(handover.get("to_model") or "the current model")
+                return _inject(
+                    f"A host-driven model handover occurred ({from_model} → {to_model}) "
+                    "after the previous model had already used tools. Continue the owner's "
+                    "open task from the preserved plan and tool results. Use tools for the "
+                    "next substantive step or state a concrete blocker; do not stop at a "
+                    "work-in-progress status update.",
+                    "Authoring handover recovery nudge injected before final response.",
+                )
+            tools._ctx._authoring_handover = None
+            handover["status"] = "incomplete"
+            handover["incomplete_observed"] = True
+            usage = getattr(tools._ctx, "_accumulated_usage", None)
+            if isinstance(usage, dict):
+                usage["execution_status"] = "degraded"
+                usage["reason_code"] = "authoring_handover_incomplete"
+            llm_trace["authoring_handover_incomplete"] = handover
+            # Existing one-shot readiness/verification nudges and acceptance
+            # can still continue the task. Later tool work heals only this
+            # warning; the history row retains the handover and its recovery.
 
     if (getattr(tools._ctx, "_nanny_route_dispatched", False)
             and not getattr(tools._ctx, "_nanny_finalization_injected", False)):

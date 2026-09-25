@@ -212,12 +212,21 @@ export const ru = {
   "Behavior": "Поведение",
   "Language": "Язык",
   "Interface Language": "Язык интерфейса",
-  "Interface language of this browser. Applies immediately; strings without a translation stay English.": "Язык интерфейса в этом браузере. Применяется сразу; строки без перевода остаются на английском.",
+  "Interface language, saved with your UI preferences. Applies immediately; strings without a translation stay English.": "Язык интерфейса, сохраняется в настройках интерфейса. Применяется сразу; строки без перевода остаются на английском.",
   "Language choice could not be saved.": "Не удалось сохранить выбор языка.",
-  "The agent's reasoning is recorded either way; this only controls whether it is displayed.": "Рассуждения агента записываются в любом случае; переключатель управляет только их отображением.",
-  "Show the agent's reasoning in chat and logs": "Показывать рассуждения агента в чате и логах",
-  "Display only: reasoning stays in the durable log, so turning this on also reveals it in past conversations.": "Только отображение: рассуждения остаются в журнале, поэтому после включения они видны и в прошлых диалогах.",
-  "Reasoning display choice could not be saved.": "Не удалось сохранить выбор отображения рассуждений.",
+  "Appearance": "Оформление",
+  "Theme": "Тема",
+  "Appearance applies until this window reloads; this device blocks storage.": "Оформление действует до перезагрузки окна: это устройство блокирует хранилище.",
+  "This client reports no OS appearance, so System uses Dark.": "Клиент не сообщает оформление ОС, поэтому «Системная» использует тёмную тему.",
+  "Notifications": "Уведомления",
+  "Enable notifications": "Включить уведомления",
+  "A question or decision is waiting for you": "Вас ждёт вопрос или решение",
+  "A task finished or stopped": "Задача завершилась или остановлена",
+  "Messages Ouroboros sends you while it works": "Сообщения, которые Ouroboros присылает во время работы",
+  "Ordinary replies in Main": "Обычные ответы в Main",
+  "Sound": "Звук",
+  "Show the message text (otherwise only the kind of event)": "Показывать текст сообщения (иначе только тип события)",
+  "Send a test notification": "Отправить тестовое уведомление",
   "Advanced": "Дополнительно",
   "About": "О программе",
   "Configure providers, secrets, models, behavior, source control, and runtime controls.": "Настройка провайдеров, секретов, моделей, поведения, системы контроля версий и рантайма.",
@@ -787,6 +796,11 @@ export const ruPatterns = [
   [/^Delete (.+)$/, (m, name) => `Удалить ${name}`],
   [/^\[Attached file: (.+)\]$/, (m, name) => `[Вложенный файл: ${name}]`],
   [re("\\[" + NUM + " more attached files\\]"), (m, n) => `[ещё ${n} ${plural(n, "вложенный файл", "вложенных файла", "вложенных файлов")}]`],
+];
+
+/** Words whose translation depends on where they appear (see createTranslator). */
+export const ruScoped = [
+  ["[data-theme-control]", { "Light": "Светлая", "Dark": "Тёмная", "System": "Системная" }],
 ];
 
 export const ruMonths = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"];

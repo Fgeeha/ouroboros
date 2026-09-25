@@ -2,6 +2,8 @@
 
 import json
 
+import pytest
+
 
 def test_llm_usage_writes_cached_tokens_and_cache_write_tokens(tmp_path):
     from supervisor import events as ev_module
@@ -11,8 +13,9 @@ def test_llm_usage_writes_cached_tokens_and_cache_write_tokens(tmp_path):
 
     class FakeCtx:
         DRIVE_ROOT = tmp_path
+
         def update_budget_from_usage(self, usage):
-            self.last_usage = usage
+            pytest.fail("the writer runs once per loop turn, never per event")
 
     evt = {
         "type": "llm_usage",
@@ -54,8 +57,8 @@ def test_llm_usage_writes_cached_tokens_and_cache_write_tokens(tmp_path):
     assert written.get("root_task_id") == "root-1"
     assert written.get("parent_task_id") == "parent-1"
     assert written.get("delegation_role") == "subagent"
-    assert ctx.last_usage["cached_tokens"] == 1200
-    assert ctx.last_usage["prompt_cache_ttl"] == "default"
+    assert written["projection_update_status"] == "deferred"
+    assert ctx.budget_projection_dirty is True
 
 
 def test_llm_usage_persists_reasoning_effort_projection(tmp_path):
@@ -67,7 +70,7 @@ def test_llm_usage_persists_reasoning_effort_projection(tmp_path):
         DRIVE_ROOT = tmp_path
 
         def update_budget_from_usage(self, usage):
-            self.last_usage = usage
+            pytest.fail("the writer runs once per loop turn, never per event")
 
     note = {"requested": "medium", "applied": "high",
             "reason": "provider_wire_mapping", "model": "deepseek-v4-flash"}
@@ -88,7 +91,7 @@ def test_llm_usage_preserves_unknown_cost_as_null(tmp_path):
         DRIVE_ROOT = tmp_path
 
         def update_budget_from_usage(self, usage):
-            self.last_usage = usage
+            pytest.fail("the writer runs once per loop turn, never per event")
 
     ctx = FakeCtx()
     ev_module._handle_llm_usage(
@@ -98,7 +101,64 @@ def test_llm_usage_preserves_unknown_cost_as_null(tmp_path):
     written = json.loads((tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8"))
     assert written["cost"] is None
     assert written["cost_known"] is False
-    assert ctx.last_usage["cost"] is None
+    assert ctx.budget_projection_dirty is True
+
+
+def test_llm_usage_defers_the_projection_write_and_keeps_paid_usage(tmp_path):
+    """The event never pays the projection write: it marks the loop context dirty and
+    records ``deferred``; the paid usage row itself is retained either way."""
+    from supervisor import events as ev_module
+    (tmp_path / "logs").mkdir()
+
+    class FakeCtx:
+        DRIVE_ROOT = tmp_path
+
+        def update_budget_from_usage(self, usage):
+            pytest.fail("the writer runs once per loop turn, never per event")
+
+    ctx = FakeCtx()
+    for _ in range(3):
+        ev_module._handle_llm_usage(
+            {"type": "llm_usage", "task_id": "paid", "usage": {"prompt_tokens": 4, "cost": 0.75}},
+            ctx,
+        )
+    rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert [row["projection_update_status"] for row in rows] == ["deferred"] * 3
+    assert all(row["cost"] == 0.75 for row in rows)
+    assert ctx.budget_projection_dirty is True
+
+
+def test_llm_usage_real_corrupt_ledger_keeps_the_projection_dirty_and_paid_event_survives(tmp_path):
+    from ouroboros.server_liveness import flush_budget_projection
+    from supervisor import events as ev_module
+    from supervisor import state
+    from ouroboros.usage_ledger import LEDGER_REL
+
+    (tmp_path / "logs").mkdir()
+    state.init(tmp_path, total_budget_limit=0.0)
+    state.save_state({"spent_usd": 1.25})
+    ledger = tmp_path / LEDGER_REL
+    ledger.parent.mkdir(parents=True, exist_ok=True)
+    ledger.write_text("{broken}\n{}\n", encoding="utf-8")
+
+    class Ctx:
+        DRIVE_ROOT = tmp_path
+
+        @staticmethod
+        def update_budget_from_usage(usage):
+            return state.update_budget_from_usage(usage)
+
+    ctx = Ctx()
+    ev_module._handle_llm_usage(
+        {"type": "llm_usage", "task_id": "paid-real", "usage": {"prompt_tokens": 2, "cost": 0.5}},
+        ctx,
+    )
+    written = json.loads((tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8"))
+    assert written["projection_update_status"] == "deferred"
+    assert written["cost"] == 0.5
+    flush_budget_projection(ctx)  # the one write of the turn: refused on a corrupt ledger
+    assert state.load_state()["spent_usd"] == 1.25
+    assert ctx.budget_projection_dirty is True and ctx.budget_projection_retry_at > 0
 
 
 def test_cost_breakdown_aggregates_cache_tokens_and_ttl(tmp_path):

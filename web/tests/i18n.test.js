@@ -8,7 +8,7 @@ import {
     createTranslator, setLanguage, translateString,
     EXCLUDE_SELECTOR, SKIP_ROOTS, USER_CONTENT,
 } from '../modules/i18n.js';
-import { ru, ruPatterns, plural } from '../i18n/ru.js';
+import { ru, ruPatterns, ruScoped, plural } from '../i18n/ru.js';
 
 test('an exact dictionary key is replaced', () => {
     assert.equal(translateString('Settings', ru, ruPatterns), 'Настройки');
@@ -210,6 +210,20 @@ test('owner-supplied names are left alone while the chrome around them is transl
     assert.equal(plainRow.getAttribute('title'), 'Настройки');
     // Inputs are excluded as content but their chrome attributes are translated.
     assert.equal(input.getAttribute('placeholder'), 'Поиск');
+});
+
+test('a scoped word wins only inside its scope and restores like any other', () => {
+    const themes = el('div', {}, el('button', {}, 'Light'), el('button', {}, 'System'));
+    themes.dataset.themeControl = '';
+    const root = el('div', {}, themes, el('button', {}, 'Light'));
+    const translator = createTranslator({ dict: ru, patterns: ruPatterns, scoped: ruScoped });
+    translator.applyTo(root);
+    assert.equal(text(themes.childNodes[0]), 'Светлая');
+    assert.equal(text(themes.childNodes[1]), 'Системная');
+    assert.equal(text(root.childNodes[1]), 'Лёгкий');
+    translator.restore(root);
+    assert.equal(text(themes.childNodes[0]), 'Light');
+    assert.equal(text(root.childNodes[1]), 'Light');
 });
 
 test('restore returns every rewritten node and attribute to its exact English source', () => {

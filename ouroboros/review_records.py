@@ -87,6 +87,18 @@ def validate_author_disposition(
         )
     except (TypeError, ValueError):
         return None
+    if "action" in record:
+        if record["action"] not in {"finish", "stop"}:
+            return None
+        normalized["action"] = record["action"]
+    if "review_reference" in record:
+        import json
+        try:
+            if not isinstance(record["review_reference"], dict):
+                return None
+            normalized["review_reference"] = json.loads(json.dumps(record["review_reference"], allow_nan=False))
+        except (TypeError, ValueError):
+            return None
     expected = str(subject_hash or "").strip()
     if expected and normalized["subject_hash"] != expected and not allow_stale:
         return None
@@ -103,6 +115,45 @@ def build_author_disposition_from_mapping(
         disposition=value.get("disposition", ""), rationale=value.get("rationale", ""),
         subject_hash=subject_hash, reviewer_signal=reviewer_signal, enforcement=enforcement,
     )
+
+
+def review_outcome_received(actors: Any, *, findings: Any = (), terminal: bool = False) -> bool:
+    """Separate received feedback/unavailability from wholly live review custody.
+
+    Surface owners supply their recorded terminal fact. A local custody_lost
+    outcome leaves remote uncertainty intact; it is not a locally running actor.
+    Nested scope receipts retain each slot's state instead of its aggregate label.
+    """
+    rows = [row for row in actors or [] if isinstance(row, dict)]
+    pending = False
+    while rows:
+        row = rows.pop()
+        children = row.get("raw_results")
+        if isinstance(children, list) and children:
+            rows.extend(item for item in children if isinstance(item, dict))
+            continue
+        live = row.get("operation_state") in {"in_flight", "pending_dispatch"}
+        pending = pending or live
+        if live:
+            continue  # A host pending placeholder is not a received critic payload.
+        if (row.get("ok") is True or row.get("status") in {"responded", "ok", "empty", "parse_failure"}
+                or row.get("operation_state") == "custody_lost" or row.get("error") or row.get("failure_code")):
+            return True
+    return not pending and (terminal or any(isinstance(item, dict) and
+        (item.get("item") or item.get("summary")) for item in findings or []))
+
+
+def review_slot_awaiting(row: Any) -> bool:
+    """A PLANNED wait: the caller released the dispatch barrier before this slot
+    answered. An answer that has not arrived is a gap, never a failure or a verdict."""
+    return isinstance(row, dict) and row.get("operation_state") == "pending_dispatch"
+
+
+def review_slot_unresolved(row: Any) -> bool:
+    """No answer and NOT a planned wait: the logical window expired or the worker
+    handle is gone. ``late_result_pending`` is true for these rows and for awaiting
+    ones alike, so it never tells the two apart — only ``operation_state`` does."""
+    return isinstance(row, dict) and row.get("operation_state") in {"in_flight", "custody_lost"}
 
 
 def apply_review_model_override(slot: Any, overrides: Dict[str, dict], *, slot_id: str = "") -> Any:
@@ -244,6 +295,9 @@ class ReviewActorRecord:
     failure_code: str = ""
     reset_at: str = ""
     http_status: Optional[int] = None
+    # What the engine REPORTED about the failed run, bounded and redacted at the gateway
+    # (``run_failure_cause``); "" when nothing was reported. Opaque: shown, never branched on.
+    reported_cause: str = ""
     parse_status: str = ""
     semantic_verdict: str = ""
     provider: str = ""
@@ -261,6 +315,11 @@ class ReviewActorRecord:
     operation_state: str = "settled"
     late_result_pending: bool = False
     recovery_binding: Dict[str, Any] = field(default_factory=dict)
+    # Wall clock at which THIS process sent this reviewer its request, for the
+    # rows that are still waiting for an answer. Empty whenever the host did not
+    # perform the send itself (a free replay, a rejoin of an earlier process's
+    # paid operation): the owner is never shown an inferred moment.
+    awaiting_since: str = ""
 
 
 @dataclass
@@ -291,4 +350,4 @@ HARDNESS_LABEL_ONLY = "label_only"              # recorded on the objective axis
 HARDNESS_HARD_GATE = "hard_gate"                # blocking commit/scope immune gate (unchanged)
 
 
-TYPED_FAILURE_FACT_KEYS = ("failure_code", "reset_at", "http_status", "transport_status")
+TYPED_FAILURE_FACT_KEYS = ("failure_code", "reset_at", "http_status", "transport_status", "reported_cause")

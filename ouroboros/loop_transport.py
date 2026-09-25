@@ -498,22 +498,30 @@ def _owner_signal_pending(
     owner_msg_seen: Optional[set],
     attempt: Any,
     mailbox_peek: Optional[OwnerMailboxPeek] = None,
+    *,
+    owner_authority_only: bool = False,
 ) -> bool:
-    """Non-destructive peek: is an owner message or typed control waiting?"""
+    """Peek unread input; acceptance may exclude context-only task messages.
+
+    Transport and wait callers still wake for every message. Owner admission
+    uses the same typed provenance boundary as the ordinary mailbox drain.
+    """
     if incoming_messages is not None and not incoming_messages.empty():
         return True
     if drive_root is None or not task_id:
         return False
     try:
+        from ouroboros.loop_messages import owner_authority_kinds
         from ouroboros.owner_mailbox import drain_owner_entries
 
-        if mailbox_peek is not None:
+        if mailbox_peek is not None and not owner_authority_only:
             return mailbox_peek.pending(pathlib.Path(drive_root), task_id, set(owner_msg_seen or ()), attempt)
         # A COPY of the seen-set: this is a peek — the round top performs the
         # real drain, delivery, and acknowledgement.
-        return bool(drain_owner_entries(
+        entries = drain_owner_entries(
             pathlib.Path(drive_root), task_id, set(owner_msg_seen or ()), attempt,
-        ))
+        )
+        return bool(owner_authority_kinds(entries) if owner_authority_only else entries)
     except Exception:
         log.debug("owner-signal peek failed during transport wait", exc_info=True)
         return False
@@ -706,6 +714,37 @@ def last_assistant_text(messages: List[Dict[str, Any]]) -> str:
     return ""
 
 
+# Unknown outcome alone establishes neither a receipt nor a numeric bound.
+UNKNOWN_ATTEMPT_COST_NOTE = (
+    " This does not establish the attempt's cost; any recorded estimate or "
+    "upper bound is not a settled receipt."
+)
+
+
+def _unknown_wait_note(unknown: bool, waited_sec: float, interactive: bool) -> str:
+    """The REAL wait this unknown terminal spent, on the rails that never said it.
+
+    The transport-wait branch below states its own wait in the sentence. The
+    no-call rails (``provider_no_call_source`` -> ``provider_outcome_unknown_no_resend``)
+    reach the generic terminal instead, which named neither the wait nor the
+    fence, so an owner whose turn had waited minutes read a bare "no usable
+    response". Zero stays silent rather than claiming a wait that never ran.
+    """
+    if not unknown or waited_sec <= 0:
+        return ""
+    subject = "This turn" if interactive else "The task"
+    return f" {subject} spent {waited_sec / 60.0:.1f} min in the provider wait; that wait did not confirm the attempt's outcome."
+
+
+def _unknown_terminal_recovery_hint(usage: Dict[str, Any]) -> str:
+    # Wording only, confined to unknown terminals. Stop/Wrap up keep their
+    # existing byte-for-byte control sentence and recovery hint.
+    return provider_recovery_hint(usage).replace(
+        "the dead ones stay unresolved at their upper bound",
+        "the dead ones stay unresolved; any recorded bound is retained",
+    )
+
+
 def provider_terminal_fallback_text(
     accumulated_usage: Dict[str, Any],
     *,
@@ -746,6 +785,14 @@ def provider_terminal_fallback_text(
             "Any files written so far are preserved in the workspace."
         )
     if is_transport_wait:
+        if unknown:
+            # A wait duration does not prove a redial, nor a numeric price bound.
+            return (
+                "⚠️ The dispatched attempt has no confirmed provider outcome."
+                f"{_unknown_wait_note(True, waited_sec, interactive)}"
+                " Inspect the preserved facts before starting another run."
+                f"{_unknown_terminal_recovery_hint(accumulated_usage)}{UNKNOWN_ATTEMPT_COST_NOTE}"
+            )
         advice = ("Inspect the preserved facts before starting another run." if unknown
                   else "Retry when connectivity returns.")
         if interactive and waited_sec > 0:
@@ -771,25 +818,21 @@ def provider_terminal_fallback_text(
                 "time to wait; the task ended as a provider outage, not completed. Any files "
                 f"written so far are preserved in the workspace. {advice}"
             )
-        if unknown:
-            # The episode redialed a granted transport-death repeat that never left the
-            # host: an earlier attempt of the round is still unresolved at its upper
-            # bound, and the owner text says both facts (the wait and the fence). The
-            # class the repeat was released with is on the record, and the hint reads it
-            # there — never the sticky kind, which by the time the window closes names a
-            # LATER free redial's refusal (``deadline_exhausted``).
-            text += provider_recovery_hint(accumulated_usage)
         return text
     if is_deadline_exhausted:
         text = "⚠️ The owner deadline ended primary model work; any files written so far are preserved."
         if unknown:
-            text += provider_recovery_hint(accumulated_usage)
+            text += _unknown_terminal_recovery_hint(accumulated_usage) + UNKNOWN_ATTEMPT_COST_NOTE
         return text
     return (
         "⚠️ The model provider returned no usable response."
-        f"{provider_failure_hint(accumulated_usage)}{provider_recovery_hint(accumulated_usage)} "
+        f"{_unknown_wait_note(unknown, waited_sec, interactive)}"
+        f"{provider_failure_hint(accumulated_usage)}"
+        f"{_unknown_terminal_recovery_hint(accumulated_usage) if unknown else provider_recovery_hint(accumulated_usage)}"
+        f"{UNKNOWN_ATTEMPT_COST_NOTE if unknown else ''} "
         "Any files written so far are preserved in the workspace."
     )
+
 
 
 def provider_failure_hint(accumulated_usage: Dict[str, Any]) -> str:
@@ -835,6 +878,51 @@ def emit_model_effort_mismatch(
         incident={"task_incident": "model_effort_mismatch",
                   "toast_once": ":".join(part for part in (task_id, "model_effort_mismatch", model) if part)},
     )
+
+
+# What the host KNOWS it did. It asks again and names no account; which account
+# answers the redo is the engine's choice, so no wording here may claim the
+# round moved (architecture: rotation is possible, not guaranteed).
+_SUBSTITUTION_DISPOSITIONS = {
+    "redo": "the answer was not accepted and the round was asked again without naming an account",
+    "redos_exhausted": "the answer was not accepted and no further attempt was available",
+    "pinned_account": "the account is pinned, so the round was not asked again",
+    "admitted_candidate": "this send was already admitted, so the round was not asked again",
+    "send_budget_spent": "this caller had no send left, so the round was not asked again",
+    "deadline_spent": "the task's own time was spent, so the round was not asked again",
+}
+
+
+def emit_model_substitution(
+    accumulated_usage: Dict[str, Any], *, task_id: str, emit_progress: Optional[Callable[..., None]],
+) -> None:
+    """Disclose once per task and requested model that another model answered.
+
+    A timeline row of the task that spent the round, never a chat message and
+    never a toast: the round recovers by itself, and the owner's interest is
+    the cognitive horizon the task ran under, not an interruption. A second
+    substitution of the same model in the same task stays in the durable rows.
+    The sentence names what actually happened — a recovered redo and a refusal
+    are different facts and must not share one wording.
+    """
+    rows = accumulated_usage.get("_model_substitutions")
+    notified = accumulated_usage.setdefault("_model_substitution_notified", [])
+    if emit_progress is None or not isinstance(rows, list):
+        return
+    for row in rows:
+        requested, observed = str(row.get("requested") or ""), str(row.get("observed") or "")
+        if not requested or not observed or requested in notified:
+            continue
+        notified.append(requested)
+        account = str(row.get("account") or "")
+        outcome = _SUBSTITUTION_DISPOSITIONS.get(str(row.get("disposition") or ""), "")
+        emit_progress(
+            f"⚠️ {observed} answered instead of the requested {requested}"
+            f"{f' (Claudexor account {account})' if account else ''}"
+            f"{f'; {outcome}' if outcome else ''}.",
+            card_row="timeline",
+            card_row_id=":".join(part for part in (task_id, "model_substitution", requested) if part),
+        )
 
 
 def provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
@@ -890,6 +978,20 @@ def provider_recovery_hint(accumulated_usage: Dict[str, Any]) -> str:
             " The subscription window for the delegated route is spent. This is "
             f"TRANSIENT, not a billing refusal — waiting cures it.{when} Retrying is "
             "scheduled against that reset time, not the ordinary short backoff."
+        )
+    if kind == "model_substituted":
+        return (
+            " The route answered with a different model than the one requested, so "
+            "the answer was not accepted. Another account may serve the requested "
+            "model right away; the engine ranks this one lower for a while after this."
+        )
+    if kind == "bad_request" and str(accumulated_usage.get("_last_llm_provider_code") or "") == "invalid_continuation":
+        # The generic bad_request sentence below blames the caller's transcript,
+        # which is wrong here: the engine refused its OWN continuation record.
+        return (
+            " The provider refused the stored continuation of this conversation "
+            "rather than the request itself. Dropping it and sending the same "
+            "conversation again is the repair, and this round already spent it."
         )
     if kind in {"quota_exhausted", "auth_error", "request_too_large", "bad_request", "context_overflow"}:
         guidance = {

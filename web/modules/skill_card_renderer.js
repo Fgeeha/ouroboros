@@ -424,6 +424,13 @@ export function patchInstalledSkillEnrichment(card, skill, reviewing, repairing,
     }
     const publish = menu.querySelector('.skills-submit-hub'), nextPublish = next.querySelector('.skills-submit-hub');
     if (publish && nextPublish) attributes(publish, nextPublish, true);
+    // A late hub fact adds or drops "Skip review" in place; the menu stays as it is.
+    const attest = menu.querySelector('.skills-attest-review'), nextAttest = next.querySelector('.skills-attest-review');
+    if (attest && !nextAttest) attest.remove();
+    else if (!attest && nextAttest) {
+        const dialog = menu.querySelector('.skills-card-menu-dialog') || menu.closest?.('.skills-card-menu-dialog');
+        dialog?.insertBefore(nextAttest, dialog.querySelector('.skills-submit-hub, .skills-update, .skills-delete-local'));
+    }
 }
 
 function submitHubReady(skill, githubTokenConfigured) {

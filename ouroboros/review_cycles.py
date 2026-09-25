@@ -14,9 +14,9 @@ identical material is never re-reviewed for pay:
 
 * plan review — paid reviewer-panel cycles per task (the engine consumes the
   getter; this module only exposes it);
-* task acceptance — paid panel runs per task, ``passes = cycles - 1``
-  (``acceptance_max_improvement_passes_from_cycles``), so the default 2 equals
-  the historical default of 1 improvement pass; unlimited → None;
+* task acceptance — paid panel runs per task. The last paid result still
+  permits an author response; only an explicit task-local improvement-pass
+  limit bounds author work, independently of this paid ceiling;
 * commit gate — paid triad+scope cycles per ROOT task (the whole task tree
   shares one ceiling; a manual session is its own task; a follow-up task is a
   fresh root). The paid fact is recorded on the attempt row AT DISPATCH and
@@ -30,8 +30,8 @@ identical material is never re-reviewed for pay:
   the recorded verdict); a rebuttal is content-hashed and a hash new to the
   streak buys exactly ONE paid re-review (a rebuttal is "spent" only when it
   bought a dispatched, verdict-answered wave). Exhaustion under blocking is a
-  free typed refusal; under advisory the commit proceeds with a loud typed
-  disclosure and no further paid dispatch;
+  free typed refusal; under advisory the outcome returns with a typed
+  disclosure for explicit author continuation, without another paid dispatch;
 * skill review — paid reviewer-panel dispatches per ceiling key (the root task
   for task-driven review groups — shared across every skill that task reviews,
   follow-ups start fresh — or, for the manual lane, the CURRENT content
@@ -64,6 +64,9 @@ from ouroboros.config import SETTINGS_DEFAULTS
 from ouroboros.outcomes import REASON_REVIEW_CYCLES_EXHAUSTED  # noqa: F401 — re-export
 from ouroboros.utils import append_jsonl, emit_log_event, utc_now_iso
 from ouroboros.config import runtime_setting
+# The canonical "no cap" token (the UI's ∞ saves it), its aliases and the strict parser are the
+# ONE optional-bound vocabulary in ``settings_scales``, shared with the task round/lifetime limits.
+from ouroboros.settings_scales import UNLIMITED, parse_positive_or_unlimited
 
 log = logging.getLogger(__name__)
 
@@ -71,20 +74,7 @@ REVIEW_MAX_CYCLES_KEY = "OUROBOROS_REVIEW_MAX_CYCLES"
 # Deprecated alias (task acceptance only). Kept as a settings key so an explicit
 # owner customization keeps binding; removal is a separate owner decision.
 ACCEPTANCE_PASSES_LEGACY_KEY = "OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES"
-# Canonical persisted token for "no cap"; the UI's ∞ choice saves this string.
-UNLIMITED = "unlimited"
-# "none" is deliberately NOT an alias: it reads as "no cycles" as easily as "no cap".
-UNLIMITED_ALIASES = frozenset({UNLIMITED, "inf", "∞"})
-# Legacy passes clamp, unchanged from the former config.py getter.
-
 _WARNED: set = set()
-
-
-def _warn_once(tag: str, message: str) -> None:
-    if tag in _WARNED:
-        return
-    _WARNED.add(tag)
-    log.warning(message)
 
 
 def parse_review_max_cycles(raw: Any) -> Optional[int]:
@@ -92,15 +82,7 @@ def parse_review_max_cycles(raw: Any) -> Optional[int]:
 
     Raises ``ValueError`` for anything else (empty, zero, negative, non-integer,
     unknown word) so callers decide between fail-closed default and 400."""
-    text = str(raw if raw is not None else "").strip().lower()
-    if text in UNLIMITED_ALIASES:
-        return None
-    if not text:
-        raise ValueError("empty review-cycle cap")
-    value = int(text)  # ValueError on non-integer text (incl. "true"/"1.5")
-    if value < 1:
-        raise ValueError(f"review-cycle cap must be a positive integer, got {value}")
-    return value
+    return parse_positive_or_unlimited(raw)
 
 
 def is_valid_review_max_cycles(raw: Any) -> bool:
@@ -136,11 +118,12 @@ def review_max_cycles() -> Optional[int]:
     try:
         return parse_review_max_cycles(raw)
     except (TypeError, ValueError):
-        _warn_once(
-            f"invalid:{raw!r}",
-            f"{REVIEW_MAX_CYCLES_KEY}={raw!r} is not a positive integer or "
-            f"'unlimited'; using the shipped default {default_text} (bounded).",
-        )
+        if f"invalid:{raw!r}" not in _WARNED:
+            _WARNED.add(f"invalid:{raw!r}")
+            log.warning(
+                f"{REVIEW_MAX_CYCLES_KEY}={raw!r} is not a positive integer or "
+                f"'unlimited'; using the shipped default {default_text} (bounded).",
+            )
         return default_review_max_cycles()
 
 
@@ -152,21 +135,14 @@ def review_max_cycles_source() -> str:
     return "owner_setting" if runtime_setting(REVIEW_MAX_CYCLES_KEY, "") else "shipped_default"
 
 
-def acceptance_max_improvement_passes_from_cycles() -> Optional[int]:
-    """Pure formula: task-acceptance improvement passes = shared cycles - 1
-    (2 cycles → 1 pass); ``None`` when the shared cap is unlimited."""
-    cycles = review_max_cycles()
-    return None if cycles is None else max(0, cycles - 1)
-
-
 def get_acceptance_max_improvement_passes() -> Optional[int]:
-    """Acceptance improvement-pass cap = the shared review-cycle cap minus one.
+    """The paid review ceiling never limits ordinary author response work.
 
     The deprecated ``OUROBOROS_ACCEPTANCE_MAX_IMPROVEMENT_PASSES`` no longer binds at runtime:
     a customized value is MIGRATED into the shared knob when settings load (``config``), the
     same rename-alias shape the retention keys use. Disclosed residual: a legacy value supplied
     only through the environment (never saved) is not migrated and no longer binds."""
-    return acceptance_max_improvement_passes_from_cycles()
+    return None
 
 def emit_review_cycles_exhausted(
     event_queue: Any, drive_root: Any, *, surface: str, task_id: str,

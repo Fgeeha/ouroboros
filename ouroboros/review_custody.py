@@ -28,7 +28,7 @@ from ouroboros.review_dispatch import slot_id_for_row
 from ouroboros.usage_accounting import (
     PHYSICAL_ATTEMPT_STATES, POSITIVE_PHYSICAL_ATTEMPT_STATES,
 )
-from ouroboros.utils import emit_cognitive_operation_event
+from ouroboros.utils import emit_cognitive_operation_event, utc_now_iso
 
 log = logging.getLogger("review_custody")
 
@@ -45,6 +45,9 @@ class ActiveReviewAttempt:
     retry_state: Dict[str, Any] = field(default_factory=dict)
     pending_invocation_checkpoint: Callable[[str], None] | None = None
     recovery_binding: Dict[str, Any] = field(default_factory=dict)
+    # Wall clock of the send THIS process performs; empty when it rejoins an
+    # operation an earlier process paid for, whose send moment it cannot know.
+    started_at: str = ""
 
 
 _ACTIVE_LOCK = threading.Lock()
@@ -492,6 +495,7 @@ def _frozen_actor(row: Dict[str, Any], slot: Any) -> Any:
         transport_status=str(row.get("transport_status") or ""),
         failure_code=str(row.get("failure_code") or ""),
         reset_at=str(row.get("reset_at") or ""),
+        reported_cause=str(row.get("reported_cause") or ""),
         http_status=http_status,
         parse_status=str(row.get("parse_status") or ""),
         semantic_verdict=str(row.get("semantic_verdict") or ""),
@@ -772,6 +776,7 @@ def _emit_operation(
     entry: ActiveReviewAttempt,
     slot: Any,
     phase: str,
+    actor: Any = None,
     **extra: Any,
 ) -> None:
     if usage_ctx is None:
@@ -793,12 +798,21 @@ def _emit_operation(
         }
         if event_queue is not None:
             emit_cognitive_operation_event(event_queue, **values)
-            return
-        from ouroboros.tools.review_helpers import emit_review_event
+        else:
+            from ouroboros.tools.review_helpers import emit_review_event
 
-        emit_review_event(usage_ctx, {"type": "cognitive_operation", **values})
+            emit_review_event(usage_ctx, {"type": "cognitive_operation", **values})
     except Exception:
         log.debug("review operation event failed", exc_info=True)
+    try:
+        emit = getattr(usage_ctx, "emit_progress_fn", None)
+        if callable(emit) and phase in {"started", "finished", "failed"}:
+            from ouroboros.review_execution_projection import review_actor_progress_text
+
+            emit(review_actor_progress_text(str(getattr(request, "surface", "") or ""), phase, slot, actor))
+    except Exception:
+        # Publish custody before best-effort UI disclosure.
+        log.debug("review actor progress failed", exc_info=True)
 
 
 def _late_or_timeout_actor(
@@ -823,6 +837,7 @@ def _late_or_timeout_actor(
             entry.operation_id, "pending_dispatch",
         )
         actor.late_result_pending = True
+        actor.awaiting_since = entry.started_at
         return actor
     actor = error_actor(
         slot,
@@ -830,6 +845,8 @@ def _late_or_timeout_actor(
         entry.operation_id if entry is not None else "",
         "in_flight" if entry is not None else "settled",
     )
+    if entry is not None:
+        actor.awaiting_since = entry.started_at
     if entry is not None and entry.retry_state:
         usage = dict(getattr(actor, "usage", None) or {})
         usage.update({
@@ -1020,11 +1037,12 @@ def _settle_review_attempt(
         _emit_operation(
             usage_ctx, task_id=task_id, request=request, entry=entry, slot=slot,
             phase="failed" if actor.status == "error" else "finished",
+            actor=actor,
         )
     if entry.released_early:  # plan review's event route: progress line + the settled-wave frame
         from ouroboros.tools.plan_review_collect import announce_released_settlement
 
-        announce_released_settlement(usage_ctx, request=request, task_id=task_id, slot=slot, actor=actor,
+        announce_released_settlement(usage_ctx, request=request, task_id=task_id, actor=actor,
                                      settled_wave=dict(released_wave.get("slots") or {}), roster_size=int(released_wave.get("total") or 0))
         if getattr(request, "surface", "") == "task_acceptance" and (released_wave or quorum_wave):
             from ouroboros.acceptance_settlement import announce_acceptance_settlement
@@ -1089,12 +1107,13 @@ def _settled_slot_verdict(actor: Any) -> Dict[str, str]:
         parsed, findings, signal = parse_review_findings(str(getattr(actor, "raw_text", "") or ""))
     except Exception:
         log.debug("released acceptance verdict could not be parsed", exc_info=True)
-        return {"verdict": "", "note": ""}
+        parsed, findings, signal = {}, [], ""
     from ouroboros.utils import truncate_review_artifact
 
     note = str((parsed or {}).get("summary") or "") if isinstance(parsed, dict) else ""
     note = note or next((str(row.get("recommendation") or row.get("item") or "")
                          for row in (findings or []) if isinstance(row, dict)), "")
+    note = note or str(getattr(actor, "error", "") or getattr(actor, "parse_reason", "") or "")
     return {"verdict": str(signal or "").upper(), "note": truncate_review_artifact(" ".join(note.split()), limit=400)}
 
 
@@ -1275,6 +1294,9 @@ def run_custodied_review_slots(
                         operation_id=retry_operation_id or reserved_operation_id or new_call_id(
                             f"review_{getattr(request, 'surface', 'review')}_{getattr(slot, 'slot_id', 'slot')}"),
                         retry_state=retry_payload,
+                        # A rejoin inherits an EARLIER process's send; only a new
+                        # physical operation is sent from here, and only now.
+                        started_at="" if exact_recovery else utc_now_iso(),
                     )
                     entry.recovery_binding = review_operation_binding(request, slot, entry.operation_id)
                     entry.wave_key = _wave_key(request)

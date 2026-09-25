@@ -297,7 +297,7 @@ def test_agent_stop_on_top_of_an_owner_stop_keeps_the_owner_stop(tmp_path, monke
     monkeypatch.setattr(queue, "stop_evolution_tasks", lambda reason="": {
         "cancelled": [], "already_settled": [], "not_found": [], "failed": [], "intent_write_failed": []})
     ctx = types.SimpleNamespace(PENDING=[], sort_pending=lambda: None, persist_queue_snapshot=lambda reason="": None,
-                                send_with_budget=lambda cid, text: None,
+                                send_with_budget=lambda cid, text, **kw: None,
                                 load_state=lambda: {"owner_chat_id": 7, "evolution_owner_stopped": True})
     _handle_toggle_evolution({"enabled": False}, ctx)
     assert captured["evolution_owner_stopped"] is True and "evolution_stop_source" not in captured
@@ -345,7 +345,7 @@ def test_toggle_evolution_off_wires_owner_stop(tmp_path, monkeypatch):
         PENDING=[{"type": "evolution"}, {"type": "task"}],
         sort_pending=lambda: None,
         persist_queue_snapshot=lambda reason="": None,
-        send_with_budget=lambda cid, text: None,
+        send_with_budget=lambda cid, text, **kw: None,
         load_state=lambda: {"owner_chat_id": 7},
     )
     _handle_toggle_evolution({"enabled": False}, ctx)
@@ -387,7 +387,7 @@ def test_toggle_evolution_on_clears_owner_stop(tmp_path, monkeypatch):
 
     ctx = types.SimpleNamespace(
         load_state=lambda: {"owner_chat_id": 7},
-        send_with_budget=lambda cid, text: None,
+        send_with_budget=lambda cid, text, **kw: None,
     )
     _handle_toggle_evolution({"enabled": True, "objective": "improve X"}, ctx)
 
@@ -405,7 +405,7 @@ def test_toggle_evolution_start_failure_sends_owner_correction(monkeypatch):
     sent = []
     ctx = types.SimpleNamespace(
         load_state=lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False},
-        send_with_budget=lambda chat_id, text: sent.append((chat_id, text)),
+        send_with_budget=lambda chat_id, text, **kw: sent.append((chat_id, text)),
     )
 
     events._handle_toggle_evolution({"enabled": True}, ctx)

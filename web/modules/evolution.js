@@ -1,6 +1,7 @@
-import { allowanceLabel, cssToken, escapeHtmlText, formatUsd2 } from './utils.js';
+import { allowanceLabel, escapeHtmlText, formatUsd2 } from './utils.js';
 import { apiFetch } from './api_client.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import { applyChartTheme, chartChrome, onThemeChange } from './theme_palette.js';
 
 /**
  * Ask for the evolution-campaign objective (pure decision helper, node-tested
@@ -66,6 +67,7 @@ export function initEvolution({ ws, state, mount }) {
     let evoChart = null;
     let loadSequence = 0;
     let chartLoaded = false;
+    let disposed = false;
     const refreshBtn = document.getElementById('evo-refresh');
     const startBtn = document.getElementById('evo-start');
     const stopBtn = document.getElementById('evo-stop');
@@ -202,6 +204,7 @@ export function initEvolution({ ws, state, mount }) {
     }
 
     async function loadEvolution(force = false) {
+        if (disposed) return;
         chartLoaded = true;
         const requestId = ++loadSequence;
         refreshBtn.disabled = true;
@@ -277,7 +280,7 @@ export function initEvolution({ ws, state, mount }) {
                     legend: {
                         position: 'top',
                         labels: {
-                            color: cssToken('--text-meta', '#94a3b8'),
+                            color: '#94a3b8',
                             usePointStyle: true,
                             pointStyle: 'circle',
                             padding: 16,
@@ -285,10 +288,10 @@ export function initEvolution({ ws, state, mount }) {
                         },
                     },
                     tooltip: {
-                        backgroundColor: cssToken('--ui-modal-bg', 'rgba(26, 21, 32, 0.95)'),
-                        titleColor: cssToken('--text-primary', '#e2e8f0'),
-                        bodyColor: cssToken('--text-meta', '#94a3b8'),
-                        borderColor: cssToken('--accent-18', 'rgba(201, 53, 69, 0.18)'),
+                        backgroundColor: 'rgba(26, 21, 32, 0.95)',
+                        titleColor: '#e2e8f0',
+                        bodyColor: '#94a3b8',
+                        borderColor: 'rgba(201, 53, 69, 0.18)',
                         borderWidth: 1,
                         titleFont: { family: 'JetBrains Mono, monospace', size: 12 },
                         bodyFont: { family: 'JetBrains Mono, monospace', size: 11 },
@@ -310,26 +313,52 @@ export function initEvolution({ ws, state, mount }) {
                 },
                 scales: {
                     x: {
-                        ticks: { color: cssToken('--text-secondary', '#64748b'), font: { size: 10, family: 'JetBrains Mono, monospace' }, maxRotation: 45 },
-                        grid: { color: cssToken('--divider', '#1e293b') },
+                        ticks: { color: '#64748b', font: { size: 10, family: 'JetBrains Mono, monospace' }, maxRotation: 45 },
+                        grid: { color: chartChrome().grid },
                     },
                     y: {
                         type: 'linear',
                         position: 'left',
-                        title: { display: true, text: 'Lines of Code', color: cssToken('--blue', '#60a5fa'), font: { size: 11 } },
-                        ticks: { color: cssToken('--blue', '#60a5fa'), font: { size: 10 } },
-                        grid: { color: cssToken('--divider', '#1e293b') },
+                        // Repaint assigns readable themed blue to this series
+                        // axis, and neutral themed ink to the other axes.
+                        title: { display: true, text: 'Lines of Code', color: '#60a5fa', font: { size: 11 } },
+                        ticks: { color: '#60a5fa', font: { size: 10 } },
+                        grid: { color: chartChrome().grid },
                     },
                     y1: {
                         type: 'linear',
                         position: 'right',
-                        title: { display: true, text: 'Size (KB)', color: cssToken('--text-meta', '#94a3b8'), font: { size: 11 } },
-                        ticks: { color: cssToken('--text-meta', '#94a3b8'), font: { size: 10 } },
+                        title: { display: true, text: 'Size (KB)', color: '#94a3b8', font: { size: 11 } },
+                        ticks: { color: '#94a3b8', font: { size: 10 } },
                         grid: { drawOnChartArea: false },
                     },
                 },
             },
         });
+        repaintChart();
+    }
+
+    function repaintChart() {
+        if (!evoChart) return;
+        // Keep the series-coded blue axis in a readable foreground shade.
+        // Never rebuild an instance just to change its ink.
+        const { text, grid } = chartChrome();
+        const style = getComputedStyle(document.documentElement);
+        const token = (name, fallback) => style.getPropertyValue(name).trim() || fallback;
+        const blue = token('--status-info-fg', text);
+        const tooltip = evoChart.options?.plugins?.tooltip;
+        if (tooltip) {
+            tooltip.backgroundColor = token('--bg-secondary', tooltip.backgroundColor);
+            tooltip.titleColor = token('--text-primary', tooltip.titleColor);
+            tooltip.bodyColor = token('--text-meta', tooltip.bodyColor);
+        }
+        for (const [id, scale] of Object.entries(evoChart.scales || {})) {
+            const options = scale.options;
+            if (options.grid) options.grid.color = grid;
+            if (options.ticks) options.ticks.color = id === 'y' ? blue : text;
+            if (options.title) options.title.color = id === 'y' ? blue : text;
+        }
+        applyChartTheme(evoChart, { scales: {} });
     }
 
     function renderTagsList(points) {
@@ -392,24 +421,39 @@ export function initEvolution({ ws, state, mount }) {
         loadEvolution(true);
     });
 
-    ws.on('open', () => {
+    const unsubscribeOpen = ws.on('open', () => {
         if (isEvolutionVisible()) {
             ensureEvolutionLoaded(false);
         }
     });
 
-    window.addEventListener('ouro:page-shown', (event) => {
+    const onPageShown = (event) => {
         if (event?.detail?.page === 'dashboard' && state.dashboardActiveSubtab === 'evolution') {
             ensureEvolutionLoaded(false);
         }
-    });
-    window.addEventListener('ouro:dashboard-subtab-shown', (event) => {
+    };
+    const onSubtabShown = (event) => {
         if (event?.detail?.tab === 'evolution') ensureEvolutionLoaded(false);
-    });
-
-    document.addEventListener('visibilitychange', () => {
+    };
+    const onVisibilityChange = () => {
         if (!document.hidden && isEvolutionVisible()) {
             if (chartLoaded) loadEvolution(false);
         }
-    });
+    };
+    window.addEventListener('ouro:page-shown', onPageShown);
+    window.addEventListener('ouro:dashboard-subtab-shown', onSubtabShown);
+    document.addEventListener('visibilitychange', onVisibilityChange);
+    const unsubscribeTheme = onThemeChange(repaintChart);
+    return () => {
+        if (disposed) return;
+        disposed = true;
+        loadSequence += 1;
+        unsubscribeOpen();
+        unsubscribeTheme();
+        window.removeEventListener('ouro:page-shown', onPageShown);
+        window.removeEventListener('ouro:dashboard-subtab-shown', onSubtabShown);
+        document.removeEventListener('visibilitychange', onVisibilityChange);
+        if (evoChart) evoChart.destroy();
+        evoChart = null;
+    };
 }

@@ -32,6 +32,7 @@ os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 from ouroboros.config import (
     AGENT_SERVER_PORT,
     DATA_DIR,
+    LAUNCHER_STOP_GRACE_SEC,
     PANIC_EXIT_CODE,
     PORT_FILE,
     REPO_DIR,
@@ -95,15 +96,13 @@ from ouroboros.platform_layer import (
     subprocess_new_group_kwargs,
     terminate_job,
     terminate_process_group_id,
-    terminate_process_tree,
+    request_native_attention,
 )
-from ouroboros.utils import atomic_write_json, read_json_dict, utc_now_iso
+from ouroboros.utils import atomic_write_json, utc_now_iso
 
 MAX_CRASH_RESTARTS = 5
 CRASH_WINDOW_SEC = 120
-# One bounded, visible retry when a restart's dependency install fails (XG-7B.3):
-# long enough to ride out a transient index/network hiccup, short enough not to
-# stall an offline restart whose requirements are already satisfied.
+# One bounded visible retry when dependency installation fails.
 _DEPS_RETRY_DELAY_SEC = 5
 _CREATE_SUSPENDED = getattr(subprocess, "CREATE_SUSPENDED", 0x4) if IS_WINDOWS else 0
 _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if IS_WINDOWS else 0
@@ -267,12 +266,14 @@ def _server_process_identity_matches(record: dict) -> bool:
     return expected_server in command or ("server.py" in command and expected_repo in command)
 
 
-def _write_server_process_record(proc: subprocess.Popen, *, port: int, server_py: pathlib.Path) -> None:
+def _write_server_process_record(proc: subprocess.Popen, *, port: int, server_py: pathlib.Path,
+                                 server_host_source: str) -> None:
     try:
         record = {
             "pid": int(proc.pid),
             "pgid": process_group_id(proc.pid),
             "server_path": str(server_py.resolve()),
+            "server_host_source": server_host_source,
             "repo_dir": str(REPO_DIR.resolve()),
             "requested_port": int(port),
             "port": int(port),
@@ -386,6 +387,7 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     # export exclusion closed — setdefault lets the settings value stand in
     # only when the environment says nothing.
     saved_host = str(settings.get("OUROBOROS_SERVER_HOST") or "").strip()
+    host_source = "environment" if str(env.get("OUROBOROS_SERVER_HOST") or "").strip() else "settings"
     if saved_host:
         env.setdefault("OUROBOROS_SERVER_HOST", saved_host)
     env["OUROBOROS_SERVER_PORT"] = str(port)
@@ -393,8 +395,8 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     env["OUROBOROS_REPO_DIR"] = str(REPO_DIR)
     env["OUROBOROS_APP_VERSION"] = str(APP_VERSION)
     env["OUROBOROS_MANAGED_BY_LAUNCHER"] = "1"
-    # Owner Surface Fact: the launcher is the only actor that knows HOW this
-    # server will be presented. `_headless` is decided in main() before the
+    env["OUROBOROS_MANAGED_REPO_DIR"] = str(REPO_DIR.resolve())
+    # Owner Surface Fact: the launcher alone knows presentation; `_headless` is decided in main() before the
     # lifecycle loop ever calls start_agent(), and every managed restart funnels
     # back through here, so the export is re-stamped fresh each time. Absence of
     # the var (source mode, Docker, Colab, CLI server) truthfully means "web".
@@ -465,7 +467,7 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
             return proc
         log.info("Agent pid %d assigned to Windows Job Object", proc.pid)
 
-    _write_server_process_record(proc, port=port, server_py=server_py)
+    _write_server_process_record(proc, port=port, server_py=server_py, server_host_source=host_source)
 
     def _stream_output() -> None:
         # Size-capped copy (CPL4-C5): same bound as the server.log stdlib
@@ -531,11 +533,9 @@ def stop_agent() -> None:
 
     log.info("Stopping agent (pid=%s)...", proc.pid)
     try:
-        if IS_WINDOWS:
-            proc.terminate()
-        else:
-            terminate_process_tree(proc)
-        proc.wait(timeout=10)
+        # Graceful phase signals only the server: it owns its Manager and workers (#1142).
+        proc.terminate()
+        proc.wait(timeout=LAUNCHER_STOP_GRACE_SEC)
     except subprocess.TimeoutExpired:
         if IS_WINDOWS and job is not None:
             terminate_job(job)
@@ -1067,18 +1067,15 @@ def _headless_signal_handler(signum, frame) -> None:
 
 def _open_browser_detached(url: str, outcome: Optional[list] = None) -> threading.Thread:
     """Open the default browser without ever blocking the caller.
-
     `webbrowser.open` waits for the child on a stdlib-resolved console
     browser (w3m/lynx or an unrecognized $BROWSER), which would stall the
     keep-alive loop for that browser's lifetime; the URL is already printed,
     so the open is best-effort and rides a daemon thread. Returns the thread
     so a short-lived caller (the already-running notice) can bound-join it
     before process exit would kill the daemon thread under the opener.
-
     An ``outcome`` list, when given, receives exactly one entry — True/False
     from ``webbrowser.open`` or the raised exception — so a bounded-join
     caller (the desktop bridge) can report failure honestly.
-
     DELIBERATE (owner-approved): the opened browser is the USER'S own
     application, intentionally outside process custody and launcher teardown —
     the Emergency-Stop invariant governs the AGENT'S tree, and killing the
@@ -1097,6 +1094,23 @@ def _open_browser_detached(url: str, outcome: Optional[list] = None) -> threadin
     thread = threading.Thread(target=_open, name="ouroboros-open-browser", daemon=True)
     thread.start()
     return thread
+
+
+def _open_external_url(url: str) -> dict:
+    """Shared external-link handoff for both desktop window bridges."""
+    try:
+        raw = str(url or "")
+        if not raw.lower().startswith(("http://", "https://", "mailto:")):
+            return {"ok": False, "error": "Only absolute http://, https:// or mailto: links can be opened."}
+        outcome: list = []
+        # Settled failure is reported; a slow browser stays detached.
+        _open_browser_detached(raw, outcome).join(timeout=3.0)
+        if outcome and outcome[0] is not True:
+            return {"ok": False, "error": f"The default browser could not be opened: {outcome[0] or 'no handler found'}"}
+        return {"ok": True}
+    except Exception as exc:
+        log.warning("Desktop external-URL open failed: %s", exc, exc_info=True)
+        return {"ok": False, "error": str(exc)}
 
 
 def _run_headless_main(url: str, port: int, lifecycle_thread: threading.Thread) -> None:
@@ -1209,7 +1223,7 @@ def main(argv=()):
             width=420,
             height=200,
         )
-        webview.start()
+        webview.start(private_mode=False)
         return
 
     import atexit
@@ -1296,7 +1310,7 @@ def main(argv=()):
             width=520,
             height=300,
         )
-        webview.start(func=_git_page, args=[git_window])
+        webview.start(func=_git_page, args=[git_window], private_mode=False)
         if not check_git():
             sys.exit(1)
 
@@ -1342,7 +1356,8 @@ def main(argv=()):
         # The gateway is live and, with no provider configured, runs WITHOUT a
         # supervisor — the supported state that lets the wizard reach /api/*.
         onboarding = _present_first_run_onboarding(
-            onboarding_settings, actual_port, headless=_headless
+            onboarding_settings, actual_port, headless=_headless,
+            open_external_url=_open_external_url,
         )
         if not onboarding["saved"]:
             log.info(
@@ -1397,7 +1412,7 @@ def main(argv=()):
             width=520,
             height=260,
         )
-        webview.start()
+        webview.start(private_mode=False)
         return
 
     def _resolve_bridge_file_url(raw_url: str) -> str:
@@ -1495,19 +1510,9 @@ def main(argv=()):
                 return {"ok": False, "error": str(exc)}
 
         def open_external_url(self, url: str) -> dict:
-            try:
-                raw = str(url or "")
-                if not raw.lower().startswith(("http://", "https://", "mailto:")):
-                    return {"ok": False, "error": "Only absolute http://, https:// or mailto: links can be opened."}
-                outcome: list = []
-                # Bounded join: settled failure reported honestly; still-running stays detached.
-                _open_browser_detached(raw, outcome).join(timeout=3.0)
-                if outcome and outcome[0] is not True:
-                    return {"ok": False, "error": f"The default browser could not be opened: {outcome[0] or 'no handler found'}"}
-                return {"ok": True}
-            except Exception as exc:
-                log.warning("Desktop external-URL open failed: %s", exc, exc_info=True)
-                return {"ok": False, "error": str(exc)}
+            return _open_external_url(url)
+        def request_attention(self, sound: bool = True) -> dict:
+            return request_native_attention(_webview_window.show if _webview_window else None, sound=bool(sound))
 
         def save_bytes_to_downloads(self, filename: str, b64: str) -> dict:
             try:
@@ -1549,12 +1554,6 @@ def main(argv=()):
         # Never returns: keep-alive loop + teardown + sys.exit inside.
         _run_headless_main(url, actual_port, lifecycle_thread)
 
-    def _window_background_color() -> str:
-        # Same values as --bg-primary in web/ui.css so the shell chrome does not
-        # flash the other theme before the page paints.
-        prefs = read_json_dict(DATA_DIR / "state" / "ui_preferences.json") or {}
-        return "#f7f5f8" if prefs.get("theme") == "light" else "#0d0b0f"
-
     window = webview.create_window(
         f"Ouroboros v{APP_VERSION}",
         url=url,
@@ -1562,7 +1561,7 @@ def main(argv=()):
         width=1100,
         height=750,
         min_size=(800, 500),
-        background_color=_window_background_color(),
+        background_color="#0d0b0f",
         text_select=True,
     )
 
@@ -1575,9 +1574,9 @@ def main(argv=()):
         os._exit(0)
 
     window.events.closing += _on_closing
-    _webview_window = window
+    _webview_window = window  # Persist cookies and website data (ouroboros.theme); rebuild/limits: ARCHITECTURE §3.
 
-    webview.start(debug=False)
+    webview.start(debug=False, private_mode=False)
 
 
 if __name__ == "__main__":
