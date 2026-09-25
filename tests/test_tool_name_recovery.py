@@ -384,6 +384,15 @@ def test_one_oversized_raw_identity_never_bypasses_the_reply_bound():
     text = "\n".join(name_miss_guidance("x", "mcp_svc", rows, discovery=True, identity=rows))
     assert len(text) < 500 and "exceeds the inline bound" in text
     assert 'list_available_tools(namespace="mcp_svc")' in text
+    without_discovery = "\n".join(name_miss_guidance("x", "mcp_svc", rows, discovery=False, identity=rows))
+    assert "list_available_tools" not in without_discovery
+    assert "discovery is unavailable" in without_discovery
+
+    ambiguous = [{"name": f"mcp_svc__{i}", "raw_name": "x" * 5000} for i in range(2)]
+    without_discovery = "\n".join(name_miss_guidance("x", "mcp_svc", ambiguous,
+                                                        discovery=False, identity=ambiguous))
+    assert "list_available_tools" not in without_discovery
+    assert "discovery is unavailable" in without_discovery
 
 
 @pytest.mark.parametrize("mode", ["max", "low", "nano"])
