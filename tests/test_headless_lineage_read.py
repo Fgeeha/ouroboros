@@ -41,6 +41,13 @@ def _write(path: pathlib.Path, text: str) -> pathlib.Path:
     return path
 
 
+def _symlink_or_skip(link: pathlib.Path, target: pathlib.Path) -> None:
+    try:
+        link.symlink_to(target, target_is_directory=True)
+    except (OSError, NotImplementedError) as exc:
+        pytest.skip(f"directory symlinks unavailable: {exc}")
+
+
 @pytest.fixture
 def geometry(tmp_path, monkeypatch):
     """Every task runs forked on its own headless drive under the canonical root,
@@ -156,7 +163,7 @@ def test_sibling_stranger_and_cross_paired_headless_files_stay_refused(geometry)
 def test_a_symlink_inside_the_parents_headless_drive_does_not_escape(geometry):
     registry, _ctx = child_registry(geometry)
     link = geometry.parent_brief.parent / "escape"
-    link.symlink_to(geometry.sibling_notes.parent, target_is_directory=True)
+    _symlink_or_skip(link, geometry.sibling_notes.parent)
 
     for out in _reads(registry, "task_drive", link / "notes.txt"):
         assert "SIBLING_BYTES" not in out and "outside selected root" in out, out
@@ -171,10 +178,10 @@ def test_a_symlinked_headless_task_root_is_not_a_lineage_base(geometry, linked):
     _write(geometry.outside / "task_drives" / ROOT / "notes.txt", "ESCAPED_BYTES\n")
     if linked == "headless_drive":
         shutil.rmtree(root_drive)
-        root_drive.symlink_to(geometry.outside, target_is_directory=True)
+        _symlink_or_skip(root_drive, geometry.outside)
     else:
         (root_drive / "task_drives").mkdir(parents=True)
-        (root_drive / "task_drives" / ROOT).symlink_to(geometry.outside / "task_drives" / ROOT)
+        _symlink_or_skip(root_drive / "task_drives" / ROOT, geometry.outside / "task_drives" / ROOT)
     target = root_drive / "task_drives" / ROOT / "notes.txt"
 
     out = registry.execute("read_file", {"root": "task_drive", "path": str(target)})
