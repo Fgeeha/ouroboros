@@ -625,7 +625,16 @@ def supervise_run(args: argparse.Namespace, command: list[str], bench_dir: pathl
     finally:
         # Also fence creation on unexpected exceptions. Cleanup must not race the shell
         # admitting the next task after a finished task returned its concurrency token.
-        mark_stop(stop_file, reason or "runner_finished")
+        stop_marker_error = None
+        try:
+            mark_stop(stop_file, reason or "runner_finished")
+        except OSError as exc:
+            # The marker is not the kill: a full/read-only run filesystem must not
+            # strand the runner and its paid containers before process custody runs.
+            stop_marker_error = exc
+            reason = reason or "supervisor_error"
+            print(json.dumps({"event": "cowork_stop_marker_failed", "error_type": type(exc).__name__}),
+                  file=sys.stderr, flush=True)
         try:
             if proc is not None:
                 stop_process_group(proc)
@@ -640,13 +649,22 @@ def supervise_run(args: argparse.Namespace, command: list[str], bench_dir: pathl
         except Exception as exc:
             meter_error = type(exc).__name__
         cause = reason or "runner_exited"
-        campaign.finish(root, outcome=reason or "runner_finished", meter_error=meter_error)
-        counts = publish_diagnostics(root, bench_dir, args, {
-            "observed_at": time.time(), "finished": True, "runner_exit_code": code,
-            "campaign_spent_usd": campaign.spent, "campaign_remaining_usd": campaign.remaining,
-            "run_spent_usd": campaign.spent - initial_spent, "stop_reason": reason,
-            "meter_error": meter_error, "meter_diagnostics": meter_diagnostics,
-        }, write_failures, cause=cause)
+        settlement_recorded = False
+        try:
+            campaign.finish(root, outcome=reason or "runner_finished", meter_error=meter_error)
+            settlement_recorded = True
+        finally:
+            # A failed campaign settlement retains active_run and must still leave
+            # per-task interruption evidence when the diagnostic store is writable.
+            counts = publish_diagnostics(root, bench_dir, args, {
+                "observed_at": time.time(), "finished": True, "runner_exit_code": code,
+                "campaign_spent_usd": campaign.spent, "campaign_remaining_usd": campaign.remaining,
+                "run_spent_usd": campaign.spent - initial_spent, "stop_reason": reason,
+                "meter_error": meter_error, "meter_diagnostics": meter_diagnostics,
+                "campaign_settlement": "recorded" if settlement_recorded else "unconfirmed",
+            }, write_failures, cause=cause)
+        if stop_marker_error is not None:
+            raise stop_marker_error
     return {"stop_reason": reason, "runner_exit_code": code, "meter_error": meter_error,
             "meter_diagnostics": meter_diagnostics, "interruption_cause": cause,
             "diagnostic_write_failures": write_failures,

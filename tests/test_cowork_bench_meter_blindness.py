@@ -248,6 +248,8 @@ def test_transient_campaign_write_failure_stops_with_its_own_reason(sim):
 def test_persistent_campaign_write_failure_keeps_custody_unsettled_after_exact_cleanup(sim):
     sim.runner_ends = 100.0
     sim.script = [101.0, 105.0]
+    sim.args.selected_tasks = ["cut"]
+    write_task(sim.dumps, "cut", {"applied_settings.json": {}, "ouroboros/events.jsonl": [USAGE]})
     sim.fail_campaign_write = lambda index: index >= 3
     with pytest.raises(budgets.CampaignPersistenceError):
         sim.supervise()
@@ -255,9 +257,32 @@ def test_persistent_campaign_write_failure_keeps_custody_unsettled_after_exact_c
     assert lifecycle(sim) == ["spawn", "stop-group", "cleanup-owned"]
     record = durable(sim)
     assert record["active_run"] == str(sim.bench.parent) and record["last_usage"] == 101.0
+    row = json.loads((sim.bench.parent / "result_index.jsonl").read_text(encoding="utf-8"))
+    assert (row["status"], row["reason_code"], row["details"]["paid_activity"]) == (
+        "infra_failed", "interrupted:campaign_persistence_failed", "observed")
+    assert json.loads((sim.bench.parent / "monitor.json").read_text(encoding="utf-8"))["campaign_settlement"] == "unconfirmed"
     sim.fail_campaign_write = lambda _index: False
     with pytest.raises(ValueError, match="unsettled custody"):
         budgets.CampaignBudget(sim.budget.path, fingerprint="key-a", ceiling=1000, usage=110)
+
+
+def test_unwritable_stop_marker_never_skips_owned_cleanup_or_interruption_evidence(sim, monkeypatch, capsys):
+    sim.args.selected_tasks = ["cut"]
+    write_task(sim.dumps, "cut", {"applied_settings.json": {}, "ouroboros/events.jsonl": [USAGE]})
+    sim.script = [101.0]
+    sim.default = offline
+
+    def unwritable(_path, _reason):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(launcher, "mark_stop", unwritable)
+    with pytest.raises(OSError, match="No space left on device"):
+        sim.supervise()
+    assert lifecycle(sim) == ["spawn", "stop-group", "cleanup-owned"]
+    assert "cowork_stop_marker_failed" in capsys.readouterr().err
+    row = json.loads((sim.bench.parent / "result_index.jsonl").read_text(encoding="utf-8"))
+    assert (row["status"], row["reason_code"]) == ("infra_failed", "interrupted:budget_meter_unavailable")
+    assert durable(sim)["runs"][-1]["outcome"] == "budget_meter_unavailable"
 
 
 def test_diagnostic_write_failures_are_disclosed_and_valid_work_continues(sim, monkeypatch, capsys):
