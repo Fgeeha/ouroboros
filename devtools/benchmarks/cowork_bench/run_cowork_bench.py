@@ -53,7 +53,7 @@ from devtools.benchmarks.cowork_bench.campaign import (
     validate_usage,
 )
 from devtools.benchmarks.cowork_bench.eval_attempt import FLAG as DIAGNOSTIC_FLAG
-from devtools.benchmarks.cowork_bench.eval_attempt import attempt_facts
+from devtools.benchmarks.cowork_bench.eval_attempt import attempt_facts, claim_protocol
 from devtools.benchmarks.cowork_bench.official_receipt import read_linked_runtime_result, read_official_receipt
 from devtools.benchmarks.cowork_bench.resource_limits import LABEL_KEY, prepare_resource_env
 from ouroboros.platform_layer import kill_process_group_id, terminate_process_group_id
@@ -288,7 +288,7 @@ def _load(path: pathlib.Path) -> dict[str, Any]:
 
 
 def ledger_row(task: str, task_dump: pathlib.Path, runner_row: dict[str, str],
-               *, cause: str = "in_progress") -> dict[str, Any]:
+               *, protocol: str, cause: str = "in_progress") -> dict[str, Any]:
     """One denominator-preserving row. The runner's exit code and CSV are NOT the status: the
     adapter summary says how the agent phase ended and ``eval_res.json`` is the verdict.
 
@@ -310,14 +310,17 @@ def ledger_row(task: str, task_dump: pathlib.Path, runner_row: dict[str, str],
         # This run's claimed attempt proved it never called the evaluator (for example a
         # preserved unclaimed eval_res.json), so no file present there is its verdict.
         official, eval_res = "not_run", None
-    elif attempt["state"] != "absent" and not attempt.get("file_matches_returned"):
-        # A claim-only, invalid or exceptional attempt cannot borrow an old file's PASS.
-        # Historical roots with no claim still use PR-A's independent receipt reader.
+    elif (attempt["state"] != "absent" and not attempt.get("file_matches_returned")) or (
+            attempt["state"] == "absent" and protocol != "legacy"):
+        # A missing claim in a CURRENT run may mean admission was refused before
+        # entrypoint start. Only a positively identified legacy manifest permits
+        # the pre-protocol file reader to supply a verdict.
         official = "unknown" if official in {"completed", "declined"} else official
         eval_res = None
     paths = {"task_dump": str(task_dump)}
     details: dict[str, Any] = {"runner": runner_row, "adapter": summary, "official_receipt": receipt,
-                               "official_attempt": attempt, "runtime_result_source": runtime_source}
+                               "official_attempt": {**attempt, "protocol": protocol},
+                               "runtime_result_source": runtime_source}
     runtime = {"runtime_result": runtime_result}
     if runner_row.get("status") == "pg_fail":
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="infra_failed",
@@ -366,7 +369,9 @@ def write_ledger(ledger_path: pathlib.Path, bench_dir: pathlib.Path, model: str,
     reason, ``runner_exited``, or ``in_progress`` in a snapshot taken while the run is live."""
     runner_rows = read_summary_csv(bench_dir / "benchmark_logs")
     dumps = bench_dir / "dumps" / dump_dir_name(model)
-    rows = [ledger_row(task, dumps / f"SingleUserTurn-{task}", runner_rows.get(task, {}), cause=cause)
+    protocol = claim_protocol(bench_dir.parent)
+    rows = [ledger_row(task, dumps / f"SingleUserTurn-{task}", runner_rows.get(task, {}),
+                       cause=cause, protocol=protocol)
             for task in tasks]
     write_result_index(ledger_path, rows)
     counts: dict[str, int] = {}
@@ -850,6 +855,9 @@ def main(argv: list[str] | None = None) -> int:
             **manifest["harness"], "fixed_model_actor": actor, "image": args.image,
             "applied_config": config, "bench": bench_provenance(bench_root, args.bench_commit),
         }
+        # The ledger reads this run's protocol from disk while supervise_run is live;
+        # waiting until finalization would label every live row unknown.
+        final.checkpoint("configured")
 
         if args.build_image and not image_exists(args.docker_host, args.image):
             build_image(args, seed_head, args.bench_commit, out_root / "image_build.log")

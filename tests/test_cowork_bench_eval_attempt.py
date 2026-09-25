@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+from functools import partial
 import hashlib
 import json
 import os
@@ -25,6 +26,7 @@ import pytest
 from devtools.benchmarks.cowork_bench import eval_attempt as attempts
 from devtools.benchmarks.cowork_bench import run_cowork_bench as launcher
 
+current_ledger_row = partial(launcher.ledger_row, protocol="current")
 pytestmark = pytest.mark.skipif(os.name == "nt", reason="the Cowork eval container is POSIX")
 
 REPO = pathlib.Path(__file__).resolve().parents[1]
@@ -292,7 +294,7 @@ def test_diagnostic_output_never_reaches_runner_log_and_command_matches_pinned_e
     assert official["returned"]["pass"] is None
     assert attempts.file_facts(bench.dump / "eval_res.json")["sha256"] == official["result_file"]["sha256"]
     assert (bench.dump / "traj_log.json").read_bytes() == log_before
-    row = launcher.ledger_row(TASK, bench.dump, {"status": "unknown"})
+    row = current_ledger_row(TASK, bench.dump, {"status": "unknown"})
     assert (row["status"], row["official_eval_status"]) == ("agent_failed", "declined")
     assert "checks_passed" not in json.dumps(row) and not any("diagnostic" in key for key in row["details"])
     # Reentry replays the official lines only: no evaluator call and no second diagnostic.
@@ -368,7 +370,7 @@ def test_unclaimed_existing_result_is_preserved_never_overwritten_diagnosed_or_s
     assert forged.read_bytes() == before
     assert text.count("official evaluator not run: unclaimed_prior_result") == 2 and "Pass:" not in text
     assert not (bench.dump / attempts.DIAGNOSTIC_CLAIM_NAME).exists()
-    row = launcher.ledger_row(TASK, bench.dump, {"status": "success"})
+    row = current_ledger_row(TASK, bench.dump, {"status": "success"})
     assert (row["status"], row["reason_code"], row["official_eval_status"]) == (
         "infra_failed", "official_eval_not_run", "not_run")
     assert row["details"]["official_attempt"]["cause"] == "unclaimed_prior_result"
@@ -390,7 +392,7 @@ def test_unfinished_or_exceptional_claim_cannot_score_a_prior_pass(tmp_path, ter
             "raised": "KeyboardInterrupt", "returned": None,
             "result_file": attempts.file_facts(forged),
         })
-    row = launcher.ledger_row(TASK, bench.dump, {"status": "success"})
+    row = current_ledger_row(TASK, bench.dump, {"status": "success"})
     assert (row["status"], row["official_eval_status"], row["details"]["official_receipt"]["pass"]) == (
         "infra_failed", "unknown", True)
     attempt = row["details"]["official_attempt"]

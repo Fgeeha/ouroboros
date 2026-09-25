@@ -143,6 +143,20 @@ def _load(path: pathlib.Path) -> tuple[str, dict[str, Any] | None]:
     return facts["state"], value
 
 
+def claim_protocol(run_root: pathlib.Path) -> str:
+    """Only a readable pre-protocol manifest proves that an unclaimed file is legacy.
+
+    The current launcher always writes FLAG, even when the diagnostic is off. A
+    missing or unreadable manifest cannot license scoring an unclaimed old file.
+    """
+    state, manifest = _load(run_root / "run_manifest.json")
+    harness = manifest.get("harness") if state == "parsed" else None
+    config = harness.get("applied_config") if isinstance(harness, dict) else None
+    if not isinstance(config, dict):
+        return "unknown"
+    return "current" if FLAG in config else "legacy"
+
+
 def _valid_id(value: Any) -> bool:
     return isinstance(value, str) and len(value) == 32 and all(c in "0123456789abcdef" for c in value)
 

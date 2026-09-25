@@ -233,8 +233,16 @@ flight, killed, or with an unpublished receipt), changed bindings or an
 unreadable claim never cause another official effect. An `eval_res.json` present
 before any claim is preserved byte for byte: the evaluator and the diagnostic do
 not run, and the ledger records `not_run` (`official_eval_not_run`) instead of
-scoring that file. Upstream `TaskConfig` construction deletes such a file, so the
-claim check precedes it. Claims and receipts share the dump directory that a
+scoring that file. A current run may also be refused before its eval entrypoint creates
+any claim. The launcher reads `run_manifest.json`: only a readable `applied_config`
+without the diagnostic flag identifies a pre-protocol legacy run whose unclaimed
+receipt may retain its old scoring behavior. The flag is recorded for every new
+run, even when false. A missing or unreadable manifest cannot authenticate an
+unclaimed `pass:true` as this attempt's verdict; it stays disclosed but unscored.
+The launcher checkpoints the applied config before runner execution, so live
+ledger snapshots and later audits read the same protocol provenance.
+Upstream `TaskConfig` construction deletes an existing file, so the claim check
+precedes it. Claims and receipts share the dump directory that a
 lingering agent process could write before its container is removed, as it could
 write `traj_log.json`; the audit flags tool arguments naming them.
 
