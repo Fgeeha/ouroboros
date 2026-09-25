@@ -408,6 +408,25 @@ def test_runner_row_without_summary_names_interruption_and_discloses_activity(tm
     assert row["details"]["provisional"] is False
 
 
+def test_interrupted_agent_keeps_independent_official_evaluator_receipt(tmp_path):
+    write_task(tmp_path, "task", {"applied_settings.json": {}, "ouroboros/events.jsonl": [USAGE],
+                                   "eval_res.json": {"pass": False, "failure": "private evaluator detail"}})
+    row = launcher.ledger_row("task", tmp_path / "SingleUserTurn-task", {}, cause="budget_meter_unavailable")
+    assert (row["status"], row["reason_code"], row["official_eval_status"]) == (
+        "infra_failed", "interrupted:budget_meter_unavailable", "completed")
+    assert row["details"]["paid_activity"] == "observed"
+    assert row["details"]["official_receipt"]["pass"] is False
+    assert "private evaluator detail" not in json.dumps(row)
+
+
+def test_evaluator_log_alone_does_not_claim_agent_started(tmp_path):
+    write_task(tmp_path, "task", {"traj_log.json": {"status": "failed"},
+                                   "eval_res.json": {"pass": None}})
+    row = launcher.ledger_row("task", tmp_path / "SingleUserTurn-task", {}, cause="budget_meter_unavailable")
+    assert (row["status"], row["reason_code"], row["official_eval_status"]) == (
+        "not_attempted", "missing_result", "unknown")
+
+
 def test_slow_persistence_cannot_renew_an_expired_window(sim, monkeypatch):
     real_observe = sim.budget.observe
 

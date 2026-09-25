@@ -195,14 +195,27 @@ def audit_task(task_dump: Path, ledger: dict[str, Any]) -> dict[str, Any]:
     # Lack of telemetry is an audit gap, never a reason to rewrite its verdict.
     log_incomplete = any(g["source"] == "events.jsonl" for g in gaps)
     cost_complete = bool(activity["usage_records"]) and not unknown_cost and not log_incomplete
-    official_status = str(ledger.get("official_eval_status") or "not_run")
+    official_status = str(ledger.get("official_eval_status") or "unreported")
+    # Literal evaluator truth is independent of agent execution and the scoring classification.
+    # Legacy rows without receipt metadata retain their previously recorded scored verdict.
+    details = ledger.get("details") if isinstance(ledger.get("details"), dict) else {}
+    receipt = details.get("official_receipt") if isinstance(details.get("official_receipt"), dict) else {}
+    receipt_bytes = receipt.get("bytes")
     return {
         "instance_id": str(ledger.get("instance_id") or task_dump.name.removeprefix("SingleUserTurn-")),
         "ledger_status": status,
         "classification": classification,
         "reason_code": str(ledger.get("reason_code") or summary.get("reason_code") or ""),
         "official_eval_status": official_status,
-        "official_pass": status == "passed" if official_status == "completed" and status in {"passed", "failed"} else None,
+        "official_pass": (receipt.get("pass") if receipt else status == "passed")
+        if official_status == "completed" and (isinstance(receipt.get("pass"), bool)
+                                                or not receipt and status in {"passed", "failed"}) else None,
+        "official_receipt": {
+            "available": bool(receipt),
+            "pass": receipt.get("pass") if isinstance(receipt.get("pass"), bool) else None,
+            "bytes": receipt_bytes if isinstance(receipt_bytes, int) and not isinstance(receipt_bytes, bool) else None,
+            "sha256": str(receipt.get("sha256") or "") or None,
+        },
         "activity": activity,
         "model_activity_observed": bool(activity["nonempty_usage_records"]),
         "mcp_activity_observed": bool(activity["mcp_calls"]),
@@ -241,7 +254,8 @@ def audit_run(run_root: Path | str) -> dict[str, Any]:
         "limitations": ["Diagnostic argument references require manual review, not automatic disqualification.",
                         "No flags do not prove no contamination; copied logs may omit full arguments or responses.",
                         "llm_usage cost is a compatibility projection, not authoritative provider billing.",
-                        "Billing provider names do not identify OpenRouter upstream endpoints."],
+                        "Billing provider names do not identify OpenRouter upstream endpoints.",
+                        "A receipt verdict on an agent/infrastructure-failed row is disclosure, never a scored pass."],
         "task_count": len(rows), "classifications": dict(Counter(row["classification"] for row in rows)),
         "manual_review_tasks": [row["instance_id"] for row in rows if row["manual_review"]],
         "cost": {"known_usd": known, "total_usd": known if complete else None, "complete": complete},

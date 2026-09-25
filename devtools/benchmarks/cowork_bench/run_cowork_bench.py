@@ -52,6 +52,7 @@ from devtools.benchmarks.cowork_bench.campaign import (
     key_usage,
     validate_usage,
 )
+from devtools.benchmarks.cowork_bench.official_receipt import read_linked_runtime_result, read_official_receipt
 from devtools.benchmarks.cowork_bench.resource_limits import LABEL_KEY, prepare_resource_env
 from ouroboros.platform_layer import kill_process_group_id, terminate_process_group_id
 from ouroboros.process_custody import spawn_supervised
@@ -77,9 +78,10 @@ METER_POLL_SEC = 15.0
 METER_RETRY_SEC = 3.0
 METER_READ_SLICE_SEC = 5.0
 # Adapter-owned artifacts that exist only after this task's container began work.
-# The benchmark pre-creates the dump and its empty workspace; neither is evidence.
+# The benchmark pre-creates the dump/workspace; evaluator traj logs and receipts
+# alone also do not prove the agent phase started.
 START_EVIDENCE = ("ouroboros", "applied_settings.json", "preprocess.log", "mcp_proxy.log",
-                  "ouroboros_server.log", "traj_log.json", "traj.json")
+                  "ouroboros_server.log")
 
 
 def dump_dir_name(model: str) -> str:
@@ -273,26 +275,38 @@ def _load(path: pathlib.Path) -> dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
-def ledger_row(task: str, task_dump: pathlib.Path, runner_row: dict[str, str], *, cause: str) -> dict[str, Any]:
+def ledger_row(task: str, task_dump: pathlib.Path, runner_row: dict[str, str],
+               *, cause: str = "in_progress") -> dict[str, Any]:
     """One denominator-preserving row. The runner's exit code and CSV are NOT the status: the
     adapter summary says how the agent phase ended and ``eval_res.json`` is the verdict.
 
     Without that summary, only a task with no runner row and no start evidence is
     ``not_attempted``. Otherwise it is an infrastructure row whose paid activity is
     ``observed`` from token-bearing usage or else ``unknown``, never an invented cost.
-    """
+
+    The official receipt is attached on EVERY branch, independently of that status: a
+    timed-out agent phase keeps the evaluator's own record instead of a claimed ``not_run``,
+    and only a literal boolean verdict on a successful agent phase is scored.
+    A caller without a terminal cause sees a provisional snapshot, not an
+    invented assertion that the runner already exited."""
     summary = _load(task_dump / "ouroboros_summary.json")
-    eval_res = _load(task_dump / "eval_res.json")
+    receipt, eval_res = read_official_receipt(task_dump)
+    runtime_result, runtime_source = read_linked_runtime_result(task_dump, summary)
+    official = receipt["official_eval_status"]
     paths = {"task_dump": str(task_dump)}
-    details: dict[str, Any] = {"runner": runner_row, "adapter": summary}
+    details: dict[str, Any] = {"runner": runner_row, "adapter": summary, "official_receipt": receipt,
+                               "runtime_result_source": runtime_source}
+    runtime = {"runtime_result": runtime_result}
     if runner_row.get("status") == "pg_fail":
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="infra_failed",
-                               reason_code="pg_fail", output_paths=paths, details=details)
+                               reason_code="pg_fail", output_paths=paths, details=details,
+                               official_eval_status=official, **runtime)
     if not summary:
         evidence = [name for name in START_EVIDENCE if (task_dump / name).exists()]
         if not (runner_row or evidence):
             return task_result_row(benchmark=BENCHMARK, instance_id=task, status="not_attempted",
-                                   reason_code="missing_result", output_paths=paths, details=details)
+                                   reason_code="missing_result", output_paths=paths, details=details,
+                                   official_eval_status=official, **runtime)
         observed = model_activity_observed(task_dump / "ouroboros" / "events.jsonl")
         details.update({"start_evidence": evidence, "paid_activity": "observed" if observed else "unknown"})
         # A live diagnostic snapshot is not proof of interruption. The legacy infra
@@ -300,28 +314,32 @@ def ledger_row(task: str, task_dump: pathlib.Path, runner_row: dict[str, str], *
         details["provisional"] = cause == "in_progress"
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="infra_failed",
                                reason_code="missing_adapter_summary" if cause == "in_progress" else f"interrupted:{cause}",
-                               output_paths=paths, details=details)
+                               output_paths=paths, details=details, official_eval_status=official, **runtime)
     reason = str(summary.get("reason_code") or "")
     if summary.get("infra_failed"):
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="infra_failed",
                                reason_code=reason or "infra_failed", output_paths=paths,
-                               error=str(summary.get("error") or ""), details=details)
+                               error=str(summary.get("error") or ""), details=details,
+                               official_eval_status=official, **runtime)
     if summary.get("bench_status") != "success":
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="agent_failed",
-                               reason_code=reason or "agent_not_finished", output_paths=paths, details=details)
-    if "pass" not in eval_res or eval_res.get("pass") is None:
+                               reason_code=reason or "agent_not_finished", output_paths=paths,
+                               details=details, official_eval_status=official, **runtime)
+    if eval_res is None:
+        # No literal boolean verdict: never coerce a string/number `pass` into a score.
         return task_result_row(benchmark=BENCHMARK, instance_id=task, status="infra_failed",
-                               reason_code="missing_eval_result", output_paths=paths, details=details)
-    passed = bool(eval_res.get("pass"))
+                               reason_code="missing_eval_result", output_paths=paths, details=details,
+                               official_eval_status=official, **runtime)
+    passed = receipt["pass"]
     return task_result_row(
         benchmark=BENCHMARK, instance_id=task, status="passed" if passed else "failed",
         reason_code="passed" if passed else "verifier_failed", official_eval_status="completed",
-        output_paths=paths, details={**details, "eval": eval_res},
+        output_paths=paths, details={**details, "eval": eval_res}, **runtime,
     )
 
 
 def write_ledger(ledger_path: pathlib.Path, bench_dir: pathlib.Path, model: str, tasks: list[str],
-                 *, cause: str) -> dict[str, int]:
+                 *, cause: str = "in_progress") -> dict[str, int]:
     """``cause`` names why a started task without a summary did not finish: the run's stop
     reason, ``runner_exited``, or ``in_progress`` in a snapshot taken while the run is live."""
     runner_rows = read_summary_csv(bench_dir / "benchmark_logs")
