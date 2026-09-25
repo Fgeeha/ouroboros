@@ -28,6 +28,7 @@ import { createModelRolesEditor, modelRoleMap } from './model_roles.js';
 import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY } from './route_editor_primitives.js';
 import { collectSafeFieldValues, normalizeTone, renderSafeField, setInlineStatus, revealNewRow } from './ui_helpers.js';
 import { extensionActionStatus } from './extension_status_text.js';
+import { bindReasoningToggle } from './reasoning_visibility.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
@@ -459,6 +460,8 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     const disposeSettingsTabs = bindSettingsTabs(page, { state });
     bindSecretInputs(page);
     bindEffortSegments(page);
+    bindReasoningToggle(page, (show) => apiClient.saveUiPreferences({ show_reasoning: show })
+        .catch(() => showToast('Reasoning display choice could not be saved.', 'error')));
     // Appearance is client-local and injected after boot; never a server setting.
     globalThis.ouroTheme?.mount();
     // Notification preferences are client-local for the same reason; the module

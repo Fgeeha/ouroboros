@@ -20,6 +20,11 @@ DEFAULT_UI_PREFERENCES: dict[str, Any] = {
     # the owner's choice instead of losing it with the next discovery.
     "widget_start_mode": {},
     "nested_subagents_expanded": False,
+    # Display-only: whether the agent's reasoning rows are rendered in the chat
+    # timeline and the Logs tab. The backend keeps emitting and storing them
+    # either way (OUROBOROS_REASONING_SUMMARY is the separate backend switch),
+    # so turning this on reveals the recorded rows on history replay too.
+    "show_reasoning": False,
     # Resizable side sections (0 = use the CSS default). Clamped to sane ranges so
     # a stored value can never collapse or run away with the layout.
     "sidebar_width": 0,
@@ -119,6 +124,11 @@ def _normalize_preferences(
         if not isinstance(value, bool):
             raise ValueError("nested_subagents_expanded must be a boolean")
         prefs["nested_subagents_expanded"] = value
+    if "show_reasoning" in raw:
+        value = raw.get("show_reasoning")
+        if not isinstance(value, bool):
+            raise ValueError("show_reasoning must be a boolean")
+        prefs["show_reasoning"] = value
     if "sidebar_width" in raw:
         prefs["sidebar_width"] = _normalize_width(raw.get("sidebar_width"), _SIDEBAR_WIDTH_MIN, _SIDEBAR_WIDTH_MAX)
     if "project_panel_width" in raw:

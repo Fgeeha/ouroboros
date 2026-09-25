@@ -176,7 +176,7 @@ A registry of `config.SETTINGS_DEFAULTS` (exact defaults canonical in `settings_
 | OUROBOROS_EFFORT_DEEP_SELF_REVIEW | high | Deep-self-review surface default; a saved `deep_review` row's own effort outranks it |
 | OUROBOROS_EFFORT_CONSCIOUSNESS | (empty) | Consciousness effort; empty = the Task / Chat effort (a wake is an ordinary Main turn), a set value is honored |
 | OUROBOROS_RETURN_REASONING | true | Ask OpenRouter to return reasoning; direct/local request copies strip OpenRouter-only fields |
-| OUROBOROS_REASONING_SUMMARY | auto | Readable reasoning-summary rendering; presentation-only, never added to history or returned to providers |
+| OUROBOROS_REASONING_SUMMARY | auto | Readable reasoning-summary rendering; display-only; the stamped progress row is durable and replays via history (`_PROGRESS_META_FIELDS`), never re-enters the prompt digest or goes back to providers |
 | OUROBOROS_TASK_IDLE_TIMEOUT_SEC | 900 | Idle timeout; needs absence of real task/subtree progress — a typed in-flight main-LLM row spares only this rail, a settled child result stamps parent progress, because delivery creates immediate integration work and must not coincide with idle termination |
 | OUROBOROS_TASK_ABS_CEILING_SEC | unlimited | Optional absolute task lifetime in seconds (floor 300), activity-independent; deadline and budget stay separate hard axes |
 | OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC | 90 | Supervisor/direct-turn liveness watchdog; alerts and recommends `/restart`, never frees an in-process lock held by a wedged turn |

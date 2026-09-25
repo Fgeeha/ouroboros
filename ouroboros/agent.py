@@ -1155,6 +1155,7 @@ class OuroborosAgent:
 
     def _emit_progress(self, text: str, *, incident: Optional[Dict[str, str]] = None,
                        executor_observation: Optional[Dict[str, Any]] = None,
+                       meta: Optional[Dict[str, Any]] = None,
                        narration: bool = False, card_row: str = "", card_row_id: str = "",
                        _task_id_override: Any = _PROGRESS_ID_UNSET,
                        _chat_id_override: Any = _PROGRESS_ID_UNSET,
@@ -1162,6 +1163,8 @@ class OuroborosAgent:
                        _task_attempt_override: Any = _PROGRESS_ID_UNSET) -> None:
         """Owner-visible note; ``incident`` is the typed ``task_incident``/``toast_once``
         pair the browser toasts once.
+        ``meta`` is merged into ``progress_meta`` verbatim (``{"reasoning": True}`` stamps
+        a display-reasoning line); the subagent lineage stamps still win over it.
 
         ``card_row`` is the note's PLACEMENT fact: a host fact about this task
         belongs to a row of its card, so a producer that has one states it here
@@ -1195,6 +1198,7 @@ class OuroborosAgent:
             }
             progress_meta: Dict[str, Any] = {}
             progress_meta.update(incident or {})
+            progress_meta.update(meta or {})
             if card_row:
                 progress_meta["card_row"] = card_row
                 if card_row_id:

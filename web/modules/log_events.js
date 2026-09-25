@@ -15,12 +15,14 @@ const REVIEW_LIFECYCLE_ERROR_STATUSES = new Set([
 ]);
 
 export { formatReviewProjection } from './review_presentation.js';
+import { claimsReasoningFrame, isReasoningVisible } from './reasoning_visibility.js';
 
 export const LOG_CATEGORIES = {
     tools: { label: 'Tools', color: 'var(--blue)' },
     llm: { label: 'LLM', color: 'var(--accent)' },
     errors: { label: 'Errors', color: 'var(--red)' },
     tasks: { label: 'Tasks', color: 'var(--amber)' },
+    reasoning: { label: 'Reasoning', color: 'var(--accent)' },
     system: { label: 'System', color: 'var(--text-muted)' },
     consciousness: { label: 'Consciousness', color: 'var(--accent)' },
 };
@@ -37,6 +39,8 @@ export function categorizeLogEvent(evt, view = summarizeLogEvent(evt)) {
     // A wake-up's rows carry the turn's origin label (`initiator`).
     const wake = evt.initiator === 'consciousness';
     if (evt.is_progress) {
+        // A reasoning row files under its own chip (same projection as its pill).
+        if (String(view?.phase || '') === 'thinking') return 'reasoning';
         return wake ? 'consciousness' : 'tasks';
     }
     // Severity comes from the typed projection, never from the event name; the
@@ -732,6 +736,13 @@ export function summarizeLogEvent(evt) {
     const taskMeta = (...items) => [evt.task_id ? `task=${evt.task_id}` : '', ...items];
 
     if (evt.is_progress || t === 'send_message') {
+        if (claimsReasoningFrame(evt, isSubagentEvent(evt))) {
+            const thinking = view('thinking', 'Thinking', {
+                body: shortText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240),
+                meta: taskMeta(),
+            });
+            return isReasoningVisible() ? thinking : { ...thinking, visible: false };
+        }
         const narration = describeText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240, { markdown: true });
         if (isSubagentEvent(evt)) {
             const sid = subagentId(evt);
@@ -1239,6 +1250,16 @@ function summarizeChatLiveEventView(evt) {
             terminal: ['done', 'lifecycle_error', 'cancelled'].includes(phase),
             human: true,
             dedupeKey: lifecycle.id ? `lifecycle:${lifecycle.id}:${status}:${label}:${stale ? 'stale' : 'fresh'}` : key(status, label),
+        });
+    }
+
+    if ((evt.is_progress || t === 'send_message') && claimsReasoningFrame(evt, isSubagentEvent(evt))) {
+        // A collapsed "Thinking" line that never becomes the headline; it must run
+        // before the subagent branch so a hidden child frame is claimed here.
+        return chatView({
+            phase: 'thinking', headline: 'Thinking', body: progressText.preview,
+            fullBody: progressText.full, activityPreview: '', visible: isReasoningVisible(),
+            dedupeKey: `reasoning:${evt.ts || ''}:${progressText.full}`,
         });
     }
 

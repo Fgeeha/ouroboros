@@ -25,6 +25,7 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
             "widget_order": [],
             "widget_start_mode": {},
             "nested_subagents_expanded": False,
+            "show_reasoning": False,
             "sidebar_width": 0,
             "project_panel_width": 0,
             "project_seen_revision": {},
@@ -121,6 +122,21 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
         assert client.post("/api/ui/preferences", json={"widget_order": "bad"}).status_code == 400
         assert client.post("/api/ui/preferences", json={"project_seen_revision": {"racer": "bad"}}).status_code == 400
         assert client.post("/api/ui/preferences", json={"unknown": True}).status_code == 400
+
+        # Reasoning display: a strict boolean, hidden by default. Numbers (1/0)
+        # are not booleans here, and the unhashable [] / {} must answer 400 like
+        # every other rejected value, never a 500.
+        assert client.get("/api/ui/preferences").json()["show_reasoning"] is False
+        shown = client.post("/api/ui/preferences", json={"show_reasoning": True})
+        assert shown.status_code == 200 and shown.json()["show_reasoning"] is True
+        assert client.get("/api/ui/preferences").json()["show_reasoning"] is True
+        for bad in (1, 0, "true", "false", "", None, [], {}, [True], {"show_reasoning": True}):
+            rejected = client.post("/api/ui/preferences", json={"show_reasoning": bad})
+            assert rejected.status_code == 400, bad
+            assert "show_reasoning" in rejected.json()["error"]
+        assert client.get("/api/ui/preferences").json()["show_reasoning"] is True
+        hidden = client.post("/api/ui/preferences", json={"show_reasoning": False})
+        assert hidden.status_code == 200 and hidden.json()["show_reasoning"] is False
 
 
 def test_ui_preferences_concurrent_paint_acks_are_monotonic(tmp_path):

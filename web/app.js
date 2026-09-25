@@ -18,6 +18,7 @@ import { apiClient } from './modules/api_client.js';
 import { openNewProjectDialog, openProjectRowMenu } from './modules/project_create.js';
 
 import { initLogs } from './modules/logs.js';
+import { setReasoningVisible } from './modules/reasoning_visibility.js';
 import { initEvolution } from './modules/evolution.js';
 import { initSettings } from './modules/settings.js';
 import { initCosts } from './modules/costs.js';
@@ -37,7 +38,7 @@ const state = {
     messages: [],
     logs: [],
     dashboard: {},
-    activeFilters: { tools: true, llm: true, errors: true, tasks: true, system: true, consciousness: true },
+    activeFilters: { tools: true, llm: true, errors: true, tasks: true, reasoning: true, system: true, consciousness: true },
     unreadCount: 0,
     activePage: 'chat',
     settingsActiveSubtab: 'providers',
@@ -824,6 +825,8 @@ apiFetch('/api/ui/preferences', { cache: 'no-store' })
     .then((prefs) => {
         state.projectSeenRevision = (prefs && prefs.project_seen_revision) || {};
         setupResizablePanels(prefs || {});
+        // Display-only preference: reasoning rows stay recorded either way.
+        setReasoningVisible(prefs?.show_reasoning === true);
         // Re-evaluate unread now that revision cursors are known.
         if (Array.isArray(lastProjectRows)) { knownProjectsJson = null; renderProjectsNav(lastProjectRows, Array.from(state.projectChatIds || [])); }
     })
