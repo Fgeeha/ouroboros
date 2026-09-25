@@ -212,7 +212,7 @@ export const ru = {
   "Behavior": "Поведение",
   "Language": "Язык",
   "Interface Language": "Язык интерфейса",
-  "Interface language of this browser. Applies immediately; strings without a translation stay English.": "Язык интерфейса в этом браузере. Применяется сразу; строки без перевода остаются на английском.",
+  "Interface language, saved with your UI preferences. Applies immediately; strings without a translation stay English.": "Язык интерфейса, сохраняется в настройках интерфейса. Применяется сразу; строки без перевода остаются на английском.",
   "Language choice could not be saved.": "Не удалось сохранить выбор языка.",
   "Appearance": "Оформление",
   "Theme": "Тема",
