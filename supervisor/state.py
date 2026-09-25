@@ -484,6 +484,8 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     persisted by the transport wrapper.  This prevents logical usage events,
     retries, and review aggregation from charging the same attempt twice.
     The persisted projection carries totals only; the per-root map is never written.
+    The ledger read is the writer's slim snapshot (``usage_writer_snapshot``): only what
+    this function persists is rendered, once per supervisor loop turn (``server_liveness``).
     """
     def _to_float(v: Any, default: float = 0.0) -> float:
         try:
@@ -519,18 +521,18 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
     from ouroboros.usage_accounting import (
         UsageLedgerCorrupt,
         ensure_legacy_imported,
-        usage_breakdown,
         usage_projection,
+        usage_writer_snapshot,
     )
 
     # Ledger I/O is deliberately OUTSIDE STATE_LOCK: the lock stays
     # short-lived, and the validated-snapshot marker below preserves the old
     # serialization invariant without holding STATE_LOCK across a long read.
-    # A DISPLAY read (``allow_stale``: this runs on the supervisor loop per ``llm_usage``
-    # event): a lagging snapshot carries its own lower marker, so it never regresses money.
+    # A DISPLAY read (``allow_stale``: this runs on the supervisor loop once per turn with
+    # ``llm_usage`` events): a lagging snapshot carries its own lower marker, so it never regresses money.
     try:
         ensure_legacy_imported(DRIVE_ROOT)
-        breakdown = usage_breakdown(DRIVE_ROOT, allow_stale=True)
+        breakdown = usage_writer_snapshot(DRIVE_ROOT, allow_stale=True)
         total_limit = float(TOTAL_BUDGET_LIMIT or 0.0)
         projection_snapshot = breakdown.pop("_usage_projection", None)
         if total_limit > 0 and isinstance(projection_snapshot, dict):
@@ -605,11 +607,8 @@ def update_budget_from_usage(usage: Dict[str, Any]) -> bool:
         # is now the ordered ``[compaction_epoch, seq]`` pair.
         st["usage_ledger_high_water_seq"] = list(ledger_high_water_marker)
         previous_check_call = _to_int(st.get("openrouter_last_check_call"), -1)
-        should_check_ground_truth = bool(
-            st["spent_calls"] > 0
-            and st["spent_calls"] % 50 == 0
-            and st["spent_calls"] != previous_check_call
-        )
+        # Every 50th call by CROSSING (a coalesced write may jump 49 -> 51), deduped by the last check.
+        should_check_ground_truth = st["spent_calls"] > 0 and st["spent_calls"] // 50 > max(previous_check_call, 0) // 50
         if should_check_ground_truth:
             st["openrouter_last_check_call"] = st["spent_calls"]
         _save_state_unlocked(st)

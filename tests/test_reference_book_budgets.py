@@ -92,7 +92,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 31300 -> 31500 (issue #1230): the reconciliation sentence states the two-read rule of
     # task reconciliation (decide on a status-only read, materialize only the healed row)
     # and the cadence stamp at pass end; the older clause it extends is kept, not duplicated.
-    "docs/architecture/05-supervisor-loop.md": 31500,
+    # 31500 -> 32400: the tick description names the bounded events batch and the one
+    # projection write per turn (the unbounded drain and per-event write they replace had
+    # no sentence of their own), and the projection paragraph states the writer's slim read,
+    # its retry interval and the crossing rule of the OpenRouter check.
+    "docs/architecture/05-supervisor-loop.md": 32400,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
@@ -150,7 +154,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the run-origin sentences replace the "request decides what the run was for" and the
     # owner-turn descriptions (+144 on the merged base) rather than appending to them.
     "docs/architecture/06-agent-core.md": 308900,
-    "docs/architecture/07-configuration.md": 36991,
+    # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
+    # gained (events batch bound, budget-projection retry interval); no older text to displace.
+    "docs/architecture/07-configuration.md": 37300,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     # 19287 -> 20560 (#1215): three contracts the chapter had no older text for — the
     # ONE reusable browser lane and the two triggers that share it (the unfiltered
