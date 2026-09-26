@@ -33,8 +33,9 @@ head cut `truncated_to_<N>`), and a re-asked locator stays `need_evidence`
 Classification, packet composition, bounds and wave/replay mechanics: ARCHITECTURE §6 "Plan
 construction and review", `ouroboros/tools/plan_packet.py`, `plan_spec.py`.
 
-Exact-wave custody is fail-closed: the evidence continuation uses a fresh
-full-packet dispatch only when no exact artifact reference exists; an unreadable
+Exact-wave custody is fail-closed: each packet slot continues its recorded
+transcript; the panel goes out fresh only when no exact artifact reference exists
+or the roster changed, each packet slot disclosing its cause; an unreadable
 referenced artifact returns `plan_review_exact_artifact_unavailable` and never
 mints replacement authority.
 
