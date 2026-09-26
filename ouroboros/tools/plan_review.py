@@ -411,7 +411,7 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
         fp = str(raw_disposition.get("review_fingerprint") or "").strip()
         return _apply_disposition(ctx, raw_disposition, then_review=lambda items, *, was_open: _review(
             ctx, request, address={"review_fingerprint": fp, "was_open": was_open,
-                                   "finding_ids": [i["finding_id"] for i in items]}))
+                                   "finding_ids": [i["finding_id"] for i in items]} if items else None))
     if "review_disposition" in params and not envelope_fields:
         return _typed_refusal(
             ctx, "TOOL_ARG_ERROR",
@@ -803,10 +803,11 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             "ERROR: PLAN_REVIEW_CUSTODY_INVALID: " + str(resume["error"]),
             "plan_review_custody_invalid",
         )
-    previous = _resolve_previous(state_root, task_id, state, resume=resume if resume_in_flight else None,
-                                 override=previous_override)
-    if isinstance(previous, str):
-        return _plan_unavailable(ctx, previous, "plan_review_exact_artifact_unavailable")
+    try:
+        previous = _resolve_previous(state_root, task_id, state, resume=resume if resume_in_flight else None,
+                                     override=previous_override)
+    except PlanReviewSourceUnavailable as exc:
+        return _plan_unavailable(ctx, f"ERROR: {exc}", "plan_review_exact_artifact_unavailable")
     standing = _standing_or_refusal(ctx, state_root, task_id, state, previous, spec, enforcement)
     if isinstance(standing, str):
         return standing
@@ -965,15 +966,16 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
                                   notes=_addressed_notes(unaddressed) if not named and not resume_in_flight else None)
 
 def _resolve_previous(state_root: pathlib.Path, task_id: str, state: dict, *, resume: Optional[dict],
-                      override: Optional[dict]) -> Any:
-    """The exact predecessor this dispatch judges against (``None`` for a first cycle), or the
-    refusal text when its authority is unreadable."""
+                      override: Optional[dict]) -> Optional[dict]:
+    """The exact predecessor this dispatch judges against (``None`` for a first cycle); an
+    unreadable authority raises ``PlanReviewSourceUnavailable`` for the caller's typed refusal."""
     try:
         previous = resume.get("previous") if resume is not None else (
             override if override is not None else _last_paid_wave(state, state_root, task_id))
         return _authority_wave(state_root, task_id, previous) if previous is not None else None
-    except (OSError, ValueError, json.JSONDecodeError, PlanReviewSourceUnavailable):
-        return "ERROR: Prior exact plan-review authority is unreadable; a delta review is refused."
+    except (OSError, ValueError, json.JSONDecodeError) as exc:  # PlanReviewSourceUnavailable is a ValueError
+        raise PlanReviewSourceUnavailable(
+            "Prior exact plan-review authority is unreadable; a delta review is refused.") from exc
 
 
 def _last_paid_wave(state: dict, state_root: pathlib.Path, task_id: str) -> Optional[dict]:
@@ -1315,7 +1317,8 @@ def _apply_disposition(ctx: ToolContext, disposition: dict, *, then_review=None)
             # wave takes no answers, but the envelope beside them is still reviewed (a changed one as
             # an ordinary wave, the identical one as the free replay with its typed note).
             ctx.emit_progress_fn("📐 Plan review: the named wave is closed and takes no answers; reviewing the envelope.")
-            return then_review([], was_open=False)
+            named = [{"finding_id": str(i.get("finding_id") or "")} for i in disposition.get("items") or [] if isinstance(i, dict)]
+            return then_review(named, was_open=False)  # the unrecorded answers still name what was not addressed
         return _publish_rendered_wave(ctx, wave, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
                                       cached=True,
                                       notes=["already_closed: this wave is closed; the disposition is not re-applied"])
