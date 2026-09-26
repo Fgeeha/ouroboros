@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.6
+version: 1.2.7
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -62,6 +62,9 @@ waiting line while the buttons stay, and a finished task says a late answer stil
 counts as your message. The card only moves forward — nothing reopens an answer.
 An open question (no options) is the same whole card without buttons; it asks for
 a reply in your own words.
+Version 1.2.7 registers the Mini App and selects its pinned Windows
+cloudflared binary even when `platform.machine()` is empty; unknown
+or unsupported interpreter architectures still refuse rather than guessing.
 
 The Mini App exposes the unchanged Ouroboros SPA through the established
 owner-authenticated sidecar and a pinned Cloudflare Quick Tunnel. It is enabled

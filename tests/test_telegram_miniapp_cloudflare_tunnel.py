@@ -131,6 +131,56 @@ def test_platform_matrix_rejects_unpinned_targets(
         cloudflare._current_asset()
 
 
+@pytest.mark.parametrize("build,arch", [("win-amd64", "amd64"), ("win-arm64", "arm64"), ("win32", "x86"), ("unknown", "")])
+def test_empty_windows_machine_uses_interpreter_build(monkeypatch, tmp_path, build, arch):
+    import json
+    import platform_support
+    from runtime_status import RuntimeStatus
+
+    monkeypatch.setattr(cloudflare.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(cloudflare.platform, "machine", lambda: "")
+    monkeypatch.setattr(platform_support.sysconfig, "get_platform", lambda: build)
+    assert platform_support.machine_architecture() == arch
+    if arch == "amd64":
+        assert cloudflare._current_asset().platform_id == "windows-amd64"
+    else:
+        with pytest.raises(cloudflare.CloudflaredError, match="Unsupported"):
+            cloudflare._current_asset()
+    RuntimeStatus(tmp_path, cloudflared_version="test").publish()
+    assert json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))["platform"] == "windows-" + arch
+
+
+def test_build_fallback_preserves_known_machine_and_other_os(monkeypatch):
+    import platform_support
+
+    monkeypatch.setattr(platform_support.sysconfig, "get_platform", lambda: "win-amd64")
+    monkeypatch.setattr(cloudflare.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(cloudflare.platform, "machine", lambda: "ARM64")
+    assert platform_support.machine_architecture() == "arm64"
+    monkeypatch.setattr(cloudflare.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(cloudflare.platform, "machine", lambda: "")
+    assert platform_support.machine_architecture() == ""
+
+
+@pytest.mark.serial
+@pytest.mark.skipif(sys.platform != "win32", reason="Real scrubbed Windows interpreter")
+def test_real_windows_scrubbed_interpreter_selects_pinned_asset(tmp_path):
+    import subprocess
+    import sysconfig
+    from platform_support import minimal_process_environment
+
+    if sysconfig.get_platform().lower() != "win-amd64":
+        pytest.skip("Pinned Windows cloudflared asset supports amd64 only")
+    env = minimal_process_environment(tmp_path)
+    assert not any(key.startswith("PROCESSOR_") for key in env)
+    result = subprocess.run(
+        [sys.executable, "-c", "import cloudflare_tunnel as c; print(c._current_asset().platform_id)"],
+        cwd=SCRIPTS_DIR, env=env, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "windows-amd64"
+
+
 @pytest.mark.parametrize(
     "url",
     [

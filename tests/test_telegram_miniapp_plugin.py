@@ -148,6 +148,18 @@ def test_unsupported_platform_skips_only_miniapp_companion(
     assert status["reason_code"] == "unsupported_platform"
 
 
+def test_empty_windows_machine_still_registers_companion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from telegram_native_test.scripts import platform_support
+
+    monkeypatch.setattr(plugin.platform, "system", lambda: "Windows")
+    monkeypatch.setattr(plugin.platform, "machine", lambda: "")
+    monkeypatch.setattr(platform_support.sysconfig, "get_platform", lambda: "win-amd64")
+    api = FakeAPI(tmp_path)
+    plugin.register(api)
+    assert api.companions == ["miniapp_gateway"]
+    assert plugin._read_status(api)["state"] == "starting"
+
+
 def test_windows_status_uses_heartbeat_without_destructive_kill(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
