@@ -416,13 +416,19 @@ def apply_pending_request(drive_root: Any) -> bool:
             _safe_unlink(path)
             return False
 
-        from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
-        from supervisor.state import load_state
+        from supervisor.evolution_lifecycle import evolution_block_reason, evolution_stop_reason, start_evolution_campaign
+        from supervisor.state import control_value, load_state
 
         if evolution_block_reason():  # light runtime mode, etc.
             _safe_unlink(path)
             return False
         st = load_state()
+        if not all(control_value(st, key)[0] for key in (
+                "evolution_owner_stopped", "evolution_mode_enabled")) or evolution_stop_reason():
+            # An autonomous re-arm needs KNOWN current controls and no received Stop/Panic
+            # (#1307): unknown is neither "not stopped" nor "not enabled". The durable
+            # request stays for a later tick; only a known stop drops it (below).
+            return False
         if not st.get("owner_chat_id"):
             # Evolution requires an owner-bound chat; without it the cycle could
             # never run. Drop the stale request rather than leaking it.
@@ -500,15 +506,22 @@ def apply_pending_request(drive_root: Any) -> bool:
             # are already serialized ahead of this on the supervisor loop). Honor the
             # LIVE flag inside the atomic update so evolution is never enabled against a
             # fresh owner stop, even in that window.
-            if bool(live.get("evolution_owner_stopped")):
+            known, stopped = control_value(live, "evolution_owner_stopped")
+            if not known or stopped:
                 return
             live["evolution_mode_enabled"] = True
             live["evolution_consecutive_failures"] = 0
             live["post_task_autostop"] = True
 
-        st_after = update_state(_activate_one_shot)
-        _safe_unlink(path)
-        if not bool(st_after.get("evolution_mode_enabled")):
+        from supervisor.state import StateUnavailable
+
+        try:
+            st_after = update_state(_activate_one_shot)
+        except StateUnavailable:
+            st_after = None  # the request stays durable for a later tick; the minted campaign closes below
+        else:
+            _safe_unlink(path)
+        if st_after is None or not bool(st_after.get("evolution_mode_enabled")):
             # Owner stop won the race: the atomic re-check refused the enable. Terminal-
             # close the campaign this now-stale path minted so no dangling active campaign
             # survives, and do NOT audit a self-enable that did not happen. The durable

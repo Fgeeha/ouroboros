@@ -16,6 +16,7 @@ from typing import Any, Dict
 from ouroboros.model_wait import budget_paused_seconds
 from supervisor.events_budget import budget_fence_selected, budget_hold_fact
 from supervisor.queue import _queue_lock
+from supervisor.schedule_occurrence import record_dispatch_possible
 
 
 def _pool():
@@ -449,6 +450,9 @@ def assign_tasks() -> None:
                         queue.persist_queue_snapshot(reason="evolution_authority_rejected")
                     else:
                         _pool().PENDING.insert(chosen_idx, task)
+                    continue
+                if not record_dispatch_possible(task):  # its receipt must first say it MAY run (#1315)
+                    _pool().PENDING.insert(chosen_idx, task)
                     continue
                 _mirror_assigned_running_status(task)
                 w.busy_task_id = task["id"]

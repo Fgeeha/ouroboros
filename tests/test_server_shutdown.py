@@ -689,7 +689,7 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     monkeypatch.setattr(events_mod, "make_server_log_sink", lambda *_a, **_k: None)
     monkeypatch.setattr(events_mod, "dispatch_event", noop)
     monkeypatch.setattr(state_mod, "init", noop)
-    monkeypatch.setattr(state_mod, "init_state", noop)
+    monkeypatch.setattr(state_mod, "init_state", lambda **_k: state_mod.StateRead("current", "primary", {}))
     monkeypatch.setattr(state_mod, "load_state", lambda: {"owner_chat_id": 7})
     for name in ("save_state", "update_state", "append_jsonl", "update_budget_from_usage",
                  "rotate_jsonl_log_if_needed"):

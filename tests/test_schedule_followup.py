@@ -56,7 +56,7 @@ def test_once_schedule_fires_exactly_once_and_is_marked_done(tmp_path):
         "id": "fu-due", "name": "Follow-up", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
         "task": {"type": "task", "text": "resume the blocked plan after the window resets",
-                 "metadata": {"origin_task_id": "t-origin"}},
+                 "metadata": {"origin_task_id": "t-origin", "resource_intent": {"kind": "system_repo"}}},
     })
     queue.upsert_scheduled_task({
         "id": "fu-future", "name": "Later", "enabled": True, "source": "task_followup",
@@ -79,37 +79,46 @@ def test_once_schedule_fires_exactly_once_and_is_marked_done(tmp_path):
 
 
 def test_once_schedule_survives_a_refused_admission_and_retries(tmp_path, monkeypatch):
-    """Review fix 5: the once-trigger is consumed ONLY when admission succeeded.
-    A refused admission (worker pool down, duplicate id, routing fence) leaves the
-    record enabled with last_error, so the next scheduler tick retries it."""
+    """Review fix 5 + #1315: a refused admission consumes nothing and mints no failed
+    root: the row WAITS with a typed reason, keeps ONE occurrence (the same task id)
+    and retries it when the wait ends; admission then consumes the one-shot."""
+    from ouroboros.task_results import load_task_result
+
+    import ouroboros.config as config
+
     queue, pending = _queue(tmp_path)
+    monkeypatch.setattr(config, "get_bg_wakeup_min_sec", lambda: 0)  # the wait ends at once in this test
     queue.upsert_scheduled_task({
         "id": "fu-blocked", "name": "Follow-up", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume after the window resets"},
+        "task": {"type": "task", "text": "resume after the window resets",
+                 "metadata": {"resource_intent": {"kind": "system_repo"}}},
     })
     real_enqueue = queue.enqueue_task
+    attempts: list = []
     monkeypatch.setattr(
         queue, "enqueue_task",
-        lambda task: {**task, "_admission_blocked": "worker_pool_unavailable"})
+        lambda task, **_kw: attempts.append(task["id"]) or {**task, "_admission_blocked": "worker_pool_unavailable"})
     queue.check_scheduled_tasks()
-    assert pending == []
+    queue.check_scheduled_tasks()
+    assert pending == [] and len(attempts) == 2 and len(set(attempts)) == 1  # one occurrence, retried
     record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
     assert record["enabled"] is True and not record.get("completed_at")
-    assert "worker_pool_unavailable" in str(record.get("last_error") or "")
-    # Admission heals: the very next tick fires and consumes the record.
+    assert record["hold"]["reason"] == "worker_pool_unavailable"
+    assert not record.get("failure_count") and load_task_result(tmp_path, attempts[0]) is None  # no failed root
+    # Admission heals: the next tick admits the SAME occurrence and consumes the record.
     monkeypatch.setattr(queue, "enqueue_task", real_enqueue)
     queue.check_scheduled_tasks()
-    assert len(pending) == 1
+    assert len(pending) == 1 and pending[0]["id"] == attempts[0]
     record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is False and record["completed_at"]
+    assert record["enabled"] is False and record["completed_at"] and "hold" not in record
     assert record.get("last_error") == ""
 
 
-def test_once_schedule_refused_by_the_consciousness_door_defers_by_the_alarm_floor(tmp_path, monkeypatch):
+def test_once_schedule_refused_by_the_consciousness_door_waits_on_the_row(tmp_path, monkeypatch):
     """A one-shot a wake scheduled and the consciousness door refuses (allowance, concurrency —
-    a refusal that can last hours) must not re-fire on every supervisor pass: the record stays
-    armed, its run point moves forward by the alarm floor (opus round 4)."""
+    a refusal that can last hours) must not re-fire on every supervisor pass: the row waits
+    with the typed reason until the alarm floor passes; no failed root, run point unchanged."""
     import datetime
 
     queue, pending = _queue(tmp_path)
@@ -118,22 +127,25 @@ def test_once_schedule_refused_by_the_consciousness_door_defers_by_the_alarm_flo
         "id": "fu-conscious", "name": "Follow-up", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
         "task": {"type": "task", "text": "resume later",
-                 "metadata": {"initiator": "consciousness", "usage_category": "consciousness_task"}},
+                 "metadata": {"initiator": "consciousness", "usage_category": "consciousness_task",
+                              "resource_intent": {"kind": "system_repo"}}},
     })
     fires: list = []
     monkeypatch.setattr(
         queue, "enqueue_task",
-        lambda task: fires.append(task["id"]) or {**task, "_admission_blocked": "consciousness_allowance_exhausted",
-                                                 "_admission_detail": "$20.00 of $20.00 spent in the last 24 h"})
+        lambda task, **_kw: fires.append(task["id"]) or {
+            **task, "_admission_blocked": "consciousness_allowance_exhausted",
+            "_admission_detail": "$20.00 of $20.00 spent in the last 24 h"})
     before = datetime.datetime.now(datetime.timezone.utc)
     queue.check_scheduled_tasks()
-    queue.check_scheduled_tasks()  # the very next pass: NOT due again
+    queue.check_scheduled_tasks()  # the very next pass: still waiting
     assert len(fires) == 1 and pending == []
     record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
     assert record["enabled"] is True and not record.get("completed_at")
-    assert "consciousness_allowance_exhausted" in str(record.get("last_error") or "")
-    run_at = datetime.datetime.fromisoformat(record["trigger"]["run_at"])
-    assert run_at >= before + datetime.timedelta(seconds=890)
+    assert record["trigger"]["run_at"] == "2000-01-01T00:00:00+00:00"
+    assert record["hold"]["reason"] == "consciousness_allowance_exhausted"
+    assert "$20.00" in record["hold"]["detail"]
+    assert datetime.datetime.fromisoformat(record["hold"]["retry_after"]) >= before + datetime.timedelta(seconds=890)
 
 
 def test_re_enabled_completed_once_never_refires(tmp_path):

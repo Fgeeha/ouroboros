@@ -158,7 +158,8 @@ def test_panic_never_calls_replay_before_the_hard_exit(monkeypatch):
     stops = []
     monkeypatch.setattr(server, "_execute_panic_stop", lambda *_a, **_k: stops.append(True))
     assert server._process_bridge_updates(bridge, 0, ctx) == 2
-    assert ctx.sent == [(1, "🛑 PANIC: killing everything. App will close.")], "nothing behind Panic ran"
+    # The local door stops before any reply, chat record or state write (#1307); nothing behind it runs.
+    assert ctx.sent == [], "nothing behind Panic ran"
     assert stops == [True]
 
 

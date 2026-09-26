@@ -332,8 +332,10 @@ def test_cron_schedule_enqueues_once_when_due(tmp_path, monkeypatch):
     assert pending[0]["metadata"]["schedule_id"] == "hourly"
 
 
-def test_cron_schedule_admission_refusal_is_terminal(tmp_path, monkeypatch):
-    from ouroboros.task_results import STATUS_FAILED, load_task_result
+def test_cron_schedule_admission_refusal_waits_without_a_phantom_root(tmp_path, monkeypatch):
+    """#1315: a refused cron occurrence WAITS on its row with the typed reason: no
+    failed root, no failure_count, the same occurrence kept for the retry."""
+    from ouroboros.task_results import load_task_result
     from supervisor import queue
 
     queue.init(tmp_path)
@@ -348,7 +350,7 @@ def test_cron_schedule_admission_refusal_is_terminal(tmp_path, monkeypatch):
     })
     admitted_ids = []
 
-    def _blocked(task, front=False):
+    def _blocked(task, front=False, **_kw):
         admitted_ids.append(task["id"])
         return {**task, "_admission_blocked": "project_routing_fence"}
 
@@ -356,12 +358,12 @@ def test_cron_schedule_admission_refusal_is_terminal(tmp_path, monkeypatch):
     queue.check_scheduled_tasks()
 
     assert len(admitted_ids) == 1
-    result = load_task_result(tmp_path, admitted_ids[0])
-    assert result["status"] == STATUS_FAILED
-    assert result["reason_code"] == "project_routing_fence"
+    assert load_task_result(tmp_path, admitted_ids[0]) is None
     schedule = queue.list_scheduled_tasks()["tasks"][0]
-    assert schedule["failure_count"] == 1
-    assert "project_routing_fence" in schedule["last_error"]
+    assert not schedule.get("failure_count")
+    assert schedule["hold"]["reason"] == "project_routing_fence"
+    assert schedule["occurrence"]["task_id"] == admitted_ids[0]
+    assert schedule["next_run_at"] == "2000-01-01T00:00:00+00:00"  # no catch-up bookkeeping while waiting
 
 
 def test_scheduled_task_without_owner_chat_is_headless_safe(tmp_path):

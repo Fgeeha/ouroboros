@@ -734,6 +734,40 @@ def test_failed_child_capture_is_explicit_and_other_files_still_publish(tmp_path
         assert recovered["status"] == "completed" and recovered["accounted_upper_bound_usd"] == 3.5
 
 
+def test_unchanged_pending_ref_retry_rewrites_nothing_and_keeps_late_facts(tmp_path):
+    """#1305: retrying a still-unpromotable ref leaves bytes, mtime and updated_at alone; a
+    genuine late fact still lands, survives the next retry, and a restored source converges."""
+    from ouroboros.headless import prepare_task_drive, copy_child_task_result
+    from ouroboros.observability import retry_pending_child_ref_promotions
+    from ouroboros.task_results import task_result_path, write_task_result
+
+    parent = tmp_path / "canonical"
+    child = prepare_task_drive(parent, "stale", "empty")
+    source = child / "report.txt"
+    source.write_bytes(b"report")
+    record = artifacts.copy_file_to_task_artifacts(
+        SimpleNamespace(drive_root=child, task_id="stale"), source, immutable=True)
+    write_task_result(child, "stale", "failed", artifacts=[record], artifact_status="ready")
+    write_task_result(parent, "stale", "running", headless_child_drive_root=str(child))
+    Path(record["path"]).write_bytes(b"appended after the digest was captured")
+    assert copy_child_task_result(parent, {"id": "stale", "drive_root": str(child)})[
+        "child_ref_promotion"]["status"] == "incomplete"
+    row = task_result_path(parent, "stale")
+    before, stamp = row.read_bytes(), row.stat().st_mtime_ns
+    report = retry_pending_child_ref_promotions(parent)
+    assert report["retried"] == report["pending"] == ["stale"] and not report["errors"]
+    assert row.read_bytes() == before and row.stat().st_mtime_ns == stamp
+    write_task_result(parent, "stale", "failed", accounted_upper_bound_usd=4.25)
+    late = row.read_bytes()
+    assert retry_pending_child_ref_promotions(parent)["pending"] == ["stale"]
+    assert row.read_bytes() == late and json.loads(late)["accounted_upper_bound_usd"] == 4.25
+    Path(record["path"]).write_bytes(b"report")
+    assert retry_pending_child_ref_promotions(parent)["completed"] == ["stale"]
+    settled = json.loads(row.read_bytes())
+    assert settled["status"] == "failed" and settled["accounted_upper_bound_usd"] == 4.25
+    assert settled["child_ref_promotion"]["status"] == "complete"
+
+
 @pytest.mark.parametrize("copy_failure", [False, True])
 def test_failed_artifact_bundle_drives_public_and_routing_status_without_mutating_capture(tmp_path, copy_failure):
     from ouroboros.outcomes import artifact_bundle_from_result, public_task_result

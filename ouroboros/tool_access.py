@@ -64,7 +64,7 @@ from ouroboros.tool_access_roots import (  # noqa: F401 — re-exported moved su
     _is_subagent_ctx,
     _skill_payload_base,
     active_tool_profile,
-    binding_targets_system_repo,
+    binding_targets_system_repo, folderless_scratch_dir,
     is_external_workspace,
     load_bound_skill,
     predicted_subagent_profile,
@@ -761,7 +761,7 @@ def build_resolved_resource_binding(
         normalized == "runtime_data" and operation in {"write", "edit"}
     ) or (
         normalized == "active_workspace" and operation == "edit" and not workspace_active
-        and project_room_lens_dir(ctx) is None
+        and project_room_lens_dir(ctx) is None and folderless_scratch_dir(ctx) is None
     )
     if legacy_data_form:
         from ouroboros.contracts.skill_payload_policy import (

@@ -1373,10 +1373,11 @@ def get_tools() -> List[ToolEntry]:
                     "Optional reduction of native access for this fresh run: readonly or workspace_write. "
                     "Omit to inherit the captured actor profile (new mutating sessions default to full). "
                     "Explicit readonly task authority still wins. Omit on retry_of."},
-                "root": {"type": "string", "enum": ["skill_payload"], "description":
-                    "Optional exact-resource selector: 'skill_payload' delegates ONE "
-                    "installed user-managed skill payload you can already write. Omit "
-                    "for ordinary workspace delegation."},
+                "root": {"type": "string", "enum": ["active_workspace", "skill_payload"],
+                    "default": "active_workspace", "description":
+                    "active_workspace (the default, same as omitting) is ordinary workspace "
+                    "delegation. 'skill_payload' delegates ONE installed user-managed skill "
+                    "payload you can already write, named by bucket and skill_name."},
                 "bucket": {"type": "string", "description":
                     "With root='skill_payload': the payload location "
                     "(external|clawhub|ouroboroshub|user_repo)."},

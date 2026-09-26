@@ -165,7 +165,7 @@ def test_v5_apply_pending_request_activates_gated_campaign(tmp_path, monkeypatch
     monkeypatch.setattr(st, "load_state", lambda: {"owner_chat_id": 7})
     monkeypatch.setattr(st, "save_state", lambda s: saved.update(s))
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         live = {"owner_chat_id": 7}
         mutator(live)
         saved.update(live)
@@ -204,7 +204,7 @@ def test_evolution_owner_stopped_blocks_post_task_rearm(tmp_path, monkeypatch):
     monkeypatch.setattr(st, "load_state",
                         lambda: {"owner_chat_id": 7, "evolution_owner_stopped": True, "evolution_mode_enabled": False})
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         live = {"owner_chat_id": 7, "evolution_owner_stopped": True}
         mutator(live)
         saved.update(live)
@@ -285,7 +285,7 @@ def test_agent_stop_on_top_of_an_owner_stop_keeps_the_owner_stop(tmp_path, monke
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     captured = {}
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         live = {"owner_chat_id": 7, "evolution_owner_stopped": True}  # the owner's stop: no source
         mutator(live)
         captured.update(live)
@@ -320,7 +320,7 @@ def test_toggle_evolution_off_wires_owner_stop(tmp_path, monkeypatch):
     captured = {}
     calls = {"complete": [], "start": []}
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         live = {"owner_chat_id": 7}
         mutator(live)
         captured.update(live)
@@ -372,7 +372,7 @@ def test_toggle_evolution_on_clears_owner_stop(tmp_path, monkeypatch):
     captured = {}
     calls = {"complete": [], "start": []}
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         live = {"owner_chat_id": 7}
         mutator(live)
         captured.update(live)
@@ -438,7 +438,7 @@ def test_apply_pending_request_atomic_recheck_aborts_on_raced_owner_stop(tmp_pat
                         lambda: {"owner_chat_id": 7, "evolution_owner_stopped": False, "evolution_mode_enabled": False})
     saved = {}
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         # ...but by the time of the atomic update the owner stop has landed (raced True).
         live = {"owner_chat_id": 7, "evolution_owner_stopped": True}
         mutator(live)
@@ -470,6 +470,15 @@ def test_execute_panic_stop_wires_owner_stop(tmp_path, monkeypatch):
     calls = {"complete": [], "drop": []}
     monkeypatch.setattr(state, "load_state", lambda: {"evolution_mode_enabled": True, "post_task_autostop": True})
     monkeypatch.setattr(state, "save_state", lambda s: saved.update(s))
+
+    def _panic_update(mutator, **_kwargs):  # Panic writes FIELDS, bounded, after the kills (#1307)
+        live = {"evolution_mode_enabled": True, "post_task_autostop": True}
+        mutator(live)
+        saved.update(live)
+        return live
+
+    monkeypatch.setattr(state, "update_state", _panic_update)
+    monkeypatch.setattr(lifecycle, "record_evolution_stop_intent", lambda *a, **k: True)
     monkeypatch.setattr(lifecycle, "complete_evolution_campaign",
                         lambda reason="", *, status="stopped", cleanup_worktree=True:
                         calls["complete"].append((reason, status, cleanup_worktree)))
@@ -643,7 +652,7 @@ def _apply_with_request(tmp_path, monkeypatch, backlog_id):
     monkeypatch.setattr(stt, "load_state", lambda: {"owner_chat_id": 7})
     monkeypatch.setattr(stt, "save_state", lambda s: None)
 
-    def _fake_update_state(mutator):
+    def _fake_update_state(mutator, **_kwargs):
         # The REAL update_state reads the machine-resolved state file through its private
         # unlocked loader, so the load_state patch above never reaches it — on a machine whose
         # LIVE state carries evolution_owner_stopped=True the atomic re-check would then refuse

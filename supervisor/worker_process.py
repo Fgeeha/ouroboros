@@ -28,7 +28,9 @@ log = logging.getLogger(__name__)
 
 
 WORKER_LOG_SINK_SUPPRESSED_TYPES = frozenset({
-    "tool_call", "llm_round", "task_checkpoint", "task_done", "llm_usage",
+    # The durable start/wait-ended rows share the live frame's payload (#1316).
+    "tool_call", "tool_call_started", "tool_call_timeout",
+    "llm_round", "task_checkpoint", "task_done", "llm_usage",
     "provider_incomplete_response", "llm_empty_response", "provider_body_error",
     "review_cycles_exhausted", "plan_review_advisory_open",
 })

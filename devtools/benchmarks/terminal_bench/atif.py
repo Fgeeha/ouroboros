@@ -244,10 +244,15 @@ def build_trajectory(
     agent_dir = Path(agent_dir)
     data_dir = agent_dir / "ouroboros-data"
     events = _read_jsonl_chain(data_dir, "events.jsonl", "events")
+    all_tool_rows = _read_jsonl_chain(data_dir, "tools.jsonl", "tools")
+    # One step per call: its settlement, else the wait-ended row of a call that never
+    # settled; start rows are not steps (host processing began, not a result).
+    settled = {r.get("invocation_id") for r in all_tool_rows if r.get("type") == "tool_call"}
     tool_rows = [
         r
-        for r in _read_jsonl_chain(data_dir, "tools.jsonl", "tools")
+        for r in all_tool_rows
         if r.get("type") == "tool_call"
+        or (r.get("type") == "tool_call_timeout" and r.get("invocation_id") not in settled)
     ]
     narration_rows = [
         r

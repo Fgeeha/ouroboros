@@ -48,14 +48,63 @@ def _read_evolution_campaign() -> Dict[str, Any]:
     return data if isinstance(data, dict) else {}
 
 
+# #1307: a received Stop outlives a failed state write. The live latch keeps it in this
+# process; the campaign's ``stop_intent`` keeps it durably, beside (never instead of) the
+# state flag and whether or not cancellation finished. Only an owner-sourced successful
+# ``start_evolution_campaign`` clears them.
+_STOP_LATCH = {"stopped": False}
+_OWNER_START_SOURCES = frozenset({"owner", "owner_chat"})
+
+
+def record_evolution_stop_intent(source: str, reason: str = "") -> bool:
+    """Latch the Stop, then record it in the EXISTING campaign record (no invented
+    terminal status). False: the durable intent could not be written (the caller
+    discloses it); no campaign file means nothing can run to stop."""
+    from supervisor import state
+
+    _STOP_LATCH["stopped"] = True
+    lock_fd = state.acquire_file_lock(state.STATE_LOCK_PATH, timeout_sec=1.0)
+    if lock_fd is None:
+        return False
+    try:
+        campaign = _read_evolution_campaign()
+        if not campaign:
+            return not _evolution_campaign_path().exists()
+        campaign["stop_intent"] = {"at": utc_now_iso(), "source": str(source or "owner"), "reason": str(reason or "")}
+        return _write_evolution_campaign(campaign, _state_lock_held=True)
+    finally:
+        state.release_file_lock(state.STATE_LOCK_PATH, lock_fd)
+
+
+def evolution_stop_reason(campaign: Optional[Dict[str, Any]] = None) -> str:
+    """Why no new evolution may be admitted regardless of state.json: a received
+    Stop (latch or durable intent) or an unconsumed Panic flag. "" when none."""
+    from supervisor import queue
+
+    if _STOP_LATCH["stopped"]:
+        return "stop_latched"
+    if isinstance((campaign if campaign is not None else _read_evolution_campaign()).get("stop_intent"), dict):
+        return "stop_intent"
+    try:
+        os.lstat(pathlib.Path(queue.DRIVE_ROOT) / "state" / "panic_stop.flag")
+        return "panic_flag"
+    except FileNotFoundError:
+        return ""
+    except OSError:
+        return "panic_flag_unknown"
+
+
 def disable_evolution_projection() -> None:
     """Clear the scheduler projection without changing campaign history."""
     from supervisor import state
 
-    state.update_state(lambda live: live.update({
-        "evolution_mode_enabled": False,
-        "post_task_autostop": False,
-    }))
+    try:
+        state.update_state(lambda live: live.update({
+            "evolution_mode_enabled": False,
+            "post_task_autostop": False,
+        }), confirm=("evolution_mode_enabled", "post_task_autostop"))
+    except state.StateUnavailable:
+        log.warning("evolution projection disable not persisted: state unavailable", exc_info=True)
 
 
 def disable_evolution_authority(
@@ -103,14 +152,19 @@ def enqueue_evolution_task_if_needed() -> None:
     q._deliver_pending_owner_report()
     if q.PENDING or q.RUNNING:
         return
+    from supervisor.state import StateUnavailable, control_is, update_state
+
     st = q.load_state()
-    if not bool(st.get("evolution_mode_enabled")):
+    # Autonomy needs KNOWN current controls (#1307): an unknown flag is not "enabled".
+    # The owner chat is only the notice address, so its display value serves.
+    if not (control_is(st, "evolution_mode_enabled", True) and control_is(st, "evolution_owner_stopped", False)):
         return
     owner_chat_id = st.get("owner_chat_id")
     if not owner_chat_id:
         return
     campaign = q._read_evolution_campaign()
-    from supervisor.state import update_state
+    if evolution_stop_reason(campaign):
+        return
     has_authority = all(str(campaign.get(key) or "").strip() for key in ("id", "source"))
     if campaign.get("status") != "active" or not has_authority:
         q.disable_evolution_authority("bare_flag_disabled", campaign_id=str(campaign.get("id") or ""))
@@ -240,7 +294,10 @@ def enqueue_evolution_task_if_needed() -> None:
         live["evolution_cycle"] = cycle
         live["last_evolution_task_at"] = utc_now_iso()
 
-    update_state(_record_cycle)
+    try:
+        update_state(_record_cycle)
+    except StateUnavailable:
+        log.warning("evolution cycle %s admitted; its state counter was not persisted", tid, exc_info=True)
 
 
 def _write_evolution_campaign(
@@ -324,6 +381,9 @@ def start_evolution_campaign(objective: str = "", *, source: str = "owner", orig
         return {}
     try:
         campaign = _read_evolution_campaign()
+        owner_start = str(source or "") in _OWNER_START_SOURCES
+        if not owner_start and evolution_stop_reason(campaign):
+            return {}  # a received Stop yields only to the owner's own start (#1307)
         prior_campaign_id = str(campaign.get("id") or "")
         now = utc_now_iso()
         objective = str(objective or "").strip()
@@ -365,11 +425,15 @@ def start_evolution_campaign(objective: str = "", *, source: str = "owner", orig
         generation = current_evolution_boot_generation()
         if generation:
             campaign["last_boot_reconcile_gen"] = generation
-        return campaign if _write_evolution_campaign(
+        campaign.pop("stop_intent", None)  # cleared ONLY by this successful authorized start
+        written = _write_evolution_campaign(
             campaign,
             expected_campaign_id=prior_campaign_id,
             _state_lock_held=True,
-        ) else {}
+        )
+        if written and owner_start:
+            _STOP_LATCH["stopped"] = False
+        return campaign if written else {}
     finally:
         state.release_file_lock(state.STATE_LOCK_PATH, lock_fd)
 
@@ -494,22 +558,12 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
         # per-cycle fingerprint. Read here (not at outcome time) because campaign["objective"]
         # can be overwritten by a later promotion before the outcome is recorded.
         "objective_fp": canonical_objective_fingerprint(str((campaign or {}).get("objective") or "")),
-        "created_at": utc_now_iso(),
-        "updated_at": utc_now_iso(),
-        "base_head": base_head,
-        "base_branch": base_branch,
-        "preflight_status": "pending",
-        "advisory_status": "pending",
-        "triad_scope_status": "pending",
-        "commit_sha": "",
-        "push_status": "pending",
-        "restart_decision": "",
-        "restart_required": False,
-        "restart_verified": False,
-        "restart_verified_at": "",
-        "rescue_ref": "",
-        "rescue_path": "",
-        "recovery_hint": "",
+        "created_at": utc_now_iso(), "updated_at": utc_now_iso(),
+        "base_head": base_head, "base_branch": base_branch,
+        "preflight_status": "pending", "advisory_status": "pending", "triad_scope_status": "pending",
+        "commit_sha": "", "push_status": "pending",
+        "restart_decision": "", "restart_required": False, "restart_verified": False, "restart_verified_at": "",
+        "rescue_ref": "", "rescue_path": "", "recovery_hint": "",
     }
     from supervisor import state
 
@@ -519,12 +573,13 @@ def begin_evolution_transaction(task_id: str, *, cycle: int, campaign: Dict[str,
         return {}
     try:
         current = _read_evolution_campaign()
-        live_state = state.json_load_file(state.STATE_PATH) or {}
+        live_state = state.read_state().projection()
         existing_tx = current.get("active_transaction")
         existing_tx = existing_tx if isinstance(existing_tx, dict) else {}
         if (
-            bool(live_state.get("evolution_owner_stopped"))
-            or not bool(live_state.get("evolution_mode_enabled"))
+            not state.control_is(live_state, "evolution_owner_stopped", False)
+            or not state.control_is(live_state, "evolution_mode_enabled", True)
+            or evolution_stop_reason(current)
             or current.get("status") != "active"
             or str(current.get("id") or "") != str(campaign.get("id") or "")
             or bool(str(existing_tx.get("commit_sha") or "").strip())
@@ -578,11 +633,17 @@ def _evolution_claim_error(
     campaign_id: str, transaction_id: str, task_id: str, commit_sha: str = "",
     require_uncommitted: bool = False,
 ) -> str:
+    from supervisor.state import control_value
+
     if not campaign_id or not transaction_id or not task_id:
         return "claim_identity_missing"
-    if bool(live_state.get("evolution_owner_stopped")):
+    stopped_known, stopped = control_value(live_state, "evolution_owner_stopped")
+    if (stopped_known and stopped) or evolution_stop_reason(campaign):
         return "owner_stopped"
-    if not bool(live_state.get("evolution_mode_enabled")) and not commit_sha:
+    enabled_known, enabled = control_value(live_state, "evolution_mode_enabled")
+    if not stopped_known or (not enabled_known and not commit_sha):
+        return "state_controls_unknown"  # an unknown control never reads as permission (#1307)
+    if not enabled and not commit_sha:
         return "evolution_disabled"
     if campaign.get("status") != "active":
         return "campaign_not_active"
@@ -621,7 +682,7 @@ def check_evolution_authority(
         return {"ok": False, "reason": "state_lock_unavailable"}
     try:
         campaign = _read_evolution_campaign()
-        live_state = state.json_load_file(state.STATE_PATH) or {}
+        live_state = state.read_state().projection()
         reason = _evolution_claim_error(
             campaign, live_state,
             campaign_id=str(campaign_id or ""),
@@ -731,7 +792,7 @@ def record_evolution_commit(
     if lock_fd is None:
         return {"ok": False, "reason": "state_lock_unavailable", "commit_sha": commit_sha}
     try:
-        live_state = state.json_load_file(state.STATE_PATH) or {}
+        live_state = state.read_state().projection()
         from ouroboros.utils import update_json_locked
 
         receipt: Dict[str, Any] = {}

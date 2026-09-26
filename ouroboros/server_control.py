@@ -120,46 +120,10 @@ def execute_panic_stop(
     except Exception:
         pass
 
-    try:
-        from supervisor.state import load_state, save_state
-
-        st = load_state()
-        st["evolution_mode_enabled"] = False
-        st["bg_consciousness_enabled"] = False
-        # Panic is an owner stop: make it authoritative against the post-task pipeline too,
-        # so evolution cannot autonomously re-arm on the next boot (mirrors /evolve off).
-        st["evolution_owner_stopped"] = True
-        st.pop("evolution_stop_source", None)  # an owner stop: no agent source may un-stick it
-        st["post_task_autostop"] = False
-        save_state(st)
-    except Exception:
-        pass
-
-    # Terminal-close the campaign + drop any queued promotion. Each in its own guard so a
-    # missing/locked file never blocks the panic hard-exit (the flag above is the durable gate).
-    # cleanup_worktree=False: the Emergency Stop Invariant (BIBLE) forbids delaying panic, so
-    # panic must NOT run the mid-cycle git stash/reset cleanup — the panic flag + boot reconcile
-    # own that recovery. (Graceful /evolve off + toggle do run the cleanup, after cancelling.)
-    try:
-        from supervisor.evolution_lifecycle import complete_evolution_campaign
-
-        complete_evolution_campaign("panic stop", status="stopped", cleanup_worktree=False)
-    except Exception:
-        pass
-    try:
-        from ouroboros.post_task_evolution import drop_pending_request
-
-        drop_pending_request(data_dir)
-    except Exception:
-        pass
-
-    try:
-        panic_flag = data_dir / "state" / "panic_stop.flag"
-        panic_flag.parent.mkdir(parents=True, exist_ok=True)
-        panic_flag.write_text("panic", encoding="utf-8")
-    except Exception:
-        pass
-
+    # Physical termination requests come FIRST (#1307): no state, campaign or log
+    # write may delay them. The durable gate (panic flag) and the disabled controls
+    # follow, each bounded, and all of it precedes the port sweep that can kill THIS
+    # process and the hard exit.
     try:
         from ouroboros.local_model import get_manager
 
@@ -176,14 +140,7 @@ def execute_panic_stop(
         get_owned_daemon().stop()
     except Exception as exc:
         log.critical("PANIC: owned Claudexor stop raised %s; custody is unconfirmed", type(exc).__name__)
-        try:
-            from ouroboros.utils import append_jsonl, utc_now_iso
-            append_jsonl(data_dir / "logs" / "supervisor.jsonl", {
-                "ts": utc_now_iso(), "type": "process_stop_unconfirmed",
-                "purpose": "claudexor_daemon", "reason": f"stop raised {type(exc).__name__}",
-            })
-        except Exception:
-            log.critical("PANIC: failed to record unconfirmed daemon stop")
+        _bounded(lambda error=exc: _record_unconfirmed_daemon_stop(data_dir, error), 1.0)
 
     try:
         from ouroboros.tools.shell import kill_all_tracked_subprocesses
@@ -220,6 +177,12 @@ def execute_panic_stop(
     except Exception:
         pass
 
+    # The durable gate: every boot grant consults it, and boot consumes it only
+    # after the disabled controls are durably saved (auto_resume_after_restart).
+    if not _bounded(lambda: _write_panic_flag(data_dir), 2.0):
+        log.critical("PANIC: the panic flag was not confirmed on disk; boot grants cannot see this stop")
+    _bounded(lambda: _persist_panic_controls(data_dir), 2.0)
+
     try:
         import multiprocessing
         from ouroboros.gateway.host_service import host_service_port
@@ -244,3 +207,67 @@ def execute_panic_stop(
 
     log.critical("PANIC STOP teardown finished — hard exit with code %d; consult stop diagnostics for unconfirmed custody.", panic_exit_code)
     os._exit(panic_exit_code)
+
+
+def _bounded(fn, timeout_sec: float) -> bool:
+    """Run one best-effort Panic write on a daemon thread and wait at most
+    ``timeout_sec``: a stalled disk or lock can never hold the exit. True only
+    when it finished without raising."""
+    import threading
+
+    done = threading.Event()
+
+    def _run() -> None:
+        try:
+            fn()
+            done.set()
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, name="panic-bounded-write", daemon=True).start()
+    return done.wait(timeout_sec)
+
+
+def _write_panic_flag(data_dir: pathlib.Path) -> None:
+    panic_flag = data_dir / "state" / "panic_stop.flag"
+    panic_flag.parent.mkdir(parents=True, exist_ok=True)
+    panic_flag.write_text("panic", encoding="utf-8")
+
+
+def _persist_panic_controls(data_dir: pathlib.Path) -> None:
+    """Panic is an owner stop: disable evolution and consciousness as KNOWN controls
+    (short lock, never unlocked), record the evolution stop intent, close the campaign
+    without git cleanup and drop a queued promotion. Each step is independent."""
+    from ouroboros.post_task_evolution import drop_pending_request
+    from supervisor import state
+    from supervisor.evolution_lifecycle import complete_evolution_campaign, record_evolution_stop_intent
+
+    def _panic_controls(st: dict) -> None:
+        st.update(evolution_mode_enabled=False, bg_consciousness_enabled=False,
+                  evolution_owner_stopped=True, post_task_autostop=False)
+        st.pop("evolution_stop_source", None)  # an owner stop: no agent source may un-stick it
+
+    for step in (
+        lambda: state.update_state(_panic_controls, confirm=PANIC_CONTROL_KEYS, lock_timeout_sec=0.5),
+        lambda: record_evolution_stop_intent("panic", "panic stop"),
+        # cleanup_worktree=False: Panic never runs git stash/reset; the flag + boot reconcile own it.
+        lambda: complete_evolution_campaign("panic stop", status="stopped", cleanup_worktree=False),
+        lambda: drop_pending_request(data_dir),
+    ):
+        try:
+            step()
+        except Exception:
+            pass
+
+
+PANIC_CONTROL_KEYS = ("evolution_mode_enabled", "bg_consciousness_enabled", "evolution_owner_stopped",
+                      "evolution_stop_source", "post_task_autostop")
+
+
+def _record_unconfirmed_daemon_stop(data_dir: pathlib.Path, exc: BaseException) -> None:
+    from ouroboros.utils import append_jsonl, utc_now_iso
+
+    append_jsonl(data_dir / "logs" / "supervisor.jsonl", {
+        "ts": utc_now_iso(), "type": "process_stop_unconfirmed",
+        "purpose": "claudexor_daemon", "reason": f"stop raised {type(exc).__name__}",
+    })

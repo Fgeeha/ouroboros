@@ -386,16 +386,26 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
             )
             client_message_id = f"host-{uuid.uuid5(uuid.NAMESPACE_URL, identity).hex}"
 
-        st = ctx.load_state()
-        owner_id = st.get("owner_id")
         lowered = text.strip().lower()
         is_slash_command = lowered.startswith("/")
         is_external_transport = source != "web"
         external_identity_present = (not is_external_transport) or (chat_id > 0 and user_id > 0)
-        # Global owner = primary chat for outbound notices (web on desktop, the
-        # first transport on headless Colab). Bound once, on the first message.
-        if owner_id is None and external_identity_present:
-            owner_id = user_id
+        # Emergency Stop Invariant (#1307): the local door stops before any state read,
+        # chat record, state update or reply; an external transport needs a POSITIVELY
+        # bound owner (one lock-free read) and never registers a stranger from an unknown slot.
+        panic = lowered.startswith("/panic")
+        if panic and not is_external_transport:
+            _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
+            return offset  # Never drain another already-queued message after Panic.
+        from supervisor.state import StateUnavailable, control_value
+
+        st = ctx.load_state()
+        ext_known, owner_ext_id = control_value(st, "owner_external_id")
+        _, owner_ext_chat_id = control_value(st, "owner_external_chat_id")
+        if panic and external_identity_present and ext_known and owner_ext_id is not None and (
+                int(owner_ext_id or 0), int(owner_ext_chat_id or 0)) == (user_id, chat_id):
+            _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
+            return offset
 
         from supervisor.message_bus import record_inbound_message
 
@@ -413,12 +423,17 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
         def reply(body: str, status: str = "completed") -> None:
             ctx.send_with_budget(chat_id, body, **host_operation_reply_kwargs(reply_source, status), role="system", system_type="command_reply")
         def _stamp_owner_activity(live: dict) -> None:
-            if live.get("owner_id") is None and external_identity_present:
+            # Global owner = primary chat for outbound notices (web on desktop, the first
+            # transport on headless Colab), bound once — only into a slot KNOWN to be empty.
+            if control_value(live, "owner_id") == (True, None) and external_identity_present:
                 live["owner_id"] = user_id
                 live["owner_chat_id"] = _owner_binding_chat_id(ctx, chat_id, is_external_transport)
             live["last_owner_message_at"] = now_iso
 
-        ctx.update_state(_stamp_owner_activity)
+        try:
+            ctx.update_state(_stamp_owner_activity)
+        except StateUnavailable as exc:
+            log.warning("Owner activity not stamped: %s", exc)  # the message itself still proceeds
 
         if not text and not image_base64 and not (task_metadata or {}).get("chat_attachment_uploads"):
             continue
@@ -427,17 +442,27 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
             if not external_identity_present:
                 reply("⚠️ Command ignored: this transport did not provide owner identity.", "failed")
                 continue
-            owner_ext_id = st.get("owner_external_id")
-            owner_ext_chat_id = st.get("owner_external_chat_id")
+            if not ext_known:
+                reply("⚠️ Command ignored: the bound owner chat is unknown right now (runtime state "
+                      "is unavailable or recovering), so no command runs and no chat is registered.", "failed")
+                continue
             if owner_ext_id is None:
+                bound = {"ok": False}
+
                 def _bind_external_owner(live: dict) -> None:
-                    if live.get("owner_external_id") is None:
+                    if control_value(live, "owner_external_id") == (True, None):
                         live["owner_external_id"] = user_id
                         live["owner_external_chat_id"] = chat_id
                         live["owner_external_bound_at"] = now_iso
+                        bound["ok"] = True
 
-                ctx.update_state(_bind_external_owner)
-                reply("✅ Owner chat registered. Send the command again to execute it.")
+                try:
+                    ctx.update_state(_bind_external_owner)
+                except StateUnavailable:
+                    pass
+                reply("✅ Owner chat registered. Send the command again to execute it." if bound["ok"] else
+                      "⚠️ Command ignored: the owner chat could not be registered right now.",
+                      "completed" if bound["ok"] else "failed")
                 continue
             try:
                 owner_ext_id_int = int(owner_ext_id or 0)
@@ -449,14 +474,7 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
                 reply("⚠️ Command ignored: this transport is not the bound owner chat.", "failed")
                 continue
 
-        if lowered.startswith("/panic"):
-            reply("🛑 PANIC: killing everything. App will close.", "")
-            # Never hand back a volatile tail before Panic: even a nonblocking
-            # callback could perform I/O or delay the hard stop, and this memory
-            # cannot survive the exit. Accepted ingress rows remain on disk.
-            _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
-            return offset  # Never drain another already-queued message after Panic.
-        elif lowered.startswith("/restart"):
+        if lowered.startswith("/restart"):
             reply("♻️ Restarting.", "")
             ok, restart_msg = _perform_owner_restart(ctx, reply)
             if not ok:
@@ -476,69 +494,21 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
             if turn_on and len(parts) > 2:
                 objective = text.split(None, 2)[2].strip()
             if turn_on:
-                from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
-                from supervisor.state import update_state as _evo_update_state
+                from supervisor.events_runtime_controls import owner_evolution_start
 
-                block = evolution_block_reason()
-                if block:
-                    reply(block, "failed")
-                    continue
-                # GR4-6: clear the durable owner-stop flag BEFORE the campaign is
-                # minted — the old order (campaign first, flag cleared in the later
-                # save_state below) left a window where the owner-stop backstop,
-                # fired by an old evolution task settling, read flag=True +
-                # campaign=active and closed the FRESH campaign. Owner-authorized
-                # clear (the owner is explicitly starting evolution). GR5-1: the
-                # prior value is captured FIRST so a failed start can restore it.
-                _prior_owner_stop = bool(ctx.load_state().get("evolution_owner_stopped"))
-                _evo_update_state(lambda live: live.__setitem__("evolution_owner_stopped", False))
-                try:
-                    if not start_evolution_campaign(objective, source="owner_chat"):
-                        raise RuntimeError("campaign write was refused")
-                except Exception:
-                    log.warning("Failed to start evolution campaign", exc_info=True)
-                    # GR5-1: the start FAILED, so the pre-mint clear was not an
-                    # owner-authorized state change after all. Restore the CAPTURED
-                    # prior value — leaving it cleared would let the post-task
-                    # promotion pipeline (apply_pending_request reads the flag)
-                    # autonomously re-arm evolution the owner believes is off, and
-                    # an unconditional True would invent a stop that never happened.
-                    _evo_update_state(lambda live, _v=_prior_owner_stop: live.__setitem__(
-                        "evolution_owner_stopped", _v))
-                    reply("⚠️ Evolution stayed OFF: campaign state could not be created.", "failed")
-                    continue
-            st2 = ctx.load_state()
-            st2["evolution_mode_enabled"] = bool(turn_on)
-            if turn_on:
-                st2["evolution_consecutive_failures"] = 0
-            # Owner stop is AUTHORITATIVE against the post-task promotion pipeline: the
-            # durable evolution_owner_stopped flag (read by apply_pending_request) blocks an
-            # autonomous re-arm until the owner /evolve starts again. Set True on stop,
-            # cleared (False) on turn_on — the only owner-authorized clear.
-            st2["evolution_owner_stopped"] = (not turn_on)
-            # An owner's stop carries no agent source (absent = owner-placed, sticky against
-            # toggle_evolution); an owner's start drops a stale one with the flag.
-            st2.pop("evolution_stop_source", None)
-            # Owner-initiated evolution must not inherit a stale post-task one-shot
-            # autostop, which would disable the owner's campaign after one cycle.
-            st2["post_task_autostop"] = False
-            ctx.save_state(st2)
-            reply(f"🧬 Evolution campaign: {'ON' if turn_on else _owner_evolution_stop(ctx, chat_id)}")
+                refusal = owner_evolution_start(objective, source="owner_chat")
+                reply(refusal or "🧬 Evolution campaign: ON", "failed" if refusal else "completed")
+            else:
+                reply(f"🧬 Evolution campaign: {_owner_evolution_stop(ctx, chat_id)}")
         elif lowered.startswith("/bg"):
             parts = lowered.split()
             action = parts[1] if len(parts) > 1 else "status"
-            if action in ("start", "on", "1"):
-                result = ctx.consciousness.start()
-                _bg_s = ctx.load_state()
-                _bg_s["bg_consciousness_enabled"] = True
-                ctx.save_state(_bg_s)
-                reply(f"🧠 {result}")
-            elif action in ("stop", "off", "0"):
-                result = ctx.consciousness.stop()
-                _bg_s = ctx.load_state()
-                _bg_s["bg_consciousness_enabled"] = False
-                ctx.save_state(_bg_s)
-                reply(f"🧠 {result}")
+            if action in ("start", "on", "1", "stop", "off", "0"):
+                from supervisor.events_runtime_controls import persist_consciousness_choice
+
+                on = action in ("start", "on", "1")
+                result = ctx.consciousness.start() if on else ctx.consciousness.stop()
+                reply(f"🧠 {result}{persist_consciousness_choice(on)}")
             else:
                 described = _describe_bg_consciousness_state(bool(ctx.load_state().get("bg_consciousness_enabled")))
                 reply(f"🧠 Background consciousness: {described['status']} — {described['detail']}")
@@ -613,12 +583,9 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
         )
         if not ok and policy == "rescue_and_block":
             try:
-                from supervisor.evolution_lifecycle import pause_evolution_campaign
-                from supervisor.state import load_state, save_state
+                from supervisor.evolution_lifecycle import disable_evolution_projection, pause_evolution_campaign
 
-                st = load_state()
-                st["evolution_mode_enabled"] = False
-                save_state(st)
+                disable_evolution_projection()
                 pause_evolution_campaign(f"bootstrap blocked to protect active evolution transaction: {msg}")
             except Exception:
                 log.debug("Failed to pause evolution after blocked bootstrap", exc_info=True)
@@ -636,6 +603,19 @@ def _bootstrap_supervisor_repo(settings: dict, git_ops_module=None):
     if import_result.get("ok"):
         return True, "OK: local-dev bootstrap"
     return False, f"Local-dev import test failed (rc={import_result.get('returncode', -1)})"
+
+
+def _initialize_runtime_state(settings: dict) -> None:
+    """The ONE explicit state initializer, run before chat ingress can record or bind
+    anything (#1307). An unavailable state is disclosed loudly and never minted; the
+    supervisor still serves independent work, chat and diagnosis."""
+    from supervisor.state import init as state_init, init_state
+
+    state_init(DATA_DIR, float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])))
+    boot_state = init_state()
+    if boot_state.quality not in {"current", "recovered"}:
+        log.critical("Runtime state is %s (%s): owner binding, evolution and consciousness "
+                     "controls stay unknown until it is readable", boot_state.quality, boot_state.reason)
 
 
 def _run_supervisor(settings: dict) -> None:
@@ -660,6 +640,9 @@ def _run_supervisor(settings: dict) -> None:
         _loop_liveness[1], _loop_liveness[0] = loop_phase_facts(_loop_liveness, "startup", new_tick=True), time.monotonic()
         _start_supervisor_liveness_watchdog(_loop_liveness, _watchdog_stop)
         ensure_legacy_imported(pathlib.Path(DATA_DIR))
+        from supervisor.state import control_is, load_state, save_state, update_state
+        from supervisor.state import append_jsonl, update_budget_from_usage, rotate_chat_log_if_needed, rotate_jsonl_log_if_needed
+        _initialize_runtime_state(settings)
 
         from supervisor.message_bus import LocalChatBridge, init as bus_init
 
@@ -677,11 +660,6 @@ def _run_supervisor(settings: dict) -> None:
             budget_report_every=10,
             chat_bridge=bridge,
         )
-
-        from supervisor.state import init as state_init, init_state, load_state, save_state, update_state
-        from supervisor.state import append_jsonl, update_budget_from_usage, rotate_chat_log_if_needed, rotate_jsonl_log_if_needed
-        state_init(DATA_DIR, float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])))
-        init_state()
 
         from supervisor.git_ops import safe_restart
         ok, msg = _bootstrap_supervisor_repo(settings)
@@ -772,7 +750,8 @@ def _run_supervisor(settings: dict) -> None:
             drive_root=DATA_DIR, repo_dir=REPO_DIR, owner_chat_id_fn=_get_owner_chat_id,
             routing_metadata_fn=lambda cid: main_lane_routing_metadata(_event_ctx, cid))  # _event_ctx is built below
 
-        if load_state().get("bg_consciousness_enabled"):
+        # A boot grant needs a KNOWN True and no unconsumed Panic flag (#1307).
+        if control_is(load_state(), "bg_consciousness_enabled", True) and not (DATA_DIR / "state" / "panic_stop.flag").exists():
             _consciousness.start()
             log.info("Background consciousness auto-restored from saved state.")
 
@@ -1078,10 +1057,9 @@ def _perform_supervisor_restart(
     )
     if not ok:
         try:
-            from supervisor.evolution_lifecycle import pause_evolution_campaign
+            from supervisor.evolution_lifecycle import disable_evolution_projection, pause_evolution_campaign
 
-            st["evolution_mode_enabled"] = False
-            ctx.save_state(st)
+            disable_evolution_projection()
             pause_evolution_campaign(f"agent restart blocked to protect local changes: {msg}")
         except Exception:
             log.debug("Failed to pause evolution after blocked agent restart", exc_info=True)
@@ -1116,9 +1094,10 @@ def _perform_supervisor_restart(
         preserve_running_task_ids=planned_handoffs,
         **restart_kill_kwargs,
     )
-    st2 = ctx.load_state()
-    st2["session_id"] = uuid.uuid4().hex
-    ctx.save_state(st2)
+    try:  # a field update: a stale snapshot never erases a control written meanwhile (#1307)
+        ctx.update_state(lambda live: live.__setitem__("session_id", uuid.uuid4().hex))
+    except Exception:
+        log.warning("Restart session id not rotated: runtime state unavailable", exc_info=True)
     ctx.persist_queue_snapshot(reason="pre_restart_exit")
     _request_restart_exit()
 

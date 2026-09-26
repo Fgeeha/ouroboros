@@ -771,6 +771,14 @@ def _hide_bundled_skills(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_evolution_stop_latch(monkeypatch):
+    """A received evolution Stop is a process-lifetime latch (#1307); no test inherits one."""
+    from supervisor import evolution_lifecycle
+
+    monkeypatch.setitem(evolution_lifecycle._STOP_LATCH, "stopped", False)
+
+
+@pytest.fixture(autouse=True)
 def _isolate_workspace_executor_globals():
     """Isolate process/service registry module-globals between tests (parallel-safety).
 

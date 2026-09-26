@@ -324,6 +324,8 @@ Historical helper observations use `state/subagent_last_delegation.json`, owned 
 | top-level task selecting an exact skill payload (`root="skill_payload"`) | captured `full` or `workspace_write` | `agent` | `live` | `true` |
 | anything else, including a fail-closed subagent or an invocation lowered to readonly | `readonly` | `ask` | envelope (default) | not sent |
 
+`root="active_workspace"` is the selector's default and is dropped as omission before the configured-session check and the binder; only a complete `skill_payload`+`bucket`+`skill_name` selector binds, an incomplete one earns `payload_selector_incomplete`, an unresolvable one a typed `payload_selector_unresolved` no-run with one `START_BLOCKED` row.
+
 WHERE a mutating run's changes are destined is the second, separate record — the host-derived **mutation authority** (`tools/delegate_integration._mutation_authority` / `_payload_mutation_authority`, re-exported by `tools/delegate`), never model-supplied:
 
 | source | `target_root` derivation | `capture_mode` |

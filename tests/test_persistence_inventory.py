@@ -584,7 +584,8 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # 296 -> 300 (TZ-1 child-drive custody): ``task_results/<id>.custody.lock`` (the per-task
 # custody lock) and the settlement's ``state/custody_staging`` / ``state/custody_trash``
 # entries; one PERSISTENCE.md row covers all three.
-EXPECTED_SCAN_PATHS = 300
+# 300 -> 301: ``state/state.initialized.json`` (the one state-initialization witness).
+EXPECTED_SCAN_PATHS = 301
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts

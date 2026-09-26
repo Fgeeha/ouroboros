@@ -909,11 +909,17 @@ class Memory:
         section discloses it; ``read_file`` on the log pages the rest).
         """
         from ouroboros.jsonl_tail import read_rotated_jsonl_entries
+        from ouroboros.tool_call_log import counts_as_call
 
         wanted = str(task_id or "").strip()
 
-        def counts(entry: Dict[str, Any]) -> bool:
+        def matches(entry: Dict[str, Any]) -> bool:
             return not wanted or str(entry.get("task_id", "")).strip() == wanted
+
+        def counts(entry: Dict[str, Any]) -> bool:
+            # tools.jsonl quota is LOGICAL calls (#1316): a start or a legacy row opens
+            # one; its later rows ride along uncounted instead of a guessed multiplier.
+            return matches(entry) and (log_name != "tools.jsonl" or counts_as_call(entry))
 
         stem = log_name[:-len(".jsonl")] if log_name.endswith(".jsonl") else log_name
         coverage: Dict[str, Any] = {"task_id": wanted, "source": f"logs/{log_name}"}
@@ -925,7 +931,15 @@ class Memory:
         except Exception:
             log.warning("Failed to read recent %s rows", log_name, exc_info=True)
             return [], {**coverage, "shown": 0, "matched": 0, "quota_met": False, "gaps": ["read_failed"]}
-        shown = [row for row in rows if counts(row)][-max(1, int(want)):]
+        shown: List[Dict[str, Any]] = []
+        opened = 0
+        for row in reversed(rows):  # newest first, until `want` calls have opened
+            if opened >= max(1, int(want)):
+                break
+            if matches(row):
+                shown.append(row)
+                opened += counts(row)
+        shown.reverse()
         coverage.update({"shown": len(shown), "quota_met": int(coverage.get("matched") or 0) >= int(want)})
         return shown, coverage
 
@@ -1079,12 +1093,17 @@ class Memory:
         )
 
     def summarize_tools(self, entries: List[Dict[str, Any]]) -> str:
+        """One line per LOGICAL call (#1316): a start with no later row is an
+        unknown outcome, a caller whose wait ended is not a failed handler."""
+        from ouroboros.tool_call_log import logical_calls
+
         if not entries:
             return ""
         lines = []
-        for e in entries[-10:]:
-            tool = e.get("tool") or e.get("tool_name") or "?"
-            args = e.get("args", {})
+        for call in logical_calls(entries)[-10:]:
+            e = call.get("settled") or call.get("wait_ended") or call.get("started") or {}
+            tool = call.get("tool") or e.get("tool_name") or "?"
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
             hints = []
             for key in ("path", "dir", "commit_message", "query"):
                 if key in args:
@@ -1092,8 +1111,13 @@ class Memory:
             if "cmd" in args:
                 hints.append(f"cmd={short(str(args['cmd']), 80)}")
             hint_str = ", ".join(hints) if hints else ""
-            status = "✓" if ("result_preview" in e and not str(e.get("result_preview", "")).lstrip().startswith("⚠️")) else "·"
-            lines.append(f"{status} {tool} {hint_str}".strip())
+            settled = call.get("settled")
+            status = ("?" if settled is None and "wait_ended" not in call else
+                      "✓" if settled and "result_preview" in settled
+                      and not str(settled.get("result_preview", "")).lstrip().startswith("⚠️") else "·")
+            note = (" (started; no outcome recorded)" if status == "?" else
+                    " (wait ended; no result recorded)" if settled is None else "")
+            lines.append(f"{status} {tool} {hint_str}".strip() + note)
 
         _REVIEW_MARKERS = ("REVIEW_BLOCKED", "TESTS_FAILED", "REVIEW_MAX_ITERATIONS", "COMMIT_BLOCKED")
         seen_failures: set = set()

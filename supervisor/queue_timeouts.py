@@ -414,7 +414,7 @@ def _enforce_task_timeouts_locked(
         )
         # A stopped evolution campaign breaks the auto-retry chain. `st` is the live state
         # loaded this tick, so this reflects the current owner decision.
-        if will_retry and task_type == "evolution" and not bool(st.get("evolution_mode_enabled")):
+        if will_retry and task_type == "evolution" and not _evolution_known_enabled(st):
             will_retry = False
         # An unreadable projection/lineage cannot authorize a new dispatch.
         # Readable active intents already yielded the timeout rail above.
@@ -449,3 +449,10 @@ def _enforce_task_timeouts_locked(
             "incident_toast_once": f"{task_id}:{terminal_reason}:{int(finalization_requested_at or now)}",
         })
         _queue().persist_queue_snapshot(reason="task_timeout_reap_queued")
+
+
+def _evolution_known_enabled(st: Dict[str, Any]) -> bool:
+    """A retry is new evolution work: it needs a KNOWN enabled control (#1307)."""
+    from supervisor.state import control_is
+
+    return control_is(st, "evolution_mode_enabled", True)

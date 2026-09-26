@@ -388,7 +388,7 @@ def test_owner_restart_copy_is_explicit_about_stopped_task(tmp_path, monkeypatch
     assert "stable_skip_flag.unlink(missing_ok=True)" in source
     # Checkout gate first (a refusal leaves the server intact), then the durable
     # no-resume intent, then the owned-work stop, then the owner's stop notice.
-    owner_restart = _read("server.py").split('elif lowered.startswith("/restart"):', 1)[1].split(
+    owner_restart = _read("server.py").split('lowered.startswith("/restart"):', 1)[1].split(
         'elif lowered == "/review"', 1
     )[0]
     assert "_perform_owner_restart(ctx, reply)" in owner_restart

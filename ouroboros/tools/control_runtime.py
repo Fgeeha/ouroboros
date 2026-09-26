@@ -367,7 +367,7 @@ def _set_next_wakeup(ctx: ToolContext, seconds: int) -> str:
     (``consciousness.py``) reads the value when the wake-up ends.
     """
     from ouroboros.config import get_bg_wakeup_max_sec, get_bg_wakeup_min_sec
-    from supervisor.state import update_state
+    from supervisor.state import StateUnavailable, update_state
 
     try:
         requested = int(seconds)
@@ -375,7 +375,11 @@ def _set_next_wakeup(ctx: ToolContext, seconds: int) -> str:
         return f"⚠️ TOOL_ARG_ERROR (set_next_wakeup): invalid seconds={seconds!r}"
     low, high = get_bg_wakeup_min_sec(), get_bg_wakeup_max_sec()
     interval = max(low, min(high, requested))
-    state = update_state(lambda st: st.__setitem__("consciousness_next_interval_sec", interval))
+    try:
+        state = update_state(lambda st: st.__setitem__("consciousness_next_interval_sec", interval))
+    except StateUnavailable as exc:
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=(
+            f"⚠️ CAPABILITY_UNAVAILABLE: the interval was not stored: runtime state is unavailable ({exc.reason}).")))
     clamp_note = f" (requested {requested} s, clamped into {low}-{high} s)" if interval != requested else ""
     if not bool(state.get("bg_consciousness_enabled")):
         return (f"OK: consciousness is off; the next wake-up interval of {interval} s{clamp_note} "

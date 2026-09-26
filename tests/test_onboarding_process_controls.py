@@ -148,7 +148,9 @@ def test_onboarding_panic_runs_real_panic_marker_and_exit_99(startup_without_con
     assert not (obj.data / 'settings.json').exists()
     from supervisor import state
     assert state.DRIVE_ROOT == obj.data
-    assert state.load_state()['evolution_owner_stopped'] is True
+    # Before onboarding there is no state to write: Panic never mints one (#1307). The flag is
+    # the durable gate; the first real boot writes the disabled controls, then consumes it.
+    assert state.read_state().quality == "uninitialized"
 
 
 @pytest.mark.parametrize('command', ['ordinary chat', '/review', '/evolve', '/panic later', '/restart later'])

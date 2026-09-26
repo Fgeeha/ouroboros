@@ -40,7 +40,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # settlement's staging/trash; the artifact-route sentence was replaced, not appended to.
     # 166450 -> 166700 (steer sprint 2026-09-26, measured 166595 on the merged tree: delegate_message,
     # truthful waiting A-E, low-water reclaim; see the sprint ledger).
-    "docs/architecture/01-high-level-architecture.md": 166700,
+    # 166700 -> 166800 (Batch 1, measured 166799): three new owners on the module map
+    # (state_initialization.py, schedule_occurrence.py, tool_call_log.py), each folded
+    # into its sibling's existing row instead of a new row.
+    "docs/architecture/01-high-level-architecture.md": 166800,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -121,7 +124,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # (own latch, the attempt-basis fence, the drive-custody pass: child-ref retry then bounded
     # drive settlements under the queue interlock, generation re-asked per item and commit) and
     # the watchdog watches startup with the stall stack; the sentences they change were replaced.
-    "docs/architecture/05-supervisor-loop.md": 34100,
+    # 34100 -> 35500 (Batch 1, measured 35462): two new nodes of this flow — explicit state
+    # initialization at boot (witness, unavailable-but-serving, writer-owned recovery) and the
+    # schedule occurrence protocol (claim, typed wait, receipt, dispatch barrier); the budget-
+    # projection sentence they change was replaced by a shorter one.
+    "docs/architecture/05-supervisor-loop.md": 35500,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
@@ -212,7 +219,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # clause gains the queued receipt and the terminal unread-mail custody.
     # 317750 -> 323400 (steer sprint 2026-09-26, measured 323255 on the merged tree: delegate_message,
     # truthful waiting A-E, low-water reclaim; see the sprint ledger).
-    "docs/architecture/06-agent-core.md": 323400,
+    # 323400 -> 323650 (Batch 1, measured 323607): the delegate_start selector contract (neutral
+    # default = omission, complete-selector binding, typed unresolved refusal) had no sentence to replace.
+    "docs/architecture/06-agent-core.md": 323650,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route
@@ -242,7 +251,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 12405 -> 14400 (issue #1142): the ordinary-close paragraph gains the mechanism the chapter had
     # no text for — graceful stop signals the server PID only, the server half (stop event at the
     # signal, bounded uvicorn drain) is self-sufficient against an old group-SIGTERM launcher.
-    "docs/architecture/09-shutdown-and-process-cleanup.md": 14400,
+    # 14400 -> 14750 (Batch 1, measured 14725): the Panic sentence was rewritten for its new
+    # order (physical stops first, bounded persistence, known-binding external ingress, boot consumption).
+    "docs/architecture/09-shutdown-and-process-cleanup.md": 14750,
     # 17655 -> 20400: the supervisor-reliability sprint adds eight invariants the chapter lacked
     # (typed permanent engine refusal, interrupted parent, stalled-loop facts, source-ack
     # pre-check, host-owed round, reviewer tool bound, off-thread custody, fence transport) —

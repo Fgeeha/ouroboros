@@ -402,9 +402,10 @@ def _mine_metrics(data_root: pathlib.Path, task_id: str) -> dict:
     seen_tool_rows: set[tuple] = set()
     for tools_file in sorted(set(data_root.rglob("tools.jsonl"))):
         for row in _iter_jsonl(tools_file):
+            # One count per call: its settlement row (start / wait-ended rows are not results).
             if row.get("type") != "tool_call" or not _matches_task(row, task_id):
                 continue
-            key = (row.get("ts"), row.get("tool"), row.get("tool_call_id"))
+            key = row.get("invocation_id") or (row.get("ts"), row.get("tool"), row.get("tool_call_id"))
             if key in seen_tool_rows:
                 continue  # the same row is mirrored into the budget drive root
             seen_tool_rows.add(key)

@@ -1325,7 +1325,12 @@ def budget_line(force: bool = False) -> str:
             live["budget_messages_since_report"] = 0
             report_box["emit"] = True
 
-        st = update_state(_tick_counter)
+        from supervisor.state import StateUnavailable
+
+        try:
+            st = update_state(_tick_counter)
+        except StateUnavailable:  # a budget report is bookkeeping; the message itself proceeds
+            return ""
         if not report_box["emit"]:
             return ""
         display_state = dict(st)

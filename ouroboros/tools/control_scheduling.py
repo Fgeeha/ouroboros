@@ -58,6 +58,7 @@ from ouroboros.tools.control_subagent_spec import (
     _validated_schedule_fields,
     schedule_subagent_param_names,
 )
+from ouroboros.tool_access import folderless_scratch_dir
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for, system_repo_dir_for
 from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
@@ -610,10 +611,10 @@ def _inherited_workspace_from_active_repo(
     """Inherit an external active workspace for readonly children when metadata is absent."""
     if workspace_root:
         return workspace_root, workspace_mode
-    try:
+    try:  # a folderless parent's scratch is a default cwd, never an inherited workspace (#1315)
         active = active_repo_dir_for(ctx).resolve(strict=False)
         system = system_repo_dir_for(ctx).resolve(strict=False)
-        if active != system:
+        if active != system and folderless_scratch_dir(ctx) is None:
             return str(active), workspace_mode or "external"
     except Exception:
         pass

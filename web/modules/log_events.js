@@ -856,8 +856,8 @@ export function summarizeLogEvent(evt) {
         });
     }
 
-    if (t === 'tool_call_started') {
-        return view('start', `Running ${evt.tool || 'tool'}`, {
+    if (t === 'tool_call_started') {  // processing began; a replayed start alone is no liveness claim
+        return view('start', `Started ${evt.tool || 'tool'}`, {
             body: compactJson(evt.args, 260),
             meta: taskMeta(evt.timeout_sec ? `timeout ${evt.timeout_sec}s` : ''),
         });

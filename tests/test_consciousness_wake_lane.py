@@ -304,6 +304,7 @@ def test_set_next_wakeup_clamps_persists_and_speaks_honestly(tmp_path, monkeypat
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "locks").mkdir(parents=True)
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     assert control._set_next_wakeup is control_runtime._set_next_wakeup
     ctx = SimpleNamespace(task_id="w1")
     with mock.patch.dict(os.environ, {"OUROBOROS_BG_WAKEUP_MIN": "120", "OUROBOROS_BG_WAKEUP_MAX": "600"}):

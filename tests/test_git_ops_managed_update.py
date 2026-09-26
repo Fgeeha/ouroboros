@@ -390,6 +390,7 @@ def test_checkout_and_reset_keeps_bundled_sha_on_first_managed_bootstrap(monkeyp
 
     saved_state = {}
     monkeypatch.setattr(git_ops, "save_state", lambda state: saved_state.update(state))
+    monkeypatch.setattr(git_ops, "update_state", lambda mutator, **_kw: mutator(saved_state) or saved_state)
 
     def fake_git_capture(cmd):
         if cmd == ["git", "rev-parse", "HEAD"]:

@@ -121,7 +121,7 @@ ADMISSION_RESERVATIONS: Dict[str, str] = {}
 # Guards PENDING/RUNNING mutations across main loop, direct chat, watchdog.
 _queue_lock = threading.RLock()
 from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
-    coerce_queue_order, prefer_terminalization_retry_rows, record_scheduled_admission,
+    coerce_queue_order, prefer_terminalization_retry_rows,
     reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission,
     restore_terminalization_retry, restore_terminalization_retry_rows,
     reserve_task_admission,
@@ -178,17 +178,26 @@ def drain_all_pending(*, persist: bool = True) -> list:
 
 def enqueue_task(
     task: Dict[str, Any], front: bool = False, *, restoring_snapshot: bool = False,
+    consciousness_window: Optional[Dict[str, Any]] = None, continuation: bool = False,
 ) -> Dict[str, Any]:
     """Add task to PENDING (thread-safe: HTTP handlers enqueue concurrently
-    with the supervisor main loop, so the mutation must hold the queue lock)."""
+    with the supervisor main loop, so the mutation must hold the queue lock).
+
+    ``consciousness_window``: an allowance the caller already read OFF the queue lock
+    (the scheduler). ``continuation``: host-derived only (a follow-up row's own
+    ``continuation_of``) — a named continuation is not a spontaneous start, so it is
+    outside the consciousness concurrency cap; money (the allowance) still applies."""
     t = dict(task)
+    if not restoring_snapshot:
+        t.pop("_consciousness_continuation", None)  # never a caller-supplied marker
+        if continuation:
+            t["_consciousness_continuation"] = True
     attach_task_contract(apply_consciousness_authority(t))
     # The allowance read takes the cross-process ledger lock: read it BEFORE the queue
     # lock so a contended ledger never stalls every queue reader; only the live-root
     # count and the append must be one transaction with the lock (the window gates
     # starts — a window stale by milliseconds changes nothing).
-    consciousness_window = None
-    if not restoring_snapshot and _consciousness_root(t):
+    if consciousness_window is None and not restoring_snapshot and _consciousness_root(t):
         from ouroboros.consciousness_allowance import allowance_window
 
         consciousness_window = allowance_window(DRIVE_ROOT)
@@ -316,6 +325,7 @@ def live_consciousness_root_count() -> int:
             isinstance(task, dict)
             and str(task.get("delegation_role") or "root") == "root"
             and is_consciousness_origin(task.get("metadata"))
+            and not task.get("_consciousness_continuation")  # a named continuation is not spontaneous
         )
 
     live = sum(1 for task in PENDING if _counts(task))
@@ -352,7 +362,7 @@ def _consciousness_admission_block(task: Dict[str, Any], window: Optional[Dict[s
 
     max_tasks = get_consciousness_max_tasks()
     live = live_consciousness_root_count()
-    if live >= max_tasks:
+    if live >= max_tasks and not task.get("_consciousness_continuation"):
         return ("consciousness_task_limit", (
             f"{live} of {max_tasks} consciousness-started tasks already live"
             if max_tasks else "OUROBOROS_CONSCIOUSNESS_MAX_TASKS=0: consciousness never starts tasks"
@@ -530,7 +540,10 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
     nothing, so the paused-evolution disclosure still comes from this snapshot.
     """
     st = load_state()
-    enabled = bool(st.get("evolution_mode_enabled"))
+    from supervisor.state import control_value
+
+    enabled_known, enabled = control_value(st, "evolution_mode_enabled")
+    enabled = bool(enabled)
     owner_chat_id = int(st.get("owner_chat_id") or 0)
     consecutive_failures = int(st.get("evolution_consecutive_failures") or 0)
     try:
@@ -562,7 +575,10 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
         and (bool(active_tx.get("restart_required")) or not bool(active_tx.get("restart_verified")))
     )
 
-    if restart_blocked:
+    if not enabled_known:
+        status = "state_unknown"  # never read an unknown control as on or off (#1307)
+        detail = "Evolution control is unknown: runtime state is unavailable or recovering from a backup."
+    elif restart_blocked:
         status = "waiting_for_restart_verify"
         detail = "Waiting for restart verification before the next absorbed evolution cycle."
     elif isinstance(running_task, dict):
@@ -603,7 +619,7 @@ def get_evolution_status_snapshot(*, budget_projection: Optional[Dict[str, Any]]
         )
 
     return {
-        "enabled": enabled,
+        "enabled": enabled if enabled_known else None,
         "status": status,
         "detail": detail,
         "campaign": campaign,

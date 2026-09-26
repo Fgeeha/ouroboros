@@ -153,6 +153,11 @@ async def api_reset(request: Request) -> JSONResponse:
         if settings_file.exists():
             settings_file.unlink()
             deleted.append("settings.json")
+        # The owner's explicit fresh start (#1307): boot initializes a new state from
+        # this pending witness instead of reading the wiped root as a lost one.
+        from supervisor.state_initialization import mark_pending
+
+        mark_pending(data_dir, origin="owner_reset")
         _request_restart(request)
         return JSONResponse({"status": "ok", "deleted": deleted, "restarting": True})
     except Exception as exc:

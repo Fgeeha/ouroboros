@@ -21,6 +21,7 @@ def _assignment_case(tmp_path, monkeypatch, task_id="assign-evo"):
     from supervisor import evolution_lifecycle, queue, state, workers
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 0.0)
     pending, running = [], {}
     monkeypatch.setattr(workers, "PENDING", pending)

@@ -884,14 +884,6 @@ def test_double_takeover_loser_restores_the_reaping_marker_as_found(qenv, monkey
         "the loser must restore the marker as found — the winner is mid-kill behind it"
     )
 
-def test_task_lifecycle_keeps_scheduled_admission_import_surface():
-    from supervisor import task_admission, task_lifecycle
-
-    assert (
-        task_lifecycle.record_scheduled_admission
-        is task_admission.record_scheduled_admission
-    )
-
 def test_task_lifecycle_keeps_capture_miss_calling_convention(monkeypatch):
     from supervisor import cancel_publication, task_lifecycle
 

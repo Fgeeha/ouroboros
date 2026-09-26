@@ -82,7 +82,9 @@ class BackgroundConsciousness:
         self._routing_metadata_fn = routing_metadata_fn
         self._booted_at = time.time() if now is None else float(now)
         state = self._read_state()
-        self._enabled = bool(state.get("bg_consciousness_enabled"))
+        from supervisor.state import control_is
+
+        self._enabled = control_is(state, "bg_consciousness_enabled", True)  # unknown is not on (#1307)
         try:
             persisted = float(state.get(NEXT_WAKE_STATE_KEY) or 0.0)
         except (TypeError, ValueError):

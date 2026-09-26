@@ -322,6 +322,7 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
     from ouroboros.task_results import load_task_result
     from supervisor.budget_resume import revoke_exact_budget_resume
     from supervisor.events_budget import HOLD_RESTORE_REFUSED_PREFIX, hold_restored_budget_pause
+    from supervisor.schedule_occurrence import restore_allowed
 
     for task in snapshot_pending:
         if isinstance(task.get("_budget_pause_resume"), dict):
@@ -362,6 +363,8 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
         elif task.get("_owner_wait_resume"):
             if restore_owner_wait_allowed(_queue().DRIVE_ROOT, task):
                 retained.append(task)
+        elif not restore_allowed(task):
+            continue  # a schedule-born row that may have been dispatched, or is unprovable, is never replayed
         elif not stale:
             retained.append(task)
     if consumed:
