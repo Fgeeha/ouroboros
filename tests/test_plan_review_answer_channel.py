@@ -203,6 +203,23 @@ def test_invalid_envelope_beside_answers_records_nothing(harness):  # noqa: F811
     assert load_plan_review_state(harness.drive, ctx.task_id) == before
 
 
+def test_a_store_failure_in_the_validate_first_prepare_is_typed_and_records_nothing(harness, monkeypatch):  # noqa: F811
+    harness.install({"s1": json.dumps([_question("q1")]), "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    before = load_plan_review_state(harness.drive, ctx.task_id)
+    fp = before["waves"][-1]["request_fingerprint"]
+
+    def broken(*_a, **_k):
+        raise OSError("artifact store unreadable")
+
+    monkeypatch.setattr(pr, "_prepare_plan_inputs", broken)
+    refused = pr._handle_plan_task(ctx, goal="Ship the deck", plan="Changed prose.", spec=DECK_SPEC,
+                                   review_disposition={"review_fingerprint": fp, "items": [_item("s1:q1")]})
+    assert "PLAN_REVIEW_STATE_INVALID" in refused and "artifact store unreadable" in refused
+    assert load_plan_review_state(harness.drive, ctx.task_id) == before
+
+
 def test_changed_envelope_with_items_records_the_answers_then_reviews_every_slot(harness, monkeypatch):  # noqa: F811
     """A CHANGED envelope with items is an ordinary full wave: the answers are stored on the
     answered wave first, every slot reviews the new envelope, and the packet's PRIOR CYCLES
@@ -508,6 +525,7 @@ def test_addressed_wave_collects_after_the_barrier(harness, monkeypatch):  # noq
     # A5: custody pending + empty items + envelope collects, then follows the ordinary rule.
     settled = _call(ctx, review_disposition={"review_fingerprint": fp, "items": []})
     assert _control(settled) == {"outcome": "GREEN", "closed": True}
+    assert "answers_not_addressed" not in settled, "the in-flight collection is decided before the addressed rule: no note"
     assert calls2[1]["slots"] == ["s1"] and calls2[1]["reconcile_only"] is True and len(calls2) == 2
     state = _state(harness)
     assert state["cycles_paid"] == 2 and state["waves"][-1]["closed"]

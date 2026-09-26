@@ -962,7 +962,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         ctx.emit_progress_fn(_plan_wave_progress_line(
             aggregate, agg["counts"], cycles_paid=paid_now, cap=cap, wave=wave))
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=paid_now, enforcement=enforcement, reminder=reminder,
-                                  notes=_addressed_notes(unaddressed) if not named else None)
+                                  notes=_addressed_notes(unaddressed) if not named and not resume_in_flight else None)
 
 def _resolve_previous(state_root: pathlib.Path, task_id: str, state: dict, *, resume: Optional[dict],
                       override: Optional[dict]) -> Any:
