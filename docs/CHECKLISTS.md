@@ -151,7 +151,7 @@ or Intent/Scope checklists are.
 | 4 | Shared log / memory / replay format changed? | Grep every reader and writer first. JSONL logs (`events.jsonl`, `task_reflections.jsonl`, replay indexes), durable state files (`advisory_review.json`, `review_continuations/*.json`), and canonical-vs-derived memory pairs (patterns-register journal / `patterns.md`, improvement-backlog items) must stay coherent across every consumer. |
 | 5 | New validation guard, input filter, or edge-case check? | Before the first commit attempt, name three concrete ways it could break: wrong bounds, legitimate inputs it silently blocks, platform-specific edge cases. If you cannot name three, think longer. One honest minute here is cheaper than one reviewer round. |
 | 6 | New tool added? | `get_tools()` exports it, its schema description says WHEN to choose it (each profile receives its visible schema set every round, so the schema is the SSOT of the per-tool contract; `prompts/SYSTEM.md` is the cross-tool selection policy and mentions a tool only when the change alters that policy, never as a catalog entry; mechanism documentation lives in ARCHITECTURE/DEVELOPMENT), the handler signature matches the declared schema, and (if it mutates repo state) it is routed through the reviewed commit path rather than ad-hoc `run_command`. Also add an explicit entry in `ouroboros/safety.py::TOOL_POLICY` (`POLICY_SKIP` for trusted built-ins, `POLICY_CHECK` for opaque or outward-facing ones) — the `test_tool_policy_covers_all_builtin_tools` invariant will fail otherwise, and without an entry the tool falls through to `DEFAULT_POLICY = check` and pays a light-model LLM call per invocation. |
-| 7 | Tests green before first `commit_reviewed`? | Run `pytest -x` on the narrowest relevant target(s) you can name before the first `preflight_review` / `commit_reviewed` attempt. Size gates no longer block locally: they live in the official-CI-only `size_ratchet` pytest lane (manifest exactness plus the pairwise base-vs-tip shrink-only transition), and local surfaces (`check_worktree_readiness`, `codebase_health`) surface the same `validate_size_ratchet` findings as "official CI will enforce" warnings. When a size warning appears — or a new `.py` file lands under `ouroboros/` or `supervisor/` — run `pytest tests/ -m size_ratchet` and `scripts/regenerate_size_ratchet.py` locally to preview and fix what official CI would reject. A red test suite before the first commit attempt has caused repeated $2-5 blocked-review cycles. |
+| 7 | Tests green before first `commit_reviewed`? | Run `pytest -x` on the narrowest relevant target(s) you can name before the first `preflight_review` / `commit_reviewed` attempt. Size gates no longer block locally: they live in the official-CI-only `size_ratchet` pytest lane (manifest exactness plus the pairwise base-vs-tip shrink-only transition), and local surfaces (`check_worktree_readiness`, `codebase_health`) surface the same `validate_size_ratchet` findings as "official CI will enforce" warnings. When a size warning appears — or a new `.py` file lands under `ouroboros/` or `supervisor/` — run `pytest tests/ -m size_ratchet` and `scripts/regenerate_size_ratchet.py` locally to preview and fix what official CI would reject. |
 | 8 | Adding a `README.md` version row? | BIBLE.md P9 hard cap: ≤ 2 major, ≤ 5 minor, ≤ 5 patch visible entries. Categories are mutually exclusive: major = `X.0.0` (minor=0, patch=0); minor = `X.Y.0` (patch=0, Y≠0); patch = all other `X.Y.Z` (Z≠0). Count existing rows in the category you are adding to. Easy check: `run_command(["python", "-c", "import sys; from ouroboros.tools.release_sync import check_history_limit; warns=check_history_limit(open('README.md').read()); print(warns or 'OK')"])` — if it prints warnings, trim the oldest row in the over-limit category **in the same edit** before committing. |
 | 9 | Changing any of `build.sh`, `build_linux.sh`, `build_windows.ps1`, `Dockerfile`, or `ouroboros/tools/browser.py`? | Cross-surface doc sync is mandatory. Check ALL of: `README.md` Install section (Linux native-lib caveat), `README.md` Build section (per-platform instructions), `docs/ARCHITECTURE.md` browser tools paragraph, WebKit/mobile verification notes, and inline comments in the touched build script. Any one of these being stale has blocked review twice. Verify before staging. |
 | 10 | Changing `ouroboros/tools/commit_gate.py`? | Coupled surfaces that MUST be updated atomically in the same commit: (a) `claude_advisory_review.py::get_tools()` tool description for `preflight_review` and `review_status`; (b) `claude_advisory_review.py::_next_step_guidance()` strings; (c) `docs/DEVELOPMENT.md` Review & Commit Protocol section; (d) the `prompts/SYSTEM.md` Self-Modification section IF the commit-gate rule it states changed. Missing any one has blocked review. |
@@ -168,18 +168,29 @@ Rule: read before write. Never reconstruct `VERSION`, `pyproject.toml`
 `version`, or the README badge from memory — one stale reconstruction creates
 a `self_consistency` FAIL that an entire advisory cycle is then spent on.
 
-**After a blocked reviewed commit (`commit_reviewed`) — mandatory regrouping before the next attempt:**
-When a reviewed commit returns critical findings, the reflex is to patch the single
-flagged finding and retry. That pattern reliably produces 5-10 blocked rounds.
-The correct procedure before **every** retry:
-1. List all open obligations and commit-readiness debt (`review_status` tool or the Review Continuity context section).
-2. Group them by root cause — one underlying problem often generates 2-4 separately-named obligations from reviewer rephrasing.
-3. Write a short plan in a progress message: one paragraph naming each root-cause group and the single code/doc change that resolves it.
-4. Only then open any file and edit.
-
-This step takes 2-3 minutes and has saved $20-50 in blocked-review cycles in practice.
-The rule is stated where the block message is built (`review.py::_build_critical_block_message`),
-but without it appearing here as a procedural step it stays theoretical rather than reflexive.
+**Before retrying after review findings (`commit_reviewed`, `skill_review`):**
+The recorded review state — the verdict when one was reached and the individual
+findings, including the partial findings of a pending review; for commits also
+the open obligations and commit-readiness debt shown by `review_status` and the
+Review Continuity context section — stays recorded until a later review or
+successful commit resolves it; the author's response rewrites neither it nor the
+selected enforcement. Before the next attempt the author owes an outcome, not a
+procedure: consider the open findings together against the evidence rather than
+patching one visible symptom, repair what the evidence supports, rebut with
+reasons what it does not (`review_rebuttal`), and keep anything unresolved
+visible. How to inspect, group, order and explain that work, and whether to seek
+more feedback first, is the author's judgment for the case (BIBLE P13). Whether
+the next attempt is replayed or refused for free, rejoins unresolved review
+work, or dispatches a paid review is decided by the gate's recorded replay
+eligibility, custody, budget and configured cycle limit (`docs/DEVELOPMENT.md`
+Review & Commit Protocol), not by this checklist: an eligible verdict on
+unchanged material under the same review contract is not re-reviewed without a
+genuinely new rebuttal, while an infrastructure outcome such as a missed
+reviewer quorum neither replays nor lapses a verdict. If attempts stop
+converging, reconsider the approach instead of repeating it. The shared retry
+note (`review_prompt_text.py::build_self_verification_template`, in the commit
+block message and the skill review block) and the `review_status` `next_step`
+state this same duty.
 
 ---
 
