@@ -862,6 +862,7 @@ def test_the_fence_is_the_same_on_either_side_of_the_reap(roots):
     import time
 
     from ouroboros import cancel_intents
+    from ouroboros.project_dialogue import _completion_verdict
     from supervisor import queue as queue_module, task_lifecycle, workers
     root, _ = roots
 
@@ -896,6 +897,9 @@ def test_the_fence_is_the_same_on_either_side_of_the_reap(roots):
             "outcome": outcome,
             "status": settled.get("status"),
             "result": settled.get("result"),
+            # The owner line the same stored origin speaks (#1317): one sentence,
+            # not the raw ``snapshot_restore · server_shutdown`` pair.
+            "verdict": _completion_verdict(settled, {}),
             "replay_notice": replay,
             "replay_intent": cancel_intents.active_intent(root, task_id),
             "replay_result": (load_task_result(root, task_id) or {}).get("result"),
@@ -914,6 +918,7 @@ def test_the_fence_is_the_same_on_either_side_of_the_reap(roots):
         "outcome": "cancelled",
         "status": "cancelled",
         "result": SERVER_STOPPED_CANCEL,
+        "verdict": "The server stopped while this task was still running.",
         "replay_notice": [],
         "replay_intent": None,
         "replay_result": SERVER_STOPPED_CANCEL,

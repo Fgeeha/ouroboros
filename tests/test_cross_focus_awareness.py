@@ -365,3 +365,173 @@ def test_replayed_older_queue_focus_never_replaces_a_newer_durable_focus(tmp_pat
     assert json.loads((tmp_path / "task_results" / "root.json").read_text())["focus"]["text"] == "newer"
     agent._persist_running_record({"id": "root", "description": "d", "focus": {**newer, "text": "newest", "authored_at": "2026-01-03T00:00:00+00:00"}})
     assert json.loads((tmp_path / "task_results" / "root.json").read_text())["focus"]["text"] == "newest"
+
+
+def _roster_rows(root):
+    from ouroboros.peer_roster import independent_roots
+    return {row["task_id"]: row for row in independent_roots(root)["roots"]}
+
+
+def test_published_focus_survives_a_lost_event_and_stays_dated_through_an_owner_wait(tmp_path, monkeypatch):
+    """The real update_focus write is the carrier: a queue event that never
+    arrived loses nothing, and a root parked on its owner keeps its dated focus,
+    its queue status and its task start while the wait is dated by itself."""
+    from ouroboros.owner_wait import set_owner_wait
+    from ouroboros.peer_roster import independent_roots, maybe_append_roster_note, render_roster_note
+    from ouroboros.tools.project_journal import _update_focus
+    from ouroboros.utils import append_jsonl
+
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path)
+    append_jsonl(tmp_path / "projects" / "alpha" / "journal.jsonl", {"kind": "note", "text": "migration seam"})
+    write_task_result(tmp_path, "root", STATUS_RUNNING, project_id="alpha", started_at="2026-09-26T10:00:00+00:00")
+
+    def lost(_event):
+        raise RuntimeError("queue full")
+
+    ctx = types.SimpleNamespace(
+        task_id="root", drive_root=tmp_path, project_id="alpha", is_direct_chat=False,
+        task_metadata={"root_task_id": "root", "budget_drive_root": str(tmp_path)},
+        event_queue=types.SimpleNamespace(put_nowait=lost),
+    )
+    stored_but_unannounced = _update_focus(ctx, "Waiting on the owner's migration choice",
+                                           {"reader": "journal_read", "project_id": "alpha"})
+    assert "FOCUS_PROJECTION_UNAVAILABLE" in stored_but_unannounced and "focus was stored" in stored_but_unannounced
+    # The queue row never learned the focus (the event was lost) -- the roster reads the durable record.
+    _queue_snapshot(tmp_path, [{"id": "root", "attempt": 1, "started_at": 1790416800.0,
+                                "task": {"id": "root", "title": "Migration", "project_id": "alpha", "_attempt": 1}}])
+    row = _roster_rows(tmp_path)["root"]
+    assert row["focus"]["text"] == "Waiting on the owner's migration choice" and "waiting" not in row
+    authored_at = row["focus"]["authored_at"]
+
+    set_owner_wait(tmp_path, "root", {"wait_id": "w1", "state": "waiting", "quiz_id": "q7", "reason": "owner",
+                                      "review_binding": "", "task_attempt": 1,
+                                      "started_at": 1790416800.0, "parked_at": "2026-09-26T11:30:00+00:00"})
+    row = _roster_rows(tmp_path)["root"]
+    assert row["status"] == "running"  # the queue fact is not rewritten by the wait
+    assert row["focus"]["authored_at"] == authored_at
+    assert row["waiting"] == [{"kind": "owner", "since": "2026-09-26T11:30:00+00:00", "quiz_id": "q7"}]
+    assert row["started_at"] == "2026-09-26T10:00:00+00:00" != row["waiting"][0]["since"]
+    note = render_roster_note(independent_roots(tmp_path))
+    assert "waiting (recorded; the queue status above is unchanged): owner answer (quiz_id=q7, since=2026-09-26T11:30:00+00:00)" in note
+    assert "started_at=2026-09-26T10:00:00+00:00" in note and 'Waiting on the owner' in note
+    # An unchanged roster adds no second note, even when the host projection's own ts moves.
+    observer = types.SimpleNamespace(task_id="observer", task_metadata={})
+    messages = []
+    assert maybe_append_roster_note(observer, messages, tmp_path) is True
+    _queue_snapshot(tmp_path, [{"id": "root", "attempt": 1, "started_at": 1790416800.0,
+                                "task": {"id": "root", "title": "Migration", "project_id": "alpha", "_attempt": 1}}])
+    assert maybe_append_roster_note(observer, messages, tmp_path) is False and len(messages) == 1
+    # A wait from an earlier attempt is not this attempt's wait.
+    _queue_snapshot(tmp_path, [{"id": "root", "attempt": 2, "started_at": 1790416800.0,
+                                "task": {"id": "root", "title": "Migration", "project_id": "alpha", "_attempt": 2}}])
+    assert "waiting" not in _roster_rows(tmp_path)["root"]
+    # Settled: no live focus and no live wait, whatever the lagging snapshot says.
+    _queue_snapshot(tmp_path, [{"id": "root", "attempt": 1, "started_at": 1790416800.0,
+                                "task": {"id": "root", "title": "Migration", "project_id": "alpha", "_attempt": 1}}])
+    write_task_result(tmp_path, "root", STATUS_COMPLETED, result="done")
+    settled = _roster_rows(tmp_path)["root"]
+    assert "focus" not in settled and "waiting" not in settled
+
+
+def test_budget_paused_root_keeps_dated_focus_and_a_legacy_wait_stays_undated(tmp_path):
+    """A pause parks the root back in PENDING with a stored ``scheduled`` status:
+    still this root's active work, so its focus stays; a wait recorded before
+    waits were dated says so instead of borrowing the task start."""
+    from ouroboros.focus import normalize_focus
+    from ouroboros.peer_roster import independent_roots, render_roster_note
+
+    focus = normalize_focus("Paused mid-migration", {"reader": "recent_tasks"}, task_id="paused",
+                            authored_at="2026-09-26T09:00:00+00:00")
+    write_task_result(tmp_path, "paused", STATUS_RUNNING, started_at="2026-09-26T07:00:00+00:00", focus=focus)
+    write_task_result(tmp_path, "paused", "scheduled", reason_code="budget_paused",
+                      budget_pause={"pause_id": "p1", "state": "paused", "rail": "graceful_ceiling",
+                                    "task_attempt": 1, "paused_at": 1790409600.0, "started_at": 1790406000.0})
+    write_task_result(tmp_path, "legacy", STATUS_RUNNING,
+                      owner_wait={"wait_id": "w0", "state": "waiting", "quiz_id": "q0", "task_attempt": 1,
+                                  "started_at": 1790406000.0})
+    atomic_write_json(tmp_path / "state" / "queue_snapshot.json", {
+        "ts": utc_now_iso(),
+        "running": [{"id": "legacy", "attempt": 1, "started_at": 1790406000.0, "task": {"id": "legacy", "title": "Old"}}],
+        "pending": [{"id": "paused", "attempt": 1, "task": {"id": "paused", "title": "Paused", "_attempt": 1,
+                                                             "_budget_pause": {"exact_continuation": True}}}],
+    })
+    rows = _roster_rows(tmp_path)
+    paused = rows["paused"]
+    assert paused["status"] == "pending" and paused["focus"]["text"] == "Paused mid-migration"
+    assert paused["waiting"] == [{"kind": "budget", "state": "paused", "rail": "graceful_ceiling",
+                                  "since": "2026-09-26T08:00:00+00:00"}]
+    assert paused["started_at"] == "2026-09-26T07:00:00+00:00"  # the task start, not the pause
+    legacy = rows["legacy"]
+    assert legacy["waiting"] == [{"kind": "owner", "since": None, "quiz_id": "q0"}]
+    note = render_roster_note(independent_roots(tmp_path))
+    assert "owner answer (quiz_id=q0, since=unknown)" in note
+    assert "budget pause (state=paused, rail=graceful_ceiling, since=2026-09-26T08:00:00+00:00)" in note
+
+
+def test_model_wait_is_dated_by_itself_and_a_foreign_focus_is_never_live(tmp_path):
+    from ouroboros.focus import normalize_focus
+
+    foreign = normalize_focus("Someone else's line", {"reader": "recent_tasks"}, task_id="other")
+    write_task_result(tmp_path, "quota", STATUS_RUNNING, focus=foreign, model_waits={
+        "m1": {"wait_id": "m1", "state": "waiting", "task_attempt": 1, "reason": "quota", "role": "main",
+               "started_at": "2026-09-26T12:00:00+00:00", "reset_at": "2026-09-26T13:00:00+00:00",
+               "revision": 4, "updated_at": "2026-09-26T12:05:00+00:00"},
+        "m0": {"wait_id": "m0", "state": "resolved", "task_attempt": 1, "reason": "quota", "role": "main",
+               "started_at": "2026-09-26T11:00:00+00:00"},
+    })
+    _queue_snapshot(tmp_path, [{"id": "quota", "attempt": 1, "task": {"id": "quota", "title": "Quota", "focus": foreign}}])
+    row = _roster_rows(tmp_path)["quota"]
+    assert "focus" not in row
+    assert row["waiting"] == [{"kind": "model", "since": "2026-09-26T12:00:00+00:00", "reason": "quota",
+                               "role": "main", "reset_at": "2026-09-26T13:00:00+00:00"}]
+
+
+def test_direct_fragment_carries_name_start_and_typed_origin_until_the_result_exists(tmp_path, monkeypatch):
+    """A direct turn's title is empty; its prepared name, start and origin are host
+    facts the live actor already holds. The durable result wins once it exists.
+    Origin is provenance, never authority: addressability is unchanged."""
+    from ouroboros.peer_roster import host_listed_independent_root, independent_roots, render_roster_note
+    from supervisor.direct_roots import direct_turn_facts
+
+    owner_turn = {"id": "direct1", "type": "task", "chat_id": 3, "project_id": "", "title": "",
+                  "suggested_name": "", "_started_at": 1790413200.0,
+                  "metadata": {"origin_message_ref": {"chat_id": 3, "client_message_id": "m1"}}}
+    wake = {"id": "wake1", "type": "task", "chat_id": 3, "title": "", "suggested_name": "Background check",
+            "_started_at": 0.0, "metadata": {"initiator": "consciousness"}}
+    assert direct_turn_facts(owner_turn) == {"started_at": "2026-09-26T09:00:00+00:00",
+                                             "origin": {"owner_ingress": True, "task_type": "task"}}
+    assert direct_turn_facts(wake) == {"suggested_name": "Background check",
+                                       "origin": {"owner_ingress": False, "initiator": "consciousness", "task_type": "task"}}
+    assert direct_turn_facts({"id": "bare"}) == {}
+    _queue_snapshot(tmp_path, [])
+    atomic_write_json(tmp_path / "state" / "direct_roots.json", {"ts": utc_now_iso(), "incomplete": False, "roots": [
+        {"task_id": "direct1", "title": "", "chat_id": 3, "project_id": "", **direct_turn_facts(owner_turn)},
+        {"task_id": "wake1", "title": "", "chat_id": 3, "project_id": "", **direct_turn_facts(wake)},
+    ]})
+    rows = _roster_rows(tmp_path)
+    assert rows["direct1"]["origin"]["owner_ingress"] is True and "suggested_name" not in rows["direct1"]
+    assert rows["wake1"]["origin"]["initiator"] == "consciousness" and "started_at" not in rows["wake1"]
+    # The namer's later durable name is read from the result.
+    write_task_result(tmp_path, "direct1", STATUS_RUNNING, _is_direct_chat=True, suggested_name="Fix the invoice export")
+    note = render_roster_note(independent_roots(tmp_path))
+    assert 'direct1 · suggested name "Fix the invoice export" · chat=3 · running · live direct conversation' in note
+    assert 'origin={"initiator":"consciousness","owner_ingress":false,"task_type":"task"}' in note
+    assert "never authority" in note and "its initiator may be the owner or consciousness" not in note
+    listed = host_listed_independent_root(tmp_path, "wake1")
+    assert listed is not None and listed["status"] == "running" and listed["direct_chat"] is True
+    # A malformed fragment origin is dropped, not echoed.
+    atomic_write_json(tmp_path / "state" / "direct_roots.json", {"ts": utc_now_iso(), "incomplete": False, "roots": [
+        {"task_id": "odd", "title": "T", "origin": {"initiator": {"nested": "x"}, "owner_ingress": "yes", "extra": "z"}},
+    ]})
+    assert "origin" not in _roster_rows(tmp_path)["odd"]
+
+
+def test_update_focus_affordance_states_audience_lifetime_and_optionality():
+    from ouroboros.tools.project_journal import get_tools
+
+    description = next(entry.schema for entry in get_tools() if entry.name == "update_focus")["description"]
+    for phrase in ("Optionally publish", "OTHER live roots", "unsettled (waits included)", "task-scoped",
+                   "not a project-level record", "journal/workpad writes do not publish", "nothing refreshes it",
+                   "never an owner directive"):
+        assert phrase in description
+    assert len(description) < 600, "an operational paragraph, not the roster's architecture"

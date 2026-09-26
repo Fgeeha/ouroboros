@@ -18,19 +18,31 @@ Main moves on — so they live together:
   delivery to the ordinary acceptance path with the collected verdicts in its
   dialogue history;
 * a panel that settles after its task ended is collected at $0, republished on
-  the task's own review projection with the host's own settlement note, and
-  announced once in the task's room as one row of that card's Reviews group
-  (``attach_late_acceptance_settlement``); no model turn starts (fork 2=A);
+  the task's own review projection with the host's own settlement note and a
+  neutral late-evidence fact (which version the reviewers read, what the host
+  proved it emitted, when it settled and the exact source), and announced once
+  in the task's room as one row of that card's Reviews group
+  (``attach_late_acceptance_settlement``). The fact is evidence for Ouroboros
+  to judge, never a host decision: no model turn starts here (fork 2=A). A
+  worker that no longer holds the trace falls back to the canonical published
+  source, and a controller that died is collected by the existing maintenance
+  pass through the same ``settle_acceptance_operation``;
 * a forced rail that ends the turn while the panel is still out collects it at
   $0 before recording anything, so the rail's "never reviewed" reason is never
   stamped over a panel that ran (``forced_rail_panel_verdict``).
 """
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
 import logging
 import pathlib
+import threading
 from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
+
+from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -360,8 +372,8 @@ def forced_rail_panel_verdict(tools_ctx: Any, llm_trace: Dict[str, Any], rail_re
             "reviewed_panel_id": str(run.get("panel_id") or "")}
 
 
-def _unsettled_head(run: Dict[str, Any]) -> str:
-    """The head of a panel that settled without a PASS or FAIL.
+def _unsettled_clause(run: Dict[str, Any]) -> str:
+    """The verdict clause of a panel that settled without a PASS or FAIL.
 
     It states what the host holds (no settled verdict), not what the panel did:
     DEGRADED can be a reviewer's own deliberate answer. A reviewer whose PHYSICAL
@@ -376,18 +388,193 @@ def _unsettled_head(run: Dict[str, Any]) -> str:
     tail = ("" if not unknown
             else " — 1 reviewer's outcome is still unknown" if unknown == 1
             else f" — {unknown} reviewers' outcomes are still unknown")
-    return "Reviewers later returned no settled verdict on this answer" + tail + "."
+    return "reviewers later returned no settled verdict" + tail + "."
 
 
-def _late_settlement_text(run: Dict[str, Any], wave: Dict[str, Any]) -> str:
-    """The owner row: which verdict, which revision, and the reviewers' own lines."""
+# The version the reviewers read comes FIRST, then what they said about it: a
+# categorical "this answer was rejected" followed by a qualifier misstates which
+# bytes were judged (owner, Batch 2 §4). The version is proven only by exact
+# emitted-byte receipts; everything else is "unknown".
+_VERSION_CLAUSES = {
+    "delivered": "On the delivered version of this answer",
+    "different": "On a version of this answer other than the one delivered",
+    "unknown": "On the reviewed version of this answer (whether it was the delivered one is unknown)",
+}
+
+# Late settlements this process could not publish: the operation's pointer then
+# closes as ``unpublished`` so the existing maintenance pass retries it.
+_LATE_UNPUBLISHED: set = set()
+_LATE_LOCK = threading.Lock()
+
+
+def late_publication_owed(task_id: str, retry_key: str) -> bool:
+    with _LATE_LOCK:
+        return (str(task_id), str(retry_key)) in _LATE_UNPUBLISHED
+
+
+def _late_settlement_text(run: Dict[str, Any], wave: Dict[str, Any],
+                          fact: Optional[Dict[str, Any]] = None) -> str:
+    """The owner row: which version, then the verdict, then the reviewers' own lines."""
     signal = str(run.get("aggregate_signal") or "").upper()
-    head = ({"PASS": "Reviewers later passed this answer.",
-             "FAIL": "Reviewers later rejected this answer."}.get(signal)
-            or _unsettled_head(run))
-    which = (" They reviewed the earlier version, which was rewritten before delivery."
-             if run.get("superseded_by_revision") else " They reviewed the answer that was delivered.")
-    return "\n".join([head + which, *_reviewer_lines(wave)])
+    verdict = ({"PASS": "reviewers later passed it.", "FAIL": "reviewers later rejected it."}.get(signal)
+               or _unsettled_clause(run))
+    version = str((fact or {}).get("reviewed_revision") or "unknown")
+    return "\n".join([f"{_VERSION_CLAUSES.get(version, _VERSION_CLAUSES['unknown'])}, {verdict}",
+                      *_reviewer_lines(wave)])
+
+
+def emitted_answer_fact(root: Any, task_id: str) -> Dict[str, Any]:
+    """What the host PROVED it emitted as this task's answer: send receipts only.
+
+    Exact text digest, routed chat and retained source, captured by the send
+    handler after a real send (``terminal_delivery.terminal_answer_receipts``).
+    An owed or unconfirmed send, a delivered id without a receipt, the task's
+    current result or an author-disposition hash is never byte proof.
+    """
+    from supervisor.terminal_delivery import terminal_answer_receipts
+
+    return terminal_answer_receipts(root, task_id)
+
+
+def _subject_digest(run: Dict[str, Any]) -> tuple:
+    subject = str((run.get("request") or {}).get("subject") or "")
+    return hashlib.sha256(subject.encode("utf-8")).hexdigest(), len(subject)
+
+
+def _reviewed_revision(run: Dict[str, Any], emitted: Optional[Dict[str, Any]]) -> str:
+    """``delivered``/``different`` only against exact emitted-byte receipts, else ``unknown``.
+
+    A supersession the trace recorded says a later candidate existed, not which
+    bytes went out; it stays its own fact and never picks the version.
+    """
+    receipts = [row for row in (emitted or {}).get("delivered") or [] if isinstance(row, dict)]
+    if not receipts:
+        return "unknown"
+    digest, _chars = _subject_digest(run)
+    return "delivered" if any(row.get("text_sha256") == digest for row in receipts) else "different"
+
+
+def late_evidence_fact(run: Dict[str, Any], emitted: Dict[str, Any], *, settled_at: str) -> Dict[str, Any]:
+    """Neutral late-review evidence: the exact subject read, what was emitted, and each reviewer's output."""
+    request = run.get("request") if isinstance(run.get("request"), dict) else {}
+    digest, chars = _subject_digest(run)
+    revision = _reviewed_revision(run, emitted)
+    return {
+        "settled_after_terminal": True, "settled_at": settled_at, "reviewed_revision": revision,
+        "reviewed_subject": {"retry_key": str(request.get("retry_key") or ""),
+                             "panel_id": str(run.get("panel_id") or ""),
+                             "binding_hash": str(run.get("binding_hash") or ""),
+                             "candidate_hash": str(run.get("candidate_hash") or ""),
+                             "subject_sha256": digest, "subject_chars": chars},
+        "reviewed_superseded": bool(run.get("superseded_by_revision")),
+        "emitted_answer": copy.deepcopy(emitted),
+        "reviewed_is_emitted": {"delivered": True, "different": False}.get(revision),
+        "reviewer_outputs": [
+            {"slot_id": str(actor.get("slot_id") or ""), "operation_id": str(actor.get("operation_id") or ""),
+             "operation_state": str(actor.get("operation_state") or ""),
+             "verdict": str(actor.get("semantic_verdict") or actor.get("signal") or "").upper(),
+             "response_ref": dict(actor.get("response_ref") or {})}
+            for actor in (run.get("actors") or []) if isinstance(actor, dict)],
+    }
+
+
+def late_acceptance_facts(result: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Every late acceptance fact of one task result, for a reader that wants the evidence.
+
+    Each row names its panel, when it settled, the exact applied source and the
+    neutral fact; nothing here ranks, summarizes or decides.
+    """
+    panels = ((result or {}).get("review_projection") or {}).get("panels") or []
+    return [{"task_id": str(result.get("task_id") or ""), "panel_id": str(panel.get("panel_id") or ""),
+             "settled_at": str(panel["late_settlement"].get("settled_at") or ""),
+             "aggregate_signal": str(panel.get("aggregate_signal") or ""),
+             "source_ref": panel.get("applied_source_ref"), "late_settlement": panel["late_settlement"]}
+            for panel in panels
+            if isinstance(panel, dict) and panel.get("surface") == "task_acceptance"
+            and isinstance(panel.get("late_settlement"), dict)]
+
+
+def canonical_acceptance_trace(root: Any, task_id: str, retry_key: str, *,
+                               result: Optional[Dict[str, Any]] = None,
+                               checkpoint: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:
+    """The wave's runs from the canonical PUBLISHED source when no live trace holds them.
+
+    Each published acceptance panel carries its full applied host record; the
+    one whose recorded operation matches this wave is loaded exactly. A panel
+    never published falls back to the operation's pre-dispatch checkpoint, but
+    never beside a published panel whose source cannot be read and that may be
+    this operation: that returns ``source_status: unreadable`` and no runs.
+    """
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.task_results import load_task_result
+
+    row = result if isinstance(result, dict) and result.get("review_projection") else (load_task_result(root, task_id) or {})
+    runs: List[Dict[str, Any]] = []
+    unreadable: List[Dict[str, Any]] = []
+    top = 0
+    for panel in ((row.get("review_projection") or {}).get("panels") or []):
+        ref = panel.get("applied_source_ref") if isinstance(panel, dict) else None
+        if not isinstance(panel, dict) or panel.get("surface") != "task_acceptance":
+            continue
+        top = max(top, int(panel.get("publication_revision") or 0))
+        try:
+            run = json.loads(read_actor_source_bytes(root, task_id, ref))
+        except (OSError, ValueError):
+            log.debug("published acceptance source unreadable for %s", task_id, exc_info=True)
+            unreadable.append(panel)
+            continue
+        if isinstance(run, dict) and (run.get("request") or {}).get("retry_key") == retry_key:
+            runs.append({**run, "applied_source_ref": ref, "applied_source_status": "available",
+                         "publication_revision": panel.get("publication_revision")})
+    if runs:
+        return {"review_runs": runs, "_acceptance_publication_revision": top}
+    fallback = None
+    if isinstance(checkpoint, dict):
+        from ouroboros.review_operation import run_from_checkpoint
+
+        try:
+            fallback = run_from_checkpoint(root, task_id, checkpoint, str(checkpoint.get("owner_id") or ""), row)
+        except (OSError, ValueError):
+            fallback = None
+    binding = str((fallback or {}).get("binding_hash") or "")
+    if any(str(panel.get("binding_hash") or "") in {"", binding} for panel in unreadable):
+        return {"review_runs": [], "source_status": "unreadable",
+                "unreadable_panels": [str(panel.get("panel_id") or "") for panel in unreadable]}
+    return {"review_runs": [fallback], "_acceptance_publication_revision": top} if fallback else None
+
+
+def _collected_wave(run: Dict[str, Any]) -> Dict[str, Any]:
+    """The reviewers' own lines for a wave whose release roster died with its worker."""
+    from ouroboros.review_custody import _settled_slot_verdict
+
+    slots, verdicts = {}, {}
+    for actor in run.get("actors") or []:
+        if not isinstance(actor, dict):
+            continue
+        slot_id = str(actor.get("slot_id") or "")
+        slots[slot_id] = "" if actor.get("operation_state") in {"pending_dispatch", "in_flight"} else str(actor.get("status") or "settled")
+        if slots[slot_id]:
+            verdicts[slot_id] = _settled_slot_verdict(SimpleNamespace(**{"raw_text": "", "error": "", **actor}))
+    return {"slots": slots, "verdicts": verdicts, "total": len(slots)}
+
+
+def _stored_late_settlement(outcome: Dict[str, Any], run: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The late settlement the canonical record holds for this run's panel, read back.
+
+    The first published settlement of a panel is the settlement (its bytes and
+    ``settled_at``); None when the write failed, the panel conflicted or it is
+    still pending in the stored record.
+    """
+    if outcome.get("status") != "published" or str(run.get("panel_id") or "") in outcome.get("rejected", []):
+        return None
+    from ouroboros.review_projection import _actor_pending
+
+    for panel in (outcome.get("projection") or {}).get("panels") or []:
+        if (isinstance(panel, dict) and panel.get("surface") == "task_acceptance"
+                and panel.get("panel_id") == run.get("panel_id") and isinstance(panel.get("late_settlement"), dict)
+                and not any(_actor_pending(actor) for actor in panel.get("actors") or [] if isinstance(actor, dict))):
+            return panel
+    return None
 
 
 def attach_late_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[str, Any],
@@ -402,52 +589,101 @@ def attach_late_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[s
     sees it; the next turn reads it in chat history. The acceptance twin of plan
     review's historical supplement (docs/architecture/06-agent-core.md).
     """
-    retry_key = str(getattr(request, "retry_key", "") or "")
-    task_id = str(getattr(request, "task_id", "") or "")
-    trace = _settlement_trace(usage_ctx, retry_key) if retry_key else None
-    if trace is None:
-        log.debug("late acceptance settlement %s: no trace holds this wave (worker rebound?)", retry_key)
-        return False  # the worker was rebound to another task; the record stays as published
-    runs = [run for run in (trace.get("review_runs") or [])
-            if isinstance(run, dict) and run.get("authority") == "host_root"
-            and isinstance(run.get("request"), dict)
-            and str(run["request"].get("retry_key") or "") == retry_key]
+    return settle_acceptance_operation(
+        usage_ctx, retry_key=str(getattr(request, "retry_key", "") or ""),
+        task_id=str(getattr(request, "task_id", "") or ""), result=result, wave=wave) == "announced"
+
+
+def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str, result: Dict[str, Any],
+                                wave: Optional[Dict[str, Any]] = None, checkpoint: Optional[Dict[str, Any]] = None,
+                                controller: Any = None) -> str:
+    """Collect one wave of a terminal task purely, publish it and announce it once.
+
+    Returns ``announced`` (publication read back, row enqueued), ``published``
+    (read back; the row was already delivered or could not be queued now),
+    ``settled`` (nothing was pending), ``pending`` (still in flight),
+    ``unpublished`` (the canonical record did not take the settlement: nothing
+    is announced), ``source_unreadable`` (a published source exists but cannot
+    be read: never duplicated from the checkpoint) or ``unavailable`` (no trace
+    and no canonical source).
+    """
     from ouroboros.loop_acceptance_review import acceptance_run_pending
     from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
     from ouroboros.review_projection import publish_acceptance_checkpoint
     from supervisor.terminal_delivery import enqueue_terminal_delivery
 
-    root = pathlib.Path(usage_ctx.drive_root)
+    root = _result_root(usage_ctx)
+    trace = _settlement_trace(usage_ctx, retry_key) if retry_key else None
+    partial = trace is None
+    if trace is None and retry_key:
+        trace = canonical_acceptance_trace(root, task_id, retry_key, result=result, checkpoint=checkpoint)
+    if trace is None:
+        log.debug("late acceptance settlement %s: neither a live trace nor a published source holds it", retry_key)
+        return "unavailable"
+    if trace.get("source_status") == "unreadable":
+        return _unpublished(task_id, retry_key, "source_unreadable")
+    runs = [run for run in (trace.get("review_runs") or [])
+            if isinstance(run, dict) and run.get("authority") == "host_root"
+            and isinstance(run.get("request"), dict)
+            and str(run["request"].get("retry_key") or "") == retry_key]
+    was_pending = any(acceptance_run_pending(run) for run in runs)
     # Only THIS wave's runs: reconciling every pending panel here would let one
     # settlement collect a sibling panel's verdicts and leave that panel's own
     # settlement with nothing to announce (the run objects are shared with the trace).
-    advanced = reconcile_pending_acceptance_runs({"review_runs": runs}, drive_root=root, usage_ctx=usage_ctx)
+    advanced = reconcile_pending_acceptance_runs({"review_runs": runs}, drive_root=root, usage_ctx=usage_ctx,
+                                                 **({"controller": controller} if controller is not None else {}))
+    settled = runs[-1] if runs else {}
+    # A settlement this process already stamped but could not publish is published again, never re-stamped.
+    republish = (not advanced and isinstance(settled.get("late_settlement"), dict)
+                 and not acceptance_run_pending(settled) and late_publication_owed(task_id, retry_key))
+    if not advanced and not republish:
+        log.debug("late acceptance settlement %s: nothing reconciled (still pending or already collected)", retry_key)
+        if not was_pending:
+            (getattr(usage_ctx, "_acceptance_settlement_traces", None) or {}).pop(retry_key, None)
+        return "pending" if was_pending else "settled"
+    if advanced:
+        # The sentence has ONE author: it is stamped on the exact run this wave
+        # reconciled, so the republished projection carries the same bytes the row
+        # does and the card's Reviews group prints them verbatim.
+        fact = late_evidence_fact(settled, emitted_answer_fact(root, task_id), settled_at=utc_now_iso())
+        settled["late_settlement"] = {"note": _late_settlement_text(settled, wave or _collected_wave(settled), fact),
+                                      **fact}
+    outcome = publish_acceptance_checkpoint(usage_ctx, trace, task_id=task_id, drive_root=root,
+                                            chat_id=result.get("chat_id"), partial_trace=partial)
+    panel = _stored_late_settlement(outcome, settled)
+    if panel is None:
+        log.warning("late acceptance settlement %s was not published (%s); nothing announced", retry_key,
+                    outcome.get("error") or outcome.get("status"))
+        return _unpublished(task_id, retry_key, "unpublished")
     if not any(acceptance_run_pending(run) for run in runs):
         (getattr(usage_ctx, "_acceptance_settlement_traces", None) or {}).pop(retry_key, None)
-    if not advanced:
-        log.debug("late acceptance settlement %s: nothing reconciled (still pending or already collected)", retry_key)
-        return False
-    # The sentence has ONE author: it is stamped on the exact run this wave
-    # reconciled, so the republished projection carries the same bytes the row
-    # does and the card's Reviews group prints them verbatim.
-    settled = runs[-1]
-    note = _late_settlement_text(settled, wave)
-    settled["late_settlement"] = {
-        "note": note,
-        "reviewed_revision": "earlier" if settled.get("superseded_by_revision") else "delivered",
-        "settled_after_terminal": True,
-    }
-    publish_acceptance_checkpoint(usage_ctx, trace, task_id=task_id, drive_root=_result_root(usage_ctx),
-                                  chat_id=result.get("chat_id"))
-    return bool(enqueue_terminal_delivery(root, {
+    with _LATE_LOCK:
+        _LATE_UNPUBLISHED.discard((str(task_id), str(retry_key)))
+    late = panel["late_settlement"]
+    # A compact, source-bound pointer rides the row itself (progress_meta survives
+    # live delivery, replay and history); the full fact stays on the projection.
+    evidence = {"task_id": task_id, "panel_id": str(panel.get("panel_id") or ""),
+                "settled_at": str(late.get("settled_at") or ""), "reviewed_revision": late.get("reviewed_revision"),
+                "reviewed_is_emitted": late.get("reviewed_is_emitted"),
+                "source_ref": panel.get("applied_source_ref") or {}}
+    queued = enqueue_terminal_delivery(pathlib.Path(usage_ctx.drive_root), {
         "type": "send_message", "chat_id": int(result.get("chat_id") or 0), "task_id": task_id,
-        "text": note,
+        "text": str(late.get("note") or ""),
         "role": "system", "system_type": LATE_SETTLEMENT_SYSTEM_TYPE,
         "delivery_id": f"acceptance-late:{retry_key}",
         # The verdict belongs inside the task's card, in its Reviews group, and
-        # stays one row across live delivery, outbox replay and history.
-        "progress_meta": {"card_row": "reviews", "card_row_id": f"acceptance-late:{retry_key}"},
-    }, event_queue=getattr(usage_ctx, "event_queue", None)))
+        # stays one row across live delivery, outbox replay and history. The
+        # evidence pointer is neutral: it grants no action and starts no turn.
+        "progress_meta": {"card_row": "reviews", "card_row_id": f"acceptance-late:{retry_key}",
+                          "late_evidence": evidence},
+    }, event_queue=getattr(usage_ctx, "event_queue", None))
+    return "announced" if queued else "published"
+
+
+def _unpublished(task_id: str, retry_key: str, status: str) -> str:
+    with _LATE_LOCK:
+        _LATE_UNPUBLISHED.add((str(task_id), str(retry_key)))
+    return status
 
 
 def expose_acceptance_feedback(trace: Dict[str, Any], messages: list, task_id: str) -> None:

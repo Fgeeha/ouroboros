@@ -413,6 +413,13 @@ def _attempt_request(
     context = _canonical_candidate_bytes({
         key: payload[key] for key in ("system", "messages", "tools", "functions") if key in payload
     })
+    from ouroboros.send_clock import record_candidate, split_clock_note
+
+    # The same bytes carry the Main clock line; its clock-free twin identifies
+    # the candidate across two samples (the forced-final admission predicate).
+    clock_note, clock_free = split_clock_note(payload)
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    record_candidate(raw_sha256, clock_note)
     return AttemptRequest(
         model=str(target.get("usage_model") or target.get("resolved_model") or payload.get("model") or ""),
         provider=str(target.get("provider") or "unknown"),
@@ -420,7 +427,7 @@ def _attempt_request(
         max_completion_tokens=int(payload.get("max_completion_tokens") or payload.get("max_tokens") or 0),
         source=str(request_source or ""),
         prompt_cache_ttl=_applied_payload_cache_ttl(payload) or "",
-        candidate_raw_sha256=hashlib.sha256(raw).hexdigest(),
+        candidate_raw_sha256=raw_sha256,
         candidate_raw_size_bytes=len(raw),
         candidate_context_sha256=hashlib.sha256(context).hexdigest(),
         candidate_context_size_bytes=len(context),
@@ -431,6 +438,10 @@ def _attempt_request(
         processing_preference=str(target.get("processing_preference") or ""),
         submitted_processing_mode=submitted_processing_mode(target, payload),
         processing_basis=copy.deepcopy(target.get("processing_basis")),
+        candidate_clock_free_sha256=(
+            hashlib.sha256(_canonical_candidate_bytes(clock_free)).hexdigest()
+            if clock_note is not None else None
+        ),
     )
 
 

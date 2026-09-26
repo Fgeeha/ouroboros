@@ -37,6 +37,7 @@ from ouroboros.reasoning_artifacts import (
     pop_reasoning_pin_note,
     transcript_has_sealed_reasoning,
 )
+from ouroboros.send_clock import stamp_clock_note
 from ouroboros.request_wire_recovery import (
     note_wire_send_failed,
     note_wire_send_succeeded,
@@ -367,6 +368,10 @@ class _RecoveryLadderMixin:
             nonlocal prior_capture
             # Socket policy is not model input; seal only the provider payload.
             candidate = {key: value for key, value in candidate.items() if key != "timeout"}
+            # A Main send's clock line joins before measurement and sealing; a
+            # rebound compatibility retry keeps the line its source already carries.
+            candidate = stamp_clock_note(candidate, blocks=target.get("provider") == "anthropic",
+                                         keep_existing=True)
             candidate = _finalized_physical_candidate(
                 target, candidate, "messages" if target.get("provider") == "anthropic" else "chat.completions",
             )
@@ -533,6 +538,7 @@ class _RecoveryLadderMixin:
         async def _send(candidate: Dict[str, Any]) -> Any:
             nonlocal prior_capture
             candidate = {key: value for key, value in candidate.items() if key != "timeout"}
+            candidate = stamp_clock_note(candidate, keep_existing=True)  # the sync driver's rule
             candidate = _finalized_physical_candidate(target, candidate, "chat.completions")
             request = _attempt_request(target, candidate)
 

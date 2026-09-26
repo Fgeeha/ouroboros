@@ -321,6 +321,9 @@ class TaskModelWait:
         self.auto_continue: dict[str, bool] = {}
         self.seen_controls: set[str] = set()
         self.mailbox_stamp = None
+        # Public facts every new row of this owner carries (a review operation
+        # names its exact controller); the waiting slot is stamped per row.
+        self.row_facts: dict[str, dict] = {}
 
     @property
     def waits_allowed(self) -> bool:
@@ -617,6 +620,7 @@ class TaskModelWait:
                "worker_slot_held": self.worker_slot_held, "started_at": utc_now_iso()}
         if self.owner_id:
             row["model_wait_owner_id"] = self.owner_id
+        row.update({key: {**copy.deepcopy(value), "slot_id": slot_id} for key, value in self.row_facts.items()})
         if getattr(error, "account_rotation", None):
             row["account_rotation"] = copy.deepcopy(error.account_rotation)
         # A vendor refusal with no reset evidence gives the engine no cooldown for that
@@ -716,6 +720,23 @@ def task_model_wait_scope(*, task: dict, drive_root: Any, event_queue: Any,
 
 def current_model_wait() -> TaskModelWait | None:
     return _CURRENT.get()
+
+
+@contextlib.contextmanager
+def operation_wait_scope(owner: TaskModelWait) -> Iterator[TaskModelWait]:
+    """Bind an already-paid operation's own wait owner for its caller and workers.
+
+    The author's execution-lifetime scopes (a tool or call execution deadline,
+    Main's re-preparation callbacks) are not the operation's and are cleared
+    explicitly; explicit calendar deadlines stay. Clocks read under this scope
+    are the operation's own union and per-slot quota clocks.
+    """
+    tokens = ((_CURRENT, _CURRENT.set(owner)), (_REPREPARE, _REPREPARE.set(None)), (_LOGICAL, _LOGICAL.set(())))
+    try:
+        yield owner
+    finally:
+        for variable, token in reversed(tokens):
+            variable.reset(token)
 
 
 def model_waitable(function: Callable | None = None, *, client_parameter: str = "self") -> Callable:

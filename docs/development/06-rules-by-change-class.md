@@ -396,6 +396,19 @@ The imperatives:
   `cancel_origin` through terminal publication, history, root/child card metadata and
   conditional result-tool reads after the active intent is removed; missing actors
   stay unknown, and exposure must not change `requested_by` parent-decision semantics.
+  A pool teardown that writes `cancelled` (Restart) takes the existing intent's origin
+  through the same `_intent_outcome_fields` and invents none without one; the stated
+  reason is kept whole and a surface that shows less labels it a preview. A source
+  with a known producer speaks one sentence (`CANCEL_SOURCE_PHRASES`), that producer's
+  exact fixed label (`CANCEL_SOURCE_LABELS`) is not repeated beside it, and any other
+  source or reason stays as recorded, word for word in the Python and browser twins
+  (`tests/test_zombie_prevention.py`, `tests/test_startup_terminal_files.py`,
+  `tests/test_cancel_origin.py`, `tests/test_truthful_card_presentation.py`,
+  `web/tests/cancel_origin.test.js`).
+- An owed terminal message whose send was never confirmed is disclosed as "not
+  confirmed", with its saved copy named a copy of that message; only the matching
+  receipt's recorded destination for the same delivery id retires the owner notice,
+  never a bare id (`tests/test_cancel_pending_outbox.py`).
 - Cancel INTENT is never a status value: every cancel ingress writes a durable
   intent through `ouroboros/cancel_intents.request_cancel`, fails closed when
   that write fails, checks live physical ownership (a settled RESULT does not
@@ -806,7 +819,7 @@ and what enforces each.
   Persist the completed-tool source, task wait and queue snapshot before lending; grant
   the original worker only after reserving active capacity (both marks restored on
   failure); attempt, start time, completed effects and usage are unchanged across a
-  warm wake; cold recovery needs the acknowledged planned-restart handoff through every
+  warm wake, and a wait is dated by its own `parked_at`, never by the task start; cold recovery needs the acknowledged planned-restart handoff through every
   shutdown cleanup, and a direct-actor checkpoint alone grants none. After either wait,
   control/deadline handling precedes the saved round's budget decision, and
   TaskModelWait role overrides, explicit Auto, auto-continue and the completed quota

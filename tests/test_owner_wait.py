@@ -199,3 +199,16 @@ def test_cold_wait_requires_observed_restart_and_current_wait(tmp_path):
     assert restore_owner_wait_allowed(tmp_path, task)
     (tmp_path / "state/panic_stop.flag").write_text("panic")
     assert not restore_owner_wait_allowed(tmp_path, task)
+
+
+def test_a_new_owner_wait_is_dated_by_itself_and_a_review_park_is_not_stamped_here(tmp_path):
+    from datetime import datetime
+
+    ctx = context(tmp_path)
+    block = checkpoint_owner_wait(ctx, [], {}, {}, 1, [], set())
+    assert block["started_at"] == ctx.task_started_at  # the lifetime clock is untouched
+    parked = datetime.fromisoformat(block["parked_at"])
+    assert parked.tzinfo is not None and parked.timestamp() >= ctx.task_started_at
+    review = checkpoint_owner_wait(ctx, [], {}, {}, 1, [], set(), review_binding="acceptance-1")
+    assert "parked_at" not in review and review["review_binding"] == "acceptance-1"
+    assert review["started_at"] == ctx.task_started_at

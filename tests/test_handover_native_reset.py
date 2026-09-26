@@ -6,6 +6,7 @@ from copy import deepcopy
 import pytest
 
 from ouroboros.llm_messages import STABLE_PREFIX_BLOCKS_KEY
+from ouroboros.send_clock import CLOCK_NOTE_PREFIX
 from ouroboros import loop, usage_accounting as ua
 from ouroboros.llm_claudexor import ModelTurnState
 from ouroboros.loop_model_call import _reprepare_waiting_main
@@ -57,12 +58,17 @@ def test_main_dual_token_reset_survives_wait_reprepare_and_adopts_new_envelope(
     expected = deepcopy(original)
     for message in expected:
         message.pop("nativeContinuation", None)
-    assert ctx.messages == expected
+    # A synchronous Main round seals one clock line into the repaired send and, once it
+    # answers, appends exactly that line to the canonical transcript (``send_clock``).
+    sent = gateway.uploads[-1][0]["messages"]
+    clock = [] if asynchronous else [sent[-1]]
+    assert not clock or clock[0]["content"].startswith(CLOCK_NOTE_PREFIX)
+    assert ctx.messages == expected + clock
     # The canonical system message carries the builder's host-only stable-prefix
     # declaration; the Codex send copy pops it (llm_claudexor._request).
     wire_expected = deepcopy(expected)
     wire_expected[0].pop(STABLE_PREFIX_BLOCKS_KEY, None)
-    assert gateway.uploads[-1][0]["messages"] == wire_expected
+    assert sent == wire_expected + clock
     assert ctx.context_fit_plan.core_sha256 == "a" * 64
     assert any(item["model_route"] == route for item in observations)
     rows = ledger(ctx.drive_root)

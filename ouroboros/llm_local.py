@@ -281,7 +281,11 @@ class _LocalLaneMixin:
         client = self._get_local_client()
         local_target, candidate = self._build_local_candidate(
             messages, tools, max_tokens, tool_choice, timeout, processing_preference, context_mode)
-        candidate = self._finalize_local_candidate(local_target, candidate)
+        from ouroboros.send_clock import stamp_clock_note
+
+        # ONE clock line per call, sampled before both finalizations: the serving
+        # instance measures exactly the bytes that are then sealed and sent.
+        candidate = self._finalize_local_candidate(local_target, stamp_clock_note(candidate))
         clean_tools = candidate.get("tools")
         preference = local_target["processing_preference"]
         # ONE physical attempt per call. Re-sending here spent the caller's

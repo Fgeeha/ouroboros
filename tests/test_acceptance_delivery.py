@@ -242,6 +242,51 @@ def test_child_and_off_acceptance_run_packet_rows_only(structured_env, tmp_path)
     assert calls == [["t_api"]]
 
 
+def _consume_acceptance_results(results):
+    from ouroboros.loop_tool_execution import process_tool_results
+
+    trace = {"tool_calls": [], "reasoning_notes": []}
+    process_tool_results([{
+        "fn_name": "task_acceptance_review", "tool_call_id": f"call-{index}", "result": result,
+        "is_error": False, "args_for_log": {}, "tool_args": {}, "result_meta": {"status": "ok"},
+    } for index, result in enumerate(results)], [], trace, emit_progress=lambda _msg, *, incident=None: None)
+    return trace
+
+
+def test_a_typed_predispatch_refusal_is_tool_evidence_not_a_degraded_review_run(structured_env, tmp_path):
+    """#1318: the child/off refusal the REAL tool returns reaches the ordinary
+    tool-result consumer; no reviewer ran, so it is recorded as this call's tool
+    result and never as a review run that alone degrades the review axis. A
+    dispatched run -- malformed, overflowed or degraded -- still counts."""
+    from ouroboros.outcomes import _objective_axis, _review_axis
+    from ouroboros.tools.review import _handle_task_acceptance_review
+
+    structured_env.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    structured_env.setenv(REVIEWER_SLOTS_ENV, json.dumps({**_TRIAD, "triad": _TRIAD["triad"][1:]}))
+    ctx = SimpleNamespace(drive_root=str(tmp_path), task_id="root", root_task_id="root",
+                          task_metadata={"root_task_id": "root"}, task_contract={})
+    refused = _handle_task_acceptance_review(ctx, claim="root done")
+    structured_env.setenv(REVIEWER_SLOTS_ENV, "{broken")
+    misconfigured = _handle_task_acceptance_review(ctx, claim="root done")
+    trace = _consume_acceptance_results([refused, misconfigured])
+    assert "review_runs" not in trace
+    assert [row["result"] for row in trace["tool_calls"]] == [refused, misconfigured]
+    review = _review_axis(trace)
+    assert review["status"] == "skipped" and review["run_count"] == 0
+    assert _objective_axis(review)["status"] != "degraded"
+
+    dispatched_malformed = {"request": {"surface": "task_acceptance"}, "actors": [{"status": "error"}],
+                            "parsed_findings": [], "aggregate_signal": ""}
+    overflowed = {"request": {"surface": "task_acceptance"}, "actors": [], "parsed_findings": [],
+                  "aggregate_signal": "DEGRADED", "degraded": True,
+                  "degraded_reasons": ["__immutable_core_overflow__"]}
+    # A status field alone is not a refusal when run evidence rides beside it.
+    evidenced = {"status": "not_dispatched", "aggregate_signal": "DEGRADED", "actors": [{"status": "not_dispatched"}]}
+    trace = _consume_acceptance_results([json.dumps(dispatched_malformed), json.dumps(overflowed), json.dumps(evidenced)])
+    assert len(trace["review_runs"]) == 3
+    assert _review_axis(trace)["status"] == "degraded"
+
+
 # ---------------------------------------------------------------------------
 # The retrieving work order (R1/R4/R5/R15/R23) and the route-aware gates.
 # ---------------------------------------------------------------------------

@@ -25,6 +25,9 @@ from ouroboros.model_wait import (
     calendar_scope, copy_wait_context, current_model_wait, execution_deadline_scope, monotonic_now,
 )
 from ouroboros.review_dispatch import slot_id_for_row
+from ouroboros.review_operation import (
+    current_review_operation, release_review_operation, review_operation_scope, stamp_review_controller,
+)
 from ouroboros.usage_accounting import (
     PHYSICAL_ATTEMPT_STATES, POSITIVE_PHYSICAL_ATTEMPT_STATES,
 )
@@ -48,6 +51,8 @@ class ActiveReviewAttempt:
     # Wall clock of the send THIS process performs; empty when it rejoins an
     # operation an earlier process paid for, whose send moment it cannot know.
     started_at: str = ""
+    # The operation-owned wait/lifetime this worker belongs to (None: no owner).
+    operation: Any = field(default_factory=current_review_operation)
 
 
 _ACTIVE_LOCK = threading.Lock()
@@ -838,6 +843,7 @@ def _late_or_timeout_actor(
         )
         actor.late_result_pending = True
         actor.awaiting_since = entry.started_at
+        stamp_review_controller(actor, entry)
         return actor
     actor = error_actor(
         slot,
@@ -855,6 +861,8 @@ def _late_or_timeout_actor(
             if entry.retry_state.get(key)
         })
         actor.usage = usage
+    if entry is not None:
+        stamp_review_controller(actor, entry)
     return actor
 
 
@@ -1065,6 +1073,7 @@ def _settle_review_attempt(
         except Exception:
             log.debug("late review result event failed", exc_info=True)
     result_queue.put(actor)
+    release_review_operation(entry)
 
 
 def _wave_key(request: Any) -> str:
@@ -1158,7 +1167,58 @@ def _pending_checkpoint(usage_ctx: Any, request: Any, slot_id: str, operation_id
     return record
 
 
-def run_custodied_review_slots(
+def operation_has_live_workers(operation: Any) -> bool:
+    with _ACTIVE_LOCK:
+        return any(entry.operation is operation for entry in _ACTIVE.values())
+
+
+def review_dispatch_plan(request: Any, slots: List[Any], usage_ctx: Any) -> Dict[str, tuple]:
+    """How each slot of this call will proceed, read before any window or send.
+
+    ``("relay", operation)``: a live worker of this process already owns it;
+    ``("settled", None)``: a cached settlement or a no-resend refusal answers it;
+    ``("send", operation_id)``: a physical operation this call owns — the exact
+    pending delegated operation it rejoins, or ``""`` for a new one.
+    """
+    settled = getattr(usage_ctx, "_review_settled_attempts", None)
+    pending = getattr(usage_ctx, "_review_pending_invocations", None)
+    settled = settled if isinstance(settled, dict) else {}
+    pending = pending if isinstance(pending, dict) else {}
+    plan: Dict[str, tuple] = {}
+    with _ACTIVE_LOCK:
+        for slot in slots:
+            key = _attempt_key(request, slot)
+            entry = _ACTIVE.get(key)
+            if entry is not None:
+                plan[str(slot.slot_id)] = ("relay", entry.operation)
+            elif key in settled or _NO_RESEND.get(key):
+                plan[str(slot.slot_id)] = ("settled", None)
+            else:
+                retry = pending.get(key) if isinstance(pending.get(key), dict) else {}
+                plan[str(slot.slot_id)] = ("send", str(retry.get("operation_id") or ""))
+    return plan
+
+
+def run_custodied_review_slots(*, request: Any, slots: List[Any], usage_ctx: Any, **custody: Any) -> List[Any]:
+    """Bind the panel's own operation (wait, controls, lifetime) before any window or send.
+
+    A slot whose operation could not be retained before its send is refused at
+    $0; a slot another live worker owns, or a settled one, still runs as before.
+    """
+    with review_operation_scope(request=request, slots=slots, usage_ctx=usage_ctx,
+                                task_id=str(custody.get("task_id") or "")) as binding:
+        refused = [custody["error_actor"](slot, binding.refused[str(slot.slot_id)], "", "not_dispatched")
+                   for slot in slots if str(slot.slot_id) in binding.refused]
+        runnable = [slot for slot in slots if str(slot.slot_id) not in binding.refused]
+        if not refused:
+            return _run_custodied_review_slots(request=request, slots=slots, usage_ctx=usage_ctx, **custody)
+        actors = refused + (_run_custodied_review_slots(request=request, slots=runnable, usage_ctx=usage_ctx,
+                                                        **custody) if runnable else [])
+        order = {str(slot.slot_id): index for index, slot in enumerate(slots)}
+        return sorted(actors, key=lambda actor: order.get(str(actor.slot_id), len(order)))
+
+
+def _run_custodied_review_slots(
     *,
     request: Any,
     slots: List[Any],
@@ -1355,6 +1415,8 @@ def run_custodied_review_slots(
                     slot_entries.pop(slot_id, None)
                     raise
                 paid_stamped = True
+            if entry.operation is not None:
+                entry.operation.note_dispatch()
             def worker() -> None:
                 _emit_operation(
                     usage_ctx, task_id=task_id, request=request, entry=entry, slot=slot,

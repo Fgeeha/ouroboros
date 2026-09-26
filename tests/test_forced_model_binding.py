@@ -17,7 +17,15 @@ from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, task_model_binding
 from ouroboros.model_wait import task_model_wait_scope
 from ouroboros.tools.registry import ToolRegistry
 from ouroboros.usage_accounting import PhysicalAttemptPreconditionFailed
+from ouroboros.send_clock import CLOCK_NOTE_PREFIX
 from tests.test_llm_claudexor import MODEL, ROUTE, result, setup as setup
+
+
+def _unclocked(messages):
+    """A Main send ends with exactly one host clock line (``send_clock``); the rest is canonical."""
+    assert str(messages[-1].get("content") or "").startswith(CLOCK_NOTE_PREFIX), messages[-1]
+    assert not any(str(row.get("content") or "").startswith(CLOCK_NOTE_PREFIX) for row in messages[:-1])
+    return messages[:-1]
 
 
 @pytest.fixture
@@ -59,7 +67,8 @@ def test_forced_call_keeps_configured_actor_account_and_image(acting):
     normal, final = [payload for payload, _ in acting.gateway.uploads]
     assert normal["account"] == {"mode": "pin", "profileId": "actor-only"}
     assert final["account"] == normal["account"]
-    assert normal["messages"] == final["messages"] == acting.messages
+    # The direct call binds no Main clock; the forced final is a Main send and does.
+    assert normal["messages"] == _unclocked(final["messages"]) == acting.messages
 
 
 def test_prospective_image_preparation_keeps_actor_pin(acting):
@@ -156,7 +165,8 @@ def test_subscription_prospective_and_send_share_transcript_normalization(acting
     assert forced._call_forced_model_once(acting.ctx, initial_messages=prepared,
                                           admitted_request=request) == "Ответ 🐍"
     sent = acting.gateway.uploads[0][0]["messages"]
-    assert sent == normalized and messages == original
+    # The answered send's clock line joins the canonical transcript; nothing else changes.
+    assert _unclocked(sent) == normalized and _unclocked(messages) == original
     assert len(acting.gateway.creates) == 1
     if shape == "mid_round_image":
         assert sent[3]["role"] == "tool" and sent[3]["tool_call_id"] == "shot"
@@ -178,7 +188,7 @@ def test_forced_and_prospective_preserve_task_actor_override_including_auto(acti
                                               admitted_request=request) == "Ответ 🐍"
     payload = acting.gateway.uploads[0][0]
     assert payload["account"] == ({"mode": "pin", "profileId": pin} if pin else {"mode": "auto"})
-    assert payload["messages"] == acting.messages
+    assert _unclocked(payload["messages"]) == acting.messages
     assert acting.catalogs[-1][1] == (pin or None)
 
 
@@ -245,7 +255,7 @@ def test_ordinary_round_uses_the_same_actor_or_active_plan_binding(acting, fallb
     assert message["content"] == "Ответ 🐍"
     payload = acting.gateway.uploads[0][0]
     assert payload["account"] == {"mode": "pin", "profileId": "fallback-only" if fallback else "actor-only"}
-    assert payload["messages"] == acting.messages
+    assert _unclocked(payload["messages"]) == acting.messages
 
 
 TURN = {"route": ROUTE, "format": "codex.turn.v1", "payload": {"turnState": "the-running-turn"}}

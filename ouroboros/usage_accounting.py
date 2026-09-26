@@ -289,6 +289,9 @@ class AttemptRequest:
     processing_preference: str = ""
     submitted_processing_mode: str = ""
     processing_basis: Optional[Dict[str, Any]] = None
+    # The same canonical candidate without its Main clock line (``send_clock``);
+    # None when the candidate carries none. An identity, never a row field.
+    candidate_clock_free_sha256: Optional[str] = None
 @dataclass(frozen=True)
 class AttemptReservation:
     attempt_id: str

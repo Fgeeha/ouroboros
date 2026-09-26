@@ -28,8 +28,10 @@ same ``delivery_id`` vocabulary, now deduped durably by this registry);
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import pathlib
+import re
 from typing import Any, Dict, List, Optional
 
 from ouroboros.utils import update_json_locked, utc_now_iso
@@ -84,6 +86,101 @@ def _registry_path(drive_root: Any) -> pathlib.Path:
     root = pathlib.Path(drive_root) / "state"
     root.mkdir(parents=True, exist_ok=True)
     return root / "terminal_deliveries.json"
+
+
+# A terminal ANSWER's identity; custody-notice and other suffixed rows are not answers.
+_TERMINAL_ANSWER_ID = re.compile(r"final:(?P<task>[^:]+):[0-9a-f]{16}")
+
+
+def _receipt_rows(current: Dict[str, Any], *, strict: bool = False) -> Dict[str, Any]:
+    """The emitted-bytes receipts; ``strict`` refuses a malformed container (as ``_pending_rows``)."""
+    receipts = current.get("receipts")
+    if isinstance(receipts, dict):
+        return dict(receipts)
+    if strict and receipts is not None:
+        raise ValueError("terminal-delivery registry 'receipts' is malformed (not an object)")
+    return {}
+
+
+def _registry_document(current: Dict[str, Any], rows: List[str], pending: Dict[str, Any],
+                       receipts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """The whole registry a mutator writes: every mutator keeps the receipts it did not touch."""
+    receipts = _receipt_rows(current, strict=True) if receipts is None else receipts
+    document = {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:], "pending": pending}
+    if receipts:
+        document["receipts"] = dict(list(receipts.items())[-_REGISTRY_CAP:])
+    return document
+
+
+def _capture_emitted_answer(drive_root: Any, delivery_id: str, emitted: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Retain the exact bytes a terminal answer send carried, and where it went.
+
+    Called only after the send handler's real send returned. The text, routed
+    chat, task and delivery id go to the task's immutable source store; the
+    receipt names them by digest. A capture that cannot be retained returns
+    None — the delivery is still registered for dedupe, but proves no bytes.
+    """
+    match = _TERMINAL_ANSWER_ID.fullmatch(delivery_id)
+    task_id = str(emitted.get("task_id") or "")
+    text = emitted.get("text")
+    if match is None or match.group("task") != task_id or not isinstance(text, str):
+        return None
+    try:
+        from ouroboros.artifacts import store_actor_source_bytes
+
+        record = {"delivery_id": delivery_id, "task_id": task_id, "chat_id": int(emitted["chat_id"]),
+                  "text": text, "sent_at": utc_now_iso(), "basis": "send_handler_returned",
+                  **{key: str(emitted.get(key) or "") for key in ("format", "role", "system_type", "terminal_origin")}}
+        ref = store_actor_source_bytes(
+            pathlib.Path(drive_root), task_id, category="context_checkpoints", source_id="terminal-delivery",
+            data=json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8"), extension="json")
+    except Exception:
+        log.warning("terminal answer %s: emitted bytes could not be retained; no receipt", delivery_id, exc_info=True)
+        return None
+    return {"task_id": task_id, "chat_id": record["chat_id"], "sent_at": record["sent_at"],
+            "text_sha256": hashlib.sha256(text.encode("utf-8")).hexdigest(), "text_chars": len(text),
+            "basis": record["basis"], "source_ref": ref}
+
+
+def terminal_answer_receipts(drive_root: Any, task_id: str) -> Dict[str, Any]:
+    """What the host can PROVE it emitted as one task's terminal answer.
+
+    ``delivered`` lists only receipts: exact text digest, routed chat and the
+    retained source, captured after a real send. An owed outbox row is a send
+    not yet confirmed, and a delivered id without a receipt (an older row, a
+    failed capture, an evicted receipt) proves no bytes; both stay listed as
+    such. ``state`` is ``delivered`` (at least one receipt), ``owed`` or
+    ``unknown`` — never inferred from the task result or an id digest.
+    """
+    fact: Dict[str, Any] = {"source": "terminal_delivery_registry", "state": "unknown", "delivered": [],
+                            "unverified_delivery_ids": [], "owed_delivery_ids": []}
+    try:
+        from ouroboros.utils import read_json_dict
+
+        path = pathlib.Path(drive_root) / "state" / "terminal_deliveries.json"
+        data = read_json_dict(path) if path.is_file() else {}
+        if data is None:
+            raise ValueError("registry file is malformed or is not an object")
+        receipts, pending = _receipt_rows(data, strict=True), _pending_rows(data, strict=True)
+        delivered = _delivered_rows(data, strict=True)
+    except Exception:
+        log.debug("terminal-delivery registry unreadable for %s", task_id, exc_info=True)
+        fact["registry"] = "unreadable"
+        return fact
+
+    def answer(did: str) -> bool:
+        match = _TERMINAL_ANSWER_ID.fullmatch(did)
+        return match is not None and match.group("task") == str(task_id)
+
+    for did in (item for item in delivered if answer(item)):
+        receipt = receipts.get(did)
+        if isinstance(receipt, dict) and receipt.get("text_sha256") and isinstance(receipt.get("source_ref"), dict):
+            fact["delivered"].append({"delivery_id": did, **receipt})
+        else:
+            fact["unverified_delivery_ids"].append(did)
+    fact["owed_delivery_ids"] = sorted(did for did in pending if answer(str(did)) and did not in delivered)
+    fact["state"] = "delivered" if fact["delivered"] else "owed" if fact["owed_delivery_ids"] else "unknown"
+    return fact
 
 
 def delivery_id_for(task_id: str, text: str) -> str:
@@ -163,7 +260,7 @@ def _delivered_rows(current: Dict[str, Any], *, strict: bool = False) -> List[st
     return []
 
 
-def register_delivery(drive_root: Any, delivery_id: str) -> bool:
+def register_delivery(drive_root: Any, delivery_id: str, *, emitted: Optional[Dict[str, Any]] = None) -> bool:
     """Durably register one delivery id AFTER a successful send.
 
     Returns whether the id was newly registered. Registration only after the
@@ -175,15 +272,20 @@ def register_delivery(drive_root: Any, delivery_id: str) -> bool:
 
     The same write CLEARS the pending-outbox row: "delivered" and "still owed"
     are one transaction, so a replay can never re-send an answer that landed.
+    ``emitted`` is the send handler's own fact of what it just sent (exact text,
+    routed chat, task); for a terminal answer it becomes the receipt
+    ``terminal_answer_receipts`` reads. The first observed send keeps its receipt.
     """
     did = str(delivery_id or "").strip()
     if not did:
         return True
     fresh = {"value": False}
+    receipt = _capture_emitted_answer(drive_root, did, emitted) if isinstance(emitted, dict) else None
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         rows: List[str] = _delivered_rows(current, strict=True)
         pending = _pending_rows(current, strict=True)
+        receipts = _receipt_rows(current, strict=True)
         target = pending.get(did)
         if target is not None and not isinstance(target, dict):
             # GR6-3: a malformed owed ROW is corruption — clearing it as part
@@ -192,15 +294,16 @@ def register_delivery(drive_root: Any, delivery_id: str) -> bool:
                 f"terminal-delivery registry pending row for {did} is malformed"
             )
         had_pending = pending.pop(did, None) is not None
+        new_receipt = receipt is not None and did not in receipts
+        if new_receipt:
+            receipts[did] = receipt
         if did in rows:
-            if not had_pending:
+            if not had_pending and not new_receipt:
                 return None
-            return {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:],
-                    "pending": pending}
+            return _registry_document(current, rows, pending, receipts)
         rows.append(did)
         fresh["value"] = True
-        return {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:],
-                "pending": pending}
+        return _registry_document(current, rows, pending, receipts)
 
     try:
         # GR3-9 strict read: a malformed registry must refuse the mutation
@@ -290,8 +393,7 @@ def register_pending_delivery(drive_root: Any, event: Dict[str, Any]) -> bool:
                 # (full-text preservation + typed event + owner notice).
                 if isinstance(row, dict):
                     evicted.append({**row, "delivery_id": str(stale)})
-        return {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:],
-                "pending": pending}
+        return _registry_document(current, rows, pending)
 
     try:
         # GR3-9 strict read: a malformed registry refuses the mutation loudly
@@ -423,8 +525,7 @@ def _bump_replay_attempts(drive_root: Any, ids: List[str]) -> List[str]:
         if not changed:
             return None
         rows = _delivered_rows(current, strict=True)
-        return {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:],
-                "pending": pending}
+        return _registry_document(current, rows, pending)
 
     try:
         # GR3-9 strict read: never rebuild a malformed registry from {}.
@@ -443,17 +544,17 @@ def _bump_replay_attempts(drive_root: Any, ids: List[str]) -> List[str]:
 def _disclose_exhausted_delivery(
     drive_root: Any, row: Dict[str, Any], *, reason: str = "replay_exhausted",
 ) -> None:
-    """Owner-visible disclosure for an outbox row that is dropped undelivered.
+    """Owner-visible disclosure for an outbox row dropped with no confirmed send.
 
-    Two callers, one seam: a row that exhausted its bounded replays
-    (``reason="replay_exhausted"``, AR2-7) and a row evicted past
-    ``_PENDING_CAP`` by newer registrations (``reason="outbox_capacity"``,
-    GR2-6). Either way the undelivered answer must not vanish into a
-    log.error: the FULL message text is preserved durably, a typed
-    ``terminal_delivery_exhausted`` event lands in ``logs/events.jsonl`` (the
-    guaranteed half — it works even when chat itself is what is failing), and
-    a chat notice through the ordinary supervisor notification path names the
-    task, the preserved copy, and why delivery gave up. Every step fail-soft.
+    Two callers, one seam: replays exhausted (``reason="replay_exhausted"``,
+    AR2-7) or eviction past ``_PENDING_CAP`` (``reason="outbox_capacity"``,
+    GR2-6). A copy of THIS row's text (a receipt may carry only an excerpt, not
+    the whole answer) is preserved, and a typed ``terminal_delivery_exhausted``
+    event lands in ``logs/events.jsonl`` either way (it works when chat fails).
+    A missing confirmation is not non-delivery, so the chat notice says "not
+    confirmed"; only positive evidence that this delivery reached this chat
+    (the cancel receipt's ``delivered_chat_id`` for this ``delivery_id``; a bare
+    id is never proof) retires the notice. Every step fail-soft.
     """
     did = str(row.get("delivery_id") or "")
     tid = str(row.get("task_id") or "")
@@ -467,17 +568,9 @@ def _disclose_exhausted_delivery(
         chat_id = int(row.get("chat_id") or 0)
     except (TypeError, ValueError):
         chat_id = 0
-    if capacity:
-        log.error(
-            "Terminal answer %s (task %s) was evicted from the pending outbox "
-            "(capacity %d exceeded) before its send confirmed; disclosing",
-            did, tid, _PENDING_CAP,
-        )
-    else:
-        log.error(
-            "Terminal answer %s (task %s) could not be delivered after %d replays; giving up",
-            did, tid, _PENDING_MAX_REPLAYS,
-        )
+    detail = ("pending outbox over capacity; oldest owed row evicted" if capacity
+              else "send never confirmed; replay cap reached")
+    log.error("Terminal message %s (task %s) dropped with no confirmed send (%s); disclosing", did, tid, detail)
     preserved = ""
     try:
         from ouroboros.observability import preserve_salvaged_output
@@ -488,6 +581,13 @@ def _disclose_exhausted_delivery(
             )
     except Exception:
         log.debug("exhausted-delivery preservation failed for %s", did, exc_info=True)
+    try:  # positive evidence only: the cancel receipt stamped THIS delivery at THIS chat
+        from ouroboros.task_results import load_task_result
+
+        receipt = (load_task_result(pathlib.Path(drive_root), tid) or {}).get("cancel_receipt") if tid and did and chat_id else None
+        reached = isinstance(receipt, dict) and receipt.get("delivery_id") == did and receipt.get("delivered_chat_id") == chat_id
+    except Exception:
+        reached = False
     try:
         from ouroboros.utils import append_jsonl
 
@@ -497,33 +597,30 @@ def _disclose_exhausted_delivery(
                 "ts": utc_now_iso(), "type": "terminal_delivery_exhausted",
                 "task_id": tid, "delivery_id": did, "chat_id": chat_id,
                 "reason": reason,
-                "attempts": attempts, "preserved_path": preserved,
-                "detail": (
-                    "pending outbox over capacity; oldest owed row evicted"
-                    if capacity else "send never confirmed; replay cap reached"
-                ),
+                "attempts": attempts, "preserved_path": preserved, "detail": detail,
+                **({"owner_notice": "not_sent_same_delivery_recorded_at_this_chat"} if reached else {}),
             },
         )
     except Exception:
         log.debug("exhausted-delivery event append failed for %s", did, exc_info=True)
-    if not chat_id:
+    if not chat_id or reached:
         return
     try:
         from supervisor.message_bus import send_with_budget
 
         copy_note = (
-            f"The full text is preserved at {preserved}." if preserved
-            else "No durable copy could be preserved."
+            f"A copy of this message is saved at {preserved}." if preserved
+            else "No copy of this message could be saved."
         )
         cause = (
-            f"its pending-outbox slot was evicted by newer owed answers (capacity {_PENDING_CAP})"
+            f"its pending-outbox slot was taken by newer owed messages (capacity {_PENDING_CAP})"
             if capacity else
-            f"the send never confirmed after {_PENDING_MAX_REPLAYS} replay attempts (chat "
+            f"no send was confirmed after {_PENDING_MAX_REPLAYS} replay attempts (chat "
             "transport failing or the supervisor kept crashing mid-send)"
         )
         send_with_budget(
             chat_id,
-            f"⚠️ A terminal answer for task {tid} could not be delivered: {cause}. {copy_note}",
+            f"⚠️ Sending a message for task {tid} was not confirmed: {cause}. {copy_note}",
             role="system",
             system_type="terminal_incident",
         )

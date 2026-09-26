@@ -62,6 +62,25 @@ def _serialized_worker_lifecycle(fn):
     return wrapped
 
 
+def _recorded_cancel_fields(task_id: str) -> dict:
+    """The cancel origin an existing intent for ``task_id`` records, else ``{}``.
+
+    A pool teardown that terminalizes as ``cancelled`` (an owner Restart mints
+    its intent first, then kills the pool) must keep the SAME recorded cause the
+    custody writer would: one helper, ``_intent_outcome_fields``. No intent means
+    no origin -- a teardown never invents one. Fail-soft: an unreadable
+    projection leaves the result without an origin rather than blocking it.
+    """
+    try:
+        from ouroboros.cancel_intents import active_intent
+        from supervisor.cancel_publication import _intent_outcome_fields
+
+        return _intent_outcome_fields(active_intent(_pool().DRIVE_ROOT, task_id) or {})
+    except Exception:
+        log.debug("cancel origin unreadable for %s", task_id, exc_info=True)
+        return {}
+
+
 def _write_failure_result(
     task_id: str,
     reason: str = "Worker process crashed (crash storm). Task was not completed.",
@@ -103,6 +122,7 @@ def _write_failure_result(
                 review_trigger="worker_terminal",
             ),
             **f_cost_fields,
+            **(_recorded_cancel_fields(task_id) if final_status == STATUS_CANCELLED else {}),
         )
         persisted_status = str((stored or {}).get("status") or "").strip()
         if (

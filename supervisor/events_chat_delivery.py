@@ -120,12 +120,16 @@ def _handle_typing_start(evt: Dict[str, Any], ctx: Any) -> None:
 _DELIVERED_MESSAGE_IDS: "deque[str]" = deque(maxlen=256)
 
 
-def _register_delivered(ctx: Any, delivery_id: str) -> None:
-    """Atomically mark one id delivered and clear its pending-outbox row."""
+def _register_delivered(ctx: Any, delivery_id: str, emitted: "Dict[str, Any] | None" = None) -> None:
+    """Atomically mark one id delivered and clear its pending-outbox row.
+
+    ``emitted`` is what THIS handler just sent (exact text, routed chat, task):
+    a terminal answer's receipt of its bytes, never inferred elsewhere.
+    """
     try:
         from supervisor.terminal_delivery import register_delivery
 
-        register_delivery(ctx.DRIVE_ROOT, delivery_id)
+        register_delivery(ctx.DRIVE_ROOT, delivery_id, emitted=emitted)
     except Exception:
         log.debug("durable delivery registration failed", exc_info=True)
 
@@ -309,7 +313,10 @@ def _handle_send_message(evt: Dict[str, Any], ctx: Any) -> None:
         # Register only after send; a failed first copy must not suppress retry.
         if delivery_id:
             _DELIVERED_MESSAGE_IDS.append(delivery_id)
-            _register_delivered(ctx, delivery_id)
+            _register_delivered(ctx, delivery_id, emitted={
+                "text": str(evt.get("text") or ""), "chat_id": chat_id, "task_id": task_id, "format": fmt,
+                "role": str(evt.get("role") or ""), "system_type": system_type,
+                "terminal_origin": str(evt.get("terminal_origin") or "")})
             if system_type == "cancel_receipt":
                 from supervisor.terminal_delivery import record_cancel_receipt_delivery
 

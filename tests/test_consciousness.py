@@ -59,8 +59,13 @@ def clock(monkeypatch, tmp_path):
     launches: list = []
     receipt = {"admitted": True, "task_id": "wake0001", "reason": ""}
 
-    def handle_wake_direct(chat_id, text, task_metadata, on_finished=None):
-        launches.append({"chat_id": chat_id, "text": text, "metadata": task_metadata, "on_finished": on_finished})
+    def handle_wake_direct(chat_id, text, task_metadata, on_finished=None, bind_input=None):
+        launch = {"chat_id": chat_id, "text": text, "metadata": task_metadata, "on_finished": on_finished}
+        if receipt.get("admitted") and bind_input is not None:
+            # The real lane binds after registration, before the turn's thread starts.
+            launch["task"] = {"id": receipt["task_id"], "text": text, "metadata": dict(task_metadata)}
+            bind_input(launch["task"])
+        launches.append(launch)
         return dict(receipt)
 
     monkeypatch.setattr(workers, "handle_wake_direct", handle_wake_direct)
@@ -112,17 +117,83 @@ def test_boot_discloses_invalid_wake_boundary_and_uses_process_start(caplog, clo
     assert any("invalid persisted last wake boundary" in record.message for record in caplog.records)
 
 
+def _chat_row(**row):
+    with (_chat_path := row.pop("root") / "logs" / "chat.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row) + "\n")
+    return _chat_path
+
+
 def test_restored_boundary_reaches_the_launched_wake_text(clock):
+    """Without an accepted observation boundary yet, the first window starts at the last wake."""
     clock.store[LAST_WAKE_STATE_KEY] = T0 - 3600
     (clock.root / "task_results").mkdir()
     (clock.root / "task_results" / "settled.json").write_text(json.dumps({
         "task_id": "settled", "status": "completed", "updated_at": _iso(T0 - 1800),
         "ts": _iso(T0 - 1800), "description": "settled before restart", "_schema_version": 1,
     }), encoding="utf-8")
+    _chat_row(root=clock.root, ts=_iso(T0 - 7200), direction="system", type="task_summary", task_id="older",
+              status="completed")
+    _chat_row(root=clock.root, ts=_iso(T0 - 1800), direction="system", type="task_summary", task_id="settled",
+              status="completed")
     later = BackgroundConsciousness(clock.root, clock.root / "repo", lambda: 7, now=T0)
     assert later.tick(T0 + FLOOR + 1) == "launched"
     assert "- task settled completed" in clock.launches[-1]["text"]
+    assert "older" not in clock.launches[-1]["text"]
     assert "no wake since this process started" not in clock.launches[-1]["text"]
+
+
+def test_an_accepted_wake_advances_the_observation_boundary_and_a_refused_one_does_not(clock):
+    from ouroboros.consciousness import OBSERVATION_STATE_KEY
+
+    _chat_row(root=clock.root, ts=_iso(T0 + 5), direction="in", chat_id=1, source="web", text="first")
+    clock.receipt.update({"admitted": False, "task_id": "", "reason": "budget_exhausted"})
+    assert clock.clock.tick(T0 + FLOOR + 1) == "rejected:budget_exhausted"
+    assert OBSERVATION_STATE_KEY not in clock.store  # a refused launch consumed nothing
+    clock.receipt.update({"admitted": True, "task_id": "wake0001", "reason": ""})
+    clock.clock._next_wake_at = T0 + FLOOR + 2
+    assert clock.clock.tick(T0 + FLOOR + 2) == "launched"
+    assert '"first"' in clock.launches[-1]["text"]  # the refused window is observed again, whole
+    accepted = clock.store[OBSERVATION_STATE_KEY]
+    assert accepted["task_id"] == "wake0001" and accepted["upper"] == (clock.root / "logs" / "chat.jsonl").stat().st_size
+    # The observation was bound to the registered wake before its turn could run.
+    bound = clock.launches[-1]["task"]["metadata"]["wake_observation"]
+    assert bound["composition"] == {"owner_message": 1} and bound["source"]["sha256"]
+    # A line appended while that wake runs — stamped even before its capture — reaches the next wake.
+    _chat_row(root=clock.root, ts=_iso(T0 + 10), direction="in", chat_id=1, source="web", text="second")
+    clock.clock._wake_finished("wake0001", True)
+    clock.clock._next_wake_at = T0 + 2 * FLOOR
+    get_direct_activity_registry().clear()
+    assert clock.clock.tick(T0 + 2 * FLOOR) == "launched"
+    text = clock.launches[-1]["text"]
+    assert '"second"' in text and '"first"' not in text
+
+
+def test_a_refused_wake_consumes_no_transition_and_the_admitted_one_persists_what_can_still_change(clock):
+    """The accepted boundary carries the task-result transition state beside the chat position:
+    a child that settles with no chat row is reported by the next ADMITTED wake, not lost to a
+    refused one, and only still-open work is persisted."""
+    from ouroboros.consciousness import OBSERVATION_STATE_KEY
+
+    (clock.root / "task_results").mkdir()
+    row = {"task_id": "kid", "status": "running", "ts": _iso(T0 - 100), "updated_at": _iso(T0 - 100),
+           "_schema_version": 1, "metadata": {}, "description": "child work"}
+    (clock.root / "task_results" / "kid.json").write_text(json.dumps(row), encoding="utf-8")
+    assert clock.clock.tick(T0 + FLOOR + 1) == "launched"
+    accepted = clock.store[OBSERVATION_STATE_KEY]["transitions"]
+    assert accepted["inventory"] == {"kid": []} and accepted["scan_at"] == _iso(T0 + FLOOR + 1)
+    (clock.root / "task_results" / "kid.json").write_text(json.dumps(
+        {**row, "status": "failed", "updated_at": _iso(T0 + FLOOR + 50)}), encoding="utf-8")  # the orphan sweep
+    clock.clock._wake_finished("wake0001", True)
+    get_direct_activity_registry().clear()
+    clock.receipt.update({"admitted": False, "task_id": "", "reason": "budget_exhausted"})
+    clock.clock._next_wake_at = T0 + 2 * FLOOR
+    assert clock.clock.tick(T0 + 2 * FLOOR) == "rejected:budget_exhausted"
+    assert clock.store[OBSERVATION_STATE_KEY]["transitions"] == accepted
+    clock.receipt.update({"admitted": True, "task_id": "wake0002", "reason": ""})
+    clock.clock._next_wake_at = T0 + 3 * FLOOR
+    assert clock.clock.tick(T0 + 3 * FLOOR) == "launched"
+    assert "- task kid failed, completion time not recorded" in clock.launches[-1]["text"]
+    assert clock.store[OBSERVATION_STATE_KEY]["transitions"]["inventory"] == {}
 
 
 def test_legacy_inbox_is_archived_once_without_being_read(clock):
