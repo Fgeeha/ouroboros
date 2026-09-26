@@ -24,6 +24,7 @@ disclosed on the later rows. Nothing here vetoes execution.
 from __future__ import annotations
 
 import pathlib
+import threading
 import time
 import uuid
 from typing import Any, Dict, Iterable, List, Optional
@@ -33,7 +34,7 @@ from ouroboros.utils import append_jsonl
 CALL_STARTED = "tool_call_started"
 CALL_SETTLED = "tool_call"
 CALL_WAIT_ENDED = "tool_call_timeout"
-_FROZEN_KEYS = ("invocation_id", "tool_call_id", "task_attempt", "execution_id", "round_id", "llm_call_id")
+_FROZEN_KEYS = ("invocation_id", "tool_call_id", "task_attempt", "execution_id", "round_id", "llm_call_id", "args_source_ref", "args_source_status")
 
 
 def new_invocation(tool_call_id: Any, correlation: Dict[str, Any], task_attempt: Any) -> Dict[str, Any]:
@@ -47,12 +48,37 @@ def new_invocation(tool_call_id: Any, correlation: Dict[str, Any], task_attempt:
         "llm_call_id": correlation.get("llm_call_id"),
     }
     return {**{key: value for key, value in frozen.items() if value not in (None, "")},
-            "_started_mono": time.monotonic()}
+            "_started_mono": time.monotonic(), "_settlement_lock": threading.Lock()}
 
 
 def invocation_fields(invocation: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     """The frozen facts a row carries (never the private monotonic stamp)."""
     return {key: invocation[key] for key in _FROZEN_KEYS if invocation and key in invocation}
+
+
+def persist_dispatch_source(meta: Dict[str, Any], drive_logs: pathlib.Path, task_id: str,
+                            invocation: Dict[str, Any], tool: str, arguments: Any) -> None:
+    """Full redacted dispatch input, in canonical observability before any execution.
+
+    The preview sanitizer is intentionally lossy; this existing CAS/manifest is
+    not. Readback verifies the actual bytes, including False/no-op writer failures.
+    Failure is evidence loss, never an execution veto or a fabricated source ref.
+    """
+    from ouroboros.observability import persist_call, read_call_payload
+
+    try:
+        root = pathlib.Path(meta.get("budget_drive_root") or pathlib.Path(drive_logs).parent).resolve()
+        call_id = f"tool_dispatch_{invocation['invocation_id']}"
+        persist_call(root, task_id=task_id, call_id=call_id, call_type="tool_dispatch",
+                     payload={"tool": tool, "arguments": arguments, **invocation_fields(invocation)},
+                     manifest={"tool": tool, **invocation_fields(invocation)}, keep_raw=False)
+        _manifest, payload, verified = read_call_payload(root, task_id=task_id, call_id=call_id)
+        if payload.get("invocation_id") != invocation["invocation_id"]:
+            raise ValueError("dispatch source identity mismatch")
+        invocation["args_source_ref"] = verified["manifest_ref"]
+        invocation["args_source_status"] = "ready"
+    except Exception as exc:
+        invocation["args_source_status"] = f"unavailable:{type(exc).__name__}"
 
 
 def elapsed_ms(invocation: Optional[Dict[str, Any]]) -> Optional[int]:
@@ -82,9 +108,12 @@ def append_call_row(meta: Dict[str, Any], drive_logs: pathlib.Path, payload: Dic
     outcome: Dict[str, Any] = {"task_log": _append(local, payload), "canonical": None}
     root = str(meta.get("budget_drive_root") or "").strip()
     if root:
-        candidate = pathlib.Path(root).resolve(strict=False) / "logs" / "tools.jsonl"
-        if candidate != local.resolve(strict=False):
-            outcome["canonical"] = _append(candidate, payload)
+        try:
+            candidate = pathlib.Path(root).resolve(strict=False) / "logs" / "tools.jsonl"
+            if candidate != local.resolve(strict=False):
+                outcome["canonical"] = _append(candidate, payload)
+        except Exception:
+            outcome["canonical"] = False
     return outcome
 
 
@@ -99,8 +128,31 @@ def append_failed(outcome: Optional[Dict[str, Any]]) -> bool:
     return bool(outcome) and (outcome.get("task_log") is False or outcome.get("canonical") is False)
 
 
+def start_log_field(invocation: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """``{"start_log": outcome}`` when the call's start append failed — the ONE field every
+    later row (settlement, host refusal, wait end) discloses it in; else nothing."""
+    outcome = (invocation or {}).get("start_log")
+    return {"start_log": outcome} if append_failed(outcome) else {}
+
+
+def claim_settlement(invocation: Optional[Dict[str, Any]]) -> bool:
+    """Claim operation settlement once. A wait end never owns this fact."""
+    if invocation is None:
+        return True
+    lock = invocation.setdefault("_settlement_lock", threading.Lock())
+    with lock:
+        first = not invocation.get("_settled")
+        invocation["_settled"] = True
+        return first
+
+
 def counts_as_call(row: Dict[str, Any]) -> bool:
-    """A row that opens one logical call: a start, or a legacy row without identity."""
+    """A per-row LOWER bound for sizing a read window: a start, or a legacy row.
+
+    A settlement or wait end whose start is missing (a lost append, or a start
+    outside the window) is not counted here, so a window only grows; the exact
+    count is ``len(logical_calls(rows))`` over the rows read, where such an
+    orphan is one call and a start with its later rows is one call."""
     return row.get("type") == CALL_STARTED or not row.get("invocation_id")
 
 
@@ -111,7 +163,8 @@ def logical_calls(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
     ``settled`` (a result exists, in either order with a timeout), ``wait_ended``
     (the caller stopped waiting, no result recorded), ``unknown`` (only a start),
     ``legacy`` (a pre-identity row) or ``orphan`` (a result whose start row lies
-    outside the rows given)."""
+    outside the rows given). A duplicate settlement (pre-guard data) never
+    replaces a real one with a host ``host_error`` row."""
     calls: List[Dict[str, Any]] = []
     by_id: Dict[str, Dict[str, Any]] = {}
     slot = {CALL_STARTED: "started", CALL_SETTLED: "settled", CALL_WAIT_ENDED: "wait_ended"}
@@ -127,7 +180,11 @@ def logical_calls(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
             call = by_id[invocation_id] = {"invocation_id": invocation_id, "tool": row.get("tool"),
                                            "args": row.get("args")}
             calls.append(call)
-        call.setdefault(slot.get(str(row.get("type") or ""), "settled"), row)
+        key = slot.get(str(row.get("type") or ""), "settled")
+        held = call.get(key)
+        if held is None or (key == "settled" and held.get("status") == "host_error"
+                            and row.get("status") != "host_error"):
+            call[key] = row
     for call in calls:
         if "state" not in call:
             call["state"] = ("settled" if "settled" in call and "started" in call

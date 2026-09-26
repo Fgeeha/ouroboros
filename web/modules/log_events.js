@@ -363,14 +363,24 @@ function toolCallTarget(args) {
     return '';
 }
 
-// Start, finish, failure and timeout of one call share a row: the call id when
-// the producer stamped one, else the tool with its target.
+// Legacy observations lack host identity: retain them separately rather than
+// guessing a call from a reused provider id, tool name or target.
+const legacyToolObservations = new WeakMap();
+let nextLegacyToolObservation = 0;
 function toolCallKey(evt, groupId) {
-    return `tool:${groupId}:${evt.tool_call_id || `${evt.tool || ''}|${toolCallTarget(evt.args)}`}`;
+    if (evt.invocation_id) return `tool:${groupId}:${evt.invocation_id}`;
+    if (evt.history_id) return `tool:${groupId}:history:${evt.history_id}`;
+    if (evt.event_id) return `tool:${groupId}:event:${evt.event_id}`;
+    if (!legacyToolObservations.has(evt)) legacyToolObservations.set(evt, ++nextLegacyToolObservation);
+    return `tool:${groupId}:observation:${legacyToolObservations.get(evt)}`;
 }
 
-const toolObservation = (evt, groupId, status) => ({  // one frame's fact about one invocation
-    key: toolCallKey(evt, groupId), status, receipt: Boolean(evt.routing_action), tool: evt.tool || '' });
+const toolObservation = (evt, groupId, status) => ({
+    key: toolCallKey(evt, groupId), status, receipt: Boolean(evt.routing_action), tool: evt.tool || '',
+    fact: (evt.type || evt.event) === 'tool_call_started' ? 'started'
+        : ['tool_call_timeout', 'tool_timeout'].includes(evt.type || evt.event) ? 'wait_ended' : 'settled',
+    hostError: evt.status === 'host_error', live: evt._live_tool_frame === true,
+});
 
 function describeStartupChecks(checks) {
     if (!checks || typeof checks !== 'object') return '';
@@ -1411,13 +1421,13 @@ function summarizeChatLiveEventView(evt) {
         });
     }
 
-    if (t === 'tool_call_started' || (t === 'tool_call_finished' && !evt.is_error)) {
+    if (t === 'tool_call_started' || (['tool_call_finished', 'tool_call'].includes(t) && !evt.is_error)) {
         // A successful call is execution evidence, not narration: start and finish feed the
         // block's ONE folded row (counts; tools behind Expand), a receipt while every counted
         // call is a host-stamped addressing act (`routing_action`, reported by the owner
         // message's annotation). A failure keeps its own error row and still counts. `done` is
         // the TASK's phase; a finished CALL is `ok`.
-        const status = t === 'tool_call_finished' ? 'ok' : 'calling';
+        const status = t === 'tool_call_started' ? (evt._live_tool_frame ? 'calling' : 'unknown') : 'ok';
         return chatView({
             phase: status,
             headline: '',
@@ -1470,15 +1480,15 @@ function summarizeChatLiveEventView(evt) {
 
     if (t === 'tool_call_timeout' || t === 'tool_timeout') {
         return chatView({
-            phase: 'error',
-            headline: `One of the steps took too long${evt.tool ? ` · ${evt.tool}` : ''}`,
+            phase: 'warn',
+            headline: `Tool wait ended; operation may still settle${evt.tool ? ` · ${evt.tool}` : ''}`,
             visible: true,
             dedupeKey: toolCallKey(evt, groupId),
-            toolCall: toolObservation(evt, groupId, 'error'),
+            toolCall: toolObservation(evt, groupId, 'wait_ended'),
         });
     }
 
-    if (t === 'tool_call_finished' && evt.is_error) {
+    if (['tool_call_finished', 'tool_call'].includes(t) && evt.is_error) {
         const failed = toolObservation(evt, groupId, 'error');
         const commandText = describeText(extractCommandText(evt.args), 120);
         const errorResult = describeText(evt.result_preview || evt.error, 220);

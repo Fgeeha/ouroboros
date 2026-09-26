@@ -23,7 +23,9 @@ const fold = (...observations) => {
     for (const observation of observations) noteToolCall(record, observation);
     return toolEvidenceView(record.toolFold);
 };
-const frame = (type, task, row) => summarizeChatLiveEvent({ type, task_id: task, ...row });
+// Modern host fixtures carry invocation identity; legacy independence is tested separately.
+const invocation = row => row.tool_call_id ? { invocation_id: `host-${row.tool_call_id}` } : {};
+const frame = (type, task, row) => summarizeChatLiveEvent({ type, task_id: task, _live_tool_frame: true, ...invocation(row), ...row });
 
 // The flat fixture's querySelector does not descend; the status badge and
 // card internals need a real descendant lookup.
@@ -84,7 +86,7 @@ function fixture(history = []) {
         typingHidden: () => messages.children
             .find((node) => String(node.className || '').includes('typing-bubble'))?.style.display === 'none',
         emit: (type, row) => handlers.get(type)({ chat_id: 1, ts: TS, ...row }),
-        log: (row) => handlers.get('log')({ chat_id: 1, data: { task_id: TASK, ts: TS, ...row } }),
+        log: (row) => handlers.get('log')({ chat_id: 1, data: { task_id: TASK, ts: TS, ...invocation(row), ...row } }),
         census: (rows) => instance.hydrateStateSnapshot({
             active_chat_activities: rows, active_chat_activities_complete: true, supervisor_ready: true,
         }, Infinity, ++generation),
@@ -404,7 +406,7 @@ const ownerRow = { role: 'user', content: 'Turn this into a project', text: 'Tur
     client_message_id: 'owner-1', ts: TS, chat_id: 1 };
 const receipt = { annotation_type: 'routing_ack', client_message_id: 'owner-1', action: 'promote_chat_to_task',
     status: 'scheduled', target: 'managed-root', target_title: 'Requested work' };
-const promote = (row = {}) => ({ tool: 'promote_chat_to_task', routing_action: 'promote_chat_to_task', tool_call_id: 'p1', ...row });
+const promote = (row = {}) => ({ tool: 'promote_chat_to_task', routing_action: 'promote_chat_to_task', tool_call_id: 'p1', invocation_id: 'p1', ...row });
 
 test('an addressing-only turn keeps no block live or on reload; the owner message carries the receipt', async () => {
     const f = fixture();
@@ -786,5 +788,20 @@ test('#931 a typed checkpoint is a real expanded row without stealing narration'
         const count = f.rows().length;
         f.log({ type: 'worker_starting', worker_id: 0 });
         assert.equal(f.rows().length, count);
+    } finally { f.close(); }
+});
+
+
+test('real Chat clears a provisional wait notice after durable successful settlement', async () => {
+    const f = fixture();
+    try {
+        const identity = { tool: 'read_file', tool_call_id: 'call_0', invocation_id: 'real-i' };
+        f.log({ type: 'tool_call_started', ...identity });
+        f.log({ type: 'tool_call_timeout', ...identity });
+        f.log({ ...final, type: 'task_done', status: 'completed', tool_calls: 1, tool_errors: 1, _is_direct_chat: true });
+        f.log({ type: 'tool_call', ...identity, status: 'ok', is_error: false });
+        const rows = f.rows().map(row => row.innerHTML).join(' ');
+        assert.doesNotMatch(rows, /operation may still settle|One of the steps failed/);
+        assert.match(rows, /1 tool call/);
     } finally { f.close(); }
 });

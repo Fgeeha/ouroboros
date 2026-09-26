@@ -233,6 +233,55 @@ def _final_answer(agent_dir: Path) -> str:
     return ""
 
 
+def _tool_call_steps(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """ONE row per logical tool call (#1316), shaped like a settlement row.
+
+    A call's ``tool_call_started`` / ``tool_call`` / ``tool_call_timeout`` rows share
+    one ``invocation_id``; a legacy row without it stands alone. What the model SAW
+    is the step: a call whose wait ended shows the timeout text at the timeout's
+    position (a late settlement is only noted); a call with only a start is kept
+    as an unknown outcome, never dropped and never read as a failure."""
+    calls: dict[str, dict[str, dict[str, Any]]] = {}
+    order: list[Any] = []
+    for row in rows:
+        kind = row.get("type")
+        if kind not in ("tool_call", "tool_call_started", "tool_call_timeout"):
+            continue
+        invocation_id = str(row.get("invocation_id") or "")
+        if not invocation_id:
+            if kind == "tool_call":
+                order.append(row)
+            continue
+        if invocation_id not in calls:
+            calls[invocation_id] = {}
+            order.append(invocation_id)
+        held = calls[invocation_id].get(kind)
+        # A duplicate settlement never replaces a real result with a host_error row.
+        if held is None or (kind == "tool_call" and held.get("status") == "host_error"
+                            and row.get("status") != "host_error"):
+            calls[invocation_id][kind] = row
+    out: list[dict[str, Any]] = []
+    for item in order:
+        if isinstance(item, dict):
+            out.append(item)
+            continue
+        call = calls[item]
+        started, settled, waited = (call.get(k) for k in ("tool_call_started", "tool_call", "tool_call_timeout"))
+        if waited is not None:
+            text = str(waited.get("result_preview") or "")
+            if settled is not None:
+                text += (f"\n[the worker also settled (status={settled.get('status')} "
+                         f"is_error={bool(settled.get('is_error'))}), but the model saw only this timeout]")
+            out.append({**waited, "status": "timeout", "is_error": True, "result_preview": text})
+        elif settled is not None:
+            out.append(settled)
+        else:
+            out.append({**(started or {}), "status": "unknown", "is_error": False,
+                        "result_preview": "(no outcome recorded: host processing began; "
+                                          "neither a result nor a wait end was logged)"})
+    return out
+
+
 def build_trajectory(
     agent_dir: Path,
     *,
@@ -244,16 +293,7 @@ def build_trajectory(
     agent_dir = Path(agent_dir)
     data_dir = agent_dir / "ouroboros-data"
     events = _read_jsonl_chain(data_dir, "events.jsonl", "events")
-    all_tool_rows = _read_jsonl_chain(data_dir, "tools.jsonl", "tools")
-    # One step per call: its settlement, else the wait-ended row of a call that never
-    # settled; start rows are not steps (host processing began, not a result).
-    settled = {r.get("invocation_id") for r in all_tool_rows if r.get("type") == "tool_call"}
-    tool_rows = [
-        r
-        for r in all_tool_rows
-        if r.get("type") == "tool_call"
-        or (r.get("type") == "tool_call_timeout" and r.get("invocation_id") not in settled)
-    ]
+    tool_rows = _tool_call_steps(_read_jsonl_chain(data_dir, "tools.jsonl", "tools"))
     narration_rows = [
         r
         for r in _read_jsonl_chain(agent_dir / "ouroboros-data", "progress.jsonl", "progress")

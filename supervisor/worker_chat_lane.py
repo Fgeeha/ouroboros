@@ -615,10 +615,14 @@ def handle_wake_direct(
     """
     if not wake_gate_open():
         return {"admitted": False, "task_id": "", "reason": "repo_writer_gate_closed"}
-    from supervisor.state import budget_remaining, load_state
+    from supervisor.state import budget_remaining, control_is, load_state
+    from ouroboros.consciousness import panic_blocks_wake
 
+    current = load_state()
+    if panic_blocks_wake(_pool().DRIVE_ROOT) or not control_is(current, "bg_consciousness_enabled", True):
+        return {"admitted": False, "task_id": "", "reason": "consciousness_disabled_or_unknown"}
     try:
-        remaining = budget_remaining(load_state(), strict=True)
+        remaining = budget_remaining(current, strict=True)
     except Exception:
         return {"admitted": False, "task_id": "", "reason": "cost_accounting_unavailable"}
     if remaining <= 0:
@@ -672,7 +676,8 @@ def auto_resume_after_restart() -> None:
             except Exception:
                 log.debug("Failed to consume owner restart compatibility flag", exc_info=True)
             log.info("Owner restart flag detected — skipping auto-resume.")
-            return
+            if not (_pool().DRIVE_ROOT / "state" / "panic_stop.flag").exists():
+                return  # a kept Panic flag still owes its durable controls below
 
         # Panic/owner-restart flags suppress auto-resume. The Panic flag is consumed
         # only AFTER its disabled controls are durably known in state (#1307): if that
@@ -696,10 +701,11 @@ def auto_resume_after_restart() -> None:
             log.info("Panic flag detected — skipping auto-resume.")
             return
 
-        st = _pool().load_state()
-        chat_id = st.get("owner_chat_id")
-        if not chat_id:
-            return
+        from supervisor.state import control_value
+
+        chat_known, chat_id = control_value(_pool().load_state(), "owner_chat_id")
+        if not chat_known or not chat_id:
+            return  # an autonomous resume turn needs a KNOWN owner chat (#1307)
 
         restart_verify_path = _pool().DRIVE_ROOT / "state" / "pending_restart_verify.json"
         recent_restart = False
@@ -791,11 +797,11 @@ def stop_direct_chat_turn(task_id: str, turn: Dict[str, Any], *, deliver: bool =
     ``deliver=False`` (a cascade sweep, which speaks for the tree once)
     suppresses the owner toast.
     """
+    from ouroboros.config import get_direct_turn_stop_wait_sec
     from supervisor import queue as q
     from supervisor import workers
     from supervisor.owner_stop import REASON_OWNER_STOPPED_DIRECT_TURN
     from supervisor.task_reaper import request_finalization_grace
-    from ouroboros.config import get_direct_turn_stop_wait_sec
 
     if turn.get("stop_control_msg_id"):
         return DIRECT_TURN_STOP_LIVE if workers.direct_chat_turn(task_id) is not None else DIRECT_TURN_STOP_ENDED

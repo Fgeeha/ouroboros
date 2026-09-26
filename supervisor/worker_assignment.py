@@ -356,6 +356,8 @@ def assign_tasks() -> None:
                 # and project-leased candidates)
                 chosen_idx = None
                 for i, candidate in enumerate(_pool().PENDING):
+                    if candidate.get("_owner_hold"):
+                        continue
                     if remaining <= 0 and not candidate.get("_owner_wait_resume"):
                         continue
                     if _pool()._invalid_depth_deferred(candidate, unresolved_invalid_id_set):

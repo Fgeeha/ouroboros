@@ -235,12 +235,15 @@ def _clock_of(iso_value: Any) -> str:
     return parsed.astimezone().strftime("%H:%M") if parsed is not None else "?"
 
 
-def _describe_bg_consciousness_state(requested_enabled: bool) -> dict:
-    """Project the alarm clock's snapshot into one honest status + detail line."""
+def _describe_bg_consciousness_state(requested_enabled: bool | None) -> dict:
+    """Project the alarm clock's snapshot into one honest status + detail line
+    (``None``: the stored control is unknown, never read as off — #1307)."""
     snapshot = _consciousness.status_snapshot() if _consciousness else {}
     outcome = str(snapshot.get("last_wake_outcome") or "")
     next_at = _clock_of(snapshot.get("next_wake_at"))
-    if not requested_enabled:
+    if requested_enabled is None:
+        status, detail = "unknown", "The stored consciousness control is unknown: runtime state is unavailable or recovering."
+    elif not requested_enabled:
         status, detail = "disabled", "Background consciousness is off."
     elif not snapshot:
         status, detail = "stopped", "Enabled in state, but the alarm clock was not constructed (supervisor init failed)."
@@ -401,9 +404,14 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
 
         st = ctx.load_state()
         ext_known, owner_ext_id = control_value(st, "owner_external_id")
-        _, owner_ext_chat_id = control_value(st, "owner_external_chat_id")
+        chat_known, owner_ext_chat_id = control_value(st, "owner_external_chat_id")
+        ext_known = ext_known and chat_known
+        try:
+            bound_pair = (int(owner_ext_id or 0), int(owner_ext_chat_id or 0))
+        except (TypeError, ValueError):
+            bound_pair = (0, 0)  # a malformed binding matches nobody
         if panic and external_identity_present and ext_known and owner_ext_id is not None and (
-                int(owner_ext_id or 0), int(owner_ext_chat_id or 0)) == (user_id, chat_id):
+                bound_pair == (user_id, chat_id)):
             _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
             return offset
 
@@ -464,13 +472,7 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
                       "⚠️ Command ignored: the owner chat could not be registered right now.",
                       "completed" if bound["ok"] else "failed")
                 continue
-            try:
-                owner_ext_id_int = int(owner_ext_id or 0)
-                owner_ext_chat_id_int = int(owner_ext_chat_id or 0)
-            except (TypeError, ValueError):
-                owner_ext_id_int = 0
-                owner_ext_chat_id_int = 0
-            if owner_ext_id_int != user_id or owner_ext_chat_id_int != chat_id:
+            if bound_pair != (user_id, chat_id):
                 reply("⚠️ Command ignored: this transport is not the bound owner chat.", "failed")
                 continue
 
@@ -510,7 +512,10 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
                 result = ctx.consciousness.start() if on else ctx.consciousness.stop()
                 reply(f"🧠 {result}{persist_consciousness_choice(on)}")
             else:
-                described = _describe_bg_consciousness_state(bool(ctx.load_state().get("bg_consciousness_enabled")))
+                from supervisor.state import control_value
+
+                known, enabled = control_value(ctx.load_state(), "bg_consciousness_enabled")
+                described = _describe_bg_consciousness_state(bool(enabled) if known else None)
                 reply(f"🧠 Background consciousness: {described['status']} — {described['detail']}")
         elif lowered.startswith("/status"):
             from supervisor.state import status_text

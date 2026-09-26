@@ -71,6 +71,17 @@ def _iso(ts: float) -> str:
     return _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc).isoformat() if ts else ""
 
 
+def panic_blocks_wake(drive_root: Any) -> bool:
+    """A kept Panic intent (or an unreadable flag) bars all automatic wake grants."""
+    try:
+        (pathlib.Path(drive_root) / "state" / "panic_stop.flag").stat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
 class BackgroundConsciousness:
     """The alarm clock; one instance per supervisor, ticked from its loop."""
 
@@ -84,7 +95,7 @@ class BackgroundConsciousness:
         state = self._read_state()
         from supervisor.state import control_is
 
-        self._enabled = control_is(state, "bg_consciousness_enabled", True)  # unknown is not on (#1307)
+        self._enabled = not panic_blocks_wake(self._drive_root) and control_is(state, "bg_consciousness_enabled", True)  # unknown is not on (#1307)
         try:
             persisted = float(state.get(NEXT_WAKE_STATE_KEY) or 0.0)
         except (TypeError, ValueError):
@@ -187,7 +198,12 @@ class BackgroundConsciousness:
         """One supervisor pass; never blocks on a wake. Returns the typed decision."""
         now = time.time() if now is None else float(now)
         with self._lock:
-            if not self._enabled:
+            from supervisor.state import control_is
+
+            if panic_blocks_wake(self._drive_root):
+                self._enabled = False
+                return "panic_stop"
+            if not self._enabled or not control_is(self._read_state(), "bg_consciousness_enabled", True):
                 return "disabled"
             wake, owner_live = self.live_turns()
             if wake or owner_live:
@@ -290,6 +306,8 @@ class BackgroundConsciousness:
 
     def start(self) -> str:
         with self._lock:
+            if panic_blocks_wake(self._drive_root):
+                return "Background consciousness stays disabled while Panic controls await persistence."
             if self._enabled:
                 return "Background consciousness is already enabled."
             self._enabled = True

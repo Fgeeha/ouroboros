@@ -134,6 +134,8 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "focus": t.get("focus"),
                 "allowed_resources": t.get("allowed_resources"), "deadline_at": t.get("deadline_at"),
                 "task_contract": t.get("task_contract"),
+                "_owner_hold": t.get("_owner_hold"),
+                "_consciousness_continuation": t.get("_consciousness_continuation"),
                 # Scheduling INTENT survives a restart and is all a PENDING child has;
                 # `parent_model_lane` and the F9 admission fact `required_model_lane`
                 # above all (R2-3). Pinned to SUBAGENT_INTENT_FIELDS by test_model_slot.

@@ -112,100 +112,60 @@ def execute_panic_stop(
     Unconfirmed shutdown remains disclosed with custody retained; names or
     recycled descriptor ports never authorize signalling an unrelated process.
     """
-    log.critical("PANIC STOP initiated.")
+    import threading
     from ouroboros.startup_historical_audit import audit
-    audit.stop()  # latch first; never wait for spawn/publication/exit or audit locks
-    try:
-        consciousness.stop()
-    except Exception:
-        pass
 
-    # Physical termination requests come FIRST (#1307): no state, campaign or log
-    # write may delay them. The durable gate (panic flag) and the disabled controls
-    # follow, each bounded, and all of it precedes the port sweep that can kill THIS
-    # process and the hard exit.
-    try:
-        from ouroboros.local_model import get_manager
+    audit.stop()
+    requests = []
 
-        get_manager().stop_server()
-    except Exception:
-        pass
-
-    # One explicit owned-daemon stop, including older server generations. No
-    # per-run cancellation fan-out: CLI shutdown and measured/Popen fallback
-    # own completion. Worker cleanup below deliberately spares shared daemons.
-    try:
-        from ouroboros.claudexor_daemon import get_owned_daemon
-
-        get_owned_daemon().stop()
-    except Exception as exc:
-        log.critical("PANIC: owned Claudexor stop raised %s; custody is unconfirmed", type(exc).__name__)
-        _bounded(lambda error=exc: _record_unconfirmed_daemon_stop(data_dir, error), 1.0)
-
-    try:
-        from ouroboros.tools.shell import kill_all_tracked_subprocesses
-
-        kill_all_tracked_subprocesses()
-    except Exception:
-        pass
-
-    try:
-        from ouroboros.workspace_executor import kill_all_foreground
-
-        kill_all_foreground(data_dir, wait=False)
-    except Exception:
-        pass
-
-    try:
-        from ouroboros.tools.services import kill_all_services
-
-        kill_all_services(data_dir, wait=False)
-    except Exception:
-        pass
-
-    try:
-        from ouroboros.extension_companion import panic_kill_all
-
-        panic_kill_all()
-    except Exception:
-        pass
-
-    try:
-        kill_workers_fn(
-            force=True, archive_service_logs=False, reconcile_delegate_custody=False,
-        )
-    except Exception:
-        pass
-
-    # The durable gate: every boot grant consults it, and boot consumes it only
-    # after the disabled controls are durably saved (auto_resume_after_restart).
-    if not _bounded(lambda: _write_panic_flag(data_dir), 2.0):
-        log.critical("PANIC: the panic flag was not confirmed on disk; boot grants cannot see this stop")
-    _bounded(lambda: _persist_panic_controls(data_dir), 2.0)
-
-    try:
-        import multiprocessing
-        from ouroboros.gateway.host_service import host_service_port
-        from ouroboros.platform_layer import force_kill_pid, kill_process_on_port
-
-        for child in multiprocessing.active_children():
+    def request(name, fn):
+        # No join here: one helper's lock, disk, CLI or exit wait must not stand
+        # between Panic and another positively owned process's stop request.
+        done = threading.Event()
+        def run():
             try:
-                force_kill_pid(child.pid)
-            except (ProcessLookupError, PermissionError):
-                pass
-        # Sweep the actually bound main port (not hardcoded 8765/8766 — a
-        # custom-port install would panic-kill an unrelated listener). The
-        # default install port stays the last resort, for a caller that has no
-        # bound port to give and for a sweep that fails.
-        try:
-            kill_process_on_port(bound_port or 8765)
-        except Exception:
-            kill_process_on_port(8765)
-        kill_process_on_port(host_service_port())
-    except Exception:
-        pass
+                fn()
+            except Exception:
+                pass  # custody stays unconfirmed; no fabricated completion
+            finally:
+                done.set()
+        threading.Thread(target=run, name=f"panic-{name}", daemon=True).start()
+        requests.append((name, done))
 
-    log.critical("PANIC STOP teardown finished — hard exit with code %d; consult stop diagnostics for unconfirmed custody.", panic_exit_code)
+    import multiprocessing
+
+    from ouroboros.claudexor_daemon import get_owned_daemon
+    from ouroboros.extension_companion import panic_kill_all
+    from ouroboros.gateway.host_service import host_service_port
+    from ouroboros.local_model import get_manager
+    from ouroboros.platform_layer import force_kill_pid, kill_process_on_port
+    from ouroboros.tools.services import kill_all_services
+    from ouroboros.tools.shell import kill_all_tracked_subprocesses
+    from ouroboros.workspace_executor import kill_all_foreground
+
+    request("consciousness", consciousness.stop)
+    request("local-model", lambda: get_manager().panic_stop())
+    request("daemon", lambda: get_owned_daemon().panic_stop())
+    request("commands", kill_all_tracked_subprocesses)
+    request("executors", lambda: kill_all_foreground(data_dir, wait=False))
+    request("services", lambda: kill_all_services(data_dir, wait=False))
+    request("companions", panic_kill_all)
+    request("workers", lambda: kill_workers_fn(
+        force=True, archive_service_logs=False, reconcile_delegate_custody=False))
+    # Multiprocessing handles are positively owned; never expand to PID/name scans.
+    for child in multiprocessing.active_children():
+        request(f"child-{child.pid}", lambda pid=child.pid: force_kill_pid(pid))
+    request("main-port", lambda: kill_process_on_port(bound_port or 8765))
+    request("host-port", lambda: kill_process_on_port(host_service_port()))
+
+    # All stop paths have been launched before any persistence wait. The flag can
+    # progress even if a helper is stuck; no successful thread launch proves death.
+    flag_written = _bounded(lambda: _write_panic_flag(data_dir), 2.0)
+    _bounded(lambda: _persist_panic_controls(data_dir), 2.0)
+    unsettled = [name for name, done in requests if not done.is_set()]
+    _bounded(lambda: log.critical("PANIC STOP: flag persisted=%s; unfinished stop helpers=%s; "
+                                  "hard exit %d, unresolved custody retained.",
+                                  flag_written, unsettled, panic_exit_code), 0.5)
     os._exit(panic_exit_code)
 
 

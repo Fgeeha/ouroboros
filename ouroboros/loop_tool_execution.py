@@ -5,6 +5,7 @@ from __future__ import annotations
 from ouroboros.model_wait import execution_deadline_scope, future_result, monotonic_now
 
 import concurrent.futures
+import copy
 import contextlib
 import contextvars
 import json
@@ -24,8 +25,8 @@ from ouroboros.config import (
 from ouroboros.deadline_utils import deadline_remaining_sec
 from ouroboros.observability import new_call_id, persist_call
 from ouroboros.tool_call_log import (
-    CALL_STARTED, CALL_SETTLED, CALL_WAIT_ENDED, append_call_row, append_failed,
-    elapsed_ms, invocation_fields, new_invocation,
+    CALL_STARTED, CALL_SETTLED, CALL_WAIT_ENDED, append_call_row, append_failed, claim_settlement,
+    elapsed_ms, invocation_fields, new_invocation, start_log_field, persist_dispatch_source,
 )
 from ouroboros.tool_capabilities import (
     FOREGROUND_MUTATIVE_TOOLS,
@@ -84,16 +85,16 @@ def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
     # aware of it through the same typed operation seam as LLM/review calls;
     # a timeout/late notice deliberately does NOT close the lease because the
     # worker thread may still be running after the logical caller returned.
-    operation_id = str(enriched.get("tool_call_id") or "")
+    operation_id = str(enriched.get("invocation_id") or enriched.get("tool_call_id") or "")
     event_type = str(enriched.get("type") or "")
-    if operation_id and event_type in {"tool_call_started", "tool_call_finished"}:
+    if operation_id and event_type in {"tool_call_started", "tool_call_finished", CALL_SETTLED}:
         emit_cognitive_operation_event(
             event_queue,
             task_id=str(enriched.get("task_id") or getattr(tool_ctx, "task_id", "") or ""),
             operation_id=operation_id,
             phase="started" if event_type == "tool_call_started" else "finished",
             kind="tool",
-            task_attempt=getattr(tool_ctx, "task_attempt", None),
+            task_attempt=enriched.get("task_attempt", getattr(tool_ctx, "task_attempt", None)),
             execution_id=str(enriched.get("execution_id") or ""),
             round_id=str(enriched.get("round_id") or ""),
             tool=str(enriched.get("tool") or ""),
@@ -103,6 +104,36 @@ def _emit_live_log(tools: ToolRegistry, payload: Dict[str, Any]) -> None:
         {"ts": utc_now_iso(), **enriched},
         log_label="tool live",
     )
+
+
+def _publish_settlement(tools, drive_logs, row):
+    action = routing_action_for_tool(str(row.get("tool") or ""))
+    if action:
+        row["routing_action"] = action
+    outcome = _append_tool_log(tools, drive_logs, dict(row))
+    _emit_live_log(tools, {**row, **({"settlement_log": outcome} if append_failed(outcome) else {})})
+
+
+def _settle_host_error(tools, drive_logs, live, invocation, exc):
+    if claim_settlement(invocation):
+        _publish_settlement(tools, drive_logs, {
+            **live, "ts": utc_now_iso(), "type": CALL_SETTLED, "is_error": True,
+            "status": "host_error", "elapsed_ms": elapsed_ms(invocation),
+            "result_preview": f"{type(exc).__name__}: {sanitize_tool_result_for_log(str(exc))[:500]}",
+            **start_log_field(invocation),
+        })
+
+
+def _observe_tool_exception(future, tools, drive_logs, live, invocation):
+    invocation["_worker_submitted"] = True
+    def settled(done):
+        try:
+            exc = done.exception()
+        except BaseException as failure:
+            exc = failure
+        if exc is not None:
+            _settle_host_error(tools, drive_logs, live, invocation, exc)
+    future.add_done_callback(settled)
 
 
 def _attach_late_tool_settlement(
@@ -120,7 +151,7 @@ def _attach_late_tool_settlement(
     # Claim the quiescence row BEFORE attaching: a budget pause may not release
     # the native worker while this callback is still producing effects, and
     # ``future.done()`` is not callback-complete (#1196).
-    release_quiescence = budget_pause.hold_tool_settlement(tool_ctx, tool_call_id)
+    release_quiescence = budget_pause.hold_tool_settlement(tool_ctx, str(correlation.get("invocation_id") or tool_call_id))
 
     def _settled(_future: Any) -> None:
         try:
@@ -132,10 +163,10 @@ def _attach_late_tool_settlement(
             emit_cognitive_operation_event(
                 event_queue,
                 task_id=task_id,
-                operation_id=tool_call_id,
+                operation_id=str(correlation.get("invocation_id") or tool_call_id),
                 phase="finished",
                 kind="tool",
-                task_attempt=getattr(tool_ctx, "task_attempt", None),
+                task_attempt=correlation.get("task_attempt"),
                 execution_id=str(correlation.get("execution_id") or ""),
                 round_id=str(correlation.get("round_id") or ""),
                 tool=str(correlation.get("tool") or ""),
@@ -577,10 +608,11 @@ def _execute_browser_tool_bound(
         fn_name = str(tc.get("function", {}).get("name") or "")
         result = ("⚠️ BROWSER_SESSION_RETIRED: this call timed out before it "
                   "started and its browser generation was retired; nothing ran.")
-        _append_tool_log(tools, drive_logs, {  # the started call's settlement: a host refusal
+        claim_settlement(invocation)
+        _publish_settlement(tools, drive_logs, {  # the started call's settlement: a host refusal
             "ts": utc_now_iso(), "type": CALL_SETTLED, "tool": fn_name, "task_id": task_id,
             "result_preview": result, "is_error": True, "status": "refused",
-            "elapsed_ms": elapsed_ms(invocation), **invocation_fields(invocation)})
+            "elapsed_ms": elapsed_ms(invocation), **invocation_fields(invocation), **start_log_field(invocation)})
         return {"tool_call_id": tc.get("id"), "fn_name": fn_name, "result": result,
                 "is_error": True, "args_for_log": {}, "is_code_tool": False}
     if tool_ctx is not None and generation is not None:
@@ -617,7 +649,7 @@ def _execute_single_tool(
     # The FROZEN correlation: a body that starts after an executor wait never adopts a later round's ids.
     correlation = {key: invocation[key] for key in ("execution_id", "round_id", "llm_call_id") if key in invocation}
     settlement = {"type": CALL_SETTLED, "tool": fn_name, "task_id": task_id, **invocation_fields(invocation),
-                  **({"start_log": invocation["start_log"]} if append_failed(invocation.get("start_log")) else {})}
+                  **start_log_field(invocation)}
 
     try:
         args = json.loads(tc["function"]["arguments"] or "{}")
@@ -658,7 +690,8 @@ def _execute_single_tool(
             )
         except Exception:
             log.debug("Failed to persist tool arg-error observability payload", exc_info=True)
-        _append_tool_log(tools, drive_logs, _with_correlation({
+        claim_settlement(invocation)
+        _publish_settlement(tools, drive_logs, _with_correlation({
             "ts": utc_now_iso(), **settlement, "args": {}, "result_preview": result, "is_error": True,
             "status": result_meta.get("status"), "elapsed_ms": elapsed_ms(invocation),
             "result_ref": trace_ref.get("manifest_ref") if trace_ref else None,
@@ -763,8 +796,10 @@ def _execute_single_tool(
     except Exception:
         log.debug("Failed to persist tool observability payload", exc_info=True)
 
-    _append_tool_log(tools, drive_logs, _with_correlation({
+    claim_settlement(invocation)  # the real result always writes; it only stops a later host fallback
+    settled_row = _with_correlation({
         "ts": utc_now_iso(), **settlement, "elapsed_ms": elapsed_ms(invocation),
+        **({"routing_action": routing_action_for_tool(fn_name)} if routing_action_for_tool(fn_name) else {}),
         "args": args_for_log,
         "result_preview": sanitize_tool_result_for_log(truncate_for_log(result, 2000)),
         "is_error": is_error,
@@ -780,7 +815,8 @@ def _execute_single_tool(
         "tool_result_meta": result_meta.get("tool_result_meta") or {},
         "args_ref": (trace_ref.get("manifest_ref") or {}).get("path") if trace_ref else None,
         "result_ref": trace_ref.get("manifest_ref") if trace_ref else None,
-    }, correlation, tool_call_id=tool_call_id))
+    }, correlation, tool_call_id=tool_call_id)
+    _publish_settlement(tools, drive_logs, settled_row)
 
     return {
         "tool_call_id": tool_call_id,
@@ -949,15 +985,18 @@ def _make_timeout_result(
         "tool": fn_name, "args": args_for_log,
         "timeout_sec": timeout_sec,
         "result_ref": result_ref,
+        # The UI keys a call's rows by invocation (#1316); this events twin joins that row.
+        **({"invocation_id": invocation["invocation_id"]} if invocation and invocation.get("invocation_id") else {}),
     }, corr, tool_call_id=tool_call_id))
     row = _with_correlation({
         **(live or {}), "ts": utc_now_iso(), "type": CALL_WAIT_ENDED, "tool": fn_name, "task_id": task_id,
         "args": args_for_log, "timeout_sec": timeout_sec, "waited_ms": elapsed_ms(invocation),
         "result_preview": result, "result_ref": result_ref, **invocation_fields(invocation),
+        **start_log_field(invocation),
     }, corr, tool_call_id=tool_call_id)
-    _append_tool_log(tools, drive_logs, dict(row))
-    if live is not None:
-        _emit_live_log(tools, row)
+    wait_log = _append_tool_log(tools, drive_logs, dict(row))
+    if live is not None:  # the live frame also names a failed append of this very row
+        _emit_live_log(tools, {**row, **({"wait_log": wait_log} if append_failed(wait_log) else {})})
 
     return {
         "tool_call_id": tool_call_id,
@@ -1003,6 +1042,7 @@ def _execute_with_timeout(
     The call's identity is frozen and its durable ``tool_call_started`` row written
     BEFORE submission (#1316): that row means host processing began, not that the
     handler ran. A failed append is disclosed on the later rows, never a veto."""
+    tc = copy.deepcopy(tc)  # caller mutation during executor delay cannot change the dispatched request
     requested_fn_name = tc["function"]["name"]
     fn_name = str(requested_fn_name or "").strip()
     tool_call_id = tc["id"]
@@ -1013,6 +1053,11 @@ def _execute_with_timeout(
     correlation = _tool_correlation(tools)
     tool_ctx = getattr(tools, "_ctx", None)
     invocation = new_invocation(tool_call_id, correlation, getattr(tool_ctx, "task_attempt", None))
+    try:
+        arguments = json.loads(tc.get("function", {}).get("arguments") or "{}")
+    except (ValueError, TypeError):
+        arguments = {"raw_arguments": tc.get("function", {}).get("arguments")}
+    persist_dispatch_source(_tool_task_metadata(tools), drive_logs, task_id, invocation, fn_name, arguments)
     args_for_log = sanitize_tool_args_for_log(fn_name, _tc_args(tc))
     # The addressing stamp of the live frames: the routing action this call
     # represents (tool_capabilities owns the family); the chat block renders a
@@ -1028,6 +1073,7 @@ def _execute_with_timeout(
         **receipt, **invocation_fields(invocation),
     }, correlation, tool_call_id=tool_call_id)
     invocation["start_log"] = _append_tool_log(tools, drive_logs, dict(live))
+    live.update(start_log_field(invocation))  # the live frames (and the wait-end row built on them) disclose it
     _emit_live_log(tools, live)
     try:
         if use_stateful:
@@ -1038,7 +1084,8 @@ def _execute_with_timeout(
             # Registered before the wait, so a call abandoned at its timeout is
             # already visible to budget-pause quiescence (#1196); ownership is
             # pinned until the finally below, after any late hold was claimed.
-            release_tool_custody = budget_pause.register_tool_future(tool_ctx, tool_call_id, fn_name, future)
+            _observe_tool_exception(future, tools, drive_logs, live, invocation)
+            release_tool_custody = budget_pause.register_tool_future(tool_ctx, invocation["invocation_id"], fn_name, future)
             try:
                 result = future.result() if is_reviewed_mutative else future_result(future, timeout_sec)
                 return _emit_finished(tools, live, result, started_at)
@@ -1055,7 +1102,7 @@ def _execute_with_timeout(
                     return _emit_finished(tools, live, future.result(), started_at, late=True, terminal_wait=True)
                 _attach_late_tool_settlement(
                     tools, future, task_id=task_id, tool_call_id=tool_call_id,
-                    correlation={**correlation, "tool": fn_name},
+                    correlation={**correlation, **invocation_fields(invocation), "tool": fn_name},
                 )
                 return _make_timeout_result(
                     fn_name, tool_call_id, is_code_tool, tc, drive_logs, timeout_sec, task_id,
@@ -1068,12 +1115,10 @@ def _execute_with_timeout(
     except BaseException as exc:
         # A submission failure or a body that raised before its own row (e.g. the
         # accounting stop) still settles the started call, then propagates unchanged.
-        _append_tool_log(tools, drive_logs, _with_correlation({
-            "ts": utc_now_iso(), "type": CALL_SETTLED, "tool": fn_name, "task_id": task_id,
-            "args": args_for_log, "is_error": True, "status": "host_error",
-            "result_preview": f"{type(exc).__name__}: {sanitize_tool_result_for_log(str(exc))[:500]}",
-            "elapsed_ms": elapsed_ms(invocation), **invocation_fields(invocation),
-        }, correlation, tool_call_id=tool_call_id))
+        # A failure AFTER the real settlement (a live emit, the custody release, an
+        # interrupt) writes no second settlement: the call already has its result.
+        if not invocation.get("_worker_submitted"):
+            _settle_host_error(tools, drive_logs, live, invocation, exc)
         raise
 
 
@@ -1097,7 +1142,8 @@ def _await_stateful_tool(tools: ToolRegistry, tc: Dict[str, Any], drive_logs: pa
     # The registration PINS settlement ownership until this call's own
     # handling is over (result in time, or the late hold claimed below):
     # released in the finally, after either branch (#1196).
-    release_tool_custody = budget_pause.register_tool_future(tool_ctx, tool_call_id, fn_name, future)
+    _observe_tool_exception(future, tools, drive_logs, live, invocation)
+    release_tool_custody = budget_pause.register_tool_future(tool_ctx, invocation["invocation_id"], fn_name, future)
     try:
         return _emit_finished(tools, live, future_result(future, timeout_sec), started_at)
     except (TimeoutError, concurrent.futures.TimeoutError):
@@ -1135,7 +1181,7 @@ def _await_stateful_tool(tools: ToolRegistry, tc: Dict[str, Any], drive_logs: pa
                 on_settled = lambda: cleanup_browser_handles(retired_generation)  # noqa: E731
         _attach_late_tool_settlement(
             tools, settlement_target, task_id=task_id, tool_call_id=tool_call_id,
-            correlation={**correlation, "tool": fn_name},
+            correlation={**correlation, **invocation_fields(invocation), "tool": fn_name},
             on_settled=on_settled,
         )
         # retire(), not reset(): cancel_futures would cancel exactly the

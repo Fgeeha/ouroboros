@@ -213,7 +213,7 @@ def test_server_navigation_and_chat_static_contracts():
     settings = _read("web/modules/settings.js")
     costs = _read("web/modules/costs.js")
 
-    assert "def _describe_bg_consciousness_state(requested_enabled: bool) -> dict:" in server_source
+    assert "def _describe_bg_consciousness_state(requested_enabled: bool | None) -> dict:" in server_source
     assert '"evolution_state": evolution_state,' in state_source
     assert '"bg_consciousness_state": bg_state,' in state_source
     assert 'request.query_params.get("force")' in control_source

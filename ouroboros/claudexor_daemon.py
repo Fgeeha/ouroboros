@@ -967,6 +967,23 @@ class OwnedClaudexorDaemon:
             log.warning("Owned daemon operator stop did not confirm completion (%s)", type(exc).__name__)
             return False
 
+    def panic_stop(self) -> None:
+        """Stop a captured child immediately; existing attested stop owns attachments.
+
+        The Popen handle is direct ownership. Do not acquire the manager lock or
+        wait on CLI/logging before signalling it. Prior-generation attachments
+        still require stop_outcome's existing home/endpoint/custody proofs.
+        """
+        proc = self._proc
+        if proc is not None and proc.poll() is None:
+            from ouroboros.platform_layer import kill_process_tree
+
+            try:
+                kill_process_tree(proc)
+            except Exception:
+                pass
+        self.stop_outcome()
+
     def stop_outcome(self) -> DaemonStopOutcome:
         """Stop verified own roots; report every unconfirmed remainder.
 
@@ -1099,6 +1116,8 @@ _MANAGER_LOCK = threading.Lock()
 
 def get_owned_daemon() -> OwnedClaudexorDaemon:
     global _MANAGER
+    if _MANAGER is not None:
+        return _MANAGER
     with _MANAGER_LOCK:
         if _MANAGER is None:
             _MANAGER = OwnedClaudexorDaemon()

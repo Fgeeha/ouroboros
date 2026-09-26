@@ -331,7 +331,10 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
 
         # Fast path: drop any queued post-task promotion so it cannot re-arm on
         # the next boot tick (the evolution_owner_stopped flag is the durable backstop).
-        drop_pending_request(ctx.DRIVE_ROOT)
+        try:
+            drop_pending_request(ctx.DRIVE_ROOT)
+        except Exception:
+            log.warning("Pending evolution request could not be dropped; cancellation still attempted", exc_info=True)
         stopped = stop_evolution_tasks("disabled via owner chat")
         ctx.sort_pending()
         ctx.persist_queue_snapshot(reason="evolve_off")

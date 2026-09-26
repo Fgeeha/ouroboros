@@ -150,25 +150,30 @@ def _task_root_drives(ctx: Any) -> list[pathlib.Path]:
     return drives
 
 
-def lineage_read_base(ctx: Any, root: ResourceRoot, target: pathlib.Path) -> pathlib.Path | None:
-    """The lineage ``task_drive``/``artifact_store`` base containing ``target``, or None:
-    ``lineage_task_ids`` on the canonical data root and the task's own drives (where a parent's
-    files live while the child runs elsewhere), and each id on ITS OWN headless drive (#1260),
-    never through a symlinked headless root. Physical containment only; the caller keeps the READ-only gate."""
+def lineage_read_roots(ctx: Any, root: ResourceRoot) -> tuple[pathlib.Path, ...]:
+    """Enumerate only the same host-attested lineage containers used by native reads."""
     if root not in {"task_drive", "artifact_store"} or not hasattr(ctx, "drive_root"):
-        return None
-    candidate, canonical = pathlib.Path(target).resolve(strict=False), canonical_data_root(ctx)
+        return ()
+    canonical = canonical_data_root(ctx)
     drives = [canonical] + [drive for drive in _task_root_drives(ctx) if drive != canonical]
     task_ids = lineage_task_ids(ctx)
     pairs = [(drive, task_id, False) for drive in drives for task_id in task_ids]
     pairs += [(task_state_dir(canonical, task_id) / "data", task_id, True) for task_id in task_ids]
+    bases = []
     for drive, task_id, headless in pairs:
         lexical = (drive / "task_drives" / task_id if root == "task_drive"
                    else task_artifact_dir_path(drive, task_id, create=False))
         base = lexical.resolve(strict=False)
-        if path_is_relative_to(candidate, base) and (base == lexical or not headless):
-            return base
-    return None
+        if (base == lexical or not headless) and base not in bases:
+            bases.append(base)
+    return tuple(bases)
+
+
+def lineage_read_base(ctx: Any, root: ResourceRoot, target: pathlib.Path) -> pathlib.Path | None:
+    """Containing lineage base for a READ; never a sibling or an external runtime root."""
+    candidate = pathlib.Path(target).resolve(strict=False)
+    return next((base for base in lineage_read_roots(ctx, root)
+                 if path_is_relative_to(candidate, base)), None)
 
 
 def _effective_policy_profile(profile: ToolProfile) -> ToolProfile:

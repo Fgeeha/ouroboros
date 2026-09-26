@@ -133,10 +133,12 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
     from ouroboros.tools.github import github_token_from_env_or_settings
     from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection, usage_writer_snapshot
     from supervisor.queue import get_evolution_status_snapshot
-    from supervisor.state import TOTAL_BUDGET_LIMIT, load_state
+    from supervisor.state import TOTAL_BUDGET_LIMIT, control_value, load_state
     from supervisor.workers import PENDING, RUNNING, WORKERS
 
     st = load_state()
+    bg_known, bg_value = control_value(st, "bg_consciousness_enabled")
+    bg_enabled = bool(bg_value) if bg_known else None  # unknown is never shown as off (#1307)
     alive = 0
     total_w = 0
     try:
@@ -242,7 +244,7 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
         "evolution_state": evolution_state,
         # The alarm's snapshot reads the usage ledger (a cross-process lock): computed HERE,
         # on the worker thread with the rest of the snapshot, never on the event loop.
-        "bg_state": (_describe_bg(request)(bool(st.get("bg_consciousness_enabled"))) if _describe_bg(request) else {}),
+        "bg_state": (_describe_bg(request)(bg_enabled) if _describe_bg(request) else {}),
         "github_token_configured": bool(github_token_from_env_or_settings()),
         "projects": projects,
         "project_chat_ids": project_chat_ids,

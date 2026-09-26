@@ -527,6 +527,16 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 if snapshot is not None:
                     snapshot_id, baseline_sha, root = snapshot.snapshot_id, snapshot.baseline_sha, snapshot.path
                     resource_ref = dict(record_auth.get("resource_ref") or {})
+            if authority.access == "readonly":
+                from ouroboros.delegate_readonly_inputs import prepare_folderless_inputs
+
+                try:
+                    readonly_root, input_instruction = prepare_folderless_inputs(ctx, invocation_id)
+                except (OSError, ValueError) as exc:
+                    return _fail("delegate_start", "readonly_inputs_unavailable", str(exc), definitely_unrun=True)
+                if readonly_root:
+                    root = readonly_root
+                    instructions += input_instruction
             execution_root = (root if directory_options.get("isolation") == "live" else "") if directory_options else delegated_execution_workspace_root(gateway, authority, root)
             scope_root = target_root if execution_root or directory_options else root
             if snapshot is not None:

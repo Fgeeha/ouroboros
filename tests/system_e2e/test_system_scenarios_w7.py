@@ -264,8 +264,8 @@ def _forwards(oracle: ArtifactOracle, sender: str) -> list:
     exact message bytes ride ``args.message`` and the typed write receipt the preview.
     The mailbox FILES themselves are cleaned at the recipient's task_done by design,
     so they are not evidence a scenario may read after completion."""
-    return [row for row in oracle.tools_rows()
-            if str(row.get("tool") or "") == "forward_to_worker" and str(row.get("task_id") or "") == sender]
+    return [row for row in oracle.tools_rows() if str(row.get("type") or "tool_call") == "tool_call"
+            and str(row.get("tool") or "") == "forward_to_worker" and str(row.get("task_id") or "") == sender]
 
 
 def _injected(oracle: ArtifactOracle, recipient: str) -> list:
@@ -285,7 +285,9 @@ def _dump_misses(model: ReplayModel, root: pathlib.Path) -> None:
 
 
 def _tool_rows(drive: ArtifactOracle, tool: str) -> list:
-    return [row for row in drive.tools_rows() if str(row.get("tool") or "") == tool]
+    # Result rows only (#1316): a call's start / wait-end rows share its invocation_id.
+    return [row for row in drive.tools_rows()
+            if str(row.get("type") or "tool_call") == "tool_call" and str(row.get("tool") or "") == tool]
 
 
 def _isolation_settings(root: pathlib.Path) -> dict:

@@ -134,24 +134,28 @@ function ensureToolFold(record) {
 
 /**
  * One frame's fact about one invocation: {key, status, receipt, tool}. Status
- * never regresses — a start frame that arrives after the finish cannot reopen
- * the call, and an error stays an error however many frames report that key.
+ * preserves independent start/wait/settlement facts. Reordered starts never reopen
+ * a settled call; a true result replaces only a provisional host-error settlement.
  */
 export function noteToolCall(record, observation) {
     const key = observation?.key;
     if (!record || !key) return record;
     const { calls } = ensureToolFold(record);
     const prev = calls.get(key);
-    const status = observation.status === 'error' || prev?.status === 'error' ? 'error'
-        : ((observation.status === 'ok' || prev?.status === 'ok') ? 'ok' : 'calling');
-    calls.set(key, {
-        status,
-        // A call is an addressing receipt only while EVERY frame about it says so
-        // (the host stamps `routing_action`): the first frame without the stamp
-        // makes the call content, and content it stays.
+    const fact = observation.fact || (['ok', 'error'].includes(observation.status) ? 'settled' : 'started');
+    const next = { ...prev,
         receipt: Boolean(observation.receipt) && (prev ? prev.receipt : true),
         tool: observation.tool || prev?.tool || '',
-    });
+    };
+    if (fact === 'settled') {
+        if (!next.settlement || (next.settlement.hostError && !observation.hostError)) {
+            next.settlement = { status: observation.status, hostError: Boolean(observation.hostError) };
+        }
+    } else if (fact === 'wait_ended') next.waitEnded = true;
+    else next.started = true;
+    next.live = next.live || observation.live === true || (!observation.fact && observation.status === 'calling');
+    next.status = next.settlement?.status || (next.waitEnded ? 'wait_ended' : next.live ? 'calling' : 'unknown');
+    calls.set(key, next);
     return record;
 }
 
@@ -191,6 +195,13 @@ export function applyToolObservation(record, observation) {
     const view = toolEvidenceView(record.toolFold);
     record.toolCalls = view.calls;
     record.toolErrors = view.errors;
+    // Successful settlement retires an earlier provisional error/wait notice;
+    // the fold retains the independent wait fact, including after task terminal.
+    if (record.toolFold.calls.get(observation.key)?.settlement?.status === 'ok' && record.items) {
+        const count = record.items.length;
+        record.items = record.items.filter(item => item.dedupeKey !== observation.key);
+        view.clearedNotice = count !== record.items.length;
+    }
     return view;
 }
 
@@ -208,15 +219,19 @@ export function toolEvidenceView(fold = null) {
     const live = fold?.calls instanceof Map ? [...fold.calls.values()] : [];
     const host = fold?.host || null;
     const calls = Number.isInteger(host?.calls) ? host.calls : live.length;
-    const errors = Number.isInteger(host?.errors) ? host.errors
-        : live.filter((call) => call.status === 'error').length;
+    // Host round totals include wait errors. Once every call has its own
+    // observation, use operation settlements rather than resurrecting a timeout.
+    const errors = live.length >= calls ? live.filter(call => call.status === 'error').length
+        : (Number.isInteger(host?.errors) ? host.errors : live.filter(call => call.status === 'error').length);
     const liveCounts = new Map();
     for (const call of live) liveCounts.set(call.tool, (liveCounts.get(call.tool) || 0) + 1);
     const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
     return {
         phase: errors > 0 ? 'warn'
             : ((!host && live.some((call) => call.status === 'calling')) ? 'calling' : 'result'),
-        headline: `${plural(calls, 'tool call')}${errors > 0 ? ` · ${plural(errors, 'error')}` : ''}`,
+        headline: `${plural(calls, 'tool call')}${errors > 0 ? ` · ${plural(errors, 'error')}` : ''}`
+            + (live.some(call => call.waitEnded) ? ' · wait ended' : '')
+            + (live.some(call => call.status === 'unknown') ? ' · outcome unknown' : ''),
         body: '',
         fullBody: perToolLine(host?.counts && typeof host.counts === 'object'
             ? Object.entries(host.counts) : [...liveCounts]),

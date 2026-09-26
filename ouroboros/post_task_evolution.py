@@ -424,7 +424,7 @@ def apply_pending_request(drive_root: Any) -> bool:
             return False
         st = load_state()
         if not all(control_value(st, key)[0] for key in (
-                "evolution_owner_stopped", "evolution_mode_enabled")) or evolution_stop_reason():
+                "evolution_owner_stopped", "evolution_mode_enabled", "owner_chat_id")) or evolution_stop_reason():
             # An autonomous re-arm needs KNOWN current controls and no received Stop/Panic
             # (#1307): unknown is neither "not stopped" nor "not enabled". The durable
             # request stays for a later tick; only a known stop drops it (below).

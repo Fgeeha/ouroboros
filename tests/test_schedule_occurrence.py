@@ -158,7 +158,8 @@ def test_resource_intent_is_resolved_at_admission(q, tmp_path, case):
         "explicit_kept": "explicit_resource", "explicit_none": "explicit_none"}[case]
 
 
-@pytest.mark.parametrize("origin", ["external_workspace", "main", "missing", "project_without_folder"])
+@pytest.mark.parametrize("origin", ["external_workspace", "main", "missing", "project_without_folder",
+                                    "unaddressed", "bound_to_project"])
 def test_a_legacy_followup_recovers_only_from_its_origin_record(q, tmp_path, origin):
     from ouroboros.task_results import write_task_result
 
@@ -167,12 +168,20 @@ def test_a_legacy_followup_recovers_only_from_its_origin_record(q, tmp_path, ori
     if origin == "external_workspace":
         write_task_result(q.root, "origin1", "completed", workspace_root=str(folder), workspace_mode="external")
     elif origin == "main":
-        write_task_result(q.root, "origin1", "completed")
+        write_task_result(q.root, "origin1", "completed", chat_id=1)  # destination alone is no workspace authority
+    elif origin == "unaddressed":
+        write_task_result(q.root, "origin1", "completed")  # bare absence proves nothing
+    elif origin == "bound_to_project":
+        from ouroboros.projects_registry import bind_task_to_project
+
+        _project(q)
+        write_task_result(q.root, "origin1", "completed", chat_id=1)
+        bind_task_to_project(q.root, "origin1", "proj", origin={"absent": "system"})
     elif origin == "project_without_folder":
         write_task_result(q.root, "origin1", "completed", project_id="proj")
     _row(q, metadata={"origin_task_id": "origin1"})
     q.queue.check_scheduled_tasks()
-    if origin in {"missing", "project_without_folder"}:
+    if origin in {"missing", "main", "project_without_folder", "unaddressed", "bound_to_project"}:
         assert q.pending == [] and _rows(q)["s1"]["hold"]["reason"] == "resource_intent_unknown"
         return
     [task] = q.pending
@@ -349,3 +358,132 @@ def test_a_folderless_delegated_run_reads_but_never_writes_through_scratch(tmp_p
     assert refusal is None and readonly["capture_mode"] == "none" and readonly["target_root"].endswith("task_drives/t")
     _, refused = _mutation_authority(ctx, delegated_run_shape(True, "workspace_write"))
     assert refused is not None and "workspace_not_active" in refused.text
+
+
+def test_receipt_and_dispatch_mark_are_monotonic_and_read_back_from_disk(q, monkeypatch):
+    import ouroboros.task_results as task_results
+    from supervisor import schedule_occurrence as occurrences
+
+    _row(q, intent={"kind": "system_repo"}, cron=True)
+    q.queue.check_scheduled_tasks()
+    [task] = q.pending
+    occ = _rows(q)["s1"]["occurrence"]
+    item = {"schedule_id": "s1", "task": task, "occurrence": occ}
+    assert occurrences.record_dispatch_possible(task) is True
+    # A late/duplicate receipt never downgrades a possibly-dispatched occurrence.
+    assert occurrences._write_receipt(item, _rows(q)["s1"]) is False
+    stored = load_task_result(q.root, task["id"])
+    assert stored["status"] == "running" and stored["schedule_admission"]["dispatch"] == "possible"
+    # A terminal occurrence is never dispatched again through the barrier.
+    task_results.write_task_result(q.root, task["id"], "completed", result="done")
+    assert occurrences.record_dispatch_possible(task) is False
+    # The verdict is what the FILE says, not what a writer returned.
+    _row(q, "s2", intent={"kind": "system_repo"}, cron=True)
+    monkeypatch.setattr(task_results, "write_task_result", lambda *_a, **k: {
+        "status": "scheduled", "schedule_admission": dict(k.get("schedule_admission") or {})})
+    q.pending.clear()
+    q.queue.check_scheduled_tasks()
+    assert q.pending == [] and _rows(q)["s2"]["hold"]["reason"] == "receipt_failed"
+
+
+def test_the_allowance_is_read_just_before_admission_not_during_prepare(q, monkeypatch):
+    from ouroboros import consciousness_allowance
+    from supervisor import schedule_occurrence as occurrences
+
+    window = {"status": "available", "limit_usd": 10.0, "accounted_usd": 0.0, "unknown_unmetered": 0, "resets_at": ""}
+    monkeypatch.setattr(consciousness_allowance, "allowance_window", lambda _root: dict(window))
+    _row(q, intent={"kind": "system_repo"}, metadata={"initiator": "consciousness"})
+    real_prepare = occurrences.prepare
+
+    def prepare_then_spend(claimed):
+        prepared = real_prepare(claimed)
+        window.update(status="exhausted", accounted_usd=10.0)  # spent while the prepare ran
+        return prepared
+
+    monkeypatch.setattr(occurrences, "prepare", prepare_then_spend)
+    q.queue.check_scheduled_tasks()
+    assert q.pending == [] and _rows(q)["s1"]["hold"]["reason"] == "consciousness_allowance_exhausted"
+
+
+def test_deleting_a_row_never_takes_back_an_accepted_occurrence(q, monkeypatch):
+    from supervisor import schedule_occurrence as occurrences
+
+    _row(q, intent={"kind": "system_repo"}, cron=True)
+    monkeypatch.setattr(q.queue, "persist_queue_snapshot", lambda reason="": False)
+    q.queue.check_scheduled_tasks()  # accepted, then withdrawn: the snapshot did not persist
+    assert q.pending == []
+    task_id = _rows(q)["s1"]["occurrence"]["task_id"]
+    outcome = q.queue.mutate_scheduled_task("delete", "s1", reason="owner", actor="owner")
+    row = _rows(q)["s1"]
+    assert outcome["status"] == "deleted" and "owed" in outcome["detail"]
+    assert row["enabled"] is False and row["delete_requested_at"]
+    monkeypatch.setattr(q.queue, "persist_queue_snapshot", lambda reason="": True)
+    q.queue.check_scheduled_tasks()
+    [task] = q.pending
+    assert task["id"] == task_id  # the SAME accepted occurrence still runs
+    assert occurrences.record_dispatch_possible(task) is True
+    q.pending.clear()
+    q.queue.check_scheduled_tasks()
+    assert "s1" not in _rows(q)  # removed once its run was dispatched
+    # A row whose occurrence was never accepted is deleted at once (future-only).
+    _row(q, "s3", intent={"kind": "system_repo"}, cron=True)
+    assert q.queue.mutate_scheduled_task("delete", "s3", reason="owner", actor="owner")["status"] == "deleted"
+    assert "s3" not in _rows(q)
+
+
+def test_a_folderless_direct_parent_dispatches_a_readonly_child_with_its_own_scratch(tmp_path, monkeypatch):
+    """The ACTUAL dispatch shape: the real tool emits the event, the supervisor's own
+    admission builds the task, and the child's context resolves from that task."""
+    from types import SimpleNamespace
+
+    from ouroboros.contracts.task_constraint import normalize_task_constraint
+    from ouroboros.tool_access import build_resolved_resource_binding, resource_root_path
+    from ouroboros.tools import control
+    from ouroboros.tools.registry import ToolContext
+    from supervisor.events_subagent_admission import _resolve_subagent_constraint
+    from supervisor.task_dispatch import build_scheduled_task_payload
+
+    repo, data = tmp_path / "repo", tmp_path / "data"
+    repo.mkdir()
+    data.mkdir()
+    import json
+
+    from devtools.benchmarks.common.model_slots import single_model_subagents_setting
+
+    subagents = json.loads(single_model_subagents_setting("openai/test-actor"))
+    monkeypatch.setattr(control, "load_settings", lambda: {"OUROBOROS_SUBAGENTS": subagents})
+    parent = ToolContext(repo_dir=repo, drive_root=data, task_id="parent")
+    parent.task_metadata = {"resource_intent": {"kind": "explicit_none"}}
+    parent.pending_events = []
+    scratch = parent.active_repo_dir()
+    (scratch / "notes.txt").write_text("parent input", encoding="utf-8")
+    control._schedule_task(parent, subagent_id=subagents["items"][0]["subagent_id"],
+                           objective="Research the question in notes.txt.", expected_output="An answer.")
+    [event] = [e for e in parent.pending_events if e.get("type") == "schedule_subagent"]
+    assert not event.get("workspace_root") and not event.get("workspace_mode")  # scratch is never a workspace
+    constraint, workspace, mode, refusal = _resolve_subagent_constraint(
+        SimpleNamespace(REPO_DIR=repo, DRIVE_ROOT=data), tid=event["task_id"],
+        requested_constraint=event["task_constraint"], workspace_root="", workspace_mode="",
+        base_sha=event.get("base_sha", ""), parent_task_id="parent")
+    assert not refusal and not workspace and not mode
+    task = build_scheduled_task_payload({**event, "tid": event["task_id"], "desc": event["objective"],
+                                        "text": event["objective"], "task_constraint": constraint,
+                                        "workspace_root": workspace, "workspace_mode": mode, "parent_id": "parent"})
+    assert not task.get("workspace_root") and str(data) not in str(task.get("workspace_root") or "")
+    child = ToolContext(repo_dir=repo, drive_root=data, task_id=task["id"], project_id=task.get("project_id", ""))
+    child.task_metadata = {**task["metadata"], "parent_task_id": "parent", "root_task_id": "parent"}
+    child.task_constraint = normalize_task_constraint(task.get("task_constraint"))
+    own = child.active_repo_dir()
+    assert own == resource_root_path(child, "task_drive") != scratch  # its OWN scratch as default cwd
+    binding = build_resolved_resource_binding(child, root="task_drive", operation="read",
+                                              path=str(scratch / "notes.txt"))
+    assert binding.target_path.read_text(encoding="utf-8") == "parent input"  # lineage input, read-only
+    from ouroboros.tools.registry import ToolRegistry
+
+    registry = ToolRegistry(repo_dir=repo, drive_root=data)
+    registry.set_context(child)
+    assert "parent input" in registry.execute("read_file", {"root": "task_drive", "path": str(scratch / "notes.txt")})
+    sibling = data / "task_drives" / "sibling"
+    sibling.mkdir(parents=True)
+    (sibling / "notes.txt").write_text("sibling-private-input", encoding="utf-8")
+    assert "sibling-private-input" not in registry.execute("read_file", {"root": "task_drive", "path": str(sibling / "notes.txt")})

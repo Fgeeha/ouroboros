@@ -72,6 +72,8 @@ _manager_lock = threading.Lock()
 
 def get_manager() -> LocalModelManager:
     global _manager
+    if _manager is not None:
+        return _manager
     with _manager_lock:
         if _manager is None:
             _manager = LocalModelManager()
@@ -606,6 +608,17 @@ class LocalModelManager:
         self._status = "error"
         self._error = f"Server failed to become healthy within {timeout}s"
         log.error(self._error)
+
+    def panic_stop(self) -> None:
+        """Signal our captured children before manager locks or cleanup waits."""
+        self._install_cancelled.set()
+        for proc in (self._proc, self._install_proc):
+            if proc is not None and proc.poll() is None:
+                try:
+                    kill_process_tree(proc)
+                except Exception:
+                    pass
+        self.stop_server()
 
     def stop_server(self) -> None:
         """Stop the local model server subprocess and any ongoing install."""

@@ -168,10 +168,10 @@ def test_room_registry_failure_is_visible(tmp_path, monkeypatch):
     from ouroboros import projects_registry
     from ouroboros.workspace_admission import room_chat_lens_dir
 
-    def fail(*args):
+    def fail(*args, **kwargs):
         raise OSError("fixture registry failure")
 
-    monkeypatch.setattr(projects_registry, "get_project", fail)
+    monkeypatch.setattr(projects_registry, "get_reserved_project", fail)
     directory, note = room_chat_lens_dir(tmp_path, "project-fixture")
     assert directory == ""
     assert "registry entry is unreadable" in note

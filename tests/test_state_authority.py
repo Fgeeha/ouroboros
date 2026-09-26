@@ -112,8 +112,8 @@ def test_evolution_after_a_recovery_waits_for_the_owner_then_resumes(root, monke
     from supervisor import queue
     from supervisor.events_runtime_controls import owner_evolution_start
 
+    state.save_state(_prior())
     _write(state.STATE_PATH, b'{"evolution_mode_enabled": tru')
-    _write(state.STATE_LAST_GOOD_PATH, _prior())
     assert lifecycle.start_evolution_campaign("improve", source="owner")
     state.update_state(lambda live: live.__setitem__("last_owner_message_at", "now"))  # the recovery write
     pending = []
@@ -125,10 +125,9 @@ def test_evolution_after_a_recovery_waits_for_the_owner_then_resumes(root, monke
     assert pending == []  # a recovered "enabled" is not the owner's current decision
     assert owner_evolution_start("resume", source="owner_chat") == ""
     queue.enqueue_evolution_task_if_needed()
-    # The owner's start confirms only the evolution controls; the recovered owner chat
-    # stays unconfirmed yet still serves as the notice address.
+    # The witnessed write-once binding survives; Start confirms evolution only.
     assert [task["chat_id"] for task in pending] == [7]
-    assert state.control_value(state.load_state(), "owner_chat_id") == (False, None)
+    assert state.control_value(state.load_state(), "owner_chat_id") == (True, 7)
 
 
 def test_writers_never_proceed_unlocked(root, monkeypatch):
@@ -231,8 +230,7 @@ def test_stop_during_an_outage_outlives_the_primary_coming_back(root, monkeypatc
     from supervisor import evolution_lifecycle as lifecycle
     from supervisor.events_runtime_controls import owner_evolution_start, owner_evolution_stop_controls
 
-    _write(state.STATE_PATH, _prior())
-    _write(state.STATE_LAST_GOOD_PATH, _prior())
+    state.save_state(_prior())
     assert lifecycle.start_evolution_campaign("improve", source="owner")
     real = pathlib.Path.read_bytes
     outage = {"on": True}
@@ -270,15 +268,34 @@ def test_panic_requests_every_physical_stop_before_any_persistence_and_never_wai
     monkeypatch.setattr(platform_layer, "kill_process_on_port", lambda port: order.append(("port", port)))
     started = time.monotonic()
     with pytest.raises(SystemExit):
-        control.execute_panic_stop(
-            SimpleNamespace(stop=lambda: order.append("consciousness")),
+        control.execute_panic_stop(  # a stalled log handler and a held clock lock block nothing either
+            SimpleNamespace(stop=lambda: release.wait(30)),
             lambda **kw: order.append("workers"), data_dir=root, panic_exit_code=99,
-            log=SimpleNamespace(critical=lambda *a, **k: None), bound_port=12345)
+            log=SimpleNamespace(critical=lambda *a, **k: release.wait(30)), bound_port=12345)
     release.set()
-    assert time.monotonic() - started < 15  # a blocked state lock bounded, never awaited
-    assert order.index("workers") < order.index("flag") < order.index("state")
-    assert order.index("flag") < order.index(("port", 12345))
+    assert time.monotonic() - started < 15  # every write bounded, never awaited
+    assert "workers" in order and ("port", 12345) in order
+    assert order.index("flag") < order.index("state")
     assert (root / "state" / "panic_stop.flag").read_text() == "panic"
+
+
+def test_an_owner_restart_never_replaces_a_panic_flag_still_owed_its_controls(root, monkeypatch):
+    import ouroboros.server_restart as restart
+    from supervisor import worker_chat_lane
+
+    flag = root / "state" / "panic_stop.flag"
+    _write(flag, b"panic")  # boot kept it: the disabled controls were not durable yet
+    monkeypatch.setattr(restart, "DATA_DIR", root)
+    monkeypatch.setattr(restart, "_safe_restart_serialized", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(restart, "_stop_owned_work", lambda ctx: [])
+    monkeypatch.setattr(restart, "_request_restart_exit", lambda owner=False: None)
+    assert restart._perform_owner_restart(SimpleNamespace(safe_restart=None)) == (True, "")
+    assert flag.read_text() == "panic" and (root / "state" / "owner_restart_no_resume.flag").exists()
+    monkeypatch.setattr(worker_chat_lane, "_pool", lambda: SimpleNamespace(DRIVE_ROOT=root, load_state=state.load_state))
+    state.save_state(_prior())
+    worker_chat_lane.auto_resume_after_restart()  # the owner-restart boot still settles the Panic debt
+    assert not flag.exists()
+    assert state.control_value(state.load_state(), "bg_consciousness_enabled") == (True, False)
 
 
 def test_boot_consumes_the_panic_flag_only_after_its_controls_are_durable(root, monkeypatch):
@@ -289,7 +306,7 @@ def test_boot_consumes_the_panic_flag_only_after_its_controls_are_durable(root, 
     _write(flag, b"panic")
     worker_chat_lane.auto_resume_after_restart()  # state uninitialized: controls not durable
     assert flag.exists()
-    _write(state.STATE_PATH, _prior())
+    state.save_state(_prior())
     worker_chat_lane.auto_resume_after_restart()
     assert not flag.exists()
     live = state.load_state()
@@ -329,6 +346,7 @@ def test_external_commands_need_a_positively_bound_owner(root, monkeypatch, read
     _write(state.STATE_LAST_GOOD_PATH, backup)
     if readable:
         _write(state.STATE_PATH, _prior())
+        state.init_state()
     replies: list = []
     ctx = _ingress_ctx(root, replies, panics)
     server._process_bridge_updates(_bridge("/panic", user=5, chat=5), 0, ctx)  # a stranger
@@ -386,3 +404,205 @@ def test_the_local_panic_door_reads_no_state(root, monkeypatch):
     ctx.load_state = lambda: pytest.fail("the local /panic must not read state first")
     server._process_bridge_updates(_bridge("/panic", source="web", user=1, chat=1), 0, ctx)
     assert panics == ["panic"]
+
+
+def test_a_file_where_the_state_directory_belongs_is_unknown_not_absent(root):
+    import shutil
+
+    shutil.rmtree(root / "state", ignore_errors=True)
+    (root / "state").write_text("not a directory", encoding="utf-8")
+    read = state.init_state()  # typed unavailable, never a crash and never a mint
+    assert read.quality == "unavailable" and read.values == {}
+    assert state_initialization.supervisor_evidence(root)[0] in {"none", "unknown"}
+    (root / "state").unlink()
+    (root / "task_results").write_text("a file", encoding="utf-8")
+    assert state_initialization.supervisor_evidence(root)[0] == "unknown"
+
+
+def test_a_first_state_whose_witness_cannot_complete_admits_nothing_this_boot(root, monkeypatch):
+    real_complete = state_initialization.complete
+    monkeypatch.setattr(state_initialization, "complete", lambda *a, **k: False)
+    read = state.init_state()
+    assert read.quality == "unavailable" and "witness" in read.reason
+    with pytest.raises(state.StateUnavailable):
+        state.update_state(lambda live: live.update(owner_id=5))  # no registration on that identity
+    assert not state.control_value(state.load_state(), "owner_id")[0]
+    pending = state_initialization.read_witness(root)[1]
+    assert pending["phase"] == "pending"
+    monkeypatch.setattr(state_initialization, "complete", real_complete)
+    state.init(root)  # the next boot adopts and completes the SAME identity
+    assert state.init_state().values["initialization_id"] == pending["initialization_id"]
+    assert state_initialization.read_witness(root)[1]["phase"] == "complete"
+
+
+def test_a_whole_state_write_mints_only_where_initialization_would(root):
+    state.save_state({"owner_chat_id": 1})  # a fresh root: a first state with a completed witness
+    witness = state_initialization.read_witness(root)[1]
+    assert witness["phase"] == "complete" and state.load_state()["initialization_id"] == witness["initialization_id"]
+    state.save_state({"owner_chat_id": 2})
+    assert state.load_state()["initialization_id"] == witness["initialization_id"]  # identity kept
+    state.STATE_PATH.unlink()
+    with pytest.raises(state.StateUnavailable):  # a recoverable backup is not overwritten
+        state.save_state({})
+    state.STATE_LAST_GOOD_PATH.unlink()
+    with pytest.raises(state.StateUnavailable):  # a lost initialized state is never re-minted
+        state.save_state({})
+    assert not state.STATE_PATH.exists()
+
+
+def test_a_writer_racing_an_owner_reset_never_resurrects_the_old_identity(root):
+    raw = _write(state.STATE_PATH, _prior(initialization_id="old-id"))
+    _write(state.STATE_LAST_GOOD_PATH, raw)
+    state_initialization.mark_pending(root, origin="owner_reset")
+    read = state.init_state()
+    assert read.quality == "current" and read.values["initialization_id"] != "old-id"
+    assert state.control_value(state.load_state(), "owner_external_id") == (True, None)
+    kept = sorted(p.name for p in (root / "state").glob("*.pre-reset-*.json"))
+    assert len(kept) == 2  # set aside, never deleted
+
+
+def test_owner_bindings_have_only_known_empty_slot_writers():
+    """The proof a backup's SET binding relies on (``_backup_unconfirmed``): every
+    production write of an owner binding key sits behind a known-empty-slot check."""
+    import ast
+
+    keys = {"owner_id", "owner_chat_id", "owner_external_id", "owner_external_chat_id"}
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    writers = []
+    for path in [repo / "server.py", *repo.joinpath("ouroboros").rglob("*.py"), *repo.joinpath("supervisor").rglob("*.py")]:
+        tree = ast.parse(path.read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target] if isinstance(
+                node, ast.AugAssign) else []
+            for target in targets:
+                if (isinstance(target, ast.Subscript) and isinstance(target.slice, ast.Constant)
+                        and target.slice.value in keys):
+                    writers.append((path.name, target.slice.value))
+            if (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                    and node.func.attr in {"update", "pop"} and any(
+                        (isinstance(arg, ast.Constant) and arg.value in keys) for arg in node.args)
+                    or isinstance(node, ast.Call) and any(kw.arg in keys for kw in node.keywords)
+                    and isinstance(node.func, ast.Attribute) and node.func.attr == "update"):
+                writers.append((path.name, "update/pop"))
+    assert sorted(writers) == sorted([("server.py", "owner_id"), ("server.py", "owner_chat_id"),
+                                      ("server.py", "owner_external_id"), ("server.py", "owner_external_chat_id")])
+    source = (repo / "server.py").read_text(encoding="utf-8")
+    assert source.count('control_value(live, "owner_id") == (True, None)') == 1
+    assert source.count('control_value(live, "owner_external_id") == (True, None)') == 1
+
+
+def test_an_initialization_write_failure_is_typed_never_fatal(root, monkeypatch):
+    def refuse(*_a, **_k):
+        raise PermissionError(errno.EACCES, "denied")
+
+    monkeypatch.setattr(state_initialization, "_write", refuse)
+    read = state.init_state()  # the pending witness cannot be written: unavailable, supervisor keeps serving
+    assert read.quality in {"uninitialized", "unavailable"} and not state.STATE_PATH.exists()
+
+
+@pytest.mark.parametrize('failure', ['complete', 'backup'])
+def test_interrupted_initialization_never_grants_on_repeated_boot(root, monkeypatch, failure):
+    real_complete, real_write = state_initialization.complete, state.atomic_write_text
+    if failure == 'complete':
+        monkeypatch.setattr(state_initialization, 'complete', lambda *a, **k: False)
+    else:
+        def write(path, body):
+            if path == state.STATE_LAST_GOOD_PATH:
+                raise OSError(errno.ENOSPC, 'backup full')
+            return real_write(path, body)
+        monkeypatch.setattr(state, 'atomic_write_text', write)
+    for _ in range(2):
+        state.init(root)  # no process-local latch is relied on
+        assert state.init_state().quality == 'unavailable'
+        assert state.control_value(state.load_state(), 'owner_id') == (False, None)
+        assert state.control_in_copy(state.STATE_PATH, 'owner_id') == (False, None)
+    identity = json.loads(state.STATE_PATH.read_text())['initialization_id']
+    monkeypatch.setattr(state_initialization, 'complete', real_complete)
+    monkeypatch.setattr(state, 'atomic_write_text', real_write)
+    assert state.init_state().quality == 'current'
+    assert state.read_state().values['initialization_id'] == identity
+
+
+def test_complete_witness_does_not_adopt_mismatched_primary(root):
+    state.init_state()
+    prior = json.loads(state.STATE_PATH.read_text())
+    _write(state.STATE_PATH, {**prior, 'initialization_id': 'foreign'})
+    assert state.read_state().reason == 'initialization_identity_mismatch'
+    assert state.init_state().quality == 'unavailable'
+    assert state_initialization.read_witness(root)[1]['initialization_id'] == prior['initialization_id']
+    with pytest.raises(state.StateUnavailable):
+        state.update_state(lambda st: st.update(owner_id=99))
+
+
+def test_partial_state_write_is_typed_and_stop_without_campaign_is_durable(root, monkeypatch):
+    from supervisor import evolution_lifecycle as lifecycle
+    from supervisor.events_runtime_controls import owner_evolution_stop_controls
+
+    state.save_state(_prior())
+    real = state.atomic_write_text
+    def write(path, body):
+        if path == state.STATE_LAST_GOOD_PATH:
+            raise OSError(errno.EIO, 'backup unavailable')
+        return real(path, body)
+    monkeypatch.setattr(state, 'atomic_write_text', write)
+    with pytest.raises(state.StateUnavailable) as err:
+        state.update_state(lambda st: st.update(last_owner_message_at='now'))
+    assert err.value.reason == 'backup_write_failed' and err.value.primary_written
+    assert 'runtime state' in owner_evolution_stop_controls('owner off')
+    campaign = lifecycle._read_evolution_campaign()
+    assert campaign['stop_intent']['reason'] == 'owner off'
+    assert 'status' not in campaign and 'id' not in campaign
+    lifecycle._STOP_LATCH['stopped'] = False
+    assert lifecycle.evolution_stop_reason() == 'stop_intent'
+
+
+def test_panic_flag_blocks_constructor_tick_and_public_wake_after_failed_disable(root, monkeypatch):
+    from ouroboros.consciousness import BackgroundConsciousness
+    from supervisor import worker_chat_lane
+
+    state.save_state(_prior())
+    _write(root / 'state/panic_stop.flag', b'panic')
+    monkeypatch.setattr(worker_chat_lane, '_pool', lambda: SimpleNamespace(DRIVE_ROOT=root))
+    monkeypatch.setattr(state, 'update_state', lambda *a, **k: (_ for _ in ()).throw(
+        state.StateUnavailable('backup_write_failed', primary_written=True)))
+    worker_chat_lane.auto_resume_after_restart()
+    clock = BackgroundConsciousness(root, root, lambda: 7, now=0)
+    assert not clock.enabled
+    assert clock.tick(now=99999) == 'panic_stop'
+    monkeypatch.setattr(worker_chat_lane, 'wake_gate_open', lambda: True)
+    assert worker_chat_lane.handle_wake_direct(7, 'wake', {})['reason'] == 'consciousness_disabled_or_unknown'
+    assert (root / 'state/panic_stop.flag').exists()
+
+
+def test_recovery_uses_existing_owner_stop_evidence_without_reset(root):
+    from supervisor import evolution_lifecycle as lifecycle
+
+    state.save_state(_prior())
+    assert lifecycle.record_evolution_stop_intent("owner", "stop during outage")
+    _write(state.STATE_PATH, b"broken")
+    state.init_state()
+    restored = state.load_state()
+    assert state.control_value(restored, "evolution_owner_stopped") == (True, True)
+    assert state.control_value(restored, "evolution_mode_enabled") == (True, False)
+    assert state.control_value(restored, "owner_chat_id") == (True, _prior()["owner_chat_id"])
+
+
+def test_raw_campaign_and_state_errors_do_not_skip_actual_stop_cancellation(root, monkeypatch):
+    import ouroboros.server_owner_routing as routing
+    from supervisor import evolution_lifecycle, queue
+
+    attempts = []
+    def fail_campaign(*args, **kwargs):
+        attempts.append("campaign")
+        raise OSError(28, "full")
+    def fail_state(*args, **kwargs):
+        attempts.append("state")
+        raise OSError(5, "io")
+    monkeypatch.setattr(evolution_lifecycle, "record_evolution_stop_intent", fail_campaign)
+    monkeypatch.setattr(state, "update_state", fail_state)
+    monkeypatch.setattr(queue, "stop_evolution_tasks", lambda *_: attempts.append("cancel") or {})
+    monkeypatch.setattr(queue, "evolution_stop_report", lambda _: ([], True))
+    ctx = SimpleNamespace(DRIVE_ROOT=root, sort_pending=lambda: None, persist_queue_snapshot=lambda **_: None)
+    routing._owner_evolution_stop(ctx, 1)
+    assert attempts[:3] == ["campaign", "state", "cancel"]
+    assert evolution_lifecycle._STOP_LATCH["stopped"] is True

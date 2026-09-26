@@ -192,3 +192,136 @@ def test_memory_and_replay_count_logical_calls_and_never_revive_an_unfinished_st
     assert len(summary.splitlines()) == 5
     types = [_event_from_log_entry("tools", n, row, tmp_path)["type"] for n, row in enumerate(rows[-3:])]
     assert types == ["tool_call_started", "tool_call", "tool_call_started"]
+
+
+def _log_row(kind, inv=None, **extra):
+    return {"type": kind, "task_id": "t", "tool": "read_file", "args": {"path": inv or "legacy"},
+            **({"invocation_id": inv} if inv else {}), **extra}
+
+
+def test_memory_counts_calls_in_one_unit_orphans_pairs_both_orders_and_legacy_rows(tmp_path):
+    from ouroboros.memory import Memory
+
+    rows = [_log_row("tool_call", "orphan", result_preview="ok"),  # its start was lost / lies outside the window
+            _log_row("tool_call_started", "pair"), _log_row("tool_call", "pair", result_preview="ok"),
+            _log_row("tool_call_started", "late"), _log_row("tool_call_timeout", "late"),
+            _log_row("tool_call", "late", result_preview="ok"),
+            _log_row("tool_call_started", "early"), _log_row("tool_call", "early", result_preview="ok"),
+            _log_row("tool_call_timeout", "early"),
+            _log_row("tool_call_timeout", "waited"),  # an orphan wait end
+            _log_row("tool_call", result_preview="ok"), _log_row("tool_call", result_preview="ok")]
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "tools.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    memory = Memory(drive_root=tmp_path)
+    shown, coverage = memory.read_task_recent("tools.jsonl", "t", 20)
+    assert (coverage["shown"], coverage["matched"], coverage["quota_met"]) == (7, 7, False) and shown == rows
+    calls = logical_calls(shown)
+    assert [c["state"] for c in calls] == ["orphan", "settled", "settled", "settled", "wait_ended", "legacy", "legacy"]
+    assert all(c["wait_ended"]["type"] == "tool_call_timeout" and c["settled"]["type"] == "tool_call" for c in calls[2:4])
+    shown, coverage = memory.read_task_recent("tools.jsonl", "t", 3)
+    assert (coverage["shown"], coverage["matched"], coverage["quota_met"]) == (3, 7, True) and shown == rows[-3:]
+
+
+def test_the_recent_tools_header_counts_calls_not_rows(tmp_path):
+    from ouroboros.memory import Memory
+
+    rows = [row for i in range(30) for row in (_log_row("tool_call_started", f"i{i}"),
+                                                 _log_row("tool_call", f"i{i}", result_preview="ok"))]
+    (tmp_path / "logs").mkdir()
+    (tmp_path / "logs" / "tools.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    [tools] = [s for s in Memory(drive_root=tmp_path).recent_activity_sections("t") if s.startswith("## Recent tools")]
+    assert "newest 20 of 30 matching calls in the window (10 rendered, 20 scanned for review markers)" in tools.splitlines()[0]
+    assert tools.count("✓ read_file path=") == 10
+
+
+@pytest.mark.parametrize("real_first", [True, False])
+def test_a_duplicate_host_error_settlement_never_hides_the_real_one(real_first):
+    real, host = _log_row("tool_call", "i", status="ok"), _log_row("tool_call", "i", status="host_error")
+    [call] = logical_calls([_log_row("tool_call_started", "i"), *([real, host] if real_first else [host, real])])
+    assert call["state"] == "settled" and call["settled"] is real
+
+
+@pytest.mark.parametrize("exc", [RuntimeError("live emit failed"), SystemExit(3)])
+def test_a_failure_after_the_real_settlement_writes_no_second_settlement(tmp_path, monkeypatch, exc):
+    def failing_emit(*_args, **_kwargs):
+        raise exc
+
+    monkeypatch.setattr(execution, "_emit_finished", failing_emit)
+    registry = _Registry(tmp_path, lambda *_: ToolResult(status="ok", code="OK", text="x"))
+    with pytest.raises(type(exc)):
+        _call(registry, tmp_path)
+    rows = _rows(tmp_path / "child" / "logs" / "tools.jsonl")
+    assert [(row["type"], row.get("status")) for row in rows] == [("tool_call_started", None), ("tool_call", "ok")]
+
+
+def test_a_failure_after_the_wait_ended_leaves_the_settlement_to_the_worker(tmp_path, monkeypatch):
+    from ouroboros import budget_pause
+
+    release = threading.Event()
+
+    def failing_release():
+        raise RuntimeError("custody release failed")
+
+    monkeypatch.setattr(budget_pause, "register_tool_future", lambda *_args: failing_release)
+    registry = _Registry(tmp_path, lambda *_: release.wait(timeout=10) and ToolResult(status="ok", code="OK", text="late"))
+    with pytest.raises(RuntimeError):
+        _call(registry, tmp_path, timeout=1)
+    release.set()
+    logs = tmp_path / "child" / "logs" / "tools.jsonl"
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline and len(_rows(logs)) < 3:
+        time.sleep(0.05)
+    assert [(row["type"], row.get("status")) for row in _rows(logs)] == [
+        ("tool_call_started", None), ("tool_call_timeout", None), ("tool_call", "ok")]
+
+
+def test_a_failed_start_append_is_disclosed_on_the_wait_end_host_error_and_refusal_rows(tmp_path, monkeypatch):
+    import ouroboros.tool_call_log as tool_call_log
+    from ouroboros.usage_accounting import UsageAccountingError
+
+    real = tool_call_log.append_jsonl
+    monkeypatch.setattr(tool_call_log, "append_jsonl", lambda path, payload, **kw: (
+        False if payload.get("type") == "tool_call_started" else real(path, payload, **kw)))
+    missed = {"task_log": False, "canonical": False}
+    release = threading.Event()
+    registry = _Registry(tmp_path, lambda *_: release.wait(timeout=10) and ToolResult(status="ok", code="OK", text="x"))
+    _, logs = _call(registry, tmp_path, timeout=1)
+    release.set()
+    [waited] = [row for row in _rows(logs / "tools.jsonl") if row["type"] == "tool_call_timeout"]
+    assert waited["start_log"] == missed
+    live = [frame for frame in registry.frames if frame.get("type") in {"tool_call_started", "tool_call_timeout"}]
+    assert [frame["start_log"] for frame in live] == [missed, missed]
+
+    def raising(_name, _args):
+        raise UsageAccountingError("ledger unavailable")
+
+    registry.handler = raising
+    with pytest.raises(UsageAccountingError):
+        _call(registry, tmp_path)
+    host = [row for row in _rows(logs / "tools.jsonl") if row.get("status") == "host_error"]
+    assert [row["start_log"] for row in host] == [missed]
+
+    invocation = execution.new_invocation("c", {}, 2)
+    invocation["start_log"] = missed
+    registry._ctx.browser_state = object()
+    tc = {"id": "c", "function": {"name": "browse_page", "arguments": "{}"}}
+    refused = execution._execute_browser_tool_bound(registry, tc, logs, "task-1", object(), invocation)
+    [refusal] = [row for row in _rows(logs / "tools.jsonl") if row.get("status") == "refused"]
+    assert refused["is_error"] is True and refusal["start_log"] == missed
+
+
+def test_editbench_counts_each_logical_call_once(tmp_path):
+    from devtools.benchmarks.editbench.run_editbench import _mine_metrics
+
+    rows = [_log_row("tool_call_started", "ok"), _log_row("tool_call", "ok", is_error=False),
+            _log_row("tool_call_started", "unknown"),
+            _log_row("tool_call_started", "waited"), _log_row("tool_call_timeout", "waited"),
+            _log_row("tool_call_started", "late"), _log_row("tool_call_timeout", "late"),
+            _log_row("tool_call", "late", is_error=False),
+            {**_log_row("tool_call"), "ts": "t0", "is_error": True}]  # a legacy row
+    for logs in (tmp_path / "logs", tmp_path / "task" / "logs"):  # the canonical mirror repeats every row
+        logs.mkdir(parents=True)
+        (logs / "tools.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+    metrics = _mine_metrics(tmp_path, "t")
+    # ok + unknown + waited + late + legacy; the two waits ended and the legacy row erred.
+    assert metrics["tool_calls"] == {"read_file": 5} and metrics["tool_errors"] == {"read_file": 3}

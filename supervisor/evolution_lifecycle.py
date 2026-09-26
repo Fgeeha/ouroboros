@@ -59,7 +59,7 @@ _OWNER_START_SOURCES = frozenset({"owner", "owner_chat"})
 def record_evolution_stop_intent(source: str, reason: str = "") -> bool:
     """Latch the Stop, then record it in the EXISTING campaign record (no invented
     terminal status). False: the durable intent could not be written (the caller
-    discloses it); no campaign file means nothing can run to stop."""
+    discloses it). An absent campaign gets only the intent, never a fake status."""
     from supervisor import state
 
     _STOP_LATCH["stopped"] = True
@@ -68,10 +68,10 @@ def record_evolution_stop_intent(source: str, reason: str = "") -> bool:
         return False
     try:
         campaign = _read_evolution_campaign()
-        if not campaign:
-            return not _evolution_campaign_path().exists()
         campaign["stop_intent"] = {"at": utc_now_iso(), "source": str(source or "owner"), "reason": str(reason or "")}
         return _write_evolution_campaign(campaign, _state_lock_held=True)
+    except OSError:
+        return False
     finally:
         state.release_file_lock(state.STATE_LOCK_PATH, lock_fd)
 

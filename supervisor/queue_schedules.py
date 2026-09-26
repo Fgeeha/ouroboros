@@ -80,7 +80,7 @@ _RUNTIME_OWNED_FIELDS: tuple[str, ...] = (
     "source", "skill", "created_at", "last_run_at", "last_task_id", "last_error",
     "skill_content_hash", "manual_override",
     # The occurrence protocol's host facts (supervisor/schedule_occurrence.py).
-    "occurrence", "hold", "continuation_of",
+    "occurrence", "hold", "continuation_of", "delete_requested_at",
 )
 # What an audit event may say about a row: lifecycle facts only. The task template
 # is a private objective, never audit material, and would also be unbounded.
@@ -443,7 +443,8 @@ def _write_scheduled_tasks(data: Dict[str, Any], drive_root: pathlib.Path | None
     data.setdefault("schema_version", 1)
     path = _scheduled_tasks_path(drive_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, data, trailing_newline=True)
+    if atomic_write_json(path, data, trailing_newline=True) is False:
+        raise OSError("scheduled task store write returned False")
 
 
 def _audit_row(record: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -666,7 +667,11 @@ def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[st
     task_id = task_id or uuid.uuid4().hex[:8]
     # Membership, not truthiness: a template's explicit chat 0 is its hidden partition.
     has_chat = template.get("chat_id") not in (None, "")
-    owner_chat_id = 0 if has_chat else (_queue().load_state().get("owner_chat_id") or 0)
+    from supervisor.state import control_value
+
+    known, owner_chat_id = (True, None) if has_chat else control_value(_queue().load_state(), "owner_chat_id")
+    if not known:
+        owner_chat_id = None
     session_id = str(template.get("session_id") or f"schedule-{record.get('id') or task_id}")
     raw_metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else {}
     metadata = {
@@ -757,6 +762,9 @@ def check_scheduled_tasks() -> None:
                 changed = changed or verdict != "live"
                 if verdict == "settled":
                     occurrences.settle(record)
+                    if record.get("delete_requested_at"):  # its deletion waited for this run
+                        data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
+                        continue
                 elif verdict in {"prepare", "republish"}:
                     claims.append(occurrences.view(record, stored))
                     continue
@@ -826,7 +834,8 @@ def check_scheduled_tasks() -> None:
         if pruned:
             data["tasks"], changed = kept, True
         if changed:
-            _write_scheduled_tasks(data)
+            if _write_scheduled_tasks(data) is False:
+                return
             _queue().persist_queue_snapshot(reason="scheduled_tasks")
     if claims:
         occurrences.admit([occurrences.prepare(claimed) for claimed in claims])

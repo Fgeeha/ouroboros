@@ -303,7 +303,9 @@ def acquire_exclusive_file_lock(
         log.warning("Name-tier lock refused by caller policy at %s: no lock taken", lock_path)
         return None
     started = time.time()
-    while (time.time() - started) < timeout_sec:
+    first_attempt = True
+    while first_attempt or (time.time() - started) < timeout_sec:
+        first_attempt = False
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
             stamp = (metadata or f"pid={os.getpid()} ts={time.time()}\n").encode("utf-8")
@@ -334,7 +336,7 @@ def acquire_exclusive_file_lock(
             if IS_WINDOWS:  # a lock goes before its handle (see _win32_unlock)
                 file_unlock(fd)
             os.close(fd)  # the file we created was kernel-locked by a racing
-            time.sleep(poll_sec)  # evictor's probe, or evicted: the name alone is
+            time.sleep(min(poll_sec, max(0.0, timeout_sec - (time.time() - started))))  # evictor's probe, or evicted: the name alone is
             continue  # not ownership — stand down and re-contend
         except (FileExistsError, PermissionError):
             stale = refused = None
@@ -373,7 +375,9 @@ def acquire_exclusive_file_lock(
             if refused is not None:
                 log.warning("Kernel lock refused on stale %s (%s): no lock taken", lock_path, refused)
                 return None
-            time.sleep(poll_sec)
+            remaining = timeout_sec - (time.time() - started)
+            if remaining > 0:
+                time.sleep(min(poll_sec, remaining))
         except Exception:
             log.warning("Failed to acquire lock at %s", lock_path, exc_info=True)
             break

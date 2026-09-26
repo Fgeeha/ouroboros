@@ -198,7 +198,17 @@ def owner_evolution_stop_controls(reason: str) -> str:
     from supervisor.evolution_lifecycle import record_evolution_stop_intent
     from supervisor.state import StateUnavailable, update_state
 
-    missing = [] if record_evolution_stop_intent("owner", reason) else ["campaign stop intent"]
+    # A failed campaign filesystem/lock operation cannot skip the independent state
+    # decision or the caller's cancellation. The latch is set before either write.
+    from supervisor.evolution_lifecycle import _STOP_LATCH
+
+    _STOP_LATCH["stopped"] = True
+    missing = []
+    try:
+        if not record_evolution_stop_intent("owner", reason):
+            missing.append("campaign stop intent")
+    except Exception as exc:
+        missing.append(f"campaign stop intent ({type(exc).__name__})")
 
     def _owner_stop(live: Dict[str, Any]) -> None:
         live["evolution_mode_enabled"] = False
@@ -208,8 +218,8 @@ def owner_evolution_stop_controls(reason: str) -> str:
 
     try:
         update_state(_owner_stop, confirm=EVOLUTION_CONTROL_KEYS)
-    except StateUnavailable as exc:
-        missing.append(f"runtime state ({exc.reason})")
+    except (StateUnavailable, OSError) as exc:
+        missing.append(f"runtime state ({getattr(exc, 'reason', type(exc).__name__)})")
     return ("" if not missing else
             f" The Stop holds in this process, but {' and '.join(missing)} did not persist.")
 
@@ -257,6 +267,7 @@ def owner_evolution_start(objective: str, *, source: str = "owner_chat", origin:
             return "🧬 Evolution stayed OFF: campaign state could not be created."
         update_state(_enable, confirm=EVOLUTION_CONTROL_KEYS)
     except StateUnavailable as exc:
+        owner_evolution_stop_controls("owner Start could not persist activation")
         return f"🧬 Evolution did not turn on: runtime state became unavailable ({exc.reason})."
     return ""
 
@@ -355,9 +366,9 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
         # custody (GR2-13) — the old in-place prune left them with no intent, no
         # terminal result and no task_done, and intent-write failures vanished from
         # the caller's view while Evolution was still declared stopped.
-        from supervisor.queue import evolution_stop_report, stop_evolution_tasks
         from ouroboros.post_task_evolution import drop_pending_request
         from supervisor import state as _evo_state
+        from supervisor.queue import evolution_stop_report, stop_evolution_tasks
 
         drop_pending_request(_evo_state.DRIVE_ROOT)
         stopped = stop_evolution_tasks("disabled via agent tool")

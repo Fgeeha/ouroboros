@@ -381,9 +381,12 @@ def _set_next_wakeup(ctx: ToolContext, seconds: int) -> str:
         return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=(
             f"⚠️ CAPABILITY_UNAVAILABLE: the interval was not stored: runtime state is unavailable ({exc.reason}).")))
     clamp_note = f" (requested {requested} s, clamped into {low}-{high} s)" if interval != requested else ""
-    if not bool(state.get("bg_consciousness_enabled")):
-        return (f"OK: consciousness is off; the next wake-up interval of {interval} s{clamp_note} "
-                "is stored for when it is enabled.")
+    from supervisor.state import control_value
+
+    known, enabled = control_value(state, "bg_consciousness_enabled")
+    if not (known and enabled):
+        return (f"OK: consciousness is {'off' if known else 'unknown (runtime state is recovering)'}; the next "
+                f"wake-up interval of {interval} s{clamp_note} is stored for when it is enabled.")
     # The interval is finish-relative: the alarm reads it when a wake-up ends. Said plainly,
     # so a Main turn is not promised a wake it did not move (astra scope, round 7).
     return (f"OK: the wake-up interval is now {interval} s{clamp_note}; it applies from the end of the "

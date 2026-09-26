@@ -179,6 +179,7 @@ def drain_all_pending(*, persist: bool = True) -> list:
 def enqueue_task(
     task: Dict[str, Any], front: bool = False, *, restoring_snapshot: bool = False,
     consciousness_window: Optional[Dict[str, Any]] = None, continuation: bool = False,
+    project_admission: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Add task to PENDING (thread-safe: HTTP handlers enqueue concurrently
     with the supervisor main loop, so the mutation must hold the queue lock).
@@ -201,6 +202,15 @@ def enqueue_task(
         from ouroboros.consciousness_allowance import allowance_window
 
         consciousness_window = allowance_window(DRIVE_ROOT)
+    project_id = str(t.get("project_id") or "").strip()
+    project_error = ""
+    if project_id and project_admission is None:
+        try:
+            from ouroboros.projects_registry import project_admission_view
+
+            project_admission = project_admission_view(DRIVE_ROOT, project_id)
+        except Exception:
+            project_error = "project_routing_fence_lookup_failed"
     with _queue_lock:
         require_unique_id = bool(t.pop("_require_unique_task_id", False))
         require_worker_pool = bool(t.pop("_require_worker_pool", False))
@@ -267,24 +277,12 @@ def enqueue_task(
         if admission_token and reserved_token != admission_token:
             t["_admission_blocked"] = "admission_reservation_lost"
             return t
-        project_id = str(t.get("project_id") or "").strip()
         if project_id:
-            try:
-                from ouroboros.projects_registry import get_reserved_project
-
-                project = get_reserved_project(DRIVE_ROOT, project_id)
-                lifecycle = str((project or {}).get("lifecycle") or "active")
-                if project is not None and lifecycle != "active":
-                    t["_admission_blocked"] = "project_routing_fence"
-                    t["_project_lifecycle"] = lifecycle
-                    t["_project_id"] = project_id
-                    if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
-                        ADMISSION_RESERVATIONS.pop(task_id, None)
-                    return t
-            except Exception:
-                log.warning("Project admission check failed for %s", project_id, exc_info=True)
-                t["_admission_blocked"] = "project_routing_fence_lookup_failed"
-                t["_project_id"] = project_id
+            project = (project_admission or {}).get("project")
+            lifecycle = str((project or {}).get("lifecycle") or "active")
+            if project_error or (project is not None and lifecycle != "active"):
+                t.update(_admission_blocked=project_error or "project_routing_fence",
+                         _project_lifecycle=lifecycle, _project_id=project_id)
                 if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
                     ADMISSION_RESERVATIONS.pop(task_id, None)
                 return t
@@ -310,7 +308,17 @@ def enqueue_task(
         t["queued_at"] = utc_now_iso()
         if admission_token:
             t["_admission_owner_token"] = admission_token
-        PENDING.append(t)
+        if project_id:
+            from ouroboros.projects_registry import project_admission_guard
+
+            try:
+                with project_admission_guard(DRIVE_ROOT, project_admission):
+                    PENDING.append(t)
+            except (OSError, RuntimeError, TimeoutError):
+                t["_admission_blocked"] = "project_routing_fence_changed"
+                return t
+        else:
+            PENDING.append(t)
         sort_pending()
         if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
             ADMISSION_RESERVATIONS.pop(task_id, None)

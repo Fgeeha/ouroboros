@@ -847,6 +847,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "required_capabilities": required_caps,
         **intent_fields,
         "subagent_envelope": envelope,
+        "resource_intent": ({"kind": "explicit_none"} if folderless_scratch_dir(ctx) is not None
+                            else dict(metadata.get("resource_intent") or {})),
         "origin_metadata": consciousness_origin_metadata(metadata),  # a consciousness child: label, category, level
         **presence_binding_authority_metadata(metadata, task_contract=getattr(ctx, "task_contract", None)),  # never speaker
     }

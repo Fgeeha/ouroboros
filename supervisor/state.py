@@ -72,12 +72,13 @@ def read_state_copy(path: pathlib.Path) -> Tuple[str, Optional[Dict[str, Any]], 
 
 def _read_json_file(path: pathlib.Path) -> Tuple[str, Optional[Dict[str, Any]], bytes, str]:
     """``(status, object, raw bytes, detail)`` for one state copy, classified by the
-    operation itself (#1307): ``missing`` only for ENOENT/ENOTDIR, ``unreadable`` for
-    any other OSError (EACCES, ENFILE, EIO...), ``invalid`` for bytes that are not a
-    non-empty JSON object. No ``exists()`` pre-check: it can fail the same way."""
+    operation itself (#1307): ``missing`` only for ENOENT, ``unreadable`` for any other
+    OSError (EACCES, ENFILE, EIO, and ENOTDIR — a file where ``state/`` belongs is not
+    absence), ``invalid`` for bytes that are not a non-empty JSON object. No
+    ``exists()`` pre-check: it can fail the same way."""
     try:
         raw = pathlib.Path(path).read_bytes()
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
         return "missing", None, b"", ""
     except OSError as exc:
         return "unreadable", None, b"", f"{type(exc).__name__} errno={exc.errno}"
@@ -172,15 +173,17 @@ CONTROL_KEYS = (
     "post_task_autostop", "bg_consciousness_enabled",
     "owner_id", "owner_chat_id", "owner_external_id", "owner_external_chat_id",
 )
+OPTIONAL_CONTROL_KEYS = frozenset({"evolution_stop_source", "post_task_autostop"})
 CURRENT_QUALITIES = frozenset({"current", "recovered"})
 
 
 class StateUnavailable(RuntimeError):
-    """``state.json`` cannot serve as current authority right now; nothing was written."""
+    """State authority or persistence is unavailable; partial writes are explicit."""
 
-    def __init__(self, reason: str, detail: str = "") -> None:
+    def __init__(self, reason: str, detail: str = "", *, primary_written: bool = False) -> None:
         super().__init__(f"state unavailable: {reason}" + (f" ({detail})" if detail else ""))
         self.reason = reason
+        self.primary_written = primary_written
 
 
 @dataclasses.dataclass(frozen=True)
@@ -218,7 +221,18 @@ def control_value(st: Dict[str, Any], key: str) -> Tuple[bool, Any]:
     recovery = st.get(RECOVERY_KEY) if isinstance(st, dict) else None
     if isinstance(recovery, dict) and key in (recovery.get("unconfirmed") or ()):
         return False, None
-    return True, st.get(key)
+    return (True, st.get(key)) if isinstance(st, dict) and (key in st or key in OPTIONAL_CONTROL_KEYS) else (False, None)
+
+
+def control_in_copy(path: pathlib.Path, key: str) -> Tuple[bool, Any]:
+    """``control_value`` of one control in the primary copy at ``path`` (a lock-free read
+    for a caller that addresses a drive by path): unknown unless that copy is readable."""
+    status, obj, _raw, _detail = _read_json_file(path)
+    from supervisor.state_initialization import authority_reason
+
+    if status != "ok" or authority_reason(pathlib.Path(path).parent.parent, str(obj.get("initialization_id") or "")):
+        return False, None
+    return control_value(obj, key)
 
 
 def mark_unconfirmed(live: Dict[str, Any], key: str) -> None:
@@ -247,7 +261,8 @@ def _backup_unconfirmed(backup: Dict[str, Any]) -> Tuple[str, ...]:
     status, record = witness.read_witness(DRIVE_ROOT) if identity else ("missing", {})
     same = status == "ok" and record.get("phase") == "complete" and record.get("initialization_id") == identity
     return tuple(key for key in CONTROL_KEYS
-                 if not (same and key.startswith("owner_") and backup.get(key) is not None))
+                 if not (same and key.startswith("owner_") and backup.get(key) is not None
+                         and key not in _recovery_unconfirmed(backup)))
 
 
 def _recovery_unconfirmed(st: Dict[str, Any]) -> Tuple[str, ...]:
@@ -257,9 +272,13 @@ def _recovery_unconfirmed(st: Dict[str, Any]) -> Tuple[str, ...]:
 
 def read_state() -> StateRead:
     """Classify both copies WITHOUT writing (a GET, a display, a boot probe)."""
+    from supervisor.state_initialization import authority_reason, read_witness
     p_status, primary, _raw, p_detail = _read_json_file(STATE_PATH)
     if p_status == "ok":
-        unconfirmed = _recovery_unconfirmed(primary)
+        reason = authority_reason(DRIVE_ROOT, str(primary.get("initialization_id") or ""))
+        if reason:
+            return StateRead("unavailable", "primary", dict(primary), CONTROL_KEYS, reason)
+        unconfirmed = tuple(set(_recovery_unconfirmed(primary)) | (set(CONTROL_KEYS) - primary.keys() - OPTIONAL_CONTROL_KEYS))
         return StateRead("recovered" if unconfirmed else "current", "primary",
                          ensure_state_defaults(dict(primary)), unconfirmed)
     b_status, backup, _braw, b_detail = _read_json_file(STATE_LAST_GOOD_PATH)
@@ -267,7 +286,8 @@ def read_state() -> StateRead:
     if b_status == "ok":
         return StateRead("recovered_transient", "backup", ensure_state_defaults(dict(backup)),
                          _backup_unconfirmed(backup), reason)
-    quality = "uninitialized" if p_status == b_status == "missing" else "unavailable"
+    w_status, _witness = read_witness(DRIVE_ROOT)
+    quality = "uninitialized" if p_status == b_status == w_status == "missing" else "unavailable"
     return StateRead(quality, "none", {}, CONTROL_KEYS, reason + (f" ({b_detail})" if b_detail else ""))
 
 
@@ -292,7 +312,7 @@ def _preserve_corrupt_primary(raw: bytes) -> str:
     raise StateUnavailable("corrupt_primary_unpreserved", "no free name")
 
 
-def _state_for_write() -> Dict[str, Any]:
+def _state_for_write(*, initializing: bool = False) -> Dict[str, Any]:
     """The CURRENT dict a locked writer may mutate (caller holds STATE_LOCK).
 
     A readable primary is returned as is. A missing/invalid primary with a readable
@@ -301,6 +321,16 @@ def _state_for_write() -> Dict[str, Any]:
     freshness marker is dropped so money re-derives). Anything else raises."""
     p_status, primary, raw, p_detail = _read_json_file(STATE_PATH)
     if p_status == "ok":
+        from supervisor.state_initialization import authority_reason
+
+        reason = authority_reason(DRIVE_ROOT, str(primary.get("initialization_id") or ""))
+        if reason and not initializing:
+            # Ordinary bookkeeping may retain legacy data; it cannot adopt or grant.
+            if reason == "initialization_witness_missing" and not primary.get("initialization_id"):
+                for key in CONTROL_KEYS:
+                    mark_unconfirmed(primary, key)
+            else:
+                raise StateUnavailable(reason)
         return primary
     if p_status == "unreadable":
         raise StateUnavailable("primary_unreadable", p_detail)
@@ -336,15 +366,27 @@ def _save_state_unlocked(st: Dict[str, Any]) -> None:
     st = ensure_state_defaults(st)
     st[SCHEMA_VERSION_KEY] = STATE_SCHEMA_VERSION
     payload = json.dumps(st, ensure_ascii=False, indent=2)
-    atomic_write_text(STATE_PATH, payload)
-    atomic_write_text(STATE_LAST_GOOD_PATH, payload)
+    primary_written = False
+    try:
+        if atomic_write_text(STATE_PATH, payload) is False:
+            raise OSError("primary writer returned False")
+        primary_written = True
+        if atomic_write_text(STATE_LAST_GOOD_PATH, payload) is False:
+            raise OSError("backup writer returned False")
+    except OSError as exc:
+        raise StateUnavailable("backup_write_failed" if primary_written else "primary_write_failed",
+                               f"{type(exc).__name__} errno={exc.errno}",
+                               primary_written=primary_written) from exc
 
 
 @contextlib.contextmanager
 def _state_lock(op: str, timeout_sec: float = 4.0):
     """STATE_LOCK or a typed refusal: a writer never proceeds unlocked (#1307)."""
     assert_test_data_path(STATE_PATH)
-    lock_fd = acquire_file_lock(STATE_LOCK_PATH, timeout_sec=timeout_sec)
+    try:
+        lock_fd = acquire_file_lock(STATE_LOCK_PATH, timeout_sec=timeout_sec)
+    except OSError as exc:
+        raise StateUnavailable("lock_unavailable", f"{type(exc).__name__} errno={exc.errno}") from exc
     if lock_fd is None:
         log.error("state.json %s refused: lock timeout on %s", op, STATE_LOCK_PATH)
         raise StateUnavailable("lock_timeout", op)
@@ -365,16 +407,37 @@ def save_state(st: Dict[str, Any]) -> None:
     """Author one WHOLE state (fixtures and isolated tooling). Production changes
     fields through ``update_state``. It never overwrites an unreadable primary,
     preserves an invalid one's bytes, and keeps the writer-owned ``_recovery``."""
+    from supervisor import state_initialization as witness
+
     with _state_lock("save"):
         p_status, primary, raw, p_detail = _read_json_file(STATE_PATH)
         if p_status == "unreadable":
             raise StateUnavailable("primary_unreadable", p_detail)
-        if p_status == "invalid":
-            _preserve_corrupt_primary(raw)
         st = {key: value for key, value in st.items() if key not in (RECOVERY_KEY, STATE_READ_KEY)}
+        created = ""
+        if p_status == "missing":
+            # A whole-state write mints identity ONLY where ``init_state`` would: never
+            # over a lost initialized state, a history, or a recoverable backup.
+            b_status, _backup, _braw, b_detail = _read_json_file(STATE_LAST_GOOD_PATH)
+            if b_status != "missing":
+                raise StateUnavailable("primary_missing", f"backup {b_status} {b_detail}".strip())
+            decision = witness.initialization_decision(DRIVE_ROOT)
+            if not decision.get("create"):
+                raise StateUnavailable(str(decision.get("reason") or "refused"), str(decision.get("detail") or ""))
+            created = st["initialization_id"] = str(decision["initialization_id"])
+        if p_status == "invalid":
+            primary = _state_for_write()
+            p_status = "ok"
         if p_status == "ok" and isinstance(primary.get(RECOVERY_KEY), dict):
             st[RECOVERY_KEY] = primary[RECOVERY_KEY]
+        if p_status == "ok":
+            try:
+                st["initialization_id"] = witness.prepare_adoption(DRIVE_ROOT, primary)
+            except ValueError as exc:
+                raise StateUnavailable(str(exc)) from exc
         _save_state_unlocked(st)
+        if not witness.complete(DRIVE_ROOT, st["initialization_id"], adopted=not created):
+            raise StateUnavailable("initialization_incomplete", "the witness could not be completed")
 
 
 def update_state(mutator, *, confirm: Tuple[str, ...] = (), lock_timeout_sec: float = 4.0) -> Dict[str, Any]:
@@ -409,6 +472,39 @@ def update_state(mutator, *, confirm: Tuple[str, ...] = (), lock_timeout_sec: fl
         return st
 
 
+def _set_aside_copies_older_than_a_reset(witness: Any) -> None:
+    """An owner Reset's ``pending`` witness is the owner's explicit fresh start: a state
+    copy of another identity (a writer that raced the Reset's delete) is moved aside
+    under a new name — never adopted as current, never deleted. Caller holds STATE_LOCK."""
+    w_status, record = witness.read_witness(DRIVE_ROOT)
+    if not (w_status == "ok" and record.get("phase") == "pending" and record.get("origin") == "owner_reset"):
+        return
+    identity, stamp = str(record.get("initialization_id") or ""), time.strftime("%Y%m%dT%H%M%S", time.gmtime())
+    for path in (STATE_PATH, STATE_LAST_GOOD_PATH):
+        status, obj, _raw, detail = _read_json_file(path)
+        if status == "missing" or (status == "ok" and obj.get("initialization_id") == identity):
+            continue
+        if status == "unreadable":
+            raise StateUnavailable("primary_unreadable", detail)
+        target = path.with_name(f"{path.stem}.pre-reset-{stamp}-{uuid.uuid4().hex[:6]}.json")
+        os.replace(path, target)
+        log.warning("owner reset pending: %s of another identity set aside as %s", path.name, target.name)
+
+
+def _recover_stopped_controls(st: Dict[str, Any]) -> None:
+    """An existing owner Stop intent proves disabled controls, never an enable grant."""
+    status, campaign, _raw, _detail = _read_json_file(DRIVE_ROOT / "state" / "evolution_campaign.json")
+    intent = campaign.get("stop_intent") if status == "ok" else None
+    if not isinstance(intent, dict) or intent.get("source") not in {"owner", "owner_chat", "panic"}:
+        return
+    facts = {"evolution_mode_enabled": False, "evolution_owner_stopped": True,
+             "evolution_stop_source": None, "post_task_autostop": False}
+    st.update(facts)
+    recovery = st.get(RECOVERY_KEY)
+    if isinstance(recovery, dict):
+        recovery["unconfirmed"] = [key for key in recovery.get("unconfirmed", []) if key not in facts]
+
+
 def init_state(*, origin: str = "first_boot") -> StateRead:
     """The ONE explicit state initializer, run by supervisor boot before any
     owner registration, autonomy admission or chat ingress.
@@ -426,8 +522,9 @@ def init_state(*, origin: str = "first_boot") -> StateRead:
     try:
         with _state_lock("init"):
             created = ""
+            _set_aside_copies_older_than_a_reset(witness)
             try:
-                st = ensure_state_defaults(_state_for_write())
+                st = _state_for_write(initializing=True)
             except StateUnavailable as exc:
                 if exc.reason != "uninitialized":
                     raise
@@ -437,12 +534,15 @@ def init_state(*, origin: str = "first_boot") -> StateRead:
                                            str(decision.get("detail") or ""))
                 created = str(decision["initialization_id"])
                 st = ensure_state_defaults({"initialization_id": created})
-            if not created and not st.get("initialization_id"):
-                # A legacy state adopted now carries the identity its witness completes with
-                # (never a complete witness's id: an id-less state beside one was replaced).
-                w_status, record = witness.read_witness(DRIVE_ROOT)
-                if w_status == "missing" or (w_status == "ok" and record.get("phase") == "pending"):
-                    st["initialization_id"] = str(record.get("initialization_id") or uuid.uuid4().hex)
+            if not created:
+                try:
+                    st["initialization_id"] = witness.prepare_adoption(DRIVE_ROOT, st)
+                except ValueError as exc:
+                    raise StateUnavailable(str(exc)) from exc
+                for key in set(CONTROL_KEYS) - st.keys() - OPTIONAL_CONTROL_KEYS:
+                    mark_unconfirmed(st, key)
+            st = ensure_state_defaults(st)
+            _recover_stopped_controls(st)
             st["session_spent_snapshot"] = float(st.get("spent_usd") or 0.0)
             st["session_openrouter_settled_snapshot"] = or_settled
             st["openrouter_ledger_settled_usd"] = or_settled
@@ -457,13 +557,14 @@ def init_state(*, origin: str = "first_boot") -> StateRead:
             st["budget_drift_pct"] = None
             st["budget_drift_alert"] = False
             _save_state_unlocked(st)
-            witness.complete(DRIVE_ROOT, created or str(st.get("initialization_id") or ""),
-                             adopted=not created)
-    except StateUnavailable as exc:
+            if not witness.complete(DRIVE_ROOT, st["initialization_id"], adopted=not created):
+                raise StateUnavailable("initialization_incomplete", "the exact witness did not complete")
+    except (StateUnavailable, OSError) as exc:  # a failed witness/set-aside write is typed too, never fatal
         log.error("State initialization refused: %s", exc)
         try:
             append_jsonl(DRIVE_ROOT / "logs" / "events.jsonl", {
-                "ts": utc_now_iso(), "type": "state_unavailable_at_boot", "reason": exc.reason, "detail": str(exc)})
+                "ts": utc_now_iso(), "type": "state_unavailable_at_boot",
+                "reason": getattr(exc, "reason", type(exc).__name__), "detail": str(exc)})
         except Exception:
             log.warning("state_unavailable_at_boot could not be recorded", exc_info=True)
         read = read_state()

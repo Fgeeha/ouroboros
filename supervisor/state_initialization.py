@@ -58,9 +58,9 @@ def read_witness(drive_root: Any) -> Tuple[str, Dict[str, Any]]:
     """``("missing"|"ok"|"invalid"|"unreadable", witness)`` by the operation's errno."""
     try:
         raw = witness_path(drive_root).read_bytes()
-    except (FileNotFoundError, NotADirectoryError):
+    except FileNotFoundError:
         return "missing", {}
-    except OSError:
+    except OSError:  # NotADirectoryError included: a file where ``state/`` belongs is not absence
         return "unreadable", {}
     try:
         data = json.loads(raw.decode("utf-8"))
@@ -90,25 +90,25 @@ def mark_pending(drive_root: Any, *, origin: str) -> str:
 def supervisor_evidence(drive_root: Any) -> Tuple[str, str]:
     """``("none"|"present"|"unknown", path)``: did a supervisor already run here?"""
     root = pathlib.Path(drive_root)
-    try:
+    try:  # only ENOENT is absence; NotADirectoryError (a file where a directory belongs) is unknown
         for rel in _EVIDENCE_FILES:
             try:
                 os.lstat(root / rel)
                 return "present", str(rel)
-            except (FileNotFoundError, NotADirectoryError):
+            except FileNotFoundError:
                 continue
         for rel in _EVIDENCE_NONEMPTY_FILES:
             try:
                 if os.lstat(root / rel).st_size > 0:
                     return "present", str(rel)
-            except (FileNotFoundError, NotADirectoryError):
+            except FileNotFoundError:
                 continue
         for rel in _EVIDENCE_DIRS:
             try:
                 with os.scandir(root / rel) as entries:
                     if next(entries, None) is not None:
                         return "present", str(rel)
-            except (FileNotFoundError, NotADirectoryError):
+            except FileNotFoundError:
                 continue
     except OSError as exc:
         return "unknown", f"{type(exc).__name__} errno={exc.errno}"
@@ -141,23 +141,49 @@ def initialization_decision(drive_root: Any, *, origin: str = "first_boot") -> D
     return {"create": True, "initialization_id": initialization_id}
 
 
-def complete(drive_root: Any, initialization_id: str, *, adopted: bool) -> None:
-    """Mark the witness ``complete`` after the state it describes is durable. A
-    readable legacy state without a witness is ADOPTED (values untouched). A
-    failure is logged and retried at the next boot; the state itself stands."""
+def authority_reason(drive_root: Any, initialization_id: str) -> str:
+    """Read-only admission proof: a durable completion of this exact identity."""
+    status, witness = read_witness(drive_root)
+    if status != "ok":
+        return f"initialization_witness_{status}"
+    if not initialization_id or witness["initialization_id"] != initialization_id:
+        return "initialization_identity_mismatch"
+    return "" if witness["phase"] == "complete" else "initialization_incomplete"
+
+
+def prepare_adoption(drive_root: Any, state: Dict[str, Any]) -> str:
+    """Bind readable legacy data or resume a pending identity before writing it.
+
+    Caller holds STATE_LOCK. Readable legacy session/creation facts, rather than
+    absence of files, are the adoption evidence. An existing witness never changes
+    identity here; only the explicit Reset owner may replace it.
+    """
+    status, witness = read_witness(drive_root)
+    identity = str(state.get("initialization_id") or "")
+    if status == "ok":
+        if identity != witness["initialization_id"]:
+            raise ValueError("initialization_identity_mismatch")
+        return identity
+    if status != "missing":
+        raise ValueError(f"initialization_witness_{status}")
+    if not identity and not (state.get("session_id") and state.get("created_at")):
+        raise ValueError("legacy_initialization_evidence_missing")
+    identity = identity or uuid.uuid4().hex
+    _write(drive_root, {"initialization_id": identity, "phase": "pending",
+                        "origin": "legacy_adopted", "created_at": utc_now_iso()})
+    return identity
+
+
+def complete(drive_root: Any, initialization_id: str, *, adopted: bool) -> bool:
+    """Complete only the exact pending identity after both state writes succeeded."""
     try:
         status, witness = read_witness(drive_root)
-        if status == "ok" and witness.get("phase") == "complete":
-            return
-        if status in {"invalid", "unreadable"}:
-            log.warning("state initialization witness is %s; leaving it for inspection", status)
-            return
-        _write(drive_root, {
-            "initialization_id": str(witness.get("initialization_id") or initialization_id or uuid.uuid4().hex),
-            "phase": "complete",
-            "origin": str(witness.get("origin") or ("legacy_adopted" if adopted else "first_boot")),
-            "created_at": str(witness.get("created_at") or utc_now_iso()),
-            "completed_at": utc_now_iso(),
-        })
+        if (status != "ok" or not initialization_id
+                or witness.get("initialization_id") != initialization_id):
+            return False
+        if witness["phase"] != "complete":
+            _write(drive_root, {**witness, "phase": "complete", "completed_at": utc_now_iso()})
+        return not authority_reason(drive_root, initialization_id)
     except Exception:
-        log.warning("state initialization witness could not be completed; retried next boot", exc_info=True)
+        log.warning("state initialization witness could not be completed", exc_info=True)
+        return False

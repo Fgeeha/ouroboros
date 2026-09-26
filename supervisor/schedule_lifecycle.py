@@ -275,8 +275,17 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                     current["manual_override"] = "deleted"
                     status = "suppressed"
                 else:
-                    tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
-                    status, removed = "deleted", True
+                    from supervisor.schedule_occurrence import owed
+
+                    status, owes = "deleted", owed(current)
+                    if owes is not False:
+                        # An accepted run waits to be re-queued: removal is deferred until it
+                        # starts, because deleting a row never takes back an admission (#1315).
+                        current["enabled"], current["delete_requested_at"] = False, utc_now_iso()
+                        detail = "an accepted run of this schedule is still owed; the row goes once that run starts"
+                    else:
+                        tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
+                        removed = True
             elif _is_consumed_once(current):
                 status = "consumed_not_rearmed"
                 detail = "a one-shot that already fired is history; schedule a new run_at instead"
@@ -313,6 +322,7 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                         status, detail = "restored_not_ready", blocker
             else:
                 current["enabled"] = True
+                current.pop("delete_requested_at", None)  # restoring withdraws a deferred delete
                 status = "updated"
             changed = status not in UNCHANGED_STATUSES
             if changed:

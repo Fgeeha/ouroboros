@@ -579,8 +579,11 @@ export function createChatInstance({
             const state = cmd === 'evolve' ? [data?.evolution_enabled, data?.evolution_state?.detail]
                 : cmd === 'bg' ? [data?.bg_consciousness_enabled, data?.bg_consciousness_state?.detail] : null;
             if (state) {
-                button.classList.toggle('on', !!state[0]);
-                if (state[1]) button.title = state[1];
+                const unknown = state[0] == null;
+                button.classList.toggle('on', state[0] === true);
+                button.dataset.tone = unknown ? 'warn' : '';
+                button.textContent = `${cmd === 'bg' ? 'Consciousness' : 'Evolve'}${unknown ? ' · unknown' : ''}`;
+                button.title = state[1] || (unknown ? 'State unknown' : 'Toggle mode');
             }
         });
         // Mark More while background mode is active in the menu.
@@ -1698,6 +1701,11 @@ export function createChatInstance({
             return changed;
         }
         if (record.finished && !isTerminalTaskPhase(nextPhase, summary.terminal)) {
+            if (summary.toolCall) {
+                upsertToolFoldRow(record, applyToolObservation(record, summary.toolCall), ts, rawTs);
+                renderLiveCardTimeline(record);
+                updateLiveCardCount(record);
+            }
             if (summary.modelExecution) record.modelExecution = summary.modelExecution;
             renderLiveCardMeta(record, summary.costProjection);
             return liveCardProjectionChanged(before, record);
@@ -1713,6 +1721,7 @@ export function createChatInstance({
         markReviewAnchor(record);
         // Routine execution folds into ONE evidence row per block.
         const foldView = summary.toolCall ? applyToolObservation(record, summary.toolCall) : null;
+        if (foldView?.clearedNotice) { renderLiveCardTimeline(record); timelineChanged = true; }
 
         if (!record.isSubagent) {
             activeLiveGroupId = nextGroupId;
@@ -3828,7 +3837,7 @@ export function createChatInstance({
         // Project panel alone builds/animates/finalizes that card. Legacy
         // frames without chat_id default to the main chat.
         if (!isMyLogThread(msg)) return;
-        withRemoteActivity(() => updateLiveCardFromLogEvent(msg.data));
+        withRemoteActivity(() => updateLiveCardFromLogEvent({ ...msg.data, _live_tool_frame: !msg.data._historical }));
     });
 
     // Admission naming (a promoted root, a headless run) coined a name for a

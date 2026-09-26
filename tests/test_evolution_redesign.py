@@ -39,6 +39,7 @@ def test_evolution_campaign_pause_resume_preserves_history(tmp_path):
     from supervisor import queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     first = queue.start_evolution_campaign("Improve scheduler observability", source="test")
     live = state.load_state()
@@ -70,6 +71,7 @@ def test_evolution_auto_stop_pauses_campaign(tmp_path, monkeypatch):
     from supervisor import state as supervisor_state
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     monkeypatch.setattr(queue, "send_with_budget", lambda *args, **kwargs: None)
     queue.init(tmp_path)
     queue.init_queue_refs([], {}, {"value": 0})
@@ -90,6 +92,7 @@ def test_evolution_enqueue_attaches_lightweight_transaction(tmp_path, monkeypatc
     from supervisor import state as supervisor_state
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     monkeypatch.setattr(queue, "send_with_budget", lambda *args, **kwargs: None)
     queue.init(tmp_path)
     pending = []
@@ -116,6 +119,7 @@ def test_evolution_task_completion_preserves_live_transaction_updates(tmp_path):
     from supervisor import state as supervisor_state
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     campaign = queue.start_evolution_campaign("Improve", source="test")
     st = supervisor_state.load_state()
@@ -189,6 +193,7 @@ def test_terminal_evolution_event_without_running_metadata_updates_transaction(t
     from ouroboros.utils import iter_jsonl_objects
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     campaign = queue.start_evolution_campaign("Improve", source="test")
     st = supervisor_state.load_state()
@@ -239,6 +244,7 @@ def test_degraded_evolution_axes_count_as_failure(tmp_path):
     from ouroboros.task_results import STATUS_COMPLETED, write_task_result
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     campaign = queue.start_evolution_campaign("Improve", source="test")
     st = supervisor_state.load_state()
@@ -884,6 +890,7 @@ def test_evolution_restart_uses_local_commit_not_origin_and_blocks_dirty_tree(tm
         ["git", "rev-parse", "HEAD"], cwd=str(repo), check=True, capture_output=True, text=True
     ).stdout.strip()
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
     st = supervisor_state.load_state()
@@ -986,6 +993,7 @@ def test_enqueue_evolution_blocked_in_light_mode(tmp_path, monkeypatch):
     from supervisor import state as supervisor_state
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     sent = []
     monkeypatch.setattr(queue, "send_with_budget", lambda chat_id, text, *a, **k: sent.append(text))
     monkeypatch.setattr("ouroboros.config.get_runtime_mode", lambda: "light")
@@ -1011,6 +1019,7 @@ def test_enqueue_evolution_omits_duplicate_cycle_message(tmp_path, monkeypatch):
     from supervisor import state as supervisor_state
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install (#1307)
     monkeypatch.setattr(supervisor_state, "TOTAL_BUDGET_LIMIT", 100.0)
     sent = []
     monkeypatch.setattr(queue, "send_with_budget", lambda chat_id, text, *a, **k: sent.append(text))
