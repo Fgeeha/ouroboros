@@ -40,10 +40,14 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # settlement's staging/trash; the artifact-route sentence was replaced, not appended to.
     # 166450 -> 166700 (steer sprint 2026-09-26, measured 166595 on the merged tree: delegate_message,
     # truthful waiting A-E, low-water reclaim; see the sprint ledger).
-    # 166700 -> 166800 (Batch 1, measured 166799): three new owners on the module map
-    # (state_initialization.py, schedule_occurrence.py, tool_call_log.py), each folded
-    # into its sibling's existing row instead of a new row.
-    "docs/architecture/01-high-level-architecture.md": 166800,
+    # 165900 -> 166100: the plan_spec.py and plan_review.py rows name the open-set aggregate, the
+    # one closure table and the author path's labelled critic pair; the base sat 110 bytes under.
+    # 166100 -> 166300: the reviewer_slot_config.py and plan_review_runtime.py rows name the plan
+    # order precedence and the wave effort/standing facts (descriptions replaced in place).
+    # 166450 -> 167000 (merge of the moved target into the plan-review branch, measured 166885): both
+    # sides' replaced paragraphs land together; no text was appended by the merge itself.
+    # 167000 -> 167300 (merge of the moved target into the plan-review branch, measured 167032): both sides' paragraphs land together.
+    "docs/architecture/01-high-level-architecture.md": 167300,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -83,7 +87,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # and the merged #1236 base already sat 5 bytes under the previous budget.
     # 107000 -> 107200 (TZ-1 PR-2, measured 107174): one module row for result_files.js, the
     # card's Files row; no older text described task result files on the card.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 107200,
+    # 107000 -> 107300: the Reviews projection names the per-seat effort, weaker-order and
+    # earlier-plan facts as read-side projections (one clause); the base sat 22 bytes under.
+    # 107300 -> 107500 (merge of the moved target into the plan-review branch, measured 107392): both
+    # sides' replaced paragraphs land together; no text was appended by the merge itself.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 107500,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
@@ -124,11 +132,7 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # (own latch, the attempt-basis fence, the drive-custody pass: child-ref retry then bounded
     # drive settlements under the queue interlock, generation re-asked per item and commit) and
     # the watchdog watches startup with the stall stack; the sentences they change were replaced.
-    # 34100 -> 35500 (Batch 1, measured 35462): two new nodes of this flow — explicit state
-    # initialization at boot (witness, unavailable-but-serving, writer-owned recovery) and the
-    # schedule occurrence protocol (claim, typed wait, receipt, dispatch barrier); the budget-
-    # projection sentence they change was replaced by a shorter one.
-    "docs/architecture/05-supervisor-loop.md": 35500,
+    "docs/architecture/05-supervisor-loop.md": 34100,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is
@@ -219,16 +223,37 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # clause gains the queued receipt and the terminal unread-mail custody.
     # 317750 -> 323400 (steer sprint 2026-09-26, measured 323255 on the merged tree: delegate_message,
     # truthful waiting A-E, low-water reclaim; see the sprint ledger).
-    # 323400 -> 323650 (Batch 1, measured 323607): the delegate_start selector contract (neutral
-    # default = omission, complete-selector binding, typed unresolved refusal) had no sentence to replace.
-    "docs/architecture/06-agent-core.md": 323650,
+    # 316800 -> 318000: the plan-review open-set verdict (GREEN = empty open set, notes never
+    # count), the per-finding advisory closure of a below-quorum blocking finding, the closed
+    # REVIEW_REQUIRED written GREEN, and the author path's labelled critic pair REPLACE the
+    # closure/aggregate/disclosed-gap sentences in place; the base sat 69 bytes under.
+    # 318000 -> 318700: the reviewer stance sentence names the cycle-2 adjudication duty, the
+    # goal-changed fact, the subtraction voice and the per-slot seat line (REPLACED in place).
+    # 318700 -> 319500: the reviewer-effort paragraph REPLACES the default-rung ladder with the
+    # order-outranks-pins ladder, the recorded per-seat/owner/ordered_weaker facts, and the
+    # unanswered-slot floor gains the same-spec standing-findings clause.
+    # 319500 -> 320500: the dialogue-delivery paragraph REPLACES the byte-suffix/mandatory-full-read
+    # contract with the numbered conversation view, the per-route fit, the session pointer and the
+    # observed-source read facts; the capture paragraph gains the snapshot-vs-inline clause.
+    # 320500 -> 321400 (merge of the moved target into the plan-review branch, measured 321261): both
+    # sides' replaced paragraphs land together; no text was appended by the merge itself.
+    # 321400 -> 321600 (measured 321394): the closure sentence names the CONFIGURED enforcement against the hurry-projected advisory.
+    # 321600 -> 321800 (measured 321594): the unanswered-slot floor names the terminal-absence rule and the lineage walk.
+    # 323400 -> 327400 (merge of the moved target into the plan-review branch, measured 327146): both sides' paragraphs land together.
+    # 327400 -> 328400 (measured 328111): the addressed answer replaces the automatic delta; answers merge by
+    # finding_id; continuation per slot; the escalated-question clause (each extended in place).
+    # 328400 -> 328500 (measured 328427): the addressed clause names the cases decided before it that carry no note.
+    "docs/architecture/06-agent-core.md": 328500,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route
     # paragraph (plan-selected endpoint, low/high/max projection, 1113 billing) plus two
     # settings rows; the base sat 95 bytes under the previous budget, no older text to displace.
     # 38400 -> 38700 (PR #1300): one settings row for the extra-CA trust bundle; the base sat 33 bytes under.
-    "docs/architecture/07-configuration.md": 38700,
+    # 38700 -> 39000: OUROBOROS_EFFORT_REVIEW and the reviewer-slot row description name the plan
+    # order that outranks a pinned row effort (compound slugs keep theirs); the base sat 139 under.
+    # 39000 -> 39100 (measured 38988): the review-enforcement row names what plan-review closure reads.
+    "docs/architecture/07-configuration.md": 39100,
     # 18947 -> 19287: CI failure collection now documents diagnostic desktop builds while release remains gated.
     # 19287 -> 20560 (#1215): three contracts the chapter had no older text for — the
     # ONE reusable browser lane and the two triggers that share it (the unfiltered
@@ -251,9 +276,7 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 12405 -> 14400 (issue #1142): the ordinary-close paragraph gains the mechanism the chapter had
     # no text for — graceful stop signals the server PID only, the server half (stop event at the
     # signal, bounded uvicorn drain) is self-sufficient against an old group-SIGTERM launcher.
-    # 14400 -> 14750 (Batch 1, measured 14725): the Panic sentence was rewritten for its new
-    # order (physical stops first, bounded persistence, known-binding external ingress, boot consumption).
-    "docs/architecture/09-shutdown-and-process-cleanup.md": 14750,
+    "docs/architecture/09-shutdown-and-process-cleanup.md": 14400,
     # 17655 -> 20400: the supervisor-reliability sprint adds eight invariants the chapter lacked
     # (typed permanent engine refusal, interrupted parent, stalled-loop facts, source-ack
     # pre-check, host-owed round, reviewer tool bound, off-thread custody, fence transport) —
@@ -315,7 +338,11 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     "docs/development/03-module-size-and-complexity.md": 23500,
     # 16431 -> 17100 (steer sprint 2026-09-26, measured 16930 on the merged tree: delegate_message,
     # truthful waiting A-E, low-water reclaim; see the sprint ledger).
-    "docs/development/04-core-governance-artifacts.md": 17100,
+    # 16431 -> 16600: the disposition paragraph names the advisory reasoned-reject closure of a
+    # below-quorum blocking finding (one clause); the base sat 2 bytes under.
+    # 16600 -> 16700: the snapshot sentence names the conversation-only inline view and its pointer.
+    # 17100 -> 17400 (merge of the moved target into the plan-review branch, measured 17123): both sides' paragraphs land together.
+    "docs/development/04-core-governance-artifacts.md": 17400,
     "docs/development/05-review-and-commit-protocol.md": 12956,
     # 94197 -> 94520: the usage-ledger lock rule gains its reader contract (a display read
     # on the supervisor loop or a gateway thread rides the last validated snapshot; money
@@ -342,7 +369,16 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # the union displaces nothing.
     # 96800 -> 97500 (steer sprint 2026-09-26, measured 97380 on the merged tree: delegate_message,
     # truthful waiting A-E, low-water reclaim; see the sprint ledger).
-    "docs/development/06-rules-by-change-class.md": 97500,
+    # 96800 -> 97700: one Loop / State-Machine bullet for the plan-review open-set verdict, the
+    # one closure table and the labelled critic pair of an author-selected plan; the base sat 48 under.
+    # 97700 -> 98300: the plan-review bullet gains the effort-order precedence, the recorded
+    # effort facts and the same-spec standing-findings clause (extended in place).
+    # 98300 -> 98600: the plan-review bullet gains the numbered-conversation delivery and the
+    # observed-source read fact (extended in place) and two test pointers.
+    # 98600 -> 99300 (merge of the moved target into the plan-review branch, measured 99030): both sides' paragraphs land together.
+    # 99300 -> 99800 (measured 99712): one bullet — plan-review answers merge by finding_id, the addressed re-ask
+    # and its $0 replay rows, the quiz-answer rule; the base sat 270 bytes under.
+    "docs/development/06-rules-by-change-class.md": 99800,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,

@@ -298,7 +298,9 @@ lives in `log_events.js`). The routing receipt under an owner
 message is such a surface: a refused addressing act carries the host-composed
 `cause` sentence (`project_dialogue.routing_refusal_cause` — one host table for
 the receipt line, the System row and the picker toast), a landed act carries
-none, and an unknown reason stays raw. A terminal whose preserved output was
+none, and an unknown reason stays raw. Host text speaks only for the host's own
+actions, its own counts and signed quotes; a source it could not read is
+unknown, never zero. A terminal whose preserved output was
 never reviewed shows that output labelled rather than hidden: a short labelled
 excerpt beside the pointer to the full copy, so a `Failed` card over applied work
 is never a bare headline and never names preserved bytes without a way to reach
@@ -604,6 +606,13 @@ not child-task cards and never prove execution by themselves.
   its `DEGRADED` verdict), and each unavailable plan reviewer row names the
   model and quotes the engine's reported sentence when one exists — the
   failure code stays in the task detail and Logs.
+- A plan wave the mind ordered weaker than the owner's effort setting says so in
+  its attempt detail as one keyed line naming each seat, the ordered effort and
+  the setting (`Reviewers ordered weaker than your setting: s1 low (setting
+  xhigh)`), at desktop and phone width alike; the verdict token is never
+  recoloured for it. A seat that did not answer a same-spec cycle adds `· did
+  not answer; its earlier finding is still listed` to its unavailable row (a
+  never-sent seat: `· not sent; its earlier finding is still listed`).
 - An awaited or unresolved reviewer row adds `· since HH:MM` in the viewer's
   local 24-hour clock, prefixed with the short date when the wait began on an
   earlier day, only where the host recorded the moment it sent that reviewer's
