@@ -464,9 +464,9 @@ def plan_wave_only_awaited(wave: Any) -> bool:
     (the census names no unresolved, uncollected, refused or failed slot), and the
     recorded answers hold no verdict of their own beneath the stored placeholder. A
     collected blocking or ``need_evidence`` finding keeps the wave open whatever the
-    awaited slots answer, and a quorum of answers that raised findings IS a critic
-    verdict the wait merely postpones — neither reads as a mere wait. A roster or a
-    quorum the typed facts cannot vouch for is never a mere wait either."""
+    awaited slots answer, so it never reads as a mere wait; notes are neutral (they
+    never move the verdict), so a quorum whose only findings are notes is still a mere
+    wait. A roster or a quorum the typed facts cannot vouch for is never a mere wait."""
     from ouroboros.tools.plan_review_runtime import plan_wave_slot_census
 
     if not isinstance(wave, dict) or not wave.get("custody_pending"):
@@ -480,10 +480,8 @@ def plan_wave_only_awaited(wave: Any) -> bool:
         return False
     counts = wave.get("counts") if isinstance(wave.get("counts"), dict) else {}
     quorum = counts.get("quorum")
-    if (type(quorum) is not int or quorum <= 0 or not isinstance(findings, list)
-            or any(not isinstance(item, dict) or item.get("class") != "note" for item in findings)):
-        return False
-    return len(census["answered"]) < quorum or not findings
+    return not (type(quorum) is not int or quorum <= 0 or not isinstance(findings, list)
+                or any(not isinstance(item, dict) or item.get("class") != "note" for item in findings))
 
 
 def plan_review_class_facts(wave: Any, *, awaited: bool) -> Dict[str, Any]:
@@ -733,23 +731,25 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
         )
     if outcome == "REVIEW_REQUIRED":
         return (
-            f"{tag} Blocking plan review remains REVIEW_REQUIRED. Re-call plan_task with a "
-            "complete review_disposition as the only field, naming the latest fingerprint, "
-            "then continue; do not rerun reviewers."
+            f"{tag} Blocking plan review remains REVIEW_REQUIRED. Open need_evidence requests close "
+            "with a $0 review_disposition naming the latest fingerprint; a blocking finding below quorum "
+            "stays open until its slot no longer raises it in a later paid cycle (the unchanged envelope "
+            "with your items asks only that slot) or a changed spec is reviewed without it. "
+            "Implementation stays held while the review is open."
         )
     if outcome == "REVISE_PLAN":
         return (
-            f"{tag} Blocking plan review requires a revised spec. Change the spec — it carries "
-            "affected_paths, the files the work will change ([] when none) — and call "
-            "plan_task again (or reject the blocking findings with a rationale via "
-            "review_disposition). Continue analysis and non-mutating preparation, but do not "
-            "begin the work before the review closes or a real task-wide rail fires."
+            f"{tag} Blocking plan review is REVISE_PLAN. A changed spec — with affected_paths, the files "
+            "the work will change ([] when none) — is a new envelope every slot reviews; the unchanged "
+            "envelope with review_disposition items asks only the slots those items name. Analysis and "
+            "non-mutating preparation remain open; the work starts after the review closes — a task-wide "
+            "rail releases finalization, never implementation."
         )
     return (
         f"{tag} Call plan_task with a concrete goal, plan and spec, whose affected_paths lists "
         "the files the work will change ([] when none). If review infrastructure "
         "is unavailable, continue analysis and non-mutating preparation, but do not begin the "
-        "work before the review closes or a real task-wide rail fires."
+        "work before the review closes; a task-wide rail releases finalization, never implementation."
     )
 
 

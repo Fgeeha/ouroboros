@@ -673,7 +673,9 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
             run.assert_not_called()
             self.assertFalse((root / "task_results" / "parent.json").exists())
 
-    def test_mixed_disposition_and_plan_envelope_is_rejected_without_mutation(self):
+    def test_answer_beside_an_envelope_naming_no_wave_is_refused_without_mutation(self):
+        """The valid envelope is prepared read-only, then the answers are bound to their wave:
+        none holds this fingerprint, so the call is refused before any review or write."""
         import tempfile
         import ouroboros.tools.plan_review as pr
         from ouroboros.tools.registry import ToolContext
@@ -682,18 +684,14 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
             root = pathlib.Path(raw)
             ctx = ToolContext(repo_dir=root, drive_root=root)
             ctx.task_id = "parent"
-            disposition = {
-                "review_fingerprint": "f" * 64,
-                "items": [{"finding_id": "slot_1:f1", "decision": "reject", "rationale": "one"}],
-            }
+            disposition = {"review_fingerprint": "f" * 64,
+                           "items": [{"finding_id": "slot_1:f1", "decision": "reject", "rationale": "one"}]}
             with patch.object(pr, "_record_raw_plan_request_with_reference") as record, patch.object(
                 pr, "_run_plan_review_async",
             ) as run:
-                out = pr._handle_plan_task(
-                    ctx, plan="P changed", goal="G", spec={"in_scope": ["a"]},
-                    review_disposition=disposition,
-                )
-            self.assertIn("PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE", out)
+                out = pr._handle_plan_task(ctx, plan="P changed", goal="G", spec={"in_scope": ["a"], "affected_paths": []},
+                                           review_disposition=disposition)
+            self.assertIn("PLAN_REVIEW_DISPOSITION_UNBINDABLE", out)
             record.assert_not_called()
             run.assert_not_called()
             self.assertFalse((root / "task_results" / "parent.json").exists())
@@ -723,34 +721,32 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
                 apply_.assert_called_once_with(ctx, disposition)
                 run.assert_not_called()
 
-    def test_meaningful_or_invalid_padding_beside_a_disposition_is_still_mixed(self):
+    def test_meaningful_or_invalid_padding_beside_a_disposition_is_refused_by_the_envelope_form(self):
         """Only schema-equivalent emptiness is ignored: a non-empty list, an unknown spec
-        key or a wrong type is meaning (or an error) and keeps the typed refusal — a
-        vacuity rule must never discard an invalid value to make a call pass."""
+        key or a wrong type is an envelope, validated FIRST — its typed form refusal comes
+        before the answers are touched; a vacuity rule never discards an invalid value."""
+        import tempfile
         import ouroboros.tools.plan_review as pr
         from ouroboros.tools.registry import ToolContext
 
-        ctx = ToolContext(repo_dir=pathlib.Path("."), drive_root=pathlib.Path("."))
-        ctx.task_id = "parent"
-        disposition = {"review_fingerprint": "f" * 64, "items": []}
-        for padding in (
-            {"spec": {"in_scope": [""]}},
-            {"spec": {"unknown": ""}},
-            {"goal": []},
-            {"plan": "P changed"},
-        ):
-            with self.subTest(padding=padding):
-                with patch.object(pr, "_apply_disposition") as apply_, patch.object(
+        with tempfile.TemporaryDirectory() as raw:
+            root = pathlib.Path(raw)
+            ctx = ToolContext(repo_dir=root, drive_root=root)
+            ctx.task_id = "parent"
+            disposition = {"review_fingerprint": "f" * 64, "items": []}
+            for padding in ({"spec": {"in_scope": [""]}}, {"spec": {"unknown": ""}}, {"goal": []}, {"plan": "P changed"}):
+                with self.subTest(padding=padding), patch.object(pr, "_apply_disposition") as apply_, patch.object(
                     pr, "_run_plan_review_async",
                 ) as run:
                     out = pr._handle_plan_task(ctx, review_disposition=disposition, **padding)
-                self.assertIn("PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE", out)
-                apply_.assert_not_called()
-                run.assert_not_called()
+                    self.assertTrue("PLAN_SPEC_INVALID" in out or "PLAN_RESOURCE_FORM_REQUIRED" in out, out)
+                    apply_.assert_not_called()
+                    run.assert_not_called()
+            self.assertFalse((root / "task_results" / "parent.json").exists())
 
     def test_disposition_with_an_empty_item_beside_a_plan_is_not_vacuous(self):
-        """``items=[{}]`` says something malformed, not nothing: beside a plan it is a
-        mixed envelope (refused typed), never silently promoted into review mode."""
+        """``items=[{}]`` says something malformed, not nothing: beside a plan it is an answer
+        with an envelope whose (malformed) form is refused typed, never plain review mode."""
         import ouroboros.tools.plan_review as pr
         from ouroboros.tools.registry import ToolContext
 
@@ -761,7 +757,7 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
                 ctx, plan="P", goal="G", spec={},
                 review_disposition={"review_fingerprint": "", "items": [{}]},
             )
-        self.assertIn("PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE", out)
+        self.assertIn("PLAN_RESOURCE_FORM_REQUIRED", out)
         run.assert_not_called()
 
     def test_state_lookup_failure_is_error_not_absence(self):
@@ -830,11 +826,16 @@ class TestPlanReviewDispositionEnvelope(unittest.TestCase):
             out = pr._handle_plan_task(ctx, plan="P", goal="G", spec={}, review_disposition=filler)
         self.assertEqual(out, "reviewed")
         run.assert_called_once()
-        # A rationale is a statement; with it the disposition is real and still refused beside a plan.
+        # A rationale is a statement; with it the disposition is real: beside a valid plan it is
+        # bound to its wave first, and an empty fingerprint names none.
+        import tempfile
+
         spoken = {**filler, "author_disposition": {"disposition": "rejected", "rationale": "no"}}
-        with patch.object(pr, "_run_plan_review_async") as run:
-            out = pr._handle_plan_task(ctx, plan="P", goal="G", spec={}, review_disposition=spoken)
-        self.assertIn("PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE", out)
+        with tempfile.TemporaryDirectory() as raw, patch.object(pr, "_run_plan_review_async") as run:
+            ctx = ToolContext(repo_dir=pathlib.Path(raw), drive_root=pathlib.Path(raw))
+            ctx.task_id = "parent"
+            out = pr._handle_plan_task(ctx, plan="P", goal="G", spec={"affected_paths": []}, review_disposition=spoken)
+        self.assertIn("review_fingerprint is required", out)
         run.assert_not_called()
 
     def test_duplicate_plan_calls_use_existing_sequential_tool_lane(self):

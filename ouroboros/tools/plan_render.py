@@ -164,6 +164,47 @@ def _quorum_unreachable_fact(wave: dict) -> str:
     )
 
 
+def _open_questions_line(wave: dict, enforcement: str) -> str:
+    """The open ``need_evidence`` ids, split into questions to the author (no locator) and
+    document requests (a locator), read from the ONE closure table; '' when none is open."""
+    from ouroboros.tools import plan_spec
+
+    findings = [f for f in wave.get("findings") or [] if isinstance(f, dict)]
+    open_ids = set(plan_spec.closure_after_disposition(
+        str(wave.get("aggregate") or ""), findings, wave.get("dispositions") or [], enforcement)["open_ids"])
+    asks = [f for f in findings if f.get("class") == "need_evidence"
+            and str(f.get("finding_id") or f.get("id") or "") in open_ids]
+    questions = [f for f in asks if not str(f.get("locator") or "").strip()]
+    documents = [f for f in asks if str(f.get("locator") or "").strip()]
+
+    def named(rows: list, field: str) -> str:
+        shown = [f"{f.get('finding_id') or f.get('id')} ({f.get(field) or '?'})" for f in rows[:8]]
+        return ", ".join(shown) + (f", +{len(rows) - 8} more" if len(rows) > 8 else "")
+
+    return ((f"Open questions to you: {named(questions, 'breaks')}. " if questions else "")
+            + (f"Open document requests: {named(documents, 'locator')}. " if documents else ""))
+
+
+def _answer_route(fp: str, *, at_cap: bool, cycles_paid: int, cap: Optional[int]) -> str:
+    """The route an answer takes, as facts: recorded at $0 and merged by id; beside the
+    unchanged envelope it asks again only the seats it names (one paid cycle, the rest kept at
+    $0); beside a changed one every seat reviews with the answers in view. Whether to buy that
+    cycle is the mind's; at the cap the answer stays recorded evidence."""
+    recorded = (f"An answer is recorded at $0 by plan_task(review_disposition={{review_fingerprint: '{fp}', "
+                "items: [...]}) (accept = answered, the rationale is the answer; reject; defer = deferred "
+                "openly) and merged by finding_id")
+    if at_cap:
+        return recorded + ("; the cycle cap is reached, so no paid cycle remains to show it to a reviewer: "
+                           "it stays recorded evidence. ")
+    return recorded + (
+        ". The same call beside the unchanged goal/plan/spec asks only the slots its items name — one paid "
+        f"cycle {cycles_paid + 1}{'' if cap is None else f' of {cap}'}; every other slot keeps its recorded "
+        "answer at $0 — and a slot that no longer raises its finding retires it; beside a changed "
+        "goal/plan/spec every slot reviews the new envelope with the answers in view. Whether to buy that "
+        "cycle is yours. An envelope sent without items supersedes this wave (its recorded answers stay); "
+        "the identical one replays free. ")
+
+
 def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid: int) -> str:
     aggregate = str(wave.get("aggregate") or "")
     fp = str(wave.get("request_fingerprint") or "")
@@ -187,8 +228,8 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
             author_note + "Cyber Pro: Ouroboros decides whether and how to continue. "
             "The recorded verdict, open findings and any unresolved physical reviewers remain "
             "independent facts; continuation does not close the wave or create a PASS. "
-            f"The existing $0 plan_task(review_disposition={{review_fingerprint: '{fp}', items: [...]}}) "
-            "can collect results or record a disposition without a new panel."
+            + ("" if bool(wave.get("closed")) else
+               _open_questions_line(wave, enforcement) + _answer_route(fp, at_cap=at_cap, cycles_paid=cycles_paid, cap=cap))
         )
     if bool(wave.get("closed")):
         if plan_review_notes_are_annotatable(wave):
@@ -262,40 +303,31 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
             text += _quorum_unreachable_fact(wave)
     elif aggregate == "REVIEW_REQUIRED":
         blocking = [f for f in wave.get("findings") or [] if f.get("class") == "blocking"]
-        text = author_note + (
-            "Notes are optional. Open need_evidence requests (an evidence locator or "
-            "a question addressed to you by spec id) close with ONE $0 call: "
-            f"plan_task(review_disposition={{review_fingerprint: '{fp}', items: [...]}}) — accept = "
-            "answered (your rationale is the answer; "
-            + ("the cap leaves no further paid cycle to deliver it to reviewers), " if at_cap else
-               "it reaches reviewers on the next paid cycle), ")
-            + "reject, or defer = deferred openly; no reviewer call, no cycle. A revised envelope "
-            "supersedes this wave and its open requests can no longer be dispositioned. "
-        )
-        if blocking:
+        text = (author_note + "Notes are optional and need no answer. " + _open_questions_line(wave, enforcement)
+                + _answer_route(fp, at_cap=at_cap, cycles_paid=cycles_paid, cap=cap))
+        if blocking:  # the closure table's per-finding rule, stated as a fact
             ids = ", ".join(str(f.get("finding_id") or f.get("id")) for f in blocking[:4])
             text += (
-                f"NOTE: {len(blocking)} BLOCKING finding(s) below quorum ({ids}) stay OPEN whatever "
-                "you disposition. "
-                + ("A changed spec or a justified rejection may be judged in another paid cycle. "
-                   if not at_cap else "The cycle cap is reached; no further paid panel is available. ")
-            )
+                f"NOTE: {len(blocking)} BLOCKING finding(s) below quorum ({ids}): a reject with its "
+                "rationale closes each one; accept or defer keeps it open until a changed spec is reviewed. "
+                if enforcement == "advisory" else
+                f"NOTE: {len(blocking)} BLOCKING finding(s) below quorum ({ids}) stay open after any "
+                "disposition; they leave the review when the slot that raised them no longer raises it in a "
+                "later paid cycle, or when a changed spec is reviewed without them. "
+            ) + ("The cycle cap is reached; no further paid panel is available. " if at_cap else "")
     else:
-        text = author_note + (
-            "Blocking findings: accept ⇒ change the spec and re-call plan_task (new fingerprint, "
-            f"{'the cap is reached — no further paid cycle' if at_cap else 'next paid cycle ' + str(cycles_paid + 1) + ('' if cap is None else f' of {cap}')}); "
-            "reject ⇒ record reject + rationale via review_disposition naming this fingerprint — "
-            + ("it is recorded as evidence; the cap leaves no further paid delta cycle to judge it. "
-               if at_cap else
-               "it rides into the next paid delta cycle where reviewers mark it resolved or still-open. ")
-            + "A disposition never closes REVISE_PLAN. "
-        )
+        blocking = [f for f in wave.get("findings") or [] if f.get("class") == "blocking"]
+        ids = ", ".join(str(f.get("finding_id") or f.get("id")) for f in blocking[:6])
+        text = (author_note + f"Blocking findings at quorum{f' ({ids})' if ids else ''}. A disposition records "
+                "an answer; a disposition never closes REVISE_PLAN. " + _open_questions_line(wave, enforcement)
+                + _answer_route(fp, at_cap=at_cap, cycles_paid=cycles_paid, cap=cap))
     if enforcement == "blocking":
         text += (
             _BLOCKING_HOLDS
-            + (" — the cycle cap is reached: exits are owner unstick (Swarm/hurry), a revised spec "
-               "once the owner raises OUROBOROS_REVIEW_MAX_CYCLES, or finalizing with "
-               "outcome_tier=blocked_with_evidence." if at_cap else ".")
+            + (" — the cycle cap is reached: no paid panel remains; finalization is RELEASED, and finalizing "
+               "now records outcome_tier=blocked_with_evidence with the review left OPEN and implementation "
+               "still held; a revised spec buys a paid cycle once the owner raises OUROBOROS_REVIEW_MAX_CYCLES "
+               "(owner authority, never reviewer approval)." if at_cap else ".")
         )
         if wave.get("quorum_unreachable") and not bool(wave.get("closed")):
             # B2b facts, never imperatives: the honest exits that exist alongside
@@ -315,13 +347,17 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
 
 def _closure_note_view(note: str) -> str:
     """Legacy host notes describe state; the current renderer owns available steps."""
-    prefix = str(note).partition(":")[0]
+    prefix, _sep, reason = str(note).partition(":")
     meaning = {
+        "closed_by_disposition": "the open set emptied; the wave is recorded GREEN",
         "blocking_finding_below_quorum_stays_open": "blocking findings remain open after disposition",
         "revise_plan_not_closable_by_disposition": "disposition does not close blocking findings",
         "degraded_not_closable_by_disposition": "no parseable reviewer quorum; disposition does not close the wave",
+        "answers_not_addressed": "no slot was asked again by the answers",
     }.get(prefix)
-    return f"{prefix}: {meaning}" if meaning else str(note)
+    if not meaning:
+        return str(note)
+    return f"{prefix}: {meaning}" + (f" ({reason.strip()})" if prefix == "answers_not_addressed" and reason.strip() else "")
 
 
 def _dialogue_source_view(wave: dict, *, cached: bool) -> list[str]:
@@ -369,6 +405,12 @@ def _render_wave(
         + (", ".join(f"{o.get('locator')}: {o.get('reason')}" for o in manifest.get("omissions") or []) or "none"),
     ]
     lines.extend(_dialogue_source_view(wave, cached=cached))
+    if isinstance(wave.get("addressed"), dict) and wave["addressed"].get("slots"):
+        addressed = wave["addressed"]
+        lines.append(
+            f"**Addressed answer:** asked again {', '.join(addressed['slots'])} on "
+            f"{', '.join(addressed.get('finding_ids') or [])}"
+            + (f"; kept at $0: {', '.join(addressed['kept'])}" if addressed.get("kept") else "") + ".")
     if wave.get("compact"):
         ref = wave.get("wave_artifact") if isinstance(wave.get("wave_artifact"), dict) else {}
         artifact_path = str(ref.get("path") or "")
@@ -402,8 +444,16 @@ def _render_wave(
         lines += ["", "⚠️ DEGRADED: no parseable reviewer quorum — recorded as an OPEN wave; "
                   + _degraded_replay_note(wave, paid_available=cap is None or cycles_paid < cap) + "."]
     actor_lines = [
-        f"- {a.get('slot_id')} · {a.get('model')} · {a.get('route')} · host_file_read: "
-        f"{a.get('host_file_read_attestation')} · {_actor_outcome(a, slot_class.get(id(a), ''))}"
+        f"- {a.get('slot_id')} · {a.get('model')} · {a.get('route')}"
+        + (f" · effort {a['effort']}{' (ordered)' if a.get('declared_effort') else ''}" if a.get("effort") else "")
+        + f" · host_file_read: {a.get('host_file_read_attestation')}"
+        + (f" · room snapshot read {a['room_read_coverage'].get('covered_chars')}/{a['room_read_coverage'].get('complete_chars')} "
+           f"chars ({a['room_read_coverage'].get('provenance')})" if isinstance(a.get("room_read_coverage"), dict) else "")
+        + f" · {_actor_outcome(a, slot_class.get(id(a), ''))}"
+        + ((" · not sent" if a.get("operation_state") == "not_dispatched" else " · did not answer")
+           + "; its earlier finding is still listed" if a.get("carried_findings") else "")
+        + (f" · kept its cycle-{a['replayed_from'].get('cycle_index')} answer at $0"
+           if isinstance(a.get("replayed_from"), dict) and a["replayed_from"] else "")
         + (f" · disclosures: {', '.join(a['disclosures'])}" if a.get("disclosures") else "")
         for a in wave.get("actors") or []
     ] or ["(no actor records)"]
@@ -411,9 +461,11 @@ def _render_wave(
     findings_total = int(wave.get("findings_total") or len(findings))
     finding_page = findings[:MAX_FINDINGS_PER_SLOT]
     if wave.get("reviewer_effort"):
-        actor_lines.append(
-            f"- declared reviewer effort: {wave['reviewer_effort']} (this envelope's order; an explicit "
-            "per-row effort or a compound route slug outranks it)")
+        actor_lines.append(f"- reviewer effort ordered for this envelope: {wave['reviewer_effort']}")
+    if isinstance(wave.get("ordered_weaker"), dict) and wave["ordered_weaker"]:
+        actor_lines.append("- ORDERED WEAKER THAN THE OWNER SETTING on " + ", ".join(
+            f"{sid} ({row.get('effort')} < {row.get('owner_effort')})"
+            for sid, row in wave["ordered_weaker"].items() if isinstance(row, dict)))
     lines += [
         "", "### Reviewer slots" + (" (original recorded state)" if historical_feedback is not None else ""), "", *actor_lines,
         "", "### Findings (per slot; finding_id = slot:id)", "", "```json",
