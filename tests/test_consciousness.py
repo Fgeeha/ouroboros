@@ -168,7 +168,7 @@ def test_an_accepted_wake_advances_the_observation_boundary_and_a_refused_one_do
     assert '"second"' in text and '"first"' not in text
 
 
-def test_a_refused_wake_consumes_no_transition_and_the_admitted_one_persists_what_can_still_change(clock):
+def test_a_refused_wake_consumes_no_transition_and_the_admitted_one_persists_observed_identities(clock):
     """The accepted boundary carries the task-result transition state beside the chat position:
     a child that settles with no chat row is reported by the next ADMITTED wake, not lost to a
     refused one, and only still-open work is persisted."""
@@ -193,7 +193,7 @@ def test_a_refused_wake_consumes_no_transition_and_the_admitted_one_persists_wha
     clock.clock._next_wake_at = T0 + 3 * FLOOR
     assert clock.clock.tick(T0 + 3 * FLOOR) == "launched"
     assert "- task kid failed, completion time not recorded" in clock.launches[-1]["text"]
-    assert clock.store[OBSERVATION_STATE_KEY]["transitions"]["inventory"] == {}
+    assert set(clock.store[OBSERVATION_STATE_KEY]["transitions"]["inventory"]) == {"kid"}
 
 
 def test_legacy_inbox_is_archived_once_without_being_read(clock):

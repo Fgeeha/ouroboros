@@ -512,12 +512,7 @@ class _AnthropicLaneMixin:
 
         def _send(candidate: Dict[str, Any]):
             nonlocal prior_capture
-            from ouroboros.send_clock import stamp_clock_note
-
-            # A Main send's clock line joins the trailing user turn before sealing;
-            # a rebound compatibility retry keeps the line its source carries.
-            candidate = stamp_clock_note(candidate, blocks=True, keep_existing=True)
-            candidate = _finalized_physical_candidate(target, candidate, "messages")
+            candidate = _finalized_physical_candidate(target, candidate, "messages", fresh_clock=True)
             request = _attempt_request(target, candidate, source="llm.anthropic")
 
             def _post():

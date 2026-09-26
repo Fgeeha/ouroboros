@@ -55,8 +55,8 @@ OPERATIONS_FIELD = "review_operations"
 # ``retained``: checkpoint written, no worker released by this controller yet (a
 # crash right after a release can leave it, so it never proves "not sent");
 # ``dispatched``: released to physical workers; ``closed``: the operation ended;
-# ``unpublished``: it ended but its late settlement did not land (maintenance
-# retries it); ``collected``: a late settlement was published and read back.
+# ``unpublished``: it ended but publication or durable notice custody did not
+# land (maintenance retries it); ``collected``: a late settlement was published and read back.
 # Another surface's pointer only proves liveness and is removed when it closes.
 OPERATION_RETAINED, OPERATION_DISPATCHED, OPERATION_CLOSED = "retained", "dispatched", "closed"
 OPERATION_UNPUBLISHED, OPERATION_COLLECTED = "unpublished", "collected"
@@ -143,14 +143,6 @@ def _operation_stop_state(root: pathlib.Path, task_id: str) -> str:
     return ""
 
 
-def _snapshot(value: Dict[str, Any]) -> Dict[str, Any]:
-    """An independent copy of task facts; a value that cannot be copied is kept as its text."""
-    try:
-        return copy.deepcopy(value)
-    except Exception:
-        return json.loads(json.dumps(value, default=str))
-
-
 class _OperationWait(TaskModelWait):
     """The operation's wait owner: a decision is the canonical row's ``pending_action``.
 
@@ -219,10 +211,14 @@ class ReviewOperation:
         metadata = metadata if isinstance(metadata, dict) else parent_task.get("metadata")
         # A fresh snapshot, never the author's mutable context: explicit deadlines,
         # contract, chat and root lineage ride it; the author's live objects do not.
-        task = _snapshot({key: value for key, value in parent_task.items()
-                          if not str(key).startswith("_") or key == "_presence_turn"})
+        task = {key: value for key, value in parent_task.items()
+                if not str(key).startswith("_") or key == "_presence_turn"}
         task.update(id=str(task_id or parent.task_id), _attempt=parent.attempt,
-                    model_wait_owner_id=self.owner_id, metadata=_snapshot(metadata or {}))
+                    model_wait_owner_id=self.owner_id, metadata=metadata or {})
+        try:
+            task = copy.deepcopy(task)
+        except Exception:
+            task = json.loads(json.dumps(task, default=str))
         self.task_id = task["id"]
         root, tid = self.result_root, self.task_id
         self.wait = _OperationWait(
@@ -621,6 +617,89 @@ def review_operation_event_admitted(root: Any, payload: Dict[str, Any]) -> bool:
 
 # --- pure collection -----------------------------------------------------------
 
+def recover_review_producer(root: Any, request: Any, slot: Any, row: dict) -> Any:
+    """Resolve one known operation from its complete existing CAS, never dispatch.
+
+    The caller retains its own wave writer and aggregator. A missing terminal
+    artifact is still in flight; an unreadable or differently bound artifact is
+    custody loss with the original full source attached, never a semantic PASS.
+    """
+    from ouroboros.observability import read_call_payload
+    from ouroboros.review_custody import finalize_review_actor
+    from ouroboros.review_dispatch import review_operation_binding
+    from ouroboros.review_records import ReviewActorRecord
+
+    operation = str(row.get("operation_id") or "")
+    if not operation or not root:
+        return None
+    expected = review_operation_binding(request, slot, operation)
+    refs, payload = {}, None
+    try:
+        for suffix in ("response", "error"):
+            try:
+                manifest, payload, refs = read_call_payload(
+                    root, task_id=request.task_id or "review", call_id=f"{operation}_{suffix}")
+                break
+            except FileNotFoundError:
+                continue
+        if payload is None:
+            return None
+        outcome = payload.get("producer_outcome") if isinstance(payload, dict) else None
+        if not manifest.get("producer_complete") or not isinstance(outcome, dict):
+            return None  # Historical/partial blobs carry no completed-producer receipt.
+        binding = outcome.get("recovery_binding")
+        if not isinstance(binding, dict) or manifest.get("review_operation_binding") != binding:
+            raise ValueError("producer binding missing or inconsistent")
+        if {k: v for k, v in binding.items() if k != "pending_invocation_id"} != expected:
+            raise ValueError("operation/task/root/material/contract/roster binding mismatch")
+        frozen = row.get("recovery_binding")
+        if frozen and {k: v for k, v in frozen.items() if k != "pending_invocation_id"} != expected:
+            raise ValueError("recorded wave binding mismatch")
+        prompt_manifest, prompt, prompt_ref = read_call_payload(
+            root, task_id=request.task_id or "review", call_id=f"{operation}_prompt")
+        if prompt_manifest.get("review_operation_binding") != expected:
+            raise ValueError("original prompt operation binding mismatch")
+        original_request = SimpleNamespace(**prompt["request"])
+        original_slot = SimpleNamespace(**prompt["slot"])
+        if review_operation_binding(original_request, original_slot, operation) != expected:
+            raise ValueError("original request provenance mismatch")
+        token = str(binding.get("pending_invocation_id") or "")
+        frozen_token = str(row.get("pending_invocation_id") or
+                           (row.get("usage") or {}).get("pending_invocation_id") or "")
+        if frozen_token and token != frozen_token:
+            raise ValueError("recorded pending invocation mismatch")
+        if str(getattr(slot.route, "value", slot.route)) == "agent_session":
+            from ouroboros.delegate_custody import invocation_record
+            invocation = invocation_record(root, token) if token else None
+            if not invocation or any(str(invocation.get(k) or "") != str(expected[k] or "")
+                                     for k in ("task_id", "root_task_id", "surface", "slot_id", "operation_id")):
+                raise ValueError("completed producer has no exact delegated invocation")
+            run_id = str((payload.get("usage") or {}).get("delegated_run_id") or "")
+            if run_id and run_id != str(invocation.get("run_id") or ""):
+                raise ValueError("completed producer delegated run mismatch")
+        if outcome.get("operation_id") != operation or outcome.get("slot_id") != slot.slot_id:
+            raise ValueError("producer actor identity mismatch")
+        actor = ReviewActorRecord(**outcome)
+        message = payload.get("message")
+        actor.raw_text = str(message.get("content") or "") if isinstance(message, dict) else ""
+        actor.usage = dict(payload.get("usage") or {})
+        actor.prompt_ref, actor.response_ref = prompt_ref, refs
+        finalize_review_actor(actor, operation_id=operation, late=True)
+        if actor.operation_state in {"in_flight", "custody_lost"}:
+            actor.status, actor.raw_text = "error", ""
+            actor.error = actor.error or "Producer outcome still lacks terminal custody; full partial source retained"
+        return actor
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        return ReviewActorRecord(
+            slot_id=slot.slot_id, model=slot.model, status="error",
+            error=f"Exact persisted review result unavailable: {exc}",
+            failure_code="review_custody_lost", operation_id=operation,
+            operation_state="custody_lost", late_result_pending=True,
+            response_ref=refs, recovery_binding=expected,
+        )
+
+
+
 def _row_actor(slot: Any, operation_id: str, row: Optional[dict], *, state: str, reason: str) -> Any:
     """A typed gap (``custody_lost``) or a proven zero-send row (``not_dispatched``)."""
     from ouroboros.review_records import ReviewActorRecord
@@ -756,7 +835,7 @@ def _attach_only_run(root: Any, request: Any, slot: Any, operation_id: str, run_
 def _collect_pending_row(root: Any, request: Any, slot: Any, row: dict, usage_ctx: Any,
                          controller: Any) -> Tuple[Any, str]:
     from ouroboros.review_custody import (
-        _ACTIVE, _ACTIVE_LOCK, _attempt_key, _frozen_actor, recover_review_producer,
+        _ACTIVE, _ACTIVE_LOCK, _attempt_key, _frozen_actor,
     )
 
     operation_id = str(row.get("operation_id") or "")

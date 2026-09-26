@@ -277,10 +277,13 @@ a blocking exit still read `Done with warnings` or `Failed`.
 
 A host fact about a task is a row of that task's card, never a standalone
 bubble beside it. A reviewer panel that settles after its task already ended
-adds one System row naming the verdict and which revision it covered; that row
-lands inside the finished card (its Reviews group carries the note, the timeline
+adds one System row naming the reviewed version — delivered, different, or delivery
+unknown — before its verdict. That row lands inside the finished card (its Reviews group carries the note, the timeline
 keeps the row) without changing the card's chip, title or meta, and a standalone
-row appears only when the task has no card record in the page. The untyped
+row appears only when the task has no card record in the page. Saving and showing
+late criticism does not replace passing it to Ouroboros for consideration: the host
+owns sources and fact delivery; Ouroboros judges the evidence, explains it and
+chooses any further work on an admissible turn. The untyped
 terminal host notice and the origin-addressed routing notices stay ordinary rows by design. Local diagnostic failures remain inspectable
 in details and Logs, but do not relabel the whole still-working task. A failed child keeps a compact factual
 `Failed` marker inside its parent while the root continues under its own

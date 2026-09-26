@@ -94,19 +94,18 @@ def test_the_line_names_utc_and_the_sender_zone_at_a_fixed_width():
     assert "(UTC-05:00)" in winter and "(UTC-04:00)" in summer and len(winter) == len(summer)
 
 
-def test_stamping_replaces_its_pending_line_keeps_a_rebound_one_and_never_mutates(ticking):
+def test_stamping_replaces_its_pending_line_and_never_mutates(ticking):
     source = {"messages": [{"role": "user", "content": "work"}], "model": "m"}
     before = copy.deepcopy(source)
     assert sc.stamp_clock_note(source) is source  # no Main scope: nothing changes
     with sc.MainSendClock(MOSCOW).bound() as clock:
         first = sc.stamp_clock_note(source)
         again = sc.stamp_clock_note(first)
-        kept = sc.stamp_clock_note(first, keep_existing=True)
         with sc.MainSendClock(None).bound():
             assert sc.stamp_clock_note(source) is source  # a helper call inside Main
     assert source == before
-    assert [len(_clock_rows(item["messages"])) for item in (first, again, kept)] == [1, 1, 1]
-    assert first["messages"][-1] != again["messages"][-1] and kept is first
+    assert [len(_clock_rows(item["messages"])) for item in (first, again)] == [1, 1]
+    assert first["messages"][-1] != again["messages"][-1]
     assert clock.notes == [first["messages"][-1]["content"], again["messages"][-1]["content"]]
 
 
@@ -170,7 +169,8 @@ def test_the_clock_free_identity_is_the_candidate_without_its_line():
     assert _attempt_request({"provider": "openai", "usage_model": "m"}, stamped).candidate_clock_free_sha256 is None
 
 
-def test_a_compatibility_rebind_keeps_its_line_and_a_new_preparation_samples_anew(tmp_path, monkeypatch, ticking):
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_every_compatibility_attempt_refreshes_its_clock_and_preserves_recovery(tmp_path, monkeypatch, ticking, asynchronous):
     import ouroboros.request_wire_contract as wire
     from tests.test_request_wire_recovery_phase2b import _Rejected, _Response, _payload, _target
 
@@ -190,16 +190,27 @@ def test_a_compatibility_rebind_keeps_its_line_and_a_new_preparation_samples_ane
 
         with request_wire_call_scope(), ua.usage_scope(ua.UsageScope(drive_root=tmp_path / "ledger", task_id="wire")), \
                 sc.MainSendClock(MOSCOW).bound():
-            response = client._create_chat_completion_with_retries(create, payload, _target(provider="openai"))
-            _message, usage = client._normalize_remote_response(
-                response.model_dump(), _target(provider="openai"), skip_cost_fetch=True)
+            if asynchronous:
+                async def create_async(**candidate):
+                    return create(**candidate)
+                async def send_and_normalize():
+                    response = await client._create_chat_completion_with_retries_async(
+                        create_async, payload, _target(provider="openai"))
+                    return client._normalize_remote_response(
+                        response.model_dump(), _target(provider="openai"), skip_cost_fetch=True)[1]
+                usage = asyncio.run(send_and_normalize())
+            else:
+                response = client._create_chat_completion_with_retries(create, payload, _target(provider="openai"))
+                _message, usage = client._normalize_remote_response(
+                    response.model_dump(), _target(provider="openai"), skip_cost_fetch=True)
         return sent, usage
 
-    # A learned effort downgrade rebinds the registered candidate: same preparation, same line.
+    # A rejected attempt creates a new physical preparation; the canonical recovery source survives.
     sent, usage = run(_payload(effort="high"), "reasoning_effort value 'high' is not supported")
     assert [item["reasoning_effort"] for item in sent] == ["high", "medium"]
     assert usage["request_wire"]["applied_effort"] == "medium"  # the recovery action is retained
-    assert [_clock_rows(item["messages"]) for item in sent] == [_clock_rows(sent[0]["messages"])] * 2
+    first, second = (_clock_rows(item["messages"]) for item in sent)
+    assert len(first) == len(second) == 1 and first != second
     # A carrier-less optional-field repair rebuilds from the logical request: a new sample.
     sent, _usage = run(_payload(effort="", toolful=False), "temperature is unsupported")
     assert "temperature" in sent[0] and "temperature" not in sent[1]
@@ -614,3 +625,84 @@ from tests.test_subscription_main_wait import main_call as _main_call  # noqa: E
 setup = _gateway_setup
 live_wait = _live_wait
 main_call = _main_call
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_native_anthropic_compatibility_retry_has_a_fresh_sealed_clock(transport, ticking, monkeypatch, asynchronous):
+    import requests
+    from tests.test_anthropic_native_custody import _NativeResponse, _target
+
+    root, client, _ = transport
+    sent = []
+    def post(*_args, **kwargs):
+        sent.append(copy.deepcopy(kwargs["json"]))
+        return _NativeResponse(reject=len(sent) == 1)
+    monkeypatch.setattr(requests, "post", post)
+    with sc.MainSendClock(MOSCOW).bound() as clock:
+        if asynchronous:
+            message, usage = asyncio.run(client.chat_async(
+                [{"role": "user", "content": "hi"}], "anthropic::test-model", reasoning_effort="none", max_tokens=64))
+        else:
+            message, usage = client._chat_anthropic(_target(), [{"role": "user", "content": "hi"}], None,
+                                                   "none", 64, "auto")
+    assert message["content"] == "ok" and len(sent) == 2
+    assert "thinking" in sent[0] and "thinking" not in sent[1]
+    assert len(clock.notes) == 2 and clock.notes[0] != clock.notes[1]
+    for payload, note in zip(sent, clock.notes):
+        assert payload["messages"][-1]["content"][-1] == {"type": "text", "text": note}
+    rows = [r for r in _ledger(root) if r["state"] == "reserved"]
+    assert len(rows) == 2
+    assert [r["candidate_raw_sha256"] for r in rows] == [_digest(p) for p in sent]
+    assert [_sealed(r) for r in _ledger(root) if r["state"] == "dispatched"] == [_digest(p) for p in sent]
+    assert usage["request_wire"]["applied_effort"] == "provider_default"
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+@pytest.mark.parametrize("dialect_first", [False, True])
+def test_clock_refresh_preserves_composed_tool_dialect_and_effort_recovery(
+        tmp_path, monkeypatch, ticking, asynchronous, dialect_first):
+    import ouroboros.request_wire_contract as wire
+    from ouroboros.request_wire_recovery import current_wire_candidate, request_wire_call_scope
+    from tests.test_openai_chat_dispatch import _DialectError
+    from tests.test_request_wire_recovery_phase2b import _Rejected, _Response, _payload, _target
+
+    monkeypatch.setattr(wire, "canonical_wire_evidence_root", lambda: tmp_path / "wire")
+    client, sent, catalogs = LLMClient(api_key="unused"), [], []
+    source = _payload(effort="high")
+    errors = [_DialectError("custom tools are not supported", param="tools[0].type"),
+              _Rejected("reasoning_effort value 'high' is not supported")]
+    if not dialect_first:
+        errors.reverse()
+
+    def create(**candidate):
+        sent.append(copy.deepcopy(candidate))
+        catalogs.append(current_wire_candidate().custom_catalog_sha256)
+        if len(sent) <= len(errors):
+            raise errors[len(sent) - 1]
+        return _Response()
+
+    async def create_async(**candidate):
+        return create(**candidate)
+
+    def normalize(response):
+        return client._normalize_remote_response(response.model_dump(), _target(provider="openai"), skip_cost_fetch=True)[1]
+
+    async def asynchronous_send():
+        return normalize(await client._create_chat_completion_with_retries_async(create_async, source, _target(provider="openai")))
+
+    with request_wire_call_scope(), ua.usage_scope(ua.UsageScope(drive_root=tmp_path, task_id="composed-clock")), \
+            sc.MainSendClock(MOSCOW).bound() as clock:
+        usage = (asyncio.run(asynchronous_send()) if asynchronous else
+                 normalize(client._create_chat_completion_with_retries(create, source, _target(provider="openai"))))
+        assert len(clock.notes) == len(set(clock.notes)) == 3
+        assert [sc.split_clock_note(candidate)[0] for candidate in sent] == clock.notes
+    assert [wire.infer_tool_dialect(p) for p in sent] == (
+        ["openai_chat_custom", "function", "function"] if dialect_first else ["openai_chat_custom", "openai_chat_custom", "function"])
+    # The existing dialect owner restarts requested effort on function tools:
+    # a custom-profile rejection is not authority for the function profile.
+    assert [wire.payload_effort(p) for p in sent] == (["high", "high", "medium"] if dialect_first else ["high", "medium", "high"])
+    assert catalogs[0] and (dialect_first or catalogs[0] == catalogs[1])
+    assert sent[-1]["tools"] == source["tools"] and source["messages"] == [{"role": "user", "content": "probe"}]
+    assert usage["request_wire"]["applied_effort"] == ("medium" if dialect_first else "high")
+    assert usage["request_wire"]["candidate_sha256"] == _digest(sent[-1])
+    assert [_sealed(row) for row in _ledger(tmp_path) if row["state"] == "dispatched"] == [_digest(p) for p in sent]

@@ -45,8 +45,6 @@ DIRECT_ROOTS_FRAGMENT = pathlib.Path("state") / "direct_roots.json"
 ROSTER_NOTE_CAP = 40
 # The first line of every roster note; `_latest_roster_note` finds a note by it.
 ROSTER_NOTE_HEADER = "[System task message]\n[INDEPENDENT_ROOTS]"
-#: Attribute the last note's fingerprint is parked on, per execution slot.
-FINGERPRINT_ATTR = "_peer_roster_fingerprint"
 
 
 def _projection_observation(payload: Dict[str, Any], source: str) -> Dict[str, Any]:
@@ -437,21 +435,18 @@ def maybe_append_roster_note(ctx: Any, messages: List[Dict[str, Any]], drive_roo
         roster = independent_roots(canonical)
     except Exception:
         return False
-    fingerprint = roster_fingerprint(roster, exclude=task_id)
     current_note = render_roster_note(roster, exclude=task_id)
     # Only the LATEST roster representation in the transcript counts: after
     # roster A → B → A the old A row must not suppress the fresh A tail, or the
     # model keeps reading B.  A note may stand alone or have been merged into an
     # unsent owner row (string or text blocks); either form is one representation.
     if _latest_roster_note(messages) == current_note:
-        setattr(ctx, FINGERPRINT_ATTR, fingerprint)
         return False
     # A standalone host row remains identifiable after history reclaim. Never
     # merge it with unsent owner text: that loses its representation boundary.
     # Main's routing manifest does not carry focus, so it cannot substitute for
     # this view; exact current-note presence deduplicates every root alike.
     messages.append({"role": "user", "content": current_note})
-    setattr(ctx, FINGERPRINT_ATTR, fingerprint)
     return True
 
 

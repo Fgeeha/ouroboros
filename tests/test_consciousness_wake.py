@@ -173,7 +173,7 @@ def test_terminals_no_chat_row_announced_reach_the_next_wake_once(tmp_path):
     first = _wake(tmp_path, None, T0)
     assert first.window["transitions_basis"] == "time_bootstrap"
     state = first.boundary["transitions"]
-    assert set(state["inventory"]) == {"root1", "kid1"}  # only what can still change
+    assert set(state["inventory"]) == {"root1", "kid1", "old"}  # closed tasks can receive new review facts
     # While/after that wake: the sweep settles the child, the root settles with no task_done
     # row, and enrichment bumps the old task's updated_at. No chat row anywhere.
     _write(tmp_path, "kid1", status="failed", updated_at=_iso(T0 + 100), reason_code="orphaned_running_after_worker_restart")
@@ -187,7 +187,7 @@ def test_terminals_no_chat_row_announced_reach_the_next_wake_once(tmp_path):
     assert lines[1].startswith("- task root1 completed, completion time not recorded (last updated 6 min ago)")
     assert "Recorded in task results with no chat row in this window" in second.full_text()
     assert not any("old" in line.split()[2] for line in lines)
-    assert second.boundary["transitions"]["inventory"] == {}
+    assert set(second.boundary["transitions"]["inventory"]) == {"root1", "kid1", "old"}
     # Accepted: the next wake finds nothing new, however often the rows are rewritten.
     _write(tmp_path, "root1", updated_at=_iso(T0 + 700))
     assert _wake(tmp_path, second.boundary, T0 + 1200).events == ()
@@ -204,7 +204,7 @@ def test_a_task_first_recorded_after_the_scan_is_new_and_a_proven_terminal_keeps
            canonical_terminal_projection_ready={"task_done_ts": _iso(T0 + 880)})
     third = _wake(tmp_path, second.boundary, T0 + 1200)
     assert _lines(third) == ["- task brief completed, 5 min ago: do brief"]  # its task_done stamp, proven
-    assert "terminal:brief:" in " ".join(third.boundary["transitions"]["observed"])
+    assert "terminal:brief:" in " ".join(third.boundary["transitions"]["inventory"]["brief"])
     # Reported once: the carried key keeps the overlap from reporting it again.
     assert _wake(tmp_path, third.boundary, T0 + 1800).events == ()
 
@@ -276,7 +276,7 @@ def test_a_late_review_is_read_from_its_canonical_fact_with_its_exact_source(tmp
     assert line.startswith("- late review settled for task rv, 9 min ago: On the reviewed version of this answer, "
                            "reviewers later rejected it.; panel p1; signal FAIL; reviewed version unknown; "
                            "emitted answer unknown; 1 reviewer outputs; exact source ")
-    assert f"sha256 {ref['sha256']}" in line and "rv" not in second.boundary["transitions"]["inventory"]
+    assert f"sha256 {ref['sha256']}" in line and "rv" in second.boundary["transitions"]["inventory"]
     read = json.loads(line.split("exact source ", 1)[1].rsplit(" sha256 ", 1)[0])
     reader = ToolContext(repo_dir=REPO, drive_root=tmp_path, task_id="wake0002", task_metadata={})
     assert '"FAIL: the tests were never run"' in _read_file(reader, **read["arguments"])
@@ -308,7 +308,7 @@ def test_a_transition_takes_the_position_of_the_row_that_announced_it_once(tmp_p
 
 def test_a_result_first_written_late_under_an_old_stamp_is_found_through_its_row(tmp_path):
     """The compatibility terminal persist may create a row after the scan with the task's
-    original (older) ``ts``: the identity window calls it old, its announcing row still counts."""
+    original (older) ``ts``: its first observed identity counts, at its announcing row."""
     _write(tmp_path, "seed", status="running", ts=_iso(T0 - 10), updated_at=_iso(T0 - 10))
     second = _wake(tmp_path, _wake(tmp_path, None, T0).boundary, T0 + 600)
     _write(tmp_path, "revived", status="completed", ts=_iso(T0 - 86400), updated_at=_iso(T0 + 700))
@@ -324,7 +324,7 @@ def test_an_unreadable_task_store_keeps_the_accepted_inventory(tmp_path, monkeyp
     _write(tmp_path, "kid", status="running", ts=_iso(T0 - 900), updated_at=_iso(T0 - 900))
     first = _wake(tmp_path, None, T0)
     real = task_results.list_task_results
-    monkeypatch.setattr(task_results, "list_task_results", lambda _root: (_ for _ in ()).throw(OSError("busy")))
+    monkeypatch.setattr(task_results, "list_task_results", lambda _root, **_kw: (_ for _ in ()).throw(OSError("busy")))
     _write(tmp_path, "kid", status="completed", updated_at=_iso(T0 + 60))
     blind = _wake(tmp_path, first.boundary, T0 + 600)
     assert blind.boundary["transitions"] == first.boundary["transitions"]  # nothing consumed
@@ -477,7 +477,7 @@ def test_project_digest_task_id_wins_when_multiple_settled_rows_share_a_project(
 def test_trigger_stays_first_when_task_results_are_unreadable(tmp_path, monkeypatch):
     import ouroboros.task_results as task_results
 
-    def broken(_root):
+    def broken(_root, **_kw):
         raise OSError("broken task store")
 
     monkeypatch.setattr(task_results, "list_task_results", broken)
@@ -620,3 +620,56 @@ def test_render_substitutes_placeholders_in_one_pass(tmp_path):
                                      disabled_tools=[], spent_usd=1.0, daily_usd=20.0, running=0, max_tasks=2,
                                      interval=900, events=events, spent_is_floor=True)
     assert floor.startswith("spent at least 1.00 / 20.00;")
+
+
+def test_new_result_with_old_timestamps_and_no_chat_row_is_observed_once(tmp_path):
+    first = _wake(tmp_path, None, T0)
+    _write(tmp_path, "late-write", status="completed", ts=_iso(T0 - 86400), updated_at=_iso(T0 - 80000))
+    second = _wake(tmp_path, first.boundary, T0 + 600)
+    assert [(kind, offset) for kind, offset, _ in second.events] == [("task_terminal", None)]
+    assert "late-write completed" in second.full_text()
+    assert _wake(tmp_path, second.boundary, T0 + 1200).events == ()
+
+
+def test_new_and_settled_panel_on_old_closed_task_is_observed_without_chat(tmp_path):
+    _write(tmp_path, "old", status="completed", ts=_iso(T0 - 86400), updated_at=_iso(T0 - 80000))
+    first = _wake(tmp_path, None, T0)
+    projection, _ref = _late_panel(tmp_path, "old", settled_at=T0 - 70000)
+    _write(tmp_path, "old", review_projection=projection)
+    second = _wake(tmp_path, first.boundary, T0 + 600)
+    assert [(kind, offset) for kind, offset, _ in second.events] == [("late_review", None)]
+    assert "late review settled for task old" in second.full_text()
+    assert _wake(tmp_path, second.boundary, T0 + 1200).events == ()
+
+
+def test_partial_old_inventory_upgrades_with_explicit_coverage_gap(tmp_path):
+    _write(tmp_path, "old", status="completed", ts=_iso(T0 - 86400))
+    boundary = _wake(tmp_path, None, T0).boundary
+    boundary["transitions"] = {"version": 1, "inventory": {}, "observed": [], "scan_at": _iso(T0)}
+    second = _wake(tmp_path, boundary, T0 + 600)
+    assert second.window["transitions_basis"] == "partial_inventory_upgrade"
+    assert second.gaps and "task old completed" in second.full_text()
+    assert _wake(tmp_path, second.boundary, T0 + 1200).events == ()
+
+
+def test_wake_scan_reads_each_result_and_project_registry_once(tmp_path, monkeypatch):
+    from collections import Counter
+    from ouroboros import projects_registry as projects, task_results
+
+    total = 240
+    for index in range(total):
+        _write(tmp_path, f"t{index:04d}", status="completed", ts=_iso(T0 - 10), updated_at=_iso(T0 - 10), project_id="p1")
+    reads, project_reads = Counter(), []
+    original = task_results.read_json_dict
+
+    def read(path, *args, **kwargs):
+        reads[str(path)] += 1
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(task_results, "read_json_dict", read)
+    monkeypatch.setattr(projects, "list_reserved_projects", lambda _root: project_reads.append(True) or [
+        {"id": "p1", "name": "Project", "chat_id": 42, "lifecycle": "active"}])
+    observed = _wake(tmp_path, None, T0)
+    assert len(observed.events) == total
+    assert len(reads) == total and set(reads.values()) == {1}
+    assert project_reads == [True]

@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from ouroboros.anthropic_native_custody import is_replayed_native_content
 from ouroboros.context_budget import CONTEXT_OVERFLOW_CODES
+from ouroboros.request_wire_contract import physical_candidate_bytes as _canonical_candidate_bytes
 from ouroboros.request_wire_recovery import prepare_wire_payload_for_send
 from ouroboros.transport_custody import ProviderNotDispatched, is_loopback_base_url
 from ouroboros.usage_accounting import (
@@ -445,13 +446,6 @@ def _attempt_request(
     )
 
 
-def _canonical_candidate_bytes(payload: Dict[str, Any]) -> bytes:
-    return json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        allow_nan=False, default=str,
-    ).encode("utf-8")
-
-
 def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Return the send copy with capsule metadata removed only from context turns."""
     candidate = copy.deepcopy(payload)
@@ -471,9 +465,13 @@ def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _finalized_physical_candidate(
-    target: Dict[str, Any], payload: Dict[str, Any], api_surface: str,
+    target: Dict[str, Any], payload: Dict[str, Any], api_surface: str, *, fresh_clock: bool = False,
 ) -> Dict[str, Any]:
+    from ouroboros.request_wire_recovery import refresh_wire_clock
+
     physical = _physical_candidate(payload)
+    if fresh_clock:
+        physical = refresh_wire_clock(physical, api_surface=api_surface)
     if target.get("context_mode") == "nano":
         physical = _fit_output_payload(target, physical, api_surface)
     return prepare_wire_payload_for_send(

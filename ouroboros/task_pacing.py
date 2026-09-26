@@ -125,18 +125,17 @@ def _supplied_budget_profile(ctx: Any) -> Any:
 
 
 def observe_budget_profile(ctx: Any) -> Dict[str, Any]:
-    """The task's normalized budget_profile resolved SIDE-EFFECT FREE (R49): the
-    reader the coordination poll (``delegate_supervision._time_fact``) uses."""
+    """The task's normalized budget_profile, with defaults and no side effects.
+
+    Coordination observation (``delegate_supervision._time_fact``, R49) and
+    ordinary resolution share this reader. The retired ``until_deadline`` /
+    ``stall_rounds_threshold`` aliases require no migration write or event.
+    """
     return normalize_budget_profile(_supplied_budget_profile(ctx))
 
 
-def resolve_budget_profile(ctx: Any) -> Dict[str, Any]:
-    """The task's normalized budget_profile (from task_contract; absent ->
-    defaults). The deprecated ``until_deadline`` / ``stall_rounds_threshold``
-    aliases and their deprecation row are gone (7.0 ABI window), so this is
-    the same side-effect-free read as ``observe_budget_profile``; both names
-    stay so the observer contract remains explicit at its call sites."""
-    return normalize_budget_profile(_supplied_budget_profile(ctx))
+# Both public names retain their caller contracts over the same pure read.
+resolve_budget_profile = observe_budget_profile
 
 
 def _acceptance_floor_sec() -> float:

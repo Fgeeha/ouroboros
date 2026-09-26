@@ -43,6 +43,8 @@ from types import SimpleNamespace
 from typing import Any, Dict, List, Optional
 
 from ouroboros.utils import utc_now_iso
+# Late settlement reads the canonical result, including a forked task's budget root.
+from ouroboros.tool_access_paths import canonical_data_root as _result_root
 
 log = logging.getLogger(__name__)
 
@@ -99,15 +101,6 @@ def acceptance_settlement_message(request: Any, wave: Dict[str, Any]) -> str:
     return "\n".join([head, *lines])
 
 
-def _result_root(usage_ctx: Any) -> pathlib.Path:
-    """The root the task result lives under, resolved the way the acceptance
-    projection writer resolves it (a forked drive keeps its budget root)."""
-    meta = getattr(usage_ctx, "task_metadata", {})
-    meta = meta if isinstance(meta, dict) else {}
-    return pathlib.Path(meta.get("budget_drive_root") or getattr(usage_ctx, "budget_drive_root", None)
-                        or usage_ctx.drive_root)
-
-
 # The loop exit restores the context's ``_execution_trace`` to whatever it was
 # before the loop ran (``loop_budget._cleanup_loop_resources``), so a wave that
 # settles after the turn ended would find no trace to attach to. A panel that
@@ -135,18 +128,15 @@ def remember_settlement_trace(tools_ctx: Any, llm_trace: Dict[str, Any], run: Di
 def _settlement_trace(usage_ctx: Any, retry_key: str) -> Optional[Dict[str, Any]]:
     """The trace holding this wave's run: the live one while the loop runs, the
     remembered one after it exited."""
-    def holds(trace: Any) -> bool:
-        return isinstance(trace, dict) and any(
-            isinstance(run, dict) and run.get("authority") == "host_root"
-            and isinstance(run.get("request"), dict)
-            and str(run["request"].get("retry_key") or "") == retry_key
-            for run in (trace.get("review_runs") or []))
-
-    live = getattr(usage_ctx, "_execution_trace", None)
-    if holds(live):
-        return live
-    remembered = (getattr(usage_ctx, "_acceptance_settlement_traces", None) or {}).get(retry_key)
-    return remembered if holds(remembered) else None
+    for trace in (getattr(usage_ctx, "_execution_trace", None),
+                  (getattr(usage_ctx, "_acceptance_settlement_traces", None) or {}).get(retry_key)):
+        if isinstance(trace, dict) and any(
+                isinstance(run, dict) and run.get("authority") == "host_root"
+                and isinstance(run.get("request"), dict)
+                and str(run["request"].get("retry_key") or "") == retry_key
+                for run in trace.get("review_runs") or []):
+            return trace
+    return None
 
 
 def announce_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[str, Any]) -> None:
@@ -436,29 +426,16 @@ def emitted_answer_fact(root: Any, task_id: str) -> Dict[str, Any]:
     return terminal_answer_receipts(root, task_id)
 
 
-def _subject_digest(run: Dict[str, Any]) -> tuple:
-    subject = str((run.get("request") or {}).get("subject") or "")
-    return hashlib.sha256(subject.encode("utf-8")).hexdigest(), len(subject)
-
-
-def _reviewed_revision(run: Dict[str, Any], emitted: Optional[Dict[str, Any]]) -> str:
-    """``delivered``/``different`` only against exact emitted-byte receipts, else ``unknown``.
-
-    A supersession the trace recorded says a later candidate existed, not which
-    bytes went out; it stays its own fact and never picks the version.
-    """
-    receipts = [row for row in (emitted or {}).get("delivered") or [] if isinstance(row, dict)]
-    if not receipts:
-        return "unknown"
-    digest, _chars = _subject_digest(run)
-    return "delivered" if any(row.get("text_sha256") == digest for row in receipts) else "different"
-
-
 def late_evidence_fact(run: Dict[str, Any], emitted: Dict[str, Any], *, settled_at: str) -> Dict[str, Any]:
     """Neutral late-review evidence: the exact subject read, what was emitted, and each reviewer's output."""
     request = run.get("request") if isinstance(run.get("request"), dict) else {}
-    digest, chars = _subject_digest(run)
-    revision = _reviewed_revision(run, emitted)
+    subject = str(request.get("subject") or "")
+    digest, chars = hashlib.sha256(subject.encode("utf-8")).hexdigest(), len(subject)
+    # Supersession only proves a later candidate existed; emitted-byte receipts
+    # alone establish delivered/different. No receipt remains unknown.
+    receipts = [row for row in emitted.get("delivered") or [] if isinstance(row, dict)]
+    revision = ("delivered" if any(row.get("text_sha256") == digest for row in receipts)
+                else "different" if receipts else "unknown")
     return {
         "settled_after_terminal": True, "settled_at": settled_at, "reviewed_revision": revision,
         "reviewed_subject": {"retry_key": str(request.get("retry_key") or ""),
@@ -600,17 +577,19 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
     """Collect one wave of a terminal task purely, publish it and announce it once.
 
     Returns ``announced`` (publication read back, row enqueued), ``published``
-    (read back; the row was already delivered or could not be queued now),
+    (read back; the row was already delivered),
     ``settled`` (nothing was pending), ``pending`` (still in flight),
-    ``unpublished`` (the canonical record did not take the settlement: nothing
-    is announced), ``source_unreadable`` (a published source exists but cannot
+    ``unpublished`` (the canonical record or durable notice custody did not
+    take the settlement; retry duty remains), ``source_unreadable`` (a published source exists but cannot
     be read: never duplicated from the checkpoint) or ``unavailable`` (no trace
     and no canonical source).
     """
     from ouroboros.loop_acceptance_review import acceptance_run_pending
     from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
     from ouroboros.review_projection import publish_acceptance_checkpoint
-    from supervisor.terminal_delivery import enqueue_terminal_delivery
+    from supervisor.terminal_delivery import (
+        ENQUEUE_ALREADY_DELIVERED, ENQUEUE_QUEUED, enqueue_terminal_delivery_outcome,
+    )
 
     root = _result_root(usage_ctx)
     trace = _settlement_trace(usage_ctx, retry_key) if retry_key else None
@@ -635,7 +614,9 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
     settled = runs[-1] if runs else {}
     # A settlement this process already stamped but could not publish is published again, never re-stamped.
     republish = (not advanced and isinstance(settled.get("late_settlement"), dict)
-                 and not acceptance_run_pending(settled) and late_publication_owed(task_id, retry_key))
+                 and not acceptance_run_pending(settled)
+                 and (late_publication_owed(task_id, retry_key)
+                      or (checkpoint or {}).get("state") in {"retained", "dispatched", "unpublished"}))
     if not advanced and not republish:
         log.debug("late acceptance settlement %s: nothing reconciled (still pending or already collected)", retry_key)
         if not was_pending:
@@ -657,8 +638,6 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
         return _unpublished(task_id, retry_key, "unpublished")
     if not any(acceptance_run_pending(run) for run in runs):
         (getattr(usage_ctx, "_acceptance_settlement_traces", None) or {}).pop(retry_key, None)
-    with _LATE_LOCK:
-        _LATE_UNPUBLISHED.discard((str(task_id), str(retry_key)))
     late = panel["late_settlement"]
     # A compact, source-bound pointer rides the row itself (progress_meta survives
     # live delivery, replay and history); the full fact stays on the projection.
@@ -666,7 +645,9 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
                 "settled_at": str(late.get("settled_at") or ""), "reviewed_revision": late.get("reviewed_revision"),
                 "reviewed_is_emitted": late.get("reviewed_is_emitted"),
                 "source_ref": panel.get("applied_source_ref") or {}}
-    queued = enqueue_terminal_delivery(pathlib.Path(usage_ctx.drive_root), {
+    # The operation outlives the execution drive; replay belongs to the same
+    # canonical root as its publication and the supervisor's delivery registry.
+    outcome = enqueue_terminal_delivery_outcome(root, {
         "type": "send_message", "chat_id": int(result.get("chat_id") or 0), "task_id": task_id,
         "text": str(late.get("note") or ""),
         "role": "system", "system_type": LATE_SETTLEMENT_SYSTEM_TYPE,
@@ -677,7 +658,13 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
         "progress_meta": {"card_row": "reviews", "card_row_id": f"acceptance-late:{retry_key}",
                           "late_evidence": evidence},
     }, event_queue=getattr(usage_ctx, "event_queue", None))
-    return "announced" if queued else "published"
+    if outcome not in {ENQUEUE_QUEUED, ENQUEUE_ALREADY_DELIVERED}:
+        # Publication survived, but a live queue alone is not durable custody.
+        # The operation pointer carries this retry duty across controller exit.
+        return _unpublished(task_id, retry_key, "unpublished")
+    with _LATE_LOCK:
+        _LATE_UNPUBLISHED.discard((str(task_id), str(retry_key)))
+    return "announced" if outcome == ENQUEUE_QUEUED else "published"
 
 
 def _unpublished(task_id: str, retry_key: str, status: str) -> str:

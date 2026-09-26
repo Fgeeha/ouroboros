@@ -13,9 +13,10 @@ Scope: only a Main send binds a policy (``loop_llm_call._send_main_candidate``);
 delegated children, Presence, reviewers and helper calls made inside a Main call
 (vision, reclaim summaries) bind none and their bytes are unchanged.
 
-Identity: a compatibility or processing rebind of a candidate this call already
-prepared keeps its sealed source, clock included; a new host preparation samples
-anew. The line of the send whose response came back becomes canonical history,
+Identity: every new physical send samples anew, including compatibility and
+processing retries. Request-wire rebinding preserves the canonical tool source
+and its applied actions. Rejoining one idempotent invocation retains its bytes.
+The line of the send whose response came back becomes canonical history,
 appended just before the answer (``main_send_scope``), so the next request
 extends the last one byte for byte (OpenAI-family caches reuse only an exact
 prefix, #906) and a replay shows what the model actually read. A line no
@@ -178,24 +179,20 @@ def record_candidate(raw_sha256: Optional[str], note: Optional[str]) -> None:
         scope.by_candidate[str(raw_sha256)] = note
 
 
-def stamp_clock_note(payload: Dict[str, Any], *, blocks: bool = False,
-                     keep_existing: bool = False) -> Dict[str, Any]:
+def stamp_clock_note(payload: Dict[str, Any], *, blocks: bool = False) -> Dict[str, Any]:
     """Return ``payload`` ending with a fresh clock line; no policy, no change.
 
     ``blocks`` is the Anthropic Messages shape: the line joins a trailing user
     turn as a text block, exactly as that provider's builder coalesces the
-    canonical line on the next request. ``keep_existing`` preserves a line this
-    call already sealed into a rebound candidate (compatibility/processing
-    retries); otherwise a pending line is replaced, never stacked. The input
-    payload is not mutated.
+    canonical line on the next request. A pending line is replaced, never stacked;
+    previously consumed lines belong to earlier scopes and remain history. The
+    input payload is not mutated.
     """
     scope = _SCOPE.get()
     messages = payload.get("messages") if isinstance(payload, dict) else None
     if scope is None or scope.policy is None or not isinstance(messages, list):
         return payload
-    found, rest = _tail_note(messages, scope.notes)
-    if found is not None and keep_existing:
-        return payload
+    _found, rest = _tail_note(messages, scope.notes)
     note = render_clock_note(scope.policy, _now())
     scope.notes.append(note)
     last = rest[-1] if rest else None

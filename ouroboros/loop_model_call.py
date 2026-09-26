@@ -9,6 +9,7 @@ from ouroboros.config import runtime_setting
 
 import logging
 import contextlib
+import copy
 import json
 import pathlib
 import queue
@@ -795,6 +796,7 @@ def _reprepare_waiting_main(ctx: _RoundModelCallContext, kwargs: dict):
         to_model=str(model or ""),
         tool_calls=len(trace.get("tool_calls") or []) if isinstance(trace, dict) else 0,
     )
+    _project_wake_input(ctx)
     disposition = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False)
     from ouroboros.send_clock import MainSendClock
 
@@ -1070,36 +1072,47 @@ def _project_wake_input(ctx: _RoundModelCallContext, *, overflowed: bool = False
     tool_ctx = ctx.tools._ctx
     meta = getattr(tool_ctx, "task_metadata", None)
     wake = meta.get("wake_observation") if isinstance(meta, dict) else None
-    if (not isinstance(wake, dict) or not wake.get("projection_text")
-            or getattr(tool_ctx, "_wake_input_projected", False)):
+    if not isinstance(wake, dict) or not wake.get("projection_text"):
         return False
     index = next((i for i, message in enumerate(ctx.messages) if message.get("role") == "user"), None)
     if index is None or any(isinstance(message, dict) and message.get("role") == "assistant"
                             for message in ctx.messages[index + 1:]):
         return False  # a response already followed the wake input: consumed history, never rewritten
+    if not hasattr(tool_ctx, "_wake_input_full_message"):
+        tool_ctx._wake_input_full_message = copy.deepcopy(ctx.messages[index])
+    full = tool_ctx._wake_input_full_message
     delivery = {"role": "user", "content": str(wake["projection_text"])}
-    if len(json.dumps(delivery, ensure_ascii=False)) >= len(json.dumps(ctx.messages[index], ensure_ascii=False)):
-        return False  # only a strictly smaller delivery can help a request that does not fit
+    if len(json.dumps(delivery, ensure_ascii=False)) >= len(json.dumps(full, ensure_ascii=False)):
+        return False  # a pointer must actually save space
+    projected = overflowed
     if not overflowed:
-        disposition = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False)
+        # Re-evaluate the FULL input on each actual route, even when the last
+        # unconsumed candidate used a pointer. Measurement never rewrites history.
+        current = ctx.messages[index]
+        ctx.messages[index] = full
+        try:
+            disposition = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False)
+        finally:
+            ctx.messages[index] = current
         measurement = disposition.measurement if disposition is not None else None
-        if measurement is None or measurement.capacity_total_tokens is None:
-            return False
         from datetime import datetime, timezone
         from ouroboros.send_clock import main_clock_policy, render_clock_note
         from ouroboros.utils import estimate_tokens
 
         policy = main_clock_policy(meta, task_type=ctx.task_type)
         clock = estimate_tokens(render_clock_note(policy, datetime.now(timezone.utc))) if policy else 0
-        if (measurement.estimated_input_tokens + measurement.response_reserve_tokens + clock
-                <= measurement.capacity_total_tokens):
-            return False
-    ctx.messages[index] = delivery
+        projected = bool(measurement is not None and measurement.capacity_total_tokens is not None
+                         and measurement.estimated_input_tokens + measurement.response_reserve_tokens + clock
+                         > measurement.capacity_total_tokens)
+    if projected == bool(getattr(tool_ctx, "_wake_input_projected", False)):
+        return False
+    ctx.messages[index] = delivery if projected else copy.deepcopy(full)
     invalidate_task_cache_splits(ctx.task_id)
     _loop().seal_task_transcript(ctx.messages)
-    tool_ctx.messages, tool_ctx._wake_input_projected = ctx.messages, True
+    tool_ctx.messages, tool_ctx._wake_input_projected = ctx.messages, projected
     _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
-        "checkpoint_kind": "wake_input_by_source", "round": ctx.round_idx, "after_overflow": overflowed,
+        "checkpoint_kind": "wake_input_by_source" if projected else "wake_input_inline",
+        "round": ctx.round_idx, "after_overflow": overflowed,
         "composition": wake.get("composition"), "source_sha256": (wake.get("source") or {}).get("sha256"),
     })
     return True

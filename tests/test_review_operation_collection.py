@@ -678,3 +678,41 @@ def test_recovery_defers_an_unverifiable_controller_without_marking_it(tmp_path)
     assert report["deferred"] == [{"task_id": TASK, "owner_id": "review-operation-legacy",
                                    "reason": "controller_unverifiable"}]
     assert load_task_result(tmp_path, TASK)["review_operations"]["review-operation-legacy"]["state"] == "dispatched"
+
+
+def test_notice_registration_and_live_enqueue_failure_retain_retry_duty(tmp_path, monkeypatch):
+    from ouroboros import acceptance_settlement, model_wait
+    from ouroboros.review_projection import publish_acceptance_checkpoint
+
+    class RefusingQueue:
+        def put(self, _event):
+            raise OSError("live queue unavailable")
+
+    delivered, model = queue.Queue(), _HeldModel()
+    monkeypatch.setattr("supervisor.workers.get_event_q", lambda: delivered)
+    write_task_result(tmp_path, TASK, "running", chat_id=3)
+    ctx = _ctx(tmp_path)
+    with model_wait.task_model_wait_scope(task={"id": TASK, "chat_id": 3, "_attempt": 1}, drive_root=tmp_path,
+                                          event_queue=None, worker_slot_held=False):
+        run = _released_panel(tmp_path, ctx, model, retry_key="wave-notice-failed")
+    publish_acceptance_checkpoint(ctx, {"review_runs": [run]}, task_id=TASK, drive_root=tmp_path)
+    owner_id = next(iter(load_task_result(tmp_path, TASK)["review_operations"]))
+    write_task_result(tmp_path, TASK, "completed", chat_id=3, result="reviewed answer A")
+    ctx.event_queue = RefusingQueue()
+    with monkeypatch.context() as patched:
+        patched.setattr("supervisor.terminal_delivery.register_pending_delivery", lambda *_a, **_kw: False)
+        _settle(model, run)
+        _until(lambda: load_task_result(tmp_path, TASK)["review_operations"][owner_id]["state"] in {"closed", "unpublished"})
+    stored = load_task_result(tmp_path, TASK)
+    panel = stored["review_projection"]["panels"][0]
+    assert panel["late_settlement"] and panel["applied_source_ref"]  # critique publication survived
+    assert stored["review_operations"][owner_id]["state"] == "unpublished"
+    # A fresh collector cannot rely on the author's process-local retry set.
+    with acceptance_settlement._LATE_LOCK:
+        acceptance_settlement._LATE_UNPUBLISHED.clear()
+    report = review_operation.recover_orphaned_acceptance_operations(tmp_path)
+    assert report["settled"] == [{"task_id": TASK, "owner_id": owner_id, "status": "announced"}], report
+    after = load_task_result(tmp_path, TASK)
+    assert after["review_projection"]["panels"][0]["late_settlement"] == panel["late_settlement"]
+    assert [e["delivery_id"] for e in list(delivered.queue)] == ["acceptance-late:wave-notice-failed"]
+    assert model.calls == 1

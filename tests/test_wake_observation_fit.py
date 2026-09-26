@@ -209,3 +209,58 @@ def test_a_real_overflow_before_any_response_retries_with_the_strictly_smaller_d
     assert {row["candidate_raw_sha256"] for row in rows if row["attempt_id"] == settled["attempt_id"]} == {digest}
     checkpoints = [event for event in list(events.queue) if "wake_input_by_source" in json.dumps(event, default=str)]
     assert len(checkpoints) == 1 and '"after_overflow": true' in json.dumps(checkpoints[0], default=str)
+
+
+def test_unconsumed_pointer_returns_to_full_input_on_larger_route_then_stays_history(tmp_path, monkeypatch):
+    events = _record_events(monkeypatch)
+    ctx, _ = _ctx(tmp_path, window=120_000)
+    assert _project_wake_input(ctx)
+    assert PROJECTION in json.dumps(ctx.messages[1])
+    ctx.context_fit_plan = replace(ctx.context_fit_plan, window_tokens=500_000)
+    assert _project_wake_input(ctx)
+    assert FULL in json.dumps(ctx.messages[1], ensure_ascii=False).replace("\\n", "\n")
+    assert [e["checkpoint_kind"] for e in events] == ["wake_input_by_source", "wake_input_inline"]
+    ctx.messages.append({"role": "assistant", "content": "consumed"})
+    before = deepcopy(ctx.messages)
+    ctx.context_fit_plan = replace(ctx.context_fit_plan, window_tokens=120_000)
+    assert not _project_wake_input(ctx)
+    assert ctx.messages == before
+
+
+@pytest.mark.parametrize("initial_window,next_window", [(900_000, 120_000), (120_000, 500_000)])
+def test_waiting_account_repair_reprojects_wake_before_dispatch(main_call, monkeypatch, initial_window, next_window):
+    from ouroboros import context
+    from tests.test_subscription_main_wait import ROUTE_B, _failed
+
+    ctx, gateway, _controller, events, decide, _observations = main_call
+    route_evidence = context._context_fit_route
+    def changed_capacity(*args, **kwargs):
+        route, evidence = route_evidence(*args, **kwargs)
+        evidence.window_tokens = next_window
+        return route, evidence
+    monkeypatch.setattr(context, "_context_fit_route", changed_capacity)
+    ctx.context_fit_plan = ctx.tools._ctx.context_fit_plan = replace(ctx.context_fit_plan, window_tokens=initial_window)
+    ctx.messages[:] = [ctx.context_fit_plan.messages_for("max")[0], {"role": "user", "content": FULL}]
+    ctx.tools._ctx.task_metadata = {"wake_observation": deepcopy(WAKE)}
+    gateway.results = [_failed("subscription_window_exhausted"), result(route=ROUTE_B)]
+    def select_account(*_args, **_kwargs):
+        wait = next(e for e in reversed(list(events.queue)) if e.get("type") == "task_model_wait")
+        response = decide({"request_id": "wake-account-switch", "decision_id": f"model_wait:task-one:{wait['wait_id']}",
+                           "revision": wait["revision"], "action": "switch", "model": ctx.active_model,
+                           "credential_profile_id": "account-b", "use_local": False, "persist_role": False})
+        assert response.status_code == 202
+        return {}
+    monkeypatch.setattr(ctx.llm, "claudexor_model_catalog", select_account)
+    gateway.dispatch = ["not_started", "response_received"]
+    answer, _cost, _mode = loop._call_round_model(ctx)
+    assert answer, json.dumps({k: v for k, v in ctx.accumulated_usage.items() if "error" in k}, default=str)
+    assert len(gateway.uploads) == 2
+    first, second = (entry[0]["messages"][1] for entry in gateway.uploads)
+    def text_of(message):
+        value = message["content"]
+        return value if isinstance(value, str) else "".join(b.get("text", "") for b in value)
+    assert text_of(first) == (FULL if initial_window > 120_000 else PROJECTION)
+    assert text_of(second) == (FULL if next_window > 120_000 else PROJECTION)
+    settled = [row for row in ledger(ctx.drive_root) if row["state"] == "settled"][-1]
+    assert settled["physical_context"]["capacity_total_tokens"] == next_window
+    assert settled["candidate_raw_sha256"] == hashlib.sha256(_canonical_candidate_bytes(gateway.uploads[1][0])).hexdigest()

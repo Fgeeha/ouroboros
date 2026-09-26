@@ -26,7 +26,8 @@ from ouroboros.model_wait import (
 )
 from ouroboros.review_dispatch import slot_id_for_row
 from ouroboros.review_operation import (
-    current_review_operation, release_review_operation, review_operation_scope, stamp_review_controller,
+    current_review_operation, recover_review_producer, release_review_operation, review_operation_scope,
+    stamp_review_controller,
 )
 from ouroboros.usage_accounting import (
     PHYSICAL_ATTEMPT_STATES, POSITIVE_PHYSICAL_ATTEMPT_STATES,
@@ -669,16 +670,6 @@ def retryable_review_exception(
     """Whether a second byte-identical review send has a terminal basis."""
     from ouroboros.loop_llm_call import classify_llm_exception
 
-    def _annotate_unknown_outcome() -> None:
-        # Provider exception types may expose ``code`` as a read-only property.
-        # This annotation is diagnostic only; it must never replace the
-        # original failure or weaken the no-resend decision.
-        try:
-            if not str(getattr(exc, "code", "") or ""):
-                setattr(exc, "code", "provider_outcome_unknown")
-        except Exception:
-            pass
-
     # A cancellation requested after the first route attempt is a terminal
     # owner decision for this wave, even when the transport wrapper surfaced a
     # generic retryable preparation error. Reusing the existing durable cancel
@@ -690,17 +681,18 @@ def retryable_review_exception(
     if history is None:
         history = _ReviewAttemptHistory()
         history.observe(exc)
-    if history.unknown_outcome_seen:
+    classification = None if history.unknown_outcome_seen else classify_llm_exception(exc)
+    if history.unknown_outcome_seen or classification.kind == "provider_outcome_unknown":
         if usage_ctx is not None:
             setattr(usage_ctx, "_review_custody_lost", True)
-        _annotate_unknown_outcome()
+        # Read-only provider exception properties must not replace the failure
+        # or weaken the no-resend decision; the annotation is diagnostic only.
+        try:
+            if not str(getattr(exc, "code", "") or ""):
+                setattr(exc, "code", "provider_outcome_unknown")
+        except Exception:
+            pass
         return False
-
-    classification = classify_llm_exception(exc)
-    if classification.kind == "provider_outcome_unknown":
-        if usage_ctx is not None:
-            setattr(usage_ctx, "_review_custody_lost", True)
-        _annotate_unknown_outcome()
     return classification.retry_same_request
 
 
@@ -1331,13 +1323,8 @@ def _run_custodied_review_slots(
                     actor=cached_actor,
                 )
                 entry.event.set()
-            elif (
-                entry is None
-                and bool(getattr(request, "reconcile_only", False))
-                and not exact_recovery
-            ):
-                custody_lost = True
-            elif entry is None and retry_state and not exact_recovery:
+            elif entry is None and not exact_recovery and (
+                    bool(getattr(request, "reconcile_only", False)) or retry_state):
                 custody_lost = True
             elif entry is None and not custody_lost:
                 if exact_recovery:
@@ -1520,87 +1507,6 @@ def _run_custodied_review_slots(
         actors.append(_late_or_timeout_actor(slot, entry, timeout, error_actor,
                                              released_early=slot_id in released_ids))
     return actors
-
-
-def recover_review_producer(root: Any, request: Any, slot: Any, row: dict) -> Any:
-    """Resolve one known operation from its complete existing CAS, never dispatch.
-
-    The caller retains its own wave writer and aggregator. A missing terminal
-    artifact is still in flight; an unreadable or differently bound artifact is
-    custody loss with the original full source attached, never a semantic PASS.
-    """
-    from ouroboros.observability import read_call_payload
-    from ouroboros.review_dispatch import review_operation_binding
-    from ouroboros.review_records import ReviewActorRecord
-
-    operation = str(row.get("operation_id") or "")
-    if not operation or not root:
-        return None
-    expected = review_operation_binding(request, slot, operation)
-    refs, payload = {}, None
-    try:
-        for suffix in ("response", "error"):
-            try:
-                manifest, payload, refs = read_call_payload(
-                    root, task_id=request.task_id or "review", call_id=f"{operation}_{suffix}")
-                break
-            except FileNotFoundError:
-                continue
-        if payload is None:
-            return None
-        outcome = payload.get("producer_outcome") if isinstance(payload, dict) else None
-        if not manifest.get("producer_complete") or not isinstance(outcome, dict):
-            return None  # Historical/partial blobs carry no completed-producer receipt.
-        binding = outcome.get("recovery_binding")
-        if not isinstance(binding, dict) or manifest.get("review_operation_binding") != binding:
-            raise ValueError("producer binding missing or inconsistent")
-        if {k: v for k, v in binding.items() if k != "pending_invocation_id"} != expected:
-            raise ValueError("operation/task/root/material/contract/roster binding mismatch")
-        frozen = row.get("recovery_binding")
-        if frozen and {k: v for k, v in frozen.items() if k != "pending_invocation_id"} != expected:
-            raise ValueError("recorded wave binding mismatch")
-        prompt_manifest, prompt, prompt_ref = read_call_payload(
-            root, task_id=request.task_id or "review", call_id=f"{operation}_prompt")
-        if prompt_manifest.get("review_operation_binding") != expected:
-            raise ValueError("original prompt operation binding mismatch")
-        original_request = SimpleNamespace(**prompt["request"])
-        original_slot = SimpleNamespace(**prompt["slot"])
-        if review_operation_binding(original_request, original_slot, operation) != expected:
-            raise ValueError("original request provenance mismatch")
-        token = str(binding.get("pending_invocation_id") or "")
-        frozen_token = str(row.get("pending_invocation_id") or
-                           (row.get("usage") or {}).get("pending_invocation_id") or "")
-        if frozen_token and token != frozen_token:
-            raise ValueError("recorded pending invocation mismatch")
-        if str(getattr(slot.route, "value", slot.route)) == "agent_session":
-            from ouroboros.delegate_custody import invocation_record
-            invocation = invocation_record(root, token) if token else None
-            if not invocation or any(str(invocation.get(k) or "") != str(expected[k] or "")
-                                     for k in ("task_id", "root_task_id", "surface", "slot_id", "operation_id")):
-                raise ValueError("completed producer has no exact delegated invocation")
-            run_id = str((payload.get("usage") or {}).get("delegated_run_id") or "")
-            if run_id and run_id != str(invocation.get("run_id") or ""):
-                raise ValueError("completed producer delegated run mismatch")
-        if outcome.get("operation_id") != operation or outcome.get("slot_id") != slot.slot_id:
-            raise ValueError("producer actor identity mismatch")
-        actor = ReviewActorRecord(**outcome)
-        message = payload.get("message")
-        actor.raw_text = str(message.get("content") or "") if isinstance(message, dict) else ""
-        actor.usage = dict(payload.get("usage") or {})
-        actor.prompt_ref, actor.response_ref = prompt_ref, refs
-        finalize_review_actor(actor, operation_id=operation, late=True)
-        if actor.operation_state in {"in_flight", "custody_lost"}:
-            actor.status, actor.raw_text = "error", ""
-            actor.error = actor.error or "Producer outcome still lacks terminal custody; full partial source retained"
-        return actor
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        return ReviewActorRecord(
-            slot_id=slot.slot_id, model=slot.model, status="error",
-            error=f"Exact persisted review result unavailable: {exc}",
-            failure_code="review_custody_lost", operation_id=operation,
-            operation_state="custody_lost", late_result_pending=True,
-            response_ref=refs, recovery_binding=expected,
-        )
 
 
 def review_retry_custody_available(

@@ -1,28 +1,15 @@
-"""Durable terminal-answer delivery seam (Poltergeist phase A2, owner 5=A).
+"""Durable terminal-answer delivery, shared by completion, cancellation and reap.
 
-The incident: a cancelled root's finished final report was salvaged to disk but
-never reached chat, because final-answer delivery existed only on the natural
-finalization path. This module is the ONE shared seam for terminal delivery:
+``register_delivery`` atomically dedupes every delivery-id-bearing send through
+``state/terminal_deliveries.json``; the owed outbox replays across restart.
+Registration follows the send, so a crash between them can duplicate delivery:
+external transports remain at-least-once, prioritizing no lost answer.
 
-- ``register_delivery`` is the DURABLE logical dedupe every terminal delivery
-  goes through (``state/terminal_deliveries.json``, bounded, atomic). The
-  supervisor's ``send_message`` handler consults it for every ``delivery_id``-
-  bearing event, so the natural completion path (worker-buffered final answer),
-  the cancel path, and the reap path share one at-most-once-per-restart-free
-  registry instead of a process-local deque that forgets on restart. External
-  transports remain at-least-once; the residual is disclosed here rather than
-  papered over: a delivery can still double across a crash BETWEEN send and
-  registration ("never lost" outranks "never doubled").
-- ``deliver_unreviewed_salvage`` builds and enqueues the one chat message for a
-  cancelled / non-retry-reaped task: a loud UNREVIEWED banner, an honest bounded
-  preview (exact omitted count), a durable full-copy receipt (path + size +
-  sha256), and — for a subtree cascade — a compact children digest. Routed by
-  task lineage chat, never blindly to ``owner_chat_id``. Zero paid rounds.
-
-Outcome routing stays with the callers: ``completed`` keeps the existing
-review-aware final delivery (``task_finalization.deliver_final_message_live``,
-same ``delivery_id`` vocabulary, now deduped durably by this registry);
-``cancelled``/non-retry reap deliver here; a retryable reap delivers nothing.
+Completed tasks keep review-aware delivery via ``task_finalization``. Cancelled
+or non-retry-reaped tasks use ``deliver_unreviewed_salvage``: an UNREVIEWED
+banner, bounded preview with exact omitted count, full-copy path/size/hash and
+optional subtree digest, routed by task lineage. Retryable reap sends nothing.
+These delivery paths buy no model rounds; outcome routing stays with callers.
 """
 
 from __future__ import annotations
@@ -92,20 +79,25 @@ def _registry_path(drive_root: Any) -> pathlib.Path:
 _TERMINAL_ANSWER_ID = re.compile(r"final:(?P<task>[^:]+):[0-9a-f]{16}")
 
 
-def _receipt_rows(current: Dict[str, Any], *, strict: bool = False) -> Dict[str, Any]:
-    """The emitted-bytes receipts; ``strict`` refuses a malformed container (as ``_pending_rows``)."""
-    receipts = current.get("receipts")
-    if isinstance(receipts, dict):
-        return dict(receipts)
-    if strict and receipts is not None:
-        raise ValueError("terminal-delivery registry 'receipts' is malformed (not an object)")
+def _mapping_rows(current: Dict[str, Any], key: str, *, strict: bool = False) -> Dict[str, Any]:
+    """Read a registry mapping; strict mutations preserve malformed forensic bytes.
+
+    Both pending rows and emitted receipts use this contract. Missing/None is
+    empty; other non-objects raise on strict reads, never silently vanish
+    when a mutator rewrites the whole registry.
+    """
+    value = current.get(key)
+    if isinstance(value, dict):
+        return dict(value)
+    if strict and value is not None:
+        raise ValueError(f"terminal-delivery registry '{key}' is malformed (not an object)")
     return {}
 
 
 def _registry_document(current: Dict[str, Any], rows: List[str], pending: Dict[str, Any],
                        receipts: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """The whole registry a mutator writes: every mutator keeps the receipts it did not touch."""
-    receipts = _receipt_rows(current, strict=True) if receipts is None else receipts
+    receipts = _mapping_rows(current, "receipts", strict=True) if receipts is None else receipts
     document = {"schema_version": _SCHEMA_VERSION, "delivered": rows[-_REGISTRY_CAP:], "pending": pending}
     if receipts:
         document["receipts"] = dict(list(receipts.items())[-_REGISTRY_CAP:])
@@ -113,13 +105,10 @@ def _registry_document(current: Dict[str, Any], rows: List[str], pending: Dict[s
 
 
 def _capture_emitted_answer(drive_root: Any, delivery_id: str, emitted: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    """Retain the exact bytes a terminal answer send carried, and where it went.
+    """Retain the terminal text, routed chat and identity after the send returned.
 
-    Called only after the send handler's real send returned. The text, routed
-    chat, task and delivery id go to the task's immutable source store; the
-    receipt names them by digest. A capture that cannot be retained returns
-    None — the delivery is still registered for dedupe, but proves no bytes.
-    """
+    The receipt binds exact text to its immutable source. Failed capture returns
+    None: the id still dedupes delivery, but proves no emitted bytes."""
     match = _TERMINAL_ANSWER_ID.fullmatch(delivery_id)
     task_id = str(emitted.get("task_id") or "")
     text = emitted.get("text")
@@ -145,12 +134,10 @@ def _capture_emitted_answer(drive_root: Any, delivery_id: str, emitted: Dict[str
 def terminal_answer_receipts(drive_root: Any, task_id: str) -> Dict[str, Any]:
     """What the host can PROVE it emitted as one task's terminal answer.
 
-    ``delivered`` lists only receipts: exact text digest, routed chat and the
-    retained source, captured after a real send. An owed outbox row is a send
-    not yet confirmed, and a delivered id without a receipt (an older row, a
-    failed capture, an evicted receipt) proves no bytes; both stay listed as
-    such. ``state`` is ``delivered`` (at least one receipt), ``owed`` or
-    ``unknown`` — never inferred from the task result or an id digest.
+    ``delivered`` lists exact text digests, routed chats and retained sources
+    captured after sends. Owed rows and ids without receipts prove no bytes.
+    Both remain listed; state is delivered (at least one receipt), owed or
+    unknown, never inferred from the task result or an id digest.
     """
     fact: Dict[str, Any] = {"source": "terminal_delivery_registry", "state": "unknown", "delivered": [],
                             "unverified_delivery_ids": [], "owed_delivery_ids": []}
@@ -161,7 +148,7 @@ def terminal_answer_receipts(drive_root: Any, task_id: str) -> Dict[str, Any]:
         data = read_json_dict(path) if path.is_file() else {}
         if data is None:
             raise ValueError("registry file is malformed or is not an object")
-        receipts, pending = _receipt_rows(data, strict=True), _pending_rows(data, strict=True)
+        receipts, pending = _mapping_rows(data, "receipts", strict=True), _mapping_rows(data, "pending", strict=True)
         delivered = _delivered_rows(data, strict=True)
     except Exception:
         log.debug("terminal-delivery registry unreadable for %s", task_id, exc_info=True)
@@ -184,17 +171,10 @@ def terminal_answer_receipts(drive_root: Any, task_id: str) -> Dict[str, Any]:
 
 
 def delivery_id_for(task_id: str, text: str) -> str:
-    """The shared delivery identity: ``final:<tid>:<sha256[:16]>`` — the same
-    vocabulary ``deliver_final_message_live`` mints for the natural path.
+    """Stable terminal identity: ``final:<tid>:<sha256[:16]>``.
 
-    GR7-4: callers digest the STABLE part of the message (task id + settled
-    status framing + core answer), never the mutable unreconciled-runs
-    disclosure note — the note rides the TEXT only. A watchdog replay rebuilds
-    the note from the CURRENT audit (the list shrinks as runs reconcile); a
-    note-bearing digest minted a fresh id per replay, and each became a second
-    owed message for the same terminal answer (mirror of the cascade's GR4-2
-    intent-derived identity: identity from the durable task/answer, not from
-    mutable content)."""
+    Callers hash task/status framing and core answer, excluding mutable custody
+    disclosures. Replay can refresh those notes without owing a second answer."""
     digest = hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()[:16]
     return f"final:{task_id}:{digest}"
 
@@ -217,35 +197,11 @@ def already_delivered(drive_root: Any, delivery_id: str) -> bool:
         return False
 
 
-def _pending_rows(current: Dict[str, Any], *, strict: bool = False) -> Dict[str, Any]:
-    """The owed-outbox rows; ``strict`` refuses a malformed nested value.
-
-    GR5-6: the three MUTATORS pass ``strict=True`` — a present-but-non-dict
-    ``pending`` under a valid top-level dict used to be coerced to ``{}`` and
-    the next mutation overwrote EVERY owed row silently, the exact loss the
-    top-level ``strict_existing_dict`` check refuses. The raise is the same
-    typed ``ValueError`` that check uses, so the callers' existing
-    corrupt-registry handling (refuse + disclose, no overwrite) applies.
-    Read paths stay fail-soft (they disclose separately)."""
-    pending = current.get("pending")
-    if isinstance(pending, dict):
-        return dict(pending)
-    if strict and pending is not None:
-        raise ValueError(
-            "terminal-delivery registry 'pending' is malformed (not an object)"
-        )
-    return {}
-
-
 def _delivered_rows(current: Dict[str, Any], *, strict: bool = False) -> List[str]:
-    """The delivered-id list; ``strict`` refuses a malformed container or entry.
+    """Read delivered ids; strict reads reject malformed containers or entries.
 
-    GR6-3 row strictness: the mutators rewrite the whole file, so a
-    present-but-non-list ``delivered`` — or a non-string ENTRY inside a valid
-    list — used to be silently coerced and overwritten on the next write,
-    destroying the dedupe evidence with no corruption event. Strict raises the
-    same typed ``ValueError`` the container checks use (refuse + disclose, no
-    overwrite — the malformed bytes stay on disk); reads stay fail-soft."""
+    Mutators refuse corruption without overwriting the file. Fail-soft readers
+    keep only a valid list; corruption disclosure belongs to their caller."""
     delivered = current.get("delivered")
     if isinstance(delivered, list):
         if strict and any(not isinstance(item, str) for item in delivered):
@@ -261,21 +217,13 @@ def _delivered_rows(current: Dict[str, Any], *, strict: bool = False) -> List[st
 
 
 def register_delivery(drive_root: Any, delivery_id: str, *, emitted: Optional[Dict[str, Any]] = None) -> bool:
-    """Durably register one delivery id AFTER a successful send.
+    """Register an id AFTER a successful send and clear its owed row atomically.
 
-    Returns whether the id was newly registered. Registration only after the
-    send preserves the "never lost" ordering: a send that raised keeps its id
-    unregistered, so a buffered second copy is still delivered. The registry is
-    a bounded newest-last list — old ids age out, which is safe because a
-    delivery id binds a terminal answer to its content hash and terminal answers
-    stop being re-sent long before the cap turns over.
-
-    The same write CLEARS the pending-outbox row: "delivered" and "still owed"
-    are one transaction, so a replay can never re-send an answer that landed.
-    ``emitted`` is the send handler's own fact of what it just sent (exact text,
-    routed chat, task); for a terminal answer it becomes the receipt
-    ``terminal_answer_receipts`` reads. The first observed send keeps its receipt.
-    """
+    Return whether the id is new. A send that raises remains owed; old ids age
+    out of the bounded newest-last registry after their replay lifetime.
+    ``emitted`` contains the handler's exact text, routed chat and task; its
+    first retained receipt supplies ``terminal_answer_receipts``. Registration
+    failure is disclosed and returns True so the live send still counts."""
     did = str(delivery_id or "").strip()
     if not did:
         return True
@@ -284,8 +232,8 @@ def register_delivery(drive_root: Any, delivery_id: str, *, emitted: Optional[Di
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         rows: List[str] = _delivered_rows(current, strict=True)
-        pending = _pending_rows(current, strict=True)
-        receipts = _receipt_rows(current, strict=True)
+        pending = _mapping_rows(current, "pending", strict=True)
+        receipts = _mapping_rows(current, "receipts", strict=True)
         target = pending.get(did)
         if target is not None and not isinstance(target, dict):
             # GR6-3: a malformed owed ROW is corruption — clearing it as part
@@ -300,14 +248,12 @@ def register_delivery(drive_root: Any, delivery_id: str, *, emitted: Optional[Di
         if did in rows:
             if not had_pending and not new_receipt:
                 return None
-            return _registry_document(current, rows, pending, receipts)
-        rows.append(did)
-        fresh["value"] = True
+        else:
+            rows.append(did)
+            fresh["value"] = True
         return _registry_document(current, rows, pending, receipts)
 
     try:
-        # GR3-9 strict read: a malformed registry must refuse the mutation
-        # loudly, never collapse to {} and overwrite every owed answer.
         update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True)
     except ValueError:
         _log_registry_corrupt(drive_root, did, op="register_delivery")
@@ -319,12 +265,9 @@ def register_delivery(drive_root: Any, delivery_id: str, *, emitted: Optional[Di
 
 
 def _log_registry_corrupt(drive_root: Any, delivery_id: str, *, op: str) -> None:
-    """Typed fail-closed disclosure for a corrupt delivery registry (GR3-9).
+    """Disclose a refused corrupt-registry mutation as a durable typed event.
 
-    The mutation was REFUSED (no overwrite — the malformed file keeps whatever
-    forensic value it has); the gap is made visible through a durable typed
-    event, because a silent {}-collapse was exactly the loss mode this closes.
-    """
+    The original malformed file stays untouched for diagnosis."""
     log.error(
         "terminal-delivery registry is corrupt; %s refused for %s (no overwrite)",
         op, delivery_id,
@@ -342,26 +285,13 @@ def _log_registry_corrupt(drive_root: Any, delivery_id: str, *, op: str) -> None
 
 
 def register_pending_delivery(drive_root: Any, event: Dict[str, Any]) -> bool:
-    """Record a terminal send as OWED, before it is enqueued.
+    """Record a terminal send as owed BEFORE enqueue, for boot/tick replay.
 
-    The incident class in its purest form: the answer was salvaged to disk and
-    the send was handed to an in-memory queue — a crash between the settle and
-    the send lost the owner's answer forever, because the delivered registry only
-    remembers what ALREADY went out. This row is the other half: written first,
-    cleared by ``register_delivery`` after a confirmed send, and replayed by
-    ``replay_pending_deliveries`` on boot and on the supervisor tick.
-
-    Deliberately NOT a general send queue (owner scope): it holds only terminal
-    answers going through this seam, bounded to ``_PENDING_CAP`` newest rows.
-
-    Return semantics (GR3-4 — callers now BRANCH on this): ``True`` means the
-    answer is durably tracked — newly owed, already owed, or already in the
-    delivered registry. ``False`` means a REAL durability gap: the event
-    carries no ``delivery_id``, or the registry write failed (a typed
-    ``terminal_delivery_unregistered`` event is emitted so the gap is
-    visible). Cancel paths leave the intent open on ``False``; the normal
-    completion path still enqueues the live send and relies on the typed event.
-    """
+    ``register_delivery`` clears it only after a confirmed send. The outbox
+    retains the newest ``_PENDING_CAP`` rows and discloses every eviction.
+    True means newly owed, already owed or delivered; False means a missing id
+    or a disclosed write failure. Cancel callers leave the intent open on
+    False; ordinary completion still tries the live send."""
     did = str(event.get("delivery_id") or "").strip()
     if not did:
         return False
@@ -372,13 +302,10 @@ def register_pending_delivery(drive_root: Any, event: Dict[str, Any]) -> bool:
         rows: List[str] = _delivered_rows(current, strict=True)
         if did in rows:
             return None  # already delivered: nothing is owed
-        pending = _pending_rows(current, strict=True)
+        pending = _mapping_rows(current, "pending", strict=True)
         if did in pending:
             if not isinstance(pending.get(did), dict):
-                # GR6-3: the probe shape — a malformed row for THIS id would
-                # be reported as "already durably owed" while the replay read
-                # can never deliver it. Refuse loudly instead (typed
-                # corruption event + unregistered disclosure, no overwrite).
+                # A malformed row cannot count as durably owed: replay cannot send it.
                 raise ValueError(
                     f"terminal-delivery registry pending row for {did} is malformed"
                 )
@@ -388,16 +315,12 @@ def register_pending_delivery(drive_root: Any, event: Dict[str, Any]) -> bool:
         if len(pending) > _PENDING_CAP:
             for stale in list(pending)[: len(pending) - _PENDING_CAP]:
                 row = pending.pop(stale, None)
-                # GR2-6: eviction is a LOST OWED ANSWER, never a silent pop —
-                # the row is disclosed below through the same exhaustion seam
-                # (full-text preservation + typed event + owner notice).
+                # Every eviction is disclosed through the exhaustion seam below.
                 if isinstance(row, dict):
                     evicted.append({**row, "delivery_id": str(stale)})
         return _registry_document(current, rows, pending)
 
     try:
-        # GR3-9 strict read: a malformed registry refuses the mutation loudly
-        # instead of collapsing to {} and overwriting every owed answer.
         update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True)
     except ValueError:
         _log_registry_corrupt(drive_root, did, op="register_pending_delivery")
@@ -434,16 +357,11 @@ def _log_unregistered_delivery(drive_root: Any, event: Dict[str, Any], did: str)
 def pending_deliveries(
     drive_root: Any, *, disclose_corruption: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Terminal sends registered as owed and not yet confirmed delivered.
+    """Read owed sends, excluding delivered ids, with disclosed corruption.
 
-    GR5-6 read semantics: an ABSENT registry is an ordinary empty outbox; an
-    UNREADABLE/MALFORMED one (file or nested ``pending``) is a real gap — it
-    is disclosed with a typed ``log.error`` (and, for the watchdog's replay
-    read via ``disclose_corruption=True``, the existing typed corruption
-    event) before the read still returns ``[]``. Fail-soft read, but the
-    owner can see the replay lane is degraded instead of silently owing
-    nothing.
-    """
+    An absent registry is empty. Unreadable/malformed data logs an error and
+    returns []; malformed individual rows are skipped with their bytes intact.
+    ``disclose_corruption`` also emits the durable corruption event for replay."""
     path = pathlib.Path(drive_root) / "state" / "terminal_deliveries.json"
     if not path.is_file():
         return []
@@ -453,7 +371,7 @@ def pending_deliveries(
         data = read_json_dict(path)
         if data is None:
             raise ValueError("registry file is malformed or is not an object")
-        pending = _pending_rows(data, strict=True)
+        pending = _mapping_rows(data, "pending", strict=True)
     except Exception as exc:
         log.error(
             "terminal-delivery registry is unreadable/malformed (%s); the owed "
@@ -468,11 +386,7 @@ def pending_deliveries(
     malformed: List[str] = []
     for did, row in pending.items():
         if not isinstance(row, dict):
-            # GR6-3 row strictness on the enforcement read: a malformed owed
-            # row used to vanish from replay silently — an answer the file
-            # still claims is owed. Quarantined (skipped here, bytes kept on
-            # disk — the strict mutators refuse to rewrite it) and disclosed
-            # loudly below.
+            # Quarantine and disclose; strict mutations preserve these bytes on disk.
             malformed.append(str(did))
             continue
         if str(did) in delivered_ids:
@@ -492,22 +406,15 @@ def pending_deliveries(
 
 
 def _bump_replay_attempts(drive_root: Any, ids: List[str]) -> List[str]:
-    """Count one replay per id and DROP the ones that exhausted their attempts.
+    """Count replays and return ids still eligible; disclose exhausted rows.
 
-    Returns the ids that may still be replayed. The cap is what keeps a durable
-    outbox from becoming a retry storm: a chat that is permanently unreachable
-    would otherwise have its answer re-enqueued on every supervisor tick forever.
-    Each bump also stamps ``last_replay_at`` — ``_replay_due`` spaces attempts
-    with exponential backoff from it, so the cap covers a realistic outage
-    window instead of burning on consecutive ticks. An exhausted row is dropped
-    LOUDLY (AR2-7): the full message text is preserved on disk and the owner is
-    told through a typed durable event plus a chat notice — never a silent drop.
-    """
+    Each bump stamps ``last_replay_at`` for exponential backoff. Exhaustion
+    preserves the message and emits a durable event plus a live notice."""
     live: List[str] = []
     exhausted: List[Dict[str, Any]] = []
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        pending = _pending_rows(current, strict=True)
+        pending = _mapping_rows(current, "pending", strict=True)
         changed = False
         for did in ids:
             row = pending.get(did)
@@ -528,7 +435,6 @@ def _bump_replay_attempts(drive_root: Any, ids: List[str]) -> List[str]:
         return _registry_document(current, rows, pending)
 
     try:
-        # GR3-9 strict read: never rebuild a malformed registry from {}.
         update_json_locked(_registry_path(drive_root), _mutate, strict_existing_dict=True)
     except ValueError:
         _log_registry_corrupt(drive_root, ",".join(ids), op="bump_replay_attempts")
@@ -544,18 +450,13 @@ def _bump_replay_attempts(drive_root: Any, ids: List[str]) -> List[str]:
 def _disclose_exhausted_delivery(
     drive_root: Any, row: Dict[str, Any], *, reason: str = "replay_exhausted",
 ) -> None:
-    """Owner-visible disclosure for an outbox row dropped with no confirmed send.
+    """Disclose an outbox row dropped without a confirmed send.
 
-    Two callers, one seam: replays exhausted (``reason="replay_exhausted"``,
-    AR2-7) or eviction past ``_PENDING_CAP`` (``reason="outbox_capacity"``,
-    GR2-6). A copy of THIS row's text (a receipt may carry only an excerpt, not
-    the whole answer) is preserved, and a typed ``terminal_delivery_exhausted``
-    event lands in ``logs/events.jsonl`` either way (it works when chat fails).
-    A missing confirmation is not non-delivery, so the chat notice says "not
-    confirmed"; only positive evidence that this delivery reached this chat
-    (the cancel receipt's ``delivered_chat_id`` for this ``delivery_id``; a bare
-    id is never proof) retires the notice. Every step fail-soft.
-    """
+    Replay exhaustion and capacity eviction share this seam. Preserve THIS row's
+    full message (a receipt may hold only an excerpt), emit ``terminal_delivery_exhausted`` even
+    if chat fails, and say sending was not confirmed. Only a cancel receipt
+    proving this delivery reached this destination suppresses the notice;
+    a bare delivery id proves no destination. Every step is fail-soft."""
     did = str(row.get("delivery_id") or "")
     tid = str(row.get("task_id") or "")
     text = str(row.get("text") or "")
@@ -584,7 +485,7 @@ def _disclose_exhausted_delivery(
     try:  # positive evidence only: the cancel receipt stamped THIS delivery at THIS chat
         from ouroboros.task_results import load_task_result
 
-        receipt = (load_task_result(pathlib.Path(drive_root), tid) or {}).get("cancel_receipt") if tid and did and chat_id else None
+        receipt = (load_task_result(pathlib.Path(drive_root), tid) or {}).get("cancel_receipt") if tid and did and chat_id != 0 else None
         reached = isinstance(receipt, dict) and receipt.get("delivery_id") == did and receipt.get("delivered_chat_id") == chat_id
     except Exception:
         reached = False
@@ -603,7 +504,8 @@ def _disclose_exhausted_delivery(
         )
     except Exception:
         log.debug("exhausted-delivery event append failed for %s", did, exc_info=True)
-    if not chat_id or reached:
+    # A live notice needs a reader; the hidden partition (0) has none.
+    if chat_id == 0 or reached:
         return
     try:
         from supervisor.message_bus import send_with_budget
@@ -1361,7 +1263,7 @@ def _stop_episode_delivery_id(drive_root: Any, task_id: str) -> str:
         prefix = f"cancel:{tid}:"
         owed = [
             (str(row.get("registered_at") or ""), did)
-            for did, row in _pending_rows(data).items()
+            for did, row in _mapping_rows(data, "pending").items()
             if isinstance(row, dict) and did.startswith(prefix)
         ]
         if owed:

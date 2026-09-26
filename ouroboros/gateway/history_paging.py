@@ -12,7 +12,8 @@ from pathlib import Path
 from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway import _helpers
 from ouroboros.gateway._helpers import _TAIL_WINDOW_START_BYTES
-from ouroboros.utils import JsonlChainUnreadable, jsonl_chain_handles
+from ouroboros.jsonl_tail import JsonlChainSnapshot
+from ouroboros.utils import JsonlChainUnreadable
 
 _SOURCES = ("chat", "progress")
 _READ_BYTES = 64 * 1024
@@ -87,18 +88,14 @@ def decode_cursor(value, thread_id, view):
     return cursor
 
 
-class HistorySource:
+class HistorySource(JsonlChainSnapshot):
     """One metadata snapshot, with no handles retained across a read batch."""
 
     def __init__(self, path: Path, source: str, upper=None):
-        self.path, self.source, self.snapshot = path, source, {}
-        with jsonl_chain_handles(path, strict=True, start_offset=0, snapshot=self.snapshot):
-            pass
-        self.upper = self.snapshot["total"] if upper is None else upper
-        if self.upper > self.snapshot["total"]:
-            raise JsonlChainUnreadable("history source is shorter than its captured boundary")
+        super().__init__(path, upper=upper)
+        self.source = source
         if upper is None and self.snapshot["entries"] and self.snapshot["entries"][-1][2]:
-            base, end = self._segment_range(len(self.snapshot["entries"]) - 1)
+            base, end = self.segment(len(self.entries) - 1)
             # A writer owns an unfinished live line. Freeze only complete rows,
             # so completing/rotating that line later cannot alter this page.
             while end > base and self._read(end - 1, end) != b"\n":
@@ -107,23 +104,6 @@ class HistorySource:
                 newline = data.rfind(b"\n")
                 end = start + newline + 1 if newline >= 0 else start
             self.upper = end
-
-    def _read(self, start, end):
-        parts = []
-        while start < end:
-            with jsonl_chain_handles(self.path, strict=True, start_offset=start,
-                                     snapshot=self.snapshot) as handles:
-                if not handles:
-                    raise JsonlChainUnreadable("history source ended before its captured boundary")
-                _path, handle = handles[0]
-                index = bisect_left(self.snapshot["ends"], start + 1)
-                size = min(end, self.snapshot["ends"][index]) - start
-                data = handle.read(size)
-                if len(data) != size:
-                    raise JsonlChainUnreadable("history source read ended before its captured boundary")
-                parts.append(data)
-                start += size
-        return b"".join(parts)
 
     def _entries(self, start, end, gaps):
         data = self._read(start, end)
@@ -153,10 +133,6 @@ class HistorySource:
                          "_history_end": lines.row_end})
         return rows
 
-    def _segment_range(self, index):
-        return (self.snapshot["ends"][index - 1] if index else 0,
-                min(self.snapshot["ends"][index], self.upper))
-
     def _aligned_start(self, start, end, base):
         if start <= base or self._read(start - 1, start) == b"\n":
             return start
@@ -168,7 +144,7 @@ class HistorySource:
         """The existing recent byte-window and three-archive selection, with ids."""
         entries, gaps, before, archive_count = [], set(), self.upper, 0
         for index in reversed(range(len(self.snapshot["entries"]))):
-            base, end = self._segment_range(index)
+            base, end = self.segment(index)
             if base >= self.upper:
                 continue
             was_live = self.snapshot["entries"][index][2]
@@ -194,7 +170,7 @@ class HistorySource:
         selected, gaps, counted, scanned, scanned_rows = [], set(), 0, 0, 0
         while before > 0 and scanned < _PAGE_SCAN_BYTES and scanned_rows < _PAGE_SCAN_ROWS:
             index = bisect_left(self.snapshot["ends"], before)
-            base, _end = self._segment_range(index)
+            base, _end = self.segment(index)
             window = _READ_BYTES
             while True:
                 start = self._aligned_start(max(base, before - window), before, base)
@@ -217,7 +193,7 @@ class HistorySource:
     def replay(self, lower, before):
         gaps, rows = set(), []
         for index in range(len(self.snapshot["entries"])):
-            base, end = self._segment_range(index)
+            base, end = self.segment(index)
             start, end = max(base, lower), min(end, before)
             if start < end:
                 rows.extend(self._entries(start, end, gaps))
