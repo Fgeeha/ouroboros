@@ -914,6 +914,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     if named:  # the lineage every reader can name: which seats were asked again, which kept their answer
         wave["addressed"] = {"slots": list(named), "finding_ids": list(address.get("finding_ids") or []),
                              "kept": [str(r.get("slot_id") or "") for r in kept], "wave_artifact": wave["previous_wave_artifact"]}
+    elif resume_in_flight and isinstance((existing or {}).get("addressed"), dict):
+        wave["addressed"] = dict(existing["addressed"])  # the $0 collection re-records the addressed cycle it settles
     aggregate = str(wave["aggregate"])
     exact_wave = _exact_wave(
         wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,

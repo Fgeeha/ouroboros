@@ -420,6 +420,9 @@ def test_addressed_wave_collects_after_the_barrier(harness, monkeypatch):  # noq
     assert calls2[1]["slots"] == ["s1"] and calls2[1]["reconcile_only"] is True and len(calls2) == 2
     state = _state(harness)
     assert state["cycles_paid"] == 2 and state["waves"][-1]["closed"]
+    settled = state["waves"][-1]  # the collection re-records the addressed cycle it settles: the lineage survives it
+    assert settled["addressed"] == wave["addressed"] and settled["previous_wave_artifact"] == wave["addressed"]["wave_artifact"]
+    assert authority_wave(harness.drive, ctx.task_id, settled)["addressed"] == wave["addressed"]
     actors = _actors(harness)
     assert actors["s2"]["replayed_from"]["cycle_index"] == 1 and actors["s2"]["cost"] == 0.0 and actors["s2"]["ok"]
     assert actors["s1"]["ok"] and "replayed_from" not in actors["s1"]

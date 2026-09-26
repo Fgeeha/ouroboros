@@ -248,7 +248,8 @@ def test_s34_addressed_answer_reasks_the_objector_alone_and_closes_green(e2e_clo
             # The exact artifact chain: the cycle-2 BARRIER snapshot names the seats it asked
             # again and the cycle-1 wave it answered; that reference reads back as the
             # answered wave (cycle 1, same fingerprint, the reject recorded); the collected
-            # cycle-2 wave carries the same predecessor reference and is closed GREEN.
+            # cycle-2 wave carries the same predecessor reference AND the same addressed
+            # lineage (the collection re-records the cycle it settles) and is closed GREEN.
             barrier = [p for p in _wave_artifacts(oracle)
                        if p.get("custody_pending") and int(p.get("cycle_index") or 0) == 2]
             assert len(barrier) == 1, [(p.get("cycle_index"), p.get("custody_pending")) for p in _wave_artifacts(oracle)]
@@ -263,6 +264,7 @@ def test_s34_addressed_answer_reasks_the_objector_alone_and_closes_green(e2e_clo
             collected = read_wave(oracle.data_root, task_id, last["wave_artifact"])
             assert collected.get("closed") is True and collected.get("aggregate") == "GREEN"
             assert int(collected.get("cycle_index") or 0) == 2
+            assert last.get("addressed") == addressed and collected.get("addressed") == addressed, last.get("addressed")
 
             # FIVE plan_task calls bought exactly one re-ask: dispatch, collect, the $0
             # reject, the addressed re-ask (barrier), collect.
