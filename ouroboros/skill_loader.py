@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import pathlib
+import stat
 from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, Iterable, List, Optional
 
@@ -356,10 +357,11 @@ def _iter_payload_files(
         resolved = (skill_dir / rel).resolve()
         try:
             resolved.relative_to(resolved_root)
-        except ValueError:
+            # is_file() hides ELOOP; an unreadable declared entry cannot be omitted from its hash.
+            if stat.S_ISREG(resolved.stat().st_mode):
+                _add(resolved)
+        except (ValueError, FileNotFoundError, NotADirectoryError):
             return
-        if resolved.is_file():
-            _add(resolved)
 
     # Broad walk: everything runtime-reachable, minus metadata/cache names.
     # Every candidate is resolved back under skill_dir so symlinks cannot leak

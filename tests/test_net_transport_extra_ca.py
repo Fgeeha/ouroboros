@@ -45,11 +45,18 @@ def _throwaway_ca(tmp_path: pathlib.Path):
     now = _dt.datetime.now(_dt.timezone.utc)
     ca_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
     ca_name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Ouroboros throwaway test CA")])
+    # Python 3.13 enables strict X.509 verification: CA SKI/key usage and leaf AKI are required.
     ca = (
         x509.CertificateBuilder().subject_name(ca_name).issuer_name(ca_name)
         .public_key(ca_key.public_key()).serial_number(x509.random_serial_number())
         .not_valid_before(now - _dt.timedelta(days=1)).not_valid_after(now + _dt.timedelta(days=2))
         .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(x509.SubjectKeyIdentifier.from_public_key(ca_key.public_key()), critical=False)
+        .add_extension(x509.KeyUsage(
+            digital_signature=False, content_commitment=False, key_encipherment=False,
+            data_encipherment=False, key_agreement=False, key_cert_sign=True, crl_sign=True,
+            encipher_only=False, decipher_only=False,
+        ), critical=True)
         .sign(ca_key, hashes.SHA256())
     )
     leaf_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
@@ -59,6 +66,7 @@ def _throwaway_ca(tmp_path: pathlib.Path):
         .issuer_name(ca_name).public_key(leaf_key.public_key()).serial_number(x509.random_serial_number())
         .not_valid_before(now - _dt.timedelta(days=1)).not_valid_after(now + _dt.timedelta(days=2))
         .add_extension(x509.SubjectAlternativeName([x509.IPAddress(ipaddress.ip_address("127.0.0.1"))]), critical=False)
+        .add_extension(x509.AuthorityKeyIdentifier.from_issuer_public_key(ca_key.public_key()), critical=False)
         .sign(ca_key, hashes.SHA256())
     )
     tmp_path.mkdir(parents=True, exist_ok=True)
