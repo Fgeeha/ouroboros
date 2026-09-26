@@ -903,7 +903,10 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             _carried_dispositions(existing, named) if named else None),
         owner_efforts=owner_efforts,
         standing=standing,
-        standby_dispositions=list(existing.get("dispositions") or []) if named else None,
+        # The answered wave's recorded answers stand by for findings carried for a seat's absence:
+        # on the collection of an addressed wave they live on its exact predecessor.
+        standby_dispositions=(list(existing.get("dispositions") or []) if named else
+                              list((previous or {}).get("dispositions") or []) if resume_in_flight and existing.get("addressed") else None),
     )
     wave["previous_wave_artifact"] = _predecessor_ref(existing, previous, state, resume_in_flight)
     if named:  # the lineage every reader can name: which seats were asked again, which kept their answer

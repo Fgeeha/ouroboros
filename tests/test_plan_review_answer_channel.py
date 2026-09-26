@@ -475,6 +475,35 @@ def test_an_all_skipped_addressed_collection_keeps_the_paid_predecessor_reachabl
     assert wave["actors"][0]["slot_id"] == "s1" and "findings_carried_absent_answer:1" in wave["actors"][0]["disclosures"]
 
 
+def test_a_failed_re_ask_on_the_barrier_route_keeps_the_recorded_answer(harness, monkeypatch):  # noqa: F811
+    """Production returns at the dispatch barrier: the re-asked seat is collected later and
+    answers garbage. The carried finding must keep the mind's recorded answer (it lives on the
+    exact predecessor while the wave is in flight) — the inline pin of the same rule is
+    test_addressed_slot_without_an_answer_keeps_its_findings."""
+    from tests.test_plan_review_reconciliation import _install_barrier_substrate
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
+    calls: list = []
+    _install_barrier_substrate(monkeypatch, calls, texts={"s1": _blocking()})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    fp = _state(harness)["waves"][-1]["request_fingerprint"]
+    assert _control(_answer(ctx, fp)) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    _reject(ctx, fp)
+    calls2: list = []
+    _install_barrier_substrate(monkeypatch, calls2, texts={"s1": "garbage, not an array"})
+    pending = _call(ctx, review_disposition={"review_fingerprint": fp, "items": [
+        _item("s1:f1", "reject", "the budget line is already approved")]})
+    assert _control(pending) == {"outcome": "DEGRADED", "closed": False}
+    settled = _call(ctx, review_disposition={"review_fingerprint": fp, "items": []})
+    assert _control(settled) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    wave = _state(harness)["waves"][-1]
+    assert wave["paid"] and _state(harness)["cycles_paid"] == 2
+    assert [(f["finding_id"], bool(f.get("carried_absent_answer"))) for f in wave["findings"]] == [("s1:f1", True)]
+    assert _ids(wave) == [("s1:f1", "reject")], "the recorded answer rides the collected wave"
+    assert _ids(authority_wave(harness.drive, ctx.task_id, wave)) == [("s1:f1", "reject")]
+
+
 def test_addressed_helper_names_every_typed_reason():
     from ouroboros.tools.plan_review_artifacts import ADDRESSED_REASONS, addressed_slots
 
