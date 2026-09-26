@@ -1486,8 +1486,8 @@ def record_plan_review_wave(
         waves.append(recorded)
         if not state.get("series_id"):
             state["series_id"] = fingerprint[:16]
-        # C-07: replacement writes don't charge again; a fully-rejected wave's
-        # earned delta advances cycle_index and charges its new physical panel.
+        # C-07: replacement writes don't charge again; an addressed answer advances
+        # cycle_index and charges its new physical panel.
         already_paid = any(
             w.get("paid") and int(w.get("cycle_index") or 0) >= int(wave.get("cycle_index") or 0)
             for w in previous
@@ -1541,8 +1541,9 @@ def record_plan_review_dispositions(
     recorded_at: str = "",
     author_disposition: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Store the agent's dispositions on one FULL wave and its resulting closure.
-    Only note-only closed waves accept annotations. Closure authority remains
+    """Record this call's answers MERGED into one FULL wave's answers by ``finding_id``
+    (``plan_spec.merge_dispositions``: a later answer supersedes only its own id) and the
+    resulting closure. Only note-only closed waves accept annotations. Closure authority remains
     ``plan_spec.closure_after_disposition`` (``aggregate`` is the verdict that
     table says to record — GREEN when a REVIEW_REQUIRED open set emptied); this
     writer is rule-free. Other closed waves are immutable."""
@@ -1556,7 +1557,9 @@ def record_plan_review_dispositions(
             raise ValueError("PLAN_REVIEW_DISPOSITION_STALE: a newer attempt supersedes this wave")
         if wave.get("closed") and not plan_review_notes_are_annotatable(wave):
             raise ValueError("PLAN_REVIEW_DISPOSITION_IMMUTABLE: a closed wave cannot be changed")
-        wave["dispositions"] = copy.deepcopy(list(dispositions))
+        from ouroboros.tools.plan_spec import merge_dispositions
+
+        wave["dispositions"] = merge_dispositions(wave.get("dispositions"), dispositions)
         wave["disposition_recorded_at"] = recorded_at or utc_now_iso()
         if closure_notes is not None:
             wave["closure_notes"] = list(closure_notes)

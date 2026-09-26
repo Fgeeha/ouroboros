@@ -1212,9 +1212,11 @@ def test_session_reviewer_gets_redacted_evidence_inline_never_raw_locators(harne
     assert "plan notes" in task  # the evidence text itself IS inline (redacted)
 
 
-def test_fully_rejected_revise_plan_wave_earns_the_promised_delta_cycle(harness, monkeypatch):
-    """Final-gate finding (scope, 4e133c8a): after a full reject-disposition of a REVISE_PLAN
-    wave, re-calling the SAME envelope must buy the delta cycle, not replay forever."""
+def test_rejected_blocking_findings_replay_free_until_an_answer_is_addressed(harness, monkeypatch):
+    """No host path buys a panel the mind did not send: after a full reject-disposition of a
+    REVISE_PLAN wave the identical envelope REPLAYS the recorded wave at $0 (the answers stay
+    recorded on it); re-judgement is the mind's explicit move — the same envelope sent WITH
+    review_disposition items (the addressed answer)."""
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
     blocking = json.dumps([_finding("f1", "blocking", breaks="claim_1")])
     sub = harness.install({"s1": blocking, "s2": blocking, "s3": CLEAN})
@@ -1227,64 +1229,32 @@ def test_fully_rejected_revise_plan_wave_earns_the_promised_delta_cycle(harness,
         {"finding_id": "s2:f1", "decision": "reject", "rationale": "the deadline is fine"},
     ]})
     assert "revise_plan_not_closable_by_disposition" in rejected
-    again = _call(ctx)  # SAME envelope
-    assert len(sub.calls) == 2, "the fully-rejected wave earns a paid delta cycle"
-    assert "cycle 2" in again
-    assert _state(harness)["cycles_paid"] == 2
-    assert "PRIOR CYCLES" in _user_text(sub.calls[1]["request"].messages[1]["content"])
-
-
-def test_invalid_or_contradictory_rejections_do_not_earn_the_delta_cycle(harness, monkeypatch):
-    """Delta-review finding D1: only VALID rejections buy the promised delta panel."""
-    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
-    blocking = json.dumps([_finding("f1", "blocking", breaks="claim_1")])
-    sub = harness.install({"s1": blocking, "s2": blocking, "s3": CLEAN})
-    ctx = harness.make_ctx()
-    first = _call(ctx)
-    assert "REVISE_PLAN" in first
-    fp = _state(harness)["waves"][-1]["request_fingerprint"]
-    # contradictory accept+reject for one finding, valid reject for the other
-    pr._handle_plan_task(ctx, review_disposition={"review_fingerprint": fp, "items": [
-        {"finding_id": "s1:f1", "decision": "accept", "rationale": "ok"},
-        {"finding_id": "s1:f1", "decision": "reject", "rationale": "no"},
-        {"finding_id": "s2:f1", "decision": "reject", "rationale": "the deadline is fine"},
-    ]})
-    again = _call(ctx)
-    assert len(sub.calls) == 1, "a contradictory rejection must replay, not buy a panel"
+    again = _call(ctx)  # SAME envelope, no items: a free replay, never a bought panel
+    assert len(sub.calls) == 1 and "cached exact review" in again
     assert _state(harness)["cycles_paid"] == 1
-    assert "PLAN_REVIEW_CYCLES_EXHAUSTED" not in again and "cycle 1" in again
+    assert [d["finding_id"] for d in _state(harness)["waves"][-1]["dispositions"]] == ["s1:f1", "s2:f1"]
 
 
-def test_dispatched_degraded_delta_attempt_pays_and_becomes_current(harness, monkeypatch):
-    """B2 wave-record authority change (deliberate, supersedes delta-review D2 for
-    DISPATCHED waves): the earned delta panel ran — garbage answers and all — so it
-    pays its cycle and replaces the paid predecessor. The old free-retry
-    preservation survives only for nothing-dispatched waves (next test)."""
+def test_dispatched_degraded_wave_pays_and_the_identical_envelope_redispatches(harness, monkeypatch):
+    """B2 wave-record authority: a panel that RAN and came back DEGRADED (garbage answers,
+    not window-spent lanes) pays its cycle like any other paid wave, and — having no
+    structural epoch — the identical envelope RE-DISPATCHES instead of replaying it."""
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
-    blocking = json.dumps([_finding("f1", "blocking", breaks="claim_1")])
-    harness.install({"s1": blocking, "s2": blocking, "s3": CLEAN})
-    ctx = harness.make_ctx()
-    _call(ctx)
-    fp = _state(harness)["waves"][-1]["request_fingerprint"]
-    pr._handle_plan_task(ctx, review_disposition={"review_fingerprint": fp, "items": [
-        {"finding_id": "s1:f1", "decision": "reject", "rationale": "fine"},
-        {"finding_id": "s2:f1", "decision": "reject", "rationale": "fine"},
-    ]})
     harness.install({"s1": "garbage not an array", "s2": "also garbage", "s3": "nope"})
-    degraded = _call(ctx)  # the earned delta panel comes back DEGRADED — but it RAN
+    ctx = harness.make_ctx()
+    degraded = _call(ctx)
     assert _control(degraded) == {"outcome": "DEGRADED", "closed": False}
     state = _state(harness)
+    fp = state["waves"][-1]["request_fingerprint"]
     waves = [w for w in state["waves"] if w.get("request_fingerprint") == fp]
     assert len(waves) == 1 and waves[0]["aggregate"] == "DEGRADED"
     assert waves[0]["paid"] is True and not waves[0].get("degraded_retries")
-    assert state["cycles_paid"] == 2, "the dispatched delta panel charged its cycle"
-    # Fix 2: this DEGRADED wave has NO structural epoch (garbage answers, not
-    # window-spent lanes), so the identical envelope RE-DISPATCHES, never replays.
-    sub3 = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
+    assert state["cycles_paid"] == 1, "the dispatched panel charged its cycle"
+    sub2 = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
     fresh = _call(ctx)
-    assert len(sub3.calls) == 1 and "cached exact review" not in fresh
+    assert len(sub2.calls) == 1 and "cached exact review" not in fresh
     assert _control(fresh) == {"outcome": "GREEN", "closed": True}
-    assert _state(harness)["cycles_paid"] == 3
+    assert _state(harness)["cycles_paid"] == 2
 
 
 def test_nothing_dispatched_wave_stays_unpaid_and_preserves_the_paid_predecessor(tmp_path):
@@ -1354,20 +1324,6 @@ def test_engine_denies_the_runtime_data_plane_as_evidence(harness, tmp_path, mon
     ctx = harness.make_ctx()
     denied = pr._evidence_deny_paths(ctx)
     assert any(str(data_root) in d for d in denied)
-
-
-def test_unknown_disposition_id_does_not_earn_the_delta_cycle():
-    """Delta-review D3: an unknown finding id in the disposition invalidates the earn."""
-    from ouroboros.tools import plan_spec
-
-    findings = [{"finding_id": "s1:f1", "id": "f1", "class": "blocking", "breaks": "goal", "summary": "x"}]
-    ok = plan_spec.blocking_fully_rejected(findings, [
-        {"finding_id": "s1:f1", "decision": "reject", "rationale": "no"},
-        {"finding_id": "s9:zz", "decision": "reject", "rationale": "phantom"},
-    ])
-    assert ok is False
-    assert plan_spec.blocking_fully_rejected(findings, [
-        {"finding_id": "s1:f1", "decision": "reject", "rationale": "no"}]) is True
 
 
 def test_schema_conformant_clean_session_verdict_counts_as_clean():

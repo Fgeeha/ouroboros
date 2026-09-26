@@ -803,36 +803,16 @@ def aggregate(slot_results: Iterable[Mapping[str, Any]], *, quorum: Optional[int
     return {"aggregate": verdict, "reasons": reasons, "counts": counts, "findings": flat}
 
 
-def blocking_fully_rejected(findings, dispositions) -> bool:
-    """Whether EVERY blocking finding carries exactly one VALID reject disposition.
-
-    The earned-delta admission (a fully-rejected REVISE_PLAN wave buys its promised
-    delta cycle) must not trust raw items: an empty rationale, an unknown id, or a
-    contradictory accept+reject pair is refused by the closure table and must not
-    earn a paid panel (delta-review finding D1)."""
-    blocking = [f for f in findings or [] if isinstance(f, Mapping) and f.get("class") == "blocking"]
-    if not blocking:
-        return False
-    known = {str(f.get("finding_id") or f.get("id") or "") for f in findings or [] if isinstance(f, Mapping)}
-    seen: dict[str, str] = {}
-    invalid: set[str] = set()
-    for item in dispositions or []:
-        if not isinstance(item, Mapping):
-            continue
-        fid = str(item.get("finding_id") or "").strip()
-        decision = str(item.get("decision") or "").strip().lower()
-        ok = decision in DISPOSITION_DECISIONS and bool(str(item.get("rationale") or "").strip())
-        if fid not in known:
-            return False  # D3: an unknown id makes the whole disposition invalid — no earned cycle
-        if not ok or fid in seen:
-            invalid.add(fid)
-            continue
-        seen[fid] = decision
-    return all(
-        (fid := str(f.get("finding_id") or f.get("id") or "")) not in invalid
-        and seen.get(fid) == "reject"
-        for f in blocking
-    )
+def merge_dispositions(prior, new) -> list[dict]:
+    """One wave's answers after another call: every earlier answer survives unless this
+    call answers the same ``finding_id``, which then supersedes ALL earlier entries for that
+    id. Two entries for one id inside ONE call stay as written — ``closure_after_disposition``
+    refuses that contradiction and the finding stays open. Non-mapping entries are dropped."""
+    fresh = [dict(item) for item in new or [] if isinstance(item, Mapping)]
+    answered = {str(item.get("finding_id") or "").strip() for item in fresh}
+    kept = [dict(item) for item in prior or [] if isinstance(item, Mapping)
+            and str(item.get("finding_id") or "").strip() not in answered]
+    return kept + fresh
 
 
 def closure_after_disposition(

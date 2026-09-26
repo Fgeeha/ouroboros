@@ -1013,3 +1013,33 @@ def test_the_findings_contract_advertises_locator_forms_and_range_selectors() ->
         assert token in PLAN_FINDINGS_ARRAY_CONTRACT, token
     assert _PLAN_FINDING_ELEMENT_SCHEMA.startswith("{")
     assert _PLAN_FINDING_ELEMENT_SCHEMA.endswith("}")
+
+
+def test_merge_dispositions_keeps_earlier_answers_and_supersedes_only_the_answered_id() -> None:
+    """One wave's answers after another call: order is kept-then-fresh, a later answer
+    replaces every earlier entry for ITS id only, and non-mapping entries are dropped."""
+    from ouroboros.tools.plan_spec import merge_dispositions
+
+    a = {"finding_id": "s1:q1", "decision": "accept", "rationale": "yes"}
+    b = {"finding_id": "s2:q2", "decision": "defer", "rationale": "later"}
+    a2 = {"finding_id": "s1:q1", "decision": "reject", "rationale": "no"}
+    assert merge_dispositions([], [a]) == [a]
+    assert merge_dispositions([a], [b]) == [a, b]
+    assert merge_dispositions([a, b], [a2]) == [b, a2]
+    assert merge_dispositions([a, a2], [b]) == [a, a2, b]  # an earlier contradiction is not rewritten
+    assert merge_dispositions([a, "junk", None], [b, 3]) == [a, b]
+    assert merge_dispositions(None, None) == []
+
+
+def test_merge_dispositions_keeps_a_within_call_duplicate_for_closure_to_refuse() -> None:
+    """Two entries for one id in ONE call stay as written: ``closure_after_disposition`` reads
+    them as a contradiction (``duplicate_disposition``) and keeps the finding open."""
+    from ouroboros.tools.plan_spec import closure_after_disposition, merge_dispositions
+
+    twice = [{"finding_id": "1:q1", "decision": "accept", "rationale": "yes"},
+             {"finding_id": "1:q1", "decision": "reject", "rationale": "no"}]
+    merged = merge_dispositions([], twice)
+    assert merged == twice
+    question = {"finding_id": "1:q1", "id": "q1", "class": "need_evidence", "breaks": "claim_1", "summary": "?"}
+    closure = closure_after_disposition("REVIEW_REQUIRED", [question], merged, "blocking")
+    assert closure["closed"] is False and "duplicate_disposition:1:q1" in closure["notes"]

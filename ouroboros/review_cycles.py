@@ -10,7 +10,8 @@ default would silently swallow ``"unlimited"``. ``review_max_cycles()`` returns
 ``Optional[int]`` — ``None`` means unlimited.
 
 Per-gate meaning of the ONE number — on every gate it counts PAID cycles, and
-identical material is never re-reviewed for pay:
+identical material is never re-reviewed for pay unless the mind sends it with
+answers (a plan re-ask addressed by ``review_disposition`` items is one paid cycle):
 
 * plan review — paid reviewer-panel cycles per task (the engine consumes the
   getter; this module only exposes it);

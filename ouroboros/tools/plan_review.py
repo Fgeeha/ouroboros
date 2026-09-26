@@ -21,9 +21,10 @@ verdict); need_evidence closes by disposition at $0; under advisory enforcement 
 reject with its rationale also closes a below-quorum blocking finding (per
 finding), under blocking it stays open until a changed spec is reviewed or the
 reviewer retires it; a REVIEW_REQUIRED whose open set empties is recorded GREEN.
-REVISE_PLAN never closes by disposition. A subsequent paid delta review may
-evaluate a changed spec or a justified rejection when another paid cycle is
-available. Under blocking enforcement an open wave HOLDS
+REVISE_PLAN never closes by disposition. Answers merge by ``finding_id`` across
+calls; an envelope sent with ``review_disposition`` items records them first and
+is then reviewed; no host path buys a panel the mind did not send. Under
+blocking enforcement an open wave HOLDS
 finalization (``owner_hurry.force_plan_decision``); at the cap the typed
 ``plan_review_cycles_exhausted`` result + event leave the honest exits: owner
 unstick or a ``blocked_with_evidence`` terminal. Advisory proceeds open under the
@@ -372,30 +373,42 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
     if raw_disposition is not None and not disposition_vacuous:
         if isinstance(raw_disposition, dict) and "author_action" in raw_disposition:
             return _apply_author_subject(ctx, raw_disposition, params if envelope_fields else None)
-        if envelope_fields:
-            return _typed_refusal(
-                ctx, "TOOL_ARG_ERROR",
-                "ERROR: PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE: disposition mode accepts "
-                "review_disposition only; a changed plan needs a new review-mode call "
-                "without review_disposition. No plan attempt was recorded. Non-empty plan fields: "
-                + _argument_values(params, envelope_fields),
-            )
         if not isinstance(raw_disposition, dict):
             return _typed_refusal(
                 ctx, "TOOL_ARG_ERROR",
                 "ERROR: PLAN_REVIEW_DISPOSITION_INVALID: review_disposition must be an object",
             )
-        return _apply_disposition(ctx, raw_disposition)
+        if not envelope_fields:
+            return _apply_disposition(ctx, raw_disposition)
+        # Answers travelling with an envelope: the envelope is validated FIRST through the
+        # read-only prepare (an invalid one records nothing — a superseding raw attempt would
+        # make the answered wave stale and its answers undeliverable), the answers are
+        # recorded merged, then the envelope is reviewed with them in view.
+        request = _request_of(params)
+        try:
+            prepared = _prepare_plan_inputs(ctx, request, _planning_state_location(ctx)[0])
+        except ValueError as exc:
+            return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}")
+        if prepared.get("error"):
+            return _typed_refusal(ctx, str(prepared.get("code") or "TOOL_ARG_ERROR"), prepared["error"])
+        return _apply_disposition(ctx, raw_disposition, then_review=lambda items: _review(ctx, request))
     if "review_disposition" in params and not envelope_fields:
         return _typed_refusal(
             ctx, "TOOL_ARG_ERROR",
             "ERROR: PLAN_REVIEW_DISPOSITION_EMPTY: submit goal, plan and spec for review "
             "mode, or a complete review_disposition as the only field. No plan attempt was recorded.",
         )
-    request = _PlanRequest(
+    return _review(ctx, _request_of(params))
+
+
+def _request_of(params: dict) -> "_PlanRequest":
+    return _PlanRequest(
         goal=str(params.get("goal") or ""), plan=str(params.get("plan") or ""), spec=params.get("spec"),
         reviewer_effort=params.get("reviewer_effort"),
     )
+
+
+def _review(ctx: ToolContext, request: "_PlanRequest") -> str:
     try:  # the ToolEntry envelope is the outer settlement bound (plan_review_collect.run_plan_coroutine)
         return _collect.run_plan_coroutine(_run_plan_review_async(ctx, request))
     except Exception as e:
@@ -676,20 +689,9 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             return _publish_rendered_wave(ctx, existing, cap=cap, cycles_paid=cycles_paid,
                 enforcement=enforcement, cached=True, reminder=reminder, historical_feedback=historical)
         resume_in_flight = _plan_wave_has_in_flight(existing)
-        # Identical requests replay free unless authority lapsed; fully rejected
-        # blocking findings are the one earned-delta exception (4e133c8a).
-        earned_delta = (
-            str(existing.get("aggregate")) in {"REVISE_PLAN", "REVIEW_REQUIRED"}
-            and not existing.get("closed")
-            # D1: only VALID rejections earn the panel — raw items are persisted for
-            # disclosure, but an invalid or contradictory one must not buy a cycle.
-            and plan_spec.blocking_fully_rejected(
-                existing.get("findings"), existing.get("dispositions"))
-        )
-        if earned_delta and not resume_in_flight:
-            # the rejected wave IS the previous cycle for the delta panel
-            previous_override = existing
-        elif bool(existing.get("closed")) and not resume_in_flight:
+        # Identical requests replay free unless authority lapsed: no host path buys a
+        # panel the mind did not send (an addressed re-ask carries its items explicitly).
+        if bool(existing.get("closed")) and not resume_in_flight:
             # A closed verdict is earned authority; later roster changes govern
             # future panels and do not retroactively void it (accepted 3a).
             return _publish_rendered_wave(ctx, existing, cap=cap, cycles_paid=cycles_paid,
@@ -1040,6 +1042,7 @@ def _apply_author_subject(ctx: ToolContext, disposition: dict, envelope: Optiona
     from ouroboros.observability import redact_projection
     from ouroboros.review_custody import review_retry_cancelled
 
+    items: List[dict] = []
     try:
         if set(disposition) - {"review_fingerprint", "items", "author_disposition", "author_action"}:
             raise ValueError("unknown disposition fields: " + _argument_values(disposition,
@@ -1060,7 +1063,11 @@ def _apply_author_subject(ctx: ToolContext, disposition: dict, envelope: Optiona
         if wave:
             wave = _authority_wave(root, task_id, wave)
         if disposition.get("items"):
-            raise ValueError("submit per-finding dispositions separately before selecting the current author plan")
+            if not wave:
+                raise ValueError("items answer the findings of a recorded wave; this outcome has none")
+            items, item_error = _disposition_items(wave, disposition.get("items"))
+            if item_error:
+                raise ValueError(item_error.removeprefix("ERROR: PLAN_REVIEW_DISPOSITION_INVALID: "))
         from ouroboros.review_records import review_outcome_received
 
         if action == "finish" and review_enforcement_blocks("blocking") and not unavailable:
@@ -1079,6 +1086,8 @@ def _apply_author_subject(ctx: ToolContext, disposition: dict, envelope: Optiona
         else:
             raise ValueError("include goal, plan and spec to retain the exact current author plan")
         enforcement = get_review_enforcement()
+        if items:  # the same call's answers land on the critic wave first, merged by finding_id
+            wave, _closure = _record_disposition(root, task_id, wave, items, fingerprint=critic_fp, enforcement=enforcement)
         author = build_author_disposition_from_mapping(disposition.get("author_disposition"),
             subject_hash=fingerprint, reviewer_signal=str((wave or {}).get("aggregate") or "unavailable"), enforcement=enforcement)
         author["action"] = action
@@ -1102,6 +1111,7 @@ def _apply_author_subject(ctx: ToolContext, disposition: dict, envelope: Optiona
     signal = str((wave or {}).get("aggregate") or "DEGRADED")
     historical = bool(wave) and fingerprint != critic_fp
     text = (f"Current author plan saved: {fingerprint}. Critic subject: {critic_fp}. "
+            + (f"{len(items)} answer(s) recorded on the critic wave, merged by finding_id. " if items else "")
             + (f"Earlier plan {critic_fp} was {signal}; this revised plan has no verdict of its own. "
                if historical else "")
             + "No reviewer called and no cycle consumed; original findings and custody remain unchanged. "
@@ -1114,7 +1124,66 @@ def _apply_author_subject(ctx: ToolContext, disposition: dict, envelope: Optiona
         "author_action": action, "author_disposition": author}, text)
 
 
-def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
+def _disposition_items(wave: dict, raw_items: Any) -> tuple[List[dict], str]:
+    """Bound and validate one call's answers against the wave's findings → ``(items, error)``."""
+    if not isinstance(raw_items, list):
+        return [], "ERROR: PLAN_REVIEW_DISPOSITION_INVALID: items must be an array"
+    if len(raw_items) > 2 * len(wave.get("findings") or []) + 8:  # bounded like the findings they answer
+        return [], "ERROR: PLAN_REVIEW_DISPOSITION_INVALID: more items than findings could need"
+    items: List[dict] = []
+    for index, item in enumerate(raw_items):
+        if not isinstance(item, dict):
+            return [], f"ERROR: PLAN_REVIEW_DISPOSITION_INVALID: items[{index}] must be an object"
+        items.append({
+            "finding_id": str(item.get("finding_id") or "").strip()[:plan_spec.MAX_ID_CHARS * 2],
+            "decision": str(item.get("decision") or "").strip().lower()[:40],  # enum-like, bounded
+            "rationale": plan_spec.bounded_text(item.get("rationale"), plan_spec.MAX_FINDING_TEXT_CHARS),
+        })
+    known = {str(f.get("finding_id") or "") for f in wave.get("findings") or []}
+    unknown_ids = sorted({i["finding_id"] for i in items if i["finding_id"] not in known})
+    if unknown_ids:
+        return [], ("ERROR: PLAN_REVIEW_DISPOSITION_INVALID: unknown finding ids " + ", ".join(unknown_ids)
+                    + "; valid ids: " + ", ".join(sorted(known)))
+    return items, ""
+
+
+def _record_disposition(root: pathlib.Path, task_id: str, wave: dict, items: List[dict], *,
+                        fingerprint: str, enforcement: str, author_record: Optional[dict] = None) -> tuple[dict, dict]:
+    """Merge this call's answers into the wave's (``plan_spec.merge_dispositions``), close over
+    the MERGED answers, write the exact artifact, then the hot record → ``(stored, closure)``.
+    Store errors (OSError/TimeoutError/ValueError, incl. a stale or immutable wave) propagate."""
+    merged = plan_spec.merge_dispositions(wave.get("dispositions"), items)
+    closure = plan_spec.closure_after_disposition(
+        str(wave.get("aggregate") or ""), wave.get("findings") or [], merged, enforcement,
+    )
+    disposition_recorded_at = utc_now_iso()
+    prior_ref = wave.get("wave_artifact") if isinstance(wave.get("wave_artifact"), dict) else {}
+    closure_notes = [*closure["notes"], *([] if prior_ref else [
+        "exact_artifact_absent: v2 wave had no exact wave_artifact reference",
+    ])]
+    exact = _read_plan_review_wave_artifact(root, task_id, prior_ref) if prior_ref else dict(wave)
+    exact.update({
+        "dispositions": merged, "closed": bool(closure["closed"]),
+        "aggregate": closure["aggregate"], "closure_notes": closure_notes,
+        "disposition_recorded_at": disposition_recorded_at,
+        "supersedes_wave_artifact": prior_ref,
+    })
+    if author_record is not None:
+        exact["author_disposition"] = author_record
+    disposition_ref = _persist_plan_review_wave_artifact(root, task_id, exact)
+    stored = record_plan_review_dispositions(
+        root, task_id, fingerprint=fingerprint, dispositions=merged,
+        closed=bool(closure["closed"]), aggregate=closure["aggregate"], closure_notes=closure_notes,
+        wave_artifact=disposition_ref, recorded_at=disposition_recorded_at,
+        author_disposition=author_record,
+    )
+    return stored, closure
+
+
+def _apply_disposition(ctx: ToolContext, disposition: dict, *, then_review=None) -> str:
+    """``then_review(items)`` — the review of an envelope sent beside the answers — replaces
+    this call's own rendering at its two non-refusal exits, so nothing is published twice;
+    refusals and the already-closed note stand alone (a closed, immutable wave takes no answers)."""
     def _bad(text: str) -> str:  # every refusal below is an argument-shape refusal
         return _typed_refusal(ctx, "TOOL_ARG_ERROR", text)
 
@@ -1157,26 +1226,15 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
         except PlanReviewSourceUnavailable as exc:
             return _plan_unavailable(ctx, str(exc), "plan_review_exact_artifact_unavailable")
         if not disposition.get("items") and not disposition.get("author_disposition"):
-            return text
+            return then_review([]) if then_review is not None else text
         cycles_paid = int(state.get("cycles_paid") or 0)
     if wave.get("closed") and not plan_review_notes_are_annotatable(wave):
         return _publish_rendered_wave(ctx, wave, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
                                       cached=True,
                                       notes=["already_closed: this wave is closed; the disposition is not re-applied"])
-    raw_items = disposition.get("items")
-    if not isinstance(raw_items, list):
-        return _bad("ERROR: PLAN_REVIEW_DISPOSITION_INVALID: items must be an array")
-    if len(raw_items) > 2 * len(wave.get("findings") or []) + 8:  # bounded like the findings they answer
-        return _bad("ERROR: PLAN_REVIEW_DISPOSITION_INVALID: more items than findings could need")
-    items: List[dict] = []
-    for index, item in enumerate(raw_items):
-        if not isinstance(item, dict):
-            return _bad(f"ERROR: PLAN_REVIEW_DISPOSITION_INVALID: items[{index}] must be an object")
-        items.append({
-            "finding_id": str(item.get("finding_id") or "").strip()[:plan_spec.MAX_ID_CHARS * 2],
-            "decision": str(item.get("decision") or "").strip().lower()[:40],  # enum-like, bounded
-            "rationale": plan_spec.bounded_text(item.get("rationale"), plan_spec.MAX_FINDING_TEXT_CHARS),
-        })
+    items, item_error = _disposition_items(wave, disposition.get("items"))
+    if item_error:
+        return _bad(item_error)
     author_record = None
     if disposition.get("author_disposition") is not None:
         from ouroboros.review_custody import review_retry_cancelled
@@ -1194,38 +1252,9 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
             author_record = build_author_disposition_from_mapping(disposition["author_disposition"], subject_hash=fingerprint, reviewer_signal=str(wave.get("aggregate") or ""), enforcement=enforcement)
         except ValueError as exc:
             return _bad("ERROR: PLAN_REVIEW_DISPOSITION_INVALID: " + str(exc))
-    known = {str(f.get("finding_id") or "") for f in wave.get("findings") or []}
-    unknown_ids = sorted({i["finding_id"] for i in items if i["finding_id"] not in known})
-    if unknown_ids:
-        return _bad(
-            "ERROR: PLAN_REVIEW_DISPOSITION_INVALID: unknown finding ids " + ", ".join(unknown_ids)
-            + "; valid ids: " + ", ".join(sorted(known)),
-        )
-    closure = plan_spec.closure_after_disposition(
-        str(wave.get("aggregate") or ""), wave.get("findings") or [], items, enforcement,
-    )
-    disposition_recorded_at = utc_now_iso()
     try:
-        prior_ref = wave.get("wave_artifact") if isinstance(wave.get("wave_artifact"), dict) else {}
-        closure_notes = [*closure["notes"], *([] if prior_ref else [
-            "exact_artifact_absent: v2 wave had no exact wave_artifact reference",
-        ])]
-        exact = _read_plan_review_wave_artifact(root, task_id, prior_ref) if prior_ref else dict(wave)
-        exact.update({
-            "dispositions": list(items), "closed": bool(closure["closed"]),
-            "aggregate": closure["aggregate"], "closure_notes": closure_notes,
-            "disposition_recorded_at": disposition_recorded_at,
-            "supersedes_wave_artifact": prior_ref,
-        })
-        if author_record is not None:
-            exact["author_disposition"] = author_record
-        disposition_ref = _persist_plan_review_wave_artifact(root, task_id, exact)
-        stored = record_plan_review_dispositions(
-            root, task_id, fingerprint=fingerprint, dispositions=items,
-            closed=bool(closure["closed"]), aggregate=closure["aggregate"], closure_notes=closure_notes,
-            wave_artifact=disposition_ref, recorded_at=disposition_recorded_at,
-            author_disposition=author_record,
-        )
+        stored, closure = _record_disposition(root, task_id, wave, items, fingerprint=fingerprint,
+                                              enforcement=enforcement, author_record=author_record)
     except (OSError, TimeoutError, ValueError) as exc:
         return _typed_refusal(
             ctx, "TOOL_ERROR", "ERROR: PLAN_REVIEW_STATE_PERSIST_FAILED: " + str(exc))
@@ -1236,5 +1265,7 @@ def _apply_disposition(ctx: ToolContext, disposition: dict) -> str:
         "review closed." if closure["closed"] else
         f"{open_count} finding{'s'[:open_count != 1]} remain{'s'[:open_count == 1]} open." if open_count else
         "review stays open."))
+    if then_review is not None:
+        return then_review(items)
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=cycles_paid,
                                   enforcement=enforcement, notes=list(closure["notes"]))
