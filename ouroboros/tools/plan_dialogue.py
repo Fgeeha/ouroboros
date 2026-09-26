@@ -277,7 +277,7 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
     from ouroboros.review_execution import _messages_char_count
 
     own = manifest.get("own_dialogue") or {}
-    messages, tasks, lengths, coverage = dict(slot_messages), {}, {}, {}
+    messages, tasks, lengths, coverage, restarted = dict(slot_messages), {}, {}, {}, {}
     api = [slot for slot in slots if not slot_retrieves(slot)]
     limits = per_slot_input_token_limits([s.model for s in api], output_reserve=PLAN_REVIEW_MAX_TOKENS,
                                        tokenizer_margin=155_000, slots=api)
@@ -300,9 +300,16 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
                 # automatic source can shrink, never its prior paid inputs.
                 total = _messages_char_count(existing)
                 view, coverage[sid] = fit_dialogue_view(user_content, own, capacity - total + len(user_content) - len(seat))
-                messages[sid] = [{**m, "content": view + seat} if i == len(existing) - 1 and m.get("role") == "user" else dict(m)
-                                 for i, m in enumerate(existing)]
-            else:
+                continued = [{**m, "content": view + seat} if i == len(existing) - 1 and m.get("role") == "user" else dict(m)
+                             for i, m in enumerate(existing)]
+                if _messages_char_count(continued) <= capacity:
+                    messages[sid] = continued
+                else:
+                    # The prior transcript plus this packet exceeds this slot's window: the slot
+                    # goes out FRESH (disclosed on its row) instead of being dropped as oversize.
+                    existing = None
+                    restarted[sid] = "prior_transcript_exceeds_slot_window"
+            if not existing:
                 view, coverage[sid] = fit_dialogue_view(user_content, own, capacity - len(system_prompt) - len(seat))
                 messages[sid] = build_plan_review_messages(system_prompt, view + seat, plan_user_stable_len(view))
             lengths[sid] = _messages_char_count(messages[sid])
@@ -336,7 +343,7 @@ def dialogue_slot_inputs(slots: list, *, system_prompt: str, user_content: str,
             coverage[sid]["delivery"] = ("delegated_session" if slot_is_session(slot) else
                                          "native_retrieving" if slot_retrieves(slot) else "packet")
     return {"slot_messages": messages, "slot_session_tasks": tasks, "slot_prompt_chars": lengths,
-            "dialogue_delivery": coverage,
+            "dialogue_delivery": coverage, "continuation_restarted": restarted,
             "native_mandatory_read_chars": native_mandatory_chars,
             "request_policy": {"output_contract": PLAN_FINDINGS_ARRAY_CONTRACT,
                                "native_data_root": str(data_root),

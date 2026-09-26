@@ -886,8 +886,10 @@ authority, and prose outside the array is not parsed.
   paid cycle) or the slot that raised it no longer raising it in a later paid cycle. A
   REVIEW_REQUIRED wave whose open set empties is recorded GREEN.
 - **REVISE_PLAN** — blocking findings at quorum. A disposition can never close it: the agent
-  either changes the spec (a new fingerprint, the next paid cycle) or rejects a blocking finding
-  with a rationale that rides into that next cycle, where reviewers mark it resolved or still open.
+  either changes the spec (a new fingerprint, the next paid cycle) or answers a blocking finding
+  and sends the unchanged envelope with that answer, which asks again only the slot that raised
+  it (one paid cycle; every other slot keeps its recorded answer at $0) so it marks the finding
+  resolved or still open.
 - **DEGRADED** — no parseable quorum. Not a verdict, but the dispatched panel PAID its cycle:
   the wave records OPEN with each slot's typed failure state (code and reset time when known),
   the control line reports DEGRADED honestly, and the recorded result replays for free ONLY
@@ -905,9 +907,12 @@ authority, and prose outside the array is not parsed.
   stays held), waiting via a one-shot `schedule_followup` and asking the owner stay open too.
 
 Paid cycles per task are bounded by the owner's `OUROBOROS_REVIEW_MAX_CYCLES` (default 2,
-`unlimited` available). Replaying an identical envelope is free — identical including the
-evidence the host attaches for reviewers' `need_evidence` requests, so a request received in the
-last cycle makes the next envelope a new one. On cycle 2+ every reviewer sees
+`unlimited` available). Replaying an identical envelope without answers is free — identical
+including the evidence the host attaches for reviewers' `need_evidence` requests, so a request
+received in the last cycle makes the next envelope a new one. Answers merge by `finding_id`
+across calls; the identical envelope sent WITH `review_disposition` items is the addressed
+re-ask (one paid cycle for the named slots only), and no host path buys a panel the agent did
+not send. On cycle 2+ every reviewer sees
 all reviewers' findings from the previous cycle, the agent's dispositions and the spec delta, and
 its first duty is to adjudicate its OWN earlier findings (the rows whose finding_id starts with its
 panel seat): RESOLVED (the delta or the rationale answers it) and SUPERSEDED (the element it targeted

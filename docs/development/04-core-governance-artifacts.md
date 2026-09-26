@@ -33,8 +33,9 @@ head cut `truncated_to_<N>`), and a re-asked locator stays `need_evidence`
 Classification, packet composition, bounds and wave/replay mechanics: ARCHITECTURE §6 "Plan
 construction and review", `ouroboros/tools/plan_packet.py`, `plan_spec.py`.
 
-Exact-wave custody is fail-closed: the evidence continuation uses a fresh
-full-packet dispatch only when no exact artifact reference exists; an unreadable
+Exact-wave custody is fail-closed: each packet slot continues its recorded
+transcript; the panel goes out fresh only when no exact artifact reference exists
+or the roster changed, each packet slot disclosing its cause; an unreadable
 referenced artifact returns `plan_review_exact_artifact_unavailable` and never
 mints replacement authority.
 
@@ -82,9 +83,12 @@ Accept, reject or defer findings. Disposition-only
 `plan_task(review_disposition={review_fingerprint, items:[{finding_id, decision, rationale}]})`
 closes `need_evidence` at $0, one item per required finding; under advisory a
 reasoned reject also closes a below-quorum blocking finding.
-Duplicate, conflicting, unknown, stale, incomplete, mixed or vacuous calls
+Answers merge by `finding_id` across calls: a later answer supersedes only its
+own id, and two entries for one id in ONE call stay contradictory and open.
+Duplicate, conflicting, unknown, stale, incomplete or vacuous calls
 return typed argument errors before recording; `plan_review._handle_plan_task` ignores
-default-empty optional fields. Do not replay plans for dispositions.
+default-empty optional fields. An envelope sent with items records them first,
+then reviews.
 
 Only explicit `review_disposition.author_action`, author disposition and critic
 fingerprint select corrected goal/plan/spec. Exact `current_attempt.author_subject`
@@ -121,7 +125,7 @@ post-consolidation reader or the acceptance directive ledger that task
 acceptance keeps (`review_evidence._accept_owner_directives`). JSONL records
 and chat line selectors split on physical LF only, never on valid Unicode
 inside a message. Each consumer redacts at its boundary and discloses missing
-source or ranges; a replay or earned paid retry of the same author request
+source or ranges; a replay or an addressed re-ask of the same author request
 keeps its recorded snapshot (complete and uncapped; the inline view is the
 conversation only, with a pointer naming exact omitted line ranges),
 disclosing later messages as unreviewed. Follow

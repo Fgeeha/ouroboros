@@ -508,30 +508,6 @@ def test_worst_case_state_successor_receives_the_current_decision_core(tmp_path)
         assert decision_fact in preview
 
 
-def test_below_quorum_blocking_rejection_earns_the_promised_delta_cycle(harness, monkeypatch):
-    """R9-5: a REVIEW_REQUIRED wave carrying ONE below-quorum blocking finding cannot be closed
-    by disposition (C-08); the closure table promises "the next paid delta cycle" for its
-    rejection — so an identical envelope after a valid reject must RUN that paid delta panel,
-    not replay the cached wave forever."""
-    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
-    blocking = json.dumps([_finding("f1", "blocking", breaks="claim_1")])
-    harness.install({"s1": blocking, "s2": CLEAN, "s3": CLEAN})  # 1 of 3 < quorum(2)
-    ctx = harness.make_ctx()
-    out = _call(ctx)
-    assert _control(out) == {"outcome": "REVIEW_REQUIRED", "closed": False}
-    fp = _state(harness)["waves"][-1]["request_fingerprint"]
-    replay = _call(ctx)  # nothing rejected yet: idempotent replay
-    assert "cached" in replay.lower() and _state(harness)["cycles_paid"] == 1
-    closed = pr._handle_plan_task(ctx, review_disposition={"review_fingerprint": fp, "items": [
-        {"finding_id": "s1:f1", "decision": "reject", "rationale": "the visa is already granted"},
-    ]})
-    assert _control(closed) == {"outcome": "REVIEW_REQUIRED", "closed": False}
-    sub = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
-    delta = _call(ctx)  # same envelope: the rejection now buys the promised delta panel
-    assert _control(delta) == {"outcome": "GREEN", "closed": True}
-    assert len(sub.calls) == 1 and _state(harness)["cycles_paid"] == 2
-
-
 def test_disposition_inputs_are_bounded_at_entry(harness):
     """R9-4: a disposition is bounded like the findings it answers — the rationale text and the
     item count — so a $0 closure can always be persisted."""
@@ -615,30 +591,30 @@ def test_a_truncated_requested_document_dispatches_with_the_cut_named(harness):
     assert "cannot_verify" not in out
 
 
-def test_a_compacted_paid_predecessor_degrades_to_a_fresh_dispatch(harness, monkeypatch):
-    """When the prior exact wave is gone (compacted out of the hot state), the evidence
-    continuation is a cache miss: the wave re-dispatches fresh and every slot row
-    discloses the typed `prior_exact_wave_missing` cause."""
+def test_a_predecessor_the_state_cannot_name_dispatches_fresh_without_a_delta(harness, monkeypatch):
+    """When no paid predecessor can be named at all, the cycle has nothing to continue: it
+    dispatches fresh like a first cycle and discloses nothing (a NAMED predecessor whose exact
+    record is gone is the per-slot `prior_exact_wave_ref_missing` cause, pinned in
+    ``tests/test_phase4_plan_review_continuity.py``)."""
     (harness.workspace / "notes.md").write_text("deck notes\n", encoding="utf-8")
     ask = json.dumps([_finding("f1", "need_evidence", breaks="goal", locator="notes.md",
                                summary="I need the notes")])
     sub = harness.install({"s1": ask, "s2": CLEAN, "s3": CLEAN})
     _call(harness.make_ctx())
-    monkeypatch.setattr(pr, "_last_paid_wave", lambda state: None)
+    monkeypatch.setattr(pr, "_last_paid_wave", lambda state, *_a, **_k: None)
     sub = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
     out = _call(harness.make_ctx())
     assert len(sub.calls) == 1  # dispatched, not refused
     wave = _state(harness)["waves"][-1]
     assert wave["paid"] is True
-    deltas = [d for row in wave["actors"] for d in row.get("capability_delta") or []]
-    assert deltas and all(d["kind"] == "capability_delta" for d in deltas)
-    assert {d["reason"] for d in deltas} == {"prior_exact_wave_missing"}
+    assert not [d for row in wave["actors"] for d in row.get("capability_delta") or []]
     assert "cannot_verify" not in out
 
 
 def test_first_cycle_and_no_request_delta_cycle_carry_no_continuation_delta(harness):
-    """The `reviewer_requested` guard is load-bearing: a cycle with no reviewer request
-    has no prior thread to continue, so it must not disclose a missing predecessor."""
+    """A first cycle has nothing to continue and discloses nothing; a delta cycle with no
+    reviewer request CONTINUES every packet slot's recorded transcript, so it discloses
+    nothing either."""
     sub = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
     _call(harness.make_ctx())
     wave = _state(harness)["waves"][-1]
@@ -853,7 +829,7 @@ def test_reviewer_question_holds_the_wave_until_a_free_disposition_and_its_answe
     [finding] = wave["findings"]
     assert finding["class"] == "need_evidence" and finding["breaks"] == "claim_1" and finding["locator"] == ""
     assert _state(harness).get("need_evidence_seen", []) == []  # a question is not a locator the host attaches
-    assert "a question addressed to you by spec id" in first and "defer = deferred openly" in first
+    assert "Open questions to you: s1:q1 (claim_1)." in first and "defer = deferred openly" in first
     answered = pr._handle_plan_task(ctx, review_disposition={
         "review_fingerprint": wave["request_fingerprint"],
         "items": [{"finding_id": "s1:q1", "decision": "accept", "rationale": "The board asked for five."}]})

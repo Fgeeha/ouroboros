@@ -94,6 +94,8 @@ def test_advisory_author_can_select_current_plan_after_no_dispatch_outcome(harne
 
 
 def test_full_plan_needs_explicit_action_even_with_a_prior_wave(harness, monkeypatch):  # noqa: F811
+    """A changed plan beside a stance (no author_action) is REVIEWED — the stance lands on the
+    critic wave, the envelope goes to the panel — and is never SELECTED as the author plan."""
     h = harness
     h.state["enforcement"] = "advisory"
     monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
@@ -102,12 +104,17 @@ def test_full_plan_needs_explicit_action_even_with_a_prior_wave(harness, monkeyp
                            for slot in ("s1", "s2", "s3")})
     _call(ctx)
     before = load_plan_review_state(h.drive, ctx.task_id)
+    critic_fp = before["waves"][-1]["request_fingerprint"]
     result = _call(ctx, plan="Changed plan without a finish action.", review_disposition={
-        "review_fingerprint": before["waves"][-1]["request_fingerprint"], "items": [],
+        "review_fingerprint": critic_fp, "items": [],
         "author_disposition": {"disposition": "partial", "rationale": "This is a stance, not a finish choice."}})
-    assert "PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE" in result
-    assert load_plan_review_state(h.drive, ctx.task_id) == before
-    assert len(transport.calls) == 1
+    assert "Current author plan saved" not in result and "ERROR:" not in result
+    after = load_plan_review_state(h.drive, ctx.task_id)
+    assert len(transport.calls) == 2 and after["cycles_paid"] == 2
+    assert after["current_attempt"]["fingerprint"] != critic_fp
+    assert not after["current_attempt"].get("author_subject"), "a full plan is never selected without author_action"
+    critic = next(w for w in after["waves"] if w["request_fingerprint"] == critic_fp)
+    assert critic["author_disposition"]["rationale"] == "This is a stance, not a finish choice."
 
 
 @pytest.mark.parametrize("action", [None, "none"])
@@ -166,13 +173,12 @@ def test_neutral_action_records_finding_answers_but_no_author_finish(harness, mo
 
 @pytest.mark.parametrize("field,value", [("goal", "Changed goal"), ("plan", "Changed plan"),
     ("spec", {"in_scope": ["Changed scope"]})])
-def test_neutral_action_still_rejects_a_real_mixed_envelope(harness, field, value):  # noqa: F811
+def test_neutral_action_beside_a_malformed_envelope_is_refused_by_its_form(harness, field, value):  # noqa: F811
     ctx = harness.make_ctx()
     transport = harness.install({})
     result = pr._handle_plan_task(ctx, **{field: value}, reviewer_effort="low", review_disposition={
         "review_fingerprint": "f" * 64, "items": [], "author_action": "none"})
-    assert "PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE" in result
-    assert field + "=" in result and "Changed" in result
+    assert "PLAN_SPEC_INVALID" in result or "PLAN_RESOURCE_FORM_REQUIRED" in result, result
     assert not transport.calls and not (harness.drive / "task_results" / (ctx.task_id + ".json")).exists()
 
 
@@ -244,8 +250,7 @@ def test_omitted_action_keeps_intentional_legacy_advisory_finish(harness, monkey
     assert not after["waves"][-1]["closed"] and len(transport.calls) == 1
 
 
-def test_mixed_envelope_error_discloses_bounded_field_previews(harness):  # noqa: F811
+def test_envelope_form_refusal_beside_answers_stays_bounded(harness):  # noqa: F811
     result = pr._handle_plan_task(harness.make_ctx(), plan="Long plan " * 10_000,
         review_disposition={"review_fingerprint": "f" * 64, "items": []})
-    assert "PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE" in result and "plan=" in result
-    assert "OMISSION NOTE" in result and len(result) < 1200
+    assert "PLAN_SPEC_INVALID" in result and len(result) < 1200

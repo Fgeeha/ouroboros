@@ -315,8 +315,10 @@ def plan_deadline_skip(ctx: ToolContext, *, emit: bool = False) -> str:
         f"review window of {int(scaled)}s (< {int(minimum)}s useful floor)."
     )
     return (
-        f"PLAN_TASK_SKIPPED_DEADLINE: {cause} Proceed with your own best plan "
-        "directly; do not re-call plan_task under this deadline."
+        f"PLAN_TASK_SKIPPED_DEADLINE: {cause} This call dispatched no reviewer; remaining time "
+        f"{max(0, int(remaining))}s. Any recorded plan review keeps its state (open stays open, its "
+        "answers stay recorded); the same call under this deadline returns this rail again. The "
+        "deadline is the owner's task bound, not a reviewer verdict."
     )
 
 
@@ -572,6 +574,7 @@ def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
     facts = {
         **_typed_facts_from(row, lambda source, key: source.get(key)),
         "capability_delta": row.get("capability_delta") or [],
+        **({"replayed_from": dict(row["replayed_from"])} if isinstance(row.get("replayed_from"), dict) and row["replayed_from"] else {}),
     }
     physical_attempt_state = str(row.get("physical_attempt_state") or "")
     provider_status_code = row.get("provider_status_code")
@@ -605,6 +608,7 @@ def synthesize_plan_review_wave(
     enforcement: str, cap: Any, quorum: int, configured_slots: list,
     health_evidence: Any, reviewer_effort: str = "", dispositions: Optional[list] = None,
     owner_efforts: Optional[dict] = None, standing: Optional[dict] = None,
+    standby_dispositions: Optional[list] = None,
 ) -> tuple[dict, set[str], dict]:
     """Validate raw actor rows and build one durable plan-review wave. ``dispositions``
     are the ones already recorded on the wave being collected (an author's answers
@@ -615,7 +619,11 @@ def synthesize_plan_review_wave(
     ``ordered_weaker``; ``standing`` (``plan_spec.plan_standing_findings``) is each seat's
     still-open findings from a same-spec predecessor: a seat that does not answer
     keeps them listed on this wave (``findings_carried_absent_answer``) — silence
-    never manufactures GREEN and never counts as parseable."""
+    never manufactures GREEN and never counts as parseable. ``standby_dispositions`` are
+    the answered wave's recorded answers for the seats an addressed re-ask sent: a finding
+    the host CARRIED for a seat's absence keeps its recorded answer (the mind's word stands
+    until the reviewer re-judges it), while a finding the seat re-emitted starts
+    undispositioned."""
     from ouroboros.tools import plan_spec
 
     ids = plan_spec.spec_ids(spec)
@@ -659,6 +667,10 @@ def synthesize_plan_review_wave(
             **({"carried_findings": len(carried)} if carried else {}),
         ))
     agg = plan_spec.aggregate(slot_results, quorum=quorum)
+    carried_ids = {str(f.get("finding_id") or "") for f in agg["findings"] if f.get("carried_absent_answer")}
+    dispositions = plan_spec.merge_dispositions(dispositions, [
+        d for d in standby_dispositions or [] if isinstance(d, Mapping)
+        and str(d.get("finding_id") or "").strip() in carried_ids]) if carried_ids and standby_dispositions else list(dispositions or [])
     # ONE closure table for every write path: a REVIEW_REQUIRED whose open set is
     # already empty (answers recorded while slots were in flight) is written GREEN.
     closure = plan_spec.closure_after_disposition(
