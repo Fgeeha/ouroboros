@@ -347,8 +347,17 @@ def in_flight_resume_inputs(
             "Refusing to infer custody from current reviewer health."
         )}
     frozen_rows = []
+    recorded_outputs = {str(r.get("slot_id") or ""): r for r in existing.get("reviewer_outputs") or [] if isinstance(r, dict)}
     for row in actor_rows:
-        if str(row.get("slot_id") or "") in dispatched_ids:
+        sid = str(row.get("slot_id") or "")
+        if sid in dispatched_ids:
+            continue
+        if isinstance(row.get("replayed_from"), dict) and row["replayed_from"]:
+            # A kept seat of an addressed re-ask: its recorded answer was replayed at $0 and
+            # is carried as a frozen row with its exact text re-attached (never re-sent).
+            frozen_rows.append({**row, "text": str((recorded_outputs.get(sid) or {}).get("text") or ""),
+                                "carried_output": recorded_outputs.get(sid) or {},
+                                "request_model": str(row.get("request_model") or row.get("model") or "")})
             continue
         if bool(row.get("ok")) or not str(row.get("error") or ""):
             return {"error": (
@@ -628,7 +637,7 @@ def exact_wave(
     outputs = []
     for row in rows:
         sid, route = str(row.get("slot_id") or ""), str(row.get("route") or "")
-        recorded = sent.get(sid) or {}
+        recorded = sent.get(sid) or (row.get("carried_output") if isinstance(row.get("carried_output"), dict) else None) or {}
         outputs.append({
             "slot_id": sid, "model": str(row.get("model") or ""),
             "request_model": str(row.get("request_model") or ""), "route": route,
@@ -657,6 +666,69 @@ def exact_wave(
         "slot_prompt_chars": copy.deepcopy(dispatched["slot_prompt_chars"] if dispatched is not None else slot_prompt_chars),
         "slots": [slot_row(slot) for slot in slots], "reviewer_outputs": outputs,
     }
+
+
+ADDRESSED_REASONS = ("envelope_changed", "not_the_answered_wave", "wave_closed", "no_quorum_to_keep", "no_finding_named")
+_KEPT_ROW_DROPS = frozenset({"ok", "disclosures", "raw_text_preview", "executions", "carried_findings"})
+
+
+def addressed_slots(existing: Optional[dict], address: Optional[dict], *, fingerprint: str) -> tuple[list[str], str]:
+    """The addressed answer, decided by structure only: ``address`` = the answers just recorded
+    (``review_fingerprint``, ``finding_ids``, ``was_open`` = the wave was open BEFORE they landed).
+    When the envelope's fingerprint equals the answered wave's, that wave was open, and it bears a
+    parseable quorum, the slots whose findings the items name are the ones to ask again → ``(slot
+    ids in roster order, "")``. Any other case follows the ordinary rule → ``([], reason)`` with
+    one of ``ADDRESSED_REASONS``; roster and in-flight cases are decided by the caller before."""
+    if not address:
+        return [], ""
+    if existing is None or str(existing.get("request_fingerprint") or "") != fingerprint:
+        return [], "envelope_changed"
+    if str(address.get("review_fingerprint") or "") != fingerprint:
+        return [], "not_the_answered_wave"
+    if not address.get("was_open"):
+        return [], "wave_closed"
+    if str(existing.get("aggregate") or "") == "DEGRADED":
+        return [], "no_quorum_to_keep"
+    named = {str(fid) for fid in address.get("finding_ids") or []}
+    seats = {str(f.get("slot") or "") for f in existing.get("findings") or []
+             if isinstance(f, dict) and str(f.get("finding_id") or "") in named}
+    ordered = [str(a.get("slot_id") or "") for a in existing.get("actors") or []
+               if isinstance(a, dict) and str(a.get("slot_id") or "") in seats]
+    return (ordered, "") if ordered else ([], "no_finding_named")
+
+
+def addressed_notes(reason: str) -> list[str]:
+    return [f"answers_not_addressed:{reason}"] if reason else []
+
+
+def kept_rows(existing: dict, slot_ids: list) -> list[dict]:
+    """The $0 replay rows of the seats an addressed re-ask does NOT send: each is its recorded
+    actor record with its exact recorded answer re-attached, marked ``not_dispatched`` with no
+    physical state and no cost, stamped ``replayed_from`` and carrying its recorded request
+    (``carried_output``) so the exact wave keeps it byte for byte. A failed seat is replayed as
+    recorded (failed, $0). A missing recorded answer fails closed."""
+    outputs = {str(r.get("slot_id") or ""): r for r in existing.get("reviewer_outputs") or [] if isinstance(r, dict)}
+    wanted, rows = {str(s) for s in slot_ids}, []
+    for actor in existing.get("actors") or []:
+        sid = str((actor or {}).get("slot_id") or "")
+        if not isinstance(actor, dict) or sid not in wanted:
+            continue
+        recorded = outputs.get(sid)
+        if recorded is None:
+            raise PlanReviewSourceUnavailable(
+                f"PLAN_REVIEW_SOURCE_UNAVAILABLE: recorded answer of kept reviewer slot {sid} is missing")
+        rows.append({
+            **{k: v for k, v in actor.items() if k not in _KEPT_ROW_DROPS},
+            "text": str(recorded.get("text") or ""), "error": actor.get("error") or None,
+            "request_model": str(recorded.get("request_model") or actor.get("model") or ""),
+            "operation_state": "not_dispatched", "physical_attempt_state": "", "operation_id": "",
+            "late_result_pending": False, "awaiting_since": "", "cost": 0.0, "tokens_in": 0, "tokens_out": 0,
+            "executions": [], "capability_delta": [], "carried_output": dict(recorded),
+            "replayed_from": {"request_fingerprint": str(existing.get("request_fingerprint") or ""),
+                              "cycle_index": int(existing.get("cycle_index") or 0),
+                              "operation_id": str(actor.get("operation_id") or "")},
+        })
+    return rows
 
 
 def compact_wave(wave: Dict[str, Any]) -> Dict[str, Any]:

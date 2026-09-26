@@ -572,6 +572,7 @@ def plan_row_typed_facts(row: Dict[str, Any]) -> Dict[str, Any]:
     facts = {
         **_typed_facts_from(row, lambda source, key: source.get(key)),
         "capability_delta": row.get("capability_delta") or [],
+        **({"replayed_from": dict(row["replayed_from"])} if isinstance(row.get("replayed_from"), dict) and row["replayed_from"] else {}),
     }
     physical_attempt_state = str(row.get("physical_attempt_state") or "")
     provider_status_code = row.get("provider_status_code")

@@ -1233,6 +1233,14 @@ def test_rejected_blocking_findings_replay_free_until_an_answer_is_addressed(har
     assert len(sub.calls) == 1 and "cached exact review" in again
     assert _state(harness)["cycles_paid"] == 1
     assert [d["finding_id"] for d in _state(harness)["waves"][-1]["dispositions"]] == ["s1:f1", "s2:f1"]
+    sub2 = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
+    addressed = _call(ctx, review_disposition={"review_fingerprint": fp, "items": [  # the SAME envelope WITH items
+        {"finding_id": "s1:f1", "decision": "reject", "rationale": "the deadline is fine"},
+        {"finding_id": "s2:f1", "decision": "reject", "rationale": "the deadline is fine"},
+    ]})
+    assert [s.slot_id for s in sub2.calls[0]["slots"]] == ["s1", "s2"], "only the seats the answers name are asked again"
+    assert "cycle 2" in addressed and _state(harness)["cycles_paid"] == 2
+    assert _control(addressed) == {"outcome": "GREEN", "closed": True}
 
 
 def test_dispatched_degraded_wave_pays_and_the_identical_envelope_redispatches(harness, monkeypatch):

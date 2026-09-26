@@ -85,6 +85,9 @@ from ouroboros.tools.plan_spec import plan_fingerprint as _plan_fingerprint
 from ouroboros.tools.plan_evidence import task_evidence_reader as _task_evidence_reader
 from ouroboros.tools.plan_dialogue import attach_own_dialogue, plan_chat_reader, dialogue_slot_inputs
 from ouroboros.tools.plan_review_artifacts import (
+    addressed_notes as _addressed_notes,
+    addressed_slots as _addressed_slots,
+    kept_rows as _kept_rows,
     standing_findings_lineage as _standing_findings_lineage,
     PlanReviewSourceUnavailable,
     attach_continuation_restart_delta as _attach_continuation_restart_delta,
@@ -391,7 +394,10 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
             return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}")
         if prepared.get("error"):
             return _typed_refusal(ctx, str(prepared.get("code") or "TOOL_ARG_ERROR"), prepared["error"])
-        return _apply_disposition(ctx, raw_disposition, then_review=lambda items: _review(ctx, request))
+        fp = str(raw_disposition.get("review_fingerprint") or "").strip()
+        return _apply_disposition(ctx, raw_disposition, then_review=lambda items, *, was_open: _review(
+            ctx, request, address={"review_fingerprint": fp, "was_open": was_open,
+                                   "finding_ids": [i["finding_id"] for i in items]}))
     if "review_disposition" in params and not envelope_fields:
         return _typed_refusal(
             ctx, "TOOL_ARG_ERROR",
@@ -408,9 +414,11 @@ def _request_of(params: dict) -> "_PlanRequest":
     )
 
 
-def _review(ctx: ToolContext, request: "_PlanRequest") -> str:
+def _review(ctx: ToolContext, request: "_PlanRequest", address: Optional[dict] = None) -> str:
     try:  # the ToolEntry envelope is the outer settlement bound (plan_review_collect.run_plan_coroutine)
-        return _collect.run_plan_coroutine(_run_plan_review_async(ctx, request))
+        coroutine = (_run_plan_review_async(ctx, request, address=address) if address is not None
+                     else _run_plan_review_async(ctx, request))  # a plain review keeps its two-argument shape
+        return _collect.run_plan_coroutine(coroutine)
     except Exception as e:
         log.error("plan_task failed: %s", e, exc_info=True)
         return _plan_unavailable(ctx, f"ERROR: Plan review failed: {e}", "review_failed")
@@ -614,6 +622,32 @@ def _standing_or_refusal(ctx: ToolContext, state_root, task_id: str, state: dict
         return _plan_unavailable(ctx, str(exc), "plan_review_exact_artifact_unavailable")
 
 
+def _budget_refusal(ctx: ToolContext, callable_slots: list, delivery: dict) -> str:
+    """The wave budget gate's refusal text for a fresh dispatch, or '' when admitted."""
+    admission = review_wave_budget_gate(
+        ctx, surface="plan_review", models=[str(s.model) for s in callable_slots],
+        prompt_chars=[delivery["slot_prompt_chars"][str(s.slot_id)] for s in callable_slots],
+        max_completion_tokens=_PLAN_REVIEW_MAX_TOKENS,
+    )
+    if admission is None:
+        return ""
+    fence, remedy = review_wave_binding_fence(admission)
+    return ("⚠️ PLAN_REVIEW_SKIPPED_BUDGET: the reviewer wave was declined before dispatch — "
+            f"estimated cost ~${admission.get('estimated_wave_usd')} exceeds the remaining budget "
+            f"${admission.get('remaining_usd')} ({fence}). No reviewer was called. Shrink the evidence, "
+            f"split the plan, or {remedy}.")
+
+
+def _carried_dispositions(existing: dict, named: list) -> list:
+    """The recorded answers that ride an addressed wave: those of the KEPT seats' findings. A
+    re-asked seat's findings start undispositioned even when it reuses an id — its earlier
+    answer is what it was asked to re-judge (the full history stays in the answered wave)."""
+    reasked = {str(f.get("finding_id") or "") for f in existing.get("findings") or []
+               if isinstance(f, dict) and str(f.get("slot") or "") in set(named)}
+    return [dict(d) for d in existing.get("dispositions") or []
+            if isinstance(d, dict) and str(d.get("finding_id") or "") not in reasked]
+
+
 def _predecessor_ref(existing: Optional[dict], previous: Optional[dict], state: dict, resume_in_flight: bool) -> dict:
     """The exact artifact of the predecessor this dispatch judged against: kept on resume, else
     the selected predecessor's own reference (its hot entry when the materialized copy lacks one),
@@ -624,8 +658,10 @@ def _predecessor_ref(existing: Optional[dict], previous: Optional[dict], state: 
     return dict((previous or {}).get("wave_artifact") or hot.get("wave_artifact") or {})
 
 
-async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, collect: Optional[dict] = None) -> str:
-    """``collect`` = the recorded inputs of an open wave being collected at $0 (window 0)."""
+async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, collect: Optional[dict] = None,
+                                 address: Optional[dict] = None) -> str:
+    """``collect`` = the recorded inputs of an open wave being collected at $0 (window 0);
+    ``address`` = the answers just recorded beside this envelope (the addressed re-ask)."""
     try:
         state_root, task_id = _planning_state_location(ctx)
     except ValueError as exc:
@@ -668,6 +704,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     previous_override: Optional[dict] = None
     replay_snapshot: Any = _PLAN_NO_SNAPSHOT
     resume_in_flight = False
+    named, unaddressed = [], ("envelope_changed" if address else "")
     # The declaration wraps the builder ONLY when non-empty: zero-arg stubs of the builder stay valid.
     slots_fn = (lambda: _plan_review_slots(default_effort=request.reviewer_effort)) if request.reviewer_effort else _plan_review_slots
     existing = plan_review_wave(state, fingerprint)
@@ -690,21 +727,27 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
                 enforcement=enforcement, cached=True, reminder=reminder, historical_feedback=historical)
         resume_in_flight = _plan_wave_has_in_flight(existing)
         # Identical requests replay free unless authority lapsed: no host path buys a
-        # panel the mind did not send (an addressed re-ask carries its items explicitly).
-        if bool(existing.get("closed")) and not resume_in_flight:
+        # panel the mind did not send. The addressed re-ask is the mind's explicit send:
+        # the identical envelope WITH answers asks again only the seats they name.
+        if not resume_in_flight:
+            named, unaddressed = _addressed_slots(existing, address, fingerprint=fingerprint)
+        if bool(existing.get("closed")) and not resume_in_flight and not named:
             # A closed verdict is earned authority; later roster changes govern
             # future panels and do not retroactively void it (accepted 3a).
-            return _publish_rendered_wave(ctx, existing, cap=cap, cycles_paid=cycles_paid,
-                                          enforcement=enforcement, cached=True, reminder=reminder)
-        elif not resume_in_flight:  # stale ⇒ identical envelope re-dispatches fresh
+            return _publish_rendered_wave(ctx, existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
+                                          cached=True, reminder=reminder, notes=_addressed_notes(unaddressed))
+        elif not resume_in_flight:  # stale ⇒ identical envelope re-dispatches fresh (every seat)
             stale, replay_snapshot = _plan_wave_replay_decision(slots_fn, existing)
-            if not stale:
+            if not stale and not named:
                 if not review_enforcement_blocks(enforcement):
                     # Still-OPEN wave: re-invoke the emitter so a durable append that FAILED
                     # at record time retries on replay (memo only on success ⇒ landed dedups).
                     _emit_plan_review_advisory_open(ctx, state_root, task_id=task_id,
                                                     wave=existing, cycles_paid=cycles_paid, cap=cap)
-                return _publish_rendered_wave(ctx, existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement, cached=True, reminder=reminder)
+                return _publish_rendered_wave(ctx, existing, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
+                                              cached=True, reminder=reminder, notes=_addressed_notes(unaddressed))
+            named = [] if stale else named
+            previous_override = existing if named else None  # the answered wave IS the previous cycle
     deadline_skip = _plan_deadline_skip(ctx)
     # An existing paid wave with a live physical reviewer is a custody
     # reconciliation, not a new planning dispatch.  Let it pass the owner
@@ -773,15 +816,16 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     slots, slot_messages, session_threads, continuation_restarted = _continuation_state(
         state_root, task_id, previous, slots, manifest, user_content=user_content,
     )
-    delivery = dialogue_slot_inputs(slots, system_prompt=system_prompt, user_content=user_content,
+    dispatch_slots = [s for s in slots if str(s.slot_id) in named] if named else slots
+    delivery = dialogue_slot_inputs(dispatch_slots, system_prompt=system_prompt, user_content=user_content,
         session_task=session_task, manifest=manifest, slot_messages=slot_messages,
         native_mandatory_chars=len(system_prompt) + len(user_content), data_root=state_root,
         frozen=existing if resume_in_flight else None, session_root=str(active_root), task_id=task_id)
     slot_messages = delivery["slot_messages"]
-    quorum = adaptive_quorum(len(slots))
+    quorum = adaptive_quorum(len(slots))  # the wave's quorum spans the whole roster; the send fits its seats
     fanout = _plan_fanout_inputs(
-        slots, resume=resume if resume_in_flight else None, replay_snapshot=replay_snapshot,
-        prompt_chars=len(system_prompt) + len(user_content), quorum=quorum,
+        dispatch_slots, resume=resume if resume_in_flight else None, replay_snapshot=replay_snapshot,
+        prompt_chars=len(system_prompt) + len(user_content), quorum=len(named) if named else quorum,
         slot_prompt_chars=delivery["slot_prompt_chars"],
     )
     pending_note = fanout["error"]
@@ -802,26 +846,19 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             cached=True, reminder="\n".join(x for x in (reminder, pending_note) if x))
     health_skip_rows, oversize_rows = fanout["health_skip_rows"], fanout["oversize_rows"]
     health_evidence = fanout["health_evidence"]
-    admission = None if resume_in_flight else review_wave_budget_gate(
-        ctx, surface="plan_review", models=[str(s.model) for s in callable_slots],
-        prompt_chars=[delivery["slot_prompt_chars"][str(s.slot_id)] for s in callable_slots],
-        max_completion_tokens=_PLAN_REVIEW_MAX_TOKENS,
-    )
-    if admission is not None:
-        fence, remedy = review_wave_binding_fence(admission)
-        return _plan_unavailable(
-            ctx,
-            "⚠️ PLAN_REVIEW_SKIPPED_BUDGET: the reviewer wave was declined before dispatch — "
-            f"estimated cost ~${admission.get('estimated_wave_usd')} exceeds the remaining budget "
-            f"${admission.get('remaining_usd')} ({fence}). No reviewer was called. Shrink the evidence, "
-            f"split the plan, or {remedy}.",
-            "review_budget_unavailable")
+    if not resume_in_flight and (refusal := _budget_refusal(ctx, callable_slots, delivery)):
+        return _plan_unavailable(ctx, refusal, "review_budget_unavailable")
+    try:  # the seats the answers did not name keep their recorded answers at $0
+        kept = _kept_rows(existing, [str(s.slot_id) for s in slots if str(s.slot_id) not in named]) if named else []
+    except PlanReviewSourceUnavailable as exc:
+        return _plan_unavailable(ctx, str(exc), "plan_review_exact_artifact_unavailable")
     ctx.emit_progress_fn(  # a $0 collection dispatches nothing, so it never reads as a plan being sent
         "📐 Plan review: checking for reviewer answers…" if collect is not None or resume_in_flight else
         (f"📐 Plan review: sending the plan to {len(callable_slots)} reviewer{'' if len(callable_slots) == 1 else 's'} "
          if callable_slots else "📐 Plan review: no reviewer lane can take the plan ")  # nothing is sent to zero lanes
         + f"(round {cycle_index}{'' if cap is None else f' of {cap}'}, {enforcement}{', constitutional' if constitutional else ''})"
-        + (f"; {len(health_skip_rows)} lane{'' if len(health_skip_rows) == 1 else 's'} skipped at $0" if health_skip_rows else "") + ("…" if callable_slots else ".")
+        + (f"; {len(health_skip_rows)} lane{'' if len(health_skip_rows) == 1 else 's'} skipped at $0" if health_skip_rows else "")
+        + (f"; {len(kept)} recorded answer{'' if len(kept) == 1 else 's'} kept at $0" if kept else "") + ("…" if callable_slots else ".")
     )
     rows = await _run_plan_review_slots(
         ctx, callable_slots, system_prompt=system_prompt, user_content=user_content,
@@ -841,7 +878,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         },
     ) if callable_slots else []
     # excluded slots stay configured rows: they count in the quorum denominator
-    rows = list(rows) + oversize_rows + health_skip_rows
+    rows = list(rows) + oversize_rows + health_skip_rows + kept
     _attach_continuation_restart_delta(rows, continuation_restarted)
     # The owner baseline for `ordered_weaker`: the same builder with no order, recorded at
     # dispatch and reused on resume (never recomputed from the live setting at collection).
@@ -855,11 +892,15 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         cycle_index=cycle_index, retry_key=retry_key, enforcement=enforcement, cap=cap,
         quorum=quorum, configured_slots=configured_slots,
         health_evidence=health_evidence, reviewer_effort=request.reviewer_effort,
-        dispositions=list((existing or {}).get("dispositions") or []) if resume_in_flight else None,
+        dispositions=list((existing or {}).get("dispositions") or []) if resume_in_flight else (
+            _carried_dispositions(existing, named) if named else None),
         owner_efforts=owner_efforts,
         standing=standing,
     )
     wave["previous_wave_artifact"] = _predecessor_ref(existing, previous, state, resume_in_flight)
+    if named:  # the lineage every reader can name: which seats were asked again, which kept their answer
+        wave["addressed"] = {"slots": list(named), "finding_ids": list(address.get("finding_ids") or []),
+                             "kept": [str(r.get("slot_id") or "") for r in kept], "wave_artifact": wave["previous_wave_artifact"]}
     aggregate = str(wave["aggregate"])
     exact_wave = _exact_wave(
         wave, plan_prose=request.plan, manifest=manifest, slots=configured_slots, rows=rows,
@@ -1181,9 +1222,10 @@ def _record_disposition(root: pathlib.Path, task_id: str, wave: dict, items: Lis
 
 
 def _apply_disposition(ctx: ToolContext, disposition: dict, *, then_review=None) -> str:
-    """``then_review(items)`` — the review of an envelope sent beside the answers — replaces
-    this call's own rendering at its two non-refusal exits, so nothing is published twice;
-    refusals and the already-closed note stand alone (a closed, immutable wave takes no answers)."""
+    """``then_review(items, was_open=...)`` — the review of an envelope sent beside the answers —
+    replaces this call's own rendering at its two non-refusal exits, so nothing is published
+    twice; refusals and the already-closed note stand alone (a closed, immutable wave takes no
+    answers). ``was_open`` is the wave's state BEFORE these answers landed."""
     def _bad(text: str) -> str:  # every refusal below is an argument-shape refusal
         return _typed_refusal(ctx, "TOOL_ARG_ERROR", text)
 
@@ -1226,8 +1268,9 @@ def _apply_disposition(ctx: ToolContext, disposition: dict, *, then_review=None)
         except PlanReviewSourceUnavailable as exc:
             return _plan_unavailable(ctx, str(exc), "plan_review_exact_artifact_unavailable")
         if not disposition.get("items") and not disposition.get("author_disposition"):
-            return then_review([]) if then_review is not None else text
+            return then_review([], was_open=not wave.get("closed")) if then_review is not None else text
         cycles_paid = int(state.get("cycles_paid") or 0)
+    was_open = not wave.get("closed")  # a closure this call causes never cancels its requested exchange
     if wave.get("closed") and not plan_review_notes_are_annotatable(wave):
         return _publish_rendered_wave(ctx, wave, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
                                       cached=True,
@@ -1266,6 +1309,6 @@ def _apply_disposition(ctx: ToolContext, disposition: dict, *, then_review=None)
         f"{open_count} finding{'s'[:open_count != 1]} remain{'s'[:open_count == 1]} open." if open_count else
         "review stays open."))
     if then_review is not None:
-        return then_review(items)
+        return then_review(items, was_open=was_open)
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=cycles_paid,
                                   enforcement=enforcement, notes=list(closure["notes"]))

@@ -328,6 +328,7 @@ def _closure_note_view(note: str) -> str:
         "blocking_finding_below_quorum_stays_open": "blocking findings remain open after disposition",
         "revise_plan_not_closable_by_disposition": "disposition does not close blocking findings",
         "degraded_not_closable_by_disposition": "no parseable reviewer quorum; disposition does not close the wave",
+        "answers_not_addressed": "the answers are recorded; no slot was asked again by them",
     }.get(prefix)
     return f"{prefix}: {meaning}" if meaning else str(note)
 
@@ -377,6 +378,12 @@ def _render_wave(
         + (", ".join(f"{o.get('locator')}: {o.get('reason')}" for o in manifest.get("omissions") or []) or "none"),
     ]
     lines.extend(_dialogue_source_view(wave, cached=cached))
+    if isinstance(wave.get("addressed"), dict) and wave["addressed"].get("slots"):
+        addressed = wave["addressed"]
+        lines.append(
+            f"**Addressed answer:** asked again {', '.join(addressed['slots'])} on "
+            f"{', '.join(addressed.get('finding_ids') or [])}"
+            + (f"; kept at $0: {', '.join(addressed['kept'])}" if addressed.get("kept") else "") + ".")
     if wave.get("compact"):
         ref = wave.get("wave_artifact") if isinstance(wave.get("wave_artifact"), dict) else {}
         artifact_path = str(ref.get("path") or "")
@@ -418,6 +425,8 @@ def _render_wave(
         + f" · {_actor_outcome(a, slot_class.get(id(a), ''))}"
         + ((" · not sent" if a.get("operation_state") == "not_dispatched" else " · did not answer")
            + "; its earlier finding is still listed" if a.get("carried_findings") else "")
+        + (f" · kept its cycle-{a['replayed_from'].get('cycle_index')} answer at $0"
+           if isinstance(a.get("replayed_from"), dict) and a["replayed_from"] else "")
         + (f" · disclosures: {', '.join(a['disclosures'])}" if a.get("disclosures") else "")
         for a in wave.get("actors") or []
     ] or ["(no actor records)"]
