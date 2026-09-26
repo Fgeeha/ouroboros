@@ -731,17 +731,19 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
         )
     if outcome == "REVIEW_REQUIRED":
         return (
-            f"{tag} Blocking plan review remains REVIEW_REQUIRED. Re-call plan_task with a "
-            "complete review_disposition as the only field, naming the latest fingerprint, "
-            "then continue; do not rerun reviewers."
+            f"{tag} Blocking plan review remains REVIEW_REQUIRED. Open need_evidence requests close "
+            "with a $0 review_disposition naming the latest fingerprint; a blocking finding below quorum "
+            "stays open until its slot no longer raises it in a later paid cycle (the unchanged envelope "
+            "with your items asks only that slot) or a changed spec is reviewed without it. "
+            "Implementation stays held while the review is open."
         )
     if outcome == "REVISE_PLAN":
         return (
-            f"{tag} Blocking plan review requires a revised spec. Change the spec — it carries "
-            "affected_paths, the files the work will change ([] when none) — and call "
-            "plan_task again (or reject the blocking findings with a rationale via "
-            "review_disposition). Continue analysis and non-mutating preparation, but do not "
-            "begin the work before the review closes or a real task-wide rail fires."
+            f"{tag} Blocking plan review is REVISE_PLAN. A changed spec — with affected_paths, the files "
+            "the work will change ([] when none) — is a new envelope every slot reviews; the unchanged "
+            "envelope with review_disposition items asks only the slots those items name. Analysis and "
+            "non-mutating preparation remain open; the work starts after the review closes or a real "
+            "task-wide rail fires."
         )
     return (
         f"{tag} Call plan_task with a concrete goal, plan and spec, whose affected_paths lists "

@@ -591,10 +591,11 @@ def test_a_truncated_requested_document_dispatches_with_the_cut_named(harness):
     assert "cannot_verify" not in out
 
 
-def test_a_compacted_paid_predecessor_degrades_to_a_fresh_dispatch(harness, monkeypatch):
-    """When the prior exact wave is gone (compacted out of the hot state), the evidence
-    continuation is a cache miss: the wave re-dispatches fresh and every slot row
-    discloses the typed `prior_exact_wave_missing` cause."""
+def test_a_predecessor_the_state_cannot_name_dispatches_fresh_without_a_delta(harness, monkeypatch):
+    """When no paid predecessor can be named at all, the cycle has nothing to continue: it
+    dispatches fresh like a first cycle and discloses nothing (a NAMED predecessor whose exact
+    record is gone is the per-slot `prior_exact_wave_ref_missing` cause, pinned in
+    ``tests/test_phase4_plan_review_continuity.py``)."""
     (harness.workspace / "notes.md").write_text("deck notes\n", encoding="utf-8")
     ask = json.dumps([_finding("f1", "need_evidence", breaks="goal", locator="notes.md",
                                summary="I need the notes")])
@@ -606,15 +607,14 @@ def test_a_compacted_paid_predecessor_degrades_to_a_fresh_dispatch(harness, monk
     assert len(sub.calls) == 1  # dispatched, not refused
     wave = _state(harness)["waves"][-1]
     assert wave["paid"] is True
-    deltas = [d for row in wave["actors"] for d in row.get("capability_delta") or []]
-    assert deltas and all(d["kind"] == "capability_delta" for d in deltas)
-    assert {d["reason"] for d in deltas} == {"prior_exact_wave_missing"}
+    assert not [d for row in wave["actors"] for d in row.get("capability_delta") or []]
     assert "cannot_verify" not in out
 
 
 def test_first_cycle_and_no_request_delta_cycle_carry_no_continuation_delta(harness):
-    """The `reviewer_requested` guard is load-bearing: a cycle with no reviewer request
-    has no prior thread to continue, so it must not disclose a missing predecessor."""
+    """A first cycle has nothing to continue and discloses nothing; a delta cycle with no
+    reviewer request CONTINUES every packet slot's recorded transcript, so it discloses
+    nothing either."""
     sub = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
     _call(harness.make_ctx())
     wave = _state(harness)["waves"][-1]
@@ -829,7 +829,7 @@ def test_reviewer_question_holds_the_wave_until_a_free_disposition_and_its_answe
     [finding] = wave["findings"]
     assert finding["class"] == "need_evidence" and finding["breaks"] == "claim_1" and finding["locator"] == ""
     assert _state(harness).get("need_evidence_seen", []) == []  # a question is not a locator the host attaches
-    assert "a question addressed to you by spec id" in first and "defer = deferred openly" in first
+    assert "Open questions to you: s1:q1 (claim_1)." in first and "defer = deferred openly" in first
     answered = pr._handle_plan_task(ctx, review_disposition={
         "review_fingerprint": wave["request_fingerprint"],
         "items": [{"finding_id": "s1:q1", "decision": "accept", "rationale": "The board asked for five."}]})

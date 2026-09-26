@@ -230,15 +230,21 @@ _DISPOSITION_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
     "description": (
-        "Answer the findings of the wave (ordinary dispositions use only this field); "
-        "explicit author_action=finish|stop with author_disposition may also select a full current goal/plan/spec without a new reviewer. The wave is "
-        "named by review_fingerprint. While that wave is still open with reviewer slots in "
-        "flight, this call first COLLECTS what has settled at $0 without waiting (items may be "
-        "[]); to wait longer, re-submit the same envelope. Notes never hold the wave; need_evidence "
-        "closes at $0; under advisory a reject with rationale also closes a below-quorum blocking "
-        "finding; otherwise a blocking finding stays open. A subsequent paid delta review may consider a changed spec or "
-        "justified rejection when another paid cycle is available. Recording a disposition "
-        "consumes no cycle and never closes REVISE_PLAN."
+        "Answer the findings of the wave named by review_fingerprint. Alone, this field records the "
+        "answers at $0, merged by finding_id (a later answer to the same id supersedes the earlier one; "
+        "every other answer stays). Beside goal/plan/spec the answers are recorded first and the envelope "
+        "is then reviewed: the unchanged envelope asks again ONLY the slots whose findings the items name, "
+        "in one paid cycle, and every other slot keeps its recorded answer at $0; a changed envelope is "
+        "reviewed by every slot with the answers in view. With author_action=finish|stop the items are "
+        "recorded and the current goal/plan/spec may be selected without a new reviewer. While the wave "
+        "still has reviewer slots in flight this call first COLLECTS what has settled at $0 without "
+        "waiting (items may be []); to wait longer, re-submit the same envelope. A note or need_evidence "
+        "finding closes at $0 by its answer; a blocking finding stays open until the slot that raised it "
+        "no longer raises it or a changed spec is reviewed without it (under advisory a reject with its "
+        "rationale also closes a below-quorum blocking finding). Recording answers consumes no cycle and "
+        "never closes REVISE_PLAN. A question you escalate to the owner (escalate) stays open until you "
+        "record its answer here: defer (rationale names the quiz) while the quiz is open, accept with the "
+        "owner's decision in the rationale once decided. A quiz answer never closes a finding by itself."
     ),
     "properties": {
         "review_fingerprint": {"type": "string"},
@@ -247,12 +253,16 @@ _DISPOSITION_SCHEMA = {
                           "description": "Default none means no author action, even if author_disposition is filled; collect or answer findings only. finish/stop explicitly select the current plan. stop permits unfinished finalization only; finish never overrides Blocking review."},
         "items": {
             "type": "array",
+            "description": ("Answers by finding_id. Every item names its reviewer slot; beside the unchanged "
+                            "envelope those slots are asked again."),
             "items": {
                 "type": "object", "additionalProperties": False,
                 "properties": {
                     "finding_id": {"type": "string"},
                     "decision": {"type": "string", "enum": list(plan_spec.DISPOSITION_DECISIONS)},
-                    "rationale": {"type": "string"},
+                    "rationale": {"type": "string", "description": (
+                        "Your answer. For an escalated question: the quiz id while it is open (defer), "
+                        "the owner's decision once answered (accept).")},
                 },
                 "required": ["finding_id", "decision", "rationale"],
             },
@@ -276,11 +286,14 @@ def get_tools():
                     "no open need_evidence (notes never change the verdict); need_evidence closes by "
                     "review_disposition at no cost; under advisory enforcement a reject with its rationale "
                     "also closes a blocking finding below quorum; REVISE_PLAN needs "
-                    "a changed spec or justified rejection judged by a subsequent paid delta review "
-                    "when another paid cycle is available. Cycles are bounded by the owner's Max review cycles; an unchanged "
+                    "a changed spec, or your answer re-judged by the slot that raised the finding. "
+                    "Cycles are bounded by the owner's Max review cycles; an unchanged "
                     "envelope replays the recorded result for free (a locator a reviewer asked for "
                     "with need_evidence is attached by the host next time and makes the envelope "
-                    "new; on an OPEN review a different reviewer_effort re-dispatches the panel, a CLOSED review stands for its envelope). Under blocking enforcement an "
+                    "new; on an OPEN review a different reviewer_effort re-dispatches the panel, a CLOSED review stands for its envelope); "
+                    "the unchanged envelope together with review_disposition items records the answers and asks again "
+                    "only the slots those items name (one paid cycle; the others keep their answers at $0), while a "
+                    "changed envelope with items is reviewed by every slot. Under blocking enforcement an "
                     "open review holds implementation. An explicit review_disposition.author_action=stop "
                     "permits unfinished finalization only. Advisory author_action=finish may select a corrected "
                     "goal+plan+spec in the same call without another panel, citing the earlier review_fingerprint "
@@ -298,7 +311,7 @@ def get_tools():
                         "spec": _SPEC_SCHEMA,
                         "reviewer_effort": {**_REVIEWER_EFFORT_SCHEMA,
                             "enum": ["default", *_REVIEWER_EFFORT_SCHEMA["enum"]], "default": "default",
-                            "description": "default uses the configured effort without an override; ignored when collecting or answering a recorded wave. " + _REVIEWER_EFFORT_SCHEMA["description"]},
+                            "description": "default uses the configured effort without an override; ignored when only collecting a recorded wave. " + _REVIEWER_EFFORT_SCHEMA["description"]},
                         "review_disposition": _DISPOSITION_SCHEMA,
                     },
                     # Review, disposition-only, or explicit author selection with a current envelope.
@@ -1037,11 +1050,12 @@ def _cycles_exhausted(
     )
     if review_enforcement_blocks(enforcement):
         head += (
-            "Blocking enforcement: the plan review stays OPEN, so implementation stays held — but "
+            "Blocking enforcement: the plan review stays OPEN, so implementation stays held — and "
             "finalization is RELEASED so the task can end honestly instead of waiting for a panel it "
-            "can no longer buy (owner decision D27). Your exits are an owner unstick (Swarm/hurry), a "
-            "revised spec once the owner raises OUROBOROS_REVIEW_MAX_CYCLES, or finalizing now with "
-            "outcome_tier=blocked_with_evidence. Do not start the work under an open blocking review."
+            "can no longer buy: finalizing now records outcome_tier=blocked_with_evidence with the "
+            "review left open. Recorded answers stay recorded evidence. Available authority beyond "
+            "yours: the owner may raise OUROBOROS_REVIEW_MAX_CYCLES (a revised spec then buys a paid "
+            "cycle) or perform an owner unstick — owner authority, never reviewer approval."
         )
     elif not review_enforcement_blocks("blocking"):
         head += "Cyber Pro permits proceeding by Ouroboros's judgment; the open review and spent cycles remain recorded facts."

@@ -240,7 +240,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 321400 -> 321600 (measured 321394): the closure sentence names the CONFIGURED enforcement against the hurry-projected advisory.
     # 321600 -> 321800 (measured 321594): the unanswered-slot floor names the terminal-absence rule and the lineage walk.
     # 323400 -> 327400 (merge of the moved target into the plan-review branch, measured 327146): both sides' paragraphs land together.
-    "docs/architecture/06-agent-core.md": 327400,
+    # 327400 -> 328400 (measured 328111): the addressed answer replaces the automatic delta; answers merge by
+    # finding_id; continuation per slot; the escalated-question clause (each extended in place).
+    "docs/architecture/06-agent-core.md": 328400,
     # 36991 -> 37300: the facade paragraph names the three loop constants runtime_limits.py
     # gained (events batch bound, budget-projection retry interval); no older text to displace.
     # 37300 -> 38400 (PR #1207): the Z.ai (`zai::`) direct provider gets its own route
@@ -373,7 +375,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 98300 -> 98600: the plan-review bullet gains the numbered-conversation delivery and the
     # observed-source read fact (extended in place) and two test pointers.
     # 98600 -> 99300 (merge of the moved target into the plan-review branch, measured 99030): both sides' paragraphs land together.
-    "docs/development/06-rules-by-change-class.md": 99300,
+    # 99300 -> 99800 (measured 99712): one bullet — plan-review answers merge by finding_id, the addressed re-ask
+    # and its $0 replay rows, the quiz-answer rule; the base sat 270 bytes under.
+    "docs/development/06-rules-by-change-class.md": 99800,
     "docs/development/07-managed-update-rule.md": 4166,
     "docs/development/08-mutation-attribution-rule.md": 2899,
     "docs/development/09-process-custody-rule.md": 10028,

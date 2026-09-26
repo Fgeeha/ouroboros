@@ -1092,6 +1092,14 @@ and what enforces each.
   author completion separately, never rewriting criticism or hiding independent failed
   effects, unaccepted review or unfinished stops (DEVELOPMENT §11; ARCHITECTURE §3).
   No task scope review or commit-gate reuse.
+- Plan-review answers are durable statements merged by `finding_id`: a later answer
+  supersedes only its own id, and two entries for one id in ONE call stay contradictory and
+  open. Answering and re-asking are one optional call: an envelope with items records them
+  first, then reviews; the unchanged envelope asks only the named slots, and every other
+  slot's recorded row is replayed at $0 (`not_dispatched` + `replayed_from`, never a send),
+  keyed by fingerprint equality. An addressed slot without a parseable answer keeps its
+  findings; a quiz answer never closes a finding; no host path buys a panel the mind did
+  not send (`tests/test_plan_review_answer_channel.py`).
 - Keep reviewer DIALOGUE evidence: typed `disposition_kind`/`obligation_id` identifies
   obligations; disclose unknown re-raise ids as `new`. Reopen rows with
   arguments intact. A terminal critic vote cannot deny author reaction or choose its stop. Blocking may save corrections and stop; advancement needs fresh
