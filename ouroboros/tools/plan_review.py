@@ -1290,6 +1290,12 @@ def _apply_disposition(ctx: ToolContext, disposition: dict, *, then_review=None)
         cycles_paid = int(state.get("cycles_paid") or 0)
     was_open = not wave.get("closed")  # a closure this call causes never cancels its requested exchange
     if wave.get("closed") and not plan_review_notes_are_annotatable(wave):
+        if then_review is not None:
+            # The already-closed exit applies only when no envelope is present: a closed, immutable
+            # wave takes no answers, but the envelope beside them is still reviewed (a changed one as
+            # an ordinary wave, the identical one as the free replay with its typed note).
+            ctx.emit_progress_fn("📐 Plan review: the named wave is closed and takes no answers; reviewing the envelope.")
+            return then_review([], was_open=False)
         return _publish_rendered_wave(ctx, wave, cap=cap, cycles_paid=cycles_paid, enforcement=enforcement,
                                       cached=True,
                                       notes=["already_closed: this wave is closed; the disposition is not re-applied"])

@@ -213,7 +213,7 @@ def test_changed_envelope_with_items_records_the_answers_then_reviews_every_slot
         "review_fingerprint": old_fp, "items": [_item("s1:f1", "reject", "the budget line is already approved")]})
     assert _control(result) == {"outcome": "GREEN", "closed": True}
     assert [s.slot_id for s in sub2.calls[0]["slots"]] == ["s1", "s2", "s3"]
-    assert "no slot was asked again by them (envelope_changed)" in result, "the typed note rides the full dispatch too"
+    assert "no slot was asked again by the answers (envelope_changed)" in result, "the typed note rides the full dispatch too"
     packet = _user_text(sub2.calls[0]["request"].messages[1]["content"])
     assert "PRIOR CYCLES" in packet and "the budget line is already approved" in packet
     state = _state(harness)
@@ -364,7 +364,7 @@ def test_unaddressable_waves_follow_their_ordinary_rule(harness, monkeypatch):  
     fp = _state(harness)["waves"][-1]["request_fingerprint"]
     sub = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
     closed = _call(ctx, review_disposition={"review_fingerprint": fp, "items": [_item("s1:n1", "accept", "noted")]})
-    assert not sub.calls and "answers_not_addressed: the answers are recorded; no slot was asked again by them (wave_closed)" in closed
+    assert not sub.calls and "answers_not_addressed: no slot was asked again by the answers (wave_closed)" in closed
     assert _ids(_state(harness)["waves"][-1]) == [("s1:n1", "accept")]
     # DEGRADED, no epoch: the identical envelope with items re-dispatches EVERY seat (no note, no kept row).
     degraded_ctx = harness.make_ctx(task_id="task-degraded")
@@ -376,8 +376,37 @@ def test_unaddressable_waves_follow_their_ordinary_rule(harness, monkeypatch):  
         _item("s1:f1", "reject", "already approved")]})
     assert _control(fresh) == {"outcome": "GREEN", "closed": True}
     assert [s.slot_id for s in sub2.calls[0]["slots"]] == ["s1", "s2", "s3"]
-    assert "answers_not_addressed: the answers are recorded; no slot was asked again by them (no_quorum_to_keep)" in fresh
+    assert "answers_not_addressed: no slot was asked again by the answers (no_quorum_to_keep)" in fresh
     assert "addressed" not in _state(harness, "task-degraded")["waves"][-1]
+
+
+def test_an_envelope_beside_answers_to_a_closed_wave_is_still_reviewed(harness, monkeypatch):  # noqa: F811
+    """A closed, immutable wave takes no answers, but the envelope beside them is reviewed: the
+    IDENTICAL envelope replays the closed wave free with `wave_closed`; a CHANGED envelope goes to
+    every seat as an ordinary wave (the old wave untouched, the typed note names why nothing was
+    addressed) — never the old closure returned for new bytes."""
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
+    harness.install({"s1": json.dumps([_question("q1")]), "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx)) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    fp = _state(harness)["waves"][-1]["request_fingerprint"]
+    assert _control(_answer(ctx, fp, _item("s1:q1"))) == {"outcome": "GREEN", "closed": True}
+    sub = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
+    identical = _call(ctx, review_disposition={"review_fingerprint": fp, "items": [_item("s1:q1", "defer", "later")]})
+    assert _control(identical) == {"outcome": "GREEN", "closed": True} and not sub.calls
+    assert "no slot was asked again by the answers (wave_closed)" in identical and "already_closed" not in identical
+    assert _ids(_state(harness)["waves"][-1]) == [("s1:q1", "accept")], "the immutable wave took no answer"
+    sub2 = harness.install({"s1": json.dumps([_finding("f1", "blocking", breaks="claim_1")]), "s2": CLEAN, "s3": CLEAN})
+    changed = _call(ctx, plan="A revised outline with a new budget line.",
+                    review_disposition={"review_fingerprint": fp, "items": [_item("s1:q1", "defer", "later")]})
+    assert _control(changed) == {"outcome": "REVIEW_REQUIRED", "closed": False}, "the new bytes got their own review"
+    assert [s.slot_id for s in sub2.calls[0]["slots"]] == ["s1", "s2", "s3"] and "already_closed" not in changed
+    assert "no slot was asked again by the answers (envelope_changed)" in changed
+    state = _state(harness)
+    assert state["cycles_paid"] == 2 and state["waves"][-1]["request_fingerprint"] != fp
+    old = next(w for w in state["waves"] if w["request_fingerprint"] == fp)
+    assert old["closed"] and _ids(old) == [("s1:q1", "accept")]
+    assert "the named wave is closed and takes no answers; reviewing the envelope." in "\n".join(harness.progress)
 
 
 def test_a_spent_cap_refuses_the_re_ask_and_keeps_the_answers(harness, monkeypatch):  # noqa: F811

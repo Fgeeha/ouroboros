@@ -353,7 +353,7 @@ def _closure_note_view(note: str) -> str:
         "blocking_finding_below_quorum_stays_open": "blocking findings remain open after disposition",
         "revise_plan_not_closable_by_disposition": "disposition does not close blocking findings",
         "degraded_not_closable_by_disposition": "no parseable reviewer quorum; disposition does not close the wave",
-        "answers_not_addressed": "the answers are recorded; no slot was asked again by them",
+        "answers_not_addressed": "no slot was asked again by the answers",
     }.get(prefix)
     if not meaning:
         return str(note)
