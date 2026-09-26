@@ -381,11 +381,13 @@ def test_telegram_owner_wait_upgrade_reseeds_current_version(tmp_path, fake_log)
 
 @pytest.mark.serial
 @pytest.mark.parametrize("name,source,old_version,new_version", [
-    ("telegram", "d5418e05b822feaf6aaa652e8cdc5b53af1232cc", "1.2.1", "1.2.7"),
+    ("telegram", "d918b6973235013e5d7b9d78fe98701979396d4f", "1.2.6", "1.2.7"),
     ("unix_computer_use", "162ad3fe6791fcaf6cf625e6b0c50d3a2a27e7f8", "0.4.1", "0.4.2"),
 ])
-def test_resync_delivers_payload_from_real_previous_seed(tmp_path, fake_log, name, source, old_version, new_version):
-    """Use the full seed before 59ce693b / 3f8db1e1, including its real payload.
+def test_resync_delivers_payload_from_real_previous_seed(
+    tmp_path, fake_log, monkeypatch, name, source, old_version, new_version,
+):
+    """Use the full preceding seed, including its real payload.
 
     These official history objects are available in CI's full checkout; a missing
     object is a fixture error, not evidence that an upgrade was exercised.
@@ -395,15 +397,17 @@ def test_resync_delivers_payload_from_real_previous_seed(tmp_path, fake_log, nam
     import tarfile
 
     from ouroboros.launcher_bootstrap import _per_skill_version_resync, _read_skill_manifest
-    from ouroboros.skill_loader import compute_content_hash
+    from ouroboros.skill_loader import compute_content_hash, load_review_state, save_enabled
 
     repo = pathlib.Path(__file__).resolve().parents[1]
     drive = tmp_path / "data"
+    monkeypatch.setenv("OUROBOROS_TRUST_NATIVE_SEEDED_SKILLS", "true")
+    monkeypatch.setattr("ouroboros.config.SETTINGS_PATH", drive / "settings.json")
     native = drive / "skills" / "native"
     installed = native / name
     installed.mkdir(parents=True)
     archived = subprocess.run(["git", "archive", f"{source}:skills/{name}"], cwd=repo,
-                              capture_output=True, check=True)
+                              capture_output=True, check=True, timeout=30)
     with tarfile.open(fileobj=io.BytesIO(archived.stdout)) as archive:
         for member in archive:
             if member.isdir():
@@ -414,11 +418,29 @@ def test_resync_delivers_payload_from_real_previous_seed(tmp_path, fake_log, nam
             target.write_bytes(archive.extractfile(member).read())
     (installed / ".seed-origin").write_text(f"seeded_from={source}\n", encoding="utf-8")
     assert _read_skill_manifest(installed).version == old_version
+    changed_payload = (
+        "lib/miniapp_registration.py", "scripts/platform_support.py",
+        "scripts/cloudflare_tunnel.py", "scripts/runtime_status.py",
+    ) if name == "telegram" else ()
+    for path in changed_payload:
+        assert (installed / path).read_bytes() != (repo / "skills" / name / path).read_bytes()
+    save_enabled(drive, name, False)
+    state = drive / "state" / "skills" / name
+    (state / "settings.json").write_text('{"TELEGRAM_CHAT_ID":"12345"}', encoding="utf-8")
+    preserved = {path.name: path.read_bytes() for path in state.iterdir() if path.is_file()}
     assert _per_skill_version_resync(repo / "skills", native, fake_log, drive_root=drive) == 1
     manifest = _read_skill_manifest(installed)
     assert manifest.version == new_version
     hash_args = {"manifest_entry": manifest.entry, "manifest_scripts": manifest.scripts}
-    assert compute_content_hash(installed, **hash_args) == compute_content_hash(repo / "skills" / name, **hash_args)
+    new_hash = compute_content_hash(installed, **hash_args)
+    assert new_hash == compute_content_hash(repo / "skills" / name, **hash_args)
+    for path in changed_payload:
+        assert (installed / path).read_bytes() == (repo / "skills" / name / path).read_bytes()
+    for path, payload in preserved.items():
+        assert (state / path).read_bytes() == payload
+    review = load_review_state(drive, name, skill_dir=installed)
+    assert review.review_profile == "native_seed"
+    assert review.content_hash == new_hash
 
 
 @pytest.mark.parametrize("drift", [False, True])

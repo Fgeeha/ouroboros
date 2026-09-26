@@ -150,35 +150,35 @@ def test_empty_windows_machine_uses_interpreter_build(monkeypatch, tmp_path, bui
     assert json.loads((tmp_path / "status.json").read_text(encoding="utf-8"))["platform"] == "windows-" + arch
 
 
-def test_build_fallback_preserves_known_machine_and_other_os(monkeypatch):
+@pytest.mark.parametrize(
+    "system,machine,build,arch,platform_id",
+    [
+        ("Windows", "AMD64", "win32", "amd64", "windows-amd64"),
+        ("Windows", "ARM64", "win-amd64", "arm64", None),
+        ("Windows", "x86", "win-amd64", "x86", None),
+        ("Windows", "mystery", "win-amd64", "mystery", None),
+        ("Darwin", "arm64", "win32", "arm64", "darwin-arm64"),
+        ("Darwin", "x86_64", "win32", "x86_64", "darwin-amd64"),
+        ("Linux", "aarch64", "win32", "aarch64", "linux-arm64"),
+        ("Linux", "amd64", "win32", "amd64", "linux-amd64"),
+        ("Darwin", "", "win-amd64", "", None),
+        ("Linux", "", "win-amd64", "", None),
+    ],
+)
+def test_build_fallback_preserves_known_machine_and_other_os(
+    monkeypatch, system, machine, build, arch, platform_id,
+):
     import platform_support
 
-    monkeypatch.setattr(platform_support.sysconfig, "get_platform", lambda: "win-amd64")
-    monkeypatch.setattr(cloudflare.platform, "system", lambda: "Windows")
-    monkeypatch.setattr(cloudflare.platform, "machine", lambda: "ARM64")
-    assert platform_support.machine_architecture() == "arm64"
-    monkeypatch.setattr(cloudflare.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(cloudflare.platform, "machine", lambda: "")
-    assert platform_support.machine_architecture() == ""
-
-
-@pytest.mark.serial
-@pytest.mark.skipif(sys.platform != "win32", reason="Real scrubbed Windows interpreter")
-def test_real_windows_scrubbed_interpreter_selects_pinned_asset(tmp_path):
-    import subprocess
-    import sysconfig
-    from platform_support import minimal_process_environment
-
-    if sysconfig.get_platform().lower() != "win-amd64":
-        pytest.skip("Pinned Windows cloudflared asset supports amd64 only")
-    env = minimal_process_environment(tmp_path)
-    assert not any(key.startswith("PROCESSOR_") for key in env)
-    result = subprocess.run(
-        [sys.executable, "-c", "import cloudflare_tunnel as c; print(c._current_asset().platform_id)"],
-        cwd=SCRIPTS_DIR, env=env, capture_output=True, text=True, timeout=30,
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "windows-amd64"
+    monkeypatch.setattr(platform_support.sysconfig, "get_platform", lambda: build)
+    monkeypatch.setattr(cloudflare.platform, "system", lambda: system)
+    monkeypatch.setattr(cloudflare.platform, "machine", lambda: machine)
+    assert platform_support.machine_architecture() == arch
+    if platform_id is None:
+        with pytest.raises(cloudflare.CloudflaredError, match="Unsupported"):
+            cloudflare._current_asset()
+    else:
+        assert cloudflare._current_asset().platform_id == platform_id
 
 
 @pytest.mark.parametrize(
