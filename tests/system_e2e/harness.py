@@ -135,9 +135,18 @@ SCENARIOS = {
     # FOUR tests: executor starvation alone, a held Host authentication alone,
     # both together, and the owner's Panic under the combined load.
     "S33": ("Presence waits keep owner controls answering: 12 events (2 held at the model, slot and same-conversation waits) on a 12-thread default executor and/or one held Host authentication; while held, /api/state, a v1 receipt and the owner's Stop (durable cancel intent, cancelled terminal) answer inside 10s/15s windows (health alone never passes); a disconnected turn and its retry are ONE model call and a later replay answers the same projection; Panic under the combined load ends the whole tree", LANE_MOCK),
+    # Plan review's ANSWER CHANNEL under blocking enforcement at the shipped cycle cap,
+    # over the asynchronous barrier route with three DISTINCT keyless reviewer models
+    # (the stub answers per seat by the wire model id).
+    "S34": ("plan review addressed answer, BLOCKING at the shipped cap: t1 objects below quorum -> $0 reject -> the identical envelope with the answer re-asks t1 ALONE (t2/t3 kept at $0 as replayed rows) over the barrier route -> t1 retires -> GREEN closed, two paid cycles, the task completes under blocking", LANE_MOCK),
+    "S35": ("plan review no-need path, BLOCKING: t1 asks the author (need_evidence), t2 leaves a note; a $0 accept closes the wave GREEN with no second panel (three reviewer calls, one paid cycle) and the task completes under blocking", LANE_MOCK),
 }
 
 MOCK_SLUG = "openai-compatible::mock-model"
+# The three DISTINCT reviewer slugs of the per-seat scenarios: seat t<i> rides
+# ``<MOCK_SLUG>-t<i>``, so ``default_slot_binder`` (the wire ``model`` field) names
+# the seat that made the call and a ReviewScript step can answer per seat.
+DISTINCT_MOCK_MODEL_IDS = tuple(f"mock-model-t{i}" for i in (1, 2, 3))
 
 # ---------------------------------------------------------------------------
 # Prompt markers the stub classifies review-organ calls by (roast F22).
@@ -638,12 +647,20 @@ class ScriptedStubModel(LoopbackModelServer):
 
     def __init__(self, script=None, *, final_answer: str = "Final answer: scripted scenario complete.",
                  latency_sec: float = 0.0, review_script: "ReviewScript | None" = None,
-                 gate: "ModelGate | None" = None) -> None:
+                 gate: "ModelGate | None" = None, model_ids=None) -> None:
         super().__init__(latency_sec=latency_sec, gate=gate)
         self.script = list(script or [])
         self.final_answer = final_answer
         self.review_script = review_script
+        # As on ReplayModel: extra wire ids to advertise on /models, so the
+        # capability-evidence window probe confirms a window for each distinct slot route.
+        self._explicit_model_ids = [str(m) for m in model_ids] if model_ids else None
         self._script_index = 0
+
+    def _model_ids(self) -> list[str]:
+        if self._explicit_model_ids is not None:
+            return sorted(set(self._explicit_model_ids) | {"mock-model"})
+        return super()._model_ids()
 
     def _next_step(self, _body) -> dict | None:
         if self._script_index >= len(self.script):
@@ -1087,7 +1104,7 @@ class KeylessIsolatedServer(IsolatedServer):
         self.candidate.release()
 
 
-def keyless_reviewer_slots(*, advisory: bool = False) -> str:
+def keyless_reviewer_slots(*, advisory: bool = False, distinct_models: bool = False) -> str:
     """The structured ``OUROBOROS_REVIEWER_SLOTS`` value pinning every reviewer row
     to the loopback stub.
 
@@ -1102,10 +1119,15 @@ def keyless_reviewer_slots(*, advisory: bool = False) -> str:
     the stub (wave 3a): the advisory pre-review then runs the bounded NATIVE
     inspection episode against the loopback model instead of being unavailable
     keyless (which the commit gate compensates with an audited bypass).
+
+    ``distinct_models=True`` pins seat ``t<i>`` to its own slug
+    (``DISTINCT_MOCK_MODEL_IDS``) so a per-seat ReviewScript can tell the seats
+    apart on the wire; the stub must advertise those ids (``model_ids``).
     """
     row = {"kind": "api_chat", "target_id": MOCK_SLUG}
     payload = {
-        "triad": [{"slot_id": f"t{i}", "route": dict(row)} for i in (1, 2, 3)],
+        "triad": [{"slot_id": f"t{i}", "route": {**row, **({"target_id": f"{MOCK_SLUG}-t{i}"} if distinct_models else {})}}
+                  for i in (1, 2, 3)],
         "scope": [{"slot_id": "s1", "route": dict(row)}],
     }
     if advisory:
