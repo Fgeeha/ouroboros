@@ -742,14 +742,14 @@ def plan_review_reminder(decision: Dict[str, Any]) -> str:
             f"{tag} Blocking plan review is REVISE_PLAN. A changed spec — with affected_paths, the files "
             "the work will change ([] when none) — is a new envelope every slot reviews; the unchanged "
             "envelope with review_disposition items asks only the slots those items name. Analysis and "
-            "non-mutating preparation remain open; the work starts after the review closes or a real "
-            "task-wide rail fires."
+            "non-mutating preparation remain open; the work starts after the review closes — a task-wide "
+            "rail releases finalization, never implementation."
         )
     return (
         f"{tag} Call plan_task with a concrete goal, plan and spec, whose affected_paths lists "
         "the files the work will change ([] when none). If review infrastructure "
         "is unavailable, continue analysis and non-mutating preparation, but do not begin the "
-        "work before the review closes or a real task-wide rail fires."
+        "work before the review closes; a task-wide rail releases finalization, never implementation."
     )
 
 

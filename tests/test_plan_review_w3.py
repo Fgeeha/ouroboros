@@ -601,7 +601,7 @@ def test_a_predecessor_the_state_cannot_name_dispatches_fresh_without_a_delta(ha
                                summary="I need the notes")])
     sub = harness.install({"s1": ask, "s2": CLEAN, "s3": CLEAN})
     _call(harness.make_ctx())
-    monkeypatch.setattr(pr, "_last_paid_wave", lambda state: None)
+    monkeypatch.setattr(pr, "_last_paid_wave", lambda state, *_a, **_k: None)
     sub = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
     out = _call(harness.make_ctx())
     assert len(sub.calls) == 1  # dispatched, not refused

@@ -315,9 +315,10 @@ def plan_deadline_skip(ctx: ToolContext, *, emit: bool = False) -> str:
         f"review window of {int(scaled)}s (< {int(minimum)}s useful floor)."
     )
     return (
-        f"PLAN_TASK_SKIPPED_DEADLINE: {cause} No reviewer was dispatched and no plan review is open "
-        f"for this envelope; remaining time {max(0, int(remaining))}s. The same call under this deadline "
-        "returns this rail again: the deadline is the owner's task bound, not a reviewer verdict."
+        f"PLAN_TASK_SKIPPED_DEADLINE: {cause} This call dispatched no reviewer; remaining time "
+        f"{max(0, int(remaining))}s. Any recorded plan review keeps its state (open stays open, its "
+        "answers stay recorded); the same call under this deadline returns this rail again. The "
+        "deadline is the owner's task bound, not a reviewer verdict."
     )
 
 

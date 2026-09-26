@@ -13,7 +13,7 @@ import json
 from ouroboros.task_results import (STATUS_RUNNING, load_plan_review_state, plan_review_wave,
     record_plan_review_dispositions, record_plan_review_wave, write_task_result)
 from ouroboros.tools import plan_review as pr
-from ouroboros.tools.plan_review_artifacts import authority_wave
+from ouroboros.tools.plan_review_artifacts import authority_wave, read_wave
 from tests.test_plan_review_engine import (  # noqa: F401
     CLEAN, DECK_SPEC, _call, _control, _finding, _state, _user_text, harness,
 )
@@ -56,7 +56,7 @@ def test_answers_across_calls_merge_and_close_the_wave(harness):  # noqa: F811
     assert _control(second) == {"outcome": "GREEN", "closed": True}
     hot = _state(harness)["waves"][-1]
     assert _ids(hot) == [("s1:q1", "accept"), ("s2:q2", "accept")] and hot["closed"]
-    exact = authority_wave(harness.drive, ctx.task_id, hot)
+    exact = read_wave(harness.drive, ctx.task_id, hot["wave_artifact"])  # the raw artifact, no hot overlay
     assert _ids(exact) == [("s1:q1", "accept"), ("s2:q2", "accept")] and exact["closed"]
 
 
@@ -167,6 +167,10 @@ def test_an_invalid_author_record_beside_items_writes_nothing(harness, monkeypat
         "items": [_item("s1:f1", "reject", "the budget line is already approved")],
         "author_disposition": {"disposition": "partial", "rationale": ""}})
     assert "PLAN_AUTHOR_SUBJECT_INVALID" in refused and "rationale" in refused
+    assert load_plan_review_state(harness.drive, ctx.task_id) == before
+    omitted = pr._handle_plan_task(ctx, review_disposition={  # stop with items and no author record at all
+        "review_fingerprint": fp, "author_action": "stop", "items": [_item("s1:f1", "reject", "already approved")]})
+    assert "PLAN_AUTHOR_SUBJECT_INVALID" in omitted
     assert load_plan_review_state(harness.drive, ctx.task_id) == before
 
 
@@ -416,6 +420,42 @@ def test_a_spent_cap_refuses_the_re_ask_and_keeps_the_answers(harness, monkeypat
         _item("s1:f1", "reject", "the budget line is already approved")]})
     assert "PLAN_REVIEW_CYCLES_EXHAUSTED" in result and not sub.calls
     assert _ids(_state(harness)["waves"][-1]) == [("s1:f1", "reject")] and _state(harness)["cycles_paid"] == 1
+
+
+def test_an_all_skipped_addressed_collection_keeps_the_paid_predecessor_reachable(harness, monkeypatch):  # noqa: F811
+    """Async route: the re-asked seat settles as a $0 refusal (daemon unavailable) and the kept
+    rows cost nothing, so the collected addressed wave is UNPAID and replaced the paid cycle-1
+    wave in the hot index at the barrier. The next same-spec review must still start from that
+    paid wave (through the recorded predecessor pointer): s1's objection stands, never a false
+    GREEN. Two-sided: the sync all-skipped attempt (health skip) preserves the predecessor by the
+    writer rule, pinned in test_plan_review_engine."""
+    from tests.test_plan_review_reconciliation import _install_barrier_substrate
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
+    calls: list = []
+    _install_barrier_substrate(monkeypatch, calls, texts={"s1": _blocking()})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    fp = _state(harness)["waves"][-1]["request_fingerprint"]
+    assert _control(_answer(ctx, fp)) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    _reject(ctx, fp)
+    calls2: list = []
+    _install_barrier_substrate(monkeypatch, calls2, texts={"s1": CLEAN}, refused={"s1"})
+    pending = _call(ctx, review_disposition={"review_fingerprint": fp, "items": [
+        _item("s1:f1", "reject", "the budget line is already approved")]})
+    assert _control(pending) == {"outcome": "DEGRADED", "closed": False}
+    settled = _call(ctx, review_disposition={"review_fingerprint": fp, "items": []})
+    state = _state(harness)
+    assert state["cycles_paid"] == 1 and state["waves"][-1]["paid"] is False, "nothing was sent: nothing is charged"
+    assert _control(settled) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    assert not any(w.get("paid") for w in state["waves"]), "the paid cycle-1 wave left the hot index at the barrier"
+    sub = harness.install({"s1": "garbage, not an array", "s2": CLEAN, "s3": CLEAN})
+    later = _call(ctx, plan="A revised outline with the budget line fixed.")  # same spec, changed prose
+    assert _control(later) == {"outcome": "REVIEW_REQUIRED", "closed": False}, "the objection stands through the pointer"
+    assert len(sub.calls) == 1
+    wave = _state(harness)["waves"][-1]
+    assert wave["previous_fingerprint"] == fp and [f["finding_id"] for f in wave["findings"]] == ["s1:f1"]
+    assert wave["actors"][0]["slot_id"] == "s1" and "findings_carried_absent_answer:1" in wave["actors"][0]["disclosures"]
 
 
 def test_addressed_helper_names_every_typed_reason():

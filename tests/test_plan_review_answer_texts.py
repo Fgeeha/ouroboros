@@ -103,7 +103,8 @@ def test_blocking_reminder_states_the_answer_route():
     assert "do not rerun reviewers" not in held and "Implementation stays held" in held
     revise = plan_review_reminder({"outcome": "REVISE_PLAN", "status": "open", "cycles_paid": 1})
     assert "asks only the slots those items name" in revise and "a new envelope every slot reviews" in revise
-    assert "the work starts after the review closes or a real task-wide rail fires" in revise
+    assert "a task-wide rail releases finalization, never implementation" in revise
+    assert "rail fires" not in revise and "rail fires" not in plan_review_reminder({"outcome": "", "status": "open"})
 
 
 def test_deadline_and_cap_producers_state_facts_not_advice(harness, monkeypatch):  # noqa: F811
@@ -119,7 +120,8 @@ def test_deadline_and_cap_producers_state_facts_not_advice(harness, monkeypatch)
     monkeypatch.setattr(pr, "_plan_deadline_skip", plan_deadline_skip)
     text = plan_deadline_skip(ctx)
     assert text.startswith("PLAN_TASK_SKIPPED_DEADLINE:") and "remaining time 0s" in text
-    assert "no plan review is open" in text and "proceed with your own" not in text.lower()
+    assert "This call dispatched no reviewer" in text and "Any recorded plan review keeps its state" in text
+    assert "no plan review is open" not in text and "proceed with your own" not in text.lower()
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")
     harness.install({"s1": json.dumps([_finding("f1", "blocking", breaks="claim_1")]), "s2": CLEAN, "s3": CLEAN})
     ctx2 = harness.make_ctx(task_id="task-cap")

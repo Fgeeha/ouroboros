@@ -89,6 +89,7 @@ from ouroboros.tools.plan_review_artifacts import (
     addressed_slots as _addressed_slots,
     kept_rows as _kept_rows,
     standing_findings_lineage as _standing_findings_lineage,
+    _earlier_wave as _earlier_wave_of,
     PlanReviewSourceUnavailable,
     attach_continuation_restart_delta as _attach_continuation_restart_delta,
     authority_wave as _authority_wave,
@@ -802,18 +803,10 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             "ERROR: PLAN_REVIEW_CUSTODY_INVALID: " + str(resume["error"]),
             "plan_review_custody_invalid",
         )
-    previous = resume.get("previous") if resume_in_flight else (
-        previous_override if previous_override is not None else _last_paid_wave(state)
-    )
-    if previous is not None:
-        try:
-            previous = _authority_wave(state_root, task_id, previous)
-        except (OSError, ValueError, json.JSONDecodeError):
-            return _plan_unavailable(
-                ctx,
-                "ERROR: Prior exact plan-review authority is unreadable; a delta review is refused.",
-                "plan_review_exact_artifact_unavailable",
-            )
+    previous = _resolve_previous(state_root, task_id, state, resume=resume if resume_in_flight else None,
+                                 override=previous_override)
+    if isinstance(previous, str):
+        return _plan_unavailable(ctx, previous, "plan_review_exact_artifact_unavailable")
     standing = _standing_or_refusal(ctx, state_root, task_id, state, previous, spec, enforcement)
     if isinstance(standing, str):
         return standing
@@ -971,13 +964,40 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=paid_now, enforcement=enforcement, reminder=reminder,
                                   notes=_addressed_notes(unaddressed) if not named else None)
 
-def _last_paid_wave(state: dict) -> Optional[dict]:
-    """The latest PAID wave, compact or not: a compact entry is materialized (or refused as
-    unreadable) by the authority read that follows, never skipped as if no panel had run."""
-    for wave in reversed(state.get("waves") or []):
-        if wave.get("paid"):
-            return wave
-    return None
+def _resolve_previous(state_root: pathlib.Path, task_id: str, state: dict, *, resume: Optional[dict],
+                      override: Optional[dict]) -> Any:
+    """The exact predecessor this dispatch judges against (``None`` for a first cycle), or the
+    refusal text when its authority is unreadable."""
+    try:
+        previous = resume.get("previous") if resume is not None else (
+            override if override is not None else _last_paid_wave(state, state_root, task_id))
+        return _authority_wave(state_root, task_id, previous) if previous is not None else None
+    except (OSError, ValueError, json.JSONDecodeError, PlanReviewSourceUnavailable):
+        return "ERROR: Prior exact plan-review authority is unreadable; a delta review is refused."
+
+
+def _last_paid_wave(state: dict, state_root: pathlib.Path, task_id: str) -> Optional[dict]:
+    """The latest PAID wave this dispatch judges against. The newest hot entry when it is paid;
+    when the newest entry is an UNPAID attempt that replaced its paid predecessor in the hot
+    index at the barrier (an addressed re-ask whose named seat settled as a $0 refusal, an
+    all-skipped panel), the walk follows its recorded predecessor pointer (bounded) to that paid
+    wave, so a $0 attempt never drops a still-open objection; otherwise the newest paid hot
+    entry, compact or not (a compact entry is materialized, or refused as unreadable, by the
+    authority read that follows). An unreadable pointer raises ``PlanReviewSourceUnavailable``,
+    never an empty history."""
+    waves = [w for w in state.get("waves") or [] if isinstance(w, dict)]
+    newest = waves[-1] if waves else None
+    for _hop in range(8):
+        if newest is None or newest.get("paid"):
+            break
+        earlier = _earlier_wave_of(state_root, task_id, state, newest)
+        if earlier is None:
+            break
+        ref = newest.get("previous_wave_artifact") if isinstance(newest.get("previous_wave_artifact"), dict) else {}
+        newest = {**earlier, "wave_artifact": earlier.get("wave_artifact") or ref} if ref else earlier
+    if newest is not None and newest.get("paid"):
+        return newest
+    return next((w for w in reversed(waves) if w.get("paid")), None)
 
 def build_plan_review_packet_for_dry_run(ctx: ToolContext, request: "_PlanRequest") -> dict:
     """Assemble the packet SHAPE of a fresh cycle (cycle_index=1, no prior-cycle section) with the
