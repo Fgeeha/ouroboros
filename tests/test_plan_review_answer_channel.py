@@ -538,6 +538,23 @@ def test_a_retry_after_a_refused_addressed_attempt_is_collectable(harness, monke
     assert state["current_attempt"]["status"] == "open"
 
 
+def test_predecessor_identity_is_the_artifact_when_both_references_are_known():
+    """Two attempts of one cycle share (cycle_index, fingerprint); with both references known
+    the artifact decides: a pointer naming the wave's OWN artifact is the wave itself (refused
+    as self-naming), a pointer naming another artifact is a distinct predecessor; without both
+    references the pair is the only identity there is."""
+    from ouroboros.tools.plan_review_artifacts import _same_wave
+
+    own = {"root": "artifact_store", "path": "waves/attempt-2.json"}
+    other = {"root": "artifact_store", "path": "waves/attempt-1.json"}
+    wave = {"cycle_index": 2, "request_fingerprint": "a" * 64, "wave_artifact": own}
+    earlier = {"cycle_index": 2, "request_fingerprint": "a" * 64}
+    assert _same_wave(earlier, wave, pointer=own) is True
+    assert _same_wave(earlier, wave, pointer=other) is False
+    assert _same_wave(earlier, {"cycle_index": 2, "request_fingerprint": "a" * 64}, pointer=other) is True  # pair fallback
+    assert _same_wave({**earlier, "cycle_index": 1}, wave, pointer={}) is False
+
+
 def test_addressed_helper_names_every_typed_reason():
     from ouroboros.tools.plan_review_artifacts import ADDRESSED_REASONS, addressed_slots
 
