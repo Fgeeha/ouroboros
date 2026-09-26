@@ -139,15 +139,9 @@ def _task_root_drives(ctx: Any) -> list[pathlib.Path]:
     """The data drives a task's own task roots are enumerated on."""
     meta = getattr(ctx, "task_metadata", {})
     meta = meta if isinstance(meta, dict) else {}
-    drives: list[pathlib.Path] = []
-    for raw in (getattr(ctx, "drive_root", ""), *(meta.get(key) for key in (
-            "drive_root", "child_drive_root", "headless_child_drive_root"))):
-        if not raw:
-            continue
-        drive = pathlib.Path(raw).resolve(strict=False)
-        if drive not in drives:
-            drives.append(drive)
-    return drives
+    values = (getattr(ctx, "drive_root", ""), *(meta.get(key) for key in (
+        "drive_root", "child_drive_root", "headless_child_drive_root")))
+    return list(dict.fromkeys(pathlib.Path(raw).resolve(strict=False) for raw in values if raw))
 
 
 def lineage_read_roots(ctx: Any, root: ResourceRoot) -> tuple[pathlib.Path, ...]:

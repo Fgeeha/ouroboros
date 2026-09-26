@@ -3,8 +3,8 @@
 Characterization of the Emergency Stop contract that must survive any change to
 how ``server_control.execute_panic_stop`` learns the port the server bound: the
 sweep targets the ACTUALLY bound main port (a custom-port install must not
-panic-kill an unrelated listener on 8765), the host-service port follows it, and
-nothing — including a failing sweep — may delay or reorder the hard exit.
+panic-kill an unrelated listener on 8765), the host-service gets an independent
+sweep, and neither sweep's failure may prevent the hard exit.
 
 Every destructive operation is neutralized here: no real process, port, daemon
 or interpreter teardown runs.
@@ -12,9 +12,13 @@ or interpreter teardown runs.
 
 from __future__ import annotations
 
+import copy
+import threading
 from types import SimpleNamespace
 
 import pytest
+
+pytestmark = pytest.mark.serial
 
 
 class _ExitCalled(RuntimeError):
@@ -30,47 +34,56 @@ def _harness(monkeypatch, tmp_path, *, port_kill=None):
     def _record(name, value=None):
         events.append((name, value) if value is not None else (name,))
 
+    def _phase(name, *, request_only=False):
+        _record(name + ("_request" if request_only else "_settlement"))
+        return [{"requested": True, "scope": "group", "pid": 123}] if request_only else None
+
     def _kill_port(port):
         _record("kill_process_on_port", port)
         if port_kill is not None:
             port_kill(port)
 
-    monkeypatch.setattr("supervisor.state.load_state", lambda: {})
-    monkeypatch.setattr("supervisor.state.save_state", lambda _state: None)
-    monkeypatch.setattr(
-        "supervisor.evolution_lifecycle.complete_evolution_campaign", lambda *a, **k: {}
-    )
-    monkeypatch.setattr("ouroboros.post_task_evolution.drop_pending_request", lambda *a, **k: None)
-    monkeypatch.setattr(
-        "ouroboros.local_model.get_manager",
-        lambda: SimpleNamespace(stop_server=lambda: _record("local_model_stop")),
-    )
-    monkeypatch.setattr(
-        "ouroboros.claudexor_daemon.get_owned_daemon",
-        lambda: SimpleNamespace(stop=lambda: _record("owned_daemon_stop")),
-    )
-    monkeypatch.setattr(
-        "ouroboros.tools.shell.kill_all_tracked_subprocesses", lambda: _record("kill_shells")
-    )
-    monkeypatch.setattr(
-        "ouroboros.workspace_executor.kill_all_foreground",
-        lambda *a, **k: _record("kill_foreground"),
-    )
-    monkeypatch.setattr(
-        "ouroboros.tools.services.kill_all_services", lambda *a, **k: _record("kill_services")
-    )
-    monkeypatch.setattr(
-        "ouroboros.extension_companion.panic_kill_all", lambda: _record("panic_kill_companions")
-    )
+    from ouroboros.startup_historical_audit import audit
+
+    monkeypatch.setattr(audit, "stop", lambda: None)
+    monkeypatch.setattr(server_control, "_persist_panic_controls", lambda _root: _record("persist_controls"))
+    original_flag = server_control._write_panic_flag
+
+    def write_flag(root):
+        _record("write_flag")
+        original_flag(root)
+
+    monkeypatch.setattr(server_control, "_write_panic_flag", write_flag)
+    monkeypatch.setattr("ouroboros.local_model.get_manager", lambda **kw: SimpleNamespace(
+        panic_stop=lambda **kw: _phase("local_model", **kw),
+        stop_server=lambda: _phase("local_model")))
+    monkeypatch.setattr("ouroboros.claudexor_daemon.get_owned_daemon", lambda **kw: SimpleNamespace(
+        panic_stop=lambda **kw: _phase("owned_daemon", **kw),
+        stop_outcome=lambda: _phase("owned_daemon")))
+    monkeypatch.setattr("ouroboros.tools.shell.kill_all_tracked_subprocesses", lambda **kw: _phase("shells", **kw))
+    monkeypatch.setattr("ouroboros.workspace_executor.kill_all_foreground",
+                        lambda *a, **kw: _phase("foreground", request_only=kw.get("request_only", False)))
+    monkeypatch.setattr("ouroboros.tools.services.kill_all_services",
+                        lambda *a, **kw: _phase("services", request_only=kw.get("request_only", False)))
+    monkeypatch.setattr("ouroboros.extension_companion.panic_kill_all", lambda **kw: _phase("companions", **kw))
     monkeypatch.setattr("multiprocessing.active_children", lambda: [])
     monkeypatch.setattr("ouroboros.platform_layer.force_kill_pid", lambda *a, **k: None)
     monkeypatch.setattr("ouroboros.platform_layer.kill_process_on_port", _kill_port)
     monkeypatch.setattr("ouroboros.gateway.host_service.host_service_port", lambda: 8767)
-    monkeypatch.setattr(
-        server_control.os, "_exit", lambda code: (_ for _ in ()).throw(_ExitCalled(code))
-    )
-    return events, lambda **kw: _record("kill_workers", kw)
+    before = set(threading.enumerate())
 
+    def exit_for_test(code):
+        _record("hard_exit", code)
+        # Only the test joins already-launched, neutralized settlement helpers.
+        # Their asynchronous completion is not an os._exit guarantee.
+        for thread in set(threading.enumerate()) - before:
+            if thread.name.startswith("panic-"):
+                thread.join(timeout=5)
+                assert not thread.is_alive()
+        raise _ExitCalled(code)
+
+    monkeypatch.setattr(server_control.os, "_exit", exit_for_test)
+    return events, lambda **kw: _record("kill_workers", kw)
 
 def _swept_ports(events: list) -> list:
     return [value for name, value in (e for e in events if len(e) == 2) if name == "kill_process_on_port"]
@@ -87,7 +100,7 @@ def test_panic_through_the_server_sweeps_the_actually_bound_port(monkeypatch, tm
     with pytest.raises(_ExitCalled) as exit_info:
         server._execute_panic_stop(SimpleNamespace(stop=lambda: None), kill_workers)
 
-    assert _swept_ports(events) == [9123, 8767]
+    assert sorted(_swept_ports(events)) == [8767, 9123]
     assert exit_info.value.args[0] == server.PANIC_EXIT_CODE
 
 
@@ -107,14 +120,13 @@ def test_panic_with_no_known_bound_port_sweeps_the_default_install_port(monkeypa
             log=SimpleNamespace(critical=lambda *a, **k: None),
         )
 
-    assert _swept_ports(events) == [8765, 8767]
+    assert sorted(_swept_ports(events)) == [8765, 8767]
 
 
-def test_a_failing_main_port_sweep_still_sweeps_the_default_and_the_host_service(
+def test_a_failing_main_port_sweep_is_disclosed_and_does_not_target_unrelated_default(
     monkeypatch, tmp_path,
 ):
-    """The main-port sweep is fail-soft: a raising kill must not cost the panic the
-    default-port fallback or the host-service sweep that follows it."""
+    """Failure retains the actual-port identity; host-service cleanup is independent."""
     import server
 
     def _boom(port):
@@ -122,18 +134,21 @@ def test_a_failing_main_port_sweep_still_sweeps_the_default_and_the_host_service
             raise OSError("port sweep failed")
 
     events, kill_workers = _harness(monkeypatch, tmp_path, port_kill=_boom)
+    diagnostics = []
+    monkeypatch.setattr(server.log, "critical", lambda message, *args:
+                        diagnostics.append(copy.deepcopy(args)) if args and isinstance(args[0], dict) else None)
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
     monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", 9123)
 
     with pytest.raises(_ExitCalled):
         server._execute_panic_stop(SimpleNamespace(stop=lambda: None), kill_workers)
 
-    assert _swept_ports(events) == [9123, 8765, 8767]
+    assert sorted(_swept_ports(events)) == [8767, 9123]
+    assert diagnostics[0][1]["main-port"] == {"requested": False, "error": "OSError: port sweep failed"}
 
 
-def test_panic_teardown_order_ends_with_the_port_sweep_then_the_hard_exit(monkeypatch, tmp_path):
-    """Cleanup, then the fail-soft child/port sweep, then os._exit — and the
-    durable panic flag is written before any of the killing starts."""
+def test_requests_precede_settlement_and_persistence_before_hard_exit(monkeypatch, tmp_path):
+    """All direct owner requests finish before cleanup helpers or flag writes."""
     import server
 
     events, kill_workers = _harness(monkeypatch, tmp_path)
@@ -143,21 +158,18 @@ def test_panic_teardown_order_ends_with_the_port_sweep_then_the_hard_exit(monkey
     with pytest.raises(_ExitCalled):
         server._execute_panic_stop(SimpleNamespace(stop=lambda: None), kill_workers)
 
-    assert [event[0] for event in events] == [
-        "local_model_stop",
-        "owned_daemon_stop",
-        "kill_shells",
-        "kill_foreground",
-        "kill_services",
-        "panic_kill_companions",
-        "kill_workers",
-        "kill_process_on_port",
-        "kill_process_on_port",
-    ]
-    # Upstream bytes (dc4c0204) added reconcile_delegate_custody=False to the
-    # panic's kill_workers call; the pinned contract (kill everything, then
-    # sweep ports, then hard-exit) is unchanged.
-    assert events[6][1] == {
+    names = [event[0] for event in events]
+    assert names[:6] == ["local_model_request", "owned_daemon_request", "shells_request",
+                         "foreground_request", "services_request", "companions_request"]
+    assert all(name.endswith("_request") for name in names[:6])
+    assert not any(name.endswith("_request") for name in names[6:])
+    assert names.index("write_flag") > 5
+    assert names.index("persist_controls") > 5
+    assert names.index("hard_exit") > names.index("persist_controls")
+    assert {name for name in names if name.endswith("_settlement")} == {
+        "local_model_settlement", "owned_daemon_settlement", "shells_settlement",
+        "foreground_settlement", "services_settlement", "companions_settlement"}
+    assert next(event[1] for event in events if event[0] == "kill_workers") == {
         "force": True, "archive_service_logs": False, "reconcile_delegate_custody": False,
     }
     assert (tmp_path / "state" / "panic_stop.flag").read_text(encoding="utf-8") == "panic"

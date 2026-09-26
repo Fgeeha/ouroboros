@@ -14,6 +14,7 @@ import os
 import pathlib
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional
 
 from ouroboros import budget_pause
@@ -114,26 +115,19 @@ def _publish_settlement(tools, drive_logs, row):
     _emit_live_log(tools, {**row, **({"settlement_log": outcome} if append_failed(outcome) else {})})
 
 
-def _settle_host_error(tools, drive_logs, live, invocation, exc):
-    if claim_settlement(invocation):
+def _settle_host_error(tools, drive_logs, live, invocation, outcome):
+    """Record a submission failure or a failed future through one settlement guard."""
+    try:
+        exc = outcome if isinstance(outcome, BaseException) else outcome.exception()
+    except BaseException as failure:
+        exc = failure
+    if exc is not None and claim_settlement(invocation):
         _publish_settlement(tools, drive_logs, {
             **live, "ts": utc_now_iso(), "type": CALL_SETTLED, "is_error": True,
             "status": "host_error", "elapsed_ms": elapsed_ms(invocation),
             "result_preview": f"{type(exc).__name__}: {sanitize_tool_result_for_log(str(exc))[:500]}",
             **start_log_field(invocation),
         })
-
-
-def _observe_tool_exception(future, tools, drive_logs, live, invocation):
-    invocation["_worker_submitted"] = True
-    def settled(done):
-        try:
-            exc = done.exception()
-        except BaseException as failure:
-            exc = failure
-        if exc is not None:
-            _settle_host_error(tools, drive_logs, live, invocation, exc)
-    future.add_done_callback(settled)
 
 
 def _attach_late_tool_settlement(
@@ -485,7 +479,9 @@ def _extract_result_metadata(
     """Compatibility wrapper for text-only callers (old name and signature)."""
     if not isinstance(tool_result, ToolResult):
         tool_result = LegacyTextResultAdapter.from_text(fn_name, str(result or ""))
-    return _typed_result_metadata(fn_name, result, is_error, tool_result)
+    # Text-only compatibility callers retain their legacy metadata shape.
+    return {key: value for key, value in _typed_result_metadata(fn_name, result, is_error, tool_result).items()
+            if key not in {"tool_result_status", "tool_result_code", "tool_result_meta"}}
 
 
 def _typed_result_metadata(
@@ -512,6 +508,10 @@ def _typed_result_metadata(
         status = "error" if is_error else "ok"
 
     meta: Dict[str, Any] = {"status": status}
+    if isinstance(tool_result, ToolResult):
+        # One typed projection supplies both the legacy bucket and the published result facts.
+        meta.update(tool_result_status=tool_result.status, tool_result_code=tool_result.code,
+                    tool_result_meta=dict(tool_result.meta))
     # Legacy non-process deliverable fallback reads the FULL result before trace
     # truncation. Process producers must supply the typed fact below.
     if (
@@ -581,14 +581,6 @@ def _process_fact_fields(result_meta: Dict[str, Any]) -> Dict[str, Any]:
     return {key: result_meta[key] for key in PROCESS_FACT_KEYS if key in result_meta}
 
 
-def _tool_result_fields(result: ToolResult) -> Dict[str, Any]:
-    """Return the JSON-safe typed projection without shadowing legacy fields."""
-    return {
-        "tool_result_status": result.status,
-        "tool_result_code": result.code,
-        "tool_result_meta": dict(result.meta),
-    }
-
 def _execute_browser_tool_bound(
     tools: ToolRegistry,
     tc: Dict[str, Any],
@@ -648,6 +640,9 @@ def _execute_single_tool(
         tool_call_id, _tool_correlation(tools), getattr(getattr(tools, "_ctx", None), "task_attempt", None))
     # The FROZEN correlation: a body that starts after an executor wait never adopts a later round's ids.
     correlation = {key: invocation[key] for key in ("execution_id", "round_id", "llm_call_id") if key in invocation}
+    trace_identity = {"tool": fn_name, "tool_call_id": tool_call_id,
+                      "parent_call_id": correlation.get("llm_call_id"),
+                      "execution_id": correlation.get("execution_id"), "round_id": correlation.get("round_id")}
     settlement = {"type": CALL_SETTLED, "tool": fn_name, "task_id": task_id, **invocation_fields(invocation),
                   **start_log_field(invocation)}
 
@@ -656,10 +651,7 @@ def _execute_single_tool(
     except (json.JSONDecodeError, ValueError) as e:
         result = f"⚠️ TOOL_ARG_ERROR: Could not parse arguments for '{requested_fn_name}': {e}"
         tool_result = ToolResult(status="error", code="TOOL_ARG_ERROR", text=result)
-        result_meta = {
-            **_typed_result_metadata(fn_name, result, True, tool_result),
-            **_tool_result_fields(tool_result),
-        }
+        result_meta = _typed_result_metadata(fn_name, result, True, tool_result)
         trace_ref = {}
         try:
             trace_ref = persist_call(
@@ -668,21 +660,13 @@ def _execute_single_tool(
                 call_id=new_call_id("tool_arg_error"),
                 call_type="tool_call",
                 payload={
-                    "tool": fn_name,
-                    "tool_call_id": tool_call_id,
-                    "parent_call_id": correlation.get("llm_call_id"),
-                    "execution_id": correlation.get("execution_id"),
-                    "round_id": correlation.get("round_id"),
+                    **trace_identity,
                     "raw_arguments": tc.get("function", {}).get("arguments"),
                     "result": result,
                     "result_meta": result_meta,
                 },
                 manifest={
-                    "execution_id": correlation.get("execution_id"),
-                    "round_id": correlation.get("round_id"),
-                    "parent_call_id": correlation.get("llm_call_id"),
-                    "tool_call_id": tool_call_id,
-                    "tool": fn_name,
+                    **trace_identity,
                     "status": "arg_error",
                     "tool_code": tool_result.code,
                     "error_preview": truncate_for_log(sanitize_tool_result_for_log(result), 600),
@@ -739,10 +723,7 @@ def _execute_single_tool(
     # typed meta, so producer-controlled stdout can forge none of them (ABI-6(b):
     # the loop holds the dispatcher's typed result and reads it directly).
     is_error = _typed_execution_failure(tool_ok, tool_result)
-    result_meta = {
-        **_typed_result_metadata(fn_name, result, is_error, tool_result),
-        **_tool_result_fields(tool_result),
-    }
+    result_meta = _typed_result_metadata(fn_name, result, is_error, tool_result)
     # R5 (node-runtime sprint): merge the handler's TYPED process facts into
     # the call's result_meta. When a typed publication exists it owns the WHOLE
     # fact family — including the ABSENCE of a member (a typed publication
@@ -767,11 +748,7 @@ def _execute_single_tool(
             call_id=new_call_id(f"tool_{fn_name}"),
             call_type="tool_call",
             payload={
-                "tool": fn_name,
-                "tool_call_id": tool_call_id,
-                "parent_call_id": correlation.get("llm_call_id"),
-                "execution_id": correlation.get("execution_id"),
-                "round_id": correlation.get("round_id"),
+                **trace_identity,
                 "args": args,
                 "result": result,
                 **({"producer_result": tool_result.producer_text,
@@ -782,11 +759,7 @@ def _execute_single_tool(
                 "result_meta": result_meta,
             },
             manifest={
-                "execution_id": correlation.get("execution_id"),
-                "round_id": correlation.get("round_id"),
-                "parent_call_id": correlation.get("llm_call_id"),
-                "tool_call_id": tool_call_id,
-                "tool": fn_name,
+                **trace_identity,
                 "status": str(result_meta.get("status") or ("ok" if tool_ok else "exception")),
                 "semantic_ok": not is_error,
                 "tool_code": tool_result.code,
@@ -799,7 +772,6 @@ def _execute_single_tool(
     claim_settlement(invocation)  # the real result always writes; it only stops a later host fallback
     settled_row = _with_correlation({
         "ts": utc_now_iso(), **settlement, "elapsed_ms": elapsed_ms(invocation),
-        **({"routing_action": routing_action_for_tool(fn_name)} if routing_action_for_tool(fn_name) else {}),
         "args": args_for_log,
         "result_preview": sanitize_tool_result_for_log(truncate_for_log(result, 2000)),
         "is_error": is_error,
@@ -939,10 +911,7 @@ def _make_timeout_result(
         text=result,
         meta={"timeout_sec": timeout_sec},
     )
-    result_meta = {
-        **_typed_result_metadata(fn_name, result, True, tool_result),
-        **_tool_result_fields(tool_result),
-    }
+    result_meta = _typed_result_metadata(fn_name, result, True, tool_result)
     trace_ref = {}
     corr = dict(correlation or {})
     try:
@@ -1084,7 +1053,8 @@ def _execute_with_timeout(
             # Registered before the wait, so a call abandoned at its timeout is
             # already visible to budget-pause quiescence (#1196); ownership is
             # pinned until the finally below, after any late hold was claimed.
-            _observe_tool_exception(future, tools, drive_logs, live, invocation)
+            invocation["_worker_submitted"] = True
+            future.add_done_callback(partial(_settle_host_error, tools, drive_logs, live, invocation))
             release_tool_custody = budget_pause.register_tool_future(tool_ctx, invocation["invocation_id"], fn_name, future)
             try:
                 result = future.result() if is_reviewed_mutative else future_result(future, timeout_sec)
@@ -1142,7 +1112,8 @@ def _await_stateful_tool(tools: ToolRegistry, tc: Dict[str, Any], drive_logs: pa
     # The registration PINS settlement ownership until this call's own
     # handling is over (result in time, or the late hold claimed below):
     # released in the finally, after either branch (#1196).
-    _observe_tool_exception(future, tools, drive_logs, live, invocation)
+    invocation["_worker_submitted"] = True
+    future.add_done_callback(partial(_settle_host_error, tools, drive_logs, live, invocation))
     release_tool_custody = budget_pause.register_tool_future(tool_ctx, invocation["invocation_id"], fn_name, future)
     try:
         return _emit_finished(tools, live, future_result(future, timeout_sec), started_at)
@@ -1308,15 +1279,7 @@ def handle_tool_calls(
                         "tool_args": {},
                         "args_for_log": {},
                         "is_code_tool": fn_name in tools.CODE_TOOLS,
-                        "result_meta": {
-                            **_typed_result_metadata(
-                                fn_name,
-                                result,
-                                True,
-                                tool_result,
-                            ),
-                            **_tool_result_fields(tool_result),
-                        },
+                        "result_meta": _typed_result_metadata(fn_name, result, True, tool_result),
                         "tool_result": tool_result,
                     }
             batch_raised = False

@@ -14,7 +14,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D04 | Tool execution: registry, access & typed results | 21 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 29 | 0 |
 | D06 | Review stack | 68 | 0 |
-| D07 | Delegation, subagents & Claudexor | 54 | 0 |
+| D07 | Delegation, subagents & Claudexor | 55 | 0 |
 | D08 | Supervisor: queue, workers, events & runtime control | 50 | 0 |
 | D09 | Cancellation, owner control & process custody | 13 | 0 |
 | D10 | Git, update & release machinery | 28 | 0 |
@@ -28,7 +28,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **580** | **0** |
+| **total** | | **581** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -425,6 +425,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/delegate_output.py`
 - `ouroboros/delegate_pending.py`
 - `ouroboros/delegate_progress.py`
+- `ouroboros/delegate_readonly_inputs.py`
 - `ouroboros/delegate_recovery.py`
 - `ouroboros/delegate_registration_policy.py`
 - `ouroboros/delegate_shared.py`

@@ -756,9 +756,8 @@ def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker
     setattr(bs, "_browser_context", context)
     setattr(bs, "_thread_id", 1)
 
-    class HungFuture:
-        def result(self, timeout=None):
-            raise TimeoutError()
+    # A real unfinished Future retains the settlement callback while the wait expires.
+    from concurrent.futures import Future
 
     class CleanupFuture:
         def __init__(self):
@@ -767,7 +766,7 @@ def test_timed_out_stateful_tool_retires_the_generation_and_closes_on_the_worker
         def add_done_callback(self, callback):
             self.callbacks.append(callback)
 
-    hung = HungFuture()
+    hung = Future()
     cleanup_future = CleanupFuture()
 
     class FakeExecutor:

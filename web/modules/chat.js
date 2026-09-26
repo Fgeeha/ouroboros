@@ -586,7 +586,7 @@ export function createChatInstance({
                 button.title = state[1] || (unknown ? 'State unknown' : 'Toggle mode');
             }
         });
-        // Mark More while background mode is active in the menu.
+        // More reflects active background mode.
         const moreSummary = headerActions?.querySelector('.chat-header-more > summary');
         if (moreSummary) {
             const anyActive = !!data?.evolution_enabled || !!data?.bg_consciousness_enabled;
@@ -1672,7 +1672,7 @@ export function createChatInstance({
 
     const historyResyncScheduler = createHistoryResyncScheduler({
         isReplayActive: () => _historyReplayActive,
-        // A joined run's timer was spent on a window fetched before the arm: re-arm.
+        // Re-arm if the joined sync fetched its window before the arm.
         run: () => syncHistory({ includeUser: false }).catch(() => {}).then(() => {
             if (!destroyed && lastHistorySyncSucceeded && liveCardBound.isArmed()) scheduleHistorySync();
         }),
@@ -1700,9 +1700,11 @@ export function createChatInstance({
             if (changed) { renderLiveCardTimeline(record); updateLiveCardCount(record); }
             return changed;
         }
+        // One tool evidence row per block.
+        const foldView = summary.toolCall ? applyToolObservation(record, summary.toolCall) : null;
         if (record.finished && !isTerminalTaskPhase(nextPhase, summary.terminal)) {
-            if (summary.toolCall) {
-                upsertToolFoldRow(record, applyToolObservation(record, summary.toolCall), ts, rawTs);
+            if (foldView) {
+                upsertToolFoldRow(record, foldView, ts, rawTs);
                 renderLiveCardTimeline(record);
                 updateLiveCardCount(record);
             }
@@ -1719,8 +1721,6 @@ export function createChatInstance({
             }
         }
         markReviewAnchor(record);
-        // Routine execution folds into ONE evidence row per block.
-        const foldView = summary.toolCall ? applyToolObservation(record, summary.toolCall) : null;
         if (foldView?.clearedNotice) { renderLiveCardTimeline(record); timelineChanged = true; }
 
         if (!record.isSubagent) {
@@ -1732,7 +1732,7 @@ export function createChatInstance({
         const headline = summary.headline || record.lastHumanHeadline || 'Working...';
         const syntheticKey = summary.dedupeKey || dedupeKey || `${summary.phase || 'working'}|${headline}|${summary.body || ''}`;
         const isLegacyParentSubagentKey = syntheticKey.startsWith('parent-subagent:');
-        // A call's failure and timeout evolve one row; success feeds the fold.
+        // Failure/timeout update one row; success feeds the fold.
         const inPlaceByKey = isLegacyParentSubagentKey
             || ['subagent-lifecycle:', 'subagent-progress:', 'subagent-result:', 'task_done|', 'tool:']
                 .some((prefix) => syntheticKey.startsWith(prefix));
@@ -1743,7 +1743,7 @@ export function createChatInstance({
             record.lastHumanHeadline = headline;
         }
         if (summary.model) record.agentModel = summary.model;
-        // The origin label (a consciousness wake-up) is sticky once any frame names it.
+        // Origin (including consciousness) stays sticky once observed.
         if (summary.initiator) record.initiator = summary.initiator;
 
         const shouldPromote = Boolean(summary.promote) || record.finished;
@@ -1752,24 +1752,20 @@ export function createChatInstance({
             : (record.lastHumanHeadline
                 || (record.updates > 1 ? record.titleEl.textContent : '')
                 || 'Working...');
-        // #1110: a task-scope frame's observed outcome is the chip under the hold; a failed tool call is diagnostics, never the task's outcome.
+        // Only task facts own the outcome chip under a hold; failed tools are diagnostics.
         if (summary.observedOutcome && !record.finished) record.observedOutcome = summary.observedOutcome;
         const desiredPhase = desiredLiveCardPhase(record, record.finished ? summary.phase || 'done' : '');
         setLiveCardPhase(record, desiredPhase.phase, desiredPhase.text, desiredPhase.className,
             desiredPhase.secondary);
-        // A coined project name takes the title slot (the activity headline stays in the
-        // timeline); a child's title is its lineage identity; a block without work
-        // (open attention, a bare non-Done ending) carries no title; otherwise the
-        // activity headline.
+        // Title: project name, child's lineage, or activity; an empty block has none.
+        // Project naming leaves the activity headline in the timeline.
         const title = record.suggestedName || (record.isSubagent ? childTitle(record)
             : !blockHasWork(record) ? ''
                 : (record.finished ? record.lastHumanHeadline || 'Task activity'
                     : record.lastHumanHeadline || activeHeadline));
         if (record.titleEl.textContent !== title) record.titleEl.textContent = title;
-        // The collapsed line is a compact projection; the full activity stays in the
-        // expanded timeline. Every card, a child's included, takes activity only from
-        // a frame in the turn's own voice: a host note and a terminal "Done" cannot
-        // overwrite the last action.
+        // Collapsed activity comes only from the turn's voice, including child cards;
+        // host notes and terminal Done cannot overwrite it. Expand keeps full activity.
         const previewSource = record.isSubagent && summary.human !== false
             ? String(summary.activityPreview ?? summary.body ?? '')
             : (summary.human ? String(summary.activityPreview ?? activeHeadline ?? '')
@@ -1786,8 +1782,7 @@ export function createChatInstance({
         renderCollapsedActivity(record, activityText);
 
         const shouldRenderLine = summary.visible !== false && Boolean(headline || summary.body);
-        // Legacy parent-subagent rows update in place if replayed from old
-        // history. Child-card lifecycle/progress rows also evolve in place.
+        // Parent-child replay and child lifecycle/progress update in place.
         let timelineUpdate = 'none';
         let patchIndex = -1;
         if (_historyRow?.history_id) {
@@ -1796,7 +1791,7 @@ export function createChatInstance({
             ({ timelineUpdate, patchIndex } = updateLiveTimelineItem(record, summary,
                 { ts, rawTs, syntheticKey, headline, inPlaceByKey }));
         }
-        // A failure keeps its own row where it happened AND feeds the fold.
+        // Failures keep their row and feed the fold.
         if (foldView && !_historyRow?.history_id) {
             const fold = upsertToolFoldRow(record, foldView, ts, rawTs);
             if (timelineUpdate === 'none') ({ timelineUpdate, patchIndex } = fold);
@@ -1826,8 +1821,7 @@ export function createChatInstance({
         }
         ensureLiveCardVisible(record, { suppressDomInsert });
         hideTypingIndicatorOnly();
-        // A log-channel task_done settles here without finishLiveCard: remove
-        // its Cancel run action and retained cancelable marker.
+        // Log task_done bypasses finishLiveCard; settle Cancel and its marker.
         if (record.finished) {
             settleLiveCard(record, summary.phase || 'done', wasFinished);
         } else {

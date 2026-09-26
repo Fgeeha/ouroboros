@@ -252,8 +252,14 @@ def test_stop_during_an_outage_outlives_the_primary_coming_back(root, monkeypatc
 
 def test_panic_requests_every_physical_stop_before_any_persistence_and_never_waits(root, monkeypatch):
     import ouroboros.server_control as control
+    from ouroboros import workspace_executor
+    from ouroboros.tools import services, shell_process
     from supervisor import evolution_lifecycle as lifecycle
 
+    # Production exits permanently; this in-process exit stub must not leave
+    # its terminal admission latches set for subsequent consumer tests.
+    for owner in (workspace_executor, services, shell_process):
+        monkeypatch.setattr(owner, "_panic_requested", False)
     _write(state.STATE_PATH, _prior())
     order: list = []
     release = threading.Event()

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import copy
 import hashlib
+import io
 import json
 import os
 import pathlib
@@ -16,9 +17,10 @@ import stat
 
 
 def prepare_folderless_inputs(ctx, invocation_id: str) -> tuple[str, str]:
-    from ouroboros.artifacts import copy_artifact_file
+    from ouroboros.artifacts import stream_artifact_file
     from ouroboros.protected_artifacts import block_reason_for_path
     from ouroboros.secret_masking import mask_secret_bytes
+    from ouroboros.task_custody import fence_publication
     from ouroboros.tool_access import (
         active_tool_profile,
         build_resolved_resource_binding,
@@ -27,6 +29,7 @@ def prepare_folderless_inputs(ctx, invocation_id: str) -> tuple[str, str]:
         lineage_read_roots,
     )
     from ouroboros.tools.core_file_tools import _local_readonly_resource_block
+    from ouroboros.utils import write_bytes_atomic
 
     scratch = folderless_scratch_dir(ctx)
     if scratch is None:
@@ -61,13 +64,16 @@ def prepare_folderless_inputs(ctx, invocation_id: str) -> tuple[str, str]:
                                                   binding.base_path, action="READ_FILE"):
                     continue
                 local = pathlib.Path("inputs") / label / str(index) / relative
-                measured = copy_artifact_file(binding.target_path, root / local)
-                destination = root / local
-                raw = destination.read_bytes()
+                # Verify the original once, then publish only the permitted bytes.
+                # Source permissions describe the input, not this owned projection;
+                # copying a read-only mode first would make masking fail.
+                fence_publication()
+                contents = io.BytesIO()
+                measured = stream_artifact_file(binding.target_path, contents)
+                raw = contents.getvalue()
                 masked_text, masked = mask_secret_bytes(raw.decode("utf-8", "replace"), preserve_layout=True)
-                if masked:
-                    destination.write_bytes(masked_text.encode("utf-8"))
-                delivered = destination.read_bytes()
+                delivered = masked_text.encode("utf-8") if masked else raw
+                write_bytes_atomic(root / local, delivered)
                 manifest.append({"root": label, "source": str(source), "local": local.as_posix(),
                                  "source_sha256": measured["sha256"], "source_size": measured["size"],
                                  "sha256": hashlib.sha256(delivered).hexdigest(), "size": len(delivered),

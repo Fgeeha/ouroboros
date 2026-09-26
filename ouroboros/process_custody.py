@@ -163,6 +163,7 @@ def spawn_supervised(
     scope: str,
     owner_task_id: str = "",
     new_process_group: bool = True,
+    on_spawn: Any = None,
     **popen_kwargs: Any,
 ) -> subprocess.Popen:
     """Popen + durable custody record (the single supervised chokepoint).
@@ -171,6 +172,8 @@ def spawn_supervised(
     any time later cannot orphan the child invisibly (the reaper finds it in the
     ledger); a hard kill INSIDE that spawn-to-record window is the disclosed
     residual — such a child is unledgered and the reaper cannot see it.
+    ``on_spawn`` publishes the Popen into its existing owner before custody I/O;
+    it must not wait or persist. Callback failure follows normal spawn cleanup.
     """
     if new_process_group:
         merged = dict(subprocess_new_group_kwargs())
@@ -178,6 +181,8 @@ def spawn_supervised(
         popen_kwargs = merged
     proc = subprocess.Popen(cmd, **popen_kwargs)  # noqa: S603 — callers pass vetted argv lists
     try:
+        if on_spawn is not None:
+            on_spawn(proc)
         record_process(
             drive_root,
             pid=proc.pid,

@@ -124,27 +124,43 @@ def test_onboarding_panic_runs_real_panic_marker_and_exit_99(startup_without_con
     exits, stops = [], []
     from ouroboros import server_control
     from ouroboros.gateway.host_service import host_service_port
-    monkeypatch.setattr('ouroboros.tools.shell.kill_all_tracked_subprocesses', lambda: None)
-    monkeypatch.setattr('ouroboros.workspace_executor.kill_all_foreground', lambda *a, **kw: None)
-    monkeypatch.setattr('ouroboros.tools.services.kill_all_services', lambda *a, **kw: None)
-    monkeypatch.setattr('ouroboros.local_model.get_manager', lambda: SimpleNamespace(stop_server=lambda: None))
+    from ouroboros.startup_historical_audit import audit
+    monkeypatch.setattr(audit, 'stop', lambda: None)
+    monkeypatch.setattr('ouroboros.tools.shell.kill_all_tracked_subprocesses', lambda **kw: [])
+    monkeypatch.setattr('ouroboros.workspace_executor.kill_all_foreground', lambda *a, **kw: [])
+    monkeypatch.setattr('ouroboros.tools.services.kill_all_services', lambda *a, **kw: [])
+    monkeypatch.setattr('ouroboros.local_model.get_manager', lambda **kw: SimpleNamespace(
+        panic_stop=lambda **kw: [], stop_server=lambda: None))
     monkeypatch.setattr('supervisor.evolution_lifecycle.complete_evolution_campaign', lambda *a, **kw: {})
     monkeypatch.setattr('ouroboros.post_task_evolution.drop_pending_request', lambda *a, **kw: None)
-    monkeypatch.setattr('ouroboros.extension_companion.panic_kill_all', lambda: None)
+    monkeypatch.setattr('ouroboros.extension_companion.panic_kill_all', lambda **kw: [])
     monkeypatch.setattr('multiprocessing.active_children', lambda: [])
     monkeypatch.setattr('ouroboros.platform_layer.kill_process_on_port', lambda port: stops.append(('port', port)))
     monkeypatch.setattr('ouroboros.claudexor_daemon.get_owned_daemon',
-                        lambda: SimpleNamespace(stop=lambda: stops.append(('daemon',))))
+                        lambda **kw: SimpleNamespace(
+                            panic_stop=lambda *, request_only: stops.append(('daemon_request', request_only)) or [],
+                            stop_outcome=lambda: stops.append(('daemon',))))
     monkeypatch.setattr('supervisor.workers.kill_workers', lambda **kw: stops.append(('workers', kw)))
     monkeypatch.setattr(obj.server, '_ACTUAL_BOUND_PORT', 19876)
     monkeypatch.setattr(server_control.os, '_exit', lambda code: exits.append(code))
-    response = obj.client.post('/api/command', json={'cmd': '/panic'})
+    before = set(threading.enumerate())
+    try:
+        response = obj.client.post('/api/command', json={'cmd': '/panic'})
+    finally:
+        # Production hard-exits without waiting for helpers. This test retains
+        # its fake owners until their independent settlement threads finish.
+        for thread in set(threading.enumerate()) - before:
+            if thread.name.startswith('panic-'):
+                thread.join(timeout=5)
+                assert not thread.is_alive()
     assert response.status_code == 200 and response.json() == {'status': 'ok'}
     assert exits == [99]
     assert (obj.data / 'state/panic_stop.flag').read_text(encoding="utf-8") == 'panic'
-    assert stops == [('daemon',), ('workers', {'force': True, 'archive_service_logs': False,
-                                              'reconcile_delegate_custody': False}),
-                     ('port', 19876), ('port', host_service_port())]
+    assert stops[0] == ('daemon_request', True)
+    assert stops.count(('daemon',)) == 1
+    assert [event for event in stops if event[0] == 'workers'] == [
+        ('workers', {'force': True, 'archive_service_logs': False, 'reconcile_delegate_custody': False})]
+    assert sorted(event[1] for event in stops if event[0] == 'port') == sorted([19876, host_service_port()])
     assert not (obj.data / 'settings.json').exists()
     from supervisor import state
     assert state.DRIVE_ROOT == obj.data

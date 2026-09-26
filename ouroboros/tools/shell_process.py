@@ -17,7 +17,7 @@ import subprocess
 import threading
 from typing import List
 
-from ouroboros.platform_layer import kill_process_tree, scrub_repo_from_pythonpath, subprocess_new_group_kwargs
+from ouroboros.platform_layer import kill_process_tree, request_process_tree_kill, scrub_repo_from_pythonpath, subprocess_new_group_kwargs
 from ouroboros.config import SETTINGS_DEFAULTS, load_settings, runtime_environ
 from ouroboros.tools.registry import ToolContext
 from ouroboros.deadline_utils import deadline_remaining_sec
@@ -28,6 +28,7 @@ from ouroboros.workspace_executor import map_host_path as executor_map_host_path
 # Tracked process groups let panic kill descendant trees too.
 _active_subprocesses: set = set()
 _subprocess_lock = threading.Lock()
+_panic_requested = False
 _RUN_SHELL_DEFAULT_TIMEOUT_SEC = 360
 
 
@@ -42,10 +43,14 @@ def _tracked_subprocess_run(cmd, **kwargs):
         kwargs.setdefault("errors", "replace")
     kwargs.setdefault("stdin", subprocess.DEVNULL)
     kwargs.update(subprocess_new_group_kwargs())
+    if _panic_requested:
+        raise RuntimeError("Emergency Stop has retired command admission")
     proc = subprocess.Popen(cmd, **kwargs)
-    with _subprocess_lock:
-        _active_subprocesses.add(proc)
+    # Publish the positive Popen identity before any helper lock or pipe I/O.
+    _active_subprocesses.add(proc)
     try:
+        if _panic_requested:
+            request_process_tree_kill(proc)
         stdout, stderr = proc.communicate(timeout=timeout)
         return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
     except subprocess.TimeoutExpired:
@@ -53,8 +58,7 @@ def _tracked_subprocess_run(cmd, **kwargs):
         proc.wait(timeout=5)
         raise
     finally:
-        with _subprocess_lock:
-            _active_subprocesses.discard(proc)
+        _active_subprocesses.discard(proc)
 
 
 def _kill_process_group(proc):
@@ -62,8 +66,12 @@ def _kill_process_group(proc):
     kill_process_tree(proc)
 
 
-def kill_all_tracked_subprocesses():
-    """Kill all tracked subprocess trees on panic."""
+def kill_all_tracked_subprocesses(*, request_only=False):
+    """Request owned kills without locks, or perform ordinary tree cleanup."""
+    global _panic_requested
+    if request_only:
+        _panic_requested = True
+        return [request_process_tree_kill(proc) for proc in _active_subprocesses.copy()]
     with _subprocess_lock:
         procs = list(_active_subprocesses)
     for proc in procs:

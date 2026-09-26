@@ -349,6 +349,10 @@ class OwnedClaudexorDaemon:
         self._engine_build_sha = ""
         self._generation = 0
         self._stopping = False
+        self._panic_requested = False
+        self._panic_endpoint = None
+        self._panic_targets: tuple = ()
+        self._panic_capture_error = "no attested attachment captured"
         self._startup_attempt: Dict[str, Any] = {}
         # Spawn latch (#844): the typed record of the last start that ended
         # with ``ExitFact.failed_without_control``. While set, no caller
@@ -485,7 +489,7 @@ class OwnedClaudexorDaemon:
         """A Stop retires in-flight callers, never a later explicit start."""
         from ouroboros.gateways.claudexor import ClaudexorUnavailable
 
-        if self._stopping or generation != self._generation:
+        if self._panic_requested or self._stopping or generation != self._generation:
             raise ClaudexorUnavailable(
                 "daemon_start_cancelled", "owned daemon startup was cancelled by Stop",
                 status_code=503,
@@ -515,6 +519,7 @@ class OwnedClaudexorDaemon:
     def _accept_endpoint(self, endpoint: Any, generation: int) -> Any:
         self._check_start_generation(generation)
         _write_ownership_marker()
+        self._remember_stop_targets(endpoint)
         with self._lock:
             self._check_start_generation(generation)
         # An own child that exited while a live daemon answers — an election
@@ -711,6 +716,7 @@ class OwnedClaudexorDaemon:
                     drive_root=pathlib.Path(DATA_DIR),
                     purpose=CUSTODY_PURPOSE,
                     scope="daemon",
+                    on_spawn=self._publish_child,
                     env=env,
                     stdin=subprocess.DEVNULL,
                     stdout=sink,
@@ -718,6 +724,12 @@ class OwnedClaudexorDaemon:
                     **subprocess_new_group_kwargs(breakaway_from_job=True),
                 )
                 self._startup_attempt = {**attempt, "pid": self._proc.pid}
+
+    def _publish_child(self, proc) -> None:
+        """Expose the owned handle before custody I/O; retire a raced Panic spawn."""
+        self._proc = proc
+        if self._panic_requested:
+            self.panic_stop(request_only=True)
 
     def _wait_for_start(self, generation: int, startup_wait_sec: Optional[float]) -> Any:
         from ouroboros.gateways.claudexor import SHORT_POLL_TIMEOUT_SEC, ClaudexorUnavailable
@@ -967,22 +979,51 @@ class OwnedClaudexorDaemon:
             log.warning("Owned daemon operator stop did not confirm completion (%s)", type(exc).__name__)
             return False
 
-    def panic_stop(self) -> None:
-        """Stop a captured child immediately; existing attested stop owns attachments.
+    def _remember_stop_targets(self, endpoint) -> None:
+        """Prepare attachment identity during normal admission, never during Panic.
 
-        The Popen handle is direct ownership. Do not acquire the manager lock or
-        wait on CLI/logging before signalling it. Prior-generation attachments
-        still require stop_outcome's existing home/endpoint/custody proofs.
+        The authenticated endpoint and owned-home marker authorize only measured
+        custody rows. Pin OS references between two full fingerprint checks;
+        later requests use those references, never a descriptor PID or port.
         """
-        proc = self._proc
-        if proc is not None and proc.poll() is None:
-            from ouroboros.platform_layer import kill_process_tree
+        if (endpoint == self._panic_endpoint and self._panic_targets) or self._panic_requested:
+            return
+        from ouroboros.config import DATA_DIR
+        from ouroboros.platform_layer import capture_process_stop_target
+        from ouroboros.process_custody import _fingerprint_matches, process_stop_snapshot
 
-            try:
-                kill_process_tree(proc)
-            except Exception:
-                pass
-        self.stop_outcome()
+        targets = []
+        try:
+            if problem := verify_owned_home(require_marker=True):
+                raise OSError(problem)
+            for entry in process_stop_snapshot(pathlib.Path(DATA_DIR), {CUSTODY_PURPOSE}):
+                if not _fingerprint_matches(entry, require_measured=True):
+                    continue
+                target = capture_process_stop_target(int(entry["pid"]))
+                if _fingerprint_matches(entry, require_measured=True):
+                    target["custody"] = entry
+                    targets.append(target)
+            self._panic_targets = tuple(targets)
+            self._panic_capture_error = "" if targets else "no measured attached process identity"
+            self._panic_endpoint = endpoint
+            if self._panic_requested:  # publication raced the immediate request
+                self.panic_stop(request_only=True)
+        except Exception as exc:
+            self._panic_capture_error = f"attachment capture failed: {type(exc).__name__}"
+
+    def panic_stop(self, *, request_only: bool = False) -> list:
+        """Signal captured children/attachments without manager, CLI or disk waits."""
+        from ouroboros.platform_layer import request_process_tree_kill
+
+        self._panic_requested = True
+        proc = self._proc
+        targets = ([proc] if proc is not None else []) + list(self._panic_targets)
+        requests = [request_process_tree_kill(target) for target in targets]
+        if not targets and self._panic_capture_error:
+            requests.append({"requested": False, "error": self._panic_capture_error})
+        if not request_only:
+            self.stop_outcome()
+        return requests
 
     def stop_outcome(self) -> DaemonStopOutcome:
         """Stop verified own roots; report every unconfirmed remainder.
@@ -1039,7 +1080,8 @@ class OwnedClaudexorDaemon:
             if endpoint is not None or state == _TRANSPORT_UNREACHABLE or pre_listener:
                 expected_entries, observed = [], set()
                 try:
-                    expected_entries = process_stop_snapshot(root, purposes)
+                    expected_entries = ([target["custody"] for target in self._panic_targets]
+                                        if self._panic_requested else process_stop_snapshot(root, purposes))
                     for entry in expected_entries:
                         pid = int(entry["pid"])
                         observed.add(pid)
@@ -1048,7 +1090,7 @@ class OwnedClaudexorDaemon:
                         observed.add(self._proc.pid)
                 except Exception:
                     unconfirmed.append("stop target custody could not be observed")
-                if endpoint is not None:
+                if endpoint is not None and (not self._panic_requested or endpoint == self._panic_endpoint):
                     operator_stopped = self._request_operator_stop()
                 if operator_stopped:
                     # Lease release confirms clean service shutdown; a Node tail
@@ -1114,9 +1156,9 @@ _MANAGER: Optional[OwnedClaudexorDaemon] = None
 _MANAGER_LOCK = threading.Lock()
 
 
-def get_owned_daemon() -> OwnedClaudexorDaemon:
+def get_owned_daemon(*, create: bool = True) -> Optional[OwnedClaudexorDaemon]:
     global _MANAGER
-    if _MANAGER is not None:
+    if _MANAGER is not None or not create:
         return _MANAGER
     with _MANAGER_LOCK:
         if _MANAGER is None:
@@ -1177,9 +1219,11 @@ def read_owned_gateway() -> Any:
     """
     from ouroboros.gateways.claudexor import ClaudexorGateway, discover_daemon_at
 
-    gateway = ClaudexorGateway(discover_daemon_at(owned_config_dir()))
+    endpoint = discover_daemon_at(owned_config_dir())
+    gateway = ClaudexorGateway(endpoint)
     try:
         gateway.handshake()
+        get_owned_daemon()._remember_stop_targets(endpoint)
     except Exception:
         gateway.close()
         raise

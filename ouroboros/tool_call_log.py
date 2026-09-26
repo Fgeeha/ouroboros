@@ -105,23 +105,23 @@ def append_call_row(meta: Dict[str, Any], drive_logs: pathlib.Path, payload: Dic
         if meta.get(key) not in (None, ""):
             payload[key] = meta.get(key)
     local = pathlib.Path(drive_logs) / "tools.jsonl"
-    outcome: Dict[str, Any] = {"task_log": _append(local, payload), "canonical": None}
+    targets = {"task_log": local}
+    outcome: Dict[str, Any] = {"canonical": None}
     root = str(meta.get("budget_drive_root") or "").strip()
     if root:
         try:
             candidate = pathlib.Path(root).resolve(strict=False) / "logs" / "tools.jsonl"
             if candidate != local.resolve(strict=False):
-                outcome["canonical"] = _append(candidate, payload)
+                targets["canonical"] = candidate
         except Exception:
             outcome["canonical"] = False
+    # Every target gets its own attempt and outcome, including False returns.
+    for name, path in targets.items():
+        try:
+            outcome[name] = bool(append_jsonl(path, payload))
+        except Exception:
+            outcome[name] = False
     return outcome
-
-
-def _append(path: pathlib.Path, payload: Dict[str, Any]) -> bool:
-    try:
-        return bool(append_jsonl(path, payload))
-    except Exception:
-        return False
 
 
 def append_failed(outcome: Optional[Dict[str, Any]]) -> bool:

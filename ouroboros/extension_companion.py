@@ -13,7 +13,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-from ouroboros.platform_layer import IS_WINDOWS, assign_pid_to_job, close_job, create_kill_on_close_job, kill_process_on_port, kill_process_tree, merge_hidden_kwargs, subprocess_new_group_kwargs, terminate_job, terminate_process_tree
+from ouroboros.platform_layer import IS_WINDOWS, assign_pid_to_job, close_job, create_kill_on_close_job, kill_process_on_port, kill_process_tree, merge_hidden_kwargs, request_process_tree_kill, subprocess_new_group_kwargs, terminate_job, terminate_process_tree
 from ouroboros.provider_models import MODEL_PROVIDER_CREDENTIAL_KEYS
 from ouroboros.usage_accounting import record_unmetered_external_dispatch
 from ouroboros.utils import atomic_write_json, utc_now_iso
@@ -110,6 +110,7 @@ class CompanionSupervisor:
         self._lock = threading.RLock()
         self._runtimes: Dict[str, CompanionRuntime] = {}
         self._restart_history: Dict[str, List[float]] = {}
+        self._panic_requested = False
 
     def _key(self, skill_name: str, name: str) -> str:
         return f"{skill_name}:{name}"
@@ -121,6 +122,8 @@ class CompanionSupervisor:
             return False
         key = self._key(descriptor.skill_name, descriptor.name)
         with self._lock:
+            if self._panic_requested:
+                return False
             existing = self._runtimes.get(key)
             if existing and existing.process.poll() is None:
                 return True
@@ -138,6 +141,22 @@ class CompanionSupervisor:
                 popen_kwargs.update(subprocess_new_group_kwargs())
             popen_kwargs = merge_hidden_kwargs(popen_kwargs)
             proc = subprocess.Popen(descriptor.command, **popen_kwargs)  # noqa: S603
+            # The existing runtime owner publishes the positive identity before
+            # accounting, custody or snapshot writes can block this lock.
+            runtime = CompanionRuntime(descriptor, proc, time.monotonic())
+            self._runtimes[key] = runtime
+            job_handle = None
+            if IS_WINDOWS and os.environ.get("OUROBOROS_MANAGED_BY_LAUNCHER") != "1":
+                job_handle = create_kill_on_close_job()
+                if job_handle is None or not assign_pid_to_job(job_handle, proc.pid):
+                    if job_handle is not None:
+                        close_job(job_handle)
+                    kill_process_tree(proc)
+                    raise RuntimeError("failed to assign companion process to Windows Job Object")
+            runtime.job_handle = job_handle
+            if self._panic_requested:
+                request_process_tree_kill(proc, job_handle=job_handle)
+                return False
             if any(
                 str(descriptor.env.get(key) or "").strip()
                 for key in MODEL_PROVIDER_CREDENTIAL_KEYS
@@ -177,21 +196,6 @@ class CompanionSupervisor:
                 )
             except Exception:
                 log.debug("companion custody record failed", exc_info=True)
-            job_handle = None
-            if IS_WINDOWS and os.environ.get("OUROBOROS_MANAGED_BY_LAUNCHER") != "1":
-                job_handle = create_kill_on_close_job()
-                if job_handle is None or not assign_pid_to_job(job_handle, proc.pid):
-                    if job_handle is not None:
-                        close_job(job_handle)
-                    kill_process_tree(proc)
-                    raise RuntimeError("failed to assign companion process to Windows Job Object")
-            runtime = CompanionRuntime(
-                descriptor=descriptor,
-                process=proc,
-                started_at=time.monotonic(),
-                job_handle=job_handle,
-            )
-            self._runtimes[key] = runtime
             self._start_drainers(runtime)
             try:
                 from ouroboros.extension_health import clear_companion_restart_exhausted
@@ -237,7 +241,7 @@ class CompanionSupervisor:
         restart_exhausted = False
         with self._lock:
             current = self._runtimes.get(key)
-            if current is runtime and descriptor.restart_policy == "on_failure" and returncode != 0:
+            if current is runtime and not self._panic_requested and descriptor.restart_policy == "on_failure" and returncode != 0:
                 now = time.monotonic()
                 history = [
                     ts for ts in self._restart_history.get(key, [])
@@ -304,7 +308,11 @@ class CompanionSupervisor:
         for runtime in list(self.snapshot().values()):
             self.stop(str(runtime["skill_name"]), str(runtime["name"]), timeout_sec=timeout_sec)
 
-    def panic_kill_all(self) -> None:
+    def panic_kill_all(self, *, request_only: bool = False) -> list[dict[str, Any]] | None:
+        self._panic_requested = True
+        if request_only:
+            return [request_process_tree_kill(runtime.process, job_handle=runtime.job_handle)
+                    for runtime in self._runtimes.copy().values()]
         with self._lock:
             runtimes = list(self._runtimes.values())
             self._runtimes.clear()
@@ -382,9 +390,10 @@ def snapshot_processes() -> Dict[str, Dict[str, Any]]:
     return _GLOBAL_SUPERVISOR.snapshot()
 
 
-def panic_kill_all() -> None:
+def panic_kill_all(*, request_only: bool = False) -> list[dict[str, Any]] | None:
     if _GLOBAL_SUPERVISOR is not None:
-        _GLOBAL_SUPERVISOR.panic_kill_all()
+        return _GLOBAL_SUPERVISOR.panic_kill_all(request_only=request_only)
+    return [] if request_only else None
 
 
 __all__ = [

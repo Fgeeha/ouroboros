@@ -224,6 +224,13 @@ def owner_evolution_stop_controls(reason: str) -> str:
             f" The Stop holds in this process, but {' and '.join(missing)} did not persist.")
 
 
+def _enable_evolution_controls(live: Dict[str, Any]) -> None:
+    """The common state projection after either authorized campaign start."""
+    live.update(evolution_mode_enabled=True, evolution_consecutive_failures=0,
+                evolution_owner_stopped=False, post_task_autostop=False)
+    live.pop("evolution_stop_source", None)
+
+
 def owner_evolution_start(objective: str, *, source: str = "owner_chat", origin: Any = None) -> str:
     """The owner's authorized start: clears the owner stop (GR4-6: BEFORE the campaign
     is minted), starts the campaign (which alone clears a recorded stop intent), then
@@ -247,11 +254,6 @@ def owner_evolution_start(objective: str, *, source: str = "owner_chat", origin:
         if not prior.get("known"):
             mark_unconfirmed(live, "evolution_owner_stopped")
 
-    def _enable(live: Dict[str, Any]) -> None:
-        live.update(evolution_mode_enabled=True, evolution_consecutive_failures=0,
-                    evolution_owner_stopped=False, post_task_autostop=False)
-        live.pop("evolution_stop_source", None)
-
     try:
         update_state(_clear_owner_stop, confirm=("evolution_owner_stopped", "evolution_stop_source"))
     except StateUnavailable as exc:
@@ -265,7 +267,7 @@ def owner_evolution_start(objective: str, *, source: str = "owner_chat", origin:
         if not started:
             update_state(_restore)
             return "🧬 Evolution stayed OFF: campaign state could not be created."
-        update_state(_enable, confirm=EVOLUTION_CONTROL_KEYS)
+        update_state(_enable_evolution_controls, confirm=EVOLUTION_CONTROL_KEYS)
     except StateUnavailable as exc:
         owner_evolution_stop_controls("owner Start could not persist activation")
         return f"🧬 Evolution did not turn on: runtime state became unavailable ({exc.reason})."
@@ -330,13 +332,8 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
                 return
     persisted = ""
     if enabled and not owner_sourced:
-        def _agent_enable(live: Dict[str, Any]) -> None:
-            live.update(evolution_mode_enabled=True, evolution_consecutive_failures=0,
-                        evolution_owner_stopped=False, post_task_autostop=False)
-            live.pop("evolution_stop_source", None)
-
         try:
-            update_state(_agent_enable, confirm=EVOLUTION_CONTROL_KEYS)
+            update_state(_enable_evolution_controls, confirm=EVOLUTION_CONTROL_KEYS)
         except StateUnavailable as exc:
             persisted = f" — not persisted: runtime state unavailable ({exc.reason})"
     elif not enabled and owner_sourced:

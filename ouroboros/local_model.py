@@ -70,9 +70,9 @@ _manager: Optional[LocalModelManager] = None
 _manager_lock = threading.Lock()
 
 
-def get_manager() -> LocalModelManager:
+def get_manager(*, create: bool = True) -> Optional[LocalModelManager]:
     global _manager
-    if _manager is not None:
+    if _manager is not None or not create:
         return _manager
     with _manager_lock:
         if _manager is None:
@@ -107,6 +107,7 @@ class LocalModelManager:
         # Cancellation flag — set in stop_server() so _run_install() can abort
         # even before _install_proc is assigned, closing the panic-window race.
         self._install_cancelled = threading.Event()
+        self._panic_requested = False
 
     def get_status(self) -> str:
         if self._proc is not None and self._proc.poll() is not None:
@@ -184,6 +185,8 @@ class LocalModelManager:
                 log.info("Runtime install already in progress")
                 return
             # stop_server may have cancelled a previous lifecycle.
+            if self._panic_requested:
+                raise RuntimeError("Local runtime install cancelled by Panic")
             self._install_cancelled.clear()
             self._runtime_status = "installing"
             self._runtime_install_log = ""
@@ -441,6 +444,8 @@ class LocalModelManager:
     ) -> None:
         """Start the server; rechecks runtime as a safety net before Popen."""
         with self._lock:
+            if self._panic_requested:
+                raise RuntimeError("Local model startup cancelled by Panic")
             if self._proc is not None and self._proc.poll() is None:
                 raise RuntimeError("Local model server is already running")
 
@@ -508,6 +513,8 @@ class LocalModelManager:
                 )
                 _popen_kwargs.update(subprocess_new_group_kwargs())
                 self._proc = subprocess.Popen(cmd, **_with_hidden_subprocess(_popen_kwargs))
+                if self._panic_requested:
+                    self.panic_stop(request_only=True)
                 try:
                     from ouroboros.config import DATA_DIR
                     from ouroboros.process_custody import record_process
@@ -609,16 +616,17 @@ class LocalModelManager:
         self._error = f"Server failed to become healthy within {timeout}s"
         log.error(self._error)
 
-    def panic_stop(self) -> None:
+    def panic_stop(self, *, request_only: bool = False) -> list:
         """Signal our captured children before manager locks or cleanup waits."""
+        from ouroboros.platform_layer import request_process_tree_kill
+
+        self._panic_requested = True
         self._install_cancelled.set()
-        for proc in (self._proc, self._install_proc):
-            if proc is not None and proc.poll() is None:
-                try:
-                    kill_process_tree(proc)
-                except Exception:
-                    pass
-        self.stop_server()
+        requests = [request_process_tree_kill(proc) for proc in (self._proc, self._install_proc)
+                    if proc is not None]
+        if not request_only:
+            self.stop_server()
+        return requests
 
     def stop_server(self) -> None:
         """Stop the local model server subprocess and any ongoing install."""

@@ -595,30 +595,20 @@ def pid_is_alive(pid: int) -> bool:
     if IS_WINDOWS:
         # os.kill(pid, 0) is WRONG here: signal 0 is CTRL_C_EVENT, delivered to the pid's
         # whole console group. Probe with OpenProcess + GetExitCodeProcess, which never signals anything.
-        import ctypes
-        from ctypes import wintypes
-
-        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
-        kernel32.OpenProcess.restype = wintypes.HANDLE
-        kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
-        kernel32.GetExitCodeProcess.restype = wintypes.BOOL
-        kernel32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
-        kernel32.CloseHandle.restype = wintypes.BOOL
-        kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
         _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         _STILL_ACTIVE = 259
         _ERROR_ACCESS_DENIED = 5
-        handle = kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        handle = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
         if not handle:
             # A live but access-protected process reads as alive; anything else (invalid parameter -> no such pid) reads as dead.
             return ctypes.get_last_error() == _ERROR_ACCESS_DENIED
         try:
-            code = wintypes.DWORD()
-            if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
+            code = ctypes.wintypes.DWORD()
+            if not _kernel32.GetExitCodeProcess(handle, ctypes.byref(code)):
                 return True  # opened but unreadable -> fail SAFE toward alive
             return int(code.value) == _STILL_ACTIVE
         finally:
-            kernel32.CloseHandle(handle)
+            _kernel32.CloseHandle(handle)
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -656,53 +646,20 @@ _WIN32_LOCK_OFFSET = 0x7FFFFFFF00000000
 _WIN32_LOCK_LENGTH = 1
 
 
-_OVERLAPPED_CLS = None  # cached once per process
-
-
-def _win32_overlapped_class():
-    """Return cached portable OVERLAPPED; ctypes requires one class identity."""
-    global _OVERLAPPED_CLS
-    if _OVERLAPPED_CLS is not None:
-        return _OVERLAPPED_CLS
-
-    import ctypes
-    from ctypes import wintypes
-
-    class OVERLAPPED(ctypes.Structure):
-        _fields_ = [
-            ("Internal", ctypes.c_void_p),
-            ("InternalHigh", ctypes.c_void_p),
-            ("Offset", wintypes.DWORD),
-            ("OffsetHigh", wintypes.DWORD),
-            ("hEvent", wintypes.HANDLE),
-        ]
-
-    _OVERLAPPED_CLS = OVERLAPPED
-    return OVERLAPPED
-
-
 def _win32_lock(fd: int, *, exclusive: bool = True, blocking: bool = True) -> None:
     """Lock the fixed out-of-stamp byte range with LockFileEx (including empty files)."""
     import ctypes
-    from ctypes import wintypes
     import msvcrt as _msvcrt
 
     _LOCKFILE_FAIL_IMMEDIATELY = 0x00000001
     _LOCKFILE_EXCLUSIVE_LOCK = 0x00000002
 
-    OVERLAPPED = _win32_overlapped_class()
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.LockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
-                                    wintypes.DWORD, wintypes.DWORD, ctypes.POINTER(OVERLAPPED)]
-    kernel32.LockFileEx.restype = wintypes.BOOL
-
     hfile = _msvcrt.get_osfhandle(fd)
     flags = (_LOCKFILE_EXCLUSIVE_LOCK if exclusive else 0) | (0 if blocking else _LOCKFILE_FAIL_IMMEDIATELY)
 
-    ov = OVERLAPPED()
+    ov = _OVERLAPPED()
     ov.Offset, ov.OffsetHigh = _WIN32_LOCK_OFFSET & 0xFFFFFFFF, _WIN32_LOCK_OFFSET >> 32
-    if not kernel32.LockFileEx(hfile, flags, 0, _WIN32_LOCK_LENGTH, 0, ctypes.byref(ov)):
+    if not _kernel32.LockFileEx(hfile, flags, 0, _WIN32_LOCK_LENGTH, 0, ctypes.byref(ov)):
         raise _win32_lock_error(ctypes.get_last_error())
 
 
@@ -723,56 +680,100 @@ def _win32_unlock(fd: int) -> None:
 
     Rebuild OVERLAPPED; no recycled-fd map. ERROR_NOT_LOCKED needs no recovery."""
     import ctypes
-    from ctypes import wintypes
     import msvcrt as _msvcrt
 
-    OVERLAPPED = _win32_overlapped_class()
-
-    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
-    kernel32.UnlockFileEx.argtypes = [wintypes.HANDLE, wintypes.DWORD, wintypes.DWORD,
-                                      wintypes.DWORD, ctypes.POINTER(OVERLAPPED)]
-    kernel32.UnlockFileEx.restype = wintypes.BOOL
-
-    ov = OVERLAPPED()
+    ov = _OVERLAPPED()
     ov.Offset, ov.OffsetHigh = _WIN32_LOCK_OFFSET & 0xFFFFFFFF, _WIN32_LOCK_OFFSET >> 32
     with contextlib.suppress(Exception):
-        kernel32.UnlockFileEx(_msvcrt.get_osfhandle(fd), 0, _WIN32_LOCK_LENGTH, 0, ctypes.byref(ov))
+        _kernel32.UnlockFileEx(_msvcrt.get_osfhandle(fd), 0, _WIN32_LOCK_LENGTH, 0, ctypes.byref(ov))
 
 
 # Process management.
+
+def capture_process_stop_target(pid: int) -> dict:
+    """Pin an already authorized process for a later wait-free stop request.
+
+    The caller proves custody before AND after capture; a PID is not authority.
+    Handles own their lifetime; Darwin's exit watch rejects a departed target.
+    No attached-daemon Job is created: ordinary client close must preserve it.
+    """
+    if pid <= 0 or pid == os.getpid():
+        raise ValueError("invalid stop target")
+    if IS_WINDOWS:
+        import _winapi
+        handle = subprocess.Handle(_winapi.OpenProcess(0x1001, False, pid))
+    elif IS_MACOS:
+        import select
+        handle = select.kqueue()
+        handle.control([select.kevent(pid, filter=select.KQ_FILTER_PROC,
+                                     flags=select.KQ_EV_ADD | select.KQ_EV_CLEAR,
+                                     fflags=select.KQ_NOTE_EXIT | select.KQ_NOTE_EXEC)], 0, 0)
+    else:
+        import io
+        handle = io.FileIO(os.pidfd_open(pid), mode="rb", closefd=True)
+    return {"pid": pid, "handle": handle, "pgid": process_group_id(pid)}
+
+
+def request_process_tree_kill(proc, *, job_handle=None) -> dict:
+    """Issue native termination now; never wait, scan descendants or touch disk.
+
+    Accept a live owner Popen or a previously custody-validated OS target. The
+    receipt proves a request only. A Job/group covers its members; escaped
+    descendants and a process-only Windows request still require settlement.
+    """
+    pinned = isinstance(proc, dict)
+    pid = int(proc["pid"] if pinned else proc.pid)
+    result = {"pid": pid, "requested": False, "scope": "process"}
+    try:
+        if pid <= 0 or pid == os.getpid():
+            raise ValueError("refusing current/invalid process")
+        if IS_WINDOWS:
+            if job_handle is not None:
+                result["scope"] = "job"
+                if not (problem := terminate_job(job_handle)):
+                    return {**result, "requested": True}
+                result.update(scope="process", error=problem)  # still request the known root
+            import _winapi
+            handle = proc["handle"] if pinned else getattr(proc, "_handle", None)
+            _winapi.TerminateProcess(handle if handle is not None else proc._popen._handle, 1)
+        else:
+            if pinned:
+                if IS_MACOS:
+                    if proc["handle"].control([], 1, 0):
+                        proc["handle"].close()  # an exit/exec refusal cannot be consumed then forgotten
+                        raise ProcessLookupError("captured process exited or exec'd")
+                else:
+                    signal.pidfd_send_signal(proc["handle"].fileno(), 0)
+            elif (proc.poll() if hasattr(proc, "poll") else proc.exitcode) is not None:
+                raise ProcessLookupError("owned child already exited")
+            pgid = os.getpgid(pid)
+            if pgid == pid and pgid != os.getpgrp() and (not pinned or pgid == proc["pgid"]):
+                os.killpg(pgid, signal.SIGKILL)
+                result["scope"] = "group"
+            elif pinned and not IS_MACOS:
+                signal.pidfd_send_signal(proc["handle"].fileno(), signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+        result["requested"] = True
+    except Exception as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+    return result
+
 
 def kill_process_tree(proc: subprocess.Popen, *, exclude_pids: "set[int] | None" = None) -> None:
     """Capture descendants before termination and spare retained branches.
 
     POSIX kills the group only when it contains no spared PID, then escaped
     descendants. Windows uses selective PID termination when exclusions exist."""
-    pid = proc.pid
-    if IS_WINDOWS and not exclude_pids:
-        try:
-            _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
-                        capture_output=True, timeout=10)
-        except Exception:
-            pass
-        return
-    targets, spared = _tree_kill_targets(pid, exclude_pids)
-    if not IS_WINDOWS:
-        pgid = process_group_id(pid)
-        if pgid > 0 and not any(process_group_id(p) == pgid for p in spared):
-            kill_process_group_id(pgid)
-    for dpid in targets:
-        force_kill_pid(dpid)
+    kill_pid_tree(proc.pid, exclude_pids=exclude_pids, include_process_group=True)
 
 
 def terminate_process_tree(proc: subprocess.Popen) -> None:
     """Gracefully terminate a subprocess and its process tree."""
     if IS_WINDOWS:
         proc.terminate()
-    else:
-        try:
-            pgid = os.getpgid(proc.pid)
-            os.killpg(pgid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            pass
+    elif pgid := process_group_id(proc.pid):
+        terminate_process_group_id(pgid)
 
 
 def terminate_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = None) -> None:
@@ -932,10 +933,12 @@ def force_kill_pid(pid: int) -> None:
             pass
 
 
-def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
+def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None, *,
+                  include_process_group: bool = False) -> None:
     """Kill a captured PID tree, sparing excluded roots and their descendants.
 
-    The caller owns daemon/service retention policy; this helper only signals."""
+    The caller owns retention policy. Popen cleanup also selects its unspared group;
+    PID-only callers keep their existing selective-tree semantics."""
     if IS_WINDOWS and not exclude_pids:
         try:
             _hidden_run(["taskkill", "/F", "/T", "/PID", str(pid)],
@@ -944,7 +947,11 @@ def kill_pid_tree(pid: int, exclude_pids: "set[int] | None" = None) -> None:
             pass
         return
 
-    targets, _ = _tree_kill_targets(pid, exclude_pids)
+    targets, spared = _tree_kill_targets(pid, exclude_pids)
+    if include_process_group and not IS_WINDOWS:
+        pgid = process_group_id(pid)
+        if pgid > 0 and not any(process_group_id(p) == pgid for p in spared):
+            kill_process_group_id(pgid)
     for dpid in targets:
         force_kill_pid(dpid)
 
@@ -1353,35 +1360,40 @@ if IS_WINDOWS:
     # Snapshot the actual call error; declare full-width HANDLE ABI (ARCHITECTURE §1).
     _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)  # type: ignore[attr-defined]
 
-    _kernel32.CreateJobObjectW.restype = ctypes.wintypes.HANDLE
-    _kernel32.CreateJobObjectW.argtypes = (ctypes.wintypes.LPVOID, ctypes.wintypes.LPCWSTR)
-    _kernel32.SetInformationJobObject.restype = ctypes.wintypes.BOOL
-    _kernel32.SetInformationJobObject.argtypes = (
-        ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.LPVOID, ctypes.wintypes.DWORD,
-    )
-    _kernel32.OpenProcess.restype = ctypes.wintypes.HANDLE
-    _kernel32.OpenProcess.argtypes = (ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)
-    _kernel32.GetProcessTimes.restype = ctypes.wintypes.BOOL
-    _kernel32.GetProcessTimes.argtypes = (
-        ctypes.wintypes.HANDLE, *(ctypes.POINTER(ctypes.wintypes.FILETIME),) * 4,
-    )
-    _kernel32.GetCurrentProcess.restype = ctypes.wintypes.HANDLE
-    _kernel32.GetCurrentProcess.argtypes = ()
-    _kernel32.IsProcessInJob.restype = ctypes.wintypes.BOOL
-    _kernel32.IsProcessInJob.argtypes = (
-        ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.wintypes.BOOL),
-    )
-    _kernel32.QueryInformationJobObject.restype = ctypes.wintypes.BOOL
-    _kernel32.QueryInformationJobObject.argtypes = (
-        ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.LPVOID,
-        ctypes.wintypes.DWORD, ctypes.POINTER(ctypes.wintypes.DWORD),
-    )
-    _kernel32.AssignProcessToJobObject.restype = ctypes.wintypes.BOOL
-    _kernel32.AssignProcessToJobObject.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE)
-    _kernel32.TerminateJobObject.restype = ctypes.wintypes.BOOL
-    _kernel32.TerminateJobObject.argtypes = (ctypes.wintypes.HANDLE, ctypes.wintypes.UINT)
-    _kernel32.CloseHandle.restype = ctypes.wintypes.BOOL
-    _kernel32.CloseHandle.argtypes = (ctypes.wintypes.HANDLE,)
+    class _OVERLAPPED(ctypes.Structure):
+        _fields_ = [
+            ("Internal", ctypes.c_void_p),
+            ("InternalHigh", ctypes.c_void_p),
+            ("Offset", ctypes.wintypes.DWORD),
+            ("OffsetHigh", ctypes.wintypes.DWORD),
+            ("hEvent", ctypes.wintypes.HANDLE),
+        ]
+
+    # One complete ABI table for process presence, locks and Job ownership.
+    for _api_name, _result_type, _argument_types in (
+        ("CreateJobObjectW", ctypes.wintypes.HANDLE, (ctypes.wintypes.LPVOID, ctypes.wintypes.LPCWSTR)),
+        ("SetInformationJobObject", ctypes.wintypes.BOOL,
+         (ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.LPVOID, ctypes.wintypes.DWORD)),
+        ("OpenProcess", ctypes.wintypes.HANDLE, (ctypes.wintypes.DWORD, ctypes.wintypes.BOOL, ctypes.wintypes.DWORD)),
+        ("GetExitCodeProcess", ctypes.wintypes.BOOL, (ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.wintypes.DWORD))),
+        ("GetProcessTimes", ctypes.wintypes.BOOL, (ctypes.wintypes.HANDLE, *(ctypes.POINTER(ctypes.wintypes.FILETIME),) * 4)),
+        ("GetCurrentProcess", ctypes.wintypes.HANDLE, ()),
+        ("IsProcessInJob", ctypes.wintypes.BOOL,
+         (ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE, ctypes.POINTER(ctypes.wintypes.BOOL))),
+        ("QueryInformationJobObject", ctypes.wintypes.BOOL,
+         (ctypes.wintypes.HANDLE, ctypes.c_int, ctypes.wintypes.LPVOID, ctypes.wintypes.DWORD, ctypes.POINTER(ctypes.wintypes.DWORD))),
+        ("AssignProcessToJobObject", ctypes.wintypes.BOOL, (ctypes.wintypes.HANDLE, ctypes.wintypes.HANDLE)),
+        ("TerminateJobObject", ctypes.wintypes.BOOL, (ctypes.wintypes.HANDLE, ctypes.wintypes.UINT)),
+        ("CloseHandle", ctypes.wintypes.BOOL, (ctypes.wintypes.HANDLE,)),
+        ("LockFileEx", ctypes.wintypes.BOOL,
+         (ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD, ctypes.wintypes.DWORD,
+          ctypes.wintypes.DWORD, ctypes.wintypes.DWORD, ctypes.POINTER(_OVERLAPPED))),
+        ("UnlockFileEx", ctypes.wintypes.BOOL,
+         (ctypes.wintypes.HANDLE, ctypes.wintypes.DWORD, ctypes.wintypes.DWORD,
+          ctypes.wintypes.DWORD, ctypes.POINTER(_OVERLAPPED))),
+    ):
+        _api = getattr(_kernel32, _api_name)
+        _api.restype, _api.argtypes = _result_type, _argument_types
 
     # .value, not the HANDLE instance: with restype=HANDLE the calls return plain
     # ints (or None for NULL), and an int never equals a ctypes instance.

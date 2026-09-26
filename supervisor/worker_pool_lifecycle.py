@@ -390,7 +390,7 @@ def _release_booting_slot(
     })
 
 
-def kill_worker_tree(pid: int, *, keep_services: bool = False) -> None:
+def kill_worker_tree(pid: int, *, keep_services: bool = False, panic_process=None):
     """The ONE worker process-tree kill, for every teardown and backstop.
 
     A worker's tree is not the worker's property: the installation's daemon
@@ -402,7 +402,14 @@ def kill_worker_tree(pid: int, *, keep_services: bool = False) -> None:
     ends those services with the generation, so the pool paths leave it off.
     The platform helper applies the same retained-subtree contract on every OS.
     """
-    from ouroboros.platform_layer import kill_pid_tree
+    from ouroboros.platform_layer import kill_pid_tree, request_process_tree_kill
+    if panic_process is not None:
+        # Explicit Panic has already requested installation-owned daemon stops.
+        # The supplied multiprocessing handle proves ownership without reading
+        # custody under the pool/queue locks. Ordinary teardown is unchanged.
+        if panic_process.pid != pid:
+            raise ValueError("Panic worker identity mismatch")
+        return request_process_tree_kill(panic_process)
     from supervisor import queue as _q
 
     spared = _q._retained_daemon_pids()

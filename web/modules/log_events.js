@@ -873,20 +873,6 @@ export function summarizeLogEvent(evt) {
         });
     }
 
-    if (t === 'tool_call_finished') {
-        // A child killed by a signal (typed signal name / negative exit code)
-        // is a failure even when the handler rendered a normal result (T11).
-        const signalDeath = Boolean(evt.signal) || (typeof evt.exit_code === 'number' && evt.exit_code < 0);
-        const isError = Boolean(evt.is_error) || signalDeath;
-        const label = signalDeath ? `killed (${evt.signal || evt.exit_code})`
-            : evt.is_error ? 'failed'
-            : 'finished';
-        return view(isError ? 'error' : 'done', `${evt.tool || 'tool'} ${label}`, {
-            body: shortText(evt.result_preview, 260),
-            meta: taskMeta(formatLogDuration(evt.duration_sec)),
-        });
-    }
-
     if (t === 'tool_call_timeout' || t === 'tool_timeout') {
         return view('timeout', `${evt.tool || 'tool'} timed out`, {
             body: compactJson(evt.args, 220),
@@ -894,15 +880,17 @@ export function summarizeLogEvent(evt) {
         });
     }
 
-    if (t === 'tool_call' || evt.tool) {
+    if (t === 'tool_call' || t === 'tool_call_finished' || evt.tool) {
         // The durable tools.jsonl row (replay/backfill) carries the same typed
         // failure facts as the live tool_call_finished frame — is_error plus the
         // signal/exit facts — so a failed call reads the same after a reload.
         const signalDeath = Boolean(evt.signal) || (typeof evt.exit_code === 'number' && evt.exit_code < 0);
         const failed = Boolean(evt.is_error) || signalDeath;
-        const label = signalDeath ? `killed (${evt.signal || evt.exit_code})` : failed ? 'failed' : 'result';
-        return view(failed ? 'error' : 'result', `${evt.tool || 'tool'} ${label}`, {
-            body: shortText(evt.result_preview || compactJson(evt.args, 220), 260),
+        const finished = t === 'tool_call_finished';
+        const label = signalDeath ? `killed (${evt.signal || evt.exit_code})`
+            : failed ? 'failed' : finished ? 'finished' : 'result';
+        return view(failed ? 'error' : finished ? 'done' : 'result', `${evt.tool || 'tool'} ${label}`, {
+            body: shortText(evt.result_preview || (finished ? '' : compactJson(evt.args, 220)), 260),
             meta: taskMeta(formatLogDuration(evt.duration_sec)),
         });
     }

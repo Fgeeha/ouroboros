@@ -104,11 +104,11 @@ def execute_panic_stop(
     module for it. Omitted (or falsy), the sweep falls back to the default
     install port — see the sweep below.
 
-    The owned Claudexor daemon is stopped by ``get_owned_daemon().stop()``:
-    authenticated same-home CLI shutdown handles attached and prior-generation
-    daemons, with measured custody/Popen signalling as fallback. Delegated work
-    ends through that explicit stop. The shared daemon survives ordinary close
-    outside the Windows launcher Job, so that Job is not a Panic backstop.
+    Owner-local request-only APIs signal captured children before settlement.
+    Normal admission pins attested daemon identities; ``stop_outcome`` later
+    settles custody and attempts same-home CLI shutdown for unresolved targets.
+    The shared daemon survives ordinary close outside the Windows launcher Job,
+    so that Job is not a Panic backstop.
     Unconfirmed shutdown remains disclosed with custody retained; names or
     recycled descriptor ports never authorize signalling an unrelated process.
     """
@@ -116,21 +116,26 @@ def execute_panic_stop(
     from ouroboros.startup_historical_audit import audit
 
     audit.stop()
-    requests = []
+    requests, settlements = {}, {}
 
-    def request(name, fn):
-        # No join here: one helper's lock, disk, CLI or exit wait must not stand
-        # between Panic and another positively owned process's stop request.
-        done = threading.Event()
+    def attempt(name, fn, *, settle=False):
         def run():
             try:
-                fn()
-            except Exception:
-                pass  # custody stays unconfirmed; no fabricated completion
-            finally:
-                done.set()
-        threading.Thread(target=run, name=f"panic-{name}", daemon=True).start()
-        requests.append((name, done))
+                value = fn()
+                (settlements if settle else requests)[name] = value
+            except Exception as exc:
+                (settlements if settle else requests)[name] = {"requested": False,
+                    "error": f"{type(exc).__name__}: {exc}"}
+                if settle and name == "daemon":
+                    try:
+                        _record_unconfirmed_daemon_stop(data_dir, exc)
+                    except Exception as disclosure_error:
+                        settlements[name]["disclosure_error"] = type(disclosure_error).__name__
+        if settle:
+            settlements[name] = "unfinished"
+            threading.Thread(target=run, name=f"panic-{name}", daemon=True).start()
+        else:
+            run()  # only owner-local native requests; no locks, I/O or waits
 
     import multiprocessing
 
@@ -138,34 +143,51 @@ def execute_panic_stop(
     from ouroboros.extension_companion import panic_kill_all
     from ouroboros.gateway.host_service import host_service_port
     from ouroboros.local_model import get_manager
-    from ouroboros.platform_layer import force_kill_pid, kill_process_on_port
+    from ouroboros.platform_layer import kill_process_on_port
     from ouroboros.tools.services import kill_all_services
     from ouroboros.tools.shell import kill_all_tracked_subprocesses
     from ouroboros.workspace_executor import kill_all_foreground
+    from supervisor.worker_pool_lifecycle import kill_worker_tree
 
-    request("consciousness", consciousness.stop)
-    request("local-model", lambda: get_manager().panic_stop())
-    request("daemon", lambda: get_owned_daemon().panic_stop())
-    request("commands", kill_all_tracked_subprocesses)
-    request("executors", lambda: kill_all_foreground(data_dir, wait=False))
-    request("services", lambda: kill_all_services(data_dir, wait=False))
-    request("companions", panic_kill_all)
-    request("workers", lambda: kill_workers_fn(
-        force=True, archive_service_logs=False, reconcile_delegate_custody=False))
-    # Multiprocessing handles are positively owned; never expand to PID/name scans.
+    # Singleton creation can wait on a startup lock; only already-owned handles
+    # belong to this immediate phase. Unknown attachments stay explicitly unproved.
+    model, daemon = get_manager(create=False), get_owned_daemon(create=False)
+    if model is not None:
+        attempt("local-model", lambda: model.panic_stop(request_only=True))
+    if daemon is not None:
+        attempt("daemon", lambda: daemon.panic_stop(request_only=True))
+    else:
+        requests["daemon"] = {"requested": False, "error": "no captured daemon identity"}
+    attempt("commands", lambda: kill_all_tracked_subprocesses(request_only=True))
+    attempt("executors", lambda: kill_all_foreground(data_dir, request_only=True))
+    attempt("services", lambda: kill_all_services(data_dir, request_only=True))
+    attempt("companions", lambda: panic_kill_all(request_only=True))
     for child in multiprocessing.active_children():
-        request(f"child-{child.pid}", lambda pid=child.pid: force_kill_pid(pid))
-    request("main-port", lambda: kill_process_on_port(bound_port or 8765))
-    request("host-port", lambda: kill_process_on_port(host_service_port()))
+        attempt(f"child-{child.pid}", lambda child=child: kill_worker_tree(
+            child.pid, panic_process=child))
 
-    # All stop paths have been launched before any persistence wait. The flag can
-    # progress even if a helper is stuck; no successful thread launch proves death.
+    # Every captured target has its OWN native request above before any helper
+    # may wait. These existing owners settle trees/custody independently; neither
+    # their launch nor this process's exit is proof that another process died.
+    if consciousness is not None:
+        attempt("consciousness", consciousness.stop, settle=True)
+    if model is not None:
+        attempt("local-model", model.stop_server, settle=True)
+    attempt("daemon", lambda: get_owned_daemon().stop_outcome(), settle=True)
+    attempt("commands", kill_all_tracked_subprocesses, settle=True)
+    attempt("executors", lambda: kill_all_foreground(data_dir, wait=False), settle=True)
+    attempt("services", lambda: kill_all_services(data_dir, wait=False), settle=True)
+    attempt("companions", panic_kill_all, settle=True)
+    attempt("workers", lambda: kill_workers_fn(
+        force=True, archive_service_logs=False, reconcile_delegate_custody=False), settle=True)
+    attempt("main-port", lambda: kill_process_on_port(bound_port or 8765), settle=True)
+    attempt("host-port", lambda: kill_process_on_port(host_service_port()), settle=True)
+
     flag_written = _bounded(lambda: _write_panic_flag(data_dir), 2.0)
-    _bounded(lambda: _persist_panic_controls(data_dir), 2.0)
-    unsettled = [name for name, done in requests if not done.is_set()]
-    _bounded(lambda: log.critical("PANIC STOP: flag persisted=%s; unfinished stop helpers=%s; "
+    controls_written = _bounded(lambda: _persist_panic_controls(data_dir), 2.0)
+    _bounded(lambda: log.critical("PANIC STOP: requests=%s; settlement=%s; flag persisted=%s; controls=%s; "
                                   "hard exit %d, unresolved custody retained.",
-                                  flag_written, unsettled, panic_exit_code), 0.5)
+                                  requests, settlements, flag_written, controls_written, panic_exit_code), 0.5)
     os._exit(panic_exit_code)
 
 
@@ -207,6 +229,7 @@ def _persist_panic_controls(data_dir: pathlib.Path) -> None:
                   evolution_owner_stopped=True, post_task_autostop=False)
         st.pop("evolution_stop_source", None)  # an owner stop: no agent source may un-stick it
 
+    failures = []
     for step in (
         lambda: state.update_state(_panic_controls, confirm=PANIC_CONTROL_KEYS, lock_timeout_sec=0.5),
         lambda: record_evolution_stop_intent("panic", "panic stop"),
@@ -215,9 +238,12 @@ def _persist_panic_controls(data_dir: pathlib.Path) -> None:
         lambda: drop_pending_request(data_dir),
     ):
         try:
-            step()
-        except Exception:
-            pass
+            if step() is False:
+                failures.append("write returned False")
+        except Exception as exc:
+            failures.append(type(exc).__name__)
+    if failures:
+        raise OSError(f"Panic controls unconfirmed: {failures}")
 
 
 PANIC_CONTROL_KEYS = ("evolution_mode_enabled", "bg_consciousness_enabled", "evolution_owner_stopped",
