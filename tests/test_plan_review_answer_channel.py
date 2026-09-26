@@ -504,6 +504,40 @@ def test_a_failed_re_ask_on_the_barrier_route_keeps_the_recorded_answer(harness,
     assert _ids(authority_wave(harness.drive, ctx.task_id, wave)) == [("s1:f1", "reject")]
 
 
+def test_a_retry_after_a_refused_addressed_attempt_is_collectable(harness, monkeypatch):  # noqa: F811
+    """Barrier route: the first addressed re-ask is refused at $0 (daemon unreachable), so its
+    collected wave is unpaid and the retry shares its cycle index and fingerprint. The retry is a
+    DISTINCT wave (its own artifact): its collection settles it, GREEN closed, one cycle charged
+    — never PLAN_REVIEW_CUSTODY_INVALID and never a wedged task. Two consecutive refusals then
+    a changed-prose envelope still find the paid cycle-1 wave through the pointer chain."""
+    from tests.test_plan_review_reconciliation import _install_barrier_substrate
+
+    monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "5")
+    calls: list = []
+    _install_barrier_substrate(monkeypatch, calls, texts={"s1": _blocking()})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    fp = _state(harness)["waves"][-1]["request_fingerprint"]
+    assert _control(_answer(ctx, fp)) == {"outcome": "REVIEW_REQUIRED", "closed": False}
+    _reject(ctx, fp)
+    ask = {"review_fingerprint": fp, "items": [_item("s1:f1", "reject", "the budget line is already approved")]}
+    for _attempt in range(2):  # two refused attempts in a row
+        _install_barrier_substrate(monkeypatch, [], texts={"s1": CLEAN}, refused={"s1"})
+        assert _control(_call(ctx, review_disposition=ask)) == {"outcome": "DEGRADED", "closed": False}
+        settled = _call(ctx, review_disposition={"review_fingerprint": fp, "items": []})
+        assert _control(settled) == {"outcome": "REVIEW_REQUIRED", "closed": False} and "CUSTODY_INVALID" not in settled
+    assert _state(harness)["cycles_paid"] == 1
+    calls3: list = []
+    _install_barrier_substrate(monkeypatch, calls3, texts={"s1": CLEAN})
+    assert _control(_call(ctx, review_disposition=ask)) == {"outcome": "DEGRADED", "closed": False}
+    assert calls3[0]["slots"] == ["s1"]
+    collected = _call(ctx, review_disposition={"review_fingerprint": fp, "items": []})
+    assert _control(collected) == {"outcome": "GREEN", "closed": True}, collected[-600:]
+    state = _state(harness)
+    assert state["cycles_paid"] == 2 and state["waves"][-1]["paid"] and state["waves"][-1]["closed"]
+    assert state["current_attempt"]["status"] == "open"
+
+
 def test_addressed_helper_names_every_typed_reason():
     from ouroboros.tools.plan_review_artifacts import ADDRESSED_REASONS, addressed_slots
 

@@ -978,7 +978,7 @@ def _resolve_previous(state_root: pathlib.Path, task_id: str, state: dict, *, re
         return _authority_wave(state_root, task_id, previous) if previous is not None else None
     except (OSError, ValueError, json.JSONDecodeError) as exc:  # PlanReviewSourceUnavailable is a ValueError
         raise PlanReviewSourceUnavailable(
-            "Prior exact plan-review authority is unreadable; a delta review is refused.") from exc
+            f"Prior exact plan-review authority is unreadable; a delta review is refused ({exc}).") from exc
 
 
 def _last_paid_wave(state: dict, state_root: pathlib.Path, task_id: str) -> Optional[dict]:

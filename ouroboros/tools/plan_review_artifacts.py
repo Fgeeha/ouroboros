@@ -262,6 +262,19 @@ def _row_has_physical_dispatch(row: Dict[str, Any]) -> bool:
     return True
 
 
+def _same_wave(earlier: Dict[str, Any], wave: Dict[str, Any], *, pointer: Dict[str, Any]) -> bool:
+    """Whether a predecessor resolves to ``wave`` itself. When the pointer and the wave's own
+    artifact reference are both known, identity is the artifact: two attempts of one cycle
+    (an unpaid $0 attempt and its retry share ``cycle_index`` and fingerprint, since an unpaid
+    attempt advances nothing) are distinct waves with distinct artifacts. Without both
+    references the pair (cycle_index, fingerprint) is the only identity there is."""
+    own = wave.get("wave_artifact") if isinstance(wave.get("wave_artifact"), dict) else {}
+    if pointer and own and str(pointer.get("path") or "") and str(own.get("path") or ""):
+        return str(pointer.get("path") or "") == str(own.get("path") or "")
+    return bool(earlier.get("cycle_index") == wave.get("cycle_index") and str(
+        earlier.get("request_fingerprint") or "") == str(wave.get("request_fingerprint") or ""))
+
+
 def in_flight_resume_inputs(
     existing: Dict[str, Any], state: Dict[str, Any], state_root: pathlib.Path,
     task_id: str, configured_slots: list,
@@ -295,9 +308,7 @@ def in_flight_resume_inputs(
                     "Prior exact plan-review authority is unreadable; "
                     "in-flight reconciliation is refused."
                 )}
-    if (replaced or previous_fingerprint) and (previous is None or (
-            previous.get("cycle_index") == existing.get("cycle_index")
-            and str(previous.get("request_fingerprint") or "") == str(existing.get("request_fingerprint") or ""))):
+    if (replaced or previous_fingerprint) and (previous is None or _same_wave(previous, existing, pointer=replaced)):
         return {"error": (  # a recorded predecessor that resolves to nothing, or to this very wave, is not a first wave
             "Prior plan-review predecessor cannot be resolved to a distinct wave; in-flight reconciliation is refused."
         )}
@@ -856,8 +867,7 @@ def _earlier_wave(state_root: Any, task_id: str, state: Dict[str, Any], wave: Di
         earlier = authority_wave(state_root, task_id, hot)
     else:
         return None
-    if isinstance(earlier, dict) and earlier.get("cycle_index") == wave.get("cycle_index") and str(
-            earlier.get("request_fingerprint") or "") == str(wave.get("request_fingerprint") or ""):
+    if isinstance(earlier, dict) and _same_wave(earlier, wave, pointer=ref):
         raise PlanReviewSourceUnavailable("PLAN_REVIEW_SOURCE_UNAVAILABLE: a plan-review wave names itself as its predecessor")
     return earlier if isinstance(earlier, dict) else None
 
