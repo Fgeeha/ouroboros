@@ -9,6 +9,7 @@ from starlette.routing import Route
 from starlette.testclient import TestClient
 
 from ouroboros import artifacts, review_projection
+from ouroboros.gateway import task_archive
 from ouroboros.gateway.tasks import api_task_artifact
 from ouroboros.headless import copy_child_task_result, prepare_task_drive, remove_subagent_task_drive
 from ouroboros.task_results import write_task_result
@@ -82,7 +83,12 @@ def test_source_download_is_bound_and_distinct_from_same_named_user_file(tmp_pat
     app.state.drive_root = tmp_path
     with TestClient(app) as client:
         url = f"/api/tasks/applied/artifacts/{name}"
-        assert client.get(url).content == b"user result"
+        artifact = client.get(url)
+        if task_archive.CONFINED:
+            assert artifact.status_code == 200 and artifact.content == b"user result"
+        else:
+            assert artifact.status_code == 503
+            assert artifact.json()["reason_code"] == "artifact_unavailable"
         source = client.get(url, params={"source": ref["path"]})
         assert source.status_code == 200
         assert hashlib.sha256(source.content).hexdigest() == ref["sha256"]
