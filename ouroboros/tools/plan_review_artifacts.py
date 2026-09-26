@@ -414,22 +414,6 @@ def hot_index_wave(wave: dict, *, page_size: int) -> dict:
     }
 
 
-def continuation_state(
-    state_root: pathlib.Path, task_id: str, previous: Optional[dict], slots: List[Any],
-    manifest: dict, *, user_content: str,
-) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], str]:
-    """Resolve one evidence continuation; the fourth element names a restart cause.
-
-    The guard is load-bearing: a cycle whose manifest names no reviewer-requested
-    locator has no prior reviewer thread to continue, so the configured slots are
-    returned untouched instead of reporting an absent predecessor wave."""
-    if not manifest.get("reviewer_requested"):
-        return slots, {}, {}, ""
-    return continuation_inputs(
-        state_root, task_id, previous, slots, user_content=user_content,
-    )
-
-
 def record_exact_wave(
     state_root: pathlib.Path, task_id: str, wave: dict, exact: dict,
     *, need_evidence_seen: List[str], page_size: int,
@@ -489,23 +473,24 @@ def slot_row(slot: Any) -> dict:
 
 
 def continuation_restart_delta(cause: str) -> dict:
-    """The existing-style disclosure of one continuation that restarted fresh."""
+    """The disclosure of one packet slot whose transcript continuation restarted fresh."""
     return {
         "kind": "capability_delta",
-        "requested": "continuation of prior thread",
-        "effective": "fresh session, full packet",
+        "requested": "continuation of prior transcript",
+        "effective": "fresh full packet",
         "reason": str(cause or ""),
     }
 
 
-def attach_continuation_restart_delta(rows: List[dict], cause: str) -> None:
-    """Disclose one fresh continuation restart on every slot row (no-op when
-    the continuation held). Thread memory was lost and the wave re-dispatched
-    fresh with the full packet: disclosed per slot through the existing
-    capability-delta lane."""
-    if not cause:
-        return
+def attach_continuation_restart_delta(rows: List[dict], causes: Dict[str, str]) -> None:
+    """Disclose a fresh restart on exactly the PACKET rows it happened to (``causes`` =
+    slot id → typed cause; no-op when every continuation held). A session row's continuity
+    is its settled ``review_thread_receipt`` (recorded on the row already): the host never
+    states a guess about it. A kept $0 replay row was not sent at all, so nothing restarted."""
     for row in rows:
+        cause = str(causes.get(str(row.get("slot_id") or "")) or "") if causes else ""
+        if not cause or str(row.get("route") or "") == "agent_session" or row.get("replayed_from"):
+            continue
         row["capability_delta"] = [
             *(row.get("capability_delta") or []),
             continuation_restart_delta(cause),
@@ -515,24 +500,32 @@ def attach_continuation_restart_delta(rows: List[dict], cause: str) -> None:
 def continuation_inputs(
     state_root: pathlib.Path, task_id: str, previous: Optional[dict], slots: List[Any],
     *, user_content: str,
-) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], str]:
-    """Rebuild one evidence continuation from the prior exact wave.
+) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], Dict[str, str]]:
+    """Continue every reviewer from the prior exact wave: ``(slots, slot_messages,
+    session_threads, causes)``.
 
-    Every miss here is a cache miss, never a validity event: the dispositions
-    custody chain is enforced one level up, before this function is reached. An
-    absent, unreferenced or unreadable prior exact wave, a changed reviewer
-    roster, a prior slot receipt or thread that is gone, an invalid prior API
-    transcript — each degrades to a FRESH full-packet dispatch, because the
-    packet is self-contained on every send (prior findings, dispositions and
-    spec delta already ride it). The fourth element names the typed cause of
-    such a restart ('' when continuation held); slots are returned exactly as
-    currently configured, never rebound to prior rows."""
+    Every miss here is a cache miss, never a validity event: the dispositions custody
+    chain is enforced one level up. A packet (api_chat) slot continues its exact recorded
+    transcript (prior request, its answer, this cycle's packet); a session slot resumes its
+    sticky thread (``review_thread_id`` when recorded — a missing id is not a restart, the
+    thread is resolved by its idempotency key) and never gets a cause; a retrieving native
+    row is not a packet slot and is skipped. ``causes`` names, PER SLOT, why a packet slot
+    could not continue and goes out fresh: a wave-level miss (no prior wave reference, an
+    unreadable one, a changed roster) is a cause for every packet slot; a per-slot miss
+    (``prior_slot_receipt_missing``, ``prior_api_transcript_invalid``) touches that slot
+    only. A first cycle (``previous is None``) has nothing to continue and discloses
+    nothing. The packet is self-contained on every send (prior findings, dispositions and
+    spec delta already ride it), so a fresh send loses no answer. Slots are returned
+    exactly as currently configured, never rebound to prior rows."""
+    from ouroboros.tools.plan_review_runtime import slot_retrieves
 
-    def fresh(cause: str) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], str]:
-        return slots, {}, {}, cause
+    packet_ids = [str(getattr(slot, "slot_id", "") or "") for slot in slots if not slot_retrieves(slot)]
+
+    def fresh(cause: str) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], Dict[str, str]]:
+        return slots, {}, {}, {sid: cause for sid in packet_ids}
 
     if not previous:
-        return fresh("prior_exact_wave_missing")
+        return slots, {}, {}, {}
     ref = previous.get("wave_artifact") if isinstance(previous.get("wave_artifact"), dict) else {}
     if not ref:
         return fresh("prior_exact_wave_ref_missing")
@@ -546,35 +539,38 @@ def continuation_inputs(
     outputs = {str(r.get("slot_id") or ""): r for r in exact.get("reviewer_outputs") or [] if isinstance(r, dict)}
     slot_messages: Dict[str, List[Dict[str, Any]]] = {}
     session_threads: Dict[str, str] = {}
-    for config in current_rows:
+    causes: Dict[str, str] = {}
+    for slot, config in zip(slots, current_rows):
         sid = str(config.get("slot_id") or "")
-        output = outputs.get(sid)
-        if not output:
-            return fresh(f"prior_slot_receipt_missing:{sid}")
+        output = outputs.get(sid) or {}
         if str(config.get("route") or "") == "agent_session":
-            thread_id = str(output.get("review_thread_id") or "")
-            if not thread_id:
-                return fresh(f"prior_review_thread_missing:{sid}")
-            session_threads[sid] = thread_id
-        else:
-            prior_messages = output.get("request_messages")
-            if (
-                not isinstance(prior_messages, list)
-                or not prior_messages
-                or any(
-                    not isinstance(row, dict)
-                    or not str(row.get("role") or "").strip()
-                    or "content" not in row
-                    for row in prior_messages
-                )
-            ):
-                return fresh(f"prior_api_transcript_invalid:{sid}")
-            slot_messages[sid] = [
-                *[dict(row) for row in prior_messages],
-                {"role": "assistant", "content": str(output.get("text") or "")},
-                {"role": "user", "content": user_content},
-            ]
-    return slots, slot_messages, session_threads, ""
+            if str(output.get("review_thread_id") or ""):
+                session_threads[sid] = str(output["review_thread_id"])
+            continue
+        if slot_retrieves(slot):
+            continue  # a native retrieving row reads the subject itself; it carries no packet transcript
+        if not output:
+            causes[sid] = f"prior_slot_receipt_missing:{sid}"
+            continue
+        prior_messages = output.get("request_messages")
+        if (
+            not isinstance(prior_messages, list)
+            or not prior_messages
+            or any(
+                not isinstance(row, dict)
+                or not str(row.get("role") or "").strip()
+                or "content" not in row
+                for row in prior_messages
+            )
+        ):
+            causes[sid] = f"prior_api_transcript_invalid:{sid}"
+            continue
+        slot_messages[sid] = [
+            *[dict(row) for row in prior_messages],
+            {"role": "assistant", "content": str(output.get("text") or "")},
+            {"role": "user", "content": user_content},
+        ]
+    return slots, slot_messages, session_threads, causes
 
 
 def frozen_delivery_inputs(wave: dict, slots: list) -> dict:

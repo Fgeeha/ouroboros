@@ -92,7 +92,7 @@ from ouroboros.tools.plan_review_artifacts import (
     PlanReviewSourceUnavailable,
     attach_continuation_restart_delta as _attach_continuation_restart_delta,
     authority_wave as _authority_wave,
-    continuation_state as _continuation_state,
+    continuation_inputs as _continuation_inputs,
     exact_wave as _exact_wave,
     in_flight_resume_inputs as _plan_in_flight_resume_inputs,
     persist_wave as _persist_plan_review_wave_artifact,
@@ -813,8 +813,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
         system_root=system_root, active_root=active_root, cycle_index=cycle_index,
         enforcement=enforcement, previous=previous,
     )
-    slots, slot_messages, session_threads, continuation_restarted = _continuation_state(
-        state_root, task_id, previous, slots, manifest, user_content=user_content,
+    slots, slot_messages, session_threads, continuation_restarted = _continuation_inputs(
+        state_root, task_id, previous, slots, user_content=user_content,
     )
     dispatch_slots = [s for s in slots if str(s.slot_id) in named] if named else slots
     delivery = dialogue_slot_inputs(dispatch_slots, system_prompt=system_prompt, user_content=user_content,
@@ -879,7 +879,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     ) if callable_slots else []
     # excluded slots stay configured rows: they count in the quorum denominator
     rows = list(rows) + oversize_rows + health_skip_rows + kept
-    _attach_continuation_restart_delta(rows, continuation_restarted)
+    _attach_continuation_restart_delta(rows, {**continuation_restarted, **(delivery.get("continuation_restarted") or {})})
     # The owner baseline for `ordered_weaker`: the same builder with no order, recorded at
     # dispatch and reused on resume (never recomputed from the live setting at collection).
     owner_efforts = None if not request.reviewer_effort else (
