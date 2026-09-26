@@ -607,6 +607,7 @@ def synthesize_plan_review_wave(
     enforcement: str, cap: Any, quorum: int, configured_slots: list,
     health_evidence: Any, reviewer_effort: str = "", dispositions: Optional[list] = None,
     owner_efforts: Optional[dict] = None, standing: Optional[dict] = None,
+    standby_dispositions: Optional[list] = None,
 ) -> tuple[dict, set[str], dict]:
     """Validate raw actor rows and build one durable plan-review wave. ``dispositions``
     are the ones already recorded on the wave being collected (an author's answers
@@ -617,7 +618,11 @@ def synthesize_plan_review_wave(
     ``ordered_weaker``; ``standing`` (``plan_spec.plan_standing_findings``) is each seat's
     still-open findings from a same-spec predecessor: a seat that does not answer
     keeps them listed on this wave (``findings_carried_absent_answer``) — silence
-    never manufactures GREEN and never counts as parseable."""
+    never manufactures GREEN and never counts as parseable. ``standby_dispositions`` are
+    the answered wave's recorded answers for the seats an addressed re-ask sent: a finding
+    the host CARRIED for a seat's absence keeps its recorded answer (the mind's word stands
+    until the reviewer re-judges it), while a finding the seat re-emitted starts
+    undispositioned."""
     from ouroboros.tools import plan_spec
 
     ids = plan_spec.spec_ids(spec)
@@ -661,6 +666,10 @@ def synthesize_plan_review_wave(
             **({"carried_findings": len(carried)} if carried else {}),
         ))
     agg = plan_spec.aggregate(slot_results, quorum=quorum)
+    carried_ids = {str(f.get("finding_id") or "") for f in agg["findings"] if f.get("carried_absent_answer")}
+    dispositions = plan_spec.merge_dispositions(dispositions, [
+        d for d in standby_dispositions or [] if isinstance(d, Mapping)
+        and str(d.get("finding_id") or "").strip() in carried_ids]) if carried_ids and standby_dispositions else list(dispositions or [])
     # ONE closure table for every write path: a REVIEW_REQUIRED whose open set is
     # already empty (answers recorded while slots were in flight) is written GREEN.
     closure = plan_spec.closure_after_disposition(

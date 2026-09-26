@@ -373,8 +373,8 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
     # refused, not ignored. A default-filled ``author_disposition``
     # ({"disposition": "accepted", "rationale": ""}) beside an EMPTY fingerprint
     # names no wave and answers no finding, so it carries nothing either: without
-    # this a model that fills every schema key sent it with its first plan and
-    # looped on PLAN_REVIEW_DISPOSITION_MIXED_ENVELOPE (seen live).
+    # this a model that fills every schema key sent it with its first plan and was
+    # refused beside that plan on every turn (seen live).
     disposition_vacuous = False
     if (isinstance(raw_disposition, dict)
             and not set(raw_disposition) - {"review_fingerprint", "items", "author_disposition", "author_action"}
@@ -403,7 +403,7 @@ def _handle_plan_task(ctx: ToolContext, **params) -> str:
         request = _request_of(params)
         try:
             prepared = _prepare_plan_inputs(ctx, request, _planning_state_location(ctx)[0])
-        except ValueError as exc:
+        except (OSError, TimeoutError, ValueError) as exc:
             return _typed_refusal(ctx, "TOOL_ERROR", f"ERROR: PLAN_REVIEW_STATE_INVALID: {exc}")
         if prepared.get("error"):
             return _typed_refusal(ctx, str(prepared.get("code") or "TOOL_ARG_ERROR"), prepared["error"])
@@ -909,6 +909,7 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
             _carried_dispositions(existing, named) if named else None),
         owner_efforts=owner_efforts,
         standing=standing,
+        standby_dispositions=list(existing.get("dispositions") or []) if named else None,
     )
     wave["previous_wave_artifact"] = _predecessor_ref(existing, previous, state, resume_in_flight)
     if named:  # the lineage every reader can name: which seats were asked again, which kept their answer
@@ -967,7 +968,8 @@ async def _run_plan_review_async(ctx: ToolContext, request: _PlanRequest, *, col
     if collect is not None or resume_in_flight or _plan_wave_line_has_news(wave):  # a fresh dispatch prints news only
         ctx.emit_progress_fn(_plan_wave_progress_line(
             aggregate, agg["counts"], cycles_paid=paid_now, cap=cap, wave=wave))
-    return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=paid_now, enforcement=enforcement, reminder=reminder)
+    return _publish_rendered_wave(ctx, stored, cap=cap, cycles_paid=paid_now, enforcement=enforcement, reminder=reminder,
+                                  notes=_addressed_notes(unaddressed) if not named else None)
 
 def _last_paid_wave(state: dict) -> Optional[dict]:
     """The latest PAID wave, compact or not: a compact entry is materialized (or refused as
@@ -1143,11 +1145,11 @@ def _apply_author_subject(ctx: ToolContext, disposition: dict, envelope: Optiona
         else:
             raise ValueError("include goal, plan and spec to retain the exact current author plan")
         enforcement = get_review_enforcement()
-        if items:  # the same call's answers land on the critic wave first, merged by finding_id
-            wave, _closure = _record_disposition(root, task_id, wave, items, fingerprint=critic_fp, enforcement=enforcement)
         author = build_author_disposition_from_mapping(disposition.get("author_disposition"),
             subject_hash=fingerprint, reviewer_signal=str((wave or {}).get("aggregate") or "unavailable"), enforcement=enforcement)
         author["action"] = action
+        if items:  # every refusal above came first: the answers now land on the critic wave, merged by finding_id
+            wave, _closure = _record_disposition(root, task_id, wave, items, fingerprint=critic_fp, enforcement=enforcement)
         source = redact_projection({"kind": "plan_author_subject", "fingerprint": fingerprint,
             "goal": spec["goal"], "plan_prose": prose, "spec": spec}).value
         ref = store_actor_source_bytes(root, task_id, category="context_checkpoints",

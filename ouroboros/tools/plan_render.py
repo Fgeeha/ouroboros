@@ -347,7 +347,7 @@ def _next_step(wave: dict, *, enforcement: str, cap: Optional[int], cycles_paid:
 
 def _closure_note_view(note: str) -> str:
     """Legacy host notes describe state; the current renderer owns available steps."""
-    prefix = str(note).partition(":")[0]
+    prefix, _sep, reason = str(note).partition(":")
     meaning = {
         "closed_by_disposition": "the open set emptied; the wave is recorded GREEN",
         "blocking_finding_below_quorum_stays_open": "blocking findings remain open after disposition",
@@ -355,7 +355,9 @@ def _closure_note_view(note: str) -> str:
         "degraded_not_closable_by_disposition": "no parseable reviewer quorum; disposition does not close the wave",
         "answers_not_addressed": "the answers are recorded; no slot was asked again by them",
     }.get(prefix)
-    return f"{prefix}: {meaning}" if meaning else str(note)
+    if not meaning:
+        return str(note)
+    return f"{prefix}: {meaning}" + (f" ({reason.strip()})" if prefix == "answers_not_addressed" and reason.strip() else "")
 
 
 def _dialogue_source_view(wave: dict, *, cached: bool) -> list[str]:

@@ -151,6 +151,25 @@ def test_finish_while_reviewers_run_is_refused_and_records_no_answers(harness, m
     assert load_plan_review_state(harness.drive, ctx.task_id) == before
 
 
+def test_an_invalid_author_record_beside_items_writes_nothing(harness, monkeypatch):  # noqa: F811
+    """The author record is validated BEFORE the answers land: a schema-filled empty rationale
+    refuses the whole call and the critic wave stays byte-identical (the working case, a valid
+    record, is pinned by test_author_finish_with_items_records_answers_then_selects_the_plan)."""
+    harness.state["enforcement"] = "advisory"
+    monkeypatch.setenv("OUROBOROS_REVIEW_ENFORCEMENT", "advisory")
+    harness.install({"s1": json.dumps([_finding("f1", "blocking", breaks="claim_1")]), "s2": CLEAN, "s3": CLEAN})
+    ctx = harness.make_ctx()
+    _call(ctx)
+    before = load_plan_review_state(harness.drive, ctx.task_id)
+    fp = before["waves"][-1]["request_fingerprint"]
+    refused = _call(ctx, {**DECK_SPEC, "acceptance_claims": ["the corrected claim"]}, plan="Corrected.", review_disposition={
+        "review_fingerprint": fp, "author_action": "finish",
+        "items": [_item("s1:f1", "reject", "the budget line is already approved")],
+        "author_disposition": {"disposition": "partial", "rationale": ""}})
+    assert "PLAN_AUTHOR_SUBJECT_INVALID" in refused and "rationale" in refused
+    assert load_plan_review_state(harness.drive, ctx.task_id) == before
+
+
 def test_author_finish_items_are_validated_against_the_critic_wave(harness):  # noqa: F811
     """An unknown finding id beside a finish is refused as a whole, before any write."""
     harness.install({"s1": json.dumps([_finding("f1", "blocking", breaks="claim_1")]), "s2": CLEAN, "s3": CLEAN})
@@ -194,6 +213,7 @@ def test_changed_envelope_with_items_records_the_answers_then_reviews_every_slot
         "review_fingerprint": old_fp, "items": [_item("s1:f1", "reject", "the budget line is already approved")]})
     assert _control(result) == {"outcome": "GREEN", "closed": True}
     assert [s.slot_id for s in sub2.calls[0]["slots"]] == ["s1", "s2", "s3"]
+    assert "no slot was asked again by them (envelope_changed)" in result, "the typed note rides the full dispatch too"
     packet = _user_text(sub2.calls[0]["request"].messages[1]["content"])
     assert "PRIOR CYCLES" in packet and "the budget line is already approved" in packet
     state = _state(harness)
@@ -293,6 +313,7 @@ def test_addressed_slot_without_an_answer_keeps_its_findings(harness, monkeypatc
     assert [f["finding_id"] for f in wave["findings"]] == ["s1:f1"]
     assert wave["actors"][0]["slot_id"] == "s1" and not wave["actors"][0]["ok"]
     assert "findings_carried_absent_answer:1" in wave["actors"][0]["disclosures"]
+    assert _ids(wave) == [("s1:f1", "reject")], "a finding carried for absence keeps the mind's recorded answer"
     assert "did not answer; its earlier finding is still listed" in result
     assert force_plan_decision(ctx, {}, enforcement="blocking")["allow"] is False
 
@@ -343,7 +364,7 @@ def test_unaddressable_waves_follow_their_ordinary_rule(harness, monkeypatch):  
     fp = _state(harness)["waves"][-1]["request_fingerprint"]
     sub = harness.install({"s1": CLEAN, "s2": CLEAN, "s3": CLEAN})
     closed = _call(ctx, review_disposition={"review_fingerprint": fp, "items": [_item("s1:n1", "accept", "noted")]})
-    assert not sub.calls and "answers_not_addressed: the answers are recorded; no slot was asked again by them" in closed
+    assert not sub.calls and "answers_not_addressed: the answers are recorded; no slot was asked again by them (wave_closed)" in closed
     assert _ids(_state(harness)["waves"][-1]) == [("s1:n1", "accept")]
     # DEGRADED, no epoch: the identical envelope with items re-dispatches EVERY seat (no note, no kept row).
     degraded_ctx = harness.make_ctx(task_id="task-degraded")
@@ -354,7 +375,8 @@ def test_unaddressable_waves_follow_their_ordinary_rule(harness, monkeypatch):  
     fresh = _call(degraded_ctx, review_disposition={"review_fingerprint": fp2, "items": [
         _item("s1:f1", "reject", "already approved")]})
     assert _control(fresh) == {"outcome": "GREEN", "closed": True}
-    assert [s.slot_id for s in sub2.calls[0]["slots"]] == ["s1", "s2", "s3"] and "answers_not_addressed" not in fresh
+    assert [s.slot_id for s in sub2.calls[0]["slots"]] == ["s1", "s2", "s3"]
+    assert "answers_not_addressed: the answers are recorded; no slot was asked again by them (no_quorum_to_keep)" in fresh
     assert "addressed" not in _state(harness, "task-degraded")["waves"][-1]
 
 
