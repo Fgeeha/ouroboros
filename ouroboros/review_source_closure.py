@@ -47,6 +47,31 @@ def source_carrier(value: dict, key: str, carrier: str) -> str:
         return {'evidence': 'evidence', 'policy': 'metadata'}.get(key, '')
     if carrier == 'contract':
         return {'predecessor_authority': 'task_result', 'attachment_manifest_ref': 'metadata'}.get(key, '')
+    if carrier == 'task_result':
+        return {'task_contract': 'contract', 'trace_refs': 'trace', 'plan_review_state': 'plan_state',
+                'review_evidence': 'evidence', 'review_projection': 'metadata', 'loop_outcome': 'metadata',
+                'completion_observations': 'metadata', 'owner_wait': 'metadata',
+                'verification_ledger': 'metadata', 'root_phase_checkpoint': 'metadata'}.get(key, '')
+    if carrier == 'trace':
+        return 'response_ref' if key == 'response' else (
+            'metadata' if key in {'request', 'llm_call_refs', 'tool_call_refs', 'log_finalization'} else '')
+    if carrier == 'call_response':
+        return 'metadata' if key in {'usage', 'producer_outcome'} else ''
+    if carrier == 'call_request' and key in {'kwargs', 'messages', 'send_messages'}:
+        return 'call_request' if key == 'kwargs' else 'message'
+    if carrier == 'plan_state':
+        return {'waves': 'plan_wave', 'current_attempt': 'plan_attempt'}.get(key, '')
+    if carrier == 'plan_attempt':
+        return 'metadata' if key == 'author_subject' else ''
+    if carrier == 'plan_wave':
+        return {'wave_artifact': 'metadata', 'previous_wave_artifact': 'metadata',
+                'supersedes_wave_artifact': 'metadata', 'spec_source_ref': 'metadata',
+                'dialogue_source_ref': 'metadata', 'actors': 'metadata', 'reviewer_outputs': 'metadata',
+                'historical_supplements': 'metadata', 'evidence_manifest_full': 'plan_manifest'}.get(key, '')
+    if carrier == 'plan_manifest':
+        return 'metadata' if key == 'own_dialogue' else ''
+    if carrier == 'plan_history':
+        return 'metadata' if key in {'original_wave_artifact', 'result'} else ''
     if carrier == 'message':
         from ouroboros.context_compaction import _capsule_metadata
         return 'block' if key == 'content' and _capsule_metadata(value)[1] is not None else ''
@@ -62,6 +87,12 @@ def source_carrier(value: dict, key: str, carrier: str) -> str:
         return 'contract'
     if key == 'request' and carrier == 'metadata':
         return 'request'
+    if key == 'trace_refs':
+        return 'trace'
+    if key == 'plan_review_state':
+        return 'plan_state'
+    if key == 'response_ref':
+        return 'response_ref'
     return 'metadata' if key in _REF_FIELDS | _METADATA_FIELDS else ''
 
 
@@ -105,7 +136,7 @@ def retain_review_refs(value: Any, source: pathlib.Path, custody: pathlib.Path, 
     return retained
 
 
-def _retain_named_sources(request: Any, source: pathlib.Path, custody: pathlib.Path) -> list[dict]:
+def _retain_named_sources(request: Any, source: pathlib.Path, custody: pathlib.Path, canonical: pathlib.Path) -> list[dict]:
     from ouroboros.artifacts import (collect_task_artifact_records, copy_artifact_file, read_actor_source_bytes, store_actor_source_bytes,
                                     stream_artifact_file, task_artifact_dir_path)
     from ouroboros.outcome_receipt_store import publish_verification_receipt_union, verification_receipts_path
@@ -142,7 +173,7 @@ def _retain_named_sources(request: Any, source: pathlib.Path, custody: pathlib.P
     # for historical previews without a full-set ref; captured declarations still
     # participate, so disappearance after capture cannot silently shrink the set.
     manifest.extend(result.get('artifacts') or [])
-    manifest.extend(collect_task_artifact_records(source, task_id, measure=False, strict=True))
+    manifest.extend(collect_task_artifact_records(source, task_id, measure=False, strict=True, require_registered=True))
     paths = {}
     for artifact in manifest:
         if not isinstance(artifact, dict):
@@ -185,7 +216,10 @@ def _retain_named_sources(request: Any, source: pathlib.Path, custody: pathlib.P
                 row.pop('path', None)
         return value
 
-    result = retain_review_refs(bind_artifacts(result), source, custody, task_id, carrier='task_result')
+    # A saved child row can already name canonical-published sources. Close over
+    # both explicit producer roots before copying into the private reader root.
+    result = retain_review_refs(bind_artifacts(result), source, canonical, task_id, carrier='task_result')
+    result = retain_review_refs(result, canonical, custody, task_id, carrier='task_result')
     retain('task-result', task_result_path(source, task_id), json.dumps(result, ensure_ascii=False).encode())
     request.evidence = bind_artifacts(request.evidence)
     retain('artifact-inventory', base, json.dumps({'task_id': task_id, 'artifacts': [
@@ -210,7 +244,8 @@ def _retain_named_sources(request: Any, source: pathlib.Path, custody: pathlib.P
     if trajectory.exists():
         with trajectory.open(encoding='utf-8') as stream:
             records = [row for line in stream if line.strip() if (row := json.loads(line)).get('task_id') == task_id]
-        records = retain_review_refs(records, source, custody, task_id)
+        records = retain_review_refs(records, source, canonical, task_id)
+        records = retain_review_refs(records, canonical, custody, task_id)
         retain('tool-trajectory', trajectory, json.dumps(records, ensure_ascii=False).encode())
     else:
         rows.append({'name': 'tool-trajectory', 'source_path': str(trajectory), 'status': 'not_recorded'})
@@ -275,7 +310,7 @@ def retain_review_request_sources(request: Any, *, source_root: Any, custody_roo
     parent.mkdir(parents=True, exist_ok=True)
     read_root = pathlib.Path(tempfile.mkdtemp(prefix='request-', dir=parent))
     bound = dataclasses.replace(bound, **retain_review_refs(dataclasses.asdict(bound), custody, read_root, request.task_id, carrier='request'))
-    named = _retain_named_sources(bound, source, read_root) if request.surface == 'task_acceptance' else []
+    named = _retain_named_sources(bound, source, read_root, custody) if request.surface == 'task_acceptance' else []
     bindings = _reader_bindings(dataclasses.asdict(bound), read_root, request.task_id)
     bound.policy = {**bound.policy, 'native_data_root': str(read_root), 'review_source_closure': {
         'schema_version': 1, 'task_id': request.task_id, 'read_root': str(read_root),
@@ -301,6 +336,7 @@ def promote_source_payload(raw: bytes, *, source_id: str, extension: str, catego
             payload = None
         meta = payload.get("artifact_meta") if isinstance(payload, dict) else None
         plan_wave = plan_wave_source and isinstance(meta, dict) and meta.get("kind") == "plan_review_wave"
+        plan_history = source_id.startswith('plan-review-late-') and isinstance(payload, dict) and payload.get('kind') == 'plan_review_historical_supplement' and payload.get('task_id') == task_id
         # Native history/round sources use the same typed refs, including view
         # receipts. Follow their host-owned JSON shape, never arbitrary prose.
         native_source = isinstance(payload, dict) and 'read_receipts' in payload and (
@@ -309,11 +345,11 @@ def promote_source_payload(raw: bytes, *, source_id: str, extension: str, catego
         checkpoint = isinstance(payload, dict) and all(key in payload for key in (
             'messages', 'selection_fingerprint', 'observed_view_revision', 'selected_unit_ids'))
         retained_review = source_id.startswith('review-retrieval-')
-        if plan_wave or native_source or checkpoint or retained_review or (isinstance(payload, list) and source_id == "acceptance_tool_trajectory") or (
+        if plan_wave or plan_history or native_source or checkpoint or retained_review or (isinstance(payload, list) and source_id == "acceptance_tool_trajectory") or (
             isinstance(payload, dict) and isinstance(payload.get("request"), dict)
             and payload["request"].get("surface") == "task_acceptance"
         ):
-            role = 'task_result' if source_id == 'review-retrieval-task-result' else (
+            role = 'plan_wave' if plan_wave else 'plan_history' if plan_history else 'task_result' if source_id == 'review-retrieval-task-result' else (
                 'checkpoint' if checkpoint or native_source else 'metadata')
             rewritten = _rewrite_child_ref_tree(payload, parent_root, child_root, task_id, state, carrier=role)
             if checkpoint and rewritten != payload:

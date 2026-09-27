@@ -13,6 +13,7 @@ row.
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -303,7 +304,7 @@ _ACCEPTANCE_PACKET = {
         "provenance": "host_attested", "criterion_id": "claim_1", "check": "pytest -q",
     }],
     "acceptance_obligations": [],
-    "artifacts": [{"name": "report/summary.md", "size": 10, "preview": "PREVIEW-BYTES-OF-THE-ARTIFACT"}],
+    "artifacts": [{"name": "report/summary.md", "size": 29, "preview": "PREVIEW-BYTES-OF-THE-ARTIFACT"}],
     "repo_diff": "diff --git a/x b/x",
     "tool_trajectory": [{"tool": "run_command", "status": "ok", "result": "TRAJECTORY-RESULT-3-passed"}],
     "reasoning_notes": "I believe the feature works.",
@@ -452,10 +453,23 @@ def _spy_admission(monkeypatch):
 
 
 def _roots(tmp_path):
+    from ouroboros.artifacts import task_artifact_dir_path
+    from ouroboros.outcome_receipt_store import append_verification_receipt
+    from ouroboros.utils import append_jsonl
+
     governance, workspace = tmp_path / "governance", tmp_path / "workspace"
     governance.mkdir(exist_ok=True)
     workspace.mkdir(exist_ok=True)
     (workspace / "greeting.txt").write_text("hello native reviewer\n", encoding="utf-8")
+    # The packet names actual producer sources, retained by the real coordinator
+    # before our offline native/session executor is allowed to dispatch.
+    artifact = task_artifact_dir_path(tmp_path, 'root-delivery', create=True) / 'report/summary.md'
+    artifact.parent.mkdir(exist_ok=True)
+    artifact.write_text(_ACCEPTANCE_PACKET['artifacts'][0]['preview'], encoding='utf-8')
+    for receipt in _ACCEPTANCE_PACKET['verification_receipts']:
+        assert append_verification_receipt(tmp_path, 'root-delivery', receipt)
+    for row in _ACCEPTANCE_PACKET['tool_trajectory']:
+        append_jsonl(tmp_path / 'logs/tools.jsonl', {'task_id': 'root-delivery', **row})
     return governance, workspace
 
 
@@ -507,7 +521,17 @@ def test_trap_retrieving_row_receipt_ref_resolves_against_the_full_packet(monkey
     assert "TRAJECTORY-RESULT-3-passed" not in order and "PREVIEW-BYTES" not in order  # tail withheld
     assert "verification_receipts[0]" in order and "RETRIEVAL POINTERS" in order and str(tmp_path) in order
     assert request.evidence["tool_trajectory"][0]["result"] == "TRAJECTORY-RESULT-3-passed"  # FULL dict intact
-    assert request.policy["native_data_root"] == str(tmp_path)
+    closure = request.policy['review_source_closure']
+    reader = Path(closure['read_root'])
+    assert request.policy['native_data_root'] == str(reader)
+    assert reader.is_relative_to(tmp_path / 'task_results/artifacts/root-delivery/source_handles/review_inputs')
+    retained = {row['name']: Path(row['retained_path']).read_text()
+                for row in closure['sources'] if row['status'] == 'retained'}
+    assert json.loads(retained['task-result'])['task_id'] == 'root-delivery'
+    assert retained['artifact:report/summary.md'] == _ACCEPTANCE_PACKET['artifacts'][0]['preview']
+    assert json.loads(retained['verification-receipts']) == _ACCEPTANCE_PACKET['verification_receipts'][0]
+    assert json.loads(retained['tool-trajectory'])[0]['result'] == 'TRAJECTORY-RESULT-3-passed'
+    assert str(reader) in order
     assert request.session_root == str(workspace)
     sent = json.dumps(llm.calls[0]["messages"])
     assert "RETRIEVAL POINTERS" in sent and "TRAJECTORY-RESULT-3-passed" not in sent
@@ -589,7 +613,9 @@ def test_partial_source_refusal_spares_retrieving_rows_and_core_overflow_refuses
     governance, workspace = _roots(tmp_path)
     llm = _EpisodeLLM(tmp_path, [{"content": json.dumps(_CLEAN_VERDICT)}])
     _real_panel(monkeypatch, llm)
-    partial = {**_ACCEPTANCE_PACKET, "__unresolved_partial_artifacts__": True}
+    partial = {**_ACCEPTANCE_PACKET, "__unresolved_partial_artifacts__": [{
+        'tool': 'run_command', 'status': 'source_unavailable',
+        'reason': 'fixture_packet_projection_unavailable', 'source_ref': {}}]}
     result = loop_mod._execute_task_acceptance_panel(_acceptance_ctx(
         tmp_path, evidence=partial, repo_dir=str(governance),
         workspace_root=str(workspace), workspace_mode="project"))

@@ -1000,8 +1000,8 @@ and what enforces each.
   PASS; changed subject/owner source does not (`_deliver_under_running_panel`). Blocking
   waits; Cyber Pro does not; Advisory finish needs explicit `"pending_review":"finish"`.
   Bind operation wait before windows with original money/deadline/Stop; read back the
-  canonical request/subject/roster before dispatch. Collection restores custody and
-  parses locally, never sends or calls models; missing custody proves no outcome.
+  canonical request/subject/roster plus source owners before dispatch. Collection restores
+  custody and parses locally, never sends or calls models; missing custody proves no outcome.
   `remember_settlement_trace` falls back to canonical sources. Publish before announcing
   once, version before verdict; emitted-byte receipts prove no human receipt. Failed or
   nondurable enqueue retains operation retry duty. Sources/outbox survive cleanup

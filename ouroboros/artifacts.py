@@ -1509,10 +1509,11 @@ def copy_directory_to_task_artifacts(
 
 def collect_task_artifact_records(
     drive_root: Union[pathlib.Path, str], task_id: str, *, measure: bool = True, strict: bool = False,
+    require_registered: bool = False,
 ) -> List[Dict[str, Any]]:
-    """List one store's deliverables (nested ones carry ``relpath``), never its metadata or
-    inputs. ``measure=False`` is the pure view: size from lstat, ``measured: False``, only a
-    registration's recorded identity. ``strict`` raises on unreadable material instead."""
+    """List deliverables (nested ones carry ``relpath``), excluding metadata/inputs.
+    ``measure=False`` uses lstat/recorded identities, with ``measured: False``. Strict
+    listing raises on unreadable files; review's ``require_registered`` requires all entries."""
     try:
         artifact_dir = task_artifact_dir_path(pathlib.Path(drive_root), validate_task_id(task_id), create=False)
     except ValueError:
@@ -1527,11 +1528,10 @@ def collect_task_artifact_records(
     raw_manifest = (data or {}).get("artifacts") if isinstance((data or {}).get("artifacts"), dict) else {}
     manifest = {str(key): dict(value) for key, value in raw_manifest.items() if isinstance(value, dict)}
     artifact_root = artifact_dir.resolve(strict=False)
-    if strict:
+    if require_registered:
         for name in manifest:
             path = artifact_dir / name
-            if (path.is_symlink() or not path.resolve().is_relative_to(artifact_root)
-                    or not path.is_file()):
+            if path.is_symlink() or not path.resolve().is_relative_to(artifact_root) or not path.is_file():
                 raise OSError(f"registered artifact is unavailable or outside its owner: {name}")
     members = iter_artifact_tree(artifact_dir) if strict else artifact_dir.rglob("*")
     for path in sorted(p for p in members if p.is_file() and not p.is_symlink()):

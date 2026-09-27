@@ -802,7 +802,7 @@ def _accept_artifact_manifest(drive_root: Any, task_id: str, protected: set) -> 
                 marker = {"name": "…", "status": "manifest truncated at 200 entries", "provenance": "artifact"}
                 try:
                     inventory = {'task_id': task_id, 'artifacts': collect_task_artifact_records(
-                        drive_root, task_id, strict=True)}
+                        drive_root, task_id, strict=True, require_registered=True)}
                     marker['source_ref'] = store_actor_source_bytes(drive_root, task_id, category='context_checkpoints',
                         source_id='acceptance-artifact-inventory',
                         data=json.dumps(inventory, ensure_ascii=False).encode(), extension='json')

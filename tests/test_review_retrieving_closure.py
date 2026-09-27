@@ -384,3 +384,44 @@ def test_complete_inventory_survives_preview_cap_and_author_gc(tmp_path, count, 
         assert result.actors[0]['status'] == 'ok', json.dumps(result.actors[0], ensure_ascii=False)
         assert calls == [True]
         assert not author.exists()
+
+
+def test_saved_child_row_with_canonical_sources_retains_original_owner_before_dispatch(tmp_path):
+    from ouroboros import observability, review_projection
+    from tests.test_acceptance_publication import _run
+
+    canonical, author, repo, request, native, _session, ctx = _retrieving(tmp_path)
+    task = request.task_id
+    call = observability.persist_call(canonical, task_id=task, call_id='canonical-response',
+                                     call_type='llm_response', payload={'message': 'original canonical response'})
+    run = _run()
+    run['request'].update(task_id=task, evidence={'source_ref': _source(canonical, task, 'canonical-evidence',
+                                                                   {'body': 'canonical-only evidence'})})
+    trace = {'review_runs': [run]}
+    ctx.task_attempt = 1
+    review_projection.publish_acceptance_checkpoint(ctx, trace)
+    projection = load_task_result(canonical, task)['review_projection']
+    original = projection['panels'][0]['applied_source_ref']
+    assert not (artifacts.task_artifact_dir_path(author, task) / original['path']).exists()
+    write_task_result(author, task, 'running', review_projection=projection, trace_refs={'response': call['manifest_ref']})
+    reads = []
+
+    class Reader:
+        def chat(self, **kwargs):
+            root = pathlib.Path(request.policy['native_data_root'])
+            closure = request.policy['review_source_closure']
+            row = next(row for row in closure['sources'] if row['name'] == 'task-result')
+            saved = json.loads(artifacts.read_actor_source_bytes(root, task, row['source_ref']))
+            shutil.rmtree(author)
+            applied = saved['review_projection']['panels'][0]['applied_source_ref']
+            evidence = json.loads(artifacts.read_actor_source_bytes(root, task, applied))['request']['evidence']['source_ref']
+            registry, _, _ = inspection_registry(str(repo), root, task)
+            assert 'canonical-only evidence' in registry.execute_result('read_file', evidence['read']['arguments']).text
+            manifest = observability.read_call_manifest_ref(root, saved['trace_refs']['response'], task_id=task)
+            assert observability.read_blob_ref(root, manifest['full_payload_ref'])['message'] == 'original canonical response'
+            reads.append(True)
+            return {'content': json.dumps({'verdict': 'PASS', 'findings': [], 'summary': 'sources retained'})}, {}
+
+    result = run_review_request(request, slots=[native], usage_ctx=ctx, drive_root=author, llm=Reader())
+    assert result.actors[0]['status'] == 'ok', result.actors[0]
+    assert reads == [True] and not author.exists()

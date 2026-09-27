@@ -781,10 +781,20 @@ def _promote_known_observability_ref(
     task_id: str,
     ref: Dict[str, Any],
     state: Dict[str, Any],
+    *, carrier: str = "metadata",
 ) -> Dict[str, Any]:
     def transform_json(payload: Any) -> Any:
         before = len(state["pending_refs"])
-        rewritten = _rewrite_service_payload(payload, parent_root, child_root, task_id, state)
+        # Only the verified manifest owns request/response provenance. Captured
+        # model bodies cannot acquire source authority from matching JSON keys.
+        payload_carrier = 'metadata'
+        if _is_manifest_ref(ref):
+            call_type = str(read_call_manifest_ref(source_root, ref, task_id=task_id).get('call_type') or '')
+            if call_type.endswith(('_response', '_error', '_review_collected')):
+                payload_carrier = 'call_response'
+            elif call_type.endswith('_request'):
+                payload_carrier = 'call_request'
+        rewritten = _rewrite_service_payload(payload, parent_root, child_root, task_id, state, carrier=payload_carrier)
         if len(state["pending_refs"]) != before:
             raise OSError("embedded child observability ref promotion is pending")
         return rewritten
@@ -804,7 +814,7 @@ def _promote_known_observability_ref(
                 source_root,
                 parent_root,
                 ref,
-                transform_json=transform_json,
+                transform_json=None if carrier == 'response_ref' else transform_json,
             )
             if _is_blob_ref(ref)
             else promote_call_manifest_ref(
@@ -898,17 +908,18 @@ def _rewrite_service_payload(
     child_root: pathlib.Path,
     task_id: str,
     state: Dict[str, Any],
+    *, carrier: str = "metadata",
 ) -> Any:
     if not isinstance(payload, dict):
         return payload
     rewritten = copy.deepcopy(payload)
-    if str(rewritten.get("tool") or "") in _SERVICE_REF_TOOLS and isinstance(
+    if carrier == 'metadata' and str(rewritten.get("tool") or "") in _SERVICE_REF_TOOLS and isinstance(
         rewritten.get("result"), str
     ):
         rewritten["result"] = _rewrite_service_result(
             rewritten["result"], parent_root, child_root, task_id, state,
         )
-    return _rewrite_child_ref_tree(rewritten, parent_root, child_root, task_id, state)
+    return _rewrite_child_ref_tree(rewritten, parent_root, child_root, task_id, state, carrier=carrier)
 
 
 def _task_artifact_dir(root: pathlib.Path, task_id: str, *, create: bool) -> pathlib.Path:
@@ -927,8 +938,10 @@ def _rewrite_child_ref_tree(
 ) -> Any:
     from ouroboros.review_source_closure import retain_contract, source_carrier, source_owner
 
-    if carrier == "metadata" and (_is_blob_ref(value) or _is_manifest_ref(value)):
-        return _promote_known_observability_ref(parent_root, child_root, task_id, value, state)
+    if not carrier:
+        return value  # Artifact placement has its own owner; no implicit JSON closure.
+    if carrier in {"metadata", "response_ref"} and (_is_blob_ref(value) or _is_manifest_ref(value)):
+        return _promote_known_observability_ref(parent_root, child_root, task_id, value, state, carrier=carrier)
     if carrier == "metadata" and _is_task_source_ref(value):
         return _promote_task_source_ref(parent_root, child_root, task_id, value, state)
     if isinstance(value, dict):
@@ -981,8 +994,11 @@ def promote_child_task_refs(
             if key in {"task_contract", "attachment_manifest", "attachment_manifest_ref"}:
                 continue  # Input JSON and its file closure have one attachment-aware owner.
             if key in rewritten:
+                from ouroboros.review_source_closure import source_carrier
+
                 rewritten[key] = _rewrite_child_ref_tree(
                     rewritten[key], parent_root, child_root, task_id, state,
+                    carrier=source_carrier(rewritten, key, 'task_result'),
                 )
         artifacts = rewritten.get("artifacts")
         if isinstance(artifacts, list):
