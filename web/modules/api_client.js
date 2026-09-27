@@ -89,15 +89,17 @@ export function createTask(payload) {
  * "immediate" (or absent) keeps today's hard cancel byte-identical.
  * Shared by the Chat live-card stop control and the Activity tab.
  * @param {string} taskId
- * @param {{cascade?: boolean, stopPolicy?: string}} [options]
+ * @param {{cascade?: boolean, stopPolicy?: string, stopActionId?: string}} [options]
  * @returns {Promise<import('./api_types.js').TaskCancelResponse>}
  */
-export function cancelTask(taskId, { cascade = false, stopPolicy = '' } = {}) {
+export function cancelTask(taskId, { cascade = false, stopPolicy = '', stopActionId = '' } = {}) {
     const url = `/api/tasks/${encodeURIComponent(taskId)}/cancel`;
     const policy = String(stopPolicy || '');
+    /** @type {import('./api_types.js').TaskCancelRequest} */
     const body = {
         ...(cascade ? { cascade: true } : {}),
         ...(policy && policy !== 'immediate' ? { stop_policy: policy } : {}),
+        ...(stopActionId ? { stop_action_id: stopActionId } : {}),
     };
     return Object.keys(body).length ? jsonPost(url, body) : fetchJson(url, { method: 'POST' });
 }

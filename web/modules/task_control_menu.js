@@ -234,11 +234,26 @@ export async function hurryTaskAction(taskId) {
  * @param {string} action
  * @returns {Promise<import('./api_types.js').TaskCancelResponse>}
  */
+const pendingStopActions = new Map();
+
 export async function requestStop(taskId, action) {
     const id = String(taskId || '').trim();
+    const key = JSON.stringify([id, action]);
+    // A lost response keeps this page-session action retryable. A confirmed
+    // response retires it; a later click is a genuinely new Stop. Hardening a
+    // soft Stop is a distinct action, even while the soft response is unknown.
+    if (!pendingStopActions.has(key)) {
+        const uuid = globalThis.crypto?.randomUUID?.()
+            || `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+        pendingStopActions.set(key, `stop-${uuid}`);
+    }
     inFlight.add(id);
     try {
-        return await cancelTask(id, { cascade: true, stopPolicy: stopPolicyFor(action) });
+        const result = await cancelTask(id, { cascade: true, stopPolicy: stopPolicyFor(action),
+            stopActionId: pendingStopActions.get(key) });
+        if (result?.ok !== true) throw new Error('Stop acknowledgement is unknown; retry this action.');
+        pendingStopActions.delete(key);
+        return result;
     } finally {
         inFlight.delete(id);
     }

@@ -196,3 +196,28 @@ test('Activity marks root rows and hides Pause for a child; Chat cards stay root
     // A chat card offers the menu only for a root (never a subagent card).
     assert.match(chat, /cancelRunEligibility\(\{\s*groupId: record\.groupId, isSubagent: record\.isSubagent/);
 });
+
+test('Stop producer reuses uncertain action identity and distinguishes acknowledged later Stop', async () => {
+    const { requestStop } = await import('../modules/task_control_menu.js');
+    const oldFetch = globalThis.fetch;
+    const calls = [];
+    globalThis.fetch = async (url, init) => {
+        calls.push({ url, ...JSON.parse(init.body) });
+        if (calls.length === 1) throw new Error('response lost after acceptance');
+        return { ok: true, status: 202, json: async () => ({ ok: true, cancel_state: 'pending' }) };
+    };
+    try {
+        await assert.rejects(requestStop('retry-stop', ACTION_FINALIZE), /response lost/);
+        await requestStop('retry-stop', ACTION_STOP_NOW);
+        await requestStop('retry-stop', ACTION_FINALIZE);
+        await requestStop('retry-stop', ACTION_FINALIZE);
+        assert.equal(calls.length, 4);
+        assert.match(calls[0].stop_action_id, /^stop-/);
+        assert.equal(calls[0].stop_action_id, calls[2].stop_action_id);
+        assert.notEqual(calls[0].stop_action_id, calls[1].stop_action_id);
+        assert.notEqual(calls[0].stop_action_id, calls[3].stop_action_id);
+        assert.equal(calls[0].stop_policy, 'finalize_then_cancel');
+        assert.equal(calls[1].stop_policy, undefined); // immediate legacy encoding
+        assert.ok(calls.every(call => call.cascade === true));
+    } finally { globalThis.fetch = oldFetch; }
+});

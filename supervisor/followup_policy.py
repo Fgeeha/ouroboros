@@ -27,11 +27,32 @@ HOST_FIELDS = ("followup_origin", "followup_relation", "followup_hold",
 _CONTROL_DEPTH = threading.local()
 
 
-def new_stop_fields(source):
-    """A later explicit Stop is distinct even while an earlier custody cause wins."""
+class StopActionConflict(RuntimeError):
+    """A known action identity was reused with different control arguments."""
+
+
+def new_stop_fields(source, *, previous=None, action_id="", action_binding=()):
+    """Keep exact retries on the current control, even after a later Stop.
+
+    Receipts travel in the existing cancel/result carrier, never a second store.
+    Legacy calls without identity are distinct accepted actions, not deduplicated
+    by arguments or time. A reused identity cannot change the action's meaning.
+    """
     from ouroboros.utils import utc_now_iso
-    return ({"followup_stop": {"control_id": uuid.uuid4().hex, "source": str(source), "requested_at": utc_now_iso()}}
-            if source in STOP_SOURCES else {})
+    if source not in STOP_SOURCES:
+        return {}, False
+    prior = previous or {}
+    receipts = dict(prior.get("action_receipts") or {})
+    if action_id:
+        key = hashlib.sha256(action_id.encode()).hexdigest()
+        binding = hashlib.sha256(json.dumps(action_binding).encode()).hexdigest()
+        if key in receipts:
+            if receipts[key] != binding:
+                raise StopActionConflict("stop_action_id reused with a different action")
+            return {"followup_stop": copy.deepcopy(prior)}, True
+        receipts[key] = binding
+    return {"followup_stop": {"control_id": uuid.uuid4().hex, "source": str(source),
+            "requested_at": utc_now_iso(), **({"action_receipts": receipts} if receipts else {})}}, False
 
 
 def relation_kind(record):

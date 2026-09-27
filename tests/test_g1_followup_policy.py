@@ -443,3 +443,179 @@ def test_context_and_continue_expose_held_obligations_without_auto_release(world
     assert digest['held'][0]['status'] == 'consumed' and digest['held'][0]['hold_persisted']
     text = work_order_text(ORIGIN, 'owner_restart', {}, deadline_at=DEADLINE)
     assert 'manage_schedules' in text and 'does not release their holds' in text and DEADLINE in text
+
+
+@pytest.mark.parametrize('suppression', ['disable', 'delete'])
+@pytest.mark.parametrize('later', [False, True])
+def test_exact_restore_replay_cannot_lift_separate_suppression(world, suppression, later):
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+    from ouroboros.gateway.schedules import api_schedules_action
+    _, root, _ = world
+    registered = register(world)
+    stop(root)
+    queue.check_scheduled_tasks()
+    sid = registered['id']
+    held = row(root, sid)['followup_hold']['hold_id']
+    app = Starlette(routes=[Route('/api/schedules/{schedule_id}/action', api_schedules_action, methods=['POST'])])
+    app.state.drive_root = root
+    with TestClient(app) as client:
+        def action(verb, **kw):
+            response = client.post(f'/api/schedules/{sid}/action', json={'action': verb, 'reason': 'Explicit action', **kw})
+            assert response.status_code == 200, response.text
+            return response.json()
+        if not later:
+            assert action(suppression)['changed']
+        assert action('restore', expected_hold_id=held)['status'] == 'hold_released'
+        if later:
+            assert action(suppression)['changed']
+        before = row(root, sid)
+        replay = action('restore', expected_hold_id=held)
+        assert not replay['changed'], replay
+        assert row(root, sid) == before and not before['enabled']
+        # The separate, explicitly generic Restore remains available.
+        assert action('restore')['ok']
+        assert row(root, sid)['enabled']
+
+
+def _assignment_world(world, monkeypatch, count=1):
+    from tests._budget_pause_exact_helpers import _install_queue
+    ctx, root, _ = world
+    _, _, workers = _install_queue(root, monkeypatch)
+    sent = []
+    for wid in range(count):
+        workers.WORKERS[wid] = SimpleNamespace(wid=wid, busy_task_id=None,
+            in_q=SimpleNamespace(put=lambda task, wid=wid: sent.append((wid, copy.deepcopy(task)))))
+    return (ctx, root, workers.PENDING), workers, sent
+
+
+@pytest.mark.parametrize('workers_count', [1, 3])
+def test_assign_tasks_skips_final_refusal_for_same_available_worker(world, monkeypatch, workers_count):
+    world, workers, sent = _assignment_world(world, monkeypatch, workers_count)
+    _, root, pending = world
+    a = register(world)
+    b = register(world, 'independent')
+    queue.check_scheduled_tasks()
+    frozen = copy.deepcopy(pending[0])
+    stop(root)  # After preparation; actual final control check must refuse A.
+    workers.assign_tasks()
+    assert len(sent) == 1 and sent[0][0] == 0
+    assert sent[0][1]['metadata']['schedule_id'] == b['id']
+    assert pending == [frozen] and row(root, a['id'])['last_task_id'] == frozen['id']
+    assert frozen['admitted_dispatch'] == 'none'
+    workers.assign_tasks()
+    assert len(sent) == 1 and pending == [frozen]
+
+
+@pytest.mark.parametrize('state', ['pending', 'running', 'missing', 'unreadable', 'settled_live', 'settled'])
+def test_consumed_row_retained_until_actual_work_settles(world, monkeypatch, state):
+    world, workers, sent = _assignment_world(world, monkeypatch)
+    _, root, pending = world
+    registered = register(world)
+    queue.check_scheduled_tasks()
+    [task] = pending
+    frozen = copy.deepcopy(task)
+    data = schedules.load_schedule_store(root)
+    data['tasks'][0]['completed_at'] = '2000-01-01T00:00:00+00:00'
+    schedules._write_scheduled_tasks(data, root)
+    path = root / 'task_results' / (task['id'] + '.json')
+    if state != 'pending':
+        pending.clear()
+    if state in {'running', 'settled_live'}:
+        workers.RUNNING[task['id']] = {'task': task, 'worker_id': 0}
+    if state in {'settled', 'settled_live'}:
+        write_task_result(root, task['id'], 'completed', result='Work settled')
+    elif state == 'running':
+        write_task_result(root, task['id'], 'running')
+    elif state == 'missing':
+        path.unlink()
+    elif state == 'unreadable':
+        path.write_text('{torn')
+    queue.check_scheduled_tasks()
+    kept = schedules.load_schedule_store(root)['tasks']
+    assert bool(kept) is (state != 'settled')
+    if state == 'pending':
+        assert pending == [frozen]
+        workers.assign_tasks()
+        assert len(sent) == 1 and sent[0][1]['id'] == frozen['id']
+        assert sent[0][1]['metadata']['billing_group'] == BINDING
+        assert sent[0][1]['deadline_at'] == DEADLINE
+        assert row(root, registered['id'])['completed_at'] == '2000-01-01T00:00:00+00:00'
+
+
+@pytest.mark.parametrize('door', ['http', 'tool'])
+def test_stop_action_retry_and_later_action_across_release(world, monkeypatch, door):
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+    from ouroboros.gateway.tasks import api_task_cancel
+    from ouroboros.tools.join_ledger import _cancel_task
+    from supervisor import owner_stop
+    ctx, root, _ = world
+    registered = register(world)
+    sid = registered['id']
+    queue.RUNNING[ORIGIN] = {'task': {'id': ORIGIN}, 'worker_id': 0}
+    begun = []
+    monkeypatch.setattr(owner_stop, 'begin_graceful_stop', begun.append)
+    app = Starlette(routes=[Route('/api/tasks/{task_id}/cancel', api_task_cancel, methods=['POST'])])
+    with TestClient(app) as client:
+        def cancel(action_id):
+            if door == 'http':
+                reply = client.post(f'/api/tasks/{ORIGIN}/cancel', json={
+                    'stop_policy': 'finalize_then_cancel', 'stop_action_id': action_id})
+                assert reply.status_code == 202, reply.text
+                return reply.json()
+            return _cancel_task(ctx, ORIGIN, reason='Stop this work', stop_action_id=action_id)
+        cancel('one-action')  # Its response is lost to the caller.
+        first = active_intent(root, ORIGIN)
+        queue.check_scheduled_tasks()
+        assert restore(root, sid, row(root, sid)['followup_hold']['hold_id'])['ok']
+        cancel('one-action')
+        replay = active_intent(root, ORIGIN)
+        assert replay['request_id'] == first['request_id']
+        assert replay['followup_stop'] == first['followup_stop']
+        assert not observed_store(root, schedules.load_schedule_store(root))['tasks'][0].get('followup_hold')
+        cancel('later-action')
+        later = active_intent(root, ORIGIN)
+        assert later['request_id'] == first['request_id']
+        assert later['followup_stop']['control_id'] != first['followup_stop']['control_id']
+        queue.check_scheduled_tasks()
+        assert restore(root, sid, row(root, sid)['followup_hold']['hold_id'])['ok']
+        cancel('one-action')  # Delayed older replay must not replace the later control.
+        assert active_intent(root, ORIGIN)['followup_stop'] == later['followup_stop']
+        assert not observed_store(root, schedules.load_schedule_store(root))['tasks'][0].get('followup_hold')
+
+
+def test_stop_action_receipt_survives_settlement_and_storage_failure(world, monkeypatch):
+    _, root, _ = world
+    first = request_cancel(root, ORIGIN, source='http_single', stop_action_id='first')
+    write_task_result(root, ORIGIN, 'completed', result='Preserved completion')
+    assert settle_intent(root, ORIGIN, outcome='already_settled', request_id=first['request_id'])
+    stored = load_task_result(root, ORIGIN)
+    replay = request_cancel(root, ORIGIN, source='http_single', stop_action_id='first', allow_settled_target=True)
+    assert replay['stop_action_replayed'] and active_intent(root, ORIGIN) is None
+    assert load_task_result(root, ORIGIN) == stored
+    # A real later action creates authority despite the original completion.
+    second = request_cancel(root, ORIGIN, source='http_single', stop_action_id='second', allow_settled_target=True)
+    assert second['followup_stop']['control_id'] != first['followup_stop']['control_id']
+    import ouroboros.cancel_intents as ci
+    def fail(*args, **kwargs):
+        raise OSError('injected durable write failure')
+    with monkeypatch.context() as m:
+        m.setattr(ci, 'update_json_locked', fail)
+        with pytest.raises(OSError):
+            request_cancel(root, ORIGIN, source='http_single', stop_action_id='third', allow_settled_target=True)
+    assert active_intent(root, ORIGIN) == {k: v for k, v in second.items() if k not in {'already_requested', 'already_settled'}}
+    assert load_task_result(root, ORIGIN) == stored
+
+
+def test_action_identity_conflict_refuses_without_changing_authority(world):
+    _, root, _ = world
+    first = request_cancel(root, ORIGIN, source='http_single', stop_action_id='same',
+                           requested_stop_policy='finalize_then_cancel')
+    from supervisor.followup_policy import StopActionConflict
+    with pytest.raises(StopActionConflict):
+        request_cancel(root, ORIGIN, source='http_single', stop_action_id='same',
+                       requested_stop_policy='immediate')
+    assert active_intent(root, ORIGIN)['followup_stop'] == first['followup_stop']

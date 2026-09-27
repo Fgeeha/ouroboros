@@ -351,40 +351,24 @@ def request_cancel(
     allow_settled_target: bool = False,
     requested_stop_policy: str = "",
     observation: Optional[Dict[str, Any]] = None,
+    stop_action_id: str = "",
 ) -> Dict[str, Any]:
-    """Record durable cancel intent for ``task_id`` — idempotent per task.
+    """Record cancel custody, keeping action identity separate from request_id.
 
-    Returns the ACTIVE intent row (existing or newly minted) plus
-    ``already_requested``. Never touches the canonical task status: teardown and
-    the terminal write belong to the supervisor's cancellation custody.
-
-    An ALREADY-SETTLED task with NO live ownership mints nothing: an intent for
-    a task that finished on its own would show a false "Cancelling…" badge on a
-    settled card until the watchdog cleaned it up, and nothing is left to tear
-    down. The caller gets ``already_settled`` plus the real ``status`` instead
-    (completion wins).
-
-    ``allow_settled_target`` is the LIVE-OWNERSHIP exception (GR6-1, widening
-    the GR2-1b cascade case): the pipeline persists the durable terminal result
-    BEFORE post-task cognition ends, so a settled STATUS alone does not prove a
-    dead WORKER — ``already_settled`` is a terminal answer only when no live
-    physical ownership remains (no RUNNING row / busy worker). This module
-    stays pure (it never reads the queue): each INGRESS checks its own live
-    ownership fact (`supervisor.queue.task_has_live_ownership` in-process, the
-    queue-snapshot read worker-side) and passes ``allow_settled_target=True``
-    when ownership is live, so custody can kill the still-spending worker while
-    completion-wins preserves the stored result. The cascade-coordination
-    ingress (GR2-1b) passes it for a settled root with live descendants — the
-    intent is the watchdog's replay trigger and settles only at the cascade
-    postcondition. The settled-card badge hazard does not apply: the
-    effective-status read only projects ``cancel_state`` onto NON-settled
-    results.
-
-    ``scope`` is stored on the row so a watchdog replay re-runs the SAME shape:
-    a ``cascade`` intent re-fed as a single cancel would settle the root while
-    its descendants kept running.
+    Return the active intent plus already_requested. Exact stop_action_id retries
+    preserve the current future-control identity. Custody alone writes terminal
+    status. Settled targets without live ownership mint nothing (completion wins),
+    avoiding a false Cancelling badge. allow_settled_target is the ingress's live
+    ownership proof: a saved terminal result may precede post-task cognition, or a
+    settled root may still coordinate live descendants. In-process ingress checks
+    task_has_live_ownership; workers read the snapshot. This owner reads no queue.
+    Custody can stop that spending without replacing the stored completion; only
+    non-settled results project cancel_state. Cascade scope persists so watchdog
+    replay cannot settle a root while leaving its descendants running.
     """
     tid = _valid_task_id(task_id)
+    if not isinstance(stop_action_id, str) or len(stop_action_id) > 200:
+        raise ValueError("stop_action_id must be a string of at most 200 characters")
     # The whole stated cause is the durable record (``cancel_origin.reason``
     # carries it on); a surface that shows less labels its preview as one.
     reason_text = " ".join(str(reason or "").split())
@@ -397,7 +381,6 @@ def request_cancel(
     newly_hardened = {"value": False}
     observed = copy.deepcopy(observation) if isinstance(observation, dict) else None
     from supervisor.followup_policy import new_stop_fields
-    stop_fields = new_stop_fields(source)
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         newly_hardened["value"] = False
@@ -498,6 +481,15 @@ def request_cancel(
             ) from exc
         target_status = str(target_result.get("status") or "")
         resolved["status"] = target_status if target_status in SETTLED_STATUSES else ""
+        stop_fields, replayed = new_stop_fields(source,
+            previous=(existing or {}).get("followup_stop") or target_result.get("followup_stop"),
+            action_id=stop_action_id,
+            action_binding=(str(source), str(requested_by), scope_text, policy_text))
+        if replayed:
+            minted.update(existing or {"task_id": target_id, "status": target_status,
+                                       "already_settled": bool(resolved["status"]), **stop_fields})
+            minted.update(already_requested=True, stop_action_replayed=True)
+            return None
         if (
             resolved["status"]
             and not allow_settled_target

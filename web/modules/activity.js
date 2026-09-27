@@ -360,6 +360,13 @@ export function initActivity({ mount, ws } = {}) {
             showToast(`Schedule ${action} did not change anything: ${detail}`, 'error');
             return;
         }
+        // Restriction refresh can change bookkeeping while REFUSING release.
+        // Only typed applied outcomes may produce an applied/success message.
+        if (!['updated', 'deleted', 'suppressed', 'restored_not_ready',
+            'hold_released', 'changed_audit_incomplete'].includes(outcome.status)) {
+            showToast(`Schedule ${action} refused: ${detail}`, 'error');
+            return;
+        }
         if (outcome.audit !== 'recorded') {
             showToast(`Schedule ${action} applied, but its audit record is incomplete: ${detail}`, 'warn');
             return;
@@ -368,6 +375,7 @@ export function initActivity({ mount, ws } = {}) {
             showToast(`Schedule suppression lifted, but it is not ready to run: ${detail}`, 'warn');
         } else if (outcome.ok !== true) {
             showToast(`Schedule ${action} changed, but did not finish successfully: ${detail}`, 'warn');
+            return;
         }
         // Name what actually happened: a delete on a skill row is a durable
         // suppression, and saying "deleted" would claim a removal that did not occur.

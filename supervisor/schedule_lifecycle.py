@@ -276,7 +276,8 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
             if current is None:
                 return {"ok": False, "changed": False, "status": "not_found",
                         "schedule_id": wanted, "audit": "not_written"}
-            if operation == "restore" and (current.get("followup_hold") or
+            # An exact release request never becomes generic enable on replay.
+            if operation == "restore" and (expected_hold_id or current.get("followup_hold") or
                     (not _is_consumed_once(current) and policy_view(root, data, current).get("hold"))):
                 return restore_followup(root, data, current, expected_hold_id=expected_hold_id,
                                         resolved=resolved, actor=actor, task_id=task_id, reason=reason)

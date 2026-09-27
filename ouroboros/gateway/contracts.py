@@ -1306,32 +1306,31 @@ class TaskEvent(TypedDict, total=False):
     error: str
 
 
+class TaskCancelRequest(TypedDict, total=False):
+    """Optional body; stop_action_id retries one action, distinct from custody ID.
+    Omission preserves legacy ingress without exact-replay assurance."""
+    cascade: bool
+    stop_policy: str
+    stop_action_id: str
+
+
 class TaskCancelResponse(TypedDict, total=False):
     ok: bool
     task_id: str
-    # v6.82 (P5): echoed when the optional request body {"cascade": true} asked
-    # for the subtree cancel, which is COMPLETE by the time this answer is sent;
-    # the plain envelope is unchanged.
+    # Cascade echoes subtree scope; immediate success follows teardown.
     cascade: bool
-    # Additive on the 202 acknowledgement of a ``{"stop_policy": "finalize_then_cancel"}`` request: the
-    # durable intent is open ("pending") while the bounded finalization attempt runs, and ``stop_policy``
-    # echoes the EFFECTIVE policy of the durable intent ("immediate" | "finalize_then_cancel") — a graceful
-    # request over an already-hard intent never softens it, and the answer says so. Absent on the legacy immediate path.
+    # Soft 202 keeps custody pending and echoes EFFECTIVE policy, never softening
+    # an immediate intent. Legacy immediate replies omit these additive fields.
     cancel_state: str
     stop_policy: str
     error: str
 
 
 class TaskHurryRequest(TypedDict):
-    """``POST /api/tasks/{task_id}/hurry`` — the text-free owner hurry control
-    (HQ1 owner decision, paraphrased: no visible chat message ever).
-
-    The body carries ONLY a client-generated stable ``request_id`` (reused on
-    retry so the acknowledgement is idempotent); any other field is refused.
-    There is deliberately no text and no chat side effect anywhere on this
-    path — the durable facts are the typed owner-mailbox control, the
-    ``owner_hurry`` task-result projection, and one non-chat event."""
-
+    """Text-free owner hurry (HQ1), POST /api/tasks/{task_id}/hurry.
+    Only stable request_id is accepted, reused on retry. No chat side effect;
+    durable facts are the mailbox control, owner_hurry projection and one event.
+    """
     request_id: str
 
 
@@ -1591,6 +1590,7 @@ __all__ = [
     "TaskEventCursor",
     "TaskEventsRequest",
     "TaskCancelResponse",
+    "TaskCancelRequest",
     "TaskHurryRequest",
     "TaskHurryResponse",
     "OwnerHurryProjection",

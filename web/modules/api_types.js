@@ -1321,6 +1321,16 @@
  */
 
 /**
+ * Optional cancel body. Reuse stop_action_id (at most 200 characters) for this
+ * exact action; a later Stop uses a new ID. It is distinct from the server's
+ * cancellation request_id. Absent identity has no exact-retry guarantee.
+ * @typedef {Object} TaskCancelRequest
+ * @property {boolean=} cascade
+ * @property {string=} stop_policy
+ * @property {string=} stop_action_id
+ */
+
+/**
  * @typedef {Object} TaskCancelResponse
  * @property {boolean} ok
  * @property {string} task_id

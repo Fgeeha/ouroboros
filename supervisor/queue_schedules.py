@@ -596,19 +596,19 @@ def resync_skill_schedules(drive_root: pathlib.Path | None = None) -> Dict[str, 
     )
 
 
-def _rows_hold_schedule(rows: Any, schedule_id: str) -> bool:
+def _rows_hold_schedule(rows: Any, schedule_id: str, task_id: str = "") -> bool:
     """Whether any queue row (a PENDING task or a RUNNING/snapshot wrapper) is its task."""
     for row in rows or []:
         if not isinstance(row, dict):
             continue
         task = row.get("task") if isinstance(row.get("task"), dict) else row
         meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-        if str(meta.get("schedule_id") or "") == schedule_id:
+        if str(meta.get("schedule_id") or "") == schedule_id or (task_id and task.get("id") == task_id):
             return True
     return False
 
 
-def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | None = None) -> bool | None:
+def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | None = None, *, task_id: str = "") -> bool | None:
     """Whether a task this schedule already admitted is still pending or running.
 
     ``None`` means UNKNOWN, and it is load-bearing: PENDING/RUNNING are the
@@ -625,8 +625,8 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
     if not schedule_id:
         return False
     if not in_worker_process():
-        return (_rows_hold_schedule(_queue().PENDING, schedule_id)
-                or _rows_hold_schedule(_queue().RUNNING.values(), schedule_id))
+        return (_rows_hold_schedule(_queue().PENDING, schedule_id, task_id)
+                or _rows_hold_schedule(_queue().RUNNING.values(), schedule_id, task_id))
     snapshot = read_json_dict(pathlib.Path(drive_root or _queue().DRIVE_ROOT)
                               / "state" / "queue_snapshot.json")
     if not isinstance(snapshot, dict):
@@ -666,8 +666,8 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
             return None
     except (TypeError, ValueError, OverflowError):
         return None
-    return (_rows_hold_schedule(snapshot.get("pending"), schedule_id)
-            or _rows_hold_schedule(snapshot.get("running"), schedule_id))
+    return (_rows_hold_schedule(snapshot.get("pending"), schedule_id, task_id)
+            or _rows_hold_schedule(snapshot.get("running"), schedule_id, task_id))
 
 
 def _task_from_schedule(record: Dict[str, Any]) -> Dict[str, Any]:
@@ -897,8 +897,21 @@ def check_scheduled_tasks() -> None:
         # Runtime Cleanup SSOT; enabled records are never pruned — see the helper).
         from ouroboros.retention import age_cutoff, get_gc_retention_days
 
+        def work_settled(record):
+            from ouroboros.task_results import load_task_result
+            from ouroboros.task_status import SETTLED_STATUSES
+
+            if _schedule_running_or_queued(str(record.get("id") or ""), _queue().DRIVE_ROOT,
+                                           task_id=str(record["last_task_id"])) is not False:
+                return False
+            try:
+                result = load_task_result(_queue().DRIVE_ROOT, record["last_task_id"], strict=True)
+                return isinstance(result, dict) and result.get("status") in SETTLED_STATUSES
+            except Exception:
+                return False  # Unreadable authority cannot retire the only binding row.
+
         kept, pruned = _prune_consumed_once(list(data.get("tasks") or []),
-                                            age_cutoff(get_gc_retention_days()))
+                                            age_cutoff(get_gc_retention_days()), work_settled=work_settled)
         if pruned:
             data["tasks"], changed = kept, True
         if changed:

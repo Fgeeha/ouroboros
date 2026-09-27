@@ -67,12 +67,13 @@ def record_last_error(record: Dict[str, Any], message: str) -> bool:
     return True
 
 
-def prune_consumed_once_records(tasks: list, cutoff_epoch: float) -> tuple[list, int]:
+def prune_consumed_once_records(tasks: list, cutoff_epoch: float, *, work_settled=None) -> tuple[list, int]:
     """``(kept, pruned_count)`` — drop CONSUMED one-shot records (``trigger.type ==
     "once"`` + ``enabled=False`` + ``completed_at``) whose completion is older than
     the unified GC retention cutoff (epoch seconds; ``retention.age_cutoff``). The
-    consumed one-shot is a durable receipt, not a standing schedule, so it ages out
-    like every other disposable runtime artifact. ONLY one-shots are pruned: a
+    consumed one-shot remains its work's binding/Restore row until the caller
+    positively proves that work settled. Consumption alone is not settlement.
+    Without that proof a row with ``last_task_id`` is retained. ONLY one-shots are pruned: a
     disabled CRON row is a standing schedule the owner may re-enable, and is kept
     even if it carries a stray ``completed_at``. ENABLED records are never pruned;
     an unparseable ``completed_at`` is kept, conservatively."""
@@ -85,6 +86,9 @@ def prune_consumed_once_records(tasks: list, cutoff_epoch: float) -> tuple[list,
             if str(trigger.get("type") or "") == "once":
                 done = parse_schedule_time(record.get("completed_at"), datetime.timezone.utc)
                 if done is not None and done.timestamp() < float(cutoff_epoch):
+                    if record.get("last_task_id") and (work_settled is None or not work_settled(record)):
+                        kept.append(record)
+                        continue
                     pruned += 1
                     continue
         kept.append(record)

@@ -14,7 +14,7 @@
       "name": "owner Restart has a readable cause without changing its typed identity",
       "record": {"status": "cancelled", "reason_code": "owner_restart", "cancel_origin": {"source": "owner_restart", "reason": "Owner restart"}},
       "phase": "cancelled", "headline": "Cancelled",
-      "acceptance_clause": "Owner restart."
+      "acceptance_clause": "Stopped by the Restart command."
     },
     {
       "name": "shutdown has its own cause, never invented owner intent",

@@ -261,9 +261,7 @@ def assign_tasks() -> None:
     _tick_parked_work(queue)  # custody observation may wait on a remote operation
     with _queue_lock:
         st = _pool().load_state()
-        # Cancellation/terminal custody wins before validating rows left in the
-        # queue.  Then quarantine every malformed depth before budget, lease, or
-        # capacity filters can leave it waiting indefinitely.
+        # Custody wins; quarantine malformed depth before budget/lease filters.
         if not _pool()._drop_cancelled_pending():
             log.error(
                 "Task assignment blocked: cancellation authority or custody "
@@ -414,9 +412,9 @@ def assign_tasks() -> None:
         from ouroboros.project_lease import candidate_is_leasable, running_project_ids
         from ouroboros.config import get_max_active_subagents_per_root
 
-
+        refused_this_pass = set()
         for w in _pool().WORKERS.values():
-            if (w.busy_task_id is None and not getattr(w, "reaping", False)
+            while (w.busy_task_id is None and not getattr(w, "reaping", False)
                     and getattr(w, "active_capacity", True) and _pool().PENDING):
                 # One-writer-per-project lease: recompute per assignment so a
                 # task assigned in THIS loop pass immediately occupies its lane.
@@ -425,6 +423,8 @@ def assign_tasks() -> None:
                 # and project-leased candidates)
                 chosen_idx = None
                 for i, candidate in enumerate(_pool().PENDING):
+                    if str(candidate.get("id") or "") in refused_this_pass:
+                        continue
                     if remaining <= 0 and not candidate.get("_owner_wait_resume"):
                         continue
                     if _pool()._invalid_depth_deferred(candidate, unresolved_invalid_id_set):
@@ -434,11 +434,9 @@ def assign_tasks() -> None:
                     if isinstance(candidate.get("_budget_pause"), dict):
                         continue
                     if budget_hold_fact(candidate) is not None:
-                        # A durable budget hold (#1196): a sibling whose paused
-                        # root's fence was lifted without an explicit selection,
-                        # an unrestorable continuation, or a grant whose
-                        # revocation could not be written. Never assignable
-                        # until the selection is recorded on the row.
+                        # Durable #1196 hold: sibling unselected after root release,
+                        # unrestorable continuation or failed grant revocation.
+                        # Selection must be recorded before assignment.
                         continue
                     if (candidate.get("_is_direct_chat")
                             and _direct_actor_still_registered(str(candidate.get("id") or ""))):
@@ -454,10 +452,9 @@ def assign_tasks() -> None:
 
                             revoke_exact_budget_resume(candidate, "root_resume_generation_stale")
                         else:
-                            # A zero-dispatch selection whose root grant or fence is
-                            # no longer live returns to an UNSELECTED hold (#1196, Q9):
-                            # the row keeps its hold identity, drops the dead grant
-                            # binding, and the next selection records the live one.
+                            # Stale zero-dispatch selection returns to UNSELECTED
+                            # (#1196, Q9), retaining hold ID but dropping dead grant.
+                            # The next selection must record a live root grant.
                             from supervisor.events_budget import (
                                 BUDGET_HOLD_KEY, HOLD_ROOT_FENCE_LIFTED, hold_budget_row,
                             )
@@ -499,7 +496,7 @@ def assign_tasks() -> None:
                         dropped_ids = _pool()._drop_assignable_evolution_tasks(unresolved_invalid_id_set)
                         if dropped_ids:
                             queue.persist_queue_snapshot(reason="evolution_dropped_budget")
-                    continue
+                    break
                 task = _pool().PENDING[chosen_idx]
                 depth_error = _pool()._normalize_pending_task_depth(task)
                 if depth_error:
@@ -507,20 +504,24 @@ def assign_tasks() -> None:
                         _pool().PENDING.pop(chosen_idx)
                         queue.persist_queue_snapshot(reason="invalid_task_depth")
                         continue
-                    # Keep failed terminalization in queue custody for retry.
+                    # Keep failed terminalization in custody; stop this pass.
                     log.error(
                         "Assignment blocked: invalid task depth could not be terminalized for %s",
                         task.get("id"),
                     )
-                    break
+                    return
                 evolution_error = _pool()._evolution_assignment_error(task)
                 if evolution_error:
+                    refused_this_pass.add(str(task.get("id") or ""))
                     if _pool()._cancel_unauthorized_evolution(task, evolution_error):
                         _pool().PENDING.pop(chosen_idx)
                         queue.persist_queue_snapshot(reason="evolution_authority_rejected")
                     continue
                 # Keep PENDING custody through preparation and the final handoff.
                 if not _claim_worker_launch(queue, task, w):
+                    # Keep custody and identity; try another candidate on THIS
+                    # available worker without rechecking the refusal this pass.
+                    refused_this_pass.add(str(task.get("id") or ""))
                     continue
                 _pool().PENDING.pop(chosen_idx)
                 w.busy_task_id = task["id"]
