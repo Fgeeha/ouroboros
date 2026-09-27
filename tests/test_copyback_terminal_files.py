@@ -12,6 +12,7 @@ import pytest
 
 from ouroboros import headless, observability as obs
 from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes
+from ouroboros.outcomes import collect_trace_refs
 from ouroboros.task_results import load_task_result, write_task_result
 
 
@@ -34,8 +35,20 @@ def _review(ref, revision=1, headline="reviewed"):
 
 
 def _store(root, task_id, ref, **fields):
+    # The real trace producer names one call through its LLM-response and tool
+    # edges, then loop_outcome repeats the response: with a review panel, four
+    # occurrences of one call, so a copy must still do each file operation once.
+    usage = {"llm_call_refs": [{"llm_call_id": ref["call_id"], "response_ref": ref}]}
+    tool = {"tool_calls": [{"trace_ref": {"call_id": ref["call_id"], "manifest_ref": ref}}]}
     return write_task_result(root, task_id, "completed", result="done", artifact_status="ready",
-                             trace_refs={"refs": [ref, ref]}, loop_outcome={"trace_refs": [ref]}, **fields)
+                             trace_refs=collect_trace_refs(usage, tool),
+                             loop_outcome={"trace_refs": collect_trace_refs(usage, {})}, **fields)
+
+
+def _trace_occurrences(result):
+    trace, nested = result["trace_refs"], result["loop_outcome"]["trace_refs"]
+    return [trace["llm_call_refs"][0]["response_ref"], trace["tool_call_refs"][0]["manifest_ref"],
+            nested["llm_call_refs"][0]["response_ref"]]
 
 
 @pytest.mark.parametrize("alias", [False, True])
@@ -64,8 +77,7 @@ def test_same_store_keeps_original_manifest_and_reads_old_refs_after_alias_clean
     assert copied["child_ref_promotion"]["promoted_ref_count"] == 4
     assert native_path.read_bytes() == native_bytes
     assert "promoted_call_manifest" not in json.loads(native_bytes)
-    refs = [original_ref, *copied["trace_refs"]["refs"],
-            copied["loop_outcome"]["trace_refs"][0], copied["review_projection"]["panels"][0]["source_ref"]]
+    refs = [original_ref, *_trace_occurrences(copied), copied["review_projection"]["panels"][0]["source_ref"]]
     if alias:
         child.unlink()
     for ref in refs:
@@ -155,13 +167,13 @@ def test_distinct_copy_memo_reuses_verified_io_and_expires_between_operations(tm
     assert copied["child_ref_promotion"]["promoted_ref_count"] == 4
     assert writes == {"blob": 1, "manifest": 1, "source": 1}
     assert reads and all(count == 1 for count in reads.values())
-    promoted = copied["trace_refs"]["refs"][0]
+    promoted = _trace_occurrences(copied)[0]
     assert Path(promoted["path"]).name == "call.json"
     assert obs.read_call_manifest_ref(parent, promoted, task_id=task["id"])["promoted_call_manifest"] is True
     assert read_actor_source_bytes(parent, task["id"], source) == b"exact retained source"
     Path(ref["path"]).write_text("{}")
     second = headless.copy_child_task_result(parent, task)
-    assert second["trace_refs"]["refs"][0]["reason"] == "digest_mismatch"
+    assert [item["reason"] for item in _trace_occurrences(second)] == ["digest_mismatch"] * 3
 
 
 @pytest.mark.parametrize("retry", [False, True])
