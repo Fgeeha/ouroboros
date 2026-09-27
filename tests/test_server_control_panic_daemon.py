@@ -21,7 +21,7 @@ class _ExitCalled(RuntimeError):
 
 
 def _run_panic(monkeypatch, tmp_path, *, daemon_stop, panic_request=None, diagnostics=None,
-               worker_stop=None):
+               worker_stop=None, children=()):
     """Neutralize destructive owners; keep request and settlement separate.
 
     Legacy diagnostics pass the actual isolated manager.stop as daemon_stop.
@@ -40,7 +40,7 @@ def _run_panic(monkeypatch, tmp_path, *, daemon_stop, panic_request=None, diagno
     monkeypatch.setattr("ouroboros.local_model.get_manager", lambda **kw: SimpleNamespace(
         panic_stop=lambda **kw: [], stop_server=lambda: None))
     monkeypatch.setattr(server_control, "_persist_panic_controls", lambda _root: None)
-    monkeypatch.setattr("multiprocessing.active_children", lambda: [])
+    monkeypatch.setattr("multiprocessing.active_children", lambda: list(children))
     monkeypatch.setattr("ouroboros.platform_layer.kill_process_on_port", lambda _port: None)
     monkeypatch.setattr("ouroboros.gateway.host_service.host_service_port", lambda: 8767)
     monkeypatch.setattr("ouroboros.claudexor_daemon.get_owned_daemon", lambda **kw: SimpleNamespace(
@@ -87,7 +87,7 @@ def test_panic_stop_requests_and_settles_owned_claudexor_daemon(monkeypatch, tmp
     )
     assert calls == [("request", {"request_only": True}), ("settle", {})]
     assert diagnostics[0]["requests"]["daemon"] == [{"requested": True, "scope": "group", "pid": 123}]
-    assert worker_calls == [{"force": True, "archive_service_logs": False, "reconcile_delegate_custody": False}]
+    assert worker_calls == []  # root-first pool cleanup must not race worker-local requests
 
 
 @pytest.mark.parametrize("phase", ["request", "settlement"])
@@ -105,15 +105,17 @@ def test_panic_discloses_daemon_failure_and_continues(monkeypatch, tmp_path, pha
     )
     observed = diagnostics[0]["requests" if phase == "request" else "settlements"]["daemon"]
     assert observed == {"requested": False, "error": f"RuntimeError: daemon {phase} failed"}
-    assert worker_calls == [{"force": True, "archive_service_logs": False, "reconcile_delegate_custody": False}]
+    assert worker_calls == []  # root-first pool cleanup must not race worker-local requests
 
 
-def test_panic_requests_daemon_before_worker_tree_settlement(monkeypatch, tmp_path):
-    """Daemon and worker settlements may race; the physical request cannot."""
+def test_panic_requests_daemon_before_worker_owned_requests(monkeypatch, tmp_path):
+    """The worker's private request precedes independent daemon settlement."""
     order = []
+    child = SimpleNamespace(pid=123)
+    monkeypatch.setattr("supervisor.worker_pool_lifecycle.kill_worker_tree",
+                        lambda *_a, **_k: order.append("worker_request") or {"requested": True})
     _run_panic(monkeypatch, tmp_path,
                panic_request=lambda **kw: order.append("daemon_request") or [],
                daemon_stop=lambda: order.append("daemon_settlement") or True,
-               worker_stop=lambda: order.append("worker_settlement"))
-    assert order[0] == "daemon_request"
-    assert set(order[1:]) == {"daemon_settlement", "worker_settlement"}
+               children=(child,))
+    assert order == ["daemon_request", "worker_request", "daemon_settlement"]

@@ -38,14 +38,12 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
   signals (BIBLE P7, CHECKLISTS item 2(c)), not deterministic gates; existing
   baseline debt is not retroactively a failing tree.
 - Runtime Python function/method count stays under
-  `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (the same runtime-only iterator;
-  the module gates include tests/devtools) — a high-water alarm with ample
-  headroom, raised only with a one-line campaign rationale in the same commit
-  (10500 came with the owner-approved exact budget-pause lifecycle; Batch1
-  proposes 10525, its exact product count after four redundant helper removals
-  and three required worker-ownership/history helpers, versus 10526 at `81c`).
-  The +25 adjustment requires independent review before publication; all module,
-  function, byte and debt-transition limits remain unchanged.
+  `ouroboros/review.py::MAX_TOTAL_FUNCTIONS`, using the runtime-only iterator
+  (module gates also include tests/devtools). The owner-approved budget-pause
+  lifecycle set 10500. Batch1's 10525 remains an unaccepted proposal;
+  a campaign rationale alone is not approval. Count each complete product
+  candidate and disclose overruns; module, function, byte and debt-transition
+  limits remain unchanged.
 - Enforcement: the OFFICIAL repository's CI runs the dedicated `size_ratchet`
   pytest lane as a blocking step (`OURO_SIZE_RATCHET_BASE_REF` names the event
   base; lane placement and base fallback: ARCHITECTURE §8 "CI topology").

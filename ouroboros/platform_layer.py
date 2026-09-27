@@ -729,8 +729,7 @@ def request_process_tree_kill(proc, *, job_handle=None) -> dict:
             raise ValueError("refusing current/invalid process")
         channel = None if pinned else getattr(proc, "_ouroboros_stop_socket", None)
         if channel is not None:
-            channel.send(b"!")  # private nonblocking channel; worker requests its held children first
-            return {**result, "requested": True, "scope": "worker_owners"}
+            return proc._ouroboros_stop_request()
         if IS_WINDOWS:
             if job_handle is not None:
                 result["scope"] = "job"

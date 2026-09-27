@@ -655,6 +655,8 @@ def retire_worker(wid: int, slot: Any) -> bool:
         if _pool().WORKERS.get(wid) is not slot or slot.proc.is_alive():
             return False
         _pool().WORKERS.pop(wid)
+    from supervisor.worker_process import close_worker_stop_channel
+    close_worker_stop_channel(slot.proc)
     try:
         slot.in_q.close()
         slot.in_q.cancel_join_thread()
@@ -669,7 +671,7 @@ def _spawn_worker_slot(wid: int, old: Any = None, *, ready_attempt: int = 1) -> 
     ctx = _pool()._get_ctx()
     in_q = ctx.Queue()
     events_cursor, spawned_at = events_log_cursor(), time.time()
-    from supervisor.worker_process import spawn_worker_process
+    from supervisor.worker_process import close_worker_stop_channel, spawn_worker_process
 
     try:
         proc = spawn_worker_process(ctx, wid, in_q, _pool().get_event_q(), _pool().REPO_DIR, _pool().DRIVE_ROOT)
@@ -691,6 +693,7 @@ def _spawn_worker_slot(wid: int, old: Any = None, *, ready_attempt: int = 1) -> 
                 proc.terminate()
             proc.join(timeout=2)
         finally:
+            close_worker_stop_channel(proc)
             try:
                 in_q.close()
                 in_q.cancel_join_thread()
@@ -699,6 +702,8 @@ def _spawn_worker_slot(wid: int, old: Any = None, *, ready_attempt: int = 1) -> 
         return False
     # Close the crashed worker's old queue now that nothing can route to it,
     # otherwise its file descriptors / semaphores leak on every respawn.
+    if old is not None:
+        close_worker_stop_channel(old.proc)
     if old is not None and getattr(old, "in_q", None) is not None:
         try:
             old.in_q.close()

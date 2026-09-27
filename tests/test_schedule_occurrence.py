@@ -72,6 +72,7 @@ def test_one_occurrence_one_receipt_with_the_room_address(q):
 
 def test_capacity_waits_on_the_row_without_phantom_roots(q, monkeypatch):
     from ouroboros import consciousness_allowance
+    from supervisor import schedule_occurrence
 
     monkeypatch.setenv("OUROBOROS_CONSCIOUSNESS_MAX_TASKS", "1")
     monkeypatch.setattr(consciousness_allowance, "allowance_window", lambda _root: {
@@ -84,9 +85,20 @@ def test_capacity_waits_on_the_row_without_phantom_roots(q, monkeypatch):
     assert row["hold"]["reason"] == "consciousness_task_limit" and not row.get("failure_count")
     assert not list((q.root / "task_results").glob("*.json"))  # no failed root, ever
     held_task = row["occurrence"]["task_id"]
-    q.pending.clear()
-    q.queue.check_scheduled_tasks()
+    token = row["occurrence"]["token"]
+    assert row["occurrence"]["admission"] == "refused"
+    # Reconstruct process-local queue/claim state. No old Python object proves
+    # this claim unrun; the persisted actual refusal must carry it across boot.
+    schedule_occurrence._FRESH_CLAIMS.clear()
+    q.pending = []
+    q.queue.init(q.root)
+    q.queue.init_queue_refs(q.pending, {}, {"value": 0})
+    for _ in range(3):
+        q.queue.check_scheduled_tasks()
     assert [task["id"] for task in q.pending] == [held_task]  # the SAME occurrence runs
+    receipt = load_task_result(q.root, held_task)["schedule_admission"]
+    assert receipt["token"] == token and receipt["dispatch"] == "none"
+    assert "admission" not in _rows(q)["s1"]["occurrence"]
 
 
 def test_a_named_continuation_is_outside_the_cap_but_not_outside_money(q, monkeypatch):

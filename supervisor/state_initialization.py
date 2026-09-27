@@ -4,8 +4,8 @@ Two missing ``state.json`` copies used to mean "fresh install", so a lost or
 unreadable state minted a new owner slot, session and cleared Stop. First
 initialization is now positive: ``state/state.initialized.json`` records ONE
 initialization identity (``pending`` before the first state is written,
-``complete`` after), written only by supervisor boot before any owner
-registration or autonomy admission, and by an owner Reset (``pending``,
+``complete`` after), written by supervisor boot (or an isolated benchmark's
+explicit seed before boot) before admission, and by an owner Reset (``pending``,
 ``origin=owner_reset``). It holds identity and phase only — no permissions,
 no history.
 

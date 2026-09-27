@@ -97,7 +97,7 @@ def execute_panic_stop(
     log: Any,
     bound_port: int | None = None,
 ) -> None:
-    """Full emergency stop: kill everything, write panic flag, hard-exit.
+    """Request owned emergency stops, write panic flag, hard-exit; disclose unknowns.
 
     ``bound_port`` is the main port the server actually bound. The caller owns
     that fact and passes it in; this leaf does not reach back into the server
@@ -113,12 +113,14 @@ def execute_panic_stop(
     recycled descriptor ports never authorize signalling an unrelated process.
     """
     import threading
+    import time
     from ouroboros.startup_historical_audit import audit
 
     audit.stop()
     requests, settlements = {}, {}
+    request_threads = []
 
-    def attempt(name, fn, *, settle=False):
+    def attempt(name, fn, *, settle=False, native=False):
         def run():
             try:
                 value = fn()
@@ -131,11 +133,18 @@ def execute_panic_stop(
                         _record_unconfirmed_daemon_stop(data_dir, exc)
                     except Exception as disclosure_error:
                         settlements[name]["disclosure_error"] = type(disclosure_error).__name__
-        if settle:
-            settlements[name] = "unfinished"
-            threading.Thread(target=run, name=f"panic-{name}", daemon=True).start()
-        else:
-            run()  # only owner-local native requests; no locks, I/O or waits
+        if native:
+            run()  # retained multiprocessing owner; no application callbacks
+            return
+        (settlements if settle else requests)[name] = "unfinished"
+        thread = threading.Thread(target=run, name=f"panic-{name}", daemon=True)
+        try:
+            thread.start()
+        except RuntimeError as exc:
+            (settlements if settle else requests)[name] = {"requested": False, "error": str(exc)}
+            return  # failure of one owner cannot skip the remaining native children
+        if not settle:
+            request_threads.append(thread)
 
     import multiprocessing
 
@@ -162,12 +171,25 @@ def execute_panic_stop(
     attempt("executors", lambda: kill_all_foreground(data_dir, request_only=True))
     attempt("services", lambda: kill_all_services(data_dir, request_only=True))
     attempt("companions", lambda: panic_kill_all(request_only=True))
-    for child in multiprocessing.active_children():
+    children = multiprocessing.active_children()
+    for child in children:
         attempt(f"child-{child.pid}", lambda child=child: kill_worker_tree(
-            child.pid, panic_process=child))
+            child.pid, panic_process=child), native=True)
 
-    # Every captured target has its OWN native request above before any helper
-    # may wait. These existing owners settle trees/custody independently; neither
+    request_deadline = time.monotonic() + .25
+    for thread in request_threads:
+        thread.join(timeout=max(0, request_deadline - time.monotonic()))
+
+    # Complete bounded native requests BEFORE settlement helpers can kill this
+    # server via its ports. Worker cooperation is never the root-stop authority.
+    backstop_deadline = time.monotonic() + 1
+    for child in children:
+        backstop = getattr(child, "_ouroboros_stop_backstop", None)
+        if backstop is not None and backstop.ident is not None:
+            backstop.join(timeout=max(0, backstop_deadline - time.monotonic()))
+
+    # Each owner had an independent request attempt; unfinished callbacks remain
+    # unconfirmed. Existing owners settle trees/custody independently; neither
     # their launch nor this process's exit is proof that another process died.
     if consciousness is not None:
         attempt("consciousness", consciousness.stop, settle=True)

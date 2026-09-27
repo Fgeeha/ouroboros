@@ -23,9 +23,11 @@ only. ``dispatch=possible`` is written BEFORE a worker receives the task
 replayed; existing orphan/custody recovery owns it. No exactly-once external
 effect is promised.
 
-A missing receipt is never proof that a restored claim is unrun. Only a claim
-created by this live scheduler, not yet accepted, may retry preparation on
-absence. Dispatch possibility also lives monotonically on the occurrence row;
+A missing receipt is never proof that a restored claim is unrun. A live fresh
+claim or a durable ``admission=refused`` from the enqueue door proves no admission.
+The latter is consumed and read back under the locks BEFORE trying enqueue again;
+crashing after consumption without a receipt stays unknown. Dispatch possibility
+also lives monotonically on the occurrence row;
 receipt or snapshot loss cannot demote it. Deletion retains unresolved claims
 and accepted obligations in the same row until their disposition is established.
 
@@ -145,7 +147,7 @@ def reconcile(record: Dict[str, Any]) -> tuple[str, Optional[Dict[str, Any]]]:
             task["_owner_hold"] = copy.deepcopy(result["_owner_hold"])
         return "republish", task
     if (occ.get("phase") == "claimed" and not result
-            and (str(_queue().DRIVE_ROOT), token) in _FRESH_CLAIMS):
+            and (occ.get("admission") == "refused" or (str(_queue().DRIVE_ROOT), token) in _FRESH_CLAIMS)):
         return "prepare", None
     set_hold(record, "occurrence_evidence_missing",
              f"admitted task {task_id} has no readable receipt; it is not replayed")
@@ -162,8 +164,9 @@ def owed(record: Dict[str, Any]) -> Optional[bool]:
         result = _read_back(str(occ.get("task_id") or ""))
     except Exception:
         return None
-    if not result and (str(_queue().DRIVE_ROOT), str(occ.get("token") or "")) in _FRESH_CLAIMS:
-        return False  # this process has not accepted this claim
+    if (not result and occ.get("phase") == "claimed" and (occ.get("admission") == "refused"
+            or (str(_queue().DRIVE_ROOT), str(occ.get("token") or "")) in _FRESH_CLAIMS)):
+        return False  # positive refusal or this process's still-unaccepted claim
     admission = result.get("schedule_admission") if isinstance(result.get("schedule_admission"), dict) else {}
     if admission.get("token") != occ.get("token"):
         return None
@@ -377,27 +380,54 @@ def admit(prepared: List[Dict[str, Any]]) -> None:
             record = rows.get(item["schedule_id"])
             occ = item["occurrence"]
             current = record.get("occurrence") if isinstance(record, dict) else None
-            if not isinstance(current, dict) or current.get("token") != occ["token"]:
+            if (not isinstance(current, dict) or current.get("token") != occ["token"]
+                    or current.get("task_id") != occ["task_id"]):
                 continue  # deleted, or another pass already moved this row on
             changed = True
-            fresh_claim = current.get("phase") == "claimed" and not item.get("stored_task")
+            verdict, stored = reconcile(record)  # CURRENT facts, not the off-lock prepare snapshot
+            if verdict not in {"prepare", "republish"}:
+                continue
+            if (verdict == "republish") != bool(item.get("stored_task")) or stored != item.get("stored_task"):
+                continue  # accepted/held facts changed: prepare their frozen task on the next pass
+            fresh_claim = verdict == "prepare"
             if fresh_claim and (not record.get("enabled", True) or fingerprint(record) != item["fingerprint"]):
                 record.pop("occurrence", None)  # disabled/edited/rebound during prepare: future only
                 continue
             if item.get("hold"):
                 set_hold(record, *item["hold"])
                 continue
+            if current.get("admission") == "refused":
+                # Refusal is a positive no-enqueue witness, not perpetual replay
+                # permission. Remove it durably before anything may be admitted.
+                current.pop("admission")
+                try:
+                    if _write_scheduled_tasks(data) is False:
+                        raise OSError("refusal consumption returned False")
+                    saved = load_schedule_store(q.DRIVE_ROOT)
+                    if not any(r.get("id") == item["schedule_id"] and r.get("occurrence") == current
+                               for r in saved.get("tasks") or []):
+                        raise OSError("refusal consumption readback mismatch")
+                except Exception:
+                    set_hold(record, "occurrence_transition_failed", "never-admitted witness could not be consumed")
+                    continue
+            claim_key = (str(q.DRIVE_ROOT), str(current["token"]))
+            _FRESH_CLAIMS.discard(claim_key)  # no live no-admission proof while enqueue may take effect
             outcome = q.enqueue_task(item["task"], consciousness_window=windows.get(item["schedule_id"]),
                                      project_admission=item.get("project_admission"),
                                      continuation=bool(record.get("continuation_of") or
                                                        (item.get("stored_task") or {}).get("_consciousness_continuation")))
             block = str(outcome.get("_admission_blocked") or "") if isinstance(outcome, dict) else ""
             if block:
+                if fresh_claim:
+                    current["admission"] = "refused"  # the locked enqueue door positively refused this attempt
+                    _FRESH_CLAIMS.add(claim_key)
                 _refused(record, block, outcome)
                 continue
             item["task"] = outcome  # preserve host-stamped continuation and admission facts
             if not _write_receipt(item, record):
                 _unqueue([str(occ["task_id"])])
+                if fresh_claim:
+                    _FRESH_CLAIMS.add(claim_key)  # this process withdrew it under the dispatch lock
                 set_hold(record, "receipt_failed", "the admission receipt could not be written and verified")
                 continue
             _FRESH_CLAIMS.discard((str(q.DRIVE_ROOT), str(occ["token"])))

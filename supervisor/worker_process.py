@@ -108,13 +108,15 @@ def _adopt_published_extensions(pool_drive_root: str) -> None:
 def spawn_worker_process(ctx, wid, in_q, out_q, repo_dir, drive_root):
     """Bind a private emergency channel to this exact worker before it starts."""
     import socket
+    import weakref
+    from functools import partial
 
     parent, child = socket.socketpair()
-    parent.setblocking(False)
-    proc = ctx.Process(target=worker_main, args=(wid, in_q, out_q, str(repo_dir), str(drive_root),
-                                               _current_custody_session_id(), child))
-    proc.daemon = True
     try:
+        parent.setblocking(False)
+        proc = ctx.Process(target=worker_main, args=(wid, in_q, out_q, str(repo_dir), str(drive_root),
+                                                   _current_custody_session_id(), child))
+        proc.daemon = True
         proc.start()
     except BaseException:
         parent.close()
@@ -122,40 +124,125 @@ def spawn_worker_process(ctx, wid, in_q, out_q, repo_dir, drive_root):
     finally:
         child.close()
     proc._ouroboros_stop_socket = parent
+    proc._ouroboros_stop_request = partial(request_worker_stop, weakref.proxy(proc))
+    weakref.finalize(proc, parent.close)  # fallback for failed/abandoned pool installation
     return proc
 
 
-def request_worker_owned_stops(drive_root):
-    """Close admission and request every locally held owner before worker exit.
+def request_worker_stop(proc):
+    """Ask the worker's owners first; force our native child to stop after a bound.
 
-    No custody/persistence/cleanup locks. A spawn already inside Popen must
-    publish its handle before this discovering owner may be destroyed.
+    This Process still owns its native Popen. It is NOT an attached PID/watch:
+    Process.kill retains multiprocessing's native exited-child checks, including
+    on Darwin, and works before the child installs or can service its lifeline.
     """
+    import threading
+
+    native_kill = proc._popen.kill  # retain the owned native child even if the pool drops its Process
+    backstop = getattr(proc, "_ouroboros_stop_backstop", None)
+    native_request = getattr(proc, "_ouroboros_stop_native_request", None)
+    if native_request is None:
+        native_request = {"requested": False, "error": "native backstop not completed"}
+        proc._ouroboros_stop_native_request = native_request
+
+    def force_stop():
+        try:
+            native_kill()  # same native operation as Process.kill; no join or application callback
+            native_request.update(requested=True, error="")
+        except Exception as exc:
+            native_request.update(requested=False, error=f"{type(exc).__name__}: {exc}")
+
+    if backstop is None:
+        # Give held child owners their bounded request phase before root death.
+        # Retain the native child owner until its request; no PID rediscovery.
+        backstop = threading.Timer(0.75, force_stop)
+        backstop.daemon = True
+        proc._ouroboros_stop_backstop = backstop
+        try:
+            backstop.start()
+        except RuntimeError:
+            force_stop()  # inability to start a timer cannot remove the native stop
+    try:
+        proc._ouroboros_stop_socket.send(b"!")
+        requested, error = True, ""
+    except OSError as exc:
+        requested, error = False, type(exc).__name__
+    return {"pid": proc.pid, "requested": requested, "scope": "worker_owners",
+            "confirmation": "unconfirmed", "error": error,
+            "root_backstop": "armed_native_owner", "native_request": native_request,
+            "limit": "unpublished spawns/unresponsive child owners unconfirmed"}
+
+
+def close_worker_stop_channel(proc):
+    """Retire parent IPC without cancelling a still-owed native stop request."""
+    channel = getattr(proc, "_ouroboros_stop_socket", None)
+    if channel is not None:
+        channel.close()
+    backstop = getattr(proc, "_ouroboros_stop_backstop", None)
+    if backstop is not None and proc.exitcode is not None:
+        backstop.cancel()
+        if backstop.ident is not None:
+            backstop.join(timeout=1)
+        proc._ouroboros_stop_backstop = None
+
+
+def request_worker_owned_stops(drive_root):
+    """Attempt local owner requests independently within one 250 ms budget.
+
+    Only loaded modules can hold local owners. Do not import an absent owner
+    (or wait for an in-flight import) during Emergency Stop. An unpublished
+    Popen or an unresponsive owner remains unconfirmed, never a death proof.
+    """
+    import sys
+    import threading
     import time
 
-    from ouroboros.claudexor_daemon import get_owned_daemon
-    from ouroboros.extension_companion import panic_kill_all
-    from ouroboros.local_model import get_manager
-    from ouroboros.tools import shell_process
-    from ouroboros.tools.services import kill_all_services
-    from ouroboros.workspace_executor import kill_all_foreground
+    deadline = time.monotonic() + 0.25
+    results, threads = {}, []
 
-    for request in (shell_process.kill_all_tracked_subprocesses,
-                    lambda **kw: kill_all_foreground(pathlib.Path(drive_root), **kw),
-                    lambda **kw: kill_all_services(pathlib.Path(drive_root), **kw), panic_kill_all):
+    def request(module_name, method, *, manager=False):
         try:
-            request(request_only=True)
-        except Exception:
-            pass  # one owner failure must not skip other held identities
-    for owner in (get_owned_daemon(create=False), get_manager(create=False)):
-        if owner is not None:
-            try:
-                owner.panic_stop(request_only=True)
-            except Exception:
-                pass
-    while shell_process._spawning_subprocesses:
-        time.sleep(0.001)
-    shell_process.kill_all_tracked_subprocesses(request_only=True)
+            module = sys.modules.get(module_name)
+            if module is None:
+                results[module_name] = {"requested": False, "error": "owner module unavailable"}
+                return
+            owner = getattr(module, method)
+            if manager:
+                owner = owner(create=False)
+                value = owner.panic_stop(request_only=True) if owner is not None else []
+            else:
+                value = owner(request_only=True)
+                if module_name == "ouroboros.tools.shell_process":
+                    # Give returning spawns a bounded chance to publish; already
+                    # held children received their requests before this wait.
+                    while module._spawning_subprocesses and time.monotonic() < deadline:
+                        time.sleep(0.001)
+                    value.extend(owner(request_only=True))
+                    if module._spawning_subprocesses:
+                        value.append({"requested": False, "error": "spawn still unpublished"})
+            results[module_name] = value
+        except BaseException as exc:
+            results[module_name] = {"requested": False, "error": type(exc).__name__}
+
+    for module_name, method, manager in (
+        ("ouroboros.tools.shell_process", "kill_all_tracked_subprocesses", False),
+        ("ouroboros.workspace_executor", "kill_all_foreground", False),
+        ("ouroboros.tools.services", "kill_all_services", False),
+        ("ouroboros.extension_companion", "panic_kill_all", False),
+        ("ouroboros.claudexor_daemon", "get_owned_daemon", True),
+        ("ouroboros.local_model", "get_manager", True),
+    ):
+        results[module_name] = {"requested": False, "error": "owner request unfinished"}
+        thread = threading.Thread(target=request, args=(module_name, method),
+                                  kwargs={"manager": manager}, daemon=True)
+        try:
+            thread.start()
+            threads.append(thread)
+        except RuntimeError:
+            continue
+    for thread in threads:
+        thread.join(timeout=max(0, deadline - time.monotonic()))
+    return results
 
 
 def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
