@@ -421,6 +421,8 @@ class CompanionSupervisor:
             "pid": rt.process.pid,
             "returncode": rt.process.poll(),
             "ports": list(rt.descriptor.ports),
+            # Non-empty: a retained failed start or unconfirmed stop, not a running companion.
+            "retiring": rt.retiring,
             "started_at_monotonic": rt.started_at,
             "updated_at": utc_now_iso(),
         }

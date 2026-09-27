@@ -742,6 +742,80 @@ def test_loader_rollback_keeps_unconfirmed_companion_until_death(tmp_path, monke
         clean_extension_runtime_state()
 
 
+@pytest.mark.parametrize("windows", [False, True])
+def test_reconcile_reports_retained_auto_restart_not_already_running(tmp_path, monkeypatch, windows):
+    """live load -> crash -> auto-restart disclosure fails, kill unconfirmed -> real reconcile consumers."""
+    from ouroboros import extension_health, extension_loader, extension_plugin_api
+    from ouroboros.extension_reconcile_queue import process_extension_reconcile_requests, request_extension_reconcile
+    from tests._extension_loader_shared import _prepare_extension
+    from tests._shared import clean_extension_runtime_state
+
+    init_server_process_pid()
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    clean_extension_runtime_state()
+    ledger = {"down": False}
+    spawned, jobs = _isolate_companion_platform(monkeypatch, windows=windows, honours_kill=[True, False, True],
+                                                ledger=ledger)
+    supervisor = CompanionSupervisor(tmp_path / "companions")
+    for module in (extension_plugin_api, extension_loader):
+        monkeypatch.setattr(module, "get_global_supervisor", lambda: supervisor)
+    monkeypatch.setattr(extension_plugin_api, "companion_spawn_env",
+                        lambda *_args, **_kwargs: {"OPENROUTER_API_KEY": "test-provider-key"})
+    # Reconcile's health stamp would run git through the patched spawn seam.
+    monkeypatch.setattr(extension_health, "fresh_code_stamp", lambda: ("test", "test-sha"))
+    loaded, repo_root, drive_root = _prepare_extension(
+        tmp_path, "restarted", "def register(api):\n    api.register_companion_process('daemon')\n",
+        permissions=["companion_process"],
+        extra_frontmatter="companion_processes:\n  - name: daemon\n    runtime: python3\n"
+                          "    command: [\"python3\", \"scripts/daemon.py\"]\n",
+    )
+
+    def reconcile():
+        return extension_loader.reconcile_extension(loaded.name, drive_root, lambda: {},
+                                                    repo_path=str(repo_root))["companions"]["action"]
+
+    try:
+        assert extension_loader.load_extension(loaded, lambda: {}, drive_root=drive_root,
+                                               _force_in_process=True) is None
+        assert reconcile() == "already_running"  # healthy counterpart
+        first_monitors = [t for t in threading.enumerate() if t.name.startswith("companion-monitor-")]
+        ledger["down"] = True
+        spawned[0].exited.set()  # unsuccessful exit within budget: the monitor restarts it itself
+        for thread in first_monitors:
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
+        retained = supervisor.snapshot()["restarted:daemon"]
+        assert retained["pid"] == 20002 and retained["retiring"] == "cost disclosure failed"
+
+        assert reconcile() == "retained_unresolved"
+        assert extension_loader.ensure_companions_running(
+            loaded.name, drive_root, lambda: {}, repo_path=str(repo_root),
+        ) == {"action": "retained_unresolved", "started": [], "missing": [],
+              "retained": {"daemon": "cost disclosure failed"}}
+        request_extension_reconcile(drive_root, loaded.name, reason="retained")
+        processed = process_extension_reconcile_requests(drive_root, lambda: {}, repo_path=str(repo_root))
+        assert processed[-1]["companions"]["action"] == "retained_unresolved"
+        assert len(spawned) == 2 and jobs["closed"] == (["job-0"] if windows else [])  # no duplicate spawn
+
+        spawned[1].exited.set()  # observed death settles the retained owner; no automatic restart
+        _join_companion_monitors()
+        assert supervisor.snapshot() == {} and len(spawned) == 2
+        ledger["down"] = False
+        assert reconcile() == "started_missing"  # replacement after observed death
+        assert supervisor.snapshot()["restarted:daemon"]["pid"] == 20003
+        assert supervisor.snapshot()["restarted:daemon"]["retiring"] == ""
+        assert reconcile() == "already_running"
+        extension_loader.unload_extension(loaded.name)
+        _join_companion_monitors()
+        assert supervisor.snapshot() == {} and len(spawned) == 3
+        assert jobs["closed"] == jobs["created"] == (["job-0", "job-1", "job-2"] if windows else [])
+    finally:
+        for proc in spawned:
+            proc.exited.set()
+        _join_companion_monitors()
+        clean_extension_runtime_state()
+
+
 def test_extension_dispatch_inherits_bound_lineage_without_tool_context(tmp_path):
     scope = UsageScope(
         drive_root=tmp_path,

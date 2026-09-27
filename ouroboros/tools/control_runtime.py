@@ -368,18 +368,29 @@ def _consciousness_status_facts(ctx: ToolContext) -> str:
 
     One strict read of ``state/state.json`` under the root the caller's other
     canonical reads use (``budget_drive_root``, else ``drive_root``), not the
-    process-global ``supervisor.state`` path and not its loader, which writes
-    defaults for a missing file and repairs from the backup. The state file is
+    process-global ``supervisor.state`` path and not its loader, whose display
+    projection may substitute the backup's values. The state file is
     replaced atomically, so one lock-free read sees one whole version and
     writes nothing. A missing, unreadable or corrupt file is that named gap
     with no field guessed; a field the file lacks is listed, never defaulted.
+    The toggle is a #1307 control: a value this copy cannot prove (no completed
+    initialization witness, or unconfirmed after a recovery) is unknown, and a
+    kept Panic flag, which bars every wake, is named.
     ``observed_at`` is when this read happened, not when the file was written.
     """
     import json
     import math
 
     from ouroboros.config import get_bg_wakeup_max_sec, get_bg_wakeup_min_sec
-    from ouroboros.consciousness import INTERVAL_STATE_KEY, LAST_WAKE_STATE_KEY, NEXT_WAKE_STATE_KEY, _iso
+    from ouroboros.consciousness import (
+        INTERVAL_STATE_KEY,
+        LAST_WAKE_STATE_KEY,
+        NEXT_WAKE_STATE_KEY,
+        _iso,
+        panic_blocks_wake,
+    )
+    from supervisor.state import control_value
+    from supervisor.state_initialization import authority_reason
 
     metadata = ctx.task_metadata if isinstance(getattr(ctx, "task_metadata", None), dict) else {}
     path = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "")
@@ -416,6 +427,12 @@ def _consciousness_status_facts(ctx: ToolContext) -> str:
                     facts[name] = _iso(value)
                 except (OverflowError, OSError, ValueError):
                     pass
+        unproven = authority_reason(path.parent.parent, str(stored.get("initialization_id") or "")) or (
+            "" if control_value(stored, "bg_consciousness_enabled")[0] else "unconfirmed after a state recovery")
+        if "enabled" in facts and unproven:
+            facts["enabled"] = {"status": "unknown", "reason": unproven}
+    if panic_blocks_wake(path.parent.parent):
+        facts["panic_flag_kept"] = "state/panic_stop.flag is present or unreadable: no wake starts while it is kept"
     facts["configured_bounds_sec"] = {"min": get_bg_wakeup_min_sec(), "max": get_bg_wakeup_max_sec(),
                                       "source": "owner settings, not the state file"}
     facts["notes"] = [

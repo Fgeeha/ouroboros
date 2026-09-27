@@ -2187,13 +2187,12 @@ export function createChatInstance({
         }
         const childInfo = subagentChildParents.get(taskId);
         if (childInfo && eventType === 'task_done') return routeSubagentTerminalToCard(taskId, evt);
-        if (childInfo && subagentTerminalChildren.has(taskId)
-                && !['tool_call_started', 'tool_call', 'tool_call_finished', 'tool_call_timeout', 'tool_timeout'].includes(eventType)) return false;
+        const summary = summarizeChatLiveEvent(evt);
+        if (childInfo && subagentTerminalChildren.has(taskId) && !summary?.toolCall) return false;
         // Metrics and terminal facts share the root/child fold.
         let changed = ['task_metrics_event', 'task_eval', 'task_done'].includes(eventType)
             ? noteToolMetrics(taskId, evt, rawTs) : false;
         if (!childInfo) changed = attachTaskDetailReviews(taskId, evt) || changed;
-        const summary = summarizeChatLiveEvent(evt);
         if (!summary) return changed;
         if (childInfo) {
             getSubagentCardRecord(taskId, childInfo.parentId, childInfo.role);

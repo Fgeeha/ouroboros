@@ -837,6 +837,22 @@ for (const order of ['wait-first', 'settlement-first']) for (const failed of [fa
     });
 }
 
+test('a terminal child drops a late non-tool frame while its late tool fact still lands', () => {
+    const f = fixture();
+    const lineage = { task_id: TASK, subagent_task_id: 'kid', parent_task_id: TASK, root_task_id: TASK,
+        delegation_role: 'subagent', subagent_role: 'researcher' };
+    try {
+        f.emit('chat', { role: 'assistant', is_progress: true, content: 'Child working', subagent_event: 'scheduled', ...lineage });
+        f.emit('chat', { role: 'assistant', is_progress: true, content: 'Child finished', subagent_event: 'completed', ...lineage });
+        f.log({ type: 'llm_round_error', task_id: 'kid', error: 'late child noise' });
+        f.log({ type: 'tool_call_timeout', task_id: 'kid', tool: 'read_file', invocation_id: 'kid-late' });
+        f.card('kid').querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        const rows = f.rows('kid').map(row => row.innerHTML).join(' ');
+        assert.doesNotMatch(rows, /late child noise|Thinking step failed/);
+        assert.match(rows, /wait ended/);
+    } finally { f.close(); }
+});
+
 for (const child of [false, true]) test(`cold Chat merges canonical settlement with persisted metrics: child=${child}`, async () => {
     const id = child ? CHILD : TASK;
     const base = { key: `tool:${id}:real-i`, tool: 'read_file', receipt: false, live: false };
