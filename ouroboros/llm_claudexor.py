@@ -28,6 +28,7 @@ from ouroboros.deadline_utils import llm_transport_timeout_sec
 from ouroboros.gateways.claudexor import (
     ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported, _READ_TIMEOUT_SEC)
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
+from ouroboros.send_clock import stamp_clock_note
 from ouroboros.llm_substitution import (
     AccountRotation, SubstitutionBudget, substitution_fact, failed_account_preference,
     take_failed_account_preference)
@@ -745,6 +746,8 @@ def _reset_native(payload: dict, error: ClaudexorModelNotDispatched, invocation:
 
 
 def _accounted_request(invocation: _ModelInvocation):
+    # Every invocation is a new host preparation: Main's clock line, kept by the idempotent upload/rejoin.
+    invocation.payload = stamp_clock_note(invocation.payload)
     request = replace(_attempt_request(invocation.target, invocation.payload),
                       force_unknown_reservation=True, max_completion_tokens=invocation.output_reserve)
     existing = _candidate_before_dispatch(invocation.payload, request)

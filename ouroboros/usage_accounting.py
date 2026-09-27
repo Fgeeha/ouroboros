@@ -1,11 +1,10 @@
 """Durable physical-model-attempt accounting.
 
-The append-only JSONL ledger is the monetary authority; ``llm_usage`` events and
-``state.json`` remain compatibility projections carrying ledger attempt ids, so
-they can never become a second charge source. Deliberately small: no hash chain,
-fanout reservation, epoch/reconcile platform, or per-attempt snapshot database —
-strict readers capture the prepared writer generation under the same short
-cross-process lock as budget check + append + fsync; folds and network I/O stay outside."""
+The append-only JSONL ledger is monetary authority; ``llm_usage``/``state.json``
+carry attempt-id projections, never another charge source. No hash chain,
+fanout reservation, epoch/reconcile platform, or per-attempt snapshot database.
+Strict readers capture the prepared writer generation under the budget/check/
+append/fsync lock; folds and network I/O stay outside."""
 
 from __future__ import annotations
 
@@ -290,6 +289,9 @@ class AttemptRequest:
     processing_preference: str = ""
     submitted_processing_mode: str = ""
     processing_basis: Optional[Dict[str, Any]] = None
+    # The same canonical candidate without its Main clock line (``send_clock``);
+    # None when the candidate carries none. An identity, never a row field.
+    candidate_clock_free_sha256: Optional[str] = None
 @dataclass(frozen=True)
 class AttemptReservation:
     attempt_id: str

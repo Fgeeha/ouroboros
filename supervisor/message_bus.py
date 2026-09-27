@@ -1452,6 +1452,8 @@ def log_chat(
             card_row_id = str(meta.get("card_row_id") or "")
             if card_row_id and len(card_row_id) <= 200:
                 record["card_row_id"] = card_row_id
+        if record_type == "acceptance_late_settlement" and isinstance(meta.get("late_evidence"), dict):
+            record["late_evidence"] = dict(meta["late_evidence"])
         if filename:
             record["filename"] = filename
         if mime:

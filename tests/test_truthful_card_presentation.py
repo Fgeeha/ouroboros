@@ -166,7 +166,10 @@ def test_cancel_cause_is_bounded_by_unicode_characters():
 
     assert _completion_verdict({"status": "cancelled", "cancel_origin": {
         "reason": "🙂" * 200,
-    }}, {}) == "🙂" * 159 + "…"
+    }}, {}) == "🙂" * 159 + "… (preview; the full reason is kept with the task)"
+    assert _completion_verdict({"status": "cancelled", "cancel_origin": {
+        "reason": "🙂" * 160,
+    }}, {}) == "🙂" * 160 + "."
 
 
 def test_settled_early_speech_keeps_canonical_warning_axes(tmp_path):

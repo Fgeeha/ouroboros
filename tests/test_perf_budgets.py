@@ -227,7 +227,7 @@ def test_chat_history_reads_bounded_progress_tail_with_zero_artifact_work(
     — never the whole file — and its terminal-truth annotation must perform
     zero artifact collection/copies and zero disposition-hash lookups."""
     from ouroboros.gateway.history import make_chat_history_endpoint
-    from ouroboros.gateway import history_paging
+    from ouroboros import jsonl_tail
     from contextlib import contextmanager
     from ouroboros.task_results import write_task_result
 
@@ -251,7 +251,7 @@ def test_chat_history_reads_bounded_progress_tail_with_zero_artifact_work(
     # The pager feeds the shared parser an already-bounded borrowed buffer.
     # Count actual source bytes, rather than the old parser's tail_bytes hint.
     reads = []
-    chain_handles = history_paging.jsonl_chain_handles
+    chain_handles = jsonl_tail.jsonl_chain_handles
 
     class CountedHandle:
         def __init__(self, path, handle):
@@ -271,7 +271,7 @@ def test_chat_history_reads_bounded_progress_tail_with_zero_artifact_work(
         with chain_handles(*args, **kwargs) as handles:
             yield [(path, CountedHandle(path, handle)) for path, handle in handles]
 
-    monkeypatch.setattr(history_paging, "jsonl_chain_handles", counted_handles)
+    monkeypatch.setattr(jsonl_tail, "jsonl_chain_handles", counted_handles)
     artifact_counters = _install_artifact_counters(monkeypatch)
 
     endpoint = make_chat_history_endpoint(tmp_path)

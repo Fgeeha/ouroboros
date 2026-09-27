@@ -547,3 +547,40 @@ def test_delegation_fact_failure_never_drops_capability_digest(tmp_path, monkeyp
     # The surrounding digest survives intact.
     assert "allow_mutative_subagents" in capabilities
     assert "write_surfaces" in capabilities
+
+
+def test_runtime_names_its_capture_instant_and_how_this_run_learns_the_time(tmp_path):
+    """#1320: the runtime block is captured once; it says so instead of calling itself "now"."""
+    env = _make_health_env(tmp_path)
+    main = json.loads(build_runtime_section(env, {"id": "t1", "type": "task"}, captured_at="2027-01-15T12:00:00+00:00")
+                      .split("\n\n", 1)[1])
+    assert "utc_now" not in main and main["context_captured_at"] == "2027-01-15T12:00:00+00:00"
+    assert "not the current time" in main["clock_note"] and "host clock line" in main["clock_note"]
+    child = json.loads(build_runtime_section(env, {"id": "t2", "type": "task", "delegation_role": "subagent"})
+                       .split("\n\n", 1)[1])
+    assert "does not advance during this run" in child["clock_note"] and child["context_captured_at"]
+
+
+def test_captured_recent_and_drive_sections_carry_one_capture_label(tmp_path, monkeypatch):
+    """Recent*/Drive state are labelled with the core's single capture instant, below their headings,
+    and are not refreshed: two projections of one core carry byte-identical labels."""
+    from ouroboros import context as context_module
+    from ouroboros.context import build_llm_messages
+    from tests.test_cache_optimization import _make_env_and_memory
+
+    monkeypatch.setattr(context_module, "utc_now_iso", lambda: "2027-01-15T12:00:00+00:00")
+    env, memory = _make_env_and_memory(tmp_path)
+    logs = memory.drive_root / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    (logs / "chat.jsonl").write_text(json.dumps({
+        "ts": "2027-01-15T11:00:00+00:00", "direction": "in", "chat_id": 1, "text": "hello"}) + "\n",
+        encoding="utf-8")
+    messages, _info = build_llm_messages(env=env, memory=memory, task={
+        "id": "t-labels", "type": "task", "text": "hi", "_is_direct_chat": True, "chat_id": 1, "metadata": {}})
+    dynamic = messages[0]["content"][2]["text"]
+    label = "_Snapshot captured at 2027-01-15T12:00:00+00:00 when this context was built; not refreshed during this run._"
+    assert "## Drive state\n" + label in dynamic and "## Recent chat coverage\n" + label in dynamic
+    assert '"context_captured_at": "2027-01-15T12:00:00+00:00"' in dynamic
+    headings = [line for line in dynamic.splitlines() if line.startswith(("## Recent ", "## Drive state"))]
+    assert headings and all(dynamic.split(heading + "\n", 1)[1].startswith(label) for heading in headings)
+    assert "## Runtime context\n" + label not in dynamic  # labels are for the captured snapshots only

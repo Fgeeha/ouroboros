@@ -277,10 +277,13 @@ a blocking exit still read `Done with warnings` or `Failed`.
 
 A host fact about a task is a row of that task's card, never a standalone
 bubble beside it. A reviewer panel that settles after its task already ended
-adds one System row naming the verdict and which revision it covered; that row
-lands inside the finished card (its Reviews group carries the note, the timeline
+adds one System row naming the reviewed version — delivered, different, or delivery
+unknown — before its verdict. That row lands inside the finished card (its Reviews group carries the note, the timeline
 keeps the row) without changing the card's chip, title or meta, and a standalone
-row appears only when the task has no card record in the page. The untyped
+row appears only when the task has no card record in the page. Saving and showing
+late criticism does not replace passing it to Ouroboros for consideration: the host
+owns sources and fact delivery; Ouroboros judges the evidence, explains it and
+chooses any further work on an admissible turn. The untyped
 terminal host notice and the origin-addressed routing notices stay ordinary rows by design. Local diagnostic failures remain inspectable
 in details and Logs, but do not relabel the whole still-working task. A failed child keeps a compact factual
 `Failed` marker inside its parent while the root continues under its own
@@ -867,7 +870,7 @@ The quota row offers automatic continuation, initially enabled, and shows a
 known reset time or an explicit unknown. An authentication row instead offers
 the existing Accounts sign-in flow. Both can open Settings, retry explicitly,
 or use the shared model-role editor to choose a replacement model/account.
-The replacement affects the named waiting role until the task ends; an unchecked
+The replacement affects the named waiting role until its task or review operation ends; an unchecked
 "Also save this role in Settings" checkbox separately requests persistence.
 Fallback Local remains shared by its Settings group. Changing Local for one
 waiting fallback makes the replacement task-only: the persistence checkbox is
@@ -885,8 +888,8 @@ clock, and calendar deadlines stay fixed.
 A submitted action is shown as pending until the task reports its application.
 A saved Settings change and a still-pending task change are disclosed separately.
 Retries preserve the original request identity and payload. Revisioned rows reject
-older observations, resolved episodes never reopen, and a terminal task removes
-all wait actions. A mailbox delivery failure keeps Retry request available for
+older observations and resolved episodes never reopen. Terminal authors retain
+exact live paid-review controls without reviving author status; other waits end. A mailbox delivery failure keeps Retry request available for
 that same accepted command, even while its application remains pending. The
 current task attempt selects live actions; a previous attempt's retained pause
 never makes a new working attempt appear to wait. Updates and history rebuilds preserve the same keyed editor,

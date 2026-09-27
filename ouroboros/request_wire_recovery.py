@@ -479,6 +479,39 @@ def _prepare_durable_candidate(
     )
 
 
+def refresh_wire_clock(payload: Dict[str, Any], *, api_surface: str) -> Dict[str, Any]:
+    """Refresh a NEW physical candidate without losing its canonical recovery source.
+
+    Recognition precedes stamping: a projected custom-tool payload is not the
+    source from which its effort/dialect actions were derived. Rebuild through
+    the original factory and prove that only this call's clock changed. Same
+    invocation rejoins never enter this preparation seam.
+    """
+    from ouroboros.send_clock import split_clock_note, stamp_clock_note
+
+    digest = physical_candidate_sha256(payload)
+    registered = next((item for item in reversed(_WIRE_CALL_STATE.get().registered)
+                       if item.candidate.candidate_sha256 == digest), None)
+    if registered is None:
+        return stamp_clock_note(payload, blocks=api_surface == "messages")
+    source = stamp_clock_note(dict(registered.source_payload), blocks=api_surface == "messages")
+    if source == registered.source_payload:
+        return payload  # no Main policy, or the clock sample is byte-identical
+    prior = registered.candidate
+    refreshed = bind_wire_candidate(
+        target=registered.target, api_surface=prior.source_profile.api_surface,
+        source_payload=source, candidate_spec=prior.candidate_spec,
+        requested_effort=prior.requested_effort, ladder_ordinal=prior.ladder_ordinal,
+        applied_actions=prior.applied_actions,
+    )
+    physical = refreshed.physical_payload()
+    note, clock_free = split_clock_note(physical)
+    if note != split_clock_note(source)[0] or clock_free != split_clock_note(payload)[1]:
+        raise ValueError("clock refresh changed unrelated physical input")
+    register_wire_candidate(refreshed, source_payload=source, target=registered.target)
+    return physical
+
+
 def prepare_wire_payload_for_send(
     target: Mapping[str, Any],
     payload: Mapping[str, Any],

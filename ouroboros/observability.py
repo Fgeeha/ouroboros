@@ -712,24 +712,16 @@ def _promote_task_source_ref(
     source = _task_artifact_dir(child_root, task_id, create=False).joinpath(
         *rel.parts
     )
-    # Inspect owned JSON closure even when an earlier attempt copied the outer source.
-    plan_wave_source = name_match.group(1).startswith("plan-review-wave-")
-    if name_match.group(2) == "json" and (plan_wave_source or name_match.group(1) in {
-        "acceptance", "acceptance_tool_trajectory",
-    }):
-        try:
-            payload = json.loads(raw)
-        except (ValueError, UnicodeError):
-            payload = None
-        meta = payload.get("artifact_meta") if isinstance(payload, dict) else None
-        plan_wave = plan_wave_source and isinstance(meta, dict) and meta.get("kind") == "plan_review_wave"
-        if plan_wave or (isinstance(payload, list) and name_match.group(1) == "acceptance_tool_trajectory") or (
-            isinstance(payload, dict) and isinstance(payload.get("request"), dict)
-            and payload["request"].get("surface") == "task_acceptance"
-        ):
-            rewritten = _rewrite_child_ref_tree(payload, parent_root, child_root, task_id, state)
-            if rewritten != payload:
-                raw = json.dumps(rewritten, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    from ouroboros.review_source_closure import promote_source_payload
+
+    try:
+        raw = promote_source_payload(raw, source_id=name_match.group(1), extension=name_match.group(2),
+            category=rel.parts[1], parent_root=parent_root, child_root=child_root, task_id=task_id, state=state)
+    except Exception as exc:
+        _append_promotion_fact(state['pending_refs'], _promotion_fact(
+            {**ref, 'path': str(source)}, f'{type(exc).__name__}: {exc}'))
+        state['status'] = 'incomplete'
+        return dict(ref)  # The original child still owns this closure; GC must wait.
     # Preserve bytes for relative refs. Rebased absolute refs or unavailable
     # dependencies mint a new source; never overwrite the old checkpoint.
     changed = hashlib.sha256(raw).hexdigest() != expected_sha
@@ -789,10 +781,20 @@ def _promote_known_observability_ref(
     task_id: str,
     ref: Dict[str, Any],
     state: Dict[str, Any],
+    *, carrier: str = "metadata",
 ) -> Dict[str, Any]:
     def transform_json(payload: Any) -> Any:
         before = len(state["pending_refs"])
-        rewritten = _rewrite_service_payload(payload, parent_root, child_root, task_id, state)
+        # Only the verified manifest owns request/response provenance. Captured
+        # model bodies cannot acquire source authority from matching JSON keys.
+        payload_carrier = 'metadata'
+        if _is_manifest_ref(ref):
+            call_type = str(read_call_manifest_ref(source_root, ref, task_id=task_id).get('call_type') or '')
+            if call_type.endswith(('_response', '_error', '_review_collected')):
+                payload_carrier = 'call_response'
+            elif call_type.endswith('_request'):
+                payload_carrier = 'call_request'
+        rewritten = _rewrite_service_payload(payload, parent_root, child_root, task_id, state, carrier=payload_carrier)
         if len(state["pending_refs"]) != before:
             raise OSError("embedded child observability ref promotion is pending")
         return rewritten
@@ -812,7 +814,7 @@ def _promote_known_observability_ref(
                 source_root,
                 parent_root,
                 ref,
-                transform_json=transform_json,
+                transform_json=None if carrier == 'response_ref' else transform_json,
             )
             if _is_blob_ref(ref)
             else promote_call_manifest_ref(
@@ -859,8 +861,9 @@ def _rewrite_task_source_markers(
     child_root: pathlib.Path,
     task_id: str,
     state: Dict[str, Any],
+    *, tool_call_id: str,
 ) -> str:
-    """Promote the host's full-view and clean-producer source envelopes."""
+    """Promote only the host tool envelope's own call-bound result sources."""
 
     rewritten_lines: List[str] = []
     for line in str(text).splitlines(keepends=True):
@@ -874,7 +877,13 @@ def _rewrite_task_source_markers(
         except (TypeError, ValueError):
             rewritten_lines.append(line)
             continue
-        if not _is_task_source_ref(ref):
+        # Text alone is not authority. The enclosing host tool message binds
+        # this envelope to the source writer's exact task/call identity. A
+        # marker quoted by another call, user, assistant or argument is data.
+        source_id = tool_call_id + (".producer" if marker == "PRODUCER_RESULT_SOURCE_JSON=" else "")
+        source_id = re.sub(r"[^A-Za-z0-9_.-]+", "_", source_id).strip("._")[:160]
+        if (not _is_task_source_ref(ref) or not tool_call_id
+                or ref.get("path") != f"source_handles/tool_results/{source_id}-{ref.get('sha256')}.txt"):
             rewritten_lines.append(line)
             continue
         promoted = _promote_task_source_ref(
@@ -899,17 +908,18 @@ def _rewrite_service_payload(
     child_root: pathlib.Path,
     task_id: str,
     state: Dict[str, Any],
+    *, carrier: str = "metadata",
 ) -> Any:
     if not isinstance(payload, dict):
         return payload
     rewritten = copy.deepcopy(payload)
-    if str(rewritten.get("tool") or "") in _SERVICE_REF_TOOLS and isinstance(
+    if carrier == 'metadata' and str(rewritten.get("tool") or "") in _SERVICE_REF_TOOLS and isinstance(
         rewritten.get("result"), str
     ):
         rewritten["result"] = _rewrite_service_result(
             rewritten["result"], parent_root, child_root, task_id, state,
         )
-    return _rewrite_child_ref_tree(rewritten, parent_root, child_root, task_id, state)
+    return _rewrite_child_ref_tree(rewritten, parent_root, child_root, task_id, state, carrier=carrier)
 
 
 def _task_artifact_dir(root: pathlib.Path, task_id: str, *, create: bool) -> pathlib.Path:
@@ -924,29 +934,34 @@ def _rewrite_child_ref_tree(
     child_root: pathlib.Path,
     task_id: str,
     state: Dict[str, Any],
+    *, carrier: str = "metadata",
 ) -> Any:
-    if _is_blob_ref(value) or _is_manifest_ref(value):
-        return _promote_known_observability_ref(parent_root, child_root, task_id, value, state)
-    if _is_task_source_ref(value):
-        return _promote_task_source_ref(
-            parent_root, child_root, task_id, value, state
-        )
+    from ouroboros.review_source_closure import retain_contract, source_carrier, source_owner
+
+    if not carrier:
+        return value  # Artifact placement has its own owner; no implicit JSON closure.
+    if carrier in {"metadata", "response_ref"} and (_is_blob_ref(value) or _is_manifest_ref(value)):
+        return _promote_known_observability_ref(parent_root, child_root, task_id, value, state, carrier=carrier)
+    if carrier == "metadata" and _is_task_source_ref(value):
+        return _promote_task_source_ref(parent_root, child_root, task_id, value, state)
     if isinstance(value, dict):
+        if carrier == "message" and value.get("role") == "tool" and isinstance(value.get("content"), str):
+            return {**value, "content": _rewrite_task_source_markers(value["content"], parent_root,
+                child_root, task_id, state, tool_call_id=str(value.get("tool_call_id") or ""))}
+        if carrier == "contract":
+            original = value.get("attachment_manifest_ref")
+            if _is_task_source_ref(original):
+                _promote_task_source_ref(parent_root, child_root, task_id, original, state)
+            value = retain_contract(value, child_root, parent_root, task_id, state)
         return {
-            key: _rewrite_child_ref_tree(
-                item, parent_root, child_root, task_id, state
-            )
+            key: _rewrite_child_ref_tree(item, parent_root, child_root,
+                source_owner(key, item, task_id), state, carrier=role)
+            if (role := source_carrier(value, key, carrier)) else item
             for key, item in value.items()
         }
     if isinstance(value, list):
-        return [
-            _rewrite_child_ref_tree(item, parent_root, child_root, task_id, state)
-            for item in value
-        ]
-    if isinstance(value, str) and any(marker in value for marker in _TASK_SOURCE_MARKERS):
-        return _rewrite_task_source_markers(
-            value, parent_root, child_root, task_id, state
-        )
+        return [_rewrite_child_ref_tree(item, parent_root, child_root, task_id, state, carrier=carrier)
+                for item in value]
     return value
 
 
@@ -979,8 +994,11 @@ def promote_child_task_refs(
             if key in {"task_contract", "attachment_manifest", "attachment_manifest_ref"}:
                 continue  # Input JSON and its file closure have one attachment-aware owner.
             if key in rewritten:
+                from ouroboros.review_source_closure import source_carrier
+
                 rewritten[key] = _rewrite_child_ref_tree(
                     rewritten[key], parent_root, child_root, task_id, state,
+                    carrier=source_carrier(rewritten, key, 'task_result'),
                 )
         artifacts = rewritten.get("artifacts")
         if isinstance(artifacts, list):

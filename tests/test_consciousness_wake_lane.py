@@ -104,6 +104,132 @@ def test_wake_is_registered_before_the_receipt_returns_and_reports_its_end(monke
     assert drained["chat_id"] == 1
 
 
+def test_wake_observation_is_bound_after_registration_and_before_the_turn_runs(monkeypatch, tmp_path):
+    """The immutable observation source exists, named on the task, before the body starts."""
+    from ouroboros import agent as agent_module
+    from ouroboros import consciousness_wake as wake
+    from ouroboros.artifacts import read_actor_source_bytes
+
+    _lane(monkeypatch, tmp_path)
+    seen: dict = {}
+    finished: list = []
+
+    class Actor:
+        def handle_task(self, task):
+            seen["metadata"] = dict(task["metadata"])
+            seen["text"] = task["text"]
+            return []
+
+    monkeypatch.setattr(agent_module, "make_agent", lambda **kw: Actor())
+    (tmp_path / "logs" / "chat.jsonl").write_text(json.dumps({
+        "ts": TS, "direction": "in", "chat_id": 1, "source": "web", "text": "owner words"}) + "\n", encoding="utf-8")
+    observation = wake.observe_wake(tmp_path, boundary=None, since=0.0, now=1_900_000_000.0)
+    order: list = []
+
+    def bind(task):
+        order.append(get_direct_activity_registry().get(task["id"]) is not None)  # already registered
+        wake.bind_wake_observation(tmp_path, task, observation, lambda events: f"PROJECTED:{events}")
+
+    receipt = workers.handle_wake_direct(1, "the complete wake text", dict(WAKE_META), bind_input=bind,
+                                         on_finished=lambda tid, ok: finished.append(ok))
+    assert receipt["admitted"] is True and _wait_for(lambda: bool(finished)) and order == [True]
+    bound = seen["metadata"][wake.WAKE_OBSERVATION_KEY]
+    assert seen["text"] == "the complete wake text"  # the original host input is never replaced
+    assert bound["composition"] == {"owner_message": 1} and bound["window"]["basis"] == "time_bootstrap"
+    assert bound["projection_text"].startswith("PROJECTED:") and bound["source"]["sha256"] in bound["projection_text"]
+    # The source outlives the wake and is readable by the published digest; a later wake
+    # uses the runtime_data handle (``consolidator.retain_memory_source``), no new root.
+    raw = read_actor_source_bytes(tmp_path, receipt["task_id"], {**bound["source"], "root": "artifact_store"})
+    assert raw == observation.source_bytes()
+    assert bound["source"]["read"]["arguments"]["root"] == "runtime_data"
+    assert (tmp_path / bound["source"]["read"]["arguments"]["path"]).read_bytes() == raw
+    rows = [json.loads(line) for line in raw.decode("utf-8").splitlines()]
+    assert rows[0]["kind"] == "wake_observation" and rows[1]["kind"] == "owner_message"
+    assert rows[1]["chat_offset"] == 0 and "owner words" in rows[1]["line"]
+
+
+def test_the_bound_source_survives_handoff_and_cleanup_for_a_read_file_consumer(monkeypatch, tmp_path):
+    """The metadata the lane bound rides the parkable record (a budget-pause handoff) and the
+    durable running record verbatim; the wake's own read_file reads its pointer during the
+    turn, and after the turn ended and its registry entry was released a later turn reads the
+    same exact bytes through the durable handle. The task text stays the whole original input."""
+    import pathlib
+
+    from ouroboros import agent as agent_module
+    from ouroboros import consciousness_wake as wake
+    from ouroboros.budget_pause import parkable_direct_task
+    from ouroboros.task_results import load_task_result, write_task_result
+    from ouroboros.tools.core_file_tools import _read_file
+    from ouroboros.tools.tool_context import ToolContext
+
+    repo = pathlib.Path(__file__).resolve().parents[1]
+    _lane(monkeypatch, tmp_path)
+    seen: dict = {}
+    finished: list = []
+
+    class Actor:
+        def handle_task(self, task):
+            seen["task"] = task
+            # What the real agent persists at start (``_persist_running_record``: metadata verbatim).
+            write_task_result(tmp_path, task["id"], "running", _is_direct_chat=True, chat_id=task["chat_id"],
+                              metadata=task["metadata"])
+            reader = ToolContext(repo_dir=repo, drive_root=tmp_path, task_id=task["id"], task_metadata=task["metadata"])
+            seen["during"] = _read_file(reader, **task["metadata"][wake.WAKE_OBSERVATION_KEY]["source"]["read"]["arguments"])
+            seen["parked"] = parkable_direct_task(task)
+            write_task_result(tmp_path, task["id"], "completed", result="done")
+            return []
+
+    monkeypatch.setattr(agent_module, "make_agent", lambda **kw: Actor())
+    (tmp_path / "logs" / "chat.jsonl").write_text(json.dumps({
+        "ts": TS, "direction": "in", "chat_id": 1, "source": "web", "text": "owner words"}) + "\n", encoding="utf-8")
+    observation = wake.observe_wake(tmp_path, boundary=None, since=0.0, now=1_900_000_000.0)
+    receipt = workers.handle_wake_direct(
+        1, "the complete wake text", dict(WAKE_META), on_finished=lambda tid, ok: finished.append(ok),
+        bind_input=lambda task: seen.update(boundary=wake.bind_wake_observation(tmp_path, task, observation, lambda events: events)))
+    assert receipt["admitted"] is True and _wait_for(lambda: bool(finished)) and finished == [True]
+    task_id = receipt["task_id"]
+    assert get_direct_activity_registry().get(task_id) is None  # the turn's registration is gone
+    bound = seen["task"]["metadata"][wake.WAKE_OBSERVATION_KEY]
+    event_line = observation.source_bytes().decode("utf-8").splitlines()[1]
+    assert event_line in seen["during"]
+    assert seen["parked"]["metadata"][wake.WAKE_OBSERVATION_KEY] == bound  # a parked wake resumes with it
+    durable = load_task_result(tmp_path, task_id)["metadata"][wake.WAKE_OBSERVATION_KEY]
+    assert durable == json.loads(json.dumps(bound))
+    later = ToolContext(repo_dir=repo, drive_root=tmp_path, task_id="nextwake", task_metadata={})
+    after = _read_file(later, **durable["source"]["read"]["arguments"])
+    assert event_line in after and f"lines 1–{durable['source']['lines']} of {durable['source']['lines']}" in after
+    assert seen["task"]["text"] == "the complete wake text"
+    later_observation = wake.observe_wake(tmp_path, boundary=seen['boundary'], since=1_900_000_000.0,
+                                          now=1_900_000_600.0)
+    assert later_observation.window['transitions_basis'] == 'accepted_inventory'
+    assert not later_observation.gaps
+    assert not any(kind == 'owner_message' for kind, _offset, _line in later_observation.events)
+    assert 'owner words' not in later_observation.full_text()  # accepted input is not replayed
+
+
+def test_a_failed_observation_binding_keeps_the_complete_text_as_the_only_input(monkeypatch, tmp_path):
+    from ouroboros import agent as agent_module
+
+    _lane(monkeypatch, tmp_path)
+    seen: dict = {}
+    finished: list = []
+
+    class Actor:
+        def handle_task(self, task):
+            seen.update(task)
+            return []
+
+    monkeypatch.setattr(agent_module, "make_agent", lambda **kw: Actor())
+
+    def broken(_task):
+        raise OSError("source store unavailable")
+
+    receipt = workers.handle_wake_direct(1, "complete text", dict(WAKE_META), bind_input=broken,
+                                         on_finished=lambda tid, ok: finished.append(ok))
+    assert receipt["admitted"] is True and _wait_for(lambda: bool(finished)) and finished == [True]
+    assert seen["text"] == "complete text" and "wake_observation" not in seen["metadata"]
+
+
 def test_wake_refusals_are_typed_and_start_nothing(monkeypatch, tmp_path):
     from ouroboros import agent as agent_module
     from supervisor import state
@@ -319,6 +445,132 @@ def test_set_next_wakeup_clamps_persists_and_speaks_honestly(tmp_path, monkeypat
         assert state.load_state()["consciousness_next_interval_sec"] == 300
         assert "TOOL_ARG_ERROR" in control._set_next_wakeup(ctx, "soon")
         assert state.load_state()["consciousness_next_interval_sec"] == 300
+
+
+def test_consciousness_status_answers_the_caller_only_with_sourced_persisted_facts(tmp_path, monkeypatch):
+    """#1324: status is a read for the caller, never a line in the owner's chat;
+    in-memory clock facts are named as not read, not guessed. Start and stop keep
+    their supervisor path and their owner notice."""
+    from ouroboros.tools import control
+    from supervisor import events_runtime_controls, state
+
+    (tmp_path / "state").mkdir(parents=True)
+    (tmp_path / "locks").mkdir(parents=True)
+    state.init(tmp_path)
+    state.update_state(lambda st: st.update({
+        "bg_consciousness_enabled": True, "consciousness_next_wake_at": 1790416800.0,
+        "consciousness_last_wake_at": 1790413200.0, "consciousness_next_interval_sec": 900}))
+    ctx = SimpleNamespace(task_id="w1", pending_events=[], drive_root=tmp_path, task_metadata={})
+    with mock.patch.dict(os.environ, {"OUROBOROS_BG_WAKEUP_MIN": "120", "OUROBOROS_BG_WAKEUP_MAX": "600"}):
+        facts = json.loads(control._toggle_consciousness(ctx, "status"))
+    assert ctx.pending_events == []  # nothing for the supervisor to publish
+    assert facts["source"] == str(tmp_path / "state" / "state.json") and facts["observed_at"]
+    assert "source_modified_at" not in facts and "read_gap" not in facts and "not_recorded" not in facts
+    assert facts["enabled"] is True and facts["chosen_interval_sec"] == 900
+    assert facts["stored_next_wake_at"] == "2026-09-26T10:00:00+00:00"
+    assert facts["last_wake_ended_at"] == "2026-09-26T09:00:00+00:00"
+    assert facts["configured_bounds_sec"] == {"min": 120, "max": 600, "source": "owner settings, not the state file"}
+    assert "last_wake_outcome" not in facts and "pending early-wake reason" in facts["notes"][1]
+
+    def unpublished():
+        raise AssertionError("status must not be published")
+
+    sent, clock = [], SimpleNamespace(start=lambda: "enabled", stop=lambda: "disabled", status_snapshot=unpublished)
+    supervisor = SimpleNamespace(consciousness=clock, load_state=lambda: {"owner_chat_id": 5},
+                                 send_with_budget=lambda chat, text, **kw: sent.append((chat, text, kw)))
+    events_runtime_controls._handle_toggle_consciousness({"action": "status"}, supervisor)
+    assert sent == []
+    assert control._toggle_consciousness(ctx, "stop") == "OK: consciousness 'stop' requested."
+    assert ctx.pending_events[-1]["action"] == "stop"
+    events_runtime_controls._handle_toggle_consciousness({"action": "stop"}, supervisor)
+    assert sent == [(5, "🧠 disabled", {"role": "system", "system_type": "consciousness_notice"})]
+
+
+def _tree(root):
+    """Every path under ``root`` with its bytes (None for a directory)."""
+    return {str(path.relative_to(root)): (None if path.is_dir() else path.read_bytes())
+            for path in sorted(root.rglob("*"))}
+
+
+def test_consciousness_status_reads_the_callers_canonical_root_and_writes_nothing(tmp_path, monkeypatch):
+    """The read goes to the caller's canonical data root (``budget_drive_root``
+    over a child's own execution drive), never to the process-global state path,
+    and leaves every byte of both roots as it found them: no lock file, no
+    defaults, no repair. A field the file lacks is named, not defaulted."""
+    from ouroboros.tools import control
+    from supervisor import state
+
+    canonical, forked, wrong = (tmp_path / name for name in ("canonical", "forked", "wrong"))
+    for root, stored in ((canonical, {"bg_consciousness_enabled": False, "consciousness_next_interval_sec": 1800,
+                                      "consciousness_next_wake_at": 0}),
+                         (forked, {"bg_consciousness_enabled": True}),
+                         (wrong, {"bg_consciousness_enabled": True, "consciousness_next_interval_sec": 60})):
+        (root / "state").mkdir(parents=True)
+        (root / "state" / "state.json").write_text(json.dumps(stored), encoding="utf-8")
+    for name, path in (("STATE_PATH", wrong / "state" / "state.json"),
+                       ("STATE_LAST_GOOD_PATH", wrong / "state" / "state.last_good.json"),
+                       ("STATE_LOCK_PATH", wrong / "locks" / "state.lock")):
+        monkeypatch.setattr(state, name, path)
+    before = _tree(tmp_path)
+    ctx = SimpleNamespace(task_id="child", pending_events=[], drive_root=forked,
+                          task_metadata={"budget_drive_root": str(canonical)})
+    facts = json.loads(control._toggle_consciousness(ctx, "status"))
+    assert _tree(tmp_path) == before and ctx.pending_events == []
+    assert facts["source"] == str(canonical / "state" / "state.json")
+    assert facts["enabled"] is False and facts["chosen_interval_sec"] == 1800
+    assert facts["stored_next_wake_at"] == 0  # recorded zero stays zero, not a guessed time
+    assert facts["not_recorded"] == ["last_wake_ended_at"] and "last_wake_ended_at" not in facts
+    # A root task with no budget root reads its own drive, which IS its canonical root.
+    facts = json.loads(control._toggle_consciousness(SimpleNamespace(pending_events=[], drive_root=forked), "status"))
+    assert facts["source"] == str(forked / "state" / "state.json") and facts["enabled"] is True
+    assert _tree(tmp_path) == before
+
+
+def test_consciousness_status_names_a_read_gap_instead_of_defaults(tmp_path):
+    """Missing, unreadable and corrupt state each come back as that gap: no field
+    is fabricated (not ``enabled: false``, not zeros), the backup the repairing
+    loader would restore from is not read, and nothing is created or rewritten."""
+    from ouroboros.tools import control
+
+    def status(root):
+        before = _tree(root)
+        facts = json.loads(control._toggle_consciousness(SimpleNamespace(pending_events=[], drive_root=root), "status"))
+        assert _tree(root) == before, "a status read must not write"
+        assert facts["not_read"] == ["enabled", "stored_next_wake_at", "last_wake_ended_at", "chosen_interval_sec"]
+        assert not {"enabled", "stored_next_wake_at", "last_wake_ended_at", "chosen_interval_sec"} & set(facts)
+        assert facts["source"] == str(root / "state" / "state.json") and facts["observed_at"]
+        return facts["read_gap"]
+
+    missing = tmp_path / "missing"
+    missing.mkdir()
+    assert status(missing).startswith("missing:") and not (missing / "state").exists()
+
+    backup = json.dumps({"bg_consciousness_enabled": True, "consciousness_next_interval_sec": 60})
+    for name, body in (("corrupt", b'{"bg_consciousness_enabled": tr'), ("undecodable", b"\xff\xfe{"),
+                       ("list", b"[true]"), ("null", b"null")):
+        root = tmp_path / name
+        (root / "state").mkdir(parents=True)
+        (root / "state" / "state.json").write_bytes(body)
+        (root / "state" / "state.last_good.json").write_text(backup, encoding="utf-8")
+        assert status(root).startswith("corrupt:"), name
+
+    unreadable = tmp_path / "unreadable"
+    (unreadable / "state" / "state.json").mkdir(parents=True)  # present, but no file can be read there
+    assert status(unreadable).startswith("unreadable:")
+
+
+def test_wake_affordances_describe_the_real_alarm_and_the_status_audience():
+    from ouroboros.tools.control import get_tools
+
+    schemas = {entry.name: entry.schema for entry in get_tools()}
+    wake = schemas["set_next_wakeup"]["description"]
+    for phrase in ("after a wake-up ends", "OUROBOROS_BG_WAKEUP_MIN/MAX", "already pending keeps its time",
+                   "stored for later", "failed wake-up doubles the interval (up to MAX)",
+                   "pending event brings the next wake-up forward", "retries after MIN",
+                   "exhausted allowance waits for its reset", "sooner than MIN after the last wake-up, boot or skip"):
+        assert phrase in wake
+    assert len(wake) < 600, "an operational paragraph, not the alarm's whole algorithm"
+    assert "answered to you only" in schemas["toggle_consciousness"]["description"]
 
 
 def test_a_wake_whose_thread_cannot_start_leaves_no_registered_turn(monkeypatch, tmp_path):
