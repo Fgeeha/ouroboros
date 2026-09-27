@@ -114,6 +114,7 @@ def conflicting_writers(q: Any, predecessor: str) -> List[Dict[str, Any]]:
 
     blockers: List[Dict[str, Any]] = []
     members = {predecessor}
+    member_results = {}
     with q._queue_lock:
         running = [(str(tid), dict(meta.get("task") or {})) for tid, meta in q.RUNNING.items()
                    if isinstance(meta, dict)]
@@ -130,7 +131,8 @@ def conflicting_writers(q: Any, predecessor: str) -> List[Dict[str, Any]]:
                                                    and not task.get("_budget_pause")):
                 blockers.append({"kind": "dispatchable_member", "task_id": tid})
     try:
-        for task_id, row in tree_member_results(q.DRIVE_ROOT, predecessor).items():
+        member_results = tree_member_results(q.DRIVE_ROOT, predecessor)
+        for task_id, row in member_results.items():
             members.add(task_id)
             for op in (row.get("launch_handoffs") or {}).values():
                 blockers.append({"kind": "tool_handoff", "task_id": task_id, "operation": op})
@@ -155,7 +157,7 @@ def conflicting_writers(q: Any, predecessor: str) -> List[Dict[str, Any]]:
                             for run in observed.get("runs") or [] if isinstance(run, dict))
     try:
         from ouroboros import process_custody as pc
-        from ouroboros.platform_layer import IS_WINDOWS, pid_is_alive
+        from ouroboros.platform_layer import pid_is_alive
         complete, records = pc._read_ledger_strict(pathlib.Path(q.DRIVE_ROOT))
         if not complete:
             raise OSError("process_custody_unreadable")
@@ -168,19 +170,18 @@ def conflicting_writers(q: Any, predecessor: str) -> List[Dict[str, Any]]:
         blockers.append({"kind": "process_custody_unreadable", "detail": str(exc)[:200]})
     try:
         from ouroboros import usage_accounting as ua
-        with ua._locked(pathlib.Path(q.DRIVE_ROOT)):
-            attempts = ua._final_rows(ua._read_records_locked(pathlib.Path(q.DRIVE_ROOT)))
-        for attempt in attempts.values():
+        attempts, integrity, _memo, _generation = ua._memoized_final_rows(pathlib.Path(q.DRIVE_ROOT))
+        if not integrity:
+            raise OSError("attempt_custody_unreadable")
+        for attempt in attempts:
             if (str(attempt.get("root_task_id") or "") == predecessor
                     and attempt.get("state") in {"dispatched", "unresolved"}):
-                # Only raw model sends bind a sole local answer consumer. Its
-                # positively absent PID cannot execute later host tools. This
-                # does NOT settle the attempt's money or any remote operation.
-                # Legacy/unbound/live owners stay held. Windows presence errors
-                # are not specific enough to prove absence here: keep the hold.
-                owner_pid = attempt.get("local_answer_owner_pid")
-                if (type(owner_pid) is int and owner_pid > 0 and not IS_WINDOWS
-                        and not pid_is_alive(owner_pid)):
+                consumer = attempt.get("local_answer_consumer_id")
+                retired = (member_results.get(str(attempt.get("task_id") or ""), {})
+                           .get("retired_model_consumers") or {}).get(consumer) if consumer else None
+                if (isinstance(retired, dict) and retired.get("retired_at")
+                        and type(attempt.get("local_answer_task_attempt")) is int
+                        and retired.get("task_attempt") == attempt["local_answer_task_attempt"]):
                     continue
                 blockers.append({"kind": "model_handoff", "attempt_id": attempt.get("attempt_id")})
     except Exception as exc:
@@ -279,7 +280,9 @@ def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[s
     claim = result.get("continued_by") if isinstance(result.get("continued_by"), dict) else {}
     if claim and str(claim.get("action_nonce") or "") != nonce:
         return {"ok": False, "error": "already_continued",
-                "successor_task_id": str(claim.get("successor_task_id") or "")}
+                "successor_task_id": str(claim.get("successor_task_id") or ""),
+                **({"state": "bound", "action_nonce": claim.get("action_nonce")}
+                   if claim.get("state") == "bound" else {})}
     verdict = continuation_eligibility(result, predecessor) if not claim else {
         "eligible": True, "cause": str((claim.get("binding") or {}).get("cause") or ""), "refusal": ""}
     if not verdict["eligible"]:
@@ -307,7 +310,13 @@ def admit_continuation(predecessor_task_id: str, *, action_nonce: str) -> Dict[s
         except ValueError as exc:
             text = str(exc)
             if text.startswith("already_continued:"):
-                return {"ok": False, "error": "already_continued", "successor_task_id": text.split(":", 1)[1]}
+                try:
+                    other = (load_task_result(q.DRIVE_ROOT, predecessor, strict=True) or {}).get("continued_by") or {}
+                    return {"ok": False, "error": "already_continued", "successor_task_id": other["successor_task_id"],
+                            **({"state": "bound", "action_nonce": other["action_nonce"]}
+                               if other.get("state") == "bound" else {})}
+                except Exception:
+                    return {"ok": False, "error": "continuation_unconfirmed"}
             return {"ok": False, "error": text or "continuation_refused"}
         except Exception as exc:
             return {"ok": False, "error": "continuation_claim_unwritable", "detail": str(exc)[:200]}

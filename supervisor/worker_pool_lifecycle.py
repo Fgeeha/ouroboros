@@ -530,13 +530,17 @@ def _record_worker_pids() -> None:
 
         for w in _pool().WORKERS.values():
             if w.proc.pid:
-                record_process(
+                was_alive = w.proc.is_alive()
+                record = record_process(
                     _pool().DRIVE_ROOT,
                     pid=int(w.proc.pid),
                     cmd=f"ouroboros-worker-{w.wid}",
                     purpose=f"worker:{w.wid}",
                     scope="session",
                 )
+                if was_alive and w.proc.is_alive() and not getattr(w, "process_birth", ""):
+                    fingerprint = record["fingerprint"]
+                    w.process_birth = fingerprint.get("start_time_boot") or fingerprint.get("start_time") or ""
     except Exception:
         log.debug("Failed to ledger worker pids", exc_info=True)
 

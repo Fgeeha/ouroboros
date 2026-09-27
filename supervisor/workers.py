@@ -90,6 +90,7 @@ class Worker:
     active_capacity: bool = True
     # Unlike temporary reaping, the readiness owner exhausted its bounded attempts.
     readiness_exhausted: bool = False
+    process_birth: str = ""  # captured while this exact Process is alive; never inferred after death
 
 
 _EVENT_Q = None

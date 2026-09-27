@@ -125,7 +125,19 @@ def test_real_admission_hurry_and_pre_running_death_recover(pool, monkeypatch, o
     assert response.status_code == 200, response.text
     row = results.load_task_result(pool.root, task_id, strict=True)
     assert row["status"] == ("scheduled" if phase == "pending" else "running")
-    assert set(row) == {"task_id", "status", "_schema_version", "ts", "updated_at", "owner_hurry"}
+    admitted = queue.PENDING[0] if phase == "pending" else queue.RUNNING[task_id]["task"]
+    persisted = {key for key in (
+        "type", "chat_id", "metadata", "task_contract", "parent_task_id", "delegation_role",
+        "project_id", "workspace_root", "workspace_mode", "memory_mode", "budget_drive_root",
+        "_attempt", "queued_at", "admitted_dispatch", "_admission_owner_token", "origin_message_text",
+        "origin_message_ref", "objective", "title", "suggested_name", "original_task_id", "timeout_retry_from",
+        "deadline_at", "root_cost_ceiling_usd", "billing_group", "task_constraint", "objective_author",
+        "owner_corpus", "task_group_id", "task_group",
+    ) if key in admitted}
+    assert set(row) == ({"task_id", "status", "_schema_version", "ts", "updated_at", "owner_hurry",
+                         "root_task_id", "description"} | persisted | ({"started_at"} if phase == "assigned" else set()))
+    assert all(row[key] == admitted[key] for key in persisted)
+    assert row["root_task_id"] == task_id and row["description"] == admitted["text"]
     assert row["owner_hurry"]["attempt_key"] == 1
     assert [entry["kind"] for entry in drain_owner_entries(pool.root, task_id)] == [KIND_HURRY]
     assert not (pool.root / "logs/chat.jsonl").exists()
@@ -166,7 +178,12 @@ def test_initializer_holds_queue_lock_and_does_not_rewrite_existing_wait(pool, m
 
     monkeypatch.setattr(results, "write_task_result", observe)
     _admit_hurry_locked(task_id)
-    assert calls == [{"create_only": True, "strict_existing_dict": True}]
+    assert len(calls) == 1
+    assert calls[0]["create_only"] is True and calls[0]["strict_existing_dict"] is True
+    row = results.load_task_result(pool.root, task_id, strict=True)
+    assert {key: value for key, value in calls[0].items() if key not in {"create_only", "strict_existing_dict"}} == {
+        key: value for key, value in row.items() if key not in {"task_id", "status", "_schema_version", "ts", "updated_at"}}
+    assert row["root_task_id"] == task_id and row["metadata"] == queue.PENDING[0]["metadata"]
     actual(pool.root, task_id, "running", owner_wait={"state": "waiting", "wait_id": "w", "source_ref": {"sha256": "source"}},
            metadata={"grant": "preserved"}, started_at="original", model_waits={"quota": "kept"})
     path = results.task_result_path(pool.root, task_id)

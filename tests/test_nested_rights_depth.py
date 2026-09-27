@@ -834,7 +834,7 @@ def test_replayed_schedule_event_keeps_one_physical_task_and_transition(
     monkeypatch.setattr(workers, "WORKERS", worker_map)
     monkeypatch.setattr(workers, "load_state", lambda: {})
     monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
 
     workers.assign_tasks()
 
@@ -871,7 +871,7 @@ def test_assignment_quarantines_bypassed_invalid_depth_and_normalizes_legacy_row
     monkeypatch.setattr(workers, "WORKERS", {1: worker})
     monkeypatch.setattr(workers, "load_state", lambda: {})
     monkeypatch.setattr(state, "budget_remaining", lambda *_args, **_kwargs: 100.0)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
     monkeypatch.setattr(
         workers,
         "_emit_task_done_terminal",
@@ -1070,7 +1070,7 @@ def test_budget_pause_leaves_unresolved_invalid_depth_in_retry_custody(
             "budget_drive_root": str(tmp_path),
         },
         {
-            "id": "healthy-before-budget",
+            "id": "healthy-before-budget", "admitted_dispatch": "none",
             "type": "task",
             "chat_id": 1,
             "description": "pause this task",

@@ -106,6 +106,8 @@ def set_owner_wait(root: Any, task_id: str, wait: dict,
 
     def update(current: dict) -> dict:
         require_writable_task_result_schema(current)
+        if not current.get("status") or current.get("task_id") != task_id:
+            raise ValueError("owner wait requires its lifecycle owner's task result")
         if current.get("status") in _TRULY_TERMINAL_STATUSES:
             raise ValueError("a terminal task cannot continue owner waiting")
         old = current.get("owner_wait") or {}

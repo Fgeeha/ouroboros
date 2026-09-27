@@ -16,9 +16,8 @@ from tests.test_owner_continue import NONCE, _interrupted
 pytestmark = pytest.mark.serial
 
 
-@pytest.mark.skipif(os.name == "nt", reason="Windows absence remains conservative until its presence reader distinguishes probe failures")
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_dead_local_answer_owner_releases_same_continue_without_settling_money(tmp_path, monkeypatch, asynchronous):
+def test_retired_local_answer_owner_releases_same_continue_without_settling_money(tmp_path, monkeypatch, asynchronous):
     from ouroboros import platform_layer, usage_accounting as ua
     from supervisor.continuation_admission import admit_continuation
     from supervisor.queue_transitions import resume_budget_paused_task
@@ -35,7 +34,10 @@ def test_dead_local_answer_owner_releases_same_continue_without_settling_money(t
     async def failed_async_send():
         return failed_send()
 
-    with pytest.raises(RuntimeError, match="transport result unknown"):
+    from ouroboros.model_wait import TaskModelWait, operation_wait_scope
+    consumer = TaskModelWait(task={"id": "pred-1"}, drive_root=tmp_path,
+                             event_queue=None, worker_slot_held=True)
+    with operation_wait_scope(consumer), pytest.raises(RuntimeError, match="transport result unknown"):
         if asynchronous:
             asyncio.run(ua.execute_physical_attempt_async(request, failed_async_send))
         else:
@@ -52,6 +54,8 @@ def test_dead_local_answer_owner_releases_same_continue_without_settling_money(t
     with patch.object(platform_layer, "pid_is_alive", side_effect=OSError("probe unavailable")):
         assert not resume_budget_paused_task(successor)["ok"]
     monkeypatch.setattr(platform_layer, "pid_is_alive", lambda pid: pid != os.getpid())
+    assert not resume_budget_paused_task(successor)["ok"], "PID absence alone is not exact consumer retirement"
+    consumer.close()
     assert resume_budget_paused_task(successor)["ok"]
     replay = admit_continuation("pred-1", action_nonce=NONCE)
     assert replay["successor_task_id"] == successor

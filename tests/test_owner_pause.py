@@ -209,6 +209,10 @@ def test_the_tree_turns_paused_only_when_no_member_runs_and_sent_work_settled(tm
     root = _owner_park(tmp_path, monkeypatch, "root-1", [])
     install_exact_budget_pause(ctx, "root-1", budget_pause.exact_pause_marker(root)["checkpoint"])
     assert budget_pause.budget_pause_row(tmp_path, "root-1")["state"] == budget_pause.STATE_PAUSED
+    from ouroboros.gateway.state import _chat_activities_snapshot_safe
+    phase = lambda: next(row["phase"] for row in _chat_activities_snapshot_safe(tmp_path)
+                         if row["activity_id"] == "root-1")
+    assert phase() == "budget_pausing"
     # Nothing runs any more, but the child's sent run still does: not a clean Paused.
     assert owner_pause.read_fence(tmp_path, "root-1")["state"] == owner_pause.FENCE_REQUESTED
 
@@ -234,6 +238,7 @@ def test_the_tree_turns_paused_only_when_no_member_runs_and_sent_work_settled(tm
     assert settle_requested_owner_pauses(queue, now=110.0) == ["root-1"]
     assert budget_pause.budget_pause_row(tmp_path, "child-run")["settlement"] == owner_pause.SETTLEMENT_SETTLED
     assert owner_pause.read_fence(tmp_path, "root-1")["state"] == owner_pause.FENCE_PAUSED
+    assert phase() == "budget_paused"
     # The latch kept its cause through the members' root-scoped parks.
     assert queue.BUDGET_ROOT_FENCES["root-1"]["cause"] == "owner_pause"
 

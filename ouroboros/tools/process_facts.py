@@ -110,7 +110,8 @@ def process_environment_tool(handler):
             arguments.setdefault("contract_kind", args[0])
         with process_environment_scope(ctx, name, arguments) as error:
             if error is not None:
-                return _publish_tool_result(ctx, error)
+                return _publish_tool_result(ctx, _replace_tool_result(
+                    error, meta_updates={"operation_outcome": "completed_no_effect"}))
             try:
                 result = handler(ctx, *args, **kwargs)
             except Exception as exc:

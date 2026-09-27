@@ -85,6 +85,12 @@ def request_owner_pause(task_id: str, *, request_id: str) -> Dict[str, Any]:
         except Exception:
             return {"ok": False, "error": "cancellation_authority_unavailable"}
         root_drive = pathlib.Path(task.get("budget_drive_root") or q.DRIVE_ROOT)
+        if lane != "direct":
+            try:
+                q.ensure_control_task_result(task_id)
+            except Exception:
+                log.warning("Owner pause lifecycle authority unavailable for %s", task_id, exc_info=True)
+                return {"ok": False, "error": "pause_record_unwritable"}
     try:
         fence, created = install_fence(root_drive, task_id, request_id=request_id)
     except OwnerPauseRefused as exc:

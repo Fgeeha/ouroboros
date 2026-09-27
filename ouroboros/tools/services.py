@@ -12,6 +12,8 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
+from ouroboros.owner_pause import OwnerPauseRefused
+from ouroboros.tools.tool_result import launch_refusal_result, _publish_tool_result
 from ouroboros.observability import redact_projection, write_blob
 from ouroboros.secret_masking import redact_known_values
 from ouroboros.platform_layer import (
@@ -467,6 +469,8 @@ def _start_service(
                 secret_values=secret_values,
             )
             return json.dumps(payload, ensure_ascii=False, indent=2)
+        except OwnerPauseRefused as exc:
+            return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
         except Exception as exc:
             return redact_known_values(f"⚠️ SERVICE_START_ERROR: executor backend failed: {type(exc).__name__}: {exc}", secret_values)
     task_id = str(getattr(ctx, "task_id", "") or "manual")
@@ -526,6 +530,9 @@ def _start_service(
             env=overlay_env(apply_env_path_prepend(_service_env(), active_node_resolution(ctx)), env),
         )
         log_fh.close()
+    except OwnerPauseRefused as exc:
+        log_fh.close()
+        return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
     except Exception as exc:
         log_fh.close()
         return redact_known_values(f"⚠️ SERVICE_START_ERROR: {type(exc).__name__}: {exc}", secret_values)

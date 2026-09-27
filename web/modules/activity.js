@@ -102,7 +102,10 @@ export function initActivity({ mount, ws } = {}) {
             const restartHeld = heldRow(t) && t._budget_pause_hold.reason === 'owner_restart_hold';
             const ownerPaused = t._budget_pause?.reason === 'owner'
                 || ownerFencedRoots.has(String(t.root_task_id || t.id || q.id || ''));
-            const kindLabel = restartHeld ? 'held after Restart'
+            const phase = (census?.active_chat_activities || []).find((entry) =>
+                entry.activity_id === String(t.root_task_id || t.id || q.id || ''))?.phase;
+            const kindLabel = phase === 'unknown' ? 'pause status unknown'
+                : phase === 'budget_pausing' ? 'pausing' : restartHeld ? 'held after Restart'
                 : (paused ? (ownerPaused ? 'paused' : 'paused (budget)') : kind);
             const meta = `${esc(kindLabel)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
             return `<div class="activity-row">

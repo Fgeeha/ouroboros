@@ -20,9 +20,9 @@ const sessionNonces = new Map();
 const offerReads = new WeakSet();
 
 /** One Continue action per task. Unavailable storage limits retention to this page. */
-export function continueNonce(taskId, storage) {
+export function continueNonce(taskId, storage, retainedNonce = '') {
     const key = `${NONCE_KEY}${taskId}`;
-    let nonce = sessionNonces.get(key);
+    let nonce = retainedNonce || sessionNonces.get(key);
     try {
         storage ??= globalThis.localStorage;
         nonce ||= storage?.getItem?.(key);
@@ -34,10 +34,12 @@ export function continueNonce(taskId, storage) {
     return nonce;
 }
 
-/** @returns {{kind: 'offer'|'successor'|'none', successorId?: string, cause?: string}} */
+/** @returns {{kind: 'offer'|'retry'|'successor'|'none', successorId?: string, cause?: string, actionNonce?: string}} */
 export function continueOfferView(detail) {
     const offer = detail?.continuation_offer;
     if (!offer || typeof offer !== 'object') return { kind: 'none' };
+    if (offer.state === 'bound') return offer.action_nonce
+        ? { kind: 'retry', actionNonce: String(offer.action_nonce) } : { kind: 'none' };
     if (offer.successor_task_id) return { kind: 'successor', successorId: String(offer.successor_task_id) };
     return offer.eligible ? { kind: 'offer', cause: String(offer.cause || '') } : { kind: 'none' };
 }
@@ -47,12 +49,12 @@ export function continueOfferView(detail) {
  * successor (a replay of an earlier press answers the same one).
  * @returns {Promise<string>} the successor task id, or '' when refused
  */
-export async function continueTaskAction(taskId, { request = continueTask, storage, toast = showToast } = {}) {
+export async function continueTaskAction(taskId, { request = continueTask, storage, toast = showToast, actionNonce = '' } = {}) {
     const id = String(taskId || '').trim();
     if (!id || inFlight.has(id)) return '';
     inFlight.add(id);
     try {
-        const ack = await request(id, continueNonce(id, storage));
+        const ack = await request(id, continueNonce(id, storage, actionNonce));
         const successor = String(ack?.successor_task_id || '');
         toast(ack?.held
             ? `Continue accepted as ${successor}; it waits until the interrupted task's own work has settled.`
@@ -60,10 +62,11 @@ export async function continueTaskAction(taskId, { request = continueTask, stora
         return successor;
     } catch (exc) {
         const body = exc?.body || {};
-        if (body.reason_code === 'already_continued' && body.successor_task_id) {
+        if (body.reason_code === 'already_continued' && body.successor_task_id && body.state !== 'bound') {
             toast(`Already continued as ${body.successor_task_id}.`, 'info');
             return String(body.successor_task_id);
         }
+        if (body.state === 'bound' && body.action_nonce) continueNonce(id, storage, body.action_nonce);
         // The same nonce stays: pressing again retries this very admission.
         toast(`Continue not confirmed: ${exc?.message || exc}`, 'error');
         return '';
@@ -120,13 +123,13 @@ export function syncContinueAction(record, detail, { read = fetchTaskDetail } = 
         renderSuccessor(button, view.successorId);
         return !existing;
     }
-    button.textContent = 'Continue';
+    button.textContent = view.kind === 'retry' ? 'Retry Continue' : 'Continue';
     button.disabled = false;
-    button.title = `Start a new task that continues this interrupted one (${view.cause || 'technical interruption'})`;
+    button.title = view.kind === 'retry' ? 'Retry the same unconfirmed Continue action' : `Start a new task that continues this interrupted one (${view.cause || 'technical interruption'})`;
     button.onclick = async (event) => {
         event.stopPropagation();
         button.disabled = true;
-        const successor = await continueTaskAction(record.groupId);
+        const successor = await continueTaskAction(record.groupId, { actionNonce: view.actionNonce || '' });
         if (successor) renderSuccessor(button, successor);
         else button.disabled = false;
     };

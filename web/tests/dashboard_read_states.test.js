@@ -690,3 +690,22 @@ test('Activity offers no Enable on a skill row held back by readiness alone', as
     // Delete stays (it suppresses) and is marked as a skill row for the dialog.
     assert.equal(row.querySelector('[data-act="schedule-delete"]').dataset.managed, '1');
 });
+
+test('saved Pause with unreadable tree authority remains unknown in Activity and shared Restart', async (t) => {
+    const { confirmAndSendRestart } = await import('../modules/chat_activity.js');
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    routes.set(queueUrl, response({ queue: { running: [], pending: [{ id: 'held', task: {
+        id: 'held', root_task_id: 'held', type: 'task', title: 'Saved work', _budget_pause: { reason: 'owner' },
+    } }] } }));
+    routes.set(backgroundUrl, response({ bg_consciousness_enabled: false,
+        active_chat_activities: [{ activity_id: 'held', phase: 'unknown' }], active_chat_activities_complete: false }));
+    await initActivity({ mount, ws }).refresh();
+    assert.match(section(mount, 'queue').textContent, /pause status unknown/);
+    assert.doesNotMatch(section(mount, 'queue').textContent, /paused/);
+    let body = '';
+    const result = await confirmAndSendRestart({ ws,
+        openConfirmDialog: async (options) => { body = options.body; return false; } });
+    assert.equal(result, 'cancelled');
+    assert.match(body, /Pause status could not be read/);
+});

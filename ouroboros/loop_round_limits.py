@@ -655,6 +655,36 @@ def _handle_model_wait_control(
     # catches a hold's interruption raised outside the model call, must not
     # hand the same error back here.
     error.control_rails_seen = True
+    if reason == "owner_launch_authority_unavailable":
+        # Only the positively unsent handoff waits; sent effects never retry.
+        # Reuse this task's live stack and control/deadline checks, no scheduler.
+        from ouroboros.owner_pause import OwnerPauseRefused, launch_admission
+        from ouroboros.usage_accounting import current_usage_scope
+        from ouroboros.llm_attempt import require_physical_dispatch_window
+        while True:
+            try:
+                require_physical_dispatch_window()
+                with launch_admission(current_usage_scope()):
+                    pass
+                return None
+            except OwnerPauseRefused as exc:
+                if str(exc) == reason:
+                    continue
+                error = ModelWaitInterrupted(str(exc), role=error.model_role, cause=error)
+            except Exception as exc:
+                from ouroboros.model_wait import propagate_model_control
+
+                # Physical pre-send controls carry no model_role. Rejoin the
+                # same typed contract as the model-call boundary, retaining the
+                # no-dispatch cause instead of leaking it or masking Stop.
+                try:
+                    propagate_model_control(exc, role=error.model_role)
+                except ModelWaitInterrupted as interrupted:
+                    error = interrupted
+                else:
+                    raise
+            reason = error.control_reason
+            break
     if reason == "owner_pause":
         # Raised only BEFORE request bytes (a pre-dispatch wait or the send's
         # launch handoff): nothing is in flight, the loop pauses exactly here.

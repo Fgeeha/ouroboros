@@ -232,6 +232,8 @@ class UsageScope:
     parent_task_id: str = ""
     category: str = "task"
     source: str = "llm"
+    # Explicitly attributed system probes/one-shots have no task control owner.
+    non_task_operation: bool = False
     review_skill: str = ""
     review_wave_id: str = ""
     review_slot_id: str = ""
@@ -448,6 +450,7 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
         parent_task_id=str(request.parent_task_id or (bound.parent_task_id if same_root else "") or ""),
         category=str(request.category or bound.category or "task"),
         source=str(request.source or bound.source or "llm"),
+        non_task_operation=bound.non_task_operation and same_root,
         **{key: str(getattr(bound, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
         global_limit_usd=(
             request.global_limit_usd if request.global_limit_usd is not None else bound.global_limit_usd
@@ -467,7 +470,7 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
     # Bare AttemptRequest is the ledger primitive; task consumers bind a UsageScope.
     # Only task-bound execution resolves durable lineage here (a synthetic raw
     # ledger request does not manufacture a task result).
-    if not scope.billing_group_id and bound.task_id and scope.root_task_id and scope.drive_root:
+    if not scope.non_task_operation and not scope.billing_group_id and bound.task_id and scope.root_task_id and scope.drive_root:
         from ouroboros.usage_admission import task_billing_fields
 
         scope = replace(scope, **task_billing_fields({"id": scope.task_id}, scope.root_task_id,
@@ -827,6 +830,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     "billing_group_limit_source": scope.billing_group_limit_source,
                     "billing_group_limit_revision": scope.billing_group_limit_revision,
                     "category": scope.category,
+                    **({"non_task_operation": True} if scope.non_task_operation else {}),
                     "source": scope.source,
                     **{key: str(getattr(scope, key, "") or "") for key in REVIEW_ATTRIBUTION_KEYS},
                     # The value checked above, including a resolver fallback, is
@@ -1078,7 +1082,8 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
         if state == "released" and current.get("state") == "dispatched" and not allow_release:
             raise UsageAccountingError("dispatched attempts require a typed pre-dispatch release")
         if state == "dispatched":
-            scope = UsageScope(drive_root=reservation.drive_root, **{key: current.get(key) for key in
+            scope = UsageScope(drive_root=reservation.drive_root,
+                non_task_operation=current.get("non_task_operation") is True, **{key: current.get(key) for key in
                 ("task_id", "root_task_id", "parent_task_id", "root_limit_usd", "billing_group_id",
                  "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")})
             _check_dispatch_fences(scope, reservation.drive_root)
@@ -1148,6 +1153,11 @@ def mark_dispatched(
     fields = {"candidate_manifest_ref": candidate_manifest_ref} if candidate_manifest_ref else {}
     if local_answer_owner_pid:
         fields["local_answer_owner_pid"] = local_answer_owner_pid
+        from ouroboros.model_wait import current_model_wait
+        owner = current_model_wait()
+        if (owner is not None and local_answer_owner_pid == os.getpid()
+                and owner.task_id == (reservation.scope or UsageScope()).task_id):
+            fields.update(owner.bind_answer_consumer())
     _transition(reservation, "dispatched", launch_state="claimed", transport_outcome="unknown", **fields)
     invoke_bound_api_review_paid_stamp(fail_closed=False)
 
@@ -1429,6 +1439,22 @@ def _pre_dispatch_failure(
     return failure
 
 
+def _enter_model_sender(reservation: AttemptReservation) -> None:
+    """Final SDK entry after accounting; SDK send/wait has no split wire ACK.
+
+    A claim never exempts this handoff. No await/preparation follows it before
+    sender entry, and no authority lock spans the opaque SDK's network wait.
+    """
+    from ouroboros.owner_pause import OwnerPauseRefused, launch_admission
+    from ouroboros.llm_attempt import _PhysicalSendNotStarted, require_physical_dispatch_window
+
+    try:
+        with launch_admission(reservation.scope or current_usage_scope()):
+            require_physical_dispatch_window()
+    except OwnerPauseRefused as exc:
+        raise _PhysicalSendNotStarted(str(exc)) from exc
+
+
 def execute_physical_attempt(
     request: AttemptRequest,
     send: Callable[[], Any],
@@ -1456,6 +1482,7 @@ def execute_physical_attempt(
             raise
         raise failure from exc
     try:
+        _enter_model_sender(reservation)
         response = send()
     except BaseException as exc:
         terminal_state = "dispatched"
@@ -1525,6 +1552,7 @@ async def execute_physical_attempt_async(
             raise
         raise failure from exc
     try:
+        _enter_model_sender(reservation)
         response = await send()
     except BaseException as exc:
         terminal_state = "dispatched"

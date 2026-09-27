@@ -829,7 +829,8 @@ def _await_as_sleep(ctx: ToolContext, mode: str, **chosen: Any) -> str:
         outcome = model_sleep.request_sleep(ctx, model_sleep.selectors(ctx, **chosen), mode)
     except (TypeError, ValueError) as exc:
         return _publish_tool_result(ctx, ToolResult(
-            status="error", code="TOOL_ARG_ERROR", text=f"⚠️ TOOL_ARG_ERROR (await_messages): {exc}"))
+            status="error", code="TOOL_ARG_ERROR", text=f"⚠️ TOOL_ARG_ERROR (await_messages): {exc}",
+            meta={"operation_outcome": "completed_no_effect"}))
     return json.dumps(outcome, ensure_ascii=False)
 
 

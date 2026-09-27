@@ -1,10 +1,7 @@
 """Caller-owned Claudexor model transport over physical-attempt accounting.
-One engine operation rejoins after lost control; bytes enter private CAS before ACK. The live ``ModelTurnState`` belongs to
-the caller, never stored assistant history: only a dispatched, durable result
-updates it, while unknown/no-start/legacy silence preserves it. Requests priced
-ahead of dispatch read the SAME slot; leaving this route clears it. The schema
-floor and native-continuation repair: ARCHITECTURE §6 "The live turn slot".
-No provider wait changes the task's deadline or Stop.
+One engine operation rejoins after lost control; private CAS precedes ACK.
+Only durable dispatched results update the caller's live turn slot; unknown/no-start/legacy outcomes preserve it.
+Pre-dispatch pricing reads that slot; route changes clear it. Deadlines/Stop stay unchanged (ARCHITECTURE §6).
 """
 
 from __future__ import annotations

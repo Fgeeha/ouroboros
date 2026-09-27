@@ -44,7 +44,7 @@ def _assignment_case(tmp_path, monkeypatch, task_id="assign-evo"):
     worker = SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=inbox)
     monkeypatch.setattr(workers, "WORKERS", {1: worker})
     monkeypatch.setattr(workers, "get_event_q", lambda: events)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": True)
     monkeypatch.setattr(evolution_lifecycle, "evolution_block_reason", lambda: "")
     return workers, task, tx, worker, inbox, events
 

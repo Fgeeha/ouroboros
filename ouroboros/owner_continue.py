@@ -63,7 +63,7 @@ TECHNICAL_REASON_CODES = frozenset({
     "provider_unavailable", "provider_failure", "llm_api_error", "provider_rejected_tool_dialect",
     "reaper_wedged_worker_alive", "round_limit", "execution_deadline", "absolute_ceiling",
     "task_exception", "workers_unavailable", "worker_pool_unavailable", "finalization_grace",
-    "idle_timeout",
+    "idle_timeout", "worker_crash_signal", "worker_crash_retry_exhausted",
 })
 # The loop's forced-finalization rails that are technical limits: an extracted
 # best-effort answer settles ``completed``, the host fallback ``failed``
@@ -455,10 +455,14 @@ def mark_claim_admitted(drive_root: Any, predecessor_task_id: str, nonce: str) -
 def continuation_offer(result: Dict[str, Any], task_id: str) -> Dict[str, Any]:
     """What a settled card may offer: Continue, or the successor it already has.
 
-    A claimed predecessor offers no second Continue: its card points to the
-    accepted successor (stale-card rule); new work goes through conversation.
+    A bound claim retries its exact stored action until admission is confirmed.
+    Only then does the card point to the successor; new work uses conversation.
     """
     claim = result.get("continued_by") if isinstance(result.get("continued_by"), dict) else {}
+    if claim.get("successor_task_id") and claim.get("state") == "bound":
+        return {"eligible": False, "refusal": "continuation_unconfirmed", "state": "bound",
+                "successor_task_id": str(claim["successor_task_id"]),
+                "action_nonce": str(claim.get("action_nonce") or "")}
     if claim.get("successor_task_id"):
         return {"eligible": False, "refusal": "already_continued",
                 "successor_task_id": str(claim["successor_task_id"]), "state": str(claim.get("state") or "")}

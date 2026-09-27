@@ -112,8 +112,8 @@ def test_an_explicit_stop_outranks_a_saved_pause_and_request_only_pause_is_inter
 
 def test_owner_restart_holds_the_never_started_queue_and_keeps_it_through_later_doors(tmp_path, monkeypatch):
     """Owner 7A: a never-started independent root keeps its id under a typed
-    Restart hold; a never-started child of an interrupted root and a retry of
-    work that already ran keep the ordinary cancellation. The lifespan
+    Restart hold; a never-started child remains held without adoption. A retry
+    of work that already ran keeps the ordinary cancellation. The lifespan
     teardown's second kill (no hold flag) and a stale-snapshot boot keep the
     held row; only an explicit Resume releases it — same id, still unstarted."""
     from ouroboros.task_results import (

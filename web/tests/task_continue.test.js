@@ -233,3 +233,18 @@ test('chat replays settled rows through the one seam, not a card-opening detail 
         chat.indexOf('function renderLiveCardMeta'));
     assert.match(summary, /syncSettledItems\(record, msg\);/);
 });
+
+
+test('bound history restores the server nonce after reload; its ID is not admission', async () => {
+    const reloaded = await import('../modules/task_continue.js?bound-reload');
+    const storage = memoryStorage();
+    const offer = { state: 'bound', eligible: false, successor_task_id: 'bound-successor', action_nonce: 'retained-nonce-123' };
+    assert.deepEqual(reloaded.continueOfferView({ continuation_offer: offer }),
+        { kind: 'retry', actionNonce: offer.action_nonce });
+    assert.deepEqual(reloaded.continueOfferView({ continuation_offer: { ...offer, action_nonce: '' } }), { kind: 'none' });
+    const seen = [];
+    const request = async (_id, nonce) => { seen.push(nonce); return { ok: true, successor_task_id: 'bound-successor' }; };
+    assert.equal(await reloaded.continueTaskAction('bound-root', { storage, request, toast() {}, actionNonce: offer.action_nonce }), 'bound-successor');
+    assert.deepEqual(seen, [offer.action_nonce]);
+    assert.equal(reloaded.continueNonce('bound-root', storage), offer.action_nonce);
+});

@@ -547,6 +547,8 @@ _TRUNCATION_DECISIONS: dict[str, tuple[bool, str]] = {
     "artifact_identity_changed": (False, "gateway/task_archive.py: a mutable file's bytes no longer match its recorded identity; HTTP 409, not a task terminal"),
     "artifact_name_ambiguous": (False, "gateway/tasks.py: ambiguous nested basename; HTTP refusal, not a task terminal"),
     "artifact_relpath_invalid": (False, "gateway/tasks.py: invalid exact artifact selector; HTTP refusal, not a task terminal"),
+    "invalid_action_nonce": (False, "task_cancel rejects malformed action identity; no task transition"),
+    "stop_action_conflict": (False, "task_cancel refuses conflicting action replay; no task transition"),
     "artifact_unavailable": (False, "gateway/task_archive.py: confined single-file read unavailable; HTTP refusal, not a task terminal"),
     "artifact_unverified": (False, "gateway/task_archive.py: single-file drift or capture verification failure; HTTP refusal, not a task terminal"),
     "history_source_unavailable": (False, "gateway/history_paging.py: readable recent projection with explicit source gap; no task attempt was truncated"),

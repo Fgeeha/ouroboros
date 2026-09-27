@@ -316,6 +316,7 @@ def inspection_registry(root: str, drive_root: Any, task_id: str = "") -> tuple[
         repo_dir=_pathlib.Path(root),
         drive_root=_pathlib.Path(drive_root),
         task_id=str(task_id or "") or None,
+        task_lifecycle_bound=False,  # a standalone inspection episode is an operation
         task_constraint={"mode": "local_readonly_subagent"},
         task_contract={
             "allowed_resources": {"network": False, "web": False},
@@ -324,6 +325,15 @@ def inspection_registry(root: str, drive_root: Any, task_id: str = "") -> tuple[
             ),
         },
     )
+    from ouroboros.usage_accounting import current_usage_scope
+    scope = current_usage_scope()
+    if scope is not None and scope.task_id and not scope.non_task_operation:
+        # A paid review under a task keeps that task's canonical tree controls;
+        # its scratch drive and reviewer label cannot supply Pause authority.
+        ctx.task_id = scope.task_id
+        ctx.task_metadata = {"root_task_id": scope.root_task_id or scope.task_id,
+                             "budget_drive_root": str(scope.drive_root or drive_root)}
+        ctx.task_lifecycle_bound = True
     registry.set_context(ctx)
     schemas = [schema for schema in (registry.get_schema_by_name(name) for name in _INSPECTION_TOOL_NAMES) if schema]
     if not any(s["function"]["name"] == "compact_context" for s in schemas):

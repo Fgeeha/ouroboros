@@ -77,7 +77,7 @@ def physical_attempt_headroom() -> Optional[int]:
     return None if state is None else max(0, state.maximum - state.used)
 
 
-def require_physical_dispatch_window(*, owner_pause_claimed: bool = False) -> Optional[float]:
+def require_physical_dispatch_window() -> Optional[float]:
     """The model family's launch handoff: the reservation row already exists.
 
     Checked immediately before the request bytes: task controls, an owner
@@ -89,9 +89,7 @@ def require_physical_dispatch_window(*, owner_pause_claimed: bool = False) -> Op
 
     owner = current_model_wait()
     reason = owner.control_reason() if owner is not None else None
-    if owner_pause_claimed and reason == RAIL_OWNER_PAUSE:
-        reason = None
-    if not reason and not owner_pause_claimed and scope_fence():
+    if not reason and scope_fence():
         reason = RAIL_OWNER_PAUSE
     if reason:
         raise _PhysicalSendNotStarted(reason)
@@ -657,7 +655,7 @@ def _deadline_checked_send(send: Any, before_dispatch: Any):
         return manifest
 
     def dispatch():
-        require_physical_dispatch_window(owner_pause_claimed=True)
+        require_physical_dispatch_window()
         return send()
 
     return dispatch, prepare

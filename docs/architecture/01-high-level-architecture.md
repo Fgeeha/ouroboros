@@ -35,7 +35,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   └── modules/widgets.js + widget_module.js + widget_frame.js + widget_card.js + widget_reorder.js + widget_chart.js + widget_list.js + masonry.js ← Widgets page host (`mountTab`, card registry, declarative renderer); the two framed mounts (extension-route iframe; module `srcdoc` iframe with its CSP/sandbox constants, bridge and disposer); the child-side module bootstrap; framed card chrome (launch policy incl. `retain`, Start/Stop); reorder handles; chart/table helpers; the list-request seam — `requestWidgetListPayload`/`requestWidgetCards` and the `widgetListRequests()` controller: one `AbortController` and the shared `WIDGET_REQUEST_TIMEOUT_MS` deadline over the list AND preferences reads, sibling abort on failure, disposal abort, typed timeout error for the existing Retry — plus the pure list helpers (change signatures, keyed patch plan); the masonry that writes only `--masonry-*` properties (§3 Skills and Widgets)
   │
   ├── supervisor/              ← Background thread inside server.py (§5)
-  │   ├── active_activity.py   ← Process-local owner of in-flight native chat actors (`DirectActivityRegistry`): private handles for controls and the writer drain, public snapshots for `/api/state` `active_direct_turns` and WS typing frames; no queue records (§3 Direct turns and the activity block)
+  │   ├── active_activity.py   ← process-local owner of in-flight native chat actors (`DirectActivityRegistry`): private handles for controls and the writer drain, public snapshots for `/api/state` `active_direct_turns` and WS typing frames; no queue records (§3 Direct turns and the activity block)
   │   ├── message_bus.py       ← Queue-based local message bus (Web UI + reviewed transport skills)
   │   ├── workers.py           ← Multiprocessing worker pool (forkserver on Linux, spawn on macOS/Windows; never fork from the multi-threaded supervisor)
   │   ├── worker_assignment.py, worker_chat_lane.py, worker_health.py, worker_pool_lifecycle.py, worker_process.py, worker_promotion.py ← The pool's leaves: assignment and its refusals; the direct chat lane (restart resume; admission during a managed update — DEVELOPMENT "Managed Update Rule"); health-owned crash detection and terminal-file recovery; pool lifecycle and `kill_worker_tree`, the ONE worker tree-kill (daemon roots always spared); the worker child process; promotion of a chat turn or project scope into a queued task (single refusal writer `_persist_promote_rejection`) (§5; §6 Owner routing verbs)
@@ -159,7 +159,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── _usage_rows_memo.py  ← Shared strict generation: sparse validation, finals, root/group cash, fold times; cold parse/render outside lock, detached public rows, display-only stale reads
       ├── _usage_money.py      ← Precision-60 Decimal cash; six-place half-even admission; raw literals retained
       ├── _usage_wait.py       ← Owned pre-send lock slices and joined async bridge; existing controls/custody
-      ├── _usage_cache_splits.py ← Process-local cache split by task/provider/route/review; a missing entry prices full cache write (§6)
+      ├── _usage_cache_splits.py ← process-local cache split by task/provider/route/review; a missing entry prices full cache write (§6)
       ├── skill_review_usage.py ← Read-only final-row projection for `(review_skill, review_wave_id)`; no second ledger (§6)
       ├── usage_ledger.py      ← Money lock, append/fsync, validation and tail quarantine; imported by accounting (§6)
       ├── usage_compaction.py, usage_legacy_import.py ← Seq-preserving ledger compaction and one-time legacy import (§6 Budget tracking; docs/USAGE_COMPACTION.md)
@@ -249,7 +249,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── delegate_continuation.py ← Custody-gated continuation of disposed finite-timeout leaves; no crash recovery (§6 Delegated subagents)
       ├── delegate_registration_policy.py, delegate_readonly_inputs.py ← Readonly lineage inputs; `persistent_registration` + the STARTED-row field tables
       ├── delegate_pending.py  ← Durable pending-invocation replay preserving the original idempotency key + canonical start body
-      ├── delegate_custody_memo.py  ← Process-local `custody_rows` memo over the ordered rotated-log fingerprint; appended-byte folds, exact fallback on doubt, no unreadable-chain cache; legacy bodies use `delegate_pending.request_body` (§6 Delegated subagents)
+      ├── delegate_custody_memo.py  ← process-local `custody_rows` memo over the ordered rotated-log fingerprint; appended-byte folds, exact fallback on doubt, no unreadable-chain cache; legacy bodies use `delegate_pending.request_body` (§6 Delegated subagents)
       ├── delegate_terminal.py ← Terminal reconciliation + custody-audit persistence: counters stay a frozen snapshot while `actual_substrate` and the envelope mirror follow live custody; audit-only in both directions; the typed `terminal_custody_notice` card row; `refresh_recently_settled_terminals` over the byte-offset cursor `state/delegate_terminal_refresh_cursor.json` (5 MB per tick) (§6 Delegated subagents)
       ├── subagent_dispatch_notes.py ← Dispatch-time executor notes for delegated children (configured-nanny charter note); agent.py keeps re-exports
       ├── subagent_messages.py ← Bounded durable child-message identity shared by the final frame, recovery, persistence and replay; `executor_observation_meta` validates task-bound progress actor facts
@@ -407,7 +407,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       │   ├── settings.py      ← /api/settings + /api/owner/*; `GET /api/reviewer-slots` with row limits (triad 10 / scope 4 / advisory 1 / deep_review 1) and typed `config_error`, never a 500; the deep self-review singleton rides the response (saved, or labeled `synthesized_from`), beside a `config_error` only as a repair placeholder, never an effective row
       │   ├── presence_settings.py ← Owner-facing runtime overrides and working-folder selection for reviewed Presence behavior skills
       │   ├── control.py       ← /api/reset, /api/command, /api/git/*, /api/update/*, /api/evolution-data HTTP handlers
-      │   ├── update_progress.py ← Process-local stages owned by the synchronous update executor; status projection and WS invalidation, never recovery authority
+      │   ├── update_progress.py ← process-local stages owned by the synchronous update executor; status projection and WS invalidation, never recovery authority
       │   ├── schedules.py     ← Cron schedule HTTP surface
       │   ├── files.py         ← File Browser + chat upload
       │   ├── ui_preferences.py ← `state/ui_preferences.json`: widget order, per-card start-mode overrides (`widget_start_mode`, values from `extension_ui_validation.WIDGET_START_MODES`), nested subagent expansion

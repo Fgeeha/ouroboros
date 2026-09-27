@@ -355,6 +355,12 @@ TOOL_CODE_SPECS: Mapping[str, ToolCodeSpec] = MappingProxyType(
         # The owner paused the tree before this call's launch handoff
         # (ouroboros/owner_pause.py): nothing ran — distinct from a timeout or an
         # interrupted call whose execution is unknown.
+        "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": _code_spec(
+            "unavailable", "unavailable", "warning", "retry when launch authority is available",
+        ),
+        "STOP_ACTION_CONFLICT": _code_spec(
+            "blocked", "blocked", "warning", "retry the original Stop action unchanged",
+        ),
         "OWNER_PAUSE_NOT_STARTED": _code_spec(
             "blocked",
             "blocked",
@@ -513,7 +519,8 @@ class ToolResult:
 
     Additive producer fact: ``meta.operation_outcome="completed_no_effect"``
     proves this invocation completed without effects, even if the requested
-    read failed. The registry consumes it only from a returned first-party
+    read failed; ``completed`` attests a foreground process exit, including
+    nonzero. Neither settles independent child/process custody. The registry consumes it only from a returned first-party
     body, never from dynamic/remote receipts or an escaping exception. It
     settles only that tool handoff; process, money and delegated custody remain
     separate. Missing/unknown values keep the existing conservative semantics.
@@ -663,6 +670,28 @@ def completed_local_read(handler):
     return read
 
 
+def launch_refusal_result(reason: str, *, completed_no_effect: bool = False) -> ToolResult:
+    """An unsent operation; only its producer can attest completed preparation."""
+    from ouroboros.owner_pause import NOT_STARTED_TEXT
+
+    unavailable = reason == "owner_launch_authority_unavailable"
+    code = "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE" if unavailable else "OWNER_PAUSE_NOT_STARTED"
+    if unavailable:
+        text = ("⚠️ OWNER_LAUNCH_AUTHORITY_UNAVAILABLE: NOT STARTED — launch authority is temporarily "
+                "unavailable. Nothing was submitted; retry when authority is available.")
+    elif reason in {"owner_pause_authority_unreadable", "model_sleep_authority_unreadable"}:
+        text = ("⚠️ OWNER_PAUSE_NOT_STARTED: NOT STARTED — pause/sleep authority could not be read. "
+                "Nothing was submitted; repair the authority before retrying.")
+    elif reason == "operation_already_returned":
+        text = "⚠️ OWNER_PAUSE_NOT_STARTED: NOT STARTED — this operation has ended; it cannot submit more work."
+    else:
+        text = NOT_STARTED_TEXT
+    return ToolResult(status="unavailable" if unavailable else "blocked", code=code,
+                      text=f"{text} ({reason})", meta={"owner_pause_not_started": True,
+                      "control_reason": reason, **({"operation_outcome": "completed_no_effect"}
+                                                   if completed_no_effect else {})})
+
+
 def _publish_process_result(
     ctx: Any,
     code: str,
@@ -679,6 +708,7 @@ def _publish_process_result(
     facts = dict(meta or {})
     if exit_code is not None:
         facts["exit_code"] = int(exit_code)
+        facts["operation_outcome"] = "completed"
         if int(exit_code) < 0 and not signal_name:
             signal_name = posix_signal_name(abs(int(exit_code)))
     if signal_name:
@@ -743,6 +773,8 @@ _EXACT_IDENTIFIER_CODES = MappingProxyType(
         "ROOT_REQUIRED_ACTIVE_WORKSPACE": "ROOT_REQUIRED_ACTIVE_WORKSPACE",
         "USER_FILES_PATH_BLOCKED": "USER_FILES_PATH_BLOCKED",
         "OWNER_PAUSE_NOT_STARTED": "OWNER_PAUSE_NOT_STARTED",
+        "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE": "OWNER_LAUNCH_AUTHORITY_UNAVAILABLE",
+        "STOP_ACTION_CONFLICT": "STOP_ACTION_CONFLICT",
         "COGNITIVE_TOOL_REQUIRED": "COGNITIVE_TOOL_REQUIRED",
         "RESOURCE_CONSTRAINT_BLOCKED": "RESOURCE_CONSTRAINT_BLOCKED",
         "RESOURCE_POLICY_BLOCKED": "RESOURCE_POLICY_BLOCKED",

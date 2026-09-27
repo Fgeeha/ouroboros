@@ -50,12 +50,13 @@ class ModelWaitInterrupted(RuntimeError):
                     setattr(self, name, getattr(cause, name))
 
 
-def propagate_model_control(error: Exception) -> None:
+def propagate_model_control(error: Exception, *, role: str = "") -> None:
     """One typed host interruption, whether raised by the live wait or transport."""
     if isinstance(error, ModelWaitInterrupted):
         raise error
     if getattr(error, "code", "") == "model_operation_interrupted" and getattr(error, "control_reason", ""):
-        raise ModelWaitInterrupted(error.control_reason, role=getattr(error, "model_role", ""), cause=error) from error
+        raise ModelWaitInterrupted(error.control_reason, role=getattr(error, "model_role", "") or role,
+                                   cause=error) from error
 
 
 def model_wait_reason(error: Exception) -> str:
@@ -263,6 +264,8 @@ def mutate_wait(root: Any, task_id: str, wait_id: str, transform: Callable) -> d
 
     def update(current):
         require_writable_task_result_schema(current)
+        if not current.get("status") or current.get("task_id") != task_id:
+            raise ValueError("model wait requires its lifecycle owner's task result")
         waits = current.get("model_waits", {})
         if not isinstance(waits, dict):
             raise ValueError("model_waits projection is malformed")
@@ -297,6 +300,9 @@ class TaskModelWait:
     def __init__(self, *, task: dict, drive_root: Any, event_queue: Any,
                  worker_slot_held: bool, row_mutator: Callable | None = None,
                  rows_reader: Callable | None = None, owner_control: Callable | None = None):
+        from ouroboros.platform_layer import process_start_time
+        import os
+
         self.task = task
         self.drive_root = drive_root
         metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
@@ -310,6 +316,9 @@ class TaskModelWait:
         self.tool_context = None
         self.lock = threading.RLock()
         self.closed = False
+        self.answer_consumer_id = uuid.uuid4().hex
+        self.answer_consumer_bound = False
+        self.answer_owner_birth = process_start_time(os.getpid())  # outside the dispatch/launch locks
         self.overrides: dict[str, dict] = {}
         self.waits: dict[str, dict] = {}
         self.clocks: dict[str, _QuotaClock] = {"": _QuotaClock()}
@@ -726,9 +735,48 @@ class TaskModelWait:
             row.update(state="resolved", resolution=resolution)
             self._publish(row, applied_request_id=request_id)
 
+    def bind_answer_consumer(self) -> dict:
+        """Bind this local receiver before dispatch; birth absence grants no death recovery."""
+        with self.lock:
+            if self.closed:
+                from ouroboros.llm_attempt import _PhysicalSendNotStarted
+                raise _PhysicalSendNotStarted("cancelled")
+            self.answer_consumer_bound = True
+            return {"local_answer_consumer_id": self.answer_consumer_id,
+                    "local_answer_task_attempt": self.attempt,
+                    "local_answer_owner_birth": self.answer_owner_birth}
+
     def close(self) -> None:
         with self.lock:
             self.closed = True
+            if not self.answer_consumer_bound:
+                return
+        # Positive retirement of THIS consumer, not terminal task status, PID
+        # absence or the pool's current assignment. Cash and remote custody stay.
+        try:
+            retire_model_consumers(self.canonical_root, self.task_id, {self.answer_consumer_id: self.attempt})
+        except Exception:
+            import logging
+            logging.getLogger(__name__).warning("Model consumer retirement could not persist for %s", self.task_id,
+                                                exc_info=True)
+
+
+def retire_model_consumers(root: Any, task_id: str, consumers: dict[str, int]) -> None:
+    """Positive receiver retirement, from scope exit or exact confirmed-worker death.
+
+    This existing result projection releases only local answer-writing custody.
+    It changes no usage row, external process or delegated-run obligation.
+    """
+    from ouroboros.task_results import require_writable_task_result_schema, stamp_task_result_schema, task_result_path
+    def retire(current):
+        require_writable_task_result_schema(current)
+        if not current.get("status") or current.get("task_id") != task_id:
+            raise ValueError("model consumer retirement requires its task result")
+        retired = dict(current.get("retired_model_consumers") or {})
+        for consumer, attempt in consumers.items():
+            retired[consumer] = {"task_attempt": attempt, "retired_at": utc_now_iso()}
+        return stamp_task_result_schema({**current, "retired_model_consumers": retired})
+    update_json_locked(task_result_path(pathlib.Path(root), task_id), retire, strict_existing_dict=True)
 
 
 @contextlib.contextmanager

@@ -314,17 +314,25 @@ def _execute_local(
     if _panic_requested:
         raise RuntimeError("Emergency Stop has retired executor admission")
     started = time.monotonic()
-    proc = subprocess.Popen(
-        [str(part) for part in cmd],
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        stdin=subprocess.DEVNULL,
-        text=True,
-        errors="replace",
-        env=overlay_env(overlay_env(scrub_repo_from_pythonpath(_env_with_overlay(None), _system_repo_dir()), target_env), env_overlay),
-        **subprocess_new_group_kwargs(),
-    )
+    from ouroboros.owner_pause import operation_start
+
+    process_env = overlay_env(overlay_env(scrub_repo_from_pythonpath(_env_with_overlay(None), _system_repo_dir()), target_env), env_overlay)
+    with operation_start():
+        try:
+            proc = subprocess.Popen(
+                [str(part) for part in cmd],
+                cwd=str(cwd),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                errors="replace",
+                env=process_env,
+                **subprocess_new_group_kwargs(),
+            )
+        except (OSError, ValueError) as exc:
+            exc.process_not_started = True
+            raise
     _FOREGROUND[proc] = (None, executor.kind)
     if _panic_requested:
         request_process_tree_kill(proc)
@@ -401,16 +409,23 @@ def _execute_docker(
         wrapper,
     ]
     started = time.monotonic()
-    proc = subprocess.Popen(
-        docker_cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        errors="replace",
-        stdin=subprocess.DEVNULL,
-        **({"env": {**os.environ, **{aliases[key]: value for key, value in target_env.items()}}} if target_env else {}),
-        **subprocess_new_group_kwargs(),
-    )
+    from ouroboros.owner_pause import operation_start
+
+    with operation_start():
+        try:
+            proc = subprocess.Popen(
+                docker_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                errors="replace",
+                stdin=subprocess.DEVNULL,
+                **({"env": {**os.environ, **{aliases[key]: value for key, value in target_env.items()}}} if target_env else {}),
+                **subprocess_new_group_kwargs(),
+            )
+        except (OSError, ValueError) as exc:
+            exc.process_not_started = True
+            raise
     _FOREGROUND[proc] = (None, executor.kind)
     if _panic_requested:
         request_process_tree_kill(proc)
@@ -938,24 +953,17 @@ def start_service(
             if _panic_requested:
                 raise RuntimeError(f"Emergency Stop during service spawn: {request_process_tree_kill(proc)}")
 
-        proc = spawn_supervised(
-            record.cmd,
-            drive_root=pathlib.Path(getattr(ctx, "drive_root")),
-            purpose=f"workspace_service:{name}",
-            scope="session" if record.keep_alive else "task",
-            owner_task_id=record.task_id,
-            on_spawn=publish_process,
-            cwd=str(host_cwd),
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            # The LOCAL executor is still this host: the attested emergency
-            # bundled-node PATH prepend applies here exactly as on the plain
-            # host lane (adversarial finding A-F2); the docker branch takes no
-            # overlay by design (host paths must not leak into the backend).
-            env=overlay_env(overlay_env(_executor_service_env(), env_overlay), env),
-        )
-        log_fh.close()
+        try:
+            spawn_supervised(
+                record.cmd, drive_root=pathlib.Path(getattr(ctx, "drive_root")),
+                purpose=f"workspace_service:{name}", scope="session" if record.keep_alive else "task",
+                owner_task_id=record.task_id, on_spawn=publish_process, cwd=str(host_cwd),
+                stdout=log_fh, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                # Host interpreter overlay applies only to the local executor.
+                env=overlay_env(overlay_env(_executor_service_env(), env_overlay), env),
+            )
+        finally:
+            log_fh.close()
     else:
         if executor.network == "none":
             _assert_docker_network_none(executor.container_name)
@@ -963,7 +971,7 @@ def start_service(
         prefix = f"OUROBOROS_SERVICE_ENV_{uuid.uuid4().hex}_"
         aliases = {key: f"{prefix}{index}" for index, key in enumerate(env)}
         shell = _docker_service_start_shell(record, log_path, aliases)
-        proc = subprocess.run(
+        proc = _submit_service_command(
             ["docker", "exec", *[part for alias in aliases.values() for part in ("--env", alias)],
              executor.container_name, "sh", "-lc", shell],
             # Target PATH/DOCKER_HOST/LD_PRELOAD must not reconfigure the host
@@ -972,7 +980,6 @@ def start_service(
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=20,
         )
         if proc.returncode != 0:
             raise RuntimeError(_service_diagnostic(
@@ -985,6 +992,22 @@ def start_service(
     record.durable_record_path = _register_service_process(_drive_root_from_ctx(ctx), record)
     _wait_readiness(record, readiness)
     return _service_payload(record)
+
+
+def _submit_service_command(cmd: list[str], **kwargs) -> subprocess.CompletedProcess:
+    """Start the Docker CLI under the Pause gate; wait outside it."""
+    from ouroboros.owner_pause import operation_start
+
+    with operation_start():
+        proc = subprocess.Popen(cmd, **kwargs)
+    try:
+        stdout, stderr = proc.communicate(timeout=20)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.communicate()
+        # Backend effects are unknown; the registry must keep its handoff.
+        raise
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
 
 
 def service_status(ctx: Any, name: str) -> dict[str, Any] | None:

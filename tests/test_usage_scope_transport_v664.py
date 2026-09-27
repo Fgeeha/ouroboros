@@ -57,6 +57,10 @@ def test_generic_llm_attempt_keeps_semantic_scope_source(tmp_path, monkeypatch):
     from ouroboros.usage_accounting import UsageScope, release_attempt, reserve_attempt, usage_scope
 
     monkeypatch.setenv("TOTAL_BUDGET", "10")
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, 'root-task', 'running', billing_group={
+        'billing_group_id': 'root-task', 'billing_group_limit_usd': None,
+        'billing_group_limit_source': 'initial_task_admission', 'billing_group_limit_revision': 'fixture'})
     semantic = UsageScope(
         drive_root=tmp_path,
         task_id="review-task",

@@ -104,3 +104,7 @@ test('task_start_settings_reload_failed renders a visible warning row in chat', 
     assert.match(view.headline, /Settings reload failed/);
     assert.match(view.body, /previously applied configuration/);
 });
+
+test('a per-task unknown pause is disclosed even in a returned census array', () => {
+    assert.match(restartConfirmBody([{ phase: 'unknown' }]), /Pause status could not be read/);
+});

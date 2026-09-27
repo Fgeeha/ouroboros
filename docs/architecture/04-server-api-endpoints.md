@@ -88,8 +88,8 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | GET | `/api/tasks/{task_id}/artifacts/{name}` | `gateway.tasks.api_task_artifact` (the task's own stores via `task_archive`: a bare name is a top-level file, `?relpath=` a nested one, `?archive=<dir>` a directory ZIP; the detail's `artifact_archives` says what each ZIP holds. A row that records a digest is served only when its bytes still match it — a changed mutable file is 409 `artifact_identity_changed` naming the recorded digest, a failed capture 404 `artifact_unverified` — and the response says `x-ouroboros-artifact-identity: verified` or `unmeasured`; a ZIP member follows the same rule. Windows ordinary file/chat-media/ZIP downloads return HTTP 503 pending confined opens (issue #1297); bound `?source=` review downloads remain available) |
 | POST | `/api/tasks/{task_id}/cancel` | `gateway.tasks.api_task_cancel` |
 | POST | `/api/tasks/{task_id}/hurry` | `gateway.tasks.api_task_hurry` |
-| POST | `/api/tasks/{task_id}/pause` | `gateway.task_pause.api_task_pause` — owner Pause of a root's whole tree (text-free `{request_id}`; §6 Owner Pause) |
-| POST | `/api/tasks/{task_id}/continue` | `gateway.task_continue.api_task_continue` — owner Continue of an interrupted root as a NEW root (`{action_nonce}`; replay-first, typed refusals; §6 Owner Continue). `GET /api/tasks/{task_id}` projects `continuation_offer` |
+| POST | `/api/tasks/{task_id}/pause` | `gateway.task_pause.api_task_pause`: text-free `TaskPauseRequest` `{request_id}`; `TaskPauseResponse.state`: requested=Pausing, paused=settled (§6) |
+| POST | `/api/tasks/{task_id}/continue` | `gateway.task_continue.api_task_continue`: `TaskContinueRequest` `{action_nonce}` / `TaskContinueResponse`. Detail/history `ContinuationOffer`: bound carries retry nonce; admitted confirms successor (§6) |
 | POST | `/api/tasks/{task_id}/resume` | `gateway.tasks.api_task_resume` |
 | POST | `/api/decisions` | `gateway.tasks.api_decision_answer` |
 | GET | `/api/schedules` | `gateway.schedules.api_schedules_list` |

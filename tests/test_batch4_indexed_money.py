@@ -81,6 +81,8 @@ def test_group_hot_writers_and_off_context_binding_never_scan_history(root, monk
 @pytest.mark.parametrize("axis", ["root", "group", "global"])
 @pytest.mark.parametrize("asynchronous", [False, True])
 def test_pre_send_wait_revalidates_late_charge_on_each_axis(root, short_acquisitions, monkeypatch, axis, asynchronous):
+    from ouroboros.task_results import write_task_result
+    write_task_result(root, 'successor', 'running', root_task_id='successor')
     scope = group_scope(root, cap=2 if axis == "group" else 20, root_cap=2 if axis == "root" else 20)
     other_root = "successor" if axis == "root" else "original" if axis == "group" else "foreign"
     other_scope = group_scope(root, task=other_root, root_id=other_root, cap=scope.billing_group_limit_usd)
@@ -133,6 +135,19 @@ def test_actual_pause_installs_during_money_wait_after_capture_without_blocking(
     _running(root, workers, "successor")
     scope = group_scope(root, task="successor")
     pause_ack, errors, sent, prepared = [], [], [], []
+    pause_threads = []
+    # The 25 ms acquisition fixture exercises the PRE-SEND wait. Explicitly
+    # finish its lock holder before cleanup; scheduler timing must not decide
+    # whether this test instead exercises the bounded failed-release case.
+    lock_owner = contextlib.ExitStack()
+    release_attempt = ua.release_attempt
+    def release_after_pause(*args, **kwargs):
+        for thread in pause_threads:
+            thread.join(3)
+            assert not thread.is_alive()
+        lock_owner.close()
+        return release_attempt(*args, **kwargs)
+    monkeypatch.setattr(ua, 'release_attempt', release_after_pause)
     captured = threading.Event()
     original_capture = ua._record_attempt_capture
     def capture(*a, **kw):
@@ -142,12 +157,13 @@ def test_actual_pause_installs_during_money_wait_after_capture_without_blocking(
         return result
     monkeypatch.setattr(ua, "_record_attempt_capture", capture)
     with contextlib.ExitStack() as stack:
+        stack.callback(lock_owner.close)
         stack.enter_context(ua.usage_scope(scope))
         stack.enter_context(owner(root, task={"id": "successor", "root_task_id": "successor"}))
         stack.enter_context(ua.physical_attempt_limit(1))
         def before(held):
             prepared.append(held)
-            release = stack.enter_context(held_lock(root))
+            release = lock_owner.enter_context(held_lock(root))
             def pause():
                 try:
                     assert captured.wait(2)
@@ -158,6 +174,7 @@ def test_actual_pause_installs_during_money_wait_after_capture_without_blocking(
                 finally:
                     release.set()
             thread = threading.Thread(target=pause)
+            pause_threads.append(thread)
             thread.start()
             stack.callback(thread.join, 3)
         req = request(root, task_id="successor", root_task_id="successor")

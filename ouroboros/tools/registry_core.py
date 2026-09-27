@@ -1102,7 +1102,7 @@ class ToolRegistry:
                 self._invalidate_advisory_if_worktree_changed(name, worktree_before)
 
     def _execute_legacy_text(self, name: str, args: Dict[str, Any]) -> str | ToolResult:
-        from ouroboros.owner_pause import OwnerPauseRefused, NOT_STARTED_TEXT, tool_handoff
+        from ouroboros.owner_pause import OwnerPauseRefused, tool_handoff
 
         try:
             with tool_handoff(self._ctx, str(name or "")) as handoff:
@@ -1116,20 +1116,14 @@ class ToolRegistry:
                 # prove neither settlement nor the absence of remote effects.
                 handoff["settled"] = (
                     handoff.get("builtin_returned") is True and not typed.meta.get("dynamic_provider")
-                    and (typed.meta.get("operation_outcome") == "completed_no_effect" or (
+                    and (typed.meta.get("operation_outcome") in {"completed", "completed_no_effect"} or (
                         typed.status == "ok"
                         and typed.code not in {"LEGACY_UNTYPED", "LEGACY_WARNING", "GIT_ERROR"})))
                 return typed
         except OwnerPauseRefused as exc:
-            reason = str(exc)
-            authority = "model sleep" if reason == "model_sleep_authority_unreadable" else "owner Pause"
-            text = (f"⚠️ OWNER_PAUSE_NOT_STARTED: NOT STARTED — {authority} authority could not be read. "
-                    "Nothing ran; repair the authority before retrying."
-                    if reason in {"owner_pause_authority_unreadable", "model_sleep_authority_unreadable"}
-                    else NOT_STARTED_TEXT)
-            return ToolResult(status="blocked", code="OWNER_PAUSE_NOT_STARTED",
-                              text=f"{text} ({reason})",
-                              meta={"owner_pause_not_started": True, "control_reason": reason})
+            from ouroboros.tools.tool_result import launch_refusal_result
+
+            return launch_refusal_result(str(exc))
 
     def _execute_admitted_text(self, name: str, args: Dict[str, Any],
                                handoff: Optional[Dict[str, Any]] = None) -> str | ToolResult:

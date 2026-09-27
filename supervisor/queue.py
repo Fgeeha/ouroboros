@@ -306,7 +306,7 @@ def enqueue_task(
             limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
             binding = task_billing_fields(t, task_id, limit if limit > 0 else None,
                                           t.get("budget_drive_root") or DRIVE_ROOT, pin_initial=True,
-                                          persist_initial=not bool((t.get("metadata") or {}).get("schedule_occurrence")))
+                                          persist_initial=False)
             if str(binding["billing_group_id"]).startswith(UNAVAILABLE_GROUP_PREFIX):
                 t["_admission_blocked"] = "billing_authority_unavailable"
                 return t
@@ -344,6 +344,46 @@ def enqueue_task(
         if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
             ADMISSION_RESERVATIONS.pop(task_id, None)
     return t
+
+
+def ensure_control_task_result(task_id: str) -> Dict[str, Any]:
+    """Seed absent pooled lifecycle authority for a control, never from an ID alone.
+
+    Queue membership owns the facts for every admission producer (review,
+    evolution, assisted update and restore included). Keep the lock through
+    create-only publication; a concurrent worker/terminal writer wins unchanged.
+    Billing and direct-chat operations never create lifecycle rows here.
+    """
+    from ouroboros.task_results import load_task_result, resolve_task_lineage, write_task_result
+
+    with _queue_lock:
+        meta = RUNNING.get(task_id)
+        task = meta.get("task") if isinstance(meta, dict) else None
+        status = "running" if isinstance(task, dict) else "scheduled"
+        if not isinstance(task, dict):
+            task = next((row for row in PENDING if row.get("id") == task_id), None)
+        if not isinstance(task, dict) or task.get("id") != task_id or task.get("_admission_blocked"):
+            raise ValueError("control requires an admitted pooled task")
+        root = pathlib.Path(task.get("budget_drive_root") or DRIVE_ROOT)
+        existing = load_task_result(root, task_id, strict=True)
+        if existing is not None:
+            return existing
+        fields = {key: task[key] for key in (
+            "type", "chat_id", "metadata", "task_contract", "root_task_id", "parent_task_id",
+            "delegation_role", "project_id", "workspace_root", "workspace_mode", "memory_mode",
+            "budget_drive_root", "_attempt", "queued_at", "admitted_dispatch", "_admission_owner_token",
+            "origin_message_text", "origin_message_ref", "objective", "title", "suggested_name",
+            "original_task_id", "timeout_retry_from", "deadline_at", "root_cost_ceiling_usd",
+            "billing_group", "task_constraint", "objective_author", "owner_corpus", "task_group_id", "task_group",
+        ) if key in task}
+        fields["root_task_id"] = resolve_task_lineage(task_id, **{
+            key: task.get(key) for key in ("metadata", "root_task_id", "parent_task_id", "delegation_role",
+                                          "original_task_id", "timeout_retry_from")})["root_task_id"]
+        fields["description"] = task.get("description") or task.get("text") or ""
+        if status == "running":
+            fields.update(_attempt=meta.get("attempt") or task.get("_attempt") or 1,
+                          started_at=meta.get("started_at"))
+        return write_task_result(root, task_id, status, create_only=True, strict_existing_dict=True, **fields)
 
 
 def live_consciousness_root_count() -> int:

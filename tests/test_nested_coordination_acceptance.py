@@ -394,7 +394,7 @@ def test_depth3_control_plane_reaches_root_acceptance(tmp_path, monkeypatch):
     monkeypatch.setattr(
         queue_module,
         "persist_queue_snapshot",
-        lambda reason="": None,
+        lambda reason="": True,
     )
     monkeypatch.setattr(queue_module, "BUDGET_ROOT_FENCES", {})
 
@@ -802,7 +802,7 @@ def test_depth3_waits_for_worker_slot_then_uses_active_cap_reservation(
     monkeypatch.setattr(queue_module, "RUNNING", running)
     monkeypatch.setattr(queue_module, "BUDGET_ROOT_FENCES", {})
     monkeypatch.setattr(
-        queue_module, "persist_queue_snapshot", lambda reason="": None,
+        queue_module, "persist_queue_snapshot", lambda reason="": True,
     )
 
     # Saturation preserves attempted-but-not-achieved evidence.

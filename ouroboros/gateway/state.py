@@ -337,9 +337,9 @@ def _managed_task_finalizing(drive_root: Any, task_id: str) -> bool:
     return bool(_task_activity_facts(drive_root, task_id).get("finalizing"))
 
 
-def _managed_task_budget_pausing(drive_root: Any, row: Dict[str, Any], task_id: str) -> bool:
+def _managed_task_budget_pausing(drive_root: Any, row: Dict[str, Any], task_id: str) -> bool | None:
     """A RUNNING task writing its exact budget pause (#1196): the durable
-    ``budget_pause`` row is the only truth of that window; never raises."""
+    ``budget_pause`` row is the only truth of that window; None means unreadable."""
     try:
         from ouroboros.budget_pause import STATE_PAUSING, budget_pause_row
 
@@ -353,11 +353,12 @@ def _managed_task_budget_pausing(drive_root: Any, row: Dict[str, Any], task_id: 
 
         from ouroboros.owner_pause import member_fence
 
-        return bool(member_fence(SimpleNamespace(
+        state = member_fence(SimpleNamespace(
             task_id=task_id, root_task_id=str(row.get("root_task_id") or task_id),
-            budget_drive_root=str(row.get("budget_drive_root") or drive_root))).get("fence_id"))
+            budget_drive_root=str(row.get("budget_drive_root") or drive_root))).get("state")
+        return None if state == "unknown" else state == "requested"
     except Exception:
-        return False
+        return None
 
 
 def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *, direct_turns=None, availability=None) -> list:
@@ -416,6 +417,8 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
                 return False
 
         def _activity(task_id: str, row: Dict[str, Any], phase: str, started_at: float) -> Dict[str, Any]:
+            if phase == "unknown" and availability is not None:
+                availability["complete"] = False
             return {
                 "activity_id": task_id,
                 "chat_id": int(row.get("chat_id") or 0),
@@ -435,14 +438,17 @@ def _chat_activities_snapshot_safe(drive_root: Any, task_bindings: Any = None, *
             if task_id and _is_root(task_id, row):
                 # #322 (P1): a budget-paused member must not masquerade as
                 # "queued" — nothing will dispatch it until an explicit resume.
-                phase = "budget_paused" if budget_pause_fact(row, fence_rows) else "queued"
+                pausing = _managed_task_budget_pausing(drive_root, row, task_id)
+                phase = ("unknown" if pausing is None else "budget_pausing" if pausing
+                         else "budget_paused" if budget_pause_fact(row, fence_rows) else "queued")
                 activities.append(_activity(task_id, row, phase, _epoch_or_zero(row.get("queued_at"))))
         for task_id, row, started_at in running_rows:
             if task_id and _is_root(task_id, row):
                 # #1196: a RUNNING root whose durable budget_pause row says
                 # "pausing" is neither working nor paused yet — additive phase.
-                if _managed_task_budget_pausing(drive_root, row, task_id):
-                    phase = "budget_pausing"
+                pausing = _managed_task_budget_pausing(drive_root, row, task_id)
+                if pausing is not False:
+                    phase = "unknown" if pausing is None else "budget_pausing"
                 else:
                     phase = "finalizing" if _managed_task_finalizing(drive_root, task_id) else "working"
                 activities.append(_activity(task_id, row, phase, started_at))

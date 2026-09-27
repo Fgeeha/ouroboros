@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
 
 import pytest
 
@@ -45,7 +46,7 @@ def test_activity_relationship_hold_and_stale_restore(direct_server_with_data, m
     server['start_server']()
     [record] = load_schedule_store(root)['tasks']
     old_id = record['followup_hold']['hold_id']
-    evidence = Path(__file__).resolve().parents[1] / '.review-drive/g1-repair-output/browser'
+    evidence = Path(os.environ.get('OUROBOROS_UI_EVIDENCE_DIR') or root / 'ui-evidence') / 'g1-repair'
     evidence.mkdir(parents=True, exist_ok=True)
     with sync_playwright() as pw:
         browser = pw.chromium.launch()

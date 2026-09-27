@@ -25,7 +25,6 @@ from ouroboros.gateway.history_paging import (
 from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection
 from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.history_retention import retention_summary
-from ouroboros.review_execution_projection import normalize_review_executions as _review_executions
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.project_dialogue import historical_terminal_projection
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, executor_observation_meta, initiator_meta, subagent_message_meta
@@ -859,7 +858,9 @@ def _collect_chat_rows(
                     rec[key] = coerce_int(entry.get(key), 0)
                 for key in _SKILL_REVIEW_BOOL_FIELDS:
                     rec[key] = bool(entry.get(key))
-                rec["executions"] = _review_executions(entry.get("executions"))
+                from ouroboros.review_execution_projection import normalize_review_executions
+
+                rec["executions"] = normalize_review_executions(entry.get("executions"))
             # Delivered document rows carry lightweight media metadata (no
             # base64); surface a msg_type + download_url so the frontend
             # rebuilds the file bubble on reload instead of a bare text line.

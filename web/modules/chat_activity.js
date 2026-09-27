@@ -368,9 +368,9 @@ export function restartConfirmBody(activities) {
         'Queued tasks that have not started are kept on hold under the same task, and wait for your Resume.',
         'Saved settings apply after the restart.',
     ];
-    if (!Array.isArray(activities)) {
+    if (!Array.isArray(activities) || activities.some((row) => row?.phase === 'unknown')) {
         lines.push('Pause status could not be read: a task that is still pausing would be interrupted instead of staying paused.');
-        return lines.join('\n');
+        if (!Array.isArray(activities)) return lines.join('\n');
     }
     const pausing = activities.filter((row) => PAUSING_PHASES.has(String(row?.phase || ''))).length;
     if (pausing) {
@@ -383,7 +383,9 @@ export function restartConfirmBody(activities) {
 async function readLiveActivities() {
     const resp = await apiFetch('/api/state', { cache: 'no-store' });
     const data = resp?.ok ? await resp.json() : null;
-    if (!Array.isArray(data?.active_chat_activities)) throw new Error('census unavailable');
+    if (!Array.isArray(data?.active_chat_activities) || data.active_chat_activities_complete !== true) {
+        throw new Error('census unavailable');
+    }
     return data.active_chat_activities;
 }
 

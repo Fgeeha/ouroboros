@@ -96,7 +96,7 @@ def read_fence(root_drive: Any, root_task_id: str) -> Dict[str, Any]:
         quarantine = path.parent / "quarantine"
         with _CACHE_LOCK:
             prior = _CACHE.get(key)
-        if ((prior and fence_closed(prior[1])) or (quarantine / path.name).exists()
+        if (prior or (quarantine / path.name).exists()
                 or any(quarantine.glob(f"{root_task_id}.*.json"))):
             raise ValueError("owner_pause_authority_missing")
         return {}
@@ -226,9 +226,14 @@ def admit_delegated_start(drive_root: Any, payload: Dict[str, Any]) -> bool:
 
 def _member_coordinates(source: Any) -> Tuple[str, str, str]:
     """``(root_drive, root_task_id, task_id)`` of a tool context or usage scope."""
+    if getattr(source, "non_task_operation", False) is True:
+        return "", "", ""
+    meta = getattr(source, "task_metadata", None)
+    meta = meta if isinstance(meta, dict) else {}
     task_id = str(getattr(source, "task_id", "") or "")
-    root_task_id = str(getattr(source, "root_task_id", "") or "") or task_id
-    root_drive = (getattr(source, "budget_drive_root", None) or getattr(source, "drive_root", None) or "")
+    root_task_id = str(meta.get("root_task_id") or getattr(source, "root_task_id", "") or task_id)
+    root_drive = (meta.get("budget_drive_root") or getattr(source, "budget_drive_root", None)
+                  or getattr(source, "drive_root", None) or "")
     return str(root_drive or ""), root_task_id, task_id
 
 
@@ -238,6 +243,12 @@ def member_fence(source: Any) -> Dict[str, Any]:
     if not root_drive or not root_task_id:
         return {}
     try:
+        from ouroboros.model_wait import current_model_wait
+        owner = current_model_wait()
+        required = getattr(source, "task_lifecycle_bound", False) or (
+            owner is not None and owner.task_id == _task_id)
+        if required and not _result_path(root_drive, root_task_id).is_file():
+            raise ValueError("owner_pause_authority_missing")
         fence = read_fence(root_drive, root_task_id)
     except Exception:
         log.warning("Owner pause authority unreadable for %s", root_task_id, exc_info=True)
@@ -284,6 +295,10 @@ def launch_admission(source: Any, *, root_resume: Optional[Dict[str, Any]] = Non
     This exception authorizes that handoff only, never its tools or sends.
     """
     root_drive, root_id, task_id = _member_coordinates(source)
+    from ouroboros.model_wait import current_model_wait
+    owner = current_model_wait()
+    if owner is not None and owner.task_id == task_id and owner.closed:
+        raise OwnerPauseRefused("operation_already_returned")
     with launch_lock(root_drive, root_id):
         fence = member_fence(source)
         if fence:
@@ -373,30 +388,44 @@ def tool_handoff(source: Any, name: str):
     outcome["operation_id"] = op_id
     token = _TOOL_OPERATION.set((source, name, outcome))
     def claim(current):
+        if not current.get("status") or current.get("task_id") != path.stem:
+            raise OwnerPauseRefused("owner_pause_authority_unreadable")
         outstanding = dict(current.get("launch_handoffs") or {})
         outstanding[op_id] = {"tool": name, "task_id": task_id, "root_task_id": root_id,
                               "state": "claimed", "claimed_at": utc_now_iso()}
-        return stamp_task_result_schema({**current, "task_id": task_id, "root_task_id": root_id,
-                                         "launch_handoffs": outstanding})
+        return stamp_task_result_schema({**current, "launch_handoffs": outstanding})
+    claimed = False
     try:
         with launch_admission(source):
-            update_json_locked(path, claim, strict_existing_dict=True)
+            # A standalone tool context is not a lifecycle producer. Never
+            # manufacture a status-less result that the next strict read must
+            # refuse. A not-yet-published member uses its existing root owner.
+            if not path.exists():
+                path = _result_path(root_drive, root_id)
+            if path.exists():
+                update_json_locked(path, claim, strict_existing_dict=True)
+                claimed = True
+            elif getattr(source, "task_lifecycle_bound", None) is not False:
+                raise OwnerPauseRefused("owner_pause_authority_unreadable")
         yield outcome
     finally:
         _TOOL_OPERATION.reset(token)
         def settle(current):
+            if not current.get("status") or current.get("task_id") != path.stem:
+                raise OwnerPauseRefused("owner_pause_authority_unreadable")
             outstanding = dict(current.get("launch_handoffs") or {})
             outstanding.pop(op_id, None)
             return stamp_task_result_schema({**current, "launch_handoffs": outstanding})
-        with launch_lock(root_drive, root_id):
-            # A background transport that outlives its caller cannot acquire a
-            # new start after this invocation has returned/timed out.
-            outcome["closed"] = True
-            if outcome.get("settled") is True or outcome.get("not_started") is True:
-                try:
+        # Close local admission even if durable cleanup cannot acquire its lock.
+        # Failure retains custody; it must not replace an executed result with
+        # a false NOT STARTED answer. Settlement still serializes with starts.
+        outcome["closed"] = True
+        try:
+            with launch_lock(root_drive, root_id):
+                if claimed and (outcome.get("settled") is True or outcome.get("not_started") is True):
                     update_json_locked(path, settle, strict_existing_dict=True)
-                except Exception:
-                    log.warning("Tool %s custody could not settle (%s)", name, op_id, exc_info=True)
+        except Exception:
+            log.warning("Tool %s custody could not settle (%s)", name, op_id, exc_info=True)
 
 
 def current_tool_operation(source: Any, name: str) -> str:
@@ -405,13 +434,13 @@ def current_tool_operation(source: Any, name: str) -> str:
     return str(active[2].get("operation_id") or "") if active and active[0] is source and active[1] == name else ""
 
 
-def start_tool_operation(source: Any = None) -> None:
+@contextmanager
+def operation_start(source: Any = None):
     """Final local operation-start point after preparation, serialized with Pause.
 
-    The caller invokes its prepared body immediately after this returns. This
-    begins host execution, not proof of external bytes or success. A process
-    lost after this point retains its claim. No lock spans body completion.
-    Queued/nested transports must take their own final start point when ready.
+    Hold only across the local submission (for example Popen), never its wait.
+    Preparation must finish first. A nested start refused here proves no effect
+    for that submission, not for an earlier start in the same invocation.
     """
     active = _TOOL_OPERATION.get()
     source = source if source is not None else (active[0] if active else None)
@@ -420,3 +449,10 @@ def start_tool_operation(source: Any = None) -> None:
             if active[2].get("closed"):
                 raise OwnerPauseRefused("operation_already_returned")
             active[2]["not_started"] = False
+        yield
+
+
+def start_tool_operation(source: Any = None) -> None:
+    """Enter an opaque handler/transport; split submissions use operation_start."""
+    with operation_start(source):
+        pass

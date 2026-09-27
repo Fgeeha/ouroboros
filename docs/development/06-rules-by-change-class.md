@@ -421,9 +421,10 @@ The imperatives:
   calls the ONE shared `owner_hurry.retry_reset`; the durable hurry projection
   writes only through `update_json_locked` on the `owner_hurry` keys, never
   `write_task_result`; UI surfaces share `web/modules/task_control_menu.js`;
-  queue-owned hurry admission initializes only an absent pooled result through
-  the task-result writer's atomic `create_only` branch, and direct turns stay
-  outside it.
+  queue-owned Pause/Hurry admission initializes only an absent pooled result
+  from exact admitted queue lineage/budget/source facts through the writer's
+  atomic `create_only` branch. Existing terminal rows win; direct turns and
+  billing stay outside it.
 - Code owners stay narrow behind one public queue/lifecycle surface:
   retry-aware target/subtree-liveness in `supervisor/queue_transitions.py`,
   capture-miss terminalization/publication in

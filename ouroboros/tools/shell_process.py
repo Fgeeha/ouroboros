@@ -49,7 +49,14 @@ def _tracked_subprocess_run(cmd, **kwargs):
     try:
         if _panic_requested:
             raise RuntimeError("Emergency Stop has retired command admission")
-        proc = subprocess.Popen(cmd, **kwargs)
+        from ouroboros.owner_pause import operation_start
+
+        with operation_start():
+            try:
+                proc = subprocess.Popen(cmd, **kwargs)
+            except (OSError, ValueError) as exc:
+                exc.process_not_started = True
+                raise
         _active_subprocesses.add(proc)  # publish before the spawning owner can exit
     finally:
         _spawning_subprocesses -= 1

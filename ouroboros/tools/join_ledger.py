@@ -735,7 +735,9 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "", stop_action_i
             stop_action_id=stop_action_id,
         )
     except StopActionConflict as exc:
-        return f"⚠️ STOP_ACTION_CONFLICT: {exc}; nothing was changed."
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="STOP_ACTION_CONFLICT",
+            text=f"⚠️ STOP_ACTION_CONFLICT: {exc}; nothing was changed.",
+            meta={"operation_outcome": "completed_no_effect"}))
     except CancelIntentProjectionCorrupt:
         # GR4-8: a corrupt projection is not a transient — "retry" cannot
         # succeed until the file is repaired. The malformed file was preserved

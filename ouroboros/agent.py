@@ -632,6 +632,7 @@ class OuroborosAgent:
             emit_progress_fn=self._bind_task_progress_for_task(task),
             event_queue=self._event_queue,
             task_id=str(task.get("id") or ""),
+            task_lifecycle_bound=True,
             task_depth=int(task.get("depth", 0)),
             is_direct_chat=bool(task.get("_is_direct_chat")),
             task_constraint=normalize_task_constraint(task.get("task_constraint")),

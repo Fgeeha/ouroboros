@@ -49,4 +49,4 @@ async def api_task_continue(request: Request) -> JSONResponse:
     error = str(result.get("error") or "continue_refused")
     status = 404 if error in _NOT_FOUND else 503 if error in _UNAVAILABLE else 409
     return json_error(f"continue refused: {error}", status, task_id=task_id, reason_code=error,
-                      **{key: result[key] for key in ("successor_task_id", "cause", "gaps") if result.get(key)})
+                      **{key: result[key] for key in ("successor_task_id", "cause", "gaps", "state", "action_nonce", "unconfirmed") if result.get(key)})

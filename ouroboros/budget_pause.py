@@ -548,6 +548,8 @@ def set_budget_pause(root: Any, task_id: str, row: Dict[str, Any],
 
     def update(current: dict) -> dict:
         require_writable_task_result_schema(current)
+        if not current.get("status") or current.get("task_id") != task_id:
+            raise ValueError("budget pause requires its lifecycle owner's task result")
         if current.get("status") in _TRULY_TERMINAL_STATUSES:
             raise ValueError("a terminal task cannot be budget-paused")
         if expected_owner_wait is not None and current.get("owner_wait") != expected_owner_wait:
@@ -1466,4 +1468,3 @@ def budget_pause_restore_refusal(root: Any, task: Dict[str, Any]) -> str:
     except Exception:
         return RESTORE_REFUSAL_SOURCE_UNREADABLE
     return ""
-
