@@ -13,6 +13,7 @@ import json
 import pathlib
 import shutil
 import uuid
+import zlib
 from collections import deque
 from contextlib import contextmanager
 from typing import Any
@@ -154,7 +155,7 @@ def _unavailable_basis(parent, child, task_id, result):
         if not isinstance(ref, dict) or not ref.get("path"):
             return None  # An unaddressed failure cannot supply repair evidence.
         if (ref.get("reason") == "source_unreadable" and ref.get("source_error_type") not in
-                {"BadGzipFile", "EOFError", "JSONDecodeError", "UnicodeDecodeError", "ValueError"}):
+                {"BadGzipFile", "EOFError", "JSONDecodeError", "UnicodeDecodeError", "ValueError", "zlib.error"}):
             return None  # Transient read I/O can recover without changing the file.
         owner = str(ref.get("owner_task_id") or task_id)
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", owner):
@@ -282,7 +283,7 @@ class RetentionWalk:
                 if len(raw) != int(ref["size"]) or hashlib.sha256(raw).hexdigest() != ref["sha256"]:
                     raise ValueError("observability blob ref failed size or sha256 verification")
                 return (raw, path), root
-            except (OSError, ValueError, KeyError, TypeError, EOFError) as exc:
+            except (OSError, ValueError, KeyError, TypeError, EOFError, zlib.error) as exc:
                 failures.append(exc)
         import gzip
 
@@ -363,7 +364,7 @@ class RetentionWalk:
                         size += len(chunk)
             except PublicationClosed:
                 raise
-            except (OSError, EOFError):
+            except (OSError, EOFError, zlib.error):
                 return False
             return digest.hexdigest() == ref["sha256"] and size == int(ref["size"])
 
@@ -438,11 +439,11 @@ class RetentionWalk:
             node = self.queue.popleft()
             try:
                 data, _source = self._read_source(node)
-            except (OSError, ValueError, TypeError, KeyError, EOFError) as exc:
+            except (OSError, ValueError, TypeError, KeyError, EOFError, zlib.error) as exc:
                 reason = obs._task_source_failure_reason(exc) if node["kind"] == "source" else obs._promotion_source_error(exc).reason
                 obs._append_promotion_fact(self.state["unavailable_refs"],
                     obs._promotion_fact({**node["ref"], "owner_task_id": node["task_id"],
-                                         "source_error_type": type(exc).__name__}, reason))
+                                         "source_error_type": "zlib.error" if isinstance(exc, zlib.error) else type(exc).__name__}, reason))
                 node["result"] = obs._typed_unavailable_ref(node["ref"], reason)
                 node["failure"] = "unavailable"
                 continue

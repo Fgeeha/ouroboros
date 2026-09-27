@@ -79,6 +79,8 @@ def _inventory(tmp_path, fault="missing"):
         blob.write_bytes(gzip.compress(b'{"different": "captured bytes"}'))
     elif fault == "gzip_corrupt":
         blob.write_bytes(b"not a gzip stream")
+    elif fault == "gzip_deflate":
+        blob.write_bytes(_invalid_deflate(exact))
     write_task_result(child, task, "completed", result="answer", artifact_status="ready")
     headless.copy_child_task_result(parent, {"id": task, "drive_root": str(child)})
     return parent, child, task, blob, exact
@@ -105,7 +107,7 @@ def _observe(monkeypatch):
     return counts
 
 
-@pytest.mark.parametrize("fault", ["missing", "corrupt", "gzip_corrupt"])
+@pytest.mark.parametrize("fault", ["missing", "corrupt", "gzip_corrupt", "gzip_deflate"])
 def test_unchanged_missing_inventory_waits_for_real_repair_without_rewalk_or_gc(tmp_path, monkeypatch, fault):
     parent, child, task, blob, exact = _inventory(tmp_path, fault)
     counts, generation = _observe(monkeypatch), object()
@@ -114,7 +116,10 @@ def test_unchanged_missing_inventory_waits_for_real_repair_without_rewalk_or_gc(
     assert state["call_inventory_preserved"] is False
     assert state["pending_refs"][-1]["reason"] == "call_inventory_unavailable"
     assert state["unavailable_refs"][0]["reason"] == {
-        "missing": "source_missing", "corrupt": "digest_mismatch", "gzip_corrupt": "source_unreadable"}[fault]
+        "missing": "source_missing", "corrupt": "digest_mismatch",
+        "gzip_corrupt": "source_unreadable", "gzip_deflate": "source_unreadable"}[fault]
+    if fault == "gzip_deflate":
+        assert state["unavailable_refs"][0]["source_error_type"] == "zlib.error"
     assert task_custody.settle_child_drive(parent, task, child, live=lambda _: False)["status"] == "retained"
     first = dict(counts)
     calls = child / "observability/calls" / task
@@ -297,3 +302,22 @@ def test_canonical_transient_io_is_not_reclassified_as_missing_child_or_negative
     assert not blob.exists() and source_retention._path_fact(local) == identity
     assert observability.retry_pending_child_ref_promotions(parent, generation=generation)["completed"] == [task]
     assert task_custody.settle_child_drive(parent, task, child, live=lambda _: False)["status"] == "removed"
+
+
+def _invalid_deflate(exact):
+    # Generated gzip headers may carry the original filename. Keep the header
+    # and trailer, but use a reserved deflate block type in the body.
+    header_end = exact.index(b"\x00", 10) + 1 if exact[3] & 8 else 10
+    return exact[:header_end] + b"\x07\xff\xff\xff" + exact[-8:]
+
+
+def test_corrupt_canonical_deflate_recovers_from_healthy_retained_child(tmp_path):
+    parent, child, task, blob, exact = _inventory(tmp_path, "healthy")
+    target = parent / "observability/blobs" / blob.name
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(_invalid_deflate(exact))
+    report = observability.retry_pending_child_ref_promotions(parent, generation=object())
+    assert report["completed"] == [task] and not report["errors"]
+    assert gzip.decompress(target.read_bytes()) == gzip.decompress(exact)
+    assert task_custody.settle_child_drive(parent, task, child, live=lambda _: False)["status"] == "removed"
+    assert gzip.decompress(target.read_bytes()) == gzip.decompress(exact)
