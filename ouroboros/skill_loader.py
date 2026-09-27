@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import hashlib
 import logging
-import os
 import pathlib
 import stat
 from dataclasses import asdict, dataclass, field
@@ -329,9 +328,10 @@ def _iter_payload_files(
     manifest_scripts: Optional[List[Dict[str, Any]]] = None,
     include_control_files: bool = False,
 ) -> List[pathlib.Path]:
-    """List review payload files without traversing excluded cache directories.
+    """List regular runtime payload files, excluding cache trees and symlink escapes.
 
-    Confined manifest entries are re-added even under excluded directories.
+    Confined manifest entries are re-added even under excluded directories,
+    keeping executable entry points inside the reviewed surface.
     Native lifecycle markers are omitted unless ``include_control_files`` requests
     their legacy pre-v6.31 hash. Sensitive filenames refuse ordinary loading;
     Cyber includes them in the byte hash and review pack.
@@ -381,18 +381,20 @@ def _iter_payload_files(
 
     if resolved_root.is_dir():
         paths = []
-        for parent, dirs, files in os.walk(resolved_root, topdown=True, followlinks=False):
-            dirs[:] = [name for name in dirs if name not in _SKILL_DIR_CACHE_NAMES]
-            paths.extend(pathlib.Path(parent) / name for name in files)
+        pending = [resolved_root]
+        while pending:
+            directory = pending.pop()
+            for path in directory.glob("*"):
+                if path.name in _SKILL_DIR_CACHE_NAMES:
+                    continue
+                if path.is_dir() and not path.is_symlink():
+                    pending.append(path)
+                else:
+                    paths.append(path)
         for path in sorted(paths):
             if not path.is_file():
                 continue
-            try:
-                rel_parts = path.relative_to(resolved_root).parts
-            except ValueError:
-                continue
-            if any(part in _SKILL_DIR_CACHE_NAMES for part in rel_parts):
-                continue
+            rel_parts = path.relative_to(resolved_root).parts
             # Only the TOP-LEVEL lifecycle marker of a NATIVE-bucket payload is
             # hash-exempt (the launcher writes it there; P3: everywhere else a
             # file by that name is ordinary runtime-reachable payload and stays

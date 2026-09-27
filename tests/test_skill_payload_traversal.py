@@ -1,5 +1,6 @@
 """Excluded dependency trees must not enlarge review-payload discovery."""
 
+import errno
 import hashlib
 import os
 from pathlib import Path
@@ -90,3 +91,41 @@ def test_payload_walk_preserves_file_symlinks_without_following_directory_symlin
     expected = _expected_hash({**payload, "alias.py": payload["nested/helper.py"]})
     assert compute_content_hash(root) == expected
     assert compute_content_hash(root_alias) == expected
+
+
+@pytest.mark.parametrize("error_number", [
+    getattr(errno, name) for name in ("EIO", "EMFILE", "ENOENT", "ENOTDIR", "EACCES", "ESTALE")
+    if hasattr(errno, name)
+])
+def test_included_directory_scan_errors_keep_the_runtime_glob_contract(
+    tmp_path, monkeypatch, error_number
+):
+    root = tmp_path / "skill"
+    payload = {"SKILL.md": b"# Skill\n", "included/helper.py": b"VALUE = 1\n"}
+    _write_files(root, payload)
+    assert compute_content_hash(root) == _expected_hash(payload)
+    blocked = root / "included"
+    real_scandir = os.scandir
+
+    def failing_scandir(path):
+        if Path(path) == blocked:
+            raise OSError(error_number, os.strerror(error_number), str(path))
+        return real_scandir(path)
+
+    def outcome(iterator):
+        try:
+            return "files", sorted(
+                path.relative_to(root).as_posix() for path in iterator() if path.is_file()
+            )
+        except OSError as exc:
+            return "error", type(exc), exc.errno
+
+    with monkeypatch.context() as patch:
+        patch.setattr(os, "scandir", failing_scandir)
+        if accessor := getattr(root, "_accessor", None):
+            patch.setattr(accessor, "scandir", failing_scandir)
+        # pathlib's error policy differs between supported Python runtimes.
+        # Preserve that policy without silently broadening the skipped surface.
+        expected = outcome(lambda: root.rglob("*"))
+        assert outcome(lambda: _iter_payload_files(root)) == expected
+    assert compute_content_hash(root) == _expected_hash(payload)
