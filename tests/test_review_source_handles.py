@@ -391,9 +391,27 @@ def test_response_capture_does_not_launder_nested_source_authority(tmp_path, mon
     assert not (artifacts.task_artifact_dir_path(parent, 'source') / unselected['path']).exists()
 
 
+def _record_path_reads(monkeypatch, forbidden):
+    """Record every pathlib open and refuse ``forbidden`` before its bytes are read.
+
+    ``Path.open`` sits under ``read_bytes`` on every supported Python; patching
+    ``io.open`` missed 3.10, whose pathlib accessor bound ``io.open`` at import.
+    Promotion turns the refusal into an unavailable ref, so the record, not the
+    raise, is the negative proof.
+    """
+    opened, real_open = [], Path.open
+
+    def guard(path, *args, **kwargs):
+        opened.append(path.resolve())
+        assert opened[-1] != forbidden, 'foreign bytes read before confinement check'
+        return real_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, 'open', guard)
+    return opened
+
+
 @pytest.mark.parametrize('fault', ['sibling', 'symlink', 'unknown'])
 def test_trace_response_rejects_foreign_paths_before_read_and_keeps_unknown_custody(tmp_path, monkeypatch, fault):
-    import io
     from ouroboros import observability
 
     parent = tmp_path / 'canonical'
@@ -412,16 +430,8 @@ def test_trace_response_rejects_foreign_paths_before_read_and_keeps_unknown_cust
         ref = observability.persist_call(child, task_id='source', call_id='response',
             call_type='llm_response', payload={'message': 'retained answer'})['manifest_ref']
     write_task_result(child, 'source', 'completed', trace_refs={'response': ref}, result='retained answer')
-    opened = []
-    real_open = io.open
-
-    def guard(path, *args, **kwargs):
-        if isinstance(path, (str, Path)):
-            assert Path(path).resolve() != forbidden, 'foreign bytes read before confinement check'
-        opened.append(str(path))
-        return real_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(io, 'open', guard)
+    own = Path(ref['path']).resolve()
+    opened = _record_path_reads(monkeypatch, forbidden)
     if fault == 'unknown':
         with monkeypatch.context() as fail:
             fail.setattr(observability, 'write_call_manifest', lambda *a, **k: (_ for _ in ()).throw(OSError('copy unknown')))
@@ -439,18 +449,23 @@ def test_trace_response_rejects_foreign_paths_before_read_and_keeps_unknown_cust
         assert copied['trace_refs']['response']['availability'] == 'unavailable'
         assert copied['child_ref_promotion']['unavailable_refs']
         assert not list((parent / 'observability').rglob('response.json'))
-    assert opened
+    assert forbidden not in opened
+    if fault == 'unknown':
+        assert own in opened  # the copy's own manifest read passed through the guard
+    # Positive control: the same guard intercepts the manifest reader on this very file.
+    with pytest.raises(AssertionError, match='foreign bytes'):
+        observability.read_call_manifest_ref(sibling, foreign, task_id='source')
+    assert opened[-1] == forbidden
 
 
 @pytest.mark.parametrize('link', [False, True], ids=['sibling', 'symlink'])
 def test_plan_dialogue_promotion_never_reads_a_foreign_source(tmp_path, monkeypatch, link):
-    import io
-
     parent = tmp_path / 'canonical'
     child = prepare_task_drive(parent, 'source', 'empty')
     ref = artifacts.store_actor_source_bytes(child, 'sibling', category='context_checkpoints',
         source_id='plan-dialogue-1', data=b'SIBLING UNREAD', extension='jsonl')
-    foreign = artifacts.task_artifact_dir_path(child, 'sibling') / ref['path']
+    sibling_ref = json.loads(json.dumps(ref))
+    foreign = (artifacts.task_artifact_dir_path(child, 'sibling') / ref['path']).resolve()
     if link:
         target = artifacts.task_artifact_dir_path(child, 'source') / ref['path']
         target.parent.mkdir(parents=True)
@@ -460,15 +475,13 @@ def test_plan_dialogue_promotion_never_reads_a_foreign_source(tmp_path, monkeypa
         ref['read']['arguments']['path'] = ref['path']
     write_task_result(child, 'source', 'completed', plan_review_state={
         'schema_version': 2, 'waves': [{'request_fingerprint': 'f' * 64, 'dialogue_source_ref': ref}]})
-    real_open = io.open
-
-    def guard(path, *args, **kwargs):
-        if isinstance(path, (str, Path)):
-            assert Path(path).resolve() != foreign, 'foreign plan source was read'
-        return real_open(path, *args, **kwargs)
-
-    monkeypatch.setattr(io, 'open', guard)
+    opened = _record_path_reads(monkeypatch, foreign)
     copied = copy_child_task_result(parent, {'id': 'source', 'drive_root': str(child)})
     assert copied['plan_review_state']['waves'][0]['dialogue_source_ref']['availability'] == 'unavailable'
     assert copied['child_ref_promotion']['unavailable_refs']
     assert not (artifacts.task_artifact_dir_path(parent, 'sibling') / ref['path']).exists()
+    assert foreign not in opened
+    # Positive control: the same guard intercepts the source reader on this very file.
+    with pytest.raises(AssertionError, match='foreign bytes'):
+        artifacts.read_actor_source_bytes(child, 'sibling', sibling_ref)
+    assert opened[-1] == foreign
