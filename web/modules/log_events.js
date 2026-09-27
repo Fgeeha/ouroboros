@@ -351,18 +351,6 @@ function extractCommandText(args) {
     return '';
 }
 
-// The compact row for one tool call: the command, else the first string
-// argument (a path, a query, a url — whatever the tool names first), lexical
-// only. The complete arguments stay behind the row's expand.
-function toolCallTarget(args) {
-    const cmd = extractCommandText(args);
-    if (cmd) return cmd;
-    for (const value of Object.values(args && typeof args === 'object' ? args : {})) {
-        if (typeof value === 'string' && value.trim()) return value;
-    }
-    return '';
-}
-
 // Legacy observations lack host identity: retain them separately rather than
 // guessing a call from a reused provider id, tool name or target.
 const legacyToolObservations = new WeakMap();

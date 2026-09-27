@@ -1,0 +1,351 @@
+"""Narrow counterexamples from the frozen Batch1 review; isolated consumers only."""
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import pathlib
+import sys
+import time
+from types import SimpleNamespace
+
+import pytest
+
+from supervisor import state, state_initialization
+from tests import test_schedule_occurrence as schedule_fixtures
+from tests import test_state_authority as state_fixtures
+
+root, _prior, _write = state_fixtures.root, state_fixtures._prior, state_fixtures._write
+q, _rows = schedule_fixtures.q, schedule_fixtures._rows
+
+pytestmark = pytest.mark.serial
+
+
+@pytest.mark.parametrize("writer", ["update", "save", "init"])
+def test_missing_controls_survive_all_existing_state_writers(root, writer):
+    state.save_state(_prior())
+    raw = json.loads(state.STATE_PATH.read_bytes())
+    for key in ("owner_external_id", "owner_external_chat_id", "evolution_owner_stopped"):
+        raw.pop(key)
+    _write(state.STATE_PATH, raw)
+    if writer == "update":
+        state.update_state(lambda live: live.update(last_owner_message_at="now"))
+    elif writer == "save":
+        state.save_state({**raw, "owner_external_id": None})
+    else:
+        state.init_state()
+    state.init(root)  # cold read, not a process-local recovery flag
+    for key in ("owner_external_id", "owner_external_chat_id", "evolution_owner_stopped"):
+        assert state.control_value(state.load_state(), key) == (False, None)
+    state.update_state(lambda live: live.update(evolution_owner_stopped=True),
+                       confirm=("evolution_owner_stopped",))
+    assert state.control_value(state.load_state(), "evolution_owner_stopped") == (True, True)
+    assert state.control_value(state.load_state(), "owner_external_id") == (False, None)
+
+
+@pytest.mark.parametrize("changed", [False, True])
+def test_interrupted_legacy_adoption_resumes_only_exact_source(root, monkeypatch, changed):
+    original = _write(state.STATE_PATH, _prior())
+    real = state.atomic_write_text
+    monkeypatch.setattr(state, "atomic_write_text", lambda *_: False)
+    assert state.init_state().quality == "unavailable"
+    identity = state_initialization.read_witness(root)[1]["initialization_id"]
+    assert state.STATE_PATH.read_bytes() == original
+    if changed:
+        _write(state.STATE_PATH, _prior(session_id="different"))
+    monkeypatch.setattr(state, "atomic_write_text", real)
+    observed = state.init_state()
+    assert (observed.quality == "unavailable") is changed
+    assert state_initialization.read_witness(root)[1]["initialization_id"] == identity
+    if not changed:
+        assert state.load_state()["session_id"] == "old-session"
+        assert state.control_value(state.load_state(), "owner_external_id") == (True, 99)
+
+
+@pytest.mark.parametrize("zero_write", [False, True])
+def test_corrupt_primary_is_not_replaced_until_full_copy(root, monkeypatch, zero_write):
+    state.save_state(_prior())
+    corrupt = b'{"truncated":' + b'x' * 4096
+    state.STATE_PATH.write_bytes(corrupt)
+    real = os.write
+    monkeypatch.setattr(os, "write", lambda fd, data: 0 if zero_write else real(fd, data[:17]))
+    if zero_write:
+        with pytest.raises(state.StateUnavailable, match="corrupt_primary_unpreserved"):
+            state.update_state(lambda st: st.update(message_offset=2))
+        assert state.STATE_PATH.read_bytes() == corrupt
+    else:
+        state.update_state(lambda st: st.update(message_offset=2))
+        [copy] = list((root / "state").glob("state.corrupt-*.json"))
+        assert copy.read_bytes() == corrupt
+
+
+def test_context_uses_the_addressed_witness_authority(root):
+    from ouroboros.context import _drive_state_section
+
+    state.save_state(_prior())
+    witness = root / state_initialization.WITNESS_REL
+    raw = json.loads(witness.read_bytes())
+    raw["phase"] = "pending"
+    _write(witness, raw)
+    rendered = _drive_state_section(SimpleNamespace(drive_path=lambda p: root / p))
+    assert '"evolution_mode_enabled": {\n  "status": "unknown"' in rendered
+    assert "initialization_incomplete" in rendered
+    raw["phase"] = "complete"
+    _write(witness, raw)
+    assert '"evolution_mode_enabled": true' in _drive_state_section(SimpleNamespace(drive_path=lambda p: root / p))
+
+
+def test_consciousness_recovers_unknown_but_never_overrides_live_stop(root, monkeypatch):
+    from ouroboros.consciousness import BackgroundConsciousness
+
+    state.save_state(_prior())
+    primary, backup = state.STATE_PATH.read_bytes(), state.STATE_LAST_GOOD_PATH.read_bytes()
+    state.STATE_PATH.unlink()
+    state.STATE_LAST_GOOD_PATH.unlink()
+    clock = BackgroundConsciousness(root, root / "repo", lambda: 7, now=100)
+    monkeypatch.setattr(clock, "live_turns", lambda: ("", False))
+    assert clock.tick(now=100) == "disabled"
+    state.STATE_PATH.write_bytes(primary)
+    state.STATE_LAST_GOOD_PATH.write_bytes(backup)
+    assert clock.tick(now=100) == "not_due"
+    clock.stop()
+    assert clock.tick(now=100) == "disabled"
+
+
+@pytest.mark.parametrize("project", [False, True])
+@pytest.mark.parametrize("legacy", [False, True])
+def test_real_gateway_producer_admits_without_injected_intent(q, monkeypatch, project, legacy):
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros.gateway import schedules
+    from ouroboros.gateway.schedules import api_schedules_upsert
+    from ouroboros.projects_registry import create_project
+
+    monkeypatch.setattr(schedules, "request_drive_root", lambda _: q.root)
+    if project:
+        create_project(q.root, "room", name="Folderless room")
+    if legacy:
+        from tests.test_schedule_occurrence import _row
+        _row(q, "api", project_id="room" if project else "")
+    app = Starlette(routes=[Route('/api/schedules', api_schedules_upsert, methods=['POST'])])
+    with TestClient(app) as client:
+        response = client.post('/api/schedules', json={"id": "api", "trigger": {
+            "type": "once", "run_at": "2000-01-01T00:00:00Z"}, "task": {
+            "type": "task", "text": "Do the scheduled work", "chat_id": 1,
+            **({"project_id": "room"} if project else {})}})
+        assert response.status_code == 200, response.text
+    q.queue.check_scheduled_tasks()
+    if legacy:
+        assert not q.pending
+        assert _rows(q)["api"]["hold"]["reason"] == "resource_intent_unknown"
+        return
+    [task] = q.pending
+    assert task["metadata"]["resource_intent"]["kind"] == ("room_default" if project else "system_repo")
+    assert not _rows(q)["api"].get("hold")
+
+
+def test_real_skill_producer_removal_preserves_unpublished_admission(q, monkeypatch):
+    from supervisor import queue_schedules
+    from tests.test_consciousness_schedule_controls import _ready, _skill
+
+    _ready(monkeypatch)
+    queue_schedules.sync_skill_schedules([_skill()], drive_root=q.root)
+    record = _rows(q)["skill-demo-daily"]
+    record["next_run_at"] = "2000-01-01T00:00:00Z"
+    queue_schedules._write_scheduled_tasks({"tasks": [record]}, q.root)
+    real = q.queue.persist_queue_snapshot
+    monkeypatch.setattr(q.queue, "persist_queue_snapshot", lambda **_: False)
+    q.queue.check_scheduled_tasks()
+    assert not q.pending
+    accepted = _rows(q)["skill-demo-daily"]["occurrence"]["task_id"]
+    queue_schedules.sync_skill_schedules([], drive_root=q.root)
+    tombstone = _rows(q)["skill-demo-daily"]
+    assert tombstone["delete_requested_at"] and not tombstone["enabled"]
+    monkeypatch.setattr(q.queue, "persist_queue_snapshot", real)
+    q.queue.check_scheduled_tasks()
+    assert [task["id"] for task in q.pending] == [accepted]
+    assert q.pending[0]["metadata"]["resource_intent"] == {"kind": "system_repo"}
+
+
+def test_cli_schedule_add_uses_the_gateway_producer(q, monkeypatch):
+    from starlette.applications import Starlette
+    from starlette.routing import Route
+    from starlette.testclient import TestClient
+
+    from ouroboros import cli
+    from ouroboros.gateway import schedules
+    from supervisor import queue_schedules
+
+    monkeypatch.setattr(schedules, "request_drive_root", lambda _: q.root)
+    app = Starlette(routes=[Route('/api/schedules', schedules.api_schedules_upsert, methods=['POST'])])
+    with TestClient(app) as client:
+        # Only HTTP transport is in-process: real parser, CLI body, gateway and store.
+        monkeypatch.setattr(cli, '_client', lambda _: SimpleNamespace(
+            request=lambda method, path, body: client.request(method, path, json=body).json()))
+        assert cli.main(['schedule', 'add', '--name', 'CLI work', '--cron', '* * * * *', 'Do work']) == 0
+    [record] = _rows(q).values()
+    record['next_run_at'] = '2000-01-01T00:00:00Z'  # advance to the producer's due occurrence
+    queue_schedules._write_scheduled_tasks({'tasks': [record]}, q.root)
+    q.queue.check_scheduled_tasks()
+    [task] = q.pending
+    assert task['metadata']['resource_intent'] == {'kind': 'system_repo'}
+
+
+def test_history_reloads_late_settlement_over_frozen_summary(tmp_path):
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros.post_task_synthesis import task_tool_metrics
+    from ouroboros.tool_call_log import append_call_row
+    from ouroboros.utils import append_jsonl
+
+    metrics = task_tool_metrics({"tool_calls": [{"tool": "run_command", "is_error": True}]})
+    append_jsonl(tmp_path / "logs/chat.jsonl", {"type": "task_summary", "direction": "out",
+        "role": "assistant", "chat_id": 1, "task_id": "t", "text": "Done", "ts": "2026-09-27T01:00:00Z", **metrics})
+    for event in ("tool_call_started", "tool_call_timeout", "tool_call"):
+        assert append_call_row({}, tmp_path / "logs", {"type": event, "task_id": "t",
+            "invocation_id": "call", "tool": "run_command", "is_error": event == "tool_call_timeout",
+            "status": "ok" if event == "tool_call" else "timeout"})["task_log"]
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"limit": "10"})))
+    summary = next(row for row in json.loads(response.body)["messages"] if row.get("task_id") == "t")
+    observations = summary["tool_evidence"]["observations"]
+    assert [row["fact"] for row in observations] == ["started", "wait_ended", "settled"]
+    assert observations[-1]["status"] == "ok" and summary["tool_errors"] == 1  # frozen historical wait count
+
+
+def test_osworld_readers_count_unfinished_calls_once_and_keep_legacy(tmp_path):
+    from devtools.benchmarks.osworld import run_cu_bridge_agent as bridge
+    from ouroboros.extension_loader import extension_name_prefix
+
+    prefix = extension_name_prefix(bridge.SKILL_NAME)
+    root = tmp_path / 'state/headless_tasks/t/data/logs'
+    root.mkdir(parents=True)
+    rows = [{"type": t, "task_id": "t", "tool": prefix + "screenshot", "invocation_id": "i"}
+            for t in ("tool_call_started", "tool_call_timeout")]
+    rows += [{"type": "tool_call", "tool": prefix + "remote_exec", "args": {"cmd": "pwd"}}] * 2
+    (root / 'tools.jsonl').write_text(''.join(json.dumps(row) + '\n' for row in rows))
+    counts = bridge._collect_budget_counters(tmp_path, {}, "t")
+    assert (counts["skill_tool_calls"], counts["screenshots"], counts["remote_exec_calls"]) == (3, 1, 2)
+    trace = bridge._gate_tool_trace(tmp_path, "t")
+    assert len(trace) == 3 and trace[0]["state"] == "wait_ended"
+    assert trace[0]["is_error"] is None and not trace[0]["settled"]
+
+
+def _pooled_test_entry(*args):
+    """Real worker_main and registry, with only model/extension setup replaced."""
+    from ouroboros import agent, extension_loader
+    from ouroboros.tools import shell_process
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+    from supervisor.worker_process import worker_main
+
+    class CommandAgent:
+        def handle_task(self, task):
+            import logging
+
+            from ouroboros import process_custody
+
+            root = pathlib.Path(args[4])
+            workspace = root / 'workspace'
+            workspace.mkdir(exist_ok=True)
+            ctx = ToolContext(repo_dir=root / 'repo', drive_root=root / 'data',
+                              workspace_root=workspace, workspace_mode='external', task_id='pooled')
+            registry = ToolRegistry(repo_dir=ctx.repo_dir, drive_root=ctx.drive_root)
+            registry.set_context(ctx)
+            shell_process._subprocess_lock.acquire()  # cleanup must not gate requests
+            handler = logging.StreamHandler()
+            handler.acquire()  # persistence/logging must not gate the worker's own exit
+            process_custody.log.addHandler(handler)
+            process_custody.log.setLevel(logging.WARNING)
+            result = registry.execute('run_command', {'cmd': [sys.executable, '-c',
+                'import os,time,pathlib; pathlib.Path("child.pid").write_text(str(os.getpid())); time.sleep(60)']})
+            (root / 'command-result.txt').write_text(str(result))
+            return []
+
+    agent.make_agent = lambda **_: CommandAgent()
+    extension_loader.reload_all = lambda *_a, **_k: None
+    import ouroboros.safety
+    ouroboros.safety.check_safety = lambda *_a, **_k: (True, '')
+    worker_main(*args)
+
+
+def test_actual_pooled_worker_requests_separate_session_command_before_owner_exit(tmp_path, monkeypatch):
+    import multiprocessing
+
+    from ouroboros.platform_layer import pid_is_alive
+    from ouroboros.process_containment import pid_is_zombie
+    from supervisor import worker_pool_lifecycle, worker_process
+
+    monkeypatch.setenv('OUROBOROS_RUNTIME_MODE', 'advanced')
+    monkeypatch.setattr(worker_process, 'worker_main', _pooled_test_entry)
+    ctx = multiprocessing.get_context('spawn')
+    incoming, outgoing = ctx.Queue(), ctx.Queue()
+    proc = worker_process.spawn_worker_process(ctx, 0, incoming, outgoing, tmp_path, tmp_path)
+    child_pid = 0
+    try:
+        incoming.put({'id': 'pooled', 'type': 'task'})
+        deadline = time.monotonic() + 20
+        while not (tmp_path / 'workspace/child.pid').exists() and time.monotonic() < deadline:
+            assert proc.is_alive(), proc.exitcode
+            time.sleep(.03)
+        assert (tmp_path / 'workspace/child.pid').exists(), (tmp_path / 'command-result.txt').read_text()
+        child_pid = int((tmp_path / 'workspace/child.pid').read_text())
+        if os.name != 'nt':
+            assert os.getpgid(child_pid) == child_pid != os.getpgid(proc.pid)
+        started = time.monotonic()
+        receipt = worker_pool_lifecycle.kill_worker_tree(proc.pid, panic_process=proc)
+        assert receipt['requested'] and receipt['scope'] == 'worker_owners'
+        assert time.monotonic() - started < .5
+        proc.join(timeout=5)
+        assert not proc.is_alive()
+        deadline = time.monotonic() + 3
+        while pid_is_alive(child_pid) and not pid_is_zombie(child_pid) and time.monotonic() < deadline:
+            time.sleep(.01)
+        assert not pid_is_alive(child_pid) or pid_is_zombie(child_pid)
+    finally:
+        if proc.is_alive():
+            proc.terminate()
+            proc.join(timeout=5)
+        if child_pid and pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
+            # This test created and continuously observed the child; no unrelated PID search.
+            os.kill(child_pid, 9)
+        proc._ouroboros_stop_socket.close()
+        for channel in (incoming, outgoing):
+            channel.close()
+            channel.cancel_join_thread()
+
+
+@pytest.mark.parametrize("platform_name", ["linux", "darwin"])
+def test_attached_request_never_turns_held_identity_into_numeric_group(monkeypatch, platform_name):
+    from ouroboros import platform_layer as platform
+    calls = []
+    monkeypatch.setattr(platform, "IS_WINDOWS", False)
+    monkeypatch.setattr(platform, "IS_MACOS", platform_name == "darwin")
+    monkeypatch.setattr(platform.os, "getpgid", lambda *_: pytest.fail("numeric group lookup loses identity"))
+    monkeypatch.setattr(platform.os, "kill", lambda *_: pytest.fail("numeric PID cannot signal an attachment"))
+    monkeypatch.setattr(platform.os, "killpg", lambda *_: pytest.fail("numeric group cannot signal an attachment"))
+    monkeypatch.setattr(platform.signal, "pidfd_send_signal", lambda *a: calls.append(a), raising=False)
+    target = {"pid": 123, "handle": SimpleNamespace(fileno=lambda: 987, close=lambda: None), "pgid": 123}
+    receipt = platform.request_process_tree_kill(target)
+    assert receipt["requested"] is (platform_name == "linux")
+    assert receipt["scope"] == "process"
+    assert calls == ([(987, platform.signal.SIGKILL)] if platform_name == "linux" else [])
+
+
+def test_partial_primary_cannot_register_a_stranger_after_bookkeeping(root, monkeypatch):
+    import server
+    from supervisor import message_bus
+    from tests.test_state_authority import _bridge, _ingress_ctx
+
+    state.save_state(_prior())
+    raw = json.loads(state.STATE_PATH.read_bytes())
+    raw.pop("owner_external_id")
+    raw.pop("owner_external_chat_id")
+    _write(state.STATE_PATH, raw)
+    state.update_state(lambda live: live.update(message_offset=99))
+    replies, panics = [], []
+    monkeypatch.setattr(message_bus, "log_chat", lambda *_a, **_k: None)
+    monkeypatch.setattr(message_bus, "record_inbound_message", lambda *_a, **_k: {})
+    monkeypatch.setattr(server, "_execute_panic_stop", lambda *_: panics.append(True))
+    server._process_bridge_updates(_bridge('/panic', user=5, chat=5), 0, _ingress_ctx(root, replies, panics))
+    assert not panics and any('unknown' in reply for reply in replies)
+    assert state.control_value(state.load_state(), 'owner_external_id') == (False, None)

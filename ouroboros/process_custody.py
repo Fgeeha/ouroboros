@@ -440,7 +440,7 @@ def _multiprocessing_parent_sentinel() -> Optional[int]:
         return None
 
 
-def start_parent_lifeline(*, poll_sec: float = 5.0, label: str = "") -> None:
+def start_parent_lifeline(*, poll_sec: float = 5.0, label: str = "", stop_socket=None, before_exit=None) -> None:
     """Daemon watchdog: group-suicide when the spawning parent dies (POSIX).
 
     For OUR python entrypoints only (workers, extension runner, claude child):
@@ -454,15 +454,18 @@ def start_parent_lifeline(*, poll_sec: float = 5.0, label: str = "") -> None:
     worker's exit 255. Arbitrary-argv services and skills cannot get a watchdog
     injected -- they are covered by the ledger + reaper instead.
     """
-    if os.name == "nt":
-        return  # Windows children are covered by Job Objects
+    if os.name == "nt" and stop_socket is None:
+        return  # ordinary Windows children are covered by Job Objects
 
     import threading
     import time as _time
     from multiprocessing.connection import wait as _mp_wait
 
     def _suicide() -> None:
-        log.warning("parent process died — lifeline group-suicide (%s)", label or "child")
+        if before_exit is not None:
+            before_exit()  # held child requests precede logging and discovering-owner death
+        if stop_socket is None:  # the emergency path cannot wait on a logging handler
+            log.warning("parent stopped — lifeline group-suicide (%s)", label or "child")
         try:
             from ouroboros.platform_layer import current_process_group_id
 
@@ -477,7 +480,7 @@ def start_parent_lifeline(*, poll_sec: float = 5.0, label: str = "") -> None:
         os._exit(1)
 
     def _sentinel_hung_up(sentinel: int, timeout: float) -> bool:
-        return bool(_mp_wait([sentinel], timeout=timeout))
+        return bool(_mp_wait([sentinel, stop_socket] if stop_socket is not None else [sentinel], timeout=timeout))
 
     initial_ppid = os.getppid()
     sentinel = _multiprocessing_parent_sentinel()
@@ -496,7 +499,10 @@ def start_parent_lifeline(*, poll_sec: float = 5.0, label: str = "") -> None:
         nonlocal sentinel
         while True:
             if sentinel is None:
-                _time.sleep(poll_sec)
+                if stop_socket is not None and _mp_wait([stop_socket], timeout=poll_sec):
+                    _suicide()
+                else:
+                    _time.sleep(poll_sec)
             else:
                 try:
                     hung_up = _sentinel_hung_up(sentinel, poll_sec)

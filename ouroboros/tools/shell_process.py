@@ -29,6 +29,7 @@ from ouroboros.workspace_executor import map_host_path as executor_map_host_path
 _active_subprocesses: set = set()
 _subprocess_lock = threading.Lock()
 _panic_requested = False
+_spawning_subprocesses = 0
 _RUN_SHELL_DEFAULT_TIMEOUT_SEC = 360
 
 
@@ -38,16 +39,20 @@ def _tracked_subprocess_run(cmd, **kwargs):
     interpreter, a DOOM framebuffer, raw bytes) surfaces as readable text instead
     of raising UnicodeDecodeError and collapsing the whole call into a
     shell_error."""
+    global _spawning_subprocesses
     timeout = kwargs.pop("timeout", None)
     if kwargs.get("text") or kwargs.get("universal_newlines"):
         kwargs.setdefault("errors", "replace")
     kwargs.setdefault("stdin", subprocess.DEVNULL)
     kwargs.update(subprocess_new_group_kwargs())
-    if _panic_requested:
-        raise RuntimeError("Emergency Stop has retired command admission")
-    proc = subprocess.Popen(cmd, **kwargs)
-    # Publish the positive Popen identity before any helper lock or pipe I/O.
-    _active_subprocesses.add(proc)
+    _spawning_subprocesses += 1
+    try:
+        if _panic_requested:
+            raise RuntimeError("Emergency Stop has retired command admission")
+        proc = subprocess.Popen(cmd, **kwargs)
+        _active_subprocesses.add(proc)  # publish before the spawning owner can exit
+    finally:
+        _spawning_subprocesses -= 1
     try:
         if _panic_requested:
             request_process_tree_kill(proc)

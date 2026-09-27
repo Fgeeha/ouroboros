@@ -54,10 +54,14 @@ def test_public_panic_requests_attached_and_local_children_before_blocked_settle
         return result
 
     def persist_after_requests(_root):
-        assert {r["pid"] for r in receipt_calls if r["requested"]} == {p.pid for p in procs}
+        expected = {procs[1].pid} if platform.IS_MACOS else {p.pid for p in procs}
+        assert {r["pid"] for r in receipt_calls if r["requested"]} == expected
+        if platform.IS_MACOS:
+            assert any(r["pid"] == procs[0].pid and not r["requested"] for r in receipt_calls)
         assert manager._lock.locked() and model._lock.locked()
         for proc in procs:
-            assert proc.wait(timeout=2) is not None
+            if proc.pid in expected:
+                assert proc.wait(timeout=2) is not None
         flag_calls.append(True)
 
     monkeypatch.setattr(platform, "request_process_tree_kill", observe_request)
@@ -109,7 +113,13 @@ def test_attached_request_uses_pinned_identity_without_rereading_custody(
         manager._lock.acquire()
         try:
             receipts = manager.panic_stop(request_only=True)
-            assert receipts[0]["requested"] and receipts[0]["pid"] == proc.pid
+            assert receipts[0]["pid"] == proc.pid
+            if platform.IS_MACOS:
+                assert not receipts[0]["requested"] and "signalable identity" in receipts[0]["error"]
+                assert proc.poll() is None
+                platform.request_process_tree_kill(proc)  # ordinary owned child remains signalable
+            else:
+                assert receipts[0]["requested"]
             assert proc.wait(timeout=2) is not None
         finally:
             manager._lock.release()
@@ -193,7 +203,12 @@ def test_panic_settlement_does_not_request_a_successor_daemon(tmp_path, monkeypa
     successor = None
     try:
         manager.ensure_running()
-        assert manager.panic_stop(request_only=True)[0]["requested"]
+        receipt = manager.panic_stop(request_only=True)[0]
+        if platform.IS_MACOS:
+            assert not receipt["requested"]
+            platform.request_process_tree_kill(original)
+        else:
+            assert receipt["requested"]
         original.wait(timeout=2)
         successor = _child(tmp_path, daemon.CUSTODY_PURPOSE)
         monkeypatch.setattr(manager, "_classify_liveness", lambda **_: (object(), "running", ""))

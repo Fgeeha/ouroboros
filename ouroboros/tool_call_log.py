@@ -191,3 +191,30 @@ def logical_calls(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
                              else "orphan" if "settled" in call
                              else "wait_ended" if "wait_ended" in call else "unknown")
     return calls
+
+
+def replay_evidence(drive_root: pathlib.Path, task_id: str, want: int = 200) -> Dict[str, Any]:
+    """Bounded canonical invocation facts for history, independent of frozen wait metrics."""
+    from ouroboros.memory import Memory
+    from ouroboros.tool_capabilities import routing_action_for_tool
+
+    rows, coverage = Memory(drive_root).read_task_recent("tools.jsonl", task_id, want)
+    observations = []
+    legacy = {"calls": 0, "errors": 0, "wait_ended": False, "unknown": False}
+    for call in logical_calls(rows):
+        if not call.get("invocation_id"):
+            row = call.get("settled") or {}
+            legacy["calls"] += 1
+            legacy["errors"] += int(row.get("type") == CALL_SETTLED and bool(row.get("is_error")))
+            legacy["wait_ended"] |= row.get("type") == CALL_WAIT_ENDED
+            legacy["unknown"] |= row.get("type") == CALL_STARTED
+            continue  # separate observations, never guessed joins to modern/live calls
+        base = {"key": f"tool:{task_id}:{call['invocation_id']}", "tool": call.get("tool"),
+                "receipt": bool(routing_action_for_tool(call.get("tool")))}
+        for slot, fact in (("started", "started"), ("wait_ended", "wait_ended"), ("settled", "settled")):
+            row = call.get(slot)
+            if row is not None:
+                observations.append({**base, "fact": fact, "live": False,
+                    "status": ("error" if row.get("is_error") else "ok") if slot == "settled" else "unknown",
+                    "hostError": row.get("status") == "host_error"})
+    return {"observations": observations, "legacy": legacy, "coverage": coverage}

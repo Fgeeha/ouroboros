@@ -727,6 +727,10 @@ def request_process_tree_kill(proc, *, job_handle=None) -> dict:
     try:
         if pid <= 0 or pid == os.getpid():
             raise ValueError("refusing current/invalid process")
+        channel = None if pinned else getattr(proc, "_ouroboros_stop_socket", None)
+        if channel is not None:
+            channel.send(b"!")  # private nonblocking channel; worker requests its held children first
+            return {**result, "requested": True, "scope": "worker_owners"}
         if IS_WINDOWS:
             if job_handle is not None:
                 result["scope"] = "job"
@@ -739,21 +743,18 @@ def request_process_tree_kill(proc, *, job_handle=None) -> dict:
         else:
             if pinned:
                 if IS_MACOS:
-                    if proc["handle"].control([], 1, 0):
-                        proc["handle"].close()  # an exit/exec refusal cannot be consumed then forgotten
-                        raise ProcessLookupError("captured process exited or exec'd")
-                else:
-                    signal.pidfd_send_signal(proc["handle"].fileno(), 0)
-            elif (proc.poll() if hasattr(proc, "poll") else proc.exitcode) is not None:
-                raise ProcessLookupError("owned child already exited")
-            pgid = os.getpgid(pid)
-            if pgid == pid and pgid != os.getpgrp() and (not pinned or pgid == proc["pgid"]):
-                os.killpg(pgid, signal.SIGKILL)
-                result["scope"] = "group"
-            elif pinned and not IS_MACOS:
+                    proc["handle"].close()
+                    raise RuntimeError("attached Darwin watch is not a signalable identity")
                 signal.pidfd_send_signal(proc["handle"].fileno(), signal.SIGKILL)
             else:
-                os.kill(pid, signal.SIGKILL)
+                if (proc.poll() if hasattr(proc, "poll") else proc.exitcode) is not None:
+                    raise ProcessLookupError("owned child already exited")
+                pgid = os.getpgid(pid)
+                if pgid == pid and pgid != os.getpgrp():
+                    os.killpg(pgid, signal.SIGKILL)
+                    result["scope"] = "group"
+                else:
+                    os.kill(pid, signal.SIGKILL)
         result["requested"] = True
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"

@@ -1154,20 +1154,19 @@ def _drive_state_section(env: Any) -> str:
             "evolution_owner_stopped", "evolution_cycle", "evolution_consecutive_failures",
             "last_evolution_task_at", "bg_consciousness_enabled", "post_task_autostop",
             "budget_drift_pct", "budget_drift_alert", "last_owner_message_at")
-    from supervisor.state import RECOVERY_KEY, read_state_copy
+    from supervisor.state import CONTROL_KEYS, RECOVERY_KEY, control_value, read_state
 
-    status, raw, detail = read_state_copy(env.drive_path("state/state.json"))
-    raw = raw or {}
-    projected = {k: raw[k] for k in keys if k in raw}
+    observed = read_state(env.drive_path("state/state.json").parent.parent)
+    raw = observed.values
+    authority = observed.projection()
+    projected = {k: (raw[k] if k not in CONTROL_KEYS or control_value(authority, k)[0]
+                     else {"status": "unknown"}) for k in keys if k in raw or k in observed.unconfirmed}
     omitted = sorted(set(raw) - set(projected) - {RECOVERY_KEY})
-    unconfirmed = (raw.get(RECOVERY_KEY) or {}).get("unconfirmed") if isinstance(raw.get(RECOVERY_KEY), dict) else None
     note = ("Projection of state/state.json (spend/budget facts live in the Runtime "
             "section, from the usage-accounting authority)."
-            + (f" The file is {status}{f' ({detail})' if detail else ''}: its facts are UNKNOWN here, "
-               "not defaults." if status != "ok" else "")
-            + (" Recovered from its backup: these controls are UNKNOWN until an owner decision "
-               f"confirms them: {', '.join(unconfirmed)}." if unconfirmed else "")
-            + ((" Omitted keys: " + ", ".join(omitted) + ". Full file: "
+            + (f" State authority is {observed.quality}: {observed.reason}. "
+               f"UNKNOWN controls: {', '.join(observed.unconfirmed)}." if observed.quality != "current" else "")
+            + ((" Omitted keys: " + ", ".join(omitted) + ". Full raw source: "
                 "read_file(root='runtime_data', path='state/state.json').") if omitted else ""))
     return ("## Drive state\n\n"
             + json.dumps(projected, ensure_ascii=False, indent=1, sort_keys=True, default=str)

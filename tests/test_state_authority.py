@@ -280,7 +280,7 @@ def test_panic_requests_every_physical_stop_before_any_persistence_and_never_wai
             log=SimpleNamespace(critical=lambda *a, **k: release.wait(30)), bound_port=12345)
     release.set()
     assert time.monotonic() - started < 15  # every write bounded, never awaited
-    assert "workers" in order and ("port", 12345) in order
+    assert "workers" not in order and ("port", 12345) in order  # lifelines own pooled child requests
     assert order.index("flag") < order.index("state")
     assert (root / "state" / "panic_stop.flag").read_text() == "panic"
 

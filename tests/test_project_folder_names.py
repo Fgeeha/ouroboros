@@ -20,7 +20,7 @@ def test_readable_unicode_name_replaces_only_what_a_filesystem_cannot_hold():
     assert project_folder_basename("x\ty\x00z") == "x_y_z"
     assert project_folder_basename(" ..hidden.. ") == "hidden"
     assert project_folder_basename("...") == project_folder_basename("  ") == ""
-    for reserved in ("CON", "con.md", "Lpt9", "nul.tar.gz"):
+    for reserved in ("CON", "con.md", "Lpt9", "nul.tar.gz", "COM¹", "com².txt", "COM³", "LPT¹.doc", "LPT²", "lpt³.tar.gz"):
         stem = project_folder_basename(reserved).split(".", 1)[0]
         assert stem.endswith("_") and stem[:-1].casefold() == reserved.split(".", 1)[0].casefold()
     # Normalization happens only at creation: a decomposed spelling mints the NFC name.

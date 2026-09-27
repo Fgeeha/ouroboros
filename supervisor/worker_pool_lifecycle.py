@@ -17,7 +17,6 @@ not pool state — nothing rebinds it — so the parent imports it back directly
 from __future__ import annotations
 
 import logging
-from supervisor.worker_process import _current_custody_session_id, worker_main
 import json
 import os
 import pathlib
@@ -670,18 +669,13 @@ def _spawn_worker_slot(wid: int, old: Any = None, *, ready_attempt: int = 1) -> 
     ctx = _pool()._get_ctx()
     in_q = ctx.Queue()
     events_cursor, spawned_at = events_log_cursor(), time.time()
-    proc = ctx.Process(target=worker_main,
-                       args=(wid, in_q, _pool().get_event_q(), str(_pool().REPO_DIR), str(_pool().DRIVE_ROOT),
-                             _current_custody_session_id()))
-    proc.daemon = True
+    from supervisor.worker_process import spawn_worker_process
+
     try:
-        proc.start()
+        proc = spawn_worker_process(ctx, wid, in_q, _pool().get_event_q(), _pool().REPO_DIR, _pool().DRIVE_ROOT)
     except Exception:
-        try:
-            in_q.close()
-            in_q.cancel_join_thread()
-        except Exception:
-            pass
+        in_q.close()
+        in_q.cancel_join_thread()
         raise
     installed = False
     with _queue_lock:

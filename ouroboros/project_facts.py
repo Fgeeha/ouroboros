@@ -104,7 +104,7 @@ def project_folder_basename(display_name: Any) -> str:
             head = head[:-1]
         head = head.rstrip(" .-")
         name = f"{head}-{digest}" if head else digest
-    if name.split(".", 1)[0].casefold() in _RESERVED_NAMES:
+    if name.split(".", 1)[0].casefold() in (_RESERVED_NAMES | {f"{prefix}{digit}" for prefix in ("com", "lpt") for digit in "¹²³"}):
         stem, dot, rest = name.partition(".")
         name = f"{stem}_{dot}{rest}"
     return name

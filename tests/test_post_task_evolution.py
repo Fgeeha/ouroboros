@@ -6,6 +6,7 @@ import json
 import pathlib
 import types
 
+import pytest
 
 import ouroboros.config as config
 import ouroboros.post_task_evolution as pte
@@ -162,11 +163,11 @@ def test_v5_apply_pending_request_activates_gated_campaign(tmp_path, monkeypatch
         "start_evolution_campaign",
         lambda objective, source="": started.update(objective=objective, source=source) or {"id": "test"},
     )
-    monkeypatch.setattr(st, "load_state", lambda: {"owner_chat_id": 7})
+    monkeypatch.setattr(st, "load_state", lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False})
     monkeypatch.setattr(st, "save_state", lambda s: saved.update(s))
 
     def _fake_update_state(mutator, **_kwargs):
-        live = {"owner_chat_id": 7}
+        live = {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False}
         mutator(live)
         saved.update(live)
         return live
@@ -373,7 +374,7 @@ def test_toggle_evolution_on_clears_owner_stop(tmp_path, monkeypatch):
     calls = {"complete": [], "start": []}
 
     def _fake_update_state(mutator, **_kwargs):
-        live = {"owner_chat_id": 7}
+        live = {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False}
         mutator(live)
         captured.update(live)
         return live
@@ -386,7 +387,7 @@ def test_toggle_evolution_on_clears_owner_stop(tmp_path, monkeypatch):
                         lambda objective="", *, source="": calls["start"].append((objective, source)) or {"id": "test"})
 
     ctx = types.SimpleNamespace(
-        load_state=lambda: {"owner_chat_id": 7},
+        load_state=lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False},
         send_with_budget=lambda cid, text, **kw: None,
     )
     _handle_toggle_evolution({"enabled": True, "objective": "improve X"}, ctx)
@@ -404,7 +405,7 @@ def test_toggle_evolution_start_failure_sends_owner_correction(monkeypatch):
     monkeypatch.setattr(evolution_lifecycle, "start_evolution_campaign", lambda *a, **k: {})
     sent = []
     ctx = types.SimpleNamespace(
-        load_state=lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False},
+        load_state=lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False},
         send_with_budget=lambda chat_id, text, **kw: sent.append((chat_id, text)),
     )
 
@@ -489,7 +490,7 @@ def test_execute_panic_stop_wires_owner_stop(tmp_path, monkeypatch):
     import ouroboros.tools.shell as _shell
     import ouroboros.local_model as _lm
     monkeypatch.setattr(_shell, "kill_all_tracked_subprocesses", lambda *a, **k: None)
-    monkeypatch.setattr(_lm, "get_manager", lambda: types.SimpleNamespace(stop_server=lambda: None))
+    monkeypatch.setattr(_lm, "get_manager", lambda **_: types.SimpleNamespace(stop_server=lambda: None, panic_stop=lambda **_: []))
 
     class _StopPanic(Exception):
         pass
@@ -649,7 +650,7 @@ def _apply_with_request(tmp_path, monkeypatch, backlog_id):
     )
     monkeypatch.setattr(lifecycle, "_read_evolution_campaign", lambda: camp)
     monkeypatch.setattr(lifecycle, "_write_evolution_campaign", lambda c: camp.update(c))
-    monkeypatch.setattr(stt, "load_state", lambda: {"owner_chat_id": 7})
+    monkeypatch.setattr(stt, "load_state", lambda: {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False})
     monkeypatch.setattr(stt, "save_state", lambda s: None)
 
     def _fake_update_state(mutator, **_kwargs):
@@ -657,7 +658,7 @@ def _apply_with_request(tmp_path, monkeypatch, backlog_id):
         # unlocked loader, so the load_state patch above never reaches it — on a machine whose
         # LIVE state carries evolution_owner_stopped=True the atomic re-check would then refuse
         # the enable and apply would return False for reasons outside this test's control.
-        live = {"owner_chat_id": 7}
+        live = {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False}
         mutator(live)
         return live
 
@@ -724,3 +725,19 @@ def test_promotion_chooser_uses_main_model_slot(tmp_path, monkeypatch):
     monkeypatch.setenv("OUROBOROS_MODEL", "")
     pte._decide_promotion(env, {"id": "t2"}, {"reflection": "r"}, object(), force=False)
     assert calls.get("model") == config.SETTINGS_DEFAULTS["OUROBOROS_MODEL"]
+
+
+@pytest.mark.parametrize("missing", ["evolution_owner_stopped", "evolution_mode_enabled", "owner_chat_id"])
+def test_apply_pending_preserves_request_while_control_is_unknown(tmp_path, monkeypatch, missing):
+    monkeypatch.setenv("OUROBOROS_POST_TASK_EVOLUTION", "true")
+    from supervisor import evolution_lifecycle, state
+    request = tmp_path / "state/post_task_evolution_request.json"
+    request.parent.mkdir()
+    request.write_text(json.dumps({"objective": "improve"}))
+    values = {"owner_chat_id": 7, "evolution_mode_enabled": False, "evolution_owner_stopped": False}
+    values.pop(missing)
+    monkeypatch.setattr(state, "load_state", lambda: values)
+    monkeypatch.setattr(evolution_lifecycle, "evolution_block_reason", lambda: "")
+    monkeypatch.setattr(evolution_lifecycle, "start_evolution_campaign", lambda *_a, **_k: pytest.fail("unknown cannot start"))
+    assert pte.apply_pending_request(tmp_path) is False
+    assert request.exists()

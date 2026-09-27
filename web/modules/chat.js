@@ -814,19 +814,17 @@ export function createChatInstance({
             || record.toolErrors > 0;
     }
 
-    // Tool accounting from a metrics or terminal fact: the meta counts and the
-    // block's one folded evidence row. A field the fact does not carry stays
-    // absent, so a partial snapshot cannot reclassify the row.
+    // Fold counters with canonical facts; absent fields stay absent.
     function noteToolMetrics(taskId, metrics, rawTs, { suppressDomInsert = false } = {}) {
         const known = (key) => (Number.isInteger(metrics?.[key]) ? metrics[key] : null);
         const [calls, errors, routing] = ['tool_calls', 'tool_errors', 'routing_tool_calls'].map(known);
-        if ((!calls && !errors) || subagentChildParents.has(taskId)) return false;
+        if (!calls && !errors && !metrics.tool_evidence?.observations?.length && !metrics.tool_evidence?.legacy?.calls) return false;
         return withStableViewport(() => {
             const record = getLiveCardRecord(taskId);
             const before = captureLiveCardProjection(record);
             const duration = Number(metrics.duration_sec);
             if (Number.isFinite(duration)) record.durationSec = duration;
-            const summary = noteToolHostMetrics(record, { calls, errors, routing, counts: metrics.tool_call_counts });
+            const summary = noteToolHostMetrics(record, { calls, errors, routing, counts: metrics.tool_call_counts, evidence: metrics.tool_evidence });
             record.toolCalls = summary.calls;
             record.toolErrors = summary.errors;
             const { timelineUpdate } = upsertToolFoldRow(record, summary, normalizeLogTs(rawTs), rawTs);
@@ -1702,6 +1700,9 @@ export function createChatInstance({
         }
         // One tool evidence row per block.
         const foldView = summary.toolCall ? applyToolObservation(record, summary.toolCall) : null;
+        if (summary.toolCall?.fact === 'wait_ended' && record.toolFold.calls.get(summary.toolCall.key)?.settlement) {
+            summary = { ...summary, visible: false }; // wait history remains in the fold
+        }
         if (record.finished && !isTerminalTaskPhase(nextPhase, summary.terminal)) {
             if (foldView) {
                 upsertToolFoldRow(record, foldView, ts, rawTs);
@@ -1782,7 +1783,6 @@ export function createChatInstance({
         renderCollapsedActivity(record, activityText);
 
         const shouldRenderLine = summary.visible !== false && Boolean(headline || summary.body);
-        // Parent-child replay and child lifecycle/progress update in place.
         let timelineUpdate = 'none';
         let patchIndex = -1;
         if (_historyRow?.history_id) {
@@ -1840,6 +1840,10 @@ export function createChatInstance({
     // Every terminal route releases controls and subscriptions together.
     function settleLiveCard(record, phase, wasFinished) {
         record.root.dataset.finished = '1';
+        if (record.toolFold) {
+            upsertToolFoldRow(record, noteToolHostMetrics(record, {}), '', '');
+            renderLiveCardTimeline(record);
+        }
         cancelableTaskIds.delete(record.groupId);
         syncCancelRunButton(record);
         modelWaits.finish(record.groupId);
@@ -1852,8 +1856,7 @@ export function createChatInstance({
     function finishLiveCardMutation(groupId = '', phase = '') {
         const record = groupId ? liveCardRecords.get(groupId) : null;
         if (!record) return false;
-        // A converted card is a terminal project chip now — ignore late terminal
-        // frames so they neither overwrite the chip nor touch its element refs (T4).
+        // Converted project chips ignore later task terminals (T4).
         if (record.root?.dataset?.projectCreated === '1') return false;
         const before = captureLiveCardProjection(record);
         const typingBefore = typingEl.style.display;
@@ -1989,10 +1992,10 @@ export function createChatInstance({
         if (review !== undefined) return review;
         if (!taskId) return false;
         modelWaits.observe(taskId, msg);
-        let changed = false;
+        let changed = msg.tool_evidence ? noteToolMetrics(taskId, msg, rawTs) : false;
         // Only host-attested progress grants Stop authority.
         if (grantCancelAuthority && msg?.cancelable === true && msg?.task_id) {
-            changed = markTaskCancelable(String(msg.task_id));
+            changed = markTaskCancelable(String(msg.task_id)) || changed;
         }
         const lifecycleParent = taskKey(msg?.parent_task_id);
         if (msg?.subagent_event && lifecycleParent) {
@@ -2184,9 +2187,9 @@ export function createChatInstance({
         }
         const childInfo = subagentChildParents.get(taskId);
         if (childInfo && eventType === 'task_done') return routeSubagentTerminalToCard(taskId, evt);
-        if (childInfo && subagentTerminalChildren.has(taskId)) return false;
-        // Tool accounting (metrics or the terminal) is the same fact for a
-        // child and its owner; the rows themselves come from the summarizer.
+        if (childInfo && subagentTerminalChildren.has(taskId)
+                && !['tool_call_started', 'tool_call', 'tool_call_finished', 'tool_call_timeout', 'tool_timeout'].includes(eventType)) return false;
+        // Metrics and terminal facts share the root/child fold.
         let changed = ['task_metrics_event', 'task_eval', 'task_done'].includes(eventType)
             ? noteToolMetrics(taskId, evt, rawTs) : false;
         if (!childInfo) changed = attachTaskDetailReviews(taskId, evt) || changed;
@@ -2205,10 +2208,7 @@ export function createChatInstance({
         );
         if (childInfo) return Boolean(changed || queued);
         const subagentChanged = updateSubagentCardFromEvent(evt, rawTs);
-        // The host stamps the lane on the turn's own frames (task_done always,
-        // a direct turn's tool frames too), so the header pill never waits for
-        // a census; the host-attested Stop marker rides a direct turn's tool
-        // frames the way it rides its narration rows, so a tool-only turn offers Stop.
+        // Host-attested lane and Stop facts also travel on tool-only turns.
         if (typeof evt._is_direct_chat === 'boolean') noteDirectTurn(liveCardRecords.get(taskId), evt._is_direct_chat);
         if (evt.cancelable === true) markTaskCancelable(taskId);
         if (eventType === 'task_done' && summary.terminal) {

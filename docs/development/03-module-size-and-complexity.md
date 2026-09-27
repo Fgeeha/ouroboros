@@ -41,8 +41,11 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
   `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (the same runtime-only iterator;
   the module gates include tests/devtools) — a high-water alarm with ample
   headroom, raised only with a one-line campaign rationale in the same commit
-  (the current 10500 ceiling came with the exact budget-pause lifecycle,
-  owner-approved within 10%, after that change's own single-caller inlines).
+  (10500 came with the owner-approved exact budget-pause lifecycle; Batch1
+  proposes 10525, its exact product count after four redundant helper removals
+  and three required worker-ownership/history helpers, versus 10526 at `81c`).
+  The +25 adjustment requires independent review before publication; all module,
+  function, byte and debt-transition limits remain unchanged.
 - Enforcement: the OFFICIAL repository's CI runs the dedicated `size_ratchet`
   pytest lane as a blocking step (`OURO_SIZE_RATCHET_BASE_REF` names the event
   base; lane placement and base fallback: ARCHITECTURE §8 "CI topology").

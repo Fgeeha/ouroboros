@@ -249,7 +249,7 @@ def control_is(st: Dict[str, Any], key: str, expected: Any) -> bool:
     return known and value == expected
 
 
-def _backup_unconfirmed(backup: Dict[str, Any]) -> Tuple[str, ...]:
+def _backup_unconfirmed(backup: Dict[str, Any], drive_root=None) -> Tuple[str, ...]:
     """The controls a backup copy cannot prove. A SET owner binding is proven when the
     backup carries the completed initialization identity: its only writers fill a
     known-empty slot and only an owner Reset (a new identity, both copies deleted)
@@ -258,7 +258,7 @@ def _backup_unconfirmed(backup: Dict[str, Any]) -> Tuple[str, ...]:
     from supervisor import state_initialization as witness
 
     identity = str(backup.get("initialization_id") or "")
-    status, record = witness.read_witness(DRIVE_ROOT) if identity else ("missing", {})
+    status, record = witness.read_witness(drive_root or DRIVE_ROOT) if identity else ("missing", {})
     same = status == "ok" and record.get("phase") == "complete" and record.get("initialization_id") == identity
     return tuple(key for key in CONTROL_KEYS
                  if not (same and key.startswith("owner_") and backup.get(key) is not None
@@ -270,23 +270,24 @@ def _recovery_unconfirmed(st: Dict[str, Any]) -> Tuple[str, ...]:
     return tuple(recovery.get("unconfirmed") or ()) if isinstance(recovery, dict) else ()
 
 
-def read_state() -> StateRead:
+def read_state(drive_root=None) -> StateRead:
     """Classify both copies WITHOUT writing (a GET, a display, a boot probe)."""
     from supervisor.state_initialization import authority_reason, read_witness
-    p_status, primary, _raw, p_detail = _read_json_file(STATE_PATH)
+    root = pathlib.Path(drive_root) if drive_root is not None else DRIVE_ROOT
+    p_status, primary, _raw, p_detail = _read_json_file(root / "state" / "state.json")
     if p_status == "ok":
-        reason = authority_reason(DRIVE_ROOT, str(primary.get("initialization_id") or ""))
+        reason = authority_reason(root, str(primary.get("initialization_id") or ""))
         if reason:
             return StateRead("unavailable", "primary", dict(primary), CONTROL_KEYS, reason)
         unconfirmed = tuple(set(_recovery_unconfirmed(primary)) | (set(CONTROL_KEYS) - primary.keys() - OPTIONAL_CONTROL_KEYS))
         return StateRead("recovered" if unconfirmed else "current", "primary",
                          ensure_state_defaults(dict(primary)), unconfirmed)
-    b_status, backup, _braw, b_detail = _read_json_file(STATE_LAST_GOOD_PATH)
+    b_status, backup, _braw, b_detail = _read_json_file(root / "state" / "state.last_good.json")
     reason = f"primary {p_status}{f' ({p_detail})' if p_detail else ''}; backup {b_status}"
     if b_status == "ok":
         return StateRead("recovered_transient", "backup", ensure_state_defaults(dict(backup)),
-                         _backup_unconfirmed(backup), reason)
-    w_status, _witness = read_witness(DRIVE_ROOT)
+                         _backup_unconfirmed(backup, root), reason)
+    w_status, _witness = read_witness(root)
     quality = "uninitialized" if p_status == b_status == w_status == "missing" else "unavailable"
     return StateRead(quality, "none", {}, CONTROL_KEYS, reason + (f" ({b_detail})" if b_detail else ""))
 
@@ -304,8 +305,17 @@ def _preserve_corrupt_primary(raw: bytes) -> str:
         except OSError as exc:
             raise StateUnavailable("corrupt_primary_unpreserved", f"{type(exc).__name__}") from exc
         try:
-            os.write(fd, raw)
+            offset = 0
+            while offset < len(raw):
+                written = os.write(fd, raw[offset:])
+                if written <= 0:
+                    raise OSError("corrupt copy made no progress")
+                offset += written
             os.fsync(fd)
+            if os.fstat(fd).st_size != len(raw):
+                raise OSError("corrupt copy length mismatch")
+        except OSError as exc:
+            raise StateUnavailable("corrupt_primary_unpreserved", type(exc).__name__) from exc
         finally:
             os.close(fd)
         return target.name
@@ -331,6 +341,8 @@ def _state_for_write(*, initializing: bool = False) -> Dict[str, Any]:
                     mark_unconfirmed(primary, key)
             else:
                 raise StateUnavailable(reason)
+        for key in set(CONTROL_KEYS) - primary.keys() - OPTIONAL_CONTROL_KEYS:
+            mark_unconfirmed(primary, key)
         return primary
     if p_status == "unreadable":
         raise StateUnavailable("primary_unreadable", p_detail)
@@ -428,6 +440,9 @@ def save_state(st: Dict[str, Any]) -> None:
         if p_status == "invalid":
             primary = _state_for_write()
             p_status = "ok"
+        if p_status == "ok":
+            for key in (set(CONTROL_KEYS) - primary.keys() - OPTIONAL_CONTROL_KEYS) | (set(CONTROL_KEYS) - st.keys() - OPTIONAL_CONTROL_KEYS):
+                mark_unconfirmed(primary, key)
         if p_status == "ok" and isinstance(primary.get(RECOVERY_KEY), dict):
             st[RECOVERY_KEY] = primary[RECOVERY_KEY]
         if p_status == "ok":

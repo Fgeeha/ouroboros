@@ -153,7 +153,7 @@ export function noteToolCall(record, observation) {
         }
     } else if (fact === 'wait_ended') next.waitEnded = true;
     else next.started = true;
-    next.live = next.live || observation.live === true || (!observation.fact && observation.status === 'calling');
+    next.live = !record.finished && (next.live || observation.live === true || (!observation.fact && observation.status === 'calling'));
     next.status = next.settlement?.status || (next.waitEnded ? 'wait_ended' : next.live ? 'calling' : 'unknown');
     calls.set(key, next);
     return record;
@@ -170,7 +170,13 @@ export function noteToolCall(record, observation) {
  * is never explicitly emptied while the turn counts calls.
  */
 export function noteToolHostMetrics(record, host) {
+    for (const observation of host?.evidence?.observations || []) applyToolObservation(record, observation);
     const fold = ensureToolFold(record);
+    if (host?.evidence?.coverage) { fold.coverage = host.evidence.coverage; fold.legacy = host.evidence.legacy; }
+    if (record.finished) for (const call of fold.calls.values()) {
+        call.live = false;
+        call.status = call.settlement?.status || (call.waitEnded ? 'wait_ended' : 'unknown');
+    }
     const known = fold.host || {};
     const carry = (next, before) => (next === null || next === undefined ? (before ?? null) : next);
     const counts = host?.counts && typeof host.counts === 'object' && Object.keys(host.counts).length > 0
@@ -218,10 +224,12 @@ const perToolLine = (entries) => entries
 export function toolEvidenceView(fold = null) {
     const live = fold?.calls instanceof Map ? [...fold.calls.values()] : [];
     const host = fold?.host || null;
-    const calls = Number.isInteger(host?.calls) ? host.calls : live.length;
-    // Host round totals include wait errors. Once every call has its own
-    // observation, use operation settlements rather than resurrecting a timeout.
-    const errors = live.length >= calls ? live.filter(call => call.status === 'error').length
+    const observed = live.length + (fold?.legacy?.calls || 0);
+    const calls = Math.max(Number.isInteger(host?.calls) ? host.calls : 0, observed);
+    // Frozen totals count model wait errors. Canonical evidence reports operation
+    // outcomes; a bounded partial read discloses its gap instead of reviving waits.
+    const partial = Boolean(fold?.coverage) && observed > 0 && observed < calls;
+    const errors = observed >= calls || partial ? live.filter(call => call.status === 'error').length + (fold?.legacy?.errors || 0)
         : (Number.isInteger(host?.errors) ? host.errors : live.filter(call => call.status === 'error').length);
     const liveCounts = new Map();
     for (const call of live) liveCounts.set(call.tool, (liveCounts.get(call.tool) || 0) + 1);
@@ -230,10 +238,10 @@ export function toolEvidenceView(fold = null) {
         phase: errors > 0 ? 'warn'
             : ((!host && live.some((call) => call.status === 'calling')) ? 'calling' : 'result'),
         headline: `${plural(calls, 'tool call')}${errors > 0 ? ` · ${plural(errors, 'error')}` : ''}`
-            + (live.some(call => call.waitEnded) ? ' · wait ended' : '')
-            + (live.some(call => call.status === 'unknown') ? ' · outcome unknown' : ''),
+            + (live.some(call => call.waitEnded) || fold?.legacy?.wait_ended ? ' · wait ended' : '')
+            + (live.some(call => call.status === 'unknown') || fold?.legacy?.unknown || partial ? ' · outcome unknown' : ''),
         body: '',
-        fullBody: perToolLine(host?.counts && typeof host.counts === 'object'
+        fullBody: (partial ? 'Invocation evidence is incomplete. ' : '') + perToolLine(host?.counts && typeof host.counts === 'object'
             ? Object.entries(host.counts) : [...liveCounts]),
         visible: true,
         // Addressing calls report themselves on the owner's message, so a block

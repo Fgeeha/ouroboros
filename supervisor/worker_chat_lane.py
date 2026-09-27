@@ -684,13 +684,8 @@ def auto_resume_after_restart() -> None:
         # write fails, the flag stays and every boot grant keeps reading it.
         panic_flag = _pool().DRIVE_ROOT / "state" / "panic_stop.flag"
         if panic_flag.exists():
-            from ouroboros.server_control import PANIC_CONTROL_KEYS
+            from ouroboros.server_control import PANIC_CONTROL_KEYS, _panic_controls
             from supervisor.state import StateUnavailable, update_state
-
-            def _panic_controls(st: dict) -> None:
-                st.update(evolution_mode_enabled=False, bg_consciousness_enabled=False,
-                          evolution_owner_stopped=True, post_task_autostop=False)
-                st.pop("evolution_stop_source", None)
 
             try:
                 update_state(_panic_controls, confirm=PANIC_CONTROL_KEYS)

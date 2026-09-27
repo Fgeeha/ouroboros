@@ -153,7 +153,8 @@ def _merge_onto_current(existing: Dict[str, Any], incoming: Dict[str, Any]) -> D
 
 def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | None = None,
                           actor: str = "", task_id: str = "", reason: str = "",
-                          continuation_of: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+                          continuation_of: Optional[Dict[str, Any]] = None,
+                          new_resource_intent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Create or replace a scheduled task record.
 
     Returns the stored row plus an ``audit`` field: ``recorded`` when both audit
@@ -174,6 +175,15 @@ def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | 
         schedule_id = str(incoming.get("id") or "").strip() or uuid.uuid4().hex[:8]
         incoming["id"] = schedule_id
         existing = next((item for item in tasks if str(item.get("id") or "") == schedule_id), None)
+        if new_resource_intent is not None:
+            # The producer may describe a NEW row. Editing an old followup cannot
+            # turn absent intent into self-work; preserve its current evidence.
+            template = dict(incoming.get("task") or {})
+            metadata = dict(template.get("metadata") or {})
+            intent = ((existing.get("task") or {}).get("metadata") or {}).get("resource_intent") if existing else new_resource_intent
+            if intent is not None:
+                metadata.setdefault("resource_intent", dict(intent))
+            incoming["task"] = {**template, "metadata": metadata}
         operation_id = uuid.uuid4().hex[:12]
         action = "edit" if existing is not None else "create"
         audit = {

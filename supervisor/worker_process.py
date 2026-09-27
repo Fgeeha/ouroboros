@@ -105,8 +105,61 @@ def _adopt_published_extensions(pool_drive_root: str) -> None:
         log.debug("extension generation adoption failed", exc_info=True)
 
 
+def spawn_worker_process(ctx, wid, in_q, out_q, repo_dir, drive_root):
+    """Bind a private emergency channel to this exact worker before it starts."""
+    import socket
+
+    parent, child = socket.socketpair()
+    parent.setblocking(False)
+    proc = ctx.Process(target=worker_main, args=(wid, in_q, out_q, str(repo_dir), str(drive_root),
+                                               _current_custody_session_id(), child))
+    proc.daemon = True
+    try:
+        proc.start()
+    except BaseException:
+        parent.close()
+        raise
+    finally:
+        child.close()
+    proc._ouroboros_stop_socket = parent
+    return proc
+
+
+def request_worker_owned_stops(drive_root):
+    """Close admission and request every locally held owner before worker exit.
+
+    No custody/persistence/cleanup locks. A spawn already inside Popen must
+    publish its handle before this discovering owner may be destroyed.
+    """
+    import time
+
+    from ouroboros.claudexor_daemon import get_owned_daemon
+    from ouroboros.extension_companion import panic_kill_all
+    from ouroboros.local_model import get_manager
+    from ouroboros.tools import shell_process
+    from ouroboros.tools.services import kill_all_services
+    from ouroboros.workspace_executor import kill_all_foreground
+
+    for request in (shell_process.kill_all_tracked_subprocesses,
+                    lambda **kw: kill_all_foreground(pathlib.Path(drive_root), **kw),
+                    lambda **kw: kill_all_services(pathlib.Path(drive_root), **kw), panic_kill_all):
+        try:
+            request(request_only=True)
+        except Exception:
+            pass  # one owner failure must not skip other held identities
+    for owner in (get_owned_daemon(create=False), get_manager(create=False)):
+        if owner is not None:
+            try:
+                owner.panic_stop(request_only=True)
+            except Exception:
+                pass
+    while shell_process._spawning_subprocesses:
+        time.sleep(0.001)
+    shell_process.kill_all_tracked_subprocesses(request_only=True)
+
+
 def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
-                custody_session_id: str = "") -> None:
+                custody_session_id: str = "", stop_socket=None) -> None:
     import os as _os
     # Mark this process as a worker BEFORE importing the agent/LLM stack so the
     # central network-transport policy disables system proxy resolution
@@ -149,7 +202,8 @@ def worker_main(wid: int, in_q: Any, out_q: Any, repo_dir: str, drive_root: str,
     try:
         from ouroboros.process_custody import start_parent_lifeline
 
-        start_parent_lifeline(label=f"worker-{wid}")
+        start_parent_lifeline(label=f"worker-{wid}", stop_socket=stop_socket,
+                              before_exit=lambda: request_worker_owned_stops(drive_root))
     except Exception:
         pass
     # Stream this worker's append_jsonl log lines to the dashboard Logs panel.

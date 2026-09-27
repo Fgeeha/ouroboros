@@ -453,6 +453,9 @@ def _annotate_terminal_task_truth(
             and str(message.get("role") or "") in {"assistant", "system"}
             and str(message.get("task_id") or "") not in progress_task_ids
         }
+        from ouroboros.tool_call_log import replay_evidence
+
+        tool_evidence_by_task = {}
         terminal_status_by_task: Dict[str, str] = {}
         terminal_truth_by_task: Dict[str, Dict[str, Any]] = {}
         terminal_receipt_by_task: Dict[str, Dict[str, Any]] = {}
@@ -461,6 +464,7 @@ def _annotate_terminal_task_truth(
         live_cost_by_task: Dict[str, Dict[str, Any]] = {}
         finalizing_tasks: set = set()
         for task_id in progress_task_ids | summary_task_ids | legacy_final_task_ids:
+            tool_evidence_by_task[task_id] = replay_evidence(data_dir, task_id)
             result = _load_terminal_result(data_dir, task_id, cache)
             child_meta = subagent_message_meta(result, task_id=task_id)
             if child_meta:
@@ -586,6 +590,7 @@ def _annotate_terminal_task_truth(
                 and latest_progress_by_task.get(task_id) is message
             ):
                 message.update(terminal_truth_by_task.get(task_id) or {})
+                message["tool_evidence"] = tool_evidence_by_task.get(task_id)
             if (message.get("is_progress") or is_summary) and task_id in suggested_name_by_task:
                 message["suggested_name"] = suggested_name_by_task[task_id]
             # Floor-symmetric closed lineage window for chat FINALS: strip runs

@@ -28,6 +28,7 @@ is a disclosed residual, not proof of historylessness.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -160,7 +161,13 @@ def prepare_adoption(drive_root: Any, state: Dict[str, Any]) -> str:
     """
     status, witness = read_witness(drive_root)
     identity = str(state.get("initialization_id") or "")
+    source = pathlib.Path(drive_root) / "state" / "state.json"
+    source_digest = hashlib.sha256(source.read_bytes()).hexdigest()
     if status == "ok":
+        if (not identity and witness.get("phase") == "pending"
+                and witness.get("origin") == "legacy_adopted"
+                and witness.get("legacy_source_sha256") == source_digest):
+            return str(witness["initialization_id"])
         if identity != witness["initialization_id"]:
             raise ValueError("initialization_identity_mismatch")
         return identity
@@ -170,7 +177,8 @@ def prepare_adoption(drive_root: Any, state: Dict[str, Any]) -> str:
         raise ValueError("legacy_initialization_evidence_missing")
     identity = identity or uuid.uuid4().hex
     _write(drive_root, {"initialization_id": identity, "phase": "pending",
-                        "origin": "legacy_adopted", "created_at": utc_now_iso()})
+                        "origin": "legacy_adopted", "created_at": utc_now_iso(),
+                        "legacy_source_sha256": source_digest})
     return identity
 
 

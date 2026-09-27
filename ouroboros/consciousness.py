@@ -95,7 +95,8 @@ class BackgroundConsciousness:
         state = self._read_state()
         from supervisor.state import control_is
 
-        self._enabled = not panic_blocks_wake(self._drive_root) and control_is(state, "bg_consciousness_enabled", True)  # unknown is not on (#1307)
+        self._stopped = panic_blocks_wake(self._drive_root)  # unknown is suspension, Panic is a stop
+        self._enabled = not self._stopped and control_is(state, "bg_consciousness_enabled", True)  # unknown is not on (#1307)
         try:
             persisted = float(state.get(NEXT_WAKE_STATE_KEY) or 0.0)
         except (TypeError, ValueError):
@@ -201,9 +202,10 @@ class BackgroundConsciousness:
             from supervisor.state import control_is
 
             if panic_blocks_wake(self._drive_root):
-                self._enabled = False
+                self._stopped, self._enabled = True, False
                 return "panic_stop"
-            if not self._enabled or not control_is(self._read_state(), "bg_consciousness_enabled", True):
+            self._enabled = not self._stopped and control_is(self._read_state(), "bg_consciousness_enabled", True)
+            if not self._enabled:
                 return "disabled"
             wake, owner_live = self.live_turns()
             if wake or owner_live:
@@ -310,13 +312,14 @@ class BackgroundConsciousness:
                 return "Background consciousness stays disabled while Panic controls await persistence."
             if self._enabled:
                 return "Background consciousness is already enabled."
-            self._enabled = True
+            self._stopped, self._enabled = False, True
             # The clock did not advance while disabled: never announce a wake in the past.
             self._set_next_wake(max(self._next_wake_at, time.time()))
             return f"Background consciousness enabled; next wake-up at {time.strftime('%H:%M', time.localtime(self._next_wake_at))}."
 
     def stop(self) -> str:
         with self._lock:
+            self._stopped = True
             was_enabled, self._enabled = self._enabled, False
         wake, _owner = self.live_turns()
         if wake:

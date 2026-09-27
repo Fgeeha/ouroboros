@@ -745,10 +745,9 @@ test('a host note inside a child leaves the child\'s collapsed line and title al
     } finally { f.close(); }
 });
 
-// The disclosed residual: a child folds its calls while they happen, and the
-// host's at-rest metrics stay the owner's (`noteToolMetrics` skips children),
-// so a reloaded child card carries no evidence row.
-test('a child card folds its own tool calls live and takes no at-rest evidence row', () => {
+// Child cards fold their own live calls and host counters. Canonical child
+// history is exercised separately below.
+test('a child folds its own live calls and host counters', () => {
     const f = fixture();
     try {
         f.census(managed());
@@ -764,8 +763,8 @@ test('a child card folds its own tool calls live and takes no at-rest evidence r
         assert.match(folded()[0].innerHTML, /2 tool calls/);
         f.log({ type: 'task_metrics_event', task_id: CHILD, tool_calls: 5, tool_errors: 0,
             tool_call_counts: { read_file: 5 } });
-        assert.equal(folded().length, 1, 'the at-rest fact belongs to the owning turn: a child takes no row from it');
-        assert.doesNotMatch(folded()[0].innerHTML, /5 tool calls/);
+        assert.equal(folded().length, 1, 'host counters update the same folded row');
+        assert.match(f.meta(CHILD), /5 tool calls/);
     } finally { f.close(); }
 });
 
@@ -804,4 +803,64 @@ test('real Chat clears a provisional wait notice after durable successful settle
         assert.doesNotMatch(rows, /operation may still settle|One of the steps failed/);
         assert.match(rows, /1 tool call/);
     } finally { f.close(); }
+});
+
+
+for (const order of ['wait-first', 'settlement-first']) for (const failed of [false, true]) {
+    test(`terminal child keeps independent tool facts: ${order}, error=${failed}`, () => {
+        const f = fixture();
+        try {
+            f.emit('chat', { role: 'assistant', is_progress: true, content: 'Child working', task_id: TASK,
+                subagent_event: 'scheduled', subagent_task_id: 'kid', parent_task_id: TASK,
+                root_task_id: TASK, delegation_role: 'subagent', subagent_role: 'researcher' });
+            const identity = { task_id: 'kid', tool: 'read_file', invocation_id: 'kid-call' };
+            f.log({ type: 'tool_call_started', ...identity });
+            f.emit('chat', { role: 'assistant', is_progress: true, content: 'Child finished', task_id: TASK,
+                subagent_event: 'completed', subagent_task_id: 'kid', parent_task_id: TASK,
+                root_task_id: TASK, delegation_role: 'subagent', subagent_role: 'researcher' });
+            const wait = { type: 'tool_call_timeout', ...identity };
+            const result = { type: 'tool_call', ...identity, status: failed ? 'error' : 'ok', is_error: failed };
+            for (const row of order === 'wait-first' ? [wait, result] : [result, wait]) f.log(row);
+            f.card('kid').querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+            const rows = f.rows('kid').map(row => row.innerHTML).join(' ');
+            assert.match(rows, /1 tool call/);
+            assert.match(rows, /wait ended/);
+            assert.doesNotMatch(rows, /operation may still settle/);
+            assert.equal(/1 error/.test(rows), failed);
+            assert.equal(f.card('kid').dataset.finished, '1');
+            assert.equal(Boolean(f.card('kid').querySelector('[data-cancel-run]')), false);
+        } finally { f.close(); }
+    });
+}
+
+for (const child of [false, true]) test(`cold Chat merges canonical settlement with persisted metrics: child=${child}`, async () => {
+    const id = child ? CHILD : TASK;
+    const base = { key: `tool:${id}:real-i`, tool: 'read_file', receipt: false, live: false };
+    const lineage = child ? { delegation_role: 'subagent', parent_task_id: TASK, root_task_id: TASK,
+        subagent_task_id: CHILD, subagent_role: 'scout' } : {};
+    const f = fixture([{ ...final, ...lineage, task_id: id, role: 'system', system_type: 'task_summary', text: 'Done',
+        ts: TS, chat_id: 1, tool_calls: 1, tool_errors: 1, tool_call_counts: { read_file: 1 },
+        tool_evidence: { observations: [
+            { ...base, fact: 'started', status: 'unknown' },
+            { ...base, fact: 'wait_ended', status: 'unknown' },
+            { ...base, fact: 'settled', status: 'ok' },
+        ] } }]);
+    try {
+        await f.instance.refreshHistory({ revision: 1 });
+        if (child) f.card(id).querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        const rows = f.rows(id).map(row => row.innerHTML).join(' ');
+        assert.match(rows, /1 tool call.*wait ended/);
+        assert.doesNotMatch(rows, /1 error|operation may still settle/);
+        assert.doesNotMatch(f.meta(id), /1 error/);
+    } finally { f.close(); }
+});
+
+test('terminal projection retires live calling without inventing settlement', () => {
+    const record = {};
+    noteToolCall(record, { key: 'interrupted', tool: 'read_file', fact: 'started', live: true });
+    record.finished = true;
+    const view = noteToolHostMetrics(record, {});
+    assert.match(view.headline, /outcome unknown/);
+    assert.equal(view.phase, 'result');
+    assert.equal(record.toolFold.calls.get('interrupted').settlement, undefined);
 });

@@ -178,8 +178,9 @@ def execute_panic_stop(
     attempt("executors", lambda: kill_all_foreground(data_dir, wait=False), settle=True)
     attempt("services", lambda: kill_all_services(data_dir, wait=False), settle=True)
     attempt("companions", panic_kill_all, settle=True)
-    attempt("workers", lambda: kill_workers_fn(
-        force=True, archive_service_logs=False, reconcile_delegate_custody=False), settle=True)
+    # Workers received private lifeline requests above. Root-first tree cleanup
+    # here would destroy their local child ownership before those requests run.
+    # Queue/custody reconciliation belongs to the following supervisor boot.
     attempt("main-port", lambda: kill_process_on_port(bound_port or 8765), settle=True)
     attempt("host-port", lambda: kill_process_on_port(host_service_port()), settle=True)
 
@@ -224,11 +225,6 @@ def _persist_panic_controls(data_dir: pathlib.Path) -> None:
     from supervisor import state
     from supervisor.evolution_lifecycle import complete_evolution_campaign, record_evolution_stop_intent
 
-    def _panic_controls(st: dict) -> None:
-        st.update(evolution_mode_enabled=False, bg_consciousness_enabled=False,
-                  evolution_owner_stopped=True, post_task_autostop=False)
-        st.pop("evolution_stop_source", None)  # an owner stop: no agent source may un-stick it
-
     failures = []
     for step in (
         lambda: state.update_state(_panic_controls, confirm=PANIC_CONTROL_KEYS, lock_timeout_sec=0.5),
@@ -244,6 +240,12 @@ def _persist_panic_controls(data_dir: pathlib.Path) -> None:
             failures.append(type(exc).__name__)
     if failures:
         raise OSError(f"Panic controls unconfirmed: {failures}")
+
+
+def _panic_controls(st: dict) -> None:
+    st.update(evolution_mode_enabled=False, bg_consciousness_enabled=False,
+              evolution_owner_stopped=True, post_task_autostop=False)
+    st.pop("evolution_stop_source", None)  # an owner stop: no agent source may un-stick it
 
 
 PANIC_CONTROL_KEYS = ("evolution_mode_enabled", "bg_consciousness_enabled", "evolution_owner_stopped",

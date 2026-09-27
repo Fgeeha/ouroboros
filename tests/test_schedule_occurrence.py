@@ -223,7 +223,10 @@ def test_a_change_during_prepare_never_launches_the_old_choice(q, tmp_path, monk
     if change == "delete":
         assert "s1" not in _rows(q)
         return
-    assert "occurrence" not in _rows(q)["s1"]  # the claim was dropped, not held
+    if change == "rebind":
+        assert _rows(q)["s1"]["hold"]["reason"] == "project_routing_fence_changed"
+    else:
+        assert "occurrence" not in _rows(q)["s1"]  # disabled/edited claims are dropped
     monkeypatch.setattr(occurrences, "prepare", real_prepare)
     q.queue.check_scheduled_tasks()
     if change == "disable":

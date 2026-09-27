@@ -547,6 +547,7 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
                         ),
                         "metadata": {
                             "source": "skill_scheduled_task",
+                            "resource_intent": {"kind": "system_repo"},
                             "skill": str(getattr(skill, "name", "")),
                             "scheduled_task": name,
                         },
@@ -568,7 +569,12 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
                 and schedule_id not in touched
                 and not _is_suppressed(record)
             ):
-                by_id.pop(schedule_id, None)
+                from supervisor.schedule_occurrence import owed
+
+                if owed(record) is False:
+                    by_id.pop(schedule_id, None)
+                else:
+                    record.update(enabled=False, delete_requested_at=utc_now_iso())
                 changed = True
         if changed:
             data["tasks"] = list(by_id.values())

@@ -353,22 +353,6 @@ def _bind(task: Dict[str, Any], root: str) -> None:
     return None
 
 
-def binding_moved(prepared: Dict[str, Any]) -> bool:
-    """Cheap early rejection; the registry owner also fences actual queue publication."""
-    basis = prepared.get("binding_basis")
-    intent = (prepared.get("task") or {}).get("metadata", {}).get("resource_intent") or {}
-    if basis is None or intent.get("kind") != "room_default":
-        return False
-    try:
-        from ouroboros.projects_registry import get_reserved_project
-
-        project_id = str(prepared["task"].get("project_id") or intent.get("project_id") or "")
-        room = get_reserved_project(_queue().DRIVE_ROOT, project_id, strict=True) or {}
-    except Exception:
-        return True
-    return str(room.get("working_dir") or "").strip() != basis
-
-
 # --- admit (queue + table locks) ---------------------------------------------
 
 def admit(prepared: List[Dict[str, Any]]) -> None:
@@ -379,7 +363,6 @@ def admit(prepared: List[Dict[str, Any]]) -> None:
         ScheduleStoreUnreadable, _write_scheduled_tasks, load_schedule_store, schedule_transaction,
     )
 
-    moved = {p["schedule_id"] for p in prepared if not p.get("stored_task") and binding_moved(p)}
     windows = {p["schedule_id"]: _window(p["task"]) for p in prepared if not p.get("hold")}
     with schedule_transaction(q.DRIVE_ROOT):
         try:
@@ -398,8 +381,7 @@ def admit(prepared: List[Dict[str, Any]]) -> None:
                 continue  # deleted, or another pass already moved this row on
             changed = True
             fresh_claim = current.get("phase") == "claimed" and not item.get("stored_task")
-            if fresh_claim and (not record.get("enabled", True) or fingerprint(record) != item["fingerprint"]
-                                or item["schedule_id"] in moved):
+            if fresh_claim and (not record.get("enabled", True) or fingerprint(record) != item["fingerprint"]):
                 record.pop("occurrence", None)  # disabled/edited/rebound during prepare: future only
                 continue
             if item.get("hold"):
