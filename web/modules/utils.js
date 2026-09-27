@@ -167,8 +167,9 @@ export function renderHubCard(item, {
     const lifecycleHint = lifecycle?.hint
         ? `<div class="marketplace-card-state-hint">${escapeHtmlAttr(lifecycle.hint)}</div>`
         : '';
+    // The local copy's own version only; the catalog version is the title's fact.
     const status = installed
-        ? `<span class="skills-status-chip skills-status-ok">Installed v${escapeHtmlAttr(installed.version || item.latest_version || '')}</span>`
+        ? `<span class="skills-status-chip skills-status-ok">Installed${installed.version ? ` v${escapeHtmlAttr(installed.version)}` : ''}</span>`
         : '';
     return `
         <article class="${working ? 'marketplace-card is-working' : 'marketplace-card'}" data-slug="${escapeHtmlAttr(slug)}">
@@ -195,6 +196,24 @@ export function renderHubCard(item, {
             </div>
         </article>
     `;
+}
+
+/**
+ * One quiet line of OuroborosHub submission history (the hub_sync
+ * `submission` facts), shared by the installed card's details and the hub
+ * card's disclosure. It states what this installation submitted — never
+ * ownership, a merge or an open pull request — and an unsafe receipt URL
+ * stays plain text without hiding the other facts.
+ */
+export function renderSubmissionHistory(submission) {
+    if (!submission || typeof submission !== 'object') return '';
+    const parts = [submission.version ? `Submitted v${escapeHtmlAttr(submission.version)}` : 'Submitted'];
+    const pr = submission.pr_number !== null ? `PR #${escapeHtmlAttr(String(submission.pr_number))}` : 'Pull request';
+    const href = safeExternalHrefAttr(submission.pr_url);
+    if (href) parts.push(`<a href="${href}" target="_blank" rel="noopener noreferrer">${pr}</a>`);
+    else if (submission.pr_number !== null) parts.push(pr);
+    if (submission.local_differs) parts.push('Local files differ from the submitted copy');
+    return parts.join(' · ');
 }
 
 /**

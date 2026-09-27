@@ -230,23 +230,62 @@ test('byte-verified hub skill shows Published even without a catalog snapshot', 
     assert.match(html, />Published v2\.0\.0</);
 });
 
-test('publish receipt unconfirmed by the catalog shows the Submitted PR badge', () => {
+test('byte-verified hub skill without a manifest version shows Published, never a bare v', () => {
+    const html = renderInstalledSkillCard(skill({
+        source: 'ouroboroshub',
+        payload_root: 'skills/ouroboroshub/telegram',
+        version: '',
+        official_hub_verified: true,
+    }));
+    assert.match(html, />Published</);
+    assert.doesNotMatch(html, />Published v/);
+});
+
+function receiptFor(overrides = {}) {
+    return {
+        slug: 'telegram',
+        version: '0.1.0',
+        content_hash: 'a'.repeat(64),
+        repository: 'razzant/ouroboroshub',
+        pr_number: 7,
+        pr_url: 'https://github.com/razzant/ouroboroshub/pull/7',
+        published_at: '2026-08-20T00:00:00Z',
+        ...overrides,
+    };
+}
+
+test('publish receipt is quiet details history with the submitted version, whatever the catalog says', () => {
+    const external = skill({
+        source: 'external',
+        payload_root: 'skills/external/telegram',
+        version: '0.2.0',
+        content_hash: 'b'.repeat(64),
+        published: receiptFor(),
+    });
+    const catalogs = [
+        hubOptions([]),
+        hubOptions([{ slug: 'telegram', sanitized_name: 'telegram', latest_version: '0.1.0', identity_conflict: false }]),
+        hubOptions([{ slug: 'telegram', sanitized_name: 'telegram', latest_version: '0.3.0', identity_conflict: false }]),
+        hubOptions([], false),
+        {},
+    ];
+    for (const options of catalogs) {
+        const html = renderInstalledSkillCard(external, new Set(), new Set(), {}, options);
+        const details = html.slice(html.indexOf('<details class="skills-details">'));
+        assert.match(details, /<span class="skills-detail-label">Submission<\/span>Submitted v0\.1\.0 · <a href="https:\/\/github\.com\/razzant\/ouroboroshub\/pull\/7" target="_blank" rel="noopener noreferrer">PR #7<\/a> · Local files differ from the submitted copy/);
+        assert.doesNotMatch(html, /Submitted PR #|skills-badge[^"]*">Submitted/);
+    }
+});
+
+test('an unsafe receipt URL keeps the rest of the history as text', () => {
     const html = renderInstalledSkillCard(skill({
         source: 'external',
         payload_root: 'skills/external/telegram',
-        version: '0.1.0',
-        content_hash: 'b'.repeat(64),
-        published: {
-            slug: 'telegram',
-            version: '0.1.0',
-            content_hash: 'a'.repeat(64),
-            repository: 'razzant/ouroboroshub',
-            pr_number: 7,
-            pr_url: 'https://github.com/razzant/ouroboroshub/pull/7',
-            published_at: '2026-08-20T00:00:00Z',
-        },
-    }), new Set(), new Set(), {}, hubOptions([]));
-    assert.match(html, />Submitted PR #7</);
+        content_hash: 'a'.repeat(64),
+        published: receiptFor({ pr_url: 'javascript:alert(1)' }),
+    }));
+    assert.match(html, /Submission<\/span>Submitted v0\.1\.0 · PR #7</);
+    assert.doesNotMatch(html, /javascript:/);
 });
 
 test('without a catalog snapshot no catalog-derived badge is guessed', () => {
@@ -266,6 +305,7 @@ test('without a catalog snapshot no catalog-derived badge is guessed', () => {
     }));
     assert.doesNotMatch(html, />Update available</);
     assert.doesNotMatch(html, />Submitted PR #/);
+    assert.match(html, /Submission<\/span>Submitted v1\.0\.0 · <a [^>]+>PR #9<\/a>/);
 });
 
 test('native cards never carry hub sync badges', () => {

@@ -7,8 +7,8 @@
 import { MAX_DECISION_COMMENT, MAX_QUIZ_OPTIONS } from './api_types.js';
 import { renderRoutingAnnotation, routingOptionLabel } from './chat_activity.js';
 import { nameProjectReference, projectReference } from './project_reference.js';
-
 import { ANSWERABLE_QUIZ_STATES, QUIZ_LIFECYCLE, questionPresentation, waitFacts } from './question_presentation.js';
+import { bindEnterSubmit } from './ui_interactions.js';
 
 const WAIT_FIELDS = ['wait_for_answer', 'wait_ended_at', 'owner_wait_state', 'owner_wait_resume_reason'];
 // What one observation of a question carries: its identity, lifecycle, recorded answer and wait facts.
@@ -730,10 +730,8 @@ export function createChatDecision({
             send.textContent = 'Send my answer';
             send.disabled = true;
             const syncSend = () => {
-                const text = commentText();
-                const enabled = commentPresent() && text.length <= MAX_DECISION_COMMENT;
-                if (send.disabled === !enabled) return;
-                send.disabled = !enabled;
+                const enabled = commentPresent() && commentText().length <= MAX_DECISION_COMMENT;
+                if (send.disabled !== !enabled) send.disabled = !enabled;
             };
             commentField.addEventListener('input', () => onDomWrite(() => { syncSend(); return true; }));
             send.addEventListener('click', () => {
@@ -750,6 +748,8 @@ export function createChatDecision({
                 submitAnswer(card, quiz, null, text);
             });
             box.append(commentField, send);
+            // Enter sends through this button; Shift+Enter keeps a line break.
+            bindEnterSubmit(commentField, send);
             card.append(box);
         }
 

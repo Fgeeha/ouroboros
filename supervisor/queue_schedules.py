@@ -212,13 +212,16 @@ def load_schedule_store(drive_root: pathlib.Path | None = None) -> Dict[str, Any
     filtered list back, which is how a mutation about ONE schedule silently
     dropped another.
     """
+    from supervisor.state_initialization import confirm_absent
+
     path = _scheduled_tasks_path(drive_root)
     try:
-        # lstat, not exists(): a dangling symlink at the table's path IS present,
-        # and calling it an absent store would let the next write follow it.
-        path.lstat()
-    except FileNotFoundError:
-        return {"schema_version": 1, "tasks": []}
+        # lstat, not exists(): a dangling symlink at the table's path IS present.
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            confirm_absent(path)
+            return {"schema_version": 1, "tasks": []}
     except OSError as exc:
         raise ScheduleStoreUnreadable(
             f"{path} cannot be examined ({exc}); it is not a readable schedule "

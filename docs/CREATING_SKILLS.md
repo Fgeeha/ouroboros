@@ -1559,15 +1559,33 @@ A successful publication also writes a durable local receipt to
 `data/state/skills/<name>/ouroboroshub.json` (`published` section: slug,
 version, content hash, repository, PR number/url, timestamp). The receipt is
 best-effort: a write failure is disclosed as `publication_recorded: false` in
-the tool result and never cancels the real PR. The Skills UI reads it for the
-"Submitted PR #N" badge and the adopt confirmation copy; it survives
-uninstall and adopt, and a republish overwrites it.
+the tool result and never cancels the real PR. Both Skills views show it as
+quiet submission history — the submitted version (not the current local one),
+the PR link and whether the local files now differ from the submitted copy —
+in the card's details on My skills and under **Submission history** on the
+OuroborosHub card. It is history, not a status: it never claims that the PR
+merged or that the served Hub copy is yours, and it never gates an action. When
+the catalog lists the name, a local copy offers **Use Hub version** whichever
+way the versions differ. The receipt survives uninstall (including the startup
+cleanup of uninstalled state), adopt and reinstall; a republish overwrites it,
+and an explicit **Delete** of a local skill removes it with the rest of that
+skill's state.
 
-If a submission is no longer being pursued, **Clear local submission** on its
-OuroborosHub card removes that local waiting state. The action preserves the
-installed files, review and grants, and does not close or change the GitHub PR.
-It clears the receipt shown on the card; if another publication replaced it,
-refresh the card first. Returning to My skills refreshes the submission badge.
+**Clear local submission** in that history deliberately forgets the local
+receipt. Nothing else needs it: the installed files, review and grants stay,
+the GitHub PR is not closed or changed, and Install, Use Hub version and Update
+never wait for it. It clears the receipt shown on the card; if another
+publication replaced it, refresh the card first.
+
+**Use Hub version** and **Update** (on the OuroborosHub card or the My skills
+menu) both confirm before anything changes: the local files, including any
+local edits, are replaced with the copy the Hub serves when the action runs —
+the version shown is the last one seen, not a pinned package. The skill's saved
+data, enablement and review history stay; the new files are reviewed again and
+may need access granted again. Cancelling sends nothing. Grants are bound to
+the content hash, so with auto-grant off an enabled extension whose new files
+need a granted key cannot reload: the replacement fails and rolls back to the
+previous copy, and a failed restore is reported.
 
 For a catalog update, the tool result and PR body name both the current catalog
 version and the proposed version. Versions are opaque strings: an older-looking
