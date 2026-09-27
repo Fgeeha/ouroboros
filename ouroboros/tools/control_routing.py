@@ -386,6 +386,7 @@ def _promote_chat_to_task(
     requested_root = str(workspace_root or "").strip()
     workspace_sentinel = str(workspace or "").strip().lower()
     repo_root_note = ""
+    intent_system_repo = False
     if requested_root:
         # Q4=A: naming the Ouroboros repository ITSELF names the documented
         # default (no separate workspace — the ordinary self-modification task),
@@ -409,6 +410,7 @@ def _promote_chat_to_task(
             same_root = False
         if same_root:
             requested_root, workspace_sentinel = "", WORKSPACE_NONE
+            intent_system_repo = True  # the CHOICE survives the sentinel (#1315)
             repo_root_note = (
                 " (workspace_root named the Ouroboros repository itself; started as an "
                 "ordinary task over it — no separate workspace)"
@@ -446,6 +448,7 @@ def _promote_chat_to_task(
         # default (a folder-less task in a folder-ful project stays possible).
         "workspace": workspace_sentinel,
         "chat_id": current_chat_id,
+        **({"resource_intent": {"kind": "system_repo"}} if intent_system_repo else {}),
         "client_message_id": str(
             ((getattr(ctx, "task_metadata", {}) or {}).get("client_message_id") or "")
             if isinstance(getattr(ctx, "task_metadata", {}), dict) else ""

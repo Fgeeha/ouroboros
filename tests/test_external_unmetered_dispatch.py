@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import io
+import itertools
 import json
 import pathlib
 import subprocess
 import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -540,39 +542,278 @@ def test_model_capable_companion_spawn_and_restart_each_disclose(tmp_path):
     supervisor.stop("alpha", "model-daemon", timeout_sec=1)
 
 
-def test_companion_disclosure_failure_kills_unregistered_process(tmp_path, monkeypatch):
-    class SpawnedProcess:
-        pid = 12345
-        stdout = None
-        stderr = None
+class _SyntheticCompanion:
+    """A spawned companion that dies only when it honours a kill request."""
 
-        def poll(self):
-            return None
+    stdout = stderr = None
 
-    process = SpawnedProcess()
-    killed = []
+    def __init__(self, pid: int, honours_kill: bool):
+        self.pid, self.honours_kill = pid, honours_kill
+        self.kill_requests, self.exited = 0, threading.Event()
+
+    def request_kill(self, *_args):
+        self.kill_requests += 1
+        if self.honours_kill:
+            self.exited.set()
+
+    def poll(self):
+        return -9 if self.exited.is_set() else None
+
+    def wait(self, timeout=None):
+        self.exited.wait(timeout)
+        return self.poll()
+
+
+def _isolate_companion_platform(monkeypatch, *, windows: bool, honours_kill: list, ledger: dict,
+                                assign_ok: bool = True):
+    """Replace every physical seam: spawn, kill, Panic request, custody, clock and a tracked Job."""
+    spawned, jobs, members = [], {"created": [], "terminated": [], "closed": []}, {}
+
+    def spawn(*_args, **_kwargs):
+        spawned.append(_SyntheticCompanion(20001 + len(spawned), honours_kill[len(spawned)]))
+        return spawned[-1]
+
+    def create_job():
+        jobs["created"].append(f"job-{len(jobs['created'])}")
+        return jobs["created"][-1]
+
+    def assign(job, pid):
+        members[job] = next(proc for proc in spawned if proc.pid == pid)
+        return assign_ok
+
+    def disclose(*_args, **_kwargs):
+        if ledger["down"]:
+            raise RuntimeError("ledger down")
+
+    monkeypatch.delenv("OUROBOROS_MANAGED_BY_LAUNCHER", raising=False)
+    monkeypatch.setattr(companion_mod, "IS_WINDOWS", windows)
+    monkeypatch.setattr(companion_mod.subprocess, "Popen", spawn)
+    monkeypatch.setattr(companion_mod, "create_kill_on_close_job", create_job)
+    monkeypatch.setattr(companion_mod, "assign_pid_to_job", assign)
+    monkeypatch.setattr(companion_mod, "terminate_job", lambda job: jobs["terminated"].append(job)
+                        or members[job].request_kill() or "")
+    monkeypatch.setattr(companion_mod, "close_job", lambda job: jobs["closed"].append(job) or "")
+    monkeypatch.setattr(companion_mod, "kill_process_tree", _SyntheticCompanion.request_kill)
+    monkeypatch.setattr(companion_mod, "terminate_process_tree", _SyntheticCompanion.request_kill)
+    monkeypatch.setattr(companion_mod, "request_process_tree_kill", lambda proc, job_handle=None: {
+        "pid": proc.pid, "job": job_handle, "requested": True})
+    monkeypatch.setattr(companion_mod, "record_unmetered_external_dispatch", disclose)
+    monkeypatch.setattr("ouroboros.process_custody.record_process", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(companion_mod, "time", SimpleNamespace(
+        monotonic=itertools.count(0, 10).__next__, sleep=lambda _sec: None))
+    return spawned, jobs
+
+
+def _join_companion_monitors():
+    for thread in threading.enumerate():
+        if thread.name.startswith("companion-monitor-"):
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_companion_disclosure_failure_settles_confirmed_death(tmp_path, monkeypatch, windows):
     init_server_process_pid()
+    ledger = {"down": True}
+    spawned, jobs = _isolate_companion_platform(monkeypatch, windows=windows, honours_kill=[True, True],
+                                                ledger=ledger)
     supervisor = CompanionSupervisor(tmp_path)
-    descriptor = CompanionDescriptor(
-        skill_name="alpha",
-        name="model-daemon",
-        command=["runtime"],
-        cwd=tmp_path,
-        env={"OPENROUTER_API_KEY": "test-provider-key"},
-    )
-    monkeypatch.setattr(companion_mod.subprocess, "Popen", lambda *_args, **_kwargs: process)
-    monkeypatch.setattr(companion_mod, "terminate_process_tree", lambda proc: killed.append(proc))
-    monkeypatch.setattr(
-        companion_mod,
-        "record_unmetered_external_dispatch",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("ledger down")),
-    )
+    descriptor = CompanionDescriptor("alpha", "model-daemon", ["runtime"], tmp_path,
+                                     {"OPENROUTER_API_KEY": "test-provider-key"})
 
     with pytest.raises(RuntimeError, match="ledger down"):
         supervisor.start(descriptor)
+    assert spawned[0].kill_requests == 1 and supervisor.snapshot() == {}
+    assert jobs["closed"] == jobs["created"] == (["job-0"] if windows else [])
 
-    assert killed == [process]
+    ledger["down"] = False  # the ordinary healthy start/already-running/stop path is unaffected
+    assert supervisor.start(descriptor) is True
+    assert supervisor.start(descriptor) is True
+    assert [proc.pid for proc in spawned] == [20001, 20002]
+    supervisor.stop("alpha", "model-daemon")
+    _join_companion_monitors()
     assert supervisor.snapshot() == {}
+    assert jobs["terminated"] == (["job-1"] if windows else [])
+    # Stop and the monitor both observe the death; each Job still closes exactly once.
+    assert jobs["closed"] == jobs["created"] == (["job-0", "job-1"] if windows else [])
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_companion_disclosure_failure_retains_unconfirmed_owner_until_death(tmp_path, monkeypatch, windows):
+    init_server_process_pid()
+    spawned, jobs = _isolate_companion_platform(monkeypatch, windows=windows, honours_kill=[False],
+                                                ledger={"down": True})
+    supervisor = CompanionSupervisor(tmp_path)
+    descriptor = CompanionDescriptor("alpha", "model-daemon", ["runtime"], tmp_path,
+                                     {"OPENROUTER_API_KEY": "test-provider-key"})
+    try:
+        with pytest.raises(RuntimeError, match="ledger down"):
+            supervisor.start(descriptor)
+        with pytest.raises(RuntimeError, match="replacement refused"):
+            supervisor.start(descriptor)  # no second spawn, no false already-running success
+        supervisor.stop("alpha", "model-daemon")  # unconfirmed stop keeps the exact owner
+        assert len(spawned) == 1 and supervisor.snapshot()["alpha:model-daemon"]["pid"] == 20001
+        assert jobs["closed"] == []
+        assert supervisor.panic_kill_all(request_only=True) == [
+            {"pid": 20001, "job": "job-0" if windows else None, "requested": True}]
+    finally:
+        spawned[0].exited.set()
+    _join_companion_monitors()
+    assert supervisor.snapshot() == {}
+    assert jobs["closed"] == jobs["created"] == (["job-0"] if windows else [])
+
+
+@pytest.mark.parametrize("honours_kill", [True, False])
+def test_windows_job_assignment_failure_retires_through_the_same_owner(tmp_path, monkeypatch, honours_kill):
+    init_server_process_pid()
+    spawned, jobs = _isolate_companion_platform(monkeypatch, windows=True, honours_kill=[honours_kill],
+                                                ledger={"down": False}, assign_ok=False)
+    supervisor = CompanionSupervisor(tmp_path)
+    descriptor = CompanionDescriptor("alpha", "daemon", ["runtime"], tmp_path, {})
+    try:
+        with pytest.raises(RuntimeError, match="Windows Job Object"):
+            supervisor.start(descriptor)
+        assert jobs["closed"] == ["job-0"]  # the unattached Job never stands in for a kill
+        assert spawned[0].kill_requests == 1
+        if not honours_kill:
+            with pytest.raises(RuntimeError, match="Job assignment failed.*replacement refused"):
+                supervisor.start(descriptor)
+            assert supervisor.snapshot()["alpha:daemon"]["pid"] == 20001
+    finally:
+        spawned[0].exited.set()
+    _join_companion_monitors()
+    assert supervisor.snapshot() == {} and len(spawned) == 1 and jobs["closed"] == ["job-0"]
+
+
+@pytest.mark.parametrize("windows", [False, True])
+@pytest.mark.parametrize("finale", ["panic", "retry"])
+def test_loader_rollback_keeps_unconfirmed_companion_until_death(tmp_path, monkeypatch, windows, finale):
+    """register -> publish -> start fails -> load_extension's unload -> stop keeps the owner."""
+    from ouroboros import extension_loader, extension_plugin_api
+    from tests._extension_loader_shared import _prepare_extension
+    from tests._shared import clean_extension_runtime_state
+
+    init_server_process_pid()
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    clean_extension_runtime_state()
+    ledger = {"down": True}
+    spawned, jobs = _isolate_companion_platform(monkeypatch, windows=windows, honours_kill=[False, True],
+                                                ledger=ledger)
+    supervisor = CompanionSupervisor(tmp_path / "companions")
+    for module in (extension_plugin_api, extension_loader):
+        monkeypatch.setattr(module, "get_global_supervisor", lambda: supervisor)
+    # Only the spawn env is synthetic (model-capable); the registration and rollback are real.
+    monkeypatch.setattr(extension_plugin_api, "companion_spawn_env",
+                        lambda *_args, **_kwargs: {"OPENROUTER_API_KEY": "test-provider-key"})
+    loaded, _repo, drive_root = _prepare_extension(
+        tmp_path, "unmetered", "def register(api):\n    api.register_companion_process('daemon')\n",
+        permissions=["companion_process"],
+        extra_frontmatter="companion_processes:\n  - name: daemon\n    runtime: python3\n"
+                          "    command: [\"python3\", \"scripts/daemon.py\"]\n",
+    )
+
+    def load():
+        return extension_loader.load_extension(loaded, lambda: {}, drive_root=drive_root, _force_in_process=True)
+
+    try:
+        assert "ledger down" in load()
+        assert "replacement refused" in load()  # the rollback kept the owner: no duplicate spawn
+        assert len(spawned) == 1 and supervisor.snapshot()["unmetered:daemon"]["pid"] == 20001
+        assert spawned[0].kill_requests >= 2 and jobs["closed"] == []
+        if finale == "panic":
+            assert supervisor.panic_kill_all(request_only=True) == [
+                {"pid": 20001, "job": "job-0" if windows else None, "requested": True}]
+        spawned[0].exited.set()
+        _join_companion_monitors()
+        assert supervisor.snapshot() == {}
+        if finale == "retry":
+            ledger["down"] = False
+            assert load() is None
+            assert supervisor.snapshot()["unmetered:daemon"]["pid"] == 20002
+            extension_loader.unload_extension("unmetered")
+            _join_companion_monitors()
+            assert supervisor.snapshot() == {}
+        assert jobs["closed"] == jobs["created"] == (
+            [] if not windows else ["job-0"] if finale == "panic" else ["job-0", "job-1"])
+    finally:
+        for proc in spawned:
+            proc.exited.set()
+        _join_companion_monitors()
+        clean_extension_runtime_state()
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_reconcile_reports_retained_auto_restart_not_already_running(tmp_path, monkeypatch, windows):
+    """live load -> crash -> auto-restart disclosure fails, kill unconfirmed -> real reconcile consumers."""
+    from ouroboros import extension_health, extension_loader, extension_plugin_api
+    from ouroboros.extension_reconcile_queue import process_extension_reconcile_requests, request_extension_reconcile
+    from tests._extension_loader_shared import _prepare_extension
+    from tests._shared import clean_extension_runtime_state
+
+    init_server_process_pid()
+    monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
+    clean_extension_runtime_state()
+    ledger = {"down": False}
+    spawned, jobs = _isolate_companion_platform(monkeypatch, windows=windows, honours_kill=[True, False, True],
+                                                ledger=ledger)
+    supervisor = CompanionSupervisor(tmp_path / "companions")
+    for module in (extension_plugin_api, extension_loader):
+        monkeypatch.setattr(module, "get_global_supervisor", lambda: supervisor)
+    monkeypatch.setattr(extension_plugin_api, "companion_spawn_env",
+                        lambda *_args, **_kwargs: {"OPENROUTER_API_KEY": "test-provider-key"})
+    # Reconcile's health stamp would run git through the patched spawn seam.
+    monkeypatch.setattr(extension_health, "fresh_code_stamp", lambda: ("test", "test-sha"))
+    loaded, repo_root, drive_root = _prepare_extension(
+        tmp_path, "restarted", "def register(api):\n    api.register_companion_process('daemon')\n",
+        permissions=["companion_process"],
+        extra_frontmatter="companion_processes:\n  - name: daemon\n    runtime: python3\n"
+                          "    command: [\"python3\", \"scripts/daemon.py\"]\n",
+    )
+
+    def reconcile():
+        return extension_loader.reconcile_extension(loaded.name, drive_root, lambda: {},
+                                                    repo_path=str(repo_root))["companions"]["action"]
+
+    try:
+        assert extension_loader.load_extension(loaded, lambda: {}, drive_root=drive_root,
+                                               _force_in_process=True) is None
+        assert reconcile() == "already_running"  # healthy counterpart
+        first_monitors = [t for t in threading.enumerate() if t.name.startswith("companion-monitor-")]
+        ledger["down"] = True
+        spawned[0].exited.set()  # unsuccessful exit within budget: the monitor restarts it itself
+        for thread in first_monitors:
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
+        retained = supervisor.snapshot()["restarted:daemon"]
+        assert retained["pid"] == 20002 and retained["retiring"] == "cost disclosure failed"
+
+        assert reconcile() == "retained_unresolved"
+        assert extension_loader.ensure_companions_running(
+            loaded.name, drive_root, lambda: {}, repo_path=str(repo_root),
+        ) == {"action": "retained_unresolved", "started": [], "missing": [],
+              "retained": {"daemon": "cost disclosure failed"}}
+        request_extension_reconcile(drive_root, loaded.name, reason="retained")
+        processed = process_extension_reconcile_requests(drive_root, lambda: {}, repo_path=str(repo_root))
+        assert processed[-1]["companions"]["action"] == "retained_unresolved"
+        assert len(spawned) == 2 and jobs["closed"] == (["job-0"] if windows else [])  # no duplicate spawn
+
+        spawned[1].exited.set()  # observed death settles the retained owner; no automatic restart
+        _join_companion_monitors()
+        assert supervisor.snapshot() == {} and len(spawned) == 2
+        ledger["down"] = False
+        assert reconcile() == "started_missing"  # replacement after observed death
+        assert supervisor.snapshot()["restarted:daemon"]["pid"] == 20003
+        assert supervisor.snapshot()["restarted:daemon"]["retiring"] == ""
+        assert reconcile() == "already_running"
+        extension_loader.unload_extension(loaded.name)
+        _join_companion_monitors()
+        assert supervisor.snapshot() == {} and len(spawned) == 3
+        assert jobs["closed"] == jobs["created"] == (["job-0", "job-1", "job-2"] if windows else [])
+    finally:
+        for proc in spawned:
+            proc.exited.set()
+        _join_companion_monitors()
+        clean_extension_runtime_state()
 
 
 def test_extension_dispatch_inherits_bound_lineage_without_tool_context(tmp_path):

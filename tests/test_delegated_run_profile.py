@@ -150,7 +150,7 @@ def test_the_model_has_no_argument_that_could_widen_the_profile():
         "prompt", "subagent_id", "max_seconds", "retry_of", "continue_from", "root", "bucket",
         "skill_name", "directory_strategy", "scope_paths", "access",
     }
-    assert entry.schema["parameters"]["properties"]["root"]["enum"] == ["skill_payload"]
+    assert entry.schema["parameters"]["properties"]["root"]["enum"] == ["active_workspace", "skill_payload"]
     assert entry.schema["parameters"]["properties"]["access"]["enum"] == ["readonly", "workspace_write"]
     assert not properties & {"mode", "isolation", "scope", "write_surface", "cwd"}
 

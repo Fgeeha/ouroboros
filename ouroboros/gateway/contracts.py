@@ -682,7 +682,7 @@ class HealthResponse(TypedDict):
 class EvolutionStateSnapshot(TypedDict):
     """Nested ``evolution_state`` block inside ``StateResponse``."""
 
-    enabled: bool
+    enabled: Optional[bool]  # None: unknown control (state unavailable/recovering, #1307)
     status: str
     detail: str
     cycle: int
@@ -751,8 +751,9 @@ class StateResponse(TypedDict):
     budget_pct: Optional[float]
     branch: str
     sha: str
-    evolution_enabled: bool
-    bg_consciousness_enabled: bool
+    evolution_enabled: Optional[bool]  # None: an unknown control (state unavailable/recovering), never "off"
+    bg_consciousness_enabled: Optional[bool]
+    state_quality: Dict[str, Any]  # state.json read quality: {quality, source, unconfirmed}
     evolution_cycle: int
     evolution_state: EvolutionStateSnapshot
     bg_consciousness_state: Dict[str, Any]
@@ -761,9 +762,7 @@ class StateResponse(TypedDict):
     supervisor_error: Optional[str]
     runtime_mode: str
     context_mode: str
-    # True when the EFFECTIVE `low` is a system auto-downgrade rather than an owner
-    # selection: the owner control needs it to offer "confirm Low" on a no-op click.
-    context_mode_auto_low: bool
+    context_mode_auto_low: bool  # frozen compatibility field, always False (persistent auto-Low is retired)
     safety_mode: str
     skills_repo_configured: bool
     github_token_configured: bool

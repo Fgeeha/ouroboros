@@ -64,7 +64,8 @@ def acceptance_retrieving_work_order(
         f"- task result record (contract, status, children): {root / 'task_results' / (task_id + '.json')}",
         f"- task artifacts named by the packet's `artifacts` manifest: {artifacts_dir}/",
         f"- host-attested verification receipts: {receipts}",
-        f"- tool trajectory log (rows with task_id={task_id}): {root / 'logs' / 'tools.jsonl'}",
+        f"- tool trajectory log (rows with task_id={task_id}; one call's start / settlement / wait-ended rows "
+        f"share one invocation_id): {root / 'logs' / 'tools.jsonl'}",
     ))
     closure = request.policy.get('review_source_closure')
     if closure:

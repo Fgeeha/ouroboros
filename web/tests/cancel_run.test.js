@@ -165,7 +165,8 @@ test('a timeout-retry root gains Cancel run: the host marker is the truth', () =
     const guardAt = handler.indexOf('if (!taskId) return false;');
     const grantAt = handler.indexOf('if (grantCancelAuthority && msg.cancelable === true)');
     assert.ok(guardAt >= 0 && grantAt > guardAt, 'missing task identity returns before granting authority');
-    assert.match(handler, /if \(grantCancelAuthority && msg\.cancelable === true\) \{\s*changed = markTaskCancelable\(String\(taskId\)\);\s*\}/);
+    // The grant keeps the earlier replayed tool-evidence change instead of overwriting it.
+    assert.match(handler, /if \(grantCancelAuthority && msg\.cancelable === true\) \{\s*changed = markTaskCancelable\(String\(taskId\)\) \|\| changed;\s*\}/);
     // Project-owned progress is now panel-local; Main only accepts its typed
     // terminal completion projection, so the old `!isMirror` branch is gone.
     // The shared thread predicate owns Main/Project routing (server project_thread

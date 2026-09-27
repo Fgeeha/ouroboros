@@ -231,14 +231,15 @@ def coverage_line(coverage: dict) -> str:
     live_size, live_window = int(coverage.get("live_size") or 0), int(coverage.get("live_window") or 0)
     unread = "live_size" not in coverage
     whole = live_window >= live_size and not coverage.get("archives_bounded") and not unread
+    unit = str(coverage.get("unit") or "rows")  # tools.jsonl counts logical calls (#1316)
     if shown and matched > shown:
-        rows = f"newest {shown} of {matched} matching rows in the window"
+        rows = f"newest {shown} of {matched} matching {unit} in the window"
     elif shown and whole:
-        rows = f"all {shown} matching rows"
+        rows = f"all {shown} matching {unit}"
     elif shown:
-        rows = f"newest {shown} matching rows in the window"
+        rows = f"newest {shown} matching {unit} in the window"
     else:
-        rows = "no matching rows"
+        rows = f"no matching {unit}"
     if unread:
         window = "unread"
     elif live_window >= live_size:

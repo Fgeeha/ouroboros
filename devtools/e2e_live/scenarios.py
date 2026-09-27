@@ -190,6 +190,13 @@ def sm1_palette_tokens(css_text: str) -> dict[str, str]:
             if name == "--accent" or name.startswith(("--accent-", "--focus-accent-"))}
 
 
+def tool_result_rows(tools_rows: list) -> list:
+    """The tools.jsonl RESULT rows, one per settled call (#1316): a call's ``tool_call_started`` row
+    (host processing began) and ``tool_call_timeout`` row (the caller's wait ended) share its
+    ``invocation_id`` but are not results; a legacy row without a type is a result."""
+    return [row for row in tools_rows if str(row.get("type") or "tool_call") == "tool_call"]
+
+
 def commit_refusal_facts(ledger: dict, tools_rows: list, stored: dict) -> dict:
     """The TYPED trail of every ``commit_reviewed``/``preflight_review`` refusal of a task.
 
@@ -202,6 +209,7 @@ def commit_refusal_facts(ledger: dict, tools_rows: list, stored: dict) -> dict:
     result rows named none of it."""
     attempts = [a for a in (ledger.get("attempts") or []) if isinstance(a, dict)]
     runs = [r for r in (ledger.get("advisory_runs") or []) if isinstance(r, dict)]
+    tools_rows = tool_result_rows(tools_rows)
     calls = []
     for row in tools_rows:
         if str(row.get("tool") or "") not in _REVIEW_TOOLS:
@@ -232,7 +240,9 @@ def dispatch_verdict(rows: list, expected_text: str) -> dict:
 
     ``extension_generation`` alone is NOT proof of a successful physical call: the dispatcher
     stamps it on failed outcomes too. A dispatch counts only when the row's typed ``status`` is
-    ``ok`` AND the recorded result is exactly the extension's own output."""
+    ``ok`` AND the recorded result is exactly the extension's own output. A start row alone is
+    no row: only a settlement is present evidence."""
+    rows = tool_result_rows(rows)
     last = rows[-1] if rows else {}
     meta = last.get("tool_result_meta") if isinstance(last.get("tool_result_meta"), dict) else {}
     digest = str(meta.get("extension_generation") or "")
@@ -449,9 +459,9 @@ def advisory_run_is_real(run: dict) -> bool:
 
 
 def vision_evidence_rows(tools_rows: list) -> list:
-    """tools.jsonl rows of a browser/vision inspection: the vision tools, or a browser screenshot."""
+    """tools.jsonl result rows of a browser/vision inspection: the vision tools, or a browser screenshot."""
     out = []
-    for row in tools_rows:
+    for row in tool_result_rows(tools_rows):
         tool = str(row.get("tool") or "")
         args = row.get("args") if isinstance(row.get("args"), dict) else {}
         if tool in _VISION_TOOLS or (tool == _BROWSER_TOOL and str(args.get("action") or "") == "screenshot"):

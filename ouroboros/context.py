@@ -1157,12 +1157,19 @@ def _drive_state_section(env: Any) -> str:
             "evolution_owner_stopped", "evolution_cycle", "evolution_consecutive_failures",
             "last_evolution_task_at", "bg_consciousness_enabled", "post_task_autostop",
             "budget_drift_pct", "budget_drift_alert", "last_owner_message_at")
-    raw = read_json_dict(env.drive_path("state/state.json")) or {}
-    projected = {k: raw[k] for k in keys if k in raw}
-    omitted = sorted(set(raw) - set(projected))
+    from supervisor.state import CONTROL_KEYS, RECOVERY_KEY, control_value, read_state
+
+    observed = read_state(env.drive_path("state/state.json").parent.parent)
+    raw = observed.values
+    authority = observed.projection()
+    projected = {k: (raw[k] if k not in CONTROL_KEYS or control_value(authority, k)[0]
+                     else {"status": "unknown"}) for k in keys if k in raw or k in observed.unconfirmed}
+    omitted = sorted(set(raw) - set(projected) - {RECOVERY_KEY})
     note = ("Projection of state/state.json (spend/budget facts live in the Runtime "
             "section, from the usage-accounting authority)."
-            + ((" Omitted keys: " + ", ".join(omitted) + ". Full file: "
+            + (f" State authority is {observed.quality}: {observed.reason}. "
+               f"UNKNOWN controls: {', '.join(observed.unconfirmed)}." if observed.quality != "current" else "")
+            + ((" Omitted keys: " + ", ".join(omitted) + ". Full raw source: "
                 "read_file(root='runtime_data', path='state/state.json').") if omitted else ""))
     return ("## Drive state\n\n"
             + json.dumps(projected, ensure_ascii=False, indent=1, sort_keys=True, default=str)

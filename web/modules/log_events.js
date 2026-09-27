@@ -351,26 +351,24 @@ function extractCommandText(args) {
     return '';
 }
 
-// The compact row for one tool call: the command, else the first string
-// argument (a path, a query, a url — whatever the tool names first), lexical
-// only. The complete arguments stay behind the row's expand.
-function toolCallTarget(args) {
-    const cmd = extractCommandText(args);
-    if (cmd) return cmd;
-    for (const value of Object.values(args && typeof args === 'object' ? args : {})) {
-        if (typeof value === 'string' && value.trim()) return value;
-    }
-    return '';
-}
-
-// Start, finish, failure and timeout of one call share a row: the call id when
-// the producer stamped one, else the tool with its target.
+// Legacy observations lack host identity: retain them separately rather than
+// guessing a call from a reused provider id, tool name or target.
+const legacyToolObservations = new WeakMap();
+let nextLegacyToolObservation = 0;
 function toolCallKey(evt, groupId) {
-    return `tool:${groupId}:${evt.tool_call_id || `${evt.tool || ''}|${toolCallTarget(evt.args)}`}`;
+    if (evt.invocation_id) return `tool:${groupId}:${evt.invocation_id}`;
+    if (evt.history_id) return `tool:${groupId}:history:${evt.history_id}`;
+    if (evt.event_id) return `tool:${groupId}:event:${evt.event_id}`;
+    if (!legacyToolObservations.has(evt)) legacyToolObservations.set(evt, ++nextLegacyToolObservation);
+    return `tool:${groupId}:observation:${legacyToolObservations.get(evt)}`;
 }
 
-const toolObservation = (evt, groupId, status) => ({  // one frame's fact about one invocation
-    key: toolCallKey(evt, groupId), status, receipt: Boolean(evt.routing_action), tool: evt.tool || '' });
+const toolObservation = (evt, groupId, status) => ({
+    key: toolCallKey(evt, groupId), status, receipt: Boolean(evt.routing_action), tool: evt.tool || '',
+    fact: (evt.type || evt.event) === 'tool_call_started' ? 'started'
+        : ['tool_call_timeout', 'tool_timeout'].includes(evt.type || evt.event) ? 'wait_ended' : 'settled',
+    hostError: evt.status === 'host_error', live: evt._live_tool_frame === true,
+});
 
 function describeStartupChecks(checks) {
     if (!checks || typeof checks !== 'object') return '';
@@ -857,24 +855,10 @@ export function summarizeLogEvent(evt) {
         });
     }
 
-    if (t === 'tool_call_started') {
-        return view('start', `Running ${evt.tool || 'tool'}`, {
+    if (t === 'tool_call_started') {  // processing began; a replayed start alone is no liveness claim
+        return view('start', `Started ${evt.tool || 'tool'}`, {
             body: compactJson(evt.args, 260),
             meta: taskMeta(evt.timeout_sec ? `timeout ${evt.timeout_sec}s` : ''),
-        });
-    }
-
-    if (t === 'tool_call_finished') {
-        // A child killed by a signal (typed signal name / negative exit code)
-        // is a failure even when the handler rendered a normal result (T11).
-        const signalDeath = Boolean(evt.signal) || (typeof evt.exit_code === 'number' && evt.exit_code < 0);
-        const isError = Boolean(evt.is_error) || signalDeath;
-        const label = signalDeath ? `killed (${evt.signal || evt.exit_code})`
-            : evt.is_error ? 'failed'
-            : 'finished';
-        return view(isError ? 'error' : 'done', `${evt.tool || 'tool'} ${label}`, {
-            body: shortText(evt.result_preview, 260),
-            meta: taskMeta(formatLogDuration(evt.duration_sec)),
         });
     }
 
@@ -885,15 +869,17 @@ export function summarizeLogEvent(evt) {
         });
     }
 
-    if (t === 'tool_call' || evt.tool) {
+    if (t === 'tool_call' || t === 'tool_call_finished' || evt.tool) {
         // The durable tools.jsonl row (replay/backfill) carries the same typed
         // failure facts as the live tool_call_finished frame — is_error plus the
         // signal/exit facts — so a failed call reads the same after a reload.
         const signalDeath = Boolean(evt.signal) || (typeof evt.exit_code === 'number' && evt.exit_code < 0);
         const failed = Boolean(evt.is_error) || signalDeath;
-        const label = signalDeath ? `killed (${evt.signal || evt.exit_code})` : failed ? 'failed' : 'result';
-        return view(failed ? 'error' : 'result', `${evt.tool || 'tool'} ${label}`, {
-            body: shortText(evt.result_preview || compactJson(evt.args, 220), 260),
+        const finished = t === 'tool_call_finished';
+        const label = signalDeath ? `killed (${evt.signal || evt.exit_code})`
+            : failed ? 'failed' : finished ? 'finished' : 'result';
+        return view(failed ? 'error' : finished ? 'done' : 'result', `${evt.tool || 'tool'} ${label}`, {
+            body: shortText(evt.result_preview || (finished ? '' : compactJson(evt.args, 220)), 260),
             meta: taskMeta(formatLogDuration(evt.duration_sec)),
         });
     }
@@ -1411,13 +1397,13 @@ function summarizeChatLiveEventView(evt) {
         });
     }
 
-    if (t === 'tool_call_started' || (t === 'tool_call_finished' && !evt.is_error)) {
+    if (t === 'tool_call_started' || (['tool_call_finished', 'tool_call'].includes(t) && !evt.is_error)) {
         // A successful call is execution evidence, not narration: start and finish feed the
         // block's ONE folded row (counts; tools behind Expand), a receipt while every counted
         // call is a host-stamped addressing act (`routing_action`, reported by the owner
         // message's annotation). A failure keeps its own error row and still counts. `done` is
         // the TASK's phase; a finished CALL is `ok`.
-        const status = t === 'tool_call_finished' ? 'ok' : 'calling';
+        const status = t === 'tool_call_started' ? (evt._live_tool_frame ? 'calling' : 'unknown') : 'ok';
         return chatView({
             phase: status,
             headline: '',
@@ -1470,15 +1456,15 @@ function summarizeChatLiveEventView(evt) {
 
     if (t === 'tool_call_timeout' || t === 'tool_timeout') {
         return chatView({
-            phase: 'error',
-            headline: `One of the steps took too long${evt.tool ? ` · ${evt.tool}` : ''}`,
+            phase: 'warn',
+            headline: `Tool wait ended; operation may still settle${evt.tool ? ` · ${evt.tool}` : ''}`,
             visible: true,
             dedupeKey: toolCallKey(evt, groupId),
-            toolCall: toolObservation(evt, groupId, 'error'),
+            toolCall: toolObservation(evt, groupId, 'wait_ended'),
         });
     }
 
-    if (t === 'tool_call_finished' && evt.is_error) {
+    if (['tool_call_finished', 'tool_call'].includes(t) && evt.is_error) {
         const failed = toolObservation(evt, groupId, 'error');
         const commandText = describeText(extractCommandText(evt.args), 120);
         const errorResult = describeText(evt.result_preview || evt.error, 220);

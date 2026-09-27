@@ -283,33 +283,39 @@ def _api_status(base_url: str, method: str, path: str, payload: dict | None = No
 
 
 def seed_owner_state(data_root: pathlib.Path, *, evolution_enabled: bool = False) -> None:
-    """Pre-seed state.json so the evolution loop's owner_chat_id gate passes (the
-    /api/tasks path never binds owner_chat_id). Optionally pre-enable the campaign."""
-    state_path = pathlib.Path(data_root) / "state" / "state.json"
-    state_path.parent.mkdir(parents=True, exist_ok=True)
-    st: dict = {}
-    if state_path.exists():
-        try:
-            st = json.loads(state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            st = {}
-    st["owner_chat_id"] = 1
-    if evolution_enabled:
-        campaign_path = pathlib.Path(data_root) / "state" / "evolution_campaign.json"
-        now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
-        campaign_path.write_text(json.dumps({
-            "schema_version": 1,
-            "id": uuid.uuid4().hex[:8],
-            "status": "active",
-            "objective": "Autonomously improve Ouroboros from benchmark evidence.",
-            "source": "benchmark",
-            "started_at": now,
-            "updated_at": now,
-            "cycles_done": 0,
-            "absorbed_cycles_done": 0,
-        }), encoding="utf-8")
-        st["evolution_mode_enabled"] = True
-    state_path.write_text(json.dumps(st), encoding="utf-8")
+    """Initialize a fresh isolated root before boot; never repair/reseed old state.
+
+    The real boot completes this pending identity before admitting work. Defaults
+    are valid here only because the existing initializer witnessed a fresh root.
+    """
+    from supervisor import state, state_initialization
+
+    root = pathlib.Path(data_root)
+    state_path, lock_path = root / "state/state.json", root / "locks/state.lock"
+    lock_fd = state.acquire_file_lock(lock_path)
+    if lock_fd is None:
+        raise state.StateUnavailable("lock_timeout", "benchmark seed")
+    try:
+        for path in (state_path, state_path.with_name("state.last_good.json")):
+            status, _, detail = state.read_state_copy(path)
+            if status != "missing":
+                raise state.StateUnavailable("seed_requires_new_state", f"{path.name}: {status} {detail}")
+        decision = state_initialization.initialization_decision(root, origin="isolated_benchmark")
+        if not decision.get("create"):
+            raise state.StateUnavailable(decision["reason"], str(decision.get("detail") or ""))
+        st = state.ensure_state_defaults({"initialization_id": decision["initialization_id"], "owner_chat_id": 1})
+        if evolution_enabled:
+            now = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+            state.atomic_write_text(root / "state/evolution_campaign.json", json.dumps({
+                "schema_version": 1, "id": uuid.uuid4().hex[:8], "status": "active",
+                "objective": "Autonomously improve Ouroboros from benchmark evidence.",
+                "source": "benchmark", "started_at": now, "updated_at": now,
+                "cycles_done": 0, "absorbed_cycles_done": 0,
+            }))
+            st["evolution_mode_enabled"] = True
+        state.atomic_write_text(state_path, json.dumps(st))
+    finally:
+        state.release_file_lock(lock_path, lock_fd)
 
 
 def campaign_summary(data_root: pathlib.Path) -> dict:

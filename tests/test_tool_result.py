@@ -942,7 +942,14 @@ def test_loop_outer_timeout_is_native_and_dispatches_once(tmp_path, monkeypatch)
     drive_logs = tmp_path / "logs"
     drive_logs.mkdir()
     monkeypatch.setattr(execution, "persist_call", lambda *_args, **_kwargs: {})
-    monkeypatch.setattr(execution, "_append_tool_log", lambda *_args, **_kwargs: worker_done.set())
+    appended: list[str] = []
+
+    def _append(_tools, _logs, payload):  # start + wait-ended rows, then the late settlement (#1316)
+        appended.append(payload["type"])
+        if payload["type"] == "tool_call":
+            worker_done.set()
+
+    monkeypatch.setattr(execution, "_append_tool_log", _append)
     args = {"path": "fixture.txt"}
 
     try:
@@ -958,6 +965,7 @@ def test_loop_outer_timeout_is_native_and_dispatches_once(tmp_path, monkeypatch)
 
     assert started.is_set()
     assert worker_done.wait(timeout=2)
+    assert appended == ["tool_call_started", "tool_call_timeout", "tool_call"]
     expected = (
         "⚠️ TOOL_TIMEOUT (read_file): exceeded 1s limit. "
         "The tool is still running in background but control is returned to you. "

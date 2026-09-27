@@ -402,20 +402,17 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         _work_order_source_request,
     )
     work_order_source_request = source_binding["request"]
-    work_order_coverage = source_binding["coverage"]
-    authority_fingerprint = source_binding["authority_fingerprint"]
     work_order_fingerprint = source_binding["fingerprint"]
     recovering = source_binding["recovering"]
     actor, actor_refusal = prepare_delegate_start_actor(
         ctx, drive, recovering=recovering, invocation_id=retry_token,
-        work_order_fingerprint=work_order_fingerprint, authority_fingerprint=authority_fingerprint,
+        work_order_fingerprint=work_order_fingerprint, authority_fingerprint=source_binding["authority_fingerprint"],
     )
     if actor_refusal:
         return actor_refusal
-    selected_subagent_id = str(actor.get("selected_subagent_id") or "")
-    config_fingerprint = str(actor.get("config_fingerprint") or "")
-    work_order_fingerprint = str(actor.get("work_order_fingerprint") or "")
-    authority_fingerprint = str(actor.get("authority_fingerprint") or "")
+    actor_facts = {key: str(actor.get(key) or "") for key in (
+        "selected_subagent_id", "config_fingerprint", "work_order_fingerprint", "authority_fingerprint")}
+    actor_facts.update(work_order_coverage=source_binding["coverage"], work_order_source_request=work_order_source_request)
     if recovering:
         binding, refusal = _resolve_retry_invocation(ctx, drive, retry_token, text)
         if refusal:
@@ -463,7 +460,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     history_facts = session_request_facts(
         request_body if recovering else {"model": route.model, "credentialProfileId": route.profile_id,
                                         "effort": route.effort, "access": authority.access},
-        selected_subagent_id=selected_subagent_id, task_id=str(getattr(ctx, "task_id", "") or ""),
+        selected_subagent_id=actor_facts["selected_subagent_id"], task_id=str(getattr(ctx, "task_id", "") or ""),
         route=route.route_id, processing=processing_info if recovering else {"requested": actor.get("processing_preference")})
     try:
         # Health checks the stored route/confinement shape on retries, never current
@@ -527,6 +524,16 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 if snapshot is not None:
                     snapshot_id, baseline_sha, root = snapshot.snapshot_id, snapshot.baseline_sha, snapshot.path
                     resource_ref = dict(record_auth.get("resource_ref") or {})
+            if authority.access == "readonly":
+                from ouroboros.delegate_readonly_inputs import prepare_folderless_inputs
+
+                try:
+                    readonly_root, input_instruction = prepare_folderless_inputs(ctx, invocation_id)
+                except (OSError, ValueError) as exc:
+                    return _fail("delegate_start", "readonly_inputs_unavailable", str(exc), definitely_unrun=True)
+                if readonly_root:
+                    root = readonly_root
+                    instructions += input_instruction
             execution_root = (root if directory_options.get("isolation") == "live" else "") if directory_options else delegated_execution_workspace_root(gateway, authority, root)
             scope_root = target_root if execution_root or directory_options else root
             if snapshot is not None:
@@ -554,6 +561,9 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                                           root, text, request_body["instructions"])
         lineage = getattr(ctx, "task_metadata", {}) or {}
         lineage = lineage if isinstance(lineage, dict) else {}
+        snapshot_facts = dict(snapshot_id=snapshot_id, baseline_sha=baseline_sha, target_root=target_root,
+                              authority_source=authority_source, resource_ref=resource_ref,
+                              execution_binding_fingerprint=binding_fingerprint)
         requested, claim_refusal = claimed_start_request(
             drive, claim_target=(target_root if not recovering and authority_source == "skill_payload" else ""),
             actor_ctx=ctx, enforce_actor_idle=not recovering,
@@ -562,14 +572,10 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             max_seconds=seconds, max_seconds_basis=seconds_basis, request=request_body, project_id=project_id,
             project_owned=bool(owned_project_id), project_persistent=project_persistent, route=route.route_id,
             root_task_id=str(lineage.get("root_task_id") or ""), parent_task_id=str(lineage.get("parent_task_id") or ""),
-            snapshot_id=snapshot_id, execution_root=(root if snapshot_id or resource_ref.get("strategy") == "direct" else ""),
-            execution_binding_fingerprint=binding_fingerprint,
-            baseline_sha=baseline_sha, target_root=target_root,
-            authority_source=authority_source, resource_ref=resource_ref,
+            **snapshot_facts,
+            execution_root=(root if snapshot_id or resource_ref.get("strategy") == "direct" else ""),
             # Recovery proves the original actor and compiled brief before adoption.
-            selected_subagent_id=selected_subagent_id, config_fingerprint=config_fingerprint,
-            work_order_fingerprint=work_order_fingerprint, work_order_coverage=work_order_coverage,
-            authority_fingerprint=authority_fingerprint, work_order_source_request=work_order_source_request,
+            **actor_facts,
             processing=processing_info,
         )
         if claim_refusal:
@@ -641,13 +647,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         invocation_id=invocation_id, project_id=project_id,
         continuation_of=str(continuation.get("continuation_of") or ""),
         project_owned=bool(owned_project_id), project_persistent=project_persistent,
-        selected_subagent_id=selected_subagent_id,
-        config_fingerprint=config_fingerprint, work_order_fingerprint=work_order_fingerprint,
-        work_order_coverage=work_order_coverage, work_order_source_request=work_order_source_request,
-        authority_fingerprint=authority_fingerprint, snapshot_id=snapshot_id,
-        execution_binding_fingerprint=binding_fingerprint,
-        target_root=target_root, baseline_sha=baseline_sha,
-        authority_source=authority_source, resource_ref=resource_ref, processing=processing_info,
+        **actor_facts, **snapshot_facts, processing=processing_info,
         capture_mode=("engine_directory" if resource_ref.get("workspace_kind") == "directory" else
                       _CAPTURE_DELEGATED_SNAPSHOT if snapshot_id else ""),
         max_seconds_basis=seconds_basis,
@@ -1373,10 +1373,11 @@ def get_tools() -> List[ToolEntry]:
                     "Optional reduction of native access for this fresh run: readonly or workspace_write. "
                     "Omit to inherit the captured actor profile (new mutating sessions default to full). "
                     "Explicit readonly task authority still wins. Omit on retry_of."},
-                "root": {"type": "string", "enum": ["skill_payload"], "description":
-                    "Optional exact-resource selector: 'skill_payload' delegates ONE "
-                    "installed user-managed skill payload you can already write. Omit "
-                    "for ordinary workspace delegation."},
+                "root": {"type": "string", "enum": ["active_workspace", "skill_payload"],
+                    "default": "active_workspace", "description":
+                    "active_workspace (the default, same as omitting) is ordinary workspace "
+                    "delegation. 'skill_payload' delegates ONE installed user-managed skill "
+                    "payload you can already write, named by bucket and skill_name."},
                 "bucket": {"type": "string", "description":
                     "With root='skill_payload': the payload location "
                     "(external|clawhub|ouroboroshub|user_repo)."},

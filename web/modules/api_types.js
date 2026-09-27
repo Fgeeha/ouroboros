@@ -22,8 +22,9 @@
  * @property {?number} budget_pct
  * @property {string} branch
  * @property {string} sha
- * @property {boolean} evolution_enabled
- * @property {boolean} bg_consciousness_enabled
+ * @property {?boolean} evolution_enabled  // null: the control is unknown (state unavailable/recovering)
+ * @property {?boolean} bg_consciousness_enabled  // null: unknown, never "off"
+ * @property {{quality: string, source: string, unconfirmed: Array<string>}} state_quality  // #1307 read quality of state.json
  * @property {number} evolution_cycle
  * @property {Object} evolution_state
  * @property {BgConsciousnessState} bg_consciousness_state  // the alarm clock's snapshot + server projection (status/detail)

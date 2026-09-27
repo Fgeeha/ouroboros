@@ -133,10 +133,12 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
     from ouroboros.tools.github import github_token_from_env_or_settings
     from ouroboros.usage_accounting import ensure_legacy_imported, usage_projection, usage_writer_snapshot
     from supervisor.queue import get_evolution_status_snapshot
-    from supervisor.state import TOTAL_BUDGET_LIMIT, load_state
+    from supervisor.state import TOTAL_BUDGET_LIMIT, control_value, load_state
     from supervisor.workers import PENDING, RUNNING, WORKERS
 
     st = load_state()
+    bg_known, bg_value = control_value(st, "bg_consciousness_enabled")
+    bg_enabled = bool(bg_value) if bg_known else None  # unknown is never shown as off (#1307)
     alive = 0
     total_w = 0
     try:
@@ -242,7 +244,7 @@ def _state_snapshot(request: Request) -> Dict[str, Any]:
         "evolution_state": evolution_state,
         # The alarm's snapshot reads the usage ledger (a cross-process lock): computed HERE,
         # on the worker thread with the rest of the snapshot, never on the event loop.
-        "bg_state": (_describe_bg(request)(bool(st.get("bg_consciousness_enabled"))) if _describe_bg(request) else {}),
+        "bg_state": (_describe_bg(request)(bg_enabled) if _describe_bg(request) else {}),
         "github_token_configured": bool(github_token_from_env_or_settings()),
         "projects": projects,
         "project_chat_ids": project_chat_ids,
@@ -514,7 +516,13 @@ async def api_state(request: Request) -> JSONResponse:
         accounting_available = snap["accounting_available"]
         spent = snap["spent"]
         evolution_state = snap["evolution_state"]
-        bg_requested = bool(st.get("bg_consciousness_enabled"))
+        from supervisor.state import STATE_READ_KEY, control_value
+
+        # A read that is not current never renders its controls as known (#1307).
+        state_read = st.get(STATE_READ_KEY) if isinstance(st.get(STATE_READ_KEY), dict) else {}
+        evolution_known, evolution_enabled = control_value(st, "evolution_mode_enabled")
+        bg_known, bg_requested = control_value(st, "bg_consciousness_enabled")
+        bg_requested = bool(bg_requested) if bg_known else None
         bg_state = snap.get("bg_state") or {}
         supervisor_ready = _state_attr(request, "supervisor_ready_event")
         get_supervisor_error = _state_attr(request, "get_supervisor_error")
@@ -538,8 +546,11 @@ async def api_state(request: Request) -> JSONResponse:
             # guessed branch is not identity.
             "branch": runtime_branch,
             "sha": (runtime_sha or "")[:8],
-            "evolution_enabled": bool(st.get("evolution_mode_enabled")),
+            "evolution_enabled": bool(evolution_enabled) if evolution_known else None,
             "bg_consciousness_enabled": bg_requested,
+            "state_quality": {"quality": str(state_read.get("quality") or "current"),
+                              "source": str(state_read.get("source") or "primary"),
+                              "unconfirmed": list(state_read.get("unconfirmed") or [])},
             "evolution_cycle": int(st.get("evolution_cycle") or 0),
             "evolution_state": evolution_state,
             "bg_consciousness_state": bg_state,

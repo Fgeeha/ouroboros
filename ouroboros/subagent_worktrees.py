@@ -453,26 +453,34 @@ def provision_genesis_project(
     child builds the whole project here and returns a ``workspace.patch`` that is
     a diff from the empty initial commit (``base_sha``).
 
-    ``dir_name`` names the genesis directory meaningfully (e.g. the project name)
-    instead of the raw task id, so sibling builders share a recognizable project
-    root; the handle's binding identity stays ``task_id`` (I, v6.39).
+    ``dir_name`` names the genesis directory meaningfully (e.g. the project name,
+    readable Unicode via ``project_folder_basename``) instead of the raw task id, so
+    sibling builders share a recognizable project root; the handle's binding
+    identity stays ``task_id`` (I, v6.39). Existing folders are never renamed.
     """
+    from ouroboros.project_facts import project_folder_basename
+
     repo_dir = Path(repo_dir).resolve()
     root = Path(projects_root) if projects_root else Path(get_subagent_projects_root())
     root = root.expanduser().resolve()
     _assert_root_isolated(root, repo_dir, _data_dir(data_dir))
-    safe_task = _safe_name(dir_name or task_id)
+    safe_task = project_folder_basename(dir_name) or _safe_name(task_id)
     with _ops_lock(root, op="genesis", task_id=str(task_id or "")):
-        proj = (root / safe_task).resolve()
-        # Genesis projects are durable: never clobber an existing one -> unique name. Since
-        # dir_name can repeat across projects (a shared display name), count up under the
-        # ops lock until a free path is found — a single timestamp suffix could still
-        # collide on a same-name re-provision within the same second (FileExistsError).
+        # Genesis projects are durable: never clobber an existing entry. The candidate is
+        # created EXCLUSIVELY before anything resolves it, so an existing directory, a
+        # case/normalization alias, or a (dangling) symlink all count as taken -> "_N".
+        root.mkdir(parents=True, exist_ok=True)
         _suffix = 0
-        while proj.exists():
-            _suffix += 1
-            proj = (root / f"{safe_task}_{_suffix}").resolve()
-        proj.mkdir(parents=True, exist_ok=False)
+        while True:
+            proj = root / (f"{safe_task}_{_suffix}" if _suffix else safe_task)
+            try:
+                os.mkdir(proj)
+                break
+            except FileExistsError:
+                _suffix += 1
+        if proj.resolve().parent != root:
+            raise RuntimeError(f"genesis project escaped its root: {proj}")
+        proj = proj.resolve()
         try:
             _git(proj, "init")
             # A fresh repo may have no commit identity; set a local one for the seed

@@ -77,6 +77,17 @@ def _iso(ts: float) -> str:
     return _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc).isoformat() if ts else ""
 
 
+def panic_blocks_wake(drive_root: Any) -> bool:
+    """A kept Panic intent (or an unreadable flag) bars all automatic wake grants."""
+    try:
+        (pathlib.Path(drive_root) / "state" / "panic_stop.flag").stat()
+        return True
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return True
+
+
 class BackgroundConsciousness:
     """The alarm clock; one instance per supervisor, ticked from its loop."""
 
@@ -88,7 +99,10 @@ class BackgroundConsciousness:
         self._routing_metadata_fn = routing_metadata_fn
         self._booted_at = time.time() if now is None else float(now)
         state = self._read_state()
-        self._enabled = bool(state.get("bg_consciousness_enabled"))
+        from supervisor.state import control_is
+
+        self._stopped = panic_blocks_wake(self._drive_root)  # unknown is suspension, Panic is a stop
+        self._enabled = not self._stopped and control_is(state, "bg_consciousness_enabled", True)  # unknown is not on (#1307)
         try:
             persisted = float(state.get(NEXT_WAKE_STATE_KEY) or 0.0)
         except (TypeError, ValueError):
@@ -210,6 +224,12 @@ class BackgroundConsciousness:
         """One supervisor pass; never blocks on a wake. Returns the typed decision."""
         now = time.time() if now is None else float(now)
         with self._lock:
+            from supervisor.state import control_is
+
+            if panic_blocks_wake(self._drive_root):
+                self._stopped, self._enabled = True, False
+                return "panic_stop"
+            self._enabled = not self._stopped and control_is(self._read_state(), "bg_consciousness_enabled", True)
             if not self._enabled:
                 return "disabled"
             wake, owner_live = self.live_turns()
@@ -334,15 +354,18 @@ class BackgroundConsciousness:
 
     def start(self) -> str:
         with self._lock:
+            if panic_blocks_wake(self._drive_root):
+                return "Background consciousness stays disabled while Panic controls await persistence."
             if self._enabled:
                 return "Background consciousness is already enabled."
-            self._enabled = True
+            self._stopped, self._enabled = False, True
             # The clock did not advance while disabled: never announce a wake in the past.
             self._set_next_wake(max(self._next_wake_at, time.time()))
             return f"Background consciousness enabled; next wake-up at {time.strftime('%H:%M', time.localtime(self._next_wake_at))}."
 
     def stop(self) -> str:
         with self._lock:
+            self._stopped = True
             was_enabled, self._enabled = self._enabled, False
         wake, _owner = self.live_turns()
         if wake:
