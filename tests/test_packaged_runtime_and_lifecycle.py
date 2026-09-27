@@ -908,7 +908,7 @@ def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
 
     from tests._cancel_intents_shared import settled_off_loop
 
-    assert settled_off_loop(tmp_path, task_id, child_drive), "the settlement no longer removes the child drive?"
+    assert not settled_off_loop(tmp_path, task_id, child_drive), "history remains custodied until background retention"
     result = load_task_result(tmp_path, task_id)
     assert result["status"] == "cancelled"
     assert "full copy preserved at " in result["result"]
@@ -917,6 +917,11 @@ def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
     )
     assert tmp_path in preserved.parents, "the full copy must live on the canonical drive"
     assert preserved.read_text(encoding="utf-8") == full
+    from ouroboros.headless import retry_child_task_refs
+
+    retry_child_task_refs(tmp_path, child_drive, task_id)
+    assert settled_off_loop(tmp_path, task_id, child_drive)
+    assert not child_drive.exists() and preserved.read_text(encoding="utf-8") == full
 
 
 def test_the_bind_host_is_never_stamped_from_settings_over_the_environment(monkeypatch):

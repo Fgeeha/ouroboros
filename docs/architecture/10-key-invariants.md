@@ -44,11 +44,11 @@ otherwise the view is partial and the consumer remains non-final or abstains.
 |---|---|---|---|---|
 | Owner authority and biography | Canonical `logs/chat.jsonl`, archive generations, and `memory/dialogue_blocks.json` owned by the canonical drive | Main/Project context sections and archive-aware history windows | Existing `chat_history`/archive readers with generation and gap metadata | A known gap is disclosed; summaries/blocks never replace exact current owner directives. Raw generations and durable blocks follow their existing retention owner. |
 | Shared understanding and knowledge summaries | `memory/knowledge/overview.md` and each note's authored YAML `summary`, owned by the canonical drive | The resident `## Shared understanding` section and the summary line of every knowledge-index row | `knowledge_read(topic=..., scope='global')`; `knowledge_list` | A missing overview renders as a visible gap line, never a silent omission; summaries stay resident whether or not an overview exists; a body-only rewrite keeps the previous summary |
-| Execution evidence | Task results, observability call manifests/blobs, service logs, and process-custody records | Status cards, terminal rows, bounded tails, and compact child summaries | Exact artifact/blob/service-log refs carried by the task result or canonical promotion | A projection cannot certify a missing child/source. Referenced canonical artifacts are promoted before child-drive GC; disposable execution scratch follows unified GC. An omitted-to-artifact verification ledger stub carries only its re-projected `summary`; entries and axes are read from the artifact file it points at. |
+| Execution evidence | Task results, observability call manifests/blobs, service logs, and process-custody records | Status cards, terminal rows, bounded tails, and compact child summaries | Exact artifact/blob/service-log refs carried by the task result or canonical promotion | A projection cannot certify a missing child/source. Referenced sources and the task-owned physical call inventory are retained before child-drive GC; disposable execution scratch follows unified GC. An omitted-to-artifact verification ledger stub carries only its re-projected `summary`; entries and axes are read from the artifact file it points at. |
 | Terminal task/project memory | Root terminal result plus existing task/project summary producers | Cognitive Main terminal summaries and the two Project-root UI lifecycle rows (started + terminal completion) | Task-result ID, project binding, and summary/source refs | Summary is a biography projection, not raw evidence; summary and reflection consume the same frozen origin, owner and verification inputs, with intact decision provenance and positive zero exits. Terminal outcomes, including failed/cancelled/degraded, remain retained through their canonical result owner. |
 | Plan/review authority | Exact task-artifact/observability wave bodies, evidence selectors, reviewer route/thread receipts, and the bounded review hot index | Review status, latest wave, obligations, and compact findings; a predecessor's inherited `plan_review_state` is first projected to a compact authority core ordered around the newest wave's identity, acceptance claims, findings, and dispositions, with reviewer transport removed and `need_evidence_seen` last-priority. Every bounded collection names its total and omitted count; the projection discloses `full_chars` plus `source_ref`, and the named `include_authority` source stays complete | Exact artifact/source handle plus SHA/range/thread selectors | Missing or partial evidence is `DEGRADED`/`NOT_RUN`, never PASS. Exact critic artifacts stay bound to the reviewed subject; a current author source and informed disposition are separate, never a rewritten PASS; hot indexes may rotate only after the source is retained. |
 | Task acceptance (three deliveries) | The FULL host packet (`review_evidence.build_task_acceptance_evidence` under the host ladder, with its `__provenance__` table), the applied host run retained through canonical task source handles, and the paid-identity wallet ledger | The per-delivery work order: the api pack for a packet row; the FULL packet plus absolute pointers and the access disclosure for an agent-session row; the packet without its freely degradable tail plus the scoped durable read root for a native inspection row (`acceptance_retrieving.acceptance_retrieving_work_order`) | Exact `evidence_refs` from the packet's enumerable exhibit vocabulary; absolute pointers to the active workspace and immutable named result/artifact/receipt/trajectory snapshots, with task-owned source/read bindings retained before paid dispatch; `review_projection.panels[].applied_source_ref` for the complete redacted applied review | Refs resolve against the FULL packet only, never the rendered projection; no required-source manifest is declared, so session reads stay unobserved rather than derived from a harness journal; native reads are `host_observed`; the immutable-core overflow refuses every delivery, a partial tool-result projection only packet rows; one strict wallet claim per panel whatever the rows' deliveries. |
-| Canonical versus execution roots | Canonical budget/data root owns identity, authority, biography, results, and promoted observability; execution drives own tools, workspace, transient trajectory, and per-call manifests while a task runs | Project/fork/task lenses and status projections | Existing canonical-root resolver, task-result pointers, and source handles | A fork is an execution lens, not a second mind. Copy-back/promotion precedes GC for anything referenced by a canonical result; before terminal promotion the canonical reader cannot resolve a ref bound to a child drive (issue #805), and missing legacy bytes become an explicit gap. |
+| Canonical versus execution roots | Canonical budget/data root owns identity, authority, biography, results, and promoted observability; execution drives own tools, workspace, transient trajectory, and per-call manifests while a task runs | Project/fork/task lenses and status projections | Existing canonical-root resolver, task-result pointers, and source handles | A fork is an execution lens, not a second mind. Adoption precedes background retention; exact readers use retained child sources while pending-ref custody holds the drive. GC requires referenced sources and all task-owned calls. Missing legacy bytes remain gaps. |
 
 ---
 
@@ -65,21 +65,19 @@ An omitted head leaves the corpus partial; selected records resolve only if comp
 arguments/results survive budgeting. Selection changes neither revision nor authorship;
 agent prose certifies nothing, and readable sources prove no reviewer understanding.
 
-`observability._rewrite_child_ref_tree` promotes typed refs in acceptance-checkpoint
-and trajectory JSON, preserving full handles and rechecking dependencies even for
-already copied outer sources. Relative refs preserve immutable bytes; rebased
-observability refs produce newly addressed checkpoints. Changed trajectory transport
-keeps `corpus_sha256` for citations and `sha256` for transported bytes. Failed copies
-hold cleanup custody; missing legacy bytes stay unavailable.
+`source_retention.RetentionWalk` decodes each identity/role once without payload
+caching. Captured JSON stays exact; CAS holds original manifests beside imported
+projections, preserving native seals.
 
-Copy-back selects CURRENT review authority through its field reducer, prepares bytes
-off-lock and publishes only if ref/binding basis still matches; drift repeats preparation,
-other newer fields survive, and pending retry starts from CURRENT. `child_ref_promotion_scope`
-memoizes verified work per operation, never failures. Same-store copies preserve manifest
-bytes/digest with canonical spelling and no `promoted_call_manifest`; distinct stores retain
-provenance/filename. Missing aliases resolve only through exact verified CAS/call addresses,
-including model-send reverse reads; corrupt/wrong-scope bytes get no fallback. No arbitrary
-JSON crawl, new manifest naming or persistent transfer ledger exists.
+`history_retention` adopts answers/files/attachments; receipts keep their union
+owner. Existing `child_ref_promotion` holds sources across restart for off-loop
+retention. Publication rechecks CURRENT; generation close stops at nodes.
+Readers resolve retained children. Unchanged unavailable sources wait on cheap
+file/result/inventory facts per process/generation; repairs reopen work, transient
+I/O and explicit retries remain real. No hold is released by this cache. Identical
+projections/diagnostics are reused. GC rechecks inventory before deletion; this does
+not prove quiescence of forgotten late tool futures. No new store/scheduler/ledger.
+Details/Logs show progress; cards show problems, independently of task outcome.
 
 `review_projection.publish_acceptance_checkpoint` retains full source before the compact
 `write_task_result` projection and `review_reference`. Explicit terminal chat ids include 0;
@@ -95,6 +93,12 @@ read-back; first late-settlement bytes/time and partial-trace preparation incide
 `review_operation` binds pre-dispatch request/subject/roster and controller identity through
 canonical `review_operations` pointers (§6), never restartable stacks. Applied critique,
 emitted-answer sources and the late notice's outbox survive the author's execution drive.
+Settlement checks the actor's ended mailbox even when canonical adoption lags.
+The same free collector discovers pending legacy host panels without operation
+pointers. `review_projection.late_notice_receipts` binds panel/revision and transfers
+duty to the existing outbox, preventing eviction from re-owing old notices. It proves
+custody, not delivery. Already-settled legacy panels acquire no new duty; no paid
+panel is restarted.
 `events_chat_delivery` supplies exact terminal text/routed chat after send returns;
 `terminal_delivery.register_delivery` keeps the first retained receipt in bounded `receipts`
 (task/id/chat/time, text hash/length, source ref). `terminal_answer_receipts` separates these

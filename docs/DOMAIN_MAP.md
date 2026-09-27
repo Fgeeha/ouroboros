@@ -23,12 +23,12 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D13 | Safety, guards & runtime mode | 9 | 0 |
 | D14 | Skills & extensions | 56 | 0 |
 | D15 | Memory, knowledge, consciousness & self-evolution | 23 | 0 |
-| D16 | Observability, usage accounting & cost | 13 | 0 |
-| D17 | Projects, workspaces & task results | 24 | 0 |
+| D16 | Observability, usage accounting & cost | 14 | 0 |
+| D17 | Projects, workspaces & task results | 25 | 0 |
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **586** | **0** |
+| **total** | | **588** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -753,6 +753,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/cost_projection.py`
 - `ouroboros/model_send_seal.py`
 - `ouroboros/observability.py`
+- `ouroboros/source_retention.py`
 - `ouroboros/usage_accounting.py`
 - `ouroboros/usage_compaction.py`
 - `ouroboros/usage_ledger.py`
@@ -764,6 +765,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/deliverables_paths.py`
 - `ouroboros/headless.py`
 - `ouroboros/headless_status.py`
+- `ouroboros/history_retention.py`
 - `ouroboros/project_dialogue.py`
 - `ouroboros/project_handoff.py`
 - `ouroboros/project_lease.py`

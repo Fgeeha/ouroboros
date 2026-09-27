@@ -732,6 +732,14 @@ The row under a Project lifecycle row or a routed message is the shared `createS
 
 History with no current execution or known outcome keeps its expandable content under `Outcome unavailable`, without a task chip, typing or Stop. Before complete live-source reconciliation, it is `Activity unconfirmed`. Positive current activity restores only its proven controls. A delivery warning may coexist with a preserved task-acceptance PASS. Model metadata says `Last solve response`, naming the initial request only when the route changed.
 
+History placement is separate from the task's outcome. Ordinary `Saving task history`
+and `Task history saved` appear only inside task details and Logs. A storage failure
+adds `History storage problem` to the existing collapsed-card metadata, without changing
+Done/Failed/Cancelled or creating a chat message; successful retention clears it.
+Details and Logs name the recorded failure reasons, grouping repeated reasons with their
+counts. Logs Raw retains the complete source/failure facts; a missing recorded reason is
+stated explicitly. Existing task-detail hydration and replay refresh this projection.
+
 ### Conversation activity block
 
 A task's activity block is in the transcript exactly when the record already

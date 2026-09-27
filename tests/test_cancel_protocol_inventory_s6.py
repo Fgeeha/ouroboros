@@ -70,6 +70,10 @@ TERMINAL_WRITERS = {
     # Both retain CURRENT lifecycle status rather than authoring completion.
     ('ouroboros/headless.py::_retry_child_task_refs_locked', 'source["status"]'): 'dynamic',
     ('ouroboros/headless.py::prepare_terminal_task_files', 'existing["status"]'): 'dynamic',
+    # Existing task custody/projection enrichment only: both locked field
+    # projectors preserve CURRENT lifecycle status rather than ending a task.
+    ('ouroboros/history_retention.py::call_inventory_custodied', 'current["status"]'): 'dynamic',
+    ('ouroboros/review_operation.py::_remember_legacy_notice', '"running"'): 'dynamic',
     ('ouroboros/headless.py::_finalize_task_artifacts_locked', 'status'): 'dynamic',
     ('ouroboros/headless.py::_finalize_task_artifacts_locked', 'str(existing.get("status") or status or "completed")'): 'terminal',
     ('ouroboros/mutation_attribution.py::advance_mutation_baseline', 'status'): 'dynamic',

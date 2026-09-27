@@ -394,14 +394,13 @@ def _copy_child_task_result_locked(parent_drive_root: pathlib.Path, task: Dict[s
     child_result = load_task_result(child_drive, task_id)
     if not isinstance(child_result, dict):
         return None
-    # Bulk refs precede publication/GC; review refs first select CURRENT below.
-    from ouroboros.observability import promote_child_task_refs
+    # Adopt the answer and deliverables now. Historical sources keep their exact
+    # references and their child drive until the existing off-loop custody pass
+    # verifies the archive. History size must not delay task_done or startup.
+    from ouroboros.history_retention import prepare_result_retention
 
-    review_fields = {key: value for key, value in child_result.items() if key == "review_projection"}
-    child_result, ref_promotion = promote_child_task_refs(
-        pathlib.Path(parent_drive_root), child_drive, task_id,
-        {key: value for key, value in child_result.items() if key != "review_projection"})
-    child_result.update(review_fields)
+    child_result, ref_promotion = prepare_result_retention(
+        pathlib.Path(parent_drive_root), child_drive, task_id, child_result)
     _publish_child_verification_receipts(parent_drive_root, task_id, child_drive)
     child_status = str(child_result.pop("status", None) or "completed")
     child_result.pop("task_id", None)
@@ -448,10 +447,10 @@ def retry_child_task_refs(parent: pathlib.Path, child: pathlib.Path, task_id: st
 
 def _retry_child_task_refs_locked(parent: pathlib.Path, child: pathlib.Path, task_id: str,
                                   *, replica: Optional[Dict[str, Any]] = None, stop: Any = None) -> Dict[str, Any]:
-    """Normal copyback supplies its already-copied replica (only its selected review needs I/O); retry has
+    """Normal copyback supplies its prepared replica without history I/O; retry has
     no replica and never reads an old child body; a changed CURRENT basis repeats preparation."""
     from ouroboros.observability import (
-        _has_pending_ref_promotion, _rewrite_child_ref_tree,
+        _has_pending_ref_promotion,
         child_ref_promotion_scope, promote_child_task_ref_patch,
     )
     with child_ref_promotion_scope():
@@ -470,12 +469,9 @@ def _retry_child_task_refs_locked(parent: pathlib.Path, child: pathlib.Path, tas
                 source = {**source, **project_replica_task_result_fields(source, replica)}
                 review = source.get("review_projection")
                 promotion = copy.deepcopy(replica["child_ref_promotion"])
-                prepared = _rewrite_child_ref_tree(review, pathlib.Path(parent), child, task_id, promotion)
-                if promotion["pending_refs"]:
-                    promotion["status"] = "incomplete"
                 patch = {"child_ref_promotion": promotion}
                 if isinstance(review, dict):
-                    patch["review_projection"] = prepared
+                    patch["review_projection"] = review
                 basis = {"review_projection": review}
 
             def project(current: dict, _incoming: dict) -> Optional[dict]:
@@ -564,9 +560,7 @@ def prepare_terminal_task_files(canonical_root: pathlib.Path, task: Dict[str, An
         report["terminal_source_present"] = bool(source and str(source.get("status") or "") in _FINAL_STATUSES)
         if not report["terminal_source_present"]:
             raise ValueError("terminal task source is missing or not settled")
-        if adopted and child is not None:
-            current = retry_child_task_refs(root, child, task_id)
-        elif child is not None and not cancelled:
+        if not adopted and child is not None and not cancelled:
             current = copy_child_task_result(root, {**task, "id": task_id}) or current
         if str(current.get("status") or "") not in _FINAL_STATUSES:
             raise ValueError("terminal task result is missing or not settled")
