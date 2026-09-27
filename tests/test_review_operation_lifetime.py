@@ -371,7 +371,7 @@ def _stop_remote(child, reader, executing):
     test runner's process group. The interpreter is awaited by its own pid and
     birth, since a launcher's exit alone does not prove it gone.
     """
-    from ouroboros.platform_layer import force_kill_pid, kill_pid_tree
+    from ouroboros.platform_layer import force_kill_pid, kill_pid_tree, process_start_time
 
     child.stdin.close()
     try:
@@ -382,11 +382,29 @@ def _stop_remote(child, reader, executing):
         child.wait()
     pid, birth = executing.get("pid"), executing.get("birth")
     exited = _exited(pid, birth, 10)
-    if not exited:
+    if not exited and pid and birth and process_start_time(pid) == birth:
         force_kill_pid(pid)
         _exited(pid, birth, 10)
     reader.join(10)
     return {"launcher_returncode": child.returncode, "interpreter_exited": exited, "reader_running": reader.is_alive()}
+
+
+@pytest.mark.parametrize("observed_birth,should_kill", [("", False), ("replacement", False), ("original", True)])
+def test_remote_cleanup_requires_positive_birth_match(monkeypatch, observed_birth, should_kill):
+    from types import SimpleNamespace
+    from ouroboros import platform_layer
+
+    killed = []
+    joined = []
+    child = SimpleNamespace(stdin=SimpleNamespace(close=lambda: None), wait=lambda timeout: None, returncode=0)
+    reader = SimpleNamespace(join=joined.append, is_alive=lambda: False)
+    monkeypatch.setitem(globals(), "_exited", lambda *_args: False)
+    monkeypatch.setattr(platform_layer, "process_start_time", lambda _pid: observed_birth)
+    monkeypatch.setattr(platform_layer, "force_kill_pid", killed.append)
+    result = _stop_remote(child, reader, {"pid": 123, "birth": "original"})
+    assert killed == ([123] if should_kill else [])
+    assert joined == [10]
+    assert result["interpreter_exited"] is False  # Emergency cleanup never launders a failed teardown.
 
 
 def _forge(root, wait_id, row, pointer=None, *, remove=False):
