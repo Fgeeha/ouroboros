@@ -37,6 +37,7 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import math
+import os
 import pathlib
 import threading
 import time
@@ -78,12 +79,19 @@ def _iso(ts: float) -> str:
 
 
 def panic_blocks_wake(drive_root: Any) -> bool:
-    """A kept Panic intent (or an unreadable flag) bars all automatic wake grants."""
+    """A kept Panic intent bars all automatic wake grants. Only a proven absence of the flag
+    (``confirm_absent``) permits one: a dangling link is present, and an unreadable flag or
+    an absence no directory ancestor proves is unknown, so it bars too."""
+    from supervisor.state_initialization import confirm_absent
+
+    path = pathlib.Path(drive_root) / "state" / "panic_stop.flag"
     try:
-        (pathlib.Path(drive_root) / "state" / "panic_stop.flag").stat()
+        try:
+            os.lstat(path)  # lstat, not stat: a dangling link IS present
+        except FileNotFoundError:
+            confirm_absent(path)
+            return False
         return True
-    except FileNotFoundError:
-        return False
     except OSError:
         return True
 
