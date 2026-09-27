@@ -190,7 +190,6 @@ BAND_PATHS = {
     "tests/test_deep_review_slot.py": "Deep-review delivery and receipt-provenance scenarios share native/session fixtures and keep route, memory, and source-range assertions together.",
     "tests/test_delegate_answer.py": "Entered the band by the #204 escalation-route pins (walk-up, schema and expiry-note source pins) on top of the phase-B interaction suite; one coherent delegated-question surface, split only when a natural seam appears",
     "tests/test_delegated_skill_payload.py": "Sol scope-review fix batch: P1 trust probes (forged index, symlinked git metadata), P2 golden-E2E review close and schema/docs pins joined the existing R1+gate-fix payload suite.",
-    "tests/test_e2e_live_runner.py": "Live E2E stand runner suite: the budget ledger, detached seed, confirmed absorb, per-lane env cap and manifest pins all drive one shared fake-lane harness; splitting the module would duplicate that harness across files without a second reason to change",
     "tests/test_evolution_redesign.py": None,
     "tests/test_extension_companion.py": "Entered the band at 1001 from 938 with the lock-ordering regression test (companion processes start outside the registry lock; a start failure still routes to unload) and the call-site rewiring to extension_companion.companion_spawn_env.",
     "tests/test_external_review_script.py": "F2.3b D31 port: the reference trusted-base pin suite (probe-backed handoff/forwarding/in-place/dirty/e2e pins plus the new no-list-membership and wrapperless fail-closed pins) joins the existing contributor-lane suite",
