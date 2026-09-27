@@ -523,6 +523,21 @@ def _validate_records(
     _close_baseline_block()
 
 
+def _decode_record(chunk: bytes) -> Optional[Dict[str, Any]]:
+    """One JSONL grammar for full, incremental and unlocked prepared reads.
+
+    Only empty CR/LF lines are empty records. UTF-8 (without BOM), object
+    shape and literal money spelling are identical in every cache state.
+    """
+    raw = chunk.rstrip(b"\r\n")
+    if not raw:
+        return None
+    row = json.loads(raw.decode("utf-8"), parse_float=LiteralFloat)
+    if not isinstance(row, dict):
+        raise ValueError("row is not an object")
+    return row
+
+
 def _read_records_locked(root: pathlib.Path) -> list[Dict[str, Any]]:
     path = root / LEDGER_REL
     try:
@@ -538,21 +553,16 @@ def _read_records_locked(root: pathlib.Path) -> list[Dict[str, Any]]:
     last_nonempty = nonempty[-1] if nonempty else -1
     offset = 0
     for index, chunk in enumerate(chunks):
-        raw = chunk.rstrip(b"\r\n")
-        if not raw:
-            offset += len(chunk)
-            continue
         try:
-            row = json.loads(raw.decode("utf-8"), parse_float=LiteralFloat)
-            if not isinstance(row, dict):
-                raise ValueError("row is not an object")
+            row = _decode_record(chunk)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
             if index == last_nonempty:
                 _quarantine_tail(root, chunk, offset, f"{type(exc).__name__}: {exc}")
                 break
             raise UsageLedgerCorrupt(f"corrupt usage ledger row before tail: {index + 1}") from exc
-        records.append(row)
-        record_locations.append((offset, chunk))
+        if row is not None:
+            records.append(row)
+            record_locations.append((offset, chunk))
         offset += len(chunk)
     try:
         _validate_records(records)
@@ -678,16 +688,12 @@ def _read_new_records_locked(
         return None
     records: list[Dict[str, Any]] = []
     for chunk in data.splitlines():
-        raw = chunk.rstrip(b"\r")
-        if not raw:
-            continue
         try:
-            row = json.loads(raw.decode("utf-8"), parse_float=LiteralFloat)
-            if not isinstance(row, dict):
-                raise ValueError("row is not an object")
+            row = _decode_record(chunk)
         except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
             return None
-        records.append(row)
+        if row is not None:
+            records.append(row)
     touched = {str(row.get("attempt_id") or "") for row in records}
     seeded_states = {key: resume.states[key] for key in touched if key in resume.states}
     seeded_late_receipt_ids = touched.intersection(resume.late_receipt_ids)

@@ -135,39 +135,115 @@ def distribution(values):
             "p99": ordered[min(len(ordered) - 1, int(len(ordered) * .99))], "max": max(ordered)}
 
 
-def _worker(root_text, index, phase, ready, start, seconds, output, worker_source=None):
+def owned_queue(root, writers):
+    """Real queue shape: running shared-root writers and a fenced pending sibling."""
+    from ouroboros.utils import atomic_write_json, utc_now_iso
+
+    fence_id = "scale-root-fence"
+    def member(index):
+        return {"task": {
+            "id": f"writer-{index}", "root_task_id": "dominant", "chat_id": 1,
+            "_attempt": 1, "type": "task", "status": "running",
+            "objective": "Verify the isolated ledger through reserve, dispatch and settlement.",
+            "metadata": {"root_task_id": "dominant", "parent_task_id": "scale-root",
+                         "delegation_role": "subagent", "root_limit_usd": 1000000},
+            "task_contract": {"objective": "Account one local stub receipt per physical attempt.",
+                              "expected_output": "Measured progress and exact monetary facts.",
+                              "constraints": "Synthetic data; local receipt; no external provider."},
+        }, "started_at": time.time(), "last_activity_at": time.time(), "worker_id": index}
+    pending = [member(i) for i in range(writers, writers + 32)]
+    for row in pending:
+        row["task"].update(status="pending", root_task_id="paused-sibling",
+                           _budget_pause_hold={"fence_id": fence_id, "selected": False})
+        row["task"]["metadata"]["root_task_id"] = "paused-sibling"
+    snapshot = {"running": [member(i) for i in range(writers)], "pending": pending,
+                "budget_root_fences": [{"root_task_id": "paused-sibling", "status": "active",
+                                        "fence_id": fence_id}], "updated_at": utc_now_iso()}
+    path = root / "state" / "queue_snapshot.json"
+    atomic_write_json(path, snapshot)
+    return {"bytes": path.stat().st_size, "running": writers, "pending": 32,
+            "fences": 1, "active_fence_root": "paused-sibling", "owner_control": "native readers"}
+
+
+def _worker(root_text, index, phase, ready, start, seconds, output, worker_source=None, owned=False):
+    stats = {"writer": index, "pid": os.getpid(), "stage": {}, "wait": {}, "hold": {},
+             "preparation": [], "parsed_rows": 0, "full_reads": 0, "cycles": 0, "longest_gap": 0.0,
+             "strict_reads": 0, "wait_episodes": 0, "episode_elapsed": [], "continuity_extended_waits": 0,
+             "ready": False, "owned": owned}
+    try:
+        _run_writer(stats, root_text, index, phase, ready, start, seconds, output, worker_source, owned)
+    except BaseException:
+        stats["error"] = traceback.format_exc()
+    finally:
+        stats.pop("_last_acquisition_began", None)
+        previous = stats.pop("previous", None)
+        if previous is not None:
+            stats["longest_gap"] = max(stats["longest_gap"], time.monotonic() - previous)
+        if sys.platform != "win32":
+            import resource  # guarded native measurement, never a runtime dependency
+            stats["rss_peak_native"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+            stats["rss_unit"] = "bytes" if sys.platform == "darwin" else "KiB"
+        else:
+            stats["rss_peak_native"] = None
+        (output / f"writer-{index}.json").write_text(json.dumps(stats, indent=2))
+        if not stats["ready"]:
+            ready.put({"actor": str(index), "ready": False, "error": stats.get("error")})
+    if stats.get("error"):
+        raise SystemExit(1)
+
+
+def _run_writer(stats, root_text, index, phase, ready, start, seconds, output, worker_source, owned):
     if worker_source:
         sys.path.insert(0, worker_source)
     from ouroboros import usage_accounting as ua
     from ouroboros import _usage_rows_memo as memo
 
     root = pathlib.Path(root_text)
-    stats = {"writer": index, "pid": os.getpid(), "stage": {}, "wait": {}, "hold": {},
-             "imported_source": ua.__file__, "preparation": [], "parsed_rows": 0, "full_reads": 0, "cycles": 0, "longest_gap": 0.0,
-             "strict_reads": 0, "continuity_extended_waits": 0}
-    from ouroboros import _usage_wait
-    original_hold = _usage_wait._hold
-    def observed_hold(owner, phase, started):
-        if phase == "entered":
-            stats["continuity_extended_waits"] += 1
-        return original_hold(owner, phase, started)
-    _usage_wait._hold = observed_hold
+    import importlib
+    try:
+        wait_module = importlib.import_module("ouroboros._usage_wait")
+    except ModuleNotFoundError as exc:
+        if exc.name != "ouroboros._usage_wait":
+            raise
+        wait_module = None
+    stats["imported_source"] = ua.__file__
+    stats["wait_instrumentation"] = "available" if wait_module else "baseline_module_absent"
+    if wait_module is not None:
+        original_hold = wait_module._hold
+        def observed_hold(owner, phase, started, *identity):
+            if phase == "entered":
+                stats["wait_episodes"] += 1
+                stats["_episode_acquired"] = None
+                stats["_episode_started"] = stats["_last_acquisition_began"]
+            if phase == "ended":
+                acquired = stats.pop("_episode_acquired", None)
+                elapsed = (acquired if acquired is not None else time.monotonic()) - stats.pop("_episode_started")
+                stats["episode_elapsed"].append(elapsed)
+                stats["continuity_extended_waits"] += int(elapsed > 45)
+            return original_hold(owner, phase, started, *identity)
+        wait_module._hold = observed_hold
     stage = "warmup"
     real_lock = ua._locked
     real_read = ua._read_records_locked
     real_delta = ua._read_new_records_locked
+    in_lock = False
 
     @contextlib.contextmanager
     def measured_lock(*args, **kwargs):
-        began = time.monotonic()
+        nonlocal in_lock
+        began = stats["_last_acquisition_began"] = time.monotonic()
         acquired = None
         try:
             with real_lock(*args, **kwargs) as beat:
                 acquired = time.monotonic()
+                if "_episode_acquired" in stats:
+                    stats["_episode_acquired"] = acquired
                 stats["wait"].setdefault(stage, []).append(acquired - began)
+                in_lock = True
                 try:
                     yield beat
                 finally:
+                    in_lock = False
                     stats["hold"].setdefault(stage, []).append(time.monotonic() - acquired)
         finally:
             if acquired is None:
@@ -186,6 +262,22 @@ def _worker(root_text, index, phase, ready, start, seconds, output, worker_sourc
         return result
 
     ua._locked, ua._read_records_locked, ua._read_new_records_locked = measured_lock, read, delta
+    if owned:
+        from ouroboros.model_wait import TaskModelWait
+        def observe(function, kind):
+            def call(*args, **kwargs):
+                began = time.monotonic()
+                try:
+                    return function(*args, **kwargs)
+                finally:
+                    stats.setdefault(kind, {}).setdefault("in_lock" if in_lock else "outside_lock", []).append(time.monotonic() - began)
+            return call
+        if hasattr(ua, "_check_dispatch_fences"):
+            ua._check_dispatch_fences = observe(ua._check_dispatch_fences, "fence_checks")
+        else:
+            stats["fence_instrumentation"] = "baseline_helper_absent"
+
+        TaskModelWait.control_reason = observe(TaskModelWait.control_reason, "control_checks")
     if hasattr(memo, "_prepare_writer"):
         real_prepare = memo._prepare_writer
 
@@ -197,23 +289,31 @@ def _worker(root_text, index, phase, ready, start, seconds, output, worker_sourc
                 stats["parsed_rows"] += len(result.records)
             return result
         memo._prepare_writer = prepare
+    if phase != "cold":
+        if hasattr(memo, "_writer_locked"):
+            with memo._writer_locked(root):
+                pass
+        else:
+            with ua._locked(root):
+                ua._read_records_locked_cached(root)
+    stats["warmup_wait"] = stats["wait"]
+    stats["warmup_hold"] = stats["hold"]
+    stats["wait"], stats["hold"] = {}, {}
+    ready.put({"actor": str(index), "ready": True})
+    stats["ready"] = True
+    if not start.wait(180):
+        raise TimeoutError("phase start not received")
+    began = previous = time.monotonic()
+    stats["previous"] = previous
+    sends = open(output / f"sends-{index}.jsonl", "a", buffering=1)
+    task = (json.loads((root / "state" / "queue_snapshot.json").read_text())["running"][index]["task"]
+            if owned else None)
+    if owned:
+        from ouroboros.model_wait import task_model_wait_scope
+    scope = (task_model_wait_scope(task=task, drive_root=root, event_queue=None, worker_slot_held=True)
+             if owned else contextlib.nullcontext())
     try:
-        if phase != "cold":
-            if hasattr(memo, "_writer_locked"):
-                with memo._writer_locked(root):
-                    pass
-            else:
-                with ua._locked(root):
-                    ua._read_records_locked_cached(root)
-        stats["warmup_wait"] = stats["wait"]
-        stats["warmup_hold"] = stats["hold"]
-        stats["wait"], stats["hold"] = {}, {}
-        ready.put(index)
-        if not start.wait(180):
-            raise TimeoutError("phase start not received")
-        began = previous = time.monotonic()
-        sends = open(output / f"sends-{index}.jsonl", "a", buffering=1)
-        try:
+        with scope:
             while time.monotonic() - began < seconds:
                 held = None
                 for stage in ("strict_read", "reserve", "dispatch", "send", "settle"):
@@ -224,7 +324,7 @@ def _worker(root_text, index, phase, ready, start, seconds, output, worker_sourc
                     elif stage == "reserve":
                         held = ua.reserve_attempt(ua.AttemptRequest(model="local-stub", provider="local",
                             reservation_usd=.001, global_limit_usd=1000000, drive_root=root,
-                            task_id=f"writer-{index}", root_task_id="dominant", source="scale_stub"))
+                            task_id=f"writer-{index}", root_task_id="dominant", root_limit_usd=1000000, source="scale_stub"))
                     elif stage == "dispatch":
                         ua.mark_dispatched(held)
                     elif stage == "send":
@@ -239,49 +339,37 @@ def _worker(root_text, index, phase, ready, start, seconds, output, worker_sourc
                 stats["longest_gap"] = max(stats["longest_gap"], now - previous)
                 stats["cycles"] += 1
                 previous = now
-        finally:
-            sends.close()
-        stats["elapsed_sec"] = time.monotonic() - began
-        stats["strict_reads_per_sec"] = stats["strict_reads"] / stats["elapsed_sec"]
-    except BaseException:
-        stats["error"] = traceback.format_exc()
+                stats["previous"] = previous
     finally:
-        if "previous" in locals():
-            stats["longest_gap"] = max(stats["longest_gap"], time.monotonic() - previous)
-        if sys.platform != "win32":
-            import resource  # guarded native measurement, never a runtime dependency
-            stats["rss_peak_native"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-            stats["rss_unit"] = "bytes" if sys.platform == "darwin" else "KiB"
-        else:
-            stats["rss_peak_native"] = None
-        (output / f"writer-{index}.json").write_text(json.dumps(stats, indent=2))
-    if stats.get("error"):
-        raise SystemExit(1)
+        sends.close()
+    stats["elapsed_sec"] = time.monotonic() - began
+    stats["strict_reads_per_sec"] = stats["strict_reads"] / stats["elapsed_sec"]
 
 
 def _audit_holder(root_text, ready, start, seconds, output, worker_source=None):
-    if worker_source:
-        sys.path.insert(0, worker_source)
-    from ouroboros import usage_accounting as ua
-    from ouroboros.model_send_seal import reconcile_model_send_seals
-    from ouroboros.server_maintenance import _reconcile_abandoned_usage
-    root = pathlib.Path(root_text)
-    stats = {"cycles": 0, "wait": [], "hold": [], "full_records": [], "cadence_sec": 5,
-             "imported_source": ua.__file__}
-    real_lock = ua._locked
-    @contextlib.contextmanager
-    def measured(*args, **kwargs):
-        began = time.monotonic()
-        with real_lock(*args, **kwargs) as beat:
-            acquired = time.monotonic()
-            stats["wait"].append(acquired - began)
-            try:
-                yield beat
-            finally:
-                stats["hold"].append(time.monotonic() - acquired)
-    ua._locked = measured
+    stats = {"cycles": 0, "wait": [], "hold": [], "full_records": [], "cadence_sec": 5, "ready": False}
     try:
-        ready.put("audit")
+        if worker_source:
+            sys.path.insert(0, worker_source)
+        from ouroboros import usage_accounting as ua
+        from ouroboros.model_send_seal import reconcile_model_send_seals
+        from ouroboros.server_maintenance import _reconcile_abandoned_usage
+        root = pathlib.Path(root_text)
+        stats["imported_source"] = ua.__file__
+        real_lock = ua._locked
+        @contextlib.contextmanager
+        def measured(*args, **kwargs):
+            began = time.monotonic()
+            with real_lock(*args, **kwargs) as beat:
+                acquired = time.monotonic()
+                stats["wait"].append(acquired - began)
+                try:
+                    yield beat
+                finally:
+                    stats["hold"].append(time.monotonic() - acquired)
+        ua._locked = measured
+        ready.put({"actor": "audit", "ready": True})
+        stats["ready"] = True
         if not start.wait(180):
             raise TimeoutError("audit start not received")
         began = time.monotonic()
@@ -310,6 +398,8 @@ def _audit_holder(root_text, ready, start, seconds, output, worker_source=None):
         stats["error"] = traceback.format_exc()
     finally:
         (output / "audit.json").write_text(json.dumps(stats, indent=2))
+        if not stats["ready"]:
+            ready.put({"actor": "audit", "ready": False, "error": stats.get("error")})
     if stats.get("error"):
         raise SystemExit(1)
 
@@ -423,14 +513,14 @@ def raw_breakdown(rows):
     return result
 
 
-def phase_run(root, output, writers, phase, seconds, worker_source=None):
+def phase_run(root, output, writers, phase, seconds, worker_source=None, owned=False):
     from ouroboros import usage_accounting as ua
     from ouroboros import usage_compaction as compaction
 
     output.mkdir(parents=True)
     context = mp.get_context("spawn")
     ready, start = context.Queue(), context.Event()
-    processes = [context.Process(target=_worker, args=(str(root), index, phase, ready, start, seconds, output, worker_source))
+    processes = [context.Process(target=_worker, args=(str(root), index, phase, ready, start, seconds, output, worker_source, owned))
                  for index in range(writers)]
     audit = context.Process(target=_audit_holder, args=(str(root), ready, start, seconds, output, worker_source))
     processes.append(audit)
@@ -438,8 +528,14 @@ def phase_run(root, output, writers, phase, seconds, worker_source=None):
     try:
         for process in processes:
             process.start()
-        arrivals = {ready.get(timeout=180) for _ in processes}
-        assert len(arrivals) == writers + 1
+        arrivals = []
+        for _ in processes:
+            receipt = ready.get(timeout=180)
+            if not receipt["ready"]:
+                raise RuntimeError(f"phase initialization failed: {receipt}")
+            arrivals.append(receipt["actor"])
+        assert len(set(arrivals)) == writers + 1
+        receipt = None
         started = time.monotonic()
         start.set()
         if phase == "compaction":
@@ -536,7 +632,7 @@ def phase_run(root, output, writers, phase, seconds, worker_source=None):
         if any(actual.get(key) != value for key, value in raw_breakdown(subset).items()):
             errors.append(f"independent money/nonmoney breakdown mismatch: {label}")
     for item in reports:
-        item["raw_max_acquisition_wait"] = max((value for values in item["wait"].values() for value in values), default=0)
+        item["raw_max_acquisition_wait"] = max([*item["episode_elapsed"], *(value for values in item["wait"].values() for value in values)], default=0)
         if item["raw_max_acquisition_wait"] >= 45:
             errors.append(f"writer {item['writer']} raw acquisition wait >=45s")
         if item["continuity_extended_waits"]:
@@ -545,7 +641,7 @@ def phase_run(root, output, writers, phase, seconds, worker_source=None):
         errors.append("a writer made no progress or had a >=45s progress gap")
     if receipt and compaction_timing["total_hold"] >= 45:
         errors.append("one legal compaction held the monetary lock >=45s")
-    result = {"phase": phase, "writers": writers, "seconds": seconds,
+    result = {"phase": phase, "writers": writers, "seconds": seconds, "owned": owned,
               "throughput_cycles_sec": sum(item["cycles"] for item in reports) / max(item.get("elapsed_sec", seconds) for item in reports),
               "exitcodes": [process.exitcode for process in processes], "errors": errors,
               "audit": audit_report, "strict_read_cadence": "one strict root projection before every reserve/send cycle",
@@ -564,6 +660,7 @@ def main():
     parser.add_argument("--writers", type=int, nargs="+", default=[10, 24])
     parser.add_argument("--attempts", type=int, default=30000)
     parser.add_argument("--phases", nargs="+", choices=["warm", "cold", "compaction"], default=["warm", "cold", "compaction"])
+    parser.add_argument("--owned", action="store_true", help="Use TaskModelWait, real control readers and a populated root-fence queue snapshot")
     parser.add_argument("--worker-source", help="Optional archived base source under this launcher's temporary root")
     parser.add_argument("--worker-ref", default="candidate", help="Label for separately measured baseline workers")
     args = parser.parse_args()
@@ -579,7 +676,7 @@ def main():
                  "diff_sha256": hashlib.sha256(subprocess.check_output(["git", "diff", "HEAD"])).hexdigest(),
                  "platform": platform.platform(), "python": sys.version, "source": __file__,
                  "fixture": shape, "runs": [], "worker_ref": args.worker_ref,
-                 "worker_source": args.worker_source}
+                 "worker_source": args.worker_source, "owned": args.owned}
     # Pin every runtime/control seam, launch environment and the runner, including
     # platform_layer and source files not yet tracked. Never print credentials.
     candidate["source_sha256"] = {str(path): {"sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
@@ -604,7 +701,10 @@ def main():
             name = f"{writers}-{phase}"
             root = output / name / "data"
             shutil.copytree(source, root)
-            result = phase_run(root, output / name / "metrics", writers, phase, args.seconds, args.worker_source)
+            if args.owned:
+                queue_shape = owned_queue(root, writers)
+                candidate["owned_queue_shape"] = queue_shape
+            result = phase_run(root, output / name / "metrics", writers, phase, args.seconds, args.worker_source, args.owned)
             candidate["runs"].append(result)
             (output / "matrix.json").write_text(json.dumps(candidate, indent=2))
             print(json.dumps({"run": name, "throughput": result["throughput_cycles_sec"],

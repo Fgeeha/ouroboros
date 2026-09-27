@@ -475,6 +475,7 @@ const TASK_CAUSE_PHRASES = {
     deep_self_review_error: "The deep self-review stopped on an error",
     // #869: the provider-death rail's terminal words (twin of project_dialogue.TASK_CAUSE_PHRASES).
     provider_unavailable: "The model provider stopped answering, so the task could not finish",
+    accounting_wait_expired: "Accounting access did not recover within this turn’s wait window",
     delivery_control_degraded: "Ouroboros's final delivery instruction could not be applied, so the answer stands as delivered.",
     authoring_handover_incomplete: "The replacement model stopped before resuming tool work.",
     delegated_custody_unreconciled: "Some delegated work was never reconciled.",
@@ -1053,10 +1054,9 @@ export function summarizeLogEvent(evt) {
     }
 
     if (t === 'task_checkpoint' || t === 'context_reclaim') {
-        const lowRetry = evt.checkpoint_kind === 'context_fit_low_retry';
-        return view(lowRetry ? 'warn' : 'thinking', taskCheckpointLabel(evt), {
+        return view(evt.checkpoint_kind === 'context_fit_low_retry' ? 'warn' : 'thinking', taskCheckpointLabel(evt), {
             meta: taskMeta(evt.model ? compactModel(evt.model) : '', evt.round ? `r${evt.round}` : '',
-                lowRetry ? 'same-model retry' : '', evt.context_tokens ? `~${evt.context_tokens} tok` : '',
+                evt.checkpoint_kind === 'context_fit_low_retry' ? 'same-model retry' : '', evt.context_tokens ? `~${evt.context_tokens} tok` : '',
                 formatLogMoney(evt.task_cost)),
         });
     }
@@ -1433,10 +1433,10 @@ function summarizeChatLiveEventView(evt) {
         const lowRetry = evt.checkpoint_kind === 'context_fit_low_retry';
         return chatView({
             phase: lowRetry ? 'warn' : 'thinking',
-            headline: lowRetry ? 'Context rebuilt in Low mode — retrying the same model once'
-                : taskCheckpointLabel(evt),
+            headline: taskCheckpointLabel(evt) + (lowRetry ? ' — retrying the same model once' : ''),
             visible: !checkpointHasProgressRow(evt),
-            dedupeKey: key(evt.checkpoint_kind || '', evt.checkpoint_kind === 'usage_lock_wait' ? evt.phase : evt.checkpoint_number || evt.round || ''),
+            dedupeKey: key(evt.checkpoint_kind || '', evt.checkpoint_kind === 'usage_lock_wait'
+                ? `${evt.episode_id || evt.ts || ''}:${evt.phase}` : evt.checkpoint_number || evt.round || ''),
         });
     }
 

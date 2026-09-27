@@ -295,8 +295,7 @@ def acquire_exclusive_file_lock(
     """Acquire a descriptor-owned lock; optional ``outcome`` records failure facts.
 
     Only contention retries; owner-aware recovery cannot evict a live writer.
-    Name-tier refusal is caller policy. Ordering/limits: ARCHITECTURE §1
-    "Platform substrate". A missing outcome is unknown, never contention."""
+    Name-tier refusal is caller policy; missing outcomes are unknown. See ARCHITECTURE §1 "Platform substrate"."""
     def report(reason, error=None):
         if outcome is not None:
             outcome.update(reason=reason, errno=getattr(error, "errno", None))
@@ -348,7 +347,7 @@ def acquire_exclusive_file_lock(
             continue  # not ownership — stand down and re-contend
         except (FileExistsError, PermissionError) as creation_error:
             report("permission" if isinstance(creation_error, PermissionError) else "unknown", creation_error)
-            stale = refused = None
+            stale = refused = probe = None
             try:
                 probe = os.open(str(lock_path), os.O_RDONLY)
                 try:
@@ -357,12 +356,10 @@ def acquire_exclusive_file_lock(
                         return report("identity_unreadable")
                     if isinstance(creation_error, FileExistsError):
                         report("contention")
-                    owner_pid = 0
-                    for field in os.read(probe, 512).decode("utf-8", "replace").split():
-                        if field.startswith("pid=") and field[4:].isdigit():
-                            owner_pid = int(field[4:])
-                    stale = bool(judged) and (time.time() - judged[2] / 1e9) > stale_sec
-                    if judged and owner_aware_stale and owner_pid > 0:
+                    fields = os.read(probe, 512).decode("utf-8", "replace").split()
+                    owner_pid = ([int(f[4:]) for f in fields if f.startswith("pid=") and f[4:].isdigit()] or [0])[-1]
+                    stale = (time.time() - judged[2] / 1e9) > stale_sec
+                    if owner_aware_stale and owner_pid > 0:
                         stale = not pid_is_alive(owner_pid)  # Proven death needs no age grace.
                     # Judge and evict the same inode under a kernel hold.
                     if stale and enforced:
@@ -384,8 +381,11 @@ def acquire_exclusive_file_lock(
                     lock_path.unlink()
                     continue
             except Exception as exc:
-                report("permission" if isinstance(exc, PermissionError) else "unknown", exc)
-                log.debug("Failed to inspect/remove stale lock %s", lock_path, exc_info=True)
+                if probe is None and isinstance(creation_error, FileExistsError) and isinstance(exc, FileNotFoundError):
+                    report("contention", exc)  # Observed holder released its name before our probe.
+                else:
+                    report("permission" if isinstance(exc, PermissionError) else "unknown", exc)
+                    log.debug("Failed to inspect/remove stale lock %s", lock_path, exc_info=True)
             if refused is not None:
                 report("kernel_refused", refused)
                 log.warning("Kernel lock refused on stale %s (%s): no lock taken", lock_path, refused)

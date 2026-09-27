@@ -1163,8 +1163,12 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
                 if limit is not None and view.exceeds_limit(limit, root_task_id=identity, dispatch=True):
                     raise BudgetExceeded(f"{axis} model budget changed before dispatch", limit_scope=axis,
                                          root_task_id=scope.root_task_id)
-        row = {key: value for key, value in current.items() if key not in {"seq", "ts", "pre_compaction_seq"}}
-        row.pop("settle_reason", None)
+        # Carry provenance, including future metadata; event-local reasons and
+        # receipt observations belong only to the transition that supplied them.
+        replaced = {"seq", "ts", "pre_compaction_seq", "settle_reason", "reason"}
+        if state == "settled":
+            replaced.update(("processing", "speed", "service_tier", "cost_basis", "cost_evidence"))
+        row = {key: value for key, value in current.items() if key not in replaced}
         row.update(state=state, **fields)
         appended = view.append(reservation.drive_root, [row])
         root_task_id = str(current.get("root_task_id") or "")
@@ -1506,6 +1510,11 @@ def execute_physical_attempt(
             reservation, request, terminal_state, candidate_manifest_ref=manifest_ref, exc=exc,
         )
         raise
+    return _account_response(reservation, request, response, extractor, manifest_ref)
+
+
+def _account_response(reservation, request, response, extractor, manifest_ref):
+    """Complete received-response accounting once, preserving its open bound on failure."""
     terminal_state = "settled"
     try:
         usage, cost, final = extractor(response)
@@ -1535,7 +1544,8 @@ async def execute_physical_attempt_async(
     before_dispatch: Optional[Callable[[AttemptReservation], Any]] = None,
 ) -> Any:
     _LAST_PHYSICAL_ATTEMPT.set(None)
-    from ouroboros._usage_wait import presend_off_loop
+    from ouroboros._usage_wait import presend_off_loop, postresponse_off_loop
+    from ouroboros.llm_observability import retain_cancelled_response
 
     reservation = await presend_off_loop(reserve_attempt, request, on_cancel=lambda held: (
         _pre_dispatch_failure(held, request, asyncio.CancelledError())))
@@ -1566,24 +1576,12 @@ async def execute_physical_attempt_async(
             reservation, request, terminal_state, candidate_manifest_ref=manifest_ref, exc=exc,
         )
         raise
-    terminal_state = "settled"
-    try:
-        usage, cost, final = extractor(response)
-        usage = dict(usage or {})
-        if request.prompt_cache_ttl and not usage.get("prompt_cache_ttl"):
-            usage["prompt_cache_ttl"] = request.prompt_cache_ttl
-        await presend_off_loop(settle_attempt, reservation, usage, cost_usd=cost, cost_final=final)
-        _observe_token_density(request, usage)
-    except Exception as exc:
-        log.exception("Failed to account paid provider response: %s", reservation.attempt_id)
-        terminal_state = "dispatched"
-        try:
-            await presend_off_loop(mark_unresolved, reservation, f"post_response_accounting_failed:{type(exc).__name__}")
-            terminal_state = "unresolved"
-        except Exception:
-            log.exception("Failed to mark post-response accounting failure unresolved")
-    _record_attempt_capture(reservation, request, terminal_state, candidate_manifest_ref=manifest_ref)
-    return response
+    return await postresponse_off_loop(
+        _account_response, reservation, request, response, extractor, manifest_ref,
+        retain_on_cancel=lambda exact, capture: retain_cancelled_response(
+            replace(request, drive_root=reservation.drive_root,
+                                task_id=(reservation.scope or UsageScope()).task_id or request.task_id), exact, capture),
+    )
 
 
 # v7 L-C2 split: the one-time legacy usage-telemetry import (source snapshot and

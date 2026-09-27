@@ -46,6 +46,86 @@ def seed(root, count, *, cost="0.0000015"):
     return rows
 
 
+@pytest.mark.parametrize("cache_state", ["cold", "warm", "replacement"])
+@pytest.mark.parametrize("tail", [False, True])
+@pytest.mark.parametrize("bad", [b" \n", b"\t\n", b"\xef\xbb\xbf{}\n", "{}".encode("utf-16") + b"\n"])
+def test_record_grammar_matches_canonical_replay(root, cache_state, tail, bad):
+    from shutil import copyfile
+
+    path = root / ua.LEDGER_REL
+    held = ua.reserve_attempt(request(root))
+    prefix = path.read_bytes()
+    if cache_state == "cold":
+        with memo._LEDGER_READ_CACHE_LOCK:
+            memo._LEDGER_READ_CACHE.pop(str(root.resolve()), None)
+    transition = {**json.loads(prefix.splitlines()[-1]), "seq": 2, "state": "dispatched"}
+    suffix = b"" if tail else (json.dumps(transition) + "\n").encode()
+    body = prefix + bad + suffix
+    if cache_state == "replacement":
+        replacement = root / "replacement.jsonl"
+        replacement.write_bytes(body)
+        os.replace(replacement, path)
+    else:
+        path.write_bytes(body)
+    canonical = root / "canonical"
+    (canonical / "state").mkdir(parents=True)
+    copyfile(path, canonical / ua.LEDGER_REL)
+    if tail:
+        with ledger._locked(canonical):
+            expected = ledger._read_records_locked(canonical)
+        with memo._writer_locked(root) as view:
+            assert view.records == expected
+        assert ua.read_usage_records(root) == expected
+        assert path.read_bytes() == (canonical / ua.LEDGER_REL).read_bytes() == prefix
+        assert (root / ledger.QUARANTINE_REL).read_bytes()
+        assert ua.usage_projection(root)["integrity_degraded"] is True
+    else:
+        with ledger._locked(canonical), pytest.raises(ledger.UsageLedgerCorrupt):
+            ledger._read_records_locked(canonical)
+        with pytest.raises(ledger.UsageLedgerCorrupt):
+            ua.mark_dispatched(held)
+        assert path.read_bytes() == body
+
+
+@pytest.mark.parametrize("cache_state", ["cold", "warm", "replacement"])
+def test_real_empty_lines_remain_valid_in_every_cache_state(root, cache_state):
+    held = ua.reserve_attempt(request(root))
+    path = root / ua.LEDGER_REL
+    original = path.read_bytes()
+    if cache_state == "cold":
+        with memo._LEDGER_READ_CACHE_LOCK:
+            memo._LEDGER_READ_CACHE.pop(str(root.resolve()), None)
+    body = original + b"\n\r\n"
+    if cache_state == "replacement":
+        replacement = root / "replacement.jsonl"
+        replacement.write_bytes(body)
+        os.replace(replacement, path)
+    else:
+        path.write_bytes(body)
+    ua.mark_dispatched(held)
+    ua.settle_attempt(held, cost_usd=.1, cost_final=True)
+    with ledger._locked(root):
+        expected = ledger._read_records_locked(root)
+    assert ua.read_usage_records(root) == expected
+    assert ua.usage_projection(root)["accounted_usd"] == .1
+
+
+def test_late_receipt_preserves_future_provenance_but_replaces_event_facts(root):
+    held = ua.reserve_attempt(request(root, provider="subscription"))
+    ua.mark_dispatched(held)
+    provenance = {"billing_group_future": {"owner": "one"}, "local_answer_owner_pid": 12345,
+                  "future_receipt_contract": {"nested": ["keep"]}}
+    ua._transition(held, "unresolved", reason="old failure", processing={"observed": "old"},
+                   speed="old", service_tier="old", cost_basis="old", cost_evidence={"knowledge": "old"},
+                   **provenance)
+    ua.settle_attempt(held, {}, cost_usd=.02, cost_final=True)
+    row = ua.read_usage_records(root, final_only=True)[0]
+    assert {key: row[key] for key in provenance} == provenance
+    assert row["settle_reason"] == "late_receipt"
+    assert not {"reason", "processing", "speed", "service_tier", "cost_basis", "cost_evidence"}.intersection(row)
+    assert ua.usage_projection(root).get("processing_summary", {}) == {}
+
+
 def raw_oracle(root):
     """Independent precision-200 fold of RAW literals, never the cache renderer."""
     finals = {}

@@ -3,6 +3,8 @@
 // projections of already-typed producer facts — no name substrings, no taxonomy.
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { updateLiveTimelineItem } from '../modules/chat_render_batch.js';
+import { mergeHistoricalTimelineItem } from '../modules/chat_history_replay.js';
 
 import {
     summarizeChatLiveEvent,
@@ -114,4 +116,24 @@ test('accounting wait phases remain distinct visible host checkpoints in chat an
         assert.equal(view.terminal, false);
         assert.equal(summarizeLogEvent(event).headline, view.headline);
     }
+});
+
+test('two wait episodes retain all phases through the actual live and history reducers', () => {
+    const events = ['first', 'second'].flatMap((episode_id) => ['entered', 'ended'].map((phase) => ({
+        type: 'task_checkpoint', task_id: 't1', checkpoint_kind: 'usage_lock_wait', episode_id, phase,
+    }))).map((event, index) => ({ ...event, ts: `2026-09-27T01:00:0${index}Z` }));
+    const live = { items: [] }, replay = { items: [] };
+    events.forEach((event, index) => {
+        const summary = summarizeChatLiveEvent(event);
+        updateLiveTimelineItem(live, summary, { ts: event.ts, rawTs: event.ts,
+            syntheticKey: summary.dedupeKey, headline: summary.headline });
+        const row = { ...event, history_id: `progress:${index}`, history_position: { source: 'progress', offset: index } };
+        mergeHistoricalTimelineItem(replay, summary, row, event.ts);
+        assert.equal(live.items.at(-1).headline, summary.headline);
+        assert.equal(live.items.length, index + 1);
+        // Reconnect enriches each existing live row without adding a twin.
+        mergeHistoricalTimelineItem(live, summary, row, event.ts);
+        assert.equal(live.items.length, index + 1);
+    });
+    assert.deepEqual(live.items.map(row => row.headline), replay.items.map(row => row.headline));
 });

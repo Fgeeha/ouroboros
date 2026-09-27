@@ -706,7 +706,8 @@ def _handle_model_wait_control(
                    "deadline_local" if reason == "deadline" else "finalization_grace")
     trace = ctx.llm_trace if isinstance(ctx.llm_trace, dict) else {}
     _loop()._finalize_forced_services(ctx, trace)
-    ctx.accumulated_usage.update(execution_status="failed", reason_code=reason_code)
+    ctx.accumulated_usage.update(execution_status=("infra_failed" if reason == "accounting_wait_expired" else "failed"),
+                                 reason_code=reason_code)
     fallback = _loop()._last_assistant_text(ctx.messages) or (
         "⚠️ Accounting access did not recover within this turn’s wait window; no further model call was made."
         if reason == "accounting_wait_expired" else

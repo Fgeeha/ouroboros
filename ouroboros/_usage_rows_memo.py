@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import collections
 import contextlib
-import json
 import heapq
 import os
 import copy
@@ -35,7 +34,7 @@ from ouroboros.runtime_limits import (
     USAGE_DISPLAY_REVALIDATE_AFTER_SEC,
 )
 from ouroboros.usage_ledger import QUARANTINE_REL, LedgerResumeState, UsageLockUnavailable, is_abandoned_settlement
-from ouroboros._usage_money import monetary_scope_key, LiteralFloat, ZERO_CASH, cash_contribution, change_cash, render_cash, exceeds_limit
+from ouroboros._usage_money import monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exceeds_limit
 
 log = logging.getLogger(__name__)
 
@@ -294,6 +293,8 @@ def _prepare_writer(root: pathlib.Path):
     supported locked-append/atomic-replacement protocol, not hostile writes
     preserving inode, size and timestamps.
     """
+    from ouroboros.usage_ledger import _decode_record
+
     ua = _ua()
     try:
         with open(root / ua.LEDGER_REL, "rb") as handle:
@@ -305,8 +306,10 @@ def _prepare_writer(root: pathlib.Path):
                 if not chunk.endswith(b"\n"):
                     break
                 consumed += len(chunk)
-                if chunk.strip():
-                    records.append(json.loads(chunk, parse_float=LiteralFloat))
+                for line in chunk.splitlines(keepends=True):
+                    row = _decode_record(line)
+                    if row is not None:
+                        records.append(row)
             after = os.fstat(handle.fileno())
             if after.st_size < stat.st_size or (after.st_size == stat.st_size
                                                and after.st_mtime_ns != stat.st_mtime_ns):

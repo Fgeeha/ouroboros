@@ -5,9 +5,12 @@ import asyncio
 import contextlib
 import errno
 import json
+import multiprocessing
+import os
 import queue
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -23,13 +26,13 @@ pytestmark = pytest.mark.serial
 
 
 @contextlib.contextmanager
-def held_lock(root):
+def held_lock(root, timeout=5):
     acquired, release = threading.Event(), threading.Event()
 
     def hold():
         with ledger._locked(root):
             acquired.set()
-            assert release.wait(5)
+            assert release.wait(timeout)
 
     thread = threading.Thread(target=hold)
     thread.start()
@@ -375,7 +378,7 @@ def test_interactive_expiry_rejoins_real_loop_no_call_terminal(root, short_acqui
         text, usage, trace = loop.run_llm_loop(**_loop_kwargs(root, ToolRegistry(repo_dir=root, drive_root=root), []))
     assert calls == [1] and not rows(root)
     assert usage["reason_code"] == "accounting_wait_expired"
-    assert usage["execution_status"] == "failed"
+    assert usage["execution_status"] == "infra_failed"
     assert "Accounting access" in text
     waits = [item["data"] for item in list(events.queue)
              if item.get("data", {}).get("checkpoint_kind") == "usage_lock_wait"]
@@ -394,3 +397,82 @@ def test_unreadable_named_identity_is_not_positive_contention(root, monkeypatch)
         with ledger._locked(root, timeout_sec=.01):
             pytest.fail("unreadable identity acquired")
     assert error.value.reason == "identity_unreadable"
+
+
+def test_last_poll_name_release_race_recontends_and_sends_once(root, monkeypatch):
+    ticks, facts = iter([0., 0., 1.]), {}
+    def raced_open(path, flags, *args):
+        if flags & os.O_CREAT:
+            raise FileExistsError(errno.EEXIST, "held")
+        raise FileNotFoundError(errno.ENOENT, "released before probe")
+    with monkeypatch.context() as patch:
+        patch.setattr(platform, "kernel_file_locks_enforced", lambda _: True)
+        patch.setattr(platform.os, "open", raced_open)
+        patch.setattr(platform, "time", SimpleNamespace(
+            monotonic=lambda: next(ticks), sleep=lambda _: None))
+        assert platform.acquire_exclusive_file_lock(root / "race.lock", timeout_sec=.25, outcome=facts) is None
+    assert facts["reason"] == "contention"
+    original, waits, sends = ua._locked, [], []
+    @contextlib.contextmanager
+    def acquire(*args, **kwargs):
+        waits.append(1)
+        if len(waits) == 1:
+            raise ledger.UsageLockUnavailable("observed last-poll race", reason=facts["reason"])
+        with original(*args, **kwargs) as beat:
+            yield beat
+    monkeypatch.setattr(ua, "_locked", acquire)
+    with owner(root), ua.physical_attempt_limit(1):
+        ua.execute_physical_attempt(request(root), lambda: sends.append(1) or {"usage": {}})
+        assert ua._PHYSICAL_LIMIT.get().used == 1
+    assert sends == [1]
+    assert [row["state"] for row in rows(root)] == ["reserved", "dispatched", "settled"]
+
+
+def _churn_lock(root, start, stop, ready):
+    ready.put(os.getpid())
+    assert start.wait(5)
+    for _ in range(30):
+        if stop.is_set():
+            break
+        with ledger._locked(root):
+            time.sleep(.012)
+        time.sleep(.003)
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_owned_process_churn_keeps_single_send_and_controls(root, cancel):
+    ctx = multiprocessing.get_context("spawn")
+    start, stop, ready = ctx.Event(), ctx.Event(), ctx.Queue()
+    children = [ctx.Process(target=_churn_lock, args=(root, start, stop, ready)) for _ in range(3)]
+    sends, controls = [], []
+    def control():
+        controls.append(time.monotonic())
+        return "cancelled" if cancel and len(controls) >= 3 else None
+    try:
+        for child in children:
+            child.start()
+        assert len({ready.get(timeout=10) for _ in children}) == 3
+        start.set()
+        with owner(root, control=control), ua.physical_attempt_limit(1):
+            if cancel:
+                with pytest.raises(PhysicalDispatchInterrupted):
+                    ua.execute_physical_attempt(request(root), lambda: sends.append(1))
+            else:
+                ua.execute_physical_attempt(request(root), lambda: sends.append(1) or {"usage": {}})
+                assert ua._PHYSICAL_LIMIT.get().used == 1
+        assert sends == ([] if cancel else [1])
+        assert len(controls) >= 3
+        assert max((b - a for a, b in zip(controls, controls[1:])), default=0) < 2
+        if not cancel:
+            assert [row["state"] for row in rows(root)] == ["reserved", "dispatched", "settled"]
+    finally:
+        stop.set()
+        start.set()
+        for child in children:
+            child.join(10)
+            if child.is_alive():
+                child.terminate()
+                child.join(5)
+            assert child.exitcode == 0
+        ready.close()
+        ready.join_thread()

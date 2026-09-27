@@ -618,6 +618,7 @@ def _web_search(
     active_effort = reasoning_effort or DEFAULT_REASONING_EFFORT
     reservation = None
     dispatched = False
+    send_started = False
     explicit_provider_failure = False
     manifest = None
     try:
@@ -643,6 +644,7 @@ def _web_search(
         mark_dispatched(reservation, candidate_manifest_ref=manifest)
         dispatched = True
         try:
+            send_started = True
             stream = client.responses.create(**candidate)
         except Exception as error:
             from ouroboros.llm_attempt import processing_refusal
@@ -710,12 +712,8 @@ def _web_search(
         usage["ledger_attempt_ids"] = [reservation.attempt_id]
         try:
             if response_completed:
-                settle_attempt(
-                    reservation,
-                    usage,
-                    cost_usd=reported_cost,
-                    cost_final=reported_cost_final,
-                )
+                settle_attempt(reservation, usage, cost_usd=reported_cost,
+                               cost_final=reported_cost_final)
             else:
                 mark_unresolved(reservation, "Responses stream ended without response.completed")
             dispatched = False
@@ -737,13 +735,6 @@ def _web_search(
                 "backend": "openai_responses",
                 "reason_code": "provider_outcome_unknown",
             }, ensure_ascii=False, indent=2)
-
-        # An empty result (no answer text AND no sources) is a soft failure, not
-        # a successful "(no answer)": fall through to the provider cascade so a
-        # degenerate OpenAI response does not shadow a working OpenRouter/
-        # Anthropic/ddgs backend.
-        if not text.strip() and not sources:
-            return _fallbacks(["OpenAI web search returned no answer and no sources"])
 
         # Track web search cost (estimate from tokens — OpenAI usage has no total_cost)
         if usage and hasattr(ctx, "pending_events"):
@@ -775,22 +766,25 @@ def _web_search(
             except Exception:
                 log.debug("Failed to emit web_search cost event", exc_info=True)
 
-        return json.dumps({"answer": text or "(no answer)", "answer_type": "summary", "sources": sources, "backend": "openai_responses"}, ensure_ascii=False, indent=2)
+        if text.strip() or sources:
+            return json.dumps({"answer": text or "(no answer)", "answer_type": "summary", "sources": sources, "backend": "openai_responses"}, ensure_ascii=False, indent=2)
     except Exception as e:
         from ouroboros.llm_attempt import ProcessingNotStarted
 
         processing_refused = isinstance(e, ProcessingNotStarted)
+        proven_not_started = False
         if dispatched:
             from ouroboros.transport_custody import release_pre_dispatch_attempt
 
-            dispatched = not release_pre_dispatch_attempt(reservation, e)
-        was_dispatched = reservation is not None and dispatched
+            proven_not_started = release_pre_dispatch_attempt(reservation, e)
+            dispatched = not proven_not_started
+        was_dispatched = send_started and not proven_not_started
         if reservation is not None and dispatched:
             try:
                 mark_unresolved(reservation, f"{type(e).__name__}: {e}")
             except Exception:
                 log.exception("Failed to mark OpenAI Responses search unresolved")
-        if reservation is not None and not was_dispatched:
+        if reservation is not None and (not send_started or proven_not_started):
             from ouroboros.usage_accounting import _pre_dispatch_failure
 
             failure = _pre_dispatch_failure(reservation, request, e, candidate_manifest_ref=manifest)
@@ -832,6 +826,10 @@ def _web_search(
                 _processing_submission="standard" if processing_refused else _processing_submission,
             )
         return _fallbacks([f"OpenAI web search failed ({type(e).__name__}): {detail}"])
+    # An empty completed result is a soft failure. Leave this backend's
+    # cleanup/capture scope before the cascade so another backend's exception
+    # cannot release this paid attempt or return its physical claim.
+    return _fallbacks(["OpenAI web search returned no answer and no sources"])
 
 
 def get_tools() -> List[ToolEntry]:

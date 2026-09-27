@@ -14,6 +14,7 @@ import logging
 import pathlib
 import threading
 import time
+import uuid
 
 from ouroboros.usage_ledger import UsageLockUnavailable, USAGE_LOCK_TIMEOUT_SEC
 
@@ -33,16 +34,18 @@ def _check() -> None:
     require_physical_dispatch_window()
 
 
-def _hold(owner, phase: str, started: float) -> None:
+def _hold(owner, phase: str, started: float, episode_id: str) -> None:
     if owner is None:
         return
     try:
         from ouroboros.loop_messages import _emit_checkpoint_event
 
+        detail = "Waiting for accounting access" if phase == "entered" else "Accounting wait ended"
         _emit_checkpoint_event(owner.event_queue, owner.task_id, pathlib.Path(owner.drive_root) / "logs", {
             "checkpoint_kind": "usage_lock_wait", "owner_visible": True,
-            "phase": phase, "elapsed_sec": time.monotonic() - started,
-            "detail": "Waiting for accounting access" if phase == "entered" else "Accounting wait ended",
+            "phase": phase, "episode_id": episode_id, "elapsed_sec": time.monotonic() - started,
+            "detail": detail, "content": detail, "role": "system", "system_type": "task_checkpoint",
+            **({"chat_id": owner.task["chat_id"]} if "chat_id" in owner.task else {}),
         })
     except Exception:
         log.debug("Could not disclose accounting wait", exc_info=True)
@@ -68,6 +71,7 @@ def send_acquisition(check=None):
                 yield heartbeat
             return
         entered = False
+        episode_id = uuid.uuid4().hex
         try:
             while True:
                 _check()
@@ -85,17 +89,17 @@ def send_acquisition(check=None):
                         raise
                     if not entered:
                         entered = True
-                        _hold(owner, "entered", started)
+                        _hold(owner, "entered", started, episode_id)
                     continue
                 with stack:
                     _check()
-                    if check:
-                        check()
+                    # The reserve/dispatch body checks its authoritative scope's
+                    # fence once, after preparation and under this same hold.
                     yield heartbeat
                     return
         finally:
             if entered:
-                _hold(owner, "ended", started)
+                _hold(owner, "ended", started, episode_id)
     return acquire
 
 
@@ -162,3 +166,49 @@ async def presend_off_loop(function, *args, on_cancel=None, **kwargs):
             if capture is not None:
                 ua.adopt_physical_attempt_capture(capture)
         raise
+
+
+async def postresponse_off_loop(function, *args, retain_on_cancel):
+    """Join accounting, retain the received answer, then propagate cancellation.
+
+    The response already exists: cancellation cannot cancel accounting or
+    skip its unresolved fallback. It still forbids caller continuation. The
+    existing private response store owns retention, not the cancelled stack.
+    """
+    from ouroboros import usage_accounting as ua
+
+    def invoke():
+        result = function(*args)
+        return result, ua.last_physical_attempt_capture()
+
+    future = asyncio.create_task(asyncio.to_thread(invoke))
+    cancelled = None
+    while True:
+        try:
+            response, capture = await asyncio.shield(future)
+            break
+        except asyncio.CancelledError as exc:
+            if future.cancelled():
+                raise  # Not a caller cancellation; no outcome to invent.
+            cancelled = exc
+    ua.adopt_physical_attempt_capture(capture)
+    if cancelled is None:
+        return response
+    cancelled.physical_attempt_capture = capture
+    cancelled.response = response
+    retention = asyncio.create_task(asyncio.to_thread(retain_on_cancel, response, capture))
+    while not retention.done():
+        try:
+            await asyncio.shield(retention)
+        except asyncio.CancelledError:
+            continue
+        except Exception:
+            break
+    try:
+        cancelled.response_manifest_ref = retention.result()["manifest_ref"]
+    except Exception as exc:
+        # Keep the exact object on the exception too; do not turn a failed
+        # retention into success or authorize execution after Stop.
+        cancelled.response_retention_error = type(exc).__name__
+        log.exception("Failed to retain cancelled paid response")
+    raise cancelled
