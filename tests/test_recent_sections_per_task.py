@@ -61,7 +61,7 @@ def test_single_task_log_renders_exactly_as_before(tmp_path):
     memory = Memory(drive_root=tmp_path)
     tools = _section(build_recent_sections(memory, env=None, task_id="task-a"), "## Recent tools")
     assert tools.split("\n\n", 1)[1] == memory.summarize_tools(rows)
-    assert "task task-a: all 5 matching rows; window: whole live file of logs/tools.jsonl" in tools.splitlines()[0]
+    assert "task task-a: all 5 matching calls; window: whole live file of logs/tools.jsonl" in tools.splitlines()[0]
 
 
 def test_no_task_id_keeps_the_global_tail(tmp_path):
@@ -156,7 +156,7 @@ def test_malformed_only_log_still_discloses_its_gap(tmp_path):
     (tmp_path / "logs" / "tools.jsonl").write_text("{not json}\n", encoding="utf-8")
     sections = build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a")
     tools = _section(sections, "## Recent tools")
-    assert "no matching rows" in tools and "gaps: malformed_jsonl" in tools
+    assert "no matching calls" in tools and "gaps: malformed_jsonl" in tools
     # A log with neither rows nor gaps stays silent, as before.
     (tmp_path / "logs" / "tools.jsonl").write_text("", encoding="utf-8")
     assert not [s for s in build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a")
@@ -182,7 +182,7 @@ def test_bounded_window_with_no_matching_rows_is_still_disclosed(tmp_path):
     _write(tmp_path / "logs" / "tools.jsonl", [{"ts": "t", "task_id": "task-b", "tool": "live", "args": {}, "result_preview": "ok"}])
     tools = _section(build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a"), "## Recent tools")
     header = tools.splitlines()[0]
-    assert "no matching rows" in header and "older archives not opened" in header and "3 of 4 newest archives" in header
+    assert "no matching calls" in header and "older archives not opened" in header and "3 of 4 newest archives" in header
     assert tools.strip() == header  # nothing rendered below the disclosure
 
 
@@ -191,7 +191,7 @@ def test_tools_header_says_how_many_rows_are_rendered(tmp_path):
             for i in range(30)]
     _write(tmp_path / "logs" / "tools.jsonl", rows)
     tools = _section(build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a"), "## Recent tools")
-    assert "newest 20 of 30 matching rows in the window (10 rendered, 20 scanned for review markers)" in tools.splitlines()[0]
+    assert "newest 20 of 30 matching calls in the window (10 rendered, 20 scanned for review markers)" in tools.splitlines()[0]
     assert tools.count("shell cmd=") == 10
 
 
@@ -210,7 +210,7 @@ def test_unreadable_live_file_is_disclosed_as_unread(tmp_path, monkeypatch):
     header = _section(build_recent_sections(Memory(drive_root=tmp_path), env=None, task_id="task-a"),
                       "## Recent tools").splitlines()[0]
     assert "window: unread of logs/tools.jsonl" in header and "unreadable_source" in header
-    assert "whole live file" not in header and "no matching rows" in header
+    assert "whole live file" not in header and "no matching calls" in header
     monkeypatch.setattr(pathlib.Path, "stat", real_stat)
     # A log that was never written is an empty window, not a gap: no section at all.
     (tmp_path / "logs" / "tools.jsonl").unlink()

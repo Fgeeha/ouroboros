@@ -76,6 +76,8 @@ spec = importlib.util.spec_from_file_location('isolated_conftest', pathlib.Path(
 module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 module._bind_pytest_runtime_roots()
+if state.read_state().quality == 'uninitialized':
+    state.save_state({})  # only explicit init/authoring creates state (#1307)
 state.update_state(lambda live: live.update({'probe': 'isolated'}))
 print(json.dumps({
     'root': str(state.DRIVE_ROOT),
@@ -123,6 +125,8 @@ def test_pytest_scrubbed_child_keeps_disposable_state_root(tmp_path):
     code = """
 import json
 from supervisor import evolution_lifecycle, state
+if state.read_state().quality == 'uninitialized':
+    state.save_state({})  # only explicit init/authoring creates state (#1307)
 state.update_state(lambda live: live.update({'scrubbed_child_probe': True}))
 campaign = evolution_lifecycle.start_evolution_campaign('Probe', source='test')
 print(json.dumps({

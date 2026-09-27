@@ -383,13 +383,22 @@ def get_tools() -> List[ToolEntry]:
         }, _toggle_evolution),
         ToolEntry("toggle_consciousness", {
             "name": "toggle_consciousness",
-            "description": "Control background consciousness: 'start', 'stop', or 'status'.",
+            "description": ("Control background consciousness: 'start' or 'stop' (the owner is told), or "
+                            "'status' (answered to you only: the persisted state with its source, never posted to "
+                            "the owner's chat)."),
             "parameters": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "status"], "description": "Action to perform"},
             }, "required": ["action"]},
         }, _toggle_consciousness),
         ToolEntry("set_next_wakeup", {
-            "name": "set_next_wakeup", "description": "Choose the consciousness wake-up interval in seconds: how long after a wake-up ends the next one starts (clamped into the owner's OUROBOROS_BG_WAKEUP_MIN/MAX bounds; a wake-up calling this sets its own next one; a pending wake-up keeps its time; stored for later when consciousness is off).", "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "description": "Seconds from the end of a wake-up to the next one"}}, "required": ["seconds"]},
+            "name": "set_next_wakeup", "description": (
+                "Choose the consciousness wake-up interval in seconds: how long after a wake-up ends the next one "
+                "starts, clamped into the owner's OUROBOROS_BG_WAKEUP_MIN/MAX. A wake-up calling this sets its own "
+                "next one; a wake-up already pending keeps its time; with consciousness off it is stored for later. "
+                "The alarm still adjusts it: a failed wake-up doubles the interval (up to MAX), a pending event "
+                "brings the next wake-up forward, a skipped one retries after MIN (an exhausted allowance waits for "
+                "its reset), and no wake-up starts sooner than MIN after the last wake-up, boot or skip."),
+            "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "description": "Seconds from the end of a wake-up to the next one"}}, "required": ["seconds"]},
         }, _set_next_wakeup),
         ToolEntry("switch_model", {
             "name": "switch_model",
@@ -414,6 +423,7 @@ def get_tools() -> List[ToolEntry]:
                                               "description": "Read the full stored completion observations for this task, including returns omitted from the summary. Omit bounds for source length/hash, then request explicit character ranges."},
                 "include_focus_source": {"type": "boolean", "default": False, "description": "Read the exact bytes this task's focus source_ref answered when the focus was authored (the retained_source of an [INDEPENDENT_ROOTS] row); same bounds contract as include_completion_source."},
                 "focus_source_sha256": {"type": "string", "default": "", "description": "With include_focus_source: select the retained source by the sha256 the roster row quoted, so a later focus of the same author cannot substitute its evidence."},
+                "review_source_sha256": {"type": "string", "default": "", "description": "Root turns: read only the exact acceptance-review source named by a late-evidence digest, pinned to the physical task_id even after a retry. Works across forked/empty drives. Without a range returns complete_chars/hash; then use source_start_char/source_end_char to read exact text. Does not include authority."},
                 "source_start_char": {"type": "integer", "description": "Inclusive character offset for the requested canonical source range."},
                 "source_end_char": {"type": "integer", "description": "Exclusive character offset for the requested canonical source range. A range outside the source returns no text: the answer names complete_chars and the range received, and is an argument error."},
                 "presence_scope": {"type": "string", "enum": ["own_binding"], "description": "Presence tasks only: read just independent work started from this Presence binding (any of its conversations) or this task's own tree."},
@@ -421,13 +431,13 @@ def get_tools() -> List[ToolEntry]:
         }, _get_task_result),
         ToolEntry("wait_task", {
             "name": "wait_task",
-            "description": "Wait for ONE subtask to reach a terminal status and return its effective result. May return EARLY (before terminal) if the child raises a tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon — the result then carries a [CHILD_BEACONS] block so you can steer, review, or override it. An unread message in your own mailbox also returns early so the ordinary loop can deliver and acknowledge it; the child keeps running. With SEVERAL children in flight, prefer wait_tasks(any_terminal) to absorb whichever finishes first rather than blocking serially on one id at a time.",
+            "description": "Wait for ONE subtask to reach a terminal status and return its effective result: the full single-child handoff once it settled (or when your known_result_sha256 no longer matches); a return BEFORE it settled carries the compact wait_tasks projection plus delegated_runs (its open delegated runs with dated observation facts, no liveness verdict). May return EARLY (before terminal) if the child raises a tree_note blocker/question/interface_contract/review_requested/delegation_constraint beacon — the result then carries a [CHILD_BEACONS] block so you can steer, review, or override it. An unread message in your own mailbox also returns early so the ordinary loop can deliver and acknowledge it; the child keeps running. With SEVERAL children in flight, prefer wait_tasks(any_terminal) to absorb whichever finishes first rather than blocking serially on one id at a time.",
             "parameters": {"type": "object", "required": ["task_id"], "properties": {
                 "task_id": {"type": "string", "description": "Task ID to check"},
                 "known_result_sha256": {"type": "string", "description": "Optional child_result_sha256 already obtained for this task. An exact match returns unchanged without repeating result/trace; current facts remain. Omit to return full text. This does not change when the wait ends."},
                 "timeout_sec": {"type": "integer", "default": 180, "description":
                                 "Maximum seconds to wait (default 180); a larger value is clamped to "
-                                f"{_WAIT_TASK_CLAMP_SEC}. Size the window to the child's expected life."},
+                                f"{_WAIT_TASK_CLAMP_SEC}, and a deadline narrows it (named in the result). Size the window to the child's expected life."},
             }},
         }, _wait_for_task, timeout_sec=7200),
         ToolEntry("wait_tasks", {
@@ -439,10 +449,10 @@ def get_tools() -> List[ToolEntry]:
                 "timeout_sec": {"type": "integer", "default": 600, "description":
                                 "Maximum seconds to wait (default 600); a larger value is clamped to "
                                 f"{_WAIT_TASKS_CLAMP_SEC}. Size the window to the children's expected life; "
-                                "an expired wait returns the still-live ids and this ceiling."},
+                                "an expired wait returns the still-live ids and this ceiling; a deadline narrows it (window_bound)."},
                 "mode": {"type": "string", "enum": ["all_terminal", "any_terminal"], "default": "all_terminal"},
             }},
-        }, _wait_for_tasks, timeout_sec=7200),
+        }, _wait_for_tasks, timeout_sec=_WAIT_TASKS_CLAMP_SEC + NESTED_SETTLEMENT_MARGIN_SEC),
         await_messages_entry(),
     ]
 
@@ -520,6 +530,7 @@ from ouroboros.tools.control_scheduling import (  # noqa: E402, F401 -- intentio
     maybe_emit_delegated_run_fanout,
 )
 from ouroboros.tools.control_task_results import (  # noqa: E402, F401 -- intentional public re-exports
+    NESTED_SETTLEMENT_MARGIN_SEC,
     _UNMINTED_WAIT_GRACE_SEC,
     _WAIT_TASK_CLAMP_SEC,
     _WAIT_TASKS_CLAMP_SEC,

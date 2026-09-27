@@ -409,9 +409,18 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
             return {}
         try:
             data = payload.encode("utf-8") if isinstance(payload, str) else json.dumps(payload, ensure_ascii=False).encode("utf-8")
-            return store_actor_source_bytes(root, self.assignment.request.task_id or "review",
-                                             category=category, source_id=f"{self.assignment.call_id}-{source_id}",
-                                             data=data, extension="txt" if isinstance(payload, str) else "json")
+            task_id = self.assignment.request.task_id or "review"
+            ref = store_actor_source_bytes(root, task_id, category=category,
+                source_id=f"{self.assignment.call_id}-{source_id}", data=data,
+                extension="txt" if isinstance(payload, str) else "json")
+            if (self.assignment.request.policy or {}).get('review_source_closure'):
+                from ouroboros.review_source_closure import retain_review_refs
+
+                # The inspection root contains only this request's named inputs.
+                # Its continuation closure also belongs to canonical operation custody.
+                ref = retain_review_refs(ref, root, pathlib.Path(self.assignment.custody_root), task_id)
+                retain_review_refs(ref, pathlib.Path(self.assignment.custody_root), root, task_id)
+            return ref
         except Exception as exc:
             self._source_gap = f"native_source_persistence_failed:{type(exc).__name__}"
             return {}
@@ -1075,6 +1084,7 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         outcome = "executed"
         extent: Dict[str, Any] = {}
         source_gap = ""
+        source_ref = {}
         verdict = validation_by_id.get(call_id)
         if room < _RESULT_ROOM_FLOOR_CHARS and name != "compact_context":
             # The round's earlier calls spent the room below the bound: a read
@@ -1186,6 +1196,8 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         receipt["outcome"] = outcome
         if source_gap:
             receipt["source_gap"] = source_gap
+        if source_ref:
+            receipt['result_source_ref'] = source_ref
         receipt.update(extent)
         self._tool_receipts.append(receipt)
         return {"role": "tool", "tool_call_id": call_id, "content": result}

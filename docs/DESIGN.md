@@ -277,10 +277,13 @@ a blocking exit still read `Done with warnings` or `Failed`.
 
 A host fact about a task is a row of that task's card, never a standalone
 bubble beside it. A reviewer panel that settles after its task already ended
-adds one System row naming the verdict and which revision it covered; that row
-lands inside the finished card (its Reviews group carries the note, the timeline
+adds one System row naming the reviewed version — delivered, different, or delivery
+unknown — before its verdict. That row lands inside the finished card (its Reviews group carries the note, the timeline
 keeps the row) without changing the card's chip, title or meta, and a standalone
-row appears only when the task has no card record in the page. The untyped
+row appears only when the task has no card record in the page. Saving and showing
+late criticism does not replace passing it to Ouroboros for consideration: the host
+owns sources and fact delivery; Ouroboros judges the evidence, explains it and
+chooses any further work on an admissible turn. The untyped
 terminal host notice and the origin-addressed routing notices stay ordinary rows by design. Local diagnostic failures remain inspectable
 in details and Logs, but do not relabel the whole still-working task. A failed child keeps a compact factual
 `Failed` marker inside its parent while the root continues under its own
@@ -298,7 +301,9 @@ lives in `log_events.js`). The routing receipt under an owner
 message is such a surface: a refused addressing act carries the host-composed
 `cause` sentence (`project_dialogue.routing_refusal_cause` — one host table for
 the receipt line, the System row and the picker toast), a landed act carries
-none, and an unknown reason stays raw. A terminal whose preserved output was
+none, and an unknown reason stays raw. Host text speaks only for the host's own
+actions, its own counts and signed quotes; a source it could not read is
+unknown, never zero. A terminal whose preserved output was
 never reviewed shows that output labelled rather than hidden: a short labelled
 excerpt beside the pointer to the full copy, so a `Failed` card over applied work
 is never a bare headline and never names preserved bytes without a way to reach
@@ -604,6 +609,13 @@ not child-task cards and never prove execution by themselves.
   its `DEGRADED` verdict), and each unavailable plan reviewer row names the
   model and quotes the engine's reported sentence when one exists — the
   failure code stays in the task detail and Logs.
+- A plan wave the mind ordered weaker than the owner's effort setting says so in
+  its attempt detail as one keyed line naming each seat, the ordered effort and
+  the setting (`Reviewers ordered weaker than your setting: s1 low (setting
+  xhigh)`), at desktop and phone width alike; the verdict token is never
+  recoloured for it. A seat that did not answer a same-spec cycle adds `· did
+  not answer; its earlier finding is still listed` to its unavailable row (a
+  never-sent seat: `· not sent; its earlier finding is still listed`).
 - An awaited or unresolved reviewer row adds `· since HH:MM` in the viewer's
   local 24-hour clock, prefixed with the short date when the wait began on an
   earlier day, only where the host recorded the moment it sent that reviewer's
@@ -753,22 +765,25 @@ patched in place; Expand shows the per-tool counts (`read_file ×3 ·
 web_search`); its phase is `calling` while a tracked call is still running,
 `warn` once a call failed, `result` otherwise, and the row says that phase in
 ink rather than in extra words. A failed or timed-out call keeps
-its own error row (content) and is counted in the evidence total.
-`web/modules/chat_activity.js::toolEvidenceView` builds that row for the live
-path and for the recorded metrics alike, so at rest the row carries the same
-counts and names live, on reload and on reconnect; a cold reload mints it from
-the metrics, so it carries the metrics' time and sits where the metrics
-arrived, while a reconnect keeps the live position. Live it derives from the
-observed call frames (once per call identity; identical repeats without an id
-collapse into one), and the host's metrics replace those numbers as they
-arrive, field by field: a fact that states a total says nothing about the
-routing or error count, so it can neither erase one nor reclassify a receipt
-row into content, and a call frame after the terminal changes nothing. Block presence is the same live, on
-reload and on reconnect (a turn that moved itself into a Project with
-`ensure_project_scope` is the exception: its block and answer live in the
-Project room, and Main replays only the owner message and the Started
-annotation); a child card reads the same voice rule for its own notes and folds
-its calls live, but replays no evidence row.
+its own diagnostic row and counts once. Wait end and operation settlement are
+independent facts: late success retires the provisional timeout notice but keeps
+“wait ended” in the evidence row; late failure keeps its operation error. Either
+arrival order produces the same outcome. A historical start alone means outcome
+unknown, never Running or Failed.
+`web/modules/chat_activity.js::toolEvidenceView` builds the same row live and on
+replay. Host invocation IDs join start/wait/settlement; legacy observations without
+sufficient identity remain separate even when names and arguments match. Host
+metrics fill absent counts field by field; canonical per-invocation evidence
+reconstructs later settlements on history/reconnect without resurrecting frozen
+wait errors. Reads are bounded and carry coverage; absent evidence is not proof
+of success. Start-only (live or legacy) and incomplete replay evidence preserve a known
+aggregate error; only complete settlement evidence can replace an earlier wait
+error. Typed tool evidence after task terminal updates counts and diagnostics
+on both root and child cards, preserving terminal task phase and controls.
+The row keeps its live position; history admits carrier evidence before summaries,
+progress or references choose their presentation. Block
+presence is consistent across reload and reconnect. A turn moved into a Project
+with `ensure_project_scope` lives there; Main retains its Started annotation.
 `N notes` in the collapsed header counts timeline items, the evidence row
 among them.
 
@@ -858,7 +873,7 @@ The quota row offers automatic continuation, initially enabled, and shows a
 known reset time or an explicit unknown. An authentication row instead offers
 the existing Accounts sign-in flow. Both can open Settings, retry explicitly,
 or use the shared model-role editor to choose a replacement model/account.
-The replacement affects the named waiting role until the task ends; an unchecked
+The replacement affects the named waiting role until its task or review operation ends; an unchecked
 "Also save this role in Settings" checkbox separately requests persistence.
 Fallback Local remains shared by its Settings group. Changing Local for one
 waiting fallback makes the replacement task-only: the persistence checkbox is
@@ -876,8 +891,8 @@ clock, and calendar deadlines stay fixed.
 A submitted action is shown as pending until the task reports its application.
 A saved Settings change and a still-pending task change are disclosed separately.
 Retries preserve the original request identity and payload. Revisioned rows reject
-older observations, resolved episodes never reopen, and a terminal task removes
-all wait actions. A mailbox delivery failure keeps Retry request available for
+older observations and resolved episodes never reopen. Terminal authors retain
+exact live paid-review controls without reviving author status; other waits end. A mailbox delivery failure keeps Retry request available for
 that same accepted command, even while its application remains pending. The
 current task attempt selects live actions; a previous attempt's retained pause
 never makes a new working attempt appear to wait. Updates and history rebuilds preserve the same keyed editor,

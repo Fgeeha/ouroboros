@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict
 
 from ouroboros.depth_evidence import parse_task_depth
@@ -97,6 +98,7 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "parent_cognitive_route": parent_cognitive_route,
         **directory_options,
         "metadata": {
+            "resource_intent": copy.deepcopy(fields.get("resource_intent") or {}),
             "parent_task_id": parent_id,
             "root_task_id": root_task_id,
             "session_id": session_id,

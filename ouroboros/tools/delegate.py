@@ -6,10 +6,12 @@ API tokens it starts a Claudexor run, watches it, and brings the result home. Be
 the nanny IS the host, verification receipts stay host-authored and the harness's
 output is a claim, not proof.
 
-Four verbs: ``delegate_start``, a time-bounded ``delegate_wait``,
-``delegate_cancel``, and ``delegate_answer`` (a run's pending interactive question is
-answered by its own nanny — owner decision 7=A, poltergeist phase B). There is still
-no ``hurry`` — Claudexor's only control verb is ``cancel``, and cancelling a reviewer
+Five verbs: ``delegate_start``, a time-bounded ``delegate_wait``,
+``delegate_cancel``, ``delegate_answer`` (a run's pending interactive question is
+answered by its own nanny — owner decision 7=A, poltergeist phase B) and
+``delegate_message`` (a live message into the run's running turn, gated by the
+route's declared ``liveInput`` capability, never by a harness name). There is still
+no ``hurry`` — Claudexor's control verb is ``cancel``, and cancelling a reviewer
 destroys the verdict you wanted.
 
 Read-only and mutating children share ONE nanny and ONE transport. The only difference
@@ -95,6 +97,7 @@ from ouroboros.delegate_interactions import (  # noqa: F401
     _answer_delivery_unknown,
     _bounded_interactions,
     _delegate_answer,
+    _delegate_message,
     _interactions_are_news,
     _normalized_answers,
     _waiting_on_user_payload,
@@ -399,20 +402,17 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         _work_order_source_request,
     )
     work_order_source_request = source_binding["request"]
-    work_order_coverage = source_binding["coverage"]
-    authority_fingerprint = source_binding["authority_fingerprint"]
     work_order_fingerprint = source_binding["fingerprint"]
     recovering = source_binding["recovering"]
     actor, actor_refusal = prepare_delegate_start_actor(
         ctx, drive, recovering=recovering, invocation_id=retry_token,
-        work_order_fingerprint=work_order_fingerprint, authority_fingerprint=authority_fingerprint,
+        work_order_fingerprint=work_order_fingerprint, authority_fingerprint=source_binding["authority_fingerprint"],
     )
     if actor_refusal:
         return actor_refusal
-    selected_subagent_id = str(actor.get("selected_subagent_id") or "")
-    config_fingerprint = str(actor.get("config_fingerprint") or "")
-    work_order_fingerprint = str(actor.get("work_order_fingerprint") or "")
-    authority_fingerprint = str(actor.get("authority_fingerprint") or "")
+    actor_facts = {key: str(actor.get(key) or "") for key in (
+        "selected_subagent_id", "config_fingerprint", "work_order_fingerprint", "authority_fingerprint")}
+    actor_facts.update(work_order_coverage=source_binding["coverage"], work_order_source_request=work_order_source_request)
     if recovering:
         binding, refusal = _resolve_retry_invocation(ctx, drive, retry_token, text)
         if refusal:
@@ -460,7 +460,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
     history_facts = session_request_facts(
         request_body if recovering else {"model": route.model, "credentialProfileId": route.profile_id,
                                         "effort": route.effort, "access": authority.access},
-        selected_subagent_id=selected_subagent_id, task_id=str(getattr(ctx, "task_id", "") or ""),
+        selected_subagent_id=actor_facts["selected_subagent_id"], task_id=str(getattr(ctx, "task_id", "") or ""),
         route=route.route_id, processing=processing_info if recovering else {"requested": actor.get("processing_preference")})
     try:
         # Health checks the stored route/confinement shape on retries, never current
@@ -524,6 +524,16 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                 if snapshot is not None:
                     snapshot_id, baseline_sha, root = snapshot.snapshot_id, snapshot.baseline_sha, snapshot.path
                     resource_ref = dict(record_auth.get("resource_ref") or {})
+            if authority.access == "readonly":
+                from ouroboros.delegate_readonly_inputs import prepare_folderless_inputs
+
+                try:
+                    readonly_root, input_instruction = prepare_folderless_inputs(ctx, invocation_id)
+                except (OSError, ValueError) as exc:
+                    return _fail("delegate_start", "readonly_inputs_unavailable", str(exc), definitely_unrun=True)
+                if readonly_root:
+                    root = readonly_root
+                    instructions += input_instruction
             execution_root = (root if directory_options.get("isolation") == "live" else "") if directory_options else delegated_execution_workspace_root(gateway, authority, root)
             scope_root = target_root if execution_root or directory_options else root
             if snapshot is not None:
@@ -551,6 +561,9 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                                           root, text, request_body["instructions"])
         lineage = getattr(ctx, "task_metadata", {}) or {}
         lineage = lineage if isinstance(lineage, dict) else {}
+        snapshot_facts = dict(snapshot_id=snapshot_id, baseline_sha=baseline_sha, target_root=target_root,
+                              authority_source=authority_source, resource_ref=resource_ref,
+                              execution_binding_fingerprint=binding_fingerprint)
         requested, claim_refusal = claimed_start_request(
             drive, claim_target=(target_root if not recovering and authority_source == "skill_payload" else ""),
             actor_ctx=ctx, enforce_actor_idle=not recovering,
@@ -559,14 +572,10 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
             max_seconds=seconds, max_seconds_basis=seconds_basis, request=request_body, project_id=project_id,
             project_owned=bool(owned_project_id), project_persistent=project_persistent, route=route.route_id,
             root_task_id=str(lineage.get("root_task_id") or ""), parent_task_id=str(lineage.get("parent_task_id") or ""),
-            snapshot_id=snapshot_id, execution_root=(root if snapshot_id or resource_ref.get("strategy") == "direct" else ""),
-            execution_binding_fingerprint=binding_fingerprint,
-            baseline_sha=baseline_sha, target_root=target_root,
-            authority_source=authority_source, resource_ref=resource_ref,
+            **snapshot_facts,
+            execution_root=(root if snapshot_id or resource_ref.get("strategy") == "direct" else ""),
             # Recovery proves the original actor and compiled brief before adoption.
-            selected_subagent_id=selected_subagent_id, config_fingerprint=config_fingerprint,
-            work_order_fingerprint=work_order_fingerprint, work_order_coverage=work_order_coverage,
-            authority_fingerprint=authority_fingerprint, work_order_source_request=work_order_source_request,
+            **actor_facts,
             processing=processing_info,
         )
         if claim_refusal:
@@ -638,13 +647,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
         invocation_id=invocation_id, project_id=project_id,
         continuation_of=str(continuation.get("continuation_of") or ""),
         project_owned=bool(owned_project_id), project_persistent=project_persistent,
-        selected_subagent_id=selected_subagent_id,
-        config_fingerprint=config_fingerprint, work_order_fingerprint=work_order_fingerprint,
-        work_order_coverage=work_order_coverage, work_order_source_request=work_order_source_request,
-        authority_fingerprint=authority_fingerprint, snapshot_id=snapshot_id,
-        execution_binding_fingerprint=binding_fingerprint,
-        target_root=target_root, baseline_sha=baseline_sha,
-        authority_source=authority_source, resource_ref=resource_ref, processing=processing_info,
+        **actor_facts, **snapshot_facts, processing=processing_info,
         capture_mode=("engine_directory" if resource_ref.get("workspace_kind") == "directory" else
                       _CAPTURE_DELEGATED_SNAPSHOT if snapshot_id else ""),
         max_seconds_basis=seconds_basis,
@@ -1143,10 +1146,6 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 # PREVIEW path too: a payload big enough to spill is exactly the one whose
                 # containment block a reader is least likely to reach.
                 _record_containment(ctx, entry, payload)
-                from ouroboros.tools.control import cache_horizon_note
-                _horizon = cache_horizon_note(ctx, time.monotonic() - started)
-                if _horizon:
-                    payload["cache_horizon_note"] = _horizon
                 return json.dumps(payload, ensure_ascii=False, indent=2)
             if last_seq > baseline:
                 # The STREAM is not collapsed — the TIMER is. Every advance reaches the
@@ -1174,10 +1173,9 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                                                     if entry.work_order_source_request else {}
                                                 ))
             def _expired() -> str:
-                # The window payload is a DICT here, and the cache-horizon note is a
-                # field in it: appending the note after the rendered JSON left the
-                # result unparseable for every reader of this family — the supervising
-                # loop included, which then read the whole window as a `fault`.
+                # The window payload is a DICT; the supervising wake adds its own
+                # whole-sleep facts (``sleep``, one cache-horizon note) as fields at
+                # publication, never per tick and never after the rendered JSON.
                 payload = progress.window_payload(
                     run_id=rid, state=state, last_seq=last_seq,
                     window=(time.monotonic() - started) if observation_only else window,
@@ -1188,9 +1186,6 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                     pending_interactions=_bounded_interactions(pending) if pending else None,
                     detail=detail, seen=seen,
                     budget=tool_result_limit("delegate_wait"))
-                from ouroboros.tools.control import cache_horizon_note
-                if _horizon := cache_horizon_note(ctx, time.monotonic() - started):
-                    payload["cache_horizon_note"] = _horizon
                 return json.dumps(payload, ensure_ascii=False, indent=2)
 
             if observation_only or time.monotonic() >= deadline:
@@ -1293,7 +1288,7 @@ def _delegate_cancel(ctx: ToolContext, run_id: str, reason: str = "") -> ToolRes
 
 
 def _published_entry(core: Any) -> Any:
-    """The family's four REGISTERED entries, wrapped in their one string boundary.
+    """The family's five REGISTERED entries, wrapped in their one string boundary.
 
     Inside the family a result is a native ``ToolResult``; the handler ABI is
     still ``str``. Publication happens HERE, after every decorator the core ran
@@ -1378,10 +1373,11 @@ def get_tools() -> List[ToolEntry]:
                     "Optional reduction of native access for this fresh run: readonly or workspace_write. "
                     "Omit to inherit the captured actor profile (new mutating sessions default to full). "
                     "Explicit readonly task authority still wins. Omit on retry_of."},
-                "root": {"type": "string", "enum": ["skill_payload"], "description":
-                    "Optional exact-resource selector: 'skill_payload' delegates ONE "
-                    "installed user-managed skill payload you can already write. Omit "
-                    "for ordinary workspace delegation."},
+                "root": {"type": "string", "enum": ["active_workspace", "skill_payload"],
+                    "default": "active_workspace", "description":
+                    "active_workspace (the default, same as omitting) is ordinary workspace "
+                    "delegation. 'skill_payload' delegates ONE installed user-managed skill "
+                    "payload you can already write, named by bucket and skill_name."},
                 "bucket": {"type": "string", "description":
                     "With root='skill_payload': the payload location "
                     "(external|clawhub|ouroboroshub|user_repo)."},
@@ -1431,7 +1427,10 @@ def get_tools() -> List[ToolEntry]:
                 "Terminal settlement, a new interaction, "
                 "fault, addressed owner/task message, a direct-child attention/terminal event, "
                 "cancel/deadline control, recovery judgment, or an explicit one-shot checkpoint "
-                "wakes exactly once. A run that asks its "
+                "wakes exactly once. Every wake carries `sleep` (measured over this whole call), "
+                "`leaf_live_input` (the route's declared live-input capability, 'unknown' when "
+                "unread) and, once the prompt-cache horizon has passed since your last model "
+                "response, one cache_horizon_note. A run that asks its "
                 "user a question returns IMMEDIATELY as status='waiting_on_user' with "
                 "the full question set (interaction/question ids ride WHOLE, never "
                 "truncated): answer it with delegate_answer, or raise it with the "
@@ -1444,7 +1443,9 @@ def get_tools() -> List[ToolEntry]:
                 "continuation=new_physical_run. A "
                 "large terminal result is delivered as a bounded preview plus an "
                 "artifact: read output_delivery and finish reading the artifact before "
-                "you rely on it."
+                "you rely on it. A delegate_message receipt is reconciled HERE: timeline "
+                "rows carrying its messageId (message.* receipts and the harness status "
+                "row whose outcome reads delivered) carry messageId and outcome."
             ),
             "parameters": {"type": "object", "required": ["run_id"], "properties": {
                 "run_id": {"type": "string", "description": "Run id from delegate_start."},
@@ -1491,8 +1492,8 @@ def get_tools() -> List[ToolEntry]:
                 "— the answer did NOT land; retry the SAME answers after reset_at); "
                 "delivery_unknown "
                 "(transport died mid-answer — re-check with delegate_wait and NEVER "
-                "post a different answer for the same interaction). Codex-lane runs "
-                "have no mid-run questions: a run that ENDS needing input "
+                "post a different answer for the same interaction). A run on a route "
+                "without a mid-run question channel that ENDS needing input "
                 "(outcome_facts.reason=input_required) is answered with a plain NEW "
                 "delegate_start(subagent_id=..., prompt=...) whose prompt carries the "
                 "assignment plus the answers "
@@ -1523,6 +1524,40 @@ def get_tools() -> List[ToolEntry]:
                     "before delivering it."},
             }},
         }, _published_entry(_delegate_answer), timeout_sec=120),
+        ToolEntry("delegate_message", {
+            "name": "delegate_message",
+            "description": (
+                "Place one live message into a delegated run's RUNNING turn (a "
+                "correction, a new fact, a redirection) without cancelling it. Only the "
+                "task that started the run may send. Capability-gated, never by harness "
+                "name: the route's catalog row declares liveInput (mid_turn / "
+                "next_tool_boundary / none) and the engine must list the operation; "
+                "otherwise the typed outcome is unsupported and nothing is sent. Typed "
+                "outcomes mirror the engine: delivered (the harness consumed it in the "
+                "live turn; obedience unproved); accepted (the acceptance boundary was "
+                "observed; consumption unproved until a timeline row with this message_id reads outcome=delivered); "
+                "rejected (an explicit refusal of THIS submission — see reason); "
+                "not_active (no live target: terminal/settled run, turn gap, attempt "
+                "mismatch, or a PENDING question — answer that with delegate_answer); "
+                "unsupported; delivery_unknown (it MAY have landed); not_found. Every "
+                "result returns message_id, the delivery identity: pass it back ONLY to "
+                "retry the SAME text after delivery_unknown (the engine replays the "
+                "stored receipt instead of delivering twice); after any other outcome a "
+                "new message needs a NEW id (omit message_id). A message steers only the "
+                "current attempt — a later retry or continuation never re-injects it — and "
+                "is reconciled on the delegate_wait timeline (message.* rows)."
+            ),
+            "parameters": {"type": "object", "required": ["run_id", "text"], "properties": {
+                "run_id": {"type": "string", "description": "Run id from delegate_start."},
+                "text": {"type": "string", "description":
+                    "The message, verbatim, as the harness will read it mid-turn "
+                    "(non-empty; the engine bounds its length)."},
+                "message_id": {"type": "string", "description":
+                    "ONLY the message_id a previous delivery_unknown result returned, to "
+                    "replay that exact message under its original key. Omit for a new "
+                    "message; never invent one."},
+            }},
+        }, _published_entry(_delegate_message), timeout_sec=120),
     ]
 
 

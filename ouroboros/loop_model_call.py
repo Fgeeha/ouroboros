@@ -9,6 +9,8 @@ from ouroboros.config import runtime_setting
 
 import logging
 import contextlib
+import copy
+import json
 import pathlib
 import queue
 import time
@@ -663,6 +665,7 @@ def _dispatch_round_model(
         managed_transport_continuation, transport_repeat_stop_requested,
     )
     from ouroboros.owner_mailbox import OwnerMailboxPeek
+    from ouroboros.send_clock import main_clock_policy
 
     mailbox_peek = OwnerMailboxPeek()
     ctx.tools._ctx._transport_repeat_control_reason = ""
@@ -711,6 +714,8 @@ def _dispatch_round_model(
             # owner because the slot survives kwargs deep-copying by identity.
             model_turn_state=getattr(ctx.tools._ctx, "model_turn_state", None),
             model_context_observer=observe_feedback,
+            send_clock_policy=main_clock_policy(
+                getattr(ctx.tools._ctx, "task_metadata", {}), task_type=ctx.task_type),
         )
     if primary and deferral is not None and deferral.fact and result[0] is None:
         ctx.tools._ctx._deferred_resource_refusal = deferral
@@ -791,17 +796,21 @@ def _reprepare_waiting_main(ctx: _RoundModelCallContext, kwargs: dict):
         to_model=str(model or ""),
         tool_calls=len(trace.get("tool_calls") or []) if isinstance(trace, dict) else 0,
     )
+    _project_wake_input(ctx)
     disposition = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False)
+    from ouroboros.send_clock import MainSendClock
+
     if disposition is not None and disposition.action == "reclaim_once":
         if _fit_key(disposition) not in _loop()._context_reclaim_passes(ctx.tools._ctx):
-            with bind_physical_attempt_context(None):
+            with bind_physical_attempt_context(None), MainSendClock(None).bound():
                 _loop()._run_main_reclaim(ctx, disposition)
         disposition = _measure_after_reclaim(ctx)
     from ouroboros.loop_llm_call import _prepare_main_messages
 
     # Any vision work belongs to this actual reprepare, outside both the Main
-    # fit probe and the failed attempt's physical precondition/measurement.
-    with bind_physical_attempt_context(None):
+    # fit probe and the failed attempt's physical precondition/measurement —
+    # and outside Main's clock: a helper send is not a Main request.
+    with bind_physical_attempt_context(None), MainSendClock(None).bound():
         kwargs["messages"] = _prepare_main_messages(
             ctx.messages, model=model, model_role=role,
             model_account_override=kwargs.get("model_account_override"),
@@ -867,6 +876,29 @@ def _run_main_reclaim(
         ctx.tools._ctx.messages = ctx.messages
         _loop().seal_task_transcript(ctx.messages)
         prune_reclaim_trace_refs(ctx.tools._ctx, ctx.messages)
+    # Low-water facts: the pass is deficit-triggered but sized to land below the
+    # boundary, so the landing is re-measured on the SAME fit basis as the trigger
+    # and "reached the boundary" stays distinct from "achieved the margin"
+    # (reclaimed == deficit is AT the boundary, not below it).
+    deficit = max(int(measurement.target_deficit_tokens or 0),
+                  int(measurement.capacity_deficit_tokens or 0))
+    requested_margin = int(request.reclaim_goal_tokens) - deficit
+    landed = measurement
+    if receipt.status == "applied":
+        try:
+            remeasured = _loop()._measure_round_main_fit(ctx, automatic_pass_used=True)
+        except Exception:  # telemetry only: an unmeasurable landing must not fail the pass
+            log.debug("Post-reclaim fit measurement unavailable", exc_info=True)
+            remeasured = None
+        landed = remeasured.measurement if remeasured is not None else None
+    boundary = [value for value in (
+        landed.target_total_tokens, landed.capacity_total_tokens) if value is not None] if landed else []
+    # None = the landing could not be measured (unknown), never "not reached".
+    headroom = (min(boundary) - (landed.estimated_input_tokens + landed.response_reserve_tokens)
+                if boundary else None)
+    tool_ctx = ctx.tools._ctx
+    previous_round = getattr(tool_ctx, "_context_reclaim_last_pass_round", None)
+    tool_ctx._context_reclaim_last_pass_round = int(ctx.round_idx)
     _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
         "type": "context_reclaim",
         "checkpoint_kind": "context_reclaim_automatic",
@@ -878,6 +910,13 @@ def _run_main_reclaim(
         "reclaimed_tokens": receipt.reclaimed_tokens,
         "goal_reached": receipt.goal_reached,
         "checkpoint_ref": receipt.checkpoint_ref,
+        "deficit_tokens": deficit,
+        "requested_margin_tokens": requested_margin,
+        "achieved_headroom_tokens": headroom,
+        "boundary_reached": None if headroom is None else headroom >= 0,
+        "below_boundary": None if headroom is None else headroom >= max(1, requested_margin),
+        "rounds_since_previous_pass": (
+            int(ctx.round_idx) - int(previous_round) if previous_round is not None else None),
     })
     return receipt
 
@@ -954,8 +993,140 @@ def _emit_overflow_retry_skipped(ctx: _RoundModelCallContext, reason: str) -> No
     })
 
 
+ROUTING_RECEIPTS_HEADER = "[ROUTING_RECEIPTS]"
+
+
+def _append_routing_receipts(ctx: _RoundModelCallContext) -> bool:
+    """Show the model, at this boundary, the routing acts recorded for the owner message(s) it answers.
+
+    The decision turn's metadata holds only what was recorded before it started;
+    an act taken since — this turn's own promote or steer, a picker click, another
+    lane on the same message — reaches the next request as one append-only host
+    row, read from the existing receipt rail (``project_dialogue`` annotations) and
+    only when it changed what the model has already read. Facts, not a ban. An act
+    recorded under its own synthetic ``agent-steer:`` id, or keyed only to a task,
+    carries no link to the message and is named as not listed rather than guessed.
+    """
+    tool_ctx = ctx.tools._ctx
+    meta = getattr(tool_ctx, "task_metadata", None)
+    meta = meta if isinstance(meta, dict) else {}
+    delivery = getattr(tool_ctx, "last_owner_delivery", None)
+    ids = [str(meta.get("client_message_id") or ""),
+           str(delivery.get("client_message_id") or "") if isinstance(delivery, dict) else ""]
+    ids = [value for index, value in enumerate(ids) if value and value not in ids[:index]]
+    root = meta.get("budget_drive_root") or ctx.drive_root or getattr(tool_ctx, "drive_root", None)
+    if not ids or not root or str(meta.get("delegation_role") or "") == "subagent":
+        return False
+    try:
+        from ouroboros.project_dialogue import _ANNOTATIONS_NAME, _latest_annotations_by_token
+
+        rows = [row for (message_id, _token), row in _latest_annotations_by_token(
+            pathlib.Path(str(root)) / "logs" / _ANNOTATIONS_NAME).items() if message_id in ids]
+    except Exception:
+        log.debug("routing receipts unreadable at the model boundary", exc_info=True)
+        return False
+    # One line per act from the receipt fields every reader shares, oldest first.
+    where = lambda label, target: (  # noqa: E731
+        f"{label} ({target})" if label and target and label != target else (label or target or "no target"))
+    lines = lambda acts: [  # noqa: E731
+        f"- {act.get('action') or '?'} → {where(str(act.get('target_label') or ''), str(act.get('target') or ''))}: "
+        f"{act.get('status') or 'unknown'}, recorded {act.get('ts') or '?'}"
+        for act in sorted(acts, key=lambda row: str(row.get("ts") or ""))]
+    current = lines(rows)
+    shown: Optional[List[str]] = None
+    for message in reversed(ctx.messages):
+        text = message.get("content") if isinstance(message, dict) and message.get("role") == "user" else None
+        if isinstance(text, str) and text.startswith(ROUTING_RECEIPTS_HEADER):
+            shown = [line for line in text.splitlines() if line.startswith("- ")]
+            break
+    if shown is None:  # what the turn's own metadata already showed it at start
+        contract = meta.get("routing_contract") if isinstance(meta.get("routing_contract"), dict) else {}
+        startup = contract.get("message_routing_acts") or (
+            [contract["message_routing_receipt"]] if isinstance(contract.get("message_routing_receipt"), dict) else [])
+        shown = lines([act for act in startup if isinstance(act, dict)])
+    if not current or current == shown:
+        return False
+    ctx.messages.append({"role": "user", "content": "\n".join([
+        f"{ROUTING_RECEIPTS_HEADER} Routing acts recorded so far for the owner message(s) this turn answers, "
+        "oldest first — receipts from the routing rail; facts, not a ban: another act stays your choice.",
+        *current,
+        "Not listed: an act recorded under its own agent-steer id (a steer after this message was already "
+        "routed, a scope bind) or keyed only to a task id; it carries no link to this message."])})
+    return True
+
+
+def _project_wake_input(ctx: _RoundModelCallContext, *, overflowed: bool = False) -> bool:
+    """Deliver a wake's observation by its exact source when the whole one cannot fit.
+
+    Re-decided at every round boundary until a response has consumed the wake
+    input, on that round's actual request: tool-inclusive measurement (the tools
+    and route of THIS call, so a grown tool set or a switched route is measured
+    again), the answer reserve and one clock line against a KNOWN capacity.
+    Unknown capacity sends the whole input, as any call does; a real provider
+    overflow may apply the delivery before consumption, as the one retry the
+    strict-shrink predicate admits only when it is actually smaller. Once a
+    response followed the input, the transcript is history and stays as sent.
+    Only the delivered first user message changes; the task text, the owner
+    corpus and the stored source keep the complete observation (``consciousness_wake``).
+    """
+    tool_ctx = ctx.tools._ctx
+    meta = getattr(tool_ctx, "task_metadata", None)
+    wake = meta.get("wake_observation") if isinstance(meta, dict) else None
+    if not isinstance(wake, dict) or not wake.get("projection_text"):
+        return False
+    index = next((i for i, message in enumerate(ctx.messages) if message.get("role") == "user"), None)
+    if index is None or any(isinstance(message, dict) and message.get("role") == "assistant"
+                            for message in ctx.messages[index + 1:]):
+        return False  # a response already followed the wake input: consumed history, never rewritten
+    if not hasattr(tool_ctx, "_wake_input_full_message"):
+        tool_ctx._wake_input_full_message = copy.deepcopy(ctx.messages[index])
+    full = tool_ctx._wake_input_full_message
+    delivery = {"role": "user", "content": str(wake["projection_text"])}
+    if len(json.dumps(delivery, ensure_ascii=False)) >= len(json.dumps(full, ensure_ascii=False)):
+        return False  # a pointer must actually save space
+    projected = overflowed
+    if not overflowed:
+        # Re-evaluate the FULL input on each actual route, even when the last
+        # unconsumed candidate used a pointer. Measurement never rewrites history.
+        current = ctx.messages[index]
+        ctx.messages[index] = full
+        try:
+            disposition = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False)
+        finally:
+            ctx.messages[index] = current
+        measurement = disposition.measurement if disposition is not None else None
+        from datetime import datetime, timezone
+        from ouroboros.send_clock import main_clock_policy, render_clock_note
+        from ouroboros.utils import estimate_tokens
+
+        policy = main_clock_policy(meta, task_type=ctx.task_type)
+        clock = estimate_tokens(render_clock_note(policy, datetime.now(timezone.utc))) if policy else 0
+        projected = bool(measurement is not None and measurement.capacity_total_tokens is not None
+                         and measurement.estimated_input_tokens + measurement.response_reserve_tokens + clock
+                         > measurement.capacity_total_tokens)
+    from ouroboros.context_fit import extract_plain_text_from_content
+
+    desired = delivery if projected else full
+    # Cross-family fallbacks copy the transcript, then restore it on failure.
+    # Projection belongs to THESE bytes, never a flag on the shared tool context.
+    if extract_plain_text_from_content(ctx.messages[index].get("content")) == extract_plain_text_from_content(desired.get("content")):
+        return False
+    ctx.messages[index] = delivery if projected else copy.deepcopy(full)
+    invalidate_task_cache_splits(ctx.task_id)
+    _loop().seal_task_transcript(ctx.messages)
+    tool_ctx.messages = ctx.messages
+    _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+        "checkpoint_kind": "wake_input_by_source" if projected else "wake_input_inline",
+        "round": ctx.round_idx, "after_overflow": overflowed,
+        "composition": wake.get("composition"), "source_sha256": (wake.get("source") or {}).get("sha256"),
+    })
+    return True
+
+
 def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
     """Measure, optionally reclaim, dispatch, and recover one Main round."""
+    _append_routing_receipts(ctx)
+    _project_wake_input(ctx)
     disposition = _loop()._measure_round_main_fit(ctx, automatic_pass_used=False)
     if disposition is not None:
         key = _fit_key(disposition)
@@ -986,6 +1157,7 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
 
     if isinstance(ctx.accumulated_usage.get(TRANSPORT_DEATHS_KEY), dict):
         return _skipped("round_holds_unresolved_attempt")
+    _project_wake_input(ctx, overflowed=True)
     _reproject_actual_overflow_low(ctx)
     reclaim_key = _fit_key(disposition)
     overflow_fit = (
@@ -997,7 +1169,15 @@ def _call_round_model(ctx: _RoundModelCallContext) -> Tuple[Any, float, str]:
         return msg, cost, ctx.active_context_mode
     key = _fit_key(overflow_fit)
     if key not in _loop()._context_reclaim_passes(ctx.tools._ctx):
-        _loop()._run_main_reclaim(ctx, overflow_fit, minimum_goal_tokens=1)
+        # The provider proved the prediction short by an unknown amount: request a
+        # low-water-sized pass, never a token-sized one, so the single strict-shrink
+        # retry has real headroom (the goal already carries the margin when the
+        # measurement itself found a deficit).
+        from ouroboros.context_fit import reclaim_low_water_margin
+
+        landed = overflow_fit.measurement
+        _loop()._run_main_reclaim(ctx, overflow_fit, minimum_goal_tokens=max(
+            1, reclaim_low_water_margin(landed.target_total_tokens, landed.capacity_total_tokens)))
         overflow_fit = _measure_after_reclaim(ctx)
         if overflow_fit is None:
             return msg, cost, ctx.active_context_mode

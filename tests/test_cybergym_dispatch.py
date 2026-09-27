@@ -443,10 +443,17 @@ def _transport_row(task_id: str) -> dict:
     }
 
 
-def test_breaker_pauses_probes_and_resumes_instead_of_abandoning(tmp_path):
+def test_breaker_pauses_probes_and_resumes_instead_of_abandoning(tmp_path, monkeypatch):
     """full1507: three transport rows from a ~100 s stall, not a dead isolate."""
 
+    from concurrent.futures import ALL_COMPLETED, wait
+    from devtools.benchmarks.cybergym import cybergym_dispatch
     from devtools.benchmarks.cybergym.cybergym_dispatch import run_dispatched
+
+    # This scenario delivers a whole failed wave before any later success can
+    # reset the consecutive-failure streak. Worker scheduling is not its oracle.
+    monkeypatch.setattr(cybergym_dispatch, "wait", lambda futures, **kwargs: wait(
+        futures, **{**kwargs, "return_when": ALL_COMPLETED}))
 
     clock = _PausingClock()
     probes: list[float] = []
@@ -457,17 +464,16 @@ def test_breaker_pauses_probes_and_resumes_instead_of_abandoning(tmp_path):
         probes.append(clock.now)
         return next(probe_answers)
 
-    outcomes = iter(["transport", "transport", "transport", "ok", "ok", "ok"])
+    tasks = [_Task(f"arvo:{index}") for index in range(1, 7)]
+    failed_task_ids = {task.task_id for task in tasks[:3]}
 
     def run_one(task):
-        if next(outcomes) == "ok":
+        if task.task_id not in failed_task_ids:
             return {"task_id": task.task_id, "status": "completed"}
         return _transport_row(task.task_id)
 
     events: list[dict] = []
-    tasks = [_Task(f"arvo:{index}") for index in range(1, 7)]
     for workers in (1, 3):
-        outcomes = iter(["transport", "transport", "transport", "ok", "ok", "ok"])
         probe_answers = iter([False, False, True])
         probes.clear()
         events.clear()
@@ -486,6 +492,7 @@ def test_breaker_pauses_probes_and_resumes_instead_of_abandoning(tmp_path):
             clock=clock.monotonic,
         )
 
+        assert [row["task_id"] for row in rows] == [task.task_id for task in tasks]
         assert [row["status"] for row in rows] == ["infra_failed"] * 3 + ["completed"] * 3
         # Backoff schedule: first probe after 30 s, then +60 s, then +120 s.
         assert probes == [30.0, 90.0, 210.0]

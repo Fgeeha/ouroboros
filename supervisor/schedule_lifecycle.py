@@ -14,7 +14,7 @@ from __future__ import annotations
 import logging
 import pathlib
 import uuid
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from ouroboros.schedule_contract import schedule_slug
 from ouroboros.utils import utc_now_iso
@@ -105,6 +105,9 @@ def _merge_onto_current(existing: Dict[str, Any], incoming: Dict[str, Any]) -> D
     disk, so a full-record PUT built from a stale GET cannot roll back a
     concurrent scheduler tick or skill resync.
     """
+    from supervisor.schedule_occurrence import remember_claim_basis
+
+    remember_claim_basis(existing)
     trigger_changed = dict(existing.get("trigger") or {}) != dict(incoming.get("trigger") or {})
     timezone_changed = str(existing.get("timezone") or "") != str(incoming.get("timezone") or "")
     consumed = _is_consumed_once(existing)
@@ -155,21 +158,38 @@ def _merge_onto_current(existing: Dict[str, Any], incoming: Dict[str, Any]) -> D
 
 
 def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | None = None,
-                          actor: str = "", task_id: str = "", reason: str = "") -> Dict[str, Any]:
+                          actor: str = "", task_id: str = "", reason: str = "",
+                          continuation_of: Optional[Dict[str, Any]] = None,
+                          new_resource_intent: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Create or replace a scheduled task record.
 
     Returns the stored row plus an ``audit`` field: ``recorded`` when both audit
     facts landed, ``incomplete`` when the change is durable but its outcome
     record is not. The key rides the RETURNED COPY only — it is never persisted.
+    The occurrence protocol's host facts (``occurrence``, ``hold``,
+    ``continuation_of``) are never taken from a payload: ``continuation_of`` is
+    set only by the host follow-up path through its own keyword, and an authored
+    change clears a wait so the next pass retries at once (#1315).
     """
     root = pathlib.Path(drive_root or _store._queue().DRIVE_ROOT)
     with schedule_transaction(root):
         data = load_schedule_store(root)
         tasks = list(data.get("tasks") or [])
-        incoming = dict(record)
+        from supervisor.schedule_occurrence import OCCURRENCE_FIELDS, fingerprint
+
+        incoming = {key: value for key, value in dict(record).items() if key not in OCCURRENCE_FIELDS}
         schedule_id = str(incoming.get("id") or "").strip() or uuid.uuid4().hex[:8]
         incoming["id"] = schedule_id
         existing = next((item for item in tasks if str(item.get("id") or "") == schedule_id), None)
+        if new_resource_intent is not None:
+            # The producer may describe a NEW row. Editing an old followup cannot
+            # turn absent intent into self-work; preserve its current evidence.
+            template = dict(incoming.get("task") or {})
+            metadata = dict(template.get("metadata") or {})
+            intent = ((existing.get("task") or {}).get("metadata") or {}).get("resource_intent") if existing else new_resource_intent
+            if intent is not None:
+                metadata.setdefault("resource_intent", dict(intent))
+            incoming["task"] = {**template, "metadata": metadata}
         operation_id = uuid.uuid4().hex[:12]
         action = "edit" if existing is not None else "create"
         audit = {
@@ -192,6 +212,10 @@ def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | 
                 _audit_schedule_mutation(phase="outcome", result=refusal.status,
                                          before=existing, **audit)
                 raise
+        if existing is None and isinstance(continuation_of, dict):
+            incoming["continuation_of"] = dict(continuation_of)
+        if existing is not None and fingerprint(existing) != fingerprint(incoming):
+            incoming.pop("hold", None)
         incoming.setdefault("enabled", True)
         incoming.setdefault("created_at", utc_now_iso())
         incoming["updated_at"] = utc_now_iso()
@@ -241,6 +265,9 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                 return {"ok": False, "changed": False, "status": "not_found",
                         "schedule_id": wanted, "audit": "not_written"}
             before = dict(current)
+            from supervisor.schedule_occurrence import remember_claim_basis
+
+            remember_claim_basis(current)
             operation_id = uuid.uuid4().hex[:12]
             audit = {
                 "drive_root": root, "operation_id": operation_id, "actor": actor,
@@ -268,17 +295,10 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                     current["manual_override"] = "disabled"
                 status = "updated"
             elif operation == "delete":
-                if notify_row and _is_consumed_once(current) and (owner_over_notify or not _is_suppressed(current)):
-                    # A fired reminder is a receipt, not a standing row: removing
-                    # it re-arms nothing of the owner's, so either hand removes it
-                    # outright, as a consumed task one-shot goes — unless the owner
-                    # switched even the receipt off, which the skill may not undo.
-                    tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
-                    status, removed = "deleted", True
-                elif owner_over_notify and _is_suppressed(current):
-                    # The owner already switched this reminder off and now removes
-                    # the record itself: an explicit second act, so the row goes
-                    # (a later post of the same key starts a fresh row).
+                if owner_over_notify:
+                    # Delete means remove this schedule, whether armed, disabled or
+                    # already fired. Disable is the separate durable veto against
+                    # a skill re-posting the same key (owner decision 1A/2B).
                     tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
                     status, removed = "deleted", True
                 elif notify_row and not owner_over_notify and _is_suppressed(current):
@@ -287,17 +307,24 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                     # cancel plus a repeat of the same key would lift the owner's
                     # decision. Reported as the suppression it is, and unchanged.
                     status, kept = "suppressed", True
-                elif skill_row or owner_over_notify:
-                    # Retained as a suppressed record: dropping the row would only
-                    # have it recreated by the next lifecycle resync (or the skill's
-                    # next post of the same key), and the owner would never see
-                    # that their delete did not hold.
+                elif skill_row:
+                    # Manifest resync would recreate a deleted row, so retain
+                    # its owner-authored suppression instead.
                     current["enabled"] = False
                     current["manual_override"] = "deleted"
                     status = "suppressed"
                 else:
-                    tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
-                    status, removed = "deleted", True
+                    from supervisor.schedule_occurrence import owed
+
+                    status, owes = "deleted", owed(current)
+                    if owes is not False:
+                        # An accepted run waits to be re-queued: removal is deferred until it
+                        # starts, because deleting a row never takes back an admission (#1315).
+                        current["enabled"], current["delete_requested_at"] = False, utc_now_iso()
+                        detail = "an accepted run of this schedule is still owed; the row goes once that run starts"
+                    else:
+                        tasks = [item for item in tasks if str(item.get("id") or "") != wanted]
+                        removed = True
             elif _is_consumed_once(current):
                 status = "consumed_not_rearmed"
                 detail = "a one-shot that already fired is history; schedule a new run_at instead"
@@ -340,6 +367,7 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                         status, detail = "restored_not_ready", blocker
             else:
                 current["enabled"] = True
+                current.pop("delete_requested_at", None)  # restoring withdraws a deferred delete
                 status = "updated"
             changed = status not in UNCHANGED_STATUSES and not kept
             if changed:
@@ -383,5 +411,4 @@ def remove_scheduled_task(schedule_id: str, *, drive_root: pathlib.Path | None =
         actor=str(actor or "").strip() or "host",
         reason=str(reason or "").strip() or "schedule_removed")
     return bool(outcome.get("changed"))
-
 

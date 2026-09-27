@@ -488,8 +488,9 @@ def _stage_promoted_initial_attachments(
         if attachment_manifest_all_rejected(manifest):
             remove_staged_attachments(manifest)
             from ouroboros.headless import remove_subagent_task_drive
-
-            remove_subagent_task_drive(DRIVE_ROOT, tid)
+            from supervisor.queue import task_settlement_interlock, task_settlement_liveness
+            remove_subagent_task_drive(DRIVE_ROOT, tid, live=task_settlement_liveness,
+                                       guard=task_settlement_interlock, admission_rollback=True)
             return manifest, {
                 "status": "needs_manual_target",
                 "reason": "attachment_admission_rejected",
@@ -1129,15 +1130,13 @@ def spawn_workers(n: int = 0) -> None:
             "event_queue_transport": "manager",
         },
     )
+    from supervisor.worker_process import close_worker_stop_channel, spawn_worker_process
+
     new_workers: Dict[int, Worker] = {}
     try:
         for i in range(count):
             in_q = _CTX.Queue()
-            proc = _CTX.Process(target=worker_main,
-                               args=(i, in_q, event_q, str(REPO_DIR), str(DRIVE_ROOT),
-                                     _current_custody_session_id()))
-            proc.daemon = True
-            proc.start()
+            proc = spawn_worker_process(_CTX, i, in_q, event_q, REPO_DIR, DRIVE_ROOT)
             # Unassignable until the readiness seam observes this child's worker_ready row.
             new_workers[i] = Worker(wid=i, proc=proc, in_q=in_q, busy_task_id=None, reaping=True)
     except Exception:
@@ -1147,6 +1146,8 @@ def spawn_workers(n: int = 0) -> None:
                 worker.proc.join(timeout=2)
             except Exception:
                 pass
+            finally:
+                close_worker_stop_channel(worker.proc)
         raise
     with _queue_lock:
         if WORKERS:
@@ -1156,6 +1157,8 @@ def spawn_workers(n: int = 0) -> None:
                     worker.proc.join(timeout=2)
                 except Exception:
                     pass
+                finally:
+                    close_worker_stop_channel(worker.proc)
             raise RuntimeError("worker pool appeared during serialized startup")
         WORKERS.update(new_workers)
         _WORKER_POOL_DISABLED_REASON = ""
@@ -1214,6 +1217,9 @@ def kill_workers(
                     dead_pids.add(int(w.proc.pid))
             except Exception:
                 log.debug("Cannot confirm worker %s dead", w.wid, exc_info=True)
+        from supervisor.worker_process import close_worker_stop_channel
+        for w in WORKERS.values():
+            close_worker_stop_channel(w.proc)
         WORKERS.clear()
         orphaned_ids = []
         drained_ids = []

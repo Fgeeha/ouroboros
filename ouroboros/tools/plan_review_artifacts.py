@@ -262,6 +262,19 @@ def _row_has_physical_dispatch(row: Dict[str, Any]) -> bool:
     return True
 
 
+def _same_wave(earlier: Dict[str, Any], wave: Dict[str, Any], *, pointer: Dict[str, Any]) -> bool:
+    """Whether a predecessor resolves to ``wave`` itself. When the pointer and the wave's own
+    artifact reference are both known, identity is the artifact: two attempts of one cycle
+    (an unpaid $0 attempt and its retry share ``cycle_index`` and fingerprint, since an unpaid
+    attempt advances nothing) are distinct waves with distinct artifacts. Without both
+    references the pair (cycle_index, fingerprint) is the only identity there is."""
+    own = wave.get("wave_artifact") if isinstance(wave.get("wave_artifact"), dict) else {}
+    if pointer and own and str(pointer.get("path") or "") and str(own.get("path") or ""):
+        return str(pointer.get("path") or "") == str(own.get("path") or "")
+    return bool(earlier.get("cycle_index") == wave.get("cycle_index") and str(
+        earlier.get("request_fingerprint") or "") == str(wave.get("request_fingerprint") or ""))
+
+
 def in_flight_resume_inputs(
     existing: Dict[str, Any], state: Dict[str, Any], state_root: pathlib.Path,
     task_id: str, configured_slots: list,
@@ -277,7 +290,13 @@ def in_flight_resume_inputs(
         )}
     previous = None
     previous_fingerprint = str(existing.get("previous_fingerprint") or "")
-    if previous_fingerprint:
+    replaced = existing.get("previous_wave_artifact") if isinstance(existing.get("previous_wave_artifact"), dict) else {}
+    if replaced:  # a same-fingerprint re-dispatch replaced its predecessor in the hot index: read the exact copy
+        try:
+            previous = read_wave(state_root, task_id, replaced)
+        except (OSError, ValueError, json.JSONDecodeError):
+            return {"error": "Prior exact plan-review authority is unreadable; in-flight reconciliation is refused."}
+    elif previous_fingerprint:
         from ouroboros.task_results import plan_review_wave
 
         previous = plan_review_wave(state, previous_fingerprint)
@@ -289,6 +308,10 @@ def in_flight_resume_inputs(
                     "Prior exact plan-review authority is unreadable; "
                     "in-flight reconciliation is refused."
                 )}
+    if (replaced or previous_fingerprint) and (previous is None or _same_wave(previous, existing, pointer=replaced)):
+        return {"error": (  # a recorded predecessor that resolves to nothing, or to this very wave, is not a first wave
+            "Prior plan-review predecessor cannot be resolved to a distinct wave; in-flight reconciliation is refused."
+        )}
     raw_actor_rows = existing.get("actors")
     if not isinstance(raw_actor_rows, list) or any(
         not isinstance(row, dict) for row in raw_actor_rows
@@ -335,8 +358,17 @@ def in_flight_resume_inputs(
             "Refusing to infer custody from current reviewer health."
         )}
     frozen_rows = []
+    recorded_outputs = {str(r.get("slot_id") or ""): r for r in existing.get("reviewer_outputs") or [] if isinstance(r, dict)}
     for row in actor_rows:
-        if str(row.get("slot_id") or "") in dispatched_ids:
+        sid = str(row.get("slot_id") or "")
+        if sid in dispatched_ids:
+            continue
+        if isinstance(row.get("replayed_from"), dict) and row["replayed_from"]:
+            # A kept seat of an addressed re-ask: its recorded answer was replayed at $0 and
+            # is carried as a frozen row with its exact text re-attached (never re-sent).
+            frozen_rows.append({**row, "text": str((recorded_outputs.get(sid) or {}).get("text") or ""),
+                                "carried_output": recorded_outputs.get(sid) or {},
+                                "request_model": str(row.get("request_model") or row.get("model") or "")})
             continue
         if bool(row.get("ok")) or not str(row.get("error") or ""):
             return {"error": (
@@ -391,22 +423,6 @@ def hot_index_wave(wave: dict, *, page_size: int) -> dict:
         **wave, "findings": page, "findings_total": len(findings),
         "findings_paged": True,
     }
-
-
-def continuation_state(
-    state_root: pathlib.Path, task_id: str, previous: Optional[dict], slots: List[Any],
-    manifest: dict, *, user_content: str,
-) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], str]:
-    """Resolve one evidence continuation; the fourth element names a restart cause.
-
-    The guard is load-bearing: a cycle whose manifest names no reviewer-requested
-    locator has no prior reviewer thread to continue, so the configured slots are
-    returned untouched instead of reporting an absent predecessor wave."""
-    if not manifest.get("reviewer_requested"):
-        return slots, {}, {}, ""
-    return continuation_inputs(
-        state_root, task_id, previous, slots, user_content=user_content,
-    )
 
 
 def record_exact_wave(
@@ -468,23 +484,24 @@ def slot_row(slot: Any) -> dict:
 
 
 def continuation_restart_delta(cause: str) -> dict:
-    """The existing-style disclosure of one continuation that restarted fresh."""
+    """The disclosure of one packet slot whose transcript continuation restarted fresh."""
     return {
         "kind": "capability_delta",
-        "requested": "continuation of prior thread",
-        "effective": "fresh session, full packet",
+        "requested": "continuation of prior transcript",
+        "effective": "fresh full packet",
         "reason": str(cause or ""),
     }
 
 
-def attach_continuation_restart_delta(rows: List[dict], cause: str) -> None:
-    """Disclose one fresh continuation restart on every slot row (no-op when
-    the continuation held). Thread memory was lost and the wave re-dispatched
-    fresh with the full packet: disclosed per slot through the existing
-    capability-delta lane."""
-    if not cause:
-        return
+def attach_continuation_restart_delta(rows: List[dict], causes: Dict[str, str]) -> None:
+    """Disclose a fresh restart on exactly the PACKET rows it happened to (``causes`` =
+    slot id → typed cause; no-op when every continuation held). A session row's continuity
+    is its settled ``review_thread_receipt`` (recorded on the row already): the host never
+    states a guess about it. A kept $0 replay row was not sent at all, so nothing restarted."""
     for row in rows:
+        cause = str(causes.get(str(row.get("slot_id") or "")) or "") if causes else ""
+        if not cause or str(row.get("route") or "") == "agent_session" or row.get("replayed_from"):
+            continue
         row["capability_delta"] = [
             *(row.get("capability_delta") or []),
             continuation_restart_delta(cause),
@@ -494,24 +511,32 @@ def attach_continuation_restart_delta(rows: List[dict], cause: str) -> None:
 def continuation_inputs(
     state_root: pathlib.Path, task_id: str, previous: Optional[dict], slots: List[Any],
     *, user_content: str,
-) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], str]:
-    """Rebuild one evidence continuation from the prior exact wave.
+) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], Dict[str, str]]:
+    """Continue every reviewer from the prior exact wave: ``(slots, slot_messages,
+    session_threads, causes)``.
 
-    Every miss here is a cache miss, never a validity event: the dispositions
-    custody chain is enforced one level up, before this function is reached. An
-    absent, unreferenced or unreadable prior exact wave, a changed reviewer
-    roster, a prior slot receipt or thread that is gone, an invalid prior API
-    transcript — each degrades to a FRESH full-packet dispatch, because the
-    packet is self-contained on every send (prior findings, dispositions and
-    spec delta already ride it). The fourth element names the typed cause of
-    such a restart ('' when continuation held); slots are returned exactly as
-    currently configured, never rebound to prior rows."""
+    Every miss here is a cache miss, never a validity event: the dispositions custody
+    chain is enforced one level up. A packet (api_chat) slot continues its exact recorded
+    transcript (prior request, its answer, this cycle's packet); a session slot resumes its
+    sticky thread (``review_thread_id`` when recorded — a missing id is not a restart, the
+    thread is resolved by its idempotency key) and never gets a cause; a retrieving native
+    row is not a packet slot and is skipped. ``causes`` names, PER SLOT, why a packet slot
+    could not continue and goes out fresh: a wave-level miss (no prior wave reference, an
+    unreadable one, a changed roster) is a cause for every packet slot; a per-slot miss
+    (``prior_slot_receipt_missing``, ``prior_api_transcript_invalid``) touches that slot
+    only. A first cycle (``previous is None``) has nothing to continue and discloses
+    nothing. The packet is self-contained on every send (prior findings, dispositions and
+    spec delta already ride it), so a fresh send loses no answer. Slots are returned
+    exactly as currently configured, never rebound to prior rows."""
+    from ouroboros.tools.plan_review_runtime import slot_retrieves
 
-    def fresh(cause: str) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], str]:
-        return slots, {}, {}, cause
+    packet_ids = [str(getattr(slot, "slot_id", "") or "") for slot in slots if not slot_retrieves(slot)]
+
+    def fresh(cause: str) -> tuple[List[Any], Dict[str, List[Dict[str, Any]]], Dict[str, str], Dict[str, str]]:
+        return slots, {}, {}, {sid: cause for sid in packet_ids}
 
     if not previous:
-        return fresh("prior_exact_wave_missing")
+        return slots, {}, {}, {}
     ref = previous.get("wave_artifact") if isinstance(previous.get("wave_artifact"), dict) else {}
     if not ref:
         return fresh("prior_exact_wave_ref_missing")
@@ -525,35 +550,38 @@ def continuation_inputs(
     outputs = {str(r.get("slot_id") or ""): r for r in exact.get("reviewer_outputs") or [] if isinstance(r, dict)}
     slot_messages: Dict[str, List[Dict[str, Any]]] = {}
     session_threads: Dict[str, str] = {}
-    for config in current_rows:
+    causes: Dict[str, str] = {}
+    for slot, config in zip(slots, current_rows):
         sid = str(config.get("slot_id") or "")
-        output = outputs.get(sid)
-        if not output:
-            return fresh(f"prior_slot_receipt_missing:{sid}")
+        output = outputs.get(sid) or {}
         if str(config.get("route") or "") == "agent_session":
-            thread_id = str(output.get("review_thread_id") or "")
-            if not thread_id:
-                return fresh(f"prior_review_thread_missing:{sid}")
-            session_threads[sid] = thread_id
-        else:
-            prior_messages = output.get("request_messages")
-            if (
-                not isinstance(prior_messages, list)
-                or not prior_messages
-                or any(
-                    not isinstance(row, dict)
-                    or not str(row.get("role") or "").strip()
-                    or "content" not in row
-                    for row in prior_messages
-                )
-            ):
-                return fresh(f"prior_api_transcript_invalid:{sid}")
-            slot_messages[sid] = [
-                *[dict(row) for row in prior_messages],
-                {"role": "assistant", "content": str(output.get("text") or "")},
-                {"role": "user", "content": user_content},
-            ]
-    return slots, slot_messages, session_threads, ""
+            if str(output.get("review_thread_id") or ""):
+                session_threads[sid] = str(output["review_thread_id"])
+            continue
+        if slot_retrieves(slot):
+            continue  # a native retrieving row reads the subject itself; it carries no packet transcript
+        if not output:
+            causes[sid] = f"prior_slot_receipt_missing:{sid}"
+            continue
+        prior_messages = output.get("request_messages")
+        if (
+            not isinstance(prior_messages, list)
+            or not prior_messages
+            or any(
+                not isinstance(row, dict)
+                or not str(row.get("role") or "").strip()
+                or "content" not in row
+                for row in prior_messages
+            )
+        ):
+            causes[sid] = f"prior_api_transcript_invalid:{sid}"
+            continue
+        slot_messages[sid] = [
+            *[dict(row) for row in prior_messages],
+            {"role": "assistant", "content": str(output.get("text") or "")},
+            {"role": "user", "content": user_content},
+        ]
+    return slots, slot_messages, session_threads, causes
 
 
 def frozen_delivery_inputs(wave: dict, slots: list) -> dict:
@@ -616,7 +644,7 @@ def exact_wave(
     outputs = []
     for row in rows:
         sid, route = str(row.get("slot_id") or ""), str(row.get("route") or "")
-        recorded = sent.get(sid) or {}
+        recorded = sent.get(sid) or (row.get("carried_output") if isinstance(row.get("carried_output"), dict) else None) or {}
         outputs.append({
             "slot_id": sid, "model": str(row.get("model") or ""),
             "request_model": str(row.get("request_model") or ""), "route": route,
@@ -647,6 +675,69 @@ def exact_wave(
     }
 
 
+ADDRESSED_REASONS = ("envelope_changed", "not_the_answered_wave", "wave_closed", "no_quorum_to_keep", "no_finding_named")
+_KEPT_ROW_DROPS = frozenset({"ok", "disclosures", "raw_text_preview", "executions", "carried_findings"})
+
+
+def addressed_slots(existing: Optional[dict], address: Optional[dict], *, fingerprint: str) -> tuple[list[str], str]:
+    """The addressed answer, decided by structure only: ``address`` = the answers just recorded
+    (``review_fingerprint``, ``finding_ids``, ``was_open`` = the wave was open BEFORE they landed).
+    When the envelope's fingerprint equals the answered wave's, that wave was open, and it bears a
+    parseable quorum, the slots whose findings the items name are the ones to ask again → ``(slot
+    ids in roster order, "")``. Any other case follows the ordinary rule → ``([], reason)`` with
+    one of ``ADDRESSED_REASONS``; roster and in-flight cases are decided by the caller before."""
+    if not address:
+        return [], ""
+    if existing is None or str(existing.get("request_fingerprint") or "") != fingerprint:
+        return [], "envelope_changed"
+    if str(address.get("review_fingerprint") or "") != fingerprint:
+        return [], "not_the_answered_wave"
+    if not address.get("was_open"):
+        return [], "wave_closed"
+    if str(existing.get("aggregate") or "") == "DEGRADED":
+        return [], "no_quorum_to_keep"
+    named = {str(fid) for fid in address.get("finding_ids") or []}
+    seats = {str(f.get("slot") or "") for f in existing.get("findings") or []
+             if isinstance(f, dict) and str(f.get("finding_id") or "") in named}
+    ordered = [str(a.get("slot_id") or "") for a in existing.get("actors") or []
+               if isinstance(a, dict) and str(a.get("slot_id") or "") in seats]
+    return (ordered, "") if ordered else ([], "no_finding_named")
+
+
+def addressed_notes(reason: str) -> list[str]:
+    return [f"answers_not_addressed:{reason}"] if reason else []
+
+
+def kept_rows(existing: dict, slot_ids: list) -> list[dict]:
+    """The $0 replay rows of the seats an addressed re-ask does NOT send: each is its recorded
+    actor record with its exact recorded answer re-attached, marked ``not_dispatched`` with no
+    physical state and no cost, stamped ``replayed_from`` and carrying its recorded request
+    (``carried_output``) so the exact wave keeps it byte for byte. A failed seat is replayed as
+    recorded (failed, $0). A missing recorded answer fails closed."""
+    outputs = {str(r.get("slot_id") or ""): r for r in existing.get("reviewer_outputs") or [] if isinstance(r, dict)}
+    wanted, rows = {str(s) for s in slot_ids}, []
+    for actor in existing.get("actors") or []:
+        sid = str((actor or {}).get("slot_id") or "")
+        if not isinstance(actor, dict) or sid not in wanted:
+            continue
+        recorded = outputs.get(sid)
+        if recorded is None:
+            raise PlanReviewSourceUnavailable(
+                f"PLAN_REVIEW_SOURCE_UNAVAILABLE: recorded answer of kept reviewer slot {sid} is missing")
+        rows.append({
+            **{k: v for k, v in actor.items() if k not in _KEPT_ROW_DROPS},
+            "text": str(recorded.get("text") or ""), "error": actor.get("error") or None,
+            "request_model": str(recorded.get("request_model") or actor.get("model") or ""),
+            "operation_state": "not_dispatched", "physical_attempt_state": "", "operation_id": "",
+            "late_result_pending": False, "awaiting_since": "", "cost": 0.0, "tokens_in": 0, "tokens_out": 0,
+            "executions": [], "capability_delta": [], "carried_output": dict(recorded),
+            "replayed_from": {"request_fingerprint": str(existing.get("request_fingerprint") or ""),
+                              "cycle_index": int(existing.get("cycle_index") or 0),
+                              "operation_id": str(actor.get("operation_id") or "")},
+        })
+    return rows
+
+
 def compact_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
     """Bounded summary of an older wave (S2): identity, outcome, counts, closure."""
     findings = wave.get("findings") if isinstance(wave.get("findings"), list) else []
@@ -663,7 +754,7 @@ def compact_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
         "closed": bool(wave.get("closed")),
         "paid": bool(wave.get("paid")),
         "wave_artifact": copy.deepcopy(wave.get("wave_artifact") or {}),
-        **{key: copy.deepcopy(wave[key]) for key in ("historical_supplements", "retry_key", "custody_pending") if key in wave},
+        **{key: copy.deepcopy(wave[key]) for key in ("historical_supplements", "retry_key", "custody_pending", "ordered_weaker", "previous_wave_artifact") if key in wave},
         **({"author_disposition": copy.deepcopy(wave["author_disposition"])}
            if isinstance(wave.get("author_disposition"), dict) else {}),
         **({"spec_source_ref": copy.deepcopy(wave["spec_source_ref"])} if wave.get("spec_source_ref") else {}),
@@ -742,3 +833,82 @@ def current_author_plan(drive_root: Any, task_id: str, state: dict) -> Optional[
         return {**value, "author_disposition": author, "review_fingerprint": subject["review_fingerprint"]}
     except (OSError, KeyError, TypeError, ValueError) as exc:
         raise PlanReviewSourceUnavailable(f"PLAN_AUTHOR_SOURCE_UNAVAILABLE: {exc}") from exc
+
+
+def row_pending(row: Dict[str, Any]) -> bool:
+    """A reviewer row whose answer has not arrived (awaiting, in flight, late-pending): never a terminal absence."""
+    return not row.get("ok") and (bool(row.get("late_result_pending")) or str(row.get("operation_state") or "settled") in (
+        "pending_dispatch", "in_flight", "custody_lost"))
+
+
+def _pending_seats(wave: Dict[str, Any]) -> set[str]:
+    return {str(r.get("slot_id") or "") for r in wave.get("actors") or [] if isinstance(r, dict) and row_pending(r)}
+
+
+def _earlier_wave(state_root: Any, task_id: str, state: Dict[str, Any], wave: Dict[str, Any]) -> Optional[dict]:
+    """The exact predecessor of ``wave``: by its recorded artifact pointer, else the hot index
+    materialized as authority. ``None`` only when the wave names no predecessor; an unreadable,
+    evicted or self-naming predecessor is a source failure, never an empty history."""
+    ref = wave.get("previous_wave_artifact") if isinstance(wave.get("previous_wave_artifact"), dict) else {}
+    fingerprint = str(wave.get("previous_fingerprint") or "")
+    if ref:
+        try:
+            earlier = read_wave(state_root, task_id, ref)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            raise PlanReviewSourceUnavailable(
+                f"PLAN_REVIEW_SOURCE_UNAVAILABLE: predecessor artifact {ref.get('path')}: {exc}") from exc
+    elif fingerprint:
+        from ouroboros.task_results import plan_review_wave
+
+        hot = plan_review_wave(state, fingerprint)
+        if hot is None:
+            raise PlanReviewSourceUnavailable(
+                f"PLAN_REVIEW_SOURCE_UNAVAILABLE: predecessor wave {fingerprint[:8]} is not in the index")
+        earlier = authority_wave(state_root, task_id, hot)
+    else:
+        return None
+    if isinstance(earlier, dict) and _same_wave(earlier, wave, pointer=ref):
+        raise PlanReviewSourceUnavailable("PLAN_REVIEW_SOURCE_UNAVAILABLE: a plan-review wave names itself as its predecessor")
+    return earlier if isinstance(earlier, dict) else None
+
+
+def standing_findings_lineage(state_root: Any, task_id: str, state: Dict[str, Any], previous: Optional[dict],
+                              spec: dict, enforcement: str) -> Dict[str, list]:
+    """Per-seat standing findings across the same-spec lineage. A seat still pending when its
+    wave was superseded gave no terminal answer there, so its obligation comes from the wave
+    before, walked back until a real answer, a closed predecessor or a changed spec ends it.
+    The set of seats under walk only shrinks: a seat answered in a newer wave is never
+    re-added from an older one. History that cannot be read raises (fail closed): an unknown
+    obligation is never an empty one."""
+    from ouroboros.tools import plan_spec
+
+    target = plan_spec.spec_hash(spec)
+
+    def same_spec(wave: Any) -> bool:
+        if not isinstance(wave.get("spec"), dict):  # unresolved spec authority is not a verified mismatch
+            raise PlanReviewSourceUnavailable("PLAN_REVIEW_SOURCE_UNAVAILABLE: a plan-review wave carries no operative spec")
+        return str(wave.get("spec_hash") or plan_spec.spec_hash(wave["spec"])) == target
+
+    if not isinstance(previous, dict) or not same_spec(previous) or previous.get("closed"):
+        return {}
+    standing = plan_spec.plan_standing_findings(previous, spec, enforcement)
+    pending = _pending_seats(previous) - set(standing)
+    wave, seen = previous, set()
+    while pending:
+        key = (str(wave.get("request_fingerprint") or ""), wave.get("cycle_index"))
+        if key in seen:
+            raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_SOURCE_UNAVAILABLE: plan-review lineage loops at {key[0][:8]}")
+        seen.add(key)
+        earlier = _earlier_wave(state_root, task_id, state, wave)
+        if earlier is None or earlier.get("closed") or not same_spec(earlier):
+            break  # the chain starts here, or a closed / changed-spec predecessor ended every obligation
+        step = plan_spec.plan_standing_findings(earlier, spec, enforcement)
+        rows = {str(r.get("slot_id") or ""): r for r in earlier.get("actors") or [] if isinstance(r, dict)}
+        for sid in sorted(pending):
+            if sid in step:
+                standing[sid] = step[sid]
+                pending.discard(sid)
+            elif not (sid in rows and row_pending(rows[sid])):
+                pending.discard(sid)  # a real answer (or no seat) in this wave ended the obligation
+        wave = earlier
+    return standing

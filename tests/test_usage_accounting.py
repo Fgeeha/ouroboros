@@ -943,6 +943,7 @@ def test_legacy_state_projection_cannot_regress_under_reordered_writers(
     from supervisor import state
 
     state.init(data_root, total_budget_limit=0.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     first_started = threading.Event()
     second_started = threading.Event()
     release_first = threading.Event()
@@ -990,6 +991,7 @@ def test_legacy_budget_projection_accepts_nullable_usage_cost(data_root):
     from supervisor import state
 
     state.init(data_root, total_budget_limit=0.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     reservation = ua.reserve_attempt(_request(
         data_root,
         provider="openai",

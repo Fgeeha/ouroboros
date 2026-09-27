@@ -30,6 +30,7 @@ from ouroboros.platform_layer import (
     pid_is_signalable,
     process_command,
     process_group_id,
+    request_process_tree_kill,
     scrub_repo_from_pythonpath,
     subprocess_new_group_kwargs,
 )
@@ -90,8 +91,9 @@ class _ExecutorService:
 
 
 _SERVICES: dict[str, _ExecutorService] = {}
-_FOREGROUND: dict[str, pathlib.Path] = {}
+_FOREGROUND: dict[subprocess.Popen, tuple[pathlib.Path | None, str]] = {}
 _STATE_LOCK = threading.RLock()
+_panic_requested = False
 _MAX_SERVICE_LOG_TAIL_CHARS = 80_000
 _READINESS_SCAN_CHUNK_BYTES = 64 * 1024
 _PROCESS_STATE_DIR = "workspace_executor_processes"
@@ -309,6 +311,8 @@ def _execute_local(
     env_overlay: "dict[str, str] | None" = None,
     target_env: "dict[str, str] | None" = None,
 ) -> ExecutorResult:
+    if _panic_requested:
+        raise RuntimeError("Emergency Stop has retired executor admission")
     started = time.monotonic()
     proc = subprocess.Popen(
         [str(part) for part in cmd],
@@ -321,6 +325,9 @@ def _execute_local(
         env=overlay_env(overlay_env(scrub_repo_from_pythonpath(_env_with_overlay(None), _system_repo_dir()), target_env), env_overlay),
         **subprocess_new_group_kwargs(),
     )
+    _FOREGROUND[proc] = (None, executor.kind)
+    if _panic_requested:
+        request_process_tree_kill(proc)
     record_path = _register_process(
         drive_root,
         {
@@ -332,6 +339,7 @@ def _execute_local(
             "cmd": _redacted_cmd(cmd),
         },
     )
+    _FOREGROUND[proc] = (record_path, executor.kind)
     try:
         stdout, stderr = proc.communicate(timeout=timeout_sec)
         return ExecutorResult(
@@ -346,6 +354,7 @@ def _execute_local(
         proc.wait(timeout=5)
         raise
     finally:
+        _FOREGROUND.pop(proc, None)
         _forget_process(record_path)
 
 
@@ -358,6 +367,8 @@ def _execute_docker(
     drive_root: pathlib.Path | None,
     target_env: "dict[str, str] | None" = None,
 ) -> ExecutorResult:
+    if _panic_requested:
+        raise RuntimeError("Emergency Stop has retired executor admission")
     if executor.network == "none":
         _assert_docker_network_none(executor.container_name)
     pidfile = f"/tmp/ouroboros-exec-{uuid.uuid4().hex}.pid"
@@ -400,6 +411,9 @@ def _execute_docker(
         **({"env": {**os.environ, **{aliases[key]: value for key, value in target_env.items()}}} if target_env else {}),
         **subprocess_new_group_kwargs(),
     )
+    _FOREGROUND[proc] = (None, executor.kind)
+    if _panic_requested:
+        request_process_tree_kill(proc)
     record_path = _register_process(
         drive_root,
         {
@@ -413,6 +427,7 @@ def _execute_docker(
             "cmd": _redacted_cmd(cmd),
         },
     )
+    _FOREGROUND[proc] = (record_path, executor.kind)
     cleanup_confirmed = True
     try:
         stdout, stderr = proc.communicate(timeout=timeout_sec)
@@ -425,6 +440,7 @@ def _execute_docker(
             pass
         raise
     finally:
+        _FOREGROUND.pop(proc, None)
         if cleanup_confirmed:
             _forget_process(record_path)
     return ExecutorResult(proc.returncode, stdout or "", stderr or "", _trace(executor, backend_cwd, cmd, proc.returncode, started), [str(part) for part in cmd])
@@ -545,9 +561,6 @@ def _register_process(drive_root: pathlib.Path | None, payload: dict[str, Any]) 
         record["host_command_sha256"] = host_command_sha256
     try:
         atomic_write_json(path, record, trailing_newline=True)
-        if record.get("record_type") == "foreground":
-            with _STATE_LOCK:
-                _FOREGROUND[record_id] = path
         return path
     except Exception:
         return None
@@ -583,8 +596,6 @@ def _forget_process(record_path: pathlib.Path | None) -> None:
     if record_path is None:
         return
     try:
-        with _STATE_LOCK:
-            _FOREGROUND.pop(record_path.stem, None)
         record_path.unlink(missing_ok=True)
     except Exception:
         pass
@@ -678,7 +689,7 @@ def _iter_process_records(drive_root: pathlib.Path | None = None) -> list[tuple[
         except Exception:
             pass
     with _STATE_LOCK:
-        roots.extend(path.parent for path in _FOREGROUND.values())
+        roots.extend(path.parent for path, _kind in _FOREGROUND.copy().values() if path is not None)
     seen: set[pathlib.Path] = set()
     records: list[tuple[pathlib.Path, dict[str, Any]]] = []
     for root in roots:
@@ -772,9 +783,18 @@ def _docker_pid_state(container_name: str, backend_pid: str) -> str:
     return "unknown"
 
 
-def kill_all_foreground(drive_root: pathlib.Path | None = None, *, wait: bool = True) -> list[dict[str, Any]]:
+def kill_all_foreground(drive_root: pathlib.Path | None = None, *, wait: bool = True, request_only: bool = False) -> list[dict[str, Any]]:
     """Kill durable executor foreground processes for panic/shutdown paths."""
-
+    global _panic_requested
+    if request_only:
+        _panic_requested = True
+        requested = []
+        for proc, (_path, kind) in _FOREGROUND.copy().items():
+            requested.append({"executor_type": kind, **request_process_tree_kill(proc)})
+            if kind == "docker_exec":
+                requested.append({"requested": False, "scope": "backend",
+                                  "error": "container process requires executor settlement"})
+        return requested
     killed: list[dict[str, Any]] = []
     for path, record in _iter_process_records(drive_root):
         if record.get("record_type") != "foreground":
@@ -867,6 +887,8 @@ def start_service(
     env: dict[str, str] | None = None,
     secret_values: tuple[str, ...] = (),
 ) -> dict[str, Any]:
+    if _panic_requested:
+        raise RuntimeError("Emergency Stop has retired executor admission")
     env = validate_process_env(env)
     executor = executor_ref_from_ctx(ctx)
     if executor is None:
@@ -908,12 +930,21 @@ def start_service(
         log_fh = log_path.open("ab")
         from ouroboros.process_custody import spawn_supervised
 
+        def publish_process(proc):
+            record.local_proc = proc
+            record.backend_pid = str(proc.pid)
+            record.backend_log_path = str(log_path)
+            _SERVICES[key] = record
+            if _panic_requested:
+                raise RuntimeError(f"Emergency Stop during service spawn: {request_process_tree_kill(proc)}")
+
         proc = spawn_supervised(
             record.cmd,
             drive_root=pathlib.Path(getattr(ctx, "drive_root")),
             purpose=f"workspace_service:{name}",
             scope="session" if record.keep_alive else "task",
             owner_task_id=record.task_id,
+            on_spawn=publish_process,
             cwd=str(host_cwd),
             stdout=log_fh,
             stderr=subprocess.STDOUT,
@@ -925,9 +956,6 @@ def start_service(
             env=overlay_env(overlay_env(_executor_service_env(), env_overlay), env),
         )
         log_fh.close()
-        record.local_proc = proc
-        record.backend_pid = str(proc.pid)
-        record.backend_log_path = str(log_path)
     else:
         if executor.network == "none":
             _assert_docker_network_none(executor.container_name)
@@ -952,9 +980,9 @@ def start_service(
             ))
         record.backend_pid = (proc.stdout or "").strip().splitlines()[-1].strip()
         record.backend_log_path = log_path
+        with _STATE_LOCK:
+            _SERVICES[key] = record
     record.durable_record_path = _register_service_process(_drive_root_from_ctx(ctx), record)
-    with _STATE_LOCK:
-        _SERVICES[key] = record
     _wait_readiness(record, readiness)
     return _service_payload(record)
 
@@ -1070,7 +1098,18 @@ def kill_all_services(
     drive_root: pathlib.Path | None = None,
     *,
     wait: bool = True,
+    request_only: bool = False,
 ) -> list[dict[str, Any]]:
+    global _panic_requested
+    if request_only:
+        _panic_requested = True
+        return [
+            {"service_id": record.service_id, **(
+                request_process_tree_kill(record.local_proc) if record.local_proc is not None
+                else {"requested": False, "scope": "backend", "error": "backend-only process requires executor settlement"}
+            )}
+            for record in _SERVICES.copy().values()
+        ]
     stopped = [_stop_service_record(record, wait=wait) for record in _services_snapshot()]
     stopped.extend(_kill_durable_service_records(drive_root, wait=wait))
     return stopped

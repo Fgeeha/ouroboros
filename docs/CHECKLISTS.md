@@ -168,18 +168,29 @@ Rule: read before write. Never reconstruct `VERSION`, `pyproject.toml`
 `version`, or the README badge from memory — one stale reconstruction creates
 a `self_consistency` FAIL that an entire advisory cycle is then spent on.
 
-**After a blocked reviewed commit (`commit_reviewed`) — mandatory regrouping before the next attempt:**
-When a reviewed commit returns critical findings, the reflex is to patch the single
-flagged finding and retry. That pattern reliably produces 5-10 blocked rounds.
-The correct procedure before **every** retry:
-1. List all open obligations and commit-readiness debt (`review_status` tool or the Review Continuity context section).
-2. Group them by root cause — one underlying problem often generates 2-4 separately-named obligations from reviewer rephrasing.
-3. Write a short plan in a progress message: one paragraph naming each root-cause group and the single code/doc change that resolves it.
-4. Only then open any file and edit.
-
-This step takes 2-3 minutes and has saved $20-50 in blocked-review cycles in practice.
-The rule is stated where the block message is built (`review.py::_build_critical_block_message`),
-but without it appearing here as a procedural step it stays theoretical rather than reflexive.
+**Before retrying after review findings (`commit_reviewed`, `skill_review`):**
+The recorded review state — the verdict when one was reached and the individual
+findings, including the partial findings of a pending review; for commits also
+the open obligations and commit-readiness debt shown by `review_status` and the
+Review Continuity context section — stays recorded until a later review or
+successful commit resolves it; the author's response rewrites neither it nor the
+selected enforcement. Before the next attempt the author owes an outcome, not a
+procedure: consider the open findings together against the evidence rather than
+patching one visible symptom, repair what the evidence supports, rebut with
+reasons what it does not (`review_rebuttal`), and keep anything unresolved
+visible. How to inspect, group, order and explain that work, and whether to seek
+more feedback first, is the author's judgment for the case (BIBLE P13). Whether
+the next attempt is replayed or refused for free, rejoins unresolved review
+work, or dispatches a paid review is decided by the gate's recorded replay
+eligibility, custody, budget and configured cycle limit (`docs/DEVELOPMENT.md`
+Review & Commit Protocol), not by this checklist: an eligible verdict on
+unchanged material under the same review contract is not re-reviewed without a
+genuinely new rebuttal, while an infrastructure outcome such as a missed
+reviewer quorum neither replays nor lapses a verdict. If attempts stop
+converging, reconsider the approach instead of repeating it. The shared retry
+note (`review_prompt_text.py::build_self_verification_template`, in the commit
+block message and the skill review block) and the open-obligation/debt branches
+of `review_status` `next_step` state this same duty.
 
 ---
 
@@ -786,14 +797,15 @@ block repo commits and vice versa.
 
 Used by `plan_task` to review an INTENTION before the work starts — the same organ whether the
 work is code, research, a deliverable, or an action in the world. Reviewers see the agent's typed
-SPEC, the task objective, the complete retained own-room discussion (both speakers, explanations,
-options, quiz recommendations and accepted answers, attachment names and addressed mailbox provenance),
-and declared evidence (attached bounded, with every absence named). Own dialogue uses an exact
-redacted snapshot outside those evidence bounds; when the route cannot hold it all, the newest part
-and exact accessible omitted ranges remain. Related rooms are pointers, not unsolicited content.
-Replay refers to the recorded snapshot and does not claim later messages reviewed. An agent reviewer
-can read the full artifact; its declared reading is not host-attested coverage. Missing generations
-and unavailable rooms remain gaps. For a self-modification plan, BIBLE.md and ARCHITECTURE.md are
+SPEC, the task objective, the own-room conversation inline as numbered readable lines (both
+speakers, explanations, options, quiz cards with the chosen answer, attachment names and addressed
+mailbox provenance; each line carries its snapshot line number), and declared evidence (attached
+bounded, with every absence named). Progress rows and host notices stay in the exact redacted
+snapshot outside those evidence bounds, addressed by the inline line numbers through a pointer every
+reviewer receives; a route that cannot hold the whole conversation keeps its newest rows and names
+the cut as an exact line range. Related rooms are pointers, not unsolicited content. Replay refers
+to the recorded snapshot and does not claim later messages reviewed. What a session reads of the
+snapshot is recorded as a fact, never a gate. Missing generations and unavailable rooms remain gaps. For a self-modification plan, BIBLE.md and ARCHITECTURE.md are
 required in full (inline for
 an api reviewer; a retrieving reviewer reads both in full with its own tools, the pack names them
 as mandatory reads); every other plan gets the heading-derived navigation maps of BIBLE.md and
@@ -823,7 +835,7 @@ Every element has a host-minted id (`goal`, `claim_N`, `invariant_N`, `decision_
 Those ids are the only valid `breaks` targets. Ids may shift between cycles when the agent
 rewrites the spec — re-target `breaks` against the CURRENT ids using the Spec delta.
 
-### The rubric (five domain-free questions + one for self-modification)
+### The rubric (six domain-free questions + one for self-modification)
 
 | # | item | what to check |
 |---|------|---------------|
@@ -832,14 +844,15 @@ rewrites the spec — re-target `breaks` against the CURRENT ids using the Spec 
 | 3 | constraints and invariants | Are the real constraints named — budget, deadline, safety, irreversibility, commitments to others? |
 | 4 | deferrals | Is anything deferred that will be expensive to change once the work has started? |
 | 5 | evidence sufficiency | Is the evidence enough to judge? If not, ask for exactly what is missing (`need_evidence` with a locator or a spec item id) instead of inventing a gap. |
-| 6 | governance (self-modification plans only) | Does the intention contradict BIBLE.md or a frozen contract? Name the principle or contract. |
+| 6 | subtraction | What could the spec drop (a claim, decision, invariant, deferral, path or guard) without losing the goal? Say it as a `note` naming the element id; removing is advice as legitimate as adding. |
+| 7 | governance (self-modification plans only) | Does the intention contradict BIBLE.md or a frozen contract? Name the principle or contract. |
 
 ### Height rule — what may block
 
 A finding is **blocking** only if being wrong about it AFTER the work starts would invalidate work
 already done, violate a declared commitment, or make an acceptance claim unverifiable — and it
-MUST name the spec id it breaks. Everything else is a **note**. If missing evidence makes a claim
-structurally unverifiable, that is blocking against the claim, not a `need_evidence` request.
+MUST name the spec id it breaks. Everything else is a **note**. A claim you cannot check as written
+is a question to the author (`need_evidence` with the claim id in `breaks`) or a `note`, not a blocker.
 
 - `blocking` — requires `breaks: <spec id>`. Without a valid id the host demotes it to a note and
   discloses the demotion.
@@ -871,24 +884,30 @@ authority, and prose outside the array is not parsed.
 
 ### Cycles and closure
 
-- **GREEN** — no findings. Proceed.
-- **REVIEW_REQUIRED** — notes / `need_evidence`, or a blocking finding BELOW quorum. A
-  note-only wave closes immediately in either enforcement mode. The agent closes outstanding
-  `need_evidence` with a disposition (accept / reject with rationale / defer) — no new panel,
-  no cost; notes do not need entries. Voluntary dispositions on current closed note-only
-  waves remain available through the same call, without reopening or a paid cycle.
-  A below-quorum blocking
-  finding stays OPEN whatever the disposition says: it closes only through a changed spec
-  (a new fingerprint, the next paid cycle) or a reject the next paid delta cycle judges.
+- **GREEN** — no blocking finding and no `need_evidence` without a disposition; notes never
+  change the verdict, so a note-only wave is GREEN in either enforcement mode. Proceed.
+- **REVIEW_REQUIRED** — `need_evidence` without a disposition, or a blocking finding BELOW
+  quorum. The agent closes outstanding `need_evidence` with a disposition (accept / reject with
+  rationale / defer) — no new panel, no cost; notes do not need entries. Voluntary dispositions
+  on closed note-only waves remain available through the same call, without reopening or a
+  paid cycle. Under advisory enforcement a reject with its rationale also closes a below-quorum
+  blocking finding (per finding; accept or defer keeps it open until a changed spec is
+  reviewed). Under blocking enforcement a below-quorum blocking finding stays OPEN whatever the
+  disposition says: it closes only through a changed spec (a new spec hash reviewed in the next
+  paid cycle) or the slot that raised it no longer raising it in a later paid cycle. A
+  REVIEW_REQUIRED wave whose open set empties is recorded GREEN.
 - **REVISE_PLAN** — blocking findings at quorum. A disposition can never close it: the agent
-  either changes the spec (a new fingerprint, the next paid cycle) or rejects a blocking finding
-  with a rationale that rides into that next cycle, where reviewers mark it resolved or still open.
+  either changes the spec (a new fingerprint, the next paid cycle) or answers a blocking finding
+  and sends the unchanged envelope with that answer, which asks again only the slot that raised
+  it (one paid cycle; every other slot keeps its recorded answer at $0) so it marks the finding
+  resolved or still open.
 - **DEGRADED** — no parseable quorum. Not a verdict, but the dispatched panel PAID its cycle:
   the wave records OPEN with each slot's typed failure state (code and reset time when known),
   the control line reports DEGRADED honestly, and the recorded result replays for free ONLY
   under all three conditions — an identical envelope, a NON-EMPTY recorded structural
   lane-health epoch that a fresh snapshot still matches, and an unchanged reviewer roster
-  (slot ids, targets, routes, pinned profiles and EFFORTS). An empty-epoch DEGRADED wave
+  (slot ids, targets, routes, pinned profiles and the effective per-seat EFFORTS, an
+  envelope's `reviewer_effort` included). An empty-epoch DEGRADED wave
   (slots died at dispatch time, no structural snapshot evidence) re-dispatches a PAID panel
   on the identical envelope; so does a healed or newly dead lane or a changed roster. Only a
   wave in which no reviewer slot was physically dispatched (typed $0 skip rows only —
@@ -899,12 +918,21 @@ authority, and prose outside the array is not parsed.
   stays held), waiting via a one-shot `schedule_followup` and asking the owner stay open too.
 
 Paid cycles per task are bounded by the owner's `OUROBOROS_REVIEW_MAX_CYCLES` (default 2,
-`unlimited` available). Replaying an identical envelope is free — identical including the
-evidence the host attaches for reviewers' `need_evidence` requests, so a request received in the
-last cycle makes the next envelope a new one. On cycle 2+ every reviewer sees
-all reviewers' findings from the previous cycle, the agent's dispositions and the spec delta:
-a reformulation of an earlier finding is not a new finding, and a new blocking finding must say
-why it was invisible before. When the cap is spent under blocking enforcement the host holds
+`unlimited` available). Replaying an identical envelope without answers is free — identical
+including the evidence the host attaches for reviewers' `need_evidence` requests, so a request
+received in the last cycle makes the next envelope a new one. Answers merge by `finding_id`
+across calls; the identical envelope sent WITH `review_disposition` items is the addressed
+re-ask (one paid cycle for the named slots only), and no host path buys a panel the agent did
+not send. On cycle 2+ every reviewer sees
+all reviewers' findings from the previous cycle, the agent's dispositions and the spec delta, and
+its first duty is to adjudicate its OWN earlier findings (the rows whose finding_id starts with its
+panel seat): RESOLVED (the delta or the rationale answers it) and SUPERSEDED (the element it targeted
+was removed or replaced) are not repeated; STILL OPEN is re-emitted naming the residual the answer
+does not cover, and only while the goal is unchanged (the packet states `Goal changed since cycle n`;
+a changed goal is judged afresh). Then: a reformulation of an earlier finding is not a new finding,
+and a new blocking finding must say why it was invisible before. A seat that does not answer a
+same-spec cycle is recorded as not having answered; its earlier still-open findings stay listed on
+the wave (never as re-emitted), so silence never reads as GREEN. When the cap is spent under blocking enforcement the host holds
 implementation and escalates with the typed `review_cycles_exhausted` reason; under advisory the
 agent may proceed with the wave open under a loud host disclosure. Explicit
 `review_disposition.author_action` plus author disposition may retain/select a full

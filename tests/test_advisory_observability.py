@@ -453,8 +453,9 @@ def test_next_step_guidance_for_skipped_advisory():
     assert "commit_reviewed" in msg, "message should still indicate commit can proceed"
 
 
-def test_next_step_guidance_requires_reaudit_when_obligations_remain():
-    """Open obligations after a blocked review should trigger explicit re-audit guidance."""
+def test_next_step_guidance_leaves_repair_procedure_to_author_when_obligations_remain():
+    """Open obligations keep the outcome duty and the preflight next step, with no
+    mandatory re-read/group/rewrite-plan order."""
     adv_mod = _get_advisory_module()
     from ouroboros.review_state import AdvisoryRunRecord, AdvisoryReviewState, ObligationItem
 
@@ -483,10 +484,13 @@ def test_next_step_guidance_requires_reaudit_when_obligations_remain():
         open_debts=[],
         effective_is_fresh=True,
     )
+    assert "1 open obligation(s)" in msg
+    assert adv_mod.REVIEW_REPAIR_JUDGMENT in msg
     lowered = msg.lower()
-    assert "re-read the full diff" in lowered
-    assert "group obligations by root cause" in lowered
-    assert "rewrite the plan" in lowered
+    assert "re-run preflight_review so it can mark addressed items pass" in lowered
+    for retired in ("re-read the full diff", "group obligations by root cause",
+                    "rewrite the plan", "one finding at a time"):
+        assert retired not in lowered, retired
 
 
 @pytest.mark.parametrize(

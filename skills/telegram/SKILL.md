@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.7
+version: 1.2.8
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -62,7 +62,7 @@ waiting line while the buttons stay, and a finished task says a late answer stil
 counts as your message. The card only moves forward — nothing reopens an answer.
 An open question (no options) is the same whole card without buttons; it asks for
 a reply in your own words.
-Version 1.2.7 mirrors owner notices and reminders (the `owner.notification`
+Version 1.2.8 mirrors owner notices and reminders (the `owner.notification`
 event) to the pinned chat as `🔔 <source>: <text>` behind the off-by-default
 "Notify on skill notices and reminders" toggle.
 
@@ -86,6 +86,13 @@ independently: the text bridge remains available while Mini App status reports
 that no pinned cloudflared asset exists. Invalid host runtime, unsafe state, or
 companion registration errors fail the skill load instead of claiming a partial
 healthy installation.
+
+Registration, pinned cloudflared selection, and runtime status share one
+architecture helper. Only when `platform.machine()` is empty on Windows does
+it fall back to `sysconfig.get_platform()`: `win-amd64` selects the pinned
+Windows asset; ARM64, 32-bit, and unknown builds remain unsupported in this
+fallback. A nonempty machine value takes precedence over the interpreter build;
+macOS and Linux use only the machine value.
 
 The Mini App is Beta. Its best-effort Cloudflare Quick Tunnel has no SLA and
 does not support Server-Sent Events (SSE). It targets native Telegram clients;

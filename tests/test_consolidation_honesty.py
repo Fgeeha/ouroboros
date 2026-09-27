@@ -415,3 +415,95 @@ def test_pending_health_disambiguates_two_entries_from_one_source(tmp_path):
     row = next(line for line in context_health._memory_health_lines(env)
                if "KNOWLEDGE PUBLICATION OPEN" in line)
     assert "aaaaaaaaaaaa:0:0" in row and "aaaaaaaaaaaa:1:0" in row
+
+
+# --- the event row measures what the run covered (#1321) ------------------------
+
+
+def _two_room_chat(chat):
+    rows = _write_chat(chat, count=200, text_size=0)
+    for row in rows[::2]:
+        row["chat_id"] = 2
+    chat.write_text("\n".join(json.dumps(row, ensure_ascii=False) for row in rows) + "\n", encoding="utf-8")
+
+
+def _event_row(tmp_path, monkeypatch, usage):
+    import supervisor.state as state
+    from ouroboros import post_task_synthesis as pts
+
+    logs = tmp_path / "event-logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    env = SimpleNamespace(drive_root=tmp_path, repo_dir=tmp_path, drive_path=lambda p: tmp_path / p)
+    monkeypatch.setattr(c, "should_consolidate", lambda *_a, **_k: True)
+    monkeypatch.setattr(c, "consolidate", lambda **_k: usage)
+    monkeypatch.setattr(state, "update_budget_from_usage", lambda *_a, **_k: None)
+    pts._run_chat_consolidation(env, SimpleNamespace(load_identity=lambda: "identity"), object(), {"id": "t"}, logs)
+    return json.loads((logs / "events.jsonl").read_text().splitlines()[-1])
+
+
+def test_the_event_row_measures_accepted_withheld_and_split_coverage(tmp_path, fit, monkeypatch):
+    """Two rooms per chunk: the first chunk's first draft is refused for size and
+    answered by a split whose halves then succeed, the second chunk fails and is
+    withheld. The row names each count, the ratio's denominator, and keeps an
+    unknown cost unknown."""
+    chat, blocks, meta = _paths(tmp_path)
+    _two_room_chat(chat)
+    fit.window = None
+
+    def refuse(llm, _prompt):
+        if len(llm.calls) == 1:
+            raise _Refusal()  # context overflow: answered by halves
+        if len(llm.calls) > 7:
+            raise _Refusal("down", code="invalid_api_key")
+
+    usage = c.consolidate(chat, blocks, meta, _LLM(effect=refuse))
+    assert usage["_blocks_written"] == 1
+    accepted, withheld = usage["_coverage"]
+    assert (accepted["status"], accepted["rooms"], accepted["messages"], accepted["split_attempts"]) == ("accepted", 2, 100, 1)
+    assert (withheld["status"], withheld["rooms"], withheld["messages"], withheld["output_chars"]) == ("withheld", 2, 100, 0)
+    row = _event_row(tmp_path, monkeypatch, usage)
+    coverage = row["coverage"]
+    assert coverage["attempted"]["count"] == 2 and coverage["attempted"]["messages"] == 200
+    assert coverage["accepted"]["count"] == 1 and coverage["withheld"]["count"] == 1
+    assert coverage["split_attempts"] == 1 and coverage["eras"]["count"] == 0
+    ratio = coverage["accepted_output_to_source"]
+    assert ratio["denominator"] == "source chars of accepted chunks"
+    assert ratio["ratio"] == round(accepted["output_chars"] / accepted["source_chars"], 4)
+    assert row["cost_usd"] is None  # a refusal without usage leaves the spend unknown, never 0
+
+
+def test_a_clean_zero_cost_run_reports_zero_and_nothing_attempted_has_no_ratio(tmp_path, fit, monkeypatch):
+    chat, blocks, meta = _paths(tmp_path)
+    _two_room_chat(chat)
+    usage = c.consolidate(chat, blocks, meta, _LLM(usage={"prompt_tokens": 1, "completion_tokens": 1,
+                                                          "total_tokens": 2, "cost": 0.0}))
+    row = _event_row(tmp_path, monkeypatch, usage)
+    assert row["cost_usd"] == 0.0 and row["coverage"]["accepted"]["count"] == 2
+    assert row["coverage"]["withheld"]["count"] == 0 and row["coverage"]["split_attempts"] == 0
+    empty = _event_row(tmp_path, monkeypatch, {"cost": 0.0, "_blocks_written": 0, "_consolidation_errors": []})
+    assert empty["coverage"]["attempted"]["count"] == 0
+    assert empty["coverage"]["accepted_output_to_source"]["ratio"] is None
+
+
+def test_a_split_whose_half_then_fails_is_an_attempt_not_a_recovery(tmp_path, fit, monkeypatch):
+    """Overflow, then a split, then an auth failure inside the first half: the
+    split was queued and counted, but the chunk is withheld with no output, and
+    nothing in the row reads as a recovery."""
+    chat, blocks, meta = _paths(tmp_path)
+    _two_room_chat(chat)
+    fit.window = None
+
+    def refuse(llm, _prompt):
+        if len(llm.calls) == 1:
+            raise _Refusal()  # context overflow: answered by queueing halves
+        raise _Refusal("down", code="invalid_api_key")  # the first half never lands
+
+    usage = c.consolidate(chat, blocks, meta, _LLM(effect=refuse))
+    assert usage["_blocks_written"] == 0 and not blocks.exists()
+    (withheld,) = usage["_coverage"]
+    assert (withheld["status"], withheld["output_chars"], withheld["split_attempts"]) == ("withheld", 0, 1)
+    coverage = _event_row(tmp_path, monkeypatch, usage)["coverage"]
+    assert coverage["accepted"]["count"] == 0 and coverage["withheld"]["count"] == 1
+    assert coverage["split_attempts"] == 1
+    assert coverage["accepted_output_to_source"]["ratio"] is None
+    assert "recover" not in json.dumps(coverage)

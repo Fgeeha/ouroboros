@@ -891,14 +891,13 @@ text (a one-shot that already fired needs a new `at` — the same instant answer
 row of yours). Without a key each post is a new fire-and-forget row. A
 disabled or removed skill's rows — or a skill whose `notify_owner` grant was
 revoked — stay silent until it is enabled and granted again, and an
-owner who disabled or deleted one of your rows — on the Activity page, or by
+owner who **disables** one of your rows — on the Activity page, or by
 asking Ouroboros — keeps it off: the same key posted again answers `{"scheduled": false, "status":
 "suppressed"}` and your cancel `{"cancelled": false, "status": "suppressed"}`
-until the owner restores the row — or deletes the retained record a second
-time, which removes it and frees the key. A reminder that already fired is a
-receipt: your cancel or the owner's Delete removes it at once (unless the owner
-switched it off — then your cancel answers `suppressed` and only the owner's Delete
-removes it). Every scheduled post rewrites the
+until the owner restores or deletes the row. **Delete removes the row immediately**;
+a later post with the same key may schedule it again. A reminder that already
+fired is a receipt: the owner's Delete removes it at once; your cancel cannot
+remove a row the owner disabled. Every scheduled post rewrites the
 one schedule table under its lock, so keep the armed set small — the next
 occurrences, keyed, not a year of one-shots.
 

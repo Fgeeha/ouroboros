@@ -448,7 +448,7 @@ def test_a_collection_records_the_dispatched_packet_not_one_rebuilt_from_the_liv
     # The next paid cycle continues from that same recorded history, never from the rebuild.
     _slots, history, _threads, cause = continuation_inputs(
         harness.drive, "task-1", after, harness.state["slots"], user_content="Next paid review turn")
-    assert cause == "" and history
+    assert cause == {} and history
     assert late not in json.dumps(history["s1"][:-2]), "the late directive entered the prior history"
     assert history["s1"][:-2] == before_messages
 

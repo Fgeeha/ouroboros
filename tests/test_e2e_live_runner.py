@@ -890,7 +890,8 @@ def test_absorb_wait_and_check_follow_the_scenarios_expects_absorb(tmp_path, mon
         lane = tmp_path / sid / "out" / "lanes" / f"{sid}_a1" / "data"
         state = json.loads((lane / "state" / "state.json").read_text(encoding="utf-8"))
         assert json.loads((lane / "settings.json").read_text())["OUROBOROS_POST_TASK_EVOLUTION"] == ("true" if sid == "SM1" else "false")
-        assert state["owner_chat_id"] == 1 and "evolution_mode_enabled" not in state, state
+        assert state["owner_chat_id"] == 1 and state["evolution_mode_enabled"] is False, state
+        assert state["initialization_id"]  # a positive first-boot witness, not a guessed state
         assert not (lane / "state" / "evolution_campaign.json").exists(), sid
 
 

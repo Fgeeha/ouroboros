@@ -243,7 +243,9 @@ def test_peer_stop_works_before_readiness_and_reaps_the_owned_child(startup, mon
     if action == "panic":
         from tests.test_server_control_panic_daemon import _run_panic
         with monkeypatch.context() as patch:
-            assert _run_panic(patch, startup.root, daemon_stop=stop)
+            # Panic no longer invokes the legacy cooperative worker callback;
+            # the real owned daemon + its child must be gone below.
+            _run_panic(patch, startup.root, daemon_stop=stop)
     else:
         assert stop() is True
     assert time.monotonic() - started < 5

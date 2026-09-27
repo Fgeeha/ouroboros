@@ -64,7 +64,7 @@ from ouroboros.tool_access_roots import (  # noqa: F401 — re-exported moved su
     _is_subagent_ctx,
     _skill_payload_base,
     active_tool_profile,
-    binding_targets_system_repo,
+    binding_targets_system_repo, folderless_scratch_dir,
     is_external_workspace,
     load_bound_skill,
     predicted_subagent_profile,
@@ -139,36 +139,35 @@ def _task_root_drives(ctx: Any) -> list[pathlib.Path]:
     """The data drives a task's own task roots are enumerated on."""
     meta = getattr(ctx, "task_metadata", {})
     meta = meta if isinstance(meta, dict) else {}
-    drives: list[pathlib.Path] = []
-    for raw in (getattr(ctx, "drive_root", ""), *(meta.get(key) for key in (
-            "drive_root", "child_drive_root", "headless_child_drive_root"))):
-        if not raw:
-            continue
-        drive = pathlib.Path(raw).resolve(strict=False)
-        if drive not in drives:
-            drives.append(drive)
-    return drives
+    values = (getattr(ctx, "drive_root", ""), *(meta.get(key) for key in (
+        "drive_root", "child_drive_root", "headless_child_drive_root")))
+    return list(dict.fromkeys(pathlib.Path(raw).resolve(strict=False) for raw in values if raw))
 
 
-def lineage_read_base(ctx: Any, root: ResourceRoot, target: pathlib.Path) -> pathlib.Path | None:
-    """The lineage ``task_drive``/``artifact_store`` base containing ``target``, or None:
-    ``lineage_task_ids`` on the canonical data root and the task's own drives (where a parent's
-    files live while the child runs elsewhere), and each id on ITS OWN headless drive (#1260),
-    never through a symlinked headless root. Physical containment only; the caller keeps the READ-only gate."""
+def lineage_read_roots(ctx: Any, root: ResourceRoot) -> tuple[pathlib.Path, ...]:
+    """Enumerate only the same host-attested lineage containers used by native reads."""
     if root not in {"task_drive", "artifact_store"} or not hasattr(ctx, "drive_root"):
-        return None
-    candidate, canonical = pathlib.Path(target).resolve(strict=False), canonical_data_root(ctx)
+        return ()
+    canonical = canonical_data_root(ctx)
     drives = [canonical] + [drive for drive in _task_root_drives(ctx) if drive != canonical]
     task_ids = lineage_task_ids(ctx)
     pairs = [(drive, task_id, False) for drive in drives for task_id in task_ids]
     pairs += [(task_state_dir(canonical, task_id) / "data", task_id, True) for task_id in task_ids]
+    bases = []
     for drive, task_id, headless in pairs:
         lexical = (drive / "task_drives" / task_id if root == "task_drive"
                    else task_artifact_dir_path(drive, task_id, create=False))
         base = lexical.resolve(strict=False)
-        if path_is_relative_to(candidate, base) and (base == lexical or not headless):
-            return base
-    return None
+        if (base == lexical or not headless) and base not in bases:
+            bases.append(base)
+    return tuple(bases)
+
+
+def lineage_read_base(ctx: Any, root: ResourceRoot, target: pathlib.Path) -> pathlib.Path | None:
+    """Containing lineage base for a READ; never a sibling or an external runtime root."""
+    candidate = pathlib.Path(target).resolve(strict=False)
+    return next((base for base in lineage_read_roots(ctx, root)
+                 if path_is_relative_to(candidate, base)), None)
 
 
 def _effective_policy_profile(profile: ToolProfile) -> ToolProfile:
@@ -761,7 +760,7 @@ def build_resolved_resource_binding(
         normalized == "runtime_data" and operation in {"write", "edit"}
     ) or (
         normalized == "active_workspace" and operation == "edit" and not workspace_active
-        and project_room_lens_dir(ctx) is None
+        and project_room_lens_dir(ctx) is None and folderless_scratch_dir(ctx) is None
     )
     if legacy_data_form:
         from ouroboros.contracts.skill_payload_policy import (

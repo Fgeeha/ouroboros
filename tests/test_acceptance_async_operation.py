@@ -320,11 +320,14 @@ def test_a_panel_that_settles_after_the_task_ended_is_attached_and_announced_onc
     event = rows[0]
     assert event["type"] == "send_message" and event["role"] == "system"
     assert event["chat_id"] == 1 and event["task_id"] == "late-root"
-    assert event["text"].startswith("Reviewers later passed this answer. They reviewed the earlier version")
+    # Version first, then the verdict. The trace recorded a rewrite, but a
+    # supersession is not delivery proof: with no send receipt the version is unknown.
+    assert event["text"].startswith("On the reviewed version of this answer (whether it was the delivered one "
+                                    "is unknown), reviewers later passed it.")
     assert "- a: PASS — model/a says PASS" in event["text"]
     assert event["delivery_id"] == "acceptance-late:acceptance-subject-one"
-    assert event["progress_meta"] == {"card_row": "reviews",
-                                      "card_row_id": "acceptance-late:acceptance-subject-one"}
+    assert {key: event["progress_meta"][key] for key in ("card_row", "card_row_id")} == {
+        "card_row": "reviews", "card_row_id": "acceptance-late:acceptance-subject-one"}
     assert not acceptance_run_pending(run) and run["actors"][0]["parsed"]["verdict"] == "PASS"
     stored = load_task_result(tmp_path, "late-root")
     assert stored["status"] == "completed", "the supplement never moves a terminal status"
@@ -334,8 +337,18 @@ def test_a_panel_that_settles_after_the_task_ended_is_attached_and_announced_onc
     # The panel of THIS wave carries the host's sentence verbatim; the sibling
     # that settled in time carries no settlement at all.
     assert len(panels) == 2 and panels[1]["panel_id"] == "panel_in_time"
-    assert panels[0]["late_settlement"] == {"note": event["text"], "reviewed_revision": "earlier",
-                                            "settled_after_terminal": True}
+    late = panels[0]["late_settlement"]
+    assert {key: late[key] for key in ("note", "reviewed_revision", "settled_after_terminal")} == {
+        "note": event["text"], "reviewed_revision": "unknown", "settled_after_terminal": True}
+    assert late["reviewed_superseded"] is True, "the recorded rewrite stays its own fact"
+    # Neutral evidence: when it settled, which exact subject was read, and what the host
+    # can prove it emitted (nothing here: no delivery record, so unknown, never inferred).
+    assert late["settled_at"] and late["reviewed_subject"]["retry_key"] == "acceptance-subject-one"
+    assert late["emitted_answer"]["state"] == "unknown" and late["reviewed_is_emitted"] is None
+    assert [row["slot_id"] for row in late["reviewer_outputs"]] == ["a"]
+    pointer = event["progress_meta"]["late_evidence"]
+    assert pointer["settled_at"] == late["settled_at"] and pointer["panel_id"] == "panel_1"
+    assert pointer["source_ref"] == panels[0]["applied_source_ref"] and pointer["reviewed_is_emitted"] is None
     assert "late_settlement" not in panels[1]
     assert len(model.calls) == 1, "collection is free"
     # A second settlement of the same wave finds nothing to reconcile, announces
@@ -363,20 +376,27 @@ def test_the_late_row_never_reports_a_reviewer_whose_outcome_is_unknown_as_answe
         {"operation_state": "settled", "parsed": {"verdict": "DEGRADED"}},
         {"operation_state": "custody_lost", "late_result_pending": True}]}
     text = _late_settlement_text(incident, wave)
-    assert text.startswith("Reviewers later returned no settled verdict on this answer — 1 reviewer's outcome "
-                           "is still unknown. They reviewed the answer that was delivered.")
+    unknown_version = "On the reviewed version of this answer (whether it was the delivered one is unknown), "
+    assert text.startswith(unknown_version + "reviewers later returned no settled verdict — 1 reviewer's outcome "
+                           "is still unknown.")
     assert "no quorum" not in text
     assert "- a: PASS" in text and "- c: pending" in text
     assert "— 2 reviewers' outcomes are still unknown." in _late_settlement_text(
         {**incident, "actors": [incident["actors"][2], {"operation_state": "pending_dispatch"}]}, wave)
     answered = {**incident, "actors": incident["actors"][:2]}
     assert _late_settlement_text(answered, wave).startswith(
-        "Reviewers later returned no settled verdict on this answer. They reviewed")
+        unknown_version + "reviewers later returned no settled verdict.")
     assert _late_settlement_text({**answered, "aggregate_signal": "PASS"}, wave).startswith(
-        "Reviewers later passed this answer. They reviewed the answer that was delivered.")
+        unknown_version + "reviewers later passed it.")
     assert _late_settlement_text(
         {**answered, "aggregate_signal": "FAIL", "superseded_by_revision": True}, wave).startswith(
-        "Reviewers later rejected this answer. They reviewed the earlier version,")
+        unknown_version + "reviewers later rejected it."), "a recorded rewrite proves no delivered bytes"
+    assert _late_settlement_text({**answered, "aggregate_signal": "FAIL"}, wave,
+                                 {"reviewed_revision": "different"}).startswith(
+        "On a version of this answer other than the one delivered, reviewers later rejected it.")
+    assert _late_settlement_text({**answered, "aggregate_signal": "PASS"}, wave,
+                                 {"reviewed_revision": "delivered"}).startswith(
+        "On the delivered version of this answer, reviewers later passed it.")
 
 
 def test_a_terminal_task_gets_one_row_at_completion_not_at_quorum(tmp_path, monkeypatch):

@@ -480,6 +480,18 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
         skill_name, _token_payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""), "inject_chat")
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
+    try:
+        payload = await request.json()
+        panic = getattr(ctx.bridge_getter(), "panic", None)
+        if panic is not None and panic.request(
+            str(payload.get("text") or payload.get("image_caption") or ""), source=f"skill:{skill_name}",
+            user_id=int(payload.get("user_id") or 0), chat_id=int(payload.get("chat_id") or 0),
+        ):
+            return JSONResponse({"ok": True, "status": "accepted"}, status_code=202)
+    except json.JSONDecodeError:
+        return _json_error("invalid json", 400)
+    except Exception as exc:
+        return _json_error(str(exc), 500)
     if not ctx.rate_limiter.allow(f"{skill_name}:inject"):
         return _json_error("rate limit exceeded", 429)
     if not ctx._enter_inflight(skill_name):
@@ -487,7 +499,6 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
     subscription_id = ""
     pending_uploads = ExitStack()
     try:
-        payload = await request.json()
         text = str(payload.get("text") or "")
         image_caption = str(payload.get("image_caption") or "")
         client_message_id = str(payload.get("client_message_id") or "").strip()[:128]

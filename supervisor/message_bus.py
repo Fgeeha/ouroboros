@@ -90,8 +90,9 @@ def accept_local_message(bridge, drive_root, text: str, *, retain_inputs=None, *
             if retain_inputs is not None:
                 retain_inputs()
         ref = build_owner_message_ref(chat_id=chat_id, client_message_id=message_id, ts=ts, text=logged)
-        # The row rides the item as its in-process witness (``record_inbound_message``).
-        bridge.enqueue_local_message(text, **message, accepted_source_ref=ref, accepted_source_row=row)
+        # The row rides the item as its in-process witness (``record_inbound_message``); its
+        # acceptance time is this message's receipt stamp.
+        bridge.enqueue_local_message(text, **message, accepted_source_ref=ref, accepted_source_row=row, received_at=ts)
         return row, False
 
 
@@ -280,6 +281,9 @@ class LocalChatBridge:
     """Local Queue-backed message bus."""
 
     def __init__(self, settings: Optional[Dict[str, Any]] = None):
+        from ouroboros.server_control import PanicIngress
+
+        self.panic = PanicIngress()  # server binds the existing emergency owner
         self._inbox = queue.Queue()   # user -> agent
         # Updates the consumer handed back unprocessed (``requeue_updates``); memory only.
         self._replay: List[Dict[str, Any]] = []
@@ -357,7 +361,7 @@ class LocalChatBridge:
         for key in (
             "sender_label", "sender_session_id", "client_message_id", "transport",
             "image_base64", "image_mime", "image_caption", "suppress_chat_log",
-            "task_constraint", "task_metadata", "accepted_source_ref", "accepted_source_row",
+            "task_constraint", "task_metadata", "accepted_source_ref", "accepted_source_row", "received_at",
         ):
             value = msg.get(key)
             if value not in (None, "", 0):
@@ -415,7 +419,7 @@ class LocalChatBridge:
             self._response_subs.pop(subscription_id, None)
 
     def shutdown(self) -> None:
-        return None
+        self.panic.invalidate_owner()
 
     def handle_web_message(
         self,
@@ -441,6 +445,8 @@ class LocalChatBridge:
         if thread_id < 1:
             thread_id = 1
         clean_text = str(text or "").strip()
+        if self.panic.request(clean_text):
+            return
         if not clean_text and not image_base64:
             return
         import uuid
@@ -508,14 +514,28 @@ class LocalChatBridge:
         task_metadata: Optional[Dict[str, Any]] = None,
         accepted_source_ref: Optional[Dict[str, Any]] = None,
         accepted_source_row: Optional[Dict[str, Any]] = None,
+        received_at: str = "",
     ) -> None:
+        """The ONE ingress every transport enqueues through, so it stamps the host receipt time
+        ``received_at`` for all of them: an earlier host stamp of this message (its accepted row's
+        time, the WS acceptance's ``client_surface.received_at``) is kept, else now. The update
+        carries it; a surface fact without one (a host channel stamp) gets it too, so every
+        record that copies the fact carries it. Panic uses the server's independent
+        emergency owner; ordinary ingress is a dict put, no lock or I/O."""
         clean_text = str(text or "").strip()
         caption_text = str(image_caption or "").strip()
         image_b64 = str(image_base64 or "").strip()
         if not clean_text and caption_text:
             clean_text = caption_text
+        if self.panic.request(clean_text, source=source, user_id=user_id, chat_id=chat_id):
+            return
         if not clean_text and not image_b64 and not (task_metadata or {}).get("chat_attachment_uploads"):
             return  # nothing to say and nothing attached (a file-only message carries uploads)
+        surface = (task_metadata or {}).get("client_surface")
+        surface = surface if isinstance(surface, dict) and surface else None
+        received_at = str(received_at or (surface or {}).get("received_at") or "") or utc_now_iso()
+        if surface is not None and not surface.get("received_at"):
+            task_metadata = {**(task_metadata or {}), "client_surface": {**surface, "received_at": received_at}}
         # Invariant: the default chat/user id is the web owner (1). External
         # transports (source != "web") MUST pass explicit ids — the Host Service
         # injects 0 for unidentified senders so they can never bind/own the web
@@ -537,6 +557,7 @@ class LocalChatBridge:
             "task_metadata": dict(task_metadata or {}),
             "accepted_source_ref": dict(accepted_source_ref or {}),
             "accepted_source_row": dict(accepted_source_row or {}),
+            "received_at": received_at,
         })
 
     def send_message(
@@ -1312,7 +1333,12 @@ def budget_line(force: bool = False) -> str:
             live["budget_messages_since_report"] = 0
             report_box["emit"] = True
 
-        st = update_state(_tick_counter)
+        from supervisor.state import StateUnavailable
+
+        try:
+            st = update_state(_tick_counter)
+        except StateUnavailable:  # a budget report is bookkeeping; the message itself proceeds
+            return ""
         if not report_box["emit"]:
             return ""
         display_state = dict(st)
@@ -1439,6 +1465,8 @@ def log_chat(
             card_row_id = str(meta.get("card_row_id") or "")
             if card_row_id and len(card_row_id) <= 200:
                 record["card_row_id"] = card_row_id
+        if record_type == "acceptance_late_settlement" and isinstance(meta.get("late_evidence"), dict):
+            record["late_evidence"] = dict(meta["late_evidence"])
         if filename:
             record["filename"] = filename
         if mime:

@@ -237,13 +237,13 @@ def test_copyback_failure_retains_child_until_existing_retry_finishes(tmp_path, 
         copied = copy_child_task_result(parent, {"id": "custody", "drive_root": str(child)})
     assert copied["artifact_bundle"]["status"] == "missing"
     assert copied["child_ref_promotion"]["status"] == "incomplete"
-    assert not remove_subagent_task_drive(parent, "custody")
+    assert not remove_subagent_task_drive(parent, "custody", live=lambda _task: False)
     assert Path(record["path"]).is_file()
     assert retry_pending_child_ref_promotions(parent)["completed"] == ["custody"]
     result = load_task_result(parent, "custody")
     assert result["child_ref_promotion"]["status"] == "complete"
     assert result["artifact_bundle"]["status"] == "ready"
-    assert remove_subagent_task_drive(parent, "custody")
+    assert remove_subagent_task_drive(parent, "custody", live=lambda _task: False)
     assert Path(result["artifacts"][0]["path"]).read_bytes() == b"complete generated artifact"
 
 
@@ -319,7 +319,7 @@ def test_full_inputs_survive_copyback_and_child_gc(tmp_path):
     write_task_result(child, "inputs", "completed", result="done", task_contract=authority)
     result = copy_child_task_result(parent, {"id": "inputs", "drive_root": str(child)})
     assert result["child_ref_promotion"]["status"] == "complete"
-    assert remove_subagent_task_drive(parent, "inputs")
+    assert remove_subagent_task_drive(parent, "inputs", live=lambda _task: False)
     rows = artifacts.resolve_attachment_manifest(parent, "inputs", result["task_contract"])
     assert len(rows) == 28
     for row in rows:
@@ -545,17 +545,19 @@ def test_input_copy_failure_protects_each_existing_gc_root(tmp_path, monkeypatch
         assert result["child_ref_promotion"]["status"] == "incomplete"
         prune = headless.prune_headless_task_drives if drive_kind == "headless" else headless.prune_task_drives
         assert not prune(parent, retention_days=1, now=4_000_000_000)["pruned"]
-        assert not headless.remove_subagent_task_drive(parent, "inputs")
+        assert not headless.remove_subagent_task_drive(parent, "inputs", live=lambda _task: False)
         assert child.is_dir()
     assert retry_pending_child_ref_promotions(parent)["completed"] == ["inputs"]
     result = load_task_result(parent, "inputs")
     assert result["child_ref_promotion"]["status"] == "complete"
-    assert headless.remove_subagent_task_drive(parent, "inputs")
+    assert headless.remove_subagent_task_drive(parent, "inputs", live=lambda _task: False)
     assert len(artifacts.resolve_attachment_manifest(parent, "inputs", result["task_contract"])) == 28
 
 
 @pytest.mark.parametrize("immutable", [False, True])
-def test_materialization_preserves_capture_identity_without_freezing_mutable_outputs(tmp_path, immutable):
+def test_collection_preserves_capture_identity_without_freezing_mutable_outputs(tmp_path, immutable):
+    """Writer-side collection keeps an immutable capture and discloses changed bytes,
+    a mutable output takes its new identity; the effective read re-measures nothing."""
     from ouroboros.task_results import write_task_result
     from ouroboros.task_status import load_effective_task_result
 
@@ -565,7 +567,9 @@ def test_materialization_preserves_capture_identity_without_freezing_mutable_out
     captured = artifacts.copy_file_to_task_artifacts(ctx, source, immutable=immutable)
     write_task_result(ctx.drive_root, ctx.task_id, "completed", artifacts=[captured])
     Path(captured["path"]).write_text("later changed report")
-    projected = load_effective_task_result(ctx.drive_root, ctx.task_id)["artifacts"][0]
+    assert load_effective_task_result(ctx.drive_root, ctx.task_id)["artifacts"] == [captured]
+    projected = artifacts.merge_artifact_records(
+        [captured], artifacts.collect_task_artifact_records(ctx.drive_root, ctx.task_id))[0]
     if immutable:
         assert projected["immutable"] is True
         assert projected["sha256"] == captured["sha256"]
@@ -580,7 +584,7 @@ def test_materialization_preserves_capture_identity_without_freezing_mutable_out
         assert projected["status"] == "ready"
 
 
-def test_immutable_child_materialization_retains_name_bytes_and_original_identity(tmp_path):
+def test_immutable_child_copy_back_retains_name_bytes_and_original_identity(tmp_path):
     from ouroboros.headless import prepare_task_drive, copy_child_task_result
     from ouroboros.task_results import write_task_result
     from ouroboros.task_status import load_effective_task_result
@@ -593,8 +597,10 @@ def test_immutable_child_materialization_retains_name_bytes_and_original_identit
         SimpleNamespace(drive_root=child, task_id="capture"), source, immutable=True)
     write_task_result(child, "capture", "completed", artifacts=[record], artifact_status="ready")
     write_task_result(parent, "capture", "running", headless_child_drive_root=str(child))
-    projected = load_effective_task_result(parent, "capture")
-    rebased = projected["artifacts"][0]
+    # The read lists the child's capture where it lies; copy-back alone publishes it.
+    assert load_effective_task_result(parent, "capture")["artifacts"] == [record]
+    assert not artifacts.task_artifact_dir_path(parent, "capture").exists()
+    rebased = copy_child_task_result(parent, {"id": "capture", "drive_root": str(child)})["artifacts"][0]
     assert rebased["name"] == record["name"] and rebased["sha256"] == record["sha256"]
     assert rebased["immutable"] is True
     assert Path(rebased["path"]).parent == artifacts.task_artifact_dir_path(parent, "capture")
@@ -623,7 +629,7 @@ def test_file_verification_does_not_run_on_the_asgi_loop(tmp_path, monkeypatch, 
     import uvicorn
     from starlette.applications import Starlette
     from starlette.routing import Route
-    from ouroboros.gateway import tasks
+    from ouroboros.gateway import task_archive, tasks
     from ouroboros.task_results import write_task_result
 
     api_task_artifact = tasks.api_task_artifact
@@ -661,14 +667,24 @@ def test_file_verification_does_not_run_on_the_asgi_loop(tmp_path, monkeypatch, 
         async def request():
             async with httpx.AsyncClient(timeout=10) as client:
                 reply = await client.request(method, f'http://127.0.0.1:{sock.getsockname()[1]}/api/tasks/download/artifacts/{record["name"]}')
-                assert reply.status_code == 200, reply.text
-                assert reply.content == (source.read_bytes() if method == 'GET' else b'')
+                if task_archive.CONFINED:
+                    assert reply.status_code == 200, reply.text
+                    assert reply.content == (source.read_bytes() if method == 'GET' else b'')
+                else:
+                    assert reply.status_code == 503, reply.text
+                    if method == 'GET':
+                        assert reply.json()['reason_code'] == 'artifact_unavailable'
+                    else:
+                        assert reply.content == b''
         asyncio.run(request())
         assert bool(materialization_calls) is (not registered)
         assert all(identity != thread.ident for identity in materialization_calls)
-        if registered:
-            assert len(calls) == 1, "registered downloads verify once per request"
-        assert calls and all(identity != thread.ident for identity in calls), 'whole-file hashing ran synchronously on the ASGI event loop'
+        if task_archive.CONFINED:
+            if registered:
+                assert len(calls) == 1, "registered downloads verify once per request"
+            assert calls and all(identity != thread.ident for identity in calls), 'whole-file hashing ran synchronously on the ASGI event loop'
+        else:
+            assert calls == [], "unsupported platforms refuse before reading file bytes (#1297)"
     finally:
         server.should_exit = True
         thread.join(10)
@@ -677,7 +693,7 @@ def test_file_verification_does_not_run_on_the_asgi_loop(tmp_path, monkeypatch, 
 
 
 @pytest.mark.parametrize("canonical_exists", [False, True])
-def test_failed_child_capture_is_explicit_and_other_files_still_materialize(tmp_path, canonical_exists):
+def test_failed_child_capture_is_explicit_and_other_files_still_publish(tmp_path, canonical_exists):
     from ouroboros.headless import prepare_task_drive, copy_child_task_result, remove_subagent_task_drive
     from ouroboros.observability import retry_pending_child_ref_promotions
     from ouroboros.task_results import write_task_result
@@ -695,10 +711,12 @@ def test_failed_child_capture_is_explicit_and_other_files_still_materialize(tmp_
     write_task_result(child, "capture", "completed", artifacts=records, artifact_status="ready",
                       outcome_axes=axes, accounted_upper_bound_usd=3.5, cost_final=True)
     write_task_result(parent, "capture", "running", headless_child_drive_root=str(child))
+    task = {"id": "capture", "drive_root": str(child)}
     if canonical_exists:
-        assert load_effective_task_result(parent, "capture")["artifact_bundle"]["status"] == "ready"
+        assert copy_child_task_result(parent, task)["artifact_bundle"]["status"] == "ready"
     bad = records[0]
     Path(bad["path"]).write_bytes(b"changed child bytes before copy")
+    copied = copy_child_task_result(parent, task)
     result = load_effective_task_result(parent, "capture")
     row = next(item for item in result["artifacts"] if item["name"] == bad["name"])
     assert result["status"] == "completed" and result["outcome_axes"] == axes
@@ -715,16 +733,49 @@ def test_failed_child_capture_is_explicit_and_other_files_still_materialize(tmp_
             SimpleNamespace(drive_root=parent, task_id="capture"), bad["path"], immutable=True, expected=bad)
         assert reused["path"] == row["path"] and reused["sha256"] == bad["sha256"]
     else:
-        assert row["status"] == "failed" and row["copy_status"] == "failed" and row["copy_error"]
+        assert row["copy_status"] == "failed" and row["copy_error"]
         assert result["artifact_status"] == result["artifact_bundle"]["status"] == "missing"
-        copied = copy_child_task_result(parent, {"id": "capture", "drive_root": str(child)})
         assert copied["child_ref_promotion"]["status"] == "incomplete"
-        assert not remove_subagent_task_drive(parent, "capture")
+        assert not remove_subagent_task_drive(parent, "capture", live=lambda _task: False)
         Path(bad["path"]).write_bytes(b"a-report.txt")
         assert retry_pending_child_ref_promotions(parent)["completed"] == ["capture"]
         recovered = load_effective_task_result(parent, "capture")
         assert recovered["artifact_status"] == recovered["artifact_bundle"]["status"] == "ready"
         assert recovered["status"] == "completed" and recovered["accounted_upper_bound_usd"] == 3.5
+
+
+def test_unchanged_pending_ref_retry_rewrites_nothing_and_keeps_late_facts(tmp_path):
+    """#1305: retrying a still-unpromotable ref leaves bytes, mtime and updated_at alone; a
+    genuine late fact still lands, survives the next retry, and a restored source converges."""
+    from ouroboros.headless import prepare_task_drive, copy_child_task_result
+    from ouroboros.observability import retry_pending_child_ref_promotions
+    from ouroboros.task_results import task_result_path, write_task_result
+
+    parent = tmp_path / "canonical"
+    child = prepare_task_drive(parent, "stale", "empty")
+    source = child / "report.txt"
+    source.write_bytes(b"report")
+    record = artifacts.copy_file_to_task_artifacts(
+        SimpleNamespace(drive_root=child, task_id="stale"), source, immutable=True)
+    write_task_result(child, "stale", "failed", artifacts=[record], artifact_status="ready")
+    write_task_result(parent, "stale", "running", headless_child_drive_root=str(child))
+    Path(record["path"]).write_bytes(b"appended after the digest was captured")
+    assert copy_child_task_result(parent, {"id": "stale", "drive_root": str(child)})[
+        "child_ref_promotion"]["status"] == "incomplete"
+    row = task_result_path(parent, "stale")
+    before, stamp = row.read_bytes(), row.stat().st_mtime_ns
+    report = retry_pending_child_ref_promotions(parent)
+    assert report["retried"] == report["pending"] == ["stale"] and not report["errors"]
+    assert row.read_bytes() == before and row.stat().st_mtime_ns == stamp
+    write_task_result(parent, "stale", "failed", accounted_upper_bound_usd=4.25)
+    late = row.read_bytes()
+    assert retry_pending_child_ref_promotions(parent)["pending"] == ["stale"]
+    assert row.read_bytes() == late and json.loads(late)["accounted_upper_bound_usd"] == 4.25
+    Path(record["path"]).write_bytes(b"report")
+    assert retry_pending_child_ref_promotions(parent)["completed"] == ["stale"]
+    settled = json.loads(row.read_bytes())
+    assert settled["status"] == "failed" and settled["accounted_upper_bound_usd"] == 4.25
+    assert settled["child_ref_promotion"]["status"] == "complete"
 
 
 @pytest.mark.parametrize("copy_failure", [False, True])
@@ -752,7 +803,7 @@ def test_failed_artifact_bundle_drives_public_and_routing_status_without_mutatin
 def test_first_materialization_copy_failure_keeps_each_gc_root(tmp_path, monkeypatch, drive_kind):
     import time
     from ouroboros import headless
-    from ouroboros.task_results import write_task_result
+    from ouroboros.task_results import load_task_result, write_task_result
 
     parent = tmp_path / "canonical"
     child = (headless.prepare_task_drive(parent, "capture", "empty") if drive_kind == "headless"
@@ -763,25 +814,33 @@ def test_first_materialization_copy_failure_keeps_each_gc_root(tmp_path, monkeyp
     record = artifacts.copy_file_to_task_artifacts(
         SimpleNamespace(drive_root=child, task_id="capture"), source, immutable=True)
     write_task_result(child, "capture", "completed", artifacts=[record], artifact_status="ready")
+    # An adopted row (its promotion mark set) that still names the capture at its CHILD path:
+    # the settlement itself owes the canonical copy, so its copy failure is the probe.
     write_task_result(parent, "capture", "completed", artifacts=[record], artifact_status="ready",
-                      headless_child_drive_root=str(child))
+                      headless_child_drive_root=str(child),
+                      child_ref_promotion={"schema_version": 1, "status": "complete", "pending_refs": []})
     original = artifacts.copy_artifact_file
-    canonical_files = artifacts.task_artifact_dir_path(parent, "capture")
     def fail_copy(src, dst, **kwargs):
-        if Path(dst).is_relative_to(canonical_files):
+        # Settlement prepares every canonical copy in private staging under the canonical
+        # root: that copy failing is the canonical copy failing.
+        if Path(dst).is_relative_to(parent) and not Path(dst).is_relative_to(child):
             raise OSError("controlled canonical copy failure")
         return original(src, dst, **kwargs)
     prune = headless.prune_headless_task_drives if drive_kind == "headless" else headless.prune_task_drives
     later = time.time() + 14 * 86400
     with monkeypatch.context() as patch:
         patch.setattr(artifacts, "copy_artifact_file", fail_copy)
-        refused = prune(parent, retention_days=7, now=later)
+        refused = prune(parent, retention_days=7, now=later, live=lambda _task: False)
     assert not refused["pruned"] and child.is_dir(), refused
+    assert refused["custody_pending"] == [{"task_id": "capture", "reason": "artifact_source_mismatch"}]
     assert Path(record["path"]).read_bytes() == b"complete report"
-    copied = headless.copy_child_task_result(parent, {"id": "capture", "drive_root": str(child)})
-    assert copied["child_ref_promotion"]["status"] == "complete"
-    assert prune(parent, retention_days=7, now=later)["pruned"]
-    assert Path(copied["artifacts"][0]["path"]).read_bytes() == b"complete report"
+    assert load_task_result(parent, "capture")["artifacts"] == [record]  # the row still names its source
+    assert not artifacts.task_artifact_dir_path(parent, "capture").exists()
+    settled = prune(parent, retention_days=7, now=later, live=lambda _task: False)
+    assert settled["pruned"] and not child.exists(), settled
+    published = load_task_result(parent, "capture")["artifacts"][0]
+    assert Path(published["path"]).read_bytes() == b"complete report" and published["sha256"] == record["sha256"]
+    assert Path(published["path"]).is_relative_to(artifacts.task_artifact_dir_path(parent, "capture").resolve())
 
 
 @pytest.mark.parametrize("context", ["healthy", "missing", "none", "storage_failure"])
@@ -910,7 +969,7 @@ def test_acknowledged_owner_inputs_survive_copyback_retry_mailbox_cleanup_and_gc
         assert any(row["path"] == str(mailbox) for row in result["child_ref_promotion"]["pending_refs"])
         cleanup_settled_owner_mailbox(parent, task_id, task)
         assert mailbox.is_file()
-        assert not headless.remove_subagent_task_drive(parent, task_id)
+        assert not headless.remove_subagent_task_drive(parent, task_id, live=lambda _task: False)
         assert observability.retry_pending_child_ref_promotions(parent)["completed"] == [task_id]
         result = load_task_result(parent, task_id)
         assert not mailbox.exists(), "successful retry releases retained mail through its existing owner"
@@ -920,7 +979,7 @@ def test_acknowledged_owner_inputs_survive_copyback_retry_mailbox_cleanup_and_gc
     assert result["child_ref_promotion"]["status"] == "complete"
     assert result["child_ref_promotion"]["pending_refs"] == []
     assert len(artifacts.resolve_attachment_manifest(parent, task_id, result["task_contract"])) == len(initial)
-    gc = headless.prune_headless_task_drives(parent, retention_days=1, now=time.time() + 90 * 86400)
+    gc = headless.prune_headless_task_drives(parent, retention_days=1, now=time.time() + 90 * 86400, live=lambda _task: False)
     assert [row["task_id"] for row in gc["pruned"]] == [task_id]
     assert not child.exists()
     if ref:

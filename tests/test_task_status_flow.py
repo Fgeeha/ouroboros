@@ -780,13 +780,14 @@ def test_materializing_child_read_cannot_overwrite_canonical_zero_run_receipt(tm
         "ts": "2026-01-01T00:00:02+00:00",
     })
 
-    # Repeated polling must preserve the canonical-only row.  Final copy-back
-    # then unions the ordinary child check into that same authority file.
+    # Repeated polling must preserve the canonical-only row, and a read writes no
+    # receipt (TZ-1 A: reads are pure). Final copy-back then unions the ordinary
+    # child check into that same authority file.
     effective_task_result(tmp_path, load_task_result(tmp_path, tid) or {})
     assert [
         row.get("contract_kind")
         for row in read_verification_receipts(tmp_path, tid)
-    ] == [None, "delegation_zero_run"]
+    ] == ["delegation_zero_run"]
 
     copied = copy_child_task_result(
         tmp_path, {"id": tid, "drive_root": str(child_drive)},
@@ -3343,18 +3344,17 @@ def test_expired_batch_wait_reports_the_asked_for_window_not_the_clamp(tmp_path,
     assert payload["timeout_sec"] == 7200.0, "the clamp still bounds the real wait"
 
 
-def test_wait_clamp_constants_match_the_scraped_literals():
-    """The schema text's number and the clamp arithmetic are one fact (A10)."""
-    import inspect
-    import re
-
+def test_wait_clamp_constants_are_the_windows_the_waits_use(tmp_path, monkeypatch):
+    """The schema text's number and the real wait window are one fact (A10)."""
     from ouroboros.tools import control_task_results as mod
 
-    def _scraped(fn):
-        return int(re.findall(r"min\(int\(timeout_sec\),\s*(\d+)\)", inspect.getsource(fn))[0])
-
-    assert _scraped(mod._wait_for_task) == mod._WAIT_TASK_CLAMP_SEC
-    assert _scraped(mod._wait_for_tasks) == mod._WAIT_TASKS_CLAMP_SEC
+    seen = []
+    monkeypatch.setattr(mod, "wait_for_effective_tasks", lambda root, ids, **kw: seen.append(
+        kw["timeout_sec"]) or {"all_terminal": True, "elapsed_sec": 0.0, "tasks": {}})
+    ctx = SimpleNamespace(drive_root=tmp_path)
+    mod._wait_for_task(ctx, "anychild", timeout_sec=10**6)
+    mod._wait_for_tasks(ctx, ["anychild"], timeout_sec=10**6)
+    assert seen == [mod._WAIT_TASK_CLAMP_SEC, mod._WAIT_TASKS_CLAMP_SEC]
 
 
 def test_wait_schemas_name_the_real_clamp(tmp_path):

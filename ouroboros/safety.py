@@ -125,6 +125,7 @@ TOOL_POLICY: Dict[str, str] = {
     # Answering a run's question is custody-gated to the task that started it and
     # carries no authority the task lacks (same reasoning as the verbs above).
     "delegate_answer": POLICY_SKIP,
+    "delegate_message": POLICY_SKIP,
     "cancel_task": POLICY_SKIP,
     # The other half of the same nanny authority (#1196, owner Q9): selecting ONE
     # of this task's OWN budget-paused descendants to continue under its same id.
@@ -1315,7 +1316,6 @@ def _emit_safety_mode_skip(ctx: Optional[Any], tool_name: str, mode: str, policy
 
     P3: an advisory/off mode is legitimate ONLY while every decision it waves
     through leaves a loud, durable trace at the moment it happens (review round 1)."""
-    log.warning("Safety mode=%s waved through LLM check for %s (policy=%s)", mode, tool_name, policy)
     _emit_durable_safety_event(ctx, {
         "type": "safety_mode_skip",
         "tool": tool_name,

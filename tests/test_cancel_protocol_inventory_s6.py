@@ -68,10 +68,10 @@ TERMINAL_WRITERS = {
     # Runtime707: CURRENT-ref retry publication moved out of observability's
     # locked sweep; terminal file-failure publication moved off event drain.
     # Both retain CURRENT lifecycle status rather than authoring completion.
-    ('ouroboros/headless.py::retry_child_task_refs', 'source["status"]'): 'dynamic',
+    ('ouroboros/headless.py::_retry_child_task_refs_locked', 'source["status"]'): 'dynamic',
     ('ouroboros/headless.py::prepare_terminal_task_files', 'existing["status"]'): 'dynamic',
-    ('ouroboros/headless.py::finalize_task_artifacts', 'status'): 'dynamic',
-    ('ouroboros/headless.py::finalize_task_artifacts', 'str(existing.get("status") or status or "completed")'): 'terminal',
+    ('ouroboros/headless.py::_finalize_task_artifacts_locked', 'status'): 'dynamic',
+    ('ouroboros/headless.py::_finalize_task_artifacts_locked', 'str(existing.get("status") or status or "completed")'): 'terminal',
     ('ouroboros/mutation_attribution.py::advance_mutation_baseline', 'status'): 'dynamic',
     ('ouroboros/mutation_attribution.py::capture_mutation_baseline', 'status'): 'dynamic',
     ('ouroboros/mutation_attribution.py::record_terminal_mutation_candidates', 'status'): 'dynamic',
@@ -100,6 +100,10 @@ TERMINAL_WRITERS = {
     # write_task_result still preserves any terminal status under its locked reducer.
     ('ouroboros/server_maintenance.py::_recover_terminal_task_files', '"running"'): 'dynamic',
     ('ouroboros/task_status.py::reconcile_orphaned_running_tasks', 'eff_status'): 'dynamic',
+    # TZ-1 A/V10: the one child-drive settlement and mailbox cleanup write custody fields
+    # (published artifact rows, unread mail) onto CURRENT with its own status inside the
+    # projector; a changed attempt basis aborts, and they never originate a transition.
+    ('ouroboros/task_custody.py::_write_custody_fields', 'str(observed.get("status") or "")'): 'dynamic',
     ('ouroboros/tools/control_delegation.py::record_depth_limit_refusal', 'STATUS_FAILED'): 'terminal',
     ('supervisor/cancel_publication.py::_finalize_cancel_intent_on_miss', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/events_project_routing.py::_persist_promote_rejection', 'STATUS_FAILED'): 'terminal',
@@ -115,7 +119,6 @@ TERMINAL_WRITERS = {
     ('supervisor/events_task_done.py::_refresh_terminal_task_cost', 'current["status"]'): 'dynamic',
     ('supervisor/queue_snapshot.py::restore_pending_from_snapshot', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/queue_snapshot.py::_refuse_restore_invalid_fences', 'STATUS_CANCELLED'): 'terminal',
-    ('supervisor/task_admission.py::record_scheduled_admission', 'STATUS_FAILED'): 'terminal',
     ('supervisor/task_admission.py::terminalize_invalid_depth_restore', 'STATUS_FAILED'): 'terminal',
     ('supervisor/task_lifecycle.py::_finish_captured_pending', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/task_lifecycle.py::_finish_captured_running', 'STATUS_CANCELLED'): 'terminal',
@@ -148,8 +151,6 @@ SETTLE_INTENT_CALLERS = {
 NO_DELIVERABLE_LANES = {
     'supervisor/task_lifecycle.py::_finish_captured_pending':
         'cancelled before it ever started: no answer exists',
-    'supervisor/task_admission.py::record_scheduled_admission':
-        'a cron dispatch refused at admission never had an owner answer',
     'supervisor/workers.py::_settle_cancelled_pending_row':
         'dropped before assignment; the salvage receipt belongs to custody',
     'supervisor/queue_snapshot.py::restore_pending_from_snapshot':

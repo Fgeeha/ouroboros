@@ -512,7 +512,7 @@ class _AnthropicLaneMixin:
 
         def _send(candidate: Dict[str, Any]):
             nonlocal prior_capture
-            candidate = _finalized_physical_candidate(target, candidate, "messages")
+            candidate = _finalized_physical_candidate(target, candidate, "messages", fresh_clock=True)
             request = _attempt_request(target, candidate, source="llm.anthropic")
 
             def _post():

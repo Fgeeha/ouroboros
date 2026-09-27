@@ -46,9 +46,25 @@ CANCEL_SOURCE_PHRASES = {
     "http_graceful": "Stopped from the app (Wrap up)",
     # ``_cancel_subtree_sweep`` mints this for every captured descendant.
     "cascade_descendant": "Stopped with the task tree it belongs to",
+    # ``server_restart._stop_owned_work``: the /restart command (chat or app button).
+    "owner_restart": "Stopped by the Restart command",
+    # ``queue_snapshot._fence_snapshot_running_rows``: a row still RUNNING when the
+    # previous server stopped (``shutdown_cancel_text`` states it on the result).
+    "snapshot_restore": "The server stopped while this task was still running",
+    # ``join_ledger`` cancel_task, Ouroboros's own tool; the asking run is below.
+    "agent_tool": "Stopped by Ouroboros",
+}
+# The fixed label a producer writes as ``reason`` restates its phrase, so that
+# exact label is not repeated beside it; any other reason text still shows.
+CANCEL_SOURCE_LABELS = {
+    "http_graceful": "owner requested finalize-then-stop",
+    "owner_restart": "Owner restart",
+    "snapshot_restore": "server_shutdown",
 }
 # A recorded cause is producer free text; bound it before it joins an owner line.
+# The bound is a PREVIEW of a reason the record keeps whole, and says so.
 CANCEL_REASON_MAX_CHARS = 160
+CANCEL_REASON_PREVIEW_NOTE = " (preview; the full reason is kept with the task)"
 
 
 def cancel_cause_clauses(
@@ -66,6 +82,8 @@ def cancel_cause_clauses(
     stopped (#1061). When this record's OWN lineage proves that asker is its
     parent or ancestor, the line states that relation. Only a typed
     ``request_origin`` proves an actor; ``requested_by`` alone never does.
+    Ouroboros's own cancel_task stamps the run that asked, not a swept root,
+    so there the relation is the asker's, and it names that same actor.
     """
     from ouroboros.utils import strip_markdown
 
@@ -75,6 +93,8 @@ def cancel_cause_clauses(
         if isinstance(request_origin, dict) and request_origin.get("kind") == "agent_task"
         else ""
     )
+    source = str(origin.get("source") or "")
+    asker = source == "agent_tool"
     asked = str(origin.get("requested_by") or "")
     record = {**event, **result}
     self_id = str(record.get("task_id") or record.get("id") or record.get("subagent_task_id") or "")
@@ -83,19 +103,20 @@ def cancel_cause_clauses(
     relation = ""
     if asked and asked != self_id:
         if asked == parent:
-            relation = "Stopped with its parent task"
+            relation = "Requested by its parent task" if asker else "Stopped with its parent task"
         elif parent and asked == root:
-            relation = "Stopped with an ancestor task"
-    source = str(origin.get("source") or "")
-    reason = " ".join(strip_markdown(str(origin.get("reason") or "")).split())
+            relation = "Requested by an ancestor task" if asker else "Stopped with an ancestor task"
+    stated = str(origin.get("reason") or "")
+    reason = ("" if " ".join(stated.split()) == CANCEL_SOURCE_LABELS.get(source)
+              else " ".join(strip_markdown(stated).split()))
     if len(reason) > CANCEL_REASON_MAX_CHARS:
-        reason = reason[:CANCEL_REASON_MAX_CHARS - 1].rstrip() + "\u2026"
+        reason = reason[:CANCEL_REASON_MAX_CHARS - 1].rstrip() + "\u2026" + CANCEL_REASON_PREVIEW_NOTE
     return [
         CANCEL_SOURCE_PHRASES.get(source, source),
         reason,
         "this task and its sub-tasks" if origin.get("scope") == "cascade" else "",
         relation,
-        "Requested by a task" if actor else "",
+        "Requested by a task" if actor and not (asker and relation and actor == asked) else "",
     ]
 
 
@@ -447,12 +468,9 @@ def _publish_cancelled_task(
     # the lock so the crash detector can recover the slot on a later tick.
     from supervisor.task_reaper import _respawn_after_reap
     _respawn_after_reap(q, workers, worker.wid, expected_worker=worker)
-    if str(task.get("delegation_role") or "") == "subagent":
-        try:
-            from ouroboros.headless import remove_subagent_task_drive
-            remove_subagent_task_drive(q.DRIVE_ROOT, str(task_id))
-        except Exception:
-            log.debug("Failed to remove cancelled subagent drive for %s", task_id, exc_info=True)
+    # A cancelled subagent's drive is NOT settled here: settlement copies and hashes the
+    # child store, which the cancel path must not carry. The off-loop reconcile pass
+    # settles it without waiting out retention (``headless.prune_headless_task_drives``).
     try:
         q.persist_queue_snapshot(reason="cancel_running")
     except Exception:

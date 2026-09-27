@@ -80,6 +80,11 @@ async def api_schedules_upsert(request: Request) -> JSONResponse:
                 "type": "task",
                 "text": str(body.get("description") or body.get("name") or "Scheduled task"),
             }
+        # This owner door creates Main self-work or the named room's default.
+        # Existing followups retain their recorded explicit resource/none intent.
+        task = {**task, "metadata": dict(task.get("metadata") or {})}
+        project_id = str(task.get("project_id") or "").strip()
+        new_intent = {"kind": "room_default", "project_id": project_id} if project_id else {"kind": "system_repo"}
         enabled = _enabled_value(body)
         if isinstance(enabled, str):
             return json_error(enabled, 400)
@@ -101,7 +106,7 @@ async def api_schedules_upsert(request: Request) -> JSONResponse:
         try:
             stored = upsert_scheduled_task(
                 record, drive_root=request_drive_root(request), actor="owner:gateway",
-                reason=str(body.get("reason") or "").strip())
+                reason=str(body.get("reason") or "").strip(), new_resource_intent=new_intent)
         except ScheduleRefused as refusal:
             # 409 when the write could not be made SAFELY (its audit is down);
             # 400 when the request itself asks for something this door cannot do.

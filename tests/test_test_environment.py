@@ -294,7 +294,7 @@ _SESSION_PROBE = """
 import json, os, pathlib, tempfile
 
 def pytest_sessionstart(session):
-    worker = os.environ.get("PYTEST_XDIST_WORKER", "controller")
+    worker = getattr(session.config, "workerinput", {}).get("workerid", "controller")
     record = {"tmpdir": os.environ.get("TMPDIR", ""), "gettempdir": tempfile.gettempdir(),
               "session_root": str(pathlib.Path(os.environ["OUROBOROS_DATA_DIR"]).parent)}
     pathlib.Path(os.environ["SESSION_PROBE_OUT"], worker + ".json").write_text(json.dumps(record))

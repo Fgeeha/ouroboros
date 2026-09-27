@@ -49,7 +49,7 @@ _DEPRECATED_CHAT_IDS_EVENTS: set[str] = set()
 
 
 @contextmanager
-def _file_write_lock(target_path: pathlib.Path) -> Iterator[None]:
+def _file_write_lock(target_path: pathlib.Path, *, timeout_sec: float = 4.0) -> Iterator[None]:
     """Cross-process exclusive lock for a registry/bindings read-modify-write.
 
     The registry is written from BOTH the server process (project create/bind,
@@ -65,12 +65,16 @@ def _file_write_lock(target_path: pathlib.Path) -> Iterator[None]:
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = target_path.with_name(target_path.name + ".lock")
-    fd = acquire_exclusive_file_lock(lock_path, timeout_sec=4.0)
+    fd = acquire_exclusive_file_lock(lock_path, timeout_sec=timeout_sec)
     if fd is None:
         raise TimeoutError(f"projects_registry: could not lock {lock_path} in time")
     try:
-        with _LOCK:
+        if not _LOCK.acquire(timeout=timeout_sec):
+            raise TimeoutError("projects_registry: thread lock busy")
+        try:
             yield
+        finally:
+            _LOCK.release()
     finally:
         release_exclusive_file_lock(lock_path, fd)
 
@@ -782,6 +786,37 @@ def get_reserved_project(drive_root: Any, project_id: str, *, strict: bool = Fal
     return None
 
 
+def _registry_revision(drive_root: Any) -> tuple:
+    try:
+        st = _registry_path(drive_root).stat()
+        return st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size
+    except FileNotFoundError:
+        return ()
+
+
+def project_admission_view(drive_root: Any, project_id: str) -> Dict[str, Any]:
+    """Read the registry off the queue lock and bind its exact atomic-file revision."""
+    before = _registry_revision(drive_root)
+    project = get_reserved_project(drive_root, project_id, strict=True)
+    if before != _registry_revision(drive_root):
+        raise RuntimeError("project registry changed during admission preparation")
+    return {"project_id": project_id, "project": project, "revision": before}
+
+
+@contextmanager
+def project_admission_guard(drive_root: Any, view: Dict[str, Any]):
+    """Short existing-writer fence; never wait for registry writers under queue lock.
+
+    The expensive JSON read is in project_admission_view. Stat of the atomic-file
+    identity detects every replacement, including rebind-away-and-back. The same
+    writer lock prevents replacement until the queue publishes this admission.
+    """
+    with _file_write_lock(_registry_path(drive_root), timeout_sec=0.0):
+        if view.get("revision") != _registry_revision(drive_root):
+            raise RuntimeError("project registry changed before admission")
+        yield view.get("project")
+
+
 def _bounded_presentation_name(value: Any, *, fallback: str = "") -> str:
     name = " ".join(str(value or "").split()) or str(fallback or "")
     return name if len(name) <= PROJECT_NAME_MAX else name[: PROJECT_NAME_MAX - 1].rstrip() + "…"
@@ -964,6 +999,8 @@ def update_project(
                     continue
                 if key == "name":
                     value = _validated_name(value, str(entry.get("id") or ""))
+                if key == "working_dir" and value != entry.get(key):
+                    entry["routing_generation"] = int(entry.get("routing_generation") or 0) + 1
                 entry[key] = value
             _save(drive_root, data)
             return dict(entry)

@@ -185,17 +185,14 @@ def test_owner_disable_or_delete_of_a_notify_row_survives_the_skill_reposting_it
     assert moved.status_code == 200 and moved.json()["scheduled"] is True
     assert queue.list_scheduled_tasks(tmp_path)["tasks"][0]["trigger"]["run_at"].startswith("2999-01-03T10:00")
 
-    # A delete is retained as a suppressed record for the same reason; the
-    # skill's own cancel still removes what it may.
+    # Owner decision: Delete removes this event immediately; only Disable
+    # blocks a skill from reposting the same key.
     deleted = queue.mutate_scheduled_task("delete", schedule_id, reason="owner: gone", actor="owner:gateway", drive_root=tmp_path)
-    assert deleted["ok"] is True and deleted["status"] == "suppressed"
-    assert client.post("/notify", headers=headers, json=body).json()["status"] == "suppressed"
-    rows = queue.list_scheduled_tasks(tmp_path)["tasks"]
-    assert len(rows) == 1 and rows[0]["manual_override"] == "deleted" and rows[0]["enabled"] is False
-    # A second owner delete of the suppressed record removes it for good.
-    gone = queue.mutate_scheduled_task("delete", schedule_id, reason="owner: clean up", actor="owner:gateway", drive_root=tmp_path)
-    assert gone["ok"] is True and gone["status"] == "deleted"
+    assert deleted["ok"] is True and deleted["status"] == "deleted"
     assert queue.list_scheduled_tasks(tmp_path)["tasks"] == []
+    repost = client.post("/notify", headers=headers, json=body)
+    assert repost.status_code == 200 and repost.json()["scheduled"] is True
+    assert len(queue.list_scheduled_tasks(tmp_path)["tasks"]) == 1
 
 
 def test_scheduled_notify_upsert_refuses_a_row_owned_by_another_source(tmp_path: pathlib.Path) -> None:

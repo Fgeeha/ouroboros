@@ -861,6 +861,11 @@ def write_task_result(
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
+    from ouroboros.task_custody import capture_unread_mail, merge_unread_mail
+
+    # TZ-1 V10: the mailbox bytes are read BEFORE the row lock (a bounded union happens
+    # under it); a terminal write that the projector turns terminal captures under it.
+    captured = capture_unread_mail(results_drive_root, task_id) if status in _TRULY_TERMINAL_STATUSES else None
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if strict_existing_dict and existing and (
@@ -901,6 +906,16 @@ def write_task_result(
             if resolve_task_lineage(task_id, metadata=merged.get("metadata"),
                                     **{key: merged.get(key) for key in lineage_keys})["is_root_task"]:
                 projected_fields["canonical_terminal_projection_origin"] = "terminal_transition"
+            # TZ-1 V10: this accepted transition keeps the mail no attempt read (no ACK written);
+            # later late mail joins through settlement, never through a rejected write.
+            projected_fields["unread_mailbox"] = merge_unread_mail(
+                projected_fields.get("unread_mailbox"),
+                captured if status in _TRULY_TERMINAL_STATUSES else capture_unread_mail(results_drive_root, task_id))
+        # Unread-mail custody only grows: no replica or partial write can shrink it.
+        projected_fields["unread_mailbox"] = merge_unread_mail(
+            existing.get("unread_mailbox"), projected_fields.get("unread_mailbox"))
+        if projected_fields["unread_mailbox"] is None:
+            projected_fields.pop("unread_mailbox")
         now = utc_now_iso()
         # ABI-3 write seam: the merge BASE is normalized onto honest cost names first, so a stored alias
         # neither survives nor outranks this write's fresh value; a legacy spelling IN this write still
@@ -1390,7 +1405,7 @@ _PLAN_REVIEW_IDENTITY_KEYS = frozenset({
     "previous_fingerprint", "spec_hash", "evidence_manifest_hash", "plan_prose_hash", "sha256",
     "model", "request_model", "route", "host_file_read_attestation", "reason", "decision", "kind",
     "goal", "acceptance_claims", "cycle_index", "series_id", "schema_version", "retry_key",
-    "wave_artifact", "spec_source_ref", "dialogue_source_ref", "dialogue_chat_id", "author_request_fingerprint",
+    "wave_artifact", "previous_wave_artifact", "spec_source_ref", "dialogue_source_ref", "dialogue_chat_id", "author_request_fingerprint",
     "historical_supplements",
 })
 
@@ -1471,8 +1486,8 @@ def record_plan_review_wave(
         waves.append(recorded)
         if not state.get("series_id"):
             state["series_id"] = fingerprint[:16]
-        # C-07: replacement writes don't charge again; a fully-rejected wave's
-        # earned delta advances cycle_index and charges its new physical panel.
+        # C-07: replacement writes don't charge again; an addressed answer advances
+        # cycle_index and charges its new physical panel.
         already_paid = any(
             w.get("paid") and int(w.get("cycle_index") or 0) >= int(wave.get("cycle_index") or 0)
             for w in previous
@@ -1487,9 +1502,11 @@ def record_plan_review_wave(
             for idx, w in enumerate(waves)
         ]
         overflow = max(0, len(waves) - _PLAN_REVIEW_MAX_WAVES)
-        if overflow:
-            state["waves_omitted"] = int(state.get("waves_omitted") or 0) + overflow
-            waves = waves[overflow:]
+        if overflow:  # the newest PAID wave stays reachable: the next dispatch judges against it
+            keep = next((i for i in range(len(waves) - 1, -1, -1) if waves[i].get("paid")), None)
+            dropped = set([i for i in range(len(waves)) if i != keep][:overflow])
+            state["waves_omitted"] = int(state.get("waves_omitted") or 0) + len(dropped)
+            waves = [w for i, w in enumerate(waves) if i not in dropped]
         # I-02: size-fitting (older-wave compaction, then the last-resort text cut) runs for
         # EVERY writer in `_update_plan_review_state` → `_fit_plan_review_state`.
         state["waves"] = waves
@@ -1501,9 +1518,12 @@ def record_plan_review_wave(
 
 
 def plan_review_notes_are_annotatable(wave: Dict[str, Any]) -> bool:
-    """Optional notes remain discussable after automatic closure, not new authority."""
+    """Optional notes remain discussable after automatic closure, not new authority.
+
+    A note-only wave is recorded GREEN (notes never change the verdict); older
+    records carry it as a closed REVIEW_REQUIRED, and both stay annotatable."""
     findings = wave.get("findings") or []
-    return bool(findings) and wave.get("aggregate") == "REVIEW_REQUIRED" and all(
+    return bool(findings) and wave.get("aggregate") in {"GREEN", "REVIEW_REQUIRED"} and all(
         finding.get("class") == "note" for finding in findings
     )
 
@@ -1515,14 +1535,18 @@ def record_plan_review_dispositions(
     fingerprint: str,
     dispositions: List[Dict[str, Any]],
     closed: bool,
+    aggregate: str = "",
     closure_notes: Optional[List[str]] = None,
     wave_artifact: Optional[Dict[str, Any]] = None,
     recorded_at: str = "",
     author_disposition: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Store the agent's dispositions on one FULL wave and its resulting closure.
-    Only note-only closed waves accept annotations. Closure authority remains
-    ``plan_spec.closure_after_disposition``; other closed waves are immutable."""
+    """Record this call's answers MERGED into one FULL wave's answers by ``finding_id``
+    (``plan_spec.merge_dispositions``: a later answer supersedes only its own id) and the
+    resulting closure. Only note-only closed waves accept annotations. Closure authority remains
+    ``plan_spec.closure_after_disposition`` (``aggregate`` is the verdict that
+    table says to record — GREEN when a REVIEW_REQUIRED open set emptied); this
+    writer is rule-free. Other closed waves are immutable."""
 
     def _record(state: Dict[str, Any]) -> Dict[str, Any]:
         wave = next((w for w in state["waves"] if str(w.get("request_fingerprint") or "") == fingerprint), None)
@@ -1533,7 +1557,9 @@ def record_plan_review_dispositions(
             raise ValueError("PLAN_REVIEW_DISPOSITION_STALE: a newer attempt supersedes this wave")
         if wave.get("closed") and not plan_review_notes_are_annotatable(wave):
             raise ValueError("PLAN_REVIEW_DISPOSITION_IMMUTABLE: a closed wave cannot be changed")
-        wave["dispositions"] = copy.deepcopy(list(dispositions))
+        from ouroboros.tools.plan_spec import merge_dispositions
+
+        wave["dispositions"] = merge_dispositions(wave.get("dispositions"), dispositions)
         wave["disposition_recorded_at"] = recorded_at or utc_now_iso()
         if closure_notes is not None:
             wave["closure_notes"] = list(closure_notes)
@@ -1548,7 +1574,7 @@ def record_plan_review_dispositions(
                 raise ValueError("PLAN_REVIEW_AUTHOR_DISPOSITION_INVALID: stale or malformed record")
             wave["author_disposition"] = author
         if closed and str(wave.get("aggregate") or "") == "REVIEW_REQUIRED":
-            wave["closed"] = True
+            wave.update(closed=True, aggregate=aggregate or wave["aggregate"])
         state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}
         return state
 

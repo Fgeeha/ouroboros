@@ -497,12 +497,17 @@ def test_timed_out_tool_closes_its_cognitive_lease_when_worker_settles(tmp_path,
         terminal = [
             row for row in rows
             if row.get("type") == "cognitive_operation"
-            and row.get("operation_id") == "tool-1"
+            and row.get("task_id") == "tool-task"
             and row.get("phase") == "finished"
         ]
         if not terminal:
             time.sleep(0.02)
     assert terminal, rows
+    started = [row for row in rows if row.get("type") == "cognitive_operation"
+               and row.get("phase") == "started" and row.get("task_id") == "tool-task"]
+    # The lease follows the host's frozen invocation, not a provider-reused call ID.
+    assert len(started) == len(terminal) == 1
+    assert terminal[0]["operation_id"] == started[0]["operation_id"]
 
 
 def _llm_call_event(phase, **overrides):

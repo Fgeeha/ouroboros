@@ -66,12 +66,12 @@ def active_repo_dir_for(ctx: Any) -> pathlib.Path:
         if workspace_mode:
             return workspace_path
 
-    from ouroboros.tool_access import project_room_lens_dir
+    from ouroboros.tool_access import folderless_scratch_dir, project_room_lens_dir
 
     room = project_room_lens_dir(ctx)
     if room is not None:
         return room
-    return pathlib.Path(getattr(ctx, "repo_dir"))
+    return folderless_scratch_dir(ctx) or pathlib.Path(getattr(ctx, "repo_dir"))
 
 
 def system_repo_dir_for(ctx: Any) -> pathlib.Path:
@@ -335,11 +335,13 @@ def _target_binding_operation(name: str, args: dict[str, Any]) -> str | None:
     # CONDITIONAL, never a static map entry (R1 item 1): delegate_start becomes
     # target-bound only when it explicitly selects an exact skill payload; a
     # plain or retry call keeps its current active-workspace behavior untouched.
-    # ONLY the known selector value binds here — any other root value falls
-    # through to the handler's TYPED unsupported_root refusal instead of an
-    # untyped ValueError from binding construction (gate fix 9).
+    # ONLY a COMPLETE known selector binds here — any other root value or an
+    # incomplete selector falls through to the handler's TYPED unsupported_root /
+    # payload_selector_incomplete refusal instead of an untyped ValueError from
+    # binding construction (gate fix 9, #1304).
     if (name == "delegate_start"
             and str(args.get("root") or "").strip() == "skill_payload"
+            and str(args.get("bucket") or "").strip() and str(args.get("skill_name") or "").strip()
             and not str(args.get("retry_of") or "").strip()):
         return "write"
     return None
@@ -383,6 +385,10 @@ def _normalize_tool_call_args(entry: "ToolEntry", args: dict[str, Any]) -> None:
             args[canonical] = args.pop(alias)
     if tool_name in _IGNORE_ROOT_ARG_TOOLS and "root" in args and "root" not in accepted:
         args.pop("root", None)
+    if tool_name == "delegate_start" and str(args.get("root") or "").strip() == "active_workspace":
+        # #1304: the schema's documented default IS omission (the #882 rule), removed
+        # before the configured-session selector check and the payload binder read it.
+        args.pop("root")
 
 
 def _prepare_public_builtin_args(entry: "ToolEntry", args: dict[str, Any]) -> str:
@@ -569,6 +575,20 @@ def _light_binding_failure_result(
             text=redirect,
         )
     return redirect
+
+
+def delegate_payload_binding_refusal(ctx: Any, exc: Exception) -> ToolResult:
+    """A complete skill-payload selector the binder could not resolve (#1304): a typed,
+    definite no-run that names the selector and its repair, plus the one durable
+    START_BLOCKED attempt row a pre-custody refusal owes (D5)."""
+    from ouroboros.delegate_evidence import record_start_blocked
+    from ouroboros.delegate_shared import _fail
+
+    record_start_blocked(ctx, str(getattr(ctx, "task_id", "") or ""), "payload_selector_unresolved")
+    return _fail("delegate_start", "payload_selector_unresolved",
+                 f"root='skill_payload' with this bucket/skill_name selects no payload you can write: {exc}. "
+                 "Name an installed skill exactly, or omit root (root='active_workspace') for ordinary "
+                 "workspace delegation.", definitely_unrun=True)
 
 
 def _binding_error_text(name: str, root: str, exc: Exception) -> str | ToolResult:

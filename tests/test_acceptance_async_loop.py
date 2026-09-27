@@ -516,8 +516,13 @@ def test_a_panel_that_settles_after_the_loop_exited_is_attached_through_the_reme
     result, _usage, trace = f.run()
     assert result == ANSWER and trace["review_decision"]["review_pending"] is True
     assert getattr(f.ctx, "_execution_trace", None) is None, "the loop exit detached the live trace"
-    # The pipeline seals the task before the straggler answers.
+    # The pipeline seals the task before the straggler answers, and the send
+    # handler's receipt of the bytes it sent (text, routed chat) is the proof.
     write_task_result(f.ctx.drive_root, f.ctx.task_id, "completed", chat_id=1, result=ANSWER)
+    from supervisor.terminal_delivery import delivery_id_for, register_delivery
+
+    assert register_delivery(f.ctx.drive_root, delivery_id_for(f.ctx.task_id, ANSWER),
+                             emitted={"text": ANSWER, "chat_id": 1, "task_id": f.ctx.task_id})
     f.release.set()
     with f.condition:
         assert f.condition.wait_for(lambda: f.settled_count >= 1, timeout=10)
@@ -525,7 +530,7 @@ def test_a_panel_that_settles_after_the_loop_exited_is_attached_through_the_reme
     rows = [e for e in events if e.get("system_type") == "acceptance_late_settlement"]
     assert len(rows) == 1, [e.get("type") for e in events]
     assert rows[0]["task_id"] == f.ctx.task_id and rows[0]["chat_id"] == 1
-    assert rows[0]["text"].startswith("Reviewers later passed this answer. They reviewed the answer that was delivered.")
+    assert rows[0]["text"].startswith("On the delivered version of this answer, reviewers later passed it.")
     assert "- acceptance-one: PASS" in rows[0]["text"]
     stored = load_task_result(f.ctx.drive_root, f.ctx.task_id)
     assert stored["status"] == "completed"
@@ -533,8 +538,10 @@ def test_a_panel_that_settles_after_the_loop_exited_is_attached_through_the_reme
     actor = panel["actors"][0]
     assert actor["transport_status"] == "success" and actor["parse_status"] == "valid"
     # The panel reviewed the bytes that shipped, so its settlement says so.
-    assert panel["late_settlement"] == {"note": rows[0]["text"], "reviewed_revision": "delivered",
-                                        "settled_after_terminal": True}
+    late = panel["late_settlement"]
+    assert {key: late[key] for key in ("note", "reviewed_revision", "settled_after_terminal")} == {
+        "note": rows[0]["text"], "reviewed_revision": "delivered", "settled_after_terminal": True}
+    assert late["reviewed_is_emitted"] is True and late["emitted_answer"]["state"] == "delivered"
     assert rows[0]["progress_meta"]["card_row"] == "reviews"
     assert len(f.review_sends) == 1, "the supplement bought nothing"
     assert not getattr(f.ctx, "_acceptance_settlement_traces", {}), "a settled wave releases its remembered trace"

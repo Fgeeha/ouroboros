@@ -319,6 +319,11 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
     intent, no terminal result and no ``task_done``, and a stop with still-live
     leftovers was declared clean.
     """
+    from supervisor.events_runtime_controls import owner_evolution_stop_controls
+
+    # The control half first (#1307): latch, durable campaign stop intent, state flags —
+    # none of them waits for cancellation and none skips another's failure.
+    not_persisted = owner_evolution_stop_controls("disabled via owner chat")
     stop_incomplete = False
     try:
         from supervisor.queue import evolution_stop_report, stop_evolution_tasks
@@ -326,7 +331,10 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
 
         # Fast path: drop any queued post-task promotion so it cannot re-arm on
         # the next boot tick (the evolution_owner_stopped flag is the durable backstop).
-        drop_pending_request(ctx.DRIVE_ROOT)
+        try:
+            drop_pending_request(ctx.DRIVE_ROOT)
+        except Exception:
+            log.warning("Pending evolution request could not be dropped; cancellation still attempted", exc_info=True)
         stopped = stop_evolution_tasks("disabled via owner chat")
         ctx.sort_pending()
         ctx.persist_queue_snapshot(reason="evolve_off")
@@ -359,8 +367,8 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
     if stop_incomplete:
         return ("OFF (mode disabled) — but the stop is INCOMPLETE: see the "
                 "still-live task(s) above. The campaign stays open until they "
-                "settle. Post-task auto-evolution stays paused until /evolve start")
-    return "OFF — post-task auto-evolution also paused until /evolve start"
+                "settle. Post-task auto-evolution stays paused until /evolve start" + not_persisted)
+    return "OFF — post-task auto-evolution also paused until /evolve start" + not_persisted
 
 
 def _record_routing_receipt(
@@ -562,7 +570,8 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         task_metadata = {**(task_metadata or {}), "origin_suppressed": True}
     # Owner Surface Fact channel fallback: a non-web ingress (telegram/skill
     # transports) carries no browser observables, but its channel IS the
-    # surface fact. Host-stamped here, never overwriting a real descriptor;
+    # surface fact, with the common ingress receipt stamp (``received_at``,
+    # ``enqueue_local_message``). Host-stamped here, never overwriting a real descriptor;
     # source=="web" stays an honest absence (an old SPA sends no fact), and a
     # synthetic A2A chat (negative id) is machine traffic — no owner sent it,
     # so it must never wear an owner_client fact.
@@ -574,7 +583,8 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         and not _is_a2a(chat_id)
         and not isinstance(task_metadata.get("client_surface"), dict)
     ):
-        task_metadata = {**task_metadata, "client_surface": {"channel": _ingress_source}}
+        received = {"received_at": str(incoming["received_at"])} if incoming.get("received_at") else {}
+        task_metadata = {**task_metadata, "client_surface": {"channel": _ingress_source, **received}}
     if task_metadata.get("force_plan"):
         from supervisor.worker_chat_lane import owner_conversation_admitted
         from supervisor.state import budget_remaining, load_state

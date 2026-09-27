@@ -623,6 +623,7 @@ def _gate_tool_trace(data_dir: Path, ouro_task_id: str, latest_status: Any = Non
         log_path = data_dir / "state" / "headless_tasks" / ouro_task_id / "data" / "logs" / "tools.jsonl"
         if not (ouro_task_id and log_path.is_file()):
             return trace
+        rows = []
         for line in log_path.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
@@ -631,15 +632,24 @@ def _gate_tool_trace(data_dir: Path, ouro_task_id: str, latest_status: Any = Non
                 row = json.loads(line)
             except Exception:
                 continue
-            if not isinstance(row, dict) or row.get("type") != "tool_call":
+            if not isinstance(row, dict) or row.get("type") not in {"tool_call", "tool_call_started", "tool_call_timeout"}:
                 continue
+            rows.append(row)
+        from ouroboros.tool_call_log import logical_calls
+
+        for call in logical_calls(rows):
+            row = call.get("settled") or call.get("started") or call.get("wait_ended") or {}
             tool = str(row.get("tool") or "")
             if not tool.startswith(prefix):
                 continue
             trace.append({
                 "tool": tool[len(prefix):],
                 "args": row.get("args"),
-                "is_error": bool(row.get("is_error")),
+                "is_error": bool(row.get("is_error")) if call.get("settled") else None,
+                "state": call["state"],
+                "wait_ended": bool(call.get("wait_ended")),
+                "settled": bool(call.get("settled")),
+                "invocation_id": call.get("invocation_id"),
             })
     except Exception:  # noqa: BLE001 - a sidecar must never change the flow
         pass
@@ -1105,6 +1115,7 @@ def _collect_budget_counters(data_dir: Path, latest: dict[str, Any], ouro_task_i
     screenshots = gui = remote_exec = total = 0
     src = log_path if log_path.is_file() else (fallback if fallback.is_file() else None)
     if src is not None:
+        rows = []
         for line in src.read_text(encoding="utf-8", errors="replace").splitlines():
             line = line.strip()
             if not line:
@@ -1113,10 +1124,15 @@ def _collect_budget_counters(data_dir: Path, latest: dict[str, Any], ouro_task_i
                 row = json.loads(line)
             except Exception:
                 continue
-            if not isinstance(row, dict) or row.get("type") != "tool_call":
+            if not isinstance(row, dict) or row.get("type") not in {"tool_call", "tool_call_started", "tool_call_timeout"}:
                 continue
             if src is fallback and str(row.get("task_id") or "") != ouro_task_id:
                 continue
+            rows.append(row)
+        from ouroboros.tool_call_log import logical_calls
+
+        for call in logical_calls(rows):
+            row = call.get("settled") or call.get("started") or call.get("wait_ended") or {}
             tool = str(row.get("tool") or "")
             if not tool.startswith(prefix):
                 continue

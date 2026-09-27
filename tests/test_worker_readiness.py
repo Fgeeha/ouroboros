@@ -159,6 +159,7 @@ def test_respawn_installs_the_fresh_slot_booting_through_the_same_seam_with_its_
     assert handed[0][0] == {3: fresh} and handed[0][2][0] == 1 and 0 < handed[0][2][1] <= time.time()
 
     assert workers.respawn_worker(3, ready_attempt=2) is True
+    assert fresh.proc._ouroboros_stop_socket.fileno() == -1  # old Process is still retained here
     assert _wait_for(lambda: len(handed) == 2)
     assert handed[1][0] == {3: workers.WORKERS[3]} and handed[1][2][0] == 2
 

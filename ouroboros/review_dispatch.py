@@ -143,41 +143,23 @@ def claim_task_acceptance_dispatch(
     )
 
 
-def collect_task_acceptance_run(run: dict, *, drive_root: Any, usage_ctx: Any) -> Any:
+def collect_task_acceptance_run(run: dict, *, drive_root: Any, usage_ctx: Any, controller: Any = None) -> Any:
     """Collect the recorded operation at zero new dispatch, using its exact inputs.
 
     The existing host review record owns the request and roster; custody owns live
-    workers and complete producer artifacts. No new configuration or evidence is
-    sampled here, and missing custody cannot turn collection into a new send.
+    workers and complete producer artifacts. Collection branches BEFORE the
+    ordinary runner (``review_operation.collect_recorded_acceptance_run``): exact
+    producer CAS, a live local worker, or an attach-only read of a proven
+    delegated run, parsed locally. Missing custody cannot turn it into a send.
     """
-    import copy
-    import time
-    from ouroboros.review_custody import _freeze_roster_rows
-    from ouroboros.review_execution import ReviewRouteKind
-    from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+    from ouroboros.review_operation import collect_recorded_acceptance_run
 
-    request = ReviewRequest(**copy.deepcopy(run["request"]))
-    if request.surface != "task_acceptance" or not request.retry_key:
-        raise ValueError("recorded acceptance operation identity is missing")
-    slots = [ReviewSlot(**{**row, "route": ReviewRouteKind(row["route"])})
-             for row in copy.deepcopy(run.get("slot_roster") or [])]
-    if not slots:
-        raise ValueError("recorded acceptance roster is unavailable")
-    request.reconcile_only, request.drain_deadline = True, time.monotonic()
-    previous = getattr(usage_ctx, "_review_frozen_rows", None)
-    usage_ctx._review_frozen_rows = {
-        **(previous or {}),
-        "task_acceptance": _freeze_roster_rows(usage_ctx, "task_acceptance", run.get("actors")),
-    }
-    try:
-        return run_review_request(request, slots=slots, drive_root=pathlib.Path(drive_root),
-                                  usage_ctx=usage_ctx)
-    finally:
-        usage_ctx._review_frozen_rows = previous
+    return collect_recorded_acceptance_run(run, drive_root=pathlib.Path(drive_root), usage_ctx=usage_ctx,
+                                           controller=controller)
 
 
 def reconcile_pending_acceptance_runs(
-    llm_trace: dict, *, drive_root: Any, usage_ctx: Any,
+    llm_trace: dict, *, drive_root: Any, usage_ctx: Any, controller: Any = None,
 ) -> int:
     """Collect every already-paid acceptance panel still recorded as running, $0.
 
@@ -205,6 +187,7 @@ def reconcile_pending_acceptance_runs(
         try:
             result = collect_task_acceptance_run(
                 run, drive_root=drive_root, usage_ctx=usage_ctx,
+                **({"controller": controller} if controller is not None else {}),
             )
         except (OSError, TimeoutError, ValueError, KeyError) as exc:
             log.warning("acceptance run %s could not be reconciled: %s",

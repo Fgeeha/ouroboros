@@ -1282,7 +1282,7 @@ def build_review_context(env: Any) -> str:
         if open_debts:
             lines.append("- retry_anchor=commit_readiness_debt")
             lines.append(f"- commit_readiness_debt={len(open_debts)}")
-            lines.append("\n### Commit-readiness debt (start retry here)")
+            lines.append("\n### Commit-readiness debt")
             for debt in open_debts:
                 summary = _truncate_with_notice(getattr(debt, "summary", ""), 180).replace("\n", " ")
                 lines.append(

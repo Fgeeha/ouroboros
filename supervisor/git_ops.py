@@ -15,7 +15,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from supervisor.state import (
-    append_jsonl, atomic_write_text, load_state, save_state,  # noqa: F401
+    append_jsonl, atomic_write_text, load_state, save_state, update_state,  # noqa: F401
 )
 from ouroboros import config as _config
 from ouroboros.utils import utc_now_iso  # noqa: F401

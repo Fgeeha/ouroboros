@@ -27,6 +27,7 @@ def boot_state(tmp_path, monkeypatch):
     state.init(tmp_path)
     (tmp_path / "state").mkdir(parents=True, exist_ok=True)
     (tmp_path / "locks").mkdir(parents=True, exist_ok=True)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     cfg._RETIREMENT_NOTICE_SEEN.clear()
     yield tmp_path
     cfg._RETIREMENT_NOTICE_SEEN.clear()

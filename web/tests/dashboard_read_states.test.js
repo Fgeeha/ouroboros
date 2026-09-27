@@ -719,9 +719,7 @@ test('Activity shows a notify row by its sentence with the notification tag and 
     assert.equal(retained.length, 2);
     assert.match(retained[0].textContent, /Standup[\s\S]*suppressed/);
     assert.equal(retained[0].querySelector('button').textContent, 'Restore');
-    // Delete carries what the dialog needs to tell the truth: the first Delete of
-    // an armed reminder suppresses it, deleting the retained record removes it,
-    // and a reminder that already fired is a receipt Delete removes at once.
+    // Delete removes any reminder immediately; Disable is the durable veto.
     const armedDelete = standing[0].querySelector('[data-act="schedule-delete"]');
     assert.equal(armedDelete.dataset.notify, '1');
     assert.equal(armedDelete.dataset.suppressed, '');
@@ -731,8 +729,9 @@ test('Activity shows a notify row by its sentence with the notification tag and 
     assert.match(retained[1].textContent, /Fired already[\s\S]*consumed once/);
     assert.equal(firedDelete.dataset.consumed, '1');
     // And the dialog each button opens says what the server will do.
-    assert.equal(scheduleDeleteDialog(armedDelete.dataset).title, 'Suppress reminder');
-    assert.equal(scheduleDeleteDialog(armedDelete.dataset).confirmLabel, 'Suppress');
+    assert.equal(scheduleDeleteDialog(armedDelete.dataset).title, 'Delete schedule');
+    assert.equal(scheduleDeleteDialog(armedDelete.dataset).confirmLabel, 'Delete');
+    assert.match(scheduleDeleteDialog(armedDelete.dataset).body, /Use Disable instead/);
     assert.equal(scheduleDeleteDialog(retained[0].querySelector('[data-act="schedule-delete"]').dataset).title, 'Delete schedule');
     assert.equal(scheduleDeleteDialog(firedDelete.dataset).title, 'Delete schedule');
     assert.equal(scheduleDeleteDialog(firedDelete.dataset).body, 'Delete this schedule?');

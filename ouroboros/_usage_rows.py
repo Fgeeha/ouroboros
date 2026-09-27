@@ -14,6 +14,7 @@ from typing import Any, Dict, Optional, Sequence
 from decimal import Decimal, InvalidOperation
 
 from ouroboros.usage_ledger import _number
+from ouroboros._usage_money import monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exact_money, decimal_of
 
 REVIEW_ATTRIBUTION_KEYS = ("review_skill", "review_wave_id", "review_slot_id")
 
@@ -40,11 +41,12 @@ def _merge_processing_summary(total: dict, addition: dict) -> None:
         if value is None or isinstance(value, bool):
             continue
         try:
-            amount = Decimal(str(value))
+            amount = decimal_of(value)
         except (InvalidOperation, ValueError):
             continue
         if amount.is_finite() and amount >= 0:
-            total[key] = total.get(key, Decimal(0)) + amount
+            with exact_money():
+                total[key] = total.get(key, Decimal(0)) + amount
     for key in ("unknown_cash_rows", "unknown_valuation_rows"):
         if key in addition:
             total[key] = total.get(key, 0) + int(addition[key])
@@ -97,7 +99,7 @@ def _processing_summary(rows: Sequence[Dict[str, Any]], *, decimal_values: bool 
 
 
 def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-    settled = confirmed = estimated = reserved = unresolved = 0.0
+    cash = ZERO_CASH
     unknown = 0
     # Finality is a COUNT of OPEN ROWS, not a truthiness test on dollar sums. Three of the
     # four old terms asked a STATE question of a float, so any row that is genuinely open
@@ -131,6 +133,7 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     sessions = 0
     session_windows: Dict[str, str] = {}
     for row in rows:
+        cash = change_cash(cash, new=cash_contribution(row))
         state = str(row.get("state") or "")
         kind = str(row.get("kind") or "")
         if kind == "usage_baseline":
@@ -165,17 +168,12 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
                 non_final_rows += weight
                 bound = _number(row.get("reservation_upper_bound_usd"))
                 if bound is not None:
-                    unresolved += bound
                     priced_rows += weight
                     tracked_nonfinal_rows += weight
                     accounting_open_rows += weight
             else:
                 priced_rows += weight
-                settled += cost
-                if bool(row.get("cost_final")):
-                    confirmed += cost
-                else:
-                    estimated += cost
+                if not bool(row.get("cost_final")):
                     non_final_rows += weight
                     tracked_nonfinal_rows += weight
                     accounting_open_rows += weight
@@ -186,7 +184,6 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             if bound is None or pricing_unknown:
                 unknown += weight
             if bound is not None:
-                reserved += bound
                 priced_rows += weight
                 tracked_nonfinal_rows += weight
         elif state in {"dispatched", "unresolved"}:
@@ -196,19 +193,10 @@ def _summary(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             if bound is None or pricing_unknown:
                 unknown += weight
             if bound is not None:
-                unresolved += bound
                 priced_rows += weight
                 tracked_nonfinal_rows += weight
-    settled, confirmed, estimated, reserved, unresolved = (
-        round(value, 6) for value in (settled, confirmed, estimated, reserved, unresolved)
-    )
     return {
-        "settled_usd": settled,
-        "confirmed_usd": confirmed,
-        "estimated_usd": estimated,
-        "reserved_usd": reserved,
-        "unresolved_upper_bound_usd": unresolved,
-        "accounted_usd": round(settled + reserved + unresolved, 6),
+        **render_cash(cash),
         "unknown_unmetered": unknown,
         "priced_rows": priced_rows,
         "tracked_nonfinal_rows": tracked_nonfinal_rows,
@@ -253,13 +241,13 @@ def _projection_from_final(
         known = [v for v in (_number(row.get("root_limit_usd")) for row in rows) if v is not None]
         return min(known) if known else None
     if root_task_id:
-        rows = [row for row in final if str(row.get("root_task_id") or "") == root_task_id]
+        rows = [row for row in final if monetary_scope_key(row) == root_task_id]
         return _with_integrity(_with_limit(_summary(rows), limit_of(rows)), integrity_degraded)
     result = _with_limit(_summary(final), configured_limit)
     if include_roots:
         grouped: Dict[str, list] = {}
         for row in final:
-            rid = str(row.get("root_task_id") or "")
+            rid = monetary_scope_key(row)
             if rid:
                 grouped.setdefault(rid, []).append(row)
         result["by_root"] = {
