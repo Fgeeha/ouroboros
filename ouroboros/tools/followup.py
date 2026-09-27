@@ -305,6 +305,11 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     notify = params.get("notify", False)
     if not isinstance(notify, bool):
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text="ERROR: FOLLOWUP_NOTIFY_INVALID: notify must be a boolean."))
+    if notify and presence_caller_binding(ctx) is not None:
+        # Presence's positive ceiling selects a tool name, not its arguments.
+        # A model-free owner notification has no Presence destination or carrier.
+        return _publish_tool_result(ctx, ToolResult(status="blocked", code="RESOURCE_CONSTRAINT_BLOCKED",
+            text="ERROR: FOLLOWUP_NOTIFY_PRESENCE_REFUSED: Presence may schedule its selected follow-up task, not an owner notification."))
     run_at_raw = str(params.get("run_at") or "").strip()
     cron = str(params.get("cron") or "").strip()
     if bool(run_at_raw) == bool(cron):

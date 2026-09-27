@@ -171,8 +171,9 @@ def emit_owner_notification(
 
     Returns the row when the durable append landed (the live browser frame is
     that append's log-sink copy, so it exists exactly when the row does) and
-    ``None`` when it did not — the caller words its status honestly. The topic
-    publish is best-effort after the row; ``publish=False`` leaves it to the
+    ``None`` when the append was not confirmed — bytes may have landed before
+    a failed receipt, so callers must not blindly repeat. The topic publish is
+    best-effort after the row; ``publish=False`` leaves it to the
     caller (the scheduler tick appends under its table lock and publishes the
     collected rows after releasing it, so a slow subscriber never holds the
     supervisor).

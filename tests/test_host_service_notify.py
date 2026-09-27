@@ -132,7 +132,8 @@ def test_notify_reports_a_failed_durable_write_as_503(tmp_path: pathlib.Path, mo
     client, _app = _notify_client(tmp_path)
     monkeypatch.setattr(utils, "append_jsonl", lambda *a, **k: False)
     resp = client.post("/notify", headers={"X-Skill-Token": "tok"}, json={"text": "hi"})
-    assert resp.status_code == 503 and "retry" in resp.json()["error"]
+    assert resp.status_code == 503 and resp.json()["status"] == "outcome_unknown"
+    assert "before retrying" in resp.json()["error"]
 
 
 def test_notify_with_at_schedules_a_notify_row_that_a_key_moves_and_cancels(tmp_path: pathlib.Path) -> None:
@@ -181,6 +182,13 @@ def test_notify_scheduling_validation(tmp_path: pathlib.Path) -> None:
     client, _app = _notify_client(tmp_path)
     headers = {"X-Skill-Token": "tok"}
     assert client.post("/notify", headers=headers, json={"text": "x", "at": "soon"}).status_code == 400
+    assert client.post("/notify", headers=headers, json={
+        "text": "x", "at": "2999-01-01T14:45:00", "timezone": "Europe/Moscow"}).status_code == 400
+    assert client.post("/notify", headers=headers, json={
+        "text": "x", "at": "2999-01-01T14:45:00+03:00", "timezone": "Europe/Moscow"}).status_code == 200
+    assert queue.list_scheduled_tasks(tmp_path)["tasks"][0]["trigger"]["run_at"].startswith("2999-01-01T11:45")
+    queue.mutate_scheduled_task("delete", queue.list_scheduled_tasks(tmp_path)["tasks"][0]["id"],
+                                reason="test cleanup", actor="owner:gateway", drive_root=tmp_path)
     assert client.post("/notify", headers=headers, json={"text": "x", "at": "2999-01-01T00:00:00Z", "cron": "* * * * *"}).status_code == 400
     assert client.post("/notify", headers=headers, json={"text": "x", "cron": "bad"}).status_code == 400
     assert client.post("/notify", headers=headers, json={"text": "x", "cron": "* * * * *", "timezone": "Mars/Olympus"}).status_code == 400

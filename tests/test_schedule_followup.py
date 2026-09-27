@@ -253,6 +253,26 @@ def test_schedule_followup_notify_mode_fires_without_a_task_or_chat_row(tmp_path
     assert not (tmp_path / "data" / "logs" / "chat.jsonl").exists()
 
 
+def test_presence_selected_followup_retains_tasks_but_cannot_notify_owner(tmp_path):
+    """A Presence ceiling selects the tool, not notify's argument mode."""
+    from supervisor.queue import list_scheduled_tasks
+
+    ctx = _ctx(tmp_path)
+    ctx.task_metadata["presence_binding_authority"] = {"binding_id": "mail-room"}
+    blocked = _followup(ctx, notify=True, objective="Wake owner")
+    assert "FOLLOWUP_NOTIFY_PRESENCE_REFUSED" in blocked
+    assert list_scheduled_tasks(ctx.drive_root)["tasks"] == []
+    assert _followup(ctx, notify=False, objective="Continue related work").startswith("FOLLOWUP_SCHEDULED")
+    [record] = list_scheduled_tasks(ctx.drive_root)["tasks"]
+    assert record["task"]["text"] == "Continue related work"
+
+
+def test_lost_presence_carrier_with_ceiling_still_refuses_model_free_notify(tmp_path):
+    ctx = _ctx(tmp_path)
+    ctx.task_contract["capability_ceiling"] = {"tools": ["schedule_followup"]}
+    assert "FOLLOWUP_NOTIFY_PRESENCE_REFUSED" in _followup(ctx, notify=True, objective="Wake owner")
+
+
 def test_schedule_followup_notify_rejects_context_and_oversized_text(tmp_path):
     ctx = _ctx(tmp_path)
     assert "FOLLOWUP_NOTIFY_CONTEXT" in _followup(ctx, notify=True, context="hidden")
@@ -1044,7 +1064,7 @@ def test_notify_row_of_a_skill_whose_grant_was_revoked_stays_silent(tmp_path):
     assert len([row for row in _events(tmp_path) if row.get("type") == "owner_notification"]) == 1
 
 
-def test_notify_row_survives_a_failed_append_and_retries(tmp_path, monkeypatch):
+def test_notify_row_unknown_append_does_not_retry_or_duplicate(tmp_path, monkeypatch):
     from ouroboros import utils
 
     queue, pending = _queue(tmp_path)
@@ -1053,13 +1073,69 @@ def test_notify_row_survives_a_failed_append_and_retries(tmp_path, monkeypatch):
     monkeypatch.setattr(utils, "append_jsonl", lambda path, obj, **kw: False if path.name == "events.jsonl" and obj.get("type") == "owner_notification" else real_append(path, obj, **kw))
     queue.check_scheduled_tasks()
     record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is True and not record.get("completed_at")
+    assert record["enabled"] is False and record.get("completed_at")
     assert "notification log write failed" in str(record.get("last_error") or "")
     monkeypatch.setattr(utils, "append_jsonl", real_append)
     queue.check_scheduled_tasks()
     record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is False and record["completed_at"] and record.get("last_error") == ""
-    assert len([row for row in _events(tmp_path) if row.get("type") == "owner_notification"]) == 1
+    assert record["enabled"] is False and record["completed_at"]
+    assert [row for row in _events(tmp_path) if row.get("type") == "owner_notification"] == []
+
+
+def test_notify_append_that_landed_but_lost_its_receipt_does_not_repeat(tmp_path, monkeypatch):
+    from ouroboros import utils
+
+    queue, _pending = _queue(tmp_path)
+    queue.upsert_scheduled_task(_notify_row("n-ambiguous"))
+    real_append = utils.append_jsonl
+
+    def lost_receipt(path, obj, **kw):
+        landed = real_append(path, obj, **kw)
+        return False if obj.get("type") == "owner_notification" else landed
+
+    monkeypatch.setattr(utils, "append_jsonl", lost_receipt)
+    queue.check_scheduled_tasks()
+    monkeypatch.setattr(utils, "append_jsonl", real_append)
+    queue.check_scheduled_tasks()
+    assert len([r for r in _events(tmp_path) if r.get("type") == "owner_notification"]) == 1
+    record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
+    assert record["completed_at"] and "notification log write failed" in record["last_error"]
+
+
+def test_notify_precommits_table_before_append_even_when_later_write_fails(tmp_path, monkeypatch):
+    """An append can reach Telegram before the table write fails. The next tick
+    must not repeat that already-accepted occurrence."""
+    from supervisor import queue_schedules
+
+    queue, pending = _queue(tmp_path)
+    queue.upsert_scheduled_task(_notify_row("n-once"))
+    real_write = queue_schedules._write_scheduled_tasks
+    writes = 0
+
+    def write_then_fail(data, drive_root=None):
+        nonlocal writes
+        writes += 1
+        if writes > 1:
+            raise OSError("later table write failed")
+        return real_write(data, drive_root)
+
+    monkeypatch.setattr(queue_schedules, "_write_scheduled_tasks", write_then_fail)
+    queue.check_scheduled_tasks()
+    assert len([r for r in _events(tmp_path) if r.get("type") == "owner_notification"]) == 1
+    queue.check_scheduled_tasks()
+    assert len([r for r in _events(tmp_path) if r.get("type") == "owner_notification"]) == 1
+    assert queue.list_scheduled_tasks(tmp_path)["tasks"][0]["completed_at"]
+
+
+def test_notify_never_appends_if_the_table_cannot_record_the_attempt(tmp_path, monkeypatch):
+    from supervisor import queue_schedules
+
+    queue, pending = _queue(tmp_path)
+    queue.upsert_scheduled_task(_notify_row("n-no-table"))
+    monkeypatch.setattr(queue_schedules, "_write_scheduled_tasks", lambda *a, **kw: (_ for _ in ()).throw(OSError("disk")))
+    queue.check_scheduled_tasks()
+    assert [r for r in _events(tmp_path) if r.get("type") == "owner_notification"] == []
+    assert queue.list_scheduled_tasks(tmp_path)["tasks"][0]["enabled"] is True
 
 
 def test_notify_row_projects_its_text_as_the_model_preview_and_audits_its_kind(tmp_path):

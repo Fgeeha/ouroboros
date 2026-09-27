@@ -81,7 +81,10 @@ async def _api_notify(request: Request) -> JSONResponse:
     except ValueError as exc:
         return _json_error(str(exc), 400)
     if row is None:
-        return _json_error("notification log write failed; retry the same notice", 503)
+        # A failed append receipt cannot prove the bytes did not land. The key
+        # is display dedupe, not a server-side idempotency key.
+        return JSONResponse({"ok": False, "error": "notification outcome unknown; inspect before retrying",
+                             "status": "outcome_unknown"}, status_code=503)
     return JSONResponse({"ok": True, "ts": row["ts"], "chat_id": row["chat_id"]})
 
 
@@ -119,6 +122,7 @@ def _schedule_owner_notification(ctx: "HostServiceContext", skill_name: str, tex
     the owner suppressed the row, which stays and answers ``suppressed``);
     without a key a row is fire-and-forget."""
     from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.tools.followup import _naive_instant
     from ouroboros.schedule_contract import cron_error, timezone_error
     from supervisor.queue import (
         ScheduleRefused, ScheduleStoreUnreadable, load_schedule_store, mutate_scheduled_task,
@@ -164,6 +168,8 @@ def _schedule_owner_notification(ctx: "HostServiceContext", skill_name: str, tex
         return _json_error("supply exactly one of at (ISO 8601 instant) or cron (5-field expression)", 400)
     timezone = str(timezone_raw or "").strip()
     if at_raw is not None:
+        if timezone and isinstance(at_raw, str) and _naive_instant(at_raw.strip()):
+            return _json_error("at without a UTC offset cannot be combined with timezone; put the offset in at", 400)
         at_instant = parse_deadline_ts(at_raw.strip()) if isinstance(at_raw, str) else None
         if at_instant is None:
             return _json_error("at must be a parseable ISO 8601 instant", 400)

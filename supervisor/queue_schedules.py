@@ -825,6 +825,7 @@ def check_scheduled_tasks() -> None:
     fired: List[Dict[str, Any]] = []
     claims: List[Dict[str, Any]] = []
     retired_claims: list[tuple[str, str]] = []
+    write_failed = False
     with schedule_transaction(_queue().DRIVE_ROOT):
         now_monotonic = time.monotonic()
         if now_monotonic - _last_skill_schedule_sync >= _SKILL_SCHEDULE_SYNC_INTERVAL_SEC:
@@ -945,21 +946,44 @@ def check_scheduled_tasks() -> None:
                     except Exception as exc:
                         changed = _record_last_error(record, f"{type(exc).__name__}: {exc}") or changed
                         continue
-                row, why = _fire_owner_notification(record, due_at or now)
-                if row is None:
-                    # Not fired: the row stays armed and its last_error says why;
-                    # the next pass retries it.
-                    changed = _record_last_error(record, why) or changed
+                from ouroboros.event_bus import OWNER_NOTIFICATION_TEXT_CHARS
+
+                notification = record.get("notification") if isinstance(record.get("notification"), dict) else {}
+                text = str(notification.get("text") or "").strip()
+                if not text or len(text) > OWNER_NOTIFICATION_TEXT_CHARS:
+                    changed = _record_last_error(record, "invalid notification text") or changed
                     continue
-                fired.append(row)
+                # Commit the consumed occurrence BEFORE the outward append. An
+                # append may land even when its writer reports an error; writing
+                # the schedule afterward would ring the same occurrence again
+                # whenever that table write fails. Unknown outcomes sacrifice
+                # one reminder, never silently manufacture repeated alerts.
                 record["last_run_at"] = now.isoformat()
-                record["last_error"] = ""
+                record["last_error"] = "notification delivery outcome unknown"
                 if trigger_type == "once":
                     record["enabled"] = False
                     record["completed_at"] = now.isoformat()
                     record["next_run_at"] = ""
                 else:
                     record["next_run_at"] = successor.isoformat()
+                try:
+                    if _write_scheduled_tasks(data) is False:
+                        write_failed = True
+                        break
+                except OSError:
+                    write_failed = True
+                    break
+                occurrences._FRESH_CLAIMS.difference_update(retired_claims)
+                retired_claims.clear()
+                changed = False
+                row, why = _fire_owner_notification(record, due_at or now)
+                if row is None:
+                    # The append outcome is not proven absent: keep the consumed
+                    # receipt and a visible error, but never blindly retry.
+                    changed = _record_last_error(record, why) or changed
+                    continue
+                fired.append(row)
+                record["last_error"] = ""
                 changed = True
                 continue
             # Reconcile the previous occurrence even while its root runs: that
@@ -980,11 +1004,14 @@ def check_scheduled_tasks() -> None:
                                             age_cutoff(get_gc_retention_days()))
         if pruned:
             data["tasks"], changed = kept, True
-        if changed:
-            if _write_scheduled_tasks(data) is False:
-                return
-            occurrences._FRESH_CLAIMS.difference_update(retired_claims)
-            _queue().persist_queue_snapshot(reason="scheduled_tasks")
+        if changed and not write_failed:
+            try:
+                write_failed = _write_scheduled_tasks(data) is False
+            except OSError:
+                write_failed = True
+            if not write_failed:
+                occurrences._FRESH_CLAIMS.difference_update(retired_claims)
+                _queue().persist_queue_snapshot(reason="scheduled_tasks")
     if fired:
         # The durable append happened under the table lock, but subscribers run
         # outside it, after the schedule row is written.
@@ -992,5 +1019,7 @@ def check_scheduled_tasks() -> None:
 
         for row in fired:
             publish_owner_notification(row)
+    if write_failed:
+        return
     if claims:
         occurrences.admit([occurrences.prepare(claimed) for claimed in claims])
