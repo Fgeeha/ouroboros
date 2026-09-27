@@ -400,8 +400,10 @@ def _write_content(current: KnowledgeNote | None, content: str, mode: str,
             raise ValueError("edit requires an existing readable note")
         body_start = current.source.body_span.start_byte
         body = current.raw[body_start:].decode("utf-8")
-        body = (compile_anchored_edits(body, [(old_str, content)]) if edits is None
-                else compile_anchored_edits(body, _authored_edit_pairs(edits), "old_text"))
+        if edits is not None:
+            body = compile_anchored_edits(body, _authored_edit_pairs(edits), "old_text")
+        elif old_str is not None or summary is None:  # a summary-only revision keeps every body byte
+            body = compile_anchored_edits(body, [(old_str, content)])
         if summary is None or current.metadata.get("summary") == summary:
             return current.raw[:body_start] + body.encode("utf-8")
         # A revised summary takes the ordinary overwrite merge below: it replaces
@@ -458,9 +460,11 @@ def write_knowledge_note(
 
     ``edits`` (mode=edit, instead of ``old_str``/``content``) is the automatic
     form: a list of ``{old_text, new_text, basis}`` applied to the body only by
-    the same anchored compiler; beside it, ``summary`` optionally revises that
-    one field in the same locked write through the ordinary metadata merge.
-    History retains the authored ``edits`` and, only when supplied, ``summary``.
+    the same anchored compiler. ``summary`` (mode=edit) revises that one field in
+    the same locked write through the ordinary metadata merge, beside ``edits``,
+    beside one ``old_str`` replacement, or alone with no ``old_str``/``content``.
+    History retains the authored ``edits`` and, only when supplied, ``summary``;
+    the delta says whether the body bytes and the resident summary changed.
     """
     if mode not in {"overwrite", "append", "edit"} or not isinstance(content, str):
         raise ValueError("content must be Markdown text; mode must be overwrite, append or edit")
@@ -470,8 +474,10 @@ def write_knowledge_note(
         raise ValueError("edits and summary are used only with mode=edit")
     if edits is not None and (old_str is not None or content):
         raise ValueError("edits replace old_str and content; pass one edit form")
-    if summary is not None and (edits is None or not isinstance(summary, str) or not summary.strip()):
-        raise ValueError("summary is non-empty text beside edits")
+    if summary is not None and (not isinstance(summary, str) or not summary.strip()):
+        raise ValueError("summary must be non-empty text")
+    if summary is not None and edits is None and old_str is None and content:
+        raise ValueError("content replaces old_str; a summary-only edit passes neither")
     with knowledge_write_lock(address.shelf):
         # Re-resolve inside the lock; a changed symlink cannot redirect a write.
         address.path.resolve().relative_to(address.shelf.resolve())
@@ -497,7 +503,8 @@ def write_knowledge_note(
         if current is not None and raw == current.raw:
             return KnowledgeWriteResult(True, "unchanged", current, revision,
                                         {"old_chars": len(current.text), "new_chars": len(current.text),
-                                         "change_chars": 0, "removed_headings": []})
+                                         "change_chars": 0, "removed_headings": [],
+                                         "body_changed": False, "summary_changed": False})
         updated = _note(address, raw)
         # A body edit keeps the preamble bytes; a revised summary may re-render
         # them only if every other field keeps its value (``type`` defaults, in
@@ -514,10 +521,17 @@ def write_knowledge_note(
                   if current and current.source else Counter())
         after = (Counter((heading.level, heading.title) for heading in updated.source.headings)
                  if updated.source else Counter())
+        known = (current is None or current.source) and updated.source
         removed_headings = (sorted("#" * level + " " + title for (level, title) in (before - after).elements())
-                            if (current is None or current.source) and updated.source else None)
+                            if known else None)
+        # Body bytes and the resident (index) summary, each compared as published;
+        # an unparseable side leaves both unknown, like its heading delta.
+        old_body, old_summary = ((current.raw[current.source.body_span.start_byte:], current.summary)
+                                 if current and current.source else (b"", ""))
         delta = {"old_chars": len(old_text), "new_chars": len(updated.text),
-                 "change_chars": len(updated.text) - len(old_text), "removed_headings": removed_headings}
+                 "change_chars": len(updated.text) - len(old_text), "removed_headings": removed_headings,
+                 "body_changed": old_body != raw[updated.source.body_span.start_byte:] if known else None,
+                 "summary_changed": old_summary != updated.summary if known else None}
         # Capture both complete versions before replacing source bytes, as the
         # Pattern Register already does. A capture is not a commit receipt; a
         # failed publication returns its actual current source, never success.
