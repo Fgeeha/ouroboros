@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
 import pathlib
 import stat
 from dataclasses import asdict, dataclass, field
@@ -328,16 +329,12 @@ def _iter_payload_files(
     manifest_scripts: Optional[List[Dict[str, Any]]] = None,
     include_control_files: bool = False,
 ) -> List[pathlib.Path]:
-    """Return files hashed for review freshness.
+    """List review payload files without traversing excluded cache directories.
 
-    The hash covers every regular runtime-reachable file under ``skill_dir``
-    except metadata/cache paths, lifecycle control files
-    (``HASH_EXEMPT_CONTROL_FILENAMES``), and symlink escapes. Manifest entry
-    points are re-added only when confined, keeping executable and reviewed
-    surfaces aligned. ``include_control_files=True`` reproduces the legacy
-    pre-v6.31 hash (control files included) for one-shot state migration.
-    Sensitive-looking filenames refuse ordinary loading; Cyber includes them
-    in the same byte hash and review pack rather than silently omitting them.
+    Confined manifest entries are re-added even under excluded directories.
+    Native lifecycle markers are omitted unless ``include_control_files`` requests
+    their legacy pre-v6.31 hash. Sensitive filenames refuse ordinary loading;
+    Cyber includes them in the byte hash and review pack.
     """
     out: List[pathlib.Path] = []
     seen: set[pathlib.Path] = set()
@@ -363,10 +360,7 @@ def _iter_payload_files(
         except (ValueError, FileNotFoundError, NotADirectoryError):
             return
 
-    # Broad walk: everything runtime-reachable, minus metadata/cache names.
-    # Every candidate is resolved back under skill_dir so symlinks cannot leak
-    # outside files into reviewer prompts. Sensitive-path policy is shared with
-    # repo review.
+    # Confinement and the shared sensitive-path policy still cover every candidate.
     from ouroboros.tools.review_helpers import (
         _SENSITIVE_EXTENSIONS,
         _SENSITIVE_NAMES,
@@ -386,7 +380,11 @@ def _iter_payload_files(
         return False
 
     if resolved_root.is_dir():
-        for path in sorted(resolved_root.rglob("*")):
+        paths = []
+        for parent, dirs, files in os.walk(resolved_root, topdown=True, followlinks=False):
+            dirs[:] = [name for name in dirs if name not in _SKILL_DIR_CACHE_NAMES]
+            paths.extend(pathlib.Path(parent) / name for name in files)
+        for path in sorted(paths):
             if not path.is_file():
                 continue
             try:
