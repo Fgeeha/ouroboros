@@ -145,7 +145,8 @@ def test_exact_edit_preserves_other_knowledge_and_reports_its_delta(tmp_path):
     assert change["mode"] == "edit" and change["old_content"] == original.text
     assert change["new_content"] == updated.text
     assert change["delta"] == {"old_chars": len(original.text), "new_chars": len(updated.text),
-                                "change_chars": len(updated.text) - len(original.text), "removed_headings": []}
+                                "change_chars": len(updated.text) - len(original.text), "removed_headings": [],
+                                "body_changed": True, "summary_changed": False}
     assert json.loads(reply.split("\n", 1)[1])["knowledge_delta"] == change["delta"]
 
 
