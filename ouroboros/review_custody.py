@@ -951,7 +951,6 @@ def _settle_review_attempt(
         if _ACTIVE.get(entry.key) is entry:
             if custody_lost:
                 _NO_RESEND.setdefault(entry.key, entry.operation_id)
-            _ACTIVE.pop(entry.key, None)
         # API transport errors may retry after settlement. A delegated session
         # has already spent its one run even when it settled as an error.
         pending = getattr(usage_ctx, "_review_pending_invocations", None)
@@ -1065,6 +1064,11 @@ def _settle_review_attempt(
         except Exception:
             log.debug("late review result event failed", exc_info=True)
     result_queue.put(actor)
+    # A settled actor is collectable, but its worker still owns publication.
+    # Siblings must not close the operation before durable notice/retry custody.
+    with _ACTIVE_LOCK:
+        if _ACTIVE.get(entry.key) is entry:
+            _ACTIVE.pop(entry.key, None)
     release_review_operation(entry)
 
 

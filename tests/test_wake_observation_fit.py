@@ -87,6 +87,46 @@ def test_a_route_switch_before_any_response_is_measured_again(tmp_path, monkeypa
     assert [event["after_overflow"] for event in events] == [False]
 
 
+@pytest.mark.parametrize('overflow', [False, True])
+def test_failed_cross_family_fallback_projects_each_actual_candidate(main_call, monkeypatch, overflow):
+    from ouroboros import context, fallback_cooldown
+    from ouroboros.context_fit import extract_plain_text_from_content
+
+    ctx, gateway, _controller, _events, _decide, _observations = main_call
+    targets = ['claudexor::claude=claude-test', 'claudexor::gemini=gemini-test']
+    monkeypatch.setenv('OUROBOROS_MODEL_FALLBACKS', ','.join(targets))
+    monkeypatch.setattr(fallback_cooldown, 'is_cooling_down', lambda *_args: False)
+    monkeypatch.setattr(fallback_cooldown, 'attempts_per_model', lambda: 1)
+    monkeypatch.setattr(loop, '_run_main_reclaim', lambda *_args, **_kwargs: None)
+    route_evidence = context._context_fit_route
+    def capacity(task, **kwargs):
+        route, evidence = route_evidence(task, **kwargs)
+        evidence.window_tokens = 500_000 if overflow and task['model'] == targets[0] else 120_000
+        return route, evidence
+    monkeypatch.setattr(context, '_context_fit_route', capacity)
+    ctx.messages[:] = [ctx.context_fit_plan.messages_for('max')[0], {'role': 'user', 'content': FULL}]
+    ctx.max_retries = ctx.attempt_cap = 1
+    ctx.tools._ctx.task_metadata = {'wake_observation': deepcopy(WAKE)}
+    failure = result(outcome='failed', problem={'code': 'invalid_request', 'message': 'fixture failure',
+                                               'context': {'httpStatus': 400}})
+    too_long = result(outcome='failed', problem={'code': 'provider_failed', 'message': 'too long', 'context': {
+        'httpStatus': 400, 'vendorCode': 'context_length_exceeded', 'parameter': 'input'}})
+    gateway.results = [failure, *([too_long] if overflow else []), failure, result()]
+    gateway.dispatch = ['response_received'] * len(gateway.results)
+    assert loop._call_round_model(ctx)[0] is None  # large primary sends full input and fails
+    answer, *_rest = loop._run_cross_model_fallback_chain(
+        llm=ctx.llm, ctx=ctx.tools._ctx, tools=ctx.tools, messages=ctx.messages,
+        active_model=ctx.active_model, active_use_local=False, tool_schemas=[], active_effort='medium',
+        max_retries=1, drive_logs=ctx.drive_logs, task_id=ctx.task_id, round_idx=1,
+        event_queue=ctx.event_queue, accumulated_usage=ctx.accumulated_usage, task_type='task',
+        emit_progress=lambda _text, **_kwargs: None,
+        context_fit_plan=ctx.context_fit_plan, active_context_mode='max')
+    assert answer is not None
+    sent = [extract_plain_text_from_content(payload['messages'][1]['content']) for payload, _key in gateway.uploads]
+    assert sent == [FULL, *([FULL] if overflow else []), PROJECTION, PROJECTION]
+    assert extract_plain_text_from_content(ctx.messages[1]['content']) == PROJECTION
+
+
 def test_a_grown_tool_set_before_any_response_is_measured_again(tmp_path, monkeypatch):
     _record_events(monkeypatch)
     small = FULL[:120_000]

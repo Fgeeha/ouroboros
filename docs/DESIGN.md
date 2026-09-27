@@ -870,7 +870,7 @@ The quota row offers automatic continuation, initially enabled, and shows a
 known reset time or an explicit unknown. An authentication row instead offers
 the existing Accounts sign-in flow. Both can open Settings, retry explicitly,
 or use the shared model-role editor to choose a replacement model/account.
-The replacement affects the named waiting role until the task ends; an unchecked
+The replacement affects the named waiting role until its task or review operation ends; an unchecked
 "Also save this role in Settings" checkbox separately requests persistence.
 Fallback Local remains shared by its Settings group. Changing Local for one
 waiting fallback makes the replacement task-only: the persistence checkbox is
@@ -888,8 +888,8 @@ clock, and calendar deadlines stay fixed.
 A submitted action is shown as pending until the task reports its application.
 A saved Settings change and a still-pending task change are disclosed separately.
 Retries preserve the original request identity and payload. Revisioned rows reject
-older observations, resolved episodes never reopen, and a terminal task removes
-all wait actions. A mailbox delivery failure keeps Retry request available for
+older observations and resolved episodes never reopen. Terminal authors retain
+exact live paid-review controls without reviving author status; other waits end. A mailbox delivery failure keeps Retry request available for
 that same accepted command, even while its application remains pending. The
 current task attempt selects live actions; a previous attempt's retained pause
 never makes a new working attempt appear to wait. Updates and history rebuilds preserve the same keyed editor,

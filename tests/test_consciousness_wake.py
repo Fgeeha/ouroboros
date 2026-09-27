@@ -348,6 +348,27 @@ def test_unfinished_and_malformed_lines_are_gaps_not_silence(tmp_path):
     assert [line.rsplit('"', 2)[-2] for line in _lines(second)] == ["unfinished"]
 
 
+@pytest.mark.parametrize('rotate', [False, True])
+def test_first_partial_line_survives_completion_after_accepted_wake(tmp_path, rotate):
+    path = _chat(tmp_path)
+    raw = json.dumps(_owner('old timestamp, newly complete', T0 - 100, cmid='partial'))
+    path.write_text(raw[:-1], encoding='utf-8')
+    first = wake.observe_wake(tmp_path, boundary=None, since=T0 - 500, now=T0)
+    assert not first.events and first.boundary['upper'] == 0
+    with path.open('a', encoding='utf-8') as handle:
+        handle.write('}\n')
+    if rotate:
+        archive = tmp_path / 'archive'
+        archive.mkdir()
+        path.rename(archive / 'chat_2027-01-15.jsonl')
+        path.write_text('', encoding='utf-8')
+    second = wake.observe_wake(tmp_path, boundary=first.boundary, since=T0 + 10, now=T0 + 100)
+    assert len(second.events) == 1 and 'newly complete' in second.full_text()
+    assert second.window['basis'] == 'accepted_boundary' and not second.gaps
+    third = wake.observe_wake(tmp_path, boundary=second.boundary, since=T0 + 110, now=T0 + 200)
+    assert third.events == ()
+
+
 def test_human_input_is_classified_by_producer_provenance(tmp_path):
     since = T0 - 3600
     presence_chat = 2 ** 41

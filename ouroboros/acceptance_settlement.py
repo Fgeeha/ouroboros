@@ -170,6 +170,7 @@ def announce_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[str,
         write_task_message(pathlib.Path(usage_ctx.drive_root), acceptance_settlement_message(request, wave),
                            task_id, source_task_id=task_id, provenance="system", review_feedback=source)
     except Exception:
+        _unpublished(task_id, str(getattr(request, "retry_key", "") or ""), "unpublished")
         log.warning("Acceptance settlement delivery failed for %s", task_id, exc_info=True)
 
 
@@ -645,6 +646,12 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
                 "settled_at": str(late.get("settled_at") or ""), "reviewed_revision": late.get("reviewed_revision"),
                 "reviewed_is_emitted": late.get("reviewed_is_emitted"),
                 "source_ref": panel.get("applied_source_ref") or {}}
+    if evidence["source_ref"].get("path"):
+        from ouroboros.artifacts import task_artifact_dir_path
+
+        source_path = task_artifact_dir_path(root, task_id) / evidence["source_ref"]["path"]
+        evidence["read"] = {"tool": "read_file", "arguments": {
+            "root": "runtime_data", "path": source_path.relative_to(root).as_posix(), "start_line": 1}}
     # The operation outlives the execution drive; replay belongs to the same
     # canonical root as its publication and the supervisor's delivery registry.
     outcome = enqueue_terminal_delivery_outcome(root, {

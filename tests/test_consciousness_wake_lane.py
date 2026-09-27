@@ -185,7 +185,7 @@ def test_the_bound_source_survives_handoff_and_cleanup_for_a_read_file_consumer(
     observation = wake.observe_wake(tmp_path, boundary=None, since=0.0, now=1_900_000_000.0)
     receipt = workers.handle_wake_direct(
         1, "the complete wake text", dict(WAKE_META), on_finished=lambda tid, ok: finished.append(ok),
-        bind_input=lambda task: wake.bind_wake_observation(tmp_path, task, observation, lambda events: events))
+        bind_input=lambda task: seen.update(boundary=wake.bind_wake_observation(tmp_path, task, observation, lambda events: events)))
     assert receipt["admitted"] is True and _wait_for(lambda: bool(finished)) and finished == [True]
     task_id = receipt["task_id"]
     assert get_direct_activity_registry().get(task_id) is None  # the turn's registration is gone
@@ -199,6 +199,12 @@ def test_the_bound_source_survives_handoff_and_cleanup_for_a_read_file_consumer(
     after = _read_file(later, **durable["source"]["read"]["arguments"])
     assert event_line in after and f"lines 1–{durable['source']['lines']} of {durable['source']['lines']}" in after
     assert seen["task"]["text"] == "the complete wake text"
+    later_observation = wake.observe_wake(tmp_path, boundary=seen['boundary'], since=1_900_000_000.0,
+                                          now=1_900_000_600.0)
+    assert later_observation.window['transitions_basis'] == 'accepted_inventory'
+    assert not later_observation.gaps
+    assert not any(kind == 'owner_message' for kind, _offset, _line in later_observation.events)
+    assert 'owner words' not in later_observation.full_text()  # accepted input is not replayed
 
 
 def test_a_failed_observation_binding_keeps_the_complete_text_as_the_only_input(monkeypatch, tmp_path):

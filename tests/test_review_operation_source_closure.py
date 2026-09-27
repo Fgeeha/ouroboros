@@ -129,6 +129,37 @@ def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypat
         assert (receipt["text"], receipt["chat_id"]) == (emitted, 42)
         assert receipt["basis"] == "send_handler_returned"  # producer evidence, not a human-read receipt
 
+        # The ordinary next owner turn also receives an exact readable source,
+        # even with consciousness disabled and the author drive already removed.
+        from supervisor import message_bus
+        from ouroboros.context import build_recent_sections
+        from ouroboros.memory import Memory
+        from ouroboros.tools.core_file_tools import _read_file
+        from ouroboros.tools.tool_context import ToolContext
+
+        monkeypatch.setattr(message_bus, 'DATA_DIR', canonical)
+        monkeypatch.setattr(message_bus, 'load_state', lambda: {'bg_consciousness_enabled': False})
+        bridged = []
+        monkeypatch.setattr(message_bus, 'get_bridge', lambda: SimpleNamespace(
+            send_message=lambda *args, **kwargs: bridged.append((args, kwargs))))
+        monkeypatch.setattr('ouroboros.projects_registry.list_reserved_projects', lambda _root: [
+            {'id': 'room', 'name': 'Room', 'chat_id': 42, 'lifecycle': 'active'}])
+        notice = notices[0]
+        message_bus.send_with_budget(42, notice['text'], task_id=task_id, role='system',
+                                     system_type=notice['system_type'], progress_meta=notice['progress_meta'])
+        durable = json.loads((canonical / 'logs' / 'chat.jsonl').read_text().splitlines()[-1])
+        assert durable['late_evidence'] == notice['progress_meta']['late_evidence']
+        assert bridged and len(checkpoints) == 1
+        for room in (1, 42):
+            context = '\n'.join(build_recent_sections(Memory(canonical), None, task_id='next-owner', thread_chat_id=room))
+            assert 'source-author' in context and panel['applied_source_ref']['sha256'] in context
+            evidence = json.loads(context.split('[Late review evidence: ', 1)[1].splitlines()[0][:-1])
+            assert evidence['reviewed_revision'] == ('delivered' if emitted == 'answer A' else 'different')
+            consumer = ToolContext(repo_dir=repo, drive_root=canonical, task_id='next-owner', task_metadata={})
+            retained = _read_file(consumer, **evidence['read']['arguments'], max_lines=2000)
+            assert 'answer A' in retained and 'Original critique of A' in retained
+            assert late['emitted_answer']['delivered'][0]['source_ref']['sha256'] in retained
+
         # Settlement itself launches no cognition. A later explicitly admitted
         # wake receives the fact and can open the original subject and critique.
         from ouroboros import agent as agent_module, consciousness_wake as wake

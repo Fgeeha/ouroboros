@@ -254,6 +254,12 @@ class BackgroundConsciousness:
                 daily_usd=window.get("limit_usd") or 0.0, running=self._running_roots(),
                 max_tasks=get_consciousness_max_tasks(), interval=self._interval(), events=events)
 
+        accepted_boundary = None
+
+        def bind_input(task):
+            nonlocal accepted_boundary
+            accepted_boundary = bind_wake_observation(self._drive_root, task, observation, render)
+
         # Check-and-register under the lane's own re-entrant gate lock: atomic with the census.
         with workers._repo_writer_gate_lock:
             wake, owner_live = self.live_turns()
@@ -262,7 +268,7 @@ class BackgroundConsciousness:
                 return "wake_live" if wake else "owner_turn_live"
             receipt = workers.handle_wake_direct(
                 chat_id, render(observation.full_text()), metadata, on_finished=self._wake_finished,
-                bind_input=lambda task: bind_wake_observation(self._drive_root, task, observation, render))
+                bind_input=bind_input)
         if not receipt.get("admitted"):
             why = str(receipt.get("reason") or "refused")
             self._last_wake_outcome, self._last_skip_at = f"rejected:{why}", now  # an event never undoes this backoff below the floor
@@ -281,9 +287,8 @@ class BackgroundConsciousness:
         # Accepted: the running wake owns this observation, so the next one starts
         # after it. A refused launch above consumed nothing; a crash before this
         # write replays the same window (at-least-once, never a silent skip).
-        if observation.boundary is not None:
-            self._set_state(OBSERVATION_STATE_KEY, {**observation.boundary, "task_id": self._last_wake_task_id,
-                                                    "captured_at": observation.captured_at})
+        if accepted_boundary is not None:
+            self._set_state(OBSERVATION_STATE_KEY, accepted_boundary)
         self._record("consciousness_wake_started", task_id=self._last_wake_task_id, wake_reason=reason,
                      level=level, root_cost_ceiling_usd=ceiling)
         return "launched"

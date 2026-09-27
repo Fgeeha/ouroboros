@@ -204,11 +204,22 @@ class _ChatChain(JsonlChainSnapshot):
     """
 
     def first_line_sha256(self, index: int) -> str:
-        """First-line identity of one segment, the name a boundary sits in ("" when empty)."""
-        from ouroboros.utils import jsonl_generation_signature
+        """Hash only a committed first nonempty line within this captured segment."""
+        from ouroboros.utils import jsonl_chain_handles
 
         base, end = self.segment(index)
-        return "" if end <= base else str(jsonl_generation_signature(self.entries[index][0]).get("first_line_sha256") or "")
+        if base < end:
+            with jsonl_chain_handles(self.path, strict=True, start_offset=base, snapshot=self.snapshot) as handles:
+                remaining = end - base
+                while remaining:
+                    raw = handles[0][1].readline(remaining)
+                    if not raw.endswith(b"\n"):
+                        return ""
+                    remaining -= len(raw)
+                    first = raw.decode("utf-8", errors="replace").strip()
+                    if first:
+                        return hashlib.sha256(first.encode("utf-8", errors="replace")).hexdigest()
+        return ""
 
     def rows(self, index: int, lower: int, gaps: set) -> Tuple[List[Tuple[int, Dict[str, Any]]], int]:
         """``([(offset, row)], end of the last complete line)`` of one segment from ``lower``."""
@@ -247,7 +258,9 @@ def _boundary_segment(chain: _ChatChain, boundary: Any) -> Optional[int]:
         if base == seg_start and upper <= end:
             expected = str(boundary.get("segment_sha256") or "")
             actual = chain.first_line_sha256(index)
-            return index if not expected or expected == actual else None
+            # A zero-byte boundary never committed that segment's first line;
+            # legacy cursors may have fingerprinted its then-unfinished bytes.
+            return index if upper == base or not expected or expected == actual else None
     return None
 
 
@@ -519,6 +532,7 @@ _TRANSITION_BASIS = {
     "time_bootstrap": "no accepted inventory yet, transitions stamped since the last wake",
     "partial_inventory_upgrade": "old inventory covered only open tasks; unseen identities replayed once",
     "unreadable_task_results": "unreadable, the accepted inventory is kept for the next wake",
+    "unreadable_transition_source": "unknown: accepted inventory source unreadable; boundary unchanged",
 }
 
 
@@ -594,7 +608,8 @@ class WakeObservation:
 
     def source_bytes(self) -> bytes:
         header = {"kind": "wake_observation", "captured_at": self.captured_at, "window": self.window,
-                  "gaps": list(self.gaps), "composition": self.counts(), "trigger": self.trigger}
+                  "gaps": list(self.gaps), "composition": self.counts(), "trigger": self.trigger,
+                  "boundary": self.boundary}
         rows = [header] + [{"kind": kind, "chat_offset": offset, "line": line} for kind, offset, line in self.events]
         rows += [{"kind": "outstanding_card", "line": line} for line in self.outstanding]
         return ("\n".join(json.dumps(row, ensure_ascii=False, sort_keys=True) for row in rows) + "\n").encode("utf-8")
@@ -621,6 +636,28 @@ def observe_wake(drive_root: Any, *, boundary: Any, since: float, now: float, re
 
     root, gaps = pathlib.Path(drive_root), set()
     accepted = boundary if isinstance(boundary, dict) else {}
+    prior = accepted.get("transitions")
+    source_unreadable = False
+    if isinstance(prior, dict) and "source_ref" in prior:
+        from ouroboros.artifacts import read_actor_source_bytes
+
+        try:
+            ref = prior["source_ref"]
+            raw = read_actor_source_bytes(root, ref["task_id"], ref)
+            header = json.loads(raw.splitlines()[0])
+            stored = header["boundary"]
+            inventory = stored["transitions"]
+            if (header.get("kind") != "wake_observation" or header.get("captured_at") != accepted.get("captured_at")
+                    or any(stored.get(key) != accepted.get(key) for key in _CHAT_BOUNDARY_KEYS)
+                    or inventory.get("version") != TRANSITIONS_VERSION
+                    or not isinstance(inventory.get("inventory"), dict)
+                    or any(not isinstance(keys, list) or not all(isinstance(key, str) for key in keys)
+                           for keys in inventory["inventory"].values())):
+                raise ValueError("wake source does not match accepted boundary")
+            prior = inventory
+        except Exception as exc:
+            source_unreadable = True
+            gaps.add(f"unreadable_transition_source: {type(exc).__name__}")
     try:
         rows, scanned = list_task_results(root, strict=True), True
     except Exception as exc:  # a disclosed gap beats a missing wake
@@ -629,11 +666,13 @@ def observe_wake(drive_root: Any, *, boundary: Any, since: float, now: float, re
     results = {str(row.get("task_id") or ""): row for row in rows}
     transitions = {task_id: _transition_facts(row) for task_id, row in results.items()}
 
-    if scanned:
+    if source_unreadable:
+        fresh, known, state, basis = {}, set(), None, "unreadable_transition_source"
+    elif scanned:
         fresh, known, state, basis = _transitions_since(
-            transitions, accepted.get("transitions"), since=since, scan_at=now)
+            transitions, prior, since=since, scan_at=now)
     else:  # nothing was read: the accepted state stays, so the next wake finds the same transitions
-        fresh, known, state, basis = {}, set(), accepted.get("transitions"), "unreadable_task_results"
+        fresh, known, state, basis = {}, set(), prior, "unreadable_task_results"
     try:
         chat_rows, window = _chat_window(root, accepted or None, since, gaps)
     except Exception as exc:
@@ -697,34 +736,44 @@ def observe_wake(drive_root: Any, *, boundary: Any, since: float, now: float, re
     return WakeObservation(
         trigger=trigger, events=tuple(events),
         outstanding=tuple(line for _stamp, line in sorted(cards, reverse=True)),
-        window=window, gaps=tuple(sorted(gaps)), captured_at=_iso(now), boundary=state_to_accept or None)
+        window=window, gaps=tuple(sorted(gaps)), captured_at=_iso(now),
+        boundary=None if source_unreadable else state_to_accept or None)
 
 
 def bind_wake_observation(drive_root: Any, task: Dict[str, Any], observation: WakeObservation,
-                          render: Any) -> None:
+                          render: Any) -> Optional[Dict[str, Any]]:
     """Store the whole observation under the registered wake and name its projection.
 
     Runs after the wake is registered and before its thread starts. The task's
     text stays the complete observation (the original host input); the stored
     source and the overview message only let the context fit deliver it by
-    reference when it cannot fit (``loop_model_call``). A store failure leaves
-    the complete input as the only delivery.
+    reference when it cannot fit (``loop_model_call``). Only exact source readback
+    permits accepting a compact boundary. Failure leaves full input and no advance.
     """
     from ouroboros.consolidator import retain_memory_source
+    from ouroboros.artifacts import read_actor_source_bytes
     from types import SimpleNamespace
 
     metadata = task.setdefault("metadata", {})
+    accepted = None
     facts: Dict[str, Any] = {"captured_at": observation.captured_at, "window": observation.window,
                              "composition": observation.counts(), "gaps": list(observation.gaps)}
     try:
         data = observation.source_bytes()
         source = retain_memory_source(SimpleNamespace(drive_root=drive_root, task_id=str(task["id"])),
                                       "wake_observation", data, extension="jsonl")
+        if read_actor_source_bytes(drive_root, str(task["id"]), source) != data:
+            raise ValueError("wake source readback mismatch")
         source = {**source, "lines": data.count(b"\n")}
         facts.update(source=source, projection_text=render(observation.overview_text(source)))
+        if observation.boundary is not None and (observation.boundary.get("transitions") or {}).get("version") == TRANSITIONS_VERSION:
+            accepted = {key: observation.boundary[key] for key in _CHAT_BOUNDARY_KEYS if key in observation.boundary}
+            accepted.update(transitions={"version": TRANSITIONS_VERSION, "source_ref": source},
+                            task_id=str(task["id"]), captured_at=observation.captured_at)
     except Exception as exc:
         facts["source_error"] = f"{type(exc).__name__}: {exc}"
     metadata[WAKE_OBSERVATION_KEY] = facts
+    return accepted
 
 
 def render_wake_message(repo_dir: Any, *, reason: str, last_wake_at: float, now: float, level: Any,

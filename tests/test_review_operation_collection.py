@@ -59,6 +59,96 @@ def _ctx(root):
                            task_metadata={}, pending_events=[], event_queue=queue.Queue())
 
 
+@pytest.mark.parametrize('failure', ['refused', 'raised'])
+def test_settlement_publication_holds_operation_until_retry_duty_is_durable(tmp_path, monkeypatch, failure):
+    from ouroboros import acceptance_settlement as settlement, model_wait, review_custody
+    from ouroboros.review_projection import publish_acceptance_checkpoint
+    from supervisor import terminal_delivery
+    from tests.test_review_operation_lifetime import until
+
+    gates = {key: threading.Event() for key in ('a', 'b', 'a_publish', 'b_publish')}
+    a_settled, b_publishing, a_released = threading.Event(), threading.Event(), threading.Event()
+    ctx, calls = _ctx(tmp_path), []
+    write_task_result(tmp_path, TASK, 'running', chat_id=3)
+    request = ReviewRequest(surface='task_acceptance', task_id=TASK, subject='answer A', goal='goal',
+                            retry_key='publication-race', policy={'min_successful_slots': 2},
+                            drain_deadline=time.monotonic())
+    slots = [ReviewSlot(slot_id=key, model=key, timeout_sec=30) for key in ('a', 'b')]
+
+    class Held:
+        def chat(self, model, **kwargs):
+            calls.append(model)
+            assert gates[model].wait(10)
+            return {'content': PASS}, {'prompt_tokens': 1, 'completion_tokens': 1}
+
+    emit, announce, release = review_custody._emit_operation, settlement.announce_acceptance_settlement, review_custody.release_review_operation
+
+    def hold_a(*args, **kwargs):
+        if kwargs['slot'].slot_id == 'a' and kwargs['phase'] == 'finished':
+            a_settled.set()
+            assert gates['a_publish'].wait(10)
+        return emit(*args, **kwargs)
+
+    def hold_b(*args, **kwargs):
+        b_publishing.set()
+        assert gates['b_publish'].wait(10)
+        return announce(*args, **kwargs)
+
+    def released(entry):
+        release(entry)
+        if entry.actor.slot_id == 'a':
+            a_released.set()
+
+    monkeypatch.setattr(review_custody, '_emit_operation', hold_a)
+    monkeypatch.setattr(settlement, 'announce_acceptance_settlement', hold_b)
+    monkeypatch.setattr(review_custody, 'release_review_operation', released)
+    operation = None
+    try:
+        with model_wait.task_model_wait_scope(task={'id': TASK, 'chat_id': 3, '_attempt': 1},
+                                             drive_root=tmp_path, event_queue=ctx.event_queue, worker_slot_held=False):
+            first = run_review_request(request, slots=slots, drive_root=tmp_path, usage_ctx=ctx, llm=Held())
+        operation = next(op for op in review_operation._LIVE.values() if op.task_id == TASK)
+        run = {**dataclasses.asdict(first), 'authority': 'host_root', 'binding_hash': 'b' * 64}
+        publish_acceptance_checkpoint(ctx, {'review_runs': [run]}, task_id=TASK)
+        write_task_result(tmp_path, TASK, 'completed', chat_id=3, result='answer B')
+        gates['a'].set()
+        assert a_settled.wait(5)
+        gates['b'].set()
+        assert b_publishing.wait(5)
+        gates['a_publish'].set()
+        assert a_released.wait(5)
+        assert not operation.closed, 'final publication still owns the paid operation'
+        # Rejoin observes the same paid actors without buying another call.
+        again = run_review_request(request, slots=slots, drive_root=tmp_path, usage_ctx=ctx, llm=Held())
+        assert [a['operation_id'] for a in again.actors] == [a['operation_id'] for a in first.actors]
+        assert sorted(calls) == ['a', 'b']
+        with monkeypatch.context() as fault:
+            if failure == 'refused':
+                fault.setattr(terminal_delivery, 'register_pending_delivery', lambda *a, **kw: False)
+            else:
+                fault.setattr(terminal_delivery, 'enqueue_terminal_delivery_outcome',
+                              lambda *a, **kw: (_ for _ in ()).throw(OSError('outbox unavailable')))
+            gates['b_publish'].set()
+            until(lambda: operation.closed)
+            until(lambda: load_task_result(tmp_path, TASK)['review_operations'][operation.owner_id]['state'] == 'unpublished')
+        before = load_task_result(tmp_path, TASK)['review_projection']['panels'][0]['late_settlement']
+        ctx.event_queue = queue.Queue()
+        settlement._LATE_UNPUBLISHED.discard((TASK, request.retry_key))
+        monkeypatch.setattr('supervisor.workers.get_event_q', lambda: ctx.event_queue)
+        report = review_operation.recover_orphaned_acceptance_operations(tmp_path)
+        assert report['settled'][0]['status'] == 'announced', report
+        stored = load_task_result(tmp_path, TASK)
+        assert stored['review_operations'][operation.owner_id]['state'] == 'collected'
+        assert stored['review_projection']['panels'][0]['late_settlement'] == before
+        assert [row['delivery_id'] for row in list(ctx.event_queue.queue)] == ['acceptance-late:publication-race']
+        assert sorted(calls) == ['a', 'b']
+    finally:
+        for gate in gates.values():
+            gate.set()
+        if operation:
+            until(lambda: operation.closed)
+
+
 def _session_run(slot_id="s", operation_id="op-session", controller=None):
     request = ReviewRequest(surface="task_acceptance", task_id=TASK, goal="goal", subject="reviewed answer A",
                             evidence={"requirement": "exact"}, retry_key="wave-session")
@@ -176,6 +266,49 @@ def test_proven_existing_run_is_read_attach_only_and_parsed_locally(tmp_path, fo
     else:
         assert actor["parse_status"] == "parse_unavailable" and not actor.get("semantic_verdict")
     assert not acceptance_run_pending(result)
+
+
+@pytest.mark.parametrize('telemetry', ['observed', 'missing', 'wrong_run', 'duplicate_attempt'])
+def test_cold_collection_preserves_only_final_attempt_identity(tmp_path, forbid_effects, monkeypatch, telemetry):
+    from ouroboros.review_projection import publish_acceptance_checkpoint
+
+    final = tmp_path / 'run' / 'final'
+    final.mkdir(parents=True)
+    last = {'attempt_id': 'a02', 'harness_id': 'actual-harness',
+            'observed_model': 'actual-model', 'profile_id': 'actual-profile'}
+    record = {'run_id': 'wrong' if telemetry == 'wrong_run' else 'run-live', 'final_attempt_id': 'a02',
+              'attempts': [{'attempt_id': 'a01', 'harness_id': 'prior-harness', 'observed_model': 'prior-model'}, last]}
+    if telemetry == 'duplicate_attempt':
+        record['attempts'].append(last)
+    if telemetry != 'missing':
+        (final / 'telemetry.yaml').write_text(json.dumps(record), encoding='utf-8')
+    detail = {'summary': {'state': 'succeeded', 'runDir': str(final.parent), 'model': 'request-echo'},
+              'primaryOutput': {'text': PASS, 'truncated': False}}
+    calls = _observe(monkeypatch, detail)
+    _started(tmp_path, run_id='run-live')
+    run = _session_run()
+    run['slot_roster'][0].update(model='codex=requested-model', session_target='codex=requested-model')
+    result = collect_task_acceptance_run(run, drive_root=tmp_path, usage_ctx=_ctx(tmp_path))
+    actor = result.actors[0]
+    usage = actor['usage']
+    assert actor['parsed']['verdict'] == 'PASS'
+    expected = telemetry == 'observed'
+    assert usage['resolved_model'] == ('actual-model' if expected else '')
+    assert usage['applied_profile'] == ('actual-profile' if expected else '')
+    assert usage['delegated_route'] == ('actual-harness' if expected else '')
+    assert usage['observed_attempt'] == ({'attempt_id': 'a02', 'harness_id': 'actual-harness',
+                                          'model': 'actual-model', 'profile_id': 'actual-profile'} if expected else {})
+    reasons = {delta['reason'] for delta in usage['capability_delta']}
+    assert reasons == ({'session_ran_off_pinned_route', 'session_route_resolves_its_own_model'} if expected
+                       else {'session_route_observation_unavailable'})
+    write_task_result(tmp_path, TASK, 'completed')
+    published = {**dataclasses.asdict(result), 'authority': 'host_root', 'binding_hash': 'c' * 64}
+    publish_acceptance_checkpoint(_ctx(tmp_path), {'review_runs': [published]}, task_id=TASK)
+    projected = load_task_result(tmp_path, TASK)['review_projection']['panels'][0]['actors'][0]
+    assert projected['model'] == ('actual-model' if expected else '')
+    assert projected['executions'] == ([{'kind': 'harness', 'harness_id': 'actual-harness', 'model': 'actual-model'}]
+                                       if expected else [{'kind': 'harness'}])
+    assert calls == [('handshake',), ('get_run', 'run-live'), ('close',)]
 
 
 def test_a_run_still_in_flight_stays_deferred_and_is_never_cancelled(tmp_path, forbid_effects, monkeypatch):

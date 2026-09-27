@@ -151,7 +151,7 @@ def _review_actor_projection(actor: Any, surface: str) -> Dict[str, Any]:
     reason = reason or error or ("Reviewer response was malformed or absent." if not valid else "")
     if awaiting:
         reason = _AWAITING_REASON
-    model = str(usage.get("resolved_model") or row.get("model") or "")
+    model = str(usage.get("resolved_model", row.get("model")) or "")
     provider = str(usage.get("provider") or row.get("provider") or "")
     if not provider:
         provider = _sub().provider_for_model(model) if model else "unknown"

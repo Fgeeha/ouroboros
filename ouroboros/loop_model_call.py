@@ -1104,12 +1104,17 @@ def _project_wake_input(ctx: _RoundModelCallContext, *, overflowed: bool = False
         projected = bool(measurement is not None and measurement.capacity_total_tokens is not None
                          and measurement.estimated_input_tokens + measurement.response_reserve_tokens + clock
                          > measurement.capacity_total_tokens)
-    if projected == bool(getattr(tool_ctx, "_wake_input_projected", False)):
+    from ouroboros.context_fit import extract_plain_text_from_content
+
+    desired = delivery if projected else full
+    # Cross-family fallbacks copy the transcript, then restore it on failure.
+    # Projection belongs to THESE bytes, never a flag on the shared tool context.
+    if extract_plain_text_from_content(ctx.messages[index].get("content")) == extract_plain_text_from_content(desired.get("content")):
         return False
     ctx.messages[index] = delivery if projected else copy.deepcopy(full)
     invalidate_task_cache_splits(ctx.task_id)
     _loop().seal_task_transcript(ctx.messages)
-    tool_ctx.messages, tool_ctx._wake_input_projected = ctx.messages, projected
+    tool_ctx.messages = ctx.messages
     _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
         "checkpoint_kind": "wake_input_by_source" if projected else "wake_input_inline",
         "round": ctx.round_idx, "after_overflow": overflowed,

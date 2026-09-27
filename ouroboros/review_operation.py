@@ -3,7 +3,7 @@
 A reviewer panel released at the dispatch barrier outlives the author turn that
 bought it. The panel therefore owns ONE model-wait owner shared by its drain and
 its workers (its own union and per-slot quota clocks, its own owner controls),
-closed only when its last physical worker settles — never when the author's
+closed only after settlement publication duties are durable — never when the author's
 scope closes. Explicit calendar deadlines, the task's money and root lineage and
 the task's Stop/Panic stay binding; the author's own execution-lifetime scopes
 do not (``model_wait.operation_wait_scope``). A caller that joins a panel whose
@@ -272,7 +272,7 @@ class ReviewOperation:
         self.maybe_close()
 
     def maybe_close(self) -> None:
-        """Close once every joined drain returned AND no physical worker is live."""
+        """Close after drains, workers and their settlement publication duties finish."""
         from ouroboros.review_custody import operation_has_live_workers
 
         with _LOCK:
@@ -338,7 +338,8 @@ def review_operation_scope(*, request: Any, slots: List[Any], usage_ctx: Any,
     operation of this process binds THAT operation (its controller, clocks and
     scopes); otherwise a new operation owns exactly the slots it will send, and
     a task-acceptance checkpoint that cannot be retained and read back refuses
-    those sends. No task wait owner in context (collection, or a dispatch
+    those sends. All request sources must already be canonical before entry: the
+    checkpoint serializes ``asdict(request)``. No task wait owner in context (collection, or a dispatch
     without a task frame) binds nothing.
     """
     from ouroboros.model_wait import current_model_wait, operation_wait_scope
@@ -742,7 +743,7 @@ def _observe_delegated_review(root: Any, request: Any, slot: Any, row: dict, ope
     if record is not None and record.get("state") == "started" and record.get("run_id") and (
             str(record.get("task_id") or "") == str(request.task_id or "")
             and str(record.get("operation_id") or operation_id) == operation_id):
-        observed = _attach_only_run(root, request, slot, operation_id, str(record["run_id"]))
+        observed = _attach_only_run(root, request, slot, operation_id, str(record["run_id"]), record)
         return (observed, COLLECTED) if observed is not None else (_frozen_actor(row, slot), DEFERRED)
     if not controller_known:
         return _frozen_actor(row, slot), DEFERRED
@@ -762,7 +763,7 @@ def _observe_delegated_review(root: Any, request: Any, slot: Any, row: dict, ope
         "and it is never re-posted.")), UNAVAILABLE
 
 
-def _attach_only_run(root: Any, request: Any, slot: Any, operation_id: str, run_id: str) -> Any:
+def _attach_only_run(root: Any, request: Any, slot: Any, operation_id: str, run_id: str, invocation: dict) -> Any:
     """Read one existing run: authenticated protocol handshake, GET run, GET output, local parse.
 
     The handshake is the engine's non-generative protocol negotiation (an HTTP
@@ -772,7 +773,8 @@ def _attach_only_run(root: Any, request: Any, slot: Any, operation_id: str, run_
     from ouroboros import delegate_custody as custody
     from ouroboros.claudexor_daemon import read_owned_gateway
     from ouroboros.review_dispatch import review_operation_binding
-    from ouroboros.review_execution import _full_session_text
+    from ouroboros.review_execution import _full_session_text, session_identity_deltas
+    from ouroboros.gateways.claudexor import final_attempt_facts
     from ouroboros.review_records import ReviewActorRecord
     from ouroboros.review_verdict_extraction import canonicalize_session_verdict
     from ouroboros.triad_review import default_output_contract, review_output_shape
@@ -799,6 +801,17 @@ def _attach_only_run(root: Any, request: Any, slot: Any, operation_id: str, run_
             log.debug("attach-only gateway close failed", exc_info=True)
     usage = {"provider": "claudexor", "delegated_run_started": True, "delegated_run_id": run_id,
              "collection": "attach_only_observation", "cost": None, "run_state": state}
+    observed = final_attempt_facts(detail, run_id)
+    # Requested identity comes only from this paid invocation, never live settings
+    # or the summary's request echoes. Absent final-attempt facts stay unknown.
+    routes = (invocation.get("request") or {}).get("harnesses") or []
+    requested_route = str(routes[0]) if len(routes) == 1 else ""
+    usage.update(resolved_model=observed.get("model", ""), observed_attempt=observed,
+                 delegated_route=observed.get("harness_id", ""), requested_route=requested_route,
+                 applied_profile=observed.get("profile_id", ""))
+    usage["capability_delta"] = session_identity_deltas(slot, {
+        "model": usage["resolved_model"], "route_id": requested_route,
+        "effective_route_ids": [usage["delegated_route"]] if usage["delegated_route"] else []})
     binding = review_operation_binding(request, slot, operation_id)
     if state != "succeeded":
         return ReviewActorRecord(slot_id=slot.slot_id, model=slot.model, status="error", usage=usage,
