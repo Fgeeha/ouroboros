@@ -463,6 +463,10 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
             return _publish_tool_result(ctx, ToolResult(
                 status="unavailable", code="CAPABILITY_UNAVAILABLE",
                 text=f"⚠️ CAPABILITY_UNAVAILABLE: FOLLOWUP_REFUSED: {exc.status}: {exc}"))
+        except OSError as exc:
+            return _publish_tool_result(ctx, ToolResult(
+                status="unavailable", code="CAPABILITY_UNAVAILABLE",
+                text=f"⚠️ CAPABILITY_UNAVAILABLE: FOLLOWUP_NOTIFY_OUTCOME_UNKNOWN: schedule write failed ({type(exc).__name__}); inspect the schedule id {record['id']} before retrying."))
         timing = f"once at/after {trigger['run_at']}" if trigger["type"] == "once" else f"recurring cron {cron} ({timezone or 'system local time'})"
         audit = str(stored.get("audit") or "")
         note = "" if audit == "recorded" else f" AUDIT_INCOMPLETE: durable row, audit={audit or 'unknown'}."

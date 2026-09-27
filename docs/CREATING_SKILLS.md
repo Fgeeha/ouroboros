@@ -872,22 +872,23 @@ plain; `key` (at most 128) identifies a deferred reminder for update or
 cancellation. An immediate `/notify` call is **not** server-idempotent: after a
 lost response its outcome is unknown, and repeating the same key may deliver a
 second web/Telegram notice. Do not retry an ambiguous immediate response
-blindly. `403` is a missing grant, `429` the 60-per-minute lane, `503` a failed
-durable write or a schedule audit the host could not record (use the returned
-status to distinguish a definite refusal from an unknown outcome), `409` a
+blindly. `403` is a missing grant, `429` the 60-per-minute lane, `503` an unconfirmed append or schedule write (inspect the returned status;
+`outcome_unknown` is not a safe retry), `409` a
 keyed row that belongs to another skill. A cancel whose delete landed but whose
 audit outcome was lost answers `200 {ok: false, cancelled: true, status: "changed_audit_incomplete"}` —
 the row is gone, do not retry.
 
-A deferred reminder is the same request with a time: `"at": "<ISO 8601
-instant>"` (once) or `"cron": "<5-field>"` plus optional `"timezone"`, answered
+A deferred reminder adds `"at": "<ISO 8601 instant>"` (once) or `"cron":
+"<5-field>"` plus optional `"timezone"`. A naive `at` combined with
+`timezone` is refused; put the offset in `at`. Success answers
 `200 {ok, scheduled: true, id, next_run_at}` (`ok: false` there means the row is
 stored but its audit outcome could not be recorded — no retry needed). The host
 stores a `kind: "notify"` row in the one schedule table (visible under Activity
 → Scheduled, where the owner can disable or delete it) and the supervisor tick
 fires it at its instant without a model — a reminder whose instant passed while
-Ouroboros was off fires once on the next tick, like any one-shot, and a crash
-between the durable receipt and the table write can replay one occurrence. With a `key`
+Ouroboros was off fires on the next tick, like any one-shot. The table consumes
+the occurrence before the outbound append: a crash can lose one alert, but
+cannot replay it automatically. Inspect the row and events before re-arming. With a `key`
 the row is yours to move: the same key posted again replaces its time and
 text (a one-shot that already fired needs a new `at` — the same instant answers
 `400 consumed_not_rearmed`); `{"key": ..., "cancel": true}` removes it (`404` when there is no such

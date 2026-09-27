@@ -1138,6 +1138,51 @@ def test_notify_never_appends_if_the_table_cannot_record_the_attempt(tmp_path, m
     assert queue.list_scheduled_tasks(tmp_path)["tasks"][0]["enabled"] is True
 
 
+def test_task_claim_before_due_notify_is_admitted_before_notify_precommit(tmp_path, monkeypatch):
+    """A notify precommit cannot strand an earlier task claim in the table if
+    a later write fails before that task's out-of-lock admission."""
+    queue, pending = _queue(tmp_path)
+    queue.upsert_scheduled_task({
+        "id": "task-first", "name": "one task", "source": "task_followup", "enabled": True,
+        "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
+        "task": {"type": "task", "text": "Admit me first", "chat_id": 1,
+                 "metadata": {"resource_intent": {"kind": "system_repo"}}},
+    })
+    queue.upsert_scheduled_task(_notify_row("notify-second"))
+    from supervisor import queue_schedules
+
+    real_write = queue_schedules._write_scheduled_tasks
+
+    def fail_before_write(*_a, **_kw):
+        raise OSError("table unavailable before rename")
+
+    monkeypatch.setattr(queue_schedules, "_write_scheduled_tasks", fail_before_write)
+    queue.check_scheduled_tasks()
+    assert pending == []
+    assert [r for r in _events(tmp_path) if r.get("type") == "owner_notification"] == []
+    assert not queue.list_scheduled_tasks(tmp_path)["tasks"][0].get("occurrence")
+    monkeypatch.setattr(queue_schedules, "_write_scheduled_tasks", real_write)
+    queue.check_scheduled_tasks()
+    assert len(pending) == 1 and pending[0]["text"] == "Admit me first"
+    assert [r for r in _events(tmp_path) if r.get("type") == "owner_notification"] == []
+    queue.check_scheduled_tasks()
+    assert len([r for r in _events(tmp_path) if r.get("type") == "owner_notification"]) == 1
+
+
+def test_followup_notify_write_oserror_is_not_a_scheduled_success(tmp_path, monkeypatch):
+    from supervisor import queue
+
+    ctx = _ctx(tmp_path)
+
+    def unavailable(*_a, **_kw):
+        raise OSError("disk unavailable")
+
+    monkeypatch.setattr(queue, "upsert_scheduled_task", unavailable)
+    result = _followup(ctx, notify=True, objective="Call mother")
+    assert "FOLLOWUP_NOTIFY_OUTCOME_UNKNOWN" in result
+    assert not result.startswith("FOLLOWUP_SCHEDULED")
+
+
 def test_notify_row_projects_its_text_as_the_model_preview_and_audits_its_kind(tmp_path):
     queue, _pending = _queue(tmp_path)
     queue.upsert_scheduled_task(_notify_row("n-view", text="Dentist at 9"))

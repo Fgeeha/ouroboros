@@ -786,11 +786,10 @@ def _fire_owner_notification(record: Dict[str, Any],
     """Persist one due ``kind: "notify"`` row's notification: ``(row, "")`` when
     fired, ``(None, why)`` when not.
 
-    The durable append happens here, under the table lock the tick already
-    holds (a local file write, like a task row's result); the topic publish is
-    the caller's, after the lock. The frame key carries the due instant, so a
-    recurring or re-armed reminder rings on every occurrence while a crash
-    replay of the same occurrence still collapses on the client.
+    The caller has already persisted consumption under the table lock before
+    this append; a crash cannot replay this occurrence. Topic publication runs
+    after the lock. The frame key includes the due instant so the NEXT cron
+    occurrence or an explicitly re-armed reminder keeps a distinct identity.
     """
     import hashlib
 
@@ -813,7 +812,7 @@ def _fire_owner_notification(record: Dict[str, Any],
         )
     except ValueError as exc:
         return None, f"invalid notification: {exc}"
-    return row, ("" if row is not None else "notification log write failed; retrying")
+    return row, ("" if row is not None else "notification log write failed; outcome unknown, no automatic retry")
 
 
 def check_scheduled_tasks() -> None:
@@ -933,6 +932,11 @@ def check_scheduled_tasks() -> None:
                     continue
 
             if notify_row:
+                # A task claim must reach its own admission seam outside this
+                # lock before a notification precommit can persist the table.
+                # Otherwise a later failed write could strand a claimed task.
+                if claims:
+                    continue
                 if _notify_source_silenced(str(record.get("source") or ""), silenced_sources):
                     continue
                 due_at = _parse_schedule_time(trigger.get("run_at"), tz) if trigger_type == "once" else next_run
@@ -968,9 +972,9 @@ def check_scheduled_tasks() -> None:
                     record["next_run_at"] = successor.isoformat()
                 try:
                     if _write_scheduled_tasks(data) is False:
-                        write_failed = True
-                        break
+                        raise OSError("notification occurrence precommit returned no receipt")
                 except OSError:
+                    log.error("Notification occurrence not confirmed; no outward append", exc_info=True)
                     write_failed = True
                     break
                 occurrences._FRESH_CLAIMS.difference_update(retired_claims)
@@ -1006,8 +1010,10 @@ def check_scheduled_tasks() -> None:
             data["tasks"], changed = kept, True
         if changed and not write_failed:
             try:
-                write_failed = _write_scheduled_tasks(data) is False
+                if _write_scheduled_tasks(data) is False:
+                    raise OSError("scheduler table write returned no receipt")
             except OSError:
+                log.error("Scheduled-task table write not confirmed; holding new claims", exc_info=True)
                 write_failed = True
             if not write_failed:
                 occurrences._FRESH_CLAIMS.difference_update(retired_claims)
