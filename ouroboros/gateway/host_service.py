@@ -26,6 +26,7 @@ from ouroboros.contracts.chat_id_policy import A2A_CHAT_ID_MAX, A2A_CHAT_ID_MIN,
 from ouroboros.event_bus import get_global_event_bus
 from ouroboros.config import WS_RELAY_BURST, WS_RELAY_REFILL_PER_SEC
 from ouroboros.gateway._helpers import run_sync_to_completion
+from ouroboros.server_control import dispatch_accepted_restart
 from ouroboros.gateway.files import store_chat_upload
 from ouroboros.presence_delivery import (
     DELIVERY_VERSION, PresenceDeliveryConflict, PresenceDeliveryRecorder,
@@ -575,12 +576,13 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                 try:
                     _, rejoined = await run_sync_to_completion(
                         accept_local_message, bridge, ctx.data_dir, text,
-                        retain_inputs=pending_uploads.pop_all, **message,
+                        retain_inputs=pending_uploads.pop_all,
+                        dispatch=functools.partial(dispatch_accepted_restart, bridge), **message,
                     )
                 except ValueError as exc:
                     return _json_error(str(exc), 409)
             else:
-                bridge.enqueue_local_message(text, **message)
+                dispatch_accepted_restart(bridge, text, **message)
                 pending_uploads.pop_all()
         if not wait_for_response:
             if rejoined:

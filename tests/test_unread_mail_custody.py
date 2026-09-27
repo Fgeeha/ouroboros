@@ -357,7 +357,7 @@ def _staged(tmp_path: Path, drive: Path, count: int, prefix: str) -> list:
 def test_an_acknowledged_owner_row_with_line_separators_keeps_its_inputs_through_drive_gc(tmp_path, count):
     """R1: every mailbox reader splits rows on "\\n" only (``owner_mailbox.mailbox_lines``). Owner
     text holding a literal U+2028/U+2029 that was delivered and acknowledged is no unread capture,
-    so the copy-back promotion alone carries its follow-up inputs: it reads that row whole (inline
+    so the background retention carries its follow-up inputs: it reads that row whole (inline
     and >25-row manifest alike) and the canonical store keeps the files after the drive goes."""
     data = tmp_path / "data"
     drive = headless.prepare_task_drive(data, TASK, "empty")
@@ -371,6 +371,8 @@ def test_an_acknowledged_owner_row_with_line_separators_keeps_its_inputs_through
     write_task_result(drive, TASK, "completed", result="done")
 
     copied = headless.copy_child_task_result(data, {"id": TASK, "drive_root": str(drive)})
+    assert copied["child_ref_promotion"]["status"] == "incomplete" and drive.exists()
+    copied = headless.retry_child_task_refs(data, drive, TASK)
     assert copied["child_ref_promotion"]["status"] == "complete"
     report = headless.prune_headless_task_drives(data, retention_days=1, now=4_000_000_000, live=lambda _task: False)
     assert [row["task_id"] for row in report["pruned"]] == [TASK] and not drive.exists()

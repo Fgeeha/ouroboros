@@ -739,8 +739,7 @@ def read_actor_source_bytes(
     if ref.get("root") != "artifact_store":
         raise ValueError("actor source ref has an unexpected root")
     rel = pathlib.PurePosixPath(str(ref.get("path") or ""))
-    valid_path = bool(rel.parts and rel.parts[0] == _SOURCE_HANDLES_SUBDIR)
-    if not valid_path or rel.is_absolute():
+    if not rel.parts or rel.parts[0] != _SOURCE_HANDLES_SUBDIR or rel.is_absolute():
         raise ValueError("actor source ref has an invalid path")
     base = task_artifact_dir_path(drive_root, task_id, create=False).resolve(strict=False)
     target = base.joinpath(*rel.parts)
@@ -749,8 +748,9 @@ def read_actor_source_bytes(
     try:
         target = target.resolve(strict=True)
         target.relative_to(base)
-    except FileNotFoundError as exc:
-        raise FileNotFoundError(f"actor source unavailable: {rel.as_posix()}") from exc
+    except FileNotFoundError:
+        from ouroboros.source_retention import read_retained_task_source
+        return read_retained_task_source(drive_root, task_id, ref)
     except ValueError as exc:
         raise ValueError("actor source ref escapes its task artifact root") from exc
     raw = target.read_bytes()

@@ -715,6 +715,24 @@ def merge_review_projection(previous: Any, incoming: Any) -> Any:
     """
     if not isinstance(previous, dict) or not isinstance(incoming, dict):
         return incoming
+    # A stale child snapshot cannot revoke the outbox's accepted duty. This
+    # receipt union is independent of reviewer authority and panel ordering,
+    # including legacy unstamped projections; one delivery id never migrates
+    # to another panel through a merge.
+    notices = {}
+    for source in (previous, incoming):
+        for delivery_id, receipt in (source.get("late_notice_receipts") or {}).items():
+            if not isinstance(receipt, dict):
+                continue
+            prior = notices.get(delivery_id)
+            def rank_notice(value):
+                revision = value.get("publication_revision")
+                return (value.get("custody") == "terminal_outbox", revision if type(revision) is int else 0)
+            if prior and (prior.get("panel_id") != receipt.get("panel_id") or rank_notice(prior) >= rank_notice(receipt)):
+                continue
+            notices[delivery_id] = copy.deepcopy(receipt)
+    if notices:
+        incoming = {**incoming, "late_notice_receipts": notices}
     old_rows, new_rows = previous.get("panels"), incoming.get("panels")
     if not isinstance(old_rows, list) or not isinstance(new_rows, list):
         return incoming

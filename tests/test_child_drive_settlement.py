@@ -270,6 +270,8 @@ def test_an_unadopted_terminal_child_result_waits_for_copy_back(tmp_path):
     settled = load_task_result(data, TASK)
     # A settled canonical row keeps its own outcome; the child's is recorded beside it.
     assert (settled["status"], settled["result"], settled["child_status"]) == ("failed", "orphan reconciled", "completed")
+    assert _settle(data, drive)["reason"] == "child_refs_pending"
+    headless.retry_child_task_refs(data, drive, TASK)
     assert _settle(data, drive)["status"] == "removed"
 
 
@@ -285,6 +287,8 @@ def test_a_timeout_retry_occupying_the_original_drive_keeps_it_until_its_own_cus
     write_task_result(data, retry, "completed", result="retry answer")
     assert _settle(data, drive)["reason"] == "child_result_unadopted"
     headless.copy_child_task_result(data, {"id": retry, "drive_root": str(drive)})
+    assert _settle(data, drive)["reason"] == "child_refs_pending"
+    headless.retry_child_task_refs(data, drive, retry)
     assert _settle(data, drive)["status"] == "removed"
 
 
@@ -596,6 +600,7 @@ def test_a_copy_back_between_preparation_and_publication_is_seen_by_the_revision
     task = {"id": TASK, "drive_root": str(drive)}
     headless.copy_child_task_result(data, task)
     assert load_task_result(data, TASK)["status"] == "completed"
+    headless.retry_child_task_refs(data, drive, TASK)
     real = task_custody._child_store_plan
 
     def plan_then_republish(*args, **kwargs):
@@ -607,6 +612,7 @@ def test_a_copy_back_between_preparation_and_publication_is_seen_by_the_revision
     monkeypatch.setattr(task_custody, "_child_store_plan", plan_then_republish)
     assert _settle(data, drive)["reason"] == "canonical_changed" and drive.is_dir()
     monkeypatch.undo()
+    headless.retry_child_task_refs(data, drive, TASK)
     assert _settle(data, drive)["status"] == "removed"
     row = next(item for item in load_task_result(data, TASK)["artifacts"] if item.get("relpath") == "reports/a/summary.txt")
     assert Path(row["path"]).read_text(encoding="utf-8") == "alpha v2"
@@ -675,6 +681,8 @@ def test_copy_back_and_settlement_share_one_publication_lock(tmp_path, monkeypat
     assert not artifacts.task_artifact_dir_path(data, TASK).exists()
 
     headless.copy_child_task_result(data, task)
+    assert _settle(data, drive)["reason"] == "child_refs_pending"
+    headless.retry_child_task_refs(data, drive, TASK)
     assert _settle(data, drive)["status"] == "removed"
     settled = load_task_result(data, TASK)
     assert headless.copy_child_task_result(data, task) is None  # the drive is gone: nothing to publish
@@ -728,6 +736,7 @@ def test_inputs_that_cannot_be_carried_keep_the_drive(tmp_path, monkeypatch):
     promotion mark."""
     data, drive, store = _nested_child(tmp_path)
     headless.copy_child_task_result(data, {"id": TASK, "drive_root": str(drive)})
+    headless.retry_child_task_refs(data, drive, TASK)
     assert load_task_result(data, TASK)["child_ref_promotion"]["status"] == "complete"
     manifest = _attached(data, drive, 1, msg_id="late")  # after the promotion completed
     staged = Path(manifest[0]["abs_path"])
@@ -870,6 +879,9 @@ def test_pure_custody_relocation_keeps_the_child_result_identity(tmp_path):
     write_task_result(data, TASK, "completed", result="done", child_drive_root=str(drive))
     headless.copy_child_task_result(data, {"id": TASK, "drive_root": str(drive)})
     before = _child_result_sha256(load_effective_task_result(data, TASK))
+    assert _settle(data, drive)["reason"] == "child_refs_pending"
+    headless.retry_child_task_refs(data, drive, TASK)
+    assert _child_result_sha256(load_effective_task_result(data, TASK)) == before
     assert _settle(data, drive)["status"] == "removed"
     after_view = load_effective_task_result(data, TASK)
     assert _child_result_sha256(after_view) == before
@@ -892,6 +904,7 @@ def test_a_mutable_child_edit_after_copy_back_is_published_not_lost(tmp_path):
     child's CURRENT bytes, never agreeing metadata: B publishes beside A, then the drive goes."""
     data, drive, store = _nested_child(tmp_path)
     headless.copy_child_task_result(data, {"id": TASK, "drive_root": str(drive)})
+    headless.retry_child_task_refs(data, drive, TASK)
     canonical = artifacts.task_artifact_dir_path(data, TASK)
     (store / "reports/a/summary.txt").write_text("ALPHA", encoding="utf-8")  # same length, no re-registration
 
@@ -913,6 +926,7 @@ def test_a_missing_mutable_source_is_held_only_by_agreeing_recorded_digests(tmp_
     digest-less canonical row is convenient metadata, not preserved proof."""
     data, drive, store = _nested_child(tmp_path)
     headless.copy_child_task_result(data, {"id": TASK, "drive_root": str(drive)})
+    headless.retry_child_task_refs(data, drive, TASK)
     rel = "reports/a/summary.txt"
     child_rows = load_task_result(drive, TASK)["artifacts"]
     if claim == "stale_child_claim":
@@ -1312,7 +1326,9 @@ def test_a_close_inside_the_ref_retry_walk_promotes_nothing_more_and_keeps_its_e
     for record in records:
         Path(record["path"]).write_text("changed", encoding="utf-8")
     copied = headless.copy_child_task_result(data, {"id": TASK, "drive_root": str(drive)})
-    assert len(copied["child_ref_promotion"]["pending_refs"]) == 3
+    pending = copied["child_ref_promotion"]["pending_refs"]
+    assert len([ref for ref in pending if ref.get("kind") != "history_retention_deferred"]) == 3
+    assert any(ref.get("kind") == "history_retention_deferred" for ref in pending)
     for record, name in zip(records, ("one", "two", "three")):
         Path(record["path"]).write_text(f"report {name}", encoding="utf-8")
     before = load_task_result(data, TASK)

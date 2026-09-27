@@ -1029,42 +1029,39 @@ and what enforces each.
   `cost_ceiling_disclosure` its text uses; tool error manifests carry their typed code
   and redacted reason preview. Observation links, not new accounting or zero-price
   rules.
-- Hash source identity before history-dependent budgeting; review recording changes
-  no reviewed fact. `review_projection.publish_acceptance_checkpoint` retains full
-  runs before compact publication (ARCHITECTURE §10: ordering, CURRENT-basis copy-back,
-  same-store reuse; §6: readers). Copy/hash before the short artifact-manifest lock;
-  never take a result lock inside it. `source_handles/context_checkpoints` belongs to
-  neither deliverables nor acceptance manifests. Terminal refs keep explicit chat 0;
-  disclose missing sources, never reconstruct previews. Capacity, publication order
-  and paid identity stay separate. Test stale/child snapshots, live downloads and
-  persisted readers after merge/cleanup. Memos reuse verified work only, never failures.
-- Mirror a split root's actual execution start and child-drive binding into its
-  canonical result through the existing terminal-preserving writer.
-  Recover a legacy missing binding only from positive known-child start evidence
-  plus the existing fresh-queue/later-worker orphan proof, never while pending or
-  actively cancelled and never as permission to resume execution.
-- Pooled terminal file preparation belongs to `headless.prepare_terminal_task_files`
-  at the worker's task_done boundary — after blocking post-task work, before the slot
-  is released; earlier answer/metrics delivery stays early (ARCHITECTURE §5 "Supervisor
-  Loop"). No I/O exception or lost event authorizes model replay; never persist
+- Hash identity before history budgeting; recording changes no reviewed fact.
+  Retain full review runs before compact publication (ARCHITECTURE §10). Copy/hash
+  before the short artifact lock; never take a result lock inside it. Context
+  checkpoints are neither deliverables nor acceptance manifests. Keep explicit
+  chat0, disclose missing sources, never reconstruct previews. Test stale/child
+  snapshots, downloads and reads after cleanup. Worklists retain compact identities
+  and failures per operation; repeated edges cannot turn deduplicated failure into
+  success. New operations retry durable sources. Capacity, publication order and
+  paid identity stay separate.
+- Mirror actual split-root execution start/binding into the canonical result through
+  its terminal-preserving writer. Recover legacy bindings only from positive child
+  start plus existing queue/worker orphan proof, never while pending/cancelled and
+  never as permission to resume.
+- `headless.prepare_terminal_task_files` adopts answer, output files and receipt
+  union after blocking post-work, before worker task_done/slot release. Earlier
+  answer/metrics stay early; bulk history belongs to off-loop pending-ref custody.
+  I/O failure or a lost event never authorizes model replay; do not persist
   `terminal_source_present` as an anchor.
-- Health owns terminal-file preparation/recovery; the existing reaper owns queue
-  execution and deferred-job replay on the health cadence (ARCHITECTURE §5 "Supervisor
-  Loop"). Preserve worker/meta/task/attempt/root identity across off-lock operations;
-  the normal terminal event owner keeps queue release and project/evolution hooks — no
-  separate crash executor; crash terminals withdraw their captured RUNNING owner before
-  emission; cancel checks file readiness before source removal; deferred timeout jobs
-  keep their original binding so old recovery cannot kill, requeue or replace a newer
-  execution.
-- Same physical observability store means verified reuse of original manifest bytes
-  and canonical path spelling — never a rewrite or native promotion marker; missing
-  aliases resolve only through the exact verified CAS/call readers (ARCHITECTURE §10
-  "Key Invariants"); no digest filenames, initial-adoption anchor or persistent
-  transfer store.
-- Pooled mailbox cleanup follows the file helper's settled-cleanup predicate; startup
-  recovers terminal child sources before the prune (ARCHITECTURE §5 "Supervisor Loop");
-  direct canonical cleanup stays direct, never races unknown prior ownership, needs no
-  saved anchor.
+- Health owns file recovery; the existing reaper owns execution/deferred-job replay
+  (ARCHITECTURE §5). Preserve worker/meta/task/attempt/root identity off-lock. The
+  normal terminal event owns queue release and project/evolution hooks, never a
+  second crash executor. Crash terminals withdraw captured RUNNING ownership before
+  emission; cancel checks file readiness before removal. Deferred timeout jobs keep
+  their binding so old recovery cannot replace a newer execution.
+- Same-store retention preserves native manifest bytes/digest without an import
+  marker. Exact readers resolve historical versions from existing CAS or retained
+  own children; never rewrite checkpoints to relocate them. GC requires task-owned
+  physical calls, including unlisted/late ones (ARCHITECTURE §10). Test nonblocking
+  adoption/startup and exact reads after removal: `test_deferred_history_retention.py`
+  and `test_checkpoint_promotion_scaling.py`. No new transfer store.
+- Mailbox cleanup follows the file helper's predicate. Startup recovers terminal
+  child sources before prune; canonical cleanup stays direct, never races unknown
+  prior ownership, and needs no saved anchor (ARCHITECTURE §5).
 - Acceptance payment follows the semantic subject and substantive disposition identity
   of ARCHITECTURE §6 "Task acceptance": source generations, read repetition or
   narration alone buy nothing; changed criteria or material evidence can, even with
