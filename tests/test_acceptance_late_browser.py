@@ -10,13 +10,15 @@ from urllib.parse import urlsplit
 
 import pytest
 
-from tests.test_acceptance_late_consumers import late, delivered, _caller, _request, _source, until, fresh_sends
-from tests.test_subscription_setup_browser import subscription_ui
+from tests.test_acceptance_late_consumers import delivered, _caller, _request, _source, until
+from tests.test_acceptance_late_consumers import late as late, fresh_sends as fresh_sends
+from tests.test_subscription_setup_browser import subscription_ui as subscription_ui
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 
 
-def test_historical_supplement_live_reload_reconnect_and_full_source(late, tmp_path, monkeypatch, request):
+@pytest.mark.usefixtures('late')
+def test_historical_supplement_live_reload_reconnect_and_full_source(tmp_path, monkeypatch, request):
     from starlette.applications import Starlette
     from starlette.routing import Route
     from starlette.testclient import TestClient
