@@ -296,6 +296,26 @@ def test_a_scheduled_post_refused_for_an_unwritable_audit_is_503(tmp_path: pathl
     assert queue.list_scheduled_tasks(tmp_path)["tasks"] == []
 
 
+def test_schedule_storage_oserror_is_typed_unknown_not_an_html_500(tmp_path: pathlib.Path, monkeypatch) -> None:
+    from supervisor import queue, schedule_lifecycle
+
+    queue.init(tmp_path)
+    client, _app = _notify_client(tmp_path)
+    headers = {"X-Skill-Token": "tok"}
+    body = {"text": "Meeting", "key": "cal:evt-storage", "at": "2999-01-01T14:45:00+00:00"}
+    assert client.post("/notify", headers=headers, json=body).status_code == 200
+
+    def unavailable(*_args, **_kwargs):
+        raise OSError("test storage failure")
+
+    monkeypatch.setattr(schedule_lifecycle, "_write_scheduled_tasks", unavailable)
+    for request in ({**body, "text": "Moved meeting"}, {"key": body["key"], "cancel": True}):
+        response = client.post("/notify", headers=headers, json=request)
+        assert response.status_code == 503
+        assert response.json() == {"ok": False, "error": "schedule storage unavailable",
+                                   "status": "outcome_unknown"}
+
+
 def test_the_agents_manage_schedules_is_the_owners_hand_on_a_skill_reminder(tmp_path: pathlib.Path) -> None:
     """Ouroboros switching a skill's reminder off at the owner's word (actor
     ``agent``, as manage_schedules calls it) leaves the same durable marker as

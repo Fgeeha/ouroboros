@@ -722,6 +722,7 @@ test('Activity shows a notify row by its sentence with the notification tag and 
     // Delete removes any reminder immediately; Disable is the durable veto.
     const armedDelete = standing[0].querySelector('[data-act="schedule-delete"]');
     assert.equal(armedDelete.dataset.notify, '1');
+    assert.equal(armedDelete.dataset.skillNotify, '1');
     assert.equal(armedDelete.dataset.suppressed, '');
     assert.equal(armedDelete.dataset.consumed, '');
     assert.equal(retained[0].querySelector('[data-act="schedule-delete"]').dataset.suppressed, '1');
@@ -733,6 +734,8 @@ test('Activity shows a notify row by its sentence with the notification tag and 
     assert.equal(scheduleDeleteDialog(armedDelete.dataset).confirmLabel, 'Delete');
     assert.match(scheduleDeleteDialog(armedDelete.dataset).body, /Use Disable instead/);
     assert.equal(scheduleDeleteDialog(retained[0].querySelector('[data-act="schedule-delete"]').dataset).title, 'Delete schedule');
+    assert.match(scheduleDeleteDialog(retained[0].querySelector('[data-act="schedule-delete"]').dataset).body, /Keep it disabled/);
+    assert.doesNotMatch(scheduleDeleteDialog({ notify: '1', skillNotify: '' }).body, /Its skill|Use Disable/);
     assert.equal(scheduleDeleteDialog(firedDelete.dataset).title, 'Delete schedule');
     assert.equal(scheduleDeleteDialog(firedDelete.dataset).body, 'Delete this schedule?');
     assert.equal(scheduleDeleteDialog({ managed: '1' }).title, 'Suppress skill schedule');

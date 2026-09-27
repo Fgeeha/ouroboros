@@ -146,6 +146,11 @@ def _schedule_owner_notification(ctx: "HostServiceContext", skill_name: str, tex
                     reason="notification cancelled by its skill")
         except ScheduleStoreUnreadable as exc:
             return _json_error(str(exc), 503)
+        except OSError:
+            # A storage failure need not prove whether the write landed. Do not
+            # invite a blind repeat that could cancel a later replacement row.
+            return JSONResponse({"ok": False, "error": "schedule storage unavailable",
+                                 "status": "outcome_unknown"}, status_code=503)
         if not outcome.get("ok") and not outcome.get("changed"):
             # The lifecycle refused (its audit could not be written): nothing
             # changed, and the skill must not read that as a cancellation.
@@ -203,6 +208,11 @@ def _schedule_owner_notification(ctx: "HostServiceContext", skill_name: str, tex
         return JSONResponse({"ok": False, "error": refusal.message, "status": refusal.status}, status_code=400)
     except ScheduleStoreUnreadable as exc:
         return _json_error(str(exc), 503)
+    except OSError:
+        # Failed filesystem I/O may follow a completed rename; the caller must
+        # inspect the keyed row instead of blindly retrying an ambiguous POST.
+        return JSONResponse({"ok": False, "error": "schedule storage unavailable",
+                             "status": "outcome_unknown"}, status_code=503)
     return JSONResponse({
         "ok": stored.get("audit") == "recorded", "scheduled": True, "id": schedule_id,
         "next_run_at": stored.get("next_run_at") or trigger.get("run_at") or "",

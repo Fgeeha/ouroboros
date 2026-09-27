@@ -55,12 +55,18 @@ function isSkillManaged(s) {
 // Disable is the separate way to prevent a skill re-posting its key.
 export function scheduleDeleteDialog(dataset) {
     const managedRow = dataset.managed === '1';
+    const skillReminder = dataset.skillNotify === '1';
+    const reminder = dataset.notify === '1' && dataset.consumed !== '1';
     return {
         title: managedRow ? 'Suppress skill schedule' : 'Delete schedule',
         body: managedRow
             ? 'This schedule is declared by an installed skill and cannot be removed; Delete keeps it suppressed until you Restore it. Suppress it?'
-            : dataset.notify === '1' && dataset.consumed !== '1'
-                ? 'Delete this reminder? Its skill may schedule the same event again. Use Disable instead if you want to prevent that.'
+            : reminder && skillReminder && dataset.suppressed === '1'
+                ? 'Delete this disabled reminder? Its skill may schedule it again. Keep it disabled to prevent that.'
+                : reminder && skillReminder
+                    ? 'Delete this reminder? Its skill may schedule the same event again. Use Disable instead if you want to prevent that.'
+                    : reminder
+                        ? 'Delete this reminder? A future request may create another one.'
                 : 'Delete this schedule?',
         confirmLabel: managedRow ? 'Suppress' : 'Delete',
         danger: true,
@@ -232,7 +238,7 @@ export function initActivity({ mount, ws } = {}) {
                 <span class="activity-sub">${sub}</span>
             </div>
             <div class="activity-row-actions">${lifecycle}
-               <button type="button" class="btn btn-xs btn-danger" data-act="schedule-delete" data-id="${id}" data-managed="${managed ? '1' : ''}" data-notify="${notify ? '1' : ''}" data-suppressed="${suppressed ? '1' : ''}" data-consumed="${consumed ? '1' : ''}">Delete</button></div>
+               <button type="button" class="btn btn-xs btn-danger" data-act="schedule-delete" data-id="${id}" data-managed="${managed ? '1' : ''}" data-notify="${notify ? '1' : ''}" data-skill-notify="${notify && origin.startsWith('skill:') ? '1' : ''}" data-suppressed="${suppressed ? '1' : ''}" data-consumed="${consumed ? '1' : ''}">Delete</button></div>
         </div>`;
     }
 
