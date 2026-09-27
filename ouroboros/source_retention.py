@@ -18,6 +18,10 @@ from contextlib import contextmanager
 from typing import Any
 
 _WALK = contextvars.ContextVar("immutable_source_retention", default=None)
+# Negative observations belong only to this maintenance process/generation.
+# They confer no completeness or GC authority and hold no decoded source bytes.
+_UNAVAILABLE_RETRIES: dict[tuple, tuple] = {}
+_RETENTION_LOG_FACTS: dict[tuple, str] = {}
 
 
 def active_walk():
@@ -99,6 +103,124 @@ def _check_open():
     fence_publication()
 
 
+def _retry_key(parent, child, task_id):
+    return (str(pathlib.Path(parent).resolve()), str(pathlib.Path(child).resolve()), str(task_id))
+
+
+def begin_retention_retries(parent, present, generation):
+    root = str(pathlib.Path(parent).resolve())
+    for key in list(_UNAVAILABLE_RETRIES):
+        if key[0] == root and (key[2] not in present or _UNAVAILABLE_RETRIES[key][0] is not generation):
+            _UNAVAILABLE_RETRIES.pop(key, None)
+    for key in list(_RETENTION_LOG_FACTS):
+        if key[0] == root and key[1] not in present:
+            _RETENTION_LOG_FACTS.pop(key, None)
+
+
+def forget_retention_retry(parent, child, task_id):
+    key = _retry_key(parent, child, task_id)
+    _UNAVAILABLE_RETRIES.pop(key, None)
+    _RETENTION_LOG_FACTS.pop((key[0], key[2]), None)
+
+
+def _path_fact(path):
+    """Cheap repair evidence includes in-place writes, not only directory changes."""
+    try:
+        stat = path.lstat()
+        return (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns, stat.st_mode)
+    except OSError as exc:
+        return (type(exc).__name__, exc.errno)
+
+
+def _unavailable_basis(parent, child, task_id, result):
+    """Observe only the task records, inventory and failed exact source candidates.
+
+    The healthy graph is not reread. Repair of any failed candidate reopens the
+    real traversal, including blob repair without a manifest-directory change.
+    Destination/write failures deliberately have no negative observation.
+    """
+    import re
+
+    parent, child = pathlib.Path(parent), pathlib.Path(child)
+    promotion = result.get("child_ref_promotion") or {}
+    unavailable, pending = promotion.get("unavailable_refs") or [], promotion.get("pending_refs") or []
+    if not unavailable or not pending or any(
+            not isinstance(row, dict) or row.get("kind") != "history_retention_deferred"
+            or row.get("reason") != "call_inventory_unavailable" for row in pending):
+        return None
+    watched = {parent / "task_results" / f"{task_id}.json", child / "task_results" / f"{task_id}.json",
+               child / "observability" / "calls" / task_id}
+    for ref in unavailable:
+        if not isinstance(ref, dict) or not ref.get("path"):
+            return None  # An unaddressed failure cannot supply repair evidence.
+        if (ref.get("reason") == "source_unreadable" and ref.get("source_error_type") not in
+                {"BadGzipFile", "EOFError", "JSONDecodeError", "UnicodeDecodeError", "ValueError"}):
+            return None  # Transient read I/O can recover without changing the file.
+        owner = str(ref.get("owner_task_id") or task_id)
+        if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", owner):
+            return None
+        digest, kind = str(ref.get("sha256") or ""), str(ref.get("kind") or "")
+        if kind == "task_source":
+            locator = pathlib.PurePosixPath(str(ref["path"]))
+            if locator.is_absolute() or ".." in locator.parts:
+                return None
+            watched.update(root / "task_results" / "artifacts" / owner / str(locator) for root in (parent, child))
+        elif re.fullmatch(r"[0-9a-f]{64}", digest) and kind in {"json", "txt", "bin"}:
+            watched.update(root / "observability" / "blobs" / f"{digest}.{kind}.gz" for root in (parent, child))
+        elif ref.get("call_id") and re.fullmatch(r"[A-Za-z0-9_.-]+", str(ref["call_id"])):
+            watched.update(root / "observability" / "calls" / owner / f"{ref['call_id']}.json" for root in (parent, child))
+            if re.fullmatch(r"[0-9a-f]{64}", digest):
+                watched.update(pathlib.Path(manifest_version_ref(root, digest)["path"]) for root in (parent, child))
+        else:
+            return None
+        original = pathlib.Path(str(ref["path"]))
+        if original.is_absolute() and any(original.is_relative_to(root) for root in (parent, child)):
+            watched.add(original)  # Never probe an arbitrary outside locator.
+    return tuple((str(path), _path_fact(path)) for path in sorted(watched))
+
+
+def unchanged_unavailable_retry(parent, child, task_id, result, *, generation):
+    key = _retry_key(parent, child, task_id)
+    previous = _UNAVAILABLE_RETRIES.get(key)
+    basis = _unavailable_basis(parent, child, task_id, result) if previous is not None else None
+    if previous is not None and previous[0] is generation and basis is not None and basis == previous[1]:
+        return True
+    _UNAVAILABLE_RETRIES.pop(key, None)
+    return False
+
+
+def remember_unavailable_retry(parent, child, task_id, result, *, generation):
+    key = _retry_key(parent, child, task_id)
+    basis = _unavailable_basis(parent, child, task_id, result)
+    if basis is not None:
+        _UNAVAILABLE_RETRIES[key] = (generation, basis)
+    else:
+        _UNAVAILABLE_RETRIES.pop(key, None)
+
+
+def log_retention_change(parent, task_id, result, *, stop=None):
+    from ouroboros.history_retention import retention_diagnostics, retention_summary
+    from ouroboros.task_custody import PublicationClosed, fence_publication, publication_fence
+    from ouroboros.utils import append_jsonl, utc_now_iso
+
+    fact = {"type": "history_retention", "task_id": task_id, **retention_summary(result),
+            "diagnostics": retention_diagnostics(result),
+            **{key: result[key] for key in ("chat_id", "project_id", "parent_task_id", "root_task_id") if key in result}}
+    key = (str(pathlib.Path(parent).resolve()), str(task_id))
+    fingerprint = json.dumps(fact, ensure_ascii=False, sort_keys=True, default=str)
+    if _RETENTION_LOG_FACTS.get(key) == fingerprint:
+        return
+    try:
+        with publication_fence(stop):
+            fence_publication()
+            if append_jsonl(pathlib.Path(parent) / "logs" / "events.jsonl", {"ts": utc_now_iso(), **fact}):
+                _RETENTION_LOG_FACTS[key] = fingerprint
+    except PublicationClosed:
+        raise
+    except OSError:
+        pass  # A failed diagnostic append is attempted again; custody stays in the result.
+
+
 class RetentionWalk:
     """One operation's compact, role/owner/destination-bound reference work."""
 
@@ -160,9 +282,17 @@ class RetentionWalk:
                 if len(raw) != int(ref["size"]) or hashlib.sha256(raw).hexdigest() != ref["sha256"]:
                     raise ValueError("observability blob ref failed size or sha256 verification")
                 return (raw, path), root
-            except (OSError, ValueError, KeyError, TypeError) as exc:
+            except (OSError, ValueError, KeyError, TypeError, EOFError) as exc:
                 failures.append(exc)
-        raise failures[-1]
+        import gzip
+
+        # A missing fallback cannot prove an earlier eligible source absent.
+        # In particular, transient I/O may recover without a metadata change.
+        transient = next((error for error in failures if isinstance(error, OSError)
+                          and not isinstance(error, (FileNotFoundError, gzip.BadGzipFile))), None)
+        if transient is not None:
+            raise transient
+        raise next((error for error in reversed(failures) if not isinstance(error, FileNotFoundError)), failures[-1])
 
     def _discover(self, payload, task_id, carrier):
         from ouroboros import observability as obs
@@ -285,10 +415,15 @@ class RetentionWalk:
         if target.exists():
             previous = target.read_bytes()
             obs.write_blob(self.parent, previous.decode("utf-8"), kind="txt")
-            if not json.loads(previous).get("promoted_call_manifest"):
+            previous_manifest = json.loads(previous)
+            if not previous_manifest.get("promoted_call_manifest"):
                 # An imported version must not hide a native seal from the
                 # monetary auditor. Its exact version is already held in CAS.
                 return {**ref, "path": str(target)}
+            if previous_manifest == projection:
+                self.state["promoted_ref_count"] += 1
+                return {"path": str(target), "call_id": ref["call_id"],
+                        "sha256": hashlib.sha256(previous).hexdigest()}
         _check_open()
         result = obs.write_call_manifest(self.parent, task_id=task, call_id=ref["call_id"], manifest=projection)
         self.state["promoted_ref_count"] += 1
@@ -303,9 +438,11 @@ class RetentionWalk:
             node = self.queue.popleft()
             try:
                 data, _source = self._read_source(node)
-            except (OSError, ValueError, TypeError, KeyError) as exc:
+            except (OSError, ValueError, TypeError, KeyError, EOFError) as exc:
                 reason = obs._task_source_failure_reason(exc) if node["kind"] == "source" else obs._promotion_source_error(exc).reason
-                obs._append_promotion_fact(self.state["unavailable_refs"], obs._promotion_fact(node["ref"], reason))
+                obs._append_promotion_fact(self.state["unavailable_refs"],
+                    obs._promotion_fact({**node["ref"], "owner_task_id": node["task_id"],
+                                         "source_error_type": type(exc).__name__}, reason))
                 node["result"] = obs._typed_unavailable_ref(node["ref"], reason)
                 node["failure"] = "unavailable"
                 continue
@@ -357,7 +494,7 @@ class RetentionWalk:
         after = directory.stat().st_mtime_ns if directory.is_dir() else None
         remaining = [key for key, node in self.nodes.items() if node["kind"] == "manifest"
                      and pathlib.Path(node["ref"]["path"]).parent == directory]
-        seen, complete = set(), inventory_ok and before == after
+        seen, complete, unavailable = set(), inventory_ok and before == after, False
         while remaining:
             _check_open()
             key = remaining.pop()
@@ -366,12 +503,15 @@ class RetentionWalk:
             seen.add(key)
             node = self.nodes[key]
             complete = complete and not node.get("failure")
+            unavailable = unavailable or node.get("failure") == "unavailable"
             remaining.extend(node["dependencies"])
         self.state["call_inventory_preserved"] = complete
         self.state["call_inventory_mtime_ns"] = after
         if not complete:
+            reason = ("call_inventory_changed" if before != after else "call_inventory_unreadable" if not inventory_ok
+                      else "call_inventory_unavailable" if unavailable else "call_inventory_pending")
             obs._append_promotion_fact(self.state["pending_refs"],
-                {"kind": "history_retention_deferred", "path": str(self.child), "reason": "call_inventory_changed"})
+                {"kind": "history_retention_deferred", "path": str(self.child), "reason": reason})
             self.state["status"] = "incomplete"
 
 

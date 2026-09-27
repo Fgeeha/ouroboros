@@ -363,6 +363,11 @@ def test_reconcile_heals_a_genuine_orphan_and_settlement_publishes_its_files(tmp
     listed = next(row for row in load_effective_task_result(data, tid)["artifacts"] if row["name"] == "report.html")
     assert pathlib.Path(listed["path"]).is_relative_to(child.resolve())  # served from where it lies
     assert not prepare_terminal_task_files(data, {"id": tid, "drive_root": str(child)})["error"]
+    assert promoted.read_text(encoding="utf-8") == "<h1>child</h1>", "deliverables precede history transfer"
+    assert settle_child_drive(data, tid, child, live=lambda _task: False)["reason"] == "child_refs_pending"
+    from ouroboros.headless import retry_child_task_refs
+
+    retry_child_task_refs(data, child, tid)
     assert settle_child_drive(data, tid, child, live=lambda _task: False)["status"] == "removed"
     assert promoted.read_text(encoding="utf-8") == "<h1>child</h1>"
     assert not child.exists()

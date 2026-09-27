@@ -11,6 +11,7 @@ Covers:
 from __future__ import annotations
 
 import time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -767,7 +768,10 @@ def _reserved_job(tmp_path, monkeypatch, *, exitcode=1, attempt=1, child=False):
 
     task = _make_task('saved-terminal', attempt=attempt)
     if child:
-        task.update(drive_root=str(tmp_path / 'child'), child_drive_root=str(tmp_path / 'child'))
+        from ouroboros.headless import prepare_task_drive
+
+        drive = prepare_task_drive(tmp_path, task['id'], 'empty')
+        task.update(drive_root=str(drive), child_drive_root=str(drive))
     worker = _make_worker(busy_task_id=task['id'], exitcode=exitcode)
     meta = {'task': task, 'attempt': attempt, 'worker_id': 0}
     W.WORKERS = {0: worker}
@@ -809,7 +813,7 @@ def test_child_terminal_survives_dead_worker_without_retry(tmp_path, monkeypatch
     from ouroboros.observability import persist_call, read_blob_ref
 
     job, events = _reserved_job(tmp_path, monkeypatch, child=True, exitcode=exitcode, attempt=3)
-    child = tmp_path / 'child'
+    child = Path(job['task']['drive_root'])
     ref = persist_call(child, task_id=job['task_id'], call_id='original-response',
                        call_type='tool_call', payload={'result': 'FULL ORIGINAL SOURCE'})
     write_task_result(child, job['task_id'], 'completed', result='Original natural answer',
@@ -821,6 +825,7 @@ def test_child_terminal_survives_dead_worker_without_retry(tmp_path, monkeypatch
     current = load_task_result(tmp_path, job['task_id'], strict=True)
     assert current['status'] == 'completed' and current['result'] == 'Original natural answer'
     assert current['accounted_upper_bound_usd'] == 1.25
+    assert current['child_ref_promotion']['pending_refs'] and child.exists()
     promoted = current['trace_refs']['tool_call_refs'][0]['redacted_projection_ref']
     assert read_blob_ref(tmp_path, promoted)['result'] == 'FULL ORIGINAL SOURCE'
     q.enqueue_task.assert_not_called()
@@ -830,6 +835,12 @@ def test_child_terminal_survives_dead_worker_without_retry(tmp_path, monkeypatch
     assert done['_files_prepared_attempt'] == 3 and done['worker_id'] == 0
     assert W.RUNNING[job['task_id']] is job['meta'], 'normal done ingress owns release'
     W.respawn_worker.assert_called_once_with(0)
+    from ouroboros.headless import remove_subagent_task_drive, retry_child_task_refs
+
+    retry_child_task_refs(tmp_path, child, job['task_id'])
+    assert remove_subagent_task_drive(tmp_path, job['task_id'], live=lambda _task: False)
+    assert not child.exists() and read_blob_ref(tmp_path, promoted)['result'] == 'FULL ORIGINAL SOURCE'
+    assert events.empty() and load_task_result(tmp_path, job['task_id'])['accounted_upper_bound_usd'] == 1.25
 
 
 def test_file_preparation_runs_without_queue_or_lifecycle_lock(tmp_path, monkeypatch):
@@ -984,13 +995,13 @@ def test_malformed_child_is_unknown_not_a_paid_retry(tmp_path, monkeypatch):
     from supervisor.task_reaper import TerminalFileRecoveryPending
 
     job, events = _reserved_job(tmp_path, monkeypatch, child=True)
-    path = tmp_path / 'child' / 'task_results' / (job['task_id'] + '.json')
-    path.parent.mkdir(parents=True)
-    path.write_text('{malformed preserved source')
+    path = Path(job['task']['drive_root']) / 'task_results' / (job['task_id'] + '.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text('{malformed preserved source', encoding='utf-8')
     monkeypatch.setattr(q, 'enqueue_task', MagicMock())
     with pytest.raises(TerminalFileRecoveryPending):
         recover_confirmed_dead_worker(job)
-    assert path.read_text() == '{malformed preserved source'
+    assert path.read_text(encoding='utf-8') == '{malformed preserved source'
     assert W.RUNNING[job['task_id']] is job['meta'] and job['worker'].reaping
     assert events.empty()
     q.enqueue_task.assert_not_called()

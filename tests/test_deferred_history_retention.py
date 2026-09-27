@@ -108,3 +108,64 @@ def test_gc_owes_unreferenced_physical_calls_including_old_and_cancelled_rows(tm
     assert not child.exists()
     manifest = observability.read_call_manifest_ref(parent, trace["manifest_ref"], task_id="history")
     assert observability.read_blob_ref(parent, manifest["full_payload_ref"]) == {"source": "exact"}
+
+
+def test_public_exact_review_reader_works_while_history_is_deferred(tmp_path):
+    from pathlib import Path
+    from ouroboros.artifacts import store_actor_source_bytes, task_artifact_dir_path
+    from ouroboros.task_finalization import review_source_reader
+    from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+    parent, task_id = tmp_path / "parent", "source-author"
+    child = headless.prepare_task_drive(parent, task_id, "empty")
+    raw = json.dumps({"authority": "host_root", "request": {
+        "surface": "task_acceptance", "task_id": task_id, "subject": "exact original"}}).encode("utf-8")
+    ref = store_actor_source_bytes(child, task_id, category="context_checkpoints", source_id="acceptance",
+                                   data=raw, extension="json")
+    write_task_result(child, task_id, "completed", result="saved", artifact_status="ready",
+                      review_projection={"panels": [{"surface": "task_acceptance", "authority": "host_root",
+                                                      "applied_source_ref": ref}]})
+    headless.copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    canonical = task_artifact_dir_path(parent, task_id, create=False) / ref["path"]
+    assert not canonical.exists()
+    registry = ToolRegistry(repo_dir=Path.cwd(), drive_root=parent)
+    registry.set_context(ToolContext(repo_dir=Path.cwd(), drive_root=parent, task_id="next-owner",
+                                    task_metadata={"budget_drive_root": str(parent)}))
+    selector = review_source_reader(task_id, ref)
+    result = registry.execute_result(selector["tool"], selector["arguments"])
+    assert result.status == "ok"
+    before = json.loads(result.text)["review_source"]
+    assert before.get("status") != "unavailable" and before["source_ref"]["sha256"] == ref["sha256"]
+    assert not canonical.exists(), "a read must not perform deferred history placement"
+    headless.retry_child_task_refs(parent, child, task_id)
+    assert settle_child_drive(parent, task_id, child, live=lambda _: False)["status"] == "removed"
+    after = registry.execute_result(selector["tool"], selector["arguments"])
+    assert json.loads(after.text)["review_source"] == before
+
+
+def test_gc_rechecks_call_inventory_after_preparation(tmp_path, monkeypatch):
+    from ouroboros import task_custody
+
+    parent, task_id = tmp_path / "parent", "late-inventory"
+    child = headless.prepare_task_drive(parent, task_id, "empty")
+    write_task_result(child, task_id, "completed", result="saved", artifact_status="ready")
+    observability.persist_call(child, task_id=task_id, call_id="first", call_type="tool_call", payload={"data": "first"})
+    headless.copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    headless.retry_child_task_refs(parent, child, task_id)
+    original = task_custody._child_store_plan
+    late = []
+    def write_during_preparation(*args, **kwargs):
+        plan = original(*args, **kwargs)
+        late.append(observability.persist_call(child, task_id=task_id, call_id="late", call_type="tool_call",
+                                              payload={"data": "late physical result"})["manifest_ref"])
+        return plan
+    with monkeypatch.context() as writing:
+        writing.setattr(task_custody, "_child_store_plan", write_during_preparation)
+        outcome = settle_child_drive(parent, task_id, child, live=lambda _: False)
+    assert outcome["status"] == "retained" and outcome["reason"] == "call_inventory_changed"
+    assert child.exists()
+    assert settle_child_drive(parent, task_id, child, live=lambda _: False)["reason"] == "call_inventory_pending"
+    headless.retry_child_task_refs(parent, child, task_id)
+    assert settle_child_drive(parent, task_id, child, live=lambda _: False)["status"] == "removed"
+    stored = observability.read_call_manifest_ref(parent, late[0], task_id=task_id)
+    assert observability.read_blob_ref(parent, stored["full_payload_ref"]) == {"data": "late physical result"}

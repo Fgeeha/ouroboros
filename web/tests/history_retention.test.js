@@ -36,6 +36,18 @@ test('retention Logs name the work and counts without minting chat messages', ()
     }
 });
 
+test('details and Logs show every grouped failure reason instead of a circular pointer', () => {
+    const history_retention = { status: 'problem', problem_reasons: [
+        { reason: 'source_missing', count: 2 }, { reason: 'OSError: disk full', count: 1 },
+    ] };
+    const detail = historyRetentionView({ history_retention });
+    const log = summarizeLogEvent({ type: 'history_retention', ...history_retention });
+    assert.equal(detail.body, log.body);
+    assert.match(log.body, /2 × source_missing\nOSError: disk full/);
+    assert.doesNotMatch(log.body, /See Logs/);
+    assert.match(historyRetentionView({ history_retention: { status: 'problem' } }).body, /No failure reason was recorded/);
+});
+
 test('Show details hydrates retention on the real finished card and live retry clears its problem', async () => {
     const id = 'history-task';
     const detail = { task_id: id, status: 'completed', history_retention: { status: 'pending' } };

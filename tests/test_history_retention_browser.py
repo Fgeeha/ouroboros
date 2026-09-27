@@ -99,11 +99,19 @@ def test_retention_details_and_problem_only_card(engine, width):
                 capture("details-pending")
                 toggle.click()
                 for status in ("problem", "complete"):
+                    detail["history_retention"] = {"status": status, "problem_reasons":
+                                                   [{"reason": "OSError: disk full", "count": 2}] if status == "problem" else []}
                     page.evaluate("""status => emit('log',{chat_id:1,data:{type:'history_retention',task_id:'history-task',status,
-                        pending_count:status==='complete'?0:1,problem_count:status==='problem'?1:0}})""", status)
+                        pending_count:status==='complete'?0:1,problem_count:status==='problem'?1:0,
+                        problem_reasons:status==='problem'?[{reason:'OSError: disk full',count:2}]:[],
+                        diagnostics:status==='problem'?{pending_refs:[{path:'retained-source',reason:'OSError: disk full'}]}:{}}})""", status)
                     if status == "problem":
                         playwright.expect(toggle).to_contain_text('History storage problem')
                         capture("collapsed-problem")
+                        toggle.click()
+                        playwright.expect(history).to_contain_text('2 × OSError: disk full')
+                        capture("details-problem")
+                        toggle.click()
                     else:
                         playwright.expect(toggle).not_to_contain_text('History storage problem')
                     playwright.expect(card.locator('[data-live-phase]')).to_have_text('Done')
@@ -112,6 +120,9 @@ def test_retention_details_and_problem_only_card(engine, width):
                 playwright.expect(page.locator('#log-entries')).to_contain_text('Task history saved')
                 playwright.expect(page.locator('#log-entries')).to_contain_text('Task history needs attention')
                 playwright.expect(page.locator('#log-entries')).to_contain_text('Saving task history')
+                playwright.expect(page.locator('#log-entries .log-body').filter(has_text='OSError: disk full')).to_contain_text('2 × OSError: disk full')
+                page.locator('.log-entry').filter(has_text='Task history needs attention').get_by_role('button', name='Raw', exact=True).click()
+                playwright.expect(page.locator('.log-raw:visible')).to_contain_text('retained-source')
                 capture("logs")
                 assert not errors
             finally:

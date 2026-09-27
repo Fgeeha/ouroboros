@@ -5,11 +5,14 @@ export function historyRetentionView(record) {
     const status = fact?.status === 'deferred' ? 'pending' : fact?.status;
     if (!['pending', 'problem', 'complete'].includes(status)) return null;
     const problem = status === 'problem';
+    const reasons = (Array.isArray(fact.problem_reasons) ? fact.problem_reasons : [])
+        .filter((row) => row && typeof row.reason === 'string' && row.reason)
+        .map((row) => `${Number.isInteger(row.count) && row.count > 1 ? `${row.count} × ` : ''}${row.reason}`).join('\n');
     return {
         status, phase: problem ? 'warn' : 'info',
         headline: problem ? 'Task history needs attention'
             : status === 'complete' ? 'Task history saved' : 'Saving task history',
-        body: problem ? 'Some task history could not be saved. See Logs for details.'
+        body: problem ? `Some task history could not be saved.\n${reasons || 'No failure reason was recorded.'}`
             : status === 'complete' ? 'Task history has been saved.'
                 : 'Task history is being saved in the background.',
         problem: problem ? 'History storage problem' : '',

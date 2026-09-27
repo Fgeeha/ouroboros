@@ -854,7 +854,7 @@ def _run_drive_custody_pass(stop_event: Any = None) -> None:
         return _stop_requested(stop_event)
 
     root = pathlib.Path(DATA_DIR)
-    report = retry_pending_child_ref_promotions(root, stop=stop) or {}
+    report = retry_pending_child_ref_promotions(root, stop=stop, generation=stop_event) or {}
     if report.get("retried") or report.get("errors"):
         log.info("Child-ref promotion retry: %s", report)
     if stop():

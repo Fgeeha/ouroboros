@@ -4,7 +4,7 @@ import threading
 
 import pytest
 from starlette.applications import Starlette
-from starlette.routing import Route
+from starlette.routing import Route, WebSocketRoute
 from starlette.testclient import TestClient
 
 pytestmark = pytest.mark.serial
@@ -37,6 +37,7 @@ def test_runtime_branch_defaults_preserve_managed_choices_and_fallback(monkeypat
 def startup_controls(tmp_path, monkeypatch):
     import server
     from ouroboros.gateway.control import api_command
+    from ouroboros.gateway.ws import ws_endpoint
     from supervisor import message_bus, state, workers, git_ops
 
     data, repo = tmp_path / 'data', tmp_path / 'repo'
@@ -53,15 +54,20 @@ def startup_controls(tmp_path, monkeypatch):
     monkeypatch.setattr(server_process, '_restart_requested', server._restart_requested)
     monkeypatch.setattr(server_process, '_owner_restart_requested', server._owner_restart_requested)
     monkeypatch.setattr(message_bus, '_BRIDGE', None)
+    monkeypatch.setattr(message_bus, 'DATA_DIR', data)
     monkeypatch.setattr(workers, 'RUNNING', {})
     for name in ('DRIVE_ROOT', 'STATE_PATH', 'STATE_LAST_GOOD_PATH', 'STATE_LOCK_PATH'):
         monkeypatch.setattr(state, name, getattr(state, name))
     for name in ('DRIVE_ROOT', 'REPO_DIR', 'REMOTE_URL', 'BRANCH_DEV', 'BRANCH_STABLE'):
         monkeypatch.setattr(git_ops, name, getattr(git_ops, name))
-    app = Starlette(routes=[Route('/api/command', api_command, methods=['POST'])])
+    app = Starlette(routes=[Route('/api/command', api_command, methods=['POST']), WebSocketRoute('/ws', ws_endpoint)])
     app.state.startup_owner_command = server._startup_owner_command
     with TestClient(app) as client:
         yield SimpleNamespace(server=server, client=client, app=app, data=data, repo=repo)
+    for thread in threading.enumerate():
+        if thread.name == 'startup-owner-restart':
+            thread.join(timeout=5)
+            assert not thread.is_alive()
 
 
 @pytest.fixture(params=['absent', 'initializing_at_admission', 'initializing_after_admission', 'dead_with_stale_bridge'])
@@ -77,8 +83,8 @@ def startup_without_consumer(startup_controls, monkeypatch, request):
         thread.start()
         monkeypatch.setattr(obj.server, '_supervisor_thread', thread)
 
-    def admit(command):
-        action = obj.server._startup_owner_command(command)
+    def admit(command, **kwargs):
+        action = obj.server._startup_owner_command(command, **kwargs)
         if request.param in {'initializing_after_admission', 'dead_with_stale_bridge'}:
             thread.start()
             monkeypatch.setattr(obj.server, '_supervisor_thread', thread)
@@ -121,8 +127,9 @@ def test_onboarding_restart_uses_existing_no_resume_flags_and_exit_signal(startu
 
 
 @pytest.mark.parametrize('thread_alive', [True, False])
+@pytest.mark.parametrize('surface', ['http', 'ws', 'ws_chat'])
 def test_restart_during_initialization_does_not_queue_to_published_bridge(
-        startup_controls, monkeypatch, thread_alive):
+        startup_controls, monkeypatch, thread_alive, surface):
     """Publishing the bridge precedes recovery; only a ready loop can consume Restart."""
     from supervisor import message_bus
     from ouroboros import server_restart
@@ -136,16 +143,23 @@ def test_restart_during_initialization_does_not_queue_to_published_bridge(
     monkeypatch.setattr(message_bus, '_BRIDGE', bridge)
     monkeypatch.setattr(server_restart, '_safe_restart_serialized', lambda *a, **kw: (True, 'ok'))
     stopped = []
-    monkeypatch.setattr(server_restart, '_stop_owned_work', lambda ctx: stopped.append(ctx.RUNNING))
+    did_stop = threading.Event()
+    monkeypatch.setattr(server_restart, '_stop_owned_work', lambda ctx: (stopped.append(ctx.RUNNING), did_stop.set()))
     if not thread_alive:
         release.set()
         thread.join(timeout=2)
         assert not thread.is_alive()
     try:
-        response = obj.client.post('/api/command', json={'cmd': '/restart'})
-        assert response.status_code == 200 and response.json() == {'status': 'ok'}
+        if surface == 'http':
+            response = obj.client.post('/api/command', json={'cmd': '/restart'})
+            assert response.status_code == 200 and response.json() == {'status': 'ok'}
+        else:
+            with obj.client.websocket_connect('/ws') as socket:
+                socket.send_json({'type': 'command', 'cmd': '/restart'} if surface == 'ws'
+                                 else {'type': 'chat', 'content': ' /ReStArT '})
+                assert did_stop.wait(3), 'Restart remained behind the initializing supervisor'
         assert stopped == [{}]
-        assert obj.server._restart_requested.is_set() and obj.server._owner_restart_requested.is_set()
+        assert obj.server._restart_requested.wait(3) and obj.server._owner_restart_requested.is_set()
         assert (obj.data / 'state/owner_restart_no_resume.flag').read_text(encoding='utf-8') == 'owner_restart'
         assert bridge.get_updates(0, timeout=0) == []
     finally:
@@ -227,6 +241,7 @@ def test_configured_commands_keep_the_existing_bus_path(startup_controls, monkey
     response = startup_controls.client.post('/api/command', json={'cmd': command})
     assert response.status_code == 200
     assert len(calls) == 1 and calls[0][0] == (command,)
+    assert calls[0][1]['task_metadata']['client_surface'] == {'channel': 'api_command'}
     assert not startup_controls.server._restart_requested.is_set()
 
 
@@ -243,8 +258,8 @@ def test_onboarding_finishing_before_background_dispatch_reuses_live_consumer(st
     monkeypatch.setattr(obj.server, '_execute_panic_stop', lambda *a: panic.append('requested'))
     monkeypatch.setattr(obj.server, '_perform_owner_restart', lambda *a: pytest.fail('duplicate direct Restart'))
 
-    def admit(cmd):
-        action = obj.server._startup_owner_command(cmd)
+    def admit(cmd, **kwargs):
+        action = obj.server._startup_owner_command(cmd, **kwargs)
         thread.start()
         monkeypatch.setattr(obj.server, '_supervisor_thread', thread)
         monkeypatch.setattr(message_bus, '_BRIDGE', bridge)
@@ -262,6 +277,7 @@ def test_onboarding_finishing_before_background_dispatch_reuses_live_consumer(st
             assert panic == ['requested'] and updates == []
         else:
             assert panic == [] and len(updates) == 1 and updates[0]['message']['text'] == command
+            assert updates[0]['message']['task_metadata']['client_surface']['channel'] == 'api_command'
         assert bridge.get_updates(0, timeout=0) == []
         assert not obj.server._restart_requested.is_set()
     finally:

@@ -1036,7 +1036,8 @@ and what enforces each.
   chat0, disclose missing sources, never reconstruct previews. Test stale/child
   snapshots, downloads and reads after cleanup. Worklists retain compact identities
   and failures per operation; repeated edges cannot turn deduplicated failure into
-  success. New operations retry durable sources.
+  success. New operations retry durable sources. Capacity, publication order and
+  paid identity stay separate.
 - Mirror actual split-root execution start/binding into the canonical result through
   its terminal-preserving writer. Recover legacy bindings only from positive child
   start plus existing queue/worker orphan proof, never while pending/cancelled and

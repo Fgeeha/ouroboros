@@ -29,6 +29,22 @@ def test_old_task_without_retention_has_no_invented_status():
     assert "history_retention" not in public_task_result({"status": "completed"})
 
 
+def test_problem_reasons_are_grouped_without_losing_raw_failure_facts():
+    from ouroboros.history_retention import retention_diagnostics
+
+    pending = [{"kind": "history_retention_deferred", "reason": "background_history_retention"},
+               {"kind": "task_source", "path": "source-a", "reason": "OSError: disk full"}]
+    unavailable = [{"kind": "blob", "path": path, "sha256": path, "reason": "source_missing"}
+                   for path in ("source-b", "source-c")]
+    stored = {"child_ref_promotion": {"schema_version": 1, "status": "incomplete",
+                                      "pending_refs": pending, "unavailable_refs": unavailable}}
+    public = public_task_result(stored)
+    assert public["history_retention"]["problem_reasons"] == [
+        {"reason": "OSError: disk full", "count": 1}, {"reason": "source_missing", "count": 2}]
+    assert retention_diagnostics(stored) == {"pending_refs": pending[1:], "unavailable_refs": unavailable}
+    assert public["child_ref_promotion"] == stored["child_ref_promotion"]
+
+
 def test_cold_history_uses_current_retention_and_clears_stale_problem(tmp_path, monkeypatch):
     from ouroboros.gateway.history import _annotate_terminal_task_truth, _copy_task_summary_metadata
     from ouroboros.terminal_projection import _project_row

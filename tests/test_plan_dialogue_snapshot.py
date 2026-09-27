@@ -238,7 +238,7 @@ def test_a_session_reviewers_room_read_rides_its_actor_row_and_the_verdict_text(
 
 
 def test_dialogue_source_survives_real_child_promotion_and_cleanup(harness):
-    from ouroboros.headless import prepare_task_drive, copy_child_task_result, remove_subagent_task_drive
+    from ouroboros.headless import prepare_task_drive, copy_child_task_result, remove_subagent_task_drive, retry_child_task_refs
     from ouroboros.task_results import write_task_result, load_plan_review_state
     from ouroboros.tools.plan_review_artifacts import authority_wave
 
@@ -259,6 +259,8 @@ def test_dialogue_source_survives_real_child_promotion_and_cleanup(harness):
         "items": [{"finding_id": "s1:note", "decision": "defer", "rationale": "Later cosmetic work"}]})
     write_task_result(child, "source", "completed")
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
+    assert copied["child_ref_promotion"]["status"] == "incomplete"
+    copied = retry_child_task_refs(parent, child, "source")
     assert copied["child_ref_promotion"]["status"] == "complete"
     assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert not child.exists()
@@ -509,6 +511,10 @@ def test_author_plan_and_historical_producer_closure_survive_copyback(harness, m
     monkeypatch.setattr(artifacts, 'read_actor_source_bytes', guard)
     write_task_result(child, task, 'completed', artifact_status='ready')
     copied = copy_child_task_result(parent, {'id': task, 'drive_root': str(child)})
+    assert copied['child_ref_promotion']['pending_refs']
+    from ouroboros.headless import retry_child_task_refs
+
+    copied = retry_child_task_refs(parent, child, task)
     assert not copied['child_ref_promotion']['pending_refs'] and not copied['child_ref_promotion']['unavailable_refs']
     assert remove_subagent_task_drive(parent, task, live=lambda _: False)
     state = load_plan_review_state(parent, task)

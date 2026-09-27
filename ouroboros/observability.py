@@ -405,15 +405,15 @@ def _blob_ref_path(drive_root: pathlib.Path, ref: dict) -> pathlib.Path:
     digest, kind = str(ref.get("sha256") or ""), str(ref.get("kind") or "")
     if not re.fullmatch(r"[0-9a-f]{64}", digest) or kind not in {"json", "txt", "bin"}:
         raise ValueError("observability blob ref has no valid sha256 or kind")
-    relative = pathlib.Path("blobs") / f"{digest}.{kind}.gz"
+    blob_relative = pathlib.Path("blobs") / f"{digest}.{kind}.gz"
     root = (pathlib.Path(drive_root) / OBSERVABILITY_DIR).resolve(strict=False)
-    local = root / relative
+    local = root / blob_relative
     if local.is_file():
         resolved = local.resolve(strict=True)
         if not resolved.is_relative_to(root):
             raise ValueError("observability ref points outside its drive")
         return resolved
-    return _ref_path(drive_root, ref, relative)
+    return _ref_path(drive_root, ref, blob_relative)
 
 
 def read_call_manifest_ref(drive_root: pathlib.Path, ref: dict, *, task_id: str) -> dict:
@@ -520,7 +520,7 @@ def _promotion_fact(ref: Any, reason: str = "") -> Dict[str, Any]:
     item = ref if isinstance(ref, dict) else {}
     fact = {
         key: item[key]
-        for key in ("kind", "call_id", "sha256", "size", "path")
+        for key in ("kind", "call_id", "sha256", "size", "path", "owner_task_id", "source_error_type")
         if item.get(key) not in (None, "")
     }
     if reason:
@@ -739,7 +739,9 @@ def _rewrite_child_ref_tree(
             original = value.get("attachment_manifest_ref")
             if _is_task_source_ref(original):
                 _promote_task_source_ref(parent_root, child_root, task_id, original, state)
-            value = retain_contract(value, child_root, parent_root, task_id, state)
+            placed = retain_contract(value, child_root, parent_root, task_id, state)
+            if not active_walk().discovering:
+                value = placed  # Only the mutable request projection rebinds addresses.
         return {
             key: _rewrite_child_ref_tree(item, parent_root, child_root,
                 source_owner(key, item, task_id), state, carrier=role)
@@ -872,7 +874,7 @@ def _retry_pending_child_ref_promotion(parent: pathlib.Path, child: pathlib.Path
 
 def retry_pending_child_ref_promotions(
     parent_drive_root: pathlib.Path,
-    *, stop: Any = None,
+    *, stop: Any = None, generation: Any = None,
 ) -> Dict[str, Any]:
     """Retry only newly ledgered pending refs, never the stale child result. ``stop()`` is
     the maintenance generation's close, asked before every item and again at each
@@ -881,50 +883,52 @@ def retry_pending_child_ref_promotions(
     from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR
     from ouroboros.task_status import SETTLED_STATUSES
     from ouroboros.task_results import load_task_result, validate_task_id
+    from ouroboros.source_retention import (
+        begin_retention_retries, forget_retention_retry, unchanged_unavailable_retry,
+        remember_unavailable_retry, log_retention_change,
+    )
 
     parent = pathlib.Path(parent_drive_root)
-    report: Dict[str, Any] = {"scanned": 0, "retried": [], "completed": [], "pending": [], "errors": [], "deferred": []}
+    report: Dict[str, Any] = {"scanned": 0, "retried": [], "completed": [], "pending": [], "errors": [], "deferred": [], "unchanged": []}
     directories = [(path, path / suffix) for base, suffix in
                    ((parent / HEADLESS_TASKS_DIR, "data"), (parent / TASK_DRIVES_DIR, ""))
                    if base.is_dir() for path in sorted(base.iterdir()) if path.is_dir()]
+    begin_retention_retries(parent, {path.name for path, _child in directories}, generation)
     for task_dir, child_root in directories:
         task_id = task_dir.name
         report["scanned"] += 1
         try:
             validate_task_id(task_id)
-            result = load_task_result(parent, task_id) or {}
-            if str(result.get("status") or "").lower() not in SETTLED_STATUSES:
-                continue
-            if not _has_pending_ref_promotion(result.get("child_ref_promotion")):
-                continue
             if stop is not None and stop():
                 report["deferred"].append(task_id)
+                continue
+            result = load_task_result(parent, task_id) or {}
+            if str(result.get("status") or "").lower() not in SETTLED_STATUSES:
+                forget_retention_retry(parent, child_root, task_id)
+                continue
+            if not _has_pending_ref_promotion(result.get("child_ref_promotion")):
+                forget_retention_retry(parent, child_root, task_id)
+                continue
+            if unchanged_unavailable_retry(parent, child_root, task_id, result, generation=generation):
+                report["unchanged"].append(task_id)
+                report["pending"].append(task_id)
+                log_retention_change(parent, task_id, result, stop=stop)
                 continue
             settled = _retry_pending_child_ref_promotion(
                 parent, child_root, task_id, result, stop=stop,
             )
             report["retried"].append(task_id)
             promotion = settled.get("child_ref_promotion") or {}
-            from ouroboros.utils import append_jsonl
-
-            from ouroboros.history_retention import retention_summary
-
-            summary = retention_summary(settled)
-            try:
-                append_jsonl(parent / "logs" / "events.jsonl", {
-                    "ts": utc_now_iso(), "type": "history_retention", "task_id": task_id,
-                    **summary,
-                    **{key: settled[key] for key in ("chat_id", "project_id", "parent_task_id", "root_task_id")
-                       if key in settled},
-                })
-            except OSError:
-                pass  # Canonical task-result custody does not depend on diagnostic Logs.
             destination = (
                 "completed"
                 if str(promotion.get("status") or "") == "complete"
                 else "pending"
             )
             report[destination].append(task_id)
+            if stop is not None and stop():
+                continue  # An attempted publication is not permission to log/cache after close.
+            remember_unavailable_retry(parent, child_root, task_id, settled, generation=generation)
+            log_retention_change(parent, task_id, settled, stop=stop)
         except Exception as exc:
             from ouroboros.task_custody import PublicationClosed
 

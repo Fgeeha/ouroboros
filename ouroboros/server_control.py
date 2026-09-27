@@ -9,6 +9,53 @@ import sys
 from typing import Any
 
 
+def external_owner_binding(state: dict) -> tuple[bool, Any, tuple[int, int]]:
+    """Ordinary commands use this current state observation, never Panic's cached pair."""
+    from supervisor.state import control_value
+
+    user_known, owner = control_value(state, "owner_external_id")
+    chat_known, chat = control_value(state, "owner_external_chat_id")
+    try:
+        pair = (int(owner or 0), int(chat or 0))
+    except (TypeError, ValueError):
+        pair = (0, 0)
+    return user_known and chat_known, owner, pair
+
+
+def dispatch_accepted_restart(bridge, text: str, *, callback=None, **message) -> None:
+    """Schedule accepted Restart after its transport captured the canonical receipt."""
+    import logging
+    import threading
+
+    callback = callback or getattr(bridge, "startup_owner_command", None)
+    if text.strip().lower() != "/restart" or not callable(callback):
+        bridge.enqueue_local_message(text, **message)
+        return
+    from ouroboros.task_finalization import host_operation_reply_kwargs
+    from supervisor.message_bus import send_with_budget
+
+    def reply(body, status=""):
+        bridge.activate_update_transport(message)
+        send_with_budget(message["chat_id"], body, role="system", system_type="command_reply",
+                         **host_operation_reply_kwargs(message.get("accepted_source_ref"), status))
+
+    identity = {key: message[key] for key in ("source", "user_id", "chat_id")}
+    action = callback(text, **identity, reply=reply,
+                      send_kwargs={key: value for key, value in message.items() if key not in identity})
+    if action is None:
+        bridge.enqueue_local_message(text, **message)
+        return
+
+    def execute():
+        try:
+            if not action():  # A changed/unknown owner uses ordinary authenticated intake.
+                bridge.enqueue_local_message(text, **message)
+        except Exception:
+            logging.getLogger(__name__).exception("Accepted startup Restart failed; its canonical receipt remains retained")
+
+    threading.Thread(target=execute, name="startup-owner-restart", daemon=True).start()
+
+
 class PanicIngress:
     """One bridge generation's emergency door, independent of ordinary intake.
 

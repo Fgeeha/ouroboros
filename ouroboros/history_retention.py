@@ -41,6 +41,7 @@ def prepare_result_retention(parent: Path, child: Path, task_id: str,
     event = {
         "ts": utc_now_iso(), "type": "history_retention", "task_id": task_id,
         **retention_summary({"child_ref_promotion": state}),
+        "diagnostics": retention_diagnostics({"child_ref_promotion": state}),
         **{key: result[key] for key in ("chat_id", "project_id", "parent_task_id", "root_task_id") if key in result},
     }
     try:
@@ -50,17 +51,33 @@ def prepare_result_retention(parent: Path, child: Path, task_id: str,
     return copied, state
 
 
-def retention_summary(result: dict[str, Any]) -> dict[str, Any]:
-    """Small display projection; ordinary deferral is not a storage failure."""
+def retention_diagnostics(result: dict[str, Any]) -> dict[str, Any]:
+    """Full existing failure facts for Logs/raw detail, excluding routine deferral."""
     state = result.get("child_ref_promotion")
     if not isinstance(state, dict) or state.get("schema_version") != 1:
         return {}
     pending = state.get("pending_refs") or []
     problems = [row for row in pending if isinstance(row, dict) and row.get("kind") != DEFERRED_KIND]
     unavailable = state.get("unavailable_refs") or []
+    return {"pending_refs": copy.deepcopy(problems), "unavailable_refs": copy.deepcopy(unavailable)}
+
+
+def retention_summary(result: dict[str, Any]) -> dict[str, Any]:
+    """Group failure reasons for display; preserve every full fact in diagnostics."""
+    from collections import Counter
+
+    diagnostics = retention_diagnostics(result)
+    if not diagnostics:
+        return {}
+    state = result["child_ref_promotion"]
+    pending = state.get("pending_refs") or []
+    problems, unavailable = diagnostics["pending_refs"], diagnostics["unavailable_refs"]
+    reasons = Counter(str(row.get("reason") or "No failure reason was recorded.")
+                      for row in (*problems, *unavailable) if isinstance(row, dict))
     return {"status": "problem" if problems or unavailable else
             "complete" if state.get("status") == "complete" else "pending",
             "pending_count": len(pending), "problem_count": len(problems) + len(unavailable),
+            "problem_reasons": [{"reason": reason, "count": count} for reason, count in reasons.items()],
             "promoted_ref_count": state.get("promoted_ref_count", 0),
             "promoted_source_handle_count": state.get("promoted_source_handle_count", 0)}
 

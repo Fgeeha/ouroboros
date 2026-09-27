@@ -65,19 +65,19 @@ An omitted head leaves the corpus partial; selected records resolve only if comp
 arguments/results survive budgeting. Selection changes neither revision nor authorship;
 agent prose certifies nothing, and readable sources prove no reviewer understanding.
 
-`source_retention.RetentionWalk` iteratively decodes each identity/role once,
-retaining refs/outcomes, not payload history. Captured
-JSON stays exact. Original manifests use existing text CAS; marked call-id
-projections preserve native seal accounting. Both versions remain readable;
-same-store adoption needs no traversal. Missing/corrupt sources stay disclosed.
+`source_retention.RetentionWalk` decodes each identity/role once without payload
+caching. Captured JSON stays exact; CAS holds original manifests beside imported
+projections, preserving native seals.
 
-`history_retention` adopts answers/files/attachments; receipts keep their union owner.
-Existing `child_ref_promotion` holds child sources across restart for off-loop
-retention. Publication rechecks CURRENT's basis, preserves newer fields and stops
-at node boundaries on generation close. Exact readers can use the retained child.
-GC requires all task-owned calls, including unlisted ones; directory revision
-re-arms duty for late additions. No new store/scheduler/ledger. Routine progress
-stays in details/Logs, problems on collapsed cards; task outcome is independent.
+`history_retention` adopts answers/files/attachments; receipts keep their union
+owner. Existing `child_ref_promotion` holds sources across restart for off-loop
+retention. Publication rechecks CURRENT; generation close stops at nodes.
+Readers resolve retained children. Unchanged unavailable sources wait on cheap
+file/result/inventory facts per process/generation; repairs reopen work, transient
+I/O and explicit retries remain real. No hold is released by this cache. Identical
+projections/diagnostics are reused. GC rechecks inventory before deletion; this does
+not prove quiescence of forgotten late tool futures. No new store/scheduler/ledger.
+Details/Logs show progress; cards show problems, independently of task outcome.
 
 `review_projection.publish_acceptance_checkpoint` retains full source before the compact
 `write_task_result` projection and `review_reference`. Explicit terminal chat ids include 0;

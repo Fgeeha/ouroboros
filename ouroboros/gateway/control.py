@@ -182,15 +182,6 @@ async def api_command(request: Request) -> JSONResponse:
                 bridge = get_bridge()
             except AssertionError:
                 bridge = None
-            # The bridge is published before supervisor recovery finishes. The
-            # independent Restart owner checks whether that consumer is ready.
-            if bridge is None or cmd == "/restart":
-                callback = getattr(request.app.state, "startup_owner_command", None)
-                action = callback(cmd) if callable(callback) else None
-                if action is not None:
-                    return JSONResponse({"status": "ok"}, background=BackgroundTask(action))
-            if bridge is None:
-                return json_error("Complete provider setup before sending this command.", 409)
             visible_text = str(body.get("visible_text") or "").strip()
             task_constraint = body.get("task_constraint") if isinstance(body.get("task_constraint"), dict) else None
             visible_task_id = str(body.get("visible_task_id") or "").strip()
@@ -212,6 +203,15 @@ async def api_command(request: Request) -> JSONResponse:
             # frames. The honest stamp names the ENDPOINT — the host cannot know
             # the true caller here (disclosed non-goal).
             send_kwargs["task_metadata"] = {"client_surface": {"channel": "api_command"}}
+            # Publication precedes readiness. Bind the independent owner, keeping
+            # this transport's metadata if the supervisor becomes ready meanwhile.
+            if bridge is None or str(cmd).strip().lower() == "/restart":
+                callback = getattr(request.app.state, "startup_owner_command", None)
+                action = callback(cmd, send_kwargs=send_kwargs) if callable(callback) else None
+                if action is not None:
+                    return JSONResponse({"status": "ok"}, background=BackgroundTask(action))
+            if bridge is None:
+                return json_error("Complete provider setup before sending this command.", 409)
             bridge.ui_send(cmd, **send_kwargs)
             if visible_task_id:
                 _RECENT_VISIBLE_COMMANDS[visible_task_id] = time.monotonic()
