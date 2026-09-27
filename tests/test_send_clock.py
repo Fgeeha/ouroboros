@@ -628,7 +628,7 @@ main_call = _main_call
 
 
 @pytest.mark.parametrize("asynchronous", [False, True])
-def test_native_anthropic_compatibility_retry_has_a_fresh_sealed_clock(transport, ticking, monkeypatch, asynchronous):
+def test_native_anthropic_compatibility_retry_has_a_fresh_sealed_clock(transport, ticking, monkeypatch, asynchronous):  # noqa: F811
     import requests
     from tests.test_anthropic_native_custody import _NativeResponse, _target
 

@@ -9,6 +9,7 @@ missing named bytes refuse dispatch, while an absent optional log is disclosed.
 """
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import pathlib
@@ -16,18 +17,96 @@ import tempfile
 from typing import Any
 
 
-def retain_review_refs(value: Any, source: pathlib.Path, custody: pathlib.Path, task_id: str) -> Any:
-    """Verify and retain a typed closure through the existing promotion owners."""
-    from ouroboros.observability import promote_child_task_refs
+# These are producer-owned edges, not patterns for recognizing arbitrary JSON.
+# Unknown evidence, model prose and call arguments remain byte-preserving data.
+_REF_FIELDS = frozenset({
+    'source_ref', 'source_refs', 'result_source_ref', 'checkpoint_ref', 'spec_source_ref',
+    'wave_artifact', 'applied_source_ref', 'tool_trajectory_source_ref', 'repo_diff_source_ref',
+    'required_sources_ref', 'native_required_sources_ref', 'native_history_source',
+    'exact_source_ref', 'producer_source_ref', 'request_ref', 'full_log_ref',
+    'manifest_ref', 'full_payload_ref', 'redacted_projection_ref', 'trace_ref',
+    'prompt_ref', 'response_ref', 'round_sources', 'attachment_manifest_ref',
+})
+_METADATA_FIELDS = frozenset({
+    'trace_refs', 'llm_call_refs', 'tool_call_refs', 'entries', 'services', 'log_finalization',
+    'refs', 'sources', 'review_evidence', 'review_projection', 'panels',
+    'loop_outcome', 'completion_observations', 'verification_ledger', 'owner_wait',
+    'root_phase_checkpoint', 'plan_review_state', 'waves', 'actors', 'usage',
+    'read_receipts', 'view_receipt', 'view_changes', 'sent_view', 'capsule_refs',
+    'restored_unit_refs', 'review_source_closure', 'native_required_sources',
+    'required_sources', 'late_settlement', 'reviewer_outputs', 'emitted_answer', 'delivered',
+    'tool_trajectory', 'tool_trajectory_selected', '__unresolved_partial_artifacts__',
+    'owner_requirements_and_decisions', 'plan_claims_exhibit', 'acceptance_support_refs',
+    'skill_lifecycle_history_coverage', 'evidence_manifest',
+})
 
-    retained, facts = promote_child_task_refs(custody, source, task_id, {'review_evidence': value})
+
+def source_carrier(value: dict, key: str, carrier: str) -> str:
+    """Select host-owned edges at a trusted entry point; data cannot opt in."""
+    if carrier == 'request':
+        return {'evidence': 'evidence', 'policy': 'metadata'}.get(key, '')
+    if carrier == 'contract':
+        return {'predecessor_authority': 'task_result', 'attachment_manifest_ref': 'metadata'}.get(key, '')
+    if carrier == 'message':
+        from ouroboros.context_compaction import _capsule_metadata
+        return 'block' if key == 'content' and _capsule_metadata(value)[1] is not None else ''
+    if carrier == 'block':
+        return 'metadata' if key == '_context_capsule' else ''
+    if carrier in {'checkpoint', 'metadata'} and key == 'messages':
+        return 'message'
+    if carrier == 'evidence':
+        provenance = value.get('__provenance__') or {}
+        if key == 'agent_supplied' or (isinstance(provenance, dict) and provenance.get(key) == 'agent_supplied'):
+            return ''
+    if key == 'task_contract' and carrier in {'evidence', 'task_result'}:
+        return 'contract'
+    if key == 'request' and carrier == 'metadata':
+        return 'request'
+    return 'metadata' if key in _REF_FIELDS | _METADATA_FIELDS else ''
+
+
+def retain_contract(value: dict, source: pathlib.Path, custody: pathlib.Path, task_id: str, state: dict) -> dict:
+    """Review inputs must already belong to this host-attested task's store.
+
+    Legacy attachment inheritance elsewhere keeps its admission semantics; review
+    closure never turns an inline absolute path into a new input authorization.
+    """
+    from ouroboros.artifacts import promote_task_attachment_refs, task_artifact_dir_path
+
+    if 'attachment_manifest_ref' not in value:
+        roots = [task_artifact_dir_path(root, task_id).resolve() for root in (source, custody)]
+        for row in value.get('attachment_manifest') or []:
+            if row.get('status') == 'rejected':
+                continue
+            path = pathlib.Path(row.get('abs_path') or '')
+            if (not path.is_absolute() or path.is_symlink()
+                    or not any(path.resolve().is_relative_to(root / 'attachments') for root in roots)
+                    or type(row.get('size')) is not int or len(str(row.get('sha256') or '')) != 64):
+                raise ValueError('review attachment has no captured owner-bound source')
+    wrapper = {'task_contract': copy.deepcopy(value)}
+    promote_task_attachment_refs(custody, source, task_id, wrapper, state)
+    return wrapper['task_contract']
+
+
+def retain_review_refs(value: Any, source: pathlib.Path, custody: pathlib.Path, task_id: str,
+                       *, carrier: str = 'metadata') -> Any:
+    """Retain explicit host source carriers, never infer authority from data."""
+    from ouroboros.observability import _rewrite_child_ref_tree, child_ref_promotion_scope
+    from ouroboros.owner_mailbox import promote_owner_attachments
+
+    facts = {'pending_refs': [], 'unavailable_refs': [], 'promoted_ref_count': 0,
+             'promoted_source_handle_count': 0, 'status': 'complete'}
+    with child_ref_promotion_scope():
+        # Accepted owner follow-ups have their own task-bound manifest owner.
+        promote_owner_attachments(custody, source, task_id, facts)
+        retained = _rewrite_child_ref_tree(value, custody, source, task_id, facts, carrier=carrier)
     if facts['pending_refs'] or facts['unavailable_refs']:
         raise ValueError(json.dumps(facts, sort_keys=True))
-    return retained['review_evidence']
+    return retained
 
 
 def _retain_named_sources(request: Any, source: pathlib.Path, custody: pathlib.Path) -> list[dict]:
-    from ouroboros.artifacts import (copy_artifact_file, read_actor_source_bytes, store_actor_source_bytes,
+    from ouroboros.artifacts import (collect_task_artifact_records, copy_artifact_file, read_actor_source_bytes, store_actor_source_bytes,
                                     stream_artifact_file, task_artifact_dir_path)
     from ouroboros.outcome_receipt_store import publish_verification_receipt_union, verification_receipts_path
     from ouroboros.task_results import load_task_result, task_result_path
@@ -50,25 +129,36 @@ def _retain_named_sources(request: Any, source: pathlib.Path, custody: pathlib.P
         raise ValueError('task result source unavailable')
     # A declared artifact is copied through the verified file owner, preserving
     # its name and source path beside a digest-named immutable reader target.
-    manifest = [*(request.evidence.get('artifacts') or []), *(result.get('artifacts') or [])]
+    preview = request.evidence.get('artifacts') or []
+    manifest = [row for row in preview if row.get('name') != '…']
+    if any(row.get('source_error') for row in preview if row.get('name') == '…'):
+        raise ValueError('artifact inventory source unavailable')
+    for marker in (row for row in preview if row.get('name') == '…' and row.get('source_ref')):
+        inventory = json.loads(read_actor_source_bytes(source, task_id, marker['source_ref']))
+        if inventory.get('task_id') != task_id or not isinstance(inventory.get('artifacts'), list):
+            raise ValueError('artifact inventory owner mismatch')
+        manifest.extend(inventory['artifacts'])
+    # The preview is never the inventory. Include unsampled readable files even
+    # for historical previews without a full-set ref; captured declarations still
+    # participate, so disappearance after capture cannot silently shrink the set.
+    manifest.extend(result.get('artifacts') or [])
+    manifest.extend(collect_task_artifact_records(source, task_id, measure=False, strict=True))
     paths = {}
     for artifact in manifest:
         if not isinstance(artifact, dict):
             raise ValueError('invalid artifact manifest member')
-        if artifact.get('name') == '…':
-            raise ValueError('artifact manifest incomplete')
         original = pathlib.Path(artifact.get('path') or base / str(artifact.get('relpath') or artifact.get('name') or ''))
         if not original.is_absolute():
             original = source / original
+        if (original.is_symlink() or not original.resolve().is_relative_to(base.resolve())):
+            raise ValueError(f'artifact escapes its task owner: {original}')
         if original == verification_receipts_path(source, task_id):
             continue  # receipts have their union owner below
+        identity = stream_artifact_file(original, expected=artifact)
+        if artifact.get('sha12') and artifact['sha12'] != identity['sha256'][:12]:
+            raise ValueError(f'artifact preview digest mismatch: {original}')
         if str(original) in paths:
             continue
-        identity = stream_artifact_file(original, expected=artifact if artifact.get('immutable') else None)
-        if artifact.get('sha256') and artifact['sha256'] != identity['sha256']:
-            raise ValueError(f'artifact digest mismatch: {original}')
-        if artifact.get('size') is not None and int(artifact['size']) != identity['size']:
-            raise ValueError(f'artifact size mismatch: {original}')
         artifact_rel = f"source_handles/context_checkpoints/review-artifact-{identity['sha256']}.bin"
         copy_artifact_file(original, target / artifact_rel, expected=identity)
         ref = {'kind': 'task_source', 'root': 'artifact_store', 'path': artifact_rel, **identity,
@@ -82,23 +172,31 @@ def _retain_named_sources(request: Any, source: pathlib.Path, custody: pathlib.P
                      'status': 'retained'})
 
     def bind_artifacts(value):
-        # Only structured artifact path fields are read addresses. Prose and
-        # source_path retain the author's exact provenance, even if obsolete.
-        if isinstance(value, dict):
-            return {key: paths.get(item, item) if key == 'path' and isinstance(item, str)
-                    else bind_artifacts(item) for key, item in value.items()}
-        if isinstance(value, list):
-            return [bind_artifacts(item) for item in value]
+        # Only the host-owned manifest is a locator carrier. Arbitrary nested
+        # evidence, trace arguments and captured prose remain exact data.
+        value = copy.deepcopy(value)
+        value['artifacts'] = [{**row, 'path': paths.get(str(pathlib.Path(row.get('path') or
+            base / str(row.get('relpath') or row.get('name') or ''))), row.get('path'))}
+            for row in value.get('artifacts') or []]
+        for row in value['artifacts']:
+            if row.get('path') and not pathlib.Path(row['path']).is_absolute():
+                row['path'] = paths.get(str(source / row['path']), row['path'])
+            if row.get('path') is None:
+                row.pop('path', None)
         return value
 
-    result = retain_review_refs(bind_artifacts(result), source, custody, task_id)
+    result = retain_review_refs(bind_artifacts(result), source, custody, task_id, carrier='task_result')
     retain('task-result', task_result_path(source, task_id), json.dumps(result, ensure_ascii=False).encode())
     request.evidence = bind_artifacts(request.evidence)
+    retain('artifact-inventory', base, json.dumps({'task_id': task_id, 'artifacts': [
+        row for row in rows if row['name'].startswith('artifact:')]}, ensure_ascii=False).encode())
     for row in request.evidence.get('artifacts') or []:
-        original = pathlib.Path(row.get('path') or base / row['name'])
-        original = str(original if original.is_absolute() else source / original)
-        if original in paths:
-            row['path'] = paths[original]
+        if row.get('name') == '…':
+            row['source_ref'] = rows[-1]['source_ref']
+    for issue in request.evidence.get('__unresolved_partial_artifacts__') or []:
+        if issue.get('tool') == 'artifact_manifest':
+            issue.update(source_ref=rows[-1]['source_ref'], status='not_materialized_for_reviewer',
+                         reason='artifact_manifest_preview')
 
     receipt = verification_receipts_path(source, task_id)
     canonical_receipt = verification_receipts_path(custody, task_id)
@@ -125,7 +223,7 @@ def _reader_bindings(value: Any, root: pathlib.Path, task_id: str) -> list[dict]
 
     rows = {}
 
-    def visit(item, owner):
+    def visit(item, owner, carrier='request'):
         if isinstance(item, dict):
             if item.get('kind') == 'task_source':
                 path = task_artifact_dir_path(root, owner) / item['path']
@@ -135,10 +233,12 @@ def _reader_bindings(value: Any, root: pathlib.Path, task_id: str) -> list[dict]
                         'root': 'runtime_data', 'path': str(path.relative_to(root))}}}
             else:
                 for key, child in item.items():
-                    visit(child, source_owner(key, child, owner))
+                    role = source_carrier(item, key, carrier)
+                    if role:
+                        visit(child, source_owner(key, child, owner), role)
         elif isinstance(item, list):
             for child in item:
-                visit(child, owner)
+                visit(child, owner, carrier)
 
     visit(value, task_id)
     return list(rows.values())
@@ -166,21 +266,21 @@ def retain_review_request_sources(request: Any, *, source_root: Any, custody_roo
         for row in retained['sources']:
             if row['status'] == 'retained':
                 read_actor_source_bytes(read_root, request.task_id, row['source_ref'])
-        retain_review_refs(dataclasses.asdict(request), read_root, custody, request.task_id)
+        retain_review_refs(dataclasses.asdict(request), read_root, custody, request.task_id, carrier='request')
         return
     # Work on a copy: partial publication cannot leave the caller appearing bound.
     bound = dataclasses.replace(request, **{key: value for key, value in retain_review_refs(
-        dataclasses.asdict(request), source, custody, request.task_id).items()})
+        dataclasses.asdict(request), source, custody, request.task_id, carrier='request').items()})
     parent = task_artifact_dir_path(custody, request.task_id, create=True) / 'source_handles' / 'review_inputs'
     parent.mkdir(parents=True, exist_ok=True)
     read_root = pathlib.Path(tempfile.mkdtemp(prefix='request-', dir=parent))
-    bound = dataclasses.replace(bound, **retain_review_refs(dataclasses.asdict(bound), custody, read_root, request.task_id))
+    bound = dataclasses.replace(bound, **retain_review_refs(dataclasses.asdict(bound), custody, read_root, request.task_id, carrier='request'))
     named = _retain_named_sources(bound, source, read_root) if request.surface == 'task_acceptance' else []
     bindings = _reader_bindings(dataclasses.asdict(bound), read_root, request.task_id)
     bound.policy = {**bound.policy, 'native_data_root': str(read_root), 'review_source_closure': {
         'schema_version': 1, 'task_id': request.task_id, 'read_root': str(read_root),
         'sources': named, 'refmap': bindings}}
-    retain_review_refs(dataclasses.asdict(bound), read_root, custody, request.task_id)
+    retain_review_refs(dataclasses.asdict(bound), read_root, custody, request.task_id, carrier='request')
     for field in dataclasses.fields(request):
         setattr(request, field.name, getattr(bound, field.name))
 
@@ -193,7 +293,7 @@ def promote_source_payload(raw: bytes, *, source_id: str, extension: str, catego
     from ouroboros.observability import _rewrite_child_ref_tree
 
     plan_wave_source = source_id.startswith("plan-review-wave-")
-    if extension == "json":
+    if extension == "json" and (category == "context_checkpoints" or source_id == "acceptance_tool_trajectory"):
         json_lines = source_id == 'review-retrieval-verification-receipts'
         try:
             payload = [json.loads(line) for line in raw.splitlines() if line.strip()] if json_lines else json.loads(raw)
@@ -213,7 +313,9 @@ def promote_source_payload(raw: bytes, *, source_id: str, extension: str, catego
             isinstance(payload, dict) and isinstance(payload.get("request"), dict)
             and payload["request"].get("surface") == "task_acceptance"
         ):
-            rewritten = _rewrite_child_ref_tree(payload, parent_root, child_root, task_id, state)
+            role = 'task_result' if source_id == 'review-retrieval-task-result' else (
+                'checkpoint' if checkpoint or native_source else 'metadata')
+            rewritten = _rewrite_child_ref_tree(payload, parent_root, child_root, task_id, state, carrier=role)
             if checkpoint and rewritten != payload:
                 # Capsules bind raw messages/unit identities. Copying their
                 # relative source closure may not rewrite the captured transcript.

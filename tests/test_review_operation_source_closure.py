@@ -74,7 +74,8 @@ def test_exact_review_reader_keeps_physical_identity_and_restrictions(tmp_path):
 
 @pytest.mark.parametrize("emitted", ["answer A", "answer B"])
 @pytest.mark.parametrize("receiver_mode", ["canonical", "forked", "empty"])
-def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypatch, fresh_sends, emitted, receiver_mode):
+@pytest.mark.usefixtures("fresh_sends")
+def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypatch, emitted, receiver_mode):
     task_id = "source-author"
     canonical = tmp_path / "canonical"
     child = prepare_task_drive(canonical, task_id, "empty")
@@ -218,7 +219,6 @@ def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypat
         from ouroboros import agent as agent_module, consciousness_wake as wake
         from supervisor import workers
         from tests.test_consciousness_wake_lane import _lane, _wait_for
-        from ouroboros.tools.core_file_tools import _read_file
         from ouroboros.tools.tool_context import ToolContext
 
         _lane(monkeypatch, canonical)

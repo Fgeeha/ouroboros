@@ -13,7 +13,6 @@ from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway import _helpers
 from ouroboros.gateway._helpers import _TAIL_WINDOW_START_BYTES
 from ouroboros.jsonl_tail import JsonlChainSnapshot
-from ouroboros.utils import JsonlChainUnreadable
 
 _SOURCES = ("chat", "progress")
 _READ_BYTES = 64 * 1024

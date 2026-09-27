@@ -798,7 +798,17 @@ def _accept_artifact_manifest(drive_root: Any, task_id: str, protected: set) -> 
                     entry["preview"] = "(binary — manifest only)"
             out.append(entry)
             if len(out) >= 200:
-                out.append({"name": "…", "status": "manifest truncated at 200 entries", "provenance": "artifact"})
+                from ouroboros.artifacts import collect_task_artifact_records, store_actor_source_bytes
+                marker = {"name": "…", "status": "manifest truncated at 200 entries", "provenance": "artifact"}
+                try:
+                    inventory = {'task_id': task_id, 'artifacts': collect_task_artifact_records(
+                        drive_root, task_id, strict=True)}
+                    marker['source_ref'] = store_actor_source_bytes(drive_root, task_id, category='context_checkpoints',
+                        source_id='acceptance-artifact-inventory',
+                        data=json.dumps(inventory, ensure_ascii=False).encode(), extension='json')
+                except (OSError, ValueError) as exc:
+                    marker['source_error'] = f'{type(exc).__name__}: {exc}'
+                out.append(marker)
                 break
     except OSError:
         return out
