@@ -29,7 +29,9 @@ MAX_FUNCTION_LINES = 300
 # own single-caller inlines and an upstream base that grew ~42 functions in one
 # day; the remaining delta is decomposition, not duplication, so buying the gap
 # by merging load-bearing steps would read worse.
-MAX_TOTAL_FUNCTIONS = 10500
+# Owner-approved 2026-09-26: paid-review continuity, complete wake observation and
+# physical-send clocks need distinct owners after two measured simplification passes.
+MAX_TOTAL_FUNCTIONS = 11000
 
 SIZE_RATCHET_MANIFEST_PATH = "ouroboros/size_ratchet_manifest.py"
 

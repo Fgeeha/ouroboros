@@ -121,16 +121,26 @@ def _decide(root: Any, body: dict) -> JSONResponse:
     transformation_completed = False
     mailbox_attempted = False
     owner = None
+    operation_wait = False
 
     def phase_owner():
         from ouroboros.post_task_checkpoint import post_task_model_wait
+        from ouroboros.review_operation import review_operation_controller
 
+        # A paid review operation owns its reviewers' waits, during and after
+        # the author's turn: only its exact live controller may consume them.
+        if operation_wait:
+            return review_operation_controller(root, task_id, wait_id)
         return post_task_model_wait(root, task_id)
 
     def live_task():
         if owner is None:
+            if operation_wait:
+                raise WaitDecisionRefused("task_not_live")  # never the author's mailbox
             return _live_task(task_id)
-        if owner.closed or phase_owner() is not owner:
+        current = phase_owner()
+        if owner.closed or current is None or (current is not owner and (
+                not getattr(owner, "owner_id", "") or getattr(current, "owner_id", "") != owner.owner_id)):
             raise WaitDecisionRefused("task_not_live")
         return owner.task
 
@@ -155,6 +165,9 @@ def _decide(root: Any, body: dict) -> JSONResponse:
         row = mutate(wait_id, discard)
     try:
         task_id, wait_id, action = _action(body)
+        from ouroboros.review_operation import names_review_operation
+
+        operation_wait = names_review_operation(root, task_id, wait_id)
         owner = phase_owner()
         task = live_task()
         attempt = int(task.get("_attempt") or 1)
@@ -214,12 +227,21 @@ def _decide(root: Any, body: dict) -> JSONResponse:
             # Re-check after the optional settings write. A persistent owner
             # choice may have landed even when cancellation now fences the task.
             with owner.lock if owner is not None else nullcontext():
-                task = live_task()
-                control = {**action, "wait_id": wait_id, "task_attempt": attempt}
-                mailbox_attempted = True
-                if not write_owner_message(owner.drive_root if owner is not None else _task_drive_for_task(task, task_id), json.dumps(control), task_id,
-                                           msg_id=f"model_wait:{wait_id}:{action['request_id']}", kind=KIND_MODEL_WAIT):
-                    raise WaitDecisionRefused("mailbox_write_failed", row, 503)
+                if getattr(owner, "consumes_pending_action", False):
+                    # A review operation consumes the claimed row itself (the author's
+                    # mailbox is not its ingress): its controller already applied it, or
+                    # it is still pending before that exact live controller.
+                    row = mutate(wait_id, lambda previous: None)
+                    applied = row.get("applied_request_id") == action["request_id"]
+                    if not applied and (row.get("pending_action") != action or owner.closed):
+                        raise WaitDecisionRefused("task_not_live", row)
+                else:
+                    task = live_task()
+                    control = {**action, "wait_id": wait_id, "task_attempt": attempt}
+                    mailbox_attempted = True
+                    if not write_owner_message(owner.drive_root if owner is not None else _task_drive_for_task(task, task_id), json.dumps(control), task_id,
+                                               msg_id=f"model_wait:{wait_id}:{action['request_id']}", kind=KIND_MODEL_WAIT):
+                        raise WaitDecisionRefused("mailbox_write_failed", row, 503)
         return JSONResponse({"ok": True, "decision_id": body["decision_id"], "request_id": action["request_id"],
                              "state": row["state"], "wait": row, "duplicate": duplicate, "applied": applied,
                              "saved": saved()},

@@ -157,7 +157,8 @@
               "verify_ssl_certs": true,
               "credentials": "gigachat-fixture-key",
               "base_url": "https://api.giga.chat/v1",
-              "timeout": 30.0
+              "timeout": 30.0,
+              "max_retries": 0
             },
             "payload": {
               "model": "GigaChat-3-Pro",
@@ -305,7 +306,8 @@
               "verify_ssl_certs": true,
               "user": "fixture-user",
               "password": "fixture-password",
-              "base_url": "https://api.giga.chat/v1"
+              "base_url": "https://api.giga.chat/v1",
+              "max_retries": 0
             },
             "payload": {
               "model": "GigaChat-3-Pro",
@@ -408,7 +410,8 @@
               "scope": "GIGACHAT_API_PERS",
               "verify_ssl_certs": true,
               "credentials": "gigachat-fixture-key",
-              "base_url": "https://api.giga.chat/v1"
+              "base_url": "https://api.giga.chat/v1",
+              "max_retries": 0
             },
             "payload": {
               "model": "GigaChat-3-Pro",

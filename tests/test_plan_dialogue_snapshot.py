@@ -463,3 +463,63 @@ def test_the_seat_line_follows_the_cache_stable_prefix_on_every_api_slot(harness
     # The recorded cache split is the same boundary: stable block, then the dynamic tail with the seat.
     blocks = delivery["slot_messages"]["a"][-1]["content"]
     assert isinstance(blocks, list) and blocks[0]["text"] == packet[:boundary] and blocks[-1]["text"].endswith("`a`\n")
+
+
+def test_author_plan_and_historical_producer_closure_survive_copyback(harness, monkeypatch):
+    from ouroboros import artifacts, observability
+    from ouroboros.headless import prepare_task_drive, copy_child_task_result, remove_subagent_task_drive
+    from ouroboros.task_results import write_task_result, load_plan_review_state
+    from ouroboros.tools.plan_review_artifacts import (
+        current_author_plan, persist_historical_result, record_plan_review_supplement,
+    )
+    from tests.test_plan_review_engine import DECK_SPEC
+    from tests.test_plan_review_reconciliation import _install_two_turn_substrate
+
+    parent, task = harness.drive, 'source'
+    child = prepare_task_drive(parent, task, 'empty')
+    ctx = harness.make_ctx(task_id=task)
+    ctx.drive_root, ctx.current_chat_id = child, 1
+    calls = []
+    _install_two_turn_substrate(monkeypatch, calls, pending_ids={'s3'})
+    append_jsonl(child / 'logs/chat.jsonl', {'direction': 'in', 'chat_id': 1, 'text': 'Exact owner premise'})
+    _call(ctx)
+    wave = load_plan_review_state(child, task)['waves'][-1]
+    result = _call(ctx, {**DECK_SPEC, 'acceptance_claims': ['Revised author claim']}, plan='Revised author plan.',
+        review_disposition={'review_fingerprint': wave['request_fingerprint'], 'items': [], 'author_action': 'stop',
+                            'author_disposition': {'disposition': 'partial', 'rationale': 'Retain the unfinished plan.'}})
+    assert 'Current author plan saved' in result and len(calls) == 1
+    unselected = artifacts.store_actor_source_bytes(child, task, category='tool_results',
+        source_id='unselected', data=b'PLAN CANARY UNREAD', extension='txt')
+    prompt = observability.persist_call(child, task_id=task, call_id='op-s3_prompt', call_type='plan_review_prompt',
+        payload={'request': {'surface': 'plan_review', 'subject': {'source_ref': unselected}}, 'slot': {'slot_id': 's3'}})
+    response = observability.persist_call(child, task_id=task, call_id='op-s3_response', call_type='plan_review_response',
+        payload={'message': {'source_ref': unselected, 'text': CLEAN}})
+    late = {'slot_id': 's3', 'operation_id': 'op-s3', 'operation_state': 'late_settled', 'text': CLEAN,
+            'prompt_ref': prompt['manifest_ref'], 'response_ref': response['manifest_ref'],
+            'unknown': {'dialogue_source_ref': unselected}}
+    ref = persist_historical_result(child, task, wave, late)
+    assert record_plan_review_supplement(child, task, wave=wave, result=late, source_ref=ref)
+    raw = read_actor_source_bytes(child, task, ref)
+    read = artifacts.read_actor_source_bytes
+
+    def guard(root, owner, source):
+        assert source != unselected, 'author/reviewer data acquired plan-source authority'
+        return read(root, owner, source)
+
+    monkeypatch.setattr(artifacts, 'read_actor_source_bytes', guard)
+    write_task_result(child, task, 'completed', artifact_status='ready')
+    copied = copy_child_task_result(parent, {'id': task, 'drive_root': str(child)})
+    assert not copied['child_ref_promotion']['pending_refs'] and not copied['child_ref_promotion']['unavailable_refs']
+    assert remove_subagent_task_drive(parent, task, live=lambda _: False)
+    state = load_plan_review_state(parent, task)
+    assert current_author_plan(parent, task, state)['plan_prose'] == 'Revised author plan.'
+    promoted = state['waves'][0]['historical_supplements'][0]['source_ref']
+    saved = json.loads(read_actor_source_bytes(parent, task, promoted))
+    assert read_actor_source_bytes(parent, task, ref) == raw  # original identity retained beside rebased view
+    assert saved['result']['unknown'] == late['unknown']
+    for key, expected in [('prompt_ref', 'request'), ('response_ref', 'message')]:
+        manifest = observability.read_call_manifest_ref(parent, saved['result'][key], task_id=task)
+        assert expected in observability.read_blob_ref(parent, manifest['full_payload_ref'])
+    original_wave = json.loads(read_actor_source_bytes(parent, task, saved['original_wave_artifact']))
+    assert b'Exact owner premise' in read_actor_source_bytes(parent, task, original_wave['dialogue_source_ref'])
+    assert not (artifacts.task_artifact_dir_path(parent, task) / unselected['path']).exists()

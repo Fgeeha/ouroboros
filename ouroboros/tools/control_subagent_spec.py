@@ -49,7 +49,12 @@ def schedule_subagent_properties() -> Dict[str, Any]:
         "memory_mode": {
             "type": "string",
             "enum": sorted(VALID_SUBTASK_MEMORY_MODES),
-            "description": "Child memory mode. Default forked copies stable memory only; empty starts blank. shared is disabled for live local subagents.",
+            "description": (
+                "Seed of the child's OWN execution drive. Default forked copies stable memory files there "
+                "(identity, WORLD, registry and knowledge; a Project child gets only the shared patterns); "
+                "empty seeds that drive with nothing. Either way the child's context is still built from the "
+                "canonical governance (BIBLE, SYSTEM, reference books) and the canonical data root's shared "
+                "memory, so empty is a blank drive, not a blank context. shared is disabled for live local subagents."),
         },
         "write_surface": {
             "type": "string",

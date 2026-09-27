@@ -175,6 +175,7 @@ def test_quota_reentry_keeps_captured_preference_and_same_owner(transport, monke
 @pytest.mark.parametrize("asynchronous", [False, True])
 @pytest.mark.parametrize("refusal", ["typed", "capacity", "unsupported"])
 def test_typed_no_start_reprices_standard_without_changing_custom_tools(transport, monkeypatch, asynchronous, refusal):
+    from ouroboros import send_clock
     from ouroboros.llm_attempt import ProcessingNotStarted
     from ouroboros.request_wire_recovery import current_wire_candidate
 
@@ -206,12 +207,17 @@ def test_typed_no_start_reprices_standard_without_changing_custom_tools(transpor
     async def create_async(**candidate):
         return create(**candidate)
 
-    if asynchronous:
-        asyncio.run(client._create_chat_completion_with_retries_async(create_async, payload, target))
-    else:
-        client._create_chat_completion_with_retries(create, payload, target)
-    assert len(candidates) == 2
-    assert {**candidates[0], "service_tier": "default"} == candidates[1]
+    from datetime import datetime, timedelta, timezone
+    samples = iter(datetime(2026, 9, 26, tzinfo=timezone.utc) + timedelta(minutes=i) for i in range(10))
+    monkeypatch.setattr(send_clock, "_now", lambda: next(samples))
+    with send_clock.MainSendClock(send_clock.SendClockPolicy()).bound() as clock:
+        if asynchronous:
+            asyncio.run(client._create_chat_completion_with_retries_async(create_async, payload, target))
+        else:
+            client._create_chat_completion_with_retries(create, payload, target)
+        assert len(candidates) == 2 and len(clock.notes) == 2 and clock.notes[0] != clock.notes[1]
+        first, second = [send_clock.split_clock_note(p)[1] for p in candidates]
+    assert {**first, "service_tier": "default"} == second
     assert candidates[1]["tools"][0]["type"] == "custom"
     assert catalogs[0] and catalogs[0] == catalogs[1]
     assert [mode for mode, _digest in reservations] == ["flex", "default"]

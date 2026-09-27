@@ -543,6 +543,14 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         # review wave, because the deciding turn was never told a receipt already
         # existed. The choice stays with the model - no host ban on a second root.
         routing_contract["message_routing_receipt"] = receipt
+        acts = _message_routing_acts(ctx, client_message_id)
+        if len(acts) > 1:
+            # The latest row hides earlier acts on the same message (a promote, then
+            # a steer): each act keeps its own receipt, read, never inferred.
+            routing_contract["message_routing_acts"] = acts
+            routing_contract["message_routing_acts_note"] = (
+                "Recorded routing acts already taken for THIS owner message, oldest first. "
+                "Facts, not a ban: another act stays your choice.")
     md["routing_contract"] = routing_contract
     return md
 
@@ -577,8 +585,10 @@ def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]
     except Exception:
         log.debug("message routing receipt lookup failed", exc_info=True)
         return {}
-    if not row:
-        return {}
+    return _receipt_fields(row) if row else {}
+
+
+def _receipt_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "action": str(row.get("action") or ""),
         "target": str(row.get("target") or ""),
@@ -587,6 +597,25 @@ def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]
         "ts": str(row.get("ts") or ""),
         "project_id": str(row.get("project_id") or ""),
     }
+
+
+def _message_routing_acts(ctx: Any, client_message_id: str) -> list:
+    """Every routing act recorded for THIS owner message (latest row per act), oldest first.
+
+    The routing rail already keeps one receipt per (message, routing token); this
+    only reads it. Acts keyed to a synthetic ``agent-steer:*`` id or to another
+    task's id carry no link to this message and stay unlisted (a producer gap).
+    """
+    try:
+        from ouroboros.project_dialogue import _ANNOTATIONS_NAME, _latest_annotations_by_token
+
+        rows = [row for (message_id, _token), row in _latest_annotations_by_token(
+            pathlib.Path(ctx.DRIVE_ROOT) / "logs" / _ANNOTATIONS_NAME).items()
+            if message_id == str(client_message_id)]
+    except Exception:
+        log.debug("message routing acts lookup failed", exc_info=True)
+        return []
+    return [_receipt_fields(row) for row in sorted(rows, key=lambda row: str(row.get("ts") or ""))]
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:

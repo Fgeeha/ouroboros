@@ -100,3 +100,76 @@ def test_rebuilt_task_done_carries_durable_cancel_origin(tmp_path, monkeypatch):
     assert published[0]["cancel_origin"] == origin
     rows = [json.loads(line) for line in (tmp_path / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()]
     assert next(row for row in rows if row.get("type") == "task_done")["cancel_origin"] == origin
+
+
+def test_ouroboros_cancel_task_speaks_its_producer_and_its_asker_through_custody(qenv, monkeypatch):
+    """#1317 end to end: the real cancel_task tool mints the intent, custody
+    settles it, and the stored origin speaks one truthful line. A parent that
+    stops its own child ASKED -- it was not stopped with it; a foreign cancel
+    names only that a task asked. The caller's own reason stays beside it."""
+    import queue
+
+    from ouroboros.project_dialogue import _completion_verdict
+    from ouroboros.tools.join_ledger import _cancel_task
+
+    monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *_a, **_kw: None)
+    for task_id, parent in (("child", "parent"), ("stranger", "someone-else")):
+        qenv.q.PENDING.append({"id": task_id, "chat_id": 0, "parent_task_id": parent, "root_task_id": parent})
+        write_task_result(qenv.drive, task_id, "scheduled", parent_task_id=parent, root_task_id=parent,
+                          delegation_role="subagent")
+    caller = SimpleNamespace(task_id="parent", drive_root=qenv.drive, pending_events=[], event_queue=queue.Queue(),
+                             task_metadata={"root_task_id": "parent", "delegation_role": "root"})
+    _cancel_task(caller, "child", "the plan changed")
+    _cancel_task(caller, "stranger", "not mine but stop it")
+    for task_id in ("child", "stranger"):
+        assert qenv.tl.cancel_task_custody(task_id) == qenv.tl.CANCEL_CANCELLED
+
+    child, stranger = (load_task_result(qenv.drive, task_id) for task_id in ("child", "stranger"))
+    assert child["cancel_origin"]["requested_by"] == "parent" and child["parent_decision"] == "cancelled"
+    assert _completion_verdict(child, {}) == "Stopped by Ouroboros · the plan changed · Requested by its parent task."
+    assert "requested_by" not in stranger["cancel_origin"]
+    assert _completion_verdict(stranger, {}) == "Stopped by Ouroboros · not mine but stop it · Requested by a task."
+
+
+def test_ouroboros_cancel_task_keeps_its_whole_reason_through_custody_and_receipt(qenv, monkeypatch):
+    """#1317: the reason Ouroboros gives cancel_task is the record. Its tail past
+    500 characters reaches the intent, the settled ``cancel_origin``, the parent
+    decision and the receipt; only the ledger note, the tool's own reply and the
+    owner line are previews, and each says so."""
+    import queue
+
+    from ouroboros import task_tree_ledger
+    from ouroboros.project_dialogue import _completion_verdict
+    from ouroboros.tools.join_ledger import _cancel_task
+    from supervisor.cancel_publication import CANCEL_REASON_PREVIEW_NOTE
+    from supervisor.terminal_delivery import build_unreviewed_salvage_event
+
+    tail = "UNIQUE-TAIL-past-the-old-500-cut"
+    reason = "the plan changed:\n" + "we no longer need this branch of the work " * 16 + tail
+    whole = " ".join(reason.split())
+    assert len(whole) > 600 and whole.endswith(tail)
+    notes: list = []
+    monkeypatch.setattr(task_tree_ledger, "tree_ledger_append", lambda _rid, _kind, text, **_kw: notes.append(text))
+    monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *_a, **_kw: None)
+    qenv.q.PENDING.append({"id": "child", "chat_id": 7, "parent_task_id": "parent", "root_task_id": "parent"})
+    write_task_result(qenv.drive, "child", "scheduled", parent_task_id="parent", root_task_id="parent",
+                      delegation_role="subagent")
+    caller = SimpleNamespace(task_id="parent", drive_root=qenv.drive, pending_events=[], event_queue=queue.Queue(),
+                             task_metadata={"root_task_id": "parent", "delegation_role": "root"})
+
+    reply = _cancel_task(caller, "child", reason)
+
+    assert cancel_intents.active_intent(qenv.drive, "child")["reason"] == whole
+    assert caller.event_queue.get_nowait()["reason"] == whole
+    (note,) = notes
+    for preview in (reply, note):
+        assert tail not in preview and "more chars omitted" in preview
+    assert qenv.tl.cancel_task_custody("child") == qenv.tl.CANCEL_CANCELLED
+    build_unreviewed_salvage_event(qenv.drive, {"id": "child", "chat_id": 7}, "child",
+                                   outcome="cancelled", settled_status="cancelled")
+    child = load_task_result(qenv.drive, "child")
+    assert child["cancel_origin"]["reason"] == whole
+    assert child["parent_decision_reason"] == whole
+    assert child["cancel_receipt"]["stop_reason"] == whole
+    line = _completion_verdict(child, {})
+    assert tail not in line and CANCEL_REASON_PREVIEW_NOTE.strip() in line

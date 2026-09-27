@@ -171,7 +171,8 @@ def _last_fit_rail(monkeypatch, tmp_path, execute):
     """Drive the whole rail: last-fit decision -> admitted candidate -> the real send."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "unused")
     monkeypatch.setattr("ouroboros.loop._loop_tree_accounting", lambda **_k: {"accounted_usd": 20.0})
-    answers = iter((True, False, True, False, True, False))   # proxy, exact probe, prepared: one fits, two do not
+    # proxy, exact probe, prepared: one fits, two do not; then the FRESH send's own admission fits.
+    answers = iter((True, False, True, False, True, False, True))
     monkeypatch.setattr(task_pacing, "wrapup_reservation_fits", lambda **_kwargs: next(answers))
     _patch_execute_candidate(monkeypatch, llm_module, execute)
     logs = tmp_path / "logs"
@@ -217,7 +218,7 @@ def test_a_drifted_admitted_candidate_is_sent_once_more_instead_of_losing_the_an
     calls, events = [], []
     real_once = loop_module._call_forced_model_once
 
-    def once(ctx, *, initial_messages=None, admitted_request=None):
+    def once(ctx, *, initial_messages=None, admitted_request=None, admission=None):
         calls.append(admitted_request is not None)
         if admitted_request is not None:
             raise usage_accounting.PhysicalAttemptPreconditionFailed(
@@ -243,7 +244,7 @@ def test_a_closed_dispatch_window_is_a_deadline_not_drift(monkeypatch, tmp_path)
 
     calls = []
 
-    def once(ctx, *, initial_messages=None, admitted_request=None):
+    def once(ctx, *, initial_messages=None, admitted_request=None, admission=None):
         calls.append(admitted_request is not None)
         raise PhysicalDispatchInterrupted("dispatch window closed")
 

@@ -597,6 +597,7 @@ def handle_wake_direct(
     text: str,
     task_metadata: Optional[dict],
     on_finished: Optional[Callable[[str, bool], None]] = None,
+    bind_input: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> Dict[str, Any]:
     """Start a self-initiated Main turn (a consciousness wake-up) as an
     ordinary direct turn, and answer with a typed receipt.
@@ -611,7 +612,10 @@ def handle_wake_direct(
     can back off after a failure too. The wake's ``task_metadata`` (its
     origin label, ledger category, reason, autonomy level, model role) rides
     verbatim on ``task["metadata"]``; nothing here pauses or resumes the
-    legacy background loop.
+    legacy background loop. ``bind_input(task)`` runs once the wake is
+    registered (its id exists) and before its thread starts — the alarm binds
+    its immutable observation source there; a binder failure leaves the
+    complete text as the wake's only input.
     """
     if not wake_gate_open():
         return {"admitted": False, "task_id": "", "reason": "repo_writer_gate_closed"}
@@ -633,6 +637,11 @@ def handle_wake_direct(
         reason = "repo_writer_gate_closed" if not wake_gate_open() else "admission_failed"
         return {"admitted": False, "task_id": "", "reason": reason}
     task_id = str(admitted["task"]["id"])
+    if bind_input is not None:
+        try:
+            bind_input(admitted["task"])
+        except Exception:
+            log.warning("wake %s input binding failed; the complete text stays its input", task_id, exc_info=True)
 
     def _run() -> None:
         ok = False
