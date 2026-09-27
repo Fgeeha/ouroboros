@@ -235,7 +235,8 @@ def test_hub_replacement_confirms_in_both_tabs_and_history_stays_quiet(direct_se
             page.wait_for_selector('.skills-card[data-skill="lens_fixture"]')
             page.click('.skills-tab[data-tab="ouroboroshub"]')
             results = page.locator('#oh-results')
-            expect(page.locator('#oh-status')).to_have_text('4 official skills · 1 local submission not in the catalog')
+            settled = '4 official skills · 1 local submission not in the catalog'
+            expect(page.locator('#oh-status')).to_have_text(settled)
             card = lambda name: results.locator(f'[data-slug="{name}"]')
             # Both mismatch directions offer the catalog copy.
             expect(card('lens_fixture').locator('[data-oh-action="adopt"]')).to_have_text('Use Hub version v1.1.3')
@@ -270,6 +271,8 @@ def test_hub_replacement_confirms_in_both_tabs_and_history_stays_quiet(direct_se
             dialog.locator('[data-confirm-ok]').click()
             _wait_for_posts(page, posts, 1)
             assert [post['url'].rsplit('/api/', 1)[1] for post in posts] == ['marketplace/ouroboroshub/update/hub_fixture']
+            # The action's own refresh re-reads the listing after the enabled button re-renders.
+            expect(page.locator('#oh-status')).to_have_text(settled)
             expect(update).to_be_enabled()
 
             # Use Hub version: the dialog names replacement; the CAS carries the bytes shown.
@@ -282,10 +285,15 @@ def test_hub_replacement_confirms_in_both_tabs_and_history_stays_quiet(direct_se
             _screenshot(page, f'hub-adopt-confirm-{engine}-{width}.png')
             dialog.locator('.marketplace-modal-actions [data-confirm-cancel]').click()
             assert len(posts) == 1
-            (lens / 'scripts/check.py').write_text("print('edited before adopt')\n")
             adopt.click()
+            expect(dialog).to_contain_text('Use Hub version of lens_fixture')
+            # Edited while this confirmation is open: a refresh that re-reads the new bytes does not retarget it.
+            (lens / 'scripts/check.py').write_text("print('edited before adopt')\n")
+            page.evaluate("() => document.getElementById('skills-pane-ouroboroshub')._ouroboroshubRefresh()")
+            expect(card('lens_fixture')).to_contain_text('Local files differ from the submitted copy')
             dialog.locator('[data-confirm-ok]').click()
             _wait_for_posts(page, posts, 2)
+            expect(page.locator('#oh-status')).to_have_text(settled)
             expect(adopt).to_be_enabled()
             assert posts[1]['body'] == {'slug': 'lens_fixture', 'adopt': True,
                                         'expected_content_hash': shown_hash, 'auto_review': True}
@@ -308,7 +316,7 @@ def test_hub_replacement_confirms_in_both_tabs_and_history_stays_quiet(direct_se
             expect(card('fresh_fixture')).to_contain_text('Submitted v0.1.0 · PR #63')
             _screenshot(page, f'hub-local-submission-{engine}-{width}.png')
             page.fill('#oh-query', '')
-            expect(page.locator('#oh-status')).to_have_text('4 official skills · 1 local submission not in the catalog')
+            expect(page.locator('#oh-status')).to_have_text(settled)
 
             # My skills menu Update: same confirmation, same zero/one POST contract.
             page.click('.skills-tab[data-tab="installed"]')
