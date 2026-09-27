@@ -142,7 +142,7 @@ def test_supported_command_is_stopped_even_when_another_owner_fails(tmp_path, mo
             proc.kill()
             proc.join(timeout=5)
         if child_pid and platform.pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
-            os.kill(child_pid, signal.SIGKILL)  # only the continuously observed fixture child
+            os.kill(child_pid, getattr(signal, "SIGKILL", signal.SIGTERM))  # only the observed fixture child
         worker_process.close_worker_stop_channel(proc)
         for queue in (incoming, outgoing):
             queue.close()
@@ -171,7 +171,10 @@ def test_server_completes_native_requests_before_settlement_or_exit(tmp_path, mo
         _run_panic(monkeypatch, tmp_path, daemon_stop=settle, children=(proc,), diagnostics=diagnostics)
         assert native_done.is_set()
         receipt = diagnostics[0]["requests"]["child-123"]
-        assert receipt["requested"] is not broken_channel
+        if not broken_channel or os.name != "nt":
+            assert receipt["requested"] is not broken_channel
+        # Windows socketpair uses TCP: send may be accepted after a peer close,
+        # before FIN is observable. This reports an attempt, never delivery.
         assert receipt["native_request"]["requested"]
         assert receipt["confirmation"] == "unconfirmed"  # an adapter signal is NOT observed death
     finally:
@@ -254,7 +257,7 @@ def test_ordinary_stop_channel_retirement_does_not_panic_owned_daemon(tmp_path, 
             proc.kill()
             proc.join(timeout=5)
         if daemon_pid and platform.pid_is_alive(daemon_pid) and not pid_is_zombie(daemon_pid):
-            os.kill(daemon_pid, signal.SIGKILL)
+            os.kill(daemon_pid, getattr(signal, "SIGKILL", signal.SIGTERM))  # Windows: TerminateProcess
             deadline = time.monotonic() + 3
             while platform.pid_is_alive(daemon_pid) and not pid_is_zombie(daemon_pid) and time.monotonic() < deadline:
                 time.sleep(.01)

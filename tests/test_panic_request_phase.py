@@ -151,7 +151,8 @@ def test_unmeasured_attached_custody_never_becomes_signal_authority(tmp_path, mo
 def test_request_failures_are_receipts_not_clean_stops(monkeypatch):
     proc = SimpleNamespace(pid=123, poll=lambda: None)
     monkeypatch.setattr(platform, "IS_WINDOWS", False)
-    monkeypatch.setattr(platform.os, "getpgid", lambda _: (_ for _ in ()).throw(PermissionError("refused")))
+    monkeypatch.setattr(platform.os, "getpgid", lambda _: (_ for _ in ()).throw(PermissionError("refused")),
+                        raising=False)  # a simulated POSIX host: Windows has no getpgid
     receipt = platform.request_process_tree_kill(proc)
     assert receipt == {"pid": 123, "requested": False, "scope": "process", "error": "PermissionError: refused"}
 

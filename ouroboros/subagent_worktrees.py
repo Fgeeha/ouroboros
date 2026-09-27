@@ -263,6 +263,8 @@ def _git(repo_dir: Path, *args: str, check: bool = True,
         cwd=str(repo_dir),
         capture_output=True,
         text=True,
+        encoding="utf-8",  # git's paths/messages are UTF-8, not the Windows ANSI code page
+        errors="surrogateescape",
         check=check,
         env=env,
     )

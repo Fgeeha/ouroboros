@@ -28,11 +28,13 @@ is a disclosed residual, not proof of historylessness.
 
 from __future__ import annotations
 
+import errno
 import hashlib
 import json
 import logging
 import os
 import pathlib
+import stat
 import uuid
 from typing import Any, Dict, Tuple
 
@@ -55,12 +57,30 @@ def witness_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / WITNESS_REL
 
 
+def blocked_absence(path: Any) -> str:
+    """After ENOENT: ``""`` for true absence, else the ``unreadable`` detail.
+
+    Windows answers ENOENT, not POSIX ENOTDIR, when a FILE sits where a parent
+    directory belongs; the nearest existing ancestor decides, so a blocked
+    ``state/`` is unknown on every platform, never absence."""
+    for parent in pathlib.Path(path).parents:
+        try:
+            if stat.S_ISDIR(os.stat(parent).st_mode):
+                return ""
+            return f"NotADirectoryError errno={errno.ENOTDIR}"
+        except FileNotFoundError:
+            continue
+        except OSError as exc:
+            return f"{type(exc).__name__} errno={exc.errno}"
+    return ""
+
+
 def read_witness(drive_root: Any) -> Tuple[str, Dict[str, Any]]:
     """``("missing"|"ok"|"invalid"|"unreadable", witness)`` by the operation's errno."""
     try:
         raw = witness_path(drive_root).read_bytes()
     except FileNotFoundError:
-        return "missing", {}
+        return ("unreadable" if blocked_absence(witness_path(drive_root)) else "missing"), {}
     except OSError:  # NotADirectoryError included: a file where ``state/`` belongs is not absence
         return "unreadable", {}
     try:

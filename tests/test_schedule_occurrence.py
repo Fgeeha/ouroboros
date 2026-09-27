@@ -432,7 +432,8 @@ def test_a_folderless_delegated_run_reads_but_never_writes_through_scratch(tmp_p
     ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data", task_id="t", project_id="proj")
     ctx.task_metadata = {"resource_intent": {"kind": "explicit_none", "project_id": "proj"}}
     readonly, refusal = _mutation_authority(ctx, delegated_run_shape(False, "readonly"))
-    assert refusal is None and readonly["capture_mode"] == "none" and readonly["target_root"].endswith("task_drives/t")
+    assert refusal is None and readonly["capture_mode"] == "none"
+    assert pathlib.Path(readonly["target_root"]).parts[-2:] == ("task_drives", "t")  # native separators
     _, refused = _mutation_authority(ctx, delegated_run_shape(True, "workspace_write"))
     assert refused is not None and "workspace_not_active" in refused.text
 

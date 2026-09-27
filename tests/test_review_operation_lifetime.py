@@ -272,7 +272,7 @@ def test_owner_controls_reach_the_exact_live_operation_after_author_end(env, mon
 # parks on a quota refusal inside its operation, and the process stays alive after
 # the operation closes until the test closes its stdin.
 _REMOTE_OPERATION = r"""
-import json, sys, threading, time
+import json, os, sys, threading, time
 from types import SimpleNamespace
 root, session, task, surface = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 from ouroboros import config, model_wait, process_custody, review_operation
@@ -317,7 +317,7 @@ with model_wait.task_model_wait_scope(task={"id": task, "chat_id": 7, "_attempt"
                                      drain_deadline=time.monotonic()),
                        slots=[ReviewSlot(slot_id="one", model="claudexor::codex=exact-model", timeout_sec=60)],
                        drive_root=root, usage_ctx=ctx, llm=model)
-print(json.dumps({"author_scope": "closed"}), flush=True)
+print(json.dumps({"author_scope": "closed", "pid": os.getpid()}), flush=True)
 while any(op.task_id == task for op in list(review_operation._LIVE.values())):
     time.sleep(0.01)
 print(json.dumps({"operation": "closed", "calls": model.calls}), flush=True)
@@ -349,13 +349,16 @@ def test_a_real_remote_operation_consumes_its_exact_decision_and_a_closed_one_is
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=os.getcwd())
     out, reader = _lines(child.stdout)
     try:
-        assert json.loads(out.get(timeout=60)) == {"author_scope": "closed"}
+        started = json.loads(out.get(timeout=60))
+        assert started["author_scope"] == "closed"
+        # The interpreter's own pid: a Windows venv python.exe is a launcher whose Popen pid is its parent.
+        controller_pid = started["pid"]
         # The live row once the operation published its credential harness (its last
         # revision while it waits for the owner).
         row = until(lambda: [r for r in _rows(f.root) if r.get("credential_harness")], timeout=30)[0]
         write_task_result(f.root, TASK, "completed", result="answer")  # the author ended
         block = row["review_operation"]
-        assert block["controller"] == {"pid": child.pid, "birth": process_start_time(child.pid),
+        assert block["controller"] == {"pid": controller_pid, "birth": process_start_time(controller_pid),
                                        "session": current_custody_session_id()}
         # Its open pointer is part of the proof; only task acceptance also retains a checkpoint source.
         pointer = load_task_result(f.root, TASK)["review_operations"][block["owner_id"]]

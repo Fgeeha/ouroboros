@@ -79,7 +79,9 @@ def _read_json_file(path: pathlib.Path) -> Tuple[str, Optional[Dict[str, Any]], 
     try:
         raw = pathlib.Path(path).read_bytes()
     except FileNotFoundError:
-        return "missing", None, b"", ""
+        from supervisor.state_initialization import blocked_absence  # Windows spells ENOTDIR as ENOENT
+        blocked = blocked_absence(path)
+        return ("unreadable" if blocked else "missing"), None, b"", blocked
     except OSError as exc:
         return "unreadable", None, b"", f"{type(exc).__name__} errno={exc.errno}"
     try:

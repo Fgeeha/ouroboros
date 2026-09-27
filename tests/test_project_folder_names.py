@@ -59,7 +59,9 @@ def test_unicode_folder_is_created_committed_and_passed_as_a_process_cwd(tmp_pat
     (path / "заметка.md").write_text("привет", encoding="utf-8")
     status = subprocess.run(["git", "status", "--porcelain", "-z"], cwd=path, capture_output=True, check=True)
     assert "заметка.md".encode("utf-8") in status.stdout
-    cwd = subprocess.run([sys.executable, "-c", "import os; print(os.getcwd())"], cwd=path,
+    # Raw UTF-8 bytes: a piped child's print() would use the Windows ANSI code page.
+    report_cwd = "import os, sys; sys.stdout.buffer.write(os.getcwd().encode('utf-8'))"
+    cwd = subprocess.run([sys.executable, "-c", report_cwd], cwd=path,
                          capture_output=True, text=True, encoding="utf-8", check=True).stdout.strip()
     assert os.path.samefile(cwd, path)
     assert handle.task_id == "t1" and handle.base_sha

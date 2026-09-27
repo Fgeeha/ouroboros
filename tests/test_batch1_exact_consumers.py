@@ -362,12 +362,15 @@ def test_actual_pooled_worker_requests_separate_session_command_before_owner_exi
             proc.terminate()
             proc.join(timeout=5)
         if child_pid and pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
-            # This test created and continuously observed the child; no unrelated PID search.
-            os.kill(child_pid, 9)
+            # The child may exit between the liveness probe and this signal.
+            try:
+                os.kill(child_pid, 9)
+            except ProcessLookupError:
+                pass
         proc._ouroboros_stop_socket.close()
         for channel in (incoming, outgoing):
             channel.close()
-            channel.cancel_join_thread()
+            channel.join_thread()
 
 
 @pytest.mark.parametrize("platform_name", ["linux", "darwin"])
@@ -376,9 +379,13 @@ def test_attached_request_never_turns_held_identity_into_numeric_group(monkeypat
     calls = []
     monkeypatch.setattr(platform, "IS_WINDOWS", False)
     monkeypatch.setattr(platform, "IS_MACOS", platform_name == "darwin")
-    monkeypatch.setattr(platform.os, "getpgid", lambda *_: pytest.fail("numeric group lookup loses identity"))
+    # A simulated POSIX host: Windows has no getpgid/killpg/SIGKILL to replace.
+    monkeypatch.setattr(platform.signal, "SIGKILL", getattr(platform.signal, "SIGKILL", 9), raising=False)
+    monkeypatch.setattr(platform.os, "getpgid", lambda *_: pytest.fail("numeric group lookup loses identity"),
+                        raising=False)
     monkeypatch.setattr(platform.os, "kill", lambda *_: pytest.fail("numeric PID cannot signal an attachment"))
-    monkeypatch.setattr(platform.os, "killpg", lambda *_: pytest.fail("numeric group cannot signal an attachment"))
+    monkeypatch.setattr(platform.os, "killpg", lambda *_: pytest.fail("numeric group cannot signal an attachment"),
+                        raising=False)
     monkeypatch.setattr(platform.signal, "pidfd_send_signal", lambda *a: calls.append(a), raising=False)
     target = {"pid": 123, "handle": SimpleNamespace(fileno=lambda: 987, close=lambda: None), "pgid": 123}
     receipt = platform.request_process_tree_kill(target)

@@ -768,6 +768,8 @@ def test_no_op_cycle_resets_dirty_worktree_to_base_with_recovery_refs(tmp_path, 
     (repo / "dirty.txt").write_text("dirty\n", encoding="utf-8")
 
     git_ops.init(repo, tmp_path, "")
+    supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # Initialize before queue writes supervisor history.
     queue.init(tmp_path)
     queue.RUNNING.clear()
 

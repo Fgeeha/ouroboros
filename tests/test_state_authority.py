@@ -425,6 +425,25 @@ def test_a_file_where_the_state_directory_belongs_is_unknown_not_absent(root):
     assert state_initialization.supervisor_evidence(root)[0] == "unknown"
 
 
+def test_windows_style_missing_child_under_file_is_not_first_boot(root, monkeypatch):
+    import pathlib
+    import shutil
+
+    shutil.rmtree(root / "state", ignore_errors=True)
+    (root / "state").write_text("not a directory", encoding="utf-8")
+    original_read = pathlib.Path.read_bytes
+
+    def windows_style_read(path):
+        if path.parent == root / "state":
+            raise FileNotFoundError(path)
+        return original_read(path)
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", windows_style_read)
+    assert state._read_json_file(root / "state" / "state.json")[0] == "unreadable"
+    assert state_initialization.read_witness(root)[0] == "unreadable"
+    assert state.init_state().quality == "unavailable"
+
+
 def test_a_first_state_whose_witness_cannot_complete_admits_nothing_this_boot(root, monkeypatch):
     real_complete = state_initialization.complete
     monkeypatch.setattr(state_initialization, "complete", lambda *a, **k: False)
