@@ -67,6 +67,16 @@ def acceptance_retrieving_work_order(
         f"- tool trajectory log (rows with task_id={task_id}; one call's start / settlement / wait-ended rows "
         f"share one invocation_id): {root / 'logs' / 'tools.jsonl'}",
     ))
+    closure = request.policy.get('review_source_closure')
+    if closure:
+        pointers = '\n'.join([
+            'RETRIEVAL POINTERS (immutable named snapshots; original paths in the closure are provenance):',
+            f'- task workspace — the active tree the task worked in (your root): {session_root}',
+            f'- artifact_store for task {task_id}: {artifacts_dir}/',
+            *(f"- {row['name']}: {row.get('retained_path') or row['status']}" for row in closure['sources']),
+            *(f"- source owned by task {row['owner_task_id']}: {row['retained_path']}"
+              for row in closure.get('refmap', [])),
+        ])
     native_packet: Optional[Dict[str, Any]] = None
     for slot in slots:
         if getattr(slot, "route", None) is ReviewRouteKind.AGENT_SESSION:

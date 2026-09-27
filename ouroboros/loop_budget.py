@@ -175,6 +175,7 @@ def _check_budget_limits(
                     ctx, prompt=priced_prompt, _prompt_prepared=True,
                     fallback_text=finish_reason, reason_code="budget_exhausted",
                     _initial_messages=send_messages, _admitted_request=wrapup_request,
+                    _admission=balances,  # the fresh send is admitted against these at its own price
                 )
             # Repricing admitted ordinary work after all. No forced call is committed, so the
             # Presence arm the prepared prompt set is withdrawn: it would silence the ordinary reply.
@@ -337,11 +338,10 @@ def _soft_land_exhausted_ceiling(
         root_cap_usd=cost_ceiling.root_cap_usd,
     )
     limit_ctx.accumulated_usage["cost_stop_spend_basis"] = spend_basis
-    if task_pacing.wrapup_reservation_fits(
-        request=request, root_cap_usd=cost_ceiling.root_cap_usd, deciding_usd=deciding or 0.0,
-        global_remaining_usd=_wrapup_global_remaining() if not limit_ctx.active_use_local else None,
-        use_local=limit_ctx.active_use_local,
-    ) is False:
+    admission = dict(root_cap_usd=cost_ceiling.root_cap_usd, deciding_usd=deciding or 0.0,
+                     global_remaining_usd=_wrapup_global_remaining() if not limit_ctx.active_use_local else None,
+                     use_local=limit_ctx.active_use_local)
+    if task_pacing.wrapup_reservation_fits(request=request, **admission) is False:
         limit_ctx.accumulated_usage["cost_stop_rail"] = "wrapup_reservation_last_fit"
         return _loop()._forced_fallback_result(
             limit_ctx, trace, soft_land_reason, "budget_exhausted",
@@ -350,7 +350,7 @@ def _soft_land_exhausted_ceiling(
     return _loop()._forced_final_answer(
         limit_ctx, prompt=priced_prompt, _prompt_prepared=True,
         fallback_text=soft_land_reason, reason_code="budget_exhausted",
-        _initial_messages=send_messages, _admitted_request=request,
+        _initial_messages=send_messages, _admitted_request=request, _admission=admission,
     )
 
 

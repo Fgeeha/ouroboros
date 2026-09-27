@@ -417,8 +417,12 @@ def build_task_acceptance_evidence(
         if arts:
             ev["artifacts"] = arts
             prov["artifacts"] = "artifact"
-            if any(isinstance(row, dict) and row.get("name") == "…" for row in arts):
-                partial_sources.append({"tool": "artifact_manifest", "status": "source_unavailable", "reason": "artifact_manifest_truncated_without_exact_range", "source_ref": {}})
+            for row in arts:
+                if row.get("name") == "…":
+                    ref = row.get("source_ref") or {}
+                    partial_sources.append({"tool": "artifact_manifest", "source_ref": ref,
+                        "status": "not_materialized_for_reviewer" if ref else "source_unavailable",
+                        "reason": "artifact_manifest_preview" if ref else "artifact_inventory_unavailable"})
     if ev.get("skill_lifecycle_complete") is False:
         coverage = ev.get("skill_lifecycle_history_coverage") or {}
         partial_sources.append({"tool": "skill_lifecycle", "status": "not_materialized_for_reviewer",

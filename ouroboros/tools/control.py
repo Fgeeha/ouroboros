@@ -383,13 +383,22 @@ def get_tools() -> List[ToolEntry]:
         }, _toggle_evolution),
         ToolEntry("toggle_consciousness", {
             "name": "toggle_consciousness",
-            "description": "Control background consciousness: 'start', 'stop', or 'status'.",
+            "description": ("Control background consciousness: 'start' or 'stop' (the owner is told), or "
+                            "'status' (answered to you only: the persisted state with its source, never posted to "
+                            "the owner's chat)."),
             "parameters": {"type": "object", "properties": {
                 "action": {"type": "string", "enum": ["start", "stop", "status"], "description": "Action to perform"},
             }, "required": ["action"]},
         }, _toggle_consciousness),
         ToolEntry("set_next_wakeup", {
-            "name": "set_next_wakeup", "description": "Choose the consciousness wake-up interval in seconds: how long after a wake-up ends the next one starts (clamped into the owner's OUROBOROS_BG_WAKEUP_MIN/MAX bounds; a wake-up calling this sets its own next one; a pending wake-up keeps its time; stored for later when consciousness is off).", "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "description": "Seconds from the end of a wake-up to the next one"}}, "required": ["seconds"]},
+            "name": "set_next_wakeup", "description": (
+                "Choose the consciousness wake-up interval in seconds: how long after a wake-up ends the next one "
+                "starts, clamped into the owner's OUROBOROS_BG_WAKEUP_MIN/MAX. A wake-up calling this sets its own "
+                "next one; a wake-up already pending keeps its time; with consciousness off it is stored for later. "
+                "The alarm still adjusts it: a failed wake-up doubles the interval (up to MAX), a pending event "
+                "brings the next wake-up forward, a skipped one retries after MIN (an exhausted allowance waits for "
+                "its reset), and no wake-up starts sooner than MIN after the last wake-up, boot or skip."),
+            "parameters": {"type": "object", "properties": {"seconds": {"type": "integer", "description": "Seconds from the end of a wake-up to the next one"}}, "required": ["seconds"]},
         }, _set_next_wakeup),
         ToolEntry("switch_model", {
             "name": "switch_model",
@@ -414,6 +423,7 @@ def get_tools() -> List[ToolEntry]:
                                               "description": "Read the full stored completion observations for this task, including returns omitted from the summary. Omit bounds for source length/hash, then request explicit character ranges."},
                 "include_focus_source": {"type": "boolean", "default": False, "description": "Read the exact bytes this task's focus source_ref answered when the focus was authored (the retained_source of an [INDEPENDENT_ROOTS] row); same bounds contract as include_completion_source."},
                 "focus_source_sha256": {"type": "string", "default": "", "description": "With include_focus_source: select the retained source by the sha256 the roster row quoted, so a later focus of the same author cannot substitute its evidence."},
+                "review_source_sha256": {"type": "string", "default": "", "description": "Root turns: read only the exact acceptance-review source named by a late-evidence digest, pinned to the physical task_id even after a retry. Works across forked/empty drives. Without a range returns complete_chars/hash; then use source_start_char/source_end_char to read exact text. Does not include authority."},
                 "source_start_char": {"type": "integer", "description": "Inclusive character offset for the requested canonical source range."},
                 "source_end_char": {"type": "integer", "description": "Exclusive character offset for the requested canonical source range. A range outside the source returns no text: the answer names complete_chars and the range received, and is an argument error."},
                 "presence_scope": {"type": "string", "enum": ["own_binding"], "description": "Presence tasks only: read just independent work started from this Presence binding (any of its conversations) or this task's own tree."},

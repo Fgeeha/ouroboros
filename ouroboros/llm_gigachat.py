@@ -75,7 +75,13 @@ class _GigaChatLaneMixin:
         exchanges these for a short-lived access token and refreshes it
         automatically, so caching the client across calls is safe. Any other
         ``GIGACHAT_*`` setting present in the environment (e.g.
-        ``GIGACHAT_PROFANITY_CHECK``) is picked up by the library itself.
+        ``GIGACHAT_PROFANITY_CHECK``) is picked up by the library itself —
+        except transport retries: ``max_retries=0`` is passed explicitly (an
+        init argument outranks ``GIGACHAT_MAX_RETRIES``), because one
+        ``client.chat`` is one accounted physical attempt and a retry belongs
+        to the host's own ladder, re-prepared and re-measured. The library's
+        re-send after a 401 (token reset, then the same call) has no switch;
+        it repeats the sealed bytes of the same attempt.
         A caller-supplied per-request ``timeout`` becomes part of the cache key
         (the library takes it at construction), so the safety-supervisor timeout
         SSOT bounds this lane too (v6.54.3)."""
@@ -91,7 +97,7 @@ class _GigaChatLaneMixin:
         cache_key = (credentials, user, password, scope, base_url, verify, timeout_key, extra_ca_bundle())
 
         if cache_key not in self._gigachat_clients:
-            self._gigachat_clients[cache_key] = self._new_gigachat_client(target, timeout=timeout)
+            self._gigachat_clients[cache_key] = self._new_gigachat_client(target, timeout=timeout, max_retries=0)
         return self._gigachat_clients[cache_key]
 
     @staticmethod
@@ -249,7 +255,13 @@ class _GigaChatLaneMixin:
         # hidden reasoning and return empty content/tool_calls when
         # reasoning_effort is sent. Keep the native path deterministic.
 
-        candidate = _physical_candidate(payload)
+        from ouroboros.send_clock import stamp_clock_note
+
+        # This lane bypasses the wire finalizer, so its Main clock line joins here,
+        # before measurement and sealing. The library's transport retries are off
+        # (``_get_gigachat_client``); its one re-send after a 401 repeats these
+        # sealed bytes inside the same attempt and claims no fresher clock.
+        candidate = _physical_candidate(stamp_clock_note(payload))
         request = _attempt_request(target, candidate, source="llm.gigachat")
         completion = _execute_candidate(
             request,

@@ -414,10 +414,9 @@ def _handle_toggle_consciousness(evt: Dict[str, Any], ctx: Any) -> None:
         result = ctx.consciousness.start() if on else ctx.consciousness.stop()
         result = f"{result}{persist_consciousness_choice(on)}"
     else:
-        snapshot = ctx.consciousness.status_snapshot()
-        result = (f"Background consciousness: {'enabled' if snapshot.get('enabled') else 'disabled'}; "
-                  f"next wake-up at {snapshot.get('next_wake_at') or '?'}; "
-                  f"last outcome: {snapshot.get('last_wake_outcome') or 'none yet'}")
+        # Status is answered to its caller by the tool itself; reading it is not
+        # an event the owner is told about (#1324). Only start/stop publish.
+        return
     st = ctx.load_state()
     if st.get("owner_chat_id"):
         ctx.send_with_budget(int(st["owner_chat_id"]), f"🧠 {result}", role="system", system_type="consciousness_notice")

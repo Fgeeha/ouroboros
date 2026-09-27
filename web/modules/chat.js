@@ -1837,7 +1837,7 @@ export function createChatInstance({
         return withStableViewport(() => finishLiveCardMutation(groupId, phase));
     }
 
-    // Every terminal route releases controls and subscriptions together.
+    // Author controls end here; exact paid-review waits retain their own lifetime.
     function settleLiveCard(record, phase, wasFinished) {
         record.root.dataset.finished = '1';
         if (record.toolFold) {

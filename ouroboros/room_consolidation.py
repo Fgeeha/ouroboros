@@ -305,8 +305,21 @@ def summarize_block(
     entries: List[Dict[str, Any]] = []
 
     def finish(block: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
-        return block, {**_merge_consolidation_usage(*usages), "_consolidation_retry": input_limit,
-                       **({"_knowledge_entries": entries} if entries else {})}
+        usage = {**_merge_consolidation_usage(*usages), "_consolidation_retry": input_limit,
+                 **({"_knowledge_entries": entries} if entries else {})}
+        # One coverage fact per logical chunk: the WHOLE chunk is the unit a
+        # failure withholds, so its source counts every room, attempted or not.
+        usage["_coverage"] = [*usage.get("_coverage", []), {
+            "unit": "block", "status": "accepted" if block is not None else "withheld", "rooms": len(rooms),
+            "messages": sum(len(room.entries) for room in rooms),
+            "source_chars": sum(len(room.text) for room in rooms),
+            "output_chars": len(block["content"]) if block is not None else 0,
+            # Refusals answered by queueing halves, counted when queued: the
+            # halves' own outcome is this chunk's status, so an attempt is no recovery.
+            "split_attempts": sum(1 for error in usage.get("_consolidation_errors") or []
+                                  if isinstance(error, dict) and error.get("resolution") == "split"),
+        }]
+        return block, usage
 
     for room in rooms:
         def draft(part: str, note: str, room: RoomSource = room) -> str:
@@ -370,6 +383,16 @@ def compress_blocks_to_era(
     """
     from ouroboros.consolidator import _merge_consolidation_usage
 
+    def done(era: Optional[Dict[str, Any]]) -> Tuple[Optional[Dict[str, Any]], Dict[str, Any]]:
+        # Produced is not adopted: the caller keeps the blocks unless the era is shorter.
+        usage = _merge_consolidation_usage(*usages)
+        usage["_coverage"] = [*usage.get("_coverage", []), {
+            "unit": "era", "status": "produced" if era is not None else "withheld", "blocks": len(blocks),
+            "messages": sum(int(b.get("message_count") or 0) for b in blocks),
+            "source_chars": sum(len(b.get("content", "")) for b in blocks),
+            "output_chars": len(era["content"]) if era is not None else 0}]
+        return era, usage
+
     start_date, end_date = era_dates(blocks)
     groups: Dict[str, Dict[str, Any]] = {}
     for block in blocks:
@@ -390,7 +413,7 @@ def compress_blocks_to_era(
                                           call_type="era_compression")
         usages.append(usage)
         if not content.strip():
-            return None, _merge_consolidation_usage(*usages)
+            return done(None)
         corrected, usage, _knowledge = call(
             correction_prompt(content, combined, room_label=group["label"], scope=scope, identity_text=identity_text),
             "Era correction", fixed_prompt=correction_prompt(content, "", room_label=group["label"], scope=scope,
@@ -398,18 +421,50 @@ def compress_blocks_to_era(
             call_type="era_correction")
         usages.append(usage)
         if not corrected.strip():
-            return None, _merge_consolidation_usage(*usages)
+            return done(None)
         rooms.append({"room_id": room_id, "label": group["label"], "message_count": group["message_count"],
                       "content": corrected.strip()})
     era_range = f"{start_date} to {end_date}"
-    return ({"range": era_range, "message_count": sum(int(b.get("message_count") or 0) for b in blocks),
-             "content": render_sections(f"### Era: {era_range}", rooms), "rooms": rooms},
-            _merge_consolidation_usage(*usages))
+    return done({"range": era_range, "message_count": sum(int(b.get("message_count") or 0) for b in blocks),
+                 "content": render_sections(f"### Era: {era_range}", rooms), "rooms": rooms})
+
+
+def consolidation_coverage(facts: Any) -> Dict[str, Any]:
+    """What one consolidation run covered, from its per-unit facts; every ratio names its denominator.
+
+    ``accepted`` chunks passed draft and correction (publication is the
+    separate ``blocks_written``); a ``withheld`` chunk stays behind the cursor
+    for the next cycle, and chunks after it were not attempted this run.
+    ``split_attempts`` counts refusals answered by queueing a part's halves,
+    whatever those halves then did; whether the chunk came through is its
+    status. An era ``produced`` is kept only when ``shorter``.
+    """
+    rows = [row for row in (facts or []) if isinstance(row, dict)]
+
+    def total(unit: str, status: str = "") -> Dict[str, int]:
+        chosen = [row for row in rows if row.get("unit") == unit and (not status or row.get("status") == status)]
+        keys = ("messages", "rooms", "source_chars", "output_chars") if unit == "block" else (
+            "blocks", "messages", "source_chars", "output_chars")
+        return {"count": len(chosen), **{key: sum(int(row.get(key) or 0) for row in chosen) for key in keys}}
+
+    accepted = total("block", "accepted")
+    eras = [row for row in rows if row.get("unit") == "era"]
+    return {
+        "unit": "chat chunk attempted this run",
+        "attempted": total("block"), "accepted": accepted, "withheld": total("block", "withheld"),
+        "split_attempts": sum(int(row.get("split_attempts") or 0) for row in rows if row.get("unit") == "block"),
+        "accepted_output_to_source": {
+            "ratio": round(accepted["output_chars"] / accepted["source_chars"], 4) if accepted["source_chars"] else None,
+            "numerator": "output chars of accepted chunks", "denominator": "source chars of accepted chunks"},
+        "eras": {**total("era"), "produced": sum(1 for row in eras if row.get("status") == "produced"),
+                 "shorter": sum(1 for row in eras if row.get("status") == "produced"
+                                and int(row.get("output_chars") or 0) < int(row.get("source_chars") or 0))},
+    }
 
 
 __all__ = [
     "LEGACY_ROOM_ID", "LEGACY_ROOM_LABEL", "FIDELITY_RULES", "RoomSource",
     "partition_entries", "block_range", "room_draft_prompt", "correction_prompt", "era_room_prompt",
     "split_source_text", "summarize_source", "summarize_block", "render_sections", "room_sections",
-    "era_dates", "compress_blocks_to_era",
+    "era_dates", "compress_blocks_to_era", "consolidation_coverage",
 ]

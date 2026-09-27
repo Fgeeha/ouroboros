@@ -14,6 +14,7 @@ from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
 from ouroboros.llm_claudexor import cache_key_for_model
 from ouroboros.loop_model_call import _reprepare_waiting_main
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY
+from ouroboros.send_clock import CLOCK_NOTE_PREFIX
 from tests.test_context_fit_integration import _plan
 from tests.test_llm_claudexor import MODEL, ROUTE, result, ledger, setup as gateway_fixture
 from tests.test_model_wait import live_wait as wait_fixture
@@ -95,7 +96,11 @@ def test_native_account_repair_rebinds_real_physical_candidate_before_send(main_
     assert len(gateway.accepted_operations) == 2 and gateway.creates[0] != gateway.creates[1]
     resent = gateway.uploads[1][0]["messages"]
     assert "nativeContinuation" not in resent[2]
-    assert resent[2]["tool_calls"] == original[2]["tool_calls"] and resent[3:] == original[3:]
+    # A Main round's repaired send is a new host preparation: canonical rows, then its own
+    # clock line. The bare async driver binds no Main clock.
+    clocked = resent[-1]["content"].startswith(CLOCK_NOTE_PREFIX)
+    assert clocked is (not asynchronous)
+    assert resent[2]["tool_calls"] == original[2]["tool_calls"] and resent[3:len(resent) - clocked] == original[3:]
     assert "nativeContinuation" not in ctx.messages[2]
     assert ctx.context_fit_plan.core_sha256 == "a" * 64
 
@@ -139,11 +144,13 @@ def test_wait_reprepares_vision_from_canonical_images(main_call, monkeypatch, im
     gateway.dispatch = ["not_started", "response_received"]
     answer, _, _ = _dispatch(ctx)
     assert answer and len(gateway.accepted_operations) == 2
-    assert ctx.messages[-1]["content"] == original[-1]["content"]
-    sent = [item[0]["messages"][-1]["content"] for item in gateway.uploads]
+    # The consumed clock line of the answered send now closes the canonical transcript.
+    assert ctx.messages[-1]["content"] == gateway.uploads[1][0]["messages"][-1]["content"]
+    assert ctx.messages[-2]["content"] == original[-1]["content"]
+    sent = [item[0]["messages"][-2]["content"] for item in gateway.uploads]
     assert sent[0] == sent[1] and "image_url" not in str(sent)
     assert len(captions) == (1 if image_mode == "caption" else 0)
-    assert ctx.messages[-2]["content"] == "verified read A"
+    assert ctx.messages[-3]["content"] == "verified read A"
 
 
 def test_main_authored_checkpoint_after_a_real_projected_image_wait(main_call, monkeypatch, tmp_path):
@@ -294,8 +301,10 @@ def test_manual_switch_updates_only_waiting_role_and_continues_current_main_call
     assert controller.overrides == {"main": {"model": destination, "use_local": use_local, "model_account_override": pin}}
     assert json.loads(__import__("os").environ[MODEL_ACCOUNTS_KEY])["light"] == "light-account"
     assert cost == (None if destination == MODEL else 0 if use_local else 0.2)
-    assert ctx.messages[-2:][0]["content"] == "verified read A"
-    assert ctx.messages[-1]["content"] == "completed review B"
+    rows = [row for row in ctx.messages if not str(row.get("content") or "").startswith(CLOCK_NOTE_PREFIX)]
+    assert rows[-2]["content"] == "verified read A" and rows[-1]["content"] == "completed review B"
+    # Only a real stamping lane seals — and so replays — a clock line; this fixture's direct lane does not.
+    assert str(ctx.messages[-1]["content"]).startswith(CLOCK_NOTE_PREFIX) is (destination == MODEL)
     # The same model used by Light remains pinned to its own account after Main switches.
     ctx.llm.chat([], MODEL, model_role="light")
     assert gateway.uploads[-1][0]["account"] == {"mode": "pin", "profileId": "light-account"}

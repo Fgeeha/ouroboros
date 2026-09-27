@@ -18,7 +18,7 @@ from ouroboros.loop_llm_call import forced_response_is_incomplete, forced_respon
 from ouroboros.outcomes import ACCEPTANCE_FINALIZED_UNACCEPTED, REASON_DELIVERY_CONTROL_DEGRADED
 from ouroboros.task_finalization import TERMINAL_ORIGIN_HOST_NOTICE, TERMINAL_ORIGIN_HOST_SALVAGE, TERMINAL_ORIGIN_MODEL_FINAL, set_terminal_host_notice
 from ouroboros.tools.registry import ToolRegistry
-from ouroboros.usage_accounting import BudgetExceeded
+from ouroboros.usage_accounting import BudgetExceeded, PhysicalAttemptPreconditionFailed
 from ouroboros.utils import sanitize_tool_result_for_log, truncate_review_artifact
 
 
@@ -840,8 +840,17 @@ def _drain_forced_owner_directives(
     return True
 
 
+class ForcedCandidateUnaffordable(PhysicalAttemptPreconditionFailed):
+    """The fresh forced candidate, priced on its own sealed bytes, does not fit the admitted balances.
+
+    Not drift: the candidate is the admitted one (its clock line aside), so the
+    drift rail's unpredicated resend does not apply; nothing was sent or paid.
+    """
+
+
 def _call_forced_model_once(
     ctx: _RoundLimitContext, *, initial_messages: Any = None, admitted_request: Any = None,
+    admission: Optional[Dict[str, Any]] = None,
 ) -> str:
     from ouroboros.model_slots import task_model_binding
     from ouroboros.model_wait import current_model_wait
@@ -853,13 +862,33 @@ def _call_forced_model_once(
         context_fit_plan=getattr(owner_ctx, "context_fit_plan", None),
         overrides=waiter.overrides if waiter else None)
     response_meta: Dict[str, Any] = {}
-    identity = (
-        "model", "provider", "candidate_raw_sha256", "candidate_raw_size_bytes",
-    )
-    candidate_predicate = (
-        lambda actual: all(getattr(actual, key, None) == getattr(admitted_request, key, None) for key in identity)
-        if admitted_request is not None else None
-    )
+    from ouroboros.send_clock import main_clock_policy
+
+    from ouroboros import task_pacing
+
+    content = lambda request: (getattr(request, "candidate_clock_free_sha256", None)  # noqa: E731
+                               or getattr(request, "candidate_raw_sha256", None))
+
+    def candidate_predicate(actual: Any) -> bool:
+        """Final admission of the FRESH request the host measured, priced and sealed, before a byte leaves.
+
+        The lookahead priced a copy whose Main clock line was sampled earlier; equal
+        width is not equal tokens, so its price is advice only. ``actual`` is the
+        ``AttemptRequest`` the ledger reserved and whose candidate was just sealed
+        (``llm_attempt._candidate_before_dispatch``). It must be the admitted
+        candidate apart from that line (clock-free identity, else the whole digest):
+        a genuine drift returns False for the drift rail. Its OWN price must fit the
+        admission's balances through the same ``wrapup_reservation_fits``, or it is
+        refused as unaffordable — not drift, never resent unpredicated.
+        """
+        if (any(getattr(actual, key, None) != getattr(admitted_request, key, None) for key in ("model", "provider"))
+                or content(actual) != content(admitted_request)):
+            return False
+        if admission is not None and task_pacing.wrapup_reservation_fits(request=actual, **admission) is False:
+            raise ForcedCandidateUnaffordable(
+                "the fresh forced candidate does not fit the admitted balances at its own price")
+        return True
+
     final_msg, _final_cost = _loop().call_llm_with_retry(
         ctx.llm,
         ctx.messages,
@@ -881,12 +910,14 @@ def _call_forced_model_once(
             getattr(getattr(ctx, "tools", None), "_ctx", None)
         ),
         initial_messages=initial_messages,
-        candidate_predicate=candidate_predicate,
+        candidate_predicate=candidate_predicate if admitted_request is not None else None,
         model_role=role,
         model_account_override=account,
         # A forced final belongs to the loop invocation that is finishing, so it
         # continues that same active turn instead of opening a new one.
         model_turn_state=getattr(owner_ctx, "model_turn_state", None),
+        send_clock_policy=main_clock_policy(
+            getattr(owner_ctx, "task_metadata", {}), task_type=str(getattr(ctx, "task_type", "") or "")),
     )
     ctx.accumulated_usage["_forced_response_meta"] = response_meta
     return str((final_msg or {}).get("content") or "").strip()
@@ -1162,6 +1193,7 @@ def _resolve_forced_delivery_control(
 
 def _send_admitted_forced_candidate(
     ctx: _RoundLimitContext, initial_messages: Any, admitted_request: Any, reason_code: str,
+    admission: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Send the admitted wrap-up; one that drifted from its pricing is sent once more, unpredicated.
 
@@ -1173,14 +1205,15 @@ def _send_admitted_forced_candidate(
     send it actually sees. So the drift is recorded as a typed fact — the refused
     attempt's row and sealed candidate carry the actual identity — and the answer
     is asked for once more the ordinary way. A closed dispatch window is a
-    deadline, not drift, and keeps its own rail."""
+    deadline, not drift, and keeps its own rail. A fresh candidate whose OWN price
+    no longer fits (its clock line re-sampled) is not drift either: it is refused
+    unsent and never resent unpredicated (``ForcedCandidateUnaffordable``)."""
     from ouroboros.llm_attempt import PhysicalDispatchInterrupted
-    from ouroboros.usage_accounting import PhysicalAttemptPreconditionFailed
 
     try:
         return _loop()._call_forced_model_once(
-            ctx, initial_messages=initial_messages, admitted_request=admitted_request)
-    except PhysicalDispatchInterrupted:
+            ctx, initial_messages=initial_messages, admitted_request=admitted_request, admission=admission)
+    except (PhysicalDispatchInterrupted, ForcedCandidateUnaffordable):
         raise
     except PhysicalAttemptPreconditionFailed as refusal:
         log.warning("Admitted %s wrap-up candidate drifted from its pricing; sending it unpredicated", reason_code)
@@ -1205,8 +1238,10 @@ def _forced_final_answer(
     _prompt_prepared: bool = False,
     _initial_messages: Any = None,
     _admitted_request: Any = None,
+    _admission: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, Dict[str, Any], Dict[str, Any]]:
-    """Forced rail."""
+    """Forced rail. ``_admission`` holds the balances the lookahead was admitted against;
+    the fresh request is admitted against them again at its own price."""
     live_trace = getattr(ctx, "llm_trace", None)
     llm_trace = live_trace if isinstance(live_trace, dict) else {}
     if not _prompt_prepared:
@@ -1226,13 +1261,20 @@ def _forced_final_answer(
             ctx.accumulated_usage.pop("_forced_response_meta", None)
             if attempt == 0 and _admitted_request is not None:
                 forced = _send_admitted_forced_candidate(
-                    ctx, _initial_messages, _admitted_request, reason_code)
+                    ctx, _initial_messages, _admitted_request, reason_code, admission=_admission)
             else:
                 forced = _loop()._call_forced_model_once(ctx)
             extracted, response_meta = forced_response_parts(forced, ctx.accumulated_usage)
         except BudgetExceeded:
             _loop()._drain_forced_owner_directives(ctx, llm_trace)
             raise
+        except ForcedCandidateUnaffordable:
+            _loop()._emit_checkpoint_event(ctx.event_queue, ctx.task_id, ctx.drive_logs, {
+                "checkpoint_kind": "forced_candidate_unaffordable", "reason_code": reason_code})
+            ctx.accumulated_usage.update(execution_status="failed", reason_code=reason_code)
+            return _loop()._forced_fallback_result(
+                ctx, llm_trace, fallback_text, reason_code, source="budget_wrapup_unaffordable",
+                provider_terminal=provider_terminal)
         except Exception:
             log.warning("Failed to get final response after %s", reason_code, exc_info=True)
             extracted = ""

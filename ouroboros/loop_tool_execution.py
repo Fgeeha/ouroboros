@@ -1532,7 +1532,9 @@ def process_tool_results(
                                 **(parsed.get("request") or {}),
                                 "acceptance_subject": parsed.get("acceptance_subject"),
                             }
-                    else:
+                    # A typed pre-dispatch refusal (child/off: no reviewer ran, no run or actor
+                    # evidence) stays this call's tool evidence; it is not a review run.
+                    elif not (parsed.get("status") == "not_dispatched" and not parsed.keys() & {"request", "actors", "aggregate_signal"}):
                         llm_trace.setdefault("review_runs", []).append(parsed)
                     # v6.54.4 (review round 2): dissent is recorded on the agent-called
                     # path too — merge into acceptance_decision without requiring an

@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict, Optional
 
 from ouroboros.utils import truncate_within_limit
@@ -29,6 +30,27 @@ log = logging.getLogger(__name__)
 CLIENT_SURFACE_UA_LIMIT = 512
 _CLIENT_SURFACE_SHORT_LIMIT = 64
 _CLIENT_SURFACE_VIEWPORT_MAX = 100_000
+# An IANA key (``Area/City``, ``UTC``, ``Etc/GMT+3``): no path traversal, no spaces.
+_IANA_ZONE_RE = re.compile(r"[A-Za-z][A-Za-z0-9_+\-]*(?:/[A-Za-z0-9_+\-]+){0,2}")
+
+
+def normalize_timezone_name(value: Any) -> str:
+    """The sender's IANA time-zone name when the host can load it, else ``""``.
+
+    The browser reports ``Intl...resolvedOptions().timeZone``; a missing,
+    malformed or unloadable name is dropped rather than guessed, so a reader
+    falls back to an explicitly labelled UTC and never to the server's zone.
+    """
+    name = value.strip() if isinstance(value, str) else ""
+    if not name or len(name) > _CLIENT_SURFACE_SHORT_LIMIT or not _IANA_ZONE_RE.fullmatch(name):
+        return ""
+    try:
+        from zoneinfo import ZoneInfo
+
+        ZoneInfo(name)
+    except Exception:
+        return ""
+    return name
 
 
 def normalize_client_surface(value: Any) -> Optional[Dict[str, Any]]:
@@ -58,6 +80,9 @@ def normalize_client_surface(value: Any) -> Optional[Dict[str, Any]]:
     captured_at = value.get("captured_at")
     if isinstance(captured_at, str) and captured_at.strip():
         fact["captured_at"] = truncate_within_limit(captured_at.strip(), _CLIENT_SURFACE_SHORT_LIMIT)
+    timezone = normalize_timezone_name(value.get("timezone"))
+    if timezone:
+        fact["timezone"] = timezone
     return fact or None
 
 
@@ -85,9 +110,10 @@ def owner_client_fact(meta: Any) -> Optional[Dict[str, Any]]:
 def client_surface_identity(fact: Any) -> Optional[tuple]:
     """The SURFACE IDENTITY a mid-task change-note keys on.
 
-    Deliberately excludes viewport, narrow_layout, and timestamps: a window
-    resize across the 980px breakpoint or a phone rotation is NOT a surface
-    change and must never inject a false "different client surface" note.
+    Deliberately excludes viewport, narrow_layout, timestamps and the time
+    zone: a window resize across the 980px breakpoint, a phone rotation or a
+    trip across zones is NOT a surface change and must never inject a false
+    "different client surface" note.
     """
     if not isinstance(fact, dict) or not fact:
         return None
