@@ -23,7 +23,7 @@ def _write_files(root, files):
 
 def _expected_hash(files):
     digest = hashlib.sha256()
-    for name, content in sorted(files.items()):
+    for name, content in sorted(files.items(), key=lambda item: Path(item[0])):
         digest.update(name.encode("utf-8") + b"\0" + hashlib.sha256(content).digest())
     return digest.hexdigest()
 
@@ -68,7 +68,7 @@ def test_cache_directories_are_not_visited_but_declared_entries_are_hashed(
         }
         assert compute_content_hash(root, **arguments) == _expected_hash({**payload, **declared})
         assert sorted(visited) == sorted(visits)
-        assert [p.relative_to(root).as_posix() for p in _iter_payload_files(root, **arguments)] == sorted({**payload, **declared})
+        assert [p.relative_to(root).as_posix() for p in _iter_payload_files(root, **arguments)] == sorted({**payload, **declared}, key=Path)
         (root / f"{cache_name}/entry.py").write_bytes(b"changed declared entry")
         assert compute_content_hash(root, **arguments) != _expected_hash({**payload, **declared})
         assert compute_content_hash(root) == _expected_hash(payload)
