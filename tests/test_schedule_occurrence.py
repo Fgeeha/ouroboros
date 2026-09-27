@@ -292,15 +292,22 @@ def test_each_durable_boundary_failure_reconciles_to_the_same_occurrence(q, monk
 
 def test_dispatch_barrier_restore_and_settlement(q, monkeypatch):
     import datetime
-    from supervisor import queue_schedules, schedule_occurrence as occurrences
+
+    from supervisor import queue_schedules, schedule_time
+    from supervisor import schedule_occurrence as occurrences
 
     class TickTime(datetime.datetime):
         @classmethod
         def now(cls, tz=None):
             return cls(2026, 9, 27, 19, 2, 30, tzinfo=datetime.timezone.utc).astimezone(tz)
 
-    # These two ticks settle ONE occurrence, not a newly due cron minute.
-    monkeypatch.setattr(queue_schedules.datetime, "datetime", TickTime)
+    # These two ticks settle ONE occurrence, not a newly due cron minute. Freeze the
+    # scheduler's own ``datetime`` names, never the stdlib class: dateutil binds
+    # ``datetime`` at import, so a first import under the fake class keeps it for the
+    # rest of the worker and every later cron check fails its fromutc() type check.
+    clock = SimpleNamespace(datetime=TickTime, timezone=datetime.timezone, timedelta=datetime.timedelta)
+    for module in (queue_schedules, occurrences, schedule_time):
+        monkeypatch.setattr(module, "datetime", clock)
 
     _row(q, intent={"kind": "system_repo"}, cron=True)
     q.queue.check_scheduled_tasks()

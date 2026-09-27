@@ -118,20 +118,18 @@ def test_native_worker_stop_does_not_require_lifeline_or_callback(tmp_path, monk
 
 @pytest.mark.parametrize("mode", ["owner_raises", "owner_hangs"])
 def test_supported_command_is_stopped_even_when_another_owner_fails(tmp_path, monkeypatch, mode):
+    from tests.test_batch1_exact_consumers import _await_published_command_child
+
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
     monkeypatch.setattr(worker_process, "worker_main", _owner_fault_entry)
     ctx = multiprocessing.get_context("spawn")
     incoming, outgoing = ctx.Queue(), ctx.Queue()
     proc = worker_process.spawn_worker_process(ctx, mode, incoming, outgoing, tmp_path, tmp_path)
-    child_pid = 0
+    seen = {}
     try:
         incoming.put({"id": "pooled", "type": "task"})
-        marker = tmp_path / "workspace/child.pid"
-        deadline = time.monotonic() + 20
-        while not marker.exists() and time.monotonic() < deadline:
-            assert proc.is_alive(), proc.exitcode
-            time.sleep(.01)
-        child_pid = int(marker.read_text())
+        # The published-child guarantee: the child's own marker can precede its registry entry.
+        child_pid = _await_published_command_child(proc, outgoing, tmp_path / "workspace", seen)
         if os.name != "nt":
             assert os.getpgid(child_pid) == child_pid != os.getpgid(proc.pid)
         receipt = platform.request_process_tree_kill(proc)
@@ -140,11 +138,12 @@ def test_supported_command_is_stopped_even_when_another_owner_fails(tmp_path, mo
         deadline = time.monotonic() + 3
         while platform.pid_is_alive(child_pid) and not pid_is_zombie(child_pid) and time.monotonic() < deadline:
             time.sleep(.01)
-        assert not platform.pid_is_alive(child_pid) or pid_is_zombie(child_pid)
+        assert not platform.pid_is_alive(child_pid) or pid_is_zombie(child_pid), (receipt, proc.exitcode, seen)
     finally:
         if proc.is_alive():
             proc.kill()
             proc.join(timeout=5)
+        child_pid = seen.get("pid", 0)  # the marker's own pid, even when its ACK never came
         if child_pid and platform.pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
             platform.force_kill_pid(child_pid)  # only the continuously observed fixture child
         worker_process.close_worker_stop_channel(proc)

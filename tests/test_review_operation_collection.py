@@ -579,6 +579,10 @@ def test_maintenance_collects_a_dead_controllers_operation_once(tmp_path, monkey
             "retry_key", "task_attempt", "controller", "operations", "recorded_at", "request", "slot_roster"}
     _settle(model, run)
     _settle(model, advisory)
+    # A worker leaves _ACTIVE before its operation closes its own pointer; a death
+    # simulated before that close lands would be overwritten by the live controller.
+    _until(lambda: all(load_task_result(tmp_path, TASK)["review_operations"][key]["state"]
+                       not in {"retained", "dispatched"} for key in (owner_id, advisory_id)))
     # Death after dispatch: nothing published, the pointer still says dispatched, the pid is gone.
     def died(rows):
         return {**rows, **{key: {**rows[key], "state": "dispatched", "controller": dead}
