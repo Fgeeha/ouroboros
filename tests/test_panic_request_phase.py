@@ -151,8 +151,12 @@ def test_unmeasured_attached_custody_never_becomes_signal_authority(tmp_path, mo
 def test_request_failures_are_receipts_not_clean_stops(monkeypatch):
     proc = SimpleNamespace(pid=123, poll=lambda: None)
     monkeypatch.setattr(platform, "IS_WINDOWS", False)
+    # The mocked POSIX surface exists on every host; no numeric PID/group is ever really signalled.
     monkeypatch.setattr(platform.os, "getpgid", lambda _: (_ for _ in ()).throw(PermissionError("refused")),
-                        raising=False)  # a simulated POSIX host: Windows has no getpgid
+                        raising=False)
+    monkeypatch.setattr(platform.os, "killpg", lambda *_: pytest.fail("a refused lookup must not signal"),
+                        raising=False)
+    monkeypatch.setattr(platform.os, "kill", lambda *_: pytest.fail("a refused lookup must not signal"))
     receipt = platform.request_process_tree_kill(proc)
     assert receipt == {"pid": 123, "requested": False, "scope": "process", "error": "PermissionError: refused"}
 

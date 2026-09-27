@@ -14,6 +14,7 @@ import pytest
 from supervisor import state, state_initialization
 from tests import test_schedule_occurrence as schedule_fixtures
 from tests import test_state_authority as state_fixtures
+from tests._shared import stop_socket_sharer
 
 root, _prior, _write = state_fixtures.root, state_fixtures._prior, state_fixtures._write
 q, _rows = schedule_fixtures.q, schedule_fixtures._rows
@@ -358,19 +359,23 @@ def test_actual_pooled_worker_requests_separate_session_command_before_owner_exi
             time.sleep(.01)
         assert not pid_is_alive(child_pid) or pid_is_zombie(child_pid)
     finally:
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=5)
-        if child_pid and pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
-            # The child may exit between the liveness probe and this signal.
-            try:
-                os.kill(child_pid, 9)
-            except ProcessLookupError:
-                pass
-        proc._ouroboros_stop_socket.close()
-        for channel in (incoming, outgoing):
-            channel.close()
-            channel.join_thread()
+        try:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5)
+            if child_pid and pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
+                # This test created and continuously observed the child; no unrelated PID search.
+                try:
+                    os.kill(child_pid, 9)
+                except OSError:  # exited after the probe: ESRCH on POSIX, WinError 87/5 on Windows
+                    if pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
+                        raise  # a refused kill of a still-running child is a real failure
+        finally:  # release channels and the socket sharer even when a cleanup step above failed
+            proc._ouroboros_stop_socket.close()
+            for channel in (incoming, outgoing):
+                channel.close()
+                channel.cancel_join_thread()
+            stop_socket_sharer()
 
 
 @pytest.mark.parametrize("platform_name", ["linux", "darwin"])
@@ -379,13 +384,13 @@ def test_attached_request_never_turns_held_identity_into_numeric_group(monkeypat
     calls = []
     monkeypatch.setattr(platform, "IS_WINDOWS", False)
     monkeypatch.setattr(platform, "IS_MACOS", platform_name == "darwin")
-    # A simulated POSIX host: Windows has no getpgid/killpg/SIGKILL to replace.
-    monkeypatch.setattr(platform.signal, "SIGKILL", getattr(platform.signal, "SIGKILL", 9), raising=False)
+    # The whole mocked POSIX surface, present on every host (Windows has no getpgid/killpg/SIGKILL).
     monkeypatch.setattr(platform.os, "getpgid", lambda *_: pytest.fail("numeric group lookup loses identity"),
                         raising=False)
     monkeypatch.setattr(platform.os, "kill", lambda *_: pytest.fail("numeric PID cannot signal an attachment"))
     monkeypatch.setattr(platform.os, "killpg", lambda *_: pytest.fail("numeric group cannot signal an attachment"),
                         raising=False)
+    monkeypatch.setattr(platform.signal, "SIGKILL", getattr(platform.signal, "SIGKILL", 9), raising=False)
     monkeypatch.setattr(platform.signal, "pidfd_send_signal", lambda *a: calls.append(a), raising=False)
     target = {"pid": 123, "handle": SimpleNamespace(fileno=lambda: 987, close=lambda: None), "pgid": 123}
     receipt = platform.request_process_tree_kill(target)

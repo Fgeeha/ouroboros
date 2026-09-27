@@ -72,16 +72,19 @@ def read_state_copy(path: pathlib.Path) -> Tuple[str, Optional[Dict[str, Any]], 
 
 def _read_json_file(path: pathlib.Path) -> Tuple[str, Optional[Dict[str, Any]], bytes, str]:
     """``(status, object, raw bytes, detail)`` for one state copy, classified by the
-    operation itself (#1307): ``missing`` only for ENOENT, ``unreadable`` for any other
-    OSError (EACCES, ENFILE, EIO, and ENOTDIR — a file where ``state/`` belongs is not
-    absence), ``invalid`` for bytes that are not a non-empty JSON object. No
-    ``exists()`` pre-check: it can fail the same way."""
+    operation itself (#1307): ``missing`` only for a not-found below a real directory
+    (``confirm_absent``), ``unreadable`` for any other OSError (EACCES, ENFILE, EIO, and
+    ENOTDIR — a file where ``state/`` belongs is not absence, on Windows too),
+    ``invalid`` for bytes that are not a non-empty JSON object. No ``exists()``
+    pre-check: it can fail the same way."""
+    from supervisor.state_initialization import confirm_absent
+
     try:
-        raw = pathlib.Path(path).read_bytes()
-    except FileNotFoundError:
-        from supervisor.state_initialization import blocked_absence  # Windows spells ENOTDIR as ENOENT
-        blocked = blocked_absence(path)
-        return ("unreadable" if blocked else "missing"), None, b"", blocked
+        try:
+            raw = pathlib.Path(path).read_bytes()
+        except FileNotFoundError:
+            confirm_absent(path)
+            return "missing", None, b"", ""
     except OSError as exc:
         return "unreadable", None, b"", f"{type(exc).__name__} errno={exc.errno}"
     try:

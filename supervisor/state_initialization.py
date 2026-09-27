@@ -19,6 +19,10 @@ With both copies absent the decision is:
   was lost is recovery, not first boot);
 - an unreadable witness or evidence probe: refuse; unknown never mints identity.
 
+Absence is proven, not inferred from an errno: Windows reports a file where
+``state/`` belongs as ERROR_PATH_NOT_FOUND, the same ``FileNotFoundError`` as a
+missing directory, so ``confirm_absent`` checks the entry and its ancestors.
+
 Bootstrap scaffolding that may precede init — empty ``state``/``logs``/
 ``memory``/``task_results`` directories, ``settings.json`` from onboarding,
 the usage ledger import, a benchmark sentinel — is deliberately not evidence.
@@ -57,30 +61,42 @@ def witness_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / WITNESS_REL
 
 
-def blocked_absence(path: Any) -> str:
-    """After ENOENT: ``""`` for true absence, else the ``unreadable`` detail.
+def confirm_absent(path: Any) -> None:
+    """After ``FileNotFoundError`` on ``path``, return only when it is really absent.
 
-    Windows answers ENOENT, not POSIX ENOTDIR, when a FILE sits where a parent
-    directory belongs; the nearest existing ancestor decides, so a blocked
-    ``state/`` is unknown on every platform, never absence."""
-    for parent in pathlib.Path(path).parents:
+    POSIX types a non-directory where a directory belongs as ENOTDIR; Windows reports
+    ERROR_PATH_NOT_FOUND, indistinguishable from a missing parent. A present entry
+    after the failed operation is unknown. Only missing entries below a directory
+    prove absence; a dangling link or an unexaminable ancestor cannot prove it."""
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        pass
+    else:
+        raise FileExistsError(errno.EEXIST, "path present after failed read", str(path))
+    for ancestor in pathlib.Path(path).parents:
         try:
-            if stat.S_ISDIR(os.stat(parent).st_mode):
-                return ""
-            return f"NotADirectoryError errno={errno.ENOTDIR}"
+            mode = os.stat(ancestor).st_mode
         except FileNotFoundError:
-            continue
-        except OSError as exc:
-            return f"{type(exc).__name__} errno={exc.errno}"
-    return ""
+            try:
+                os.lstat(ancestor)  # stat alone also reports a dangling link as ENOENT
+            except FileNotFoundError:
+                continue
+            raise
+        if not stat.S_ISDIR(mode):
+            raise NotADirectoryError(errno.ENOTDIR, os.strerror(errno.ENOTDIR), str(ancestor))
+        return
+    raise FileNotFoundError(errno.ENOENT, "no directory ancestor confirmed", str(path))
 
 
 def read_witness(drive_root: Any) -> Tuple[str, Dict[str, Any]]:
-    """``("missing"|"ok"|"invalid"|"unreadable", witness)`` by the operation's errno."""
+    """``("missing"|"ok"|"invalid"|"unreadable", witness)``; only proven absence is missing."""
     try:
-        raw = witness_path(drive_root).read_bytes()
-    except FileNotFoundError:
-        return ("unreadable" if blocked_absence(witness_path(drive_root)) else "missing"), {}
+        try:
+            raw = witness_path(drive_root).read_bytes()
+        except FileNotFoundError:
+            confirm_absent(witness_path(drive_root))
+            return "missing", {}
     except OSError:  # NotADirectoryError included: a file where ``state/`` belongs is not absence
         return "unreadable", {}
     try:
@@ -111,26 +127,26 @@ def mark_pending(drive_root: Any, *, origin: str) -> str:
 def supervisor_evidence(drive_root: Any) -> Tuple[str, str]:
     """``("none"|"present"|"unknown", path)``: did a supervisor already run here?"""
     root = pathlib.Path(drive_root)
-    try:  # only ENOENT is absence; NotADirectoryError (a file where a directory belongs) is unknown
+    try:  # only proven absence is absence; a file where a directory belongs is unknown
         for rel in _EVIDENCE_FILES:
             try:
                 os.lstat(root / rel)
                 return "present", str(rel)
             except FileNotFoundError:
-                continue
+                confirm_absent(root / rel)
         for rel in _EVIDENCE_NONEMPTY_FILES:
             try:
                 if os.lstat(root / rel).st_size > 0:
                     return "present", str(rel)
             except FileNotFoundError:
-                continue
+                confirm_absent(root / rel)
         for rel in _EVIDENCE_DIRS:
             try:
                 with os.scandir(root / rel) as entries:
                     if next(entries, None) is not None:
                         return "present", str(rel)
             except FileNotFoundError:
-                continue
+                confirm_absent(root / rel)
     except OSError as exc:
         return "unknown", f"{type(exc).__name__} errno={exc.errno}"
     return "none", ""

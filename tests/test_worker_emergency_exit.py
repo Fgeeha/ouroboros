@@ -14,6 +14,7 @@ import pytest
 from ouroboros import platform_layer as platform
 from ouroboros.process_containment import pid_is_zombie
 from supervisor import worker_process
+from tests._shared import stop_socket_sharer
 
 pytestmark = pytest.mark.serial
 
@@ -102,14 +103,17 @@ def test_native_worker_stop_does_not_require_lifeline_or_callback(tmp_path, monk
             if os.name != "nt":
                 assert proc.exitcode == -signal.SIGKILL
     finally:
-        if proc.is_alive():
-            proc.kill()
-            proc.join(timeout=5)
-        worker_process.close_worker_stop_channel(proc)
-        assert proc._ouroboros_stop_socket.fileno() == -1
-        for queue in (incoming, outgoing):
-            queue.close()
-            queue.cancel_join_thread()
+        try:
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+            worker_process.close_worker_stop_channel(proc)
+            assert proc._ouroboros_stop_socket.fileno() == -1
+        finally:  # a failed cleanup assertion must not leak the queues or the socket sharer
+            for queue in (incoming, outgoing):
+                queue.close()
+                queue.cancel_join_thread()
+            stop_socket_sharer()
 
 
 @pytest.mark.parametrize("mode", ["owner_raises", "owner_hangs"])
@@ -142,11 +146,12 @@ def test_supported_command_is_stopped_even_when_another_owner_fails(tmp_path, mo
             proc.kill()
             proc.join(timeout=5)
         if child_pid and platform.pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
-            os.kill(child_pid, getattr(signal, "SIGKILL", signal.SIGTERM))  # only the observed fixture child
+            platform.force_kill_pid(child_pid)  # only the continuously observed fixture child
         worker_process.close_worker_stop_channel(proc)
         for queue in (incoming, outgoing):
             queue.close()
             queue.cancel_join_thread()
+        stop_socket_sharer()
 
 
 @pytest.mark.parametrize("broken_channel", [False, True])
@@ -167,14 +172,13 @@ def test_server_completes_native_requests_before_settlement_or_exit(tmp_path, mo
 
     try:
         if broken_channel:
-            child.close()
+            # The SENDING end: its send fails on every platform. A closed peer is not enough on
+            # Windows, where socketpair is loopback TCP and the next send may still be buffered.
+            parent.close()
         _run_panic(monkeypatch, tmp_path, daemon_stop=settle, children=(proc,), diagnostics=diagnostics)
         assert native_done.is_set()
         receipt = diagnostics[0]["requests"]["child-123"]
-        if not broken_channel or os.name != "nt":
-            assert receipt["requested"] is not broken_channel
-        # Windows socketpair uses TCP: send may be accepted after a peer close,
-        # before FIN is observable. This reports an attempt, never delivery.
+        assert receipt["requested"] is not broken_channel
         assert receipt["native_request"]["requested"]
         assert receipt["confirmation"] == "unconfirmed"  # an adapter signal is NOT observed death
     finally:
@@ -243,9 +247,11 @@ def test_ordinary_stop_channel_retirement_does_not_panic_owned_daemon(tmp_path, 
     proc = worker_process.spawn_worker_process(ctx, 0, incoming, outgoing, tmp_path, tmp_path)
     slot = SimpleNamespace(proc=proc, in_q=incoming)
     monkeypatch.setattr(workers, "WORKERS", {0: slot})
-    daemon_pid = 0
+    daemon_pid, daemon_birth = 0, ""
     try:
         daemon_pid = outgoing.get(timeout=20)
+        daemon_birth = platform.process_start_time(daemon_pid)  # pinned while its owner still runs
+        assert daemon_birth
         worker_process.close_worker_stop_channel(proc)  # EOF is not the explicit Panic byte
         proc.join(timeout=3)
         assert not proc.is_alive()
@@ -253,16 +259,21 @@ def test_ordinary_stop_channel_retirement_does_not_panic_owned_daemon(tmp_path, 
         assert worker_pool_lifecycle.retire_worker(0, slot)
         assert proc._ouroboros_stop_socket.fileno() == -1 and not workers.WORKERS
     finally:
-        if proc.is_alive():
-            proc.kill()
-            proc.join(timeout=5)
-        if daemon_pid and platform.pid_is_alive(daemon_pid) and not pid_is_zombie(daemon_pid):
-            os.kill(daemon_pid, getattr(signal, "SIGKILL", signal.SIGTERM))  # Windows: TerminateProcess
-            deadline = time.monotonic() + 3
-            while platform.pid_is_alive(daemon_pid) and not pid_is_zombie(daemon_pid) and time.monotonic() < deadline:
-                time.sleep(.01)
-            assert not platform.pid_is_alive(daemon_pid) or pid_is_zombie(daemon_pid)
-        worker_process.close_worker_stop_channel(proc)
-        for queue in (incoming, outgoing):
-            queue.close()
-            queue.cancel_join_thread()
+        try:
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+            if (daemon_birth and platform.pid_is_alive(daemon_pid) and not pid_is_zombie(daemon_pid)
+                    and platform.process_start_time(daemon_pid) == daemon_birth):
+                platform.force_kill_pid(daemon_pid)  # the fixture's own daemon: its PID AND its birth
+                deadline = time.monotonic() + 3
+                while (platform.pid_is_alive(daemon_pid) and not pid_is_zombie(daemon_pid)
+                       and time.monotonic() < deadline):
+                    time.sleep(.01)
+                assert not platform.pid_is_alive(daemon_pid) or pid_is_zombie(daemon_pid)
+        finally:  # a failed death proof must not leak the stop channel, queues or socket sharer
+            worker_process.close_worker_stop_channel(proc)
+            for queue in (incoming, outgoing):
+                queue.close()
+                queue.cancel_join_thread()
+            stop_socket_sharer()
