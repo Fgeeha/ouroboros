@@ -199,7 +199,7 @@ def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypat
         notice = notices[0]
         message_bus.send_with_budget(42, notice['text'], task_id=task_id, role='system',
                                      system_type=notice['system_type'], progress_meta=notice['progress_meta'])
-        durable = json.loads((canonical / 'logs' / 'chat.jsonl').read_text().splitlines()[-1])
+        durable = json.loads((canonical / 'logs' / 'chat.jsonl').read_text(encoding='utf-8').splitlines()[-1])
         assert durable['late_evidence'] == notice['progress_meta']['late_evidence']
         assert bridged and len(checkpoints) == 1
         receiver_root = canonical if receiver_mode == 'canonical' else prepare_task_drive(canonical, 'next-owner', receiver_mode)
