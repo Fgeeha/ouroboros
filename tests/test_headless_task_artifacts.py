@@ -17,6 +17,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from ouroboros.gateway import task_archive
 from ouroboros.gateway.tasks import (
     api_task_artifact,
 )
@@ -37,6 +38,16 @@ from tests._headless_cli_shared import (  # noqa: F401  (autouse fixture applies
     _init_repo_with_file,
     _managed_worker_pool_available,
 )
+
+
+def _assert_file_response(response, content: bytes) -> None:
+    # Owner-approved #1297: platforms without confined opens return a typed 503.
+    if task_archive.CONFINED:
+        assert response.status_code == 200
+        assert response.content == content
+    else:
+        assert response.status_code == 503
+        assert response.json()["reason_code"] == "artifact_unavailable"
 
 
 def test_copy_child_result_cannot_overwrite_finalized_accounting(tmp_path):
@@ -386,7 +397,7 @@ def test_task_artifact_endpoint_serves_only_declared_artifacts(tmp_path):
     app.state.drive_root = data
     client = TestClient(app)
 
-    assert client.get("/api/tasks/task-artifact/artifacts/workspace.patch").text.startswith("diff --git")
+    _assert_file_response(client.get("/api/tasks/task-artifact/artifacts/workspace.patch"), b"diff --git a/a b/a\n")
     assert client.get("/api/tasks/task-artifact/artifacts/missing.patch").status_code == 404
     assert client.get("/api/tasks/task-artifact/artifacts/bad%5Cname").status_code == 400
 
@@ -415,8 +426,7 @@ def test_task_artifact_endpoint_serves_manifest_artifact_after_status_repair(tmp
 
     response = TestClient(app).get("/api/tasks/orphaned/artifacts/report.html")
 
-    assert response.status_code == 200
-    assert response.text == "<h1>ok</h1>"
+    _assert_file_response(response, b"<h1>ok</h1>")
 
 
 def test_task_artifact_endpoint_serves_child_drive_artifact_read_only_after_status_repair(tmp_path):
@@ -457,9 +467,8 @@ def test_task_artifact_endpoint_serves_child_drive_artifact_read_only_after_stat
 
     response = TestClient(app).get("/api/tasks/childart/artifacts/report.html")
 
-    # Two-root read: the task's own child store serves it; nothing is copied or created.
-    assert response.status_code == 200
-    assert response.text == "<h1>child</h1>"
+    # The own child store is read when supported; neither outcome copies or creates it.
+    _assert_file_response(response, b"<h1>child</h1>")
     assert not task_artifacts_dir(data, "childart", create=False).exists()
 
 
@@ -664,8 +673,7 @@ def test_task_artifact_endpoint_serves_exact_chat_media_without_task_result(tmp_
     client = TestClient(app)
 
     response = client.get(f"/api/tasks/ephemeral1/artifacts/{stored['name']}")
-    assert response.status_code == 200
-    assert response.content == b"photo-bytes"
+    _assert_file_response(response, b"photo-bytes")
     assert collect_task_artifact_records(data, "ephemeral1") == []
 
     assert client.get("/api/tasks/ephemeral1/artifacts/chat-media-bad.png").status_code == 404

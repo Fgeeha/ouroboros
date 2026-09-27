@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.6
+version: 1.2.7
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -83,6 +83,13 @@ independently: the text bridge remains available while Mini App status reports
 that no pinned cloudflared asset exists. Invalid host runtime, unsafe state, or
 companion registration errors fail the skill load instead of claiming a partial
 healthy installation.
+
+Registration, pinned cloudflared selection, and runtime status share one
+architecture helper. Only when `platform.machine()` is empty on Windows does
+it fall back to `sysconfig.get_platform()`: `win-amd64` selects the pinned
+Windows asset; ARM64, 32-bit, and unknown builds remain unsupported in this
+fallback. A nonempty machine value takes precedence over the interpreter build;
+macOS and Linux use only the machine value.
 
 The Mini App is Beta. Its best-effort Cloudflare Quick Tunnel has no SLA and
 does not support Server-Sent Events (SSE). It targets native Telegram clients;

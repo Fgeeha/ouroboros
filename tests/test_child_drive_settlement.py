@@ -117,7 +117,7 @@ def test_a_recorded_capture_whose_source_is_gone_stays_held_by_its_verified_cano
 
 
 @pytest.mark.parametrize("material", ["child_result", "registration", "file", "directory", "mailbox", "receipts"])
-def test_unreadable_material_retains_the_drive(tmp_path, material):
+def test_unreadable_material_retains_the_drive(tmp_path, monkeypatch, material):
     data, drive, record = _cancelled_with_capture(tmp_path)
     store = artifacts.task_artifact_dir_path(drive, TASK)
     if material == "child_result":
@@ -129,12 +129,26 @@ def test_unreadable_material_retains_the_drive(tmp_path, material):
     elif material == "file":
         extra = store / "notes.txt"
         extra.write_text("mutable note", encoding="utf-8")
-        extra.chmod(0)
+        original_open = Path.open
+
+        def unreadable_open(path, *args, **kwargs):
+            if path == extra:
+                raise PermissionError("file read denied")
+            return original_open(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "open", unreadable_open)
         expected = "child_artifact_store_unreadable"
     elif material == "directory":
         (store / "tree").mkdir()
         (store / "tree" / "leaf.txt").write_text("leaf", encoding="utf-8")
-        (store / "tree").chmod(0)
+        original_scandir = os.scandir
+
+        def unreadable_scandir(path):
+            if Path(path) == store / "tree":
+                raise PermissionError("directory read denied")
+            return original_scandir(path)
+
+        monkeypatch.setattr(os, "scandir", unreadable_scandir)
         expected = "child_artifact_store_unreadable"
     elif material == "mailbox":
         mailbox = owner_mailbox._mailbox_path(drive, TASK)
@@ -144,16 +158,22 @@ def test_unreadable_material_retains_the_drive(tmp_path, material):
     else:
         verification_receipts_path(drive, TASK, create=True).write_text("{torn\n", encoding="utf-8")
         expected = "verification_receipts_uncustodied"
-    try:
-        if os.name != "nt" and material in {"file", "directory"} and os.geteuid() == 0:
-            pytest.skip("root reads unreadable files")
-        outcome = _settle(data, drive)
-    finally:
-        for path in (store / "notes.txt", store / "tree"):
-            if path.exists():
-                path.chmod(0o755)
+    # chmod(0) does not deny Windows reads and is bypassed by POSIX root. Inject
+    # the actual read failure so retention and recovery are tested on every host.
+    outcome = _settle(data, drive)
     assert outcome["status"] == "retained" and outcome["reason"] == expected, outcome
     assert drive.is_dir() and not _canonical(data, record["name"]).exists()
+    if material in {"file", "directory"}:
+        if material == "file":
+            monkeypatch.setattr(Path, "open", original_open)
+        else:
+            monkeypatch.setattr(os, "scandir", original_scandir)
+        assert _settle(data, drive)["status"] == "removed"
+        assert not drive.exists()
+        extra_name = "notes.txt" if material == "file" else "tree/leaf.txt"
+        assert _canonical(data, extra_name).read_text(encoding="utf-8") == (
+            "mutable note" if material == "file" else "leaf"
+        )
 
 
 def test_a_write_that_does_not_land_or_read_back_deletes_and_seals_nothing(tmp_path, monkeypatch):

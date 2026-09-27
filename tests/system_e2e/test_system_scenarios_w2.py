@@ -266,10 +266,9 @@ _CHILD_SHA_RE = re.compile(r"child_result_sha256[\"'=:\s]+([0-9a-f]{64})")
 
 
 def _s6_slot_binder(body: dict) -> str:
-    """Slot = wire model id × tool-bearing shape: the parent loop runs on
-    ``mock-model`` with tools, the supervisor's semantic-duplicate probe runs on the
-    light slot (same slug) WITHOUT tools, and the child runs on ``mock-child`` — so
-    every fixture ordinal is deterministic even while parent and child overlap."""
+    """Bind parent ``mock-model`` and child ``mock-child`` by model and request shape.
+    Tool-less calls keep a separate slot, so an unexpected auxiliary model request
+    is a fixture miss even while parent and child overlap."""
     return f"{body.get('model') or ''}|{'tools' if body.get('tools') else 'plain'}"
 
 
@@ -301,8 +300,6 @@ S6_FIXTURE = {
         "objective": "List the repository root and report the entries you saw.",
         "expected_output": "A short list of repository root entries.",
     }},
-    # The supervisor's admission duplicate-probe (light slot, tool-less).
-    ("root", "mock-model|plain", 1): {"final": "No existing task duplicates this request."},
     ("root", "mock-model|tools", 2): _s6_wait_step,
     ("root", "mock-model|tools", 3): _s6_dispose_step,
     ("root", "mock-model|tools", 4): {"final": f"{S6_PARENT_MARKER}: child absorbed; done."},

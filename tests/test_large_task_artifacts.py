@@ -629,7 +629,7 @@ def test_file_verification_does_not_run_on_the_asgi_loop(tmp_path, monkeypatch, 
     import uvicorn
     from starlette.applications import Starlette
     from starlette.routing import Route
-    from ouroboros.gateway import tasks
+    from ouroboros.gateway import task_archive, tasks
     from ouroboros.task_results import write_task_result
 
     api_task_artifact = tasks.api_task_artifact
@@ -667,14 +667,24 @@ def test_file_verification_does_not_run_on_the_asgi_loop(tmp_path, monkeypatch, 
         async def request():
             async with httpx.AsyncClient(timeout=10) as client:
                 reply = await client.request(method, f'http://127.0.0.1:{sock.getsockname()[1]}/api/tasks/download/artifacts/{record["name"]}')
-                assert reply.status_code == 200, reply.text
-                assert reply.content == (source.read_bytes() if method == 'GET' else b'')
+                if task_archive.CONFINED:
+                    assert reply.status_code == 200, reply.text
+                    assert reply.content == (source.read_bytes() if method == 'GET' else b'')
+                else:
+                    assert reply.status_code == 503, reply.text
+                    if method == 'GET':
+                        assert reply.json()['reason_code'] == 'artifact_unavailable'
+                    else:
+                        assert reply.content == b''
         asyncio.run(request())
         assert bool(materialization_calls) is (not registered)
         assert all(identity != thread.ident for identity in materialization_calls)
-        if registered:
-            assert len(calls) == 1, "registered downloads verify once per request"
-        assert calls and all(identity != thread.ident for identity in calls), 'whole-file hashing ran synchronously on the ASGI event loop'
+        if task_archive.CONFINED:
+            if registered:
+                assert len(calls) == 1, "registered downloads verify once per request"
+            assert calls and all(identity != thread.ident for identity in calls), 'whole-file hashing ran synchronously on the ASGI event loop'
+        else:
+            assert calls == [], "unsupported platforms refuse before reading file bytes (#1297)"
     finally:
         server.should_exit = True
         thread.join(10)
