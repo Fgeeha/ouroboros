@@ -33,7 +33,7 @@ def _retrieving(tmp_path):
     write_task_result(author, task, 'running', description='original task record')
     write_task_result(canonical, task, 'running', description='canonical task')
     artifact = artifacts.task_artifact_dir_path(author, task, create=True) / 'proof.txt'
-    artifact.write_text('exact artifact evidence 🙂')
+    artifact.write_text('exact artifact evidence 🙂', encoding='utf-8')
     (artifact.parent / 'verification_receipts.jsonl').write_text(json.dumps({'check': 'original check', 'status': 'pass'}) + '\n')
     (author / 'logs' / 'tools.jsonl').write_text(json.dumps({'task_id': task, 'result': 'exact trajectory'}) + '\n'
         + json.dumps({'task_id': 'unrelated', 'result': 'must not copy'}) + '\n')
