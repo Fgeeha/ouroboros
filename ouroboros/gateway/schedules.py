@@ -28,7 +28,8 @@ async def api_schedules_list(_request: Request) -> JSONResponse:
             # "No schedules" is a claim; an unparseable table means the state is
             # UNKNOWN, and the Activity section says so instead of showing empty.
             return json_error(str(exc), 503)
-        return JSONResponse(schedule_activity_projection(store))
+        from supervisor.followup_policy import observed_store
+        return JSONResponse(schedule_activity_projection(observed_store(request_drive_root(_request), store)))
     except Exception as exc:
         return json_exception(exc)
 
@@ -138,7 +139,8 @@ async def api_schedules_action(request: Request) -> JSONResponse:
             return json_error("reason is required for a schedule lifecycle action", 400)
         return JSONResponse(mutate_scheduled_task(
             action, schedule_id, reason=reason, actor="owner:gateway",
-            drive_root=request_drive_root(request),
+            drive_root=request_drive_root(request), expected_hold_id=str(body.get("expected_hold_id") or ""),
+            relation=str(body.get("relation") or ""),
         ))
     except Exception as exc:
         return json_exception(exc)

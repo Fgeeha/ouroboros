@@ -11,6 +11,7 @@ reader are both here.
 from __future__ import annotations
 
 import contextlib
+import copy
 import datetime
 import json
 import logging
@@ -22,6 +23,7 @@ import uuid
 from typing import Any, Dict, List
 from ouroboros.consciousness_authority import apply_consciousness_authority
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
+from ouroboros.deadline_utils import parse_deadline_ts
 from ouroboros.dialogue_provenance import presence_metadata_binding
 from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS, schedule_slug
 from ouroboros.skill_loader import skill_identity_collision_names
@@ -87,6 +89,7 @@ _AUDIT_ROW_KEYS: tuple[str, ...] = (
     "id", "name", "enabled", "source", "skill", "trigger", "timezone",
     "created_at", "updated_at", "last_run_at", "last_task_id", "completed_at",
     "next_run_at", "manual_override",
+    "followup_relation", "followup_origin", "followup_hold", "followup_wait",
 )
 # ``manage_schedules`` is a model-facing tool.  Keep one page comfortably below
 # the tool result cap even when a schedule table contains many rows or hostile
@@ -263,7 +266,7 @@ def _is_consumed_once(record: Dict[str, Any]) -> bool:
 
 def _is_suppressed(record: Dict[str, Any]) -> bool:
     """A skill row the owner disabled or deleted and the resync may not re-arm."""
-    return (str(record.get("source") or "") == "skill_manifest"
+    return (str(record.get("source") or "") in {"skill_manifest", "task_followup"}
             and str(record.get("manual_override") or "").strip().lower() in SUPPRESSED_OVERRIDES)
 
 
@@ -275,6 +278,10 @@ def schedule_lifecycle_status(record: Dict[str, Any]) -> str:
     """
     if _is_consumed_once(record):
         return "consumed"
+    if record.get("followup_hold"):
+        return "held"
+    if record.get("followup_wait"):
+        return "waiting"
     if _is_suppressed(record):
         return "suppressed"
     return "active" if record.get("enabled", True) else "disabled"
@@ -341,8 +348,17 @@ def _schedule_projection_row(raw: Dict[str, Any]) -> Dict[str, Any]:
     row["suppressed"] = status == "suppressed"
     # Retained rows are history the owner can still act on; only a suppressed
     # one can come back, and only after its skill is re-evaluated.
-    row["retained"] = status in {"consumed", "suppressed"}
-    row["restorable"] = status == "suppressed"
+    row["retained"] = status in {"consumed", "suppressed", "held"}
+    row["restorable"] = status == "suppressed" or bool(raw.get("followup_hold") and raw.get("hold_persisted", True))
+    from supervisor.followup_policy import relation_kind, origin_of
+    row["relation"] = relation_kind(raw)
+    row["followup_origin"] = origin_of(raw)
+    row["followup_hold"] = raw.get("followup_hold")
+    row["followup_wait"] = raw.get("followup_wait", "")
+    row["hold_persisted"] = raw.get("hold_persisted", bool(raw.get("followup_hold")))
+    relation = raw.get("followup_relation") or {}
+    row["billing_group"] = relation.get("billing_group")
+    row["deadline_at"] = relation.get("deadline_at", "")
     return row
 
 
@@ -420,8 +436,10 @@ def schedule_activity_projection(data: Dict[str, Any]) -> Dict[str, Any]:
         row["active"] = status == "active"
         row["consumed"] = status == "consumed"
         row["suppressed"] = status == "suppressed"
-        row["retained"] = status in {"consumed", "suppressed"}
-        row["restorable"] = status == "suppressed"
+        projected = _schedule_projection_row(row)
+        for key in ("retained", "restorable", "relation", "followup_origin", "followup_hold",
+                    "followup_wait", "hold_persisted", "billing_group", "deadline_at"):
+            row[key] = projected[key]
         tasks.append(row)
     out["tasks"] = tasks
     return out
@@ -653,7 +671,8 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
 
 
 def _task_from_schedule(record: Dict[str, Any]) -> Dict[str, Any]:
-    template = dict(record.get("task") or {})
+    from supervisor.followup_policy import normalize_template, origin_of, relation_kind, task_binding
+    template = normalize_template(record)
     owner_chat_id = _queue().load_state().get("owner_chat_id") or 0
     task_id = uuid.uuid4().hex[:8]
     session_id = str(template.get("session_id") or f"schedule-{record.get('id') or task_id}")
@@ -662,6 +681,19 @@ def _task_from_schedule(record: Dict[str, Any]) -> Dict[str, Any]:
         key: value for key, value in dict(raw_metadata).items()
         if key not in RESERVED_TEMPLATE_FIELDS
     }
+    origin = origin_of(record)
+    if origin:
+        metadata.update(origin_task_id=origin["task_id"], origin_root_task_id=origin["root_task_id"])
+        metadata["objective_author"] = {"kind": "task", "task_id": origin["task_id"]}
+    metadata["followup_origin"] = origin
+    metadata["followup_relation"] = copy.deepcopy(record.get("followup_relation") or {"kind": relation_kind(record)})
+    if relation_kind(record) == "related":
+        metadata["billing_group"] = task_binding(_queue().DRIVE_ROOT, record)
+        metadata["followup_relation"] = copy.deepcopy(record["followup_relation"])
+        if record["followup_relation"].get("deadline_at"):
+            original = parse_deadline_ts(record["followup_relation"]["deadline_at"])
+            supplied = parse_deadline_ts(template.get("deadline_at"))
+            template["deadline_at"] = min(t for t in (original, supplied) if t is not None).isoformat()
     task = {
         "id": task_id,
         "type": "task",
@@ -683,7 +715,9 @@ def _task_from_schedule(record: Dict[str, Any]) -> Dict[str, Any]:
         task["allowed_resources"] = allowed_resources
     existing_contract = template.get("task_contract") if isinstance(template.get("task_contract"), dict) else {}
     if existing_contract:
-        task["task_contract"] = existing_contract
+        task["task_contract"] = dict(existing_contract)
+        if task.get("deadline_at"):
+            task["task_contract"]["deadline_at"] = task["deadline_at"]
     task["task_contract"] = build_task_contract(apply_consciousness_authority(task))
     workspace = task["task_contract"]["workspace"]
     # Presence-bound work (a speaker's follow-up, or one acting for a descendant's binding)
@@ -727,7 +761,16 @@ def check_scheduled_tasks() -> None:
         collision_names = None
         now_utc = datetime.datetime.now(datetime.timezone.utc)
         for record in list(data.get("tasks") or []):
-            if not isinstance(record, dict) or not record.get("enabled", True):
+            if not isinstance(record, dict):
+                continue
+            from supervisor.followup_policy import control_guard, refresh_policy
+            try:
+                with control_guard(_queue().DRIVE_ROOT, record):
+                    refresh_policy(_queue().DRIVE_ROOT, data, record)
+            except Exception:
+                log.exception("Follow-up policy persistence unavailable")
+                continue
+            if not record.get("enabled", True):
                 continue
             schedule_id = str(record.get("id") or "").strip()
             if not schedule_id:
@@ -779,32 +822,48 @@ def check_scheduled_tasks() -> None:
                     collision_names = skill_identity_collision_names(_queue().DRIVE_ROOT)
                 if str(record.get("skill") or "") in collision_names:
                     continue
-            task = _task_from_schedule(record)
-            try:
-                from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
+            from supervisor.followup_policy import control_guard, refresh_policy
+            with control_guard(_queue().DRIVE_ROOT, record):
+                try:
+                    view = refresh_policy(_queue().DRIVE_ROOT, data, record)
+                except Exception:
+                    log.exception("Follow-up authority unavailable; schedule %s waits", schedule_id)
+                    continue
+                if view.get("hold") or view["wait"] or record.get("followup_hold"):
+                    continue
+                task = _task_from_schedule(record)
+                try:
+                    from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
 
-                write_task_result(
-                    _queue().DRIVE_ROOT,
-                    str(task["id"]),
-                    STATUS_SCHEDULED,
-                    root_task_id=str(task["id"]),
-                    actor_id="scheduler",
-                    delegation_role="root",
-                    description=str(task.get("description") or task.get("text") or ""),
-                    expected_output=str(task.get("expected_output") or ""),
-                    constraints=str(task.get("constraints") or ""),
-                    context=str(task.get("context") or ""),
-                    allowed_resources=task.get("allowed_resources") if isinstance(task.get("allowed_resources"), dict) else {},
-                    deadline_at=str(task.get("deadline_at") or ""),
-                    task_contract=task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {},
-                    result="Scheduled task queued.",
-                    metadata=dict(task.get("metadata") or {}),
-                    schedule_id=schedule_id,
-                    schedule_name=str(record.get("name") or ""),
-                )
-            except Exception:
-                log.debug("Failed to persist scheduled task result before enqueue", exc_info=True)
-            admitted = _queue().enqueue_task(task)
+                    published = write_task_result(
+                        _queue().DRIVE_ROOT,
+                        str(task["id"]),
+                        STATUS_SCHEDULED,
+                        root_task_id=str(task["id"]),
+                        actor_id="scheduler",
+                        delegation_role="root",
+                        description=str(task.get("description") or task.get("text") or ""),
+                        expected_output=str(task.get("expected_output") or ""),
+                        constraints=str(task.get("constraints") or ""),
+                        context=str(task.get("context") or ""),
+                        allowed_resources=task.get("allowed_resources") if isinstance(task.get("allowed_resources"), dict) else {},
+                        deadline_at=str(task.get("deadline_at") or ""),
+                        task_contract=task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {},
+                        result="Scheduled task queued.",
+                        metadata=dict(task.get("metadata") or {}),
+                        **({"billing_group": task["metadata"]["billing_group"]}
+                           if task["metadata"].get("billing_group") else {}),
+                        schedule_id=schedule_id,
+                        schedule_name=str(record.get("name") or ""),
+                    )
+                    if not isinstance(published, dict) or published.get("status") != STATUS_SCHEDULED:
+                        raise ValueError("scheduled_result_not_persisted")
+                except Exception:
+                    log.debug("Failed to persist scheduled task result before enqueue", exc_info=True)
+                    record["followup_wait"] = "followup_result_persistence_unavailable"
+                    changed = True
+                    continue
+                admitted = _queue().enqueue_task(task)
             record["last_run_at"] = now.isoformat()
             record["last_task_id"] = task["id"]
             record_scheduled_admission(task, admitted, record)

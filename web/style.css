@@ -4053,6 +4053,20 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     flex-shrink: 0;
 }
 
+.activity-schedule {
+    flex-wrap: wrap;
+}
+
+.activity-schedule .activity-row-main {
+    flex: 1 1 240px;
+}
+
+.activity-schedule .activity-sub {
+    white-space: normal;
+    overflow: visible;
+    overflow-wrap: anywhere;
+}
+
 .activity-tag {
     font-size: 11px;
     color: var(--text-meta);

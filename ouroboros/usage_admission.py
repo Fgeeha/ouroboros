@@ -101,6 +101,39 @@ def task_billing_fields(task: Dict[str, Any], root_task_id: str, root_limit: Opt
             return unavailable
         row = row or {}
         root_meta = row.get("metadata") or {}
+        schedule_id = str(row.get("schedule_id") or root_meta.get("schedule_id") or metadata.get("schedule_id") or "")
+        scheduled_binding = None
+        if schedule_id:
+            from supervisor.queue_schedules import load_schedule_store
+            from supervisor.followup_policy import task_binding
+            schedule = next((r for r in load_schedule_store(budget_root)["tasks"]
+                             if r.get("id") == schedule_id), None)
+            if schedule is None:
+                # GC may remove completed schedule history. Only the producer's
+                # canonical top-level binding can preserve related late costs;
+                # old template metadata alone cannot establish that authority.
+                relation = root_meta.get("followup_relation") or {}
+                canonical = row.get("billing_group") or {}
+                if (relation.get("kind") == "related" and canonical
+                        and canonical == relation.get("billing_group")
+                        and canonical.get("billing_group_limit_source")):
+                    return {"root_limit_usd": root_limit, **canonical}
+                if (root_meta.get("followup_relation") or {}).get("kind") != "independent":
+                    return unavailable
+            else:
+                scheduled_binding = task_binding(budget_root, schedule)
+                if scheduled_binding is not None:
+                    return {"root_limit_usd": root_limit, **scheduled_binding}
+            # Historical templates cannot supply money or a continuation. The
+            # independent root uses only its own canonical initial binding.
+            own = row.get("billing_group") or {}
+            if own and own.get("billing_group_id") != root_task_id:
+                return unavailable
+            metadata = {k: v for k, v in metadata.items() if k not in {"billing_group", "continuation"}}
+            root_meta = {k: v for k, v in root_meta.items() if k not in {"billing_group", "continuation"}}
+            carried = {}
+        elif metadata.get("source") == "task_followup" or root_meta.get("source") == "task_followup":
+            return unavailable
         carried = root_meta.get("continuation") or carried
         binding = row.get("billing_group") or root_meta.get("billing_group") or metadata.get("billing_group") or carried or historical
         if not binding and row and budget_root:

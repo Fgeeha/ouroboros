@@ -228,20 +228,27 @@ def _claim_worker_launch(queue, candidate, worker):
     from ouroboros.owner_pause import launch_admission, OwnerPauseRefused
 
     try:
-        with launch_admission(SimpleNamespace(
-                task_id=candidate.get("id"), root_task_id=candidate.get("root_task_id"),
-                budget_drive_root=candidate.get("budget_drive_root") or queue.DRIVE_ROOT),
-                root_resume=candidate.get("_budget_pause_resume") if not
-                    queue.BUDGET_ROOT_FENCES.get(str(candidate.get("root_task_id") or candidate.get("id"))) else None):
-            prior = candidate.get("admitted_dispatch")
-            candidate["admitted_dispatch"] = "possible"
-            if not queue.persist_queue_snapshot(reason="worker_launch_claimed"):
-                candidate["admitted_dispatch"] = prior
+        from supervisor.followup_policy import scheduled_start
+        with scheduled_start(queue.DRIVE_ROOT, candidate) as allowed:
+            if not allowed:
                 return False
-            _mirror_assigned_running_status(candidate)
-            worker.in_q.put(candidate)
-            return True
+            with launch_admission(SimpleNamespace(
+                    task_id=candidate.get("id"), root_task_id=candidate.get("root_task_id"),
+                    budget_drive_root=candidate.get("budget_drive_root") or queue.DRIVE_ROOT),
+                    root_resume=candidate.get("_budget_pause_resume") if not
+                        queue.BUDGET_ROOT_FENCES.get(str(candidate.get("root_task_id") or candidate.get("id"))) else None):
+                prior = candidate.get("admitted_dispatch")
+                candidate["admitted_dispatch"] = "possible"
+                if not queue.persist_queue_snapshot(reason="worker_launch_claimed"):
+                    candidate["admitted_dispatch"] = prior
+                    return False
+                _mirror_assigned_running_status(candidate)
+                worker.in_q.put(candidate)
+                return True
     except OwnerPauseRefused:
+        return False
+    except Exception:
+        log.exception("Scheduled worker start refused; authority or persistence unavailable")
         return False
 
 

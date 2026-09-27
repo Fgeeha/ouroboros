@@ -57,12 +57,12 @@ def test_once_schedule_fires_exactly_once_and_is_marked_done(tmp_path):
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
         "task": {"type": "task", "text": "resume the blocked plan after the window resets",
                  "metadata": {"origin_task_id": "t-origin"}},
-    })
+    }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
     queue.upsert_scheduled_task({
         "id": "fu-future", "name": "Later", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2999-01-01T00:00:00+00:00"},
         "task": {"type": "task", "text": "far future"},
-    })
+    }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
     queue.check_scheduled_tasks()
     queue.check_scheduled_tasks()  # a consumed one-shot never re-fires
     assert len(pending) == 1
@@ -87,7 +87,7 @@ def test_once_schedule_survives_a_refused_admission_and_retries(tmp_path, monkey
         "id": "fu-blocked", "name": "Follow-up", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
         "task": {"type": "task", "text": "resume after the window resets"},
-    })
+    }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
     real_enqueue = queue.enqueue_task
     monkeypatch.setattr(
         queue, "enqueue_task",
@@ -119,7 +119,7 @@ def test_once_schedule_refused_by_the_consciousness_door_defers_by_the_alarm_flo
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
         "task": {"type": "task", "text": "resume later",
                  "metadata": {"initiator": "consciousness", "usage_category": "consciousness_task"}},
-    })
+    }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
     fires: list = []
     monkeypatch.setattr(
         queue, "enqueue_task",
@@ -187,7 +187,7 @@ def _ctx(tmp_path, *, task_id="root-1", role="root"):
 def _followup(ctx, **kw):
     from ouroboros.tools.followup import _handle_schedule_followup
 
-    params = {"run_at": "2030-01-01T00:00:00+00:00",
+    params = {"relation": "independent", "run_at": "2030-01-01T00:00:00+00:00",
               "objective": "Re-run the plan panel once the reviewer window resets."}
     if "cron" in kw and "run_at" not in kw:
         params.pop("run_at")
@@ -254,7 +254,7 @@ def test_presence_followup_preserves_ceiling_and_return_context(tmp_path):
     record = queue.list_scheduled_tasks(tmp_path / "data")["tasks"][0]
     assert record["task"]["metadata"]["presence"] == {"binding_id": "b" * 32}
     assert record["task"]["task_contract"] == ctx.task_contract
-    assert record["task"]["metadata"]["origin_task_id"] == "root-1"
+    assert record["followup_origin"]["task_id"] == "root-1"
 
 
 def test_presence_recurring_followup_uses_existing_cron_and_preserves_authority(tmp_path):
@@ -512,7 +512,7 @@ def test_schedule_followup_root_id_falls_back_to_task_id_never_the_string_none(t
     from supervisor.queue import list_scheduled_tasks
 
     record = list_scheduled_tasks(pathlib.Path(tmp_path / "data").resolve())["tasks"][0]
-    assert record["task"]["metadata"]["origin_root_task_id"] == "root-3"
+    assert record["followup_origin"]["root_task_id"] == "root-3"
 
 
 def test_schedule_followup_preserves_source_project_and_chat(tmp_path):
@@ -777,7 +777,7 @@ def test_schedule_followup_registration_surfaces():
     # tests/test_consciousness_observe_dispatch.py.
     assert [e.name for e in entries] == ["schedule_followup", "manage_schedules"]
     schema = entries[0].schema["parameters"]
-    assert set(schema["required"]) == {"objective"}
+    assert set(schema["required"]) == {"objective", "relation"}
     assert {"run_at", "cron"} <= set(schema["properties"])
     assert not ({"anyOf", "oneOf", "allOf"} & set(schema))
     from ouroboros.safety import POLICY_SKIP, TOOL_POLICY

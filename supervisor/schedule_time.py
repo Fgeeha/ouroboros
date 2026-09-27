@@ -79,7 +79,8 @@ def prune_consumed_once_records(tasks: list, cutoff_epoch: float) -> tuple[list,
     kept, pruned = [], 0
     for record in tasks:
         if (isinstance(record, dict) and not record.get("enabled", True)
-                and record.get("completed_at")):
+                and record.get("completed_at") and not record.get("followup_hold")
+                and not record.get("followup_wait")):
             trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
             if str(trigger.get("type") or "") == "once":
                 done = parse_schedule_time(record.get("completed_at"), datetime.timezone.utc)

@@ -35,11 +35,11 @@ const getJson = (url) => fetchJson(url, { cache: 'no-store' });
 /** A stored UTC schedule instant for the owner: this viewer's local time, the exact
  * UTC instant beside it (and in `datetime`/`title`). Records stay UTC; an unparseable
  * value is shown raw rather than guessed. `timeZone` exists for tests only. */
-export function scheduleInstantHtml(value, { timeZone } = {}) {
+export function scheduleInstantHtml(value, { timeZone, includeYear = false } = {}) {
     const raw = String(value || '');
     const parsed = new Date(raw);
     if (!raw || Number.isNaN(parsed.getTime())) return esc(raw);
-    const fields = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+    const fields = { ...(includeYear ? { year: 'numeric' } : {}), month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
     const local = parsed.toLocaleString([], { ...fields, timeZone, timeZoneName: 'short' });
     const utc = parsed.toLocaleString([], { ...fields, timeZone: 'UTC' });
     const exact = parsed.toISOString().replace('.000Z', 'Z');
@@ -196,7 +196,18 @@ export function initActivity({ mount, ws } = {}) {
         const consumed = status === 'consumed';
         const suppressed = status === 'suppressed';
         const id = esc(s.id || '');
-        const sub = `${timing}${next && !consumed ? ` · next ${next}` : ''} · ${esc(status)}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}`;
+        const relation = String(s.relation || 'unknown');
+        const hold = s.followup_hold || {};
+        const work = s.billing_group || {};
+        const binding = work.billing_group_id ? ` · work ${esc(work.billing_group_id)} · cap ${work.billing_group_limit_usd == null ? 'unbounded' : '$' + esc(work.billing_group_limit_usd)}` : '';
+        const explanations = {
+            origin_stopped: 'Original work stopped or restarted', relationship_unknown: 'Relationship needs a decision',
+            origin_owner_paused: 'Original work is paused', owner_restart_in_progress: 'Restart in progress',
+            followup_authority_unavailable: 'Original work details unavailable', work_deadline_passed: 'Original hard deadline passed',
+            pending_binding_unavailable: 'Fired task awaits verified work binding',
+            followup_result_persistence_unavailable: 'Task record could not be saved',
+        };
+        const sub = `${timing}${next && !consumed ? ` · next ${next}` : ''} · ${esc(status)} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}`;
         // A consumed one-shot cannot be re-armed, so it carries no Enable: the
         // only honest control left is removing the receipt. A suppressed skill
         // row offers Restore, which asks the server to re-evaluate the skill.
@@ -204,12 +215,20 @@ export function initActivity({ mount, ws } = {}) {
         // its skill's readiness and re-arms on resync; an Enable button there
         // would offer to lift a suppression nobody applied.
         const readinessHeld = managed && !enabled && !suppressed;
-        const lifecycle = consumed
+        const lifecycle = status === 'waiting'
+            ? '<span class="activity-tag">waiting for existing control</span>'
+            : hold.hold_id
+                ? (relation === 'unknown'
+                    ? '<span class="activity-tag">resolve relationship in conversation</span>'
+                    : !s.hold_persisted
+                        ? '<span class="activity-tag">hold persistence pending</span>'
+                        : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}" data-action="restore" data-hold-id="${esc(hold.hold_id || '')}">Restore hold</button>`)
+            : consumed
             ? '<span class="activity-tag">consumed once · history</span>'
             : readinessHeld
                 ? '<span class="activity-tag">disabled by skill readiness</span>'
                 : `<button type="button" class="btn btn-xs btn-default" data-act="schedule-toggle" data-id="${id}" data-action="${suppressed || !enabled ? 'restore' : 'disable'}">${enabled ? 'Disable' : (suppressed ? 'Restore' : 'Enable')}</button>`;
-        return `<div class="activity-row${enabled ? '' : ' off'}">
+        return `<div class="activity-row activity-schedule${enabled || hold.hold_id || s.followup_wait ? '' : ' off'}">
             <div class="activity-row-main">
                 <span class="activity-name">${esc(s.name || s.id || 'schedule')}</span>
                 <span class="activity-sub">${sub}</span>
@@ -318,11 +337,11 @@ export function initActivity({ mount, ws } = {}) {
     // The server applies and audits it; nothing here infers a command from text.
     // Delete goes through here too — reading the outcome is not optional for one
     // button and skipped for another, or a refused delete reads as a silent no-op.
-    async function scheduleAction(id, action, reason) {
+    async function scheduleAction(id, action, reason, expectedHoldId = '') {
         const outcome = await fetchJson(`/api/schedules/${encodeURIComponent(id)}/action`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ action, reason }),
+            body: JSON.stringify({ action, reason, expected_hold_id: expectedHoldId }),
         });
         reportScheduleOutcome(action, outcome);
         return outcome;
@@ -442,7 +461,7 @@ export function initActivity({ mount, ws } = {}) {
                 // The button already carries the action it means; no full-record
                 // round trip, so a stale read can never overwrite runtime fields.
                 const action = btn.dataset.action === 'disable' ? 'disable' : 'restore';
-                await scheduleAction(id, action, `owner chose ${action} from Activity`);
+                await scheduleAction(id, action, `owner chose ${action} from Activity`, btn.dataset.holdId || '');
             } else if (act === 'bg-toggle') {
                 const on = btn.dataset.enabled === '1';
                 // Reuse the existing direct control command (same as the chat header

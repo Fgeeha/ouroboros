@@ -683,7 +683,11 @@ def auto_resume_after_restart() -> None:
                 log.error("Owner restart holds are not durable yet; the restart marker is kept "
                           "and nothing auto-resumes.")
                 return
-            owner_restart_flag.unlink(missing_ok=True)
+            from supervisor.queue_schedules import schedule_transaction
+            from supervisor.followup_policy import record_restart
+            with schedule_transaction(_pool().DRIVE_ROOT):
+                record_restart(_pool().DRIVE_ROOT)
+                owner_restart_flag.unlink(missing_ok=True)
             panic_compat_flag = _pool().DRIVE_ROOT / "state" / "panic_stop.flag"
             try:
                 if panic_compat_flag.read_text(encoding="utf-8").strip() == "owner_restart_no_resume":

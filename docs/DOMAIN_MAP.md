@@ -15,7 +15,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D05 | Tool surfaces: files, code, shell, media, external | 29 | 0 |
 | D06 | Review stack | 70 | 0 |
 | D07 | Delegation, subagents & Claudexor | 54 | 0 |
-| D08 | Supervisor: queue, workers, events & runtime control | 52 | 0 |
+| D08 | Supervisor: queue, workers, events & runtime control | 53 | 0 |
 | D09 | Cancellation, owner control & process custody | 13 | 0 |
 | D10 | Git, update & release machinery | 28 | 0 |
 | D11 | Gateway, server & Web UI | 59 | 0 |
@@ -28,7 +28,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **590** | **0** |
+| **total** | | **591** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -65,7 +65,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
 
 ## Hidden coupling (classified out of the strict graph)
 
-- lazy-only cross-domain pairs: **109**
+- lazy-only cross-domain pairs: **110**
   - D01->D08
   - D01->D10
   - D01->D11
@@ -149,6 +149,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
   - D16->D03
   - D16->D05
   - D16->D07
+  - D16->D08
   - D16->D09
   - D16->D17
   - D17->D02
@@ -497,6 +498,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `supervisor/events_subagent_admission.py`
 - `supervisor/events_task_done.py`
 - `supervisor/events_worker_reports.py`
+- `supervisor/followup_policy.py`
 - `supervisor/log_addressing.py`
 - `supervisor/message_bus.py`
 - `supervisor/owner_pause_control.py`

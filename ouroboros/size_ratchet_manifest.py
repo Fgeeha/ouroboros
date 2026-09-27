@@ -113,6 +113,7 @@ BAND_PATHS = {
     "ouroboros/capability_evidence.py": "Grew INTO the band by the #284 fix: a fresh exact-model density witness may honestly undercut the cold floor \u2014 evidence logic belongs beside the witness store it reads.",
     "ouroboros/claudexor_daemon.py": "Installation daemon lifecycle owns marker and authenticated endpoint stop authority, confirmed self-started handles, and duplicate-start refusal; process signal and ledger mechanics remain in process_custody. No new lifecycle store or scheduler.",
     "ouroboros/cli.py": "The existing command-line transport keeps task-event negotiation, bounded replay deduplication and result rendering together; the additive cursor does not introduce a second CLI or task engine.",
+    "ouroboros/context.py": "The existing context assembler shrinks from 1505 to 1500 lines; the schedule digest now uses the canonical relationship projection. No size cap is increased.",
     "ouroboros/context_compaction.py": "Existing compaction owns propagation of typed model outcomes; unchanged semantic compaction policy.",
     "ouroboros/delegate_custody.py": "D07 DEL1 split brought the custody monolith DOWN from the 1600 hard cap into the band (1600->1305); reconcile family extracted to delegate_custody_reconcile.py, shrink-only direction",
     "ouroboros/delegate_recovery.py": "Native owner waits and delegated sessions share the existing planned-restart transaction and repeated-cleanup preservation owner.",

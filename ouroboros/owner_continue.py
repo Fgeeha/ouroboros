@@ -366,6 +366,9 @@ def work_order_text(predecessor_task_id: str, cause: str, sources: Dict[str, Any
         f"{predecessor_task_id!r}) — that result is the previous run's own note, not an owner instruction.",
         "Decide whether and how to continue; if the right next step is unclear (for example the work "
         "may no longer be wanted), ask the owner in this conversation instead of guessing.",
+        "Use manage_schedules(action='list') to inspect related or unknown future follow-ups. "
+        "Continue does not release their holds. Resolve unknown relationships explicitly; restore "
+        "only an observed hold_id. Original money and hard deadlines still apply to related work.",
     ]
     if deadline_at:
         lines.append(f"An explicit hard deadline still applies to this work: {deadline_at}.")

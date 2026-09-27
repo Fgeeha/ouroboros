@@ -46,7 +46,7 @@ _MAX_CONTEXT_CHARS = 8_000
 
 def _manage_schedules(
     ctx: ToolContext, action: str = "list", schedule_id: str = "", reason: str = "",
-    offset: int = 0, limit: int = 20,
+    offset: int = 0, limit: int = 20, expected_hold_id: str = "", relation: str = "",
 ) -> str:
     """See, or apply one narrow audited change to, the rows already in the table.
 
@@ -80,7 +80,8 @@ def _manage_schedules(
         from ouroboros.tool_capabilities import tool_result_limit
         result_limit = tool_result_limit("manage_schedules")
         if operation == "list":
-            return json.dumps(schedule_tool_projection(load_schedule_store(root),
+            from supervisor.followup_policy import observed_store
+            return json.dumps(schedule_tool_projection(observed_store(root, load_schedule_store(root)),
                                                        offset=offset, limit=limit,
                                                        result_limit=result_limit),
                               ensure_ascii=False, sort_keys=True,
@@ -95,7 +96,8 @@ def _manage_schedules(
                                "audit": "not_written", "detail": "Schedule identity exceeds the tool result limit; nothing changed."})
         outcome = mutate_scheduled_task(
             operation, schedule_id, reason=reason, actor="agent",
-            task_id=str(getattr(ctx, "task_id", "") or ""), drive_root=root)
+            task_id=str(getattr(ctx, "task_id", "") or ""), drive_root=root,
+            expected_hold_id=expected_hold_id, relation=relation)
     except ScheduleRefused as exc:
         # Same typed marker the sibling refusals carry: the text channel is the
         # registered ABI, so a refusal must be legible there and not only in the
@@ -157,7 +159,8 @@ def get_tools() -> List[ToolEntry]:
                 "name": "schedule_followup",
                 "description": (
                     "Register a deferred follow-up task that the supervisor scheduler "
-                    "enqueues as an ordinary root task. Root tasks only; subagents report "
+                    "enqueues as an ordinary root task. Explicitly choose related work (original "
+                    "verified money/deadline and Stop controls) or independent work. Root tasks only; subagents report "
                     "the proposed follow-up to their parent. Supply exactly one trigger: run_at "
                     "for a one-shot ISO 8601 instant (naive = UTC), or cron for a recurring "
                     "5-field expression with an optional IANA timezone. Write the objective "
@@ -169,6 +172,8 @@ def get_tools() -> List[ToolEntry]:
                 "parameters": {
                     "type": "object",
                     "properties": {
+                        "relation": {"type": "string", "enum": ["related", "independent"],
+                                     "description": "Explicit relationship to this work. Related preserves its original money and hard deadline; independent is separate work. Author/cron/text do not decide this."},
                         "run_at": {
                             "type": "string",
                             "description": "One-shot ISO 8601 instant to fire at/after (naive = UTC).",
@@ -196,7 +201,7 @@ def get_tools() -> List[ToolEntry]:
                             ),
                         },
                     },
-                    "required": ["objective"],
+                    "required": ["objective", "relation"],
                 },
             },
             handler=_handle_schedule_followup,
@@ -206,10 +211,12 @@ def get_tools() -> List[ToolEntry]:
             "name": "manage_schedules",
             "description": (
                 "See and govern your own existing supervisor schedules. action='list' shows every "
-                "row with its lifecycle: active, disabled, suppressed (a skill row you stopped) or "
+                "row with its lifecycle and relationship: active, disabled, held, waiting, suppressed or "
                 "consumed (a one-shot that already fired). disable/delete stop FUTURE dispatch — a "
                 "task already admitted from the schedule keeps running — and restore brings a "
                 "suppressed or disabled row back, re-checking the skill rather than enabling it. "
+                "Held restore requires the observed hold_id; an unknown relation must first be resolved. "
+                "Release preserves enabled state, pending task identity, money/deadline and other task holds. "
                 "Every change needs a concrete reason and is audited. A consumed one-shot is "
                 "history: schedule a new run_at instead of trying to re-arm it. Deleting a skill "
                 "row keeps it as a suppressed record so the skill lifecycle cannot resurrect it. "
@@ -221,6 +228,8 @@ def get_tools() -> List[ToolEntry]:
                 "action": {"type": "string", "enum": ["list", "disable", "delete", "restore"]},
                 "schedule_id": {"type": "string", "description": "Schedule id for a change."},
                 "reason": {"type": "string", "description": "Why this change is needed."},
+                "expected_hold_id": {"type": "string", "description": "Exact hold_id from list, required to restore a held row. A stale identity refuses."},
+                "relation": {"type": "string", "enum": ["related", "independent"], "description": "Resolve a legacy unknown relationship on restore. Related must bind the existing origin; no fresh budget is inferred."},
                 "offset": {"type": "integer", "minimum": 0, "description": "Zero-based list offset."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 20, "description": "Rows per list page (max 20; responses stay bounded)."},
             }, "required": ["action"], "additionalProperties": False},
@@ -274,7 +283,8 @@ def _pending_followups(records: List[Dict[str, Any]], task_id: str) -> List[Dict
             continue
         template = record.get("task") if isinstance(record.get("task"), dict) else {}
         metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else {}
-        if str(metadata.get("origin_task_id") or "") == task_id:
+        from supervisor.followup_policy import origin_of
+        if origin_of(record).get("task_id") == task_id:
             out.append(record)
     return out
 
@@ -359,6 +369,14 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
         drive_root = canonical_data_root(ctx)
     except Exception as exc:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"ERROR: FOLLOWUP_DATA_ROOT_UNRESOLVED: {exc}")))
+    from supervisor.followup_policy import resolve_relation
+    origin = {"task_id": task_id, "root_task_id": str(getattr(ctx, "root_task_id", "") or
+              (getattr(ctx, "task_metadata", None) or {}).get("root_task_id") or task_id)}
+    try:
+        relation = resolve_relation(drive_root, origin, params.get("relation"), declared_by=task_id)
+    except ValueError as exc:
+        return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE",
+                                    text=f"FOLLOWUP_REFUSED: {exc}"))
     # The cap is read from the table this call is about to write, so the count
     # and the write share ONE transaction: two tasks registering at once would
     # otherwise each read the same under-cap count and both land.
@@ -367,7 +385,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
     try:
         with schedule_transaction(drive_root):
             return _register_followup(ctx, task_id, drive_root, objective, context,
-                                      trigger, cron, timezone, timezone_note)
+                                      trigger, cron, timezone, timezone_note, origin, relation)
     except ScheduleStoreUnreadable as exc:
         # A missed table lock (ScheduleLockTimeout) or an unparseable table: the
         # follow-up was NOT registered, and the refusal says so in the text ABI
@@ -379,7 +397,7 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
 
 def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
                        objective: str, context: str, trigger: Dict[str, Any], cron: str,
-                       timezone: str, timezone_note: str) -> str:
+                       timezone: str, timezone_note: str, origin: dict, relation: dict) -> str:
     """The cap read, the record build and the write — all under the schedule lock."""
     from supervisor.queue import list_scheduled_tasks, upsert_scheduled_task
 
@@ -458,7 +476,8 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
     try:
         stored = upsert_scheduled_task(
             record, drive_root=drive_root, actor="agent:schedule_followup", task_id=task_id,
-            reason=f"follow-up registered by task {task_id}")
+            reason=f"follow-up registered by task {task_id}",
+            host_followup={"followup_origin": origin, "followup_relation": relation})
     except ScheduleRefused as exc:
         return _publish_tool_result(ctx, ToolResult(
             status="unavailable", code="CAPABILITY_UNAVAILABLE",
@@ -483,9 +502,11 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
         f"be written (audit={audit or 'unknown'}), so this registration is not fully "
         "accounted for in logs/events.jsonl.")
     return (
-        f"FOLLOWUP_SCHEDULED: follow-up {stored.get('id')} registered as {timing}. It will "
-        "enqueue ordinary root tasks through the supervisor scheduler under normal admission; "
+        f"FOLLOWUP_SCHEDULED: follow-up {stored.get('id')} registered as {timing}. Future enqueue "
+        "requires eligible relationship/controls and ordinary supervisor admission; "
         f"pending follow-ups for this task: {len(pending) + 1}/{_MAX_PENDING_FOLLOWUPS}. The "
         f"record is durable in state/scheduled_tasks.json and {lifecycle}; the owner can "
-        f"disable or delete it from the Schedules surface.{audit_note}{timezone_note}"
+        f"disable or delete it from the Schedules surface. Relationship: {relation['kind']}; "
+        f"hold: {stored.get('followup_hold') or 'none'}; wait: {stored.get('followup_wait') or 'none'}."
+        f"{audit_note}{timezone_note}"
     )

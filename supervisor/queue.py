@@ -176,7 +176,21 @@ def drain_all_pending(*, persist: bool = True) -> list:
     return drained
 
 
-def enqueue_task(
+def enqueue_task(task, front=False, *, restoring_snapshot=False):
+    """Final public admission gate; restoration retains pending identity."""
+    if (task.get("metadata") or {}).get("schedule_id") and not restoring_snapshot:
+        from supervisor.followup_policy import scheduled_start
+        try:
+            with scheduled_start(DRIVE_ROOT, task) as allowed:
+                if allowed:
+                    return _enqueue_task(task, front, restoring_snapshot=False)
+        except Exception:
+            log.exception("Scheduled admission waits for relationship/control authority")
+        return {**task, "_admission_blocked": "followup_control_wait"}
+    return _enqueue_task(task, front, restoring_snapshot=restoring_snapshot)
+
+
+def _enqueue_task(
     task: Dict[str, Any], front: bool = False, *, restoring_snapshot: bool = False,
 ) -> Dict[str, Any]:
     """Add task to PENDING (thread-safe: HTTP handlers enqueue concurrently

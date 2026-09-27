@@ -396,6 +396,8 @@ def request_cancel(
     # request over an already-hardened intent must not re-emit the forensic row.
     newly_hardened = {"value": False}
     observed = copy.deepcopy(observation) if isinstance(observation, dict) else None
+    from supervisor.followup_policy import new_stop_fields
+    stop_fields = new_stop_fields(source)
 
     def _mutate(current: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         newly_hardened["value"] = False
@@ -520,7 +522,8 @@ def request_cancel(
             minted.update(existing)
             minted["already_requested"] = True
             updated_row = dict(existing)
-            changed = rekeyed
+            changed = rekeyed or bool(stop_fields)
+            updated_row.update(stop_fields)
             if rekeyed and isinstance(updated_row.get("observation"), dict):
                 updated_row["observation"] = {**updated_row["observation"],
                     "matches_cancel_target": updated_row["observation"].get("observed_task_id") == target_id}
@@ -559,6 +562,7 @@ def request_cancel(
             "requested_at": utc_now_iso(),
             "generation": 0,
             "scope": scope_text or SCOPE_SINGLE,
+            **stop_fields,
             **({"observation": observed} if observed is not None else {}),
         }
         if policy_text == STOP_POLICY_FINALIZE:
@@ -1155,6 +1159,20 @@ def settle_intent(
         if reason:
             mismatch.update({**row, "_reason": reason})
             return None
+        if row.get("followup_stop"):
+            # Transfer before retiring the active intent, under this same cancel
+            # lock. Natural completion keeps its status, answer, cost and custody.
+            # A failed transfer leaves the intent active for watchdog recovery.
+            from ouroboros.task_results import task_result_path, require_writable_task_result_schema
+            def retain_stop(result):
+                if not result:
+                    if outcome == SETTLED_NOT_FOUND:
+                        return None
+                    raise ValueError("followup_stop_result_missing")
+                require_writable_task_result_schema(result)
+                return {**result, "followup_stop": copy.deepcopy(row["followup_stop"])}
+            update_json_locked(task_result_path(pathlib.Path(drive_root), tid), retain_stop,
+                               strict_existing_dict=True)
         intents.pop(tid, None)
         settled.update(row)
         return {"schema_version": _SCHEMA_VERSION, "intents": intents}

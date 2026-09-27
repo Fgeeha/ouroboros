@@ -12,6 +12,7 @@ second scheduler or a second store.
 from __future__ import annotations
 
 import logging
+import copy
 import pathlib
 import uuid
 from typing import Any, Dict
@@ -146,13 +147,14 @@ def _merge_onto_current(existing: Dict[str, Any], incoming: Dict[str, Any]) -> D
                 "a skill-manifest schedule is enabled by its skill's readiness; use the "
                 "disable/restore lifecycle action, which records the owner's decision so "
                 "the skill resync cannot undo it")
-        if _is_suppressed(merged):
-            merged["enabled"] = False
+    if _is_suppressed(merged):
+        merged["enabled"] = False
     return merged
 
 
 def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | None = None,
-                          actor: str = "", task_id: str = "", reason: str = "") -> Dict[str, Any]:
+                          actor: str = "", task_id: str = "", reason: str = "",
+                          host_followup: dict | None = None) -> Dict[str, Any]:
     """Create or replace a scheduled task record.
 
     Returns the stored row plus an ``audit`` field: ``recorded`` when both audit
@@ -167,6 +169,27 @@ def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | 
         schedule_id = str(incoming.get("id") or "").strip() or uuid.uuid4().hex[:8]
         incoming["id"] = schedule_id
         existing = next((item for item in tasks if str(item.get("id") or "") == schedule_id), None)
+        from supervisor.followup_policy import HOST_FIELDS, origin_of, normalize_template, policy_view, control_guard
+        # Host-only keyword is never populated from a template or public payload.
+        for key in HOST_FIELDS:
+            incoming.pop(key, None)
+        if existing is not None:
+            for key in HOST_FIELDS:
+                if key in existing:
+                    incoming[key] = copy.deepcopy(existing[key])
+            if origin_of(existing):
+                incoming["followup_origin"] = origin_of(existing)
+        elif host_followup is not None:
+            incoming.update(copy.deepcopy(host_followup))
+        elif incoming.get("source") != "task_followup":
+            incoming["source"] = "owner"
+            incoming["followup_relation"] = {"kind": "independent", "revision": uuid.uuid4().hex}
+        incoming["task"] = normalize_template(incoming)
+        if incoming.get("followup_origin"):
+            incoming["task"]["metadata"]["objective_author"] = {
+                "kind": "task", "task_id": incoming["followup_origin"]["task_id"]}
+        if existing is None and not (root / "state/owner_restart_no_resume.flag").exists():
+            incoming["followup_restart_seen"] = (data.get("followup_restart") or {}).get("control_id", "")
         operation_id = uuid.uuid4().hex[:12]
         action = "edit" if existing is not None else "create"
         audit = {
@@ -192,6 +215,11 @@ def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | 
         incoming.setdefault("enabled", True)
         incoming.setdefault("created_at", utc_now_iso())
         incoming["updated_at"] = utc_now_iso()
+        with control_guard(root, incoming):
+            view = policy_view(root, data, incoming)
+            if view.get("hold"):
+                incoming["followup_hold"] = view["hold"]
+            incoming["followup_wait"] = view["wait"]
         if not incoming.get("next_run_at"):
             incoming["next_run_at"] = _schedule_next_run(incoming)
         tasks = [item for item in tasks if str(item.get("id") or "") != schedule_id]
@@ -207,7 +235,8 @@ def upsert_scheduled_task(record: Dict[str, Any], *, drive_root: pathlib.Path | 
 
 def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                           actor: str, task_id: str = "",
-                          drive_root: pathlib.Path | None = None) -> Dict[str, Any]:
+                          drive_root: pathlib.Path | None = None,
+                          expected_hold_id: str = "", relation: str = "") -> Dict[str, Any]:
     """Apply one owner-governed future-dispatch mutation, audited intent-first.
 
     Affects DISPATCH only: a task already admitted from this schedule keeps
@@ -225,6 +254,16 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
         return {"ok": False, "changed": False, "status": "reason_required",
                 "schedule_id": wanted, "audit": "not_written"}
     root = pathlib.Path(drive_root or _store._queue().DRIVE_ROOT)
+    from supervisor.followup_policy import origin_of, policy_view, resolve_relation, restore_followup
+    resolved = None
+    if operation == "restore" and relation:
+        observed = next((r for r in load_schedule_store(root)["tasks"] if r.get("id") == wanted), {})
+        try:
+            origin = origin_of(observed)
+            resolved = (origin, resolve_relation(root, origin, relation, declared_by=task_id or actor))
+        except ValueError as exc:
+            return {"ok": False, "changed": False, "status": str(exc), "schedule_id": wanted,
+                    "audit": "not_written"}
     try:
         with schedule_transaction(root):
             try:
@@ -237,6 +276,10 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
             if current is None:
                 return {"ok": False, "changed": False, "status": "not_found",
                         "schedule_id": wanted, "audit": "not_written"}
+            if operation == "restore" and (current.get("followup_hold") or
+                    (not _is_consumed_once(current) and policy_view(root, data, current).get("hold"))):
+                return restore_followup(root, data, current, expected_hold_id=expected_hold_id,
+                                        resolved=resolved, actor=actor, task_id=task_id, reason=reason)
             before = dict(current)
             operation_id = uuid.uuid4().hex[:12]
             audit = {
@@ -252,11 +295,11 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
             detail, removed = "", False
             if operation == "disable":
                 current["enabled"] = False
-                if skill_row:
+                if skill_row or current.get("source") == "task_followup":
                     current["manual_override"] = "disabled"
                 status = "updated"
             elif operation == "delete":
-                if skill_row:
+                if skill_row or current.get("source") == "task_followup":
                     # Retained as a suppressed record: dropping the row would only
                     # have it recreated by the next lifecycle resync, and the owner
                     # would never see that their delete did not hold.
@@ -301,6 +344,7 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                     if not dispatchable:
                         status, detail = "restored_not_ready", blocker
             else:
+                current.pop("manual_override", None)
                 current["enabled"] = True
                 status = "updated"
             changed = status not in UNCHANGED_STATUSES
@@ -345,5 +389,3 @@ def remove_scheduled_task(schedule_id: str, *, drive_root: pathlib.Path | None =
         actor=str(actor or "").strip() or "host",
         reason=str(reason or "").strip() or "schedule_removed")
     return bool(outcome.get("changed"))
-
-

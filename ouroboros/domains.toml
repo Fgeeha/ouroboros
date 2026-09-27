@@ -613,6 +613,7 @@ D20 = "Presence"
 "supervisor/task_model_wait.py" = "D08"
 "supervisor/queue_schedules.py" = "D08"
 "supervisor/schedule_lifecycle.py" = "D08"
+"supervisor/followup_policy.py" = "D08"
 "supervisor/queue_transitions.py" = "D08"
 "supervisor/schedule_time.py" = "D08"
 "supervisor/state.py" = "D08"
@@ -935,6 +936,7 @@ lazy_only = [
   "D16->D03",
   "D16->D05",
   "D16->D07",
+  "D16->D08",
   "D16->D09",
   "D16->D17",
   "D17->D02",

@@ -35,10 +35,19 @@ def _perform_owner_restart(ctx: Any, reply=None) -> tuple[bool, str]:
     owner_restart_flag = state_dir / "owner_restart_no_resume.flag"
     stable_skip_flag = state_dir / "panic_stop.flag"
     try:
-        state_dir.mkdir(parents=True, exist_ok=True)
-        owner_restart_flag.write_text("owner_restart", encoding="utf-8")
-        # Pair owner flag with panic_stop for stable-build auto-resume compatibility.
-        stable_skip_flag.write_text("owner_restart_no_resume", encoding="utf-8")
+        from supervisor.queue_schedules import schedule_transaction
+        with schedule_transaction(DATA_DIR):
+            state_dir.mkdir(parents=True, exist_ok=True)
+            owner_restart_flag.write_text("owner_restart", encoding="utf-8")
+            # Pair owner flag with panic_stop for stable-build auto-resume compatibility.
+            stable_skip_flag.write_text("owner_restart_no_resume", encoding="utf-8")
+            try:
+                from supervisor.followup_policy import record_restart
+                record_restart(DATA_DIR, new=True)
+            except Exception:
+                # The marker keeps final admission closed; boot must persist
+                # the restriction before consuming it. Restart still proceeds.
+                log.exception("Restart follow-up restriction awaits boot persistence")
     except Exception:
         owner_restart_flag.unlink(missing_ok=True)
         stable_skip_flag.unlink(missing_ok=True)
