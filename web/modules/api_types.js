@@ -1172,6 +1172,9 @@
  *   confined stat each, rows left out counted); a folder offers its `.zip` only when `available`.
  * @property {Object.<string,Object>=} model_waits
  * @property {TaskCostBreakdown=} cost_breakdown
+ * @property {{status: 'pending'|'problem'|'complete', pending_count: number, problem_count: number, promoted_ref_count: number, promoted_source_handle_count: number}=} history_retention
+ *   Background history placement, separate from task outcome. Routine progress is detail-only;
+ *   only a problem appears on the collapsed card.
  * @property {string=} cancel_state
  * @property {string=} cancel_reason
  * @property {string=} stop_policy

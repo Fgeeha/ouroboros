@@ -57,7 +57,7 @@ def test_cancel_prepares_early_terminal_before_cleanup_and_real_dispatch(split, 
     monkeypatch.setattr(headless, "finalize_task_artifacts", finalize)
     cancel_intents.request_cancel(s.drive, s.task["id"], reason="owner", allow_settled_target=True)
     assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
-    assert finalized == [s.task["id"]] and settled_off_loop(s.drive, s.task["id"], s.child)
+    assert finalized == [s.task["id"]] and s.child.exists()
     for event in s.frames:
         dispatch_event(event, s.ctx)
     assert [e["status"] for e in s.pushed if e.get("type") == "task_done"] == ["completed"]
@@ -69,6 +69,9 @@ def test_cancel_prepares_early_terminal_before_cleanup_and_real_dispatch(split, 
 
     parent = SimpleNamespace(task_id="parent", drive_root=s.drive, budget_drive_root=s.drive, task_metadata={})
     assert "The child answer" in _get_task_result(parent, s.task["id"])
+    assert stored["child_ref_promotion"]["pending_refs"], "cancel and task_done do not wait for historical transfer"
+    headless.retry_child_task_refs(s.drive, s.child, s.task["id"])
+    assert settled_off_loop(s.drive, s.task["id"], s.child)
 
 
 def test_cancel_file_outage_retains_intent_and_retries_dead_worker(split, monkeypatch):
@@ -83,8 +86,10 @@ def test_cancel_file_outage_retains_intent_and_retries_dead_worker(split, monkey
     assert s.child.is_dir() and s.frames == [] and s.task["id"] in s.q.RUNNING
     assert cancel_intents.cancel_pending(s.drive, s.task["id"])
     assert s.q.cancel_task_custody(s.task["id"]) == s.q.CANCEL_ALREADY_SETTLED
-    assert s.state["kills"] == 1 and settled_off_loop(s.drive, s.task["id"], s.child)
+    assert s.state["kills"] == 1 and s.child.exists()
     assert load_task_result(s.drive, s.task["id"])["result"] == "Retained child answer"
+    headless.retry_child_task_refs(s.drive, s.child, s.task["id"])
+    assert settled_off_loop(s.drive, s.task["id"], s.child)
 
 
 def test_genuinely_ready_current_survives_cancel_byte_identical(split, monkeypatch):
@@ -92,6 +97,7 @@ def test_genuinely_ready_current_survives_cancel_byte_identical(split, monkeypat
     write_task_result(s.child, s.task["id"], "completed", result="Accepted answer",
                       review_projection={"panels": [{"panel_id": "paid-PASS", "actors": []}]})
     assert not headless.prepare_terminal_task_files(s.drive, s.task)["error"]
+    headless.retry_child_task_refs(s.drive, s.child, s.task["id"])
     before = (s.drive / "task_results" / f'{s.task["id"]}.json').read_bytes()
     write_task_result(s.child, s.task["id"], "completed", result="Stale replica")
     monkeypatch.setattr(headless, "prepare_terminal_task_files", lambda *_a: pytest.fail("accepted CURRENT recopied"))
@@ -118,4 +124,7 @@ def test_reconciled_terminal_without_checkpoint_still_needs_real_file_adoption(s
     assert not headless.prepare_terminal_task_files(s.drive, s.task)["error"]
     adopted = load_task_result(s.drive, s.task["id"])
     assert headless.terminal_task_files_ready(s.drive, s.task, adopted)
-    assert adopted["result"] == projected["result"] and (s.drive / "observability").is_dir()
+    assert adopted["result"] == projected["result"] and not (s.drive / "observability").exists()
+    assert adopted["child_ref_promotion"]["pending_refs"]
+    retained = headless.retry_child_task_refs(s.drive, s.child, s.task["id"])
+    assert not retained["child_ref_promotion"]["pending_refs"] and (s.drive / "observability").is_dir()

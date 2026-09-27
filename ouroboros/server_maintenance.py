@@ -1051,8 +1051,8 @@ def _recover_terminal_task_files(drive_root: pathlib.Path, protected: set[str]) 
                 task = {**current, "id": task_id, "drive_root": str(child_root)}
                 ready = terminal_task_files_ready(root, task, current)
                 pending = _has_pending_ref_promotion(current.get("child_ref_promotion"))
-                if ready and not pending:
-                    continue  # Already saved; do not re-copy or recapture on every boot.
+                if ready:
+                    continue  # History is already owed to the off-loop retry owner.
                 if not ready:
                     source = load_task_result(child_root, task_id, strict=True) or {}
                     if source.get("status") not in SETTLED_STATUSES:

@@ -14,6 +14,7 @@ import { syncResultFilesItem } from './result_files.js';
 import { createChatHistoryPager } from './chat_history.js';
 import { mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
+import { syncHistoryRetentionItem } from './history_retention.js';
 import {
     getLogTaskGroupId,
     isGroupedTaskEvent,
@@ -1168,7 +1169,7 @@ export function createChatInstance({
         return withStableViewport(() => {
             const id = taskKey(taskId);
             modelWaits.observe(id, detail);
-            const filed = noteResultFiles(liveCardRecords.get(id), detail);
+            const filed = noteTaskDetails(liveCardRecords.get(id), detail);
             const groups = reviewGroupsFromTaskDetail(detail, id);
             if (!id || groups.length === 0) return filed;
             const fresh = !liveCardRecords.has(id);
@@ -1181,9 +1182,11 @@ export function createChatInstance({
         });
     }
 
-    // V12: a settled detail keeps the card's one Files row current.
-    function noteResultFiles(record, detail) {
-        return Boolean(syncResultFilesItem(record, detail) && (updateLiveCardCount(record), renderLiveCardTimeline(record), true));
+    // Existing detail reads refresh files and history without changing task lifecycle.
+    function noteTaskDetails(record, detail) {
+        const files = syncResultFilesItem(record, detail);
+        const history = syncHistoryRetentionItem(record, detail);
+        return Boolean((files || history) && (renderLiveCardMeta(record), updateLiveCardCount(record), renderLiveCardTimeline(record), true));
     }
 
     function hydrateCardReviews(taskId, revision = null) {
@@ -1227,15 +1230,11 @@ export function createChatInstance({
         return lifecycle.classification === 'source_incomplete' ? false : undefined;
     }
 
-    // The host's placement fact is the ONE rule for a task-keyed System row: the
-    // row becomes one content-only timeline item of that task's card, keyed by the
-    // host's row identity, and never touches the card's chip, phase, finality or
-    // expansion. `reviews` additionally asks the Reviews group to re-read the
-    // projection that carries the same fact, and the timeline item is what remains
-    // when that read fails. A row with no placement fact, no task, or no card
-    // record for its task keeps the ordinary bubble path — the client holds no
-    // list of system types that attach. A record the two-pass replay has not
-    // mounted yet still owns its rows; pass 2 mounts the card with them.
+    // Host-stamped card_row places one System timeline item in an existing task
+    // card (including an unmounted replay card), keyed by the host's row identity.
+    // It changes no chip, phase, finality or expansion. `reviews` also refreshes
+    // that group's projection; the row survives a failed read. Missing placement,
+    // task or card keeps the ordinary bubble path; there is no system-type list.
     function attachCardRow(msg, rawTs = '', { suppressDomInsert = false } = {}) {
         const placement = taskKey(msg?.card_row);
         const phase = CARD_ROW_PHASES.get(placement);
@@ -1633,10 +1632,9 @@ export function createChatInstance({
     window.addEventListener('ouro:page-shown', handlePageShown);
     document.addEventListener('visibilitychange', handlePageShown);
 
-    // P3: fetch the genuinely-full text of a server-truncated timeline line (the WS
-    // preview is capped at 4000 chars) on demand, not over the socket; cache it on
-    // the item, re-render if the line is still expanded, and show it in a
-    // bounded-scroll box. Best-effort: the capped preview stays on failure.
+    // P3: fetch full text beyond the 4000-char WS preview on expansion. Cache per
+    // item, re-render only while expanded, and bound scrolling; keep the preview
+    // if the read fails.
     async function fetchFullLineOutput(item, record) {
         item._fetchingFull = true;
         let changed = false;
@@ -1899,6 +1897,7 @@ export function createChatInstance({
         changed = noteToolMetrics(taskId, msg, rawTs, { suppressDomInsert }) || changed;
         const summary = taskTerminalSummary({ ...msg, task_id: taskId });
         const record = getLiveCardRecord(taskId);
+        changed = noteTaskDetails(record, msg) || changed;
         noteDirectTurn(record, msg?._is_direct_chat);
         changed = Boolean(record.reviewController?.updateMany(reviewGroupsFromTaskDetail(msg, taskId))) || changed;
         if (finalizing && !record.finished) record.finalizingHold = true;
@@ -2167,6 +2166,9 @@ export function createChatInstance({
     function updateLiveCardFromLogEvent(evt) {
         if (!evt) return false;
         const eventType = evt.type || evt.event || '';
+        if (eventType === 'history_retention') {
+            return withStableViewport(() => noteTaskDetails(liveCardRecords.get(taskKey(evt.task_id)), evt));
+        }
         const reference = admitCardMetadata(evt);
         if (reference !== undefined) return reference;
         if (!isGroupedTaskEvent(evt)) return false;

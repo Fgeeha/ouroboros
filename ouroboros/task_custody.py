@@ -908,7 +908,7 @@ def _input_closure(canonical: pathlib.Path, drive: pathlib.Path, task_id: str, c
 
 
 def _prepare_occupant(canonical: pathlib.Path, drive: pathlib.Path, task_id: str, *, live: LiveProbe,
-                      staging: pathlib.Path, admission_rollback: bool) -> Dict[str, Any]:
+                      staging: pathlib.Path, admission_rollback: bool, stop=None) -> Dict[str, Any]:
     """Everything outside the locks: liveness, durable settledness, copy-back, pending refs and
     private staging; nothing served is written. Raises ``_Retained``."""
     from ouroboros.owner_mailbox import settled_mailbox_cleanup_allowed
@@ -936,6 +936,9 @@ def _prepare_occupant(canonical: pathlib.Path, drive: pathlib.Path, task_id: str
         raise _Retained("child_result_unadopted")
     if _pending_refs_under(current, drive):
         raise _Retained("child_refs_pending")  # retry_pending_child_ref_promotions owns the retry
+    from ouroboros.history_retention import call_inventory_custodied
+    if not call_inventory_custodied(canonical, drive, task_id, current, stop=stop):
+        raise _Retained("call_inventory_pending")
     if not unread_mail_rows(drive, task_id)[1]:
         raise _Retained("unread_mailbox_unreadable")  # a torn mailbox stages nothing (the closure is Phase A's)
     plan = _child_store_plan(canonical, drive, task_id, current, child, staging / task_id)
@@ -1049,7 +1052,7 @@ def settle_child_drive(canonical_root: Any, task_id: str, drive: Any, *, live: O
             raise _Retained("liveness_unknown")
         occupants = _occupants(drive, tid)
         prepared = [_prepare_occupant(canonical, drive, occupant, live=live, staging=staging,
-                                      admission_rollback=admission_rollback and occupant == tid)
+                                      admission_rollback=admission_rollback and occupant == tid, stop=closed)
                     for occupant in occupants]
         if closed():
             raise _Retained("generation_closed")

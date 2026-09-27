@@ -997,8 +997,8 @@ def recover_orphaned_acceptance_operations(drive_root: Any, *, stop: Optional[Ca
     controller that cannot be verified, a source that cannot be read or a panel
     still in flight is reported and retried — never marked unavailable.
     """
-    from ouroboros.acceptance_settlement import settle_acceptance_operation
-    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result, task_results_dir
+    from ouroboros.acceptance_settlement import acceptance_actor_ended, settle_acceptance_operation
+    from ouroboros.task_results import load_task_result, task_results_dir
 
     root = pathlib.Path(drive_root)
     report: Dict[str, Any] = {"settled": [], "pending": [], "deferred": [], "errors": []}
@@ -1011,12 +1011,15 @@ def recover_orphaned_acceptance_operations(drive_root: Any, *, stop: Optional[Ca
         if stop is not None and stop():
             break
         try:
-            if marker not in path.read_text(encoding="utf-8"):
+            text = path.read_text(encoding="utf-8")
+            if marker not in text and '"review_projection"' not in text:
                 continue
             row = load_task_result(root, path.stem) or {}
         except (OSError, ValueError):
             continue
-        if str(row.get("status") or "") not in _TRULY_TERMINAL_STATUSES:
+        ctx = SimpleNamespace(task_id=path.stem, task_attempt=None, drive_root=root,
+                              budget_drive_root=root, task_metadata={}, event_queue=None)
+        if not acceptance_actor_ended(ctx, path.stem, row):
             continue
         for owner_id, entry in list((row.get(OPERATIONS_FIELD) or {}).items()):
             state = entry.get("state") if isinstance(entry, dict) else None
@@ -1046,4 +1049,107 @@ def recover_orphaned_acceptance_operations(drive_root: Any, *, stop: Optional[Ca
                                 from_states=_OPEN_STATES | {OPERATION_UNPUBLISHED})
             report["settled" if done else "pending"].append({"task_id": path.stem, "owner_id": owner_id,
                                                              "status": status})
+        _recover_legacy_acceptance_panels(root, path.stem, row, report, stop=stop)
     return report
+
+
+def _recover_legacy_acceptance_panels(root: pathlib.Path, task_id: str, row: dict,
+                                      report: dict, *, stop: Optional[Callable[[], bool]]) -> None:
+    """Published host panels predate operation pointers; their own source owns the free catch-up.
+
+    Reuse the same collector, projection and outbox, without minting a controller
+    or inventing a paid request. A persisted late fact can owe only its notice.
+    """
+    from ouroboros.acceptance_settlement import enqueue_late_acceptance_settlement, settle_acceptance_operation
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.review_projection import _actor_pending
+    from ouroboros.task_results import load_task_result
+    from supervisor.terminal_delivery import already_delivered, pending_deliveries
+
+    pointed = {entry.get("retry_key") for entry in (row.get(OPERATIONS_FIELD) or {}).values()
+               if isinstance(entry, dict)}
+    owed = None
+    for panel in (row.get("review_projection") or {}).get("panels") or []:
+        if stop is not None and stop():
+            return
+        if not isinstance(panel, dict) or panel.get("surface") != "task_acceptance" or panel.get("authority") != "host_root":
+            continue
+        late = panel.get("late_settlement")
+        pending = any(_actor_pending(actor) for actor in panel.get("actors") or [] if isinstance(actor, dict))
+        if not pending and not isinstance(late, dict):
+            continue
+        fact = {"task_id": task_id, "panel_id": panel.get("panel_id")}
+        ctx = SimpleNamespace(task_id=task_id, task_attempt=panel.get("task_attempt"), drive_root=root,
+                              budget_drive_root=root, task_metadata={}, event_queue=None)
+        try:
+            if isinstance(late, dict) and not pending:
+                retry_key = str((late.get("reviewed_subject") or {}).get("retry_key") or "")
+                if not retry_key or retry_key in pointed:
+                    continue
+                delivery_id = f"acceptance-late:{retry_key}"
+                receipt = ((row.get("review_projection") or {}).get("late_notice_receipts") or {}).get(delivery_id)
+                if not isinstance(receipt, dict) or receipt.get("panel_id") != panel.get("panel_id"):
+                    continue  # old already-settled panels do not acquire a new notification duty
+                if (receipt.get("custody") == "terminal_outbox"
+                        and receipt.get("settled_at") == late.get("settled_at")):
+                    continue
+                if owed is None:
+                    owed = {event.get("delivery_id") for event in pending_deliveries(root)}
+                if delivery_id in owed or already_delivered(root, delivery_id):
+                    _remember_legacy_notice(root, task_id, delivery_id, panel)
+                    continue
+                status = enqueue_late_acceptance_settlement(ctx, task_id, retry_key, row, panel)
+            else:
+                run = json.loads(read_actor_source_bytes(root, task_id, panel.get("applied_source_ref")))
+                if not isinstance(run, dict):
+                    raise ValueError("published acceptance source is not an object")
+                request = run.get("request") or {}
+                retry_key = str(request.get("retry_key") or "")
+                if (run.get("authority") != "host_root" or request.get("surface") != "task_acceptance"
+                        or request.get("task_id") != task_id or not retry_key or retry_key in pointed):
+                    continue
+                if not _remember_legacy_notice(root, task_id, f"acceptance-late:{retry_key}", panel,
+                                                custody="publication"):
+                    continue
+                status = settle_acceptance_operation(ctx, retry_key=retry_key, task_id=task_id, result=row)
+            if status in {"announced", "published"}:
+                current = load_task_result(root, task_id, strict=True) or {}
+                published = next((item for item in (current.get("review_projection") or {}).get("panels") or []
+                                  if item.get("panel_id") == panel.get("panel_id")), None)
+                if published is not None:
+                    _remember_legacy_notice(root, task_id, f"acceptance-late:{retry_key}", published)
+            report["settled" if status in {"announced", "published", "settled"} else "pending"].append(
+                {**fact, "status": status})
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            report["errors"].append({**fact, "error": f"{type(exc).__name__}: {exc}"})
+
+
+def _remember_legacy_notice(root: pathlib.Path, task_id: str, delivery_id: str, panel: dict,
+                            *, custody: str = "terminal_outbox") -> bool:
+    """Keep this legacy publication's notice duty until the existing outbox takes custody.
+
+    This receipt is not delivery proof. It stays with the exact published panel,
+    while the outbox alone owns retries, delivery and exhaustion disclosures. A
+    durable handoff keeps bounded outbox eviction from re-owing old criticism.
+    """
+    from ouroboros.task_results import write_task_result
+
+    accepted = []
+    def project(current, _fields):
+        projection = current.get("review_projection") or {}
+        stored = next((item for item in projection.get("panels") or []
+                       if isinstance(item, dict) and item.get("panel_id") == panel.get("panel_id")
+                       and item.get("publication_revision") == panel.get("publication_revision")), None)
+        if stored is None or stored.get("late_settlement") != panel.get("late_settlement"):
+            return None  # a concurrent producer owns the new panel; next pass re-reads it
+        receipt = {"panel_id": stored["panel_id"], "publication_revision": stored.get("publication_revision"),
+                   "settled_at": (stored.get("late_settlement") or {}).get("settled_at"), "custody": custody}
+        receipts = projection.get("late_notice_receipts") or {}
+        accepted.append(True)
+        if receipts.get(delivery_id) == receipt:
+            return None
+        return {"status": current["status"], "review_projection": {
+            **projection, "late_notice_receipts": {**receipts, delivery_id: receipt}}}
+
+    write_task_result(root, task_id, "running", strict_existing_dict=True, _field_projector=project)
+    return bool(accepted)

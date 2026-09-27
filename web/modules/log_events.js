@@ -4,6 +4,7 @@ import { taskCheckpointLabel, checkpointHasProgressRow } from './task_checkpoint
 export { taskCheckpointLabel } from './task_checkpoints.js';
 import { harnessPresentation } from './harness_presentation.js';
 import { acceptanceIncidentClauses } from './acceptance_incident_presentation.js';
+import { historyRetentionView } from './history_retention.js';
 import {
     classifyReviewLifecycle,
     classifyReviewLifecyclePointer,
@@ -45,7 +46,7 @@ export function categorizeLogEvent(evt, view = summarizeLogEvent(evt)) {
     if (wake) return 'consciousness';
     if (t.includes('llm') || t.includes('model')) return 'llm';
     if (t.includes('tool') || evt.tool) return 'tools';
-    if (t.includes('task') || t.includes('evolution') || t.includes('review')) return 'tasks';
+    if (t === 'history_retention' || t.includes('task') || t.includes('evolution') || t.includes('review')) return 'tasks';
     if (t.includes('consciousness') || t.includes('bg_')) return 'consciousness';
     return 'system';
 }
@@ -893,6 +894,11 @@ export function summarizeLogEvent(evt) {
         });
     }
 
+    if (t === 'history_retention') {
+        const retention = historyRetentionView(evt);
+        if (retention) return view(retention.phase, retention.headline, { body: retention.body, meta: taskMeta(...retention.meta) });
+    }
+
     if (t === 'owner_hurry') {
         // S3 (HQ1): the typed non-chat control family. The LOGS tab is a
         // diagnostic surface, so the row renders here; chat stays silent (see
@@ -1210,6 +1216,8 @@ function summarizeChatLiveEventView(evt) {
     const groupId = getLogTaskGroupId(evt);
     const progressText = describeText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240, { markdown: true });
     const key = (...parts) => [t, groupId, ...parts].join(':');
+
+    if (t === 'history_retention') return chatView({ visible: false, dedupeKey: key(evt.status || '') });
 
     if (t === 'owner_hurry') {
         // S3 (HQ1) EXPLICIT hide branch: the typed hurry control family never renders a chat

@@ -44,6 +44,7 @@ def startup_controls(tmp_path, monkeypatch):
     monkeypatch.setattr(server, 'DATA_DIR', data)
     monkeypatch.setattr(server, 'REPO_DIR', repo)
     monkeypatch.setattr(server, '_supervisor_thread', None)
+    monkeypatch.setattr(server, '_supervisor_ready', threading.Event())
     monkeypatch.setattr(server, '_consciousness', None)
     monkeypatch.setattr(server, '_restart_requested', threading.Event())
     monkeypatch.setattr(server, '_owner_restart_requested', threading.Event())
@@ -119,6 +120,40 @@ def test_onboarding_restart_uses_existing_no_resume_flags_and_exit_signal(startu
     assert git_ops.REPO_DIR == obj.repo
 
 
+@pytest.mark.parametrize('thread_alive', [True, False])
+def test_restart_during_initialization_does_not_queue_to_published_bridge(
+        startup_controls, monkeypatch, thread_alive):
+    """Publishing the bridge precedes recovery; only a ready loop can consume Restart."""
+    from supervisor import message_bus
+    from ouroboros import server_restart
+
+    obj = startup_controls
+    release = threading.Event()
+    thread = threading.Thread(target=release.wait)
+    thread.start()
+    monkeypatch.setattr(obj.server, '_supervisor_thread', thread)
+    bridge = message_bus.LocalChatBridge()
+    monkeypatch.setattr(message_bus, '_BRIDGE', bridge)
+    monkeypatch.setattr(server_restart, '_safe_restart_serialized', lambda *a, **kw: (True, 'ok'))
+    stopped = []
+    monkeypatch.setattr(server_restart, '_stop_owned_work', lambda ctx: stopped.append(ctx.RUNNING))
+    if not thread_alive:
+        release.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+    try:
+        response = obj.client.post('/api/command', json={'cmd': '/restart'})
+        assert response.status_code == 200 and response.json() == {'status': 'ok'}
+        assert stopped == [{}]
+        assert obj.server._restart_requested.is_set() and obj.server._owner_restart_requested.is_set()
+        assert (obj.data / 'state/owner_restart_no_resume.flag').read_text(encoding='utf-8') == 'owner_restart'
+        assert bridge.get_updates(0, timeout=0) == []
+    finally:
+        release.set()
+        thread.join(timeout=2)
+        assert not thread.is_alive()
+
+
 def test_onboarding_panic_runs_real_panic_marker_and_exit_99(startup_without_consumer, monkeypatch):
     obj = startup_without_consumer
     exits, stops = [], []
@@ -186,6 +221,8 @@ def test_unknown_commands_are_not_accepted_without_a_consumer(startup_controls, 
 @pytest.mark.parametrize('command', ['/panic', '/restart', 'ordinary chat'])
 def test_configured_commands_keep_the_existing_bus_path(startup_controls, monkeypatch, command):
     calls = []
+    monkeypatch.setattr(startup_controls.server, '_supervisor_thread', SimpleNamespace(is_alive=lambda: True))
+    startup_controls.server._supervisor_ready.set()
     monkeypatch.setattr('supervisor.message_bus._BRIDGE', SimpleNamespace(ui_send=lambda *a, **kw: calls.append((a, kw))))
     response = startup_controls.client.post('/api/command', json={'cmd': command})
     assert response.status_code == 200
@@ -211,6 +248,7 @@ def test_onboarding_finishing_before_background_dispatch_reuses_live_consumer(st
         thread.start()
         monkeypatch.setattr(obj.server, '_supervisor_thread', thread)
         monkeypatch.setattr(message_bus, '_BRIDGE', bridge)
+        obj.server._supervisor_ready.set()
         return action
 
     obj.app.state.startup_owner_command = admit

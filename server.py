@@ -1191,7 +1191,8 @@ def _startup_owner_command(command: str):
         # owns the ordinary command rather than two concurrent control paths.
         from supervisor.message_bus import try_get_bridge
         bridge = try_get_bridge()
-        if _supervisor_thread and _supervisor_thread.is_alive() and bridge is not None:
+        if (_supervisor_thread and _supervisor_thread.is_alive()
+                and _supervisor_ready.is_set() and bridge is not None):
             bridge.ui_send(command, broadcast=False)
             return
         from supervisor import state, git_ops
