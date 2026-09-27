@@ -341,6 +341,14 @@ def _golden() -> dict[str, dict]:
 # unavailable. Keep the historical corpus intact and assert the new observed
 # outcome explicitly rather than manufacture old evidence (04-AGENCY S1/S3).
 CURRENT_PRODUCER_CONTRACTS = {
+    # New merge producers are absent from the historical oracle. The partial
+    # f-string harvest is a legacy warning; the real tool carries TOOL_ERROR
+    # (and argument refusals TOOL_ARG_ERROR) through its typed sidecar.
+    "PR_MERGE_": (False, "ok"),
+    "PR_MERGE_REFUSED": (False, "ok"),
+    "native:TOOL_ERROR:PR_MERGE_": (True, "error"),
+    "native:TOOL_ERROR:PR_MERGE_REFUSED": (True, "error"),
+    "native:TOOL_ARG_ERROR:PR_MERGE_REFUSED": (True, "argument_error"),
     # Saved-setting selection uses the existing process access authority; its new
     # foreground refusal remains blocked through both text and native ACCESS_BLOCKED.
     "PROCESS_ENV_REFERENCE_BLOCKED": (True, "blocked"),

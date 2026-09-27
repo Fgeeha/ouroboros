@@ -107,8 +107,7 @@ def _registry_document(current: Dict[str, Any], rows: List[str], pending: Dict[s
 def _capture_emitted_answer(drive_root: Any, delivery_id: str, emitted: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     """Retain the terminal text, routed chat and identity after the send returned.
 
-    The receipt binds exact text to its immutable source. Failed capture returns
-    None: the id still dedupes delivery, but proves no emitted bytes."""
+    The immutable source binds exact text; failed capture dedupes only, proving no bytes."""
     match = _TERMINAL_ANSWER_ID.fullmatch(delivery_id)
     task_id = str(emitted.get("task_id") or "")
     text = emitted.get("text")
@@ -120,6 +119,8 @@ def _capture_emitted_answer(drive_root: Any, delivery_id: str, emitted: Dict[str
         record = {"delivery_id": delivery_id, "task_id": task_id, "chat_id": int(emitted["chat_id"]),
                   "text": text, "sent_at": utc_now_iso(), "basis": "send_handler_returned",
                   **{key: str(emitted.get(key) or "") for key in ("format", "role", "system_type", "terminal_origin")}}
+        if isinstance(emitted.get("routing"), dict):
+            record["routing"] = dict(emitted["routing"])
         ref = store_actor_source_bytes(
             pathlib.Path(drive_root), task_id, category="context_checkpoints", source_id="terminal-delivery",
             data=json.dumps(record, ensure_ascii=False, sort_keys=True).encode("utf-8"), extension="json")

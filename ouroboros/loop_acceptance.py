@@ -1029,6 +1029,7 @@ def _record_forced_acceptance_bypass(
     tools_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     if tools_ctx is None:
         return
+    from ouroboros.acceptance_history import seed_acceptance_history
     # A recorded host decision (canonical status, NOT the status-less agent
     # stance merged on a deferral) wins; the bypass record exists only for the
     # no-host-verdict shape; `_set_acceptance_decision` stamps.
@@ -1038,6 +1039,8 @@ def _record_forced_acceptance_bypass(
         # take the pass it promised, so close it instead of leaving it dangling.
         terminalize_dangling_revision(llm_trace, rail=str(reason_code or ""))
         publish_acceptance_checkpoint(tools_ctx, llm_trace, task_id=ctx.task_id)
+        if decision.get("status") != "accepted":
+            seed_acceptance_history(tools_ctx, llm_trace, rail_reason)
         return
     if getattr(tools_ctx, "_task_acceptance_reviewed", False):
         return
@@ -1073,3 +1076,4 @@ def _record_forced_acceptance_bypass(
         "source": "forced_finalization",
         **forced_rail_panel_verdict(tools_ctx, llm_trace, rail_reason),
     })
+    seed_acceptance_history(tools_ctx, llm_trace, rail_reason)

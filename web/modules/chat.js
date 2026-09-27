@@ -166,8 +166,7 @@ export {
 };
 
 const PROJECT_ROW_TYPES = new Set(['project_started', 'project_handoff', 'project_completion_summary']);
-// The host's card placement values and the timeline phase each one reads as: a
-// custody fact warns, a settled review reads as a result.
+// HOST placement: custody warns; settled reviews read as results.
 const CARD_ROW_PHASES = new Map([['timeline', 'warn'], ['reviews', 'result']]);
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_DRAFT_KEY = 'ouro_chat_draft';
@@ -1182,7 +1181,7 @@ export function createChatInstance({
         });
     }
 
-    // Existing detail reads refresh files and history without changing task lifecycle.
+    // Detail reads refresh files/history, preserving lifecycle.
     function noteTaskDetails(record, detail) {
         const files = syncResultFilesItem(record, detail);
         const history = syncHistoryRetentionItem(record, detail);
@@ -1230,11 +1229,13 @@ export function createChatInstance({
         return lifecycle.classification === 'source_incomplete' ? false : undefined;
     }
 
-    // Host-stamped card_row places one System timeline item in an existing task
-    // card (including an unmounted replay card), keyed by the host's row identity.
-    // It changes no chip, phase, finality or expansion. `reviews` also refreshes
-    // that group's projection; the row survives a failed read. Missing placement,
-    // task or card keeps the ordinary bubble path; there is no system-type list.
+    // Host placement/task/card keys own content-only rows; phase/expansion stay.
+    // Reviews rehydrate; read failure keeps rows. Unkeyed rows stay bubbles.
+    // Pass 2 uses pass-1 cards, with no type allowlist.
+    function isPlacedCardRow(msg) {
+        return CARD_ROW_PHASES.has(taskKey(msg?.card_row)) && !!taskKey(msg?.task_id);
+    }
+
     function attachCardRow(msg, rawTs = '', { suppressDomInsert = false } = {}) {
         const placement = taskKey(msg?.card_row);
         const phase = CARD_ROW_PHASES.get(placement);
@@ -1244,13 +1245,12 @@ export function createChatInstance({
         const lines = String(msg.text ?? msg.content ?? '').split('\n');
         const headline = lines[0].trim();
         const rowId = taskKey(msg.card_row_id) || `${taskKey(msg.system_type)}|${rawTs}`;
-        const summary = { phase, headline, body: lines.slice(1).join('\n').trim(), dedupeKey: `cardrow|${rowId}` };
+        const summary = { phase, headline, body: lines.slice(1).join('\n').trim(), dedupeKey: `cardrow|${rowId}`, cardRowRevision: msg.card_row_revision };
         return withStableViewport(() => {
             const before = captureLiveCardProjection(record);
             let fresh;
             if (msg.history_id) {
-                // A replayed row keeps its history identity: the item sorts by its
-                // source position and leaves the card with its page.
+                // Replay keeps source/order/page identity.
                 fresh = mergeHistoricalTimelineItem(record, summary, msg, normalizeLogTs(rawTs));
             } else {
                 const { timelineUpdate } = updateLiveTimelineItem(record, summary, {
@@ -1262,14 +1262,14 @@ export function createChatInstance({
             updateLiveCardCount(record);
             reanchorTaskCard(record, rawTs, { suppressDomInsert });
             ensureLiveCardVisible(record, { suppressDomInsert });
-            // A row that repeats a fact the card already holds asks for no new read.
+            // Only new review rows trigger a read.
             if (fresh && placement === 'reviews') hydrateCardReviews(taskId);
             return Boolean(changed || liveCardProjectionChanged(before, record));
         });
     }
 
     function admitCardMetadata(row) {
-        // Carrier facts precede presentation-specific early returns.
+        // Carrier facts precede presentation returns.
         if (row.tool_evidence && row.task_id) noteToolMetrics(row.task_id, row, row.ts || row.timestamp || '');
         if (isModelWaitReference(row)) {
             const changed = modelWaits.observe(row.task_id, row);
@@ -1632,9 +1632,8 @@ export function createChatInstance({
     window.addEventListener('ouro:page-shown', handlePageShown);
     document.addEventListener('visibilitychange', handlePageShown);
 
-    // P3: fetch full text beyond the 4000-char WS preview on expansion. Cache per
-    // item, re-render only while expanded, and bound scrolling; keep the preview
-    // if the read fails.
+    // Beyond the 4000-char WS preview: fetch/cache on expansion, bound scrolling,
+    // render only while expanded; failure keeps the preview.
     async function fetchFullLineOutput(item, record) {
         item._fetchingFull = true;
         let changed = false;
@@ -1884,12 +1883,11 @@ export function createChatInstance({
         const taskId = msg?.task_id || '';
         const rawTs = msg?.ts || new Date().toISOString();
         if (!taskId) {
-            // An unkeyed summary cannot prove which task finished.  Keep the
-            // ownerless durable/log evidence, but never close the current card.
+            // Unkeyed summaries keep durable/log evidence but close no card.
             return false;
         }
         let changed = false;
-        // Restore task name from history.
+        // Restore historical task name.
         if (msg?.suggested_name) {
             changed = applySuggestedName(taskId, msg.suggested_name) || changed;
         }
@@ -2190,7 +2188,7 @@ export function createChatInstance({
         if (childInfo && eventType === 'task_done') return routeSubagentTerminalToCard(taskId, evt);
         const summary = summarizeChatLiveEvent(evt);
         if (childInfo && subagentTerminalChildren.has(taskId) && !summary?.toolCall) return false;
-        // Metrics, terminal and replayed evidence share the root/child fold.
+        // Root/child fold: metrics, terminal and replay.
         let changed = evt.tool_evidence || ['task_metrics_event', 'task_eval', 'task_done'].includes(eventType)
             ? noteToolMetrics(taskId, evt, rawTs) : false;
         if (!childInfo) changed = attachTaskDetailReviews(taskId, evt) || changed;
@@ -2490,6 +2488,8 @@ export function createChatInstance({
                         cardRowsAttached.add(msg);
                         continue;
                     }
+                    // Placement precedes progress; later real rows may create the card.
+                    if (isPlacedCardRow(msg)) continue;
                     const taskId = msg.task_id || '';
                     if (!taskId) continue;
                     if (msg.is_progress) {
@@ -2535,6 +2535,15 @@ export function createChatInstance({
                         // A record minted after its row in pass 1 takes the row here.
                         || cardRowsAttached.has(msg) || attachCardRow(msg, msg.ts || '') !== undefined
                     ) continue;
+                    if (isPlacedCardRow(msg)) {
+                        addMessage(msg.text, msg.role, !!msg.markdown, msg.ts || null, false, {
+                            historyId: msg.history_id, historyPosition: msg.history_position,
+                            systemType: msg.system_type || '', taskId,
+                            source: msg.source || '', initiator: msg.initiator || '',
+                            senderLabel: msg.sender_label || '', senderSessionId: msg.sender_session_id || '',
+                        });
+                        continue;
+                    }
                     // Reconnect: a durably recorded submission must not stay
                     // `Sending...` — history + snapshot are the authorities
                     // (a live turn re-links via census hydration).
@@ -3877,11 +3886,8 @@ export function createChatInstance({
         handoffs?.setConnected(true);
         refreshHeaderControlState(true);
         syncChatStatus();
-        // Reconnect truth comes from the ws CLIENT
-        // (previouslyConnected rides the open event) — a project instance
-        // created while the socket was already open must still treat the next
-        // open as a reconnect. The per-instance flag stays only as a fallback
-        // for open events without a payload.
+        // The socket's previouslyConnected covers newly mounted Projects too;
+        // per-instance state is only the fallback for legacy open events.
         const isReconnect = typeof msg?.previouslyConnected === 'boolean'
             ? msg.previouslyConnected
             : wsHasConnectedOnce;
@@ -3893,9 +3899,7 @@ export function createChatInstance({
         wsHasConnectedOnce = true;
         updateMessagesPadding();
         loadUiPreferences()
-            // Reconnect ALWAYS does a real fetch (a lost task_done is healed
-            // only by refetching); the first clean open is a hydration trigger
-            // and rides the sticky single-flight behind Main's idle gate.
+            // Reconnect refetches lost task_done; first open shares idle-gated hydration.
             .then(() => (isReconnect
                 ? syncHistory({ includeUser: !historyLoaded, fromReconnect: isReconnect })
                 : waitForHydrationWindow().then(

@@ -126,7 +126,13 @@ function profileEntry(entry) {
     return routeEditor.profileEntry(entry);
 }
 
+// A direct api_chat TRIAD row's saved delivery (#1334); a row loaded without it is a
+// pre-#1334 packet row and stays bare unless the owner switches it.
+export const DELIVERY_NATIVE = 'native', DELIVERY_PACKET = 'packet';
+
 export function buildReviewerSlotsSetting(state) {
+    const triadOut = (row) => ({ ...rowOut(row), ...(!row.subagent_id && row.route?.kind !== ROUTE_KIND_SESSION
+        && [DELIVERY_NATIVE, DELIVERY_PACKET].includes(row.delivery) ? { delivery: row.delivery } : {}) });
     const rowOut = (row) => {
         // The two stored forms are mutually exclusive: a configured-subagent
         // reference never duplicates route knobs (the roster row is their
@@ -175,19 +181,16 @@ export function buildReviewerSlotsSetting(state) {
         if (advisory.processing_preference) advisoryOut.processing_preference = String(advisory.processing_preference);
     }
     const setting = {
-        triad: (state.triad || []).map(rowOut),
+        triad: (state.triad || []).map(triadOut),
         scope: (state.scope || []).map(rowOut),
         advisory: advisoryOut,
     };
-    // The deep self-review singleton is OPTIONAL server-side (absent = the
-    // row synthesized from OUROBOROS_MODEL_DEEP_SELF_REVIEW). An
-    // UNTOUCHED synthesized or empty placeholder (`materialized: false`) is
-    // OMITTED: the runtime then synthesizes the identical row, and an
-    // unrelated save never writes the key's value into the setting behind the
-    // owner's back. Editing the row (or loading a SAVED one) materializes it.
-    // Same two stored forms as every row, minus slot_id (fixed identity) and
-    // minus `enabled` (no standing gate to switch off).
-    if (state.deepReview && state.deepReview.materialized !== false) {
+    // First materialization of a default panel preserves its displayed deep row:
+    // synthesis may change once the panel has saved provenance. Unrelated Save
+    // still omits the whole untouched panel in reviewerSlotsSavePayload. Existing
+    // structured panels and repair placeholders keep their legacy omission.
+    if (state.deepReview && (state.deepReview.materialized !== false
+        || (state.source === 'default' && state.deepReview.synthesizedFrom))) {
         setting.deep_review = rowOut({ ...state.deepReview, slot_id: '' });
         delete setting.deep_review.slot_id;
     }
@@ -195,12 +198,12 @@ export function buildReviewerSlotsSetting(state) {
 }
 
 export function deepReviewMetaNotes(row) {
-    // The deep row's two owner-facing facts beside its badge: an untouched
-    // synthesized row is shown but not written, and a blanked model box is a
+    // The deep row's two owner-facing facts beside its badge: a synthesized
+    // row has not been saved yet, and a blanked model box is a
     // typed save refusal (owner fork 3 = A) — said HERE, before the 400.
     const notes = [];
     if (row?.synthesizedFrom && row.materialized === false) {
-        notes.push(`Not saved as a row yet — shown from ${row.synthesizedFrom}; edit it to store it as the deep_review row (an untouched row is not written)`);
+        notes.push(`Not saved as a row yet — shown from ${row.synthesizedFrom}; stored when edited or when the default panel is first saved`);
     }
     if (row?.materialized !== false && !row?.subagent_id && row?.route?.kind !== ROUTE_KIND_SESSION
         && !String(row?.route?.target_id || '').trim()) {
@@ -603,6 +606,7 @@ export function advisoryRouteTransition(prev, decoded, memory = {}) {
 const state = {
     loaded: false,
     loadedDraft: null,
+    loadedSetting: '',
     configError: '',
     loadError: '',
     source: '',
@@ -790,6 +794,12 @@ function selectHtml(attrs, groups, selected) {
     return routeEditor.selectHtml(attrs, groups, selected);
 }
 
+/** How a direct API triad row receives the work: it reads it, or it gets the packet. */
+export const deliverySelectHtml = (attrs, row) => selectHtml(attrs, [{ label: '', options: [
+    { value: DELIVERY_NATIVE, label: 'Reads the work itself' },
+    { value: DELIVERY_PACKET, label: 'Packet — for models without tool calling' },
+] }], row?.delivery === DELIVERY_NATIVE ? DELIVERY_NATIVE : DELIVERY_PACKET);
+
 function effortSelectHtml(attrs, selected, surfaceDefault) {
     // Compact closed state (owner feedback on field proportions): the wordy
     // "Default (scope review effort)" label made this select as wide as the
@@ -965,6 +975,7 @@ function rowHtml(row, group) {
                     : routeEditor.routeModelInputHtml(`data-slot-custom-api aria-label="${label} model"`, row.route, state.catalogModels, `reviewer-${row.slot_id}-models`)}
                 ${routeEditor.routeSupportsAccount(row.route) ? selectHtml(`data-slot-profile aria-label="${label} account"`, [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
                 ${effortSelectHtml(`data-slot-effort aria-label="${label} reasoning effort"`, row.effort, surfaceDefault)}
+                ${group === 'triad' && !session ? deliverySelectHtml(`data-slot-delivery aria-label="${label} delivery"`, row) : ''}
                 <button type="button" class="btn btn-default" data-slot-remove title="Remove this slot">Remove</button>
             </div>
             ${routeEditor.processingDetailsHtml(`data-slot-processing aria-label="${label} processing"`, row.processing_preference, state.processingPreference)}
@@ -1246,6 +1257,11 @@ function bindRowEvents() {
             row.effort = String(event.target.value || '');
             state.onChange();
         });
+        // Only an explicit switch writes delivery; a model or account change never does.
+        rowEl.querySelector('[data-slot-delivery]')?.addEventListener('change', (event) => {
+            row.delivery = event.target.value === DELIVERY_NATIVE ? DELIVERY_NATIVE : DELIVERY_PACKET;
+            state.onChange();
+        });
         rowEl.querySelector('[data-slot-processing]')?.addEventListener('change', (event) => {
             if (event.target.value) row.processing_preference = event.target.value;
             else delete row.processing_preference;
@@ -1352,6 +1368,8 @@ function addRow(group) {
         route: { kind: ROUTE_KIND_API, target_id: '' },
         subagent_id: '',
         effort: '',
+        // #1334: a new API triad row reads the work itself; Packet is a choice.
+        ...(group === 'triad' ? { delivery: DELIVERY_NATIVE } : {}),
     });
     renderRows();
     // The Add button sits in the group's header while the new row lands at
@@ -1398,7 +1416,7 @@ export function applyReviewerSlotsDraft(data) {
         synthesizedFrom: String(deep.synthesized_from || ''),
         // Only a SAVED row is materialized on load; a synthesized one (or
         // no row at all, e.g. beside a config_error on an older server)
-        // stays an omitted placeholder until the owner edits it.
+        // stays synthesized until edited or its default panel is first saved.
         materialized: Boolean(data.deep_review) && !deep.synthesized_from,
     };
     // Reload is an explicit discard: source drafts belong to this loaded form,
@@ -1412,6 +1430,8 @@ export function applyReviewerSlotsDraft(data) {
     // state the owner repairs from, and treating it as "not loaded" made the
     // save drop the repair (see collectReviewerSlots).
     state.loaded = true;
+    // The panel exactly as loaded: an untouched shipped default is not written.
+    state.loadedSetting = buildReviewerSlotsSetting(state);
     renderRows();
 }
 
@@ -1552,9 +1572,14 @@ export function destroyReviewerSlots() {
 // serializes what it shows, including empty groups. Settings validates the
 // current draft before submitting; this pure serializer never hides invalid
 // rows. Backend validation remains authoritative for every other caller.
-export function reviewerSlotsSavePayload({ loaded = false, loadError = '', triad = [], scope = [], advisory, deepReview } = {}) {
+// An UNTOUCHED shipped default panel (`source: 'default'`, unchanged since load) is omitted
+// like the deep-review placeholder: an unrelated save never materializes it (#1334).
+export function reviewerSlotsSavePayload({ loaded = false, loadError = '', source = '', loadedSetting = '',
+    triad = [], scope = [], advisory, deepReview } = {}) {
     if (loadError || !loaded) return {};
-    return { OUROBOROS_REVIEWER_SLOTS: buildReviewerSlotsSetting({ triad, scope, advisory, deepReview }) };
+    const setting = buildReviewerSlotsSetting({ source, triad, scope, advisory, deepReview });
+    if (source === 'default' && loadedSetting && setting === loadedSetting) return {};
+    return { OUROBOROS_REVIEWER_SLOTS: setting };
 }
 
 export function collectReviewerSlots() {

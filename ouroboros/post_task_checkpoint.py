@@ -118,6 +118,8 @@ def project_replica_task_result_fields(
     ``updated_at`` is monotonic metadata only; it never selects field authority.
     """
     overlay = dict(replica_fields)
+    from ouroboros.acceptance_history import preserve_acceptance_history
+    overlay = preserve_acceptance_history(canonical_fields, overlay)
     # The receiving drive's first accepted terminal transition owns provenance,
     # including its absence on historical rows; replicas cannot originate it.
     overlay.pop("canonical_terminal_projection_origin", None)

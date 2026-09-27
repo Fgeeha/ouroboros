@@ -249,10 +249,10 @@ class ChatOutbound(TypedDict):
     transport: NotRequired[TransportMetadata]
     # Typed message kind; role alone selects authorship (DESIGN: Chat authorship and System rows).
     system_type: NotRequired[str]
-    # Host-stamped placement of a task-keyed System row: "timeline" = a timeline item of the task's card, "reviews" =
-    # the card's Reviews group carries it (still attached); absent = ordinary. ``card_row_id`` is its stable identity.
+    # Host placement of a task's System row: timeline or Reviews; absent = ordinary. card_row_id is stable.
     card_row: NotRequired[Literal["timeline", "reviews"]]
     card_row_id: NotRequired[str]
+    card_row_revision: NotRequired[int]  # canonical source order, independent of delivery timestamp
     # Event-time human presentation; raw task/project ids remain machine keys.
     target_label: NotRequired[str]
     project_id: NotRequired[str]

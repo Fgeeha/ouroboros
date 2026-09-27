@@ -14,6 +14,7 @@ from ouroboros.gateway._helpers import json_error, request_json_or
 from ouroboros.mcp_client import (
     canonical_server_id,
     get_manager,
+    raw_server_id,
     reconfigure_from_settings,
 )
 from ouroboros.secret_masking import looks_masked_mcp_secret, rehydrate_mcp_url
@@ -67,16 +68,21 @@ async def api_mcp_test(request: Request) -> JSONResponse:
         settings = await asyncio.to_thread(load_settings)
         if server_id:
             servers = settings.get("MCP_SERVERS") or []
-            target: Dict[str, Any] | None = None
-            for entry in servers:
-                if isinstance(entry, dict) and canonical_server_id(entry.get("id") or "") == server_id:
-                    target = dict(entry)
-                    break
-            if target is None:
+            # The loader's identity (id, slug or name), so a saved server without an
+            # explicit id is found; several claimants never lend one of their secrets.
+            matches = [dict(entry) for entry in servers if raw_server_id(entry) == server_id]
+            if len(matches) > 1:
+                return JSONResponse(
+                    {"ok": False, "code": "MCP_ID_AMBIGUOUS",
+                     "error": f"{len(matches)} saved servers resolve to server id {server_id!r}"},
+                    status_code=409,
+                )
+            if not matches:
                 return JSONResponse(
                     {"ok": False, "error": f"server id {server_id!r} not found"},
                     status_code=404,
                 )
+            target: Dict[str, Any] = matches[0]
             candidate = body.get("server")
             if isinstance(candidate, dict):
                 # Use the edited candidate, but rehydrate masked token

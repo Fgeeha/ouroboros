@@ -459,6 +459,20 @@ def late_evidence_fact(run: Dict[str, Any], emitted: Dict[str, Any], *, settled_
     receipts = [row for row in emitted.get("delivered") or [] if isinstance(row, dict)]
     revision = ("delivered" if any(row.get("text_sha256") == digest for row in receipts)
                 else "different" if receipts else "unknown")
+    historical = (request.get("policy") or {}).get("historical_acceptance")
+    if isinstance(historical, dict):
+        from ouroboros.acceptance_history import historical_receipt_matches
+
+        delivery = historical.get("confirmed_delivery") or historical.get("delivery") or {}
+        valid = (historical.get("schema_version") == 1 and historical.get("task_id") == request.get("task_id")
+                 and historical.get("task_attempt") == request.get("task_attempt")
+                 and delivery.get("task_id") == request.get("task_id") and delivery.get("text_sha256") == digest)
+        addressed = [row for row in receipts if row.get("basis") == "send_handler_returned"
+                     and row.get("source_ref") and (not delivery.get("source_ref") or row["source_ref"] == delivery["source_ref"])
+                     and all(row.get(key) == delivery.get(key)
+                     for key in ("task_id", "delivery_id", "chat_id"))]
+        revision = ("delivered" if valid and any(historical_receipt_matches(delivery, row) for row in addressed)
+                    else "different" if valid and addressed else "unknown")
     return {
         "settled_after_terminal": True, "settled_at": settled_at, "reviewed_revision": revision,
         "reviewed_subject": {"retry_key": str(request.get("retry_key") or ""),
@@ -466,6 +480,7 @@ def late_evidence_fact(run: Dict[str, Any], emitted: Dict[str, Any], *, settled_
                              "binding_hash": str(run.get("binding_hash") or ""),
                              "candidate_hash": str(run.get("candidate_hash") or ""),
                              "subject_sha256": digest, "subject_chars": chars},
+        **({"historical_delivery": copy.deepcopy(historical.get("confirmed_delivery"))} if historical else {}),
         "reviewed_superseded": bool(run.get("superseded_by_revision")),
         "emitted_answer": copy.deepcopy(emitted),
         "reviewed_is_emitted": {"delivered": True, "different": False}.get(revision),
@@ -631,12 +646,16 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
     advanced = reconcile_pending_acceptance_runs({"review_runs": runs}, drive_root=root, usage_ctx=usage_ctx,
                                                  **({"controller": controller} if controller is not None else {}))
     settled = runs[-1] if runs else {}
+    historical = ((settled.get("request") or {}).get("policy") or {}).get("historical_acceptance")
+    first_complete = (isinstance(historical, dict) and historical.get("schema_version") == 1
+                      and bool(settled.get("actors")) and not acceptance_run_pending(settled)
+                      and not isinstance(settled.get("late_settlement"), dict))
     # A settlement this process already stamped but could not publish is published again, never re-stamped.
     republish = (not advanced and isinstance(settled.get("late_settlement"), dict)
                  and not acceptance_run_pending(settled)
                  and (late_publication_owed(task_id, retry_key)
                       or (checkpoint or {}).get("state") in {"retained", "dispatched", "unpublished"}))
-    if not advanced and not republish:
+    if not advanced and not republish and not first_complete:
         log.debug("late acceptance settlement %s: nothing reconciled (still pending or already collected)", retry_key)
         if not was_pending:
             (getattr(usage_ctx, "_acceptance_settlement_traces", None) or {}).pop(retry_key, None)
@@ -646,15 +665,17 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
                 with _LATE_LOCK:
                     _LATE_UNPUBLISHED.discard((task_id, retry_key))
         return "pending" if was_pending else "settled"
-    if advanced:
+    if advanced or first_complete:
         # The sentence has ONE author: it is stamped on the exact run this wave
         # reconciled, so the republished projection carries the same bytes the row
         # does and the card's Reviews group prints them verbatim.
         fact = late_evidence_fact(settled, emitted_answer_fact(root, task_id), settled_at=utc_now_iso())
         settled["late_settlement"] = {"note": _late_settlement_text(settled, wave or _collected_wave(settled), fact),
                                       **fact}
+    chat_id = ((historical.get("confirmed_delivery") or historical.get("delivery") or {}).get("chat_id")
+               if isinstance(historical, dict) else result.get("chat_id"))
     outcome = publish_acceptance_checkpoint(usage_ctx, trace, task_id=task_id, drive_root=root,
-                                            chat_id=result.get("chat_id"), partial_trace=partial)
+                                            chat_id=chat_id, partial_trace=partial or bool(historical))
     panel = _stored_late_settlement(outcome, settled)
     if panel is None:
         log.warning("late acceptance settlement %s was not published (%s); nothing announced", retry_key,
@@ -674,6 +695,10 @@ def enqueue_late_acceptance_settlement(usage_ctx: Any, task_id: str, retry_key: 
 
     root = _result_root(usage_ctx)
     late = panel["late_settlement"]
+    # Recovery has only the retained panel. Its proven delivery owns the room,
+    # even when today's task or caller is bound to a different chat.
+    historical = late.get("historical_delivery")
+    chat_id = historical.get("chat_id") if isinstance(historical, dict) else result.get("chat_id")
     # A compact, source-bound pointer rides the row itself (progress_meta survives
     # live delivery, replay and history); the full fact stays on the projection.
     evidence = {"task_id": task_id, "panel_id": str(panel.get("panel_id") or ""),
@@ -687,7 +712,7 @@ def enqueue_late_acceptance_settlement(usage_ctx: Any, task_id: str, retry_key: 
     # The operation outlives the execution drive; replay belongs to the same
     # canonical root as its publication and the supervisor's delivery registry.
     outcome = enqueue_terminal_delivery_outcome(root, {
-        "type": "send_message", "chat_id": int(result.get("chat_id") or 0), "task_id": task_id,
+        "type": "send_message", "chat_id": int(chat_id or 0), "task_id": task_id,
         "text": str(late.get("note") or ""),
         "role": "system", "system_type": LATE_SETTLEMENT_SYSTEM_TYPE,
         "delivery_id": f"acceptance-late:{retry_key}",
@@ -701,6 +726,10 @@ def enqueue_late_acceptance_settlement(usage_ctx: Any, task_id: str, retry_key: 
         # Publication survived, but a live queue alone is not durable custody.
         # The operation pointer carries this retry duty across controller exit.
         return _unpublished(task_id, retry_key, "unpublished")
+    if historical:
+        from ouroboros.review_operation import historical_publication_retained
+
+        historical_publication_retained(root, task_id, retry_key)
     with _LATE_LOCK:
         _LATE_UNPUBLISHED.discard((str(task_id), str(retry_key)))
     return "announced" if outcome == ENQUEUE_QUEUED else "published"
