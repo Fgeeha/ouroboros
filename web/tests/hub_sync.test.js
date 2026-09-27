@@ -1,10 +1,13 @@
-// Rule table for the frozen §7.5 hub card verdict (hubflow sprint 2026-08-23).
-// Every branch of hubSyncVerdict is pinned: action enum, badge set, copy facts.
+// Rule table for the §7.5 hub card verdict (hubflow sprint 2026-08-23,
+// repaired for issue #1314: the publish receipt is history, never an action
+// gate). Every branch of hubSyncVerdict is pinned: action enum, badge set,
+// copy facts.
 
 import assert from 'node:assert/strict';
 import test from 'node:test';
 
-import { hubFactsPending, hubListingRowFor, hubSyncVerdict } from '../modules/hub_sync.js';
+import { hubFactsPending, hubListingRowFor, hubSubmissionFacts, hubSyncVerdict } from '../modules/hub_sync.js';
+import { renderSubmissionHistory } from '../modules/utils.js';
 
 const HASH_A = 'a'.repeat(64);
 const HASH_B = 'b'.repeat(64);
@@ -58,11 +61,10 @@ test('no local occupant with a live catalog row -> install', () => {
     assert.deepEqual(verdict.copy_facts, {
         local_version: '',
         catalog_version: '0.3.0',
-        receipt_pr: null,
-        edited_since_submission: false,
         occupying_bucket: null,
         no_receipt: false,
         receipt_unreadable: false,
+        submission: null,
     });
 });
 
@@ -135,6 +137,19 @@ test('verified hub bucket -> published badge rides ONLY official_hub_verified===
     assert.equal(external.badges.includes('published'), false);
 });
 
+test('arbitrary version strings compare only by inequality in both buckets', () => {
+    for (const [local, catalog] of [['nightly-7', 'release candidate ☃'], ['2026.09.27', '1'], ['', '0.1.0']]) {
+        assert.equal(hubSyncVerdict(listingRow({ version: local }), catalogRow({ latest_version: catalog }), {}).action, 'update');
+        assert.equal(hubSyncVerdict(
+            listingRow({ location: 'external', version: local }), catalogRow({ latest_version: catalog }), {},
+        ).action, 'adopt');
+    }
+    assert.equal(hubSyncVerdict(listingRow({ version: 'nightly-7' }), catalogRow({ latest_version: 'nightly-7' }), {}).action, 'installed');
+    assert.equal(hubSyncVerdict(
+        listingRow({ location: 'external', version: 'nightly-7' }), catalogRow({ latest_version: 'nightly-7' }), {},
+    ).action, 'adopt');
+});
+
 // ---------------------------------------------------------------------------
 // Adopt (external occupant) — receipt shapes the copy, never the eligibility.
 // ---------------------------------------------------------------------------
@@ -149,7 +164,7 @@ test('external occupant with a catalog slug and NO receipt -> adopt with no_rece
     assert.deepEqual(verdict.badges, []);
     assert.equal(verdict.copy_facts.no_receipt, true);
     assert.equal(verdict.copy_facts.receipt_unreadable, false);
-    assert.equal(verdict.copy_facts.receipt_pr, null);
+    assert.equal(verdict.copy_facts.submission, null);
     assert.equal(verdict.copy_facts.occupying_bucket, 'external');
 });
 
@@ -164,15 +179,16 @@ test('external occupant with receipt, hash match, catalog serves the published v
         catalogRow({ latest_version: '0.2.0' }),
         {},
     );
-    // Merged and served: adopt moves the bucket even at hash match.
+    // Served at the submitted version: adopt moves the bucket even at hash match.
     assert.equal(verdict.action, 'adopt');
     assert.deepEqual(verdict.badges, []);
-    assert.equal(verdict.copy_facts.edited_since_submission, false);
     assert.equal(verdict.copy_facts.no_receipt, false);
-    assert.equal(verdict.copy_facts.receipt_pr, 38);
+    assert.deepEqual(verdict.copy_facts.submission, {
+        version: '0.2.0', pr_number: 38, pr_url: 'https://github.com/razzant/ouroboroshub/pull/38', local_differs: false,
+    });
 });
 
-test('external occupant edited since submission -> adopt with edited fact (+ submitted_pr when catalog differs)', () => {
+test('external occupant edited since submission -> adopt, local_differs history and no badge', () => {
     const verdict = hubSyncVerdict(
         listingRow({
             location: 'external',
@@ -183,34 +199,87 @@ test('external occupant edited since submission -> adopt with edited fact (+ sub
         catalogRow({ latest_version: '0.3.0' }),
         {},
     );
-    // Local bytes differ from the submission → this is NOT wait_pr.
     assert.equal(verdict.action, 'adopt');
-    assert.deepEqual(verdict.badges, ['submitted_pr']);
-    assert.equal(verdict.copy_facts.edited_since_submission, true);
+    assert.deepEqual(verdict.badges, []);
+    assert.equal(verdict.copy_facts.submission.local_differs, true);
+    assert.equal(verdict.copy_facts.submission.version, '0.2.0');
 });
 
 // ---------------------------------------------------------------------------
-// wait_pr — local bytes ARE the submission, catalog does not serve it yet.
+// #1314 — a receipt/catalog version difference never vetoes the catalog copy.
+// It cannot tell a pending update PR from a merged one the catalog has since
+// moved past, so the confirm dialog, not a guess, owns the replacement.
 // ---------------------------------------------------------------------------
 
-test('unedited submission with a different catalog version -> wait_pr, never adopt', () => {
+for (const [label, submitted, served] of [
+    ['catalog moved past the submission (1.1.2 -> 1.1.3)', '1.1.2', '1.1.3'],
+    ['submission not served yet (pending 0.4.0, catalog 0.3.0)', '0.4.0', '0.3.0'],
+]) {
+    test(`unedited submission, ${label} -> adopt with the receipt as history`, () => {
+        const verdict = hubSyncVerdict(
+            listingRow({
+                location: 'external',
+                version: submitted,
+                content_hash: HASH_A,
+                published: receipt({ version: submitted, content_hash: HASH_A, pr_number: 42 }),
+            }),
+            catalogRow({ latest_version: served }),
+            {},
+        );
+        assert.equal(verdict.action, 'adopt');
+        assert.deepEqual(verdict.badges, []);
+        assert.equal(verdict.copy_facts.catalog_version, served);
+        assert.deepEqual(verdict.copy_facts.submission, {
+            version: submitted, pr_number: 42, pr_url: 'https://github.com/razzant/ouroboroshub/pull/38', local_differs: false,
+        });
+    });
+}
+
+test('local, submitted and served versions all differ -> adopt; history keeps the SUBMITTED version', () => {
     const verdict = hubSyncVerdict(
         listingRow({
             location: 'external',
-            version: '0.4.0',
-            content_hash: HASH_A,
-            published: receipt({ version: '0.4.0', content_hash: HASH_A, pr_number: 42 }),
+            version: '1.2.0',
+            content_hash: HASH_B,
+            published: receipt({ version: '1.1.0', content_hash: HASH_A }),
         }),
-        catalogRow({ latest_version: '0.3.0' }),
+        catalogRow({ latest_version: '1.3.0' }),
         {},
     );
-    assert.equal(verdict.action, 'wait_pr');
-    assert.deepEqual(verdict.badges, ['submitted_pr']);
-    assert.equal(verdict.copy_facts.receipt_pr, 42);
-    assert.equal(verdict.copy_facts.edited_since_submission, false);
+    assert.equal(verdict.action, 'adopt');
+    assert.equal(verdict.copy_facts.local_version, '1.2.0');
+    assert.equal(verdict.copy_facts.catalog_version, '1.3.0');
+    assert.equal(verdict.copy_facts.submission.version, '1.1.0');
+    assert.equal(verdict.copy_facts.submission.local_differs, true);
 });
 
-test('receipt with slug absent from the catalog -> submitted_pr badge (pending first merge)', () => {
+test('hub-installed copy keeps Installed/Update whatever the receipt says', () => {
+    const published = receipt({ version: '0.2.11', content_hash: HASH_B });
+    const behind = hubSyncVerdict(listingRow({ version: '0.2.11', published }), catalogRow({ latest_version: '0.2.12' }), {});
+    assert.equal(behind.action, 'update');
+    assert.deepEqual(behind.badges, ['update_available']);
+    assert.equal(behind.copy_facts.submission.version, '0.2.11');
+    const served = hubSyncVerdict(listingRow({ version: '0.2.12', published }), catalogRow({ latest_version: '0.2.12' }), {});
+    assert.equal(served.action, 'installed');
+    assert.deepEqual(served.badges, []);
+    assert.equal(served.copy_facts.submission.pr_number, 38, 'the PR stays reachable when versions match');
+});
+
+test('a structurally valid foreign-looking receipt is history, never ownership or a gate', () => {
+    const verdict = hubSyncVerdict(
+        listingRow({
+            location: 'external',
+            published: receipt({ slug: 'someone_else', repository: 'other/hub', pr_url: 'https://example.com/pr/9', pr_number: 9 }),
+        }),
+        catalogRow({ latest_version: '9.9.9' }),
+        {},
+    );
+    assert.equal(verdict.action, 'adopt');
+    assert.equal(verdict.copy_facts.no_receipt, false);
+    assert.equal(verdict.copy_facts.submission.pr_number, 9);
+});
+
+test('receipt with slug absent from the catalog -> no action; the submission is history only', () => {
     const verdict = hubSyncVerdict(
         listingRow({
             location: 'external',
@@ -221,13 +290,13 @@ test('receipt with slug absent from the catalog -> submitted_pr badge (pending f
         null,
         {},
     );
-    // No catalog row: nothing to adopt/install; the submission is the story.
-    assert.equal(verdict.action, 'wait_pr');
-    assert.deepEqual(verdict.badges, ['submitted_pr']);
-    assert.equal(verdict.copy_facts.receipt_pr, 55);
+    // No catalog row: nothing to adopt/install, and no waiting state claimed.
+    assert.equal(verdict.action, 'none');
+    assert.deepEqual(verdict.badges, []);
+    assert.equal(verdict.copy_facts.submission.pr_number, 55);
 });
 
-test('edited local copy with slug absent from the catalog -> none, badge still says submitted', () => {
+test('edited local copy with slug absent from the catalog -> none, history says the files differ', () => {
     const verdict = hubSyncVerdict(
         listingRow({
             location: 'external',
@@ -238,8 +307,8 @@ test('edited local copy with slug absent from the catalog -> none, badge still s
         {},
     );
     assert.equal(verdict.action, 'none');
-    assert.deepEqual(verdict.badges, ['submitted_pr']);
-    assert.equal(verdict.copy_facts.edited_since_submission, true);
+    assert.deepEqual(verdict.badges, []);
+    assert.equal(verdict.copy_facts.submission.local_differs, true);
 });
 
 // ---------------------------------------------------------------------------
@@ -283,6 +352,15 @@ test('identity_conflict -> conflict badge and action none, even for an installab
     // No update claims off a conflicted catalog row; the listing-plane
     // published fact stays (it is server-verified, not a catalog comparison).
     assert.deepEqual(hubBucket.badges, ['published', 'conflict']);
+
+    const submitted = hubSyncVerdict(
+        listingRow({ location: 'external', published: receipt() }),
+        catalogRow({ identity_conflict: true }),
+        {},
+    );
+    assert.equal(submitted.action, 'none');
+    assert.deepEqual(submitted.badges, ['conflict']);
+    assert.equal(submitted.copy_facts.submission.pr_number, 38, 'history is a local fact, not an action');
 });
 
 // ---------------------------------------------------------------------------
@@ -302,20 +380,26 @@ test('catalogUnavailable with a hub-bucket row -> installed stays a local fact, 
         { catalogUnavailable: true },
     );
     assert.equal(verdict.action, 'installed');
-    // No submitted_pr either: without the catalog we cannot say it is
-    // unconfirmed. Only the honest unavailability badge remains.
+    // Only the honest unavailability badge; the submission history is a
+    // local fact and stays independent of the catalog read.
     assert.deepEqual(verdict.badges, ['catalog_unavailable']);
     assert.equal(verdict.copy_facts.catalog_version, '');
+    assert.equal(verdict.copy_facts.submission.version, '0.2.0');
 });
 
-test('catalogUnavailable with an external submission -> no wait_pr/adopt guess', () => {
-    const verdict = hubSyncVerdict(
-        listingRow({ location: 'external', content_hash: HASH_A, published: receipt() }),
-        null,
-        { catalogUnavailable: true },
-    );
-    assert.equal(verdict.action, 'none');
-    assert.deepEqual(verdict.badges, ['catalog_unavailable']);
+test('catalogUnavailable with an external submission -> no adopt guess, history kept', () => {
+    // An outage is not an absent row: even a row passed by mistake is ignored.
+    for (const row of [null, catalogRow()]) {
+        const verdict = hubSyncVerdict(
+            listingRow({ location: 'external', content_hash: HASH_A, published: receipt() }),
+            row,
+            { catalogUnavailable: true },
+        );
+        assert.equal(verdict.action, 'none');
+        assert.deepEqual(verdict.badges, ['catalog_unavailable']);
+        assert.equal(verdict.copy_facts.catalog_version, '');
+        assert.equal(verdict.copy_facts.submission.pr_number, 38);
+    }
 });
 
 test('listingUnavailable -> never Install, listing_unavailable badge, local claims dropped', () => {
@@ -350,7 +434,43 @@ test('published_malformed -> receipt_unreadable fact, no_receipt stays false, ad
     assert.equal(verdict.action, 'adopt');
     assert.equal(verdict.copy_facts.receipt_unreadable, true);
     assert.equal(verdict.copy_facts.no_receipt, false);
+    assert.equal(verdict.copy_facts.submission, null);
     assert.deepEqual(verdict.badges, []);
+});
+
+test('absent and explicitly cleared receipts both read as no record; adopt is never gated on them', () => {
+    // The listing projects both absence and an owner Clear as published=null.
+    const verdict = hubSyncVerdict(listingRow({ location: 'external', published: null }), catalogRow(), {});
+    assert.equal(verdict.action, 'adopt');
+    assert.equal(verdict.copy_facts.no_receipt, true);
+    assert.equal(verdict.copy_facts.receipt_unreadable, false);
+    assert.equal(verdict.copy_facts.submission, null);
+});
+
+// ---------------------------------------------------------------------------
+// hubSubmissionFacts + the shared history line.
+// ---------------------------------------------------------------------------
+
+test('hubSubmissionFacts reads the receipt, not the local copy', () => {
+    assert.equal(hubSubmissionFacts(null), null);
+    assert.equal(hubSubmissionFacts(listingRow()), null);
+    const facts = hubSubmissionFacts(listingRow({ version: '9.0.0', content_hash: '', published: receipt({ pr_number: 1.5 }) }));
+    assert.deepEqual(facts, {
+        version: '0.2.0', pr_number: null, pr_url: 'https://github.com/razzant/ouroboroshub/pull/38',
+        // An unknown local hash claims no difference.
+        local_differs: false,
+    });
+});
+
+test('renderSubmissionHistory links only a safe URL and keeps the other facts', () => {
+    const safe = renderSubmissionHistory({ version: '1.1.2', pr_number: 60, pr_url: 'https://github.com/razzant/OuroborosHub/pull/60', local_differs: true });
+    assert.match(safe, /^Submitted v1\.1\.2 · <a href="https:\/\/github\.com\/razzant\/OuroborosHub\/pull\/60" target="_blank" rel="noopener noreferrer">PR #60<\/a> · Local files differ from the submitted copy$/);
+    for (const url of ['javascript:alert(1)', 'data:text/html,x', '" onmouseover="x', '']) {
+        const html = renderSubmissionHistory({ version: '<b>1</b>', pr_number: 7, pr_url: url, local_differs: false });
+        assert.equal(html, 'Submitted v&lt;b&gt;1&lt;/b&gt; · PR #7');
+    }
+    assert.equal(renderSubmissionHistory({ version: '', pr_number: null, pr_url: '', local_differs: false }), 'Submitted');
+    assert.equal(renderSubmissionHistory(null), '');
 });
 
 // ---------------------------------------------------------------------------

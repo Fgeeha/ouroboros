@@ -5,11 +5,12 @@ import {
     preflightFailed,
     preflightFailedStale,
     preflightFindingText,
+    renderSubmissionHistory,
     reviewReady,
     safeExternalHrefAttr as safeExternalUrl,
 } from './utils.js';
 import { formatRelativeAge, installedTime, renderToneBadge } from './ui_helpers.js';
-import { hubListingRowFor, hubSyncVerdict } from './hub_sync.js';
+import { hubListingRowFor, hubSubmissionFacts, hubSyncVerdict } from './hub_sync.js';
 
 function hasSkillUiTab(skill, live = {}) {
     return (live?.ui_tabs || []).some((tab) => (tab?.skill || tab?.skill_name || tab?.extension || '') === skill.name);
@@ -145,11 +146,12 @@ function statusChip(skill, action, live) {
 /**
  * Display-only OuroborosHub sync badges for an installed card. The verdict
  * comes from the shared hub_sync helper: "Update available" when the live
- * catalog serves a different version for a hub-bucket skill, "Published vX"
- * on the server's byte-exact verification, and "Submitted PR #N" from the
- * local publish receipt while the catalog does not confirm it. Without a
- * catalog snapshot (fetch failed or not passed) only listing-plane facts
- * ("Published vX") may be claimed.
+ * catalog serves a different version for a hub-bucket skill, and
+ * "Published vX" (just "Published" when the manifest names no version) on
+ * the server's byte-exact verification. Without a catalog snapshot (fetch
+ * failed or not passed) only listing-plane facts ("Published vX") may be
+ * claimed. The publish receipt is history in the card's details
+ * (submissionDetailRow), never a badge.
  */
 export function renderSkillHubBadges(skill, options = {}) {
     const map = options.hubCatalogByName instanceof Map ? options.hubCatalogByName : null;
@@ -158,18 +160,20 @@ export function renderSkillHubBadges(skill, options = {}) {
         map ? (map.get(skill.name) || null) : null,
         { catalogUnavailable: options.hubCatalogAvailable !== true },
     );
-    const facts = verdict.copy_facts;
     const out = [];
     if (verdict.badges.includes('update_available')) {
         out.push('<span class="skills-badge skills-badge-warn">Update available</span>');
     }
     if (verdict.badges.includes('published')) {
-        out.push(`<span class="skills-badge skills-badge-ok">Published v${escapeHtml(skill.version || '')}</span>`);
-    }
-    if (verdict.badges.includes('submitted_pr') && facts.receipt_pr !== null) {
-        out.push(`<span class="skills-badge skills-badge-warn">Submitted PR #${escapeHtml(String(facts.receipt_pr))}</span>`);
+        out.push(`<span class="skills-badge skills-badge-ok">Published${skill.version ? ` v${escapeHtml(skill.version)}` : ''}</span>`);
     }
     return out.join(' ');
+}
+
+/** The local publish receipt as one quiet details row, whatever the catalog says. */
+function submissionDetailRow(skill) {
+    const line = renderSubmissionHistory(hubSubmissionFacts(hubListingRowFor(skill)));
+    return line ? `<div class="skills-detail-row"><span class="skills-detail-label">Submission</span>${line}</div>` : '';
 }
 
 function sourceChip(skill) {
@@ -364,6 +368,7 @@ export function renderInstalledSkillCard(skill, reviewingSkills = new Set(), rep
         <div class="skills-detail-row"><span class="skills-detail-label">Type</span><code>${escapeHtml(skill.type || 'skill')}</code> · version ${escapeHtml(skill.version || '—')} · source ${escapeHtml(source)}</div>
         <div class="skills-detail-row"><span class="skills-detail-label">Review</span>${statusBadge(skill.review_status, skill.review_gate, skill.review_profile)}${skill.review_stale ? ' <span class="skills-badge skills-badge-warn">stale</span>' : ''}</div>
         <div class="skills-detail-row"><span class="skills-detail-label">Permissions</span>${(skill.permissions || []).map((p) => `<code>${escapeHtml(p)}</code>`).join(' ') || '<i class="muted">none</i>'}</div>
+        ${submissionDetailRow(skill)}
         ${presenceRuntimeBlock(skill)}
         ${provenanceBlock(prov)}
     </details>`;

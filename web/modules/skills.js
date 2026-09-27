@@ -1,5 +1,5 @@
 import { initMarketplace } from './marketplace.js';
-import { initOuroborosHub } from './ouroboroshub.js';
+import { confirmHubUpdate, hubVersionText, initOuroborosHub } from './ouroboroshub.js';
 import { bindTabStrip, renderPageHeader, renderTabStrip } from './page_header.js';
 import { bindMenu } from './ui_interactions.js';
 import { openConfirmDialog } from './confirm_dialog.js';
@@ -118,6 +118,16 @@ function loadHubCatalog(force = false) {
 
 let skillsRenderGeneration = 0;
 let skillsSnapshot = null;
+
+/** Versions for the shared Hub Update confirmation: local manifest and last catalog observation. */
+function hubUpdateFacts(name) {
+    const skill = skillsSnapshot?.rawSkills?.find((row) => row?.name === name);
+    const row = hubCatalog.byName.get(name);
+    let hubVersion = hubCatalog.available ? 'not in the catalog' : 'catalog unavailable';
+    if (row) hubVersion = hubVersionText(row.latest_version);
+    else if (!hubCatalog.available && !hubCatalog.settled) hubVersion = 'not checked yet';
+    return { localVersion: String(skill?.version || ''), hubVersion };
+}
 
 
 async function fetchSkills() {
@@ -837,6 +847,10 @@ function attachActionHandlers(container, renderFn, reviewingSkills, repairingSki
                 }
             } else if (target.classList.contains('skills-update')) {
                 const source = target.dataset.source === 'ouroboroshub' ? 'ouroboroshub' : 'clawhub';
+                if (source === 'ouroboroshub' && !await confirmHubUpdate(name, hubUpdateFacts(name))) {
+                    refreshNeeded = false;
+                    return;
+                }
                 showToast(`${name}: updating from ${source === 'ouroboroshub' ? 'OuroborosHub' : 'ClawHub'} (this may take ~30s)`, 'muted');
                 const url = source === 'ouroboroshub'
                     ? `/api/marketplace/ouroboroshub/update/${encodeURIComponent(name)}`
