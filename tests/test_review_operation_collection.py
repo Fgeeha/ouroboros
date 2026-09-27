@@ -59,6 +59,59 @@ def _ctx(root):
                            task_metadata={}, pending_events=[], event_queue=queue.Queue())
 
 
+def test_terminal_handoff_collects_mailbox_only_settlement(tmp_path, monkeypatch):
+    from ouroboros import acceptance_settlement as settlement, model_wait
+    from ouroboros.review_projection import publish_acceptance_checkpoint
+    from tests.test_review_operation_lifetime import until
+
+    ctx, calls, release = _ctx(tmp_path), [], threading.Event()
+    write_task_result(tmp_path, TASK, 'running', chat_id=3)
+    request = ReviewRequest(surface='task_acceptance', task_id=TASK, subject='answer A', goal='goal',
+                            retry_key='terminal-handoff', drain_deadline=time.monotonic())
+    slot = ReviewSlot(slot_id='one', model='model/a', timeout_sec=30)
+
+    class Held:
+        def chat(self, **kwargs):
+            calls.append(kwargs)
+            assert release.wait(10)
+            return {'content': PASS}, {'prompt_tokens': 1, 'completion_tokens': 1}
+
+    operation = None
+    try:
+        with model_wait.task_model_wait_scope(task={'id': TASK, 'chat_id': 3, '_attempt': 1},
+                                             drive_root=tmp_path, event_queue=ctx.event_queue, worker_slot_held=False):
+            first = run_review_request(request, slots=[slot], drive_root=tmp_path, usage_ctx=ctx, llm=Held())
+        operation = next(op for op in review_operation._LIVE.values() if op.task_id == TASK)
+        # Main's last collection has returned pending; terminal publication is held here.
+        run = {**dataclasses.asdict(first), 'authority': 'host_root', 'binding_hash': 'b' * 64}
+        publish_acceptance_checkpoint(ctx, {'review_runs': [run]}, task_id=TASK)
+        release.set()
+        until(lambda: operation.closed)
+        until(lambda: load_task_result(tmp_path, TASK)['review_operations'][operation.owner_id]['state']
+              not in {'retained', 'dispatched'})
+        assert load_task_result(tmp_path, TASK)['status'] == 'running'
+        # A mailbox write is not consumption. Lose all process-local settlement hints.
+        settlement._LATE_UNPUBLISHED.discard((TASK, request.retry_key))
+        ctx._execution_trace = None
+        write_task_result(tmp_path, TASK, 'completed', chat_id=3, result='answer B')
+        monkeypatch.setattr('supervisor.workers.get_event_q', lambda: ctx.event_queue)
+        monkeypatch.setattr('ouroboros.review_substrate.ReviewCoordinator.run',
+                            lambda *a, **kw: pytest.fail('maintenance started another review'))
+        report = review_operation.recover_orphaned_acceptance_operations(tmp_path)
+        assert len(report['settled']) == 1, report
+        stored = load_task_result(tmp_path, TASK)
+        panel = stored['review_projection']['panels'][0]
+        assert panel['aggregate_signal'] == 'PASS' and panel['late_settlement']['reviewer_outputs']
+        assert stored['result'] == 'answer B'
+        assert stored['review_operations'][operation.owner_id]['state'] == 'collected'
+        assert len(calls) == 1
+        assert review_operation.recover_orphaned_acceptance_operations(tmp_path)['settled'] == []
+    finally:
+        release.set()
+        if operation:
+            until(lambda: operation.closed)
+
+
 @pytest.mark.parametrize('failure', ['refused', 'raised'])
 def test_settlement_publication_holds_operation_until_retry_duty_is_durable(tmp_path, monkeypatch, failure):
     from ouroboros import acceptance_settlement as settlement, model_wait, review_custody

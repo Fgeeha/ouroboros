@@ -1,0 +1,226 @@
+"""Real retrieving requests retain named evidence before a paid executor can read it."""
+import copy
+import dataclasses
+import hashlib
+import json
+import pathlib
+import queue
+import shutil
+from types import SimpleNamespace
+
+import pytest
+
+from ouroboros import artifacts, model_wait
+from ouroboros.acceptance_retrieving import acceptance_retrieving_work_order
+from ouroboros.headless import prepare_task_drive
+from ouroboros.review_execution import AgentSessionReviewExecutor, ReviewAssignment, ReviewRouteKind
+from ouroboros.review_native_episode import inspection_registry
+from ouroboros.review_substrate import ReviewRequest, ReviewSlot, run_review_request
+from ouroboros.task_results import load_task_result, write_task_result
+from tests.test_native_tool_round_executor import _tool_call
+
+pytestmark = pytest.mark.serial
+
+
+def _source(root, task, name, payload):
+    return artifacts.store_actor_source_bytes(root, task, category='context_checkpoints', source_id=name,
+        data=json.dumps(payload, ensure_ascii=False).encode(), extension='json')
+
+
+def _retrieving(tmp_path):
+    canonical, repo, task = tmp_path / 'canonical', tmp_path / 'repo', 'retrieving-author'
+    repo.mkdir()
+    author = prepare_task_drive(canonical, task, 'empty')
+    write_task_result(author, task, 'running', description='original task record')
+    write_task_result(canonical, task, 'running', description='canonical task')
+    artifact = artifacts.task_artifact_dir_path(author, task, create=True) / 'proof.txt'
+    artifact.write_text('exact artifact evidence 🙂')
+    (artifact.parent / 'verification_receipts.jsonl').write_text(json.dumps({'check': 'original check', 'status': 'pass'}) + '\n')
+    (author / 'logs' / 'tools.jsonl').write_text(json.dumps({'task_id': task, 'result': 'exact trajectory'}) + '\n'
+        + json.dumps({'task_id': 'unrelated', 'result': 'must not copy'}) + '\n')
+    leaf = _source(author, task, 'tool-evidence', {'body': 'full nested evidence'})
+    trajectory = _source(author, task, 'acceptance_tool_trajectory', [{'result_source_ref': leaf}])
+    previous = _source(author, task, 'acceptance-operation', {'request': {'surface': 'task_acceptance',
+        'task_id': task, 'evidence': {'tool_trajectory_source_ref': trajectory}}})
+    request = ReviewRequest(surface='task_acceptance', task_id=task, goal='review the exact record', subject='answer A',
+        evidence={'artifacts': [{'name': 'proof.txt', 'size': artifact.stat().st_size}],
+                  'previous_operation': previous, 'tool_trajectory_source_ref': trajectory}, retry_key='retrieving')
+    native = ReviewSlot(slot_id='native', model='openai/fake', subagent_id='api-critic', timeout_sec=30)
+    session = ReviewSlot(slot_id='session', model='codex', route=ReviewRouteKind.AGENT_SESSION, session_target='codex')
+    acceptance_retrieving_work_order(request, [native, session], session_root=str(repo), data_root=author)
+    ctx = SimpleNamespace(task_id=task, task_attempt=1, drive_root=author, budget_drive_root=canonical, task_metadata={})
+    return canonical, author, repo, request, native, session, ctx
+
+
+def test_actual_native_and_session_work_orders_survive_author_cleanup(tmp_path):
+    canonical, author, repo, request, native, session, ctx = _retrieving(tmp_path)
+    calls, originals = [], {}
+
+    class Reader:
+        def chat(self, **kwargs):
+            calls.append(copy.deepcopy(kwargs['messages']))
+            if len(calls) == 1:
+                assert pathlib.Path(request.policy['native_data_root']).is_relative_to(artifacts.task_artifact_dir_path(canonical, request.task_id) / 'source_handles' / 'review_inputs')
+                pointer = next(iter(load_task_result(canonical, request.task_id)['review_operations'].values()))
+                checkpoint = json.loads(artifacts.read_actor_source_bytes(canonical, request.task_id, pointer['source_ref']))
+                from ouroboros.observability import redact_projection
+
+                assert checkpoint['request'] == redact_projection(dataclasses.asdict(request)).value
+                assert checkpoint['request']['policy']['native_data_root'] == request.policy['native_data_root']
+                closure = request.policy['review_source_closure']
+                for row in closure['sources']:
+                    if row['status'] == 'retained':
+                        originals[row['name']] = artifacts.read_actor_source_bytes(canonical, request.task_id, row['source_ref'])
+                session_request = dataclasses.replace(request, slot_session_tasks={})
+                acceptance_retrieving_work_order(session_request, [session], session_root=str(repo), data_root=pathlib.Path(request.policy['native_data_root']))
+                prompt = AgentSessionReviewExecutor(ReviewAssignment(request=session_request, slot=session, call_id='session-proof')).session_prompt
+                for row in closure['sources']:
+                    if row['status'] == 'retained':
+                        assert row['retained_path'] in prompt
+                shutil.rmtree(author)
+                return {'tool_calls': [_tool_call('read_file', row['source_ref']['read']['arguments'], f'read-{i}')
+                    for i, row in enumerate(closure['sources']) if row['status'] == 'retained']}, {}
+            if len(calls) == 2:
+                visible = '\n'.join(m.get('content', '') for m in calls[-1] if m.get('role') == 'tool')
+                for text in ('original task record', 'exact artifact evidence', 'original check', 'exact trajectory'):
+                    assert text in visible
+                assert 'must not copy' not in visible
+                return {'tool_calls': [_tool_call('read_file', request.evidence['previous_operation']['read']['arguments'])]}, {}
+            assert 'acceptance_tool_trajectory' in str(calls[-1])
+            return {'content': json.dumps({'verdict': 'PASS', 'findings': [], 'summary': 'read exact evidence'})}, {}
+
+    with model_wait.task_model_wait_scope(task={'id': request.task_id, 'chat_id': 7, '_attempt': 1},
+            drive_root=canonical, event_queue=queue.Queue(), worker_slot_held=False):
+        result = run_review_request(request, slots=[native], usage_ctx=ctx, drive_root=author, llm=Reader())
+    actor = result.actors[0]
+    assert actor['status'] == 'ok', json.dumps(actor, ensure_ascii=False)
+    assert not author.exists() and len(calls) == 3
+    assert artifacts.collect_task_artifact_records(canonical, request.task_id) == []
+    registry, _ctx, _schemas = inspection_registry(str(repo), request.policy['native_data_root'], request.task_id)
+    # Follow the multiple-loop reference closure using the actual tools after GC.
+    previous = json.loads(artifacts.read_actor_source_bytes(canonical, request.task_id, request.evidence['previous_operation']))
+    trajectory = previous['request']['evidence']['tool_trajectory_source_ref']
+    body = json.loads(artifacts.read_actor_source_bytes(canonical, request.task_id, trajectory))
+    leaf = body[0]['result_source_ref']
+    assert 'full nested evidence' in registry.execute_result('read_file', leaf['read']['arguments']).text
+    history = actor['usage']['native_history_source']
+    history_body = json.loads(artifacts.read_actor_source_bytes(canonical, request.task_id, history))
+    assert len(history_body['round_sources']) == 3
+    for ref in history_body['round_sources']:
+        assert registry.execute_result('read_file', ref['read']['arguments']).status == 'ok'
+    for row in request.policy['review_source_closure']['sources']:
+        if row['status'] == 'retained':
+            assert artifacts.read_actor_source_bytes(canonical, request.task_id, row['source_ref']) == originals[row['name']]
+
+
+@pytest.mark.parametrize('fault', ['missing', 'digest'])
+def test_required_closure_failure_refuses_before_paid_stamp(tmp_path, fault):
+    canonical, author, _repo, request, native, _session, ctx = _retrieving(tmp_path)
+    ref = request.evidence['previous_operation']
+    if fault == 'missing':
+        (artifacts.task_artifact_dir_path(author, request.task_id) / ref['path']).unlink()
+    else:
+        ref['sha256'] = '0' * 64
+    ctx._review_paid_stamp = lambda: pytest.fail('source gap reached paid stamp')
+    model = SimpleNamespace(chat=lambda **kw: pytest.fail('source gap reached reviewer'))
+    result = run_review_request(request, slots=[native], usage_ctx=ctx, drive_root=author, llm=model)
+    assert result.actors[0]['operation_state'] == 'not_dispatched', result
+    assert 'review_source_closure_unavailable' in result.actors[0]['error']
+
+
+def test_named_closure_keeps_attachments_foreign_owner_and_two_checkpoint_generations(tmp_path):
+    from ouroboros import context_compaction as cc
+    from ouroboros.review_session_reads import _stored_read_history
+    from ouroboros.review_source_closure import retain_review_request_sources
+    from tests.test_context_reclaim_materializer import _request, _unit
+
+    canonical, author, repo, request, _native, _session, _ctx = _retrieving(tmp_path)
+    task = request.task_id
+    inputs = []
+    for index in range(26):
+        path = repo / f'input-{index}.txt'
+        path.write_text(f'captured attachment {index}')
+        inputs.append(str(path))
+    manifest = artifacts.stage_task_attachments(author, task, inputs)
+    contract = artifacts.attachment_manifest_projection(author, task, manifest)
+    assert contract['attachment_manifest_ref']['count'] == 26
+    foreign = _source(canonical, 'predecessor', 'evidence', {'body': 'exact predecessor source'})
+    contract['predecessor_authority'] = {'task_id': 'predecessor', 'completion_observations': foreign,
+        'source': {'kind': 'task_result', 'task_id': 'predecessor', 'tool': 'get_task_result',
+                   'arguments': {'task_id': 'predecessor', 'include_authority': True}}}
+    request.evidence['task_contract'] = contract
+    relative = f'task_results/artifacts/{task}/proof.txt'
+    request.evidence['artifacts'][0]['path'] = relative
+    # Real checkpoint/capsule producers; no summarizer or provider call.
+    messages = _unit('read', 'a')
+    first_request = _request(messages, 100)
+    unit = cc._atomic_units(messages)[0]
+    first = cc._persist_reclaim_checkpoint(messages, first_request,
+        SimpleNamespace(fingerprint='a' * 64, units=[]), drive_root=author, task_id=task)
+    capsule, _ = cc._capsule_message(cc._SelectedUnit(unit, 0, ''), 'first view',
+        [cc._part(unit.unit_id, unit.source_text)], first, first_request)
+    second_messages = [capsule, *_unit('another-read', 'b')]
+    second = cc._persist_reclaim_checkpoint(second_messages, _request(second_messages, 100),
+        SimpleNamespace(fingerprint='b' * 64, units=[]), drive_root=author, task_id=task)
+    original_checkpoints = {ref['path']: artifacts.read_actor_source_bytes(author, task, ref) for ref in (first, second)}
+    round_ref = _source(author, task, 'native-round', {'round': 2, 'messages': second_messages,
+        'read_receipts': [], 'view_receipt': {'checkpoint_ref': second}})
+    required = _source(author, task, 'session-required', {'body': 'full session required source'})
+    session_history = _stored_read_history({'root': author, 'task_id': task, 'source_id': 'session-reads'},
+        {'native_required_sources_ref': required}, [], {})
+    request.evidence.update(native_history=round_ref, session_history=session_history)
+    retain_review_request_sources(request, source_root=author, custody_root=canonical)
+    root = pathlib.Path(request.policy['native_data_root'])
+    assert root != canonical and root != author
+    shutil.rmtree(author)
+    for path in inputs:
+        pathlib.Path(path).unlink()
+    registry, _, _ = inspection_registry(str(repo), root, task)
+    rows = artifacts.resolve_attachment_manifest(root, task, request.evidence['task_contract'])
+    assert len(rows) == 26
+    for row in rows:
+        value = registry.execute_result('read_file', {'root': 'artifact_store', 'path': row['abs_path']})
+        assert value.status == 'ok' and 'captured attachment' in value.text
+    proof = registry.execute_result('read_file', {'root': 'runtime_data', 'path': request.evidence['artifacts'][0]['path']})
+    assert 'exact artifact evidence' in proof.text
+    for ref in (first, second):
+        assert artifacts.read_actor_source_bytes(root, task, ref) == original_checkpoints[ref['path']]
+        assert artifacts.read_actor_source_bytes(canonical, task, ref) == original_checkpoints[ref['path']]
+    restored, _ = cc._restored_source_views([{'checkpoint_ref': first, 'unit_id': unit.unit_id,
+        'raw_sha256': unit.raw_sha256}], drive_root=root, task_id=task, request=first_request)
+    assert '-result-tail-read' in json.dumps(restored[0]['content'])
+    assert 'full session required source' in registry.execute_result('read_file', required['read']['arguments']).text
+    foreign_binding = next(row for row in request.policy['review_source_closure']['refmap'] if row['owner_task_id'] == 'predecessor')
+    assert 'exact predecessor source' in registry.execute_result('read_file', foreign_binding['read']['arguments']).text
+    write_task_result(canonical, 'unrelated', 'completed', result='private sibling')
+    denied = registry.execute_result('read_file', {'root': 'runtime_data', 'path': str(canonical / 'task_results/unrelated.json')})
+    assert denied.status != 'ok' and 'private sibling' not in denied.text
+
+
+def test_native_oversized_result_retains_typed_continuation_after_author_cleanup(tmp_path, monkeypatch):
+    from ouroboros import review_native_episode
+
+    canonical, author, _repo, request, native, _session, ctx = _retrieving(tmp_path)
+    monkeypatch.setattr(review_native_episode, '_EPISODE_TOOL_RESULT_CHAR_CAP', 1800)
+    proof = artifacts.task_artifact_dir_path(author, request.task_id) / 'proof.txt'
+    proof.write_text('exact full source\n' * 300 + 'DECISIVE END')
+    request.evidence['artifacts'][0]['size'] = proof.stat().st_size
+    calls = []
+
+    class Reader:
+        def chat(self, **kwargs):
+            calls.append(copy.deepcopy(kwargs['messages']))
+            if len(calls) == 1:
+                shutil.rmtree(author)
+                ref = next(row['source_ref'] for row in request.policy['review_source_closure']['sources']
+                           if row['name'] == 'artifact:proof.txt')
+                return {'tool_calls': [_tool_call('read_file', ref['read']['arguments'])]}, {}
+            assert 'Full result source:' in str(calls[-1])
+            return {'content': json.dumps({'verdict': 'PASS', 'findings': [], 'summary': 'collected'})}, {}
+
+    result = run_review_request(request, slots=[native], usage_ctx=ctx, drive_root=author, llm=Reader())
+    actor = result.actors[0]
+    assert actor['status'] == 'ok', actor
+    history = json.loads(artifacts.read_actor_source_bytes(canonical, request.task_id, actor['usage']['native_history_source']))
+    source = history['read_receipts'][0]['result_source_ref']
+    assert b'DECISIVE END' in artifacts.read_actor_source_bytes(canonical, request.task_id, source)

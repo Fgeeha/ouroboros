@@ -712,24 +712,16 @@ def _promote_task_source_ref(
     source = _task_artifact_dir(child_root, task_id, create=False).joinpath(
         *rel.parts
     )
-    # Inspect owned JSON closure even when an earlier attempt copied the outer source.
-    plan_wave_source = name_match.group(1).startswith("plan-review-wave-")
-    if name_match.group(2) == "json" and (plan_wave_source or name_match.group(1) in {
-        "acceptance", "acceptance_tool_trajectory",
-    }):
-        try:
-            payload = json.loads(raw)
-        except (ValueError, UnicodeError):
-            payload = None
-        meta = payload.get("artifact_meta") if isinstance(payload, dict) else None
-        plan_wave = plan_wave_source and isinstance(meta, dict) and meta.get("kind") == "plan_review_wave"
-        if plan_wave or (isinstance(payload, list) and name_match.group(1) == "acceptance_tool_trajectory") or (
-            isinstance(payload, dict) and isinstance(payload.get("request"), dict)
-            and payload["request"].get("surface") == "task_acceptance"
-        ):
-            rewritten = _rewrite_child_ref_tree(payload, parent_root, child_root, task_id, state)
-            if rewritten != payload:
-                raw = json.dumps(rewritten, ensure_ascii=False, sort_keys=True, default=str).encode("utf-8")
+    from ouroboros.review_source_closure import promote_source_payload
+
+    try:
+        raw = promote_source_payload(raw, source_id=name_match.group(1), extension=name_match.group(2),
+            category=rel.parts[1], parent_root=parent_root, child_root=child_root, task_id=task_id, state=state)
+    except Exception as exc:
+        _append_promotion_fact(state['pending_refs'], _promotion_fact(
+            {**ref, 'path': str(source)}, f'{type(exc).__name__}: {exc}'))
+        state['status'] = 'incomplete'
+        return dict(ref)  # The original child still owns this closure; GC must wait.
     # Preserve bytes for relative refs. Rebased absolute refs or unavailable
     # dependencies mint a new source; never overwrite the old checkpoint.
     changed = hashlib.sha256(raw).hexdigest() != expected_sha
@@ -932,9 +924,21 @@ def _rewrite_child_ref_tree(
             parent_root, child_root, task_id, value, state
         )
     if isinstance(value, dict):
+        from ouroboros.review_source_closure import source_owner
+
+        if isinstance(value.get('task_contract'), dict):
+            from ouroboros.artifacts import promote_task_attachment_refs
+
+            value = copy.deepcopy(value)
+            original = value['task_contract'].get('attachment_manifest_ref')
+            if _is_task_source_ref(original):
+                # The original digest still identifies the captured manifest;
+                # materializing its file addresses below may mint another view.
+                _promote_task_source_ref(parent_root, child_root, task_id, original, state)
+            promote_task_attachment_refs(parent_root, child_root, task_id, value, state)
         return {
             key: _rewrite_child_ref_tree(
-                item, parent_root, child_root, task_id, state
+                item, parent_root, child_root, source_owner(key, item, task_id), state
             )
             for key, item in value.items()
         }

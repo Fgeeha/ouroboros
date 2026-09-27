@@ -263,6 +263,53 @@ def test_inline_inventory_migrates_and_retains_closed_task_late_review(clock, ve
         assert ('late review settled for task old' in clock.launches[-1]['text']) is (index == 2)
 
 
+@pytest.mark.parametrize('failure', ['write', 'readback', 'bootstrap_write'])
+@pytest.mark.parametrize('restart', [False, True])
+def test_first_failed_source_preserves_intervening_events(clock, monkeypatch, failure, restart):
+    from ouroboros import artifacts, consolidator
+    from ouroboros.consciousness import OBSERVATION_STATE_KEY
+    from tests.test_consciousness_wake import _write
+
+    _chat_row(root=clock.root, ts=_iso(T0 - 1), direction='in', chat_id=1, source='web', text='before bootstrap')
+    with monkeypatch.context() as fault:
+        if failure in {'write', 'bootstrap_write'}:
+            fault.setattr(consolidator, 'retain_memory_source', lambda *a, **kw: (_ for _ in ()).throw(OSError('write failed')))
+        else:
+            fault.setattr(artifacts, 'read_actor_source_bytes', lambda *a, **kw: b'bad readback')
+        if failure == 'bootstrap_write':
+            from supervisor import state
+            from ouroboros.consciousness import OBSERVATION_BOOTSTRAP_STATE_KEY
+
+            update = state.update_state
+
+            def fail_bootstrap(mutator):
+                staged = dict(clock.store)
+                mutator(staged)
+                if OBSERVATION_BOOTSTRAP_STATE_KEY in staged:
+                    raise OSError('bootstrap write failed')
+                return update(mutator)
+
+            fault.setattr(state, 'update_state', fail_bootstrap)
+        assert clock.clock.tick(T0 + FLOOR) == 'launched'
+        assert not clock.store.get(OBSERVATION_STATE_KEY)
+    event_at, finish_at = T0 + FLOOR + 1, T0 + FLOOR + 2
+    _chat_row(root=clock.root, ts=_iso(event_at), direction='in', chat_id=1, source='web', text='during first wake')
+    _write(clock.root, 'intervening', status='completed', ts=_iso(event_at), updated_at=_iso(event_at))
+    monkeypatch.setattr(clock_module.time, 'time', lambda: finish_at)
+    clock.launches[-1]['on_finished']('wake0001', not restart)
+    alarm = BackgroundConsciousness(clock.root, clock.root / 'repo', lambda: 7, now=finish_at + 1) if restart else clock.clock
+    clock.receipt['task_id'] = 'wake0002'
+    assert alarm.tick(alarm.next_wake_at) == 'launched'
+    assert 'during first wake' in clock.launches[-1]['text']
+    assert 'task intervening completed' in clock.launches[-1]['text']
+    assert 'before bootstrap' not in clock.launches[-1]['text']
+    assert clock.store[OBSERVATION_STATE_KEY]
+    clock.receipt['task_id'] = 'wake0003'
+    assert alarm.tick(alarm.next_wake_at + DEFAULT) == 'launched'
+    assert 'during first wake' not in clock.launches[-1]['text']
+    assert 'task intervening completed' not in clock.launches[-1]['text']
+
+
 def test_full_inventory_moves_out_of_hot_state_without_forgetting_closed_tasks(clock):
     from ouroboros import artifacts
     from ouroboros.consciousness import OBSERVATION_STATE_KEY

@@ -153,6 +153,10 @@ def announce_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[str,
     if usage_ctx is None or not getattr(usage_ctx, "drive_root", None):
         return
     task_id = str(getattr(request, "task_id", "") or "")
+    # A mailbox notice is not canonical consumption. Keep the operation's
+    # reconciliation duty through the author's final-collection/terminal-write
+    # gap; physical closure persists it as ``unpublished`` for maintenance.
+    _unpublished(task_id, str(getattr(request, "retry_key", "") or ""), "unpublished")
     try:
         from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
 
@@ -622,6 +626,11 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
         log.debug("late acceptance settlement %s: nothing reconciled (still pending or already collected)", retry_key)
         if not was_pending:
             (getattr(usage_ctx, "_acceptance_settlement_traces", None) or {}).pop(retry_key, None)
+            if partial:
+                # This trace was reloaded from the canonical publication. A
+                # settled local/mailbox trace alone cannot consume the duty.
+                with _LATE_LOCK:
+                    _LATE_UNPUBLISHED.discard((task_id, retry_key))
         return "pending" if was_pending else "settled"
     if advanced:
         # The sentence has ONE author: it is stamped on the exact run this wave
@@ -647,11 +656,9 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
                 "reviewed_is_emitted": late.get("reviewed_is_emitted"),
                 "source_ref": panel.get("applied_source_ref") or {}}
     if evidence["source_ref"].get("path"):
-        from ouroboros.artifacts import task_artifact_dir_path
+        from ouroboros.task_finalization import review_source_reader
 
-        source_path = task_artifact_dir_path(root, task_id) / evidence["source_ref"]["path"]
-        evidence["read"] = {"tool": "read_file", "arguments": {
-            "root": "runtime_data", "path": source_path.relative_to(root).as_posix(), "start_line": 1}}
+        evidence["read"] = review_source_reader(task_id, evidence["source_ref"])
     # The operation outlives the execution drive; replay belongs to the same
     # canonical root as its publication and the supervisor's delivery registry.
     outcome = enqueue_terminal_delivery_outcome(root, {

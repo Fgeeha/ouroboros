@@ -490,6 +490,7 @@ def _transition_line(fact: Dict[str, Any], results: Dict[str, Dict[str, Any]], r
     ago = _ago(now - stamp) if stamp is not None else "at an unknown time"
     if kind == "late_review":
         from ouroboros.artifacts import task_artifact_dir_path
+        from ouroboros.task_finalization import review_source_reader
 
         record = fact["fact"]
         late = record.get("late_settlement") if isinstance(record.get("late_settlement"), dict) else {}
@@ -501,10 +502,10 @@ def _transition_line(fact: Dict[str, Any], results: Dict[str, Dict[str, Any]], r
         ref = record.get("source_ref") if isinstance(record.get("source_ref"), dict) else {}
         try:
             stored = task_artifact_dir_path(drive_root, task_id) / str(ref.get("path") or "")
-            present, path = bool(ref.get("path")) and stored.is_file(), stored.relative_to(drive_root).as_posix()
+            present = bool(ref.get("path")) and stored.is_file()
         except (ValueError, OSError):
-            present, path = False, ""
-        read = {"tool": "read_file", "arguments": {"root": "runtime_data", "path": path, "start_line": 1}}
+            present = False
+        read = review_source_reader(task_id, ref)
         parts.append(f"exact source {json.dumps(read, sort_keys=True)} sha256 {ref.get('sha256')}" if present else
                      "exact source unavailable" + (f" ({ref.get('path')})" if ref.get("path") else ""))
         first = str(late.get("note") or "").splitlines()[0] if late.get("note") else ""

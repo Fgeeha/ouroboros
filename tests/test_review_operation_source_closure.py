@@ -21,10 +21,60 @@ from supervisor import events_chat_delivery as chat
 from supervisor.terminal_delivery import delivery_id_for, pending_deliveries, register_pending_delivery
 from tests.test_review_operation_collection import _send_ctx, fresh_sends  # noqa: F401
 from tests.test_review_operation_lifetime import until
+from ouroboros.tools.registry import ToolContext, ToolRegistry
+
+
+def read_late_source(registry, selector):
+    metadata = registry.execute_result(selector['tool'], selector['arguments'])
+    assert metadata.status == 'ok', metadata.text
+    envelope = json.loads(metadata.text)
+    assert 'authority' not in envelope
+    view = envelope['review_source']
+    result = registry.execute_result(selector['tool'], {**selector['arguments'],
+        'source_start_char': 0, 'source_end_char': view['complete_chars']})
+    assert result.status == 'ok', result.text
+    body = json.loads(result.text)['review_source']
+    assert hashlib.sha256(body['text'].encode()).hexdigest() == view['complete_sha256']
+    return body['text']
+
+
+def test_exact_review_reader_keeps_physical_identity_and_restrictions(tmp_path):
+    from ouroboros.task_finalization import review_source_reader
+    from tests.test_consciousness_wake import _late_panel, T0
+
+    canonical, repo = tmp_path / 'canonical', tmp_path / 'repo'
+    repo.mkdir()
+    _projection, ref = _late_panel(canonical, 'author', settled_at=T0)
+    write_task_result(canonical, 'author', 'failed', retry_handoff={'state': 'spawned', 'child_task_id': 'replacement'})
+    write_task_result(canonical, 'replacement', 'completed', result='different task')
+    receiver = prepare_task_drive(canonical, 'next', 'empty')
+    tools = ToolRegistry(repo_dir=repo, drive_root=receiver)
+    ctx = ToolContext(repo_dir=repo, drive_root=receiver, task_id='next', task_metadata={'budget_drive_root': str(canonical)})
+    tools.set_context(ctx)
+    selector = review_source_reader('author', ref)
+    assert 'answer A' in read_late_source(tools, selector)
+    args = selector['arguments']
+    invalid_range = tools.execute_result('get_task_result', {**args, 'source_start_char': -1, 'source_end_char': 1})
+    assert invalid_range.status == 'error' and invalid_range.code == 'TOOL_ARG_ERROR'
+    for digest in ('../escape', '0' * 64):
+        result = tools.execute_result('get_task_result', {**args, 'review_source_sha256': digest})
+        assert json.loads(result.text)['review_source']['status'] == 'unavailable'
+    wrong_owner = tools.execute_result('get_task_result', {**args, 'task_id': 'replacement'})
+    assert json.loads(wrong_owner.text)['review_source']['status'] == 'unavailable'
+    for actor in ({'delegation_role': 'subagent'}, {'presence': {'binding_id': 'room'}}):
+        ctx.task_metadata = {'budget_drive_root': str(canonical), **actor}
+        refused = tools.execute_result('get_task_result', args)
+        assert refused.status != 'ok' and ref['sha256'] not in refused.text
+    ctx.task_metadata = {'budget_drive_root': str(canonical)}
+    path = artifacts.task_artifact_dir_path(canonical, 'author') / ref['path']
+    path.write_bytes(path.read_bytes().replace(b'answer A', b'answer B'))
+    corrupt = tools.execute_result('get_task_result', args)
+    assert json.loads(corrupt.text)['review_source']['reason'] == 'source_identity_mismatch'
 
 
 @pytest.mark.parametrize("emitted", ["answer A", "answer B"])
-def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypatch, fresh_sends, emitted):
+@pytest.mark.parametrize("receiver_mode", ["canonical", "forked", "empty"])
+def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypatch, fresh_sends, emitted, receiver_mode):
     task_id = "source-author"
     canonical = tmp_path / "canonical"
     child = prepare_task_drive(canonical, task_id, "empty")
@@ -134,7 +184,6 @@ def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypat
         from supervisor import message_bus
         from ouroboros.context import build_recent_sections
         from ouroboros.memory import Memory
-        from ouroboros.tools.core_file_tools import _read_file
         from ouroboros.tools.tool_context import ToolContext
 
         monkeypatch.setattr(message_bus, 'DATA_DIR', canonical)
@@ -150,13 +199,17 @@ def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypat
         durable = json.loads((canonical / 'logs' / 'chat.jsonl').read_text().splitlines()[-1])
         assert durable['late_evidence'] == notice['progress_meta']['late_evidence']
         assert bridged and len(checkpoints) == 1
+        receiver_root = canonical if receiver_mode == 'canonical' else prepare_task_drive(canonical, 'next-owner', receiver_mode)
+        consumer = ToolContext(repo_dir=repo, drive_root=receiver_root, task_id='next-owner',
+                               task_metadata={'budget_drive_root': str(canonical)})
+        receiver = ToolRegistry(repo_dir=repo, drive_root=receiver_root)
+        receiver.set_context(consumer)
         for room in (1, 42):
             context = '\n'.join(build_recent_sections(Memory(canonical), None, task_id='next-owner', thread_chat_id=room))
             assert 'source-author' in context and panel['applied_source_ref']['sha256'] in context
             evidence = json.loads(context.split('[Late review evidence: ', 1)[1].splitlines()[0][:-1])
             assert evidence['reviewed_revision'] == ('delivered' if emitted == 'answer A' else 'different')
-            consumer = ToolContext(repo_dir=repo, drive_root=canonical, task_id='next-owner', task_metadata={})
-            retained = _read_file(consumer, **evidence['read']['arguments'], max_lines=2000)
+            retained = read_late_source(receiver, evidence['read'])
             assert 'answer A' in retained and 'Original critique of A' in retained
             assert late['emitted_answer']['delivered'][0]['source_ref']['sha256'] in retained
 
@@ -173,12 +226,15 @@ def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypat
 
         class Cognition:
             def handle_task(self, task):
-                assert panel["applied_source_ref"]["path"] in task["text"]
+                assert panel["applied_source_ref"]["sha256"] in task["text"]
                 assert "late review settled for task source-author" in task["text"]
-                tool_ctx = ToolContext(repo_dir=repo, drive_root=canonical, task_id=task["id"], task_metadata=task["metadata"])
+                tool_ctx = ToolContext(repo_dir=repo, drive_root=receiver_root, task_id=task["id"],
+                                       task_metadata={**task["metadata"], 'budget_drive_root': str(canonical)})
+                wake_tools = ToolRegistry(repo_dir=repo, drive_root=receiver_root)
+                wake_tools.set_context(tool_ctx)
                 line = next(line for line in task["text"].splitlines() if "late review settled for task source-author" in line)
                 advertised = json.loads(line.split("exact source ", 1)[1].rsplit(" sha256 ", 1)[0])
-                consumed.append(_read_file(tool_ctx, **advertised["arguments"], max_lines=2000))
+                consumed.append(read_late_source(wake_tools, advertised))
                 return []
 
         monkeypatch.setattr(agent_module, "make_agent", lambda **_kw: Cognition())

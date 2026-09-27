@@ -63,6 +63,7 @@ NEXT_WAKE_STATE_KEY = "consciousness_next_wake_at"
 INTERVAL_STATE_KEY = "consciousness_next_interval_sec"
 LAST_WAKE_STATE_KEY = "consciousness_last_wake_at"
 OBSERVATION_STATE_KEY = "consciousness_observation_boundary"  # chat position + transition state the last ACCEPTED wake observed
+OBSERVATION_BOOTSTRAP_STATE_KEY = "consciousness_observation_bootstrap_since"
 LEGACY_INBOX_REL = pathlib.Path("state") / "consciousness_observations.jsonl"
 ARCHIVED_INBOX_REL = pathlib.Path("archive") / "consciousness_observations.jsonl"
 HEARTBEAT = "heartbeat"
@@ -114,6 +115,13 @@ class BackgroundConsciousness:
         self._last_wake_at, self._last_wake_task_id, self._last_wake_outcome, self._last_error = (
             persisted_last_wake, "", "", ""
         )
+        try:
+            bootstrap = float(state.get(OBSERVATION_BOOTSTRAP_STATE_KEY, persisted_last_wake or self._booted_at))
+            if not math.isfinite(bootstrap) or not 0 <= bootstrap <= self._booted_at:
+                raise ValueError("invalid observation bootstrap")
+        except (TypeError, ValueError):
+            bootstrap = persisted_last_wake or self._booted_at
+        self._observation_bootstrap_since = bootstrap
         self._last_skip_at = 0.0  # a skipped wake debounces the next event like a wake does
         self._backoff, self._allowance = 1, (0.0, {})
         self._archive_legacy_inbox()
@@ -144,7 +152,15 @@ class BackgroundConsciousness:
             log.debug("consciousness: next wake time not persisted", exc_info=True)
 
     def _set_last_wake_at(self, at: float) -> None:
-        self._set_state(LAST_WAKE_STATE_KEY, float(at))
+        from supervisor import state
+
+        try:
+            # Even if the first bootstrap write failed, alarm completion may
+            # never persist without the observation lower bound beside it.
+            state.update_state(lambda st: st.update({LAST_WAKE_STATE_KEY: float(at),
+                OBSERVATION_BOOTSTRAP_STATE_KEY: self._observation_bootstrap_since}))
+        except Exception:
+            log.debug("consciousness: wake completion not persisted", exc_info=True)
 
     @staticmethod
     def _set_state(key: str, value: Any) -> None:
@@ -241,10 +257,11 @@ class BackgroundConsciousness:
         metadata = {**self._routing_facts(chat_id),
                     **wake_task_metadata(level, reason, root_cost_ceiling_usd=ceiling)}
         # Everything since the last ACCEPTED observation — chain positions and transition
-        # identities, not this alarm's finish time (``_last_wake_at`` bounds only the first,
-        # time-based window). ``now`` precedes the scan: it anchors the next transition window.
+        # identities, not this alarm's finish time. Before a verified boundary,
+        # the bootstrap survives source failure, completion and restart.
+        self._set_state(OBSERVATION_BOOTSTRAP_STATE_KEY, self._observation_bootstrap_since)
         observation = observe_wake(self._drive_root, boundary=self._read_state().get(OBSERVATION_STATE_KEY),
-                                   since=self._last_wake_at or self._booted_at, now=now, reason=reason)
+                                   since=self._observation_bootstrap_since, now=now, reason=reason)
 
         def render(events: str) -> str:
             return render_wake_message(

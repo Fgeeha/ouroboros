@@ -242,25 +242,26 @@ def _late_panel(tmp_path, task_id, *, settled_at=None, pending=False):
     from ouroboros.artifacts import store_actor_source_bytes
     from ouroboros.review_projection import compact_review_projection
 
-    ref = store_actor_source_bytes(tmp_path, task_id, category="context_checkpoints", source_id="acceptance-run",
-                                   data=b'{"reviewers": ["FAIL: the tests were never run"]}', extension="json")
     actor = {"slot_id": "s1", "operation_id": "op1", "status": "ok", "raw_text": "FAIL: the tests were never run",
              "semantic_verdict": "FAIL", "operation_state": "in_flight" if pending else "settled"}
     run = {"authority": "host_root", "panel_id": "p1", "aggregate_signal": "FAIL", "actors": [actor],
-           "request": {"surface": "task_acceptance", "retry_key": "rk-9", "subject": "answer A", "task_id": task_id},
-           "applied_source_ref": {key: ref[key] for key in ("kind", "root", "path", "size", "sha256")}}
+           "request": {"surface": "task_acceptance", "retry_key": "rk-9", "subject": "answer A", "task_id": task_id}}
     if settled_at:
         fact = late_evidence_fact(run, {"source": "terminal_delivery_registry", "state": "unknown",
                                         "delivery_ids": []}, settled_at=_iso(settled_at))
         run["late_settlement"] = {"note": "On the reviewed version of this answer, reviewers later rejected it.\n"
                                           "- s1: FAIL", **fact}
+    ref = store_actor_source_bytes(tmp_path, task_id, category="context_checkpoints", source_id="acceptance",
+                                   data=json.dumps(run).encode(), extension="json")
+    run['applied_source_ref'] = ref
     return compact_review_projection([run]), ref
 
 
 def test_a_late_review_is_read_from_its_canonical_fact_with_its_exact_source(tmp_path):
     """No invented chat fields: the settlement, its subject and its exact published source come
     from ``acceptance_settlement.late_acceptance_facts``; the source is readable by read_file."""
-    from ouroboros.tools.core_file_tools import _read_file
+    from ouroboros.tools.registry import ToolRegistry
+    from tests.test_review_operation_source_closure import read_late_source
     from ouroboros.tools.tool_context import ToolContext
 
     projection, ref = _late_panel(tmp_path, "rv", pending=True)
@@ -268,7 +269,7 @@ def test_a_late_review_is_read_from_its_canonical_fact_with_its_exact_source(tmp
            review_projection=projection)
     first = _wake(tmp_path, None, T0)
     assert "rv" in first.boundary["transitions"]["inventory"]  # its panel may still settle
-    projection, _ref = _late_panel(tmp_path, "rv", settled_at=T0 + 60)
+    projection, ref = _late_panel(tmp_path, "rv", settled_at=T0 + 60)
     _write(tmp_path, "rv", review_projection=projection)
     second = _wake(tmp_path, first.boundary, T0 + 600)  # the outbox row has not landed yet
     assert [(kind, offset) for kind, offset, _l in second.events] == [("late_review", None)]
@@ -279,7 +280,9 @@ def test_a_late_review_is_read_from_its_canonical_fact_with_its_exact_source(tmp
     assert f"sha256 {ref['sha256']}" in line and "rv" in second.boundary["transitions"]["inventory"]
     read = json.loads(line.split("exact source ", 1)[1].rsplit(" sha256 ", 1)[0])
     reader = ToolContext(repo_dir=REPO, drive_root=tmp_path, task_id="wake0002", task_metadata={})
-    assert '"FAIL: the tests were never run"' in _read_file(reader, **read["arguments"])
+    registry = ToolRegistry(repo_dir=REPO, drive_root=tmp_path)
+    registry.set_context(reader)
+    assert '"FAIL: the tests were never run"' in read_late_source(registry, read)
     # The owner-visible row lands afterwards: already accepted, not a second report.
     _chat(tmp_path, {"ts": _iso(T0 + 700), "direction": "system", "type": "acceptance_late_settlement",
                      "task_id": "rv", "text": "On the reviewed version…", "card_row": "reviews",

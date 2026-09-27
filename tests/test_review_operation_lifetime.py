@@ -141,7 +141,8 @@ def test_reviewer_wait_outlives_the_author_scope_and_closes_only_after_settlemen
     resolved = [r for r in (load_task_result(f.root, TASK)["model_waits"] or {}).values()
                 if r["wait_id"] == row["wait_id"]][0]
     assert resolved["state"] == "resolved" and resolved["resolution"] == "resource_available"
-    until(lambda: load_task_result(f.root, TASK)["review_operations"][block["owner_id"]]["state"] == "closed")
+    # Physical close leaves canonical publication duty outstanding; the mailbox is not consumption.
+    until(lambda: load_task_result(f.root, TASK)["review_operations"][block["owner_id"]]["state"] == "unpublished")
     from ouroboros.review_dispatch import collect_task_acceptance_run
 
     collected = collect_task_acceptance_run(json.loads(json.dumps(dataclasses.asdict(first))),
@@ -385,9 +386,9 @@ def test_a_real_remote_operation_consumes_its_exact_decision_and_a_closed_one_is
             "the decision reached the operation through its canonical row, not the author's mailbox"
         resolved = load_task_result(f.root, TASK)["model_waits"][row["wait_id"]]
         assert resolved["state"] == "resolved" and resolved["applied_request_id"] == "switch-remote"
-        # Closed: a checkpoint keeps its record, a liveness-only pointer is removed.
+        # Physical close retains unpaid canonical-publication duty; a liveness-only pointer is removed.
         until(lambda: (load_task_result(f.root, TASK)["review_operations"].get(block["owner_id"]) or {}).get(
-            "state", "removed") == ("closed" if surface == "task_acceptance" else "removed"))
+            "state", "removed") == ("unpublished" if surface == "task_acceptance" else "removed"))
         # The worker process is still alive; its operation is gone. A waiting row naming
         # that exact live controller is never answered 202, nor published as live.
         assert child.poll() is None
