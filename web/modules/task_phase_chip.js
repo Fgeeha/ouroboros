@@ -38,10 +38,29 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
             className: 'chat-live-phase working finalizing',
         };
     }
+    // Owner Batch4: a paused task (owner Pause, budget pause, Restart hold) is
+    // not working, and neither is one still settling its Pause.
+    if (record.parkedPhase === 'budget_paused') return { phase: 'paused', text: 'Paused', className: 'chat-live-phase warn' };
+    if (record.parkedPhase === 'budget_pausing') return {
+        phase: 'working', text: 'Pausing…', className: 'chat-live-phase working waiting',
+    };
     if (record.modelWaiting) return {
         phase: 'working', text: 'Waiting for access', className: 'chat-live-phase working waiting',
     };
     return { phase: 'working', text: 'Working', className: 'chat-live-phase working' };
+}
+
+/**
+ * Keep an unfinished card's chip on its task's census phase (`/api/state`
+ * `active_chat_activities`): `budget_paused` / `budget_pausing` park it, any
+ * other phase releases it. true when the chip changed.
+ */
+export function syncParkedPhase(record, phase = '') {
+    const parked = /^budget_paus(ed|ing)$/.test(String(phase || '')) ? String(phase) : '';
+    if (!record || record.finished || (record.parkedPhase || '') === parked) return false;
+    record.parkedPhase = parked;
+    const desired = desiredLiveCardPhase(record);
+    return setLiveCardPhase(record, desired.phase, desired.text, desired.className, desired.secondary);
 }
 
 // A replayed final may preserve only an already-terminal phase. Ordinary DOM
@@ -117,7 +136,8 @@ export function setLiveCardPhaseSecondary(record, text = '') {
 // remains unfinished without pretending the paused role is doing computation.
 export function setLiveCardTypingVisible(record, visible) {
     if (!record?.inlineTypingEl) return false;
-    const display = visible && !record.modelWaiting && !record.reviewAnchor && !record.historicalUnavailable && !record.historicalUnconfirmed ? '' : 'none';
+    const display = visible && !record.modelWaiting && record.parkedPhase !== 'budget_paused' && !record.reviewAnchor
+        && !record.historicalUnavailable && !record.historicalUnconfirmed ? '' : 'none';
     if (record.inlineTypingEl.style.display === display) return false;
     record.inlineTypingEl.style.display = display;
     return Boolean(record.inlineTypingEl.isConnected);

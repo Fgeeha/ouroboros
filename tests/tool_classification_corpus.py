@@ -302,6 +302,9 @@ _PRODUCER_SHAPES = (
     ("root_required_active_workspace", "write_file", "⚠️ ROOT_REQUIRED_ACTIVE_WORKSPACE: absolute path '/w/x.txt' is under the active workspace.", "ROOT_REQUIRED_ACTIVE_WORKSPACE", (("required_root", "active_workspace"),)),
     ("root_required_user_files", "write_file", "⚠️ ROOT_REQUIRED_USER_FILES: an absolute home path was given but root defaulted to 'active_workspace'.", "ROOT_REQUIRED_USER_FILES", ()),
     ("resource_constraint", "read_file", "⚠️ RESOURCE_CONSTRAINT_BLOCKED: task_contract.allowed_resources.network=false blocks it.", "RESOURCE_CONSTRAINT_BLOCKED", ()),
+    # tools/registry_core.py::ToolRegistry._execute_legacy_text (owner Batch4): the
+    # owner paused the tree before this call's launch handoff; nothing ran.
+    ("owner_pause_not_started", "knowledge_read", "⚠️ OWNER_PAUSE_NOT_STARTED: NOT STARTED — the owner paused this task tree before this operation was launched. Nothing ran; it may be issued again after Resume. (owner_pause)", "OWNER_PAUSE_NOT_STARTED", (("owner_pause_not_started", True),)),
     ("resource_policy", "read_file", "⚠️ RESOURCE_POLICY_BLOCKED: task_contract.resource_policy protects 'blackbox'.", "RESOURCE_POLICY_BLOCKED", ()),
     ("cognitive_redirect", "write_file", "⚠️ COGNITIVE_TOOL_REQUIRED: cognitive memory is not written via 'write_file'.", "COGNITIVE_TOOL_REQUIRED", ()),
     ("extension_reported_failure", "ext_1_demo_screenshot", '{"ok": false, "error": "HTTP 500"}', "TOOL_REPORTED_FAILURE", (("dynamic_provider", True),)),

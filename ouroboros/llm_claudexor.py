@@ -34,6 +34,7 @@ from ouroboros.llm_substitution import (
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
 from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait, prepared_call_scope
 from ouroboros.observability import persist_call
+from ouroboros.owner_pause import launch_admission, OwnerPauseRefused
 from ouroboros.transport_custody import ProviderNotDispatched
 from ouroboros.usage_accounting import (
     PhysicalAttemptPreparationFailed, current_physical_attempt_context, current_usage_scope,
@@ -393,12 +394,18 @@ class _ModelInvocation:
         self.io_lock = threading.Lock()
         self.outage_episode = None
 
-    def check_control(self):
+    def check_control(self, *, starting=False):
         """The caller supplies deadline/cancel policy; this seam transports it."""
         reason = self.interrupt_reason or (self.poll_control() if self.poll_control else None)
         if not reason:
             waiter = current_model_wait()
             reason = waiter.control_reason() if waiter is not None else None
+        if not reason and starting:
+            try:
+                with launch_admission(current_usage_scope()):
+                    self.create_attempted = True
+            except OwnerPauseRefused as exc:
+                reason = str(exc)  # prior create_attempted remains unknown, never unsent
         if not reason:
             return
         cancellation = "not_requested"
@@ -475,8 +482,8 @@ class _ModelInvocation:
             self.check_control()
             try:
                 if not self.operation_id:
-                    self.create_attempted = True
                     self.observe_operation()
+                    self.check_control(starting=True)
                     detail = self.gateway.create_model_operation(self.request_ref, idempotency_key=self.invocation_id,
                         **({"capture_failure_evidence": True} if self.capture_failure_evidence else {}))
                     self.operation_id = detail["id"]
@@ -487,7 +494,6 @@ class _ModelInvocation:
                 if self.outage_episode is not None:
                     self._control_outage(recovered=True)
                 if detail.get("state") not in {"queued", "running"}:
-                    self.detail = detail
                     response = detail.get("response") or {}
                     if response.get("state") != "ready":
                         raise self.error(detail.get("problem"), detail,
@@ -574,13 +580,10 @@ class _ModelInvocation:
             previous, self.gateway = self.gateway, replacement
             if previous is not None:
                 previous.close()
-        def controlled():
-            self.check_control()
-            return False
         # Unlike an owner-mail peek, check_control's exception must propagate.
         deadline = time.monotonic() + backoff
         while time.monotonic() < deadline:
-            controlled()
+            self.check_control()
             time.sleep(min(config.CLAUDEXOR_MODEL_POLL_INTERVAL_SEC, max(0, deadline - time.monotonic())))
         return True
 

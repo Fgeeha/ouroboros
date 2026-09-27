@@ -344,6 +344,9 @@ CURRENT_PRODUCER_CONTRACTS = {
     # Saved-setting selection uses the existing process access authority; its new
     # foreground refusal remains blocked through both text and native ACCESS_BLOCKED.
     "PROCESS_ENV_REFERENCE_BLOCKED": (True, "blocked"),
+    # Owner Batch4: a call the owner's Pause fenced before its launch handoff never
+    # ran; it is the substrate's answer, homed with the other runtime refusals.
+    "OWNER_PAUSE_NOT_STARTED": (True, "blocked"),
     "SAFETY_ADVICE": (False, "ok"),
     "LIGHT_MODE_REPO_CHANGED": (False, "ok"),
     "BROWSER_ACTION_OUTCOME_UNKNOWN": (True, "error"),

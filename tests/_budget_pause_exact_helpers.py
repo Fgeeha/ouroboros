@@ -18,11 +18,14 @@ def _install_queue(tmp_path, monkeypatch):
 
     state.init(tmp_path, total_budget_limit=10.0)
     queue.init(tmp_path)
-    workers.DRIVE_ROOT = tmp_path
-    queue.DRIVE_ROOT = tmp_path
-    workers.PENDING[:] = []
-    workers.RUNNING.clear()
-    workers.WORKERS.clear()
+    monkeypatch.setattr(workers, "DRIVE_ROOT", tmp_path)
+    # The fixture owns these maps. In-place clearing leaked its last live task
+    # into later settings/consumer tests after monkeypatch teardown.
+    monkeypatch.setattr(workers, "PENDING", [])
+    monkeypatch.setattr(workers, "RUNNING", {})
+    monkeypatch.setattr(workers, "WORKERS", {})
+    monkeypatch.setattr(queue, "PENDING", workers.PENDING)
+    monkeypatch.setattr(queue, "RUNNING", workers.RUNNING)
     queue.BUDGET_ROOT_FENCES.clear()
     queue.init_queue_refs(workers.PENDING, workers.RUNNING, workers.QUEUE_SEQ_COUNTER_REF)
     monkeypatch.setattr(workers, "load_state", lambda: {"owner_chat_id": 0})

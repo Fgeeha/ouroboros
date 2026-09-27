@@ -522,6 +522,8 @@ def resolve_task_cost_ceiling(ctx: Any, budget_remaining_usd: Optional[float]) -
         scope = current_usage_scope()
         if scope is not None:
             root_cap = getattr(scope, "root_limit_usd", None)
+            if root_cap is None:  # a Continue's successor: the original root's carried group cap
+                root_cap = getattr(scope, "billing_group_limit_usd", None)
             root_ceiling = getattr(scope, "root_cost_ceiling_usd", None)
             non_root_member = bool(
                 scope.root_task_id and scope.task_id and scope.root_task_id != scope.task_id

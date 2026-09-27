@@ -172,7 +172,9 @@ def apply_budget_root_admission_fence(task: Dict[str, Any], root_task_id: str) -
         "active", "paused",
     }:
         return False
-    task["_admission_blocked"] = "root_budget_fence"
+    # One latch, typed by its cause: an owner Pause is not a monetary stop.
+    task["_admission_blocked"] = ("root_owner_paused" if fence.get("cause") == "owner_pause"
+                                  else "root_budget_fence")
     task["_budget_root_task_id"] = root_task_id
     task["_budget_fence_id"] = str(fence.get("fence_id") or "")
     return True
@@ -220,6 +222,9 @@ def restore_queue_fences(
                     "fence_id": fence_id,
                     "auto_resume": False,
                     "paused_at": str(fence.get("paused_at") or utc_now_iso()),
+                    # The owner's Pause survives the restart as itself, never
+                    # as a monetary latch (owner_pause.py).
+                    **({"cause": "owner_pause"} if fence.get("cause") == "owner_pause" else {}),
                 }
     if not malformed_budget:
         BUDGET_ROOT_FENCES.clear()

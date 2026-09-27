@@ -12,7 +12,7 @@ from ouroboros.knowledge import INDEX_FILE, OVERVIEW_TOPIC
 from ouroboros.knowledge import sanitize_topic as _sanitize_topic
 from ouroboros.tools.arg_feedback import ignored_argument_note
 from ouroboros.tools.registry import ToolEntry, ToolContext
-from ouroboros.tools.tool_result import ToolResult, _MAX_META_BYTES, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _MAX_META_BYTES, _publish_tool_result, completed_local_read
 from ouroboros.utils import append_jsonl, utc_now_iso
 
 KNOWLEDGE_DIR = "memory/knowledge"
@@ -95,17 +95,20 @@ def _knowledge_read(ctx: ToolContext, topic: str, scope: str = "",
         text, meta = _source_view(note, start_char, end_char)
     except ValueError as exc:
         return _publish_tool_result(ctx, ToolResult(
-            status="error", code="TOOL_ARG_ERROR", text=f"⚠️ TOOL_ARG_ERROR: {exc}"))
+            status="error", code="TOOL_ARG_ERROR", text=f"⚠️ TOOL_ARG_ERROR: {exc}",
+            meta={"operation_outcome": "completed_no_effect"}))
     except FileNotFoundError:
         elsewhere = ("" if address.scope == "global"
                      else f" A global note may exist: knowledge_read(topic={sanitized!r}, scope='global').")
         return _publish_tool_result(ctx, ToolResult(
             status="ok", code="LEGACY_WARNING", text=f"Topic {topic!r} not found in {address.scope}. Use knowledge_list to see available topics." + elsewhere,
-            meta={"knowledge_address": address.as_dict(), "knowledge_missing": True}))
+            meta={"knowledge_address": address.as_dict(), "knowledge_missing": True,
+                  "operation_outcome": "completed_no_effect"}))
     except (OSError, UnicodeDecodeError) as exc:
         return _publish_tool_result(ctx, ToolResult(
-            status="error", code="TOOL_REPORTED_FAILURE", text=f"⚠️ TOOL_ERROR: Knowledge source unavailable: {type(exc).__name__}"))
-    return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=text, meta=meta))
+            status="error", code="TOOL_REPORTED_FAILURE", text=f"⚠️ TOOL_ERROR: Knowledge source unavailable: {type(exc).__name__}",
+            meta={"operation_outcome": "completed_no_effect"}))
+    return _publish_tool_result(ctx, ToolResult(status="ok", code="OK", text=text, meta={**meta, "operation_outcome": "completed_no_effect"}))
 
 
 def _record_backlog_history(backlog_file: Path, topic: str, mode: str, task_id: str) -> None:
@@ -204,6 +207,7 @@ def _knowledge_write(
         status="error", code="TOOL_REPORTED_FAILURE", text=text, meta=meta))
 
 
+@completed_local_read
 def _knowledge_list(ctx: ToolContext, scope: str = "") -> str:
     try:
         address = _address(ctx, "topic", scope)

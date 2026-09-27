@@ -329,6 +329,10 @@ class ReviewCoordinator:
                                  else "settings_budget_resolver"),
             global_limit_revision=(base_scope.global_limit_revision if base_scope.global_limit_usd is not None else None),
             root_limit_usd=root_limit,
+            # A reviewer spends from its task's whole-work group, the original root's included.
+            billing_group_id=base_scope.billing_group_id, billing_group_limit_usd=base_scope.billing_group_limit_usd,
+            billing_group_limit_source=base_scope.billing_group_limit_source,
+            billing_group_limit_revision=base_scope.billing_group_limit_revision,
         )
 
         from ouroboros.review_custody import run_custodied_review_slots

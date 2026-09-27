@@ -468,6 +468,9 @@ def _group_key(row: Dict[str, Any]) -> Tuple[Any, ...]:
         str(row.get("task_id") or ""),
         str(row.get("root_task_id") or ""),
         str(row.get("parent_task_id") or ""),
+        str(row.get("billing_group_id") or ""),
+        "billing_group_limit_usd" in row, row.get("billing_group_limit_usd"),
+        row.get("billing_group_limit_source"), row.get("billing_group_limit_revision"),
         str(row.get("prompt_cache_ttl") or ""),
         row.get("cost_usd") is not None,
         bool(row.get("cost_final")),
@@ -692,7 +695,8 @@ def _build_candidate(
     for index, key in enumerate(sorted(groups, key=repr), start=1):
         group = groups[key]
         (state, model, provider, category, source, task_id, root_task_id,
-         parent_task_id, ttl, cost_known, cost_final, pricing_known,
+         parent_task_id, billing_group_id, has_group_limit, group_limit, group_source, group_revision,
+         ttl, cost_known, cost_final, pricing_known,
          bound_known) = key
         row: Dict[str, Any] = {
             "kind": "usage_baseline_group",
@@ -715,6 +719,11 @@ def _build_candidate(
         }
         if ttl:
             row["prompt_cache_ttl"] = ttl
+        if billing_group_id:  # whole-work attribution survives compaction (usage_admission)
+            row["billing_group_id"] = billing_group_id
+        if has_group_limit:
+            row.update(billing_group_limit_usd=None if group_limit is None else float(group_limit),
+                       billing_group_limit_source=group_source, billing_group_limit_revision=group_revision)
         if pricing_known is not None:
             row["pricing_known"] = pricing_known
         if cost_known:

@@ -1,12 +1,12 @@
 # 4. Server API Endpoints
 
-This chapter is the endpoint registry: every mounted browser, CLI and Host Service route beside the handler that owns it, plus the non-loopback authentication gate, the file-root confinement rule and the WebSocket protocol the browser actually speaks. It exists as a test-checked mirror of the executable route collector, so a route added, renamed or removed in code cannot quietly disappear from the map.
+This test-checked registry mirrors mounted browser, CLI and Host Service routes and their handlers, authentication, file confinement and WebSocket protocol. Route changes must update the map.
 
 If `OUROBOROS_NETWORK_PASSWORD` is configured, non-loopback HTTP and WebSocket access requires authentication; loopback clients bypass the gate, and `/api/health` plus the middleware-owned login/logout paths stay reachable. Browser sessions use a server-keyed, expiring HttpOnly HMAC cookie; `Secure` is set only under TLS so a plain-HTTP LAN session does not enter a login loop. An unauthenticated WebSocket is closed with code 4401 before `ws_endpoint` accepts it. With no configured password, non-loopback access remains open by explicit operator choice.
 
-The executable browser/CLI route SSOT is `ouroboros/gateway/router.py`; file-browser routes are contributed by `gateway/files.py::file_browser_routes()`. `gateway/contracts.py` is the frozen descriptive envelope and endpoint index mirrored by `web/modules/api_types.js` and parity tests; its `TypedDict` classes perform no runtime JSON validation. The loopback Host Service is a separate token-authenticated app assembled by `gateway/host_service.py::create_host_service_app`, not another public owner API.
+Browser/CLI routes live in `ouroboros/gateway/router.py`; file-browser routes are contributed by `gateway/files.py::file_browser_routes()`. `gateway/contracts.py` is the frozen descriptive envelope and endpoint index mirrored by `web/modules/api_types.js` and parity tests; its `TypedDict` classes perform no runtime JSON validation. The loopback Host Service is a separate token-authenticated app assembled by `gateway/host_service.py::create_host_service_app`, not another public owner API.
 
-Every `/api/files/*` operation resolves its requested path and refuses the operation when that resolution leaves the configured file root. In-root symlinks remain usable; out-of-root symlinks may be listed with `is_symlink: true` but cannot be read, written, downloaded, deleted, or traversed. The backend check is authoritative regardless of browser path presentation.
+Every `/api/files/*` operation resolves its requested path and refuses the operation when that resolution leaves the configured file root. In-root symlinks remain usable; out-of-root symlinks may be listed with `is_symlink: true` but cannot be read, written, downloaded, deleted, or traversed. Resolution is authoritative.
 
 | Method | Path | Handler |
 |---|---|---|
@@ -88,6 +88,8 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | GET | `/api/tasks/{task_id}/artifacts/{name}` | `gateway.tasks.api_task_artifact` (the task's own stores via `task_archive`: a bare name is a top-level file, `?relpath=` a nested one, `?archive=<dir>` a directory ZIP; the detail's `artifact_archives` says what each ZIP holds. A row that records a digest is served only when its bytes still match it — a changed mutable file is 409 `artifact_identity_changed` naming the recorded digest, a failed capture 404 `artifact_unverified` — and the response says `x-ouroboros-artifact-identity: verified` or `unmeasured`; a ZIP member follows the same rule) |
 | POST | `/api/tasks/{task_id}/cancel` | `gateway.tasks.api_task_cancel` |
 | POST | `/api/tasks/{task_id}/hurry` | `gateway.tasks.api_task_hurry` |
+| POST | `/api/tasks/{task_id}/pause` | `gateway.task_pause.api_task_pause` — owner Pause of a root's whole tree (text-free `{request_id}`; §6 Owner Pause) |
+| POST | `/api/tasks/{task_id}/continue` | `gateway.task_continue.api_task_continue` — owner Continue of an interrupted root as a NEW root (`{action_nonce}`; replay-first, typed refusals; §6 Owner Continue). `GET /api/tasks/{task_id}` projects `continuation_offer` |
 | POST | `/api/tasks/{task_id}/resume` | `gateway.tasks.api_task_resume` |
 | POST | `/api/decisions` | `gateway.tasks.api_decision_answer` |
 | GET | `/api/schedules` | `gateway.schedules.api_schedules_list` |

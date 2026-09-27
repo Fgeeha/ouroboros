@@ -169,6 +169,37 @@ export function hurryTask(taskId, requestId) {
 }
 
 /**
+ * Owner Pause of a whole task tree (Batch4): text-free like hurry — the body is
+ * ONLY the stable request_id (the same id on retry is idempotent). The answer
+ * arrives after the root's durable fence landed; its `state` is `requested`
+ * while members still settle and `paused` once the tree is saved.
+ * @param {string} taskId
+ * @param {string} requestId
+ */
+export function pauseTask(taskId, requestId) {
+    return jsonPost(
+        `/api/tasks/${encodeURIComponent(taskId)}/pause`,
+        { request_id: String(requestId || '') },
+        { rejectOkFalse: true },
+    );
+}
+
+/**
+ * Owner Continue of an interrupted root (Batch4): the body is ONLY the action
+ * nonce the caller keeps across retries and reloads, so the same press answers
+ * the same admission; a different nonce is a new press.
+ * @param {string} taskId
+ * @param {string} actionNonce
+ */
+export function continueTask(taskId, actionNonce) {
+    return jsonPost(
+        `/api/tasks/${encodeURIComponent(taskId)}/continue`,
+        { action_nonce: String(actionNonce || '') },
+        { rejectOkFalse: true },
+    );
+}
+
+/**
  * Fetch one task's durable detail record, or null when unreachable — the
  * shared reconcile read used by the cancel/stop card flows.
  * @param {string} taskId

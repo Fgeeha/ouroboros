@@ -14,7 +14,7 @@ upgraded with a recorded reason + lineage gate) live here too.
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 import hashlib
 import json
@@ -455,6 +455,7 @@ def _clip(text: object, limit: int, *, tail: bool = False) -> str:
     return f"{s[:limit]}…(+{omitted} more chars omitted)"
 
 
+@completed_local_read
 def _peek_task(ctx: ToolContext, task_id: str, view: str = "summary") -> str:
     """Read a child's CURRENT status + latest coordination beacons + result tail (D#7 — the
     parent's 'see intermediate findings' right). A PURE READ: it changes no state. The

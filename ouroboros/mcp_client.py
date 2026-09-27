@@ -689,6 +689,9 @@ async def _call_tool_async(
                 read, write = streams.read, streams.write  # pragma: no cover
             async with ClientSession(read, write) as session:
                 await session.initialize()
+                from ouroboros.owner_pause import start_tool_operation
+
+                start_tool_operation()
                 result = await session.call_tool(tool_name, arguments)
                 return _tool_result_from_call_result(result)
 
@@ -781,7 +784,10 @@ def _run_async(coro_factory: Callable[[], Awaitable[Any]], *, join_timeout: Opti
         except BaseException as exc:
             holder["error"] = exc
 
-    thread = threading.Thread(target=_runner, name="mcp-sync-runner", daemon=True)
+    import contextvars
+
+    context = contextvars.copy_context()
+    thread = threading.Thread(target=lambda: context.run(_runner), name="mcp-sync-runner", daemon=True)
     thread.start()
     thread.join(timeout=join_timeout)
     if thread.is_alive():

@@ -49,6 +49,37 @@ def _direct_actor_still_registered(task_id: str) -> bool:
         return True
 
 
+def _tick_parked_work(queue: Any) -> None:
+    """Before this tick assigns: grant cold model sleeps whose own selected source
+    is ready (``supervisor/sleep_wake.py``; each grant persists its own snapshot,
+    a failure keeps them asleep), and re-check owner Pauses still waiting on sent
+    work (``owner_pause_control.settle_requested_owner_pauses``, observe-only)."""
+    # Repair a lost consumption notification from durable authority. Until
+    # consumed, the live exclusion continues through capacity/persistence waits.
+    from supervisor.events_budget import _handle_budget_pause
+
+    with queue._queue_lock:
+        consuming = [(task_id, meta.get("attempt"), dict(meta["task"]["_budget_pause_resume"]))
+                     for task_id, meta in queue.RUNNING.items()
+                     if meta.get("sleep_parked_at") and (meta.get("task") or {}).get("_budget_pause_resume")]
+    for task_id, attempt, resume in consuming:
+        _handle_budget_pause({"phase": "consumed", "task_id": task_id,
+            "task_attempt": attempt, "pause_id": resume.get("pause_id"),
+            "grant_id": resume.get("grant_id")}, _pool())
+    try:
+        from supervisor.sleep_wake import wake_ready_sleepers
+
+        wake_ready_sleepers(queue)
+    except Exception:
+        log.warning("Sleep-wake pass failed; sleepers keep sleeping", exc_info=True)
+    try:
+        from supervisor.owner_pause_control import settle_requested_owner_pauses
+
+        settle_requested_owner_pauses(queue)
+    except Exception:
+        log.warning("Owner pause settlement pass failed; those trees stay pausing", exc_info=True)
+
+
 def _evolution_assignment_error(task: Dict[str, Any]) -> str:
     """Return the exact authority error for an evolution task about to run."""
     if str(task.get("type") or "") != "evolution":
@@ -120,6 +151,7 @@ def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
 
         _is_subagent = str(task.get("delegation_role") or "") == "subagent"
         _mirror = {
+            "task_attempt": int(task.get("_attempt") or 1),
             "root_task_id": task.get("root_task_id"),
             "session_id": task.get("session_id"),
             "actor_id": task.get("actor_id"),
@@ -171,11 +203,17 @@ def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
             # drive. Writing None for what it lacks would ERASE what
             # admission recorded, because this write MERGES.
             _mirror["chat_id"] = task.get("chat_id")
-            _mirror = {key: value for key, value in _mirror.items() if value is not None}
+        _mirror = {key: value for key, value in _mirror.items() if value is not None}
+        def before_dispatch(current, fields):
+            attempt = int(current.get("task_attempt") or 0)
+            if attempt > _mirror["task_attempt"] or current.get("status") == STATUS_RUNNING:
+                return None  # a worker/newer attempt already published its facts
+            return fields
         write_task_result(
             _pool().DRIVE_ROOT,
             str(task.get("id") or ""),
             STATUS_RUNNING,
+            _field_projector=before_dispatch, strict_existing_dict=True,
             **_mirror,
             result=("Subagent assigned to a worker." if _is_subagent
                     else "Assigned to a worker."),
@@ -184,12 +222,36 @@ def _mirror_assigned_running_status(task: Dict[str, Any]) -> None:
         log.debug("Failed to mirror the running assigned status", exc_info=True)
 
 
+def _claim_worker_launch(queue, candidate, worker):
+    """Commit prepared work to the local worker queue under Pause's lock."""
+    from types import SimpleNamespace
+    from ouroboros.owner_pause import launch_admission, OwnerPauseRefused
+
+    try:
+        with launch_admission(SimpleNamespace(
+                task_id=candidate.get("id"), root_task_id=candidate.get("root_task_id"),
+                budget_drive_root=candidate.get("budget_drive_root") or queue.DRIVE_ROOT),
+                root_resume=candidate.get("_budget_pause_resume") if not
+                    queue.BUDGET_ROOT_FENCES.get(str(candidate.get("root_task_id") or candidate.get("id"))) else None):
+            prior = candidate.get("admitted_dispatch")
+            candidate["admitted_dispatch"] = "possible"
+            if not queue.persist_queue_snapshot(reason="worker_launch_claimed"):
+                candidate["admitted_dispatch"] = prior
+                return False
+            _mirror_assigned_running_status(candidate)
+            worker.in_q.put(candidate)
+            return True
+    except OwnerPauseRefused:
+        return False
+
+
 def assign_tasks() -> None:
     from supervisor import queue
     from supervisor.state import budget_remaining, EVOLUTION_BUDGET_RESERVE
     from supervisor.worker_owner_wait import maintain_owner_wait_capacity
 
     maintain_owner_wait_capacity()
+    _tick_parked_work(queue)  # custody observation may wait on a remote operation
     with _queue_lock:
         st = _pool().load_state()
         # Cancellation/terminal custody wins before validating rows left in the
@@ -254,7 +316,8 @@ def assign_tasks() -> None:
                     or task.get("original_task_id") or task.get("timeout_retry_from")
                 )
                 replay_safe = (
-                    int(cost_fields.get("total_rounds") or 0) == 0
+                    task.get("admitted_dispatch") == "none"
+                    and int(cost_fields.get("total_rounds") or 0) == 0
                     and not bool(cost_fields.get("ledger_integrity_degraded"))
                     and not retry_lineage
                 )
@@ -430,14 +493,14 @@ def assign_tasks() -> None:
                         if dropped_ids:
                             queue.persist_queue_snapshot(reason="evolution_dropped_budget")
                     continue
-                task = _pool().PENDING.pop(chosen_idx)
+                task = _pool().PENDING[chosen_idx]
                 depth_error = _pool()._normalize_pending_task_depth(task)
                 if depth_error:
                     if _pool()._terminalize_invalid_pending_depth(task, depth_error):
+                        _pool().PENDING.pop(chosen_idx)
                         queue.persist_queue_snapshot(reason="invalid_task_depth")
                         continue
                     # Keep failed terminalization in queue custody for retry.
-                    _pool().PENDING.insert(chosen_idx, task)
                     log.error(
                         "Assignment blocked: invalid task depth could not be terminalized for %s",
                         task.get("id"),
@@ -446,13 +509,14 @@ def assign_tasks() -> None:
                 evolution_error = _pool()._evolution_assignment_error(task)
                 if evolution_error:
                     if _pool()._cancel_unauthorized_evolution(task, evolution_error):
+                        _pool().PENDING.pop(chosen_idx)
                         queue.persist_queue_snapshot(reason="evolution_authority_rejected")
-                    else:
-                        _pool().PENDING.insert(chosen_idx, task)
                     continue
-                _mirror_assigned_running_status(task)
+                # Keep PENDING custody through preparation and the final handoff.
+                if not _claim_worker_launch(queue, task, w):
+                    continue
+                _pool().PENDING.pop(chosen_idx)
                 w.busy_task_id = task["id"]
-                w.in_q.put(task)
                 now_ts = time.time()
                 resume = task.get("_owner_wait_resume") or task.get("_budget_pause_resume") or {}
                 _pool().RUNNING[task["id"]] = {
@@ -465,8 +529,9 @@ def assign_tasks() -> None:
                     # started_at is untouched; lifetime rails subtract this. ONE
                     # reader for either handoff: a budget grant names it
                     # ``paused_duration_sec``, an owner-wait restart ``budget_paused_sec``.
-                    **({"budget_paused_sec": budget_paused_seconds(resume)}
-                       if budget_paused_seconds(resume) > 0 else {}),
+                    "budget_paused_sec": budget_paused_seconds(resume),
+                    **({"sleep_parked_at": float(resume["sleep_exclusion_since"])}
+                       if resume.get("sleep_exclusion_since") else {}),
                     "soft_sent": False, "attempt": int(task.get("_attempt") or 1),
                 }
                 task_type = str(task.get("type") or "")

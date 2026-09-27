@@ -1269,6 +1269,14 @@ body.resizing-panels { user-select: none; }
     border-color: var(--accent);
 }
 .chat-load-older-btn:disabled { opacity: 0.6; cursor: default; }
+
+/* A completed Continue is a persistent reference, still readable when inert. */
+.btn[data-continue-successor]:disabled {
+    opacity: 1;
+    color: var(--text-secondary);
+    cursor: default;
+}
+
 /* First read of an empty feed: the pill is the only thing in the panel, so it
    carries the shared in-progress pulse rather than reading as a dead control. */
 .chat-load-older[aria-busy="true"] .chat-load-older-btn {

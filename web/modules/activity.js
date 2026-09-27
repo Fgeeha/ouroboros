@@ -15,6 +15,7 @@ import {
     ACTION_RESUME,
     TASK_CONTROL_TRIGGER_LABEL,
     hurryTaskAction,
+    isRootTaskRow,
     openTaskControlMenu,
     requestStop,
     resumeTaskAction,
@@ -62,10 +63,12 @@ export function initActivity({ mount, ws } = {}) {
         const { running, pending } = queue;
         // #322: the snapshot already carries the pause truth — a member's own
         // _budget_pause row, or a root fence covering its tree.
-        const fencedRoots = new Set(
-            ((queue && queue.budget_root_fences) || [])
-                .filter((f) => f && ['active', 'paused'].includes(String(f.status || '')))
-                .map((f) => String(f.root_task_id || '')));
+        const liveFences = ((queue && queue.budget_root_fences) || [])
+            .filter((f) => f && ['active', 'paused'].includes(String(f.status || '')));
+        const fencedRoots = new Set(liveFences.map((f) => String(f.root_task_id || '')));
+        // The owner's Pause rides the same latch, typed by its cause: not money.
+        const ownerFencedRoots = new Set(liveFences.filter((f) => f.cause === 'owner_pause')
+            .map((f) => String(f.root_task_id || '')));
         // #1196: a row whose root fence was lifted keeps a durable HOLD instead —
         // nothing dispatches it until an explicit selection is recorded, so
         // showing it as plain "queued" would promise work that cannot start.
@@ -80,7 +83,13 @@ export function initActivity({ mount, ws } = {}) {
             const label = esc(t.title || t.objective || t.text || q.type || id || 'task');
             const rt = kind === 'running' && q.runtime_sec != null ? ` · ${Math.round(q.runtime_sec)}s` : '';
             const paused = rowBudgetPaused(q, t, kind);
-            const kindLabel = paused ? 'paused (budget)' : kind;
+            // The owner's Restart holds never-started work under the same
+            // hold carrier (restart_retention.py): same Resume, its own words.
+            const restartHeld = heldRow(t) && t._budget_pause_hold.reason === 'owner_restart_hold';
+            const ownerPaused = t._budget_pause?.reason === 'owner'
+                || ownerFencedRoots.has(String(t.root_task_id || t.id || q.id || ''));
+            const kindLabel = restartHeld ? 'held after Restart'
+                : (paused ? (ownerPaused ? 'paused' : 'paused (budget)') : kind);
             const meta = `${esc(kindLabel)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
             return `<div class="activity-row">
                 <div class="activity-row-main">
@@ -88,7 +97,7 @@ export function initActivity({ mount, ws } = {}) {
                     <span class="activity-sub">${meta}</span>
                 </div>
                 <div class="activity-row-actions">
-                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${paused ? ' data-budget-paused="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${paused ? ' data-budget-paused="1"' : ''}${isRootTaskRow(t, q.id || t.id) ? ' data-root="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
                 </div>
             </div>`;
         };
@@ -107,7 +116,7 @@ export function initActivity({ mount, ws } = {}) {
                     <span class="activity-sub">${esc(a.phase || '')}${elapsed}</span>
                 </div>
                 <div class="activity-row-actions">
-                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${esc(a.activity_id || '')}">${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${esc(a.activity_id || '')}" data-root="1">${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
                 </div>
             </div>`;
         };
@@ -361,6 +370,8 @@ export function initActivity({ mount, ws } = {}) {
             openTaskControlMenu(btn, {
                 cancelPending: taskCancelPending(stored),
                 budgetPaused: btn.dataset.budgetPaused === '1',
+                // A child's Pause would not name its own tree (the server refuses it).
+                wholeTree: btn.dataset.root === '1',
                 busy: taskControlBusy(id),
                 onAction: async (action) => {
                     busy = true;

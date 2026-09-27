@@ -494,6 +494,11 @@ def _annotate_terminal_task_truth(
                     terminal_truth["reason_code"] = str(result.get("reason_code") or "")
                 if isinstance(result.get("cancel_origin"), dict):
                     terminal_truth["cancel_origin"] = dict(result["cancel_origin"])
+                # Batch4: a replayed card offers Continue (or points to its
+                # successor) by the same host rule as its detail, unopened.
+                from ouroboros.owner_continue import continuation_offer
+
+                terminal_truth["continuation_offer"] = continuation_offer(result, task_id)
                 review_projection = result.get("review_projection")
                 if isinstance(review_projection, dict):
                     terminal_truth["review_projection"] = dict(review_projection)

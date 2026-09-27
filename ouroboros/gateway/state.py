@@ -342,8 +342,18 @@ def _managed_task_budget_pausing(drive_root: Any, row: Dict[str, Any], task_id: 
         from ouroboros.budget_pause import STATE_PAUSING, budget_pause_row
 
         pause = budget_pause_row(pathlib.Path(row.get("budget_drive_root") or drive_root), task_id)
-        return bool(pause and pause.get("state") == STATE_PAUSING
-                    and int(pause.get("task_attempt") or 0) == int(row.get("_attempt") or 1))
+        if (pause and pause.get("state") == STATE_PAUSING
+                and int(pause.get("task_attempt") or 0) == int(row.get("_attempt") or 1)):
+            return True
+        # The owner paused this RUNNING root's tree: it is settling toward its
+        # boundary (sent work finishing), not working (ouroboros/owner_pause.py).
+        from types import SimpleNamespace
+
+        from ouroboros.owner_pause import member_fence
+
+        return bool(member_fence(SimpleNamespace(
+            task_id=task_id, root_task_id=str(row.get("root_task_id") or task_id),
+            budget_drive_root=str(row.get("budget_drive_root") or drive_root))).get("fence_id"))
     except Exception:
         return False
 

@@ -4,14 +4,17 @@ The queue owns admission and active worker capacity. This module preserves the
 native continuation through the existing source store. Pooled workers wait on
 their command queue; direct actors use the same mailbox and task controls without
 holding pooled capacity. A warm wake continues the original stack and browser;
-only a confirmed planned-restart handoff may load a cold continuation. Source
-bytes outlive their one-use resume authority in the ordinary task result.
+a confirmed planned-restart handoff can load a cold continuation. A validated
+model sleep may also transfer to the existing exact budget-pause owner on stop;
+its owner-wait state becomes ``retained`` and explicit Resume is required.
+Quiz/review waits keep their existing authority. Source bytes outlive grants.
 
 An optional bound (``escalate(max_wait_minutes=N)``) rides the checkpoint as an
 ABSOLUTE stamp (``wait_deadline_at``), so a planned restart resumes the same
 bound instead of starting it over. Both callbacks report a typed wake cause
 (``answer``, ``owner_text``, ``hurry``, ``mail:<task_id>``, ``timeout`` or
-``control:<reason>``). Stop, cancel, deadline and absolute ceiling are checked
+``control:<reason>``; ``control:owner_pause`` wakes a warm wait so the owner's
+Pause reaches its boundary without a model round). Stop, cancel, deadline and absolute ceiling are checked
 first; a timeout is not an answer and creates no new wait state, and a hurry
 is a request to finish sooner, never an answer.
 """
@@ -46,12 +49,14 @@ def classify_wake(entries: list[dict], quiz_id: str) -> str:
     Precedence: control, this card's answer, owner words, hurry, mail.
     """
     from ouroboros.owner_mailbox import (
-        KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_TASK_MESSAGE,
+        KIND_FINALIZE_NOW, KIND_HURRY, KIND_OWNER_PAUSE, KIND_OWNER_TEXT, KIND_QUIZ_ANSWER, KIND_TASK_MESSAGE,
     )
 
     kinds = [str(row.get("kind") or KIND_OWNER_TEXT) for row in entries]
     if KIND_FINALIZE_NOW in kinds:
         return "control:finalize_now"
+    if KIND_OWNER_PAUSE in kinds:
+        return "control:owner_pause"
     if any(kind == KIND_QUIZ_ANSWER and row.get("msg_id") == f"quiz_answer:{quiz_id}"
            for kind, row in zip(kinds, entries)):
         return "answer"
@@ -84,7 +89,7 @@ def _fresh_wake(ctx: Any, quiz_id: str, outcome: str) -> str:
     ``unknown``, so a bound that ended the wait keeps saying so.
     """
     observed = classify_wake(_wait_entries(ctx), quiz_id)
-    if observed in {"answer", "owner_text", "control:finalize_now"}:
+    if observed in {"answer", "owner_text", "control:finalize_now", "control:owner_pause"}:
         return observed
     return observed if outcome == "unknown" else outcome
 
@@ -179,19 +184,25 @@ def checkpoint_owner_wait(ctx: Any, messages: list, trace: dict, usage: dict,
                           *, review_binding: str = "") -> dict:
     """Capture only the live loop's continuation values, never Python handles."""
     wait_id = uuid.uuid4().hex
+    sleep = getattr(ctx, "_model_sleep", None) if not review_binding else None
+    reason = "review" if review_binding else ("sleep" if sleep else "owner")
+    quiz_id = "" if sleep else getattr(ctx, "_owner_wait_requested", "")
     state = {
         **continuation_state(ctx, messages, trace, usage, round_idx, tool_schemas, seen),
-        "wait_id": wait_id, "quiz_id": getattr(ctx, "_owner_wait_requested", ""),
+        "wait_id": wait_id, "quiz_id": quiz_id,
         **_wait_bound_fields(ctx),
-        "reason": "review" if review_binding else "owner",
+        "reason": reason, **({"sleep": dict(sleep)} if sleep else {}),
         "review_binding": review_binding,
     }
     source = store_continuation_source(ctx, state, "owner-wait-" + wait_id)
     model_state = state.get("model_wait") or {}
     return {
-        "wait_id": wait_id, "quiz_id": getattr(ctx, "_owner_wait_requested", ""),
+        "wait_id": wait_id, "quiz_id": quiz_id,
         **_wait_bound_fields(ctx),
-        "reason": "review" if review_binding else "owner",
+        # A model sleep (``model_sleep``): only its selected sources wake it.
+        "reason": reason, **({"sleep": dict(sleep),
+                                "sleep_started_at": float(getattr(ctx, "_model_sleep_started", 0) or time.time())}
+                               if sleep else {}),
         "review_binding": review_binding,
         "source_ref": source, "task_attempt": int(ctx.task_attempt or 1),
         "execution_drive_root": str(ctx.drive_root),
@@ -202,6 +213,26 @@ def checkpoint_owner_wait(ctx: Any, messages: list, trace: dict, usage: dict,
         # row's own lifetime check would count a pause as execution.
         "budget_paused_sec": float(model_state.get("budget_paused_sec") or 0.0),
     }
+
+
+def saved_sleep_checkpoint(root: Any, task_id: str, attempt: int | None = None) -> tuple[dict, dict]:
+    """Validate an exact warm-sleep source before shutdown promises retention."""
+    row = load_task_result(root, task_id, strict=True) or {}
+    wait = row.get("owner_wait") or {}
+    if (row.get("status") in _TRULY_TERMINAL_STATUSES or wait.get("state") != "waiting"
+            or wait.get("reason") != "sleep" or not wait.get("source_ref")
+            or not isinstance(wait.get("sleep"), dict) or not wait["sleep"].get("sleep_id")
+            or wait["sleep"].get("mode") != "warm"):
+        return {}, {}
+    state = json.loads(read_actor_source_bytes(root, task_id, wait["source_ref"]))
+    if (state.get("task_id") != task_id or not wait.get("wait_id")
+            or state.get("wait_id") != wait["wait_id"] or state.get("reason") != "sleep"
+            or state.get("sleep") != wait["sleep"]
+            or int(state.get("task_attempt") or 0) != int(wait.get("task_attempt") or 0)
+            or not wait.get("task_attempt")
+            or attempt is not None and int(wait["task_attempt"]) != int(attempt)):
+        return {}, {}
+    return wait, state
 
 
 def load_owner_wait(ctx: Any, handoff: dict | None = None) -> dict:
@@ -330,7 +361,13 @@ def worker_owner_wait(wid: int, in_q: Any, out_q: Any, ctx: Any,
                 elif phase == "refused":
                     raise RuntimeError(str(command.get("reason") or "owner wait refused"))
         if parked and not resume_requested:
-            if peek.pending(
+            woke = _sleep_wake(ctx, checkpoint)
+            if woke is not None:
+                if woke:  # a sleep's own selected source (or the owner) is ready
+                    outcome = woke
+                    out_q.put({**identity, "phase": "resume", "resume_reason": outcome})
+                    resume_requested = True
+            elif peek.pending(
                     pathlib.Path(ctx.drive_root), ctx.task_id,
                     set(getattr(ctx, "_loop_mailbox_seen_ids", set())), ctx.task_attempt or 1):
                 outcome = classify_wake(_wait_entries(ctx), str(checkpoint.get("quiz_id") or ""))
@@ -340,6 +377,23 @@ def worker_owner_wait(wid: int, in_q: Any, out_q: Any, ctx: Any,
                 outcome = "timeout"
                 out_q.put({**identity, "phase": "resume", "resume_reason": outcome})
                 resume_requested = True
+
+
+def _sleep_wake(ctx: Any, checkpoint: dict) -> str | None:
+    """``None`` for an owner/review wait (any mail wakes it); for a model sleep, the
+    reason its selected sources give NOW (``""`` = keep sleeping), read from the
+    canonical records on every poll — the recheck after the park that closes the
+    race with an event landing between the tool's check and the park."""
+    chosen = (checkpoint or {}).get("sleep")
+    if not isinstance(chosen, dict):
+        return None
+    from ouroboros.model_sleep import wake_reason
+
+    try:
+        return wake_reason(ctx, chosen)
+    except Exception:
+        log.warning("Sleep readiness unreadable for %s; still sleeping", ctx.task_id, exc_info=True)
+        return ""
 
 
 def direct_owner_wait(ctx: Any, checkpoint: dict) -> str:
@@ -362,9 +416,15 @@ def direct_owner_wait(ctx: Any, checkpoint: dict) -> str:
     peek = OwnerMailboxPeek()
     deadline = parse_deadline_ts((checkpoint or {}).get("wait_deadline_at"))  # None = unbounded
     outcome = "unknown"
-    while not control.control_reason() and not peek.pending(
-            pathlib.Path(ctx.drive_root), ctx.task_id,
-            set(getattr(ctx, "_loop_mailbox_seen_ids", set())), ctx.task_attempt or 1):
+    while not control.control_reason():
+        woke = _sleep_wake(ctx, checkpoint)
+        if woke:
+            outcome = woke
+            break
+        if woke is None and peek.pending(
+                pathlib.Path(ctx.drive_root), ctx.task_id,
+                set(getattr(ctx, "_loop_mailbox_seen_ids", set())), ctx.task_attempt or 1):
+            break
         if deadline is not None and utc_now() >= deadline:
             outcome = "timeout"
             break
@@ -500,13 +560,32 @@ def wait_after_tools(ctx: Any, messages: list, trace: dict, usage: dict,
     """Yield only after complete tool results; no model polling or terminal path."""
     if not getattr(ctx, "_owner_wait_requested", "") and not review_binding:
         return
+    sleep = getattr(ctx, "_model_sleep", None)
+    if isinstance(sleep, dict) and sleep.get("mode") == "cold" and not review_binding:
+        # A cold sleep ends this process at the next round boundary
+        # (``budget_pause.enter_cold_sleep``), not in a warm park here.
+        ctx._owner_wait_requested = ""
+        ctx._owner_wait_deadline_at = ""
+        return
     callback = getattr(ctx, "owner_wait_callback", None)
     if not callable(callback):
         raise RuntimeError("required owner wait has no worker continuation owner")
     checkpoint = checkpoint_owner_wait(ctx, messages, trace, usage, round_idx, tool_schemas, seen,
                                        review_binding=review_binding)
-    outcome = callback(ctx, checkpoint)
-    append_wake_notice(ctx, checkpoint, outcome, messages)
+    sleep = checkpoint.get("sleep")
+    if sleep:
+        from ouroboros import model_sleep
+
+        model_sleep.begin(ctx)
+        try:
+            outcome = callback(ctx, checkpoint)
+        finally:
+            slept = model_sleep.end(ctx)  # through capacity reacquisition: the task runs again now
+        messages.append(model_sleep.wake_notice(sleep, str(outcome or ""), slept))
+        ctx._model_sleep = None
+    else:
+        outcome = callback(ctx, checkpoint)
+        append_wake_notice(ctx, checkpoint, outcome, messages)
     ctx._owner_wait_requested = ""
     ctx._owner_wait_deadline_at = ""
     ctx._owner_wait_max_minutes = 0

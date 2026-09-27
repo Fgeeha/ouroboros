@@ -9,7 +9,7 @@ switch the model or reasoning effort for the next round.
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 import logging
 import os
@@ -166,6 +166,7 @@ def _request_deep_self_review(ctx: ToolContext, reason: str) -> str:
     return f"Deep self-review requested (reviewer: {identity}). It will be queued and executed asynchronously."
 
 
+@completed_local_read
 def _chat_history(
     ctx: ToolContext, count: int = 100, offset: int = 0, search: str = "",
     snapshot: str = "", **filters: str,

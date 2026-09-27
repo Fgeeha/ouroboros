@@ -18,6 +18,8 @@ import {
     restoreLiveCardPhaseState,
     setInertCardPresentation,
     setLiveCardPhase,
+    setLiveCardTypingVisible,
+    syncParkedPhase,
 } from '../modules/task_phase_chip.js';
 
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
@@ -545,4 +547,49 @@ test('ordinary early-final handler consumes producer status without ending lifec
         assert.equal(record.finished, false);
         assert.equal(record.title, 'Stable task name');
     }
+});
+
+function chipRecord(extra = {}) {
+    const attrs = new Map();
+    const phaseEl = { dataset: {}, className: '', textContent: 'Working',
+        getAttribute: (key) => (attrs.has(key) ? attrs.get(key) : null), setAttribute: (key, value) => attrs.set(key, value) };
+    return { phaseEl, attrs, inlineTypingEl: { style: { display: '' }, isConnected: true }, finished: false, ...extra };
+}
+
+test('Batch4: a paused or pausing card never says Working; Stop still outranks the pause', () => {
+    assert.deepEqual(desiredLiveCardPhase({ finished: false, parkedPhase: 'budget_paused' }), {
+        phase: 'paused', text: 'Paused', className: 'chat-live-phase warn',
+    });
+    assert.deepEqual(desiredLiveCardPhase({ finished: false, parkedPhase: 'budget_pausing' }), {
+        phase: 'working', text: 'Pausing…', className: 'chat-live-phase working waiting',
+    });
+    assert.equal(desiredLiveCardPhase({ finished: false, parkedPhase: 'budget_paused', cancelPendingPolicy: 'immediate' }).text,
+        'Cancelling…');
+    assert.equal(desiredLiveCardPhase({ finished: true, parkedPhase: 'budget_paused' }, 'done').text, 'Done');
+});
+
+test('Batch4: the census phase parks and releases a live card chip', () => {
+    const record = chipRecord();
+    assert.equal(syncParkedPhase(record, 'budget_pausing'), true);
+    assert.equal(record.phaseEl.textContent, 'Pausing…');
+    assert.equal(record.attrs.get('aria-label'), 'Task status: Pausing…');
+    assert.equal(syncParkedPhase(record, 'budget_paused'), true);
+    assert.equal(record.phaseEl.textContent, 'Paused');
+    assert.equal(record.inlineTypingEl.style.display, 'none', 'a paused card shows no typing activity');
+    assert.equal(syncParkedPhase(record, 'budget_paused'), false, 'an unchanged phase writes nothing');
+    assert.equal(syncParkedPhase(record, 'working'), true, 'Resume releases it');
+    assert.equal(record.phaseEl.textContent, 'Working');
+    assert.equal(record.inlineTypingEl.style.display, '');
+    const finished = chipRecord({ finished: true });
+    assert.equal(syncParkedPhase(finished, 'budget_paused'), false, 'a settled card keeps its outcome');
+    const pausingCard = chipRecord({ parkedPhase: 'budget_pausing' });
+    pausingCard.inlineTypingEl.style.display = 'none';
+    setLiveCardTypingVisible(pausingCard, true);
+    assert.equal(pausingCard.inlineTypingEl.style.display, '', 'sent work still finishing keeps its activity');
+});
+
+test('Batch4: chat feeds every census phase to its card', () => {
+    const hydrate = chatSource.slice(chatSource.indexOf('function hydrateDirectActivities'),
+        chatSource.indexOf('const isKnownProjectFrame'));
+    assert.match(hydrate, /syncParkedPhase\(record, v\.phase\);/);
 });

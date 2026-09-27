@@ -1,6 +1,6 @@
 """Memory registry tools for tracking data sources, gaps, and trust."""
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 import re
 import logging
@@ -18,6 +18,7 @@ def _registry_file(ctx: ToolContext) -> Path:
     return ctx.drive_path(REGISTRY_PATH)
 
 
+@completed_local_read
 def _memory_map(ctx: ToolContext) -> str:
     """Read the memory registry — a map of all data sources."""
     path = _registry_file(ctx)

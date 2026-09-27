@@ -40,7 +40,7 @@ from ouroboros.tools.core_secret_paths import (  # noqa: F401 — re-exported mo
     _filter_subagent_secret_repo_listing,
     _filter_subagent_secret_listing,
 )
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 from ouroboros.utils import safe_relpath
 
 log = logging.getLogger(__name__)
@@ -651,6 +651,7 @@ def _stamp_read_view(ctx: ToolContext, target: Any, opened: str, opened_root: st
     return rendered
 
 
+@completed_local_read
 def _read_file(
     ctx: ToolContext,
     path: str,
@@ -804,6 +805,7 @@ def _read_file(
         ))
 
 
+@completed_local_read
 def _list_files(
     ctx: ToolContext,
     path: str = ".",

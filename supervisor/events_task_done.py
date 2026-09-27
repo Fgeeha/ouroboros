@@ -521,23 +521,35 @@ def _finish_task_done_dispatch(
                 task_id,
                 exc_info=True,
             )
+        tree_root = ""
         try:
             from supervisor.queue_transitions import clear_budget_root_fence_for_settled_tree
 
             # Pending-cancel and reaper task_done arrive AFTER the row left
             # PENDING/RUNNING, so `task` is {} here: the tree identity falls
             # back to the event stamp, then the durable result.
-            clear_budget_root_fence_for_settled_tree({
-                "id": str(task_id or ""),
-                "root_task_id": str(
-                    (task if isinstance(task, dict) else {}).get("root_task_id")
-                    or (task_done_event or {}).get("root_task_id")
-                    or (final_task_result or {}).get("root_task_id")
-                    or ""
-                ),
-            })
+            tree_root = str(
+                (task if isinstance(task, dict) else {}).get("root_task_id")
+                or (task_done_event or {}).get("root_task_id")
+                or (final_task_result or {}).get("root_task_id")
+                or ""
+            )
+            clear_budget_root_fence_for_settled_tree({"id": str(task_id or ""), "root_task_id": tree_root})
         except Exception:
             log.warning("Failed to release budget root fence for %s", task_id, exc_info=True)
+        if tree_root and tree_root != str(task_id):
+            try:
+                from supervisor.owner_pause_control import refresh_owner_pause_tree
+
+                # A member that finished while its tree was pausing may be the
+                # last one the owner's Pause was waiting for — or the last writer
+                # an owner's Continue of that tree was held behind.
+                refresh_owner_pause_tree(tree_root)
+                from supervisor.continuation_admission import release_settled_continuations
+
+                release_settled_continuations(tree_root)
+            except Exception:
+                log.warning("Owner pause/continue settlement check failed for %s", tree_root, exc_info=True)
     ctx.persist_queue_snapshot(reason="task_done")
     try:
         ctx.bridge.push_log(task_done_event)

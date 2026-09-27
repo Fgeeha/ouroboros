@@ -861,11 +861,12 @@ def write_task_result(
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
-    from ouroboros.task_custody import capture_unread_mail, merge_unread_mail
+    from ouroboros.task_custody import capture_owner_mail, capture_unread_mail, merge_unread_mail
 
     # TZ-1 V10: the mailbox bytes are read BEFORE the row lock (a bounded union happens
     # under it); a terminal write that the projector turns terminal captures under it.
     captured = capture_unread_mail(results_drive_root, task_id) if status in _TRULY_TERMINAL_STATUSES else None
+    owner_mail = capture_owner_mail(results_drive_root, task_id) if status in _TRULY_TERMINAL_STATUSES else None
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if strict_existing_dict and existing and (
@@ -906,6 +907,9 @@ def write_task_result(
             if resolve_task_lineage(task_id, metadata=merged.get("metadata"),
                                     **{key: merged.get(key) for key in lineage_keys})["is_root_task"]:
                 projected_fields["canonical_terminal_projection_origin"] = "terminal_transition"
+                # Batch4: the owner's exact rows, ACKed ones included, outlive the mailbox cleanup.
+                projected_fields["owner_mailbox"] = merge_unread_mail(existing.get("owner_mailbox"), owner_mail
+                                                                      or capture_owner_mail(results_drive_root, task_id))
             # TZ-1 V10: this accepted transition keeps the mail no attempt read (no ACK written);
             # later late mail joins through settlement, never through a rejected write.
             projected_fields["unread_mailbox"] = merge_unread_mail(

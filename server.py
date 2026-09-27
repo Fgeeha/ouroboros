@@ -1113,6 +1113,7 @@ def _perform_supervisor_restart(
         force=True,
         terminal_status=cleanup_status,
         result_reason=cleanup_reason,
+        stop_source="server_shutdown",
         preserve_running_task_ids=planned_handoffs,
         **restart_kill_kwargs,
     )
@@ -1473,6 +1474,7 @@ async def lifespan(app):
                 force=True,
                 terminal_status=cleanup_status,
                 result_reason=cleanup_reason,
+                stop_source="server_shutdown",
                 **_restart_cleanup_kwargs(),
                 **_managed_update_pending_kwargs(),
             )
@@ -1521,21 +1523,7 @@ async def lifespan(app):
             get_manager().stop_server()
         except Exception:
             pass
-        try:
-            from ouroboros.tools.shell import kill_all_tracked_subprocesses
-            kill_all_tracked_subprocesses()
-        except Exception:
-            pass
-        try:
-            from ouroboros.workspace_executor import kill_all_foreground
-            kill_all_foreground(lifespan_drive_root)
-        except Exception:
-            pass
-        try:
-            from ouroboros.tools.services import kill_all_services
-            kill_all_services(lifespan_drive_root)
-        except Exception:
-            pass
+        _stop_owned_local_processes(lifespan_drive_root)
         try:
             from ouroboros.extension_companion import get_global_supervisor
             supervisor = get_global_supervisor()
@@ -1591,24 +1579,29 @@ def _restart_cleanup_kwargs() -> dict:
     return {}
 
 
-def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
-    """Kill child processes, workers, companions, and runtime port holders."""
-    _historical_audit.stop()  # forced path may skip lifespan's finally; stop never waits
+def _stop_owned_local_processes(drive_root: pathlib.Path, *, wait: bool = True) -> None:
+    """Shared shutdown order; the emergency path keeps its non-waiting policy."""
     try:
         from ouroboros.tools.shell import kill_all_tracked_subprocesses
         kill_all_tracked_subprocesses()
     except Exception:
-        pass
+        log.debug("Tracked shell cleanup failed", exc_info=True)
     try:
         from ouroboros.workspace_executor import kill_all_foreground
-        kill_all_foreground(DATA_DIR, wait=False)
+        kill_all_foreground(drive_root, wait=wait)
     except Exception:
-        pass
+        log.debug("Foreground executor cleanup failed", exc_info=True)
     try:
         from ouroboros.tools.services import kill_all_services
-        kill_all_services(DATA_DIR, wait=False)
+        kill_all_services(drive_root, wait=wait)
     except Exception:
-        pass
+        log.debug("Owned service cleanup failed", exc_info=True)
+
+
+def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
+    """Kill child processes, workers, companions, and runtime port holders."""
+    _historical_audit.stop()  # forced path may skip lifespan's finally; stop never waits
+    _stop_owned_local_processes(DATA_DIR, wait=False)
     try:
         from supervisor.workers import kill_workers
         cleanup_kwargs = _restart_cleanup_kwargs()
@@ -1622,6 +1615,7 @@ def _emergency_process_cleanup(*, port_sweep: bool = True) -> None:
                 archive_service_logs=False,
                 terminal_status=cleanup_status,
                 result_reason=cleanup_reason,
+                stop_source="server_shutdown",
                 **cleanup_kwargs,
                 **_managed_update_pending_kwargs(),
             )

@@ -1,6 +1,6 @@
 """Codebase health tool — complexity metrics and self-assessment."""
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 import logging
 import pathlib
@@ -10,6 +10,7 @@ from ouroboros.tools.registry import ToolContext, ToolEntry
 log = logging.getLogger(__name__)
 
 
+@completed_local_read
 def _codebase_health(ctx: ToolContext) -> str:
     """Compute and format codebase health report."""
     try:

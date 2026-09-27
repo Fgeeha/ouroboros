@@ -76,11 +76,22 @@ def physical_attempt_headroom() -> Optional[int]:
     return None if state is None else max(0, state.maximum - state.used)
 
 
-def require_physical_dispatch_window() -> Optional[float]:
+def require_physical_dispatch_window(*, owner_pause_claimed: bool = False) -> Optional[float]:
+    """The model family's launch handoff: the reservation row already exists.
+
+    Checked immediately before the request bytes: task controls, an owner
+    Pause over this send's tree (``owner_pause``: refused as NOT STARTED, the
+    reservation settles as never dispatched) and the execution deadline.
+    """
     from ouroboros.model_wait import current_model_wait, dispatch_deadline_remaining_sec
+    from ouroboros.owner_pause import RAIL_OWNER_PAUSE, scope_fence
 
     owner = current_model_wait()
     reason = owner.control_reason() if owner is not None else None
+    if owner_pause_claimed and reason == RAIL_OWNER_PAUSE:
+        reason = None
+    if not reason and not owner_pause_claimed and scope_fence():
+        reason = RAIL_OWNER_PAUSE
     if reason:
         raise _PhysicalSendNotStarted(reason)
     remaining = dispatch_deadline_remaining_sec()
@@ -637,7 +648,7 @@ def _deadline_checked_send(send: Any, before_dispatch: Any):
         return manifest
 
     def dispatch():
-        require_physical_dispatch_window()
+        require_physical_dispatch_window(owner_pause_claimed=True)
         return send()
 
     return dispatch, prepare

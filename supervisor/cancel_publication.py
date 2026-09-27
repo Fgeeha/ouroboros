@@ -41,6 +41,8 @@ _CANCEL_TERMINALIZED = frozenset({CANCEL_CANCELLED, CANCEL_ALREADY_SETTLED, CANC
 # tables must name the same sources, because one stored ``cancel_origin`` is
 # rendered by the task card AND by this host's durable terminal rows.
 CANCEL_SOURCE_PHRASES = {
+    "owner_restart": "Owner restart",
+    "server_shutdown": "Server shutdown",
     "http_single": "Stopped from the app (Stop now)",
     "http_cascade": "Stopped from the app (Stop now)",
     "http_graceful": "Stopped from the app (Wrap up)",

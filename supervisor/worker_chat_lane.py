@@ -21,7 +21,6 @@ imported BEFORE conflict markers land in the live tree (``preload_owner_control_
 from __future__ import annotations
 
 import logging
-import json
 import pathlib
 import time
 import uuid
@@ -658,10 +657,23 @@ def handle_wake_direct(
 
 
 def auto_resume_after_restart() -> None:
-    """Auto-resume after a recent restart when scratchpad still has work."""
+    """Auto-resume after a recent restart when scratchpad still has work.
+
+    The owner-Restart marker is consumed only AFTER the queue holding its
+    per-row Restart holds (``restart_retention``) is durably persisted: a
+    marker gone while the holds live only in memory would let the next boot
+    read the older queue as dispatchable work. A failed persist keeps the
+    marker (fail closed, no auto-wake) for the next boot to retry.
+    """
     try:
         owner_restart_flag = _pool().DRIVE_ROOT / "state" / "owner_restart_no_resume.flag"
         if owner_restart_flag.exists():
+            from supervisor.queue import persist_queue_snapshot
+
+            if persist_queue_snapshot(reason="owner_restart_holds") is not True:
+                log.error("Owner restart holds are not durable yet; the restart marker is kept "
+                          "and nothing auto-resumes.")
+                return
             owner_restart_flag.unlink(missing_ok=True)
             panic_compat_flag = _pool().DRIVE_ROOT / "state" / "panic_stop.flag"
             try:
@@ -674,9 +686,15 @@ def auto_resume_after_restart() -> None:
             log.info("Owner restart flag detected — skipping auto-resume.")
             return
 
-        # Panic/owner-restart flags suppress auto-resume and are consumed.
+        # Panic/owner-restart flags suppress auto-resume and are consumed — a Panic's
+        # only after the queue carrying its sleep holds is durable, like a Restart's.
         panic_flag = _pool().DRIVE_ROOT / "state" / "panic_stop.flag"
         if panic_flag.exists():
+            from supervisor.queue import persist_queue_snapshot
+
+            if persist_queue_snapshot(reason="panic_holds") is not True:
+                log.error("Panic holds are not durable yet; the panic marker is kept.")
+                return
             panic_flag.unlink(missing_ok=True)
             log.info("Panic flag detected — skipping auto-resume.")
             return
@@ -686,26 +704,10 @@ def auto_resume_after_restart() -> None:
         if not chat_id:
             return
 
+        # The one real trigger: a planned restart's verify record. A launcher
+        # line in the log tail is not evidence of unfinished work (owner Batch4).
         restart_verify_path = _pool().DRIVE_ROOT / "state" / "pending_restart_verify.json"
-        recent_restart = False
-        if restart_verify_path.exists():
-            recent_restart = True
-        else:
-            sup_log = _pool().DRIVE_ROOT / "logs" / "supervisor.jsonl"
-            if sup_log.exists():
-                try:
-                    lines = sup_log.read_text(encoding="utf-8").strip().split("\n")
-                    for line in reversed(lines[-20:]):
-                        if not line.strip():
-                            continue
-                        evt = json.loads(line)
-                        if evt.get("type") in ("launcher_start", "restart"):
-                            recent_restart = True
-                            break
-                except Exception:
-                    log.debug("Suppressed exception", exc_info=True)
-
-        if not recent_restart:
+        if not restart_verify_path.exists():
             return
 
         scratchpad_path = _pool().DRIVE_ROOT / "memory" / "scratchpad.md"

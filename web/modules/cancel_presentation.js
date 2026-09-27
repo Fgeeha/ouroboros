@@ -3,6 +3,8 @@ import { plainCauseText } from './utils.js';
 // Twin of supervisor.cancel_publication.cancel_cause_clauses. IDs stay in
 // cancel_origin/lineage details; a compact sentence never guesses an actor.
 export const CANCEL_SOURCE_PHRASES = {
+    "owner_restart": "Owner restart",
+    "server_shutdown": "Server shutdown",
     http_single: 'Stopped from the app (Stop now)',
     http_cascade: 'Stopped from the app (Stop now)',
     http_graceful: 'Stopped from the app (Wrap up)',

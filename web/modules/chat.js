@@ -10,7 +10,7 @@ import { createChatDecision } from './chat_decision.js';
 import { bindProjectWorkPointer } from './project_work_pointer.js';
 import { createModelWaitController, isModelWaitReference } from './model_wait.js';
 import { clientSurfaceField } from './client_surface.js';
-import { syncResultFilesItem } from './result_files.js';
+import { syncSettledItems } from './settled_card.js';
 import { createChatHistoryPager } from './chat_history.js';
 import { mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
@@ -53,6 +53,7 @@ import {
     setLiveCardTypingVisible,
     setHistoricalUnavailable,
     setHistoricalUnconfirmed,
+    syncParkedPhase,
 } from './task_phase_chip.js';
 import {
     loadSkillReviewDetail,
@@ -95,6 +96,7 @@ import {
     clearStickyCardState,
     clearTransientRoutingAnnotations,
     confirmAndSendPanic,
+    confirmAndSendRestart,
     computeDerivedChatStatus,
     computeHydratedDirectActivities,
     documentMessageKey,
@@ -1183,7 +1185,7 @@ export function createChatInstance({
 
     // V12: a settled detail keeps the card's one Files row current.
     function noteResultFiles(record, detail) {
-        return Boolean(syncResultFilesItem(record, detail) && (updateLiveCardCount(record), renderLiveCardTimeline(record), true));
+        return Boolean(syncSettledItems(record, detail) && (updateLiveCardCount(record), renderLiveCardTimeline(record), true));
     }
 
     function hydrateCardReviews(taskId, revision = null) {
@@ -1879,20 +1881,18 @@ export function createChatInstance({
         const taskId = msg?.task_id || '';
         const rawTs = msg?.ts || new Date().toISOString();
         if (!taskId) {
-            // An unkeyed summary cannot prove which task finished.  Keep the
-            // ownerless durable/log evidence, but never close the current card.
+            // An unkeyed summary proves no task finished: keep its evidence, never close a card.
             return false;
         }
         let changed = false;
         // Restore task name from history.
-        if (msg?.suggested_name) {
-            changed = applySuggestedName(taskId, msg.suggested_name) || changed;
-        }
+        if (msg?.suggested_name) changed = applySuggestedName(taskId, msg.suggested_name) || changed;
         const finalizing = msg?.task_phase === 'finalizing' || msg?.outcome_final === false;
         changed = noteToolMetrics(taskId, msg, rawTs, { suppressDomInsert }) || changed;
         const summary = taskTerminalSummary({ ...msg, task_id: taskId });
         const record = getLiveCardRecord(taskId);
         noteDirectTurn(record, msg?._is_direct_chat);
+        syncSettledItems(record, msg);
         changed = Boolean(record.reviewController?.updateMany(reviewGroupsFromTaskDetail(msg, taskId))) || changed;
         if (finalizing && !record.finished) record.finalizingHold = true;
         changed = applyLiveCardState(
@@ -3290,7 +3290,7 @@ export function createChatInstance({
             return;
         }
         if (command === 'restart') {
-            ws.send({ type: 'command', cmd: '/restart' });
+            await confirmAndSendRestart({ openConfirmDialog, ws });
             return;
         }
         if (command === 'panic') {
@@ -3610,14 +3610,14 @@ export function createChatInstance({
         );
         activeDirectActivities.clear();
         for (const [k, v] of nextMap.entries()) {
+            const record = liveCardRecords.get(k);
             activeDirectActivities.set(k, v);
-            restoreCardActivity(liveCardRecords.get(k));
-            markReviewAnchor(liveCardRecords.get(k));
-            noteDirectTurn(liveCardRecords.get(k), String(v.kind || '') !== 'managed_task');
+            restoreCardActivity(record);
+            syncParkedPhase(record, v.phase);
+            markReviewAnchor(record);
+            noteDirectTurn(record, String(v.kind || '') !== 'managed_task');
             if (v.kind === 'managed_task') missingManagedTaskIds.delete(k);
-            if (v.clientMessageId) {
-                pendingSubmissions.delete(v.clientMessageId);
-            }
+            if (v.clientMessageId) pendingSubmissions.delete(v.clientMessageId);
         }
         for (const taskId of globallyActiveActivityIds) missingManagedTaskIds.delete(taskId);
         for (const row of settledDirectRows) {

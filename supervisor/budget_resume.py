@@ -28,14 +28,33 @@ log = logging.getLogger(__name__)
 def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
                               *, selected_by: str = "",
                               external: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    """Mint ONE pause/generation-bound grant under the queue lock.
+    if selected_by == "sleep_wake":
+        return {"ok": False, "error": "sleep_policy_required"}
+    return _grant_exact_resume(task, pause, selected_by=selected_by, external=external)
 
-    Refuse unknown/stale money, exhausted wallets, Stop, deadline, finite
-    lifetime, an unreadable checkpoint or unsettled custody; a stale queue
-    locator is refreshed from the durable pause, never trusted. ``paused_duration_sec``
-    carries the paused interval without moving ``started_at`` or resetting the
-    quota clock. ``external`` is THIS grant's fresh custody observation (else read
-    here); a model ``selected_by`` needs its root's live owner-derived grant (Q9).
+
+def grant_exact_sleep_resume(task: Dict[str, Any], pause: Dict[str, Any],
+                             *, external: Dict[str, Any]) -> Dict[str, Any]:
+    """Sleep readiness has its own policy; it is never a model's child selection."""
+    return _grant_exact_resume(task, pause, external=external, sleep_wake=True)
+
+
+def _sleep_policy_allows(task, row, result_root):
+    from types import SimpleNamespace
+    from ouroboros.owner_pause import member_fence
+    from supervisor.events_budget import budget_hold_fact
+
+    return bool(row.get("reason") == "sleep" and isinstance(row.get("sleep"), dict)
+                and row.get("sleep_ready") and not budget_hold_fact(task)
+                and not member_fence(SimpleNamespace(task_id=task.get("id"),
+                    root_task_id=task.get("root_task_id") or task.get("id"), budget_drive_root=result_root)))
+
+
+def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected_by: str = "",
+                        external: Optional[Dict[str, Any]] = None,
+                        sleep_wake: bool = False) -> Dict[str, Any]:
+    """Grant from durable pause, fresh custody, money, Stop and clock checks.
+    Explicit model selection needs a root grant; sleep has its own policy.
     """
     from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.budget_pause import (
@@ -92,6 +111,8 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
         return {"ok": False, "error": "pause_attempt_mismatch", "action": "cancel_or_new_run",
                 "row_attempt": int(row.get("task_attempt") or 0), "queue_attempt": int(task.get("_attempt") or 1)}
     hold = task.get(BUDGET_HOLD_KEY) if isinstance(task.get(BUDGET_HOLD_KEY), dict) else {}
+    if sleep_wake and not _sleep_policy_allows(task, row, result_root):
+        return {"ok": False, "error": "sleep_wake_vetoed"}
     if hold.get("reason") == HOLD_MALFORMED_RESUME_IDENTITY:
         return {"ok": False, "error": HOLD_MALFORMED_RESUME_IDENTITY}
     live_grant = row.get("grant") if isinstance(row.get("grant"), dict) else {}
@@ -128,7 +149,7 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
         return {"ok": False, "error": "pause_source_unreadable", "action": "cancel_or_new_run"}
     # Custody observed outside the queue lock by the caller, else read now.
     if not isinstance(external, dict):
-        external = observe_task_runs(result_root, task_id, reason="budget_resume_uncovered_cost")
+        return {"ok": False, "error": "custody_observation_required"}
     if external.get("custody_read") != "ok":
         return {"ok": False, "error": "external_custody_unreadable",
                 "detail": str(external.get("error") or ""), "action": "retry_or_cancel"}
@@ -144,7 +165,8 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
         return {"ok": False, "error": "external_runs_unsettled",
                 "runs": [{key: run.get(key) for key in ("run_id", "state", "stop_outcome")} for run in unsettled],
                 "action": "wait_for_delegated_runs_to_settle_or_cancel_them"}
-    row = {**row, "external_runs": external}
+    row = {**row, "external_runs": external,  # an owner Pause's sent work: settled per THIS read
+           **({"settlement": "settled"} if row.get("settlement") else {})}
     try:
         if has_active_intent(pathlib.Path(q.DRIVE_ROOT), task_id, strict=True):
             return {"ok": False, "error": "cancel_intent_active"}
@@ -173,17 +195,18 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
         return {"ok": False, "error": "budget_still_exhausted", "action": "increase_budget_then_resume"}
     root_task_id = str(pause.get("root_task_id") or task.get("root_task_id") or task_id)
     root_grant = live_root_resume_grant(q, root_task_id, result_root) if root_task_id != task_id else {}
-    if selected_by and root_task_id != task_id:
+    if selected_by and root_task_id != task_id and not sleep_wake:
         # Q9: lineage alone grants nothing; model selection needs this root's live grant.
         if not root_grant:
             return {"ok": False, "error": "root_resume_grant_missing",
                     "root_task_id": root_task_id, "action": "resume_root_first"}
     if str(pause.get("scope") or "") == "root":
         from ouroboros.usage_accounting import refresh_root_accounting
+        from ouroboros.usage_admission import task_accounting_key
 
-        # ONE fresh strict ledger read is this grant's monetary authority: it never
-        # answers from the display cache, so a stale snapshot cannot pose as room.
-        tree = refresh_root_accounting(result_root, root_task_id, strict=True)
+        # ONE fresh strict ledger read is this grant's monetary authority (a Continue's
+        # successor: its whole-work GROUP under the original cap), never the display cache.
+        tree = refresh_root_accounting(result_root, task_accounting_key(result_root, task, root_task_id), strict=True)
         if not isinstance(tree, dict):
             # Unknown tree spend is not room: an unreadable ledger refuses typed.
             return {"ok": False, "error": "root_accounting_unavailable",
@@ -213,7 +236,9 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
         "single_use": True, "paused_duration_sec": prior_paused + max(0.0, now - paused_at),
         "executed_sec_before_pause": round(executed_sec, 3),
         "pause_id": pause_id, "pause_generation": pause_generation, "generation": generation,
-        "selected_by": str(selected_by or "owner"),
+        "selected_by": "sleep_wake" if sleep_wake else str(selected_by or "owner"),
+        "authority": "sleep_readiness" if sleep_wake else "explicit_resume",
+        "sleep_id": str((row.get("sleep") or {}).get("sleep_id") or "") if sleep_wake else "",
         "root_grant_id": str(root_grant.get("grant_id") or ""),
         "root_resume_generation": int(root_grant.get("generation") or 0),
         "root_fence_id": (str((q.BUDGET_ROOT_FENCES.get(root_task_id) or {}).get("fence_id") or "")
@@ -236,7 +261,8 @@ def grant_exact_budget_resume(task: Dict[str, Any], pause: Dict[str, Any],
         "grant_generation": generation, "pause_id": pause_id, "pause_generation": pause_generation,
         "paused_duration_sec": grant["paused_duration_sec"], "pause": prior_pause,
         "external_runs": external,
-        **{key: grant[key] for key in ("selected_by", "root_grant_id", "root_resume_generation", "root_fence_id")},
+        **({"sleep_exclusion_since": now} if row.get("reason") == "sleep" else {}),
+        **{key: grant[key] for key in ("selected_by", "authority", "sleep_id", "root_grant_id", "root_resume_generation", "root_fence_id")},
     }
     task["budget_resumed_at"] = grant["granted_at"]
     # Release a re-validated restore/revocation hold in place (``selected`` flips,

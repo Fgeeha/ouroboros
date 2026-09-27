@@ -460,8 +460,12 @@ def _child_process(
         "stderr": subprocess.PIPE,
     }
     kwargs.update(subprocess_new_group_kwargs())
+    kwargs = merge_hidden_kwargs(kwargs)
     try:
-        proc = subprocess.Popen(cmd, **merge_hidden_kwargs(kwargs))  # noqa: S603 - argv is host-constructed
+        from ouroboros.owner_pause import start_tool_operation
+
+        start_tool_operation()
+        proc = subprocess.Popen(cmd, **kwargs)  # noqa: S603 - argv is host-constructed
     except BaseException:
         try:
             input_path.unlink(missing_ok=True)

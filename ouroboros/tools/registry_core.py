@@ -1014,9 +1014,11 @@ class ToolRegistry:
         resolved_binding: Any,
         interpreter_resolution: Any,
         worktree_before: Any,
+        handoff: Optional[Dict[str, Any]] = None,
     ) -> tuple[str | None, Any]:
         """Run one builtin handler under the scoped attestation."""
         from ouroboros.process_interpreters import interpreter_attestation
+        from ouroboros.owner_pause import OwnerPauseRefused, start_tool_operation
 
         observed_skill = None
         missing = object()
@@ -1055,7 +1057,10 @@ class ToolRegistry:
                         if refusal:
                             return refusal, None
                         observed_skill = (state_root, constraint)
+                    start_tool_operation(self._ctx)
                     result = entry.handler(self._ctx, **handler_args)
+                    if handoff is not None:
+                        handoff["builtin_returned"] = True
                     published = _published_tool_result(
                         self._ctx,
                         tool_result_sentinel,
@@ -1067,6 +1072,8 @@ class ToolRegistry:
                     ):
                         return None, published
                     return None, result
+                except OwnerPauseRefused:
+                    raise
                 except TypeError as e:
                     return f"⚠️ TOOL_ERROR ({name}): {e}", None
                 except Exception as e:
@@ -1095,6 +1102,39 @@ class ToolRegistry:
                 self._invalidate_advisory_if_worktree_changed(name, worktree_before)
 
     def _execute_legacy_text(self, name: str, args: Dict[str, Any]) -> str | ToolResult:
+        from ouroboros.owner_pause import OwnerPauseRefused, NOT_STARTED_TEXT, tool_handoff
+
+        try:
+            with tool_handoff(self._ctx, str(name or "")) as handoff:
+                result = self._execute_admitted_text(name, args, handoff)
+                typed = result if isinstance(result, ToolResult) else LegacyTextResultAdapter.from_text(name, result)
+                # Only handoff closure may decide not_started, under the launch
+                # lock: a timed-out MCP runner may still start before closure.
+                # A successful first-party body
+                # settles its local call; owned processes/runs keep their own
+                # custody. Errors/timeouts and opaque remote acknowledgements
+                # prove neither settlement nor the absence of remote effects.
+                handoff["settled"] = (
+                    handoff.get("builtin_returned") is True and not typed.meta.get("dynamic_provider")
+                    and (typed.meta.get("operation_outcome") == "completed_no_effect" or (
+                        typed.status == "ok"
+                        and typed.code not in {"LEGACY_UNTYPED", "LEGACY_WARNING", "GIT_ERROR"})))
+                return typed
+        except OwnerPauseRefused as exc:
+            reason = str(exc)
+            authority = "model sleep" if reason == "model_sleep_authority_unreadable" else "owner Pause"
+            text = (f"⚠️ OWNER_PAUSE_NOT_STARTED: NOT STARTED — {authority} authority could not be read. "
+                    "Nothing ran; repair the authority before retrying."
+                    if reason in {"owner_pause_authority_unreadable", "model_sleep_authority_unreadable"}
+                    else NOT_STARTED_TEXT)
+            return ToolResult(status="blocked", code="OWNER_PAUSE_NOT_STARTED",
+                              text=f"{text} ({reason})",
+                              meta={"owner_pause_not_started": True, "control_reason": reason})
+
+    def _execute_admitted_text(self, name: str, args: Dict[str, Any],
+                               handoff: Optional[Dict[str, Any]] = None) -> str | ToolResult:
+        if handoff is not None:
+            handoff["not_started"] = True
         name = str(name or "").strip()
         args, presence_arg_error = _presence_bound_args(self._ctx, name, args)
         if presence_arg_error:
@@ -1209,7 +1249,10 @@ class ToolRegistry:
         from ouroboros.consciousness_authority import effective_runtime_mode as _effective_runtime_mode
         _runtime_mode = _effective_runtime_mode(_runtime_mode, getattr(self._ctx, "task_metadata", None))
         if is_mcp:  # the exact catalog lookup precedes the paid safety check
-            return self._mcp_name_miss(name) or extension_dispatch._dispatch_mcp_tool_result(self._ctx, name, args)
+            miss = self._mcp_name_miss(name)
+            if miss is not None:
+                return miss
+            return extension_dispatch._dispatch_mcp_tool_result(self._ctx, name, args)
         if entry is None:
             if ext_tool and callable(ext_tool.get("handler")):
                 return extension_dispatch._dispatch_extension_tool_result(self._ctx, name, ext_tool, args)
@@ -1344,7 +1387,7 @@ class ToolRegistry:
                     effective_constraint=effective_constraint, resolved_binding=resolved_binding,
                 )
             early_error, result = self._invoke_builtin_handler(
-                name, entry, args, resolved_binding, interpreter_resolution, worktree_before,
+                name, entry, args, resolved_binding, interpreter_resolution, worktree_before, handoff,
             )
         if name in _PROCESS_COMMAND_TOOLS:
             # Tripwires run on the TOOL_ERROR path too: two early_error returns

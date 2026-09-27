@@ -10,6 +10,9 @@ The dependency runs one way: this module never imports the coordinator.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+from ouroboros.owner_pause import start_tool_operation, OwnerPauseRefused
+
 from ouroboros.config import runtime_setting
 from ouroboros.model_wait import monotonic_now
 
@@ -919,27 +922,29 @@ def run_delegated_review_session(
                     reason="review_custody_checkpoint_unwritable",
                     invocation_id=invocation_id, surface=surface, slot_id=slot_id))
             try:
+                start_tool_operation(SimpleNamespace(drive_root=custody_drive,
+                    task_id=task_id, root_task_id=root_task_id))
                 if use_thread:
                     from ouroboros.review_thread_continuity import start_review_thread_turn
                     handle = start_review_thread_turn(
                         gateway, thread_id, run_request, idempotency_key=invocation_id)
                 else:
                     handle = gateway.start_run(run_request, idempotency_key=invocation_id)
-            except ClaudexorUnavailable as exc:
+            except (ClaudexorUnavailable, OwnerPauseRefused) as exc:
+                code = getattr(exc, "code", str(exc))
                 status = int(getattr(exc, "status_code", 0) or 0)
-                definite = 400 <= status < 500
+                definite = isinstance(exc, OwnerPauseRefused) or 400 <= status < 500
                 _retire_orphaned_review_registration(
                     custody, gateway, custody_drive, project_id,
                     # Only a definite 4xx proves the registration never bound a run.
                     definite_refusal=definite and not recovering,
-                    reason=exc.code, invocation_id=invocation_id,
+                    reason=code, invocation_id=invocation_id,
                     surface=surface, slot_id=slot_id,
                 )
-                if not definite:
-                    # Unknown outcome retains the token for exact replay.
-                    state["pending_invocation_id"] = invocation_id
-                else:
+                if definite and not recovering:
                     state.pop("pending_invocation_id", None)
+                if isinstance(exc, OwnerPauseRefused):
+                    raise ReviewRouteUnavailable("New delegated review start is fenced.", code=code) from exc
                 raise
             run_id = str(handle.get("runId") or handle.get("jobId") or "")
             turn_id = str(handle.get("turnId") or "")
@@ -950,7 +955,6 @@ def run_delegated_review_session(
                     definite_refusal=False, reason="queued_without_run_id",
                     invocation_id=invocation_id, surface=surface, slot_id=slot_id,
                 )
-                state["pending_invocation_id"] = invocation_id
                 raise ReviewRouteUnavailable(
                     f"Claudexor returned a queued handle without a run id: {handle!r}", code="queued_without_run_id")
         state["pending_invocation_id"] = invocation_id or retry_token
@@ -975,17 +979,11 @@ def run_delegated_review_session(
                 "isolation": shape.isolation, "delegated": shape.delegated,
                 "root": root, "surface": surface, "slot_id": slot_id,
             }))
-        try:
-            detail = _poll_session_terminal(
-                gateway, custody, custody_drive, entry, run_id,
-                float(timeout_sec) if timeout_sec is not None else 300.0,
-            )
-        except ClaudexorUnavailable:
-            # A started run with an unreadable terminal state is still paid work.
-            # Preserve the exact durable invocation for the permitted retry rather
-            # than POSTing a second review against the same slot.
-            state["pending_invocation_id"] = invocation_id or retry_token
-            raise
+        # Pending custody remains above throughout polling, including failures.
+        detail = _poll_session_terminal(
+            gateway, custody, custody_drive, entry, run_id,
+            float(timeout_sec) if timeout_sec is not None else 300.0,
+        )
         settlement = custody.settle_run(custody_drive, gateway, entry, detail)
         summary = custody.summary_of(detail)
         observed = final_attempt_facts(detail, run_id)

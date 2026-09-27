@@ -250,8 +250,19 @@ def _recover_pending_invocation(drive_root: Any, gateway: Any,
                   "action": "invocation_retained", "reason": "invocation_request_unrecorded"}
         _custody().emit(drive_root, _custody().RECONCILED, result)
         return result
+    from types import SimpleNamespace
+    from ouroboros.owner_pause import launch_admission, OwnerPauseRefused
+
+    request = dict(body)
     try:
-        handle = gateway.start_run(dict(body), idempotency_key=invocation_id)
+        with launch_admission(SimpleNamespace(drive_root=drive_root, task_id=task_id,
+                root_task_id=record.get("root_task_id") or task_id)):
+            pass
+    except OwnerPauseRefused as exc:
+        return {"invocation_id": invocation_id, "task_id": task_id,
+                "action": "invocation_retained", "reason": str(exc)}
+    try:
+        handle = gateway.start_run(request, idempotency_key=invocation_id)
     except ClaudexorUnavailable as exc:
         status = int(getattr(exc, "status_code", 0) or 0)
         if 400 <= status < 500:

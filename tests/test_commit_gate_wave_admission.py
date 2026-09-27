@@ -655,6 +655,12 @@ def test_scope_first_hold_ignores_a_sibling_tasks_same_named_scope_slot(gate, tm
     own_seat = ua.UsageScope(drive_root=gate, task_id=ROOT, root_task_id=ROOT, root_limit_usd=8.0,
                              category="scope_review_review", review_slot_id="scope_slot_1")
 
+    # A descendant cannot create the original root's monetary authority.
+    from ouroboros.task_results import write_task_result
+    write_task_result(gate, ROOT, "running", root_task_id=ROOT, billing_group={
+        "billing_group_id": ROOT, "billing_group_limit_usd": 8.0,
+        "billing_group_limit_source": "initial_task_admission"})
+
     started = time.monotonic()
     with ua.usage_scope(sibling_seat):
         sibling = ua.reserve_attempt(ua.AttemptRequest(model=SCOPE_MODEL, provider="test"))

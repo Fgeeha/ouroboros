@@ -842,6 +842,8 @@ class OuroborosAgent:
                 root_limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
             except (TypeError, ValueError):
                 root_limit = 0.0
+            from ouroboros.usage_admission import task_billing_fields
+
             scope = UsageScope(
                 drive_root=budget_root,
                 task_id=task_id,
@@ -849,8 +851,9 @@ class OuroborosAgent:
                 parent_task_id=parent_task_id,
                 category=str(metadata.get("usage_category") or task.get("type") or "task"),
                 source="agent.task",
-                root_limit_usd=root_limit if root_limit > 0 else None,
                 root_cost_ceiling_usd=task.get("root_cost_ceiling_usd") or metadata.get("root_cost_ceiling_usd"),
+                # The whole-work group and its cap (a Continue's successor spends the ORIGINAL cap).
+                **task_billing_fields(task, root_task_id, root_limit if root_limit > 0 else None, budget_root, pin_initial=True),
             )
             with usage_scope(scope), task_model_wait_scope(
                 task=task, drive_root=self.env.drive_root, event_queue=self._event_queue,

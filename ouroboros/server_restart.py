@@ -51,21 +51,39 @@ def _perform_owner_restart(ctx: Any, reply=None) -> tuple[bool, str]:
     try:
         if reply is not None:
             # Say only what happened: with nothing owned the stop sentence
-            # named a task that was never running.
-            reply(
-                "Stopping active task. New settings apply to the next message."
-                if stopped_task_ids else "New settings apply to the next message.",
-                "",
-            )
+            # named a task that was never running, and queued work is now
+            # held rather than stopped.
+            held = _owner_restart_held_count(ctx)
+            notice = ("Stopping active task. New settings apply to the next message."
+                      if stopped_task_ids else "New settings apply to the next message.")
+            if held:
+                notice += (f" {held} queued task{'' if held == 1 else 's'} held until you resume "
+                           f"{'it' if held == 1 else 'them'}.")
+            reply(notice, "")
     except Exception:
         log.warning("Failed to send owner restart stop notice; continuing restart", exc_info=True)
     _request_restart_exit(owner=True)
     return True, ""
 
 
+def _owner_restart_held_count(ctx: Any) -> int:
+    """How many queued rows the Restart holds for an explicit Resume."""
+    from supervisor.restart_retention import restart_held
+
+    try:
+        return sum(1 for task in list(ctx.PENDING or []) if restart_held(task))
+    except Exception:
+        return 0
+
+
 def _owned_live_task_ids(ctx: Any) -> list:
     """Every id this generation's cancel intent can address: pooled tasks,
-    in-process direct/ephemeral activities and running post-task synthesis."""
+    in-process direct/ephemeral activities and running post-task synthesis —
+    minus every saved pause (``restart_retention``): a task whose checkpoint
+    is already stored survives the Restart as the same paused task, and a
+    cancel intent minted for it here would outrank that pause at restore."""
+    from supervisor.restart_retention import census_without_saved_pauses
+
     from ouroboros.post_task_checkpoint import POST_TASK_SYNTHESIS_INFLIGHT, POST_TASK_SYNTHESIS_LOCK
     from supervisor.active_activity import get_direct_activity_registry
 
@@ -74,7 +92,7 @@ def _owned_live_task_ids(ctx: Any) -> list:
     root = str(pathlib.Path(DATA_DIR).resolve(strict=False))
     with POST_TASK_SYNTHESIS_LOCK:
         task_ids.extend(task_id for (path, task_id) in POST_TASK_SYNTHESIS_INFLIGHT if path == root)
-    return [tid for tid in dict.fromkeys(task_ids) if tid]
+    return census_without_saved_pauses([tid for tid in dict.fromkeys(task_ids) if tid], DATA_DIR)
 
 
 def _stop_owned_work(ctx: Any) -> list:
@@ -84,8 +102,11 @@ def _stop_owned_work(ctx: Any) -> list:
     here can veto: an unconfirmed step is a critical diagnostic with custody
     retained, and the next generation's startup custody sweep reconciles the
     remainder (owner restart is a no-resume cause; nothing is adopted). In
-    order: one durable cancel intent per owned live id, ``kill_workers`` with
-    Panic's ``reconcile_delegate_custody=False``, delegated-run cancellation
+    order: one durable cancel intent per owned live id (saved pauses excluded),
+    ``kill_workers`` with Panic's ``reconcile_delegate_custody=False``, the
+    owner-only ``hold_never_started`` (the never-started queue is held under
+    the same ids, not cancelled) and the typed ``owner_restart`` cause every
+    task it settles records (an earlier Stop keeps its own), delegated-run cancellation
     through the public owner-gone seam over the attach-only gateway, and the
     attested owned-daemon stop exactly as Panic makes it. Between the cancel
     intents and that stop nothing may call ``ensure_owned_gateway`` — it would
@@ -111,7 +132,8 @@ def _stop_owned_work(ctx: Any) -> list:
         confirmed = ctx.kill_workers(
             force=True, terminal_status="cancelled",
             result_reason="Owner restart stopped this task before process restart.",
-            reconcile_delegate_custody=False, **_managed_update_pending_kwargs(),
+            reconcile_delegate_custody=False, hold_never_started=True, stop_source="owner_restart",
+            **_managed_update_pending_kwargs(),
         )
     except Exception:
         log.critical("Owner restart: worker shutdown raised; the restart proceeds and the next "
@@ -289,7 +311,8 @@ def _shutdown_task_cleanup_args(restart_requested: bool) -> tuple[str, str]:
     stop/restart signal (SIGTERM/SIGINT) — is not a worker crash storm, so a
     still-running task is finalized as ``cancelled`` with an honest reason
     instead of the default crash-storm text the supervisor uses for real
-    worker deaths.
+    worker deaths; its callers pass ``stop_source="server_shutdown"``, the
+    typed cause that makes it a technical interruption the owner may Continue.
     """
     if restart_requested:
         reason = (

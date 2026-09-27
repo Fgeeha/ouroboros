@@ -64,6 +64,9 @@ D20 = "Presence"
 [modules]
 "launcher.py" = "D18"
 "ouroboros/budget_pause.py" = "D01"
+"ouroboros/owner_pause.py" = "D01"
+"ouroboros/owner_continue.py" = "D01"
+"ouroboros/model_sleep.py" = "D01"
 "ouroboros/launcher_windows_runtime.py" = "D18"
 "ouroboros/__init__.py" = "D18"
 "ouroboros/_outcome_receipts.py" = "D01"
@@ -213,6 +216,8 @@ D20 = "Presence"
 "ouroboros/gateway/task_events.py" = "D11"
 "ouroboros/gateway/task_archive.py" = "D11"
 "ouroboros/gateway/task_hurry.py" = "D11"
+"ouroboros/gateway/task_pause.py" = "D11"
+"ouroboros/gateway/task_continue.py" = "D11"
 "ouroboros/gateway/task_list_scan.py" = "D11"
 "ouroboros/gateway/tasks.py" = "D11"
 "ouroboros/gateway/ui_preferences.py" = "D11"
@@ -545,6 +550,7 @@ D20 = "Presence"
 "ouroboros/update_channels.py" = "D12"
 "ouroboros/update_letter.py" = "D12"
 "ouroboros/usage_accounting.py" = "D16"
+"ouroboros/usage_admission.py" = "D16"
 "ouroboros/_usage_cache_splits.py" = "D16"
 "ouroboros/usage_compaction.py" = "D16"
 "ouroboros/usage_legacy_import.py" = "D16"
@@ -595,6 +601,10 @@ D20 = "Presence"
 "supervisor/owner_stop.py" = "D09"
 "supervisor/queue.py" = "D08"
 "supervisor/queue_snapshot.py" = "D08"
+"supervisor/restart_retention.py" = "D08"
+"supervisor/owner_pause_control.py" = "D08"
+"supervisor/continuation_admission.py" = "D08"
+"supervisor/sleep_wake.py" = "D08"
 "supervisor/direct_roots.py" = "D08"  # the main loop's off-lock fragment, written beside the snapshot
 "supervisor/queue_timeouts.py" = "D08"
 "supervisor/task_model_wait.py" = "D08"
@@ -854,6 +864,7 @@ lazy_only = [
   "D03->D16",
   "D03->D17",
   "D03->D20",
+  "D04->D01",
   "D04->D06",
   "D04->D07",
   "D04->D10",
@@ -920,6 +931,7 @@ lazy_only = [
   "D16->D01",
   "D16->D03",
   "D16->D05",
+  "D16->D07",
   "D16->D09",
   "D16->D17",
   "D17->D02",

@@ -292,6 +292,22 @@ def enqueue_task(
             if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
                 ADMISSION_RESERVATIONS.pop(task_id, None)
             return t
+        if not restoring_snapshot and task_id and str(t.get("root_task_id") or task_id) == task_id:
+            from ouroboros.config import runtime_setting
+            from ouroboros.usage_admission import task_billing_fields, UNAVAILABLE_GROUP_PREFIX
+
+            limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
+            binding = task_billing_fields(t, task_id, limit if limit > 0 else None,
+                                          t.get("budget_drive_root") or DRIVE_ROOT, pin_initial=True)
+            if str(binding["billing_group_id"]).startswith(UNAVAILABLE_GROUP_PREFIX):
+                t["_admission_blocked"] = "billing_authority_unavailable"
+                return t
+            t.setdefault("metadata", {})["billing_group"] = {k: v for k, v in binding.items()
+                                                             if k.startswith("billing_group_")}
+        if not restoring_snapshot:
+            t.setdefault("admitted_dispatch", "possible" if (
+                int(t.get("_attempt") or 1) > 1 or t.get("_owner_wait_resume")
+                or t.get("_budget_pause_resume") or t.get("timeout_retry_from")) else "none")
         QUEUE_SEQ_COUNTER_REF["value"] += 1
         seq = QUEUE_SEQ_COUNTER_REF["value"]
         t["priority"] = coerce_queue_order(t.get("priority"), _task_priority(str(t.get("type") or "")))

@@ -35,6 +35,7 @@ from ouroboros.gateway.task_events import (  # noqa: F401
 # Re-exported hurry ingress (same module-size split as task_events): route
 # wiring and tests address gateway.tasks.api_task_hurry.
 from ouroboros.gateway.task_hurry import api_task_hurry  # noqa: F401
+from ouroboros.gateway.task_pause import api_task_pause, owner_tree_control_routes  # noqa: F401 -- same split as hurry
 from ouroboros.gateway.task_decision import api_decision_answer  # noqa: F401
 from ouroboros.gateway.task_archive import (
     chat_media_identity, directory_archives, plain_segments, serve_directory_archive, serve_task_file,
@@ -925,6 +926,8 @@ def _task_get_response(request: Request) -> JSONResponse:
             pass
         return json_error("task result is unavailable", 503)
     payload = public_task_result(data)
+    from ouroboros.owner_continue import continuation_offer  # Batch4: a Continue, or its accepted successor
+    payload["continuation_offer"] = continuation_offer(data, task_id)
     if isinstance(payload.get("artifacts"), list):  # what ``?archive=<dir>`` would stream now, per top-level dir
         payload["artifact_archives"] = directory_archives(task_artifact_stores(drive_root, task_id),
                                                           payload["artifacts"], anchor=drive_root)
@@ -1586,7 +1589,7 @@ __all__ = [
     "api_task_artifact",
     "api_task_cancel",
     "api_decision_answer",
-    "api_task_hurry",
+    "api_task_hurry", "api_task_pause", "owner_tree_control_routes",
     "api_task_resume",
     "api_task_events",
     "api_task_get",

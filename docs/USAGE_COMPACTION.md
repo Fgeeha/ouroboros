@@ -53,7 +53,7 @@ settlement or release the row is immutable again. Identical actual-receipt retri
 are no-op at the accounting writer; conflicting receipts cannot append. The full
 validator and incremental `LedgerResumeState.late_receipt_ids` preserve the same
 eligibility, so a warm read grants no extra transition and loses no owed receipt.
-Compaction preserves the whole eligible chain, not just its last row. Existing
+Compaction preserves the whole eligible chain, not just its last row, including a raw send's optional `local_answer_owner_pid`. Proven local consumer death can change writer classification; it never makes an unresolved monetary chain foldable. Existing
 baseline groups keep their recorded sums and weights; the archive is not migrated
 to invent individually correctable attempts.
 
@@ -91,9 +91,15 @@ whole history.
 
 ```
 key = (state, model, provider, category, source,
-       task_id, root_task_id, parent_task_id,
+       task_id, root_task_id, parent_task_id, billing_group_id,
+       has_group_limit, group_limit, group_limit_source, group_limit_revision,
        prompt_cache_ttl, cost_known, cost_final, pricing_known, bound_known)
 ```
+
+(`billing_group_id` keeps an owner Continue's whole-work group intact through
+the fold; a group row carries it only when non-empty. Cap presence, value,
+source and revision are preserved together, including an explicitly unbounded
+cap, so compaction cannot replace an original group cap with later configuration.)
 
 carrying: the key fields verbatim; `folded_attempt_count` (int ≥ 1);
 `cost_usd` / `reservation_upper_bound_usd` as **exact-decimal JSON strings**

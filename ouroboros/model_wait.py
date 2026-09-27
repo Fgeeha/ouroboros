@@ -155,7 +155,9 @@ def execution_elapsed_seconds(meta: dict, now: float) -> float:
         return 0.0
     if started <= 0 or not math.isfinite(started):
         return 0.0
-    return max(0.0, now - started - quota_waited_seconds(meta, now) - budget_paused_seconds(meta))
+    sleeping = meta.get("sleep_parked_at")  # a pooled model sleep in progress (worker_owner_wait)
+    return max(0.0, now - started - quota_waited_seconds(meta, now) - budget_paused_seconds(meta)
+               - (max(0.0, now - float(sleeping)) if isinstance(sleeping, (int, float)) else 0.0))
 
 
 _CURRENT: contextvars.ContextVar[TaskModelWait | None] = contextvars.ContextVar(
@@ -321,6 +323,10 @@ class TaskModelWait:
         self.auto_continue: dict[str, bool] = {}
         self.seen_controls: set[str] = set()
         self.mailbox_stamp = None
+        resume = task.get("_budget_pause_resume") or {}
+        sleep_since = resume.get("sleep_exclusion_since")
+        self.sleep_started_monotonic: float | None = (
+            time.monotonic() - max(0.0, time.time() - float(sleep_since)) if sleep_since else None)
 
     @property
     def waits_allowed(self) -> bool:
@@ -348,10 +354,13 @@ class TaskModelWait:
                 for key, row in self.waits.items()}}
 
     def executed_seconds(self, *, now: float | None = None) -> float:
-        """Live execution time: elapsed minus the quota union minus budget pause."""
+        """Live execution time: elapsed minus the quota union minus budget pause,
+        minus a model sleep in progress (``model_sleep`` folds it into the paused
+        carrier when the task runs again, so it is never subtracted twice)."""
         stamp = time.monotonic() if now is None else now
-        return max(0.0, stamp - self.started_monotonic
-                   - self.paused_seconds(now=stamp) - self.budget_paused_sec)
+        sleeping = self.sleep_started_monotonic
+        return max(0.0, stamp - self.started_monotonic - self.paused_seconds(now=stamp) - self.budget_paused_sec
+                   - (max(0.0, stamp - sleeping) if sleeping is not None else 0.0))
 
     def execution_window_remaining(self) -> float | None:
         """A custom live owner supplies its own clock and a task without an absolute
@@ -506,6 +515,23 @@ class TaskModelWait:
                 return "finalize_requested"
         return None
 
+    def pre_dispatch_pause(self) -> str | None:
+        """The owner's Pause over this task's tree, for a PRE-dispatch wait only.
+
+        Never part of ``control_reason``: that reader also polls while a sent
+        model operation's result is awaited, and an owner Pause lets sent work
+        finish instead of cancelling it (``owner_pause``).
+        """
+        from types import SimpleNamespace
+
+        from ouroboros.owner_pause import RAIL_OWNER_PAUSE, member_fence
+
+        source = self.tool_context or SimpleNamespace(
+            task_id=self.task_id, root_task_id=str(self.task.get("root_task_id") or self.task_id),
+            budget_drive_root=self.canonical_root)
+        fence = member_fence(source)
+        return str(fence.get("reason") or RAIL_OWNER_PAUSE) if fence else None
+
     def _publish(self, row: dict, *, applied_request_id: str = "") -> None:
         with self.lock:
             self.revision += 1
@@ -636,7 +662,8 @@ class TaskModelWait:
         try:
             self._publish(row)
             while True:
-                control = "caller_cancelled" if caller_cancel is not None and caller_cancel.is_set() else self.control_reason()
+                control = ("caller_cancelled" if caller_cancel is not None and caller_cancel.is_set()
+                           else self.control_reason() or self.pre_dispatch_pause())
                 callback = kwargs.get("model_poll_control")
                 if not control and callback is not None:
                     control = callback()

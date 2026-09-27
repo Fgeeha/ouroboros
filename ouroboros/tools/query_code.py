@@ -15,6 +15,7 @@ from ouroboros.tool_access import (
     path_is_relative_to,
 )
 from ouroboros.tools.registry import ToolContext, ToolEntry
+from ouroboros.tools.tool_result import completed_local_read
 from ouroboros.config import runtime_setting
 
 
@@ -281,6 +282,7 @@ def _structural(
     return rows
 
 
+@completed_local_read
 def _query_code(
     ctx: ToolContext,
     op: str,

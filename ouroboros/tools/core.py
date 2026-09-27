@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result, completed_local_read
 
 import copy
 import logging
@@ -866,6 +866,7 @@ from ouroboros.code_search_rg import (  # noqa: E402
 )
 
 
+@completed_local_read
 def _code_search(ctx: ToolContext, query: str, path: str = ".",
                  regex: bool = False, max_results: int = 200,
                  include: str = "", root: str = "active_workspace",

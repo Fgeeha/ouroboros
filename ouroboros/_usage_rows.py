@@ -243,7 +243,7 @@ def _with_integrity(summary: Dict[str, Any], degraded: bool) -> Dict[str, Any]:
 
 def _projection_from_final(
     final: list, integrity_degraded: bool, configured_limit: Optional[float] = None,
-    *, root_task_id: str = "", include_roots: bool = True,
+    *, root_task_id: str = "", include_roots: bool = True, billing_group_id: str = "",
 ) -> Dict[str, Any]:
     """Render the money projection from ALREADY-VALIDATED final rows: one
     snapshot, one projection, so a caller deriving the ordering marker from
@@ -252,6 +252,12 @@ def _projection_from_final(
     def limit_of(rows: list) -> Optional[float]:
         known = [v for v in (_number(row.get("root_limit_usd")) for row in rows) if v is not None]
         return min(known) if known else None
+    if billing_group_id:  # a whole-work group: its own rows plus legacy rows of its original root
+        from ouroboros.usage_admission import group_rows
+
+        rows = group_rows(final, billing_group_id)
+        known = [v for v in (_number(row.get("billing_group_limit_usd")) for row in rows) if v is not None]
+        return _with_integrity(_with_limit(_summary(rows), min(known) if known else limit_of(rows)), integrity_degraded)
     if root_task_id:
         rows = [row for row in final if str(row.get("root_task_id") or "") == root_task_id]
         return _with_integrity(_with_limit(_summary(rows), limit_of(rows)), integrity_degraded)
