@@ -540,13 +540,36 @@ def test_display_snapshot_cannot_mask_actual_platform_refusal(root, monkeypatch,
     assert error.value.reason == reason
 
 
-def test_strict_reader_corruption_propagates_instead_of_serving_memo(root):
-    seed(root, 2)
-    ua.usage_projection(root)
+@pytest.mark.parametrize("newline", [b"\n", b"\r\n"], ids=["lf", "crlf"])
+def test_strict_reader_corruption_propagates_instead_of_serving_memo(root, newline):
+    # History changes only by atomic replacement (a new inode); a warm view
+    # never rereads its validated prefix. Exact bytes cover both line endings.
     path = root / ua.LEDGER_REL
-    path.write_text(path.read_text().replace('"state": "reserved"', '"state": "impossible"', 1))
-    with pytest.raises(ledger.UsageLedgerCorrupt):
-        ua.usage_projection(root, root_task_id="dominant")
+    good = b"".join(json.dumps(row).encode() + newline for row in seed(root, 2))
+    bad = good.replace(b'"state": "reserved"', b'"state": "impossible"', 1)
+    canonical = root / "canonical"
+    (canonical / "state").mkdir(parents=True)
+    (canonical / ua.LEDGER_REL).write_bytes(bad)
+    with ledger._locked(canonical), pytest.raises(ledger.UsageLedgerCorrupt):
+        ledger._read_records_locked(canonical)  # middle corruption, never a quarantinable tail
+
+    def replace(body):
+        inode = path.stat().st_ino
+        (root / "replacement.jsonl").write_bytes(body)
+        os.replace(root / "replacement.jsonl", path)
+        assert path.stat().st_ino != inode
+
+    replace(good)
+    assert ua.usage_projection(root, root_task_id="dominant")["accounted_usd"] == .000003
+    # Both replacements grow the file, so only identity marks a new generation
+    # and only content decides the outcome: a valid one is served, not the memo.
+    replace(good.replace(b'"cost_usd": "0.0000015"', b'"cost_usd": "0.00000250"', 1))
+    assert ua.usage_projection(root, root_task_id="dominant")["accounted_usd"] == .000004
+    replace(bad)
+    for _ in range(2):
+        with pytest.raises(ledger.UsageLedgerCorrupt):
+            ua.usage_projection(root, root_task_id="dominant")
+    assert path.read_bytes() == bad and not (root / ledger.QUARANTINE_REL).exists()
 
 
 def test_fold_heap_supersession_and_replay_scope_agree(root, monkeypatch):

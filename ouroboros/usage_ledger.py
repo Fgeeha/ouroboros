@@ -660,11 +660,13 @@ def _read_new_records_locked(
 
     Returns ``(new_records, new_resume)`` when the resume fingerprint still
     matches and the appended tail parses and validates as a seq-continuous,
-    transition-legal continuation. Returns ``None`` whenever the resume state
-    cannot be trusted — file replaced (inode/device change), shrunk below the
-    resume offset, rewritten in place (same size, different mtime), or a
+    transition-legal continuation. Returns ``None`` on a detectable break —
+    file replaced (inode/device change), shrunk below the resume offset,
+    rewritten in place at the same size (different mtime), or a
     torn/structurally invalid tail — so the caller re-reads through the normal
-    ``_read_records_locked``, which OWNS quarantine. This function never
+    ``_read_records_locked``, which OWNS quarantine. Bytes before the offset are
+    never reread: a same-inode rewrite that grows the file can go undetected, so
+    history changes only by atomic replacement. This function never
     truncates or otherwise mutates the ledger, and must be called under the
     held ledger lock.
     """
