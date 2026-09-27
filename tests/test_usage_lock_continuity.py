@@ -103,6 +103,10 @@ def test_same_chain_preparation_stamp_claim_and_one_send(root, short_acquisition
     waits = [item["data"] for item in list(events.queue)
              if item.get("data", {}).get("checkpoint_kind") == "usage_lock_wait"]
     assert [row["phase"] for row in waits] == ["entered", "ended"]
+    from ouroboros.memory import Memory
+    summary = Memory(root).summarize_progress(waits)
+    assert "Waiting for accounting access" in summary
+    assert "Accounting wait ended" in summary
 
 
 @pytest.mark.parametrize("reason", ["cancelled", "deadline", "finalize_requested"])
@@ -165,6 +169,30 @@ def test_cap_is_resolved_again_after_pre_reservation_wait(root, short_acquisitio
         finally:
             timer.join(2)
     assert rows(root) == []
+
+
+@pytest.mark.parametrize("asynchronous", [False, True])
+def test_cap_reduction_after_reservation_refuses_send_and_returns_claim(root, monkeypatch, asynchronous):
+    cap = [10]
+    monkeypatch.setattr(ua, "_global_limit", lambda req: cap[0])
+    def before(held):
+        assert rows(root)[-1]["state"] == "reserved"
+        cap[0] = .5
+    def send():
+        pytest.fail("provider called after cap reduction")
+    async def async_send():
+        send()
+    with owner(root), ua.physical_attempt_limit(1):
+        with pytest.raises(ua.BudgetExceeded) as error:
+            if asynchronous:
+                asyncio.run(ua.execute_physical_attempt_async(request(root), async_send, before_dispatch=before))
+            else:
+                ua.execute_physical_attempt(request(root), send, before_dispatch=before)
+        assert error.value.limit_scope == "global"
+        assert error.value.physical_attempt_capture.state == "released"
+        assert ua._PHYSICAL_LIMIT.get().used == 0
+    assert [row["state"] for row in rows(root)] == ["reserved", "released"]
+    assert ua.usage_projection(root)["accounted_usd"] == 0
 
 
 def test_interactive_window_expiry_is_typed_and_never_quota_wait(root, short_acquisitions, monkeypatch):

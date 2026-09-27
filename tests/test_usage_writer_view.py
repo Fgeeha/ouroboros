@@ -569,3 +569,186 @@ def test_fold_heap_supersession_and_replay_scope_agree(root, monkeypatch):
             expected = any(at is not None and at <= now for row in view.finals.values()
                            for at in [compact.fold_eligible_at(row)])
             assert view.has_foldable_attempt() == expected
+
+
+def assert_legacy_cash(root, by_root):
+    """Explicit exact expectations, checked against full replay and real consumers."""
+    with ledger._locked(root):
+        records = ledger._read_records_locked(root)
+    finals = list(ledger._final_rows(records).values())
+    with decimal.localcontext() as context:
+        context.prec = 200
+        totals = {identity: tuple(Decimal(value) for value in values)
+                  for identity, values in by_root.items()}
+        totals[None] = tuple(sum(values) for values in zip(*totals.values()))
+        for identity, expected in totals.items():
+            selected = finals if identity is None else [
+                row for row in finals if row.get("root_task_id") == identity]
+            full = ua._summary(selected)
+            rounded = [value.quantize(Decimal(".000001"), rounding=decimal.ROUND_HALF_EVEN)
+                       for value in expected]
+            money = dict(zip(("settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
+                              "unresolved_upper_bound_usd", "accounted_usd"),
+                             map(float, [*rounded, rounded[0] + rounded[3] + rounded[4]])))
+            assert {key: full[key] for key in money} == money
+            with memo._writer_locked(root) as view:
+                assert (view.cash if identity is None else view.roots[identity]) == expected
+                assert view.summary(identity) == money
+            projection = ua.usage_projection(root, root_task_id=identity or "")
+            assert {key: projection[key] for key in full} == full
+            assert projection["integrity_degraded"] is False
+    return records
+
+
+@pytest.mark.parametrize("value,exact", [
+    (True, "1"), (False, "0"), (0, "0"), (1, "1"), (1.25, "1.25"),
+    (" +1.25 ", "1.25"), ("1_0.2_5", "10.25"), ("١.٢٥", "1.25"),
+    ("1e-3", ".001"), ("-0", "0"),
+    ("0.12345678901234567890123456789", "0.12345678901234567890123456789"),
+])
+@pytest.mark.parametrize("state", ["reserved", "settled", "estimated"])
+@pytest.mark.parametrize("cache_state", ["cold", "warm", "replacement"])
+def test_legacy_monetary_scalars_match_replay_and_admission(root, value, exact, state, cache_state):
+    path = root / ua.LEDGER_REL
+    prefix = seed(root, 1, cost=".25")
+    if cache_state != "cold":
+        ua.usage_projection(root)
+    rows = [{**prefix[0], "attempt_id": "legacy", "root_task_id": "legacy",
+             "reservation_upper_bound_usd": value if state == "reserved" else True}]
+    if state != "reserved":
+        rows += [{**rows[0], "state": "dispatched"},
+                 {**rows[0], "state": "settled", "cost_usd": value,
+                  "cost_final": state == "settled"}]
+    rows = [{**row, "seq": len(prefix) + index + 1} for index, row in enumerate(rows)]
+    # These are historically accepted durable JSON values, not normalized new requests.
+    ledger._validate_records(prefix + rows)
+    suffix = "".join(json.dumps(row) + "\n" for row in rows).encode()
+    if cache_state == "replacement":
+        replacement = root / "replacement.jsonl"
+        replacement.write_bytes(path.read_bytes() + suffix)
+        os.replace(replacement, path)
+    else:
+        with path.open("ab") as handle:
+            handle.write(suffix)
+    before = path.read_bytes()
+    cash = (0, 0, 0, exact, 0) if state == "reserved" else (
+        exact, exact if state == "settled" else 0, exact if state == "estimated" else 0, 0, 0)
+    assert_legacy_cash(root, {"dominant": (".25", ".25", 0, 0, 0), "legacy": cash})
+    assert path.read_bytes() == before
+    # Fresh global AND root admission must count the accepted historical amount.
+    cap = float(exact) + .05
+    for axis, limits in (("global", {"global_limit_usd": cap + .25}),
+                         ("root", {"root_limit_usd": cap})):
+        with pytest.raises(ua.BudgetExceeded) as error:
+            ua.reserve_attempt(request(root, root_task_id="legacy", reservation_usd=.1, **limits))
+        assert error.value.limit_scope == axis
+        assert path.read_bytes() == before
+    fits = ua.reserve_attempt(request(root, root_task_id="legacy", reservation_usd=.01,
+                                      root_limit_usd=cap, global_limit_usd=cap + .25))
+    ua.release_attempt(fits)
+
+
+@pytest.mark.parametrize("cost", [True, False])
+@pytest.mark.parametrize("abandoned", [True, False])
+def test_legacy_bool_transition_replacement_and_one_late_receipt(root, cost, abandoned):
+    rows = seed(root, 1)
+    row = {**rows[0], "reservation_upper_bound_usd": True}
+    path = root / ua.LEDGER_REL
+    path.write_text(json.dumps(row) + "\n")
+    held = ua.AttemptReservation(row["attempt_id"], root, "stub", "local", True)
+    assert_legacy_cash(root, {"dominant": (0, 0, 0, 1, 0)})
+    ua.mark_dispatched(held)
+    assert_legacy_cash(root, {"dominant": (0, 0, 0, 0, 1)})
+    ua.mark_unresolved(held, "receipt pending")
+    if abandoned:
+        ua.terminalize_abandoned_attempt(held, reason="owner closed")
+    assert_legacy_cash(root, {"dominant": (0, 0, 0, 0, 1)})
+    replacement = root / "replacement.jsonl"
+    replacement.write_bytes(path.read_bytes())
+    os.replace(replacement, path)
+    with memo._writer_locked(root) as view:
+        assert held.attempt_id in view.resume.late_receipt_ids
+    # The writer seam retains the raw accepted boolean receipt, without new-send normalization.
+    actual = ua._transition(held, "settled", cost_usd=cost, cost_final=True)
+    assert actual["settle_reason"] == "late_receipt" and actual["cost_usd"] is cost
+    records = assert_legacy_cash(root, {"dominant": (int(cost), int(cost), 0, 0, 0)})
+    before = path.read_bytes()
+    assert ua._transition(held, "settled", cost_usd=cost, cost_final=True) == actual
+    with pytest.raises(ua.UsageAccountingError, match="conflicting usage settlement"):
+        ua._transition(held, "settled", cost_usd=not cost, cost_final=True)
+    duplicate = {**actual, "seq": len(records) + 1}
+    with pytest.raises(ledger.UsageLedgerCorrupt, match="changed after terminal"):
+        ledger._validate_records(records + [duplicate])
+    with memo._writer_locked(root) as view:
+        assert held.attempt_id not in view.resume.late_receipt_ids
+        with pytest.raises(ledger.UsageLedgerCorrupt, match="changed after terminal"):
+            view.append(root, [duplicate])
+    assert path.read_bytes() == before
+
+
+def test_legacy_bool_baselines_and_retained_rows_compact_exactly(root):
+    from ouroboros import usage_compaction as compact
+
+    path = root / ua.LEDGER_REL
+    original = seed(root, 30, cost=".1")
+    for index, row in enumerate(original):
+        row["root_task_id"] = ("paid", "zero", "bound")[index // 30]
+    path.write_text("".join(json.dumps(row) + "\n" for row in original))
+    with ledger._locked(root) as beat:
+        assert compact.compact_usage_ledger_locked(root, heartbeat=beat)
+    rows = [json.loads(line) for line in path.read_text().splitlines()]
+    # Construct the already-accepted legacy baseline grammar as an isolated fixture.
+    for row in rows[1:]:
+        identity = row["root_task_id"]
+        row.update(cost_usd=True if identity == "paid" else False,
+                   reservation_upper_bound_usd=False, root_limit_usd=True)
+        if identity == "bound":
+            row.update(state="unresolved", cost_usd=None, cost_final=False,
+                       reservation_upper_bound_usd=True)
+    for row in original[:60]:  # ordinary terminal history gives the real pass a byte gain
+        rows.append({**row, "attempt_id": "new-" + row["attempt_id"], "root_task_id": "new"})
+    for value in (True, False):
+        for row in original[:3]:
+            carried = {**row, "attempt_id": f"bool-{value}", "root_task_id": "retained",
+                       "reservation_upper_bound_usd": value}
+            if carried["state"] == "settled":
+                carried["cost_usd"] = value
+            rows.append(carried)
+    rows = [{**row, "seq": index + 1} for index, row in enumerate(rows)]
+    ledger._validate_records(rows)
+    replacement = root / "replacement.jsonl"
+    replacement.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    os.replace(replacement, path)
+    before = path.read_bytes()
+    expected = {"paid": (1, 1, 0, 0, 0), "zero": (0, 0, 0, 0, 0),
+                "bound": (0, 0, 0, 0, 1), "new": (2, 2, 0, 0, 0),
+                "retained": (1, 1, 0, 0, 0)}
+    assert_legacy_cash(root, expected)
+    with ledger._locked(root) as beat:
+        assert compact.compact_usage_ledger_locked(root, heartbeat=beat)
+    after = assert_legacy_cash(root, expected)
+    assert (root / after[0]["archive_rel"]).read_bytes() == before
+    for value in (True, False):
+        retained = [row for row in after if row["attempt_id"] == f"bool-{value}"]
+        assert len(retained) == 3
+        assert all(row["reservation_upper_bound_usd"] is value for row in retained)
+        assert retained[-1]["cost_usd"] is value
+    for identity in ("paid", "bound", "retained"):
+        with pytest.raises(ua.BudgetExceeded):
+            ua.reserve_attempt(request(root, root_task_id=identity, reservation_usd=.1,
+                                       root_limit_usd=.5))
+    with pytest.raises(ua.BudgetExceeded):
+        ua.reserve_attempt(request(root, reservation_usd=.1, global_limit_usd=4.5))
+
+
+@pytest.mark.parametrize("value", [None, {}, [], "", "true", -1, "-.1", float("nan"),
+                                   float("inf"), "NaN", "Infinity"])
+def test_legacy_money_invalid_or_unknown_values_keep_existing_handling(value):
+    from ouroboros._usage_money import amount
+
+    assert amount(value) is None
+    # Validation and exact-money decoding keep their respective existing domains.
+    if value is not None and ledger._number(value) is None:
+        with pytest.raises(ledger.UsageLedgerCorrupt, match="invalid cost_usd"):
+            ledger._validate_records([{"seq": 1, "kind": "legacy_usage", "attempt_id": "bad",
+                                       "state": "settled", "cost_usd": value}])

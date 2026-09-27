@@ -44,7 +44,7 @@ def _hold(owner, phase: str, started: float, episode_id: str) -> None:
         _emit_checkpoint_event(owner.event_queue, owner.task_id, pathlib.Path(owner.drive_root) / "logs", {
             "checkpoint_kind": "usage_lock_wait", "owner_visible": True,
             "phase": phase, "episode_id": episode_id, "elapsed_sec": time.monotonic() - started,
-            "detail": detail, "content": detail, "role": "system", "system_type": "task_checkpoint",
+            "detail": detail, "content": detail, "text": detail, "role": "system", "system_type": "task_checkpoint",
             **({"chat_id": owner.task["chat_id"]} if "chat_id" in owner.task else {}),
         })
     except Exception:

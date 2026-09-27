@@ -113,6 +113,11 @@ every existing aggregation exact while remaining one atomic, stamped unit.
 
 Monetary equality is defined **on decimals, never on float accumulation**:
 
+- Exact decoding preserves the ledger validator's accepted monetary scalars,
+  including legacy JSON booleans (`true` = 1, `false` = 0) and numeric strings.
+  The shared `_usage_money.decimal_of` conversion applies to replay, incremental
+  cash and compaction; rejecting a valid historical boolean would erase money.
+  Validation and fold eligibility remain with their existing owners.
 - The compactor parses the source segment with `parse_float=Decimal` and sums
   each group's `cost_usd` / `reservation_upper_bound_usd` as exact `Decimal`s
   of the literals actually stored in the file.

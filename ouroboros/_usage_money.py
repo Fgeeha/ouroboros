@@ -36,13 +36,14 @@ decimal string if binary float serialization would change the literal.
 
 def decimal_of(value: Any) -> Decimal:
     if isinstance(value, bool):
-        raise decimal.InvalidOperation
+        # The ledger's historical numeric grammar accepts JSON booleans as 0/1.
+        return Decimal(int(value))
     return value if isinstance(value, Decimal) else Decimal(
         value.literal if isinstance(value, LiteralFloat) else str(value))
 
 
 def amount(value: Any) -> Decimal | None:
-    if value is None or isinstance(value, bool):
+    if value is None:
         return None
     try:
         parsed = decimal_of(value)
