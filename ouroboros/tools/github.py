@@ -578,6 +578,7 @@ def get_tools() -> List[ToolEntry]:
                 "and the method (never auto-merge or admin), records what review you declare beside "
                 "what the host observes, reads GitHub back, and writes the receipt to this task's "
                 "record, its card and the PR body. A missing review is recorded loudly, never a lock. "
+                "An unknown or queued merge stays observation/publication-only on repeat calls; no resend. "
                 "Distinct from stage_pr_merge, which stages a local merge for a reviewed commit."
             ),
             "parameters": {"type": "object", "properties": {

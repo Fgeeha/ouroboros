@@ -202,6 +202,41 @@ def handoff_delivered_acceptance(ctx: Any, task_id: str, delivery_id: str) -> No
     run_historical_acceptance(owner, task_id=task_id, debt_id=debt.get('debt_id', ''), automatic=True)
 
 
+def _historical_writer_live(root: Path, task_id: str, operation_id: str) -> bool:
+    """Use this venue's authority; worker imports of supervisor maps prove nothing."""
+    from ouroboros.post_task_checkpoint import post_task_synthesis_is_terminal
+    from ouroboros.review_operation import task_has_live_review_operation
+    from ouroboros.task_results import load_task_result
+    from ouroboros.task_status import task_has_live_queue_ownership, queue_snapshot_observation
+    from ouroboros.utils import in_worker_process, read_json_dict
+    from supervisor import queue as task_queue
+    from supervisor.direct_roots import FRAGMENT_NAME
+
+    try:
+        if (not in_worker_process() and task_queue.INITIALIZED
+                and Path(task_queue.DRIVE_ROOT).resolve() == root.resolve()):
+            return task_queue.task_has_live_ownership(task_id, ignore_review_operation=operation_id)
+        if task_has_live_review_operation(root, task_id, exclude_owner_id=operation_id):
+            return True
+        row = load_task_result(root, task_id, strict=True) or {}
+        direct = row.get('_is_direct_chat')
+        if direct is not True and task_has_live_queue_ownership(root, task_id):
+            return True
+        if direct is False:
+            return False
+        # Direct turns do not enter the pooled snapshot. Their existing fragment
+        # omits postwork, so absence also needs its terminal phase checkpoint.
+        fragment = read_json_dict(root / FRAGMENT_NAME) or {}
+        roots = fragment.get('roots')
+        if (not queue_snapshot_observation(fragment)['fresh'] or fragment.get('incomplete') is not False
+                or not isinstance(roots, list) or any(not isinstance(item, dict) for item in roots)):
+            return True
+        return (any(item.get('task_id') == task_id for item in roots)
+                or not post_task_synthesis_is_terminal((row.get('root_phase_checkpoint') or {}).get('post_task_synthesis')))
+    except Exception:
+        return True
+
+
 def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
                               prepared: dict | None, automatic: bool, operation: Any) -> dict:
     """Run one late panel or collect its existing identity, without author work."""
@@ -253,8 +288,7 @@ def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
         if not _receipt(root, debt):
             return refused('exact_delivery_unconfirmed')
         receipt_verified = True
-        from supervisor.queue_transitions import task_has_live_ownership
-        while task_has_live_ownership(task_id, ignore_review_operation=operation.owner_id):
+        while _historical_writer_live(root, task_id, operation.owner_id):
             if not automatic:
                 return refused('historical_writer_still_live')
             if operation.control():
@@ -262,6 +296,9 @@ def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
             # The existing operation holds this preparation drain until the
             # original terminal writer releases custody, without a scheduler.
             time.sleep(0.1)
+        blocked = historical_operation_controls(root, purpose, admission=True)
+        if blocked:
+            return refused(blocked[0])
         lineage = resolve_task_lineage(task_id, metadata=row.get('metadata'), **{
             key: row.get(key) for key in ('root_task_id', 'parent_task_id', 'delegation_role', 'original_task_id', 'timeout_retry_from')})
         if not lineage['is_root_task'] or lineage['root_task_id'] != accounting_id:

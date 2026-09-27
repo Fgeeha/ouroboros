@@ -947,10 +947,9 @@ def commit_triad_delivery() -> Dict[str, Any]:
         # retrieves without an actor id, so no consumer may infer it from one.
         "retrieves": [bool(slot.retrieves) for slot in slots],
         "use_local": [slot.use_local for slot in slots],
-        # The historical fingerprint identity survives for the UNCONFIGURED
-        # panel (source="default", all api rows): a 7.0 upgrade must not lapse
-        # every install's skill-review replay authority. ABI-10 retired the
-        # legacy comma-list source, so "not structured" IS the default panel.
+        # Only an unconfigured all-packet panel keeps the legacy identity.
+        # Native defaults change the contract: a later requested review may
+        # buy a new cycle; changing defaults itself dispatches nothing.
         "legacy_skill_fingerprint": (
             config.source != "structured"
             and all(slot.route is ReviewRouteKind.API_CHAT and not slot.retrieves for slot in slots)

@@ -51,8 +51,14 @@ def late(tmp_path, monkeypatch, fresh_sends):
 
 
 def delivered(tmp_path, monkeypatch, *, retry=False, receipt='exact', cap='finite', automatic=False, chat_id=7,
-              copyback=True, capture=None):
+              copyback=True, capture=None, deadline=''):
     f = _fixture(tmp_path, split=True, retry=retry, cap=cap)
+    from supervisor import queue as task_queue
+    monkeypatch.setattr(task_queue, 'INITIALIZED', True)
+    monkeypatch.setattr(task_queue, 'DRIVE_ROOT', f.root)
+    if deadline:
+        f.task['task_contract']['deadline_at'] = deadline
+        write_task_result(f.root, f.accounting, 'running', task_contract=f.task['task_contract'])
     if retry:
         write_task_result(f.root, f.accounting, 'failed', superseded_by=f.tid, retry_task_id=f.tid)
         f.task['supersedes_task_id'] = f.accounting
@@ -190,6 +196,10 @@ def test_explicit_review_may_combine_the_absolute_cap_before_its_one_panel(late,
 
 
 @pytest.mark.parametrize('extra,reason', [
+    ({'action': None}, 'late_review_action_invalid'),
+    ({'action': None, 'new_original_root_cap_usd': None}, 'late_review_action_invalid'),
+    ({'action': False}, 'late_review_action_invalid'),
+    ({'action': {}}, 'late_review_action_invalid'),
     ({'action': 'amend'}, 'late_review_action_invalid'),
     ({'action': 'Review'}, 'late_review_action_invalid'),
     ({'action': ''}, 'late_review_action_invalid'),

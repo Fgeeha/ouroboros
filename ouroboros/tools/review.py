@@ -201,9 +201,8 @@ def _handle_task_acceptance_review(
     # rebuilds the packet at its own fence, so the nomination records only the
     # author's claims, stance and any explicit retry — which is what lets an
     # informed finish/stop register even while that builder is broken (#1223).
-    # The agent's own evidence is preserved under `agent_supplied` (its repo_diff
-    # demoted to agent_supplied_repo_diff) — never promoted to host-fact status;
-    # repo_diff is ALWAYS the HOST-collected structural fact.
+    # Agent evidence stays under `agent_supplied`; its `repo_diff` becomes
+    # `agent_supplied_repo_diff`. Only HOST structural facts own `repo_diff`.
     legacy_aliases = []
     if str(agent_disposition or "").strip():
         legacy_aliases.append("agent_disposition")

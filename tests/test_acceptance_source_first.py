@@ -337,6 +337,8 @@ def test_session_consumer_refuses_unavailable_canonical_bytes_without_start(monk
     result = run_review_request(request, slots=[slot], drive_root=canonical, llm=_EpisodeLLM(canonical, []))
     assert result.aggregate_signal != "PASS"
     assert "degraded_source_unreachable" in result.actors[0]["error"]
+    assert result.actors[0]["operation_state"] == "not_dispatched"
+    assert not result.actors[0].get("late_result_pending")
     assert all(not instance.start_requests for instance in fake.instances)
     # A surviving execution copy cannot silently replace the missing canonical source.
     assert list(author.rglob("acceptance-packet-*"))
@@ -424,3 +426,30 @@ def test_consumer_refuses_source_lost_before_retention(monkeypatch, tmp_path, se
     assert result.aggregate_signal != "PASS"
     assert "original_reader_root_unavailable" in result.actors[0]["error"]
     assert not llm.calls and all(not instance.start_requests for instance in fake.instances)
+
+
+@pytest.mark.parametrize('fact,expected', [
+    ('none', 'not_dispatched'), ('reserved', 'not_dispatched'), ('released', 'not_dispatched'),
+    ('settled', 'settled'), ('dispatched', 'custody_lost'), ('unresolved', 'custody_lost'),
+    ('malformed', 'custody_lost'), ('run', 'settled'), ('started', 'settled'),
+    ('pending', 'custody_lost'), ('native_round', 'settled'),
+])
+def test_source_refusal_preserves_stronger_physical_custody(monkeypatch, fact, expected):
+    from types import SimpleNamespace
+    from ouroboros.review_custody import _ReviewAttemptHistory, _review_exception_projection
+    from ouroboros.review_execution import ReviewRouteUnavailable
+
+    # Each real slot starts a fresh capture scope; no prior test's send belongs here.
+    monkeypatch.setattr('ouroboros.usage_accounting.last_physical_attempt_capture', lambda: None)
+    error = ReviewRouteUnavailable('exact source missing', code='degraded_source_unreachable')
+    if fact in {'reserved', 'released', 'settled', 'dispatched', 'unresolved', 'malformed'}:
+        error.physical_attempt_capture = SimpleNamespace(state=fact)
+    elif fact == 'run':
+        error.delegated_run_id = 'synthetic-run'
+    elif fact == 'started':
+        error.delegated_run_started = True
+    history = _ReviewAttemptHistory()
+    history.observe(error)
+    custody = {'native_rounds': 1} if fact == 'native_round' else {}
+    retry = {'pending_invocation_id': 'synthetic-pending'} if fact == 'pending' else {}
+    assert _review_exception_projection(error, custody, history, retry)[3] == expected

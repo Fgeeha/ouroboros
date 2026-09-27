@@ -262,6 +262,8 @@ def historical_review_controls(root: Any, row: dict, debt: dict, *, caller_task_
     blocked = []
     root = Path(root)
     ids = dict.fromkeys((row["task_id"], debt["accounting_root_task_id"], caller_task_id))
+    deadlines = [("", (historical_contract if historical_contract is not None
+                       else row.get("task_contract") or {}).get("deadline_at"))]
     try:
         for name in ("panic_stop.flag", "owner_restart_no_resume.flag"):
             if (root / "state" / name).exists():
@@ -272,12 +274,8 @@ def historical_review_controls(root: Any, row: dict, debt: dict, *, caller_task_
             current = load_task_result(root, tid, strict=True) or {}
             if not current:
                 blocked.append("control_authority_unavailable:" + tid)
-            for raw in (current.get("deadline_at"), (current.get("task_contract") or {}).get("deadline_at")):
-                parsed = parse_deadline_ts(raw)
-                if raw and parsed is None:
-                    blocked.append("deadline_unknown:" + tid)
-                elif parsed is not None and parsed <= utc_now():
-                    blocked.append("owner_deadline:" + tid)
+            deadlines.extend((":" + tid, raw) for raw in (
+                current.get("deadline_at"), (current.get("task_contract") or {}).get("deadline_at")))
             constraint = normalize_task_constraint(current.get("task_constraint"))
             if constraint is not None and not constraint.allow_review:
                 blocked.append("review_prohibited:" + tid)
@@ -296,13 +294,20 @@ def historical_review_controls(root: Any, row: dict, debt: dict, *, caller_task_
             if any(f.get("root_task_id") == debt["accounting_root_task_id"]
                    and f.get("status") in {"active", "paused"} for f in fences):
                 blocked.append("root_budget_fence")
-        deadline_raw = (historical_contract if historical_contract is not None
-                        else row.get("task_contract") or {}).get("deadline_at")
-        deadline = parse_deadline_ts(deadline_raw)
-        if deadline_raw and deadline is None:
-            blocked.append("deadline_unknown")
-        elif deadline is not None and deadline <= utc_now():
-            blocked.append("owner_deadline")
+        from ouroboros.task_pacing import BudgetSnapshot, review_launch_allowed
+        for suffix, raw in deadlines:
+            deadline = parse_deadline_ts(raw)
+            if raw and deadline is None:
+                blocked.append("deadline_unknown" + suffix)
+            elif deadline is not None:
+                remaining = (deadline - utc_now()).total_seconds()
+                if remaining <= 0:
+                    blocked.append("owner_deadline" + suffix)
+                elif automatic:
+                    # Delivery is complete: no author-finalization reserve remains.
+                    allowed, reason = review_launch_allowed(BudgetSnapshot(True, remaining_sec=remaining))
+                    if not allowed:
+                        blocked.append(reason)
         if row.get("status") not in {"completed", "failed"}:
             blocked.append("not_terminal")
         if automatic:
@@ -351,7 +356,7 @@ def prepare_owner_historical_review(ctx: Any, request: dict) -> dict:
         # Malformed intent is refused before any source or money write. A request
         # without the selector predates it: a named cap alone never buys review.
         action, amount = request.get("action"), request.get("new_original_root_cap_usd")
-        if action is None:
+        if "action" not in request:
             action = "review" if amount is None else "amend_cap"
         if action not in ("review", "amend_cap"):
             return refusal("late_review_action_invalid")
