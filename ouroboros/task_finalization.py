@@ -513,7 +513,15 @@ def review_source_projection(drive_root: Any, task_id: str, digest: str,
         return {**unavailable, "reason": "source_ref_invalid"}
     path = f"source_handles/context_checkpoints/acceptance-{digest}.json"
     try:
-        stored = task_artifact_dir_path(drive_root, task_id) / path
+        from ouroboros.source_retention import retained_task_roots
+
+        # The selector addresses exact bytes, not their current placement. Only
+        # this author's known retained drives can supply a not-yet-canonical file.
+        roots = [drive_root, *retained_task_roots(drive_root, task_id)]
+        stored = next((candidate for root in roots
+                       if (candidate := task_artifact_dir_path(root, task_id, create=False) / path).exists()), None)
+        if stored is None:
+            raise FileNotFoundError(path)
         ref = {"kind": "task_source", "root": "artifact_store", "path": path,
                "size": stored.stat().st_size, "sha256": digest}
         raw = read_actor_source_bytes(drive_root, task_id, ref)

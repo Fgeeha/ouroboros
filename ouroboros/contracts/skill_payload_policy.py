@@ -46,8 +46,9 @@ SKILL_OWNER_STATE_FILENAMES = frozenset({
     "review_history.jsonl",
     "accepted_rebuttals.json",
     "clawhub.json",
-    # OuroborosHub publication receipt: forging it would fake a "published by
-    # this owner" fact that hub sync verdicts and adopt confirmations trust.
+    # OuroborosHub publication receipt: forging it would fake the owner's
+    # submission history on the Skills cards and silence the Use Hub version
+    # confirmation's no-record warning.
     "ouroboroshub.json",
     "self_authored.json",
     "auth_token.json",

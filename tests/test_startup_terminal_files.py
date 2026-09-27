@@ -236,9 +236,11 @@ def test_failed_first_save_preserves_child_and_followup_attachment_through_prune
     assert child.exists() and _mailbox_path(child, "saved").exists()
     recovered = _recovery(root, repo)
     assert recovered["recovered"] == ["saved"]
-    assert load_task_result(root, "saved")["child_ref_promotion"]["pending_refs"] == []
+    assert load_task_result(root, "saved")["child_ref_promotion"]["pending_refs"]
     for row in manifest:
         assert (task_artifact_dir_path(root, "saved") / row["relpath"]).read_text(encoding="utf-8") == "accepted follow-up file"
+    retained = headless.retry_child_task_refs(root, child, "saved")
+    assert retained["child_ref_promotion"]["pending_refs"] == []
 
 
 @pytest.mark.parametrize("pids", [None, {777}])

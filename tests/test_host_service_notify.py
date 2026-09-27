@@ -8,7 +8,9 @@ row (never a chat row), the ``owner.notification`` topic, and with ``at``/
 
 from __future__ import annotations
 
+import asyncio
 import pathlib
+import threading
 
 from starlette.testclient import TestClient
 
@@ -70,6 +72,43 @@ def test_notify_requires_the_notify_owner_grant(tmp_path: pathlib.Path) -> None:
     assert resp.status_code == 403 and "notify_owner" in resp.json()["error"]
     assert client.post("/notify", json={"text": "hi"}).status_code == 403
     assert [r for r in _events_rows(tmp_path) if r.get("type") == "owner_notification"] == []
+
+
+def test_notify_token_discovery_does_not_hold_the_asgi_loop(tmp_path: pathlib.Path, monkeypatch) -> None:
+    import httpx
+
+    _client, app = _notify_client(tmp_path)
+    ctx = app.state.host_service_context
+    authenticate = ctx.authenticate_token_payload
+    started, release = threading.Event(), threading.Event()
+
+    def slow_auth(token):
+        started.set()
+        assert release.wait(5), "test must release the simulated disk read"
+        return authenticate(token)
+
+    monkeypatch.setattr(ctx, "authenticate_token_payload", slow_auth)
+
+    async def exercise():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            notice = asyncio.create_task(client.post("/notify", headers={"X-Skill-Token": "tok"},
+                                                    json={"text": "test"}))
+            try:
+                assert await asyncio.to_thread(started.wait, 3)
+                # If auth runs inline, this coroutine cannot resume until release.
+                assert not release.is_set()
+            finally:
+                release.set()
+            assert (await notice).status_code == 200
+
+    timer = threading.Timer(2, release.set)
+    timer.start()  # fail boundedly instead of deadlocking if auth regresses to inline I/O
+    try:
+        asyncio.run(exercise())
+    finally:
+        release.set()
+        timer.cancel()
+        timer.join()
 
 
 def test_notify_refuses_bad_bodies_and_the_rate_limit(tmp_path: pathlib.Path) -> None:

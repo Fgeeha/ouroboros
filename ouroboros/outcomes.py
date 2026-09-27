@@ -867,6 +867,11 @@ def public_task_result(result: Dict[str, Any], *, include_outcome_axes: bool = T
     from ouroboros.cost_projection import normalize_task_result_cost_planes
 
     public = normalize_task_result_cost_planes(public)
+    from ouroboros.history_retention import retention_summary
+
+    retention = retention_summary(result)
+    if retention:
+        public["history_retention"] = retention
     from ouroboros.task_finalization import terminal_host_notice_text
 
     notice = terminal_host_notice_text(public)

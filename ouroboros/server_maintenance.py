@@ -854,7 +854,7 @@ def _run_drive_custody_pass(stop_event: Any = None) -> None:
         return _stop_requested(stop_event)
 
     root = pathlib.Path(DATA_DIR)
-    report = retry_pending_child_ref_promotions(root, stop=stop) or {}
+    report = retry_pending_child_ref_promotions(root, stop=stop, generation=stop_event) or {}
     if report.get("retried") or report.get("errors"):
         log.info("Child-ref promotion retry: %s", report)
     if stop():
@@ -1051,8 +1051,8 @@ def _recover_terminal_task_files(drive_root: pathlib.Path, protected: set[str]) 
                 task = {**current, "id": task_id, "drive_root": str(child_root)}
                 ready = terminal_task_files_ready(root, task, current)
                 pending = _has_pending_ref_promotion(current.get("child_ref_promotion"))
-                if ready and not pending:
-                    continue  # Already saved; do not re-copy or recapture on every boot.
+                if ready:
+                    continue  # History is already owed to the off-loop retry owner.
                 if not ready:
                     source = load_task_result(child_root, task_id, strict=True) or {}
                     if source.get("status") not in SETTLED_STATUSES:

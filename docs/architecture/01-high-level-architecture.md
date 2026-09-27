@@ -1,6 +1,6 @@
 # 1. High-Level Architecture
 
-This chapter indexes runtime owners: the launcher, supervisor, core modules, gateway and CLI, process topology, platform substrate and data layout. Module and durable-file moves must update this map. Each row names the owner, grep targets and the section explaining its mechanism; rationale stays in a row only when no section carries it.
+Runtime ownership map: launcher, supervisor, core, gateway/CLI, process topology, platform and data layout. Module/file moves update it. Rows name owners, search targets and mechanism sections; rationale stays here only if no section carries it.
 
 ```
 User
@@ -128,7 +128,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── project_naming.py    ← SSOT for LLM-first project naming: bounded light-model title with deterministic fallback, shared by admission naming (`admission_names`, no model call), card conversion, `ensure_project_scope` and the lazy turn namer (`spawn_turn_namer`, never for a greeting)
       ├── loop_tool_execution.py, tool_call_log.py ← Dispatch, results and per-invocation counting
       ├── deadline_utils.py    ← Shared deadline parsing/remaining-time helpers + the transport-vs-logical wait seam for loop milestones and process-tool/review timeouts
-      ├── observability.py     ← Private forensic execution ledger: redaction, gzip CAS blobs, call manifests, trace refs
+      ├── observability.py, source_retention.py ← Private call/source history: redaction, gzip CAS, manifests, exact iterative retention (§10)
       ├── model_send_seal.py ← The runtime invariant `model-visible ⟺ logged` for `model_send`: a reconstruction mismatch is a typed durable fact, and the call is NOT blocked — dispatch authority stays with the pre-existing in-memory identity re-check
       ├── cancel_intents.py    ← Durable cancel-intent projection: locked `state/cancel_intents.json` of ACTIVE intents (claim owner/pid + claim GENERATION fencing every mutation, `scope` single-vs-cascade) + forensic `cancel_intent` ledger rows; the ONE ingress `request_cancel`; strict fail-closed reads (`CancelIntentProjectionCorrupt`; a malformed row is disclosed once per row content, so the ~20 s watchdog cannot repeat it forever); owns `claim_is_abandoned` and `allow_settled_target` (§5; §10 invariants 14–15)
       ├── owner_hurry.py       ← Owner "hurry": a typed TASK-LOCAL acceleration latch, never a chat message; its durable `owner_hurry` projection is written by `update_json_locked` on its own keys only — never `write_task_result`, whose status-regression guard could drop concurrent terminal fields; effects `acceptance_skip_applied`, zero improvement passes via `effective_budget_profile`, advisory force-plan; dies with the attempt (`retry_reset`; `not_applied_before_terminal`) (§5)
@@ -214,7 +214,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── context_compaction.py ← Atomic-unit compaction: exact checkpoint, gap-free map/fold, provenance capsules, transactional apply; an unfinished Anthropic native unit is ineligible (§6 Context fitting, retry, and compaction)
       ├── context_health.py    ← Health invariants for the reading task (`build_health_invariants`, ONCE per task attempt — a task-start snapshot); delegated-run obligations stay globally visible — a preserved-and-invisible result is how work rots on disk — while the instruction is ownership-aware (`delegate_shared.orphan_apply_target_ok`) (§6 Context fitting, retry, and compaction; Delegated subagents)
       ├── context_runtime_facts.py ← The runtime section's FACT builders: what the host can honestly say it knows about this turn
-      ├── headless.py          ← Child-drive isolation, workspace patch artifacts, memory export helpers; typed `sensitive_blocked` exclusions (§6 Headless finalization and workspace patch capture)
+      ├── headless.py, history_retention.py ← Child-drive isolation, answer/file adoption before bulk history, workspace patches and memory export; typed `sensitive_blocked` exclusions (§6, §10)
       ├── task_custody.py      ← The one child-drive deletion owner (`settle_child_drive`), the per-task custody lock, unread-mail capture and the pure store view (§6 Headless finalization)
       ├── headless_status.py ← Artifact and task lifecycle vocabulary shared by the headless owners
       ├── workspace_patch_rules.py ← Pure patch-exclusion rules (env/cache sets, junk regex, lockfiles, credential-shaped names); the I/O checks + `untracked_capture_veto_reason` stay in headless

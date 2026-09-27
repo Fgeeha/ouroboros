@@ -222,9 +222,11 @@ def test_pooled_post_work_preserves_real_followup_until_copyback(tmp_path, monke
     mailbox = owner_mailbox._mailbox_path(child, task_id)
     assert mailbox.is_file(), "post-task completion must not erase copyback's accepted input source"
     result = headless.copy_child_task_result(parent, task)
-    assert result["child_ref_promotion"]["pending_refs"] == []
+    assert result["child_ref_promotion"]["pending_refs"]  # adoption does not wait for history
     captured = artifacts.task_artifact_dir_path(parent, task_id) / attachments[0]["relpath"]
     assert captured.read_bytes() == source.read_bytes()
+    retained = headless.retry_child_task_refs(parent, child, task_id)
+    assert retained["child_ref_promotion"]["pending_refs"] == []
     cleanup_settled_owner_mailbox(parent, task_id, task)
     assert not mailbox.exists()
 

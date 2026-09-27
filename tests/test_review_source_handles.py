@@ -1,4 +1,5 @@
 """Review/completion handles retain exact bytes through publication and child cleanup."""
+from ouroboros.headless import retry_child_task_refs
 import hashlib
 import json
 from pathlib import Path
@@ -31,6 +32,7 @@ def test_child_source_closure_survives_real_cleanup(tmp_path, source):
                                              source_id=source, data=raw, extension="json")
     write_task_result(child, "source", "completed", **_field(ref, source))
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, "source")
     assert copied["child_ref_promotion"]["promoted_source_handle_count"] == 1
     assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert not child.exists()
@@ -48,10 +50,12 @@ def test_failed_completion_promotion_retains_child_until_retry(tmp_path, monkeyp
     with monkeypatch.context() as patch:
         patch.setattr(artifacts, "store_actor_source_bytes", lambda *_a, **_k: (_ for _ in ()).throw(OSError("copy failed")))
         copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
+        copied = retry_child_task_refs(parent, child, "source")
         assert copied["child_ref_promotion"]["status"] == "incomplete"
         assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is False
         assert child.exists()
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, "source")
     assert copied["child_ref_promotion"]["status"] == "complete"
     assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
     assert artifacts.read_actor_source_bytes(parent, "source", ref) == raw
@@ -139,6 +143,7 @@ def test_nested_acceptance_sources_survive_copy_back_and_cleanup(tmp_path, outer
                                            source_id="acceptance", data=before[0], extension="json")
     for _ in range(2):
         copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
+        copied = retry_child_task_refs(parent, child, "source")
         assert copied["child_ref_promotion"]["status"] == "complete"
         assert copied["child_ref_promotion"]["promoted_source_handle_count"] == 3
         assert copied["review_projection"]["panels"][0]["applied_source_ref"] == refs[0]
@@ -166,6 +171,7 @@ def test_nested_copy_failure_holds_child_and_rechecks_existing_checkpoint(tmp_pa
     with monkeypatch.context() as patch:
         patch.setattr(artifacts, "store_actor_source_bytes", fail_output)
         copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
+        copied = retry_child_task_refs(parent, child, "source")
         promotion = copied["child_ref_promotion"]
         assert promotion["status"] == "incomplete"
         assert promotion["pending_refs"][0]["path"] == str(
@@ -174,6 +180,7 @@ def test_nested_copy_failure_holds_child_and_rechecks_existing_checkpoint(tmp_pa
         assert artifacts.read_actor_source_bytes(parent, "source", trajectory)
         assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is False
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, "source")
     assert copied["child_ref_promotion"]["status"] == "complete"
     assert copied["child_ref_promotion"]["pending_refs"] == []
     assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
@@ -231,6 +238,7 @@ def test_nested_trajectory_promotes_existing_call_blobs_without_crawling_prose(t
         with monkeypatch.context() as patch:
             patch.setattr(artifacts, "store_actor_source_bytes", fail_corpus)
             copied = copy_child_task_result(parent, task)
+            copied = retry_child_task_refs(parent, child, task["id"])
             assert copied["child_ref_promotion"]["status"] == "incomplete"
             assert copied["child_ref_promotion"]["pending_refs"]
             assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is False
@@ -238,6 +246,7 @@ def test_nested_trajectory_promotes_existing_call_blobs_without_crawling_prose(t
     first_ref = None
     for _ in range(2):
         copied = copy_child_task_result(parent, task)
+        copied = retry_child_task_refs(parent, child, task["id"])
         assert copied["child_ref_promotion"]["status"] == "complete"
         ref = copied["review_projection"]["panels"][0]["applied_source_ref"]
         first_ref = first_ref or ref
@@ -256,13 +265,13 @@ def test_nested_trajectory_promotes_existing_call_blobs_without_crawling_prose(t
         saved = json.loads(artifacts.read_actor_source_bytes(destination, "source", ref))
         evidence = saved["request"]["evidence"]
         promoted = evidence["tool_trajectory_source_ref"]
-        assert promoted["corpus_sha256"] == trajectory["sha256"]
-        assert promoted["sha256"] != promoted["corpus_sha256"]
+        assert promoted["sha256"] == trajectory["sha256"]
+        assert "corpus_sha256" not in promoted  # Exact captured bytes need no rebased citation identity.
         assert promoted["artifact_ref"].startswith(f"artifact_store:{promoted['path']}#chars=")
         raw = artifacts.read_actor_source_bytes(destination, "source", promoted)
         assert hashlib.sha256(raw).hexdigest() == promoted["sha256"]
         with pytest.raises(ValueError, match="sha256 verification"):
-            artifacts.read_actor_source_bytes(destination, "source", {**promoted, "sha256": trajectory["sha256"]})
+            artifacts.read_actor_source_bytes(destination, "source", {**promoted, "sha256": "0" * 64})
         assert saved["actors"][0]["parsed"]["criteria_used"] == criteria
         assert evidence[section][0]["ref"] == citation
         vocabulary = acceptance_evidence_ref_vocabulary(evidence)
@@ -305,15 +314,18 @@ def test_nested_unavailable_source_is_disclosed_without_reconstructing_preview(t
         write_task_result(parent, "source", "running", review_projection=projection)
         write_task_result(child, "source", "completed", review_projection=projection)
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, "source")
     assert copied["child_ref_promotion"]["unavailable_refs"]
     promoted = copied["review_projection"]["panels"][0]["applied_source_ref"]
-    assert promoted != checkpoint
+    assert promoted == checkpoint  # Captured evidence is immutable, even when a dependency is unavailable.
     evidence = json.loads(artifacts.read_actor_source_bytes(parent, "source", promoted))["request"]["evidence"]
     dependency = evidence["tool_trajectory_source_ref"]
     if loss != "legacy_ref":
         dependency = json.loads(artifacts.read_actor_source_bytes(parent, "source", dependency))[0]["result_source_ref"]
-    assert dependency["availability"] == "unavailable"
-    assert dependency["reason"] == {"missing": "source_missing", "corrupt": "digest_mismatch", "legacy_ref": "invalid_ref"}[loss]
+    with pytest.raises((OSError, ValueError)):
+        artifacts.read_actor_source_bytes(parent, "source", dependency)
+    expected = {"missing": "source_missing", "corrupt": "digest_mismatch", "legacy_ref": "invalid_ref"}[loss]
+    assert any(row["reason"] == expected for row in copied["child_ref_promotion"]["unavailable_refs"])
     assert not (artifacts.task_artifact_dir_path(parent, "source") / result["path"]).exists()
 
 
@@ -343,6 +355,7 @@ def test_copyback_prepares_bulk_artifacts_and_selected_review_refs_outside_lock(
     monkeypatch.setattr(headless, "_copy_child_artifacts_to_parent", copy_bulk)
     monkeypatch.setattr(observability, "_promote_task_source_ref", promote_review)
     copied = copy_child_task_result(parent, {"id": "source", "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, "source")
     assert copied["child_ref_promotion"]["status"] == "complete"
     assert observed[0] == "bulk" and "review" in observed
     assert remove_subagent_task_drive(parent, "source", live=lambda _task: False) is True
@@ -380,6 +393,7 @@ def test_response_capture_does_not_launder_nested_source_authority(tmp_path, mon
 
     monkeypatch.setattr(artifacts, 'read_actor_source_bytes', guarded)
     copied = copy_child_task_result(parent, {'id': 'source', 'drive_root': str(child)})
+    copied = retry_child_task_refs(parent, child, 'source')
     assert not copied['child_ref_promotion']['unavailable_refs']
     assert copied['review_evidence']['agent_supplied'] == payload
     assert copied['review_evidence']['receipt'] == unselected
@@ -436,16 +450,19 @@ def test_trace_response_rejects_foreign_paths_before_read_and_keeps_unknown_cust
         with monkeypatch.context() as fail:
             fail.setattr(observability, 'write_call_manifest', lambda *a, **k: (_ for _ in ()).throw(OSError('copy unknown')))
             copied = copy_child_task_result(parent, {'id': 'source', 'drive_root': str(child)})
+            copied = retry_child_task_refs(parent, child, 'source')
             assert copied['child_ref_promotion']['pending_refs']
             assert not remove_subagent_task_drive(parent, 'source', live=lambda _: False)
             assert child.exists() and Path(ref['path']).exists()
         copied = copy_child_task_result(parent, {'id': 'source', 'drive_root': str(child)})
+        copied = retry_child_task_refs(parent, child, 'source')
         assert not copied['child_ref_promotion']['pending_refs']
         # Even verified publication cannot collect a drive with unknown liveness.
         assert not remove_subagent_task_drive(parent, 'source', live=lambda _: None)
         assert remove_subagent_task_drive(parent, 'source', live=lambda _: False)
     else:
         copied = copy_child_task_result(parent, {'id': 'source', 'drive_root': str(child)})
+        copied = retry_child_task_refs(parent, child, 'source')
         assert copied['trace_refs']['response']['availability'] == 'unavailable'
         assert copied['child_ref_promotion']['unavailable_refs']
         assert not list((parent / 'observability').rglob('response.json'))
@@ -477,6 +494,7 @@ def test_plan_dialogue_promotion_never_reads_a_foreign_source(tmp_path, monkeypa
         'schema_version': 2, 'waves': [{'request_fingerprint': 'f' * 64, 'dialogue_source_ref': ref}]})
     opened = _record_path_reads(monkeypatch, foreign)
     copied = copy_child_task_result(parent, {'id': 'source', 'drive_root': str(child)})
+    copied = retry_child_task_refs(parent, child, 'source')
     assert copied['plan_review_state']['waves'][0]['dialogue_source_ref']['availability'] == 'unavailable'
     assert copied['child_ref_promotion']['unavailable_refs']
     assert not (artifacts.task_artifact_dir_path(parent, 'sibling') / ref['path']).exists()

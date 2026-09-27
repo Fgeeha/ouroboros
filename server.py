@@ -40,14 +40,10 @@ from ouroboros.gateway.ws import (
 )
 
 from ouroboros.server_process import (  # noqa: F401
-    DATA_DIR,
-    _owner_restart_requested,
-    _request_restart_exit,
-    _restart_requested,
-    _supervisor_stop,
-    _exit_signalled,
-    _SignalStopServer,
-    _embedded_uvicorn_server,
+    DATA_DIR, _owner_restart_requested,
+    _request_restart_exit, _restart_requested,
+    _supervisor_stop, _exit_signalled,
+    _SignalStopServer, _embedded_uvicorn_server,
     log,
 )
 from ouroboros.server_routing_context import (  # noqa: F401
@@ -97,14 +93,10 @@ from ouroboros.server_maintenance import (  # noqa: F401
     _startup_worktree_prune,
 )
 from ouroboros.server_restart import (  # noqa: F401
-    _live_running_task_ids,
-    _managed_update_pending_kwargs,
-    _perform_owner_restart,
-    _safe_restart_serialized,
-    _shutdown_supervisor_event_bus,
-    _shutdown_task_cleanup_args,
-    _stop_owned_daemon_for_new_pin,
-    _stop_owned_work,
+    _live_running_task_ids, _managed_update_pending_kwargs,
+    _perform_owner_restart, _safe_restart_serialized,
+    _shutdown_supervisor_event_bus, _shutdown_task_cleanup_args,
+    _stop_owned_daemon_for_new_pin, _stop_owned_work,
 )
 
 REPO_DIR = pathlib.Path(os.environ.get("OUROBOROS_REPO_DIR", pathlib.Path(__file__).parent))
@@ -405,13 +397,9 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
         st = ctx.load_state()
         if getattr(bridge, "panic", None) is not None:
             bridge.panic.observe_owner(st)
-        ext_known, owner_ext_id = control_value(st, "owner_external_id")
-        chat_known, owner_ext_chat_id = control_value(st, "owner_external_chat_id")
-        ext_known = ext_known and chat_known
-        try:
-            bound_pair = (int(owner_ext_id or 0), int(owner_ext_chat_id or 0))
-        except (TypeError, ValueError):
-            bound_pair = (0, 0)  # a malformed binding matches nobody
+        from ouroboros.server_control import external_owner_binding
+
+        ext_known, owner_ext_id, bound_pair = external_owner_binding(st)
         if panic and external_identity_present and ext_known and owner_ext_id is not None and (
                 bound_pair == (user_id, chat_id)):
             _execute_panic_stop(ctx.consciousness, ctx.kill_workers)
@@ -656,6 +644,7 @@ def _run_supervisor(settings: dict) -> None:
         from supervisor.message_bus import LocalChatBridge, init as bus_init
 
         bridge = LocalChatBridge(settings)
+        bridge.startup_owner_command = _startup_owner_command
         bridge.panic = PanicIngress(_startup_owner_command("/panic"))
         bridge.panic.observe_owner(load_state())
         bridge._broadcast_fn = broadcast_ws_sync
@@ -1176,24 +1165,41 @@ def _execute_panic_stop(consciousness, kill_workers_fn) -> None:
         bound_port=_actual_bound_port(),
     )
 
-def _startup_owner_command(command: str):
+def _startup_owner_command(command: str, *, send_kwargs=None, source="web", user_id=0, chat_id=0, reply=None):
     """Bind the emergency owner directly; startup Restart retains normal routing."""
-    if command not in {"/panic", "/restart"}:
+    verb = str(command).strip().lower()
+    if verb not in {"/panic", "/restart"}:
         return None
+    from supervisor.message_bus import try_get_bridge
+
+    if (verb == "/restart" and _supervisor_thread and _supervisor_thread.is_alive()
+            and _supervisor_ready.is_set() and try_get_bridge() is not None):
+        return None  # Preserve the ready transport's ordinary metadata/acceptance path.
 
     def execute():
         from supervisor import workers
 
-        if command == "/panic":
+        if verb == "/panic":
             _execute_panic_stop(_consciousness, workers.kill_workers)
-            return
+            return True
+        if source != "web":
+            from ouroboros.server_control import external_owner_binding
+            from supervisor.state import load_state
+
+            known, owner, pair = external_owner_binding(load_state())
+            if not (known and owner is not None and user_id > 0 and chat_id > 0 and pair == (user_id, chat_id)):
+                return False  # Existing intake still owns refusal or first-time binding.
         # Onboarding may finish after HTTP admission. A newly live consumer
         # owns the ordinary command rather than two concurrent control paths.
-        from supervisor.message_bus import try_get_bridge
         bridge = try_get_bridge()
-        if _supervisor_thread and _supervisor_thread.is_alive() and bridge is not None:
-            bridge.ui_send(command, broadcast=False)
-            return
+        if (_supervisor_thread and _supervisor_thread.is_alive()
+                and _supervisor_ready.is_set() and bridge is not None):
+            if source == "web" and not (send_kwargs or {}).get("accepted_source_ref"):
+                bridge.ui_send(command, **({"broadcast": False, **(send_kwargs or {})}))
+            else:
+                bridge.enqueue_local_message(command, source=source, user_id=user_id,
+                                             chat_id=chat_id, **(send_kwargs or {}))
+            return True
         from supervisor import state, git_ops
         from types import SimpleNamespace
         state.init(DATA_DIR)
@@ -1201,9 +1207,14 @@ def _startup_owner_command(command: str):
         git_ops.init(REPO_DIR, DATA_DIR, "", branch_dev, branch_stable)
         context = SimpleNamespace(safe_restart=git_ops.safe_restart,
                                   RUNNING=workers.RUNNING, kill_workers=workers.kill_workers)
-        ok, message = _perform_owner_restart(context)
+        if reply is not None:
+            reply("♻️ Restarting.", "")
+        ok, message = _perform_owner_restart(context, reply)
         if not ok:
             log.error("Startup owner restart cancelled: %s", message)
+            if reply is not None:
+                reply(f"⚠️ Restart cancelled: {message}", "failed")
+        return True
 
     return execute
 

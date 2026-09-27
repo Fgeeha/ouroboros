@@ -258,6 +258,12 @@ the owner can still open, read and act on. A suppressed skill row keeps Restore
 so the owner can ask for it back; a consumed one keeps only Delete, because
 offering Enable on a schedule that cannot fire again would be a lie.
 
+A record of what the owner did earlier is history, not status. A skill's
+OuroborosHub submission (the version it sent and its PR link) lives in the
+card's details disclosure without a tone; it never claims the PR merged, never
+gates or replaces the card's current action, and forgetting it is an explicit
+local choice rather than the way to unlock one.
+
 A task-bound `Reviews` history row may be the only retained fact for its owner.
 That row keeps a neutral owner anchor visible, but hides task status and typing
 until a real task status or activity arrives; review presence alone never means
@@ -731,6 +737,14 @@ time, never a replacement for the handoff.
 The row under a Project lifecycle row or a routed message is the shared `createSystemMessageActions` composition around the Project reference. It owns token-based space above and below the controls, wrapping and clearance for the focus ring; a control never sits in a clipped/nowrap text line. This is a row composition, not a new card framework or a global button-margin rule.
 
 History with no current execution or known outcome keeps its expandable content under `Outcome unavailable`, without a task chip, typing or Stop. Before complete live-source reconciliation, it is `Activity unconfirmed`. Positive current activity restores only its proven controls. A delivery warning may coexist with a preserved task-acceptance PASS. Model metadata says `Last solve response`, naming the initial request only when the route changed.
+
+History placement is separate from the task's outcome. Ordinary `Saving task history`
+and `Task history saved` appear only inside task details and Logs. A storage failure
+adds `History storage problem` to the existing collapsed-card metadata, without changing
+Done/Failed/Cancelled or creating a chat message; successful retention clears it.
+Details and Logs name the recorded failure reasons, grouping repeated reasons with their
+counts. Logs Raw retains the complete source/failure facts; a missing recorded reason is
+stated explicitly. Existing task-detail hydration and replay refresh this projection.
 
 ### Conversation activity block
 

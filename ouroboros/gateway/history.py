@@ -24,6 +24,7 @@ from ouroboros.gateway.history_paging import (
 )
 from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection
 from ouroboros.outcomes import normalize_outcome_axes
+from ouroboros.history_retention import retention_summary
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.project_dialogue import historical_terminal_projection
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, executor_observation_meta, initiator_meta, subagent_message_meta
@@ -351,6 +352,8 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
         rec["reason_code"] = str(entry.get("reason_code") or "")
     if isinstance(entry.get("review_projection"), dict):
         rec["review_projection"] = dict(entry.get("review_projection") or {})
+    if isinstance(entry.get("history_retention"), dict):
+        rec["history_retention"] = dict(entry["history_retention"])
     # The row's flat task-scope cost snapshot; _annotate_terminal_task_truth
     # later OVERRIDES it with the persisted task_results values when the result
     # file survives (row = fallback only). ABI-3: CONVERTED, not copied — a
@@ -495,6 +498,9 @@ def _annotate_terminal_task_truth(
                     **initiator_meta(result)}  # + the origin label, from the persisted metadata
                 if isinstance(result.get("model_execution"), dict):
                     terminal_truth["model_execution"] = dict(result["model_execution"])
+                retention = retention_summary(result)
+                if retention:
+                    terminal_truth["history_retention"] = retention
                 if result.get("reason_code"):
                     terminal_truth["reason_code"] = str(result.get("reason_code") or "")
                 if isinstance(result.get("cancel_origin"), dict):

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from ouroboros.headless import retry_child_task_refs
 import gzip
 import json
 import pathlib
@@ -85,6 +86,7 @@ def test_copyback_promotes_trace_manifest_and_blobs_before_headless_gc(tmp_path)
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     assert copied["child_ref_promotion"]["status"] == "complete"
@@ -176,6 +178,7 @@ def test_pipeline_loop_outcome_trace_refs_are_rebased_and_readable_after_gc(tmp_
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     nested_refs = copied["loop_outcome"]["trace_refs"]
@@ -257,6 +260,7 @@ def test_real_truncated_tool_source_envelope_remains_actor_readable_after_gc(tmp
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     request_ref = copied["loop_outcome"]["trace_refs"]["llm_call_refs"][0][
@@ -305,6 +309,7 @@ def test_task_source_read_contract_mismatch_is_typed_unavailable(tmp_path, misma
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     gap = copied["review_evidence"]["exact_source_ref"]
@@ -348,6 +353,7 @@ def test_copyback_promotes_service_full_log_refs_in_durable_evidence_and_tool_pa
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     evidence_ref = copied["verification_ledger"]["entries"][0]["services"][0][
@@ -387,14 +393,15 @@ def test_interrupted_live_ref_promotion_blocks_gc_until_idempotent_retry(
         artifact_status="ready",
         trace_refs={"tool_call_refs": [{"manifest_ref": trace["manifest_ref"]}]},
     )
-    real = observability.promote_call_manifest_ref
+    real = observability.write_call_manifest
     monkeypatch.setattr(
         observability,
-        "promote_call_manifest_ref",
+        "write_call_manifest",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("interrupted copy")),
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     assert copied["child_ref_promotion"]["status"] == "incomplete"
@@ -405,8 +412,9 @@ def test_interrupted_live_ref_promotion_blocks_gc_until_idempotent_retry(
     assert report["skipped"][0]["reason"] == "child_refs_pending"
     assert child.exists()
 
-    monkeypatch.setattr(observability, "promote_call_manifest_ref", real)
+    monkeypatch.setattr(observability, "write_call_manifest", real)
     retried = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    retried = retry_child_task_refs(parent, child, task_id)
     assert retried is not None
     assert retried["child_ref_promotion"]["status"] == "complete"
     assert retried["child_ref_promotion"]["pending_refs"] == []
@@ -429,6 +437,7 @@ def test_digest_mismatch_becomes_typed_unavailable_and_does_not_pin_drive(tmp_pa
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     unavailable = copied["trace_refs"]["tool_call_refs"][0]["redacted_projection_ref"]
@@ -497,7 +506,7 @@ def test_concurrent_copyback_is_idempotent_and_copies_only_referenced_source_han
     with ThreadPoolExecutor(max_workers=2) as pool:
         first, second = list(
             pool.map(
-                lambda _ordinal: copy_child_task_result(parent, task),
+                lambda _ordinal: (copy_child_task_result(parent, task), retry_child_task_refs(parent, child, task_id))[1],
                 range(2),
             )
         )
@@ -554,6 +563,7 @@ def test_copyback_source_handle_promotion_survives_a_lost_write_race(tmp_path, m
     monkeypatch.setattr(artifacts_module, "store_actor_source_bytes", _losing_store)
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     promotion = copied["child_ref_promotion"]
     assert promotion["status"] == "complete"
@@ -628,6 +638,7 @@ def test_legacy_missing_child_ref_is_typed_gap_without_permanent_retention(tmp_p
     )
 
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
 
     assert copied is not None
     gap = copied["trace_refs"]["tool_call_refs"][0]["redacted_projection_ref"]
@@ -674,20 +685,20 @@ def test_startup_sweep_retries_only_pending_refs_then_prunes_without_manual_copy
             ]
         },
     )
-    real = observability.promote_call_manifest_ref
+    real = observability.write_call_manifest
 
     def _interrupt_pending(*args, **kwargs):
-        ref = args[2] if len(args) > 2 else kwargs.get("ref") or {}
-        if ref.get("call_id") == "startup-retry-pending":
+        if kwargs.get("call_id") == "startup-retry-pending":
             raise OSError("first copy interrupted")
         return real(*args, **kwargs)
 
     monkeypatch.setattr(
         observability,
-        "promote_call_manifest_ref",
+        "write_call_manifest",
         _interrupt_pending,
     )
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
     assert copied is not None
     assert copied["child_ref_promotion"]["status"] == "incomplete"
 
@@ -709,7 +720,7 @@ def test_startup_sweep_retries_only_pending_refs_then_prunes_without_manual_copy
             "canonical_newer": True,
         },
     )
-    monkeypatch.setattr(observability, "promote_call_manifest_ref", real)
+    monkeypatch.setattr(observability, "write_call_manifest", real)
     # The sweep reads its drive root from its owner module (v7 server split).
     monkeypatch.setattr(server_maintenance, "DATA_DIR", parent)
     monkeypatch.setenv("OUROBOROS_GC_RETENTION_DAYS", "1")
@@ -765,19 +776,21 @@ def test_startup_prune_retries_missing_pending_source_into_typed_gap(
         artifact_status="ready",
         trace_refs={"tool_call_refs": [{"manifest_ref": trace["manifest_ref"]}]},
     )
-    real = observability.promote_call_manifest_ref
+    real = observability.write_call_manifest
     monkeypatch.setattr(
         observability,
-        "promote_call_manifest_ref",
+        "write_call_manifest",
         lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("interrupted")),
     )
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
     assert copied is not None
     assert copied["child_ref_promotion"]["status"] == "incomplete"
     pathlib.Path(trace["manifest_ref"]["path"]).unlink()
-    monkeypatch.setattr(observability, "promote_call_manifest_ref", real)
+    monkeypatch.setattr(observability, "write_call_manifest", real)
 
-    # The ONE retry owner turns the missing source into a typed gap; settlement then proceeds.
+    # Exact manifest custody landed before the projection write failed. Losing
+    # the old locator does not lose that preserved version; retry can finish.
     assert observability.retry_pending_child_ref_promotions(parent)["completed"] == [task_id]
     report = prune_headless_task_drives(
         parent, retention_days=0, now=_future_now(), live=lambda _task: False
@@ -785,9 +798,10 @@ def test_startup_prune_retries_missing_pending_source_into_typed_gap(
 
     assert report["pruned"][0]["task_id"] == task_id
     settled = load_task_result(parent, task_id) or {}
-    gap = settled["trace_refs"]["tool_call_refs"][0]["manifest_ref"]
-    assert gap["availability"] == "unavailable"
-    assert gap["reason"] == "source_missing"
+    recovered = settled["trace_refs"]["tool_call_refs"][0]["manifest_ref"]
+    manifest = observability.read_call_manifest_ref(parent, recovered, task_id=task_id)
+    assert observability.read_blob_ref(parent, manifest["full_payload_ref"])["result"] == "lost before retry"
+    assert settled["child_ref_promotion"]["unavailable_refs"] == []
     assert settled["child_ref_promotion"]["status"] == "complete"
 
 

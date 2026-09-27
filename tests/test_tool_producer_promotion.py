@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.artifacts import read_actor_source_bytes
-from ouroboros.headless import copy_child_task_result, prepare_task_drive, prune_headless_task_drives
+from ouroboros.headless import copy_child_task_result, prepare_task_drive, prune_headless_task_drives, retry_child_task_refs
 from ouroboros.loop_tool_execution import process_tool_results
 from ouroboros.observability import persist_call, read_blob_ref
 from ouroboros.task_results import STATUS_COMPLETED, write_task_result
@@ -48,6 +48,7 @@ def test_clean_source_in_model_request_survives_child_copyback_and_pruning(tmp_p
     write_task_result(child, task_id, STATUS_COMPLETED, result="done", artifact_status="ready",
                       trace_refs={"llm_call_refs": [{"request_ref": request["manifest_ref"]}]})
     copied = copy_child_task_result(parent, {"id": task_id, "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, task_id)
     assert copied is not None and copied["child_ref_promotion"]["status"] == "complete"
     request_ref = copied["trace_refs"]["llm_call_refs"][0]["request_ref"]
     manifest = json.loads(Path(request_ref["path"]).read_text(encoding="utf-8"))
