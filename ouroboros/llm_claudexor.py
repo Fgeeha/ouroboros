@@ -28,6 +28,7 @@ from ouroboros.deadline_utils import llm_transport_timeout_sec
 from ouroboros.gateways.claudexor import (
     ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported, _READ_TIMEOUT_SEC)
 from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
+from ouroboros.send_clock import stamp_clock_note
 from ouroboros.llm_substitution import (
     AccountRotation, SubstitutionBudget, substitution_fact, failed_account_preference,
     take_failed_account_preference)
@@ -745,6 +746,8 @@ def _reset_native(payload: dict, error: ClaudexorModelNotDispatched, invocation:
 
 
 def _accounted_request(invocation: _ModelInvocation):
+    # Every invocation is a new host preparation: Main's clock line, kept by the idempotent upload/rejoin.
+    invocation.payload = stamp_clock_note(invocation.payload)
     request = replace(_attempt_request(invocation.target, invocation.payload),
                       force_unknown_reservation=True, max_completion_tokens=invocation.output_reserve)
     existing = _candidate_before_dispatch(invocation.payload, request)
@@ -923,7 +926,7 @@ def recover_model_attempt(drive_root, row: dict, *, gateway_factory=None):
 
 
 async def chat_claudexor_async(target: dict, messages: list, tools: list | None, **parameters: Any) -> tuple[dict, dict]:
-    """Keep accounting/capture in the async caller; offload only synchronous I/O."""
+    """Offload synchronous I/O and joined accounting; adopt its capture in this caller."""
     target = (await asyncio.to_thread(prepare_processing_target, target)
               if target.get("processing_preference") and "processing_preferences" not in target else target)
     payload = _request(target, messages, tools, parameters)

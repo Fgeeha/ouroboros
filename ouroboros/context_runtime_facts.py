@@ -2,7 +2,8 @@
 
 Extracted whole from ``context.py`` at its module ceiling (v7 leaf) so the
 facts the runtime section renders keep one home: the project room a task sits in,
-the budget rails it runs under, and the
+the budget rails it runs under, how the run learns the time (its capture instant
+labels the Recent/Drive snapshots), and the
 configured delegation route with its honestly-labeled historical observations.
 Each returns a plain projection and reads no context state, so nothing here can
 change what the section MEANS — only what it reports. ``context`` re-exports every
@@ -52,6 +53,34 @@ def task_execution_clock_fact(task: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
                                                     datetime.timezone.utc).isoformat()
     return {"started_at": started, "absolute_ceiling_at": projected,
             "absolute_ceiling_at_basis": "current estimate; quota or budget pauses may move it" if projected else "not_set"}
+
+
+def _context_clock_note(task: Dict[str, Any]) -> str:
+    """How this run learns the time: Main gets a clock line per request (``send_clock``)."""
+    from ouroboros.send_clock import main_clock_policy
+
+    meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if task.get("delegation_role") and "delegation_role" not in meta:
+        meta = {**meta, "delegation_role": task.get("delegation_role")}
+    if main_clock_policy(meta, task_type=str(task.get("type") or "")) is None:
+        return ("context_captured_at is when this context was built; it does not advance "
+                "during this run.")
+    return ("context_captured_at is when this context was built, not the current time. "
+            "Each of your model requests ends with a host clock line sampled for that request.")
+
+
+def snapshot_labelled(section: str, captured_at: str) -> str:
+    """Label a captured Recent/Drive section with its capture time, below its heading.
+
+    These sections are rendered once per run and stay byte-stable in the cached
+    prefix; the label says so instead of refreshing them every round.
+    """
+    heading, sep, body = str(section or "").partition("\n")
+    if not heading.startswith(("## Recent ", "## Drive state")) or not captured_at:
+        return section
+    label = (f"_Snapshot captured at {captured_at} when this context was built; "
+             "not refreshed during this run._")
+    return heading + "\n" + label + ((sep + body) if body else "")
 
 
 def _queue_context_fact(task: Dict[str, Any]) -> Dict[str, Any]:

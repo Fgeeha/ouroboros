@@ -281,6 +281,9 @@ class LocalChatBridge:
     """Local Queue-backed message bus."""
 
     def __init__(self, settings: Optional[Dict[str, Any]] = None):
+        from ouroboros.server_control import PanicIngress
+
+        self.panic = PanicIngress()  # server binds the existing emergency owner
         self._inbox = queue.Queue()   # user -> agent
         # Updates the consumer handed back unprocessed (``requeue_updates``); memory only.
         self._replay: List[Dict[str, Any]] = []
@@ -416,7 +419,7 @@ class LocalChatBridge:
             self._response_subs.pop(subscription_id, None)
 
     def shutdown(self) -> None:
-        return None
+        self.panic.invalidate_owner()
 
     def handle_web_message(
         self,
@@ -442,6 +445,8 @@ class LocalChatBridge:
         if thread_id < 1:
             thread_id = 1
         clean_text = str(text or "").strip()
+        if self.panic.request(clean_text):
+            return
         if not clean_text and not image_base64:
             return
         import uuid
@@ -515,12 +520,15 @@ class LocalChatBridge:
         ``received_at`` for all of them: an earlier host stamp of this message (its accepted row's
         time, the WS acceptance's ``client_surface.received_at``) is kept, else now. The update
         carries it; a surface fact without one (a host channel stamp) gets it too, so every
-        record that copies the fact carries it. Nothing else: a dict put, no lock, no I/O."""
+        record that copies the fact carries it. Panic uses the server's independent
+        emergency owner; ordinary ingress is a dict put, no lock or I/O."""
         clean_text = str(text or "").strip()
         caption_text = str(image_caption or "").strip()
         image_b64 = str(image_base64 or "").strip()
         if not clean_text and caption_text:
             clean_text = caption_text
+        if self.panic.request(clean_text, source=source, user_id=user_id, chat_id=chat_id):
+            return
         if not clean_text and not image_b64 and not (task_metadata or {}).get("chat_attachment_uploads"):
             return  # nothing to say and nothing attached (a file-only message carries uploads)
         surface = (task_metadata or {}).get("client_surface")
@@ -1325,7 +1333,12 @@ def budget_line(force: bool = False) -> str:
             live["budget_messages_since_report"] = 0
             report_box["emit"] = True
 
-        st = update_state(_tick_counter)
+        from supervisor.state import StateUnavailable
+
+        try:
+            st = update_state(_tick_counter)
+        except StateUnavailable:  # a budget report is bookkeeping; the message itself proceeds
+            return ""
         if not report_box["emit"]:
             return ""
         display_state = dict(st)
@@ -1452,6 +1465,8 @@ def log_chat(
             card_row_id = str(meta.get("card_row_id") or "")
             if card_row_id and len(card_row_id) <= 200:
                 record["card_row_id"] = card_row_id
+        if record_type == "acceptance_late_settlement" and isinstance(meta.get("late_evidence"), dict):
+            record["late_evidence"] = dict(meta["late_evidence"])
         if filename:
             record["filename"] = filename
         if mime:

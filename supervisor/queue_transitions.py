@@ -1116,11 +1116,14 @@ def _close_campaign_after_owner_stop(exclude_task_id: str = "") -> None:
             _read_evolution_campaign,
             complete_evolution_campaign,
         )
-        from supervisor.state import load_state
+        from supervisor.state import control_is, load_state
 
-        if not bool(load_state().get("evolution_owner_stopped")):
+        campaign = _read_evolution_campaign()
+        # A KNOWN owner stop or a recorded stop intent (#1307); an unknown flag closes nothing.
+        if not (control_is(load_state(), "evolution_owner_stopped", True)
+                or isinstance(campaign.get("stop_intent"), dict)):
             return
-        if _read_evolution_campaign().get("status") not in {"active", "paused"}:
+        if campaign.get("status") not in {"active", "paused"}:
             return
         from supervisor.queue import PENDING, RUNNING, _queue_lock
 

@@ -12,6 +12,42 @@ from ouroboros.gateway.task_events import _TaskEventCursorFollower
 from tests.test_task_event_cursor import append, content, seed
 
 
+@pytest.mark.parametrize("consumer", ["wake", "history"])
+def test_captured_consumer_horizon_survives_append_and_rotation(tmp_path, consumer):
+    """Sharing physical reads must not import history's selection policy into a wake."""
+    from ouroboros.consciousness_wake import _ChatChain
+    from ouroboros.gateway.history_paging import HistorySource
+
+    path = tmp_path / "logs" / "chat.jsonl"
+    path.parent.mkdir()
+    first = b'{"text":"first"}\n'
+    path.write_bytes(first + b'{"text":"next')
+    source = _ChatChain(path) if consumer == "wake" else HistorySource(path, "chat")
+    with path.open("ab") as handle:
+        handle.write(b'"}\n')
+    archive = tmp_path / "archive"
+    archive.mkdir()
+    path.rename(archive / "chat_20260101T000000.jsonl")
+    path.write_bytes(b'{"text":"new generation"}\n')
+
+    if consumer == "wake":
+        gaps = set()
+        rows, accepted = source.rows(0, 0, gaps)
+        assert [row["text"] for _, row in rows] == ["first"]
+        assert accepted == len(first) and not gaps
+        fresh = _ChatChain(path)
+        rows = [row for index in range(len(fresh.entries))
+                for _, row in fresh.rows(index, accepted, gaps)[0]]
+    else:
+        rows, _, gaps = source.replay(0, source.upper)
+        assert [row["text"] for row in rows] == ["first"]
+        assert source.upper == len(first) and not gaps
+        fresh = HistorySource(path, "chat")
+        rows, _, gaps = fresh.replay(source.upper, fresh.upper)
+    assert [row["text"] for row in rows] == ["next", "new generation"]
+    assert not gaps
+
+
 @pytest.mark.parametrize("archives,records", [(40, 1), (100, 1), (20, 4)])
 def test_cold_metadata_reads_are_linear_in_archives_and_not_multiplied_by_batches(tmp_path, monkeypatch, archives, records):
     root = seed(tmp_path / "root")

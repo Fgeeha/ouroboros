@@ -22,6 +22,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from ouroboros.anthropic_native_custody import is_replayed_native_content
 from ouroboros.context_budget import CONTEXT_OVERFLOW_CODES
+from ouroboros.request_wire_contract import physical_candidate_bytes as _canonical_candidate_bytes
 from ouroboros.request_wire_recovery import prepare_wire_payload_for_send
 from ouroboros.transport_custody import ProviderNotDispatched, is_loopback_base_url
 from ouroboros.usage_accounting import (
@@ -413,6 +414,13 @@ def _attempt_request(
     context = _canonical_candidate_bytes({
         key: payload[key] for key in ("system", "messages", "tools", "functions") if key in payload
     })
+    from ouroboros.send_clock import record_candidate, split_clock_note
+
+    # The same bytes carry the Main clock line; its clock-free twin identifies
+    # the candidate across two samples (the forced-final admission predicate).
+    clock_note, clock_free = split_clock_note(payload)
+    raw_sha256 = hashlib.sha256(raw).hexdigest()
+    record_candidate(raw_sha256, clock_note)
     return AttemptRequest(
         model=str(target.get("usage_model") or target.get("resolved_model") or payload.get("model") or ""),
         provider=str(target.get("provider") or "unknown"),
@@ -420,7 +428,7 @@ def _attempt_request(
         max_completion_tokens=int(payload.get("max_completion_tokens") or payload.get("max_tokens") or 0),
         source=str(request_source or ""),
         prompt_cache_ttl=_applied_payload_cache_ttl(payload) or "",
-        candidate_raw_sha256=hashlib.sha256(raw).hexdigest(),
+        candidate_raw_sha256=raw_sha256,
         candidate_raw_size_bytes=len(raw),
         candidate_context_sha256=hashlib.sha256(context).hexdigest(),
         candidate_context_size_bytes=len(context),
@@ -431,14 +439,11 @@ def _attempt_request(
         processing_preference=str(target.get("processing_preference") or ""),
         submitted_processing_mode=submitted_processing_mode(target, payload),
         processing_basis=copy.deepcopy(target.get("processing_basis")),
+        candidate_clock_free_sha256=(
+            hashlib.sha256(_canonical_candidate_bytes(clock_free)).hexdigest()
+            if clock_note is not None else None
+        ),
     )
-
-
-def _canonical_candidate_bytes(payload: Dict[str, Any]) -> bytes:
-    return json.dumps(
-        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
-        allow_nan=False, default=str,
-    ).encode("utf-8")
 
 
 def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -460,9 +465,13 @@ def _physical_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _finalized_physical_candidate(
-    target: Dict[str, Any], payload: Dict[str, Any], api_surface: str,
+    target: Dict[str, Any], payload: Dict[str, Any], api_surface: str, *, fresh_clock: bool = False,
 ) -> Dict[str, Any]:
+    from ouroboros.request_wire_recovery import refresh_wire_clock
+
     physical = _physical_candidate(payload)
+    if fresh_clock:
+        physical = refresh_wire_clock(physical, api_surface=api_surface)
     if target.get("context_mode") == "nano":
         physical = _fit_output_payload(target, physical, api_surface)
     return prepare_wire_payload_for_send(

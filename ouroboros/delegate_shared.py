@@ -72,6 +72,7 @@ _AGENT_FAULT_REASONS = frozenset({
     "missing_run_id",
     "payload_binding_mismatch",
     "payload_selector_incomplete",
+    "payload_selector_unresolved",
     "retry_prompt_mismatch",
     "retry_selector_conflict",
     "selector_on_retry",

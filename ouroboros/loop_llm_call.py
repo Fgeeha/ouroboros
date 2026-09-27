@@ -31,6 +31,7 @@ from ouroboros.openai_chat_dispatch import CUSTOM_RECEIPTS_USAGE_KEY, pop_custom
 from ouroboros.llm_attempt import PROVIDER_POLICY_REFUSAL, _is_provider_policy_refusal  # typed-refusal contract owner
 from ouroboros.observability import new_call_id, new_execution_id, persist_call
 from ouroboros.pricing import emit_llm_usage_event, estimate_cost_optional, infer_model_category
+from ouroboros.send_clock import main_send_scope
 from ouroboros.task_pacing import main_loop_wire_options
 from ouroboros.transport_custody import attempt_custody_event_fields, is_pre_dispatch_transport_failure, is_retryable_transport_death
 from ouroboros._usage_response import provider_cost_value as _provider_cost_value
@@ -1196,23 +1197,20 @@ def _send_main_candidate(
     physical_context: Optional[PhysicalAttemptContext],
     candidate_predicate: Optional[Callable[[Any], Any]],
     model_context_observer: Any = None,
+    send_clock_policy: Any = None, canonical_messages: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    binding = (
-        contextlib.nullcontext() if physical_context is None and candidate_predicate is None
-        else bind_physical_attempt_context(physical_context, candidate_predicate=candidate_predicate)
-    )
-    with model_concurrency.model_call_slot(model, use_local, deadline_ts), binding:
+    binding = (contextlib.nullcontext() if physical_context is None and candidate_predicate is None
+               else bind_physical_attempt_context(physical_context, candidate_predicate=candidate_predicate))
+    # Main's clock line per physical send; the consumed one joins ``canonical_messages``.
+    clock = main_send_scope(send_clock_policy, canonical_messages)
+    with model_concurrency.model_call_slot(model, use_local, deadline_ts), binding, clock:
         result = llm.chat(**kwargs)
         if callable(model_context_observer):
             model_context_observer(kwargs["messages"])
         return result
 
 
-def _take_custom_receipts(
-    usage: Dict[str, Any],
-    msg: Dict[str, Any],
-    accumulated_usage: Dict[str, Any],
-) -> None:
+def _take_custom_receipts(usage: Dict[str, Any], msg: Dict[str, Any], accumulated_usage: Dict[str, Any]) -> None:
     receipts = pop_custom_validation_receipts(usage, msg.get("tool_calls") or [])
     accumulated_usage.pop(CUSTOM_RECEIPTS_USAGE_KEY, None)
     if receipts:
@@ -1323,7 +1321,7 @@ def call_llm_with_retry(
     stop_retry_check: Optional[Callable[[], bool]] = None,
     model_role: str = "main", model_turn_state: Any = None,
     model_account_override: Optional[str] = None, processing_preference: Optional[str] = None,
-    model_context_observer: Any = None,
+    model_context_observer: Any = None, send_clock_policy: Any = None,
 ) -> Tuple[Optional[Dict[str, Any]], Optional[float]]:
     """Call one model with bounded retries and deadline-aware transport."""
     from ouroboros.model_slots import resolve_processing_preference
@@ -1429,6 +1427,7 @@ def call_llm_with_retry(
             msg, usage = _send_main_candidate(
                 llm, kwargs, model=model, use_local=use_local, deadline_ts=deadline_ts,
                 physical_context=physical_context, candidate_predicate=candidate_predicate if attempt == 0 else None, model_context_observer=model_context_observer,
+                send_clock_policy=send_clock_policy, canonical_messages=messages,
             )
             host_route = usage.get("model_role_route") or {}
             model, use_local = host_route.get("model", model), host_route.get("use_local", use_local)

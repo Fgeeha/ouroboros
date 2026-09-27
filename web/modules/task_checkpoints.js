@@ -21,6 +21,7 @@ export const CHECKPOINT_LABELS = {
 
 export function taskCheckpointLabel(evt = {}) {
     const kind = String(evt.checkpoint_kind || '');
+    if (kind === 'usage_lock_wait') return evt.phase === 'ended' ? 'Accounting wait ended' : 'Waiting for accounting access';
     if (!kind && Number(evt.checkpoint_number) > 0) {
         return `Checkpoint ${evt.checkpoint_number} — periodic self-check`;
     }

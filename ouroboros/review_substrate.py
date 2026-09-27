@@ -384,7 +384,20 @@ class ReviewCoordinator:
             )
             else self.usage_ctx
         )
-        actors = run_custodied_review_slots(
+        source_error = ''
+        if request.surface == 'task_acceptance' and request.policy.get('native_data_root') and not request.reconcile_only:
+            try:
+                from ouroboros.review_source_closure import retain_review_request_sources
+                from ouroboros.acceptance_retrieving import acceptance_retrieving_work_order
+
+                retain_review_request_sources(request, source_root=request.policy['native_data_root'],
+                                              custody_root=self._custody_drive_root())
+                acceptance_retrieving_work_order(request, [slot for slot in slots if slot.retrieves],
+                    session_root=request.session_root, data_root=pathlib.Path(request.policy['native_data_root']))
+            except Exception as exc:
+                source_error = f'review_source_closure_unavailable: {type(exc).__name__}: {exc}'
+        actors = [self._error_actor(request, slot, source_error, operation_state='not_dispatched')
+                  for slot in slots] if source_error else run_custodied_review_slots(
             request=request, slots=slots,
             usage_ctx=custody_usage_ctx,
             task_id=task_id,

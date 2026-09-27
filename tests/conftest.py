@@ -774,20 +774,23 @@ def _hide_bundled_skills(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _isolate_workspace_executor_globals():
-    """Isolate process/service registry module-globals between tests (parallel-safety).
+def _isolate_evolution_stop_latch(monkeypatch):
+    """A received evolution Stop is a process-lifetime latch (#1307); no test inherits one."""
+    from supervisor import evolution_lifecycle
 
-    Two modules keep service/process state in module-level dicts that nothing reset between tests
-    — a latent ordering bug that pytest-xdist's test REDISTRIBUTION exposes (a test inherits
-    another's leftover registry → e.g. the docker-cleanup tests flake under ``-n``):
-      * ``ouroboros.workspace_executor._SERVICES`` / ``_FOREGROUND`` (re-entrant ``_STATE_LOCK``);
-      * the legacy ``ouroboros.tools.services._SERVICES`` (a PLAIN ``_LOCK``).
-    Snapshot → clear → run → restore each around every test so each starts from an empty registry,
-    in both serial and parallel runs. Registry isolation ONLY — the records may wrap live Popen
-    handles, so we never terminate them (production owns process teardown). Each module is
-    lazy-imported under its own guard so a stripped build still collects, and only raw dict ops run
-    under the lock (never a services function that re-acquires the plain ``_LOCK`` → no deadlock).
-    Makes the ad-hoc manual ``_SERVICES.clear()`` calls in the executor tests redundant (harmless).
+    monkeypatch.setitem(evolution_lifecycle._STOP_LATCH, "stopped", False)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_workspace_executor_globals():
+    """Snapshot/reset/restore service registries AND their process-lifetime Panic latches.
+
+    Real Panic requests retire admission even with empty registries. A mocked hard exit in
+    test_post_task_evolution left that latch set for the next black-box service test.
+    Each test gets fresh admission; Panic still latches for its whole test.
+    Never terminate saved Popen handles here: production owns process teardown. Lazy imports
+    keep stripped builds collectable; only raw state operations run under either module lock
+    (services._LOCK is non-reentrant, so calling a service helper there would deadlock).
     """
     try:
         from ouroboros import workspace_executor as we
@@ -799,12 +802,16 @@ def _isolate_workspace_executor_globals():
         svc = None
     if we is not None:
         with we._STATE_LOCK:
+            saved_we_panic = we._panic_requested
+            we._panic_requested = False
             saved_we_services = dict(we._SERVICES)
             saved_we_foreground = dict(we._FOREGROUND)
             we._SERVICES.clear()
             we._FOREGROUND.clear()
     if svc is not None:
         with svc._LOCK:
+            saved_svc_panic = svc._panic_requested
+            svc._panic_requested = False
             saved_svc_services = dict(svc._SERVICES)
             svc._SERVICES.clear()
     try:
@@ -812,12 +819,14 @@ def _isolate_workspace_executor_globals():
     finally:
         if we is not None:
             with we._STATE_LOCK:
+                we._panic_requested = saved_we_panic
                 we._SERVICES.clear()
                 we._SERVICES.update(saved_we_services)
                 we._FOREGROUND.clear()
                 we._FOREGROUND.update(saved_we_foreground)
         if svc is not None:
             with svc._LOCK:
+                svc._panic_requested = saved_svc_panic
                 svc._SERVICES.clear()
                 svc._SERVICES.update(saved_svc_services)
 

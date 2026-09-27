@@ -193,6 +193,8 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
     if data.get("type") in ("task_checkpoint", "task_start_settings_reload_failed"):
         try:
             ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
+            if payload.get("system_type") == "task_checkpoint":
+                ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "progress.jsonl", payload)
         except Exception:
             log.debug("Failed to persist %s event to events.jsonl", data.get("type"), exc_info=True)
 

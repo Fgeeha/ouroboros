@@ -8,14 +8,14 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 
 | domain | name | modules | proposed |
 |---|---|---:|---:|
-| D01 | Agent core & main loop | 37 | 0 |
-| D02 | LLM client, routing & providers | 38 | 0 |
+| D01 | Agent core & main loop | 38 | 0 |
+| D02 | LLM client, routing & providers | 39 | 0 |
 | D03 | Context assembly, fit & compaction | 11 | 0 |
 | D04 | Tool execution: registry, access & typed results | 21 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 29 | 0 |
-| D06 | Review stack | 68 | 0 |
-| D07 | Delegation, subagents & Claudexor | 54 | 0 |
-| D08 | Supervisor: queue, workers, events & runtime control | 48 | 0 |
+| D06 | Review stack | 70 | 0 |
+| D07 | Delegation, subagents & Claudexor | 55 | 0 |
+| D08 | Supervisor: queue, workers, events & runtime control | 50 | 0 |
 | D09 | Cancellation, owner control & process custody | 13 | 0 |
 | D10 | Git, update & release machinery | 28 | 0 |
 | D11 | Gateway, server & Web UI | 57 | 0 |
@@ -23,12 +23,12 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D13 | Safety, guards & runtime mode | 9 | 0 |
 | D14 | Skills & extensions | 56 | 0 |
 | D15 | Memory, knowledge, consciousness & self-evolution | 23 | 0 |
-| D16 | Observability, usage accounting & cost | 11 | 0 |
+| D16 | Observability, usage accounting & cost | 13 | 0 |
 | D17 | Projects, workspaces & task results | 24 | 0 |
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **577** | **0** |
+| **total** | | **586** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -221,6 +221,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/synthesis_cost_text.py`
 - `ouroboros/task_finalization.py`
 - `ouroboros/task_pacing.py`
+- `ouroboros/tool_call_log.py`
 - `ouroboros/transcript_prefix.py`
 
 ### D02 — LLM client, routing & providers
@@ -261,6 +262,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/request_wire_recovery.py`
 - `ouroboros/request_wire_resolution.py`
 - `ouroboros/route_spec.py`
+- `ouroboros/send_clock.py`
 - `ouroboros/transport_custody.py`
 - `ouroboros/vision_routing.py`
 
@@ -352,6 +354,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/review_execution.py`
 - `ouroboros/review_execution_projection.py`
 - `ouroboros/review_native_episode.py`
+- `ouroboros/review_operation.py`
 - `ouroboros/review_owner_custody.py`
 - `ouroboros/review_projection.py`
 - `ouroboros/review_records.py`
@@ -359,6 +362,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/review_session_reads.py`
 - `ouroboros/review_session_usage.py`
 - `ouroboros/review_slot_cancel.py`
+- `ouroboros/review_source_closure.py`
 - `ouroboros/review_state.py`
 - `ouroboros/review_state_custody.py`
 - `ouroboros/review_state_model.py`
@@ -424,6 +428,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/delegate_output.py`
 - `ouroboros/delegate_pending.py`
 - `ouroboros/delegate_progress.py`
+- `ouroboros/delegate_readonly_inputs.py`
 - `ouroboros/delegate_recovery.py`
 - `ouroboros/delegate_registration_policy.py`
 - `ouroboros/delegate_shared.py`
@@ -497,8 +502,10 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `supervisor/queue_timeouts.py`
 - `supervisor/queue_transitions.py`
 - `supervisor/schedule_lifecycle.py`
+- `supervisor/schedule_occurrence.py`
 - `supervisor/schedule_time.py`
 - `supervisor/state.py`
+- `supervisor/state_initialization.py`
 - `supervisor/subagent_task_truth.py`
 - `supervisor/task_admission.py`
 - `supervisor/task_dispatch.py`
@@ -738,9 +745,11 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 ### D16 — Observability, usage accounting & cost
 
 - `ouroboros/_usage_cache_splits.py`
+- `ouroboros/_usage_money.py`
 - `ouroboros/_usage_response.py`
 - `ouroboros/_usage_rows.py`
 - `ouroboros/_usage_rows_memo.py`
+- `ouroboros/_usage_wait.py`
 - `ouroboros/cost_projection.py`
 - `ouroboros/model_send_seal.py`
 - `ouroboros/observability.py`

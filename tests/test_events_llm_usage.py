@@ -161,6 +161,21 @@ def test_llm_usage_real_corrupt_ledger_keeps_the_projection_dirty_and_paid_event
     assert ctx.budget_projection_dirty is True and ctx.budget_projection_retry_at > 0
 
 
+_PRICED_CACHE_USAGE = {
+    "type": "llm_usage",
+    "model": "google/gemini-3.5-flash",
+    "api_key_type": "openrouter",
+    "model_category": "light",
+    "category": "task",
+    "cost": 0.25,
+    "prompt_tokens": 1000,
+    "completion_tokens": 100,
+    "cached_tokens": 600,
+    "cache_write_tokens": 200,
+    "prompt_cache_ttl": "default",
+}
+
+
 def test_cost_breakdown_aggregates_cache_tokens_and_ttl(tmp_path):
     import asyncio
     import json
@@ -170,29 +185,18 @@ def test_cost_breakdown_aggregates_cache_tokens_and_ttl(tmp_path):
     logs_dir.mkdir()
     (logs_dir / "events.jsonl").write_text(
         "\n".join([
-            json.dumps({
-                "type": "llm_usage",
-                "model": "google/gemini-3.5-flash",
-                "api_key_type": "openrouter",
-                "model_category": "light",
-                "category": "task",
-                "cost": 0.25,
-                "prompt_tokens": 1000,
-                "completion_tokens": 100,
-                "cached_tokens": 600,
-                "cache_write_tokens": 200,
-                "prompt_cache_ttl": "default",
-            }),
+            json.dumps(_PRICED_CACHE_USAGE),
             json.dumps({
                 "type": "llm_usage",
                 "model": "malformed/model",
                 "cost": 0.10,
                 "cached_tokens": "n/a",
             }),
+            # An honestly unknown price: its tokens count, its dollars stay undisclosed.
             json.dumps({
                 "type": "llm_usage",
-                "model": "nan/model",
-                "cost": "NaN",
+                "model": "unpriced/model",
+                "cost": None,
                 "prompt_tokens": 50,
             }),
         ]) + "\n",
@@ -202,6 +206,7 @@ def test_cost_breakdown_aggregates_cache_tokens_and_ttl(tmp_path):
     response = asyncio.run(make_cost_breakdown_endpoint(tmp_path)(None))
     payload = json.loads(response.body.decode("utf-8"))
 
+    assert response.status_code == 200
     assert payload["total_cost"] == 0.35
     assert payload["total_prompt_tokens"] == 1050
     assert payload["total_cached_tokens"] == 600
@@ -211,8 +216,64 @@ def test_cost_breakdown_aggregates_cache_tokens_and_ttl(tmp_path):
     assert by_model["cached_tokens"] == 600
     assert by_model["cache_write_tokens"] == 200
     assert by_model["prompt_cache_ttls"] == {"default": 1}
+    assert by_model["cost_final"] is True
     assert "malformed/model" in payload["by_model"]
-    assert payload["by_model"]["nan/model"]["cost"] == 0.0
+    unpriced = payload["by_model"]["unpriced/model"]
+    assert unpriced["cost"] == 0.0
+    assert unpriced["unknown_unmetered"] == 1
+    assert unpriced["cost_final"] is False
+    accounting = payload["accounting"]
+    assert accounting["available"] is True
+    assert accounting["settled_usd"] == 0.35
+    assert accounting["unknown_unmetered"] == 1
+    assert accounting["non_final_rows"] == 1
+    assert accounting["cost_final"] is False
+
+
+@pytest.mark.parametrize("encoding", ["string", "json_token"])
+@pytest.mark.parametrize("literal", ["NaN", "Infinity", "-Infinity"])
+def test_cost_breakdown_refuses_nonfinite_legacy_cost_without_import(tmp_path, caplog, literal, encoding):
+    """Nonfinite legacy money is an integrity failure at the real gateway: 503,
+    never a fabricated $0 total, and no completed import that would hide it."""
+    import asyncio
+    from ouroboros.gateway.history import make_cost_breakdown_endpoint
+    from ouroboros.usage_ledger import LEDGER_REL, QUARANTINE_REL, UsageNonFiniteMoney
+    from ouroboros.usage_legacy_import import IMPORT_REL
+
+    logs_dir = tmp_path / "logs"
+    logs_dir.mkdir()
+    events_path = logs_dir / "events.jsonl"
+    # ``json.dumps`` of a float writes the bare NaN/Infinity token a Python writer would emit.
+    cost = literal if encoding == "string" else float(literal)
+    source = (
+        json.dumps(_PRICED_CACHE_USAGE) + "\n"
+        + json.dumps({"type": "llm_usage", "model": "nonfinite/model", "cost": cost, "prompt_tokens": 50}) + "\n"
+    ).encode("utf-8")
+    events_path.write_bytes(source)
+    endpoint = make_cost_breakdown_endpoint(tmp_path)
+
+    for _ in range(2):  # no watermark was written, so a retry refuses again
+        caplog.clear()
+        response = asyncio.run(endpoint(None))
+        payload = json.loads(response.body.decode("utf-8"))
+
+        assert response.status_code == 503
+        assert "total_cost" not in payload
+        assert payload["accounting"] == {
+            "available": False,
+            "authority": "physical_attempt_ledger",
+            "cost_final": False,
+            "error_code": "ledger_unavailable",
+        }
+        refused = [record for record in caplog.records if record.exc_info]
+        assert [type(record.exc_info[1]) for record in refused] == [UsageNonFiniteMoney]
+
+    assert events_path.read_bytes() == source
+    archived = list((tmp_path / "archive" / "usage_import").glob("*/events.jsonl"))
+    assert [path.read_bytes() for path in archived] == [source]
+    assert not (tmp_path / IMPORT_REL).exists()
+    assert not (tmp_path / QUARANTINE_REL).exists()
+    assert not (tmp_path / LEDGER_REL).exists()
 
 
 def test_task_metrics_are_persisted_and_forwarded_to_live_logs(tmp_path):

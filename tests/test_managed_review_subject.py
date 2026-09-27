@@ -922,9 +922,10 @@ def test_guidance_open_debt_by_enforcement():
     assert "will be blocked" not in advisory
     assert "recorded durably" in advisory
     assert "commit_reviewed is available" in advisory
-    # The regroup methodology survives in BOTH branches (it is advice, not a lie).
+    # Both branches state the same outcome duty; the procedure is the author's.
     for msg in (blocking, advisory):
-        assert "group obligations by root cause" in msg.lower()
+        assert adv.REVIEW_REPAIR_JUDGMENT in msg
+        assert "group obligations by root cause" not in msg.lower()
 
 
 def test_skipped_guidance_is_managed_aware():

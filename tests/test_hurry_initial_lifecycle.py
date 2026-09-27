@@ -68,6 +68,7 @@ def pool(tmp_path, monkeypatch):
     proc.is_alive = lambda: proc.alive
     slot = workers.Worker(0, proc, stdqueue.Queue())
     monkeypatch.setattr(workers, "WORKERS", {0: slot})
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda row: row.update(owner_chat_id=1))
     return SimpleNamespace(root=tmp_path, slot=slot, events=events, jobs=jobs, respawns=respawns)
 

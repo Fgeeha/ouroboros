@@ -398,6 +398,12 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
                     bridge = get_bridge()
                     if msg_type == "chat":
+                        # The composer sends slash text as a chat frame. Offer
+                        # Panic to the authenticated socket's emergency door
+                        # before this socket's ordered chat-acceptance tail;
+                        # otherwise an earlier blocked append could delay Stop.
+                        if bridge.panic.request(payload):
+                            continue
                         force_plan = bool(msg.get("force_plan"))
                         client_surface = normalize_client_surface(msg.get("client_surface"))
                         image_b64, image_mime, image_caption = _first_image_attachment(
@@ -439,9 +445,9 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                         )
                         accepting = asyncio.create_task(_accept_chat_after(websocket, accepting, accept))
                     else:
-                        # A command is a queue put only (no lock, no durable write). It is
-                        # admitted on receipt, never behind this socket's pending chat
-                        # acceptances: Panic and Restart ride it on the SPA's one socket.
+                        # The bridge requests Panic independently of supervisor intake;
+                        # other commands stay queue puts. Neither waits behind this
+                        # socket's pending durable chat acceptances.
                         bridge.ui_send(payload, broadcast=False)
                 except Exception:
                     await websocket.send_text(_initialization_notice())

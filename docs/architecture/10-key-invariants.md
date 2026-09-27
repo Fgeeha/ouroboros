@@ -1,6 +1,8 @@
 # 10. Key Invariants
 
-This chapter is the short list of properties the rest of the book must not contradict: the constitution persists, release metadata has one projection, the attempt ledger is the monetary authority, cancellation is intent-then-custody, and a dozen more, each naming its owner. It also carries the continuity data-flow map that states, per surface, the canonical source, the bounded projection over it and the rule deciding when a consumer may act. It exists so a change can be checked against a numbered claim instead of an impression.
+These invariants name the owners of constitution, release metadata, money,
+cancellation and execution contracts. The continuity map identifies each surface's
+canonical source, bounded projection and decision/retention rule.
 
 1. **Constitution and identity persist.** `BIBLE.md` is never deleted; `identity.md` remains a physical file even when its content evolves.
 2. **Release metadata has one projection.** `VERSION` is canonical; `ouroboros/tools/release_sync.py::version_carrier_desyncs()` and `sync_release_metadata()` keep the PEP 440 form in `pyproject.toml` and the editable root entry in `uv.lock`, plus the author-facing version in `web/package.json` and both root entries of `web/package-lock.json`, `web/modules/api_types.js::GATEWAY_CONTRACT_VERSION`, the README badge and latest Version History row, the named direct-download links (README and both install pages), and the `docs/ARCHITECTURE.md` entrypoint header. Changelog prose remains deliberate. Pull requests into `ouroboros` leave these carriers byte-identical to their target; integration assigns the release version.
@@ -45,46 +47,57 @@ otherwise the view is partial and the consumer remains non-final or abstains.
 | Execution evidence | Task results, observability call manifests/blobs, service logs, and process-custody records | Status cards, terminal rows, bounded tails, and compact child summaries | Exact artifact/blob/service-log refs carried by the task result or canonical promotion | A projection cannot certify a missing child/source. Referenced canonical artifacts are promoted before child-drive GC; disposable execution scratch follows unified GC. An omitted-to-artifact verification ledger stub carries only its re-projected `summary`; entries and axes are read from the artifact file it points at. |
 | Terminal task/project memory | Root terminal result plus existing task/project summary producers | Cognitive Main terminal summaries and the two Project-root UI lifecycle rows (started + terminal completion) | Task-result ID, project binding, and summary/source refs | Summary is a biography projection, not raw evidence; summary and reflection consume the same frozen origin, owner and verification inputs, with intact decision provenance and positive zero exits. Terminal outcomes, including failed/cancelled/degraded, remain retained through their canonical result owner. |
 | Plan/review authority | Exact task-artifact/observability wave bodies, evidence selectors, reviewer route/thread receipts, and the bounded review hot index | Review status, latest wave, obligations, and compact findings; a predecessor's inherited `plan_review_state` is first projected to a compact authority core ordered around the newest wave's identity, acceptance claims, findings, and dispositions, with reviewer transport removed and `need_evidence_seen` last-priority. Every bounded collection names its total and omitted count; the projection discloses `full_chars` plus `source_ref`, and the named `include_authority` source stays complete | Exact artifact/source handle plus SHA/range/thread selectors | Missing or partial evidence is `DEGRADED`/`NOT_RUN`, never PASS. Exact critic artifacts stay bound to the reviewed subject; a current author source and informed disposition are separate, never a rewritten PASS; hot indexes may rotate only after the source is retained. |
-| Task acceptance (three deliveries) | The FULL host packet (`review_evidence.build_task_acceptance_evidence` under the host ladder, with its `__provenance__` table), the applied host run retained through canonical task source handles, and the paid-identity wallet ledger | The per-delivery work order: the api pack for a packet row; the FULL packet plus absolute pointers and the access disclosure for an agent-session row; the packet without its freely degradable tail plus the real data root for a native inspection row (`acceptance_retrieving.acceptance_retrieving_work_order`) | Exact `evidence_refs` from the packet's enumerable exhibit vocabulary; absolute pointers to the task's active workspace, task result record, artifact directory, verification receipts and tool-trajectory log; `review_projection.panels[].applied_source_ref` for the complete redacted applied review | Refs resolve against the FULL packet only, never the rendered projection; no required-source manifest is declared, so session reads stay unobserved rather than derived from a harness journal; native reads are `host_observed`; the immutable-core overflow refuses every delivery, a partial tool-result projection only packet rows; one strict wallet claim per panel whatever the rows' deliveries. |
+| Task acceptance (three deliveries) | The FULL host packet (`review_evidence.build_task_acceptance_evidence` under the host ladder, with its `__provenance__` table), the applied host run retained through canonical task source handles, and the paid-identity wallet ledger | The per-delivery work order: the api pack for a packet row; the FULL packet plus absolute pointers and the access disclosure for an agent-session row; the packet without its freely degradable tail plus the scoped durable read root for a native inspection row (`acceptance_retrieving.acceptance_retrieving_work_order`) | Exact `evidence_refs` from the packet's enumerable exhibit vocabulary; absolute pointers to the active workspace and immutable named result/artifact/receipt/trajectory snapshots, with task-owned source/read bindings retained before paid dispatch; `review_projection.panels[].applied_source_ref` for the complete redacted applied review | Refs resolve against the FULL packet only, never the rendered projection; no required-source manifest is declared, so session reads stay unobserved rather than derived from a harness journal; native reads are `host_observed`; the immutable-core overflow refuses every delivery, a partial tool-result projection only packet rows; one strict wallet claim per panel whatever the rows' deliveries. |
 | Canonical versus execution roots | Canonical budget/data root owns identity, authority, biography, results, and promoted observability; execution drives own tools, workspace, transient trajectory, and per-call manifests while a task runs | Project/fork/task lenses and status projections | Existing canonical-root resolver, task-result pointers, and source handles | A fork is an execution lens, not a second mind. Copy-back/promotion precedes GC for anything referenced by a canonical result; before terminal promotion the canonical reader cannot resolve a ref bound to a child drive (issue #805), and missing legacy bytes become an explicit gap. |
 
 ---
 
-Acceptance source identity is computed before history-dependent packet budgeting.
-The complete receipt/tool sources and work artifacts still invalidate the binding
-when their facts change. Applied reviews and completion observations use the existing
-write-once `source_handles/context_checkpoints` store and verified `task_source` refs;
-source handles stay outside both deliverables and the acceptance artifact manifest.
-The existing artifact route selects a published ref through its `source` query and
-returns digest-verified bytes. Ordinary artifact downloads retain their existing path.
-`api_client.taskSourceDownloadUrl` owns the shared browser URL contract.
-The final packet size includes source references and omission notes.
-Individual materialized tool records have addresses `tool_trajectory:<corpus-sha>[<source-index>]`,
-not positions in the moving tail. `task_acceptance_review(evidence={tool_trajectory_indices: [...]})`
-selects earlier records from the retained corpus through the existing source reader.
-The full trajectory remains partial when its head is omitted; a selected record
-resolves independently only when its actual arguments and result survive final
-packet budgeting complete. Selection changes the view, not source revision or
-authorship: agent-supplied prose never becomes host evidence, and a readable
-source does not prove the reviewer read or understood it.
+Acceptance identity precedes history-dependent packet budgeting; changed receipt/tool
+sources and work artifacts still invalidate it. Applied reviews, operation checkpoints
+and completion observations use write-once `source_handles/context_checkpoints` with
+verified `task_source` refs, outside deliverables and the acceptance manifest. The
+artifact route selects a published ref through `source` and verifies its digest;
+ordinary downloads remain unchanged (`api_client.taskSourceDownloadUrl`). Packet
+sizing includes refs and omission notes. `tool_trajectory:<corpus-sha>[<source-index>]`
+addresses original records, not moving-tail positions;
+`task_acceptance_review(evidence={tool_trajectory_indices: [...]})` selects them.
+An omitted head leaves the corpus partial; selected records resolve only if complete
+arguments/results survive budgeting. Selection changes neither revision nor authorship;
+agent prose certifies nothing, and readable sources prove no reviewer understanding.
 
-Child copy-back uses `observability._rewrite_child_ref_tree` for typed refs in
-the owned acceptance-checkpoint and trajectory JSON formats. It preserves the
-complete source handle and rechecks dependencies even when the outer checkpoint
-was copied before. Relative source addresses preserve immutable checkpoint bytes;
-rebased observability refs require a newly addressed checkpoint. A failed copy
-retains pending custody before cleanup; missing legacy bytes remain unavailable.
-If rebasing changes trajectory bytes, the existing handle retains the original
-`corpus_sha256` for record citations while `sha256` verifies the transported copy.
-Existing row/reviewer addresses therefore survive cleanup without rewriting claims.
-Normal copyback selects CURRENT review authority through the existing field reducer, prepares referenced bytes outside the result lock, and publishes only while the selected ref/binding basis still matches. A changed basis repeats preparation outside the lock; unrelated newer fields survive. Pending retry starts from CURRENT, not a stale child body. `child_ref_promotion_scope` memoizes verified work only for one operation; failures are not cached as success. Same-physical-store copies keep the original manifest bytes/digest and return canonical path spelling without adding `promoted_call_manifest`; distinct-root copies keep their existing provenance marker and filename. Missing aliases resolve only to the exact canonical CAS/call address through shared verified readers, including the model-send reverse reader. Existing corrupt or wrong-scope bytes never trigger a convenient fallback. No arbitrary JSON-path crawl, new manifest filename format or persistent copyback ledger is introduced.
+`observability._rewrite_child_ref_tree` promotes typed refs in acceptance-checkpoint
+and trajectory JSON, preserving full handles and rechecking dependencies even for
+already copied outer sources. Relative refs preserve immutable bytes; rebased
+observability refs produce newly addressed checkpoints. Changed trajectory transport
+keeps `corpus_sha256` for citations and `sha256` for transported bytes. Failed copies
+hold cleanup custody; missing legacy bytes stay unavailable.
 
-`review_projection.publish_acceptance_checkpoint` retains the full applied record before
-`write_task_result` publishes its compact projection and `review_reference` invalidation.
-Terminal chat id is explicit (including 0); loop/plan context defaults and Project precedence
-remain. Panel/snapshot attempt and publication revision order panels and incidents, including
-panel-less snapshots, child reads and copy-back. Task-only decisions publish changed records
-(stored digest) and never-published settlements; unchanged panels keep revision/source,
-never-published live producers gain none. Stamps grant no review authority. Missing or failed
-source retention states `applied_source_status="unavailable"`.
+Copy-back selects CURRENT review authority through its field reducer, prepares bytes
+off-lock and publishes only if ref/binding basis still matches; drift repeats preparation,
+other newer fields survive, and pending retry starts from CURRENT. `child_ref_promotion_scope`
+memoizes verified work per operation, never failures. Same-store copies preserve manifest
+bytes/digest with canonical spelling and no `promoted_call_manifest`; distinct stores retain
+provenance/filename. Missing aliases resolve only through exact verified CAS/call addresses,
+including model-send reverse reads; corrupt/wrong-scope bytes get no fallback. No arbitrary
+JSON crawl, new manifest naming or persistent transfer ledger exists.
 
+`review_projection.publish_acceptance_checkpoint` retains full source before the compact
+`write_task_result` projection and `review_reference`. Explicit terminal chat ids include 0;
+loop/plan defaults and Project precedence remain. Attempt/revision orders panels and incidents,
+including panel-less snapshots and copy-back. Task-only decisions publish changed records
+and unpublished settlements; unchanged panels keep source/revision, unpublished live producers
+gain none. Stamps grant no authority; retention failure is `applied_source_status="unavailable"`.
+Under the result lock, pure producer advances receive a later revision; stale regressions
+leave stored panels intact. Changed operation/roster/subject or settled verdicts and mixed
+advance/regression reject. `{status, revision, rejected, projection}` returns canonical
+read-back; first late-settlement bytes/time and partial-trace preparation incidents survive.
+
+`review_operation` binds pre-dispatch request/subject/roster and controller identity through
+canonical `review_operations` pointers (§6), never restartable stacks. Applied critique,
+emitted-answer sources and the late notice's outbox survive the author's execution drive.
+`events_chat_delivery` supplies exact terminal text/routed chat after send returns;
+`terminal_delivery.register_delivery` keeps the first retained receipt in bounded `receipts`
+(task/id/chat/time, text hash/length, source ref). `terminal_answer_receipts` separates these
+from owed rows and delivered ids without captured bytes. `basis="send_handler_returned"`
+proves that seam returned, not that a failure-swallowing transport reached a human.
+Replay uses the same handler. Ouroboros judges late evidence on an admissible turn (§6).

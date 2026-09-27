@@ -3,6 +3,8 @@
 // projections of already-typed producer facts — no name substrings, no taxonomy.
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { updateLiveTimelineItem } from '../modules/chat_render_batch.js';
+import { mergeHistoricalTimelineItem } from '../modules/chat_history_replay.js';
 
 import {
     summarizeChatLiveEvent,
@@ -96,4 +98,42 @@ test('#1073 the worker readiness frames render their own fields in Logs', () => 
     for (const type of ['worker_starting', 'worker_ready_window_extended', 'worker_boot', 'worker_spawn_start']) {
         assert.equal(summarizeChatLiveEvent({ type }).visible, false);
     }
+});
+
+
+test('accounting wait phases remain distinct visible host checkpoints in chat and Logs', () => {
+    const frame = { type: 'task_checkpoint', task_id: 't1', checkpoint_kind: 'usage_lock_wait', round: 3 };
+    const entered = { ...frame, phase: 'entered' };
+    const ended = { ...frame, phase: 'ended' };
+    const first = summarizeChatLiveEvent(entered);
+    const last = summarizeChatLiveEvent(ended);
+    assert.equal(first.headline, 'Waiting for accounting access');
+    assert.equal(last.headline, 'Accounting wait ended');
+    assert.notEqual(first.dedupeKey, last.dedupeKey);
+    for (const [event, view] of [[entered, first], [ended, last]]) {
+        assert.equal(view.visible, true);
+        assert.equal(view.promote, false);
+        assert.equal(view.terminal, false);
+        assert.equal(summarizeLogEvent(event).headline, view.headline);
+    }
+});
+
+test('two wait episodes retain all phases through the actual live and history reducers', () => {
+    const events = ['first', 'second'].flatMap((episode_id) => ['entered', 'ended'].map((phase) => ({
+        type: 'task_checkpoint', task_id: 't1', checkpoint_kind: 'usage_lock_wait', episode_id, phase,
+    }))).map((event, index) => ({ ...event, ts: `2026-09-27T01:00:0${index}Z` }));
+    const live = { items: [] }, replay = { items: [] };
+    events.forEach((event, index) => {
+        const summary = summarizeChatLiveEvent(event);
+        updateLiveTimelineItem(live, summary, { ts: event.ts, rawTs: event.ts,
+            syntheticKey: summary.dedupeKey, headline: summary.headline });
+        const row = { ...event, history_id: `progress:${index}`, history_position: { source: 'progress', offset: index } };
+        mergeHistoricalTimelineItem(replay, summary, row, event.ts);
+        assert.equal(live.items.at(-1).headline, summary.headline);
+        assert.equal(live.items.length, index + 1);
+        // Reconnect enriches each existing live row without adding a twin.
+        mergeHistoricalTimelineItem(live, summary, row, event.ts);
+        assert.equal(live.items.length, index + 1);
+    });
+    assert.deepEqual(live.items.map(row => row.headline), replay.items.map(row => row.headline));
 });

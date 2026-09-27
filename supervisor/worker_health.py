@@ -19,6 +19,7 @@ from ouroboros.outcomes import (
 )
 from supervisor.log_addressing import resolve_project_chat
 from supervisor.queue import _queue_lock
+from supervisor.state import control_is
 
 
 def _pool():
@@ -513,10 +514,10 @@ def _recover_crashed_task_without_terminal(job: dict, queue: Any) -> None:
         terminal_event = ("failed", reason_code)
         from ouroboros.delegate_recovery import reconcile_unrecoverable_task
         reconcile_unrecoverable_task(root, task_id)
-    elif task_type == "evolution" and not bool(_pool().load_state().get("evolution_mode_enabled")):
-        # Evolution was stopped: do not resurrect a dead evolution
-        # worker into another cycle (mirrors the hard-timeout gate
-        # in queue.enforce_task_timeouts).
+    elif task_type == "evolution" and not control_is(_pool().load_state(), "evolution_mode_enabled", True):
+        # Evolution was stopped (or its control is unknown, #1307): do not resurrect
+        # a dead evolution worker into another cycle (mirrors the hard-timeout gate
+        # in queue.enforce_task_timeouts). A running task is never killed for this.
         try:
             from ouroboros.task_results import STATUS_CANCELLED, write_task_result
             write_task_result(

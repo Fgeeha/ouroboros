@@ -486,6 +486,8 @@ def _retry_child_task_refs_locked(parent: pathlib.Path, child: pathlib.Path, tas
                 selected = {**current, **project_replica_task_result_fields(current, replica)} if replica is not None else current
                 if {key: selected.get(key) for key in basis} != basis:
                     raise _RefPublicationChanged()
+                if replica is None and all(key in current and current[key] == value for key, value in patch.items()):
+                    return None  # an unchanged retry rewrites nothing: no fresh updated_at/mtime (#1305)
                 if replica is not None and current.get("status") in _FINAL_STATUSES \
                         and selected.get("status") != current["status"]:
                     # A settled canonical row keeps its outcome; the child's is child_status.

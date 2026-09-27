@@ -319,6 +319,11 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
     intent, no terminal result and no ``task_done``, and a stop with still-live
     leftovers was declared clean.
     """
+    from supervisor.events_runtime_controls import owner_evolution_stop_controls
+
+    # The control half first (#1307): latch, durable campaign stop intent, state flags —
+    # none of them waits for cancellation and none skips another's failure.
+    not_persisted = owner_evolution_stop_controls("disabled via owner chat")
     stop_incomplete = False
     try:
         from supervisor.queue import evolution_stop_report, stop_evolution_tasks
@@ -326,7 +331,10 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
 
         # Fast path: drop any queued post-task promotion so it cannot re-arm on
         # the next boot tick (the evolution_owner_stopped flag is the durable backstop).
-        drop_pending_request(ctx.DRIVE_ROOT)
+        try:
+            drop_pending_request(ctx.DRIVE_ROOT)
+        except Exception:
+            log.warning("Pending evolution request could not be dropped; cancellation still attempted", exc_info=True)
         stopped = stop_evolution_tasks("disabled via owner chat")
         ctx.sort_pending()
         ctx.persist_queue_snapshot(reason="evolve_off")
@@ -359,8 +367,8 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
     if stop_incomplete:
         return ("OFF (mode disabled) — but the stop is INCOMPLETE: see the "
                 "still-live task(s) above. The campaign stays open until they "
-                "settle. Post-task auto-evolution stays paused until /evolve start")
-    return "OFF — post-task auto-evolution also paused until /evolve start"
+                "settle. Post-task auto-evolution stays paused until /evolve start" + not_persisted)
+    return "OFF — post-task auto-evolution also paused until /evolve start" + not_persisted
 
 
 def _record_routing_receipt(

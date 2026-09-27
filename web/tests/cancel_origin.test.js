@@ -11,7 +11,9 @@ test('recorded cancellation: Python/browser parity including absent cause and pu
         assert.equal(taskTerminalSummary(record).body, text);
     }
     assert.equal(taskReasonDetail({ status: 'cancelled', cancel_origin: { reason: '🙂'.repeat(200) } }),
-        '🙂'.repeat(159) + '…');
+        '🙂'.repeat(159) + '… (preview; the full reason is kept with the task)');
+    assert.equal(taskReasonDetail({ status: 'cancelled', cancel_origin: { reason: '🙂'.repeat(160) } }),
+        '🙂'.repeat(160) + '.');
 });
 
 test('child live and replay use genuine lineage and keep saved work inspectable', () => {

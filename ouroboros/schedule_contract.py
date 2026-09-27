@@ -24,6 +24,8 @@ RESERVED_TEMPLATE_FIELDS = frozenset({
     # routing for one accepted turn; a machine-fired template never carries it.
     "origin_message_ref",
     "origin_suppressed",
+    # The occurrence identity is minted by the scheduler for one admission (#1315).
+    "schedule_occurrence",
 })
 
 

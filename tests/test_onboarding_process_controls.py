@@ -124,31 +124,53 @@ def test_onboarding_panic_runs_real_panic_marker_and_exit_99(startup_without_con
     exits, stops = [], []
     from ouroboros import server_control
     from ouroboros.gateway.host_service import host_service_port
-    monkeypatch.setattr('ouroboros.tools.shell.kill_all_tracked_subprocesses', lambda: None)
-    monkeypatch.setattr('ouroboros.workspace_executor.kill_all_foreground', lambda *a, **kw: None)
-    monkeypatch.setattr('ouroboros.tools.services.kill_all_services', lambda *a, **kw: None)
-    monkeypatch.setattr('ouroboros.local_model.get_manager', lambda: SimpleNamespace(stop_server=lambda: None))
+    from ouroboros.startup_historical_audit import audit
+    monkeypatch.setattr(audit, 'stop', lambda: None)
+    monkeypatch.setattr('ouroboros.tools.shell.kill_all_tracked_subprocesses', lambda **kw: [])
+    monkeypatch.setattr('ouroboros.workspace_executor.kill_all_foreground', lambda *a, **kw: [])
+    monkeypatch.setattr('ouroboros.tools.services.kill_all_services', lambda *a, **kw: [])
+    monkeypatch.setattr('ouroboros.local_model.get_manager', lambda **kw: SimpleNamespace(
+        panic_stop=lambda **kw: [], stop_server=lambda: None))
     monkeypatch.setattr('supervisor.evolution_lifecycle.complete_evolution_campaign', lambda *a, **kw: {})
     monkeypatch.setattr('ouroboros.post_task_evolution.drop_pending_request', lambda *a, **kw: None)
-    monkeypatch.setattr('ouroboros.extension_companion.panic_kill_all', lambda: None)
-    monkeypatch.setattr('multiprocessing.active_children', lambda: [])
+    monkeypatch.setattr('ouroboros.extension_companion.panic_kill_all', lambda **kw: [])
+    monkeypatch.setattr('multiprocessing.active_children', lambda: [SimpleNamespace(pid=4321)])
+    monkeypatch.setattr('supervisor.worker_pool_lifecycle.kill_worker_tree',
+                        lambda pid, panic_process=None: stops.append(('native_worker', pid)) or {'requested': True})
     monkeypatch.setattr('ouroboros.platform_layer.kill_process_on_port', lambda port: stops.append(('port', port)))
     monkeypatch.setattr('ouroboros.claudexor_daemon.get_owned_daemon',
-                        lambda: SimpleNamespace(stop=lambda: stops.append(('daemon',))))
+                        lambda **kw: SimpleNamespace(
+                            panic_stop=lambda *, request_only: stops.append(('daemon_request', request_only)) or [],
+                            stop_outcome=lambda: stops.append(('daemon',))))
     monkeypatch.setattr('supervisor.workers.kill_workers', lambda **kw: stops.append(('workers', kw)))
     monkeypatch.setattr(obj.server, '_ACTUAL_BOUND_PORT', 19876)
     monkeypatch.setattr(server_control.os, '_exit', lambda code: exits.append(code))
-    response = obj.client.post('/api/command', json={'cmd': '/panic'})
+    before = set(threading.enumerate())
+    try:
+        response = obj.client.post('/api/command', json={'cmd': '/panic'})
+    finally:
+        # Production hard-exits without waiting for helpers. This test retains
+        # its fake owners until their independent settlement threads finish.
+        for thread in set(threading.enumerate()) - before:
+            if thread.name.startswith('panic-'):
+                thread.join(timeout=5)
+                assert not thread.is_alive()
     assert response.status_code == 200 and response.json() == {'status': 'ok'}
     assert exits == [99]
     assert (obj.data / 'state/panic_stop.flag').read_text(encoding="utf-8") == 'panic'
-    assert stops == [('daemon',), ('workers', {'force': True, 'archive_service_logs': False,
-                                              'reconcile_delegate_custody': False}),
-                     ('port', 19876), ('port', host_service_port())]
+    assert stops[0] == ('daemon_request', True)
+    assert stops.count(('daemon',)) == 1
+    assert [event for event in stops if event[0] == 'native_worker'] == [('native_worker', 4321)]
+    assert not [event for event in stops if event[0] == 'workers']
+    assert stops.index(('native_worker', 4321)) < next(i for i, event in enumerate(stops) if event[0] == 'port')
+    assert sorted(event[1] for event in stops if event[0] == 'port') == sorted([19876, host_service_port()])
     assert not (obj.data / 'settings.json').exists()
     from supervisor import state
-    assert state.DRIVE_ROOT == obj.data
-    assert state.load_state()['evolution_owner_stopped'] is True
+    # Before onboarding there is no state to write: Panic never mints one (#1307). The flag is
+    # the durable gate; the first real boot writes the disabled controls, then consumes it.
+    # This emergency door must not wait for supervisor.state.init to rebind
+    # process-global paths merely to kill the already-owned workers.
+    assert state.read_state(obj.data).quality == "uninitialized"
 
 
 @pytest.mark.parametrize('command', ['ordinary chat', '/review', '/evolve', '/panic later', '/restart later'])
@@ -180,7 +202,8 @@ def test_onboarding_finishing_before_background_dispatch_reuses_live_consumer(st
     thread = threading.Thread(target=release.wait)
     bridge = message_bus.LocalChatBridge()
     monkeypatch.setattr(message_bus, 'log_chat', lambda *a, **kw: None)
-    monkeypatch.setattr(obj.server, '_execute_panic_stop', lambda *a: pytest.fail('duplicate direct Panic'))
+    panic = []
+    monkeypatch.setattr(obj.server, '_execute_panic_stop', lambda *a: panic.append('requested'))
     monkeypatch.setattr(obj.server, '_perform_owner_restart', lambda *a: pytest.fail('duplicate direct Restart'))
 
     def admit(cmd):
@@ -195,7 +218,12 @@ def test_onboarding_finishing_before_background_dispatch_reuses_live_consumer(st
         response = obj.client.post('/api/command', json={'cmd': command})
         assert response.status_code == 200 and response.json() == {'status': 'ok'}
         updates = bridge.get_updates(0, timeout=0)
-        assert len(updates) == 1 and updates[0]['message']['text'] == command
+        if command == '/panic':
+            # The authenticated emergency door must not wait for the later
+            # ordinary consumer to come online or enqueue a duplicate command.
+            assert panic == ['requested'] and updates == []
+        else:
+            assert panic == [] and len(updates) == 1 and updates[0]['message']['text'] == command
         assert bridge.get_updates(0, timeout=0) == []
         assert not obj.server._restart_requested.is_set()
     finally:

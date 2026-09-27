@@ -109,8 +109,7 @@ def _reconcile_abandoned_usage(drive_root: pathlib.Path) -> None:
     from supervisor.queue import task_has_live_ownership
 
     root = pathlib.Path(drive_root)
-    with usage._locked(root):
-        rows = list(usage._final_rows(usage._read_records_locked_cached(root)).values())
+    rows = usage.read_usage_records(root, final_only=True)
     tasks, refresh = {}, set()
     gateway, gateway_unavailable = None, False
 
@@ -815,6 +814,9 @@ def _run_periodic_reconcile_sweep(marker: list, stop_event: Any = None, latch: A
         _periodic_zombie_reconcile(on_orphans_healed=on_orphans_healed, stop_event=stop_event)
         if _stop_requested(stop_event):
             return
+        from ouroboros.review_operation import collect_orphaned_operations_softly
+
+        collect_orphaned_operations_softly(DATA_DIR, stop=lambda: _stop_requested(stop_event))
         if _STARTUP_TEMP_SWEEP_OWED[0]:
             from ouroboros.utils import sweep_stale_temp_files
 

@@ -22,8 +22,9 @@
  * @property {?number} budget_pct
  * @property {string} branch
  * @property {string} sha
- * @property {boolean} evolution_enabled
- * @property {boolean} bg_consciousness_enabled
+ * @property {?boolean} evolution_enabled  // null: the control is unknown (state unavailable/recovering)
+ * @property {?boolean} bg_consciousness_enabled  // null: unknown, never "off"
+ * @property {{quality: string, source: string, unconfirmed: Array<string>}} state_quality  // #1307 read quality of state.json
  * @property {number} evolution_cycle
  * @property {Object} evolution_state
  * @property {BgConsciousnessState} bg_consciousness_state  // the alarm clock's snapshot + server projection (status/detail)
@@ -270,7 +271,7 @@
  * @property {Array<Object>=} attachments  // [{filename, display_name, mime}] — image uploads become native blocks (v6.26.0)
  * @property {number=} chat_id     // multi-project thread routing (v6.32.0); main chat = 1
  * @property {string=} project_id  // per-project memory scope (v6.32.0)
- * @property {Object=} client_surface  // raw sending-surface observables measured at send time (pywebview/ua/viewport/matchMedia/captured_at)
+ * @property {Object=} client_surface  // raw sending-surface observables measured at send time (pywebview/ua/viewport/matchMedia/captured_at; optional IANA timezone)
  */
 
 /**
@@ -445,9 +446,13 @@
  *   actors[].findings_omitted (exact count, 0 included). Both are emitted only
  *   when that reviewer produced a parsed response; their absence is a
  *   transport/parse hole, never "zero findings". panels[].late_settlement
- *   ({note, reviewed_revision: "earlier"|"delivered", settled_after_terminal})
- *   is the host-composed sentence of a panel that settled after its task ended;
- *   the Reviews group prints the note verbatim. `acceptance_incident`
+ *   ({note, settled_after_terminal, settled_at, reviewed_subject, reviewed_superseded,
+ *   reviewed_revision: "delivered"|"different"|"unknown", reviewed_is_emitted: true|false|null,
+ *   reviewer_outputs, emitted_answer}) binds original critique and subject to emitted bytes.
+ *   reviewer_outputs[].response_ref and emitted receipts' source_ref retain full sources;
+ *   emitted_answer.state is "delivered"|"owed"|"unknown", with delivered receipts,
+ *   unverified ids and owed ids. Receipt basis "send_handler_returned" proves producer
+ *   return, not human receipt. The Reviews group prints the note verbatim. `acceptance_incident`
  *   ({incident_id, status: "failed"|"resolved", stage, attempts, source_known,
  *   feedback_delivered, failure_kind?, failure_detail?, retry?, prior_incidents?})
  *   is the host's own LOCAL acceptance-preparation failure — published even when

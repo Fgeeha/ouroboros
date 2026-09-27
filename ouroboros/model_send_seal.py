@@ -457,14 +457,13 @@ def reconcile_model_send_seals(
     }
     try:
         root = pathlib.Path(drive_root)
-        from ouroboros.usage_ledger import _final_rows, _locked, _read_records_locked
+        from ouroboros.usage_accounting import read_usage_records
 
         # Reservation precedes seal persistence. Select this pass's manifests
         # before its live snapshot so a newly created seal cannot be mistaken
         # for an orphan merely because its reservation arrived after the read.
         manifest_paths = _seal_manifest_paths(root, max_manifests)
-        with _locked(root):
-            finals = _final_rows(_read_records_locked(root))
+        finals = {str(row["attempt_id"]): row for row in read_usage_records(root, final_only=True)}
     except Exception:
         log.debug("model_send reconciliation skipped: ledger state unknown", exc_info=True)
         report["status"] = "unknown"

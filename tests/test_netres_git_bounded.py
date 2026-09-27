@@ -106,6 +106,7 @@ def test_checkout_reset_fetch_uses_configured_bound_and_keeps_local_head(tmp_pat
     monkeypatch.setattr(git_ops, "load_state", lambda: {})
     state, captured, events = {}, {}, []
     monkeypatch.setattr(git_ops, "save_state", state.update)
+    monkeypatch.setattr(git_ops, "update_state", lambda mutator, **_kw: mutator(state) or state)
     monkeypatch.setattr(git_ops, "append_jsonl", lambda _path, row: events.append(row))
 
     def fake_process(cmd, *, timeout, cwd, env, text):

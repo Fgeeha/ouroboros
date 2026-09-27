@@ -453,13 +453,11 @@ def checkout_and_reset(branch: str, reason: str = "unspecified",
     # Checkout may not update mtimes; remove stale bytecode.
     for p in _go().REPO_DIR.rglob("__pycache__"):
         shutil.rmtree(p, ignore_errors=True)
-    st = _go().load_state()
-    st["current_branch"] = branch
-    st["current_sha"] = subprocess.run(
+    st = {"current_branch": branch, "current_sha": subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=str(_go().REPO_DIR),
         capture_output=True, text=True, check=True,
-    ).stdout.strip()
-    _go().save_state(st)
+    ).stdout.strip()}
+    _record_checkout_facts(st)
     if update_intent_target and st["current_sha"] != update_intent_target:
         return False, f"Update intent checkout landed on {st['current_sha']} but expected {update_intent_target}"
     if pin_bundle_sha:
@@ -627,3 +625,13 @@ def safe_restart(
         return True, f"OK: fell back to {_go().BRANCH_STABLE}"
 
     return False, "Both branches failed import (dev and stable)"
+
+
+def _record_checkout_facts(facts: dict) -> None:
+    """Field-update the checkout projection (#1307): never a stale whole-state write."""
+    from supervisor.state import StateUnavailable
+
+    try:
+        _go().update_state(lambda live: live.update(facts))
+    except StateUnavailable:
+        log.warning("Checkout facts not recorded in state: runtime state unavailable", exc_info=True)

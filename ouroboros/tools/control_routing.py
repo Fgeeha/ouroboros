@@ -386,6 +386,7 @@ def _promote_chat_to_task(
     requested_root = str(workspace_root or "").strip()
     workspace_sentinel = str(workspace or "").strip().lower()
     repo_root_note = ""
+    intent_system_repo = False
     if requested_root:
         # Q4=A: naming the Ouroboros repository ITSELF names the documented
         # default (no separate workspace — the ordinary self-modification task),
@@ -409,6 +410,7 @@ def _promote_chat_to_task(
             same_root = False
         if same_root:
             requested_root, workspace_sentinel = "", WORKSPACE_NONE
+            intent_system_repo = True  # the CHOICE survives the sentinel (#1315)
             repo_root_note = (
                 " (workspace_root named the Ouroboros repository itself; started as an "
                 "ordinary task over it — no separate workspace)"
@@ -419,8 +421,8 @@ def _promote_chat_to_task(
     if disabled_reason:
         response = (
             f"⚠️ PROMOTE_REJECTED: task {tid} was not scheduled "
-            f"(worker_pool_unavailable: {disabled_reason}). No project/workspace "
-            "admission side effects were started."
+            f"(worker_pool_unavailable: {disabled_reason}){_cause_words('worker_pool_unavailable')}. "
+            "No project/workspace admission side effects were started."
         )
         return _finish_swarm_handoff(
             ctx,
@@ -446,6 +448,7 @@ def _promote_chat_to_task(
         # default (a folder-less task in a folder-ful project stays possible).
         "workspace": workspace_sentinel,
         "chat_id": current_chat_id,
+        **({"resource_intent": {"kind": "system_repo"}} if intent_system_repo else {}),
         "client_message_id": str(
             ((getattr(ctx, "task_metadata", {}) or {}).get("client_message_id") or "")
             if isinstance(getattr(ctx, "task_metadata", {}), dict) else ""
@@ -520,7 +523,7 @@ def _promote_chat_to_task(
             shown_reason = f"{shown_reason}: {detail}" if shown_reason else detail
         response = (
             f"⚠️ PROMOTE_REJECTED: task {tid} was not scheduled"
-            f"{f' ({shown_reason})' if shown_reason else ''}. "
+            f"{f' ({shown_reason})' if shown_reason else ''}{_cause_words(reason)}. "
             "Do not report this task as created."
         )
         return _finish_swarm_handoff(
@@ -677,7 +680,7 @@ def _route_to_project(
         # the typed refusal in its own result, and no ack travels to a chat under
         # an empty message id. `list_projects` names the ids it may route to.
         return (
-            f"⚠️ ROUTE_REJECTED ({failure}): no route was dispatched. A task-authored route "
+            f"⚠️ ROUTE_REJECTED ({failure}): no route was dispatched{_cause_words(failure)}. A task-authored route "
             "needs an existing project id (see list_projects); the manual-target picker is "
             "an owner surface and is not offered to a task."
         )
@@ -735,11 +738,11 @@ def _route_to_project(
             )
             options_text = json.dumps(durable_options, ensure_ascii=False, default=str)
             return (
-                f"⚠️ NEEDS_MANUAL_TARGET ({failure}, {mode}): no route was dispatched. "
+                f"⚠️ NEEDS_MANUAL_TARGET ({failure}, {mode}): no route was dispatched{_cause_words(failure)}. "
                 f"Host-validated options: {options_text}"
             )
         return (
-            f"⚠️ ROUTING_UNCONFIRMED ({failure}, {mode}): no route was dispatched and "
+            f"⚠️ ROUTING_UNCONFIRMED ({failure}, {mode}): no route was dispatched{_cause_words(failure)}, and "
             "delivery of the manual target options was not confirmed."
         )
     tid = uuid.uuid4().hex[:16]
@@ -793,7 +796,7 @@ def _route_to_project(
     if status in {"rejected", "needs_manual_target"}:
         response = (
             f"⚠️ ROUTE_REJECTED: task {tid} was not routed to project '{name}' "
-            f"({reason_text}{(': ' + detail) if detail else ''})."
+            f"({reason_text}{(': ' + detail) if detail else ''}){_cause_words(reason_text)}."
         )
         return _finish_swarm_handoff(
             ctx, evt, response, status="rejected", reason=reason_text,
@@ -963,19 +966,32 @@ def _steer_task(ctx: ToolContext, task_id: str, message: str) -> str:
     return _steer_refusal_text(target, mode, receipt)
 
 
+def _cause_words(code: str) -> str:
+    """``": <words>"`` for a refusal code the host cause table explains, else "".
+
+    The machine prefix and the code stay exactly where readers parse them; the
+    words come from the ONE table the owner's receipts read
+    (``project_dialogue.ROUTING_REFUSAL_CAUSES``), so the mind reads the same
+    fact the owner does. A code without a row stays bare -- never a near-miss.
+    """
+    from ouroboros.project_dialogue import ROUTING_REFUSAL_CAUSES
+
+    phrase = ROUTING_REFUSAL_CAUSES.get(str(code or "").strip(), "")
+    return f": {phrase}" if phrase else ""
+
+
 def _steer_refusal_text(target: str, mode: str, receipt: Dict[str, Any]) -> str:
     """The typed refusal/unconfirmed sentence for one steer receipt."""
     status = str(receipt.get("status") or "unconfirmed")
     if status in {"rejected", "needs_manual_target"}:
-        return (
-            f"⚠️ STEER_REJECTED: task {target} was not steered "
-            f"({str(receipt.get('reason') or 'target_not_steerable')})."
-        )
+        reason = str(receipt.get("reason") or "target_not_steerable")
+        return f"⚠️ STEER_REJECTED: task {target} was not steered ({reason}){_cause_words(reason)}."
     # Only "no receipt exists yet" reaches here: a settled refusal is returned
     # above with its reason, so UNCONFIRMED never disguises a known rejection.
+    reason = str(receipt.get("reason") or "confirmation_timeout")
     return (
         f"⚠️ STEER_UNCONFIRMED: mailbox delivery to task {target} was not durably confirmed "
-        f"({mode}, {str(receipt.get('reason') or 'confirmation_timeout')}). "
+        f"({mode}, {reason}){_cause_words(reason)}. "
         "Do not report the message as delivered."
     )
 

@@ -753,6 +753,17 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         explicit_workspace=str(evt.get("workspace_root") or "").strip(),
         workspace_sentinel=str(evt.get("workspace") or ""),
     )
+    # The resource CHOICE (#1315), stamped where it is known so a follow-up carries it by
+    # value: the room's default folder, an explicit folder, an explicit "no folder", or
+    # ordinary self-work over the system repository.
+    explicit_root = bool(str(evt.get("workspace_root") or "").strip())
+    opted_out = str(evt.get("workspace") or "").strip().lower() == WORKSPACE_NONE
+    stamped = evt.get("resource_intent") if isinstance(evt.get("resource_intent"), dict) else {}
+    task.setdefault("metadata", {})["resource_intent"] = (
+        {"kind": "system_repo"} if stamped.get("kind") == "system_repo" or not (pid or explicit_root)
+        else {"kind": "explicit_resource", "root": resolved_ws} if explicit_root
+        else {"kind": "explicit_none", "project_id": pid} if opted_out
+        else {"kind": "room_default", "project_id": pid})
     if ws_error:
         return {
             "status": "needs_manual_target", "reason": "workspace_unusable", "task_id": tid,

@@ -140,6 +140,7 @@ def _drive_hard_timeout(tmp_path, monkeypatch, *, evolution_enabled):
     import ouroboros.tools.services as services_mod
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     q.init(tmp_path)
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
     state.update_state(lambda live: live.update(
@@ -266,6 +267,7 @@ def test_handle_task_done_reconstructs_cost_from_physical_ledger(tmp_path):
     from ouroboros.task_results import STATUS_CANCELLED, write_task_result
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     campaign = queue.start_evolution_campaign("Improve", source="test")
     supervisor_state.update_state(lambda live: live.update(

@@ -119,7 +119,6 @@ TERMINAL_WRITERS = {
     ('supervisor/events_task_done.py::_refresh_terminal_task_cost', 'current["status"]'): 'dynamic',
     ('supervisor/queue_snapshot.py::restore_pending_from_snapshot', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/queue_snapshot.py::_refuse_restore_invalid_fences', 'STATUS_CANCELLED'): 'terminal',
-    ('supervisor/task_admission.py::record_scheduled_admission', 'STATUS_FAILED'): 'terminal',
     ('supervisor/task_admission.py::terminalize_invalid_depth_restore', 'STATUS_FAILED'): 'terminal',
     ('supervisor/task_lifecycle.py::_finish_captured_pending', 'STATUS_CANCELLED'): 'terminal',
     ('supervisor/task_lifecycle.py::_finish_captured_running', 'STATUS_CANCELLED'): 'terminal',
@@ -152,8 +151,6 @@ SETTLE_INTENT_CALLERS = {
 NO_DELIVERABLE_LANES = {
     'supervisor/task_lifecycle.py::_finish_captured_pending':
         'cancelled before it ever started: no answer exists',
-    'supervisor/task_admission.py::record_scheduled_admission':
-        'a cron dispatch refused at admission never had an owner answer',
     'supervisor/workers.py::_settle_cancelled_pending_row':
         'dropped before assignment; the salvage receipt belongs to custody',
     'supervisor/queue_snapshot.py::restore_pending_from_snapshot':

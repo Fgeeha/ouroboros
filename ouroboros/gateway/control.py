@@ -141,6 +141,11 @@ async def api_reset(request: Request) -> JSONResponse:
     if lock_error is not None:
         return lock_error
     try:
+        from supervisor.message_bus import try_get_bridge
+
+        bridge = try_get_bridge()
+        if bridge is not None:
+            bridge.panic.invalidate_owner()
         deleted = []
         # Keep synchronization files until restart. Removing the directory that
         # contains the held managed-update lock would let a second updater enter.
@@ -153,6 +158,11 @@ async def api_reset(request: Request) -> JSONResponse:
         if settings_file.exists():
             settings_file.unlink()
             deleted.append("settings.json")
+        # The owner's explicit fresh start (#1307): boot initializes a new state from
+        # this pending witness instead of reading the wiped root as a lost one.
+        from supervisor.state_initialization import mark_pending
+
+        mark_pending(data_dir, origin="owner_reset")
         _request_restart(request)
         return JSONResponse({"status": "ok", "deleted": deleted, "restarting": True})
     except Exception as exc:
