@@ -258,6 +258,12 @@ the owner can still open, read and act on. A suppressed skill row keeps Restore
 so the owner can ask for it back; a consumed one keeps only Delete, because
 offering Enable on a schedule that cannot fire again would be a lie.
 
+A record of what the owner did earlier is history, not status. A skill's
+OuroborosHub submission (the version it sent and its PR link) lives in the
+card's details disclosure without a tone; it never claims the PR merged, never
+gates or replaces the card's current action, and forgetting it is an explicit
+local choice rather than the way to unlock one.
+
 A task-bound `Reviews` history row may be the only retained fact for its owner.
 That row keeps a neutral owner anchor visible, but hides task status and typing
 until a real task status or activity arrives; review presence alone never means
