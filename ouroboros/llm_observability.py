@@ -11,6 +11,26 @@ from ouroboros.anthropic_native_custody import public_custody_projection
 from ouroboros.utils import sanitize_tool_result_for_log
 
 
+def retain_cancelled_response(request, response, capture) -> dict:
+    """Keep a received physical response before cancellation unwinds its caller.
+
+    Reuse private CAS and the ordinary call reader. This records the provider
+    object (model_dump for SDK responses), not a completed task/review verdict.
+    Native transports continue to own any original wire-byte receipt separately.
+    """
+    from dataclasses import asdict
+
+    body = response.model_dump() if hasattr(response, "model_dump") else response
+    return persist_call(
+        request.drive_root, task_id=request.task_id or "llm",
+        call_id=f"physical_{capture.attempt_id}_response", call_type="physical_response",
+        payload={"response": body, "physical_attempt_capture": asdict(capture)}, keep_raw=True,
+        manifest={"attempt_id": capture.attempt_id, "model": capture.model,
+                  "provider": capture.provider, "state": capture.state,
+                  "status": "received", "control_reason": "caller_cancelled"},
+    )
+
+
 def persist_observed_call(root: Any, *, payload: Any, writer: Any = None, **identity: Any) -> dict:
     """Best-effort public trace: opaque continuation never enters this projection.
 

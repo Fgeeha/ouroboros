@@ -726,9 +726,9 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
         (
             "state/usage_attempts.jsonl",
             USAGE_LEDGER_WARN_BYTES,
-            "Every reservation re-reads the ledger under the monetary lock "
-            "(~0.5s hold at 20MB — see usage_ledger.py); size-triggered "
-            "compaction (usage_compaction.py, CPL4-C6) should hold the file "
+            "Warm reservations validate only appended rows under the monetary lock; "
+            "cold/replaced views prepare history outside it (_usage_rows_memo.py). "
+            "Size-triggered compaction (usage_compaction.py, CPL4-C6) should hold the file "
             "far below this — growth can mean broken compaction, a large "
             "unfoldable residue, a policy abort, refusal on the name tier "
             "(no kernel locks), or a file that has not yet outgrown the floor "

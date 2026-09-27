@@ -71,11 +71,11 @@ def test_real_settlement_wins_race_with_administrative_close(root, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     append = ua._append_rows_locked
 
-    def held_append(root, records, additions):
+    def held_append(root, records, additions, **kwargs):
         if additions[0].get("cost_usd") == .2:
             entered.set()
             assert release.wait(5)
-        return append(root, records, additions)
+        return append(root, records, additions, **kwargs)
 
     monkeypatch.setattr(ua, "_append_rows_locked", held_append)
     with ThreadPoolExecutor(2) as pool:

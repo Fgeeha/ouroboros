@@ -650,7 +650,7 @@ def _handle_model_wait_control(
     # catches a hold's interruption raised outside the model call, must not
     # hand the same error back here.
     error.control_rails_seen = True
-    if reason not in {"cancelled", "finalize_requested", "deadline", "execution_deadline", "absolute_ceiling"}:
+    if reason not in {"cancelled", "finalize_requested", "deadline", "execution_deadline", "absolute_ceiling", "accounting_wait_expired"}:
         raise error
     owner = current_model_wait()
     root = ctx.status_drive_root or ctx.drive_root
@@ -702,11 +702,15 @@ def _handle_model_wait_control(
             return _maybe_early_finalize(ctx, ctx.tools, controls, transport_episode=transport_episode)
     reason_code = (REASON_OWNER_REQUESTED_FINALIZATION
                    if first_line == REASON_OWNER_REQUESTED_FINALIZATION else
+                   "accounting_wait_expired" if reason == "accounting_wait_expired" else
                    "deadline_local" if reason == "deadline" else "finalization_grace")
     trace = ctx.llm_trace if isinstance(ctx.llm_trace, dict) else {}
     _loop()._finalize_forced_services(ctx, trace)
-    ctx.accumulated_usage.update(execution_status="failed", reason_code=reason_code)
+    ctx.accumulated_usage.update(execution_status=("infra_failed" if reason == "accounting_wait_expired" else "failed"),
+                                 reason_code=reason_code)
     fallback = _loop()._last_assistant_text(ctx.messages) or (
+        "⚠️ Accounting access did not recover within this turn’s wait window; no further model call was made."
+        if reason == "accounting_wait_expired" else
         "⚠️ The model wait ended on the task's stop or deadline; no further model call was made."
     )
     result = _loop()._forced_fallback_result(

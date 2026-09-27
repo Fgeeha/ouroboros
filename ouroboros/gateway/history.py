@@ -103,6 +103,7 @@ _PROGRESS_META_FIELDS = (
     # The frame's voice: a replayed host note must stay a host note, or a reload
     # would hand the card title back to the very line live rendering refused it.
     "narration",
+    "checkpoint_kind", "episode_id", "phase", "elapsed_sec",
 )
 
 _SKILL_REVIEW_STRING_FIELDS = (
