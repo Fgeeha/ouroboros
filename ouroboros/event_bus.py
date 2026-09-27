@@ -149,8 +149,9 @@ def owner_notification_chat_id(drive_root) -> int:
     (its own state file, never the process-global one), else Main while no
     owner is bound. Deliberately not ``notification_chat_route``: chat 0 is a
     real destination there (the Skill Review panel), but a banner addressed to
-    it reaches nobody — the browser notifier refuses it. One rule for every
-    producer (the Host route, the scheduler, a future agent tool)."""
+    it reaches nobody — the browser notifier refuses it. The immediate Host
+    route uses this fallback; a scheduled reminder may instead retain its own
+    positive origin chat_id, falling back here when none was recorded."""
     from ouroboros.contracts.chat_id_policy import WEB_UI_CHAT_ID
     from ouroboros.utils import read_json_dict
 

@@ -868,12 +868,15 @@ pinned chat when its notices toggle is on), and nothing else — no chat row, no
 model turn, no history the mind can read (a deferred reminder's sentence does
 sit in the schedule table, where Ouroboros can list and cancel it at the owner's
 word). `text` is at most 1000 characters,
-plain; `key` (at most 128) is your own identity for the notice, so a repeat
-after a lost acknowledgement rings once. `403` is a missing grant, `429` the
-60-per-minute lane, `503` a failed durable write or a schedule audit the host
-could not record (retry the same request), `409` a keyed row that belongs to
-another skill. A cancel whose delete landed but whose audit outcome was lost
-answers `200 {ok: false, cancelled: true, status: "changed_audit_incomplete"}` —
+plain; `key` (at most 128) identifies a deferred reminder for update or
+cancellation. An immediate `/notify` call is **not** server-idempotent: after a
+lost response its outcome is unknown, and repeating the same key may deliver a
+second web/Telegram notice. Do not retry an ambiguous immediate response
+blindly. `403` is a missing grant, `429` the 60-per-minute lane, `503` a failed
+durable write or a schedule audit the host could not record (use the returned
+status to distinguish a definite refusal from an unknown outcome), `409` a
+keyed row that belongs to another skill. A cancel whose delete landed but whose
+audit outcome was lost answers `200 {ok: false, cancelled: true, status: "changed_audit_incomplete"}` —
 the row is gone, do not retry.
 
 A deferred reminder is the same request with a time: `"at": "<ISO 8601

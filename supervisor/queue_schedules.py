@@ -961,9 +961,11 @@ def check_scheduled_tasks() -> None:
                 continue
             # Reconcile the previous occurrence even while its root runs: that
             # retires the dispatched token and preserves its settlement facts.
-            # Only the NEW claim must wait for the old root to leave the queue.
-            if (record.get("last_task_id")
-                    and _schedule_running_or_queued(schedule_id, _queue().DRIVE_ROOT) is not False):
+            # Gate every NEW claim by the live schedule id, including a recreated
+            # row with no last_task_id. An unknown queue snapshot holds a row that
+            # records a prior admission; it cannot prevent a first-ever claim.
+            live = _schedule_running_or_queued(schedule_id, _queue().DRIVE_ROOT)
+            if live is True or (live is None and record.get("last_task_id")):
                 continue
             claims.append(occurrences.claim(record, due_at))
             changed = True
