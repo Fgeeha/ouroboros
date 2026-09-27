@@ -1170,9 +1170,12 @@ def verify_restart(env: Any, git_sha: str) -> None:
             def _mutate(campaign: Dict[str, Any]):
                 if not isinstance(campaign, dict):
                     return None
-                live_state = read_json_dict(state_path) or {}
+                from supervisor.state import control_in_copy
+
+                stop_known, stopped = control_in_copy(state_path, "evolution_owner_stopped")
                 if (
-                    bool(live_state.get("evolution_owner_stopped"))
+                    not stop_known or bool(stopped)  # an unknown owner stop is not "not stopped" (#1307)
+                    or isinstance(campaign.get("stop_intent"), dict)  # a Stop recorded beside state (#1307)
                     or campaign.get("status") not in {"active", "paused"}
                 ):
                     return None
@@ -1331,8 +1334,10 @@ def verify_restart(env: Any, git_sha: str) -> None:
                     return False
                 mark_error["durable"] = "1"
                 return bool(ok and not mark_error.get("reason"))
-            live_state = read_json_dict(env.drive_path("state") / "state.json") or {}
-            if bool(live_state.get("evolution_owner_stopped")):
+            from supervisor.state import control_in_copy
+
+            stop_known, stopped = control_in_copy(env.drive_path("state") / "state.json", "evolution_owner_stopped")
+            if not stop_known or bool(stopped) or isinstance(campaign.get("stop_intent"), dict):
                 mark_error["reason"] = "owner_stopped"
                 mark_error["durable"] = "1"
                 return False

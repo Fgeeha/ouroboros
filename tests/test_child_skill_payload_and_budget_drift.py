@@ -272,6 +272,7 @@ class TestBudgetDriftOpenRouterOnly:
         from supervisor import state as sup_state
 
         sup_state.init(tmp_path, total_budget_limit=0.0)
+        sup_state.save_state({})  # an initialized install: only explicit init creates state (#1307)
         monkeypatch.setenv("OPENROUTER_API_KEY", "unit-test-key-1")
 
         breakdown = {

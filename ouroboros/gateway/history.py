@@ -24,6 +24,8 @@ from ouroboros.gateway.history_paging import (
 )
 from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection
 from ouroboros.outcomes import normalize_outcome_axes
+from ouroboros.history_retention import retention_summary
+from ouroboros.review_execution_projection import normalize_review_executions as _review_executions
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.project_dialogue import historical_terminal_projection
 from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, executor_observation_meta, initiator_meta, subagent_message_meta
@@ -114,12 +116,6 @@ _SKILL_REVIEW_STRING_FIELDS = (
 )
 _SKILL_REVIEW_INT_FIELDS = ("review_round", "snapshot_attempt")
 _SKILL_REVIEW_BOOL_FIELDS = ("snapshot_revised",)
-
-
-def _review_executions(value: Any) -> list[Dict[str, str]]:
-    from ouroboros.review_execution_projection import normalize_review_executions
-
-    return normalize_review_executions(value)
 
 
 def _stored_chat_id(value: Any, default: int = 1) -> int:
@@ -351,6 +347,8 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
         rec["reason_code"] = str(entry.get("reason_code") or "")
     if isinstance(entry.get("review_projection"), dict):
         rec["review_projection"] = dict(entry.get("review_projection") or {})
+    if isinstance(entry.get("history_retention"), dict):
+        rec["history_retention"] = dict(entry["history_retention"])
     # The row's flat task-scope cost snapshot; _annotate_terminal_task_truth
     # later OVERRIDES it with the persisted task_results values when the result
     # file survives (row = fallback only). ABI-3: CONVERTED, not copied — a
@@ -454,6 +452,9 @@ def _annotate_terminal_task_truth(
             and str(message.get("role") or "") in {"assistant", "system"}
             and str(message.get("task_id") or "") not in progress_task_ids
         }
+        from ouroboros.tool_call_log import replay_evidence
+
+        tool_evidence_by_task = {}
         terminal_status_by_task: Dict[str, str] = {}
         terminal_truth_by_task: Dict[str, Dict[str, Any]] = {}
         terminal_receipt_by_task: Dict[str, Dict[str, Any]] = {}
@@ -462,6 +463,7 @@ def _annotate_terminal_task_truth(
         live_cost_by_task: Dict[str, Dict[str, Any]] = {}
         finalizing_tasks: set = set()
         for task_id in progress_task_ids | summary_task_ids | legacy_final_task_ids:
+            tool_evidence_by_task[task_id] = replay_evidence(data_dir, task_id)
             result = _load_terminal_result(data_dir, task_id, cache)
             child_meta = subagent_message_meta(result, task_id=task_id)
             if child_meta:
@@ -491,6 +493,9 @@ def _annotate_terminal_task_truth(
                     **initiator_meta(result)}  # + the origin label, from the persisted metadata
                 if isinstance(result.get("model_execution"), dict):
                     terminal_truth["model_execution"] = dict(result["model_execution"])
+                retention = retention_summary(result)
+                if retention:
+                    terminal_truth["history_retention"] = retention
                 if result.get("reason_code"):
                     terminal_truth["reason_code"] = str(result.get("reason_code") or "")
                 if isinstance(result.get("cancel_origin"), dict):
@@ -592,6 +597,7 @@ def _annotate_terminal_task_truth(
                 and latest_progress_by_task.get(task_id) is message
             ):
                 message.update(terminal_truth_by_task.get(task_id) or {})
+                message["tool_evidence"] = tool_evidence_by_task.get(task_id)
             if (message.get("is_progress") or is_summary) and task_id in suggested_name_by_task:
                 message["suggested_name"] = suggested_name_by_task[task_id]
             # Floor-symmetric closed lineage window for chat FINALS: strip runs

@@ -155,6 +155,7 @@ D20 = "Presence"
 "ouroboros/delegate_pending.py" = "D07"
 "ouroboros/delegate_progress.py" = "D07"
 "ouroboros/delegate_recovery.py" = "D07"
+"ouroboros/delegate_readonly_inputs.py" = "D07"
 "ouroboros/delegate_shared.py" = "D07"
 "ouroboros/delegate_source_coverage.py" = "D07"
 "ouroboros/delegate_start_claims.py" = "D07"
@@ -230,6 +231,7 @@ D20 = "Presence"
 "ouroboros/git_shell_policy.py" = "D13"
 "ouroboros/headless.py" = "D17"
 "ouroboros/headless_status.py" = "D17"
+"ouroboros/history_retention.py" = "D17"
 "ouroboros/workspace_patch_capture.py" = "D17"
 "ouroboros/workspace_file_outputs.py" = "D17"
 "ouroboros/improvement_backlog.py" = "D15"
@@ -267,6 +269,7 @@ D20 = "Presence"
 "ouroboros/loop_round_limits.py" = "D01"
 "ouroboros/loop_llm_call.py" = "D01"
 "ouroboros/loop_tool_execution.py" = "D01"
+"ouroboros/tool_call_log.py" = "D01"
 "ouroboros/loop_transport.py" = "D01"
 "ouroboros/main_context_authority.py" = "D03"
 "ouroboros/marketplace/__init__.py" = "D14"
@@ -288,6 +291,7 @@ D20 = "Presence"
 "ouroboros/nanny_pacing.py" = "D07"
 "ouroboros/net_transport.py" = "D02"
 "ouroboros/observability.py" = "D16"
+"ouroboros/source_retention.py" = "D16"
 "ouroboros/onboarding_wizard.py" = "D12"
 "ouroboros/openai_chat_custom.py" = "D02"
 "ouroboros/openai_chat_dispatch.py" = "D02"
@@ -616,9 +620,11 @@ D20 = "Presence"
 "supervisor/queue_schedules.py" = "D08"
 "supervisor/schedule_lifecycle.py" = "D08"
 "supervisor/followup_policy.py" = "D08"
+"supervisor/schedule_occurrence.py" = "D08"
 "supervisor/queue_transitions.py" = "D08"
 "supervisor/schedule_time.py" = "D08"
 "supervisor/state.py" = "D08"
+"supervisor/state_initialization.py" = "D08"
 "supervisor/steering.py" = "D09"
 "supervisor/subagent_task_truth.py" = "D08"
 "supervisor/task_admission.py" = "D08"
@@ -779,6 +785,7 @@ allowed = [
   "D11->D03",
   "D11->D04",
   "D11->D05",
+  "D11->D06",
   "D11->D07",
   "D11->D08",
   "D11->D09",
@@ -907,7 +914,6 @@ lazy_only = [
   "D10->D14",
   "D10->D15",
   "D10->D17",
-  "D11->D06",
   "D11->D15",
   "D12->D05",
   "D12->D06",

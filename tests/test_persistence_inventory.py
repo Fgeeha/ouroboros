@@ -584,7 +584,10 @@ def scan_data_paths(root: pathlib.Path = REPO) -> frozenset[str]:
 # 296 -> 300 (TZ-1 child-drive custody): ``task_results/<id>.custody.lock`` (the per-task
 # custody lock) and the settlement's ``state/custody_staging`` / ``state/custody_trash``
 # entries; one PERSISTENCE.md row covers all three.
-EXPECTED_SCAN_PATHS = 302  # named review artifact source + scoped review_inputs directory
+# 300 -> 303: state-initialization witness plus named review source and review_inputs.
+# 303 -> 305: immutable retention names exact text-CAS manifest versions and the
+# existing blob copy destination; both stay under the documented observability store.
+EXPECTED_SCAN_PATHS = 305
 
 # Scanned paths that must always be present — guards the scanner itself
 # against a silent regression that would shrink coverage while keeping counts

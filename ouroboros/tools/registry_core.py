@@ -1209,6 +1209,8 @@ class ToolRegistry:
                 redirect = tool_resolution._light_binding_failure_result(name, args)
                 if redirect is not None:
                     return redirect
+                if name == "delegate_start":
+                    return tool_resolution.delegate_payload_binding_refusal(self._ctx, exc)
                 operation = tool_resolution._target_binding_operation(name, args)
                 if operation in {"shell", "service"}:
                     return shell_cwd_block_message(

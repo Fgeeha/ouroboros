@@ -58,6 +58,7 @@ from ouroboros.tools.control_subagent_spec import (
     _validated_schedule_fields,
     schedule_subagent_param_names,
 )
+from ouroboros.tool_access import folderless_scratch_dir
 from ouroboros.tools.registry import ToolContext, active_repo_dir_for, system_repo_dir_for
 from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
@@ -610,10 +611,10 @@ def _inherited_workspace_from_active_repo(
     """Inherit an external active workspace for readonly children when metadata is absent."""
     if workspace_root:
         return workspace_root, workspace_mode
-    try:
+    try:  # a folderless parent's scratch is a default cwd, never an inherited workspace (#1315)
         active = active_repo_dir_for(ctx).resolve(strict=False)
         system = system_repo_dir_for(ctx).resolve(strict=False)
-        if active != system:
+        if active != system and folderless_scratch_dir(ctx) is None:
             return str(active), workspace_mode or "external"
     except Exception:
         pass
@@ -821,16 +822,11 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "parent_cognitive_route": parent_cognitive_route,
         **{key: fields[key] for key in ("directory_strategy", "scope_paths") if key in fields},
     }
-    evt = {
-        "type": "schedule_subagent",
-        "description": objective,
+    child_facts = {
         "objective": objective,
         "expected_output": expected_output,
         "constraints": constraints,
         "role": role,
-        "task_id": tid,
-        "depth": new_depth,
-        "ts": utc_now_iso(),
         "root_task_id": root_task_id,
         "session_id": session_id,
         "actor_id": f"subagent:{role}",
@@ -840,12 +836,22 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "budget_drive_root": budget_drive_root,
         "root_cost_ceiling_usd": root_cost_ceiling_usd,
         "task_constraint": task_constraint,
-        "write_surface": requested_surface,
         "task_contract": child_contract,
         "allowed_resources": allowed_resources,
         "required_capabilities": required_caps,
         **intent_fields,
         "subagent_envelope": envelope,
+    }
+    evt = {
+        **child_facts,
+        "type": "schedule_subagent",
+        "description": objective,
+        "task_id": tid,
+        "depth": new_depth,
+        "ts": utc_now_iso(),
+        "write_surface": requested_surface,
+        "resource_intent": ({"kind": "explicit_none"} if folderless_scratch_dir(ctx) is not None
+                            else dict(metadata.get("resource_intent") or {})),
         "origin_metadata": consciousness_origin_metadata(metadata),  # a consciousness child: label, category, level
         **presence_binding_authority_metadata(metadata, task_contract=getattr(ctx, "task_contract", None)),  # never speaker
     }
@@ -861,32 +867,15 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
             STATUS_REQUESTED,
             created_at=created_at,
             parent_task_id=parent_task_id or None,
-            root_task_id=root_task_id,
-            session_id=session_id,
-            actor_id=f"subagent:{role}",
-            delegation_role="subagent",
-            project_id=parent_project_id,
-            role=role,
             description=objective,
-            objective=objective,
-            expected_output=expected_output,
-            constraints=constraints,
             context=context,
             workspace_root=workspace_root,
             workspace_mode=workspace_mode,
             executor_ref=executor_ref,
-            allowed_resources=allowed_resources,
-            task_contract=child_contract,
-            required_capabilities=required_caps,
             chat_id=current_chat_id,
-            memory_mode=memory_mode,
             drive_root=str(child_drive) if child_drive is not None else "",
             child_drive_root=str(child_drive) if child_drive is not None else "",
-            budget_drive_root=budget_drive_root,
-            root_cost_ceiling_usd=root_cost_ceiling_usd,
-            task_constraint=task_constraint,
-            **intent_fields,
-            subagent_envelope=envelope,
+            **child_facts,
             result="Subagent request queued. Awaiting supervisor acceptance.",
         )
     except Exception:

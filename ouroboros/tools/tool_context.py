@@ -130,7 +130,9 @@ class ToolContext:
         room = project_room_lens_dir(self)
         if room is not None:
             return room
-        return pathlib.Path(self.repo_dir)
+        from ouroboros.tool_access import folderless_scratch_dir
+
+        return folderless_scratch_dir(self) or pathlib.Path(self.repo_dir)
 
     def is_workspace_mode(self) -> bool:
         return (

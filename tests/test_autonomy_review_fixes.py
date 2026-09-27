@@ -52,26 +52,28 @@ def test_project_followup_consumes_only_a_permanent_refusal(tmp_path, monkeypatc
     project = create_project(root, "project-a", name="Project A")
     ctx = ToolContext(repo_dir=tmp_path, drive_root=root, task_id="source-task",
                       project_id=project["id"], current_chat_id=project["chat_id"])
+    ctx.task_metadata = {"resource_intent": {"kind": "room_default", "project_id": project["id"]}}
     assert _handle_schedule_followup(ctx, run_at="2000-01-01T00:00:00Z",
                                      objective="Continue in the same project").startswith("FOLLOWUP_SCHEDULED")
     begin_project_deletion(root, project["id"])
     if lifecycle == "tombstoned":
         complete_project_deletion(root, project["id"])
+    monkeypatch.setattr("ouroboros.config.get_bg_wakeup_min_sec", lambda: 0)  # a wait ends at once here
     queue.check_scheduled_tasks()
     first = queue.list_scheduled_tasks(root)["tasks"][0]
-    failed = load_task_result(root, first["last_task_id"])
-    assert failed["status"] == "failed" and failed["reason_code"] == "project_routing_fence"
     queue.check_scheduled_tasks()
     second = queue.list_scheduled_tasks(root)["tasks"][0]
     assert queue.PENDING == []
+    # #1315: neither a permanent nor a transient refusal mints a failed root.
+    assert not list((root / "task_results").glob("*.json"))
+    assert not second.get("failure_count")
     if lifecycle == "tombstoned":
-        assert second["last_task_id"] == first["last_task_id"]
-        assert second["enabled"] is False and second["completed_at"]
-        assert len(list((root / "task_results").glob("*.json"))) == 1
-        assert second["failure_count"] == 1 and "project_routing_fence" in second["last_error"]
+        assert second["enabled"] is False and second["completed_at"]  # the obligation is consumed, loudly
+        assert "deleted" in second["last_error"] and "occurrence" not in second
     else:
-        assert second["last_task_id"] != first["last_task_id"]
         assert second["enabled"] is True and not second.get("completed_at")
+        assert second["hold"]["reason"] == "project_routing_fence"
+        assert second["occurrence"]["task_id"] == first["occurrence"]["task_id"]  # one occurrence, retried
 
 
 class ReachedExec(BaseException):

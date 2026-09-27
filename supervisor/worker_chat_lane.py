@@ -618,10 +618,14 @@ def handle_wake_direct(
     """
     if not wake_gate_open():
         return {"admitted": False, "task_id": "", "reason": "repo_writer_gate_closed"}
-    from supervisor.state import budget_remaining, load_state
+    from supervisor.state import budget_remaining, control_is, load_state
+    from ouroboros.consciousness import panic_blocks_wake
 
+    current = load_state()
+    if panic_blocks_wake(_pool().DRIVE_ROOT) or not control_is(current, "bg_consciousness_enabled", True):
+        return {"admitted": False, "task_id": "", "reason": "consciousness_disabled_or_unknown"}
     try:
-        remaining = budget_remaining(load_state(), strict=True)
+        remaining = budget_remaining(current, strict=True)
     except Exception:
         return {"admitted": False, "task_id": "", "reason": "cost_accounting_unavailable"}
     if remaining <= 0:
@@ -697,7 +701,8 @@ def auto_resume_after_restart() -> None:
             except Exception:
                 log.debug("Failed to consume owner restart compatibility flag", exc_info=True)
             log.info("Owner restart flag detected — skipping auto-resume.")
-            return
+            if not (_pool().DRIVE_ROOT / "state" / "panic_stop.flag").exists():
+                return  # a kept Panic flag still owes its durable controls below
 
         # Panic/owner-restart flags suppress auto-resume and are consumed — a Panic's
         # only after the queue carrying its sleep holds is durable, like a Restart's.
@@ -708,14 +713,23 @@ def auto_resume_after_restart() -> None:
             if persist_queue_snapshot(reason="panic_holds") is not True:
                 log.error("Panic holds are not durable yet; the panic marker is kept.")
                 return
+            from ouroboros.server_control import PANIC_CONTROL_KEYS, _panic_controls
+            from supervisor.state import StateUnavailable, update_state
+
+            try:
+                update_state(_panic_controls, confirm=PANIC_CONTROL_KEYS)
+            except StateUnavailable as exc:
+                log.warning("Panic flag kept: its disabled controls are not durable yet (%s)", exc)
+                return
             panic_flag.unlink(missing_ok=True)
             log.info("Panic flag detected — skipping auto-resume.")
             return
 
-        st = _pool().load_state()
-        chat_id = st.get("owner_chat_id")
-        if not chat_id:
-            return
+        from supervisor.state import control_value
+
+        chat_known, chat_id = control_value(_pool().load_state(), "owner_chat_id")
+        if not chat_known or chat_id in (None, "", 0):
+            return  # an autonomous resume turn needs a KNOWN owner chat (#1307)
 
         # The one real trigger: a planned restart's verify record. A launcher
         # line in the log tail is not evidence of unfinished work (owner Batch4).
@@ -791,11 +805,11 @@ def stop_direct_chat_turn(task_id: str, turn: Dict[str, Any], *, deliver: bool =
     ``deliver=False`` (a cascade sweep, which speaks for the tree once)
     suppresses the owner toast.
     """
+    from ouroboros.config import get_direct_turn_stop_wait_sec
     from supervisor import queue as q
     from supervisor import workers
     from supervisor.owner_stop import REASON_OWNER_STOPPED_DIRECT_TURN
     from supervisor.task_reaper import request_finalization_grace
-    from ouroboros.config import get_direct_turn_stop_wait_sec
 
     if turn.get("stop_control_msg_id"):
         return DIRECT_TURN_STOP_LIVE if workers.direct_chat_turn(task_id) is not None else DIRECT_TURN_STOP_ENDED

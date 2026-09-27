@@ -659,6 +659,8 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     metadata.setdefault("task_id", task_id)
     metadata.setdefault("parent_task_id", "")
     metadata.setdefault("root_task_id", task_id)
+    metadata["resource_intent"] = ({"kind": "explicit_resource", "root": str(workspace_root)} if workspace_root  # #1315
+                                   else {"kind": "explicit_none", "project_id": _task_project_id} if _task_project_id else {"kind": "system_repo"})
     artifacts: List[Dict[str, Any]] = []
     workspace_preflight_summary: Dict[str, Any] = {}
     if workspace_root:

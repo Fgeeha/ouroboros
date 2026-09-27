@@ -139,6 +139,24 @@ def _settlement_trace(usage_ctx: Any, retry_key: str) -> Optional[Dict[str, Any]
     return None
 
 
+def acceptance_actor_ended(usage_ctx: Any, task_id: str, result: Dict[str, Any]) -> bool:
+    """Canonical completion or a positively ended actor drain; unknown is not ended.
+
+    File copyback may keep the canonical row running after the solve loop ended.
+    Maintenance has no live context, so it uses that row's existing child binding.
+    """
+    from ouroboros.owner_mailbox import mailbox_drain_ended
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES
+    from ouroboros.task_status import _child_drive_candidates
+
+    if str(result.get("status") or "") in _TRULY_TERMINAL_STATUSES:
+        return True
+    actor = pathlib.Path(usage_ctx.drive_root)
+    if actor.resolve() == _result_root(usage_ctx).resolve():
+        actor = next(iter(_child_drive_candidates(result)), actor)
+    return mailbox_drain_ended(actor, task_id)
+
+
 def announce_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[str, Any]) -> None:
     """Deliver a settled acceptance wave to whoever can still act on it.
 
@@ -158,10 +176,10 @@ def announce_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[str,
     # gap; physical closure persists it as ``unpublished`` for maintenance.
     _unpublished(task_id, str(getattr(request, "retry_key", "") or ""), "unpublished")
     try:
-        from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+        from ouroboros.task_results import load_task_result
 
         row = load_task_result(_result_root(usage_ctx), task_id) or {}
-        if str(row.get("status") or "") in _TRULY_TERMINAL_STATUSES:
+        if acceptance_actor_ended(usage_ctx, task_id, row):
             attach_late_acceptance_settlement(usage_ctx, request, wave, result=row)
             return
         from ouroboros.owner_mailbox import write_task_message
@@ -592,10 +610,6 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
     from ouroboros.loop_acceptance_review import acceptance_run_pending
     from ouroboros.review_dispatch import reconcile_pending_acceptance_runs
     from ouroboros.review_projection import publish_acceptance_checkpoint
-    from supervisor.terminal_delivery import (
-        ENQUEUE_ALREADY_DELIVERED, ENQUEUE_QUEUED, enqueue_terminal_delivery_outcome,
-    )
-
     root = _result_root(usage_ctx)
     trace = _settlement_trace(usage_ctx, retry_key) if retry_key else None
     partial = trace is None
@@ -648,6 +662,17 @@ def settle_acceptance_operation(usage_ctx: Any, *, retry_key: str, task_id: str,
         return _unpublished(task_id, retry_key, "unpublished")
     if not any(acceptance_run_pending(run) for run in runs):
         (getattr(usage_ctx, "_acceptance_settlement_traces", None) or {}).pop(retry_key, None)
+    return enqueue_late_acceptance_settlement(usage_ctx, task_id, retry_key, result, panel)
+
+
+def enqueue_late_acceptance_settlement(usage_ctx: Any, task_id: str, retry_key: str,
+                                      result: Dict[str, Any], panel: Dict[str, Any]) -> str:
+    """Owe the already-published fact, also after an old controller lost its outbox write."""
+    from supervisor.terminal_delivery import (
+        ENQUEUE_ALREADY_DELIVERED, ENQUEUE_QUEUED, enqueue_terminal_delivery_outcome,
+    )
+
+    root = _result_root(usage_ctx)
     late = panel["late_settlement"]
     # A compact, source-bound pointer rides the row itself (progress_meta survives
     # live delivery, replay and history); the full fact stays on the projection.

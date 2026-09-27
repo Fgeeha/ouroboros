@@ -66,7 +66,10 @@ def test_server_inline_replies_settle_their_exact_ingress(tmp_path, monkeypatch,
     import server
 
     bridge = message_bus.LocalChatBridge()
-    live_state = {"owner_id": 1, **owner}
+    # This is an initialized owner with a known-empty external binding, not
+    # a missing/lost state that could legitimately refuse first registration.
+    live_state = {"owner_id": 1, "owner_external_id": None,
+                  "owner_external_chat_id": None, **owner}
     monkeypatch.setattr(message_bus, "DATA_DIR", tmp_path)
     monkeypatch.setattr(message_bus, "_BRIDGE", bridge)
     monkeypatch.setattr(message_bus, "load_state", lambda: live_state)

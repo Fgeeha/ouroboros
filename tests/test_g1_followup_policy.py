@@ -25,6 +25,8 @@ DEADLINE = '2099-01-01T00:00:00+00:00'
 @pytest.fixture
 def world(tmp_path, monkeypatch):
     ctx = _ctx(tmp_path)
+    ctx.current_chat_id = 0
+    ctx.task_metadata["resource_intent"] = {"kind": "system_repo"}
     root = ctx.drive_root
     queue.init(root)
     pending = []
@@ -321,7 +323,7 @@ def test_legacy_template_normalization_keeps_origin_but_cannot_forge_money(world
     assert not row(root, 'legacy')['enabled']
 
 
-def test_legacy_fired_unknown_keeps_id_and_waits_for_batch1_binding_composition(world):
+def test_legacy_fired_unknown_without_receipt_keeps_id_and_waits_for_custody(world):
     _, root, pending = world
     legacy = {'id': 'legacy', 'source': 'task_followup', 'enabled': False,
               'trigger': {'type': 'once'}, 'completed_at': '2026-01-01T00:00:00+00:00',
@@ -385,7 +387,7 @@ def test_refused_scheduled_result_never_reaches_public_enqueue(world, monkeypatc
     queue.check_scheduled_tasks()
     assert pending == []
     current = row(root, registered['id'])
-    assert current['followup_wait'] == 'followup_result_persistence_unavailable'
+    assert current['hold']['reason'] == 'receipt_failed'
     assert not current.get('completed_at') and not current.get('last_task_id')
 
 

@@ -1550,7 +1550,3 @@ from supervisor.queue_transitions import (  # noqa: E402, F401 -- intentional pu
     task_subtree_is_live,
     transition_acceptance_fence,
 )
-
-# Scheduled-admission projection moved to its owner module, but callers may
-# still import the established lifecycle surface.
-from supervisor.task_admission import record_scheduled_admission  # noqa: E402, F401

@@ -21,6 +21,7 @@ def _assignment_case(tmp_path, monkeypatch, task_id="assign-evo"):
     from supervisor import evolution_lifecycle, queue, state, workers
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 0.0)
     pending, running = [], {}
     monkeypatch.setattr(workers, "PENDING", pending)
@@ -79,6 +80,7 @@ def test_scheduler_refuses_active_campaign_without_source(tmp_path, monkeypatch)
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     queue.init_queue_refs([], {}, {"value": 0})
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
@@ -114,6 +116,7 @@ def test_scheduler_does_not_enqueue_when_transaction_attach_fails(tmp_path, monk
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     pending = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -134,6 +137,7 @@ def test_transaction_attach_rechecks_owner_stop_under_state_lock(tmp_path):
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
     live = state.load_state()
@@ -152,6 +156,7 @@ def test_scheduler_replaces_uncommitted_transaction_lost_before_enqueue(tmp_path
     from supervisor import evolution_lifecycle, queue, state
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install (#1307)
     queue.init(tmp_path)
     pending = []
     queue.init_queue_refs(pending, {}, {"value": 0})

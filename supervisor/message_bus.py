@@ -47,13 +47,12 @@ def accepted_chat_message(drive_root, chat_id: int, client_message_id: str) -> O
     return None
 
 
-def accept_local_message(bridge, drive_root, text: str, *, retain_inputs=None, **message) -> tuple[dict, bool]:
-    """Accept a named skill delivery once, then hand its exact source to the queue.
+def accept_local_message(bridge, drive_root, text: str, *, retain_inputs=None, dispatch=None, **message) -> tuple[dict, bool]:
+    """Accept a named skill delivery once, then schedule/queue its exact source.
 
-    The canonical row is the acceptance record, written by this existing owner
-    BEFORE enqueue. A crash after acceptance never authorizes another enqueue;
-    operation reads disclose a lost host session instead. The single host's
-    ingress lock covers check/write/enqueue, including simultaneous HTTP calls.
+    The canonical receipt precedes dispatch under the single ingress lock, including
+    simultaneous requests. A crash after acceptance permits no redispatch; operation
+    reads disclose a lost host session instead.
     """
     from ouroboros.project_dialogue import _text_sha256, build_owner_message_ref
 
@@ -92,7 +91,8 @@ def accept_local_message(bridge, drive_root, text: str, *, retain_inputs=None, *
         ref = build_owner_message_ref(chat_id=chat_id, client_message_id=message_id, ts=ts, text=logged)
         # The row rides the item as its in-process witness (``record_inbound_message``); its
         # acceptance time is this message's receipt stamp.
-        bridge.enqueue_local_message(text, **message, accepted_source_ref=ref, accepted_source_row=row, received_at=ts)
+        # Dispatch only schedules/queues; slow work must not hold the ingress lock.
+        (dispatch or bridge.enqueue_local_message)(text, **message, accepted_source_ref=ref, accepted_source_row=row, received_at=ts)
         return row, False
 
 
@@ -281,6 +281,9 @@ class LocalChatBridge:
     """Local Queue-backed message bus."""
 
     def __init__(self, settings: Optional[Dict[str, Any]] = None):
+        from ouroboros.server_control import PanicIngress
+
+        self.panic = PanicIngress()  # server binds the existing emergency owner
         self._inbox = queue.Queue()   # user -> agent
         # Updates the consumer handed back unprocessed (``requeue_updates``); memory only.
         self._replay: List[Dict[str, Any]] = []
@@ -416,7 +419,7 @@ class LocalChatBridge:
             self._response_subs.pop(subscription_id, None)
 
     def shutdown(self) -> None:
-        return None
+        self.panic.invalidate_owner()
 
     def handle_web_message(
         self,
@@ -430,11 +433,10 @@ class LocalChatBridge:
         task_metadata: Optional[Dict[str, Any]] = None,
         chat_id: int = 1,
         project_id: str = "",
+        dispatch=None,
     ) -> None:
-        # Multi-project (v6.32.0): the web owner may address a project chat by
-        # positive chat_id. The OWNER identity never changes (user_id stays 1 —
-        # binding is security-load-bearing); only the thread id varies. A2A
-        # negative ids are rejected here — they are not a web surface.
+        # Web ownership stays user_id=1; positive chat_id selects Main/Project.
+        # Negative A2A ids are not web destinations and fall back to Main.
         try:
             thread_id = int(chat_id or 1)
         except (TypeError, ValueError):
@@ -442,6 +444,8 @@ class LocalChatBridge:
         if thread_id < 1:
             thread_id = 1
         clean_text = str(text or "").strip()
+        if self.panic.request(clean_text):
+            return
         if not clean_text and not image_base64:
             return
         import uuid
@@ -457,9 +461,8 @@ class LocalChatBridge:
             "(image attached)" if image_base64 else "(file attached)"
             if metadata.get("chat_attachment_uploads") else ""
         )
-        # A socket acceptance has its canonical, parseable row BEFORE the echo or
-        # queue handoff (a WS write or in-memory Queue survives no restart); the
-        # returned row is the dequeue witness, so validation needs no chat scan.
+        # The canonical row precedes echo/dispatch: neither WS nor Queue survives
+        # restart. Its returned witness lets dequeue validation avoid a chat scan.
         with _INGRESS_LOCK:
             row = log_chat(
                 "in", thread_id, 1, log_text, ts=ts, source="web",
@@ -468,27 +471,28 @@ class LocalChatBridge:
                 require_write=True, ensure_record_boundary=True,
             )
             ref = build_owner_message_ref(chat_id=thread_id, client_message_id=message_id, ts=ts, text=log_text)
-            self.enqueue_local_message(
-                clean_text, chat_id=thread_id, user_id=1, source="web",
+            message = dict(
+                chat_id=thread_id, user_id=1, source="web",
                 sender_session_id=sender_session_id, client_message_id=message_id,
                 image_base64=image_base64, image_mime=image_mime,
                 image_caption=image_caption, task_metadata=metadata,
                 accepted_source_ref=ref, accepted_source_row=row,
             )
-        if self._broadcast_fn:
-            echo = {
-                "type": "chat",
-                "role": "user",
-                "content": clean_text,
-                "ts": ts,
-                "source": "web",
-                "chat_id": thread_id,
-                "sender_session_id": sender_session_id,
-                "client_message_id": message_id,
-                "ingress_accepted": True,  # Canonical row was written; execution is not promised.
-            }
-            stamp_project_thread(DATA_DIR, echo)
-            self._broadcast_fn(echo)
+            if dispatch is None:
+                self.enqueue_local_message(clean_text, **message)
+        try:
+            if self._broadcast_fn:
+                echo = {
+                    "type": "chat", "role": "user", "content": clean_text,
+                    "ts": ts, "source": "web", "chat_id": thread_id,
+                    "sender_session_id": sender_session_id, "client_message_id": message_id,
+                    "ingress_accepted": True,  # Canonical row exists; execution is not promised.
+                }
+                stamp_project_thread(DATA_DIR, echo)
+                self._broadcast_fn(echo)
+        finally:
+            if dispatch is not None:
+                dispatch(clean_text, **message)  # Accepted work survives an echo/disconnect failure.
 
     def enqueue_local_message(
         self,
@@ -515,12 +519,15 @@ class LocalChatBridge:
         ``received_at`` for all of them: an earlier host stamp of this message (its accepted row's
         time, the WS acceptance's ``client_surface.received_at``) is kept, else now. The update
         carries it; a surface fact without one (a host channel stamp) gets it too, so every
-        record that copies the fact carries it. Nothing else: a dict put, no lock, no I/O."""
+        record that copies the fact carries it. Panic uses the server's independent
+        emergency owner; ordinary ingress is a dict put, no lock or I/O."""
         clean_text = str(text or "").strip()
         caption_text = str(image_caption or "").strip()
         image_b64 = str(image_base64 or "").strip()
         if not clean_text and caption_text:
             clean_text = caption_text
+        if self.panic.request(clean_text, source=source, user_id=user_id, chat_id=chat_id):
+            return
         if not clean_text and not image_b64 and not (task_metadata or {}).get("chat_attachment_uploads"):
             return  # nothing to say and nothing attached (a file-only message carries uploads)
         surface = (task_metadata or {}).get("client_surface")
@@ -1227,6 +1234,7 @@ class LocalChatBridge:
         task_metadata: Optional[Dict[str, Any]] = None,
         chat_id: int = 1,
         project_id: str = "",
+        dispatch=None,
     ):
         """Accept a web UI message for the agent."""
         if broadcast:
@@ -1240,6 +1248,7 @@ class LocalChatBridge:
                 task_metadata=task_metadata,
                 chat_id=chat_id,
                 project_id=project_id,
+                dispatch=dispatch,
             )
             return
         self.enqueue_local_message(
@@ -1248,7 +1257,6 @@ class LocalChatBridge:
             task_constraint=task_constraint,
             task_metadata=task_metadata,
         )
-
 
 
 def _send_markdown(
@@ -1325,7 +1333,12 @@ def budget_line(force: bool = False) -> str:
             live["budget_messages_since_report"] = 0
             report_box["emit"] = True
 
-        st = update_state(_tick_counter)
+        from supervisor.state import StateUnavailable
+
+        try:
+            st = update_state(_tick_counter)
+        except StateUnavailable:  # a budget report is bookkeeping; the message itself proceeds
+            return ""
         if not report_box["emit"]:
             return ""
         display_state = dict(st)

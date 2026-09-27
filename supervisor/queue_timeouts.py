@@ -9,6 +9,8 @@ teardown it decides on is handed to the off-loop reaper.
 from __future__ import annotations
 
 import datetime
+from supervisor.state import control_is
+
 import logging
 import pathlib
 import time
@@ -414,7 +416,7 @@ def _enforce_task_timeouts_locked(
         )
         # A stopped evolution campaign breaks the auto-retry chain. `st` is the live state
         # loaded this tick, so this reflects the current owner decision.
-        if will_retry and task_type == "evolution" and not bool(st.get("evolution_mode_enabled")):
+        if will_retry and task_type == "evolution" and not control_is(st, "evolution_mode_enabled", True):
             will_retry = False
         # An unreadable projection/lineage cannot authorize a new dispatch.
         # Readable active intents already yielded the timeout rail above.

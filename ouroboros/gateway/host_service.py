@@ -26,6 +26,7 @@ from ouroboros.contracts.chat_id_policy import A2A_CHAT_ID_MAX, A2A_CHAT_ID_MIN,
 from ouroboros.event_bus import get_global_event_bus
 from ouroboros.config import WS_RELAY_BURST, WS_RELAY_REFILL_PER_SEC
 from ouroboros.gateway._helpers import run_sync_to_completion
+from ouroboros.server_control import dispatch_accepted_restart
 from ouroboros.gateway.files import store_chat_upload
 from ouroboros.presence_delivery import (
     DELIVERY_VERSION, PresenceDeliveryConflict, PresenceDeliveryRecorder,
@@ -476,6 +477,18 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
         skill_name, _token_payload = await _authenticated(ctx, request.headers.get("x-skill-token", ""), "inject_chat")
     except HostServiceAuthError as exc:
         return _json_error(str(exc), 403)
+    try:
+        payload = await request.json()
+        panic = getattr(ctx.bridge_getter(), "panic", None)
+        if panic is not None and panic.request(
+            str(payload.get("text") or payload.get("image_caption") or ""), source=f"skill:{skill_name}",
+            user_id=int(payload.get("user_id") or 0), chat_id=int(payload.get("chat_id") or 0),
+        ):
+            return JSONResponse({"ok": True, "status": "accepted"}, status_code=202)
+    except json.JSONDecodeError:
+        return _json_error("invalid json", 400)
+    except Exception as exc:
+        return _json_error(str(exc), 500)
     if not ctx.rate_limiter.allow(f"{skill_name}:inject"):
         return _json_error("rate limit exceeded", 429)
     if not ctx._enter_inflight(skill_name):
@@ -483,7 +496,6 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
     subscription_id = ""
     pending_uploads = ExitStack()
     try:
-        payload = await request.json()
         text = str(payload.get("text") or "")
         image_caption = str(payload.get("image_caption") or "")
         client_message_id = str(payload.get("client_message_id") or "").strip()[:128]
@@ -564,12 +576,13 @@ async def _api_chat_inject(request: Request) -> JSONResponse:
                 try:
                     _, rejoined = await run_sync_to_completion(
                         accept_local_message, bridge, ctx.data_dir, text,
-                        retain_inputs=pending_uploads.pop_all, **message,
+                        retain_inputs=pending_uploads.pop_all,
+                        dispatch=functools.partial(dispatch_accepted_restart, bridge), **message,
                     )
                 except ValueError as exc:
                     return _json_error(str(exc), 409)
             else:
-                bridge.enqueue_local_message(text, **message)
+                dispatch_accepted_restart(bridge, text, **message)
                 pending_uploads.pop_all()
         if not wait_for_response:
             if rejoined:

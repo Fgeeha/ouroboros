@@ -39,7 +39,9 @@ def _lane(monkeypatch, tmp_path, *, event_q=None, sent=None):
     monkeypatch.setattr(workers, "get_event_q", lambda: shared)
     monkeypatch.setattr(workers, "send_with_budget",
                         lambda *a, **kw: (sent if sent is not None else []).append((a, kw)))
-    monkeypatch.setattr(state, "load_state", lambda: {})
+    # A wake is admissible only when the installed owner's consciousness toggle
+    # is positively known to be on. An absent state is deliberately unknown.
+    monkeypatch.setattr(state, "load_state", lambda: {"bg_consciousness_enabled": True})
     monkeypatch.setattr(state, "budget_remaining", lambda *a, **kw: 100)
     monkeypatch.setattr(message_bus, "get_bridge", lambda: SimpleNamespace(send_chat_action=lambda *a, **kw: None))
     workers.open_repo_writer_admission()
@@ -237,6 +239,9 @@ def test_wake_refusals_are_typed_and_start_nothing(monkeypatch, tmp_path):
     sent: list = []
     _lane(monkeypatch, tmp_path, sent=sent)
     monkeypatch.setattr(agent_module, "make_agent", lambda **kw: (_ for _ in ()).throw(AssertionError("no actor")))
+    monkeypatch.setattr(state, "load_state", lambda: {})
+    assert workers.handle_wake_direct(1, "wake", dict(WAKE_META))["reason"] == "consciousness_disabled_or_unknown"
+    monkeypatch.setattr(state, "load_state", lambda: {"bg_consciousness_enabled": True})
     monkeypatch.setattr(state, "budget_remaining", lambda *a, **kw: 0)
     assert workers.handle_wake_direct(1, "wake", dict(WAKE_META)) == {
         "admitted": False, "task_id": "", "reason": "budget_exhausted"}
@@ -430,6 +435,7 @@ def test_set_next_wakeup_clamps_persists_and_speaks_honestly(tmp_path, monkeypat
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "locks").mkdir(parents=True)
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     assert control._set_next_wakeup is control_runtime._set_next_wakeup
     ctx = SimpleNamespace(task_id="w1")
     with mock.patch.dict(os.environ, {"OUROBOROS_BG_WAKEUP_MIN": "120", "OUROBOROS_BG_WAKEUP_MAX": "600"}):
@@ -457,6 +463,7 @@ def test_consciousness_status_answers_the_caller_only_with_sourced_persisted_fac
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "locks").mkdir(parents=True)
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda st: st.update({
         "bg_consciousness_enabled": True, "consciousness_next_wake_at": 1790416800.0,
         "consciousness_last_wake_at": 1790413200.0, "consciousness_next_interval_sec": 900}))
@@ -492,6 +499,15 @@ def _tree(root):
             for path in sorted(root.rglob("*"))}
 
 
+def _initialized_state(root, stored, *, witness="init-1"):
+    """A primary copy of a completed initialization (#1307); ``witness=None`` leaves none."""
+    (root / "state").mkdir(parents=True, exist_ok=True)
+    if witness:
+        (root / "state" / "state.initialized.json").write_text(
+            json.dumps({"initialization_id": witness, "phase": "complete"}), encoding="utf-8")
+    (root / "state" / "state.json").write_text(json.dumps({"initialization_id": "init-1", **stored}), encoding="utf-8")
+
+
 def test_consciousness_status_reads_the_callers_canonical_root_and_writes_nothing(tmp_path, monkeypatch):
     """The read goes to the caller's canonical data root (``budget_drive_root``
     over a child's own execution drive), never to the process-global state path,
@@ -505,8 +521,7 @@ def test_consciousness_status_reads_the_callers_canonical_root_and_writes_nothin
                                       "consciousness_next_wake_at": 0}),
                          (forked, {"bg_consciousness_enabled": True}),
                          (wrong, {"bg_consciousness_enabled": True, "consciousness_next_interval_sec": 60})):
-        (root / "state").mkdir(parents=True)
-        (root / "state" / "state.json").write_text(json.dumps(stored), encoding="utf-8")
+        _initialized_state(root, stored)
     for name, path in (("STATE_PATH", wrong / "state" / "state.json"),
                        ("STATE_LAST_GOOD_PATH", wrong / "state" / "state.last_good.json"),
                        ("STATE_LOCK_PATH", wrong / "locks" / "state.lock")):
@@ -557,6 +572,34 @@ def test_consciousness_status_names_a_read_gap_instead_of_defaults(tmp_path):
     unreadable = tmp_path / "unreadable"
     (unreadable / "state" / "state.json").mkdir(parents=True)  # present, but no file can be read there
     assert status(unreadable).startswith("unreadable:")
+
+
+def test_consciousness_status_keeps_an_unproven_toggle_unknown_and_names_a_kept_panic_flag(tmp_path):
+    """The toggle is a #1307 control: the status read reports a stored value only when
+    that copy proves it (a completed initialization witness of its identity, no
+    recovery-unconfirmed mark), and names a kept Panic flag, which bars every wake."""
+    from ouroboros.tools import control
+
+    def status(name, stored, **kw):
+        root = tmp_path / name
+        _initialized_state(root, {"bg_consciousness_enabled": True, "consciousness_next_interval_sec": 900,
+                                  **stored}, **kw)
+        if name == "panic":
+            (root / "state" / "panic_stop.flag").write_text("panic", encoding="utf-8")
+        before = _tree(root)
+        facts = json.loads(control._toggle_consciousness(SimpleNamespace(pending_events=[], drive_root=root), "status"))
+        assert _tree(root) == before and facts["chosen_interval_sec"] == 900
+        return facts
+
+    proven = status("proven", {})
+    assert proven["enabled"] is True and "panic_flag_kept" not in proven
+    recovered = status("recovered", {"_recovery": {"source": "backup", "unconfirmed": ["bg_consciousness_enabled"]}})
+    assert recovered["enabled"] == {"status": "unknown", "reason": "unconfirmed after a state recovery"}
+    assert status("no_witness", {}, witness=None)["enabled"] == {
+        "status": "unknown", "reason": "initialization_witness_missing"}
+    assert status("foreign", {}, witness="init-2")["enabled"]["reason"] == "initialization_identity_mismatch"
+    panic = status("panic", {})
+    assert panic["enabled"] is True and "no wake starts" in panic["panic_flag_kept"]
 
 
 def test_wake_affordances_describe_the_real_alarm_and_the_status_audience():

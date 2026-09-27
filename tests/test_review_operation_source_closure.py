@@ -1,5 +1,6 @@
 """The paid panel's full evidence stays readable after its author's drive is gone."""
 
+from ouroboros.headless import retry_child_task_refs
 import dataclasses
 import hashlib
 import json
@@ -126,6 +127,7 @@ def test_full_operation_sources_survive_author_drive_cleanup(tmp_path, monkeypat
         # A mutable result is deliberately different from either possible sent answer.
         write_task_result(child, task_id, "completed", chat_id=3, result="mutable result C")
         copy_child_task_result(canonical, {"id": task_id, "drive_root": str(child)})
+        retry_child_task_refs(canonical, child, task_id)
         event = {"type": "send_message", "task_id": task_id, "chat_id": 3, "text": emitted,
                  "delivery_id": delivery_id_for(task_id, emitted), "format": "markdown"}
         assert register_pending_delivery(canonical, event)

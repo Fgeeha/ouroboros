@@ -483,8 +483,17 @@ def ensure_companions_running(
     if not names:
         return {"action": "no_registered_companions", "started": [], "missing": []}
 
-    snapshot_keys = set((supervisor.snapshot() or {}).keys())
-    missing = [name for name in names if f"{skill_name}:{name}" not in snapshot_keys]
+    runtimes = supervisor.snapshot() or {}
+    missing = [name for name in names if f"{skill_name}:{name}" not in runtimes]
+    # A retained failed start / unconfirmed stop is owned but not running: never
+    # report it as already running, and publish nothing until its death settles it.
+    retained = {
+        name: str(runtime.get("retiring"))
+        for name in names
+        if (runtime := runtimes.get(f"{skill_name}:{name}")) and runtime.get("retiring")
+    }
+    if retained:
+        return {"action": "retained_unresolved", "started": [], "missing": missing, "retained": retained}
     if not missing:
         return {"action": "already_running", "started": [], "missing": []}
 

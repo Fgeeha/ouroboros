@@ -50,15 +50,44 @@ def _sleep_policy_allows(task, row, result_root):
                     root_task_id=task.get("root_task_id") or task.get("id"), budget_drive_root=result_root)))
 
 
+def _resume_custody_refusal(result_root, task_id, row, external):
+    """Exact source and off-lock custody observation must both authorize Resume."""
+    from ouroboros.artifacts import read_actor_source_bytes
+    from ouroboros.budget_pause import EXTERNAL_STOP_CONFIRMED, set_budget_pause
+
+    try:
+        read_actor_source_bytes(result_root, task_id, row["source_ref"])
+    except Exception:
+        return {"ok": False, "error": "pause_source_unreadable", "action": "cancel_or_new_run"}
+    # Custody observed outside the queue lock by the caller, else read now.
+    if not isinstance(external, dict):
+        return {"ok": False, "error": "custody_observation_required"}
+    if external.get("custody_read") != "ok":
+        return {"ok": False, "error": "external_custody_unreadable",
+                "detail": str(external.get("error") or ""), "action": "retry_or_cancel"}
+    # ``stop_confirmed`` is the only terminal fact; every other run stays under custody.
+    unsettled = [run for run in (external.get("runs") or [])
+                 if isinstance(run, dict) and str(run.get("state") or "") != EXTERNAL_STOP_CONFIRMED]
+    if unsettled:
+        try:
+            set_budget_pause(result_root, task_id, {**row, "external_runs": external},
+                             expected_pause_id=str(row.get("pause_id") or ""), expected_state=str(row.get("state") or ""))
+        except Exception:
+            log.debug("Fresh custody observation could not be recorded on %s", task_id, exc_info=True)
+        return {"ok": False, "error": "external_runs_unsettled",
+                "runs": [{key: run.get(key) for key in ("run_id", "state", "stop_outcome")} for run in unsettled],
+                "action": "wait_for_delegated_runs_to_settle_or_cancel_them"}
+    return None
+
+
 def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected_by: str = "",
                         external: Optional[Dict[str, Any]] = None,
                         sleep_wake: bool = False) -> Dict[str, Any]:
     """Grant from durable pause, fresh custody, money, Stop and clock checks.
     Explicit model selection needs a root grant; sleep has its own policy.
     """
-    from ouroboros.artifacts import read_actor_source_bytes
     from ouroboros.budget_pause import (
-        EXTERNAL_STOP_CONFIRMED, LIVE_PAUSE_STATES, STATE_PAUSED, STATE_RESUME_GRANTED,
+        LIVE_PAUSE_STATES, STATE_PAUSED, STATE_RESUME_GRANTED,
         exact_pause_marker, observe_task_runs, set_budget_pause,
     )
     from ouroboros.cancel_intents import has_active_intent
@@ -87,6 +116,8 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
     except Exception:
         return {"ok": False, "error": "pause_record_unreadable", "action": "cancel_or_new_run"}
     row = result_row.get("budget_pause") if isinstance(result_row.get("budget_pause"), dict) else {}
+    if task.get("_owner_hold") or result_row.get("_owner_hold"):
+        return {"ok": False, "error": "owner_held"}
     if result_row.get("status") in _TRULY_TERMINAL_STATUSES:
         return {"ok": False, "error": "task_terminal"}
     if (row and row.get("state") in LIVE_PAUSE_STATES and row.get("source_ref")
@@ -143,28 +174,9 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
             return {"ok": False, "error": HOLD_REVOCATION_UNWRITTEN, "detail": str(exc)[:200],
                     "grant_id": live_grant.get("grant_id"), "action": "retry_or_cancel"}
         row = {**row, "state": STATE_PAUSED, "grant": revoked}
-    try:
-        read_actor_source_bytes(result_root, task_id, row["source_ref"])
-    except Exception:
-        return {"ok": False, "error": "pause_source_unreadable", "action": "cancel_or_new_run"}
-    # Custody observed outside the queue lock by the caller, else read now.
-    if not isinstance(external, dict):
-        return {"ok": False, "error": "custody_observation_required"}
-    if external.get("custody_read") != "ok":
-        return {"ok": False, "error": "external_custody_unreadable",
-                "detail": str(external.get("error") or ""), "action": "retry_or_cancel"}
-    # ``stop_confirmed`` is the only terminal fact; every other run stays under custody.
-    unsettled = [run for run in (external.get("runs") or [])
-                 if isinstance(run, dict) and str(run.get("state") or "") != EXTERNAL_STOP_CONFIRMED]
-    if unsettled:
-        try:
-            set_budget_pause(result_root, task_id, {**row, "external_runs": external},
-                             expected_pause_id=pause_id, expected_state=str(row.get("state") or ""))
-        except Exception:
-            log.debug("Fresh custody observation could not be recorded on %s", task_id, exc_info=True)
-        return {"ok": False, "error": "external_runs_unsettled",
-                "runs": [{key: run.get(key) for key in ("run_id", "state", "stop_outcome")} for run in unsettled],
-                "action": "wait_for_delegated_runs_to_settle_or_cancel_them"}
+    refusal = _resume_custody_refusal(result_root, task_id, row, external)
+    if refusal:
+        return refusal
     row = {**row, "external_runs": external,  # an owner Pause's sent work: settled per THIS read
            **({"settlement": "settled"} if row.get("settlement") else {})}
     try:

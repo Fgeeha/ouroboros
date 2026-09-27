@@ -277,9 +277,12 @@ def room_chat_lens_dir(drive_root: Any, project_id: str) -> tuple[str, str]:
     if not pid:
         return "", ""
     try:
-        from ouroboros.projects_registry import get_project
+        from ouroboros.projects_registry import get_reserved_project
 
-        project = get_project(drive_root, pid) or {}
+        # Strict: an unreadable registry is a note, never a folderless room (#1315).
+        project = get_reserved_project(drive_root, pid, strict=True) or {}
+        if str(project.get("lifecycle") or "active") != "active":
+            project = {}
         raw = str(project.get("working_dir") or "").strip()
     except Exception as exc:
         return "", (

@@ -75,12 +75,15 @@ def ledger_billing_binding(budget_root: Any, root_task_id: str) -> Dict[str, Any
 
 
 def task_billing_fields(task: Dict[str, Any], root_task_id: str, root_limit: Optional[float],
-                        budget_root: Any = None, *, pin_initial: bool = False) -> Dict[str, Any]:
+                        budget_root: Any = None, *, pin_initial: bool = False,
+                        persist_initial: bool = True) -> Dict[str, Any]:
     """Resolve the root's durable whole-work binding; only initial admission may pin it.
 
     Root caps remain independent of the original group cap. Missing descendant or
     continuation authority is unavailable, never an independent wallet. This is
-    also used outside an execution context for late custody settlement.
+    also used outside an execution context for late custody settlement. Scheduled
+    occurrences derive the initial binding here but persist it atomically with
+    their canonical frozen receipt (persist_initial=False).
     """
     from ouroboros.task_results import load_task_result, task_result_path, stamp_task_result_schema
     from ouroboros.utils import update_json_locked, utc_now_iso
@@ -149,8 +152,9 @@ def task_billing_fields(task: Dict[str, Any], root_task_id: str, root_limit: Opt
                     raise ValueError("initial billing authority unavailable")
                 return stamp_task_result_schema({"task_id": root_task_id, "status": "requested", **current,
                                                  "billing_group": binding})
-            update_json_locked(task_result_path(pathlib.Path(budget_root), root_task_id), pin,
-                               strict_existing_dict=True)
+            if persist_initial:
+                update_json_locked(task_result_path(pathlib.Path(budget_root), root_task_id), pin,
+                                   strict_existing_dict=True)
         if binding:
             if not isinstance(binding, dict) or not binding.get("billing_group_id") or "billing_group_limit_usd" not in binding:
                 return unavailable

@@ -141,6 +141,11 @@ async def api_reset(request: Request) -> JSONResponse:
     if lock_error is not None:
         return lock_error
     try:
+        from supervisor.message_bus import try_get_bridge
+
+        bridge = try_get_bridge()
+        if bridge is not None:
+            bridge.panic.invalidate_owner()
         deleted = []
         # Keep synchronization files until restart. Removing the directory that
         # contains the held managed-update lock would let a second updater enter.
@@ -153,6 +158,11 @@ async def api_reset(request: Request) -> JSONResponse:
         if settings_file.exists():
             settings_file.unlink()
             deleted.append("settings.json")
+        # The owner's explicit fresh start (#1307): boot initializes a new state from
+        # this pending witness instead of reading the wiped root as a lost one.
+        from supervisor.state_initialization import mark_pending
+
+        mark_pending(data_dir, origin="owner_reset")
         _request_restart(request)
         return JSONResponse({"status": "ok", "deleted": deleted, "restarting": True})
     except Exception as exc:
@@ -171,11 +181,7 @@ async def api_command(request: Request) -> JSONResponse:
             try:
                 bridge = get_bridge()
             except AssertionError:
-                callback = getattr(request.app.state, "startup_owner_command", None)
-                action = callback(cmd) if callable(callback) else None
-                if action is not None:
-                    return JSONResponse({"status": "ok"}, background=BackgroundTask(action))
-                return json_error("Complete provider setup before sending this command.", 409)
+                bridge = None
             visible_text = str(body.get("visible_text") or "").strip()
             task_constraint = body.get("task_constraint") if isinstance(body.get("task_constraint"), dict) else None
             visible_task_id = str(body.get("visible_task_id") or "").strip()
@@ -197,6 +203,15 @@ async def api_command(request: Request) -> JSONResponse:
             # frames. The honest stamp names the ENDPOINT — the host cannot know
             # the true caller here (disclosed non-goal).
             send_kwargs["task_metadata"] = {"client_surface": {"channel": "api_command"}}
+            # Publication precedes readiness. Bind the independent owner, keeping
+            # this transport's metadata if the supervisor becomes ready meanwhile.
+            if bridge is None or str(cmd).strip().lower() == "/restart":
+                callback = getattr(request.app.state, "startup_owner_command", None)
+                action = callback(cmd, send_kwargs=send_kwargs) if callable(callback) else None
+                if action is not None:
+                    return JSONResponse({"status": "ok"}, background=BackgroundTask(action))
+            if bridge is None:
+                return json_error("Complete provider setup before sending this command.", 409)
             bridge.ui_send(cmd, **send_kwargs)
             if visible_task_id:
                 _RECENT_VISIBLE_COMMANDS[visible_task_id] = time.monotonic()

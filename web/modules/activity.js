@@ -196,6 +196,9 @@ export function initActivity({ mount, ws } = {}) {
         const consumed = status === 'consumed';
         const suppressed = status === 'suppressed';
         const id = esc(s.id || '');
+        // A due occurrence that waits (capacity, a missing folder, an unknown fact) says why.
+        const waiting = s.hold && s.hold.reason
+            ? ` · <span class="activity-tag" title="${esc(s.hold.detail || '')}">waiting: ${esc(s.hold.reason)}</span>` : '';
         const relation = String(s.relation || 'unknown');
         const hold = s.followup_hold || {};
         const work = s.billing_group || {};
@@ -207,7 +210,7 @@ export function initActivity({ mount, ws } = {}) {
             pending_binding_unavailable: 'Fired task awaits verified work binding',
             followup_result_persistence_unavailable: 'Task record could not be saved',
         };
-        const sub = `${timing}${next && !consumed ? ` · next ${next}` : ''} · ${esc(status)} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}`;
+        const sub = `${timing}${next && !consumed ? ` · next ${next}` : ''} · ${esc(status)} · ${esc(relation)}${binding}${s.deadline_at ? ` · deadline ${scheduleInstantHtml(s.deadline_at, { includeYear: true })}` : ''}${hold.reason ? ` · ${esc(explanations[hold.reason] || hold.reason)}` : ''}${s.followup_wait ? ` · ${esc(explanations[s.followup_wait] || s.followup_wait)}` : ''}${s.completed_at ? ' · already fired' : ''}${managed && s.skill ? ` · ${esc(s.skill)}` : ''}${waiting}`;
         // A consumed one-shot cannot be re-armed, so it carries no Enable: the
         // only honest control left is removing the receipt. A suppressed skill
         // row offers Restore, which asks the server to re-evaluate the skill.

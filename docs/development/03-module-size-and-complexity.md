@@ -38,11 +38,12 @@ P7 makes context fit a maintenance constraint, not a line-count aesthetic.
   signals (BIBLE P7, CHECKLISTS item 2(c)), not deterministic gates; existing
   baseline debt is not retroactively a failing tree.
 - Runtime Python function/method count stays under
-  `ouroboros/review.py::MAX_TOTAL_FUNCTIONS` (the same runtime-only iterator;
-  the module gates include tests/devtools) — a high-water alarm with ample
-  headroom, raised only with a one-line campaign rationale in the same commit
-  (owner-approved 11000 after two simplification passes for paid-review,
-  wake and physical-clock changes; individual size limits stay unchanged).
+  `ouroboros/review.py::MAX_TOTAL_FUNCTIONS`, using the runtime-only iterator
+  (module gates also include tests/devtools). The approved aggregate budget
+  is 11000, adding headroom after simplification for distinct review-operation,
+  state, schedule and tool-custody duties, not duplication. Count each product
+  candidate; other size and debt-transition
+  limits remain unchanged.
 - Enforcement: the OFFICIAL repository's CI runs the dedicated `size_ratchet`
   pytest lane as a blocking step (`OURO_SIZE_RATCHET_BASE_REF` names the event
   base; lane placement and base fallback: ARCHITECTURE §8 "CI topology").

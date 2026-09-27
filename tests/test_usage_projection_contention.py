@@ -70,6 +70,7 @@ def supervisor_state(data_root, monkeypatch):
     monkeypatch.setattr(state, "STATE_LOCK_PATH", data_root / "locks" / "state.lock")
     monkeypatch.setattr(state, "TOTAL_BUDGET_LIMIT", 1_000_000.0)
     monkeypatch.setattr(state, "check_openrouter_ground_truth", lambda: None)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     return state
 
 

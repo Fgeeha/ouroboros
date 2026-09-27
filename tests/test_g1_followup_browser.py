@@ -28,7 +28,9 @@ def test_activity_relationship_hold_and_stale_restore(direct_server_with_data, m
     write_task_result(root, ORIGIN, 'completed', root_task_id=ORIGIN,
                       billing_group=BINDING, deadline_at=DEADLINE)
     ctx = ToolContext(repo_dir=server['repo_dir'], drive_root=root, task_id=ORIGIN,
-                      task_metadata={'root_task_id': ORIGIN, 'delegation_role': 'root'},
+                      current_chat_id=1,
+                      task_metadata={'root_task_id': ORIGIN, 'delegation_role': 'root',
+                                     'resource_intent': {'kind': 'system_repo'}},
                       task_contract={'objective': 'x', 'delegation_role': 'root'})
     result = _handle_schedule_followup(ctx, relation='related', run_at='2000-01-01T00:00:00+00:00',
                                       objective='Continue original work after dependency clears')

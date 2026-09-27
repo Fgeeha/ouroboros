@@ -305,9 +305,9 @@ def _prepare_writer(root: pathlib.Path):
     """Read/validate a captured newline-aligned extent without the money lock.
 
     A preparation is unpublished and has no quarantine authority. Atomic
-    replacement/shrink/rewrite is proved again under lock. This assumes the
-    supported locked-append/atomic-replacement protocol, not hostile writes
-    preserving inode, size and timestamps.
+    replacement/shrink/same-size rewrite is proved again under lock. History
+    is append-only within one inode; any other rewrite must atomically replace
+    the file, or a same-inode rewrite that grows it can go undetected.
     """
     from ouroboros.usage_ledger import _decode_record
 

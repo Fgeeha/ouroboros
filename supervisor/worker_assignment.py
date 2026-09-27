@@ -16,6 +16,7 @@ from typing import Any, Dict
 from ouroboros.model_wait import budget_paused_seconds
 from supervisor.events_budget import budget_fence_selected, budget_hold_fact
 from supervisor.queue import _queue_lock
+from supervisor.schedule_occurrence import record_dispatch_possible
 
 
 def _pool():
@@ -242,6 +243,8 @@ def _claim_worker_launch(queue, candidate, worker):
                 if not queue.persist_queue_snapshot(reason="worker_launch_claimed"):
                     candidate["admitted_dispatch"] = prior
                     return False
+                if not record_dispatch_possible(candidate):
+                    return False  # no physical handoff before verified occurrence custody
                 _mirror_assigned_running_status(candidate)
                 worker.in_q.put(candidate)
                 return True
@@ -423,7 +426,7 @@ def assign_tasks() -> None:
                 # and project-leased candidates)
                 chosen_idx = None
                 for i, candidate in enumerate(_pool().PENDING):
-                    if str(candidate.get("id") or "") in refused_this_pass:
+                    if str(candidate.get("id") or "") in refused_this_pass or candidate.get("_owner_hold"):
                         continue
                     if remaining <= 0 and not candidate.get("_owner_wait_resume"):
                         continue

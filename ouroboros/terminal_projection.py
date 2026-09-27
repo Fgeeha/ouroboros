@@ -154,6 +154,11 @@ def _project_row(tid: str, row: dict, event: dict, ready: dict) -> dict:
     }
     if isinstance(row.get("model_execution"), dict):
         result["model_execution"] = dict(row["model_execution"])
+    from ouroboros.history_retention import retention_summary
+
+    retention = retention_summary(row)
+    if retention:
+        result["history_retention"] = retention
     return result
 
 

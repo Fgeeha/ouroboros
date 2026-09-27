@@ -732,6 +732,14 @@ The row under a Project lifecycle row or a routed message is the shared `createS
 
 History with no current execution or known outcome keeps its expandable content under `Outcome unavailable`, without a task chip, typing or Stop. Before complete live-source reconciliation, it is `Activity unconfirmed`. Positive current activity restores only its proven controls. A delivery warning may coexist with a preserved task-acceptance PASS. Model metadata says `Last solve response`, naming the initial request only when the route changed.
 
+History placement is separate from the task's outcome. Ordinary `Saving task history`
+and `Task history saved` appear only inside task details and Logs. A storage failure
+adds `History storage problem` to the existing collapsed-card metadata, without changing
+Done/Failed/Cancelled or creating a chat message; successful retention clears it.
+Details and Logs name the recorded failure reasons, grouping repeated reasons with their
+counts. Logs Raw retains the complete source/failure facts; a missing recorded reason is
+stated explicitly. Existing task-detail hydration and replay refresh this projection.
+
 ### Conversation activity block
 
 A task's activity block is in the transcript exactly when the record already
@@ -765,22 +773,25 @@ patched in place; Expand shows the per-tool counts (`read_file ×3 ·
 web_search`); its phase is `calling` while a tracked call is still running,
 `warn` once a call failed, `result` otherwise, and the row says that phase in
 ink rather than in extra words. A failed or timed-out call keeps
-its own error row (content) and is counted in the evidence total.
-`web/modules/chat_activity.js::toolEvidenceView` builds that row for the live
-path and for the recorded metrics alike, so at rest the row carries the same
-counts and names live, on reload and on reconnect; a cold reload mints it from
-the metrics, so it carries the metrics' time and sits where the metrics
-arrived, while a reconnect keeps the live position. Live it derives from the
-observed call frames (once per call identity; identical repeats without an id
-collapse into one), and the host's metrics replace those numbers as they
-arrive, field by field: a fact that states a total says nothing about the
-routing or error count, so it can neither erase one nor reclassify a receipt
-row into content, and a call frame after the terminal changes nothing. Block presence is the same live, on
-reload and on reconnect (a turn that moved itself into a Project with
-`ensure_project_scope` is the exception: its block and answer live in the
-Project room, and Main replays only the owner message and the Started
-annotation); a child card reads the same voice rule for its own notes and folds
-its calls live, but replays no evidence row.
+its own diagnostic row and counts once. Wait end and operation settlement are
+independent facts: late success retires the provisional timeout notice but keeps
+“wait ended” in the evidence row; late failure keeps its operation error. Either
+arrival order produces the same outcome. A historical start alone means outcome
+unknown, never Running or Failed.
+`web/modules/chat_activity.js::toolEvidenceView` builds the same row live and on
+replay. Host invocation IDs join start/wait/settlement; legacy observations without
+sufficient identity remain separate even when names and arguments match. Host
+metrics fill absent counts field by field; canonical per-invocation evidence
+reconstructs later settlements on history/reconnect without resurrecting frozen
+wait errors. Reads are bounded and carry coverage; absent evidence is not proof
+of success. Start-only (live or legacy) and incomplete replay evidence preserve a known
+aggregate error; only complete settlement evidence can replace an earlier wait
+error. Typed tool evidence after task terminal updates counts and diagnostics
+on both root and child cards, preserving terminal task phase and controls.
+The row keeps its live position; history admits carrier evidence before summaries,
+progress or references choose their presentation. Block
+presence is consistent across reload and reconnect. A turn moved into a Project
+with `ensure_project_scope` lives there; Main retains its Started annotation.
 `N notes` in the collapsed header counts timeline items, the evidence row
 among them.
 

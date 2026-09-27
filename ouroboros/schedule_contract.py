@@ -27,6 +27,8 @@ RESERVED_TEMPLATE_FIELDS = frozenset({
     "billing_group", "continuation", "followup_relation", "followup_origin",
     "followup_hold", "followup_released", "followup_restart_seen", "followup_wait",
     "continuation_of", "origin_task_id", "origin_root_task_id",
+    # The occurrence identity is minted by the scheduler for one admission (#1315).
+    "schedule_occurrence",
 })
 
 

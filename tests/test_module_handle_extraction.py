@@ -59,7 +59,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     })),
     "supervisor/queue_schedules.py": ("supervisor/queue.py", "_queue", frozenset({
         "DRIVE_ROOT", "PENDING", "RUNNING", "SCHEDULED_TASKS_FILE", "_queue_lock",
-        "enqueue_task", "load_state", "persist_queue_snapshot",
+        "load_state", "persist_queue_snapshot",  # admission enqueues in schedule_occurrence
     })),
     "supervisor/worker_chat_lane.py": ("supervisor/workers.py", "_pool", frozenset({
         "DRIVE_ROOT", "REPO_DIR", "_repo_writer_gate_lock", "chat_turn_liveness",
@@ -217,8 +217,8 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_preserve_branch_for_official_reset", "_read_managed_repo_meta",
         "_read_update_intent", "_ref_points_at_ref", "_rescue_untracked_incomplete",
         "_run_git_resilient", "_update_source", "append_jsonl", "git_capture",
-        "checkout_and_reset", "current_drive_root", "import_test", "load_state",
-        "preserve_local_ref_branch", "rescue_git_capture", "save_state",
+        "checkout_and_reset", "current_drive_root", "import_test",
+        "preserve_local_ref_branch", "rescue_git_capture", "update_state",
         "sync_runtime_dependencies", "utc_now_iso",
     })),
     "supervisor/git_ops_updates.py": ("supervisor/git_ops.py", "_go", frozenset({

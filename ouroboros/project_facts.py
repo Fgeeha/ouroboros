@@ -77,6 +77,39 @@ def project_id_from_display_name(value: Any) -> str:
     return slug
 
 
+# A NEW project folder keeps its human name (#1308): only what a supported
+# filesystem cannot hold is replaced — path separators, the Windows-forbidden set,
+# control characters — and whitespace runs become "-". Leading/trailing dots,
+# spaces and dashes go (hidden, "."/"..", Windows trailing rules). Bounded by
+# characters AND UTF-8 bytes; a cut name carries a digest of the RAW name so two
+# long names with one prefix stay distinguishable (#850 rule for ids).
+_FOLDER_FORBIDDEN = re.compile(r'[<>:"/\\|?*]')
+_FOLDER_MAX_CHARS = 64
+_FOLDER_MAX_BYTES = 180  # leaves room for a "_N" collision suffix under 255 bytes
+
+
+def project_folder_basename(display_name: Any) -> str:
+    """Readable basename for a NEWLY created project folder, or "" when nothing
+    usable remains. NFC normalization happens here, at creation only: existing
+    folders, ids and refs are never re-derived or compared through it."""
+    import unicodedata
+
+    raw = unicodedata.normalize("NFC", str(display_name or "").strip())
+    name = "".join("_" if unicodedata.category(ch) in {"Cc", "Cs"} else ch for ch in raw)
+    name = re.sub(r"\s+", "-", _FOLDER_FORBIDDEN.sub("_", name)).strip(" .-")
+    if len(name) > _FOLDER_MAX_CHARS or len(name.encode("utf-8")) > _FOLDER_MAX_BYTES:
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:8]
+        head = name[:_FOLDER_MAX_CHARS - len(digest) - 1]
+        while len(head.encode("utf-8")) > _FOLDER_MAX_BYTES - len(digest) - 1:
+            head = head[:-1]
+        head = head.rstrip(" .-")
+        name = f"{head}-{digest}" if head else digest
+    if name.split(".", 1)[0].casefold() in (_RESERVED_NAMES | {f"{prefix}{digit}" for prefix in ("com", "lpt") for digit in "¹²³"}):
+        stem, dot, rest = name.partition(".")
+        name = f"{stem}_{dot}{rest}"
+    return name
+
+
 def explicit_project_id_ok(raw: Any) -> bool:
     """True if an EXPLICIT project id is already filesystem-clean (no silent
     normalization). The gateway rejects explicit ids that fail this, so two

@@ -35,6 +35,7 @@ def test_budget_projection_reads_ledger_before_state_lock(tmp_path, monkeypatch)
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=1.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     holding_state_lock = False
     operations = []
 
@@ -85,6 +86,7 @@ def test_older_budget_snapshot_cannot_regress_state(tmp_path, monkeypatch):
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=1.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     first_started = threading.Event()
     release_first = threading.Event()
     calls = []
@@ -124,6 +126,7 @@ def test_limited_projection_uses_breakdown_snapshot(tmp_path, monkeypatch):
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=5.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     snapshot = _breakdown(1.0, 1)
     snapshot["_usage_projection"] = {
         "accounted_usd": 1.0, "integrity_degraded": False, "cost_final": True,
@@ -147,6 +150,7 @@ def test_compaction_provenance_keeps_high_water_marker(tmp_path, monkeypatch):
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=0.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     from ouroboros import usage_compaction as compaction
     request = accounting.AttemptRequest(
         model="test/model", provider="test", drive_root=tmp_path,
@@ -182,6 +186,7 @@ def test_reordered_writers_across_real_compaction_reject_lower_epoch(tmp_path, m
     from ouroboros import usage_compaction as compaction
 
     state.init(tmp_path, total_budget_limit=0.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
 
     def settle(task):
         request = accounting.AttemptRequest(
@@ -244,14 +249,13 @@ def test_stale_snapshot_is_rejected_without_state_lock(tmp_path, monkeypatch, ca
     monkeypatch.setattr(accounting, "ensure_legacy_imported", lambda *_a, **_k: None)
     monkeypatch.setattr(accounting, "usage_writer_snapshot", lambda *_a, **_k: _breakdown(1.0, 1))
 
-    state.update_budget_from_usage({})
+    assert state.update_budget_from_usage({}) is False
 
-    # The marker check preserves the newer projection even after a lock
-    # timeout. It does not serialize two writers that both continue without
-    # STATE_LOCK; that pre-existing compare/save race remains outside this fix.
+    # A lock timeout never writes (#1307: no unlocked writer); the ledger stays the
+    # money authority and the next event refreshes this projection under the lock.
     assert state.load_state()["spent_usd"] == 2.0
     assert state.load_state()["usage_ledger_high_water_seq"] == [0, 2]
-    assert "STALE SNAPSHOT REJECTED" in caplog.text
+    assert "state lock timeout" in caplog.text
 
 
 @pytest.mark.serial
@@ -301,6 +305,7 @@ def test_missing_marker_fails_safe_without_fabricating_zero(tmp_path, monkeypatc
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=0.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     monkeypatch.setattr(accounting, "ensure_legacy_imported", lambda *_a, **_k: None)
     monkeypatch.setattr(accounting, "usage_writer_snapshot", lambda *_a, **_k: {"accounted_usd": 9.0})
 
@@ -371,6 +376,7 @@ def test_state_projection_omits_by_root_and_its_size_does_not_scale_with_roots(t
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=1000.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     monkeypatch.setattr(state, "check_openrouter_ground_truth", lambda: None)
     _settle_root(tmp_path, "root-000")
     assert state.update_budget_from_usage({}) is True
@@ -394,6 +400,7 @@ def test_per_root_money_is_still_served_from_the_ledger_after_the_slim_write(tmp
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=1000.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     monkeypatch.setattr(state, "check_openrouter_ground_truth", lambda: None)
     roots = [f"root-{index:03d}" for index in range(200)]
     for index, root in enumerate(roots):
@@ -415,6 +422,7 @@ def test_fallback_projection_branch_is_slim(tmp_path, monkeypatch):
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=5.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     _settle_root(tmp_path, "root-a")
     seen = []
     real_projection = accounting.usage_projection
@@ -466,6 +474,7 @@ def test_writer_snapshot_matches_the_full_breakdown_on_every_key_the_writer_read
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=100.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     _seed_mixed_ledger(tmp_path)
     full = accounting.usage_breakdown(tmp_path)
     slim = accounting.usage_writer_snapshot(tmp_path)
@@ -496,6 +505,7 @@ def test_state_json_is_byte_identical_whether_written_from_the_full_or_the_slim_
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=100.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     monkeypatch.setattr(state, "check_openrouter_ground_truth", lambda: None)
     _seed_mixed_ledger(tmp_path)
     assert state.update_budget_from_usage({}) is True
@@ -518,6 +528,7 @@ def test_openrouter_drift_check_fires_on_crossing_a_multiple_of_fifty(tmp_path, 
     import ouroboros.usage_accounting as accounting
 
     state.init(tmp_path, total_budget_limit=0.0)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     checks = []
     monkeypatch.setattr(state, "check_openrouter_ground_truth", lambda: checks.append(True) or None)
     monkeypatch.setattr(accounting, "ensure_legacy_imported", lambda *_a, **_k: None)

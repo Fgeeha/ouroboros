@@ -1,4 +1,5 @@
 """Large ordinary file custody must stay streaming, complete and verifiable."""
+from ouroboros.headless import retry_child_task_refs
 from hashlib import sha256
 import json
 from pathlib import Path
@@ -235,6 +236,7 @@ def test_copyback_failure_retains_child_until_existing_retry_finishes(tmp_path, 
     with monkeypatch.context() as patch:
         patch.setattr(artifacts, "copy_artifact_file", fail_canonical)
         copied = copy_child_task_result(parent, {"id": "custody", "drive_root": str(child)})
+        copied = retry_child_task_refs(parent, child, "custody")
     assert copied["artifact_bundle"]["status"] == "missing"
     assert copied["child_ref_promotion"]["status"] == "incomplete"
     assert not remove_subagent_task_drive(parent, "custody", live=lambda _task: False)
@@ -318,6 +320,7 @@ def test_full_inputs_survive_copyback_and_child_gc(tmp_path):
     authority = _many_inputs(tmp_path, child, "inputs")
     write_task_result(child, "inputs", "completed", result="done", task_contract=authority)
     result = copy_child_task_result(parent, {"id": "inputs", "drive_root": str(child)})
+    result = retry_child_task_refs(parent, child, "inputs")
     assert result["child_ref_promotion"]["status"] == "complete"
     assert remove_subagent_task_drive(parent, "inputs", live=lambda _task: False)
     rows = artifacts.resolve_attachment_manifest(parent, "inputs", result["task_contract"])
@@ -542,6 +545,7 @@ def test_input_copy_failure_protects_each_existing_gc_root(tmp_path, monkeypatch
     with monkeypatch.context() as patch:
         patch.setattr(artifacts, "copy_artifact_file", unavailable)
         result = headless.copy_child_task_result(parent, {"id": "inputs", "drive_root": str(child)})
+        result = retry_child_task_refs(parent, child, "inputs")
         assert result["child_ref_promotion"]["status"] == "incomplete"
         prune = headless.prune_headless_task_drives if drive_kind == "headless" else headless.prune_task_drives
         assert not prune(parent, retention_days=1, now=4_000_000_000)["pruned"]
@@ -609,6 +613,7 @@ def test_immutable_child_copy_back_retains_name_bytes_and_original_identity(tmp_
     # Neither effective reads nor physical copy-back may replace captured parent bytes.
     load_effective_task_result(parent, "capture")
     copied = copy_child_task_result(parent, {"id": "capture", "drive_root": str(child)})
+    copied = retry_child_task_refs(parent, child, "capture")
     assert Path(rebased["path"]).read_text() == "original report"
     assert copied["artifacts"][0]["sha256"] == record["sha256"]
     with pytest.raises(OSError, match="verification"):
@@ -717,6 +722,7 @@ def test_failed_child_capture_is_explicit_and_other_files_still_publish(tmp_path
     bad = records[0]
     Path(bad["path"]).write_bytes(b"changed child bytes before copy")
     copied = copy_child_task_result(parent, task)
+    copied = retry_child_task_refs(parent, child, task["id"])
     result = load_effective_task_result(parent, "capture")
     row = next(item for item in result["artifacts"] if item["name"] == bad["name"])
     assert result["status"] == "completed" and result["outcome_axes"] == axes
@@ -742,6 +748,43 @@ def test_failed_child_capture_is_explicit_and_other_files_still_publish(tmp_path
         recovered = load_effective_task_result(parent, "capture")
         assert recovered["artifact_status"] == recovered["artifact_bundle"]["status"] == "ready"
         assert recovered["status"] == "completed" and recovered["accounted_upper_bound_usd"] == 3.5
+
+
+def test_unchanged_pending_ref_retry_rewrites_nothing_and_keeps_late_facts(tmp_path):
+    """#1305: retrying a still-unpromotable ref leaves bytes, mtime and updated_at alone; a
+    genuine late fact still lands, survives the next retry, and a restored source converges."""
+    from ouroboros.headless import prepare_task_drive, copy_child_task_result
+    from ouroboros.observability import retry_pending_child_ref_promotions
+    from ouroboros.task_results import task_result_path, write_task_result
+
+    parent = tmp_path / "canonical"
+    child = prepare_task_drive(parent, "stale", "empty")
+    source = child / "report.txt"
+    source.write_bytes(b"report")
+    record = artifacts.copy_file_to_task_artifacts(
+        SimpleNamespace(drive_root=child, task_id="stale"), source, immutable=True)
+    write_task_result(child, "stale", "failed", artifacts=[record], artifact_status="ready")
+    write_task_result(parent, "stale", "running", headless_child_drive_root=str(child))
+    Path(record["path"]).write_bytes(b"appended after the digest was captured")
+    assert copy_child_task_result(parent, {"id": "stale", "drive_root": str(child)})[
+        "child_ref_promotion"]["status"] == "incomplete"
+    # Adoption only owes history; the first archive attempt establishes its
+    # inventory and failed-copy facts. Unchanged retries after that do not write.
+    assert retry_pending_child_ref_promotions(parent)["pending"] == ["stale"]
+    row = task_result_path(parent, "stale")
+    before, stamp = row.read_bytes(), row.stat().st_mtime_ns
+    report = retry_pending_child_ref_promotions(parent)
+    assert report["retried"] == report["pending"] == ["stale"] and not report["errors"]
+    assert row.read_bytes() == before and row.stat().st_mtime_ns == stamp
+    write_task_result(parent, "stale", "failed", accounted_upper_bound_usd=4.25)
+    late = row.read_bytes()
+    assert retry_pending_child_ref_promotions(parent)["pending"] == ["stale"]
+    assert row.read_bytes() == late and json.loads(late)["accounted_upper_bound_usd"] == 4.25
+    Path(record["path"]).write_bytes(b"report")
+    assert retry_pending_child_ref_promotions(parent)["completed"] == ["stale"]
+    settled = json.loads(row.read_bytes())
+    assert settled["status"] == "failed" and settled["accounted_upper_bound_usd"] == 4.25
+    assert settled["child_ref_promotion"]["status"] == "complete"
 
 
 @pytest.mark.parametrize("copy_failure", [False, True])
@@ -930,6 +973,7 @@ def test_acknowledged_owner_inputs_survive_copyback_retry_mailbox_cleanup_and_gc
                 raise PermissionError("controlled mailbox read failure")
             patch.setattr(owner_mailbox, "owner_attachment_manifest", unreadable)
         result = headless.copy_child_task_result(parent, task)
+        result = retry_child_task_refs(parent, child, task["id"])
     if failure:
         assert result["child_ref_promotion"]["status"] == "incomplete"
         assert any(row["path"] == str(mailbox) for row in result["child_ref_promotion"]["pending_refs"])

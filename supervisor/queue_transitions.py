@@ -293,6 +293,14 @@ def _resume_unstarted_owner_paused_root(q: Any, task: Dict[str, Any], fence: Dic
 def pending_member_replay_safe(q: Any, member: Dict[str, Any]) -> Tuple[bool, str]:
     """Whether one PENDING row genuinely never dispatched (zero physical calls)."""
     from supervisor.restart_retention import never_started
+    from supervisor.schedule_occurrence import restore_allowed
+
+    if member.get("_owner_hold"):
+        return False, "owner_held"
+    if not restore_allowed(member):
+        return False, "dispatch_outcome_unknown"
+    if member.get("_owner_hold"):
+        return False, "owner_held"
 
     pause = member.get("_budget_pause") or (member.get("_budget_pause_hold") or {}).get("replaced_fence_pause") or {}
     legacy_saved_zero = (member.get("admitted_dispatch") in (None, "")
@@ -1234,11 +1242,14 @@ def _close_campaign_after_owner_stop(exclude_task_id: str = "") -> None:
             _read_evolution_campaign,
             complete_evolution_campaign,
         )
-        from supervisor.state import load_state
+        from supervisor.state import control_is, load_state
 
-        if not bool(load_state().get("evolution_owner_stopped")):
+        campaign = _read_evolution_campaign()
+        # A KNOWN owner stop or a recorded stop intent (#1307); an unknown flag closes nothing.
+        if not (control_is(load_state(), "evolution_owner_stopped", True)
+                or isinstance(campaign.get("stop_intent"), dict)):
             return
-        if _read_evolution_campaign().get("status") not in {"active", "paused"}:
+        if campaign.get("status") not in {"active", "paused"}:
             return
         from supervisor.queue import PENDING, RUNNING, _queue_lock
 

@@ -73,20 +73,22 @@ def prune_consumed_once_records(tasks: list, cutoff_epoch: float, *, work_settle
     the unified GC retention cutoff (epoch seconds; ``retention.age_cutoff``). The
     consumed one-shot remains its work's binding/Restore row until the caller
     positively proves that work settled. Consumption alone is not settlement.
-    Without that proof a row with ``last_task_id`` is retained. ONLY one-shots are pruned: a
+    A missing task identity cannot prove settlement and retains the row. ONLY one-shots are pruned: a
     disabled CRON row is a standing schedule the owner may re-enable, and is kept
-    even if it carries a stray ``completed_at``. ENABLED records are never pruned;
-    an unparseable ``completed_at`` is kept, conservatively."""
+    even if it carries a stray ``completed_at``. ENABLED records are never pruned,
+    nor one whose occurrence has not settled (#1315); an unparseable ``completed_at``
+    is kept, conservatively."""
     kept, pruned = [], 0
     for record in tasks:
         if (isinstance(record, dict) and not record.get("enabled", True)
                 and record.get("completed_at") and not record.get("followup_hold")
-                and not record.get("followup_wait")):
+                and not record.get("followup_wait")
+                and not isinstance(record.get("occurrence"), dict)):
             trigger = record.get("trigger") if isinstance(record.get("trigger"), dict) else {}
             if str(trigger.get("type") or "") == "once":
                 done = parse_schedule_time(record.get("completed_at"), datetime.timezone.utc)
                 if done is not None and done.timestamp() < float(cutoff_epoch):
-                    if record.get("last_task_id") and (work_settled is None or not work_settled(record)):
+                    if not record.get("last_task_id") or work_settled is None or not work_settled(record):
                         kept.append(record)
                         continue
                     pruned += 1

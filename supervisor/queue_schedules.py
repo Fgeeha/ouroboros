@@ -29,7 +29,6 @@ from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS, schedule_slug
 from ouroboros.skill_loader import skill_identity_collision_names
 from ouroboros.utils import atomic_write_json, in_worker_process, read_json_dict, utc_now_iso
 from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
-from supervisor.task_admission import record_scheduled_admission
 from supervisor.schedule_time import (
     next_cron_time as _next_cron_time,
     once_due as _once_due,
@@ -82,6 +81,8 @@ SUPPRESSED_OVERRIDES: frozenset[str] = frozenset({"disabled", "deleted"})
 _RUNTIME_OWNED_FIELDS: tuple[str, ...] = (
     "source", "skill", "created_at", "last_run_at", "last_task_id", "last_error",
     "skill_content_hash", "manual_override",
+    # The occurrence protocol's host facts (supervisor/schedule_occurrence.py).
+    "occurrence", "hold", "continuation_of", "delete_requested_at",
 )
 # What an audit event may say about a row: lifecycle facts only. The task template
 # is a private objective, never audit material, and would also be unbounded.
@@ -359,6 +360,14 @@ def _schedule_projection_row(raw: Dict[str, Any]) -> Dict[str, Any]:
     relation = raw.get("followup_relation") or {}
     row["billing_group"] = relation.get("billing_group")
     row["deadline_at"] = relation.get("deadline_at", "")
+    # A due occurrence that WAITS (#1315): the typed reason is the fact; what to say
+    # about it, if anything, is the mind's call.
+    hold = raw.get("hold") if isinstance(raw.get("hold"), dict) else None
+    if hold:
+        row["waiting"] = {key: _bounded_projection_text(hold.get(key), 200) for key in ("reason", "detail", "since")}
+    occurrence = raw.get("occurrence") if isinstance(raw.get("occurrence"), dict) else None
+    if occurrence:
+        row["occurrence"] = {key: str(occurrence.get(key) or "") for key in ("phase", "task_id", "due_at")}
     return row
 
 
@@ -452,7 +461,8 @@ def _write_scheduled_tasks(data: Dict[str, Any], drive_root: pathlib.Path | None
     data.setdefault("schema_version", 1)
     path = _scheduled_tasks_path(drive_root)
     path.parent.mkdir(parents=True, exist_ok=True)
-    atomic_write_json(path, data, trailing_newline=True)
+    if atomic_write_json(path, data, trailing_newline=True) is False:
+        raise OSError("scheduled task store write returned False")
 
 
 def _audit_row(record: Dict[str, Any] | None) -> Dict[str, Any]:
@@ -529,6 +539,9 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
                     getattr(manifest, "permissions", []) or []
                 )
                 record = by_id.get(schedule_id, {})
+                from supervisor.schedule_occurrence import remember_claim_basis
+
+                remember_claim_basis(record)
                 trigger = {"type": "cron", "expr": cron}
                 timing_changed = (
                     dict(record.get("trigger") or {}) != trigger
@@ -555,6 +568,7 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
                         ),
                         "metadata": {
                             "source": "skill_scheduled_task",
+                            "resource_intent": {"kind": "system_repo"},
                             "skill": str(getattr(skill, "name", "")),
                             "scheduled_task": name,
                         },
@@ -576,7 +590,12 @@ def sync_skill_schedules(skills: List[Any], *, drive_root: pathlib.Path | None =
                 and schedule_id not in touched
                 and not _is_suppressed(record)
             ):
-                by_id.pop(schedule_id, None)
+                from supervisor.schedule_occurrence import owed, work_settled
+
+                if owed(record) is False and work_settled(record):
+                    by_id.pop(schedule_id, None)
+                else:
+                    record.update(enabled=False, delete_requested_at=utc_now_iso())
                 changed = True
         if changed:
             data["tasks"] = list(by_id.values())
@@ -670,36 +689,29 @@ def _schedule_running_or_queued(schedule_id: str, drive_root: pathlib.Path | Non
             or _rows_hold_schedule(snapshot.get("running"), schedule_id, task_id))
 
 
-def _task_from_schedule(record: Dict[str, Any]) -> Dict[str, Any]:
-    from supervisor.followup_policy import normalize_template, origin_of, relation_kind, task_binding
+def _task_from_schedule(record: Dict[str, Any], *, task_id: str = "") -> Dict[str, Any]:
+    from supervisor.followup_policy import normalize_template, bind_task
     template = normalize_template(record)
-    owner_chat_id = _queue().load_state().get("owner_chat_id") or 0
-    task_id = uuid.uuid4().hex[:8]
+    task_id = task_id or uuid.uuid4().hex[:8]
+    # Membership, not truthiness: a template's explicit chat 0 is its hidden partition.
+    has_chat = template.get("chat_id") not in (None, "")
+    from supervisor.state import control_value
+
+    known, owner_chat_id = (True, None) if has_chat else control_value(_queue().load_state(), "owner_chat_id")
+    if not known:
+        owner_chat_id = None
     session_id = str(template.get("session_id") or f"schedule-{record.get('id') or task_id}")
     raw_metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else {}
     metadata = {
         key: value for key, value in dict(raw_metadata).items()
         if key not in RESERVED_TEMPLATE_FIELDS
     }
-    origin = origin_of(record)
-    if origin:
-        metadata.update(origin_task_id=origin["task_id"], origin_root_task_id=origin["root_task_id"])
-        metadata["objective_author"] = {"kind": "task", "task_id": origin["task_id"]}
-    metadata["followup_origin"] = origin
-    metadata["followup_relation"] = copy.deepcopy(record.get("followup_relation") or {"kind": relation_kind(record)})
-    if relation_kind(record) == "related":
-        metadata["billing_group"] = task_binding(_queue().DRIVE_ROOT, record)
-        metadata["followup_relation"] = copy.deepcopy(record["followup_relation"])
-        if record["followup_relation"].get("deadline_at"):
-            original = parse_deadline_ts(record["followup_relation"]["deadline_at"])
-            supplied = parse_deadline_ts(template.get("deadline_at"))
-            template["deadline_at"] = min(t for t in (original, supplied) if t is not None).isoformat()
     task = {
         "id": task_id,
         "type": "task",
         "text": str(template.get("text") or template.get("description") or record.get("description") or record.get("name") or "Scheduled task"),
         "description": str(template.get("description") or template.get("text") or record.get("description") or record.get("name") or "Scheduled task"),
-        "chat_id": template.get("chat_id") if template.get("chat_id") not in (None, "") else owner_chat_id,
+        "chat_id": template.get("chat_id") if has_chat else owner_chat_id,
         "priority": int(template["priority"]) if str(template.get("priority") or "").strip().lstrip("-").isdigit() else None,
         "root_task_id": task_id,
         "session_id": session_id,
@@ -718,6 +730,7 @@ def _task_from_schedule(record: Dict[str, Any]) -> Dict[str, Any]:
         task["task_contract"] = dict(existing_contract)
         if task.get("deadline_at"):
             task["task_contract"]["deadline_at"] = task["deadline_at"]
+    bind_task(_queue().DRIVE_ROOT, task, record)
     task["task_contract"] = build_task_contract(apply_consciousness_authority(task))
     workspace = task["task_contract"]["workspace"]
     # Presence-bound work (a speaker's follow-up, or one acting for a descendant's binding)
@@ -740,8 +753,17 @@ def _task_from_schedule(record: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def check_scheduled_tasks() -> None:
-    """Queue due cron/on-idle schedules using the normal supervisor queue."""
+    """Admit due cron/once schedules through the occurrence protocol.
+
+    Claims and reconciliation run under the queue+table locks; every expensive
+    step (resource intent, folder checks, memory fork, the allowance read) runs
+    without them; admission rechecks and commits under them again
+    (``supervisor/schedule_occurrence.py``)."""
     global _last_skill_schedule_sync
+    from supervisor import schedule_occurrence as occurrences
+
+    claims: List[Dict[str, Any]] = []
+    retired_claims: list[tuple[str, str]] = []
     with schedule_transaction(_queue().DRIVE_ROOT):
         now_monotonic = time.monotonic()
         if now_monotonic - _last_skill_schedule_sync >= _SKILL_SCHEDULE_SYNC_INTERVAL_SEC:
@@ -766,11 +788,40 @@ def check_scheduled_tasks() -> None:
             from supervisor.followup_policy import control_guard, refresh_policy
             try:
                 with control_guard(_queue().DRIVE_ROOT, record):
-                    refresh_policy(_queue().DRIVE_ROOT, data, record)
+                    occurrences.repair_followup_binding(record)
+                    view = refresh_policy(_queue().DRIVE_ROOT, data, record)
             except Exception:
                 log.exception("Follow-up policy persistence unavailable")
                 continue
-            if not record.get("enabled", True):
+            if isinstance(record.get("occurrence"), dict):
+                # An occurrence in flight is decided from durable facts first — even on a
+                # disabled row: admission already happened, later changes are future-only.
+                if occurrences.holding(record, now_utc):
+                    continue
+                verdict, stored = occurrences.reconcile(record)
+                changed = changed or verdict != "live"
+                if verdict == "reconsider":
+                    # A positive refusal/fresh claim is not frozen admitted work.
+                    # Drop its old basis without consuming the row; ordinary due
+                    # evaluation below decides the edited timing and controls.
+                    old = record.pop("occurrence")
+                    retired_claims.append((str(_queue().DRIVE_ROOT), str(old.get("token") or "")))
+                    record.pop("hold", None)
+                elif verdict == "settled":
+                    occurrences.settle(record)
+                    if record.get("delete_requested_at") and occurrences.work_settled(record):
+                        data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
+                        continue
+                elif verdict in {"prepare", "republish"}:
+                    claims.append(occurrences.view(record, stored))
+                    continue
+                else:
+                    continue
+            if record.get("delete_requested_at") and occurrences.work_settled(record):
+                data["tasks"] = [row for row in data.get("tasks") or [] if row is not record]
+                changed = True
+                continue
+            if not record.get("enabled", True) or occurrences.holding(record, now_utc):
                 continue
             schedule_id = str(record.get("id") or "").strip()
             if not schedule_id:
@@ -785,11 +836,10 @@ def check_scheduled_tasks() -> None:
                 continue
             tz = _timezone_for_schedule(record)
             now = now_utc.astimezone(tz)
-            expr = ""
             if trigger_type == "once":
-                # One-shot (B2b W=A): fires once at/after run_at via the same admission path
-                # as cron, then is marked done below. A consumed receipt (non-empty completed_at)
-                # NEVER re-fires even re-enabled from UI; re-arm = gateway upsert, fresh run_at.
+                # One-shot (B2b W=A): fires once at/after run_at, then is consumed at
+                # admission. A consumed receipt (non-empty completed_at) NEVER re-fires
+                # even re-enabled from UI; re-arm = gateway upsert, fresh run_at.
                 if record.get("completed_at"):
                     continue
                 due, once_error = _once_due(trigger, tz, now)
@@ -798,6 +848,7 @@ def check_scheduled_tasks() -> None:
                     continue
                 if not due:
                     continue
+                due_at = str(trigger.get("run_at") or "")
             elif trigger_type != "cron":
                 changed = _record_last_error(record, f"unsupported trigger type: {trigger_type}") or changed
                 continue
@@ -817,103 +868,28 @@ def check_scheduled_tasks() -> None:
                         continue
                 if next_run > now:
                     continue
+                due_at = next_run.isoformat()
             if str(record.get("source") or "") == "skill_manifest":
                 if collision_names is None:
                     collision_names = skill_identity_collision_names(_queue().DRIVE_ROOT)
                 if str(record.get("skill") or "") in collision_names:
                     continue
-            from supervisor.followup_policy import control_guard, refresh_policy
-            with control_guard(_queue().DRIVE_ROOT, record):
-                try:
-                    view = refresh_policy(_queue().DRIVE_ROOT, data, record)
-                except Exception:
-                    log.exception("Follow-up authority unavailable; schedule %s waits", schedule_id)
-                    continue
-                if view.get("hold") or view["wait"] or record.get("followup_hold"):
-                    continue
-                task = _task_from_schedule(record)
-                try:
-                    from ouroboros.task_results import STATUS_SCHEDULED, write_task_result
-
-                    published = write_task_result(
-                        _queue().DRIVE_ROOT,
-                        str(task["id"]),
-                        STATUS_SCHEDULED,
-                        root_task_id=str(task["id"]),
-                        actor_id="scheduler",
-                        delegation_role="root",
-                        description=str(task.get("description") or task.get("text") or ""),
-                        expected_output=str(task.get("expected_output") or ""),
-                        constraints=str(task.get("constraints") or ""),
-                        context=str(task.get("context") or ""),
-                        allowed_resources=task.get("allowed_resources") if isinstance(task.get("allowed_resources"), dict) else {},
-                        deadline_at=str(task.get("deadline_at") or ""),
-                        task_contract=task.get("task_contract") if isinstance(task.get("task_contract"), dict) else {},
-                        result="Scheduled task queued.",
-                        metadata=dict(task.get("metadata") or {}),
-                        **({"billing_group": task["metadata"]["billing_group"]}
-                           if task["metadata"].get("billing_group") else {}),
-                        schedule_id=schedule_id,
-                        schedule_name=str(record.get("name") or ""),
-                    )
-                    if not isinstance(published, dict) or published.get("status") != STATUS_SCHEDULED:
-                        raise ValueError("scheduled_result_not_persisted")
-                except Exception:
-                    log.debug("Failed to persist scheduled task result before enqueue", exc_info=True)
-                    record["followup_wait"] = "followup_result_persistence_unavailable"
-                    changed = True
-                    continue
-                admitted = _queue().enqueue_task(task)
-            record["last_run_at"] = now.isoformat()
-            record["last_task_id"] = task["id"]
-            record_scheduled_admission(task, admitted, record)
-            if trigger_type == "once":
-                refused = isinstance(admitted, dict) and admitted.get("_admission_blocked")
-                permanent = (refused == "project_routing_fence"
-                             and admitted.get("_project_lifecycle") == "tombstoned")
-                if not refused or permanent:
-                    # A consumed receipt includes a permanent target refusal;
-                    # keep its failed task and last_error. Transient refusals retry.
-                    record["enabled"] = False
-                    record["completed_at"] = now.isoformat()
-                    record["next_run_at"] = ""
-                elif str(refused).startswith("consciousness_"):
-                    # The consciousness door refused (the tree's allowance or concurrency —
-                    # a refusal that can last hours): the one-shot stays armed but its run
-                    # point moves forward by the alarm floor, so it is not re-fired on every
-                    # supervisor pass (a fresh task id, a failed result row and a ledger
-                    # read per pass). The same class the evolution scheduler pauses on.
-                    from ouroboros.config import get_bg_wakeup_min_sec
-
-                    trigger["run_at"] = (now + datetime.timedelta(seconds=int(get_bg_wakeup_min_sec()))).isoformat()
-                    record["trigger"] = trigger
-            else:
-                try:
-                    record["next_run_at"] = _next_cron_time(expr, now).isoformat()
-                except Exception as exc:
-                    record["last_error"] = f"{type(exc).__name__}: {exc}"
+            if view.get("hold") or view["wait"] or record.get("followup_hold"):
+                continue
+            claims.append(occurrences.claim(record, due_at))
             changed = True
         # Consumed one-shot receipts age out past the unified GC retention (DEVELOPMENT
         # Runtime Cleanup SSOT; enabled records are never pruned — see the helper).
         from ouroboros.retention import age_cutoff, get_gc_retention_days
 
-        def work_settled(record):
-            from ouroboros.task_results import load_task_result
-            from ouroboros.task_status import SETTLED_STATUSES
-
-            if _schedule_running_or_queued(str(record.get("id") or ""), _queue().DRIVE_ROOT,
-                                           task_id=str(record["last_task_id"])) is not False:
-                return False
-            try:
-                result = load_task_result(_queue().DRIVE_ROOT, record["last_task_id"], strict=True)
-                return isinstance(result, dict) and result.get("status") in SETTLED_STATUSES
-            except Exception:
-                return False  # Unreadable authority cannot retire the only binding row.
-
         kept, pruned = _prune_consumed_once(list(data.get("tasks") or []),
-                                            age_cutoff(get_gc_retention_days()), work_settled=work_settled)
+                                            age_cutoff(get_gc_retention_days()), work_settled=occurrences.work_settled)
         if pruned:
             data["tasks"], changed = kept, True
         if changed:
-            _write_scheduled_tasks(data)
+            if _write_scheduled_tasks(data) is False:
+                return
+            occurrences._FRESH_CLAIMS.difference_update(retired_claims)
             _queue().persist_queue_snapshot(reason="scheduled_tasks")
+    if claims:
+        occurrences.admit([occurrences.prepare(claimed) for claimed in claims])

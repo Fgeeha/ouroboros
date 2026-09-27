@@ -682,7 +682,7 @@ class HealthResponse(TypedDict):
 class EvolutionStateSnapshot(TypedDict):
     """Nested ``evolution_state`` block inside ``StateResponse``."""
 
-    enabled: bool
+    enabled: Optional[bool]  # None: unknown control (state unavailable/recovering, #1307)
     status: str
     detail: str
     cycle: int
@@ -751,8 +751,9 @@ class StateResponse(TypedDict):
     budget_pct: Optional[float]
     branch: str
     sha: str
-    evolution_enabled: bool
-    bg_consciousness_enabled: bool
+    evolution_enabled: Optional[bool]  # None: an unknown control (state unavailable/recovering), never "off"
+    bg_consciousness_enabled: Optional[bool]
+    state_quality: Dict[str, Any]  # state.json read quality: {quality, source, unconfirmed}
     evolution_cycle: int
     evolution_state: EvolutionStateSnapshot
     bg_consciousness_state: Dict[str, Any]
@@ -761,9 +762,7 @@ class StateResponse(TypedDict):
     supervisor_error: Optional[str]
     runtime_mode: str
     context_mode: str
-    # True when the EFFECTIVE `low` is a system auto-downgrade rather than an owner
-    # selection: the owner control needs it to offer "confirm Low" on a no-op click.
-    context_mode_auto_low: bool
+    context_mode_auto_low: bool  # frozen compatibility field, always False (persistent auto-Low is retired)
     safety_mode: str
     skills_repo_configured: bool
     github_token_configured: bool
@@ -1106,19 +1105,15 @@ class TaskListResponse(TypedDict, total=False):
 
 
 class TaskCostBreakdown(TypedDict):
-    """Read-time "where did the money go" projection on ``GET /api/tasks/{task_id}``
-    (ROOT tasks only). Computed from the physical-attempt ledger at read time and
-    never persisted; ``own + children + unattributed == subtree``. When the object
-    is present every key is present; the WHOLE object is absent — never a confident
-    $0 — when accounting is unavailable or holds no attributable row for the
-    subtree, and on non-root task details."""
+    """Root-only task-detail ledger projection, computed on read, never persisted.
+    All keys appear together; ``own + children + unattributed == subtree``. Omit
+    the object for non-roots, unavailable accounting or no attributable subtree rows; never invent $0."""
 
     own_usd: float
     children_usd: float
     unattributed_usd: float
     delegated_disclosed_usd: float
-    # C2: the explicit subtree total under its honest name —
-    # own + children + unattributed, an accounted UPPER BOUND, not a receipt.
+    # C2: own + children + unattributed is an accounted UPPER BOUND, not a receipt.
     accounted_upper_bound_usd: float
     subscription_sessions: int
     unknown_unmetered: int
@@ -1127,29 +1122,34 @@ class TaskCostBreakdown(TypedDict):
     authority: Literal["physical_attempt_ledger"]
 
 
+class HistoryRetentionProjection(TypedDict):
+    """Storage placement facts, independent of task outcome or review authority."""
+
+    status: Literal["pending", "problem", "complete"]
+    pending_count: int
+    problem_count: int
+    promoted_ref_count: int
+    promoted_source_handle_count: int
+    problem_reasons: NotRequired[List[Dict[str, Any]]]  # Optional grouped {reason: str, count: int} rows.
+
+
 class TaskDetailResponse(TypedDict, total=False):
-    """``GET /api/tasks/{task_id}`` — the public task-result envelope (open shape;
-    stored task-result keys pass through) plus additive typed projections."""
+    """Open ``GET /api/tasks/{task_id}`` result: stored keys pass through beside typed projections."""
 
     artifacts: List[Dict[str, Any]]  # Open result rows; a nested file carries additive ``relpath``.
-    # Per top-level result dir: {name, files, size, excluded, available} of its on-demand ``?archive=`` ZIP.
+    # Per result directory: {name, files, size, excluded, available} for its ``?archive=`` ZIP.
     artifact_archives: Dict[str, Dict[str, Any]]
     cost_breakdown: TaskCostBreakdown
+    history_retention: HistoryRetentionProjection
     model_waits: Dict[str, Any]
-    # Cancel projection (additive-optional): ``"pending"`` while a durable cancel intent is open and the
-    # supervisor teardown has not settled — the status itself honestly stays running/scheduled; absent on
-    # settled results and on tasks nobody asked to cancel. The UI's interim "Cancelling…" reads this, never a status.
+    # Open cancel intent/teardown: "pending" drives "Cancelling…", not lifecycle status.
+    # Absent for settled or unrequested cancellation; running/scheduled status stays truthful.
     cancel_state: str
-    # Beside ``cancel_state`` when the intent carries a reason (GR2-11): the WHY of the pending
-    # cancellation (owner text, "subtree cancellation of <root>", …); absent when none was recorded.
+    # Pending intent's recorded reason (owner text or subtree cause); absent if none (GR2-11).
     cancel_reason: str
-    # S3 (Q1, additive-optional): rides beside a pending ``cancel_state`` when
-    # the open intent is the SOFT stop ("finalize_then_cancel") — the UI shows
-    # "Finalizing…" and offers the hard escalation. Absent on immediate intents.
+    # Soft finalize_then_cancel: "Finalizing…" plus hard escalation; absent on immediate intents (S3/Q1).
     stop_policy: str
-    # S3 (HQ1, additive-optional): the typed owner-hurry observability — the
-    # current block plus the archived history of prior same-id attempts.
-    # Absent on tasks nobody hurried. Task-detail data only, never chat.
+    # Current hurry plus prior same-id attempts; detail-only, absent if never hurried (S3/HQ1).
     owner_hurry: OwnerHurryProjection
     owner_hurry_history: list[OwnerHurryProjection]
     error: str

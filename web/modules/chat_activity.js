@@ -135,24 +135,28 @@ function ensureToolFold(record) {
 
 /**
  * One frame's fact about one invocation: {key, status, receipt, tool}. Status
- * never regresses — a start frame that arrives after the finish cannot reopen
- * the call, and an error stays an error however many frames report that key.
+ * preserves independent start/wait/settlement facts. Reordered starts never reopen
+ * a settled call; a true result replaces only a provisional host-error settlement.
  */
 export function noteToolCall(record, observation) {
     const key = observation?.key;
     if (!record || !key) return record;
     const { calls } = ensureToolFold(record);
     const prev = calls.get(key);
-    const status = observation.status === 'error' || prev?.status === 'error' ? 'error'
-        : ((observation.status === 'ok' || prev?.status === 'ok') ? 'ok' : 'calling');
-    calls.set(key, {
-        status,
-        // A call is an addressing receipt only while EVERY frame about it says so
-        // (the host stamps `routing_action`): the first frame without the stamp
-        // makes the call content, and content it stays.
+    const fact = observation.fact || (['ok', 'error'].includes(observation.status) ? 'settled' : 'started');
+    const next = { ...prev,
         receipt: Boolean(observation.receipt) && (prev ? prev.receipt : true),
         tool: observation.tool || prev?.tool || '',
-    });
+    };
+    if (fact === 'settled') {
+        if (!next.settlement || (next.settlement.hostError && !observation.hostError)) {
+            next.settlement = { status: observation.status, hostError: Boolean(observation.hostError) };
+        }
+    } else if (fact === 'wait_ended') next.waitEnded = true;
+    else next.started = true;
+    next.live = !record.finished && (next.live || observation.live === true || (!observation.fact && observation.status === 'calling'));
+    next.status = next.settlement?.status || (next.waitEnded ? 'wait_ended' : next.live ? 'calling' : 'unknown');
+    calls.set(key, next);
     return record;
 }
 
@@ -167,7 +171,13 @@ export function noteToolCall(record, observation) {
  * is never explicitly emptied while the turn counts calls.
  */
 export function noteToolHostMetrics(record, host) {
+    for (const observation of host?.evidence?.observations || []) applyToolObservation(record, observation);
     const fold = ensureToolFold(record);
+    if (host?.evidence?.coverage) { fold.coverage = host.evidence.coverage; fold.legacy = host.evidence.legacy; }
+    if (record.finished) for (const call of fold.calls.values()) {
+        call.live = false;
+        call.status = call.settlement?.status || (call.waitEnded ? 'wait_ended' : 'unknown');
+    }
     const known = fold.host || {};
     const carry = (next, before) => (next === null || next === undefined ? (before ?? null) : next);
     const counts = host?.counts && typeof host.counts === 'object' && Object.keys(host.counts).length > 0
@@ -192,6 +202,13 @@ export function applyToolObservation(record, observation) {
     const view = toolEvidenceView(record.toolFold);
     record.toolCalls = view.calls;
     record.toolErrors = view.errors;
+    // Successful settlement retires an earlier provisional error/wait notice;
+    // the fold retains the independent wait fact, including after task terminal.
+    if (record.toolFold.calls.get(observation.key)?.settlement?.status === 'ok' && record.items) {
+        const count = record.items.length;
+        record.items = record.items.filter(item => item.dedupeKey !== observation.key);
+        view.clearedNotice = count !== record.items.length;
+    }
     return view;
 }
 
@@ -208,18 +225,29 @@ const perToolLine = (entries) => entries
 export function toolEvidenceView(fold = null) {
     const live = fold?.calls instanceof Map ? [...fold.calls.values()] : [];
     const host = fold?.host || null;
-    const calls = Number.isInteger(host?.calls) ? host.calls : live.length;
-    const errors = Number.isInteger(host?.errors) ? host.errors
-        : live.filter((call) => call.status === 'error').length;
+    const observed = live.length + (fold?.legacy?.calls || 0);
+    const calls = Math.max(Number.isInteger(host?.calls) ? host.calls : 0, observed);
+    // Frozen totals count model wait errors. Canonical evidence reports operation
+    // outcomes; a bounded partial read discloses its gap instead of reviving waits.
+    const partial = Boolean(fold?.coverage) && observed > 0 && observed < calls;
+    // Only settled, individually identified calls can supersede an aggregate
+    // host error. Partial replay and legacy start-only rows have no such proof.
+    const outcomesKnown = calls > 0 && live.length === calls && !(fold?.legacy?.calls)
+        && live.every(call => call.settlement);
+    const observedErrors = live.filter(call => call.status === 'error').length + (fold?.legacy?.errors || 0);
+    const errors = outcomesKnown ? observedErrors
+        : Math.max(Number.isInteger(host?.errors) ? host.errors : 0, observedErrors);
     const liveCounts = new Map();
     for (const call of live) liveCounts.set(call.tool, (liveCounts.get(call.tool) || 0) + 1);
     const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
     return {
         phase: errors > 0 ? 'warn'
             : ((!host && live.some((call) => call.status === 'calling')) ? 'calling' : 'result'),
-        headline: `${plural(calls, 'tool call')}${errors > 0 ? ` · ${plural(errors, 'error')}` : ''}`,
+        headline: `${plural(calls, 'tool call')}${errors > 0 ? ` · ${plural(errors, 'error')}` : ''}`
+            + (live.some(call => call.waitEnded) || fold?.legacy?.wait_ended ? ' · wait ended' : '')
+            + (live.some(call => call.status === 'unknown') || fold?.legacy?.unknown || partial ? ' · outcome unknown' : ''),
         body: '',
-        fullBody: perToolLine(host?.counts && typeof host.counts === 'object'
+        fullBody: (partial ? 'Invocation evidence is incomplete. ' : '') + perToolLine(host?.counts && typeof host.counts === 'object'
             ? Object.entries(host.counts) : [...liveCounts]),
         visible: true,
         // Addressing calls report themselves on the owner's message, so a block
@@ -1447,6 +1475,7 @@ export function renderLiveCardMeta(record, { agentModel = record?.agentModel || 
         ...[
             record.initiator === 'consciousness' ? 'Consciousness' : '',
             record.historicalUnavailable ? 'Outcome unavailable' : (record.historicalUnconfirmed ? 'Activity unconfirmed' : ''),
+            record.historyRetentionProblem || '',
             modelExecutionLabel(record.modelExecution),
             Number.isInteger(record.toolCalls) ? `${record.toolCalls} tool ${record.toolCalls === 1 ? "call" : "calls"}` : '',
             record.toolErrors > 0 ? `${record.toolErrors} error${record.toolErrors === 1 ? '' : 's'}` : '',

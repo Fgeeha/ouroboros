@@ -55,8 +55,8 @@ def test_once_schedule_fires_exactly_once_and_is_marked_done(tmp_path):
     queue.upsert_scheduled_task({
         "id": "fu-due", "name": "Follow-up", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume the blocked plan after the window resets",
-                 "metadata": {"origin_task_id": "t-origin"}},
+        "task": {"type": "task", "text": "resume the blocked plan after the window resets", "chat_id": 1,
+                 "metadata": {"origin_task_id": "t-origin", "resource_intent": {"kind": "system_repo"}}},
     }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
     queue.upsert_scheduled_task({
         "id": "fu-future", "name": "Later", "enabled": True, "source": "task_followup",
@@ -79,37 +79,46 @@ def test_once_schedule_fires_exactly_once_and_is_marked_done(tmp_path):
 
 
 def test_once_schedule_survives_a_refused_admission_and_retries(tmp_path, monkeypatch):
-    """Review fix 5: the once-trigger is consumed ONLY when admission succeeded.
-    A refused admission (worker pool down, duplicate id, routing fence) leaves the
-    record enabled with last_error, so the next scheduler tick retries it."""
+    """Review fix 5 + #1315: a refused admission consumes nothing and mints no failed
+    root: the row WAITS with a typed reason, keeps ONE occurrence (the same task id)
+    and retries it when the wait ends; admission then consumes the one-shot."""
+    from ouroboros.task_results import load_task_result
+
+    import ouroboros.config as config
+
     queue, pending = _queue(tmp_path)
+    monkeypatch.setattr(config, "get_bg_wakeup_min_sec", lambda: 0)  # the wait ends at once in this test
     queue.upsert_scheduled_task({
         "id": "fu-blocked", "name": "Follow-up", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume after the window resets"},
+        "task": {"type": "task", "text": "resume after the window resets", "chat_id": 1,
+                 "metadata": {"resource_intent": {"kind": "system_repo"}}},
     }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
     real_enqueue = queue.enqueue_task
+    attempts: list = []
     monkeypatch.setattr(
         queue, "enqueue_task",
-        lambda task: {**task, "_admission_blocked": "worker_pool_unavailable"})
+        lambda task, **_kw: attempts.append(task["id"]) or {**task, "_admission_blocked": "worker_pool_unavailable"})
     queue.check_scheduled_tasks()
-    assert pending == []
+    queue.check_scheduled_tasks()
+    assert pending == [] and len(attempts) == 2 and len(set(attempts)) == 1  # one occurrence, retried
     record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
     assert record["enabled"] is True and not record.get("completed_at")
-    assert "worker_pool_unavailable" in str(record.get("last_error") or "")
-    # Admission heals: the very next tick fires and consumes the record.
+    assert record["hold"]["reason"] == "worker_pool_unavailable"
+    assert not record.get("failure_count") and load_task_result(tmp_path, attempts[0]) is None  # no failed root
+    # Admission heals: the next tick admits the SAME occurrence and consumes the record.
     monkeypatch.setattr(queue, "enqueue_task", real_enqueue)
     queue.check_scheduled_tasks()
-    assert len(pending) == 1
+    assert len(pending) == 1 and pending[0]["id"] == attempts[0]
     record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
-    assert record["enabled"] is False and record["completed_at"]
+    assert record["enabled"] is False and record["completed_at"] and "hold" not in record
     assert record.get("last_error") == ""
 
 
-def test_once_schedule_refused_by_the_consciousness_door_defers_by_the_alarm_floor(tmp_path, monkeypatch):
+def test_once_schedule_refused_by_the_consciousness_door_waits_on_the_row(tmp_path, monkeypatch):
     """A one-shot a wake scheduled and the consciousness door refuses (allowance, concurrency —
-    a refusal that can last hours) must not re-fire on every supervisor pass: the record stays
-    armed, its run point moves forward by the alarm floor (opus round 4)."""
+    a refusal that can last hours) must not re-fire on every supervisor pass: the row waits
+    with the typed reason until the alarm floor passes; no failed root, run point unchanged."""
     import datetime
 
     queue, pending = _queue(tmp_path)
@@ -117,23 +126,26 @@ def test_once_schedule_refused_by_the_consciousness_door_defers_by_the_alarm_flo
     queue.upsert_scheduled_task({
         "id": "fu-conscious", "name": "Follow-up", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume later",
-                 "metadata": {"initiator": "consciousness", "usage_category": "consciousness_task"}},
+        "task": {"type": "task", "text": "resume later", "chat_id": 1,
+                 "metadata": {"initiator": "consciousness", "usage_category": "consciousness_task",
+                              "resource_intent": {"kind": "system_repo"}}},
     }, host_followup={"followup_relation": {"kind": "independent", "revision": "explicit-test-decision"}})
     fires: list = []
     monkeypatch.setattr(
         queue, "enqueue_task",
-        lambda task: fires.append(task["id"]) or {**task, "_admission_blocked": "consciousness_allowance_exhausted",
-                                                 "_admission_detail": "$20.00 of $20.00 spent in the last 24 h"})
+        lambda task, **_kw: fires.append(task["id"]) or {
+            **task, "_admission_blocked": "consciousness_allowance_exhausted",
+            "_admission_detail": "$20.00 of $20.00 spent in the last 24 h"})
     before = datetime.datetime.now(datetime.timezone.utc)
     queue.check_scheduled_tasks()
-    queue.check_scheduled_tasks()  # the very next pass: NOT due again
+    queue.check_scheduled_tasks()  # the very next pass: still waiting
     assert len(fires) == 1 and pending == []
     record = queue.list_scheduled_tasks(tmp_path)["tasks"][0]
     assert record["enabled"] is True and not record.get("completed_at")
-    assert "consciousness_allowance_exhausted" in str(record.get("last_error") or "")
-    run_at = datetime.datetime.fromisoformat(record["trigger"]["run_at"])
-    assert run_at >= before + datetime.timedelta(seconds=890)
+    assert record["trigger"]["run_at"] == "2000-01-01T00:00:00+00:00"
+    assert record["hold"]["reason"] == "consciousness_allowance_exhausted"
+    assert "$20.00" in record["hold"]["detail"]
+    assert datetime.datetime.fromisoformat(record["hold"]["retry_after"]) >= before + datetime.timedelta(seconds=890)
 
 
 def test_re_enabled_completed_once_never_refires(tmp_path):
@@ -540,8 +552,14 @@ def test_schedule_followup_of_an_unscoped_task_invents_no_project_address(tmp_pa
     unscoped task's follow-up keeps the existing owner-chat default."""
     from supervisor.queue import list_scheduled_tasks
     from supervisor.queue_schedules import _task_from_schedule
+    from supervisor import state
     from ouroboros.project_facts import resolve_project_id
 
+    # The initial missing binding is unknown, never the hidden chat-0 partition.
+    # A real owner-bound installation supplies the positive destination.
+    state.init(tmp_path / "data")
+    state.init_state()
+    state.update_state(lambda st: st.update(owner_chat_id=17))
     assert _followup(_ctx(tmp_path, task_id="plain-task")).startswith("FOLLOWUP_SCHEDULED")
     record = list_scheduled_tasks(pathlib.Path(tmp_path / "data").resolve())["tasks"][0]
     assert "project_id" not in record["task"]
@@ -549,7 +567,7 @@ def test_schedule_followup_of_an_unscoped_task_invents_no_project_address(tmp_pa
 
     queued = _task_from_schedule(record)
     assert resolve_project_id(queued) == ""
-    assert queued["chat_id"] == 0  # the existing owner_chat_id default, unchanged
+    assert queued["chat_id"] == 17
 
 
 # ------------------------------------------------- gateway + digest + queue GC
@@ -613,7 +631,7 @@ def test_gateway_rearm_of_completed_once_requires_a_fresh_run_at(tmp_path):
     queue.upsert_scheduled_task({
         "id": "fu-done", "name": "Follow-up", "enabled": False, "completed_at": fired,
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume"},
+        "task": {"type": "task", "text": "resume", "chat_id": 1},
     })
     app = Starlette(routes=[Route("/api/schedules", endpoint=api_schedules_upsert, methods=["POST"])])
     app.state.drive_root = tmp_path
@@ -623,14 +641,14 @@ def test_gateway_rearm_of_completed_once_requires_a_fresh_run_at(tmp_path):
     refused = client.post("/api/schedules", json={
         "id": "fu-done", "enabled": True,
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume"},
+        "task": {"type": "task", "text": "resume", "chat_id": 1},
     })
     assert refused.status_code == 400 and "run_at" in refused.json()["error"]
     # Disable/edit keeping the same run_at: allowed, receipt carried forward.
     kept = client.post("/api/schedules", json={
         "id": "fu-done", "enabled": False,
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume"},
+        "task": {"type": "task", "text": "resume", "chat_id": 1},
     })
     assert kept.status_code == 200
     assert kept.json()["schedule"]["completed_at"] == fired
@@ -638,7 +656,8 @@ def test_gateway_rearm_of_completed_once_requires_a_fresh_run_at(tmp_path):
     rearmed = client.post("/api/schedules", json={
         "id": "fu-done", "enabled": True,
         "trigger": {"type": "once", "run_at": "2000-02-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume"},
+        "task": {"type": "task", "text": "resume", "chat_id": 1,
+                 "metadata": {"resource_intent": {"kind": "system_repo"}}},
     })
     assert rearmed.status_code == 200
     assert "completed_at" not in rearmed.json()["schedule"]
@@ -685,10 +704,15 @@ def test_consumed_once_records_are_pruned_past_gc_retention(tmp_path):
     now = datetime.datetime.now(UTC)
     old = (now - datetime.timedelta(days=400)).isoformat()
     queue.upsert_scheduled_task({
-        "id": "consumed-old", "enabled": False, "completed_at": old,
+        "id": "consumed-old", "enabled": False, "completed_at": old, "last_task_id": "settled-old",
         "trigger": {"type": "once", "run_at": old},
         "task": {"type": "task", "text": "done long ago"},
     })
+    from ouroboros.task_results import write_task_result
+    write_task_result(tmp_path, "settled-old", "completed", result="settled")
+    queue.upsert_scheduled_task({
+        "id": "consumed-unidentified", "enabled": False, "completed_at": old,
+        "trigger": {"type": "once", "run_at": old}, "task": {"type": "task", "text": "unknown custody"}})
     queue.upsert_scheduled_task({
         "id": "consumed-fresh", "enabled": False, "completed_at": now.isoformat(),
         "trigger": {"type": "once", "run_at": now.isoformat()},
@@ -713,7 +737,7 @@ def test_consumed_once_records_are_pruned_past_gc_retention(tmp_path):
     ids = {r["id"] for r in queue.list_scheduled_tasks(tmp_path)["tasks"]}
     # Only the aged-out CONSUMED ONE-SHOT is pruned; a disabled cron row is a
     # standing schedule the owner may re-enable, even when it carries completed_at.
-    assert ids == {"consumed-fresh", "enabled-future", "disabled-cron", "disabled-cron-stamped"}
+    assert ids == {"consumed-unidentified", "consumed-fresh", "enabled-future", "disabled-cron", "disabled-cron-stamped"}
     assert pending == []
 
 

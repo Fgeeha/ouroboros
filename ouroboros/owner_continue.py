@@ -232,8 +232,18 @@ def owner_sources(drive_root: Any, result: Dict[str, Any], task_id: str) -> Dict
                 seen[msg_id] = (text, target is later)
             target.append(dict(row))
     late_framed: set = set()  # ids whose exact row carries typed late-answer provenance
-    rows, complete = _mail_rows(root, task_id)
-    live = _mailbox_exists(root, task_id)
+    # Deferred history leaves the child's exact mailbox in custody. A canonical
+    # terminal capture is not proof that this retained source has no later words.
+    from ouroboros.task_custody import own_child_drives
+    rows, complete, live = [], True, False
+    try:
+        for drive in [root, *own_child_drives(root, task_id)]:
+            entries, whole = _mail_rows(drive, task_id)
+            rows.extend(entries)
+            complete = complete and whole
+            live = live or _mailbox_exists(drive, task_id)
+    except (OSError, ValueError):
+        complete = False
     if not complete:
         gaps.append("owner_mailbox_unreadable")
     # The root's terminal captured its exact owner rows, ACKed ones included

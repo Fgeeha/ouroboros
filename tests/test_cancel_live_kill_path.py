@@ -77,12 +77,16 @@ def test_e2e_tool_cancel_kills_live_worker_and_settles_with_cost(qenv, monkeypat
     assert stored["parent_decision"] == "cancelled"          # stamped at OUTCOME
     assert stored.get("cost_accounting_status") == "available"  # reconstructed
     assert ci.active_intent(qenv.drive, task_id) is None
-    assert settled_off_loop(qenv.drive, task_id, child_drive), "the off-loop settlement removes the cancelled subagent's drive"
+    assert not settled_off_loop(qenv.drive, task_id, child_drive), "unretained call history still owns the drive"
     # task_done carries the reconstructed accounting — never a fabricated final $0
     # (an empty ledger reconstructs to a CONFIRMED zero, which is fine).
     (done,) = done_events
     assert done["status"] == STATUS_CANCELLED
     assert done["cost_accounting_status"] == "available"
+    from ouroboros.headless import retry_child_task_refs
+
+    retry_child_task_refs(qenv.drive, child_drive, task_id)
+    assert settled_off_loop(qenv.drive, task_id, child_drive), "background retention releases the cancelled drive"
 
 @pytest.mark.serial
 def test_e2e_child_finishing_before_the_kill_keeps_its_completed_result(qenv, monkeypatch):

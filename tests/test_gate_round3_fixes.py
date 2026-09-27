@@ -262,6 +262,7 @@ def test_incomplete_evolution_stop_leaves_the_campaign_open_until_settle(tmp_pat
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     q.init(tmp_path)
     assert el.start_evolution_campaign("Improve", source="test").get("status") == "active"
     state.update_state(lambda live: live.update(

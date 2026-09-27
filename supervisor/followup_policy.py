@@ -259,7 +259,7 @@ def scheduled_start(root, task):
 
 Every pending task keeps its ID and existing dispatch evidence. Missing rows or
 unknown relationships wait; restoring the schedule does not release task holds.
-The Batch1 receipt/opaque-owner-hold composition is deliberately parent-owned.
+The occurrence owner persists dispatch before the physical handoff inside this fence.
 """
     from supervisor import queue_schedules as store
 
@@ -282,12 +282,11 @@ The Batch1 receipt/opaque-owner-hold composition is deliberately parent-owned.
 
 
 def bound_task(task, record):
-    """Prepared work must already carry the verified binding, without a new ID.
-
-    The parent must bind legacy fired unknowns through the landed Batch1 writer
-    across frozen/live/result facets. Until then they report an unavailable wait.
-    """
+    """Prepared work must carry the current host relationship and original money."""
     from ouroboros.deadline_utils import parse_deadline_ts
+    carried = (task.get("metadata") or {}).get("followup_relation") or {}
+    if carried.get("kind") != relation_kind(record):
+        return False
     if relation_kind(record) != "related":
         return relation_kind(record) == "independent"
     relation = record.get("followup_relation") or {}
@@ -300,6 +299,36 @@ def bound_task(task, record):
         if carried is None or carried > deadline or (contract is not None and contract > deadline):
             return False
     return True
+
+
+def bind_task(root, task, record):
+    """Bind creation or a proven unrun occurrence to the row's host-owned facts.
+
+    This changes neither task identity nor execution/resource intent. The
+    occurrence owner alone may apply it to already admitted work.
+    """
+    from ouroboros.deadline_utils import parse_deadline_ts
+
+    meta = task.setdefault("metadata", {})
+    origin = origin_of(record)
+    if origin:
+        meta.update(origin_task_id=origin["task_id"], origin_root_task_id=origin["root_task_id"])
+        meta["objective_author"] = {"kind": "task", "task_id": origin["task_id"]}
+    meta["followup_origin"] = origin
+    meta["followup_relation"] = copy.deepcopy(record.get("followup_relation") or {"kind": relation_kind(record)})
+    if relation_kind(record) != "related":
+        return
+    meta["billing_group"] = task_binding(root, record)
+    relation = record["followup_relation"]
+    dates = [parse_deadline_ts(raw) for raw in (relation.get("deadline_at"), task.get("deadline_at"),
+             (task.get("task_contract") or {}).get("deadline_at")) if raw]
+    if any(date is None for date in dates):
+        raise ValueError("followup_deadline_unavailable")
+    if dates:
+        task["deadline_at"] = meta["deadline_at"] = min(dates).isoformat()
+        if task.get("task_contract"):
+            task["task_contract"]["deadline_at"] = task["deadline_at"]
+            meta["task_contract"] = copy.deepcopy(task["task_contract"])
 
 
 def normalize_template(record):

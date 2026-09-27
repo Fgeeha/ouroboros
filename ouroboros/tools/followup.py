@@ -395,6 +395,18 @@ def _handle_schedule_followup(ctx: ToolContext, **params) -> str:
             text=f"⚠️ CAPABILITY_UNAVAILABLE: FOLLOWUP_STORE_UNAVAILABLE: {exc}"))
 
 
+def followup_resource_intent(ctx: Any, metadata: Any, project_id: str) -> Dict[str, Any]:
+    """The resource intent a follow-up carries: the origin's own stamped intent, or a
+    direct turn's (its room's current folder, or Main's system repo). A queued task
+    without a stamp carries none — the scheduler recovers only from its record."""
+    stamped = metadata.get("resource_intent") if isinstance(metadata, dict) else None
+    if isinstance(stamped, dict) and stamped.get("kind"):
+        return dict(stamped)
+    if not bool(getattr(ctx, "is_direct_chat", False)) or getattr(ctx, "workspace_root", None):
+        return {}
+    return {"kind": "room_default", "project_id": project_id} if project_id else {"kind": "system_repo"}
+
+
 def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
                        objective: str, context: str, trigger: Dict[str, Any], cron: str,
                        timezone: str, timezone_note: str, origin: dict, relation: dict) -> str:
@@ -459,6 +471,11 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
     # A follow-up from a consciousness turn/tree starts a consciousness root: the
     # origin, category and level ride the template; admission derives the rest.
     record["task"]["metadata"].update(consciousness_origin_metadata(metadata_src))
+    # The resource choice rides BY VALUE (#1315): the origin's producer-stamped intent,
+    # else a direct turn's own (its room's default, or Main's system repo).
+    intent = followup_resource_intent(ctx, metadata_src, project_id)
+    if intent:
+        record["task"]["metadata"]["resource_intent"] = intent
     # The same Presence carrier a promote keeps: a speaker's metadata, or the binding a
     # promoted descendant root acts for; the ceiling rides by value and no Project is chosen.
     # A new root authors its own objective, context and acceptance premises;
@@ -477,7 +494,10 @@ def _register_followup(ctx: ToolContext, task_id: str, drive_root: Any,
         stored = upsert_scheduled_task(
             record, drive_root=drive_root, actor="agent:schedule_followup", task_id=task_id,
             reason=f"follow-up registered by task {task_id}",
-            host_followup={"followup_origin": origin, "followup_relation": relation})
+            host_followup={"followup_origin": origin, "followup_relation": relation},
+            # Host-authored provenance of a NAMED continuation (never payload/prose):
+            # it keeps a consciousness follow-up out of the spontaneous-start cap.
+            continuation_of={"task_id": task_id, "root_task_id": str(root_task_id or "") or task_id})
     except ScheduleRefused as exc:
         return _publish_tool_result(ctx, ToolResult(
             status="unavailable", code="CAPABILITY_UNAVAILABLE",

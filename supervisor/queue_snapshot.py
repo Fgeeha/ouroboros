@@ -134,6 +134,8 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 "focus": t.get("focus"),
                 "allowed_resources": t.get("allowed_resources"), "deadline_at": t.get("deadline_at"),
                 "task_contract": t.get("task_contract"),
+                "_owner_hold": t.get("_owner_hold"),
+                "_consciousness_continuation": t.get("_consciousness_continuation"),
                 # Scheduling INTENT survives a restart and is all a PENDING child has;
                 # `parent_model_lane` and the F9 admission fact `required_model_lane`
                 # above all (R2-3). Pinned to SUBAGENT_INTENT_FIELDS by test_model_slot.
@@ -336,6 +338,7 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
     from supervisor.budget_resume import revoke_exact_budget_resume
     from supervisor.events_budget import HOLD_RESTORE_REFUSED_PREFIX, hold_restored_budget_pause
     from supervisor.restart_retention import hold_for_owner_restart, never_started, restart_held, retained_pending
+    from supervisor.schedule_occurrence import restore_allowed
 
     for task in snapshot_pending:
         if isinstance(task.get("_budget_pause_resume"), dict):
@@ -375,6 +378,9 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
     retained = []
     consumed: list = []
     for task in list(snapshot_pending) + parked:
+        # Import opaque owner/cap carriers even for an exact saved Pause. Its
+        # single-use Resume is a separate authority from ordinary queue replay.
+        schedule_replay = restore_allowed(task)
         if isinstance(task.get("_budget_pause_consumed"), dict):
             consumed.append(str(task.get("id") or ""))
             continue
@@ -393,9 +399,9 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
                 retained.append(task)
         elif retained_pending(task, sleep_hold_reason=sleep_hold_reason):
             retained.append(task)
-        elif owner_restart and never_started(task):
+        elif owner_restart and never_started(task) and schedule_replay:
             retained.append(hold_for_owner_restart(dict(task), _queue().DRIVE_ROOT))
-        elif task.get("admitted_dispatch") == "possible" or (owner_restart and not never_started(task)):
+        elif task.get("admitted_dispatch") == "possible" or (owner_restart and not schedule_replay) or (owner_restart and not never_started(task)):
             from supervisor.events_budget import hold_budget_row
 
             held = dict(task)
@@ -403,6 +409,8 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
                             detail="an assignment may have reached a worker; reconcile its receipt before resuming",
                             result_root=_queue().DRIVE_ROOT)
             retained.append(held)
+        elif not schedule_replay:
+            continue  # a schedule-born row that may have been dispatched, or is unprovable, is never replayed
         elif not stale:
             retained.append(task)
     if consumed:
