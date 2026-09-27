@@ -735,4 +735,7 @@ def test_web_frames_keep_reference_order_and_one_authored_reply():
     # (typing frames are receipts and never register liveness or controls).
     assert "updateLiveCardFromProgressMessage(msg, { grantCancelAuthority: true })" in fanout
     updater = chat[chat.index("function updateLiveCardFromProgressMessage"):chat.index("function updateLiveCardFromLogEvent")]
-    assert "grantCancelAuthority && msg?.cancelable === true && msg?.task_id" in updater
+    assert "const taskId = msg?.task_id || '';" in updater
+    guard = updater.index("if (!taskId) return false;")
+    grant = updater.index("if (grantCancelAuthority && msg.cancelable === true) {")
+    assert guard < grant < updater.index("changed = markTaskCancelable(String(taskId));")

@@ -36,7 +36,7 @@ import threading
 import time
 import uuid
 from decimal import Decimal, DecimalException
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from ouroboros._usage_rows import _breakdown_bucket, _summary, _processing_summary, _merge_processing_summary, row_ts_epoch
 from ouroboros.runtime_limits import USAGE_LEDGER_FOLD_MIN_AGE_SEC

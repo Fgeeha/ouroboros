@@ -113,11 +113,21 @@ every existing aggregation exact while remaining one atomic, stamped unit.
 
 Monetary equality is defined **on decimals, never on float accumulation**:
 
-- Exact decoding preserves the ledger validator's accepted monetary scalars,
+- Exact decoding preserves finite accepted monetary scalars,
   including legacy JSON booleans (`true` = 1, `false` = 0) and numeric strings.
   The shared `_usage_money.decimal_of` conversion applies to replay, incremental
   cash and compaction; rejecting a valid historical boolean would erase money.
   Validation and fold eligibility remain with their existing owners.
+- Nonfinite monetary values (`Infinity`, `-Infinity`, `NaN`, including strings)
+  raise `UsageNonFiniteMoney`, a `UsageAccountingError` distinct from torn-row
+  corruption. Validation, exact cash decoding and legacy-source import fail
+  closed: strict projection/admission and compaction cannot price that evidence
+  as zero or drop it through tail quarantine. Existing ledger/archive bytes and
+  reservations remain intact; a refused import retains its source archive and
+  does not publish a completed watermark. This intentionally narrows the former
+  numeric grammar (which accepted positive infinity): the data remains, but
+  strict accounting requires repair of the nonfinite source. Finite scalar
+  conversion, six-place rounding and counter semantics are unchanged.
 - The compactor parses the source segment with `parse_float=Decimal` and sums
   each group's `cost_usd` / `reservation_upper_bound_usd` as exact `Decimal`s
   of the literals actually stored in the file.

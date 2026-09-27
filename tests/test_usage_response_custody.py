@@ -10,9 +10,9 @@ from ouroboros import usage_accounting as ua
 from ouroboros import usage_ledger as ledger
 from ouroboros.observability import read_call_payload
 from tests.test_physical_candidate_capture import (
-    LLMClient, _Response, _rows, _scope, _target, data_root,  # noqa: F401
+    LLMClient, _Response, _rows, _scope, _target, data_root as data_root,
 )
-from tests.test_llm_claudexor import setup  # noqa: F401
+from tests.test_llm_claudexor import setup as setup
 
 pytestmark = pytest.mark.serial
 

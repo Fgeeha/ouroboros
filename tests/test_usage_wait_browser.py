@@ -28,9 +28,9 @@ from ouroboros.model_wait import task_model_wait_scope
 from ouroboros.task_results import write_task_result
 from ouroboros.utils import append_jsonl
 from supervisor.events_worker_reports import _handle_log_event
-from tests.test_subscription_setup_browser import subscription_ui, capture  # noqa: F401
+from tests.test_subscription_setup_browser import subscription_ui as subscription_ui, capture
 from tests.test_usage_lock_continuity import held_lock
-from tests.test_usage_writer_view import root, request  # noqa: F401
+from tests.test_usage_writer_view import root as root, request
 
 pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 

@@ -5,7 +5,7 @@ import pytest
 
 from ouroboros import net_transport, usage_accounting as ua, usage_ledger as ledger
 from ouroboros.tools import search
-from tests.test_usage_writer_view import request, root  # noqa: F401
+from tests.test_usage_writer_view import request, root as root
 
 pytestmark = pytest.mark.serial
 

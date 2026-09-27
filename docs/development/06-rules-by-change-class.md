@@ -641,9 +641,9 @@ and what enforces each.
   (Main and Light may share a model name with different pins; account evidence stays
   source/profile/fingerprint-bound). Manual context sizing is not scope authority; a
   scope ACK binds the actual route; a changed model's token-density observation never
-  becomes the old model's evidence. A physical attempt limit returns a claim only after
-  a successful, positive never-dispatched release; unknown or dispatched claims stay
-  charged.
+  becomes the old model's evidence. Positive never-dispatched proof returns the local
+  physical attempt claim even if bounded ledger release fails; failed release keeps
+  the reserved money and capture. Unknown or dispatched claims stay charged.
 - Resource refusals wait inside the live call, before helper catch-all blocks, on the
   existing task owner, mailbox, clocks and settings writer. Reprepare from canonical
   messages, not the prior caption/off send copy; retain original images and apply

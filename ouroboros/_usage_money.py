@@ -43,13 +43,20 @@ def decimal_of(value: Any) -> Decimal:
 
 
 def amount(value: Any) -> Decimal | None:
+    """Decode cash; nonfinite evidence is an integrity failure, never unknown."""
     if value is None:
         return None
     try:
         parsed = decimal_of(value)
     except (decimal.InvalidOperation, ValueError):
         return None
-    return parsed if parsed.is_finite() and parsed >= 0 else None
+    if not parsed.is_finite():
+        # The substrate imports this arithmetic leaf. Resolve its error lazily
+        # so every reader fails typed without making it quarantinable corruption.
+        from ouroboros.usage_ledger import UsageNonFiniteMoney
+
+        raise UsageNonFiniteMoney("non-finite monetary value; source data requires repair")
+    return parsed if parsed >= 0 else None
 
 
 def durable_literals(value: Any, key: str = "") -> Any:

@@ -741,8 +741,7 @@ def test_legacy_bool_baselines_and_retained_rows_compact_exactly(root):
         ua.reserve_attempt(request(root, reservation_usd=.1, global_limit_usd=4.5))
 
 
-@pytest.mark.parametrize("value", [None, {}, [], "", "true", -1, "-.1", float("nan"),
-                                   float("inf"), "NaN", "Infinity"])
+@pytest.mark.parametrize("value", [None, {}, [], "", "true", -1, "-.1"])
 def test_legacy_money_invalid_or_unknown_values_keep_existing_handling(value):
     from ouroboros._usage_money import amount
 

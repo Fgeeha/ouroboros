@@ -20,7 +20,7 @@ from ouroboros import usage_ledger as ledger
 from ouroboros.llm_attempt import PhysicalDispatchInterrupted
 from ouroboros.model_wait import task_model_wait_scope
 from ouroboros.review_dispatch import ReviewPaidStamp, bind_api_review_paid_stamp
-from tests.test_usage_writer_view import request, root  # noqa: F401 -- shared isolated fixture
+from tests.test_usage_writer_view import request, root as root
 
 pytestmark = pytest.mark.serial
 
@@ -77,7 +77,7 @@ def test_same_chain_preparation_stamp_claim_and_one_send(root, short_acquisition
     calls, prepared, stamps = [], [], []
     with contextlib.ExitStack() as stack:
         events = stack.enter_context(owner(root, task={"_is_direct_chat": interactive, "_presence_turn": interactive}))
-        limit = stack.enter_context(ua.physical_attempt_limit(1))
+        stack.enter_context(ua.physical_attempt_limit(1))
         stack.enter_context(bind_api_review_paid_stamp(ReviewPaidStamp(lambda: stamps.append(1), fail_closed=True)))
 
         def start_hold():
@@ -317,7 +317,6 @@ def test_async_cancellation_joins_reservation_committed_at_the_boundary(root, mo
 
 
 def test_real_loop_round_two_wait_keeps_tool_and_live_leaf(root, short_acquisitions, monkeypatch):
-    from types import SimpleNamespace
     import ouroboros.loop as loop
     from ouroboros import delegate_custody as custody
     from ouroboros.tools.registry import ToolRegistry

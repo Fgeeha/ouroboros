@@ -27,7 +27,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, Iterator, Optional, Sequence, Tuple
 
 from ouroboros.utils import append_jsonl, replace_atomic, utc_now_iso
-from ouroboros._usage_money import LiteralFloat, durable_literals
+from ouroboros._usage_money import LiteralFloat, amount, durable_literals
 
 log = logging.getLogger(__name__)
 
@@ -43,7 +43,7 @@ _TERMINAL = frozenset({"settled", "unresolved", "released"})
 
 __all__ = (
     "LEDGER_REL", "LOCK_REL", "QUARANTINE_REL", "UsageAccountingError", "UsageLedgerCorrupt",
-    "UsageLockUnavailable", "is_abandoned_settlement",
+    "UsageLockUnavailable", "UsageNonFiniteMoney", "is_abandoned_settlement",
 )
 
 
@@ -53,6 +53,10 @@ class UsageAccountingError(RuntimeError):
 
 class UsageLedgerCorrupt(UsageAccountingError):
     """Raised when durable history is structurally invalid."""
+
+
+class UsageNonFiniteMoney(UsageAccountingError):
+    """Nonfinite monetary evidence: preserve bytes, never quarantine or zero it."""
 
 
 class UsageLockUnavailable(UsageAccountingError):
@@ -415,6 +419,9 @@ def _validate_records(
             "cost_usd", "reservation_upper_bound_usd", "reservation_usd",
             "max_budget_usd", "global_limit_usd", "root_limit_usd",
         ):
+            # Nonfinite money is not a torn row. Its distinct error bypasses
+            # tail quarantine, including incremental fallback and compaction.
+            amount(row.get(numeric_field))
             if row.get(numeric_field) is not None and _number(row.get(numeric_field)) is None:
                 raise UsageLedgerCorrupt(f"invalid {numeric_field} in usage row seq={sequence}")
         for token_field in (

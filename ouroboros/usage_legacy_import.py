@@ -15,6 +15,7 @@ import os
 import pathlib
 from typing import Any, Dict, Optional, Tuple
 
+from ouroboros._usage_money import amount
 from ouroboros.usage_ledger import (
     UsageAccountingError,
     _append_rows_locked,
@@ -167,6 +168,7 @@ def _ensure_legacy_imported_locked(
         raw_cost = event.get("cost")
         if raw_cost is None:
             raw_cost = legacy_usage.get("cost", legacy_usage.get("total_cost"))
+        amount(raw_cost)  # Refuse nonfinite evidence before float coercion or a completed watermark.
         cost = _number(raw_cost)
 
         def legacy_int(field: str, *aliases: str) -> int:
@@ -235,6 +237,7 @@ def _ensure_legacy_imported_locked(
                 "source": "legacy_state_call_delta",
             }
         )
+    amount(state.get("spent_usd"))
     state_spent = _number(state.get("spent_usd")) or 0.0
     delta = round(max(0.0, state_spent - imported_cost), 6)
     if delta:
