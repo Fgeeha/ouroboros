@@ -148,7 +148,7 @@ def _canonical_payload_text(
 def canonicalize_session_verdict(
     raw_text: str, *, conformance_passed: bool, contract: str = "", llm: Any = None,
     deadline_at: Any = None, transport_timeout_sec: Any = None, shape: str = "array",
-    array_validator: Optional[Callable[[list], bool]] = None,
+    array_validator: Optional[Callable[[list], bool]] = None, allow_extraction: bool = True,
 ) -> tuple[str, str, Dict[str, Any]]:
     """Return ``(canonical_text, method, extraction_usage)`` for a session answer.
 
@@ -172,6 +172,10 @@ def canonicalize_session_verdict(
     An array surface may supply its existing row validator. Shape-valid but
     contract-invalid rows then reach the same extraction rail; the host never
     guesses a verdict or severity. Other surfaces keep their own parsing rules.
+
+    ``allow_extraction=False`` is pure collection of an already-paid answer: a
+    narrative that the trusted/strict branches cannot read is returned WHOLE
+    with method ``parse_unavailable``; no Light model is called for it.
     """
     text = str(raw_text or "")
     if shape == "report":
@@ -189,6 +193,8 @@ def canonicalize_session_verdict(
         # discloses the delta.
     if _strictly_parseable(text, shape, array_validator):
         return text, "strict", {}
+    if not allow_extraction:
+        return text, "parse_unavailable", {}
     if len(text) > _EXTRACT_MAX_CHARS:
         return text, "extraction_incomplete", {}
     canonical, usage = _extract_verdict_via_light_model(

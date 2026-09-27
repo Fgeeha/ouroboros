@@ -347,13 +347,84 @@ def _toggle_evolution(ctx: ToolContext, enabled: bool, objective: str = "") -> s
 
 
 def _toggle_consciousness(ctx: ToolContext, action: str = "status") -> str:
-    """Control background consciousness: start, stop, or status."""
+    """Control background consciousness: start, stop, or status.
+
+    Start and stop are supervisor acts (queued events, unchanged). Status is a
+    READ answered to the caller alone -- never a line in the owner's chat: the
+    facts the runtime state persists, named with their source, and the clock's
+    in-memory facts listed as not read rather than guessed.
+    """
+    if action == "status":
+        return _consciousness_status_facts(ctx)
     ctx.pending_events.append({
         "type": "toggle_consciousness",
         "action": action,
         "ts": utc_now_iso(),
     })
     return f"OK: consciousness '{action}' requested."
+
+
+def _consciousness_status_facts(ctx: ToolContext) -> str:
+    """The persisted consciousness fields of the CALLER's canonical data root.
+
+    One strict read of ``state/state.json`` under the root the caller's other
+    canonical reads use (``budget_drive_root``, else ``drive_root``), not the
+    process-global ``supervisor.state`` path and not its loader, which writes
+    defaults for a missing file and repairs from the backup. The state file is
+    replaced atomically, so one lock-free read sees one whole version and
+    writes nothing. A missing, unreadable or corrupt file is that named gap
+    with no field guessed; a field the file lacks is listed, never defaulted.
+    ``observed_at`` is when this read happened, not when the file was written.
+    """
+    import json
+    import math
+
+    from ouroboros.config import get_bg_wakeup_max_sec, get_bg_wakeup_min_sec
+    from ouroboros.consciousness import INTERVAL_STATE_KEY, LAST_WAKE_STATE_KEY, NEXT_WAKE_STATE_KEY, _iso
+
+    metadata = ctx.task_metadata if isinstance(getattr(ctx, "task_metadata", None), dict) else {}
+    path = Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "")
+                    or ctx.drive_root)) / "state" / "state.json"
+    stored, gap = None, ""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        gap = "missing: no runtime state file at this path"
+    except OSError as exc:
+        gap = f"unreadable: {type(exc).__name__}"
+    else:
+        try:
+            loaded = json.loads(raw.decode("utf-8"))
+        except ValueError as exc:  # UnicodeDecodeError and JSONDecodeError alike
+            gap = f"corrupt: {type(exc).__name__}"
+        else:
+            stored = loaded if isinstance(loaded, dict) else None
+            gap = "" if stored is not None else "corrupt: the file is not a JSON object"
+    facts = {"source": str(path), "observed_at": utc_now_iso()}
+    fields = (("enabled", "bg_consciousness_enabled"), ("stored_next_wake_at", NEXT_WAKE_STATE_KEY),
+              ("last_wake_ended_at", LAST_WAKE_STATE_KEY), ("chosen_interval_sec", INTERVAL_STATE_KEY))
+    if stored is None:
+        facts.update(read_gap=gap, not_read=[name for name, _key in fields])
+    else:
+        for name, key in fields:
+            if key not in stored:
+                facts.setdefault("not_recorded", []).append(name)
+                continue
+            value = facts[name] = stored[key]  # exactly as stored unless it is a readable time
+            if key in (NEXT_WAKE_STATE_KEY, LAST_WAKE_STATE_KEY) and type(value) in (int, float) \
+                    and math.isfinite(value) and value > 0:
+                try:
+                    facts[name] = _iso(value)
+                except (OverflowError, OSError, ValueError):
+                    pass
+    facts["configured_bounds_sec"] = {"min": get_bg_wakeup_min_sec(), "max": get_bg_wakeup_max_sec(),
+                                      "source": "owner settings, not the state file"}
+    facts["notes"] = [
+        "stored_next_wake_at is the last time the clock persisted and fires only while enabled; the running "
+        "clock keeps it no sooner than MIN after boot, and an event can pull it earlier.",
+        "Not in this read (held in the supervisor's memory): a pending early-wake reason, the last wake "
+        "outcome and error, failure backoff, the allowance window and a live wake task."]
+    return json.dumps(facts, ensure_ascii=False, indent=2)
 
 
 def _set_next_wakeup(ctx: ToolContext, seconds: int) -> str:

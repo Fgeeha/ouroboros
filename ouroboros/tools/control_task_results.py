@@ -190,7 +190,7 @@ def _get_task_result(
     include_work_order_source: bool = False, source_start_char: Any = None,
     source_end_char: Any = None, include_completion_source: bool = False,
     known_result_sha256: str = "", include_focus_source: bool = False, focus_source_sha256: str = "",
-    presence_scope: str = "",
+    presence_scope: str = "", review_source_sha256: str = "",
 ) -> str:
     """Read a task result, or a bounded canonical work-order/completion source range."""
     metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
@@ -221,14 +221,14 @@ def _get_task_result(
 
     restricted = _restricted_actor(ctx)
     if restricted:
-        if bool(include_focus_source):
+        if bool(include_focus_source) or bool(review_source_sha256):
             # Children and Presence turns hold no cross-focus view (recent_tasks
             # strips focus, live_roots refuses); the retained SOURCE of a focus is
             # part of that view, not of the ordinary task result.
             # The identifier register records TOOL_FORBIDDEN as a typed policy
             # block (the same spelling project_journal and live_roots publish).
             return ("⚠️ TOOL_FORBIDDEN (get_task_result): restricted actors have no cross-focus "
-                    "catalogue; include_focus_source is not available to them")
+                    "catalogue; focus/review source selectors are not available to them")
         if isinstance(data, dict) and "focus" in data:
             # The same ceiling on every projection of the record: the authority
             # view copies top-level fields, so focus leaves before it is built.
@@ -258,6 +258,15 @@ def _get_task_result(
                 "this one is lost is yours to judge from the two times above."
             ),
         ))
+    if review_source_sha256:
+        from ouroboros.task_finalization import review_source_projection
+
+        source = review_source_projection(status_drive_root, str(task_id), review_source_sha256,
+                                          source_start_char, source_end_char)
+        text = json.dumps({"review_source": source}, ensure_ascii=False, sort_keys=True)
+        if source.get("reason") == "source_range_invalid":
+            return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=text))
+        return text
     if bool(include_authority) or bool(include_work_order_source) or bool(include_completion_source) or bool(include_focus_source):
         from ouroboros.agent_startup_checks import task_result_authority_projection
 

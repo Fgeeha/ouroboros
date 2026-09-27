@@ -386,16 +386,23 @@ The imperatives:
   unchanged. A failed loop without captured evidence reports unknown counts —
   never infer zero work or read an unverified checkpoint to fill the gap
   (`tests/test_autonomy_review_fixes.py`).
-- Cancellation observations use `task_status.observe_cancellation_target`
-  before the existing intent write: separate source observations (resolved
-  physical target, task-result facts apart from queue freshness, recorded
-  delegated execution), not an atomic snapshot; a later target mismatch is
-  disclosed. Caller reason and request origin are distinct — an HTTP client is
-  not proof of personal owner intent — and cancellation authority and
-  completion-wins stay independent of these observations. Preserve the recorded
-  `cancel_origin` through terminal publication, history, root/child card metadata and
-  conditional result-tool reads after the active intent is removed; missing actors
-  stay unknown, and exposure must not change `requested_by` parent-decision semantics.
+- `task_status.observe_cancellation_target` precedes intent writes and reports
+  physical target, result/queue freshness and delegated custody separately, never as
+  an atomic snapshot; later target mismatch stays visible. Caller reason and request
+  origin differ: HTTP ingress proves no personal owner intent. Preserve `cancel_origin`
+  through publication, history, root/child cards and conditional result reads after
+  intent removal; unknown actors stay unknown and `requested_by` semantics remain.
+  Restart pool teardown uses `_intent_outcome_fields`, inventing no origin. Keep the
+  whole reason; shortened presentation is labeled preview. Known sources use one
+  `CANCEL_SOURCE_PHRASES` sentence without repeating `CANCEL_SOURCE_LABELS`; unknown
+  source/reason remains verbatim in Python/browser twins. Completion-wins and
+  cancellation authority stay separate (`test_zombie_prevention.py`,
+  `test_startup_terminal_files.py`, `test_cancel_origin.py`,
+  `test_truthful_card_presentation.py`, `web/tests/cancel_origin.test.js`).
+- An owed terminal message whose send was never confirmed is disclosed as "not
+  confirmed", with its saved copy named a copy of that message; only the matching
+  receipt's recorded destination for the same delivery id retires the owner notice,
+  never a bare id (`tests/test_cancel_pending_outbox.py`).
 - Cancel INTENT is never a status value: every cancel ingress writes a durable
   intent through `ouroboros/cancel_intents.request_cancel`, fails closed when
   that write fails, checks live physical ownership (a settled RESULT does not
@@ -644,7 +651,10 @@ and what enforces each.
   a successful, positive never-dispatched release; unknown or dispatched claims stay
   charged.
 - Resource refusals wait inside the live call, before helper catch-all blocks, on the
-  existing task owner, mailbox, clocks and settings writer. Reprepare from canonical
+  existing task owner, mailbox, clocks and settings writer. Reviewer calls use their
+  panel's operation wait (§6 Already-paid operations), preserving original task money
+  and controls. Reprepare wake input against the new route's tools/capacity/reserve
+  until consumed; restore the full input when it fits. Reprepare from canonical
   messages, not the prior caption/off send copy; retain original images and apply
   the selected route's image policy anew while preserving typed native reset and
   its live turn slot. No parked rounds,
@@ -655,6 +665,9 @@ and what enforces each.
 
 #### Call sites and accounting
 
+- Stamp every NEW physical Main candidate before measurement/pricing/sealing. Keep
+  canonical tools and recovery actions; same-invocation bytes and consumed history
+  stay fixed (`test_send_clock.py`, `test_processing_transport.py`).
 - New LLM calls go through the shared `LLMClient`/`llm.py` layer — no ad-hoc HTTP
   clients or provider SDKs outside it (review gate: CHECKLISTS item 2(e)). Exception:
   skill/extension `plugin.py` modules may call providers directly until a host-mediated
@@ -806,7 +819,7 @@ and what enforces each.
   Persist the completed-tool source, task wait and queue snapshot before lending; grant
   the original worker only after reserving active capacity (both marks restored on
   failure); attempt, start time, completed effects and usage are unchanged across a
-  warm wake; cold recovery needs the acknowledged planned-restart handoff through every
+  warm wake, and a wait is dated by its own `parked_at`, never by the task start; cold recovery needs the acknowledged planned-restart handoff through every
   shutdown cleanup, and a direct-actor checkpoint alone grants none. After either wait,
   control/deadline handling precedes the saved round's budget decision, and
   TaskModelWait role overrides, explicit Auto, auto-continue and the completed quota
@@ -853,11 +866,10 @@ and what enforces each.
   Default reviewer slots deliberately have no short cognition cap; the outer `plan_task` envelope
   covers the session lifetime; `web_search` sizes its envelope for the complete
   configured paid cascade, recomputed under an owner deadline.
-- A new numeric timeout constant is an SSOT in the owning settings leaf, not the
-  `config.py` facade: key and shipped default in `settings_defaults.py`
-  `SETTINGS_DEFAULTS`, the clamped getter in `runtime_limits.py`, both re-exported
-  through `ouroboros.config`, the one import surface; register the env key; no magic
-  wait numbers at call sites (`tests/test_timeout_policy.py`).
+- New numeric timeouts belong to `settings_defaults.py` (`SETTINGS_DEFAULTS` key/default)
+  and `runtime_limits.py` (clamped getter), re-exported through `ouroboros.config`,
+  the sole import surface. Register each env key; no call-site magic waits
+  (`tests/test_timeout_policy.py`).
 - Worker readiness keeps `WORKER_READY_WINDOW_SEC`, `WORKER_READY_CEILING_SEC` and
   `WORKER_READY_MAX_ATTEMPTS` in `runtime_limits.py`, re-exported by config
   (ARCHITECTURE §5 "Supervisor Loop"). Reuse the lifecycle-owned execution-state
@@ -867,20 +879,15 @@ and what enforces each.
   readiness extension to 300 seconds from birth, never a sliding deadline or a
   fresh window at observation. Readiness, process liveness and idle deadlines stay independent; a failed write keeps
   terminalization retry, never a false Done or a fresh startup budget.
-- Nested process wrappers are ordered, never tied: provider bound before its killable
-  child, child before the generic ToolEntry envelope (the settlement margin from
-  `config.py`), so no result arrives after its owner abandoned custody. The two
-  deliberate early returns — plan review's and task acceptance's dispatch barrier
-  (`ReviewRequest.drain_deadline`) — keep custody: workers settle into process-local
-  custody and announce the wave through the task mailbox (`plan_review_collect`;
-  `acceptance_settlement.announce_acceptance_settlement`, at the wave's own quorum and
-  at completion, each reviewer's own verdict, never an instruction to collect).
-  `owner_hurry.force_plan_decision` collects once at zero wait before finalization in every enforcement mode, hurry
-  included, and projects the returned state; task acceptance collects through the host
-  reconcile `review_dispatch.reconcile_pending_acceptance_runs` (recorded request and
-  roster replayed, nothing sent), never a model-callable verb; context health reads
-  only the canonical wave, as a recorded snapshot. Neither path dispatches a second
-  panel.
+- Order wrapper bounds: provider before killable child before ToolEntry, using config's
+  settlement margin. The plan/acceptance `ReviewRequest.drain_deadline` barrier may
+  return early but retains worker custody. At quorum and completion, `plan_review_collect`
+  and `acceptance_settlement.announce_acceptance_settlement` carry the reviewers' own
+  verdicts through the existing mailbox, never an instruction to collect.
+  `owner_hurry.force_plan_decision` collects once at zero wait before finalization in
+  every mode, hurry included, and projects the returned state. Acceptance uses host-only
+  `review_dispatch.reconcile_pending_acceptance_runs`, original request/roster, no send.
+  Context health reads the canonical wave snapshot; neither path buys another panel.
 - Every physical LLM/review/VLM/tool operation that can outlive a logical wait emits
   typed `cognitive_operation` start/terminal facts; the supervisor uses the
   active-operation map only to spare the idle rail, and a terminal must match
@@ -979,42 +986,40 @@ and what enforces each.
   choosing a value and its enum reads the validator's own set. A child in the legacy
   `cancel_requested` latch is intent, not outcome — cancel-pending until custody
   settles it.
-- Host acceptance: root-only, structured eligibility (`outcomes.turn_has_reviewable_effects`
-  plus a typed deliverable/criterion), never keywords or authoritative agent nomination
-  (BIBLE P3/P5; acceptance model, waiting, unanswered fence, `previous_revision_accepted`,
-  `late_settlement`: ARCHITECTURE §6 "Task acceptance"). Freeze request/roster; existing
-  review custody/mailbox handles pending/free collection. Before new-panel evidence or
-  `review_cycles_exhausted`, reconcile every paid panel still running for that root: $0,
-  recorded request/roster; reauthoring loses no verdict. Settlement wakes bring verdicts
-  whatever Main's draft. Re-offer only changed contract bytes; a spent repair stays spent, a
-  host-caused refusal (typed cause, facts, selector) spends none. A host-spoken pass
-  never parks; settled panels/queued wakes skip only parking. Accept complete revised prose,
-  never a status note; typed keep/replace/finish are optional. Prose resets pending-review
-  choice to wait, never infers finish. Effect, owner-revision and child-action controls stay
-  strict; owner-source acknowledgement and forced finalization keep their rules.
-  Context-only mail wakes waits, blocks no owner-source acknowledgement, implies no owner
-  revision. Empty or recognizable malformed controls keep the answer
-  (`test_acceptance_optional_control.py`). A text-only rewrite rides a ready or pending PASS
-  (no new panel or capacity refusal); a changed subject or owner source does not
-  (`acceptance_settlement._deliver_under_running_panel`). Pending: default wait; Blocking
-  waits; Cyber Pro never waits; Advisory finish needs an explicit
-  `"pending_review":"finish"`. Keep the trace past exit (`remember_settlement_trace`). Late
-  settlement: attach to the ended result, announce once on its task card
-  (`card_row="reviews"`); no model turn or reviewer-as-open-delegation. Workers never write
-  Main's candidate/author decision; subtree/status, findings and Cyber authority stay
-  separate (BIBLE P0).
+- Host acceptance is root-only, with structured `outcomes.turn_has_reviewable_effects`
+  plus a typed deliverable/criterion, never keywords or agent authority (BIBLE P3/P5).
+  ARCHITECTURE §6 Task acceptance owns waiting, fences, `previous_revision_accepted`
+  and `late_settlement`. Freeze request/roster; collect pending paid panels at $0 before
+  new evidence or `review_cycles_exhausted`. Reauthoring loses no verdict; settlement
+  wakes carry verdicts regardless of Main's draft. Re-offer only changed control bytes;
+  spent repair stays spent, typed host refusal spends none. Ready feedback skips parking
+  only. Complete prose is valid; optional keep/replace/finish defaults pending-review
+  choice to wait. Preserve effect/owner/child gates, source acknowledgement and forced
+  rails; context mail wakes without owner revision. Empty/malformed controls keep the
+  answer (`test_acceptance_optional_control.py`). Text-only rewrites reuse ready/pending
+  PASS; changed subject/owner source does not (`_deliver_under_running_panel`). Blocking
+  waits; Cyber Pro does not; Advisory finish needs explicit `"pending_review":"finish"`.
+  Bind operation wait before windows with original money/deadline/Stop; read back the
+  canonical request/subject/roster plus source owners before dispatch. Collection restores
+  custody and parses locally, never sends or calls models; missing custody proves no outcome.
+  `remember_settlement_trace` falls back to canonical sources. Publish before announcing
+  once, version before verdict; emitted-byte receipts prove no human receipt. Failed or
+  nondurable enqueue retains operation retry duty. Sources/outbox survive cleanup
+  (`test_review_operation_source_closure.py`, `test_review_operation_collection.py`).
+  Pass late evidence to an admissible cognition turn; settlement starts none. Workers
+  never author Main's candidate/decision or make reviewers open delegations; subtree,
+  status, findings and Cyber authority stay distinct (BIBLE P0).
 - Delivery-control JSON governs only tool-less final responses; retention leaves tools
   available. Changed criteria/material evidence mean a new subject even with kept text,
   never old verdict authority. Source acknowledgement infers no semantic change from
   generation. File/diff requests impose no commit-or-revert rule; self-modification
   keeps reviewed commits (BIBLE P0/P3).
-- Before cleanup, freeze `review_evidence.task_inputs` and `completion_observations`
-  for reflection (ARCHITECTURE §6 "Post-task reflection"): run origin, whole
-  owner Q/A, peer provenance and canonical split-root verification receipts. Zero exit is positive;
-  absent is unknown; unrelated passes erase no failure. Send content, not pointers;
-  recover the same snapshot. Count delivery via `OWNER_DELIVERY_TOOL_NAMES`, never
-  global skill state. The free `host_task_facts` row makes no model call; the paid
-  reflection and its Pattern Register write use `chat_observed` custody.
+- Freeze `review_evidence.task_inputs` and `completion_observations` before cleanup
+  (ARCHITECTURE §6 Post-task reflection): origin, whole owner Q/A, peer provenance
+  and canonical split-root verification receipts. Zero exit is positive, absence
+  unknown; unrelated passes erase no failure. Deliver content and recover the same
+  snapshot. `OWNER_DELIVERY_TOOL_NAMES` counts sends, never global skill state.
+  `host_task_facts` is free; paid reflection/Pattern Register use `chat_observed` custody.
 - Promoted tasks carry their host-minted root id and role on the queue payload.
   RUNNING writes preserve the actual `_task_started_ts` as `started_at` and an existing
   `queued_at`; terminal `ts` stays its own field; missing historical start facts stay
@@ -1024,21 +1029,15 @@ and what enforces each.
   `cost_ceiling_disclosure` its text uses; tool error manifests carry their typed code
   and redacted reason preview. Observation links, not new accounting or zero-price
   rules.
-- Acceptance evidence identity hashes source facts before history-dependent budgeting;
-  recording a review never changes the facts it reviewed. Complete applied host records
-  go through `review_projection.publish_acceptance_checkpoint` via the write-once
-  source handles before compact publication (copy-back, CURRENT-basis, same-store:
-  ARCHITECTURE §10 "Key Invariants"; the reader: §6 "Post-task reflection"). Artifact
-  registration keeps its short locked manifest merge — copy/hash before the lock, which
-  never takes a task-result lock. Review/completion sources live in
-  `source_handles/context_checkpoints`, outside deliverables and the acceptance
-  manifest; terminal references carry the task's chat id, zero included; a missing
-  source is disclosed, never rebuilt from a preview. Source/capacity, publication order
-  and paid identity are separate contracts; history or presentation changes mint no
-  work. Tests: delayed snapshots and child replicas through the central merge; the full
-  source downloads while the task still runs; the persisted consumer verified after the
-  real merge and child cleanup; an operation-scoped memo reuses verified work but never
-  caches failure or becomes a second store.
+- Hash source identity before history-dependent budgeting; review recording changes
+  no reviewed fact. `review_projection.publish_acceptance_checkpoint` retains full
+  runs before compact publication (ARCHITECTURE §10: ordering, CURRENT-basis copy-back,
+  same-store reuse; §6: readers). Copy/hash before the short artifact-manifest lock;
+  never take a result lock inside it. `source_handles/context_checkpoints` belongs to
+  neither deliverables nor acceptance manifests. Terminal refs keep explicit chat 0;
+  disclose missing sources, never reconstruct previews. Capacity, publication order
+  and paid identity stay separate. Test stale/child snapshots, live downloads and
+  persisted readers after merge/cleanup. Memos reuse verified work only, never failures.
 - Mirror a split root's actual execution start and child-drive binding into its
   canonical result through the existing terminal-preserving writer.
   Recover a legacy missing binding only from positive known-child start evidence

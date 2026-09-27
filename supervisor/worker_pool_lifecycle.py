@@ -62,6 +62,24 @@ def _serialized_worker_lifecycle(fn):
     return wrapped
 
 
+def _recorded_cancel_fields(task_id: str, *, stop_source: str = "", reason: str = "") -> dict:
+    """Keep the recorded intent's cause; only an absent intent permits a door fallback.
+
+    An unreadable authority supplies neither a recorded cause nor proof of absence.
+    """
+    try:
+        from ouroboros.cancel_intents import active_intent
+        from supervisor.cancel_publication import _intent_outcome_fields
+
+        intent = active_intent(_pool().DRIVE_ROOT, task_id, strict=True)
+        if intent:
+            return _intent_outcome_fields(intent)
+        return {"cancel_origin": {"source": stop_source, "reason": reason}} if stop_source else {}
+    except Exception:
+        log.warning("Stop cause of %s is unreadable; none recorded", task_id, exc_info=True)
+        return {}
+
+
 def _write_failure_result(
     task_id: str,
     reason: str = "Worker process crashed (crash storm). Task was not completed.",
@@ -79,8 +97,8 @@ def _write_failure_result(
     field a settled cancel intent records — and never outranks an earlier
     stop: an active intent for the task is the cause as recorded (an owner
     Stop stays a Stop), only a task no intent names takes the door's own
-    cause, and an unreadable intent store records none. Panic and a crash pass
-    no source, so their writes carry no cause.
+    cause, and an unreadable intent store records none. A cancelled result
+    without a door source still retains its recorded intent (including Panic).
     """
     if not task_id:
         return ""
@@ -98,18 +116,8 @@ def _write_failure_result(
         # Reconstruct from durable llm_usage so an abnormally-finalized task does
         # not record zero cost/rounds (understating per-task + campaign metrics).
         f_cost_fields = _pool().reconstruct_task_cost(str(task_id), fields=True)
-        cause: Dict[str, Any] = {}
-        if stop_source:
-            try:
-                from ouroboros.cancel_intents import active_intent
-                from supervisor.cancel_publication import _intent_outcome_fields
-
-                intent = active_intent(_pool().DRIVE_ROOT, str(task_id), strict=True)
-                origin = (_intent_outcome_fields(intent).get("cancel_origin") if intent
-                          else {"source": str(stop_source), "reason": str(reason or "")})
-                cause = {"cancel_origin": origin} if origin else {}
-            except Exception:
-                log.warning("Stop cause of %s is unreadable; none recorded", task_id, exc_info=True)
+        cause = (_recorded_cancel_fields(task_id, stop_source=stop_source, reason=reason)
+                 if stop_source or final_status == STATUS_CANCELLED else {})
         stored = write_task_result(
             _pool().DRIVE_ROOT,
             task_id,

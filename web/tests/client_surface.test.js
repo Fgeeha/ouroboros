@@ -30,11 +30,25 @@ test('snapshot measures raw observables at call time', async () => {
     assert.equal(snap.narrow_layout, true);
     assert.equal(snap.coarse_pointer, false);
     assert.ok(!Number.isNaN(Date.parse(snap.captured_at)), 'captured_at must be a parseable timestamp');
+    assert.equal(snap.timezone, Intl.DateTimeFormat().resolvedOptions().timeZone);
     assert.deepEqual(
         Object.keys(snap).sort(),
-        ['captured_at', 'coarse_pointer', 'narrow_layout', 'pywebview', 'ua', 'viewport'],
+        ['captured_at', 'coarse_pointer', 'narrow_layout', 'pywebview', 'timezone', 'ua', 'viewport'],
         'the wire shape is a closed set — a renamed/added key breaks the backend contract silently',
     );
+});
+
+test('a browser that cannot report its zone sends none', async () => {
+    mockWindow({});
+    const { clientSurfaceSnapshot } = await import('../modules/client_surface.js');
+    const original = Intl.DateTimeFormat;
+    Intl.DateTimeFormat = () => { throw new Error('no ICU'); };
+    try {
+        const snap = clientSurfaceSnapshot();
+        assert.ok(snap && !('timezone' in snap), 'absence stays absence, never a guessed zone');
+    } finally {
+        Intl.DateTimeFormat = original;
+    }
 });
 
 test('pywebview bridge presence flips the fact', async () => {

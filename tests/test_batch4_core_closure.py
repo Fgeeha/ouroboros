@@ -427,7 +427,7 @@ def test_fresh_owner_pause_and_zero_ledger_do_not_prove_legacy_dispatch(tmp_path
 
 
 def test_escaping_tool_exception_keeps_unknown_effects_after_owner_terminal(tmp_path, monkeypatch):
-    from ouroboros.owner_pause import tool_handoff
+    from ouroboros.owner_pause import start_tool_operation, tool_handoff
     from ouroboros.task_results import load_task_result, write_task_result
     from supervisor.continuation_admission import conflicting_writers
 
@@ -436,6 +436,7 @@ def test_escaping_tool_exception_keeps_unknown_effects_after_owner_terminal(tmp_
     source = SimpleNamespace(task_id="root", root_task_id="root", drive_root=tmp_path)
     with pytest.raises(TimeoutError):
         with tool_handoff(source, "external_write"):
+            start_tool_operation(source)
             raise TimeoutError("request sent, response unknown")
     claim = load_task_result(tmp_path, "root")["launch_handoffs"]
     assert claim
@@ -462,6 +463,8 @@ def test_pause_corpus_matches_actual_registry_producer(tmp_path):
 
 
 def test_unstarted_resume_never_reopens_a_replaced_owner_fence(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+
     from ouroboros import owner_pause
     from ouroboros.task_results import write_task_result
     from supervisor.owner_pause_control import request_owner_pause
@@ -472,16 +475,25 @@ def test_unstarted_resume_never_reopens_a_replaced_owner_fence(tmp_path, monkeyp
     write_task_result(tmp_path, "root", "scheduled", root_task_id="root")
     workers.PENDING.append(task)
     assert request_owner_pause("root", request_id="first")["ok"]
-    real_set = owner_pause.set_fence_state
+    real_lock = owner_pause.launch_lock
     installed = []
+    replacing = False
 
-    def replace_before_commit(*args, **kwargs):
-        real_set(*args, **kwargs)
-        newer, _ = owner_pause.install_fence(tmp_path, "root", request_id="newer")
-        installed.append(newer)
-        return real_set(*args, **kwargs)  # stale release must fail the actual compare-and-set
+    @contextmanager
+    def replace_before_claim(*args, **kwargs):
+        nonlocal replacing
+        if not replacing:
+            replacing = True
+            # A real replacement can win before the final lock, never inside
+            # it: install_fence also takes the process lock (non-reentrant).
+            with real_lock(*args, **kwargs):
+                owner_pause.release_fence(tmp_path, "root", reason="earlier owner Resume")
+            newer, _ = owner_pause.install_fence(tmp_path, "root", request_id="newer")
+            installed.append(newer)
+        with real_lock(*args, **kwargs):
+            yield
 
-    monkeypatch.setattr(owner_pause, "set_fence_state", replace_before_commit)
-    assert resume_budget_paused_task("root")["error"] == "owner_pause_fence_unwritable"
+    monkeypatch.setattr(owner_pause, "launch_lock", replace_before_claim)
+    assert resume_budget_paused_task("root")["error"] == "selection_authority_changed"
     assert owner_pause.read_fence(tmp_path, "root") == installed[0]
     assert "root" in queue.BUDGET_ROOT_FENCES

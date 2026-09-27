@@ -85,6 +85,16 @@ def test_system_prompt_carries_outcome_honesty_and_capability_acquisition():
     assert "FINAL ANSWER" not in " ".join(text.split())
     assert "## Capability Acquisition" in text
     assert "NOT a \"broad fallback or shim\"" in text
+    # #1323: the owner-approved generic opening, byte for byte, replaces the narrow
+    # "acquisition step, not a blocker" opening; the concrete dependency means stay.
+    section = text.split("## Capability Acquisition", 1)[1].split("\n## ", 1)[0]
+    assert section.strip().startswith(
+        "Before declaring a task blocked, establish what capability or resource is actually missing, "
+        "using evidence available within the task\u2019s scope. Distinguish unavailability from lack of "
+        "authority to use it. When an authorized means is available, use it; otherwise name the specific "
+        "blocker and the next action. Availability alone grants no permission.")
+    assert "not a blocker" not in section
+    assert "(`pip`/`uv`/`pip3`/`brew`/`apt`)" in section and "credential" not in section.lower()
 
 
 def test_public_publishing_still_requires_creator_permission():

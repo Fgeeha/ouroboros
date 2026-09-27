@@ -493,6 +493,43 @@ def focus_source_projection(
     return {**payload, **current, **({"reason": reason} if reason else {})}
 
 
+def review_source_reader(task_id: str, ref: Dict[str, Any]) -> Dict[str, Any]:
+    """A receiver-independent selector for one author's immutable acceptance source."""
+    return {"tool": "get_task_result", "arguments": {
+        "task_id": task_id, "review_source_sha256": str(ref.get("sha256") or "")}}
+
+
+def review_source_projection(drive_root: Any, task_id: str, digest: str,
+                             start_char: Any = None, end_char: Any = None) -> Dict[str, Any]:
+    """Read a physical author's exact acceptance source, including historical panels.
+
+    Only the host's digest-named acceptance sources qualify; there is no caller
+    path, successor substitution or arbitrary artifact-store search.
+    """
+    from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path, text_source_range_projection
+
+    unavailable = {"schema": 1, "kind": "task_review_source", "status": "unavailable"}
+    if len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest):
+        return {**unavailable, "reason": "source_ref_invalid"}
+    path = f"source_handles/context_checkpoints/acceptance-{digest}.json"
+    try:
+        stored = task_artifact_dir_path(drive_root, task_id) / path
+        ref = {"kind": "task_source", "root": "artifact_store", "path": path,
+               "size": stored.stat().st_size, "sha256": digest}
+        raw = read_actor_source_bytes(drive_root, task_id, ref)
+        panel = json.loads(raw)
+        request = panel.get("request") or {}
+        if panel.get("authority") != "host_root" or request.get("surface") != "task_acceptance" or request.get("task_id") != task_id:
+            raise ValueError("review source identity verification failed")
+        projection, reason = text_source_range_projection(raw.decode("utf-8"), unavailable["kind"], start_char, end_char)
+        return {**(projection or unavailable), "task_id": task_id, "source_ref": ref,
+                **({"reason": reason} if reason else {})}
+    except (ValueError, TypeError, AttributeError, UnicodeError):
+        return {**unavailable, "reason": "source_identity_mismatch"}
+    except (OSError, RuntimeError):
+        return {**unavailable, "reason": "source_unavailable"}
+
+
 def build_sealed_final_package(result_row: Any, final_text: str) -> Dict[str, Any]:
     """Seal recorded reply preparation and artifact facts, not delivery receipts.
 

@@ -1235,7 +1235,10 @@ def kill_workers(
         try:
             done_status = terminal_status or "failed"
             preserve_running = set(preserve_running_task_ids or ())
-            retention.park_saved_running_rows(RUNNING, PENDING, preserve_running, DRIVE_ROOT)
+            sleep_hold_reason = retention.saved_sleep_hold_reason(
+                DRIVE_ROOT, owner_restart=hold_never_started or stop_source == "owner_restart")
+            retention.park_saved_running_rows(RUNNING, PENDING, preserve_running, DRIVE_ROOT,
+                                             sleep_hold_reason=sleep_hold_reason)
             running_task_ids = set(RUNNING) - preserve_running
             interrupted_roots = {
                 str((meta.get("task") or {}).get("root_task_id") or task_id)
@@ -1381,7 +1384,7 @@ def kill_workers(
                 if preserve_pending and tid in preserve_running:
                     PENDING.append(task)
                     continue
-                if retention.retained_pending(task, hold_sleep=hold_never_started):
+                if retention.retained_pending(task, sleep_hold_reason=sleep_hold_reason):
                     retained_paused_ids.append(tid)
                     PENDING.append(task)
                     continue

@@ -20,6 +20,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from ouroboros.send_clock import CLOCK_NOTE_PREFIX
 from ouroboros import fallback_cooldown, loop, loop_llm_call, model_wait
 from ouroboros import llm_claudexor as transport
 from ouroboros import usage_accounting as ua
@@ -461,7 +462,8 @@ def test_owner_selected_account_rebinds_fallback_before_physical_send(main_call,
         "capacity-account-a", "capacity-account-b"]
     assert dispatched[-1]["physical_context"]["capacity_total_tokens"] == 240_000
     assert plan.route_fp == "capacity-account-b" and plan.window_tokens == 240_000
-    assert ctx.messages[-2:] == original[-2:]  # completed tools are not replayed
+    # completed tools are not replayed; the answered send's clock line follows them
+    assert ctx.messages[-3:-1] == original[-2:] and ctx.messages[-1]["content"].startswith(CLOCK_NOTE_PREFIX)
     assert len(gateway.accepted_operations) == 2
 
 

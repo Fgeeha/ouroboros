@@ -24,6 +24,7 @@ from typing import Any, Dict
 
 from ouroboros.task_results import validate_task_id
 from ouroboros.task_status import load_effective_task_result, observe_cancellation_target
+from ouroboros.tool_access_paths import canonical_data_root as _status_drive_root
 from ouroboros.task_tree_ledger import (
     CHILD_RESULT_DISPOSITIONS,
     CHILD_RESULT_DISPOSITION_TYPE,
@@ -389,11 +390,6 @@ def _record_child_decision_beacon(ctx: ToolContext, task_id: str, text: str) -> 
         log.debug("Failed to record child decision beacon for %s", task_id, exc_info=True)
 
 
-def _status_drive_root(ctx: ToolContext) -> Path:
-    metadata = getattr(ctx, "task_metadata", {}) if isinstance(getattr(ctx, "task_metadata", {}), dict) else {}
-    return Path(str(metadata.get("budget_drive_root") or getattr(ctx, "budget_drive_root", "") or ctx.drive_root))
-
-
 def _is_own_child(ctx: ToolContext, status_drive_root: Path, tid: str, *, root_tree: bool = False) -> bool:
     """True if ``tid`` is a DIRECT child of the CURRENT task (D#7 safety): a parent
     decision may only describe the caller's OWN children, never an unrelated parent's
@@ -655,7 +651,11 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
         tid = validate_task_id(task_id)
     except ValueError as exc:
         return f"⚠️ TOOL_ARG_ERROR (cancel_task): {exc}"
-    reason_text = _clip(" ".join(str(reason or "").split()), 500)
+    # The whole stated cause is the record: it rides the intent into custody,
+    # the settled ``cancel_origin`` and the receipt. The tree-ledger note and
+    # this reply only preview it, and ``_clip`` marks what they leave out.
+    reason_text = " ".join(str(reason or "").split())
+    reason_preview = _clip(reason_text, 500)
     status_drive_root = _status_drive_root(ctx)
     # Only stamp the join-ledger parent_decision (+ post to the tree ledger) when the
     # target is THIS task's own child — a cancel must not rewrite an unrelated task's
@@ -764,7 +764,7 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     if own:
         _record_child_decision_beacon(
             ctx, tid,
-            f"requested cancellation of child {tid}" + (f": {reason_text}" if reason_text else ""),
+            f"requested cancellation of child {tid}" + (f": {reason_preview}" if reason_preview else ""),
         )
     # Emit live so the supervisor processes the cancellation within one loop tick;
     # the durable intent survives a lost event (the supervisor watchdog re-feeds it).
@@ -781,7 +781,7 @@ def _cancel_task(ctx: ToolContext, task_id: str, reason: str = "") -> str:
     note = " (live)" if emitted == "live" else " (deferred to round end)"
     already = " (already requested earlier — idempotent)" if intent.get("already_requested") else ""
     return (
-        f"Cancel requested: {tid}{(' — ' + reason_text) if reason_text else ''}{note}{already}. "
+        f"Cancel requested: {tid}{(' — ' + reason_preview) if reason_preview else ''}{note}{already}. "
         "cancel_state=pending until the supervisor confirms teardown; a child that "
         "already finished keeps its completed result (use discard_child_result to drop it)." + observed_note
     )

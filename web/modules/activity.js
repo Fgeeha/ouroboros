@@ -32,6 +32,20 @@ function esc(value) {
 
 const getJson = (url) => fetchJson(url, { cache: 'no-store' });
 
+/** A stored UTC schedule instant for the owner: this viewer's local time, the exact
+ * UTC instant beside it (and in `datetime`/`title`). Records stay UTC; an unparseable
+ * value is shown raw rather than guessed. `timeZone` exists for tests only. */
+export function scheduleInstantHtml(value, { timeZone } = {}) {
+    const raw = String(value || '');
+    const parsed = new Date(raw);
+    if (!raw || Number.isNaN(parsed.getTime())) return esc(raw);
+    const fields = { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' };
+    const local = parsed.toLocaleString([], { ...fields, timeZone, timeZoneName: 'short' });
+    const utc = parsed.toLocaleString([], { ...fields, timeZone: 'UTC' });
+    const exact = parsed.toISOString().replace('.000Z', 'Z');
+    return `<time datetime="${esc(exact)}" title="${esc(exact)}">${esc(local)} (${esc(utc)} UTC)</time>`;
+}
+
 function isSkillManaged(s) {
     return Boolean(s && (String(s.source || '') === 'skill_manifest' || String(s.skill || '')));
 }
@@ -171,11 +185,12 @@ export function initActivity({ mount, ws } = {}) {
         const managed = isSkillManaged(s);
         const trigger = s.trigger || {};
         const once = String(trigger.type || 'cron') === 'once';
-        // One-shot rows have no cron: show the fire instant + a "one-shot" tag.
+        // One-shot rows have no cron: show the fire instant + a "one-shot" tag. A cron
+        // expression runs in its record's zone, or the server's when none is stored.
         const timing = once
-            ? `one-shot · at/after ${esc(trigger.run_at || '')}`
-            : esc(trigger.expr || s.cron || '');
-        const next = esc(s.next_run_at || '');
+            ? `one-shot · at/after ${scheduleInstantHtml(trigger.run_at)}`
+            : `${esc(trigger.expr || s.cron || '')} (${s.timezone ? esc(s.timezone) : 'server time zone'})`;
+        const next = s.next_run_at ? scheduleInstantHtml(s.next_run_at) : '';
         const status = scheduleStatus(s);
         const enabled = status === 'active';
         const consumed = status === 'consumed';

@@ -545,3 +545,33 @@ def test_predicted_route_downgrade_authority_is_absent():
     from ouroboros import loop
 
     assert not hasattr(loop, "_maybe_downgrade_max_unconfirmed")
+
+
+def test_an_empty_seed_is_a_blank_drive_not_a_blank_context():
+    """#1321: memory_mode=empty seeds nothing onto the child's own drive, yet the
+    child's context is still the canonical governance and shared memory -- the
+    schema says exactly that instead of "starts blank"."""
+    import json
+
+    from ouroboros.context import build_llm_messages
+    from ouroboros.headless import prepare_task_drive
+    from ouroboros.memory import Memory
+    from ouroboros.tools.control_subagent_spec import schedule_subagent_properties
+
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    env, canonical_memory = _make_env_and_memory(tmpdir)
+    canonical_memory.logs_path("chat.jsonl").write_text(
+        '{"chat_id": 1, "direction": "in", "text": "CANONICAL_SHARED_DIALOGUE"}\n', encoding="utf-8")
+    child = prepare_task_drive(env.drive_root, "emptychild1", "empty")
+    assert child is not None and not (child / "memory" / "identity.md").exists()
+    forked = prepare_task_drive(env.drive_root, "forkedchild1", "forked")
+    assert (forked / "memory" / "identity.md").read_text(encoding="utf-8") == "I am Ouroboros."
+    task = {"id": "emptychild1", "type": "task", "text": "verify", "parent_task_id": "root1",
+            "root_task_id": "root1", "delegation_role": "subagent", "memory_mode": "empty",
+            "drive_root": str(child), "budget_drive_root": str(env.drive_root)}
+    messages, _ = build_llm_messages(env=env, memory=Memory(child, repo_dir=env.repo_dir), task=task)
+    rendered = json.dumps(messages, ensure_ascii=False)
+    assert "I am Ouroboros." in rendered and "Principle 0: Agency" in rendered
+    description = schedule_subagent_properties()["memory_mode"]["description"]
+    assert "starts blank" not in description and "not a blank context" in description
+    assert "canonical governance" in description and "empty seeds that drive with nothing" in description

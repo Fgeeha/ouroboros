@@ -13,6 +13,7 @@ row.
 """
 
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -242,6 +243,51 @@ def test_child_and_off_acceptance_run_packet_rows_only(structured_env, tmp_path)
     assert calls == [["t_api"]]
 
 
+def _consume_acceptance_results(results):
+    from ouroboros.loop_tool_execution import process_tool_results
+
+    trace = {"tool_calls": [], "reasoning_notes": []}
+    process_tool_results([{
+        "fn_name": "task_acceptance_review", "tool_call_id": f"call-{index}", "result": result,
+        "is_error": False, "args_for_log": {}, "tool_args": {}, "result_meta": {"status": "ok"},
+    } for index, result in enumerate(results)], [], trace, emit_progress=lambda _msg, *, incident=None: None)
+    return trace
+
+
+def test_a_typed_predispatch_refusal_is_tool_evidence_not_a_degraded_review_run(structured_env, tmp_path):
+    """#1318: the child/off refusal the REAL tool returns reaches the ordinary
+    tool-result consumer; no reviewer ran, so it is recorded as this call's tool
+    result and never as a review run that alone degrades the review axis. A
+    dispatched run -- malformed, overflowed or degraded -- still counts."""
+    from ouroboros.outcomes import _objective_axis, _review_axis
+    from ouroboros.tools.review import _handle_task_acceptance_review
+
+    structured_env.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
+    structured_env.setenv(REVIEWER_SLOTS_ENV, json.dumps({**_TRIAD, "triad": _TRIAD["triad"][1:]}))
+    ctx = SimpleNamespace(drive_root=str(tmp_path), task_id="root", root_task_id="root",
+                          task_metadata={"root_task_id": "root"}, task_contract={})
+    refused = _handle_task_acceptance_review(ctx, claim="root done")
+    structured_env.setenv(REVIEWER_SLOTS_ENV, "{broken")
+    misconfigured = _handle_task_acceptance_review(ctx, claim="root done")
+    trace = _consume_acceptance_results([refused, misconfigured])
+    assert "review_runs" not in trace
+    assert [row["result"] for row in trace["tool_calls"]] == [refused, misconfigured]
+    review = _review_axis(trace)
+    assert review["status"] == "skipped" and review["run_count"] == 0
+    assert _objective_axis(review)["status"] != "degraded"
+
+    dispatched_malformed = {"request": {"surface": "task_acceptance"}, "actors": [{"status": "error"}],
+                            "parsed_findings": [], "aggregate_signal": ""}
+    overflowed = {"request": {"surface": "task_acceptance"}, "actors": [], "parsed_findings": [],
+                  "aggregate_signal": "DEGRADED", "degraded": True,
+                  "degraded_reasons": ["__immutable_core_overflow__"]}
+    # A status field alone is not a refusal when run evidence rides beside it.
+    evidenced = {"status": "not_dispatched", "aggregate_signal": "DEGRADED", "actors": [{"status": "not_dispatched"}]}
+    trace = _consume_acceptance_results([json.dumps(dispatched_malformed), json.dumps(overflowed), json.dumps(evidenced)])
+    assert len(trace["review_runs"]) == 3
+    assert _review_axis(trace)["status"] == "degraded"
+
+
 # ---------------------------------------------------------------------------
 # The retrieving work order (R1/R4/R5/R15/R23) and the route-aware gates.
 # ---------------------------------------------------------------------------
@@ -258,7 +304,7 @@ _ACCEPTANCE_PACKET = {
         "provenance": "host_attested", "criterion_id": "claim_1", "check": "pytest -q",
     }],
     "acceptance_obligations": [],
-    "artifacts": [{"name": "report/summary.md", "size": 10, "preview": "PREVIEW-BYTES-OF-THE-ARTIFACT"}],
+    "artifacts": [{"name": "report/summary.md", "size": 29, "preview": "PREVIEW-BYTES-OF-THE-ARTIFACT"}],
     "repo_diff": "diff --git a/x b/x",
     "tool_trajectory": [{"tool": "run_command", "status": "ok", "result": "TRAJECTORY-RESULT-3-passed"}],
     "reasoning_notes": "I believe the feature works.",
@@ -407,10 +453,23 @@ def _spy_admission(monkeypatch):
 
 
 def _roots(tmp_path):
+    from ouroboros.artifacts import task_artifact_dir_path
+    from ouroboros.outcome_receipt_store import append_verification_receipt
+    from ouroboros.utils import append_jsonl
+
     governance, workspace = tmp_path / "governance", tmp_path / "workspace"
     governance.mkdir(exist_ok=True)
     workspace.mkdir(exist_ok=True)
     (workspace / "greeting.txt").write_text("hello native reviewer\n", encoding="utf-8")
+    # The packet names actual producer sources, retained by the real coordinator
+    # before our offline native/session executor is allowed to dispatch.
+    artifact = task_artifact_dir_path(tmp_path, 'root-delivery', create=True) / 'report/summary.md'
+    artifact.parent.mkdir(exist_ok=True)
+    artifact.write_text(_ACCEPTANCE_PACKET['artifacts'][0]['preview'], encoding='utf-8')
+    for receipt in _ACCEPTANCE_PACKET['verification_receipts']:
+        assert append_verification_receipt(tmp_path, 'root-delivery', receipt)
+    for row in _ACCEPTANCE_PACKET['tool_trajectory']:
+        append_jsonl(tmp_path / 'logs/tools.jsonl', {'task_id': 'root-delivery', **row})
     return governance, workspace
 
 
@@ -462,7 +521,17 @@ def test_trap_retrieving_row_receipt_ref_resolves_against_the_full_packet(monkey
     assert "TRAJECTORY-RESULT-3-passed" not in order and "PREVIEW-BYTES" not in order  # tail withheld
     assert "verification_receipts[0]" in order and "RETRIEVAL POINTERS" in order and str(tmp_path) in order
     assert request.evidence["tool_trajectory"][0]["result"] == "TRAJECTORY-RESULT-3-passed"  # FULL dict intact
-    assert request.policy["native_data_root"] == str(tmp_path)
+    closure = request.policy['review_source_closure']
+    reader = Path(closure['read_root'])
+    assert request.policy['native_data_root'] == str(reader)
+    assert reader.is_relative_to(tmp_path / 'task_results/artifacts/root-delivery/source_handles/review_inputs')
+    retained = {row['name']: Path(row['retained_path']).read_text()
+                for row in closure['sources'] if row['status'] == 'retained'}
+    assert json.loads(retained['task-result'])['task_id'] == 'root-delivery'
+    assert retained['artifact:report/summary.md'] == _ACCEPTANCE_PACKET['artifacts'][0]['preview']
+    assert json.loads(retained['verification-receipts']) == _ACCEPTANCE_PACKET['verification_receipts'][0]
+    assert json.loads(retained['tool-trajectory'])[0]['result'] == 'TRAJECTORY-RESULT-3-passed'
+    assert str(reader) in order
     assert request.session_root == str(workspace)
     sent = json.dumps(llm.calls[0]["messages"])
     assert "RETRIEVAL POINTERS" in sent and "TRAJECTORY-RESULT-3-passed" not in sent
@@ -544,7 +613,9 @@ def test_partial_source_refusal_spares_retrieving_rows_and_core_overflow_refuses
     governance, workspace = _roots(tmp_path)
     llm = _EpisodeLLM(tmp_path, [{"content": json.dumps(_CLEAN_VERDICT)}])
     _real_panel(monkeypatch, llm)
-    partial = {**_ACCEPTANCE_PACKET, "__unresolved_partial_artifacts__": True}
+    partial = {**_ACCEPTANCE_PACKET, "__unresolved_partial_artifacts__": [{
+        'tool': 'run_command', 'status': 'source_unavailable',
+        'reason': 'fixture_packet_projection_unavailable', 'source_ref': {}}]}
     result = loop_mod._execute_task_acceptance_panel(_acceptance_ctx(
         tmp_path, evidence=partial, repo_dir=str(governance),
         workspace_root=str(workspace), workspace_mode="project"))

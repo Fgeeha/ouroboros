@@ -309,6 +309,8 @@ _OWNER_CLIENT_NOTE = (
 # builder below and the tests that monkeypatch these names address them on THIS
 # surface.
 from ouroboros.context_runtime_facts import (  # noqa: E402,F401 — re-exported public surface
+    _context_clock_note,
+    snapshot_labelled,
     _delegation_capability_fact,
     _project_room_fact,
     _queue_context_fact,
@@ -354,7 +356,7 @@ def _task_authority_projection(env: Any, task: Dict[str, Any]) -> Dict[str, Any]
     return projection
 
 
-def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, scheduled_tasks_digest_out: Optional[Dict[str, Any]] = None) -> str:
+def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, scheduled_tasks_digest_out: Optional[Dict[str, Any]] = None, captured_at: str = "") -> str:
     try:
         git_branch, git_sha = get_git_info(env.repo_dir)
     except Exception:
@@ -377,7 +379,8 @@ def build_runtime_section(env: Any, task: Dict[str, Any], *, ctx: Any = None, sc
         if is_consciousness_origin(task.get("metadata")):
             runtime_mode = effective_runtime_mode(str(runtime_mode or ""), task.get("metadata"))
     runtime_data = {
-        "utc_now": utc_now_iso(),
+        "context_captured_at": captured_at or utc_now_iso(),
+        "clock_note": _context_clock_note(task),
         "repo_dir": str(env.repo_dir),
         "drive_root": str(env.drive_root),
         "git_head": git_sha,
@@ -1174,6 +1177,7 @@ def _capture_context_core(
     ctx: Any,
 ) -> _ContextCore:
     """Read each context source once before producing route-specific views."""
+    captured_at = utc_now_iso()  # one capture instant for the runtime fact and every snapshot label
     base_prompt = safe_read(
         env.repo_path("prompts/SYSTEM.md"),
         fallback="You are Ouroboros. Your base prompt could not be loaded."
@@ -1289,8 +1293,8 @@ def _capture_context_core(
     if installed_skills:
         dynamic_parts.append(installed_skills)
     dynamic_parts.extend([
-        _drive_state_section(context_env),
-        build_runtime_section(env, task, ctx=ctx),
+        snapshot_labelled(_drive_state_section(context_env), captured_at),
+        build_runtime_section(env, task, ctx=ctx, captured_at=captured_at),
         (
             "## Task Contract Discipline\n\n"
             "For non-trivial work, state your success criteria early in your plan or reasoning, "
@@ -1352,14 +1356,13 @@ def _capture_context_core(
         # A child keeps its own process memory too (owner decision 2026-09-22):
         # its execution drive holds exactly its worker rows, progress is canonical.
         own_drive = memory if context_memory is not memory else None
-        dynamic_parts.extend(context_memory.recent_activity_sections(
-            str(task.get("id") or ""), own_drive=own_drive,
-        ))
+        recent = context_memory.recent_activity_sections(str(task.get("id") or ""), own_drive=own_drive)
     else:
-        dynamic_parts.extend(build_recent_sections(
+        recent = build_recent_sections(
             context_memory, env, task_id=task.get("id", ""), thread_chat_id=int(task.get("chat_id") or 0),
             project_id=_reflections_pid,
-        ))
+        )
+    dynamic_parts.extend(snapshot_labelled(section, captured_at) for section in recent)
     try:
         from ouroboros.presence_context import build_presence_context_section
 

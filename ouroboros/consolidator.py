@@ -507,7 +507,7 @@ def _merge_consolidation_usage(*usages: Dict[str, Any]) -> Dict[str, Any]:
     for key in ("prompt_tokens", "completion_tokens", "total_tokens", "cost"):
         values = [usage.get(key) for usage in usages]
         merged[key] = None if None in values else sum(values)
-    for key in ("ledger_attempt_ids", "_consolidation_errors"):
+    for key in ("ledger_attempt_ids", "_consolidation_errors", "_coverage"):
         merged[key] = [value for usage in usages for value in usage.get(key, [])]
     # The route that answered the LAST send of this unit, and only that one: a
     # physical usage carries provider/resolved_model, a merged one its forwarded

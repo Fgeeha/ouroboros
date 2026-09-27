@@ -1141,6 +1141,55 @@ def _full_session_text(gateway: Any, run_id: str, detail: Dict[str, Any]) -> str
         final_summary = detail.get("finalSummary")
         text = final_summary if isinstance(final_summary, str) else ""
     return text
+
+
+def session_identity_deltas(slot: Any, facts: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Disclose final-attempt identity versus the frozen request, also during pure collection."""
+    deltas = []
+    effective_routes = facts.get("effective_route_ids") or []
+    if not effective_routes:
+        deltas.append({
+            "kind": "capability_delta",
+            "requested": f"route {facts['route_id']} (pinned pool)",
+            "effective": "final-attempt route observation unavailable; pinned pool could not be verified",
+            "reason": "session_route_observation_unavailable",
+        })
+    elif facts["route_id"] and set(effective_routes) != {facts["route_id"]}:
+        # Belt over the pin: the request names exactly one eligible
+        # harness, so the engine's receipt disagreeing is drift that must
+        # surface loudly, never a quietly accepted substitute route.
+        deltas.append({
+            "kind": "capability_delta",
+            "requested": f"route {facts['route_id']} (pinned pool)",
+            "effective": "route(s) " + ", ".join(effective_routes),
+            "reason": "session_ran_off_pinned_route",
+        })
+    slot_model = str(slot.model or "")
+    session_target = str(getattr(slot, "session_target", "") or "")
+    from ouroboros.provider_models import normalize_model_identity
+    if session_target:
+        # Structured rows keep the opaque ``harness[=model]`` target in
+        # ``slot.model`` for row identity/display, while the daemon sees
+        # only the parsed model component. Compare like with like: the old
+        # full-spec-vs-model comparison invented a capability delta for
+        # every healthy pinned session row.
+        from ouroboros.subagents import parse_subagent_harness
+
+        parsed_target = parse_subagent_harness(session_target)
+        slot_model = str(getattr(parsed_target, "model", "") or "")
+    if (
+        slot_model and facts["model"]
+        and normalize_model_identity(slot_model) != normalize_model_identity(facts["model"])
+    ):
+        deltas.append({
+            "kind": "capability_delta",
+            "requested": f"model {slot_model}",
+            "effective": f"model {facts['model']}",
+            "reason": "session_route_resolves_its_own_model",
+        })
+    return deltas
+
+
 class AgentSessionReviewExecutor(ReviewSlotExecutor):
     """One pinned Claudexor run per reviewer slot.
 
@@ -1356,23 +1405,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 "reason": "schema_not_conformed_on_effective_route",
             })
         effective_routes = facts.get("effective_route_ids") or []
-        if not effective_routes:
-            self._deltas.append({
-                "kind": "capability_delta",
-                "requested": f"route {facts['route_id']} (pinned pool)",
-                "effective": "final-attempt route observation unavailable; pinned pool could not be verified",
-                "reason": "session_route_observation_unavailable",
-            })
-        elif set(effective_routes) != {facts["route_id"]}:
-            # Belt over the pin: the request names exactly one eligible
-            # harness, so the engine's receipt disagreeing is drift that must
-            # surface loudly, never a quietly accepted substitute route.
-            self._deltas.append({
-                "kind": "capability_delta",
-                "requested": f"route {facts['route_id']} (pinned pool)",
-                "effective": "route(s) " + ", ".join(effective_routes),
-                "reason": "session_ran_off_pinned_route",
-            })
+        self._deltas.extend(session_identity_deltas(slot, facts))
         spend, estimated = facts["spend"], facts["spend_estimated"]
         self._session_usage = {
             "provider": "claudexor",
@@ -1405,29 +1438,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "cost_disclosed_usd": spend,
             "cost_estimated": estimated,
         }
-        slot_model = str(slot.model or "")
-        session_target = str(getattr(slot, "session_target", "") or "")
-        from ouroboros.provider_models import normalize_model_identity
-        if session_target:
-            # Structured rows keep the opaque ``harness[=model]`` target in
-            # ``slot.model`` for row identity/display, while the daemon sees
-            # only the parsed model component. Compare like with like: the old
-            # full-spec-vs-model comparison invented a capability delta for
-            # every healthy pinned session row.
-            from ouroboros.subagents import parse_subagent_harness
-
-            parsed_target = parse_subagent_harness(session_target)
-            slot_model = str(getattr(parsed_target, "model", "") or "")
-        if (
-            slot_model and facts["model"]
-            and normalize_model_identity(slot_model) != normalize_model_identity(facts["model"])
-        ):
-            self._deltas.append({
-                "kind": "capability_delta",
-                "requested": f"model {slot_model}",
-                "effective": f"model {facts['model']}",
-                "reason": "session_route_resolves_its_own_model",
-            })
         # What the vendor harness READ, folded from the tool-call journal the
         # engine keeps under the run directory (`run_dir`, the only witness of a
         # session's reads there is): the same usage facts a native episode folds

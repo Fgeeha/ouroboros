@@ -33,6 +33,7 @@ from typing import Any
 from ouroboros.artifacts import read_actor_source_bytes, store_actor_source_bytes
 from ouroboros.owner_mailbox import OwnerMailboxPeek
 from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+from ouroboros.utils import utc_now_iso
 
 log = logging.getLogger(__name__)
 
@@ -204,6 +205,11 @@ def checkpoint_owner_wait(ctx: Any, messages: list, trace: dict, usage: dict,
                                 "sleep_started_at": float(getattr(ctx, "_model_sleep_started", 0) or time.time())}
                                if sleep else {}),
         "review_binding": review_binding,
+        # When THIS owner wait began: readers date the wait by it, never by the
+        # task's ``started_at`` below (which the lifetime clocks own). The whole
+        # row rides every later write, so a planned restart keeps the stamp. A
+        # review-bound park is dated by its review operation, not here.
+        **({} if review_binding else {"parked_at": utc_now_iso()}),
         "source_ref": source, "task_attempt": int(ctx.task_attempt or 1),
         "execution_drive_root": str(ctx.drive_root),
         "started_at": getattr(ctx, "task_started_at", None),

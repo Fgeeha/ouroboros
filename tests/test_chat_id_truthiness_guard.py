@@ -45,7 +45,7 @@ TRUTHY_ROUTE = re.compile(
 # (repo-relative path, exact stripped line) -> (occurrences, why it stays)
 ALLOWED = {
     ("supervisor/terminal_delivery.py", "if not chat_id:"): (
-        3,
+        2,
         "lineage_chat_id() answers with the task's OWN chat: a project-homed run "
         "gets its room, and 0 means the run was never homed. Delivering an "
         "unhomed answer into the hidden partition would add rows to the "

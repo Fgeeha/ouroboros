@@ -586,13 +586,16 @@ def _rebind_runtime_roots_between_tests():
 
 @pytest.fixture(autouse=True)
 def _reset_custody_memo_between_tests():
-    """The custody row memo is process-local and keyed by events-log path; a test
-    that rewrites its log in place (``write_text``) or reuses a path must never
-    inherit another test's consumed prefix (``delegate_custody_memo``)."""
+    """Isolate both custody caches: the row memo is keyed by events-log path,
+    while active custody is keyed only by run ID. Tests reuse both identities;
+    neither a consumed prefix nor a previous run's first-wins binding may leak."""
+    from ouroboros import delegate_custody
     from ouroboros.delegate_custody_memo import reset_custody_memo
 
+    delegate_custody._CUSTODY.clear()
     reset_custody_memo()
     yield
+    delegate_custody._CUSTODY.clear()
     reset_custody_memo()
 
 

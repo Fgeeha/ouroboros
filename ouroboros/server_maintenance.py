@@ -815,6 +815,9 @@ def _run_periodic_reconcile_sweep(marker: list, stop_event: Any = None, latch: A
         _periodic_zombie_reconcile(on_orphans_healed=on_orphans_healed, stop_event=stop_event)
         if _stop_requested(stop_event):
             return
+        from ouroboros.review_operation import collect_orphaned_operations_softly
+
+        collect_orphaned_operations_softly(DATA_DIR, stop=lambda: _stop_requested(stop_event))
         if _STARTUP_TEMP_SWEEP_OWED[0]:
             from ouroboros.utils import sweep_stale_temp_files
 

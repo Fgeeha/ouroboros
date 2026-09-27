@@ -9,11 +9,11 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | domain | name | modules | proposed |
 |---|---|---:|---:|
 | D01 | Agent core & main loop | 40 | 0 |
-| D02 | LLM client, routing & providers | 38 | 0 |
+| D02 | LLM client, routing & providers | 39 | 0 |
 | D03 | Context assembly, fit & compaction | 11 | 0 |
 | D04 | Tool execution: registry, access & typed results | 21 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 29 | 0 |
-| D06 | Review stack | 68 | 0 |
+| D06 | Review stack | 70 | 0 |
 | D07 | Delegation, subagents & Claudexor | 54 | 0 |
 | D08 | Supervisor: queue, workers, events & runtime control | 52 | 0 |
 | D09 | Cancellation, owner control & process custody | 13 | 0 |
@@ -28,7 +28,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **587** | **0** |
+| **total** | | **590** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -266,6 +266,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/request_wire_recovery.py`
 - `ouroboros/request_wire_resolution.py`
 - `ouroboros/route_spec.py`
+- `ouroboros/send_clock.py`
 - `ouroboros/transport_custody.py`
 - `ouroboros/vision_routing.py`
 
@@ -357,6 +358,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/review_execution.py`
 - `ouroboros/review_execution_projection.py`
 - `ouroboros/review_native_episode.py`
+- `ouroboros/review_operation.py`
 - `ouroboros/review_owner_custody.py`
 - `ouroboros/review_projection.py`
 - `ouroboros/review_records.py`
@@ -364,6 +366,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/review_session_reads.py`
 - `ouroboros/review_session_usage.py`
 - `ouroboros/review_slot_cancel.py`
+- `ouroboros/review_source_closure.py`
 - `ouroboros/review_state.py`
 - `ouroboros/review_state_custody.py`
 - `ouroboros/review_state_model.py`

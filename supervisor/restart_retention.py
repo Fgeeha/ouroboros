@@ -50,6 +50,25 @@ RETAIN_SLEEP = "saved_sleep"
 HOLD_SAVED_SLEEP_RECOVERY = "saved_sleep_recovery"
 
 
+def saved_sleep_hold_reason(result_root: Any, *, owner_restart: bool = False) -> str:
+    """Read the existing stop carriers; an ordinary recovery asserts no owner action.
+
+    Kill callers read this only after signalling workers. The explicit Restart
+    door also supplies its known intent, independent of a flag read.
+    """
+    from supervisor.events_budget import HOLD_OWNER_RESTART, HOLD_PANIC
+
+    state = pathlib.Path(result_root) / "state"
+    if owner_restart or (state / "owner_restart_no_resume.flag").exists():
+        return HOLD_OWNER_RESTART
+    try:
+        if (state / "panic_stop.flag").read_text(encoding="utf-8").strip() == "panic":
+            return HOLD_PANIC
+    except OSError:
+        pass
+    return HOLD_SAVED_SLEEP_RECOVERY
+
+
 def pause_retention(result_root: Any, task_id: str, attempt: Optional[int] = None) -> str:
     """Classify ``task_id``'s durable pause row for a stop (see module docstring)."""
     from ouroboros.budget_pause import (
@@ -286,7 +305,8 @@ def hold_after_stop(task: Dict[str, Any], drive_root: Any, reason: str) -> Dict[
 # signalled, so retention adds no prerequisite before a Panic's kill.
 
 def park_saved_running_rows(running: Dict[str, Any], pending: List[Dict[str, Any]],
-                            preserve: Iterable[str], drive_root: Any) -> List[str]:
+                            preserve: Iterable[str], drive_root: Any, *,
+                            sleep_hold_reason: str = HOLD_SAVED_SLEEP_RECOVERY) -> List[str]:
     """Move every RUNNING row whose pause is saved into PENDING under its marker.
 
     A checkpoint stored before its park event was handled leaves the row
@@ -301,7 +321,7 @@ def park_saved_running_rows(running: Dict[str, Any], pending: List[Dict[str, Any
         task = meta["task"]
         parked = park_saved_pause(task, int(meta.get("attempt") or task.get("_attempt") or 1),
                                   pathlib.Path(task.get("budget_drive_root") or drive_root),
-                                  pause_source="stopped_during_pausing")
+                                  pause_source="stopped_during_pausing", sleep_hold_reason=sleep_hold_reason)
         if parked is None:
             continue
         running.pop(task_id, None)
@@ -311,24 +331,28 @@ def park_saved_running_rows(running: Dict[str, Any], pending: List[Dict[str, Any
     return parked_ids
 
 
-def retained_pending(task: Dict[str, Any], *, hold_sleep: bool = False) -> bool:
+def retained_pending(task: Dict[str, Any], *, sleep_hold_reason: str = "") -> bool:
     """A queued saved pause (an unused grant is first returned to it) or an
     earlier owner-Restart hold: kept as the same queued task on every door.
-    ``hold_sleep`` (the owner's Restart) also holds a model's cold sleep: its
-    own readiness must not wake what the owner just restarted."""
+    A stop cause also holds cold sleeps and marker-less failed conversions;
+    their own readiness must not wake what the owner just stopped."""
     if isinstance(task.get("_budget_pause_resume"), dict):
         from supervisor.budget_resume import revoke_exact_budget_resume
 
         revoke_exact_budget_resume(task, "restart_before_dispatch")
     pause = task.get("_budget_pause")
     saved = isinstance(pause, dict) and pause.get("exact_continuation") is True
-    if saved and hold_sleep and pause.get("reason") == "sleep":
-        from supervisor import queue as q
-
-        hold_for_owner_restart(task, q.DRIVE_ROOT)
     from supervisor.events_budget import budget_hold_fact
 
-    return saved or isinstance(pause, dict) or budget_hold_fact(task) is not None
+    hold = budget_hold_fact(task)
+    if sleep_hold_reason and ((saved and pause.get("reason") == "sleep"
+                               and sleep_hold_reason != HOLD_SAVED_SLEEP_RECOVERY)
+                              or (hold or {}).get("reason") == HOLD_SAVED_SLEEP_RECOVERY):
+        from supervisor import queue as q
+
+        hold_after_stop(task, q.DRIVE_ROOT, sleep_hold_reason)
+    return saved or isinstance(pause, dict) or hold is not None
+
 
 
 def child_of_interrupted(task: Dict[str, Any], running_ids: Iterable[str], interrupted_roots: Iterable[str]) -> bool:

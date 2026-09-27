@@ -325,12 +325,11 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
     every other row needs a fresh snapshot.
     Returns ``(retained_rows, parked_rows, consumed_task_ids)``.
     """
-    owner_restart = (_queue().DRIVE_ROOT / "state" / "owner_restart_no_resume.flag").exists()
-    panic_flag = _queue().DRIVE_ROOT / "state" / "panic_stop.flag"
-    try:
-        panic = not owner_restart and panic_flag.read_text(encoding="utf-8").strip() == "panic"
-    except OSError:
-        panic = False
+    from supervisor.events_budget import HOLD_OWNER_RESTART, HOLD_PANIC
+    from supervisor.restart_retention import saved_sleep_hold_reason
+
+    sleep_hold_reason = saved_sleep_hold_reason(_queue().DRIVE_ROOT)
+    owner_restart, panic = sleep_hold_reason == HOLD_OWNER_RESTART, sleep_hold_reason == HOLD_PANIC
     from ouroboros.budget_pause import budget_pause_restore_refusal, budget_pause_row
     from ouroboros.owner_wait import restore_owner_wait_allowed
     from ouroboros.task_results import load_task_result
@@ -371,11 +370,8 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
             if stored.get(key) not in (None, ""):
                 record[key] = stored[key]
         direct_rows.append({"task": record, "attempt": attempt})
-    from supervisor.events_budget import HOLD_OWNER_RESTART, HOLD_PANIC
-    from supervisor.restart_retention import HOLD_SAVED_SLEEP_RECOVERY
-
     parked = _park_pausing_running_rows(list(running_rows) + direct_rows, snapshot_pending,
-        sleep_hold_reason=HOLD_OWNER_RESTART if owner_restart else HOLD_PANIC if panic else HOLD_SAVED_SLEEP_RECOVERY)
+        sleep_hold_reason=sleep_hold_reason)
     retained = []
     consumed: list = []
     for task in list(snapshot_pending) + parked:
@@ -395,7 +391,7 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
         elif task.get("_owner_wait_resume"):
             if restore_owner_wait_allowed(_queue().DRIVE_ROOT, task):
                 retained.append(task)
-        elif retained_pending(task):
+        elif retained_pending(task, sleep_hold_reason=sleep_hold_reason):
             retained.append(task)
         elif owner_restart and never_started(task):
             retained.append(hold_for_owner_restart(dict(task), _queue().DRIVE_ROOT))
