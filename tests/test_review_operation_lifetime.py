@@ -340,11 +340,28 @@ def _exited(pid, birth, within):
     from ouroboros.platform_layer import pid_is_alive, process_start_time
 
     deadline = time.monotonic() + within
-    while pid and birth and pid_is_alive(pid) and process_start_time(pid) == birth:
+    while pid and birth and pid_is_alive(pid):
+        observed_birth = process_start_time(pid)
+        if observed_birth and observed_birth != birth:
+            return True
         if time.monotonic() >= deadline:
             return False
         time.sleep(0.05)
     return True
+
+
+@pytest.mark.parametrize("alive,observed_birth,expected", [
+    (True, "", False),
+    (True, "original", False),
+    (True, "replacement", True),
+    (False, "", True),
+])
+def test_remote_exit_observation_does_not_turn_unknown_birth_into_death(monkeypatch, alive, observed_birth, expected):
+    from ouroboros import platform_layer
+
+    monkeypatch.setattr(platform_layer, "pid_is_alive", lambda _pid: alive)
+    monkeypatch.setattr(platform_layer, "process_start_time", lambda _pid: observed_birth)
+    assert _exited(123, "original", 0) is expected
 
 
 def _stop_remote(child, reader, executing):
