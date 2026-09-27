@@ -229,8 +229,10 @@ export function toolEvidenceView(fold = null) {
     // Frozen totals count model wait errors. Canonical evidence reports operation
     // outcomes; a bounded partial read discloses its gap instead of reviving waits.
     const partial = Boolean(fold?.coverage) && observed > 0 && observed < calls;
-    const errors = observed >= calls || partial ? live.filter(call => call.status === 'error').length + (fold?.legacy?.errors || 0)
-        : (Number.isInteger(host?.errors) ? host.errors : live.filter(call => call.status === 'error').length);
+    const outcomesKnown = observed >= calls && live.every(call => call.settlement);
+    const observedErrors = live.filter(call => call.status === 'error').length + (fold?.legacy?.errors || 0);
+    const errors = outcomesKnown || partial ? observedErrors
+        : Math.max(Number.isInteger(host?.errors) ? host.errors : 0, observedErrors);
     const liveCounts = new Map();
     for (const call of live) liveCounts.set(call.tool, (liveCounts.get(call.tool) || 0) + 1);
     const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;

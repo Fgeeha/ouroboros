@@ -105,6 +105,9 @@ def _merge_onto_current(existing: Dict[str, Any], incoming: Dict[str, Any]) -> D
     disk, so a full-record PUT built from a stale GET cannot roll back a
     concurrent scheduler tick or skill resync.
     """
+    from supervisor.schedule_occurrence import remember_claim_basis
+
+    remember_claim_basis(existing)
     trigger_changed = dict(existing.get("trigger") or {}) != dict(incoming.get("trigger") or {})
     timezone_changed = str(existing.get("timezone") or "") != str(incoming.get("timezone") or "")
     consumed = _is_consumed_once(existing)
@@ -259,6 +262,9 @@ def mutate_scheduled_task(action: str, schedule_id: str, *, reason: str,
                 return {"ok": False, "changed": False, "status": "not_found",
                         "schedule_id": wanted, "audit": "not_written"}
             before = dict(current)
+            from supervisor.schedule_occurrence import remember_claim_basis
+
+            remember_claim_basis(current)
             operation_id = uuid.uuid4().hex[:12]
             audit = {
                 "drive_root": root, "operation_id": operation_id, "actor": actor,
@@ -376,5 +382,4 @@ def remove_scheduled_task(schedule_id: str, *, drive_root: pathlib.Path | None =
         actor=str(actor or "").strip() or "host",
         reason=str(reason or "").strip() or "schedule_removed")
     return bool(outcome.get("changed"))
-
 

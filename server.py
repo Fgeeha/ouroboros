@@ -17,7 +17,7 @@ from typing import Any, Dict, Optional
 from starlette.applications import Starlette
 from starlette.routing import Route, Mount
 import uvicorn
-from ouroboros.server_control import (execute_panic_stop as _execute_panic_stop_impl,
+from ouroboros.server_control import (PanicIngress, execute_panic_stop as _execute_panic_stop_impl,
                                       restart_current_process as _restart_current_process_impl)
 from ouroboros.startup_historical_audit import audit as _historical_audit
 from ouroboros.server_auth import (
@@ -403,6 +403,8 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
         from supervisor.state import StateUnavailable, control_value
 
         st = ctx.load_state()
+        if getattr(bridge, "panic", None) is not None:
+            bridge.panic.observe_owner(st)
         ext_known, owner_ext_id = control_value(st, "owner_external_id")
         chat_known, owner_ext_chat_id = control_value(st, "owner_external_chat_id")
         ext_known = ext_known and chat_known
@@ -465,7 +467,9 @@ def _handle_bridge_update_batch(bridge, updates, offset: int, ctx: Any, cursor: 
                         bound["ok"] = True
 
                 try:
-                    ctx.update_state(_bind_external_owner)
+                    saved_owner = ctx.update_state(_bind_external_owner)
+                    if getattr(bridge, "panic", None) is not None:
+                        bridge.panic.observe_owner(saved_owner)
                 except StateUnavailable:
                     pass
                 reply("✅ Owner chat registered. Send the command again to execute it." if bound["ok"] else
@@ -652,6 +656,8 @@ def _run_supervisor(settings: dict) -> None:
         from supervisor.message_bus import LocalChatBridge, init as bus_init
 
         bridge = LocalChatBridge(settings)
+        bridge.panic = PanicIngress(_startup_owner_command("/panic"))
+        bridge.panic.observe_owner(load_state())
         bridge._broadcast_fn = broadcast_ws_sync
 
         from ouroboros.utils import set_log_sink
@@ -1171,11 +1177,16 @@ def _execute_panic_stop(consciousness, kill_workers_fn) -> None:
     )
 
 def _startup_owner_command(command: str):
-    """Bind only process verbs while the normal command consumer is absent."""
+    """Bind the emergency owner directly; startup Restart retains normal routing."""
     if command not in {"/panic", "/restart"}:
         return None
 
     def execute():
+        from supervisor import workers
+
+        if command == "/panic":
+            _execute_panic_stop(_consciousness, workers.kill_workers)
+            return
         # Onboarding may finish after HTTP admission. A newly live consumer
         # owns the ordinary command rather than two concurrent control paths.
         from supervisor.message_bus import try_get_bridge
@@ -1183,12 +1194,9 @@ def _startup_owner_command(command: str):
         if _supervisor_thread and _supervisor_thread.is_alive() and bridge is not None:
             bridge.ui_send(command, broadcast=False)
             return
-        from supervisor import state, workers, git_ops
+        from supervisor import state, git_ops
         from types import SimpleNamespace
         state.init(DATA_DIR)
-        if command == "/panic":
-            _execute_panic_stop(_consciousness, workers.kill_workers)
-            return
         branch_dev, branch_stable = _runtime_branch_defaults()
         git_ops.init(REPO_DIR, DATA_DIR, "", branch_dev, branch_stable)
         context = SimpleNamespace(safe_restart=git_ops.safe_restart,

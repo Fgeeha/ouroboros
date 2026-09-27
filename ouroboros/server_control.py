@@ -9,6 +9,47 @@ import sys
 from typing import Any
 
 
+class PanicIngress:
+    """One bridge generation's emergency door, independent of ordinary intake.
+
+    A positively observed external binding is immutable until owner Reset. Keep
+    that pair through state outages; never derive one from an unknown/empty slot.
+    Reset closes this generation before disk work. Readers already holding its
+    old cell cannot republish into the new, closed cell.
+    """
+
+    def __init__(self, stop=None):
+        self._stop = stop
+        self._owner = [True, None]
+
+    def observe_owner(self, state: dict) -> None:
+        from supervisor.state import control_value
+
+        cell = self._owner
+        if not cell[0] or cell[1] is not None or not isinstance(state, dict) or not state.get("initialization_id"):
+            return
+        user_known, user = control_value(state, "owner_external_id")
+        chat_known, chat = control_value(state, "owner_external_chat_id")
+        if user_known and chat_known and type(user) is int and type(chat) is int and user > 0 and chat > 0:
+            cell[1] = (user, chat)
+
+    def invalidate_owner(self) -> None:
+        self._owner = [False, None]
+
+    def request(self, text: str, *, source="web", user_id=0, chat_id=0) -> bool:
+        if self._stop is None or not str(text).strip().lower().startswith("/panic"):
+            return False
+        pair = self._owner[1]
+        if source != "web" and (pair is None or pair != (user_id, chat_id)):
+            return False
+        import threading
+
+        # Do not wait for the supervisor, the chat ingress lock, a fresh state
+        # read, or a shared executor slot. Existing emergency owners do the stop.
+        threading.Thread(target=self._stop, name="panic-ingress", daemon=True).start()
+        return True
+
+
 def restart_current_process(
     host: str,
     port: int,

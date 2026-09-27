@@ -141,6 +141,11 @@ async def api_reset(request: Request) -> JSONResponse:
     if lock_error is not None:
         return lock_error
     try:
+        from supervisor.message_bus import try_get_bridge
+
+        bridge = try_get_bridge()
+        if bridge is not None:
+            bridge.panic.invalidate_owner()
         deleted = []
         # Keep synchronization files until restart. Removing the directory that
         # contains the held managed-update lock would let a second updater enter.

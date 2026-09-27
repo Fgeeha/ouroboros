@@ -439,9 +439,9 @@ async def ws_endpoint(websocket: WebSocket) -> None:
                         )
                         accepting = asyncio.create_task(_accept_chat_after(websocket, accepting, accept))
                     else:
-                        # A command is a queue put only (no lock, no durable write). It is
-                        # admitted on receipt, never behind this socket's pending chat
-                        # acceptances: Panic and Restart ride it on the SPA's one socket.
+                        # The bridge requests Panic independently of supervisor intake;
+                        # other commands stay queue puts. Neither waits behind this
+                        # socket's pending durable chat acceptances.
                         bridge.ui_send(payload, broadcast=False)
                 except Exception:
                     await websocket.send_text(_initialization_notice())
