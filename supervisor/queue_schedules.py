@@ -844,13 +844,6 @@ def check_scheduled_tasks() -> None:
         for record in list(data.get("tasks") or []):
             if not isinstance(record, dict):
                 continue
-            if str(record.get("kind") or "task").strip().lower() != SCHEDULE_KIND_NOTIFY:
-                # Occurrence reconciliation may retire its token after dispatch
-                # even while that scheduled root is still running. Do not claim
-                # a later due cron point until the previous task has left the
-                # live queue; notify rows never enqueue a task.
-                if _schedule_running_or_queued(str(record.get("id") or ""), _queue().DRIVE_ROOT) is not False:
-                    continue
             if isinstance(record.get("occurrence"), dict):
                 # An occurrence in flight is decided from durable facts first — even on a
                 # disabled row: admission already happened, later changes are future-only.
@@ -965,6 +958,12 @@ def check_scheduled_tasks() -> None:
                 else:
                     record["next_run_at"] = successor.isoformat()
                 changed = True
+                continue
+            # Reconcile the previous occurrence even while its root runs: that
+            # retires the dispatched token and preserves its settlement facts.
+            # Only the NEW claim must wait for the old root to leave the queue.
+            if (record.get("last_task_id")
+                    and _schedule_running_or_queued(schedule_id, _queue().DRIVE_ROOT) is not False):
                 continue
             claims.append(occurrences.claim(record, due_at))
             changed = True

@@ -315,8 +315,8 @@ def test_dispatch_barrier_restore_and_settlement(q, monkeypatch):
 
 
 def test_running_cron_task_blocks_a_second_due_occurrence(q):
-    """The dispatch token can be retired before the task ends; the schedule-id
-    live check must still prevent an overlapping root on the next cron point."""
+    """Retire the dispatched token while live, but never claim the next point
+    until that scheduled root leaves the queue."""
     from supervisor import schedule_occurrence as occurrences
 
     _row(q, intent={"kind": "system_repo"}, cron=True)
@@ -335,7 +335,10 @@ def test_running_cron_task_blocks_a_second_due_occurrence(q):
         queue_schedules._write_scheduled_tasks(store, q.root)
         q.queue.check_scheduled_tasks()
         assert q.pending == []
-        assert _rows(q)["s1"]["occurrence"]["task_id"] == task["id"]
+        settled = _rows(q)["s1"]
+        assert "occurrence" not in settled
+        assert settled["last_task_id"] == task["id"]
+        assert settled["next_run_at"] == "2000-01-02T00:00:00+00:00"
     finally:
         q.queue.RUNNING.pop(task["id"], None)
 
