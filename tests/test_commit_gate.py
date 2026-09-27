@@ -1288,45 +1288,58 @@ def test_review_blocked_message_keeps_evidence_based_rebuttal_on_repeat():
     assert "retaining a justified rebuttal" in lowered
 
 
-def test_review_blocked_5plus_hint_suggests_split():
-    """v4.9.2: After 5+ attempts, hint suggests implementing the fix or splitting."""
+def test_review_blocked_later_attempts_keep_judgment_without_numeric_stop():
+    """Later attempts keep reassessment options as examples; no attempt number
+    or fix count turns them into a mandatory STOP or message format."""
     from ouroboros.tools.review import _build_critical_block_message
 
     class FakeCtx:
-        # v4.33.0 lowered the threshold from 5 to 3 — 5 still triggers but
-        # the phrasing changed from "report the blockage" to "send_user_message
-        # to escalate" which carries the same semantic weight.
         _review_iteration_count = 5
         _review_history = []
 
     msg = _build_critical_block_message(
         FakeCtx(), "test commit", ["tests_affected: missing tests"], [], ""
     )
-    lowered = msg.lower()
-    assert "split" in lowered, f"missing split-the-diff guidance: {msg!r}"
-    assert ("send_user_message" in lowered or "escalate" in lowered
-            or "report" in lowered), (
-        f"missing escalation guidance: {msg!r}"
-    )
+    lowered = " ".join(msg.lower().split())
+    assert "if attempts stop converging, reconsider the approach" in lowered
+    assert "split the diff" in lowered and "escalate" in lowered
+    for retired in ("circuit-breaker", "two concrete fixes", "stop retrying",
+                    "one subject line", "attempt 5+"):
+        assert retired not in lowered, retired
 
 
-def test_review_blocked_message_requires_reaudit_after_first_block():
-    """Blocked-review guidance should explicitly require a full-diff re-audit after the first block."""
+def test_review_blocked_retry_note_owes_outcome_not_procedure():
+    """From attempt 2 the note keeps every open finding and the unchanged review
+    state, defers paid/free retry to the gate's recorded eligibility, and leaves
+    inspection/grouping/order to the author."""
     from ouroboros.tools.review import _build_critical_block_message
+    from ouroboros.tools.review_prompt_text import REVIEW_REPAIR_JUDGMENT
 
     class FakeCtx:
         _review_iteration_count = 2
         _review_history = []
-        _last_review_critical_findings = [{"item": "code_quality"}]
+        _last_review_critical_findings = [
+            {"item": "code_quality"}, {"item": "tests_affected"}]
         _last_review_advisory_findings = []
 
     msg = _build_critical_block_message(
         FakeCtx(), "test commit", ["code_quality: review mismatch"], [], ""
     )
-    lowered = msg.lower()
-    assert "re-read the full diff" in lowered
-    assert "group obligations by root cause" in lowered
-    assert "rewrite the plan" in lowered
+    assert "REVIEW_BLOCKED (attempt 2)" in msg
+    note = msg.split("Before the next commit_reviewed:", 1)[1]
+    assert "  - Finding: code_quality" in note and "  - Finding: tests_affected" in note
+    assert REVIEW_REPAIR_JUDGMENT in note
+    lowered = " ".join(note.lower().split())
+    assert "recorded review state and the individual findings below stand" in lowered
+    assert "not rewrite them or the configured enforcement" in lowered
+    assert ("follows the gate's recorded replay eligibility, custody, budget and "
+            "cycle limit, not this note") in lowered
+    assert ("an eligible recorded verdict on an unchanged diff under the same review "
+            "contract is not re-reviewed without a genuinely new review_rebuttal") in lowered
+    for retired in ("do not call commit_reviewed", "addressed / rebutted / pending",
+                    "re-read the full diff", "group obligations by root cause",
+                    "rewrite the plan", "another paid review needs"):
+        assert retired not in lowered, retired
 
 
 def test_self_consistency_listed_as_critical_in_severity_rules():
