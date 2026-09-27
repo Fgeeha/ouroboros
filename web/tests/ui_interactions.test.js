@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import { bindTabStrip, renderTabStrip } from '../modules/page_header.js';
-import { bindDialogFocus, bindMenu, bindPopoverPosition } from '../modules/ui_interactions.js';
+import { bindDialogFocus, bindEnterSubmit, bindMenu, bindPopoverPosition } from '../modules/ui_interactions.js';
 
 // Small event/geometry double, following the existing DOM tests. Native Tab
 // traversal, hit testing and the real confirm markup are checked in the browser.
@@ -412,4 +412,61 @@ test('a resized page cannot make an offscreen input grant more popup height than
         assert.equal(popup.css.get('--ui-popup-top'), '8px');
     }
     binding.destroy();
+});
+
+function messageFieldFixture() {
+    const { node } = environment();
+    const field = node('textarea');
+    const send = node('button');
+    let sent = 0;
+    send.click = () => { sent += 1; };
+    const dispose = bindEnterSubmit(field, send);
+    const press = (init = {}) => field.emit('keydown', { key: 'Enter', ...init });
+    return { field, send, dispose, press, sent: () => sent };
+}
+
+test('a message field sends on Enter through its button; Shift+Enter keeps the line break', () => {
+    const { field, press, sent } = messageFieldFixture();
+    assert.equal(field.enterKeyHint, 'send', 'the touch keyboard labels the key Send');
+    assert.equal(press().defaultPrevented, true);
+    assert.equal(sent(), 1);
+    assert.equal(press({ shiftKey: true }).defaultPrevented, undefined, 'the native line break stays');
+    assert.equal(sent(), 1);
+    // The composer's existing chords keep sending.
+    for (const chord of ['ctrlKey', 'metaKey', 'altKey']) press({ [chord]: true });
+    assert.equal(sent(), 4);
+    assert.equal(field.emit('keydown', { key: 'a' }).defaultPrevented, undefined);
+    assert.equal(sent(), 4);
+});
+
+test('composition, a held key and an unavailable field or button send nothing', () => {
+    const { field, send, dispose, press, sent } = messageFieldFixture();
+    // Chromium/Firefox mark the composing keydown; WebKit ends the composition
+    // first and marks the committing Enter only with keyCode 229.
+    assert.equal(press({ isComposing: true }).defaultPrevented, undefined);
+    assert.equal(press({ keyCode: 229 }).defaultPrevented, undefined);
+    assert.equal(press({ repeat: true }).defaultPrevented, true, 'a held key adds no line breaks');
+    assert.equal(press({ defaultPrevented: true, preventDefault() {} }).defaultPrevented, true);
+    assert.equal(sent(), 0);
+    send.disabled = true;
+    assert.equal(press().defaultPrevented, true, 'an empty or pending message is not turned into a line');
+    send.disabled = false;
+    send.isConnected = false;
+    press();
+    send.isConnected = true;
+    assert.equal(sent(), 0);
+    for (const state of ['disabled', 'readOnly', 'isConnected']) {
+        const previous = field[state];
+        field[state] = state === 'isConnected' ? false : true;
+        assert.equal(press().defaultPrevented, undefined, state);
+        field[state] = previous;
+    }
+    assert.equal(sent(), 0);
+    press();
+    assert.equal(sent(), 1);
+    dispose();
+    assert.equal(field.listenerCount(), 0);
+    assert.equal(field.enterKeyHint, undefined);
+    press();
+    assert.equal(sent(), 1);
 });
