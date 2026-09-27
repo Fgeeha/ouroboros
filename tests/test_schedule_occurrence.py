@@ -294,7 +294,23 @@ def test_each_durable_boundary_failure_reconciles_to_the_same_occurrence(q, monk
 
 
 def test_dispatch_barrier_restore_and_settlement(q, monkeypatch):
+    import datetime
+
+    from supervisor import queue_schedules, schedule_time
     from supervisor import schedule_occurrence as occurrences
+
+    class TickTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 9, 27, 19, 2, 30, tzinfo=datetime.timezone.utc).astimezone(tz)
+
+    # These two ticks settle ONE occurrence, not a newly due cron minute. Freeze the
+    # scheduler's own ``datetime`` names, never the stdlib class: dateutil binds
+    # ``datetime`` at import, so a first import under the fake class keeps it for the
+    # rest of the worker and every later cron check fails its fromutc() type check.
+    clock = SimpleNamespace(datetime=TickTime, timezone=datetime.timezone, timedelta=datetime.timedelta)
+    for module in (queue_schedules, occurrences, schedule_time):
+        monkeypatch.setattr(module, "datetime", clock)
 
     _row(q, intent={"kind": "system_repo"}, cron=True)
     q.queue.check_scheduled_tasks()
@@ -380,7 +396,8 @@ def test_a_folderless_delegated_run_reads_but_never_writes_through_scratch(tmp_p
     ctx = ToolContext(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data", task_id="t", project_id="proj")
     ctx.task_metadata = {"resource_intent": {"kind": "explicit_none", "project_id": "proj"}}
     readonly, refusal = _mutation_authority(ctx, delegated_run_shape(False, "readonly"))
-    assert refusal is None and readonly["capture_mode"] == "none" and readonly["target_root"].endswith("task_drives/t")
+    assert refusal is None and readonly["capture_mode"] == "none"
+    assert pathlib.Path(readonly["target_root"]).parts[-2:] == ("task_drives", "t")  # native separators
     _, refused = _mutation_authority(ctx, delegated_run_shape(True, "workspace_write"))
     assert refused is not None and "workspace_not_active" in refused.text
 

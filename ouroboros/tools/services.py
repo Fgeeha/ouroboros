@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List
 
 from ouroboros.owner_pause import OwnerPauseRefused
-from ouroboros.tools.tool_result import launch_refusal_result, _publish_tool_result
+from ouroboros.tools.tool_result import launch_refusal_result
 from ouroboros.observability import redact_projection, write_blob
 from ouroboros.secret_masking import redact_known_values
 from ouroboros.platform_layer import (

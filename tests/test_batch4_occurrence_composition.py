@@ -14,7 +14,7 @@ pytestmark = pytest.mark.serial
 
 
 @pytest.mark.parametrize('fault', ['none', 'write', 'readback'])
-def test_actual_worker_put_follows_both_verified_dispatch_carriers(world, monkeypatch, fault):
+def test_actual_worker_put_follows_both_verified_dispatch_carriers(world, monkeypatch, fault):  # noqa: F811 - pytest fixture
     world, workers, sent = _assignment_world(world, monkeypatch)
     _, root, pending = world
     scheduled = register(world)
@@ -48,7 +48,7 @@ def test_actual_worker_put_follows_both_verified_dispatch_carriers(world, monkey
 
 
 @pytest.mark.parametrize('control', ['pause', 'stop', 'restart'])
-def test_control_accepted_during_off_lock_preparation_refuses_admission(world, monkeypatch, control):
+def test_control_accepted_during_off_lock_preparation_refuses_admission(world, monkeypatch, control):  # noqa: F811 - pytest fixture
     from ouroboros.owner_pause import install_fence
     from supervisor.followup_policy import record_restart
     _, root, pending = world
@@ -74,7 +74,7 @@ def test_control_accepted_during_off_lock_preparation_refuses_admission(world, m
 
 
 @pytest.mark.parametrize('evidence', ['none', 'possible', 'missing', 'foreign', 'snapshot_failure'])
-def test_resolved_fired_followup_rebinds_only_same_positively_unrun_receipt(world, monkeypatch, evidence):
+def test_resolved_fired_followup_rebinds_only_same_positively_unrun_receipt(world, monkeypatch, evidence):  # noqa: F811 - pytest fixture
     from supervisor.worker_assignment import _claim_worker_launch
     _, root, pending = world
     registered = register(world, 'independent')
@@ -127,7 +127,7 @@ def test_resolved_fired_followup_rebinds_only_same_positively_unrun_receipt(worl
 
 
 @pytest.mark.parametrize('owner_hold', [False, True])
-def test_saved_schedule_pause_retains_cap_and_unrelated_hold_across_stale_restart(world, monkeypatch, owner_hold):
+def test_saved_schedule_pause_retains_cap_and_unrelated_hold_across_stale_restart(world, monkeypatch, owner_hold):  # noqa: F811 - pytest fixture
     from supervisor.owner_pause_control import request_owner_pause
     from supervisor.queue_snapshot import _retain_snapshot_pending
     from supervisor.followup_policy import record_restart
@@ -163,7 +163,7 @@ def test_saved_schedule_pause_retains_cap_and_unrelated_hold_across_stale_restar
 
 
 @pytest.mark.parametrize('owner_hold', [False, True])
-def test_dispatched_schedule_exact_pause_is_not_ordinary_replay(world, monkeypatch, owner_hold):
+def test_dispatched_schedule_exact_pause_is_not_ordinary_replay(world, monkeypatch, owner_hold):  # noqa: F811 - pytest fixture
     from supervisor import state
     from supervisor.queue_snapshot import _retain_snapshot_pending
     from supervisor.worker_assignment import _claim_worker_launch

@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from tests.test_worker_crash_retry import _isolate_worker_crash_state, _reserved_job
+from tests.test_worker_crash_retry import _isolate_worker_crash_state, _reserved_job  # noqa: F401 - autouse isolation fixture
 
 pytestmark = pytest.mark.serial
 

@@ -7,7 +7,7 @@ import pytest
 
 from tests._budget_pause_exact_helpers import _install_queue
 from tests.test_batch4_repair_compositions import _running
-from tests.test_hurry_initial_lifecycle import pool, _enqueue_origin
+from tests.test_hurry_initial_lifecycle import pool, _enqueue_origin  # noqa: F401 - pytest fixture
 
 pytestmark = pytest.mark.serial
 
@@ -76,7 +76,7 @@ def test_ambiguous_command_error_retains_custody(tmp_path, monkeypatch, failure)
 
 
 @pytest.mark.parametrize('origin', ['review', 'evolution', 'assisted', 'restore'])
-def test_admitted_queued_root_pause_seeds_exact_lifecycle(pool, monkeypatch, origin):
+def test_admitted_queued_root_pause_seeds_exact_lifecycle(pool, monkeypatch, origin):  # noqa: F811 - pytest fixture
     from supervisor import queue
     from supervisor.owner_pause_control import request_owner_pause
     from ouroboros.task_results import load_task_result
@@ -204,7 +204,7 @@ def test_saved_pause_unreadable_tree_is_unknown_not_paused(tmp_path, monkeypatch
     assert availability == {'complete': False}
 
 
-def test_pause_seed_preserves_concurrent_terminal_and_refuses_unadmitted(pool, monkeypatch):
+def test_pause_seed_preserves_concurrent_terminal_and_refuses_unadmitted(pool, monkeypatch):  # noqa: F811 - pytest fixture
     from supervisor import queue
     from supervisor.owner_pause_control import request_owner_pause
     from ouroboros import task_results as results
@@ -262,7 +262,7 @@ def test_executor_and_script_preparation_refusals_close_real_handoff(tmp_path, m
     assert not list(workspace.glob('.ouroboros/tmp_scripts/script_*'))
 
 
-def test_control_seed_keeps_admitted_source_deadline_and_budget(pool):
+def test_control_seed_keeps_admitted_source_deadline_and_budget(pool):  # noqa: F811 - pytest fixture
     from supervisor import queue
     from supervisor.owner_pause_control import request_owner_pause
     from ouroboros.task_results import load_task_result

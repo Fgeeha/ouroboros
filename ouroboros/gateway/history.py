@@ -1029,6 +1029,8 @@ def _fold_task_bound_skill_reviews(combined: list[Dict[str, Any]]) -> list[Dict[
     replays Skill history and never claims an authoritative total beyond the
     references present in this Chat window.
     """
+    from ouroboros.review_execution_projection import normalize_review_executions
+
     groups: Dict[tuple[str, str, str], list[tuple[int, Dict[str, Any]]]] = {}
     for index, row in enumerate(combined):
         if row.get("is_progress") or str(row.get("system_type") or "") != "skill_review":
@@ -1073,7 +1075,7 @@ def _fold_task_bound_skill_reviews(combined: list[Dict[str, Any]]) -> list[Dict[
                 # terminal text is therefore the only useful attempt body.
                 "text": str(row.get("text") or ""),
                 "superseded": position < len(surviving_rows) - 1,
-                "executions": _review_executions(row.get("executions")),
+                "executions": normalize_review_executions(row.get("executions")),
                 **_history_identity(row),
             }
             for key in _SKILL_REVIEW_STRING_FIELDS:

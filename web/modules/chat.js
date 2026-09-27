@@ -45,6 +45,7 @@ import {
     taskControlBusy,
 } from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
+import { bindEnterSubmit } from './ui_interactions.js';
 import {
     captureLiveCardPhaseState,
     desiredLiveCardPhase,
@@ -3109,12 +3110,8 @@ export function createChatInstance({
 
     // Arrow wrappers avoid MouseEvent leaking into sendMessage(planMode).
     sendBtn.addEventListener('click', () => sendMessage(swarmArmed()));
+    bindEnterSubmit(input, sendBtn);
     input.addEventListener('keydown', (e) => {
-        if (e.key === 'Enter' && !e.shiftKey) {
-            e.preventDefault();
-            sendMessage(swarmArmed());
-            return;
-        }
         if (e.key === 'ArrowUp' && !e.shiftKey) {
             restoreInputHistory(-1);
         } else if (e.key === 'ArrowDown' && !e.shiftKey) {

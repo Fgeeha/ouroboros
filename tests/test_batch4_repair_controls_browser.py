@@ -5,7 +5,6 @@ then reloads the browser. It does not emulate Continue acknowledgements.
 """
 from functools import partial
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
-import json
 from pathlib import Path
 from threading import Thread
 

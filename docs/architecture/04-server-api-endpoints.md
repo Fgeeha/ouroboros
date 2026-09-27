@@ -42,7 +42,7 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | POST | `/api/marketplace/ouroboroshub/install` | `gateway.marketplace.api_ouroboroshub_install` (also the adopt transport: `{adopt: true, expected_content_hash}` replaces an external same-name occupant with the sha256-verified catalog payload; adopt forces `auto_review`, conflicts with `overwrite`, typed 400/409/502 codes ride the lifecycle payload) |
 | POST | `/api/marketplace/ouroboroshub/update/{name}` | `gateway.marketplace.api_ouroboroshub_update` |
 | POST | `/api/marketplace/ouroboroshub/uninstall/{name}` | `gateway.marketplace.api_ouroboroshub_uninstall` |
-| POST | `/api/marketplace/ouroboroshub/publication/{name}/clear` | `gateway.marketplace.api_ouroboroshub_clear_publication` (compares the displayed receipt and clears only local waiting state) |
+| POST | `/api/marketplace/ouroboroshub/publication/{name}/clear` | `gateway.marketplace.api_ouroboroshub_clear_publication` (compares the displayed receipt and forgets only that local record) |
 | GET | `/api/files/list` | `gateway.files.api_files_list` |
 | GET | `/api/files/read` | `gateway.files.api_files_read` |
 | GET | `/api/files/content` | `gateway.files.api_files_content` |

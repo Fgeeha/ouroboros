@@ -222,7 +222,7 @@ def budget_pause_fact(task, fences=None):
     pause = task.get("_budget_pause") if isinstance(task, dict) else None
     if isinstance(pause, dict):
         return pause
-    from supervisor.events_budget import BUDGET_HOLD_KEY, budget_fence_selected, budget_hold_fact
+    from supervisor.events_budget import budget_fence_selected, budget_hold_fact
 
     fence_map = _queue_module().BUDGET_ROOT_FENCES if fences is None else fences
     root_id = str((task or {}).get("root_task_id") or (task or {}).get("id") or "")

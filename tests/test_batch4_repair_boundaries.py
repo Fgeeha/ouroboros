@@ -1,7 +1,6 @@
 """Adversarial consumers at the Batch4 launch and sleep boundaries."""
 import asyncio
 import copy
-import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
 
@@ -224,7 +223,6 @@ def test_warm_restart_restores_after_failed_conversion(tmp_path, monkeypatch, di
 @pytest.mark.parametrize("invalid", ["source", "attempt", "quiz", "review", "stop"])
 def test_warm_retention_requires_current_sleep_proof(tmp_path, monkeypatch, invalid):
     from ouroboros import owner_wait, model_sleep
-    from ouroboros.task_results import load_task_result
     from supervisor.restart_retention import pause_retention
     _, _, workers = _install_queue(tmp_path, monkeypatch)
     _running(tmp_path, workers)
@@ -297,11 +295,11 @@ def test_cold_rechecks_a_child_claim_that_lands_after_initial_census(tmp_path, m
     assert not budget_pause.budget_pause_row(tmp_path, "root").get("source_ref")
 
 
-from tests.test_llm_claudexor import setup as model_setup
+from tests.test_llm_claudexor import setup as model_setup  # noqa: F401 - pytest fixture
 
 
 @pytest.mark.parametrize("prior_unknown", [False, True])
-def test_model_session_final_gate_preserves_prior_unknown(model_setup, monkeypatch, prior_unknown):
+def test_model_session_final_gate_preserves_prior_unknown(model_setup, monkeypatch, prior_unknown):  # noqa: F811 - pytest fixture
     from tests.test_llm_claudexor import MODEL, ledger
     from ouroboros import llm_claudexor
     from supervisor.owner_pause_control import request_owner_pause

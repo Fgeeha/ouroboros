@@ -2,14 +2,13 @@
 from __future__ import annotations
 
 import copy
-import json
 from types import SimpleNamespace
 
 import pytest
 
 from ouroboros.cancel_intents import request_cancel, settle_intent, active_intent
 from ouroboros.task_results import write_task_result, load_task_result
-from ouroboros.tools.followup import _handle_schedule_followup, _manage_schedules
+from ouroboros.tools.followup import _handle_schedule_followup
 from ouroboros.usage_admission import task_billing_fields
 from supervisor import queue, queue_schedules as schedules
 from supervisor.followup_policy import observed_store, record_restart

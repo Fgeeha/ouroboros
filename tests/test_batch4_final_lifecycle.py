@@ -104,7 +104,10 @@ def test_malformed_member_sleep_authority_is_typed_and_not_owner_intent(tmp_path
     registry._ctx.task_id, registry._ctx.root_task_id = "child", "root"
     result = registry.execute_result("knowledge_list", {})
     assert result.meta["control_reason"] == "model_sleep_authority_unreadable"
-    assert "model sleep authority could not be read" in result.text
+    # Pause and sleep share one unreadable-authority refusal: the typed reason names the
+    # sleep authority, and the text never attributes the refusal to an owner Pause.
+    assert "authority could not be read" in result.text
+    assert "(model_sleep_authority_unreadable)" in result.text and "the owner paused" not in result.text
     assert not owner_pause.read_fence(tmp_path, "root") and path.read_text() == "{malformed"
 
 

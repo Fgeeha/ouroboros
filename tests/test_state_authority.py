@@ -431,6 +431,51 @@ def test_a_file_where_the_state_directory_belongs_is_unknown_not_absent(root):
     assert state_initialization.supervisor_evidence(root)[0] == "unknown"
 
 
+def _windows_shaped_not_found(monkeypatch):
+    """Where POSIX raises ENOTDIR because a PARENT component is a file, Windows raises
+    ERROR_PATH_NOT_FOUND: the same FileNotFoundError as a missing parent. Only the readers'
+    own operation errors are reshaped; the absence proof's ``os.stat`` stays real."""
+    def reshaped(real):
+        def call(path, *args, **kwargs):
+            try:
+                return real(path, *args, **kwargs)
+            except NotADirectoryError as exc:
+                if os.path.isdir(os.path.dirname(os.fspath(path))):
+                    raise  # the path itself is the file: Windows says ENOTDIR too (WinError 267)
+                raise FileNotFoundError(errno.ENOENT, "[WinError 3] path not found", os.fspath(path)) from exc
+        return call
+
+    monkeypatch.setattr(pathlib.Path, "read_bytes", reshaped(pathlib.Path.read_bytes))
+    monkeypatch.setattr(pathlib.Path, "lstat", reshaped(pathlib.Path.lstat))
+    monkeypatch.setattr(os, "lstat", reshaped(os.lstat))
+    monkeypatch.setattr(os, "scandir", reshaped(os.scandir))
+
+
+@pytest.mark.parametrize("errors", ["native", "windows"])
+def test_only_a_directory_ancestor_proves_the_state_absent(root, monkeypatch, errors):
+    import shutil
+
+    if errors == "windows":
+        _windows_shaped_not_found(monkeypatch)
+    shutil.rmtree(root / "state", ignore_errors=True)
+    (root / "state").write_text("not a directory", encoding="utf-8")
+    assert state.read_state_copy(state.STATE_PATH)[0] == "unreadable"
+    assert state_initialization.read_witness(root)[0] == "unreadable"
+    assert state_initialization.supervisor_evidence(root)[0] == "unknown"
+    assert state.init_state().quality == "unavailable"
+    assert (root / "state").read_bytes() == b"not a directory"  # nothing minted over it
+    (root / "state").unlink()  # truly absent below a real directory: a first boot
+    assert state.read_state_copy(state.STATE_PATH)[0] == "missing"
+    assert state_initialization.supervisor_evidence(root) == ("none", "")
+    assert state.init_state().quality == "current" == state.read_state().quality
+    assert state_initialization.read_witness(root)[1]["phase"] == "complete"
+    shutil.rmtree(root / "state")
+    real_stat = os.stat
+    monkeypatch.setattr(os, "stat", lambda path, *a, **k: (_ for _ in ()).throw(PermissionError(
+        errno.EACCES, "denied")) if pathlib.Path(path) == root / "state" else real_stat(path, *a, **k))
+    assert state.read_state_copy(state.STATE_PATH)[0] == "unreadable"  # an unexaminable ancestor is unknown
+
+
 def test_a_first_state_whose_witness_cannot_complete_admits_nothing_this_boot(root, monkeypatch):
     real_complete = state_initialization.complete
     monkeypatch.setattr(state_initialization, "complete", lambda *a, **k: False)

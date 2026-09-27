@@ -281,8 +281,6 @@ def _pending_followups(records: List[Dict[str, Any]], task_id: str) -> List[Dict
             continue
         if str(record.get("source") or "") != FOLLOWUP_SOURCE:
             continue
-        template = record.get("task") if isinstance(record.get("task"), dict) else {}
-        metadata = template.get("metadata") if isinstance(template.get("metadata"), dict) else {}
         from supervisor.followup_policy import origin_of
         if origin_of(record).get("task_id") == task_id:
             out.append(record)

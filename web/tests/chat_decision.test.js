@@ -477,6 +477,69 @@ test('an over-long answer is refused client-side, not truncated', async () => {
     } finally { fx.restore(); }
 });
 
+const pressEnter = (field, init = {}) => {
+    const event = { key: 'Enter', preventDefault() { event.defaultPrevented = true; }, ...init };
+    field.listeners.get('keydown')(event);
+    return event;
+};
+
+test('Enter sends an optionless answer through Send; Shift+Enter, composition and an empty field do not', async () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard({ ...WS_MSG, options: [] });
+        const { field } = commentParts(card);
+        assert.equal(field.enterKeyHint, 'send');
+        assert.equal(pressEnter(field).defaultPrevented, true, 'an empty answer neither sends nor becomes a line');
+        field.value = 'Friday';
+        field.listeners.get('input')();
+        assert.equal(pressEnter(field, { shiftKey: true }).defaultPrevented, undefined, 'Shift+Enter is the line break');
+        field.value = 'Friday\nand say it is provisional';
+        field.listeners.get('input')();
+        assert.equal(pressEnter(field, { isComposing: true }).defaultPrevented, undefined);
+        assert.equal(pressEnter(field, { keyCode: 229 }).defaultPrevented, undefined, 'WebKit commits IME this way');
+        await turn();
+        assert.equal(fx.calls.length, 0);
+        pressEnter(field);
+        await turn();
+        const body = JSON.parse(fx.calls[0].init.body);
+        assert.deepEqual([fx.calls.length, body.comment, 'option_index' in body], [1, 'Friday\nand say it is provisional', false]);
+        assert.equal(card.dataset.state, 'answered');
+        assert.equal(card.querySelector('.chat-quiz-comment-box'), null);
+        assert.equal(pressEnter(field).defaultPrevented, undefined, 'the settled card takes no key');
+        await turn();
+        assert.equal(fx.calls.length, 1);
+    } finally { fx.restore(); }
+});
+
+test('held Enter and an Enter/click race record one answer; a refusal keeps the draft for the same retry', async () => {
+    const replies = [];
+    const fx = fixture({ fetchImpl: () => new Promise((resolve) => replies.push(resolve)) });
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const { field, send } = commentParts(card);
+        field.value = 'wait for CI, then merge';
+        field.listeners.get('input')();
+        pressEnter(field);
+        assert.equal(pressEnter(field, { repeat: true }).defaultPrevented, true);
+        pressEnter(field);
+        send.click();
+        await turn();
+        assert.equal(fx.calls.length, 1, "the card's pending answer is the one gate");
+        replies.shift()({ ok: false, status: 503, json: async () => ({}) });
+        await turn();
+        assert.deepEqual([card.dataset.state, fx.toasts.at(-1).text], ['open', 'Could not record the answer (503).']);
+        assert.equal(card.querySelector('.chat-quiz-comment'), field);
+        assert.equal(field.value, 'wait for CI, then merge', 'the draft survives the refusal');
+        pressEnter(field);
+        await turn();
+        const [first, retry] = fx.calls.map((call) => JSON.parse(call.init.body));
+        assert.deepEqual([fx.calls.length, retry.request_id], [2, first.request_id], 'the retry replays the same request');
+        replies.shift()({ ok: true, status: 200, json: async () => ({ ok: true, state: 'answered', comment: retry.comment }) });
+        await turn();
+        assert.equal(card.dataset.state, 'answered');
+    } finally { fx.restore(); }
+});
+
 test('a settled replayed card shows the owner answer and offers no field', () => {
     const fx = fixture();
     try {

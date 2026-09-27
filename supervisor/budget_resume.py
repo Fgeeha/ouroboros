@@ -88,7 +88,7 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
     """
     from ouroboros.budget_pause import (
         LIVE_PAUSE_STATES, STATE_PAUSED, STATE_RESUME_GRANTED,
-        exact_pause_marker, observe_task_runs, set_budget_pause,
+        exact_pause_marker, set_budget_pause,
     )
     from ouroboros.cancel_intents import has_active_intent
     from ouroboros.config import get_task_abs_ceiling_sec

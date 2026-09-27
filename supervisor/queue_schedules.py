@@ -11,7 +11,6 @@ reader are both here.
 from __future__ import annotations
 
 import contextlib
-import copy
 import datetime
 import json
 import logging
@@ -23,7 +22,6 @@ import uuid
 from typing import Any, Dict, List
 from ouroboros.consciousness_authority import apply_consciousness_authority
 from ouroboros.contracts.task_contract import build_task_contract, normalize_allowed_resources
-from ouroboros.deadline_utils import parse_deadline_ts
 from ouroboros.dialogue_provenance import presence_metadata_binding
 from ouroboros.schedule_contract import RESERVED_TEMPLATE_FIELDS, schedule_slug
 from ouroboros.skill_loader import skill_identity_collision_names
@@ -215,13 +213,16 @@ def load_schedule_store(drive_root: pathlib.Path | None = None) -> Dict[str, Any
     filtered list back, which is how a mutation about ONE schedule silently
     dropped another.
     """
+    from supervisor.state_initialization import confirm_absent
+
     path = _scheduled_tasks_path(drive_root)
     try:
-        # lstat, not exists(): a dangling symlink at the table's path IS present,
-        # and calling it an absent store would let the next write follow it.
-        path.lstat()
-    except FileNotFoundError:
-        return {"schema_version": 1, "tasks": []}
+        # lstat, not exists(): a dangling symlink at the table's path IS present.
+        try:
+            path.lstat()
+        except FileNotFoundError:
+            confirm_absent(path)
+            return {"schema_version": 1, "tasks": []}
     except OSError as exc:
         raise ScheduleStoreUnreadable(
             f"{path} cannot be examined ({exc}); it is not a readable schedule "

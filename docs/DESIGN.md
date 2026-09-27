@@ -183,6 +183,16 @@ a menu moves focus among actions, a chooser keeps it in the input. Dialog
 focus stays in the modal context and returns on close when the caller remains
 available. Popups sit outside decorative clipping and fit the usable viewport.
 
+A **message field** — the Main and Project composer, a question's own answer —
+sends with Enter. The key presses that field's own Send action, so the action's
+validation, disabled and pending state decide what is sent, and a message is
+sent once. Shift+Enter inserts a line break; Ctrl, Cmd or Alt with Enter send
+like Enter. An Enter that commits an input-method composition sends nothing, a
+held Enter sends once, and an empty, disabled, read-only or settled field sends
+nothing; a rejected answer keeps its draft. The field requests a Send label
+from touch keyboards; native keyboard support varies. Every other multiline field — file editors, JSON, settings and
+widget forms — keeps Enter as a line break.
+
 ### `.muted`
 
 `.muted` is a **colour-only utility**: `color: var(--text-meta)`, nothing else.
@@ -257,6 +267,12 @@ one disclosure rather than padding the standing list or disappearing: history
 the owner can still open, read and act on. A suppressed skill row keeps Restore
 so the owner can ask for it back; a consumed one keeps only Delete, because
 offering Enable on a schedule that cannot fire again would be a lie.
+
+A record of what the owner did earlier is history, not status. A skill's
+OuroborosHub submission (the version it sent and its PR link) lives in the
+card's details disclosure without a tone; it never claims the PR merged, never
+gates or replaces the card's current action, and forgetting it is an explicit
+local choice rather than the way to unlock one.
 
 A task-bound `Reviews` history row may be the only retained fact for its owner.
 That row keeps a neutral owner anchor visible, but hides task status and typing
@@ -684,11 +700,13 @@ answer keep both forms readable. Anatomy, top to bottom:
    (`MAX_QUIZ_OPTIONS`); with none, the free answer is the whole answer.
 5. **Free answer** — while the card is open, a compact always-visible field
    (`Your answer or comment…`) with a `Send my answer` button, enabled only
-   once something is typed. No option ever has to be the least wrong one: the
-   text rides with an option click as the owner's remark, or goes alone as the
-   owner's own answer. It uses the card's own ink and surface tokens (never
-   the legacy chat input), is capped by the shared Python↔JS constant
-   (`MAX_DECISION_COMMENT`), and disappears the moment the card settles.
+   once something is typed; it is a message field, so Enter sends and
+   Shift+Enter breaks the line (§3 "Controls and editable choices"). No option
+   ever has to be the least wrong one: the text rides with an option click as
+   the owner's remark, or goes alone as the owner's own answer. It uses the
+   card's own ink and surface tokens (never the legacy chat input), is capped
+   by the shared Python↔JS constant (`MAX_DECISION_COMMENT`), and disappears
+   the moment the card settles.
    A settled card instead carries what the owner said as a second primary
    line (`Owner's answer: …`, `--type-body`, `--text-primary`) under the
    options — beside the highlighted option when one was chosen, and as the

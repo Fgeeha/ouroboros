@@ -1,6 +1,5 @@
 """Whole-consumer regressions for Pause, Restart and model sleep custody."""
 import asyncio
-import copy
 import time
 from types import SimpleNamespace
 

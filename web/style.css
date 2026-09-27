@@ -4973,6 +4973,13 @@ textarea.chat-input::placeholder { color: var(--text-muted); }
     line-height: var(--line-meta);
 }
 
+/* A hub card's submission history is the Skills card detail disclosure,
+   spanning the card rather than sitting beside other secondary actions. */
+.marketplace-secondary-actions > .skills-details {
+    flex: 1 1 100%;
+    min-width: 0;
+}
+
 .marketplace-pagination {
     display: flex;
     align-items: center;

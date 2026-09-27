@@ -193,7 +193,6 @@ def _successor_task(q: Any, predecessor: str, result: Dict[str, Any], binding: D
                     verdict: Dict[str, Any], sources: Dict[str, Any], admission: Dict[str, Any]) -> Dict[str, Any]:
     from ouroboros.owner_continue import owner_corpus_rows, work_order_text
 
-    metadata = result.get("metadata") if isinstance(result.get("metadata"), dict) else {}
     deadline_at = str(binding.get("deadline_at") or "")
     text = work_order_text(predecessor, verdict["cause"], sources, deadline_at=deadline_at)
     title = str(result.get("title") or result.get("suggested_name") or result.get("objective") or predecessor)[:80]

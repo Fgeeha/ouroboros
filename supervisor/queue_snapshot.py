@@ -337,7 +337,7 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
     from ouroboros.task_results import load_task_result
     from supervisor.budget_resume import revoke_exact_budget_resume
     from supervisor.events_budget import HOLD_RESTORE_REFUSED_PREFIX, hold_restored_budget_pause
-    from supervisor.restart_retention import hold_for_owner_restart, never_started, restart_held, retained_pending
+    from supervisor.restart_retention import hold_for_owner_restart, never_started, retained_pending
     from supervisor.schedule_occurrence import restore_allowed
 
     for task in snapshot_pending:

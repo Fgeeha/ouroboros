@@ -10,7 +10,6 @@ directly — never the fence predicate alone.
 from __future__ import annotations
 
 import json
-import pathlib
 from types import SimpleNamespace
 
 import pytest
@@ -300,7 +299,7 @@ def test_an_owner_paused_tree_survives_restart_as_itself(tmp_path, monkeypatch):
     """A Restart keeps the saved member and the latch's cause: the next boot's
     model sends are gated by the owner fence, never refused as a MONEY latch
     (which would turn the owner's Pause into a budget pause)."""
-    from ouroboros import budget_pause, owner_pause
+    from ouroboros import owner_pause
     from ouroboros.usage_accounting import AttemptRequest, UsageScope, reserve_attempt, usage_scope
     from supervisor.owner_pause_control import request_owner_pause
 
