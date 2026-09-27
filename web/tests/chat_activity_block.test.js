@@ -8,6 +8,7 @@
 // block leaves with its wait and its resolved episode cannot reopen it; the
 // header keeps the census verdict beside a block.
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test, { after } from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
 import {
@@ -60,14 +61,14 @@ Object.defineProperty(ElementStub.prototype, 'innerHTML', {
 const TS = '2026-09-15T12:00:00Z';
 const TASK = 'turn-a';
 
-function fixture(history = []) {
+function fixture(history = [], detail = { active_direct_turns: [] }) {
     let historyReads = 0;
     const env = installDom(async (url) => {
         const isHistory = String(url).startsWith('/api/chat/history');
         if (isHistory) historyReads++;
         return { ok: true, json: async () => isHistory
             ? { messages: history, window: { complete: true } }
-            : { active_direct_turns: [] } };
+            : detail };
     });
     const handlers = new Map();
     let generation = 0;
@@ -924,5 +925,55 @@ test('replayed tool evidence on a latest accounting-wait checkpoint row still re
         const rows = f.rows().map(row => row.innerHTML).join(' ');
         assert.match(rows, /Waiting for accounting access/);
         assert.match(rows, /1 tool call/);
+    } finally { f.close(); }
+});
+
+for (const kind of ['review', 'model-wait', 'model-wait-outcome', 'nested-review', 'lifecycle']) test(`reference carriers retain invocation evidence: ${kind}`, async () => {
+    const base = { key: `tool:${TASK}:before-review`, tool: 'read_file', receipt: false, live: false };
+    const produced = process.env.OURO_TEST_TOOL_HISTORY;
+    const history = produced ? JSON.parse(readFileSync(produced, 'utf8')).messages : [
+        { task_id: TASK, role: 'assistant', is_progress: true, content: 'Reading the file', ts: TS, chat_id: 1 },
+        { task_id: TASK, role: 'system', is_progress: true, system_type: 'review_reference',
+            surface: 'plan_review', presentation_owner_task_id: TASK, state_revision: 'plan-1',
+            ts: '2026-09-15T12:00:05Z', chat_id: 1, tool_evidence: { observations: [
+                { ...base, fact: 'started', status: 'unknown' }, { ...base, fact: 'wait_ended', status: 'unknown' },
+                { ...base, fact: 'settled', status: 'ok' },
+                { ...base, key: `tool:${TASK}:next`, fact: 'started', status: 'unknown' },
+            ] } },
+    ];
+    const carrier = history.at(-1);
+    const owner = kind === 'nested-review' ? 'review-owner' : TASK;
+    if (kind.startsWith('model-wait')) Object.assign(carrier, wait({ is_progress: true }));
+    if (kind === 'model-wait-outcome') carrier.outcome_axes = { execution: { status: 'ok' } };
+    if (kind === 'lifecycle') {
+        carrier.system_type = 'progress';
+        carrier.progress_meta = { lifecycle: { kind: 'review', status: 'running', target: 'skill', job_id: 'job' } };
+    }
+    if (kind === 'nested-review') {
+        carrier.system_type = 'progress';
+        carrier.progress_meta = { review_reference: { surface: 'plan_review',
+            presentation_owner_task_id: owner, state_revision: 'nested-plan' } };
+    }
+    const f = fixture(history, { task_id: owner, status: 'running', plan_review_state: {
+        current_attempt: { fingerprint: 'plan-1', status: 'closed' }, waves_omitted: 0,
+        waves: [{ request_fingerprint: 'plan-1', aggregate: 'GREEN', closed: true }],
+    } });
+    try {
+        await f.instance.refreshHistory({ revision: 1 });
+        await new Promise(setImmediate);
+        for (const reconnect of [false, true]) {
+            if (reconnect) { f.emit('open', { previouslyConnected: true }); await new Promise(setImmediate); }
+            const rows = f.rows().map(row => row.innerHTML).join(' ');
+            assert.match(rows, /2 tool calls.*wait ended.*outcome unknown/);
+            assert.doesNotMatch(rows, /1 error|operation may still settle/);
+            assert.equal(f.rows().filter(row => row.innerHTML.includes('2 tool calls')).length, 1);
+            if (kind.startsWith('model-wait')) assert.equal(f.card().dataset.modelWaiting, '1');
+            else if (kind !== 'lifecycle') assert.equal(f.card(owner).querySelector('[data-live-review-summary]')?.textContent, 'Reviews 1');
+            if (owner !== TASK) assert.doesNotMatch(f.rows(owner).map(row => row.innerHTML).join(' '), /tool calls/);
+        }
+        assert.ok(f.historyReads() >= 2, 'the real reconnect handler refetched history');
+        f.emit('chat', carrier);
+        f.log({ ...carrier, type: carrier.system_type });
+        assert.equal(f.rows().filter(row => row.innerHTML.includes('2 tool calls')).length, 1);
     } finally { f.close(); }
 });

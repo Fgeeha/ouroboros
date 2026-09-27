@@ -816,8 +816,8 @@ export function createChatInstance({
 
     // Fold counters with canonical facts; absent fields stay absent.
     function noteToolMetrics(taskId, metrics, rawTs, { suppressDomInsert = false } = {}) {
-        const known = (key) => (Number.isInteger(metrics?.[key]) ? metrics[key] : null);
-        const [calls, errors, routing] = ['tool_calls', 'tool_errors', 'routing_tool_calls'].map(known);
+        const [calls, errors, routing] = ['tool_calls', 'tool_errors', 'routing_tool_calls']
+            .map(key => Number.isInteger(metrics?.[key]) ? metrics[key] : null);
         if (!calls && !errors && !metrics.tool_evidence?.observations?.length && !metrics.tool_evidence?.legacy?.calls) return false;
         return withStableViewport(() => {
             const record = getLiveCardRecord(taskId);
@@ -828,8 +828,7 @@ export function createChatInstance({
             record.toolCalls = summary.calls;
             record.toolErrors = summary.errors;
             const { timelineUpdate } = upsertToolFoldRow(record, summary, normalizeLogTs(rawTs), rawTs);
-            const changed = ['none', 'duplicate-skip'].includes(timelineUpdate)
-                ? false : renderLiveCardTimeline(record);
+            const changed = !['none', 'duplicate-skip'].includes(timelineUpdate) && renderLiveCardTimeline(record);
             updateLiveCardCount(record);
             renderLiveCardMeta(record);
             reanchorTaskCard(record, rawTs, { suppressDomInsert });
@@ -1270,7 +1269,9 @@ export function createChatInstance({
         });
     }
 
-    function handleCardReference(row) {
+    function admitCardMetadata(row) {
+        // Carrier facts precede presentation-specific early returns.
+        if (row.tool_evidence && row.task_id) noteToolMetrics(row.task_id, row, row.ts || row.timestamp || '');
         if (isModelWaitReference(row)) {
             const changed = modelWaits.observe(row.task_id, row);
             return row.outcome_axes ? appendTaskSummaryToLiveCard(row) || changed : changed;
@@ -1281,7 +1282,7 @@ export function createChatInstance({
             const owner = reference.presentationOwnerTaskId;
             const anchor = reviewAnchorEligible(owner);
             const record = getLiveCardRecord(owner);
-            const wasVisible = Boolean(record.root?.isConnected);
+            const wasVisible = record.root?.isConnected;
             if (row?.ts) reanchorTaskCard(record, row.ts);
             const anchored = anchor && markReviewAnchor(record, true);
             ensureLiveCardVisible(record);
@@ -1289,7 +1290,7 @@ export function createChatInstance({
             // Task money follows its carrier, not the review owner.
             const costChanged = renderLiveCardMeta(liveCardRecords.get(taskKey(row.task_id)),
                 taskCostProjection(row, row.ts || row.timestamp || ''));
-            return Boolean((!wasVisible && Boolean(record.root?.isConnected)) || anchored || costChanged);
+            return Boolean((!wasVisible && record.root?.isConnected) || anchored || costChanged);
         });
     }
 
@@ -1989,8 +1990,6 @@ export function createChatInstance({
         if (msg?.system_type === 'task_checkpoint') return updateLiveCardFromLogEvent({ ...msg, type: 'task_checkpoint', is_progress: false });
         const taskId = msg?.task_id || '';
         const rawTs = msg?.ts || new Date().toISOString();
-        const review = attachReviewFromRow(msg, rawTs);
-        if (review !== undefined) return review;
         if (!taskId) return false;
         modelWaits.observe(taskId, msg);
         let changed = msg.tool_evidence ? noteToolMetrics(taskId, msg, rawTs) : false;
@@ -2168,7 +2167,7 @@ export function createChatInstance({
     function updateLiveCardFromLogEvent(evt) {
         if (!evt) return false;
         const eventType = evt.type || evt.event || '';
-        const reference = handleCardReference(evt);
+        const reference = admitCardMetadata(evt);
         if (reference !== undefined) return reference;
         if (!isGroupedTaskEvent(evt)) return false;
         const taskId = getLogTaskGroupId(evt) || '';
@@ -2483,7 +2482,7 @@ export function createChatInstance({
                     _historyRow = msg;
                     if (msg.system_type === 'quiz_answer') chatDecision.applyQuizStateFrame(messagesDiv, { ...msg.quiz, task_id: msg.task_id });
                     if (isReplayEvidenceRow(msg) || msg.system_type === 'project_question_pointer') continue;
-                    if (handleCardReference(msg) !== undefined) continue;
+                    if (admitCardMetadata(msg) !== undefined) continue;
                     if (attachReviewFromRow(msg, msg.ts || '') !== undefined) continue;
                     if (attachCardRow(msg, msg.ts || '', { suppressDomInsert: true }) !== undefined) {
                         cardRowsAttached.add(msg);
@@ -2529,7 +2528,7 @@ export function createChatInstance({
                     if (isReplayEvidenceRow(msg)) continue;
                     // Owner-bound reviews attached in pass 1 are not terminal chat bubbles.
                     if (
-                        handleCardReference(msg) !== undefined
+                        admitCardMetadata(msg) !== undefined
                         || attachReviewFromRow(msg, msg.ts || '', true) !== undefined
                         // A record minted after its row in pass 1 takes the row here.
                         || cardRowsAttached.has(msg) || attachCardRow(msg, msg.ts || '') !== undefined
@@ -3718,7 +3717,7 @@ export function createChatInstance({
         if (msg.role === 'assistant' || msg.role === 'system') {
             return withRemoteActivity(() => {
             const explicitTaskId = msg.task_id || '';
-            const reference = handleCardReference(msg);
+            const reference = admitCardMetadata(msg);
             if (reference !== undefined) {
                 syncChatStatus();
                 return reference;

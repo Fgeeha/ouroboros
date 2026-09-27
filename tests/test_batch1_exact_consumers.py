@@ -232,6 +232,43 @@ def test_history_stamps_replay_evidence_on_a_latest_accounting_wait_checkpoint(t
     assert [row["fact"] for row in latest["tool_evidence"]["observations"]] == ["started", "settled"]
 
 
+def test_review_reference_producer_history_and_chat_reconnect_keep_tool_evidence(tmp_path):
+    import shutil
+    import subprocess
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros.tool_call_log import append_call_row
+    from ouroboros.tools.plan_review_references import _emit_plan_review_reference
+    from ouroboros.utils import append_jsonl
+
+    task_id = "turn-a"
+    append_jsonl(tmp_path / "logs/progress.jsonl", {"type": "send_message", "role": "assistant",
+        "task_id": task_id, "chat_id": 1, "content": "Reading the file", "ts": "2000-01-01T00:00:00Z"})
+    for invocation, event in [("before-review", "tool_call_started"), ("before-review", "tool_call_timeout"),
+                              ("before-review", "tool_call"), ("next", "tool_call_started")]:
+        assert append_call_row({}, tmp_path / "logs", {"type": event, "task_id": task_id,
+            "invocation_id": invocation, "tool_call_id": "reused-provider-id", "tool": "read_file",
+            "is_error": event == "tool_call_timeout", "status": "ok"})["task_log"]
+    owner = SimpleNamespace(drive_root=tmp_path, current_chat_id=1, task_metadata={}, event_queue=None)
+    _emit_plan_review_reference(owner, task_id, {"current_attempt": {"fingerprint": "plan-1"}})
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"limit": "10"})))
+    payload = json.loads(response.body)
+    latest = payload["messages"][-1]
+    assert latest["system_type"] == "review_reference" and latest["is_progress"] is True
+    assert latest["presentation_owner_task_id"] == task_id
+    assert not any(row.get("system_type") == "task_summary" for row in payload["messages"])
+    observations = latest["tool_evidence"]["observations"]
+    assert [row["fact"] for row in observations] == ["started", "wait_ended", "settled", "started"]
+    assert len({row["key"] for row in observations}) == 2 and observations[2]["status"] == "ok"
+    history = tmp_path / "history.json"
+    history.write_bytes(response.body)
+    node = shutil.which("node")
+    assert node, "Node is required for the real Chat consumer proof"
+    result = subprocess.run([node, "--test", "--test-name-pattern=reference carriers",
+        "web/tests/chat_activity_block.test.js"], cwd=pathlib.Path(__file__).resolve().parents[1],
+        env={**os.environ, "OURO_TEST_TOOL_HISTORY": str(history)}, capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_osworld_readers_count_unfinished_calls_once_and_keep_legacy(tmp_path):
     from devtools.benchmarks.osworld import run_cu_bridge_agent as bridge
     from ouroboros.extension_loader import extension_name_prefix

@@ -148,6 +148,83 @@ def test_early_exits_after_the_start_still_settle(tmp_path):
     assert calls[1]["settled"]["status"] == "host_error" and calls[1]["settled"]["is_error"] is True
 
 
+def test_host_error_producer_reaches_memory_as_failure(tmp_path, monkeypatch):
+    from ouroboros.memory import Memory
+    from ouroboros.usage_accounting import UsageAccountingError
+
+    def raising(*_):
+        raise UsageAccountingError("ledger unavailable")
+
+    published = threading.Event()
+    publish = execution._publish_settlement
+
+    def observed(*args):
+        publish(*args)
+        published.set()
+
+    monkeypatch.setattr(execution, "_publish_settlement", observed)
+    registry = _Registry(tmp_path, raising)
+    with pytest.raises(UsageAccountingError):
+        _call(registry, tmp_path)
+    assert published.wait(5), "a raised Future can wake its caller before its settlement callback finishes"
+    rows = _rows(tmp_path / "canonical/logs/tools.jsonl")
+    assert rows[-1]["status"] == "host_error" and rows[-1]["is_error"] is True
+    assert not rows[-1]["result_preview"].startswith("⚠️")
+    assert Memory(tmp_path).summarize_tools(rows) == "· read_file path=a.txt"
+
+
+@pytest.mark.parametrize("status,code,preview,mark", [
+    ("ok", "OK", "⚠️ quoted warning from a successful read", "✓"),
+    ("error", "TOOL_ERROR", "ordinary error text", "·"),
+    ("blocked", "ACCESS_BLOCKED", "ordinary refusal text", "·"),
+])
+def test_handler_settlement_producer_reaches_memory(tmp_path, status, code, preview, mark):
+    from ouroboros.memory import Memory
+
+    registry = _Registry(tmp_path, lambda *_: ToolResult(status=status, code=code, text=preview))
+    _call(registry, tmp_path)
+    rows = _rows(tmp_path / "canonical/logs/tools.jsonl")
+    assert rows[-1]["status"] == status
+    assert Memory(tmp_path).summarize_tools(rows) == f"{mark} read_file path=a.txt"
+
+
+@pytest.mark.parametrize("facts,preview,mark", [
+    ({"status": "ok", "is_error": False}, "⚠️ quoted warning, successful read", "✓"),
+    ({"status": "error", "is_error": True}, "ordinary exception text", "·"),
+    ({"status": "host_error"}, "ordinary exception text", "·"),
+    ({"status": "error"}, "done", "·"),
+    ({"status": "blocked"}, "done", "·"),
+    ({"status": "unavailable"}, "done", "·"),
+    ({"status": "timeout"}, "done", "·"),
+    ({"status": "ok"}, "⚠️ quoted warning", "✓"),
+    ({"is_error": True}, "done", "·"),
+    ({"is_error": False}, "⚠️ quoted warning", "✓"),
+    ({"status": "error", "is_error": False}, "⚠️ stale text", "✓"),
+    ({"status": "ok", "is_error": True}, "done", "·"),
+    ({"status": "future_status"}, "done", "?"),
+    ({}, "legacy success", "✓"),
+    ({}, " ⚠️ legacy failure", "·"),
+])
+def test_memory_settlement_truth_precedes_preview(tmp_path, facts, preview, mark):
+    from ouroboros.memory import Memory
+
+    row = {"type": "tool_call", "tool": "read_file", "result_preview": preview, **facts}
+    assert Memory(tmp_path).summarize_tools([row]) == f"{mark} read_file"
+
+
+@pytest.mark.parametrize("kind,note", [
+    ("tool_call_started", "started; no outcome recorded"),
+    ("tool_call_timeout", "wait ended; no result recorded"),
+])
+def test_memory_unsettled_typed_error_is_not_operation_failure(tmp_path, kind, note):
+    from ouroboros.memory import Memory
+
+    row = {"type": kind, "invocation_id": "i", "tool": "read_file",
+           "status": "timeout", "is_error": True, "result_preview": "⚠️ wait ended"}
+    summary = Memory(tmp_path).summarize_tools([row])
+    assert summary.endswith(f"read_file ({note})") and not summary.startswith("✓")
+
+
 def test_a_failed_start_append_is_disclosed_and_never_vetoes_execution(tmp_path, monkeypatch):
     import ouroboros.tool_call_log as tool_call_log
 

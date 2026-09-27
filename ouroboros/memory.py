@@ -1122,11 +1122,19 @@ class Memory:
                 hints.append(f"cmd={short(str(args['cmd']), 80)}")
             hint_str = ", ".join(hints) if hints else ""
             settled = call.get("settled")
-            status = ("?" if settled is None and "wait_ended" not in call else
-                      "✓" if settled and "result_preview" in settled
-                      and not str(settled.get("result_preview", "")).lstrip().startswith("⚠️") else "·")
-            note = (" (started; no outcome recorded)" if status == "?" else
-                    " (wait ended; no result recorded)" if settled is None else "")
+            status, note = "?", ""
+            if settled is None:
+                note = (" (wait ended; no result recorded)" if "wait_ended" in call else
+                        " (started; no outcome recorded)")
+            elif isinstance(settled.get("is_error"), bool):
+                status = "·" if settled["is_error"] else "✓"
+            elif settled.get("status"):
+                if settled["status"] == "ok":
+                    status = "✓"
+                elif settled["status"] in {"error", "host_error", "blocked", "timeout", "unavailable"}:
+                    status = "·"
+            elif "result_preview" in settled:  # Only untyped legacy settlements infer from text.
+                status = "·" if str(settled["result_preview"]).lstrip().startswith("⚠️") else "✓"
             lines.append(f"{status} {tool} {hint_str}".strip() + note)
 
         _REVIEW_MARKERS = ("REVIEW_BLOCKED", "TESTS_FAILED", "REVIEW_MAX_ITERATIONS", "COMMIT_BLOCKED")

@@ -780,7 +780,8 @@ of success. Start-only (live or legacy) and incomplete replay evidence preserve 
 aggregate error; only complete settlement evidence can replace an earlier wait
 error. Typed tool evidence after task terminal updates counts and diagnostics
 on both root and child cards, preserving terminal task phase and controls.
-The row keeps its live position; cold history places it with the summary. Block
+The row keeps its live position; history admits carrier evidence before summaries,
+progress or references choose their presentation. Block
 presence is consistent across reload and reconnect. A turn moved into a Project
 with `ensure_project_scope` lives there; Main retains its Started annotation.
 `N notes` in the collapsed header counts timeline items, the evidence row
