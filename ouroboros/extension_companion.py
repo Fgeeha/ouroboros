@@ -78,6 +78,7 @@ class CompanionRuntime:
     overflow: Dict[str, bool] = field(default_factory=lambda: {"stdout": False, "stderr": False})
     restart_times: List[float] = field(default_factory=list)
     job_handle: Any = None
+    disclosure_failed: bool = False
 
 
 def init_server_process_pid(pid: Optional[int] = None) -> None:
@@ -126,6 +127,8 @@ class CompanionSupervisor:
                 return False
             existing = self._runtimes.get(key)
             if existing and existing.process.poll() is None:
+                if existing.disclosure_failed:
+                    raise RuntimeError(f"companion {key} has unresolved cost disclosure; stop it before restart")
                 return True
             for port in descriptor.ports:
                 if not _port_is_available(port):
@@ -176,7 +179,16 @@ class CompanionSupervisor:
                         ),
                     )
                 except Exception:
-                    terminate_process_tree(proc)
+                    runtime.disclosure_failed = True
+                    # The physical process may ignore a graceful SIGTERM. Keep
+                    # its owner visible until death is observed; no second
+                    # start can treat an unmetered live process as success.
+                    try:
+                        kill_process_tree(proc)
+                    except Exception:
+                        log.exception("Unmetered companion kill failed: %s", key)
+                    if proc.poll() is not None and self._runtimes.get(key) is runtime:
+                        self._runtimes.pop(key, None)
                     raise
             # Write-through into the custody ledger (daemon scope). Companions
             # survive clean restarts (reconcile re-spawns them), but the reaper

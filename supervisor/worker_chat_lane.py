@@ -699,7 +699,7 @@ def auto_resume_after_restart() -> None:
         from supervisor.state import control_value
 
         chat_known, chat_id = control_value(_pool().load_state(), "owner_chat_id")
-        if not chat_known or not chat_id:
+        if not chat_known or chat_id in (None, "", 0):
             return  # an autonomous resume turn needs a KNOWN owner chat (#1307)
 
         restart_verify_path = _pool().DRIVE_ROOT / "state" / "pending_restart_verify.json"

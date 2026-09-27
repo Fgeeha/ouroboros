@@ -545,9 +545,10 @@ def test_companion_disclosure_failure_kills_unregistered_process(tmp_path, monke
         pid = 12345
         stdout = None
         stderr = None
+        alive = True
 
         def poll(self):
-            return None
+            return None if self.alive else -9
 
     process = SpawnedProcess()
     killed = []
@@ -561,7 +562,11 @@ def test_companion_disclosure_failure_kills_unregistered_process(tmp_path, monke
         env={"OPENROUTER_API_KEY": "test-provider-key"},
     )
     monkeypatch.setattr(companion_mod.subprocess, "Popen", lambda *_args, **_kwargs: process)
-    monkeypatch.setattr(companion_mod, "terminate_process_tree", lambda proc: killed.append(proc))
+    def kill(proc):
+        killed.append(proc)
+        proc.alive = False
+
+    monkeypatch.setattr(companion_mod, "kill_process_tree", kill)
     monkeypatch.setattr(
         companion_mod,
         "record_unmetered_external_dispatch",
@@ -573,6 +578,31 @@ def test_companion_disclosure_failure_kills_unregistered_process(tmp_path, monke
 
     assert killed == [process]
     assert supervisor.snapshot() == {}
+
+
+def test_companion_disclosure_failure_keeps_unconfirmed_process_owned(tmp_path, monkeypatch):
+    class StubbornProcess:
+        pid = 12345
+        stdout = None
+        stderr = None
+
+        def poll(self):
+            return None
+
+    init_server_process_pid()
+    supervisor = CompanionSupervisor(tmp_path)
+    descriptor = CompanionDescriptor("alpha", "model-daemon", ["runtime"], tmp_path,
+                                     {"OPENROUTER_API_KEY": "test-provider-key"})
+    process = StubbornProcess()
+    monkeypatch.setattr(companion_mod.subprocess, "Popen", lambda *_a, **_kw: process)
+    monkeypatch.setattr(companion_mod, "kill_process_tree", lambda _proc: None)
+    monkeypatch.setattr(companion_mod, "record_unmetered_external_dispatch",
+                        lambda *_a, **_kw: (_ for _ in ()).throw(RuntimeError("ledger down")))
+    with pytest.raises(RuntimeError, match="ledger down"):
+        supervisor.start(descriptor)
+    assert supervisor.snapshot()["alpha:model-daemon"]["pid"] == process.pid
+    with pytest.raises(RuntimeError, match="unresolved cost disclosure"):
+        supervisor.start(descriptor)  # no second spawn, no false already-running success
 
 
 def test_extension_dispatch_inherits_bound_lineage_without_tool_context(tmp_path):

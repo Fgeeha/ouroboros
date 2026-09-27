@@ -293,8 +293,10 @@ def test_degraded_evolution_axes_count_as_failure(tmp_path):
 
 
 def test_cron_schedule_enqueues_once_when_due(tmp_path, monkeypatch):
-    from supervisor import queue
+    from supervisor import queue, state
 
+    state.init(tmp_path)
+    state.save_state({"owner_chat_id": 1})
     queue.init(tmp_path)
     pending = []
     running = {}
@@ -312,7 +314,8 @@ def test_cron_schedule_enqueues_once_when_due(tmp_path, monkeypatch):
             "expected_output": "Scheduled report",
             "constraints": "No web",
             "allowed_resources": {"web": "false"},
-            "deadline_at": "2026-06-04T12:00:00Z",
+            "deadline_at": "2100-06-04T12:00:00Z",
+            "metadata": {"resource_intent": {"kind": "system_repo"}},
             "task_contract": {"success_criteria": ["report delivered"]},
         },
     })
@@ -329,7 +332,7 @@ def test_cron_schedule_enqueues_once_when_due(tmp_path, monkeypatch):
     assert pending[0]["expected_output"] == "Scheduled report"
     assert pending[0]["constraints"] == "No web"
     assert pending[0]["allowed_resources"] == {"web": False}
-    assert pending[0]["deadline_at"] == "2026-06-04T12:00:00Z"
+    assert pending[0]["deadline_at"] == "2100-06-04T12:00:00Z"
     # (W2) success_criteria is an input ALIAS: it arrives normalized into
     # acceptance_claims (one concept, one carrier), not double-persisted.
     contract = pending[0]["task_contract"]
@@ -342,8 +345,10 @@ def test_cron_schedule_admission_refusal_waits_without_a_phantom_root(tmp_path, 
     """#1315: a refused cron occurrence WAITS on its row with the typed reason: no
     failed root, no failure_count, the same occurrence kept for the retry."""
     from ouroboros.task_results import load_task_result
-    from supervisor import queue
+    from supervisor import queue, state
 
+    state.init(tmp_path)
+    state.save_state({"owner_chat_id": 1})
     queue.init(tmp_path)
     queue.init_queue_refs([], {}, {"value": 0})
     queue.upsert_scheduled_task({
@@ -352,7 +357,8 @@ def test_cron_schedule_admission_refusal_waits_without_a_phantom_root(tmp_path, 
         "enabled": True,
         "trigger": {"type": "cron", "expr": "* * * * *"},
         "next_run_at": "2000-01-01T00:00:00+00:00",
-        "task": {"type": "task", "text": "must not become a phantom"},
+        "task": {"type": "task", "text": "must not become a phantom",
+                 "metadata": {"resource_intent": {"kind": "system_repo"}}},
     })
     admitted_ids = []
 
@@ -372,12 +378,14 @@ def test_cron_schedule_admission_refusal_waits_without_a_phantom_root(tmp_path, 
     assert schedule["next_run_at"] == "2000-01-01T00:00:00+00:00"  # no catch-up bookkeeping while waiting
 
 
-def test_scheduled_task_without_owner_chat_is_headless_safe(tmp_path):
+def test_scheduled_task_without_owner_chat_waits_without_phantom_then_admits(tmp_path, monkeypatch):
     from supervisor import queue
     from supervisor import state as supervisor_state
     from ouroboros.task_results import load_task_result
 
     supervisor_state.init(tmp_path)
+    supervisor_state.save_state({"owner_chat_id": None})
+    monkeypatch.setattr("ouroboros.config.get_bg_wakeup_min_sec", lambda: 0)
     queue.init(tmp_path)
     pending = []
     queue.init_queue_refs(pending, {}, {"value": 0})
@@ -387,12 +395,19 @@ def test_scheduled_task_without_owner_chat_is_headless_safe(tmp_path):
         "enabled": True,
         "trigger": {"type": "cron", "expr": "* * * * *"},
         "next_run_at": "2000-01-01T00:00:00+00:00",
-        "task": {"type": "task", "text": "scheduled work"},
+        "task": {"type": "task", "text": "scheduled work",
+                 "metadata": {"resource_intent": {"kind": "explicit_none"}}},
     })
 
     queue.check_scheduled_tasks()
 
-    assert pending[0]["chat_id"] == 0
+    waiting = queue.list_scheduled_tasks()["tasks"][0]
+    assert pending == [] and waiting["hold"]["reason"] == "owner_chat_unknown"
+    assert not waiting.get("failure_count")
+    assert load_task_result(tmp_path, waiting["occurrence"]["task_id"]) is None
+    supervisor_state.update_state(lambda st: st.update(owner_chat_id=1), confirm=("owner_chat_id",))
+    queue.check_scheduled_tasks()
+    assert len(pending) == 1 and pending[0]["chat_id"] == 1
     assert load_task_result(tmp_path, pending[0]["id"])["status"] == "scheduled"
 
 

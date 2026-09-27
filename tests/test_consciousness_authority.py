@@ -581,10 +581,13 @@ def test_request_file_and_pending_apply_carry_the_origin(tmp_path, monkeypatch):
     monkeypatch.setattr("supervisor.evolution_lifecycle.evolution_block_reason", lambda: "")
     monkeypatch.setattr("supervisor.evolution_lifecycle.start_evolution_campaign",
                         lambda objective, source="", **kw: calls.append((objective, source, kw)) or {"id": "c1"})
-    monkeypatch.setattr("supervisor.state.load_state", lambda: {"owner_chat_id": 7})
+    monkeypatch.setattr("supervisor.state.load_state", lambda: {
+        "owner_chat_id": 7, "evolution_owner_stopped": False,
+        "evolution_mode_enabled": False,
+    })
 
     def _update_state(mutator):
-        live: dict = {}
+        live = {"evolution_owner_stopped": False, "evolution_mode_enabled": False}
         mutator(live)
         return live
 

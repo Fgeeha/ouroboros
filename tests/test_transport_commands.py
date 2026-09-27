@@ -34,7 +34,10 @@ def test_external_first_slash_binds_external_owner_without_executing(monkeypatch
     import supervisor.message_bus as message_bus
     called = []
     bridge = Bridge([{"chat": {"id": 42}, "from": {"id": 7}, "text": "/panic", "source": "skill:telegram-bridge"}])
-    ctx = Ctx({})
+    # A first owner bind requires positively initialized, known-empty slots;
+    # absence of state is not permission to mint an owner after recovery loss.
+    from supervisor.state import ensure_state_defaults
+    ctx = Ctx(ensure_state_defaults({}))
     monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_execute_panic_stop", lambda *args, **kwargs: called.append(True))
     server._process_bridge_updates(bridge, 0, ctx)
@@ -66,7 +69,8 @@ def test_desktop_web_owner_does_not_lock_out_telegram(monkeypatch):
     import server
     import supervisor.message_bus as message_bus
     called = []
-    ctx = Ctx({"owner_id": 1, "owner_chat_id": 1})
+    from supervisor.state import ensure_state_defaults
+    ctx = Ctx(ensure_state_defaults({"owner_id": 1, "owner_chat_id": 1}))
     monkeypatch.setattr(message_bus, "log_chat", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "_execute_panic_stop", lambda *args, **kwargs: called.append(True))
     # First Telegram slash binds the external owner and asks for a resend.

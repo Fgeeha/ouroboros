@@ -39,7 +39,9 @@ def _lane(monkeypatch, tmp_path, *, event_q=None, sent=None):
     monkeypatch.setattr(workers, "get_event_q", lambda: shared)
     monkeypatch.setattr(workers, "send_with_budget",
                         lambda *a, **kw: (sent if sent is not None else []).append((a, kw)))
-    monkeypatch.setattr(state, "load_state", lambda: {})
+    # A wake is admissible only when the installed owner's consciousness toggle
+    # is positively known to be on. An absent state is deliberately unknown.
+    monkeypatch.setattr(state, "load_state", lambda: {"bg_consciousness_enabled": True})
     monkeypatch.setattr(state, "budget_remaining", lambda *a, **kw: 100)
     monkeypatch.setattr(message_bus, "get_bridge", lambda: SimpleNamespace(send_chat_action=lambda *a, **kw: None))
     workers.open_repo_writer_admission()
@@ -111,6 +113,9 @@ def test_wake_refusals_are_typed_and_start_nothing(monkeypatch, tmp_path):
     sent: list = []
     _lane(monkeypatch, tmp_path, sent=sent)
     monkeypatch.setattr(agent_module, "make_agent", lambda **kw: (_ for _ in ()).throw(AssertionError("no actor")))
+    monkeypatch.setattr(state, "load_state", lambda: {})
+    assert workers.handle_wake_direct(1, "wake", dict(WAKE_META))["reason"] == "consciousness_disabled_or_unknown"
+    monkeypatch.setattr(state, "load_state", lambda: {"bg_consciousness_enabled": True})
     monkeypatch.setattr(state, "budget_remaining", lambda *a, **kw: 0)
     assert workers.handle_wake_direct(1, "wake", dict(WAKE_META)) == {
         "admitted": False, "task_id": "", "reason": "budget_exhausted"}
