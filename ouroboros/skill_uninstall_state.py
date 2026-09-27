@@ -4,9 +4,10 @@ Uninstalling a skill removes its payload but its ``state/skills/<name>/``
 directory used to outlive it forever (only ``deps.json`` was cleared). The
 hub uninstall paths now write an ``uninstalled.json`` tombstone, and the
 startup sweep clears the dead state BY that mark — keeping ``grants.json``
-(granted keys are OWNER authority, preserved across reinstall) and the
-tombstone itself. A reinstall self-heals: the sweep sees a live payload and
-retires the tombstone instead of sweeping.
+(granted keys are OWNER authority, preserved across reinstall), the
+``ouroboroshub.json`` publication receipt (the owner's local submission
+history, not payload state) and the tombstone itself. A reinstall self-heals:
+the sweep sees a live payload and retires the tombstone instead of sweeping.
 
 Explicit local deletion also lives here. Unlike marketplace uninstall, it
 removes the entire state directory under the owner's specific delete action.
@@ -20,14 +21,16 @@ import shutil
 from typing import Any, Dict
 
 from ouroboros.contracts.schema_versions import with_schema_version
+from ouroboros.marketplace.provenance import PUBLICATION_FILENAME
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 log = logging.getLogger(__name__)
 
 UNINSTALL_TOMBSTONE_FILENAME = "uninstalled.json"
-# Owner authority survives the sweep (batch №8 3A): grants are the owner's
-# durable key/permission decisions, not skill payload state.
-_SWEEP_KEEP = frozenset({UNINSTALL_TOMBSTONE_FILENAME, "grants.json"})
+# Owner facts survive the sweep: grants are the owner's durable key/permission
+# decisions (batch №8 3A), and the publication receipt is local submission
+# history that a later reinstall still shows (#1314) — neither is payload state.
+_SWEEP_KEEP = frozenset({UNINSTALL_TOMBSTONE_FILENAME, "grants.json", PUBLICATION_FILENAME})
 
 
 def delete_local_skill(
