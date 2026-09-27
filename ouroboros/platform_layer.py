@@ -290,21 +290,26 @@ def acquire_exclusive_file_lock(
     poll_sec: float = 0.05,
     owner_aware_stale: bool = False,
     refuse_name_tier_errnos: frozenset = frozenset(),
+    outcome: Optional[dict] = None,
 ) -> Optional[int]:
-    """Acquire a descriptor-owned lock whose path still names the held inode.
+    """Acquire a descriptor-owned lock; optional ``outcome`` records failure facts.
 
-    Kernel errors fail closed except contention; owner-aware stale recovery
-    cannot evict a live writer. Name-tier refusal is caller policy. Platform
-    eviction/release ordering and limitations: ARCHITECTURE §1 "Platform substrate"."""
+    Only contention retries; owner-aware recovery cannot evict a live writer.
+    Name-tier refusal is caller policy; missing outcomes are unknown. See ARCHITECTURE §1 "Platform substrate"."""
+    def report(reason, error=None):
+        if outcome is not None:
+            outcome.update(reason=reason, errno=getattr(error, "errno", None))
+    report("unknown")
     lock_path = pathlib.Path(lock_path)
     lock_path.parent.mkdir(parents=True, exist_ok=True)
     enforced = kernel_file_locks_enforced(lock_path)
     if not enforced and _KERNEL_LOCK_TIER.get(os.path.realpath(str(lock_path.parent)), (False, None))[1] in refuse_name_tier_errnos:
+        report("name_tier_refused")
         log.warning("Name-tier lock refused by caller policy at %s: no lock taken", lock_path)
         return None
-    started = time.time()
+    started = time.monotonic()
     first_attempt = True
-    while first_attempt or (time.time() - started) < timeout_sec:
+    while first_attempt or (time.monotonic() - started) < timeout_sec:
         first_attempt = False
         try:
             fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
@@ -319,37 +324,42 @@ def acquire_exclusive_file_lock(
             except OSError as exc:
                 if exc.errno not in _LOCK_HELD_ERRNOS:
                     release_exclusive_file_lock(lock_path, fd)  # ours, yet never a hold
+                    report("kernel_refused", exc)
                     log.warning("Kernel lock refused at %s (errno %s): no lock taken", lock_path, exc.errno)
                     return None
             else:
                 # Only a readable fd/path identity proves the creator still owns this name.
-                won = _lock_identity(fd)[:2]
-                if won and won == _lock_identity(lock_path)[:2]:
+                won, named = _lock_identity(fd)[:2], _lock_identity(lock_path)[:2]
+                if won and won == named:
+                    report("acquired")
                     return fd
-                if not won:
+                if not won or not named:
                     with contextlib.suppress(OSError):
                         if lock_path.read_bytes() == stamp:
                             os.unlink(str(lock_path))
                     os.close(fd)
+                    report("identity_unreadable")
                     log.warning("Lock identity unreadable at %s: no lock taken", lock_path)
                     return None
             if IS_WINDOWS:  # a lock goes before its handle (see _win32_unlock)
                 file_unlock(fd)
-            os.close(fd)  # the file we created was kernel-locked by a racing
-            time.sleep(min(poll_sec, max(0.0, timeout_sec - (time.time() - started))))  # evictor's probe, or evicted: the name alone is
-            continue  # not ownership — stand down and re-contend
-        except (FileExistsError, PermissionError):
-            stale = refused = None
+            os.close(fd)  # A racing evictor locked or removed our newly created name;
+            report("contention")  # creation alone is not ownership, so re-contend.
+        except (FileExistsError, PermissionError) as creation_error:
+            report("permission" if isinstance(creation_error, PermissionError) else "unknown", creation_error)
+            stale = refused = probe = None
             try:
                 probe = os.open(str(lock_path), os.O_RDONLY)
                 try:
                     judged = _lock_identity(probe)
-                    owner_pid = 0
-                    for field in os.read(probe, 512).decode("utf-8", "replace").split():
-                        if field.startswith("pid=") and field[4:].isdigit():
-                            owner_pid = int(field[4:])
-                    stale = bool(judged) and (time.time() - judged[2] / 1e9) > stale_sec
-                    if judged and owner_aware_stale and owner_pid > 0:
+                    if not judged:
+                        return report("identity_unreadable")
+                    if isinstance(creation_error, FileExistsError):
+                        report("contention")
+                    fields = os.read(probe, 512).decode("utf-8", "replace").split()
+                    owner_pid = ([int(f[4:]) for f in fields if f.startswith("pid=") and f[4:].isdigit()] or [0])[-1]
+                    stale = (time.time() - judged[2] / 1e9) > stale_sec
+                    if owner_aware_stale and owner_pid > 0:
                         stale = not pid_is_alive(owner_pid)  # Proven death needs no age grace.
                     # Judge and evict the same inode under a kernel hold.
                     if stale and enforced:
@@ -370,17 +380,23 @@ def acquire_exclusive_file_lock(
                 if stale and _lock_identity(lock_path) == judged:
                     lock_path.unlink()
                     continue
-            except Exception:
-                log.debug("Failed to inspect/remove stale lock %s", lock_path, exc_info=True)
+            except Exception as exc:
+                if probe is None and isinstance(creation_error, FileExistsError) and isinstance(exc, FileNotFoundError):
+                    report("contention", exc)  # Observed holder released its name before our probe.
+                else:
+                    report("permission" if isinstance(exc, PermissionError) else "unknown", exc)
+                    log.debug("Failed to inspect/remove stale lock %s", lock_path, exc_info=True)
             if refused is not None:
+                report("kernel_refused", refused)
                 log.warning("Kernel lock refused on stale %s (%s): no lock taken", lock_path, refused)
                 return None
-            remaining = timeout_sec - (time.time() - started)
-            if remaining > 0:
-                time.sleep(min(poll_sec, remaining))
-        except Exception:
+        except Exception as exc:
+            report("permission" if isinstance(exc, PermissionError) else "unknown", exc)
             log.warning("Failed to acquire lock at %s", lock_path, exc_info=True)
             break
+        remaining = timeout_sec - (time.monotonic() - started)  # contention polls only inside the deadline
+        if remaining > 0:
+            time.sleep(min(poll_sec, remaining))
     return None
 
 
@@ -588,13 +604,11 @@ def file_unlock(fd: int) -> None:
 def pid_is_alive(pid: int) -> bool:
     """Observe process presence; access denial remains alive, not signal authority.
 
-    Windows uses OpenProcess/GetExitCodeProcess, never a signal-zero probe."""
-
+    Windows probes OpenProcess/GetExitCodeProcess, never os.kill(pid, 0): there
+    signal 0 is CTRL_C_EVENT, delivered to the pid's whole console group."""
     if pid <= 0:
         return False
     if IS_WINDOWS:
-        # os.kill(pid, 0) is WRONG here: signal 0 is CTRL_C_EVENT, delivered to the pid's
-        # whole console group. Probe with OpenProcess + GetExitCodeProcess, which never signals anything.
         _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
         _STILL_ACTIVE = 259
         _ERROR_ACCESS_DENIED = 5
@@ -727,8 +741,7 @@ def request_process_tree_kill(proc, *, job_handle=None) -> dict:
     try:
         if pid <= 0 or pid == os.getpid():
             raise ValueError("refusing current/invalid process")
-        channel = None if pinned else getattr(proc, "_ouroboros_stop_socket", None)
-        if channel is not None:
+        if not pinned and getattr(proc, "_ouroboros_stop_socket", None) is not None:
             return proc._ouroboros_stop_request()
         if IS_WINDOWS:
             if job_handle is not None:
@@ -739,21 +752,20 @@ def request_process_tree_kill(proc, *, job_handle=None) -> dict:
             import _winapi
             handle = proc["handle"] if pinned else getattr(proc, "_handle", None)
             _winapi.TerminateProcess(handle if handle is not None else proc._popen._handle, 1)
+        elif pinned:
+            if IS_MACOS:
+                proc["handle"].close()
+                raise RuntimeError("attached Darwin watch is not a signalable identity")
+            signal.pidfd_send_signal(proc["handle"].fileno(), signal.SIGKILL)
         else:
-            if pinned:
-                if IS_MACOS:
-                    proc["handle"].close()
-                    raise RuntimeError("attached Darwin watch is not a signalable identity")
-                signal.pidfd_send_signal(proc["handle"].fileno(), signal.SIGKILL)
+            if (proc.poll() if hasattr(proc, "poll") else proc.exitcode) is not None:
+                raise ProcessLookupError("owned child already exited")
+            pgid = os.getpgid(pid)
+            if pgid == pid and pgid != os.getpgrp():
+                os.killpg(pgid, signal.SIGKILL)
+                result["scope"] = "group"
             else:
-                if (proc.poll() if hasattr(proc, "poll") else proc.exitcode) is not None:
-                    raise ProcessLookupError("owned child already exited")
-                pgid = os.getpgid(pid)
-                if pgid == pid and pgid != os.getpgrp():
-                    os.killpg(pgid, signal.SIGKILL)
-                    result["scope"] = "group"
-                else:
-                    os.kill(pid, signal.SIGKILL)
+                os.kill(pid, signal.SIGKILL)
         result["requested"] = True
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
@@ -778,9 +790,7 @@ def terminate_process_tree(proc: subprocess.Popen) -> None:
 
 def terminate_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = None) -> None:
     """Gracefully terminate a Unix process group by id."""
-    if IS_WINDOWS:
-        return
-    if _group_has_spared_process(pgid, exclude_pids):
+    if IS_WINDOWS or _group_has_spared_process(pgid, exclude_pids):
         return
     try:
         os.killpg(int(pgid), signal.SIGTERM)
@@ -790,9 +800,7 @@ def terminate_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = N
 
 def kill_process_group_id(pgid: int, *, exclude_pids: "set[int] | None" = None) -> None:
     """Force-kill a Unix process group by id."""
-    if IS_WINDOWS:
-        return
-    if _group_has_spared_process(pgid, exclude_pids):
+    if IS_WINDOWS or _group_has_spared_process(pgid, exclude_pids):
         return
     try:
         os.killpg(int(pgid), signal.SIGKILL)
@@ -965,10 +973,7 @@ def _tree_kill_targets(pid: int, exclude_pids: "set[int] | None") -> tuple[list[
         spared = exclude | {p for root in exclude for p in _snapshot_descendants(root, children)}
         return [p for p in [*descendants, pid] if p not in spared], spared
     descendants = collect_descendant_pids(pid)
-    spared: set[int] = set()
-    for ep in exclude:
-        spared.add(ep)
-        spared.update(collect_descendant_pids(ep))
+    spared = exclude | {p for root in exclude for p in collect_descendant_pids(root)}
     return [p for p in [*descendants, pid] if p not in spared], spared
 
 
@@ -1005,12 +1010,9 @@ def _collect_descendants(pid: int, result: list[int]) -> None:
     try:
         out = subprocess.run(["pgrep", "-P", str(pid)],
                              capture_output=True, text=True, timeout=3)
-        for line in out.stdout.strip().splitlines():
-            line = line.strip()
-            if line:
-                child_pid = int(line)
-                _collect_descendants(child_pid, result)
-                result.append(child_pid)
+        for child_pid in map(int, out.stdout.split()):
+            _collect_descendants(child_pid, result)
+            result.append(child_pid)
     except Exception:
         pass
 
@@ -1331,11 +1333,9 @@ def subprocess_hidden_kwargs() -> dict:
 
 def merge_hidden_kwargs(kwargs: dict) -> dict:
     """Merge Windows hidden-window flags without dropping caller flags."""
-    hidden = subprocess_hidden_kwargs()
-    if not hidden:
-        return dict(kwargs)
     result = dict(kwargs)
-    result["creationflags"] = result.get("creationflags", 0) | hidden.get("creationflags", 0)
+    if hidden := subprocess_hidden_kwargs():
+        result["creationflags"] = result.get("creationflags", 0) | hidden.get("creationflags", 0)
     return result
 
 

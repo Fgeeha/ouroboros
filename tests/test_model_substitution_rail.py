@@ -333,16 +333,28 @@ def test_a_failed_acknowledgement_is_disclosed_rather_than_assumed(setup):
     assert events(root, "model_served_mismatch")[0]["result_custody"]["reason"] == "RuntimeError"
 
 
-def test_a_redo_never_starts_once_the_owner_window_is_spent(setup):
+def test_a_redo_never_starts_once_the_owner_window_is_spent(setup, monkeypatch):
     from ouroboros import model_wait
 
     root, gateway, client = setup
     gateway.results = [substituted()]
-    with model_wait.calendar_scope("2000-01-01T00:00:00Z"):
+    now = [100.0]
+    monkeypatch.setattr(model_wait, "monotonic_now", lambda slot=None: now[0])
+    read_result = gateway.get_model_result
+
+    def expire_on_response(*args, **kwargs):
+        response = read_result(*args, **kwargs)
+        now[0] = 111.0  # the first paid response consumes the window, regardless of control polls
+        return response
+
+    monkeypatch.setattr(gateway, "get_model_result", expire_on_response)
+    with model_wait.execution_deadline_scope(110.0):
         with pytest.raises(transport.ClaudexorModelError) as raised:
             call(client)
     assert raised.value.problem["context"]["reason"] == "deadline_spent"
     assert len(gateway.creates) == 1
+    assert len(gateway.acks) == 1
+    assert events(root, "model_served_mismatch")[0]["disposition"] == "deadline_spent"
 
 
 def test_an_unknown_outcome_is_never_treated_as_a_substitution(setup):

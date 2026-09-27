@@ -22,11 +22,13 @@ import asyncio
 import json
 import logging
 import types
+from contextlib import contextmanager
 
 from starlette.requests import Request
 
 from ouroboros import usage_accounting as ua
 from ouroboros import usage_ledger
+from ouroboros import _usage_rows_memo as memo
 
 
 def test_retained_execution_drive_tripwire_counts_both_roots(tmp_path, monkeypatch):
@@ -108,6 +110,10 @@ def _seeded_accounting_root(tmp_path, monkeypatch):
         global_limit_usd=7.5, drive_root=root, task_id="reserved",
         root_task_id="root-1", category="task", source="test.perf",
     ))
+    # Seeding uses real writers, which now share the reader's prepared source.
+    # Evict this isolated root so the first endpoint really exercises a cold read.
+    with memo._LEDGER_READ_CACHE_LOCK:
+        memo._LEDGER_READ_CACHE.pop(str(root.resolve()), None)
     return root
 
 
@@ -190,42 +196,24 @@ def test_api_state_warm_path_replays_ledger_zero_times_and_projects_once(
     monkeypatch.setattr(queue, "load_state", lambda: {"current_branch": "ouroboros"})
     monkeypatch.setattr(queue, "_read_evolution_campaign", lambda: {})
 
-    full_reads: list = []
-    real_full_read = usage_ledger._read_records_locked
-
-    def counted_full_read(target_root):
-        full_reads.append(str(target_root))
-        return real_full_read(target_root)
-
-    monkeypatch.setattr(usage_ledger, "_read_records_locked", counted_full_read)
-    # usage_accounting re-binds the substrate name at import; the memo resolves
-    # it in its own namespace, so the counter must cover both bindings.
-    monkeypatch.setattr(ua, "_read_records_locked", counted_full_read)
-
-    projections: list = []
-    real_projection = ua.usage_projection
-
-    def counted_projection(*args, **kwargs):
-        projections.append(kwargs)
-        return real_projection(*args, **kwargs)
-
-    monkeypatch.setattr(ua, "usage_projection", counted_projection)
+    counters = _install_ledger_read_counters(monkeypatch)
 
     cold = asyncio.run(api_state(_state_request(root)))
     assert cold.status_code == 200
-    assert len(full_reads) == 1  # cold memo fill = exactly one full replay
+    assert counters["preparations"] == [str(root)]  # one parse outside the money lock
+    assert counters["full_reads"] == []
 
-    full_reads.clear()
-    projections.clear()
+    counters["preparations"].clear()
+    counters["projections"].clear()
     warm = asyncio.run(api_state(_state_request(root)))
     payload = json.loads(warm.body)
 
     assert warm.status_code == 200
-    assert full_reads == []  # warm path: ZERO full ledger replays
+    assert counters["preparations"] == counters["full_reads"] == []
     # One projection for the whole request; budget_remaining consumed it inside
     # the evolution snapshot instead of recomputing (a second entry here would
     # be the de-triplication regression this test exists to catch).
-    assert len(projections) == 1
+    assert len(counters["projections"]) == 1
     assert "budget_reserve_usd" in payload["evolution_state"]  # real snapshot ran
     assert payload["spent_usd"] == 1.25  # settled 0.25 + reserved bound 1.0
     assert payload["accounting"]["authority"] == "physical_attempt_ledger"
@@ -307,11 +295,28 @@ def test_chat_history_reads_bounded_progress_tail_with_zero_artifact_work(
 
 
 def _install_ledger_read_counters(monkeypatch):
-    """Count full ledger replays and the two projections the live branches use."""
-    counters: dict = {"full_reads": [], "projections": [], "breakdowns": []}
+    """Count cold preparations, locked replays and both live projections."""
+    counters: dict = {"preparations": [], "full_reads": [], "projections": [], "breakdowns": []}
+    real_prepare, real_lock = memo._prepare_writer, ua._locked
+    lock_depth = 0
     real_full_read = usage_ledger._read_records_locked
     real_projection = ua.usage_projection
     real_breakdown = ua.usage_breakdown
+
+    @contextmanager
+    def counted_lock(*args, **kwargs):
+        nonlocal lock_depth
+        with real_lock(*args, **kwargs) as heartbeat:
+            lock_depth += 1
+            try:
+                yield heartbeat
+            finally:
+                lock_depth -= 1
+
+    def counted_preparation(target_root):
+        assert lock_depth == 0, "cold parsing must stay outside the monetary lock"
+        counters["preparations"].append(str(target_root))
+        return real_prepare(target_root)
 
     def counted_full_read(target_root):
         counters["full_reads"].append(str(target_root))
@@ -326,6 +331,9 @@ def _install_ledger_read_counters(monkeypatch):
         return real_breakdown(*args, **kwargs)
 
     monkeypatch.setattr(usage_ledger, "_read_records_locked", counted_full_read)
+    monkeypatch.setattr(usage_ledger, "_locked", counted_lock)
+    monkeypatch.setattr(ua, "_locked", counted_lock)
+    monkeypatch.setattr(memo, "_prepare_writer", counted_preparation)
     # usage_accounting re-binds the substrate name at import; the memo resolves
     # it in its own namespace, so the counter must cover both bindings.
     monkeypatch.setattr(ua, "_read_records_locked", counted_full_read)
@@ -369,8 +377,9 @@ def test_live_root_surfaces_replay_the_ledger_zero_times_when_warm(
     )
     counters = _install_ledger_read_counters(monkeypatch)
     asyncio.run(history(request))  # cold: fills the rows memo
-    assert len(counters["full_reads"]) == 1  # cold memo fill = one full replay
-    counters["full_reads"].clear()
+    assert counters["preparations"] == [str(root)]  # one parse outside the money lock
+    assert counters["full_reads"] == []
+    counters["preparations"].clear()
     counters["projections"].clear()
 
     messages = json.loads(asyncio.run(history(request)).body)["messages"]
@@ -378,7 +387,7 @@ def test_live_root_surfaces_replay_the_ledger_zero_times_when_warm(
 
     assert live_rows  # the live-root branch really ran (not a vacuous budget)
     assert live_rows[-1]["cost_accounting_status"] == "available"
-    assert counters["full_reads"] == []  # warm: ZERO full ledger replays
+    assert counters["preparations"] == counters["full_reads"] == []
     assert len(counters["projections"]) == 1  # one live-root projection, cached
     assert counters["projections"][0]["root_task_id"] == "root-1"
 
@@ -386,7 +395,7 @@ def test_live_root_surfaces_replay_the_ledger_zero_times_when_warm(
     payload = json.loads(_task_get_response(request).body)
 
     assert payload["cost_breakdown"]["authority"] == "physical_attempt_ledger"
-    assert counters["full_reads"] == []  # warm: ZERO full ledger replays
+    assert counters["preparations"] == counters["full_reads"] == []
     assert len(counters["breakdowns"]) == 1  # one subtree breakdown, cached
     assert counters["breakdowns"][0]["root_task_id"] == "root-1"
     assert counters["projections"] == []  # the detail path reads no projection

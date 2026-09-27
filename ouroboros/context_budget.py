@@ -260,12 +260,12 @@ SCRATCHPAD_MAX_CONTENT_CHARS = 60_000
 # any instrument — these thresholds are the instrument). Same family as
 # SCRATCHPAD_BLOAT_WARN_CHARS above: a health-invariant WARNING, not a gate.
 #
-# Ledger: measured evidence in ouroboros/usage_ledger.py::_locked — a ~20MB
-# usage_attempts.jsonl costs ~0.5s per full re-read UNDER THE MONETARY LOCK,
-# starving concurrent workers (the 2026-07-23 lock-timeout incident). Warn at
-# exactly that measured degradation point. Since CPL4-C6, size-triggered
-# compaction (config.USAGE_LEDGER_COMPACT_BYTES, usage_compaction.py) should
-# hold the file far below this. Growth can reflect a large unfoldable residue,
+# Ledger: retain the historical 20MB growth tripwire (the 2026-07-23 incident).
+# Warm writers now validate only the tail; cold parsing runs outside the money
+# lock and revalidates its generation under it. Size still affects cold parsing,
+# full projections and compaction, not the cost of every reservation. Since
+# CPL4-C6, size-triggered compaction (config.USAGE_LEDGER_COMPACT_BYTES) should
+# hold the file below this. Growth can reflect a large unfoldable residue,
 # compaction that is broken or refused, or a file that has not yet outgrown the
 # growth floor its last committed pass stamped into the ledger header (declined
 # before the pass, so no typed event). The name tier (no kernel

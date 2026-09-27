@@ -910,3 +910,19 @@ test('terminal projection retires live calling without inventing settlement', ()
     assert.equal(view.phase, 'result');
     assert.equal(record.toolFold.calls.get('interrupted').settlement, undefined);
 });
+
+test('replayed tool evidence on a latest accounting-wait checkpoint row still reaches the fold', async () => {
+    const base = { key: `tool:${TASK}:before-wait`, tool: 'read_file', receipt: false, live: false };
+    const f = fixture([
+        { task_id: TASK, role: 'assistant', is_progress: true, content: 'Reading the file', ts: TS, chat_id: 1 },
+        { task_id: TASK, role: 'system', is_progress: true, system_type: 'task_checkpoint', checkpoint_kind: 'usage_lock_wait',
+            phase: 'entered', episode_id: 'wait-1', content: 'Waiting for accounting access', ts: '2026-09-15T12:00:05Z', chat_id: 1,
+            tool_evidence: { observations: [{ ...base, fact: 'started', status: 'unknown' }, { ...base, fact: 'settled', status: 'ok' }] } },
+    ]);
+    try {
+        await f.instance.refreshHistory({ revision: 1 });
+        const rows = f.rows().map(row => row.innerHTML).join(' ');
+        assert.match(rows, /Waiting for accounting access/);
+        assert.match(rows, /1 tool call/);
+    } finally { f.close(); }
+});

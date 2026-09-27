@@ -366,3 +366,19 @@ def test_api_state_uses_slim_projection_and_payload_is_field_identical(
     slim_payload.pop("uptime")
     full_payload.pop("uptime")
     assert slim_payload == full_payload
+
+
+def test_render_copies_cannot_indirectly_hold_the_money_lock(data_root, monkeypatch):
+    from ouroboros import _usage_rows_memo as memo
+    import copy
+
+    _seed_settled(data_root)
+    copies = []
+    def detached(value):
+        assert not memo._ROWS_MEMO_LOCK.locked(), "a reader can hold money while waiting for this lock"
+        copies.append(True)
+        return copy.deepcopy(value)
+    monkeypatch.setattr(memo, "copy", types.SimpleNamespace(deepcopy=detached))
+    fresh = ua.usage_breakdown(data_root)
+    assert ua.usage_breakdown(data_root) == fresh
+    assert len(copies) >= 3  # publication, fresh return, cache-hit return

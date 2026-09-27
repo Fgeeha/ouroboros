@@ -213,6 +213,25 @@ def test_history_reloads_late_settlement_over_frozen_summary(tmp_path):
     assert observations[-1]["status"] == "ok" and summary["tool_errors"] == 1  # frozen historical wait count
 
 
+def test_history_stamps_replay_evidence_on_a_latest_accounting_wait_checkpoint(tmp_path):
+    from ouroboros._usage_wait import _hold
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros.tool_call_log import append_call_row
+    from ouroboros.utils import append_jsonl
+
+    append_jsonl(tmp_path / "logs/progress.jsonl", {"type": "send_message", "role": "assistant", "chat_id": 1,
+        "task_id": "t", "content": "Reading the file", "ts": "2000-01-01T00:00:00Z"})
+    for event in ("tool_call_started", "tool_call"):
+        assert append_call_row({}, tmp_path / "logs", {"type": event, "task_id": "t",
+            "invocation_id": "call", "tool": "read_file", "status": "ok"})["task_log"]
+    owner = SimpleNamespace(event_queue=None, task_id="t", drive_root=str(tmp_path), task={"chat_id": 1})
+    _hold(owner, "entered", time.monotonic(), "wait-1")  # the upstream producer's progress projection
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(SimpleNamespace(query_params={"limit": "10"})))
+    latest = [row for row in json.loads(response.body)["messages"] if row.get("task_id") == "t"][-1]
+    assert latest["system_type"] == "task_checkpoint" and latest["is_progress"] is True
+    assert [row["fact"] for row in latest["tool_evidence"]["observations"]] == ["started", "settled"]
+
+
 def test_osworld_readers_count_unfinished_calls_once_and_keep_legacy(tmp_path):
     from devtools.benchmarks.osworld import run_cu_bridge_agent as bridge
     from ouroboros.extension_loader import extension_name_prefix

@@ -805,6 +805,7 @@ TASK_CAUSE_PHRASES = {
     # #869: the provider-death rail's terminal words; the amount of retained text is
     # said by the notice, this clause only names why the task ended.
     "provider_unavailable": "The model provider stopped answering, so the task could not finish",
+    "accounting_wait_expired": "Accounting access did not recover within this turn’s wait window",
     "delivery_control_degraded": "Ouroboros's final delivery instruction could not be applied, so the answer stands as delivered.",
     "authoring_handover_incomplete": "The replacement model stopped before resuming tool work.",
     "delegated_custody_unreconciled": "Some delegated work was never reconciled.",
