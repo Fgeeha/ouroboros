@@ -52,6 +52,7 @@ def _provision(tmp_path, name, task_id):
                                      dir_name=name)
 
 
+@pytest.mark.serial  # Real Git and Python subprocesses.
 def test_unicode_folder_is_created_committed_and_passed_as_a_process_cwd(tmp_path):
     handle = _provision(tmp_path, "ТЗ-1 — отзывчивый хост", "t1")
     path = pathlib.Path(handle.path)
@@ -59,10 +60,42 @@ def test_unicode_folder_is_created_committed_and_passed_as_a_process_cwd(tmp_pat
     (path / "заметка.md").write_text("привет", encoding="utf-8")
     status = subprocess.run(["git", "status", "--porcelain", "-z"], cwd=path, capture_output=True, check=True)
     assert "заметка.md".encode("utf-8") in status.stdout
-    cwd = subprocess.run([sys.executable, "-c", "import os; print(os.getcwd())"], cwd=path,
-                         capture_output=True, text=True, encoding="utf-8", check=True).stdout.strip()
-    assert os.path.samefile(cwd, path)
+    # Explicit UTF-8 bytes both ways: a piped child's print() uses the locale codec (cp1252 on
+    # Windows), which cannot carry this name. The child's own stderr is kept as the failure text.
+    report = "import os, sys; sys.stdout.buffer.write(os.getcwd().encode('utf-8'))"
+    child = subprocess.run([sys.executable, "-c", report], cwd=path, capture_output=True)
+    assert child.returncode == 0, child.stderr.decode("utf-8", "backslashreplace")
+    cwd = child.stdout.decode("utf-8")
+    assert os.path.samefile(cwd, path) and pathlib.Path(cwd).name == path.name  # the exact name crossed
     assert handle.task_id == "t1" and handle.base_sha
+
+
+@pytest.mark.serial  # Real Git subprocesses.
+def test_worktree_git_decodes_unicode_output_independently_of_locale(tmp_path, monkeypatch):
+    import hashlib
+
+    from ouroboros.subagent_worktrees import _git, _git_env
+
+    # Emulate Windows' default only when the caller omitted an encoding; the
+    # actual subprocess still launches Git and decodes its pipes. Python 3.10
+    # uses TextIOWrapper's "locale" codec, bypassing locale.getpreferredencoding.
+    real_run = subprocess.run
+
+    def locale_default(*args, **kwargs):
+        if kwargs.get("text") and not kwargs.get("encoding"):
+            kwargs["encoding"] = "cp1252"
+        return real_run(*args, **kwargs)
+
+    monkeypatch.setattr(subprocess, "run", locale_default)
+    repo = tmp_path / "ТЗ-1-—-отзывчивый-хост"
+    repo.mkdir()
+    result = _git(repo, "init")
+    assert result.returncode == 0 and repo.name in result.stdout
+    # The binary path still carries exact bytes, including invalid UTF-8 and CRLF.
+    raw = b"\x81\xff\x00source\r\n"
+    digest = _git_env(repo, "hash-object", "-w", "--stdin", env=dict(os.environ), input_bytes=raw).stdout
+    assert digest.strip() == hashlib.sha1(f"blob {len(raw)}\0".encode() + raw).hexdigest().encode()
+    assert _git_env(repo, "cat-file", "blob", digest.decode().strip(), env=dict(os.environ)).stdout == raw
 
 
 def test_collision_is_exclusive_including_a_dangling_symlink(tmp_path):
