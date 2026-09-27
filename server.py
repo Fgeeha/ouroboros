@@ -40,14 +40,10 @@ from ouroboros.gateway.ws import (
 )
 
 from ouroboros.server_process import (  # noqa: F401
-    DATA_DIR,
-    _owner_restart_requested,
-    _request_restart_exit,
-    _restart_requested,
-    _supervisor_stop,
-    _exit_signalled,
-    _SignalStopServer,
-    _embedded_uvicorn_server,
+    DATA_DIR, _owner_restart_requested,
+    _request_restart_exit, _restart_requested,
+    _supervisor_stop, _exit_signalled,
+    _SignalStopServer, _embedded_uvicorn_server,
     log,
 )
 from ouroboros.server_routing_context import (  # noqa: F401
@@ -97,14 +93,10 @@ from ouroboros.server_maintenance import (  # noqa: F401
     _startup_worktree_prune,
 )
 from ouroboros.server_restart import (  # noqa: F401
-    _live_running_task_ids,
-    _managed_update_pending_kwargs,
-    _perform_owner_restart,
-    _safe_restart_serialized,
-    _shutdown_supervisor_event_bus,
-    _shutdown_task_cleanup_args,
-    _stop_owned_daemon_for_new_pin,
-    _stop_owned_work,
+    _live_running_task_ids, _managed_update_pending_kwargs,
+    _perform_owner_restart, _safe_restart_serialized,
+    _shutdown_supervisor_event_bus, _shutdown_task_cleanup_args,
+    _stop_owned_daemon_for_new_pin, _stop_owned_work,
 )
 
 REPO_DIR = pathlib.Path(os.environ.get("OUROBOROS_REPO_DIR", pathlib.Path(__file__).parent))
