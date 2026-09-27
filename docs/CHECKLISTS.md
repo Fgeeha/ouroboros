@@ -168,18 +168,29 @@ Rule: read before write. Never reconstruct `VERSION`, `pyproject.toml`
 `version`, or the README badge from memory — one stale reconstruction creates
 a `self_consistency` FAIL that an entire advisory cycle is then spent on.
 
-**After a blocked reviewed commit (`commit_reviewed`) — mandatory regrouping before the next attempt:**
-When a reviewed commit returns critical findings, the reflex is to patch the single
-flagged finding and retry. That pattern reliably produces 5-10 blocked rounds.
-The correct procedure before **every** retry:
-1. List all open obligations and commit-readiness debt (`review_status` tool or the Review Continuity context section).
-2. Group them by root cause — one underlying problem often generates 2-4 separately-named obligations from reviewer rephrasing.
-3. Write a short plan in a progress message: one paragraph naming each root-cause group and the single code/doc change that resolves it.
-4. Only then open any file and edit.
-
-This step takes 2-3 minutes and has saved $20-50 in blocked-review cycles in practice.
-The rule is stated where the block message is built (`review.py::_build_critical_block_message`),
-but without it appearing here as a procedural step it stays theoretical rather than reflexive.
+**Before retrying after review findings (`commit_reviewed`, `skill_review`):**
+The recorded review state — the verdict when one was reached and the individual
+findings, including the partial findings of a pending review; for commits also
+the open obligations and commit-readiness debt shown by `review_status` and the
+Review Continuity context section — stays recorded until a later review or
+successful commit resolves it; the author's response rewrites neither it nor the
+selected enforcement. Before the next attempt the author owes an outcome, not a
+procedure: consider the open findings together against the evidence rather than
+patching one visible symptom, repair what the evidence supports, rebut with
+reasons what it does not (`review_rebuttal`), and keep anything unresolved
+visible. How to inspect, group, order and explain that work, and whether to seek
+more feedback first, is the author's judgment for the case (BIBLE P13). Whether
+the next attempt is replayed or refused for free, rejoins unresolved review
+work, or dispatches a paid review is decided by the gate's recorded replay
+eligibility, custody, budget and configured cycle limit (`docs/DEVELOPMENT.md`
+Review & Commit Protocol), not by this checklist: an eligible verdict on
+unchanged material under the same review contract is not re-reviewed without a
+genuinely new rebuttal, while an infrastructure outcome such as a missed
+reviewer quorum neither replays nor lapses a verdict. If attempts stop
+converging, reconsider the approach instead of repeating it. The shared retry
+note (`review_prompt_text.py::build_self_verification_template`, in the commit
+block message and the skill review block) and the open-obligation/debt branches
+of `review_status` `next_step` state this same duty.
 
 ---
 
