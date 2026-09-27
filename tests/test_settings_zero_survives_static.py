@@ -5,19 +5,15 @@ INPUT_FIELDS row, so a saved ``0`` (``OUROBOROS_CONSCIOUSNESS_DAILY_USD``, the
 documented "may not spend" value) rendered as its fallback ``20`` and the next
 save of any tab wrote ``20`` back. Only a missing value may take the fallback.
 
-Source pin (the pattern of the other *_static tests) plus, when ``node`` is on
-PATH, an executed check of the helper itself.
+Source pin (the pattern of the other *_static tests) plus the typed server read
+the helper relies on. The helper itself runs in the node lane
+(``web/tests/settings_stored_zero.test.js``); the load/save/reload round trip
+runs against a real server in ``tests/test_ui_smoke_settings_drafts.py``.
 """
 
 from __future__ import annotations
 
-import json
 import pathlib
-import re
-import shutil
-import subprocess
-
-import pytest
 
 SETTINGS_JS = pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "settings.js"
 
@@ -32,27 +28,12 @@ def test_input_fields_load_through_the_helper():
     assert "fallback && !s[key]" not in src
 
 
-def _helper_source() -> str:
-    match = re.search(r"export function storedOrFallback\(value, fallback\) \{.*?\n\}", _source(), re.S)
-    assert match, "storedOrFallback helper is missing"
-    return match.group(0).replace("export ", "", 1)
+def test_server_read_keeps_a_saved_zero_and_defaults_only_a_blank():
+    # GET /api/settings serves this coercion: the form gets the number 0, never ''
+    # or null, so the helper's absence branch cannot swallow it; a blank reads as the default.
+    from ouroboros import config as cfg
 
-
-@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
-def test_helper_keeps_zero_and_fills_only_absence():
-    cases = [
-        [0, "20", 0],
-        ["0", "20", "0"],
-        [0.0, "20", 0],
-        [None, "20", "20"],
-        ["", "20", "20"],
-        ["5", "20", "5"],
-        ["", "", ""],
-    ]
-    script = _helper_source() + "\n" + (
-        "const cases = " + json.dumps(cases) + ";\n"
-        "const out = cases.map(([v, f]) => storedOrFallback(v, f));\n"
-        "process.stdout.write(JSON.stringify(out));\n"
-    )
-    result = subprocess.run(["node", "-e", script], capture_output=True, text=True, check=True)
-    assert json.loads(result.stdout) == [expected for _, _, expected in cases]
+    key = "OUROBOROS_CONSCIOUSNESS_DAILY_USD"
+    assert cfg._coerce_setting_value(key, "0") == 0.0
+    assert cfg._coerce_setting_value(key, 0) == 0.0
+    assert cfg._coerce_setting_value(key, "") == cfg.SETTINGS_DEFAULTS[key]
