@@ -121,6 +121,97 @@ def test_explicit_owner_runs_full_panel_on_delivered_root_and_retry(late, tmp_pa
     assert again['reason'] == 'existing_paid_operation' and len(late.calls) == 3
 
 
+def _late_effects(f):
+    from ouroboros import review_operation
+    ledger = f.root / 'state' / 'usage_attempts.jsonl'
+    return {'live': list(review_operation._LIVE), 'ledger': ledger.read_text() if ledger.exists() else '',
+            'rows': {tid: {k: v for k, v in load_task_result(f.root, tid).items()
+                           if k not in ('acceptance_root_cap_amendments', 'updated_at')} for tid in (f.tid, f.accounting)},
+            'sources': sorted(p.name for p in f.root.rglob('source_handles/context_checkpoints/*'))}
+
+
+def _paid_facts(f, out, late):
+    root = load_task_result(f.root, f.accounting).get('task_acceptance_review_accounting') or {}
+    return {'status': out['status'], 'reason': out['reason'], 'dispatched': out['dispatched'], 'calls': len(late.calls),
+            'operations': len(load_task_result(f.root, f.tid).get('review_operations') or {}),
+            'claims': len(root.get('claims_by_binding') or {})}
+
+
+@pytest.mark.parametrize('action,retry', [('amend_cap', False), ('amend_cap', True), (None, True)])
+def test_cap_only_amendment_prepares_and_buys_nothing_even_with_every_gate_open(late, tmp_path, monkeypatch, action, retry):
+    """Owner 2A: the absolute original-root cap is money only; a panel is requested separately."""
+    from ouroboros import review_operation
+    from ouroboros.acceptance_history import historical_review_controls
+    from ouroboros.acceptance_late import _receipt
+    f = delivered(tmp_path, monkeypatch, retry=retry)
+    ctx = _caller(f)
+    ctx.event_queue = queue.Queue()
+    target = load_task_result(f.root, f.tid)
+    # Exact delivered zero-physical debt; no Stop/Pause/fence/deadline/prohibition anywhere.
+    assert _receipt(f.root, target['acceptance_debt'])
+    assert historical_review_controls(f.root, target, target['acceptance_debt'], caller_task_id=ctx.task_id,
+                                      automatic=False) == []
+    before = _late_effects(f)
+    out = _request(f, ctx, _source(ctx, text='Raise that task root cap to 9 USD; no review now.'),
+                   new_original_root_cap_usd=9, **({'action': action} if action else {}))
+    until(lambda: not review_operation._LIVE)
+    after = _late_effects(f)
+    stored = set(after.pop('sources')) - set(before.pop('sources'))
+    assert (out['status'], out['dispatched'], late.calls) == ('amended', False, []), _paid_facts(f, out, late)
+    assert after == before
+    assert [name.split('-')[0] for name in stored] == ['historical_owner_request'], stored
+    assert out['review_requested'] is False and out['execution_blocked_by'] == [], out
+    assert out['effective_original_root_cap'] == {'state': 'finite', 'usd': 9, 'source': 'owner_amendment'}
+    amendments = load_task_result(f.root, f.accounting)['acceptance_root_cap_amendments']
+    assert [(a['new_cap_usd'], a['previous_cap']['usd']) for a in amendments] == [(9, 4)]
+    assert not [e for e in list(ctx.event_queue.queue) if e.get('system_type') == 'acceptance_late_settlement']
+    # A later explicit panel buys from the same original root under the amended cap.
+    review = _request(f, ctx, _source(ctx, text='Now review that historical answer.'), action='review')
+    assert review['status'] in {'pending', 'announced', 'published', 'settled'}, review
+    until(lambda: len(late.calls) == 3)
+    assert all(scope.task_id == f.tid and scope.root_task_id == f.accounting and scope.root_limit_usd == 9
+               and scope.root_limit_source == 'owner_amendment' for scope, _ in late.calls)
+    until(lambda: not review_operation._LIVE)
+    root = load_task_result(f.root, f.accounting)
+    assert root['acceptance_root_cap_amendments'] == amendments
+    assert len(root['task_acceptance_review_accounting']['claims_by_binding']) == 1
+
+
+def test_explicit_review_may_combine_the_absolute_cap_before_its_one_panel(late, tmp_path, monkeypatch):
+    from ouroboros import review_operation
+    f = delivered(tmp_path, monkeypatch, retry=True)
+    ctx = _caller(f)
+    out = _request(f, ctx, _source(ctx), action='review', new_original_root_cap_usd=9)
+    assert out['status'] in {'pending', 'announced', 'published', 'settled'}, out
+    assert out['action'] == 'review' and out['cap_amendment']['new_cap_usd'] == 9, out
+    until(lambda: len(late.calls) == 3)
+    assert all(scope.root_task_id == f.accounting and scope.root_limit_usd == 9 for scope, _ in late.calls)
+    until(lambda: not review_operation._LIVE)
+
+
+@pytest.mark.parametrize('extra,reason', [
+    ({'action': 'amend'}, 'late_review_action_invalid'),
+    ({'action': 'Review'}, 'late_review_action_invalid'),
+    ({'action': ''}, 'late_review_action_invalid'),
+    ({'action': ['amend_cap']}, 'late_review_action_invalid'),
+    ({'action': 'amend_cap', 'new_original_root_cap_usd': None}, 'absolute_root_cap_required'),
+    ({'action': 'review', 'new_original_root_cap_usd': 0}, 'absolute_root_cap_must_be_positive_finite'),
+])
+def test_malformed_late_action_is_refused_before_any_effect(late, tmp_path, monkeypatch, extra, reason):
+    from ouroboros import review_operation
+    f = delivered(tmp_path, monkeypatch, retry=True)
+    ctx = _caller(f)
+    source = _source(ctx)
+    before = _late_effects(f)
+    amendments = load_task_result(f.root, f.accounting).get('acceptance_root_cap_amendments')
+    out = _request(f, ctx, source, **{'new_original_root_cap_usd': 9, **extra})
+    until(lambda: not review_operation._LIVE)
+    assert (out['status'], out['reason'], late.calls) == ('refused', reason, []), _paid_facts(f, out, late)
+    after = _late_effects(f)
+    assert after == before, set(after.pop('sources')) ^ set(before.pop('sources'))
+    assert load_task_result(f.root, f.accounting).get('acceptance_root_cap_amendments') == amendments
+
+
 @pytest.mark.parametrize('receipt', ['wrong_id', 'wrong_chat', 'wrong_digest', 'owed', 'registration_failure'])
 def test_explicit_receipt_requires_id_routed_chat_and_exact_bytes(late, tmp_path, monkeypatch, receipt):
     f = delivered(tmp_path, monkeypatch, receipt=receipt)

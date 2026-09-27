@@ -328,9 +328,9 @@ def historical_review_controls(root: Any, row: dict, debt: dict, *, caller_task_
 def prepare_owner_historical_review(ctx: Any, request: dict) -> dict:
     """Resolve the explicit owner request and optionally record an absolute cap.
 
-    Main interprets the resolved words and names the selected task/debt/amount
-    with a rationale. Source hashes alone, implicit origin inheritance, and
-    task/Presence messages grant nothing. Preparation makes no paid claim.
+    Main interprets the resolved words and names the selected task/debt/action/
+    amount with a rationale. Source hashes alone, implicit origin inheritance,
+    and task/Presence messages grant nothing. Preparation makes no paid claim.
     """
     from ouroboros.loop_acceptance_review import _resolve_ctx_lineage
     from ouroboros.owner_source import resolve_owner_source
@@ -348,6 +348,17 @@ def prepare_owner_historical_review(ctx: Any, request: dict) -> dict:
             return refusal("owner_caller_required")
         if not isinstance(request, dict) or not str(request.get("rationale") or "").strip():
             return refusal("explicit_owner_request_required")
+        # Malformed intent is refused before any source or money write. A request
+        # without the selector predates it: a named cap alone never buys review.
+        action, amount = request.get("action"), request.get("new_original_root_cap_usd")
+        if action is None:
+            action = "review" if amount is None else "amend_cap"
+        if action not in ("review", "amend_cap"):
+            return refusal("late_review_action_invalid")
+        if action == "amend_cap" and amount is None:
+            return refusal("absolute_root_cap_required")
+        if amount is not None and (type(amount) not in (int, float) or not math.isfinite(amount) or amount <= 0):
+            return refusal("absolute_root_cap_must_be_positive_finite")
         root = canonical_data_root(ctx)
         tid = validate_task_id(request.get("task_id"))
         row = load_task_result(root, tid, strict=True) or {}
@@ -375,10 +386,7 @@ def prepare_owner_historical_review(ctx: Any, request: dict) -> dict:
         amendment = None
         accounting_id = debt["accounting_root_task_id"]
         accounting = load_task_result(root, accounting_id, strict=True)
-        amount = request.get("new_original_root_cap_usd")
         if amount is not None:
-            if type(amount) not in (int, float) or not math.isfinite(amount) or amount <= 0:
-                return refusal("absolute_root_cap_must_be_positive_finite")
             amendment = {"source": source, "source_identity": _digest(source), "new_cap_usd": amount,
                          "accounting_root_task_id": debt["accounting_root_task_id"], "debt_id": debt["debt_id"],
                          "rationale": str(request["rationale"]), "source_ref": authority_ref,
@@ -407,7 +415,7 @@ def prepare_owner_historical_review(ctx: Any, request: dict) -> dict:
                 return {"status": current["status"], "acceptance_root_cap_amendments": amendments}
 
             write_task_result(root, accounting_id, accounting["status"], strict_existing_dict=True, _field_projector=amend)
-        return {"status": "prepared", "reason": "owner_historical_source_prepared",
+        return {"status": "prepared", "reason": "owner_historical_source_prepared", "action": action,
                 "dispatched": False, "task_id": tid, "debt_id": debt["debt_id"],
                 "source_ref": historical_source_reference(root, tid, debt["source_ref"], subject=True),
                 "owner_source_ref": historical_source_reference(root, tid, authority_ref),

@@ -211,7 +211,9 @@ def test_owner_cap_amendment_is_absolute_root_bound_idempotent_and_replica_safe(
     ctx = _caller(f)
     source = _source(ctx, kind=kind)
     out = _request(f, ctx, source, new_original_root_cap_usd=9)
-    assert out["status"] == "owed", out
+    # A bare cap (the pre-selector form) is money only: no review is prepared.
+    assert (out["status"], out["action"], out["dispatched"]) == ("amended", "amend_cap", False), out
+    assert not load_task_result(f.root, f.tid).get("review_operations")
     assert out["owner_source_ref"]["size"] > 0
     alias = copy.deepcopy(source)
     if kind == "chat":
@@ -350,7 +352,7 @@ def test_claim_after_source_capture_blocks_explicit_new_panel_preparation(tmp_pa
     assert claim["status"] == "claimed"
     before = load_task_result(f.root, f.accounting)["task_acceptance_review_accounting"]
     ctx = _caller(f)
-    out = _request(f, ctx, _source(ctx), new_original_root_cap_usd=9)
+    out = _request(f, ctx, _source(ctx), action="review", new_original_root_cap_usd=9)
     assert "paid_or_unknown_panel" in out["execution_blocked_by"] and not out["dispatched"]
     after = load_task_result(f.root, f.accounting)
     assert after["task_acceptance_review_accounting"] == before
@@ -486,7 +488,7 @@ def test_main_owner_can_name_project_history_using_current_or_host_relayed_sourc
     if relayed:
         write_task_result(f.root, ctx.task_id, "running", origin_message_ref=source["ref"])
     out = _request(f, ctx, source, new_original_root_cap_usd=9)
-    assert out["status"] == "owed" and out["dispatched"] is False, out
+    assert out["status"] == "amended" and out["dispatched"] is False, out
     amendment = load_task_result(f.root, f.accounting)["acceptance_root_cap_amendments"][0]
     assert amendment["source"]["ref"] == source["ref"]
     assert amendment["debt_id"] == out["debt_id"] and amendment["accounting_root_task_id"] == f.accounting

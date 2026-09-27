@@ -15,12 +15,16 @@ from typing import Any
 
 
 def owner_historical_acceptance(ctx: Any, request: dict) -> dict:
-    """Resolve NEW owner authority, then enter the shared historical operation."""
+    """Resolve NEW owner authority; only an explicit review enters the shared operation."""
     from ouroboros.acceptance_history import prepare_owner_historical_review
 
     prepared = prepare_owner_historical_review(ctx, request)
     if prepared['status'] != 'prepared':
         return prepared
+    if prepared['action'] == 'amend_cap':
+        # Money only: no panel, preparation operation, purpose, paid claim or
+        # reservation. A later explicit review spends the amended original cap.
+        return {**prepared, 'status': 'amended', 'reason': 'original_root_cap_amended', 'review_requested': False}
     return {**prepared, **run_historical_acceptance(ctx, task_id=prepared['task_id'],
                 debt_id=prepared['debt_id'], prepared=prepared)}
 
