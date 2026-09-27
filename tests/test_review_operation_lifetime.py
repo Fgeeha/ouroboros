@@ -110,6 +110,16 @@ def _rows(root, state="waiting"):
     return [row for row in waits.values() if row.get("state") == state and row.get("review_operation")]
 
 
+def _settled_rows(root):
+    """Waiting rows past their last waiting publication.
+
+    A parked reviewer publishes its row, then republishes it at the next revision
+    once its credential-harness lookup lands; a copy taken earlier is a stale
+    event its live operation has already superseded.
+    """
+    return [row for row in _rows(root) if row.get("credential_harness")]
+
+
 def _parent(f, **task):
     return model_wait.task_model_wait_scope(task={"id": TASK, "chat_id": 7, "_attempt": 1, **task},
                                             drive_root=f.root, event_queue=f.events, worker_slot_held=False)
@@ -236,9 +246,9 @@ def test_owner_controls_reach_the_exact_live_operation_after_author_end(env, mon
                            usage_ctx=f.ctx, llm=f.model)
         run_review_request(_request("answer B", "wave-b"), slots=[_slot()], drive_root=f.root,
                            usage_ctx=f.ctx, llm=f.model)
-        until(lambda: len(_rows(f.root)) == 2)
+        until(lambda: len(_settled_rows(f.root)) == 2)
     write_task_result(f.root, TASK, "completed", result="answer B")
-    rows = {row["review_operation"]["retry_key"]: row for row in _rows(f.root)}
+    rows = {row["review_operation"]["retry_key"]: row for row in _settled_rows(f.root)}
     op_a = review_operation._LIVE[rows["wave-a"]["review_operation"]["owner_id"]]
     op_b = review_operation._LIVE[rows["wave-b"]["review_operation"]["owner_id"]]
     # The supervisor publishes a live operation's waiting row although the author ended.
@@ -266,6 +276,39 @@ def test_owner_controls_reach_the_exact_live_operation_after_author_end(env, mon
     f.model.ready.set()
     until(lambda: op_b.closed)
     assert [c["model"] for c in f.model.calls if "answer B" in c["subject"]] == [MODEL, MODEL]
+
+
+def test_a_waiting_row_superseded_by_its_live_operation_is_not_forwarded(env):
+    """The first visible waiting row is not the settled one, and its copy stays refused."""
+    from supervisor.task_model_wait import handle_task_model_wait
+
+    f = env
+    parked, gate = threading.Event(), threading.Event()
+    lookup = f.model.claudexor_model_sources
+
+    def held_lookup():
+        parked.set()
+        gate.wait(10)
+        return lookup()
+
+    f.model.claudexor_model_sources = held_lookup
+    try:
+        with _parent(f):
+            run_review_request(_request(), slots=[_slot()], drive_root=f.root, usage_ctx=f.ctx, llm=f.model)
+            assert parked.wait(10), "the reviewer published its first waiting row, then looked up its harness"
+        early = _rows(f.root)[0]
+    finally:
+        gate.set()
+    assert not early["credential_harness"]
+    settled = until(lambda: _settled_rows(f.root))[0]
+    assert settled["wait_id"] == early["wait_id"] and settled["revision"] > early["revision"]
+    write_task_result(f.root, TASK, "completed")
+    forwarded = []
+    sup = _supervisor_ctx(f.root, forwarded)
+    handle_task_model_wait({"type": "task_model_wait", "task_id": TASK, **early}, sup)
+    assert forwarded == [], "a revision the live operation already republished is never forwarded"
+    handle_task_model_wait({"type": "task_model_wait", "task_id": TASK, **settled}, sup)
+    assert len(forwarded) == 1 and forwarded[0]["revision"] == settled["revision"] and forwarded[0]["chat_id"] == 7
 
 
 # A REAL review operation in another process: the author scope ends, the reviewer
