@@ -148,30 +148,36 @@ def test_a_failing_main_port_sweep_is_disclosed_and_does_not_target_unrelated_de
 
 
 def test_requests_precede_settlement_and_persistence_before_hard_exit(monkeypatch, tmp_path):
-    """All direct owner requests finish before cleanup helpers or flag writes."""
+    """Physical owned-worker requests, not the legacy cooperative callback,
+    precede cleanup and control persistence."""
     import server
 
     events, kill_workers = _harness(monkeypatch, tmp_path)
     monkeypatch.setattr(server, "DATA_DIR", tmp_path)
     monkeypatch.setattr(server, "_ACTUAL_BOUND_PORT", 9123)
+    child = SimpleNamespace(pid=12345, _ouroboros_stop_backstop=None)
+    monkeypatch.setattr("multiprocessing.active_children", lambda: [child])
+    monkeypatch.setattr("supervisor.worker_pool_lifecycle.kill_worker_tree",
+                        lambda pid, *, panic_process: events.append(("owned_worker_request", pid, panic_process)))
 
     with pytest.raises(_ExitCalled):
         server._execute_panic_stop(SimpleNamespace(stop=lambda: None), kill_workers)
 
     names = [event[0] for event in events]
-    assert names[:6] == ["local_model_request", "owned_daemon_request", "shells_request",
-                         "foreground_request", "services_request", "companions_request"]
-    assert all(name.endswith("_request") for name in names[:6])
-    assert not any(name.endswith("_request") for name in names[6:])
-    assert names.index("write_flag") > 5
-    assert names.index("persist_controls") > 5
+    direct_requests = {"local_model_request", "owned_daemon_request", "shells_request",
+                       "foreground_request", "services_request", "companions_request",
+                       "owned_worker_request"}
+    assert set(names[:7]) == direct_requests
+    assert all(name.endswith("_request") for name in names[:7])
+    assert not any(name.endswith("_request") for name in names[7:])
+    assert ("owned_worker_request", child.pid, child) in events[:7]
+    assert names.index("write_flag") > 6
+    assert names.index("persist_controls") > 6
     assert names.index("hard_exit") > names.index("persist_controls")
     assert {name for name in names if name.endswith("_settlement")} == {
         "local_model_settlement", "owned_daemon_settlement", "shells_settlement",
         "foreground_settlement", "services_settlement", "companions_settlement"}
-    assert next(event[1] for event in events if event[0] == "kill_workers") == {
-        "force": True, "archive_service_logs": False, "reconcile_delegate_custody": False,
-    }
+    assert not any(name == "kill_workers" for name in names)
     assert (tmp_path / "state" / "panic_stop.flag").read_text(encoding="utf-8") == "panic"
 
 

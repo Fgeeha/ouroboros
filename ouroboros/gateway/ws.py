@@ -398,6 +398,12 @@ async def ws_endpoint(websocket: WebSocket) -> None:
 
                     bridge = get_bridge()
                     if msg_type == "chat":
+                        # The composer sends slash text as a chat frame. Offer
+                        # Panic to the authenticated socket's emergency door
+                        # before this socket's ordered chat-acceptance tail;
+                        # otherwise an earlier blocked append could delay Stop.
+                        if bridge.panic.request(payload):
+                            continue
                         force_plan = bool(msg.get("force_plan"))
                         client_surface = normalize_client_surface(msg.get("client_surface"))
                         image_b64, image_mime, image_caption = _first_image_attachment(

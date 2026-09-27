@@ -10,7 +10,7 @@ import pytest
 pytestmark = pytest.mark.serial
 
 
-@pytest.mark.parametrize("surface", ["http", "ws", "external", "external_correlated"])
+@pytest.mark.parametrize("surface", ["http", "ws", "ws_chat", "external", "external_correlated"])
 def test_panic_reaches_emergency_owner_with_stalled_normal_consumer(tmp_path, surface):
     from ouroboros.test_environment import isolated_environment
 
@@ -108,6 +108,30 @@ def _exercise(surface):
                 if surface == "http":
                     response = client.post("/api/command", headers=headers, json={"cmd": "/panic"})
                     assert response.status_code == 200
+                elif surface == "ws_chat":
+                    # The composer sends slash text as type=chat, not type=command.
+                    # Keep an earlier acceptance on this authenticated socket held:
+                    # typed Panic must reach the SAME emergency owner before it.
+                    entered, release = threading.Event(), threading.Event()
+                    original_send = bridge.ui_send
+
+                    def held_send(text, **kwargs):
+                        if text == "ordinary held chat":
+                            entered.set()
+                            assert release.wait(5), "held acceptance was never released"
+                        return original_send(text, **kwargs)
+
+                    bridge.ui_send = held_send
+                    with client.websocket_connect("/ws", headers=headers) as socket:
+                        try:
+                            socket.send_json({"type": "chat", "content": "ordinary held chat"})
+                            assert entered.wait(3)
+                            socket.send_json({"type": "chat", "content": " /PaNiC ",
+                                              "client_message_id": "typed-panic"})
+                            assert request_made.wait(3), "typed Panic waited behind ordinary chat acceptance"
+                            assert not release.is_set()
+                        finally:
+                            release.set()
                 else:
                     with client.websocket_connect("/ws", headers=headers) as socket:
                         socket.send_json({"type": "command", "cmd": "/panic"})

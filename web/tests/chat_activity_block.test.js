@@ -61,10 +61,14 @@ const TS = '2026-09-15T12:00:00Z';
 const TASK = 'turn-a';
 
 function fixture(history = []) {
-    const env = installDom(async (url) => ({ ok: true, json: async () =>
-        String(url).startsWith('/api/chat/history')
+    let historyReads = 0;
+    const env = installDom(async (url) => {
+        const isHistory = String(url).startsWith('/api/chat/history');
+        if (isHistory) historyReads++;
+        return { ok: true, json: async () => isHistory
             ? { messages: history, window: { complete: true } }
-            : { active_direct_turns: [] } }));
+            : { active_direct_turns: [] } };
+    });
     const handlers = new Map();
     let generation = 0;
     const instance = createChatInstance({
@@ -78,7 +82,7 @@ function fixture(history = []) {
     const messages = document.byId.get('chat-messages');
     const nodes = (node) => [node, ...(node?.children || []).flatMap(nodes)];
     return {
-        instance, messages,
+        instance, messages, historyReads: () => historyReads,
         card: (id = TASK) => walkCard(messages, id),
         rows: (id = TASK) => nodes(walkCard(messages, id)).filter((n) => n.classList?.contains('chat-live-line')),
         meta: (id = TASK) => walkCard(messages, id)?.querySelector('[data-live-meta]')?.innerHTML || '',
@@ -852,6 +856,32 @@ for (const child of [false, true]) test(`cold Chat merges canonical settlement w
         assert.match(rows, /1 tool call.*wait ended/);
         assert.doesNotMatch(rows, /1 error|operation may still settle/);
         assert.doesNotMatch(f.meta(id), /1 error/);
+    } finally { f.close(); }
+});
+
+for (const legacy of [false, true]) test(`Chat history keeps a known error when ${legacy ? 'legacy start' : 'partial replay'} lacks settlement`, async () => {
+    const id = TASK;
+    const evidence = legacy
+        ? { observations: [], legacy: { calls: 1, errors: 0, unknown: true }, coverage: { complete: false } }
+        : { observations: [{ key: `tool:${id}:partial`, tool: 'read_file', fact: 'started', status: 'unknown' }],
+            legacy: { calls: 0, errors: 0 }, coverage: { complete: false } };
+    const f = fixture([{ ...final, task_id: id, role: 'system', system_type: 'task_summary',
+        content: '', text: '', ts: TS, chat_id: 1, _is_direct_chat: true,
+        tool_calls: legacy ? 1 : 2, tool_errors: 1, routing_tool_calls: legacy ? 1 : 2,
+        tool_evidence: evidence }]);
+    try {
+        await f.instance.refreshHistory({ revision: 1 });
+        assert.equal(f.historyReads(), 1);
+        for (const reconnect of [false, true]) {
+            if (reconnect) {
+                f.emit('open', { previouslyConnected: true });
+                await new Promise(setImmediate);
+                assert.ok(f.historyReads() >= 2, 'the actual reconnect handler fetched history');
+            }
+            assert.ok(f.card(), 'an addressing-only row with a known error stays visible');
+            assert.match(f.rows().map(row => row.innerHTML).join(' '), /1 error/);
+            assert.match(f.meta(), /1 error/);
+        }
     } finally { f.close(); }
 });
 

@@ -773,8 +773,8 @@ sufficient identity remain separate even when names and arguments match. Host
 metrics fill absent counts field by field; canonical per-invocation evidence
 reconstructs later settlements on history/reconnect without resurrecting frozen
 wait errors. Reads are bounded and carry coverage; absent evidence is not proof
-of success. Start-only live evidence preserves a known aggregate error when its
-finish frame is missing; complete settlement evidence can replace an earlier wait
+of success. Start-only (live or legacy) and incomplete replay evidence preserve a known
+aggregate error; only complete settlement evidence can replace an earlier wait
 error. Typed tool evidence after task terminal updates counts and diagnostics
 on both root and child cards, preserving terminal task phase and controls.
 The row keeps its live position; cold history places it with the summary. Block

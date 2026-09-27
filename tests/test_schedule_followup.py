@@ -55,7 +55,7 @@ def test_once_schedule_fires_exactly_once_and_is_marked_done(tmp_path):
     queue.upsert_scheduled_task({
         "id": "fu-due", "name": "Follow-up", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume the blocked plan after the window resets",
+        "task": {"type": "task", "text": "resume the blocked plan after the window resets", "chat_id": 1,
                  "metadata": {"origin_task_id": "t-origin", "resource_intent": {"kind": "system_repo"}}},
     })
     queue.upsert_scheduled_task({
@@ -91,7 +91,7 @@ def test_once_schedule_survives_a_refused_admission_and_retries(tmp_path, monkey
     queue.upsert_scheduled_task({
         "id": "fu-blocked", "name": "Follow-up", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume after the window resets",
+        "task": {"type": "task", "text": "resume after the window resets", "chat_id": 1,
                  "metadata": {"resource_intent": {"kind": "system_repo"}}},
     })
     real_enqueue = queue.enqueue_task
@@ -126,7 +126,7 @@ def test_once_schedule_refused_by_the_consciousness_door_waits_on_the_row(tmp_pa
     queue.upsert_scheduled_task({
         "id": "fu-conscious", "name": "Follow-up", "enabled": True, "source": "task_followup",
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume later",
+        "task": {"type": "task", "text": "resume later", "chat_id": 1,
                  "metadata": {"initiator": "consciousness", "usage_category": "consciousness_task",
                               "resource_intent": {"kind": "system_repo"}}},
     })
@@ -552,8 +552,14 @@ def test_schedule_followup_of_an_unscoped_task_invents_no_project_address(tmp_pa
     unscoped task's follow-up keeps the existing owner-chat default."""
     from supervisor.queue import list_scheduled_tasks
     from supervisor.queue_schedules import _task_from_schedule
+    from supervisor import state
     from ouroboros.project_facts import resolve_project_id
 
+    # The initial missing binding is unknown, never the hidden chat-0 partition.
+    # A real owner-bound installation supplies the positive destination.
+    state.init(tmp_path / "data")
+    state.init_state()
+    state.update_state(lambda st: st.update(owner_chat_id=17))
     assert _followup(_ctx(tmp_path, task_id="plain-task")).startswith("FOLLOWUP_SCHEDULED")
     record = list_scheduled_tasks(pathlib.Path(tmp_path / "data").resolve())["tasks"][0]
     assert "project_id" not in record["task"]
@@ -561,7 +567,7 @@ def test_schedule_followup_of_an_unscoped_task_invents_no_project_address(tmp_pa
 
     queued = _task_from_schedule(record)
     assert resolve_project_id(queued) == ""
-    assert queued["chat_id"] == 0  # the existing owner_chat_id default, unchanged
+    assert queued["chat_id"] == 17
 
 
 # ------------------------------------------------- gateway + digest + queue GC
@@ -625,7 +631,7 @@ def test_gateway_rearm_of_completed_once_requires_a_fresh_run_at(tmp_path):
     queue.upsert_scheduled_task({
         "id": "fu-done", "name": "Follow-up", "enabled": False, "completed_at": fired,
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume"},
+        "task": {"type": "task", "text": "resume", "chat_id": 1},
     })
     app = Starlette(routes=[Route("/api/schedules", endpoint=api_schedules_upsert, methods=["POST"])])
     app.state.drive_root = tmp_path
@@ -635,14 +641,14 @@ def test_gateway_rearm_of_completed_once_requires_a_fresh_run_at(tmp_path):
     refused = client.post("/api/schedules", json={
         "id": "fu-done", "enabled": True,
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume"},
+        "task": {"type": "task", "text": "resume", "chat_id": 1},
     })
     assert refused.status_code == 400 and "run_at" in refused.json()["error"]
     # Disable/edit keeping the same run_at: allowed, receipt carried forward.
     kept = client.post("/api/schedules", json={
         "id": "fu-done", "enabled": False,
         "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume"},
+        "task": {"type": "task", "text": "resume", "chat_id": 1},
     })
     assert kept.status_code == 200
     assert kept.json()["schedule"]["completed_at"] == fired
@@ -650,7 +656,8 @@ def test_gateway_rearm_of_completed_once_requires_a_fresh_run_at(tmp_path):
     rearmed = client.post("/api/schedules", json={
         "id": "fu-done", "enabled": True,
         "trigger": {"type": "once", "run_at": "2000-02-01T00:00:00+00:00"},
-        "task": {"type": "task", "text": "resume"},
+        "task": {"type": "task", "text": "resume", "chat_id": 1,
+                 "metadata": {"resource_intent": {"kind": "system_repo"}}},
     })
     assert rearmed.status_code == 200
     assert "completed_at" not in rearmed.json()["schedule"]
