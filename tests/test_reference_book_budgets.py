@@ -142,7 +142,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 34100 -> 35700 (measured 35539): the model-free notify dispatch verb
     # and owner suppression semantics are a new paragraph next to upstream's
     # task occurrence protocol, not a replacement for its admission contract.
-    "docs/architecture/05-supervisor-loop.md": 35700,
+    # 35700 -> 35900 (measured 35828): one live-run overlap invariant
+    # preserves task cron behavior while the notification kind bypasses it.
+    "docs/architecture/05-supervisor-loop.md": 35900,
     # 286850 -> 287600: "an answer that has not arrived is a gap" is a new invariant of
     # plan review and task acceptance (the slot census vocabulary, the `awaiting`
     # projection, the only-awaited task outcome); the in-flight sentence it grew from is

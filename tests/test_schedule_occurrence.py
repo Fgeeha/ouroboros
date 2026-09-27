@@ -314,6 +314,32 @@ def test_dispatch_barrier_restore_and_settlement(q, monkeypatch):
     assert occurrences.restore_allowed(task) is False  # unreadable is unknown, never revived
 
 
+def test_running_cron_task_blocks_a_second_due_occurrence(q):
+    """The dispatch token can be retired before the task ends; the schedule-id
+    live check must still prevent an overlapping root on the next cron point."""
+    from supervisor import schedule_occurrence as occurrences
+
+    _row(q, intent={"kind": "system_repo"}, cron=True)
+    q.queue.check_scheduled_tasks()
+    [task] = q.pending
+    assert occurrences.record_dispatch_possible(task) is True
+    q.pending.clear()
+    q.queue.RUNNING[task["id"]] = {"task": task}
+    try:
+        record = _rows(q)["s1"]
+        record["next_run_at"] = "2000-01-02T00:00:00+00:00"
+        from supervisor import queue_schedules
+
+        store = q.queue.load_schedule_store(q.root)
+        store["tasks"][0] = record
+        queue_schedules._write_scheduled_tasks(store, q.root)
+        q.queue.check_scheduled_tasks()
+        assert q.pending == []
+        assert _rows(q)["s1"]["occurrence"]["task_id"] == task["id"]
+    finally:
+        q.queue.RUNNING.pop(task["id"], None)
+
+
 def test_an_unreadable_or_missing_receipt_holds_instead_of_replaying(q):
     _row(q, intent={"kind": "system_repo"}, cron=True)
     q.queue.check_scheduled_tasks()
