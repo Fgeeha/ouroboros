@@ -929,7 +929,7 @@ def recover_model_attempt(drive_root, row: dict, *, gateway_factory=None):
 
 
 async def chat_claudexor_async(target: dict, messages: list, tools: list | None, **parameters: Any) -> tuple[dict, dict]:
-    """Keep accounting/capture in the async caller; offload only synchronous I/O."""
+    """Offload synchronous I/O and joined accounting; adopt its capture in this caller."""
     target = (await asyncio.to_thread(prepare_processing_target, target)
               if target.get("processing_preference") and "processing_preferences" not in target else target)
     payload = _request(target, messages, tools, parameters)

@@ -46,14 +46,13 @@ OUROBOROS_RUN_UI_SMOKE=1 OUROBOROS_EXPECT_BROWSER_ENGINES=chromium,webkit \
 
 `--require-ui-browser` fails on narrowed/empty collection, missing engines,
 unsettled cases, or skips outside `tests/browser_lane.py`'s reviewed platform
-registry. Registered skips report their node and reason. `--temp-parent` (`/tmp` on macOS: short socket paths) is refused inside any Git checkout, where git resolves; neither launcher nor pytest session deletes its tree (`SAFE_TEST_RETAINED <path>`). The same stdlib
+registry. Registered skips name node/reason. `--temp-parent` (`/tmp` on macOS: short socket paths) refuses Git checkouts. Launcher and pytest trees persist (`SAFE_TEST_RETAINED <path>`). The stdlib
 `ouroboros/test_environment.py` owns the data, settings, app, HOME, projects,
 worktrees, Deliverables, cache and userbase defaults for pytest, preflight and
-their server children — including a child that passes `env=None` — while roots a
-test chose explicitly survive. Bare pytest keeps explicitly supplied
+their server children — including `env=None` children; explicit test roots survive. Bare pytest keeps explicitly supplied
 provider/lane controls for integration CI; launcher and preflight scrub them.
 Under that marker `supervisor/git_ops_reset.py` installs no dependencies for ANY
-caller; production unchanged. C locale/Git ceilings stabilize probes; pytest Deliverables follows synthetic HOME. `MAC_CHROMIUM_TMPDIR` shares the disposable temp root: macOS Chromium ignores `TMPDIR` for initial download staging. Not an OS sandbox.
+caller; production unchanged. C locale/Git ceilings stabilize probes; pytest Deliverables follows synthetic HOME. `MAC_CHROMIUM_TMPDIR` shares the disposable temp root: macOS Chromium ignores `TMPDIR` for initial download staging. Not an OS sandbox. Ledger scale: [contract and runner](../USAGE_COMPACTION.md#writer-continuity-and-qualification).
 
 `tests/candidate_checkout.py` owns shared UI and keyless wait/repair checkouts: tracked
 worktree bytes plus non-ignored new files — staged, unstaged, deleted, executable

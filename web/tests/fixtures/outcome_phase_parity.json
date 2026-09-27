@@ -2,6 +2,15 @@
   "purpose": "One status-word family across the browser and the host. Every case is a terminal-or-not task record read by log_events.js (taskDoneIsTerminal + taskTerminalPhase + taskPresentation) and by ouroboros.project_dialogue (outcome_phase + OUTCOME_PHASE_HEADLINE + _completion_verdict). Every typed cause with an owner sentence carries a case here, so the two TASK_CAUSE_PHRASES twins cannot drift apart unnoticed. A new axis, reason or acceptance status is added to both sides in the same commit, with a row here.",
   "cases": [
     {
+      "name": "accounting wait expiry is an infrastructure failure with a readable cause",
+      "record": {
+        "status": "failed", "reason_code": "accounting_wait_expired",
+        "outcome_axes": {"execution": {"status": "infra_failed"}, "objective": {"status": "not_evaluated"}}
+      },
+      "phase": "error", "headline": "Failed",
+      "acceptance_clause": "Accounting access did not recover within this turn’s wait window."
+    },
+    {
       "name": "owner Restart has a readable cause without changing its typed identity",
       "record": {"status": "cancelled", "reason_code": "owner_restart", "cancel_origin": {"source": "owner_restart", "reason": "Owner restart"}},
       "phase": "cancelled", "headline": "Cancelled",

@@ -15,7 +15,7 @@ existed — when it has no group and its root is ``G``, so legacy history joins
 by the original root without being rewritten. The check is symmetric: the
 original root's own later work (its reviews, its post-work) is a member of the
 same group and sees every successor's spend. Nothing here is a second ledger:
-it filters the same validated final rows. Unknown-priced admission keeps its
+it derives the group axis from the same validated final rows. Unknown-priced admission keeps its
 existing policy (an unknown bound is admitted while the known accounting still
 fits); the projection discloses unknown liabilities and never promises a bound
 on an eventual bill. A late charge that exceeds the cap is recorded and bars
@@ -37,8 +37,9 @@ GROUP_KEY_PREFIX = "group:"
 
 def group_member(row: Dict[str, Any], group_id: str) -> bool:
     """Whether one ledger row counts toward billing group ``group_id``."""
-    group = str(row.get("billing_group_id") or "")
-    return bool(group_id) and (group == group_id or (not group and str(row.get("root_task_id") or "") == group_id))
+    from ouroboros._usage_money import billing_group_key
+
+    return bool(group_id) and billing_group_key(row) == group_id
 
 
 def group_rows(finals: Iterable[Dict[str, Any]], group_id: str) -> list:
@@ -63,13 +64,9 @@ def ledger_billing_binding(budget_root: Any, root_task_id: str) -> Dict[str, Any
     from ouroboros import usage_accounting as ua
 
     root = ua._drive_root(budget_root)
-    with ua._locked(root):
-        rows = ua._read_records_locked(root)
-    for row in rows:
-        if str(row.get("root_task_id") or "") != root_task_id:
-            continue
-        if "billing_group_limit_usd" not in row and "root_limit_usd" not in row:
-            continue
+    with ua._writer_locked(root) as view:
+        row = view.root_bindings.get(root_task_id)
+    if row is not None:
         return {"billing_group_id": str(row.get("billing_group_id") or root_task_id),
                 "billing_group_limit_usd": row.get("billing_group_limit_usd", row.get("root_limit_usd")),
                 "billing_group_limit_source": row.get("billing_group_limit_source") or "ledger_first_row",
@@ -188,7 +185,7 @@ def settlement_billing_fields(root: Any, task_id: str, root_task_id: str) -> Dic
     return binding
 
 
-def raise_group_refusal(finals: Sequence[Dict[str, Any]], scope: Any, bound: Optional[float]) -> None:
+def raise_group_refusal(view: Any, scope: Any, bound: Optional[float] = None, *, dispatch: bool = False) -> None:
     """The group axis of ONE reservation, on the caller's locked snapshot."""
     from ouroboros import usage_accounting as ua
 
@@ -198,8 +195,8 @@ def raise_group_refusal(finals: Sequence[Dict[str, Any]], scope: Any, bound: Opt
                                 limit_scope="root", root_task_id=str(getattr(scope, "root_task_id", "") or ""))
     if not group or limit is None:
         return
-    accounted = float(ua._summary(group_rows(finals, group))["accounted_usd"])
-    if limit <= 0 or accounted >= limit - 1e-9 or (bound is not None and accounted + bound > limit + 1e-9):
+    accounted = view.summary(billing_group_id=group)["accounted_usd"]
+    if view.exceeds_limit(limit, bound, billing_group_id=group, dispatch=dispatch):
         raise ua.BudgetExceeded(
             f"whole-work budget exhausted for group {group}: accounted=${accounted:.6f}, limit=${limit:.6f}",
             limit_scope="root", root_task_id=str(getattr(scope, "root_task_id", "") or group))
@@ -222,13 +219,11 @@ def original_group_limit(drive_root: Any, group_id: str) -> Dict[str, Any]:
     from ouroboros import usage_accounting as ua
 
     root = ua._drive_root(drive_root)
-    with ua._locked(root):
-        records = ua._read_records_locked(root)
-    for row in records:  # ledger order: the first member row that recorded a cap
-        if isinstance(row, dict) and group_member(row, group_id) and (
-                "billing_group_limit_usd" in row or "root_limit_usd" in row):
-            carried = row.get("billing_group_limit_usd", row.get("root_limit_usd"))
-            return {"limit_usd": ua._number(carried), "source": "ledger_first_row"}
+    with ua._writer_locked(root) as view:
+        row = view.group_bindings.get(group_id)
+    if row is not None:
+        carried = row.get("billing_group_limit_usd", row.get("root_limit_usd"))
+        return {"limit_usd": ua._number(carried), "source": "ledger_first_row"}
     return {"limit_usd": None, "source": "no_attempt_recorded"}
 
 

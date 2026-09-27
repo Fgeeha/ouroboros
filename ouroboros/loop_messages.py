@@ -53,14 +53,17 @@ def _emit_checkpoint_event(
     drive_logs: Optional[pathlib.Path],
     data: Dict[str, Any],
 ) -> bool:
-    """Emit a task_checkpoint via event queue or direct events.jsonl append."""
+    """Emit a checkpoint; an explicit System row also projects to chat history."""
     payload = {"type": "task_checkpoint", "task_id": task_id, **data}
     if event_queue is not None:
         _emit_live_log(event_queue, payload)
     elif drive_logs:
         try:
             from ouroboros.utils import append_jsonl, utc_now_iso
-            append_jsonl(drive_logs / "events.jsonl", {"ts": utc_now_iso(), **payload})
+            payload = {"ts": utc_now_iso(), **payload}
+            append_jsonl(drive_logs / "events.jsonl", payload)
+            if payload.get("system_type") == "task_checkpoint":
+                append_jsonl(drive_logs / "progress.jsonl", payload)
         except Exception:
             pass
 

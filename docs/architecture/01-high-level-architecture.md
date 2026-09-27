@@ -152,14 +152,16 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── code_intelligence_architecture.py ← Architecture facts over the pinned domain/contract/persistence carriers: `owner_of`, the domain quotient, and the facade inventory (`docs/inventories/FACADE_INVENTORY.md`)
       ├── code_search_rg.py    ← Optional ripgrep-backed search for search_code; every match is post-filtered through the protected/secret gates
       ├── pricing.py           ← Exact-route best-effort provider-catalog lookup with nullable estimates; no static model tariffs (they go stale) and not the monetary ledger (§6 Budget tracking)
-      ├── usage_accounting.py  ← Physical-attempt authority: reserved→dispatched→settled|unresolved, reserved→released; global/root/group admission, exact candidate identities and manifest; raw sends bind `local_answer_owner_pid` (§6 Budget tracking; Owner Continue)
-      ├── _usage_response.py   ← Pure provider-response usage normalization for physical accounting — the one NORMALIZER of a provider's usage block. Not the only READER of that block: every provider adapter reads the raw `usage` dict itself (§6 Usage ledger substrate vs. accounting policy)
-      ├── usage_admission.py   ← Read-side admission projections over the ledger: the review wave's fit and the whole-work billing group (§6 Monetary authority)
-      ├── _usage_rows.py       ← Pure monetary row arithmetic: summaries, limits/integrity, physical-call counts, breakdowns and Skill Review wave/slot projections; no I/O (§6 Monetary authority)
-      ├── _usage_rows_memo.py  ← Validated replay/render memo; `allow_stale` is display-only, monetary checks use locked authority (§6 Monetary authority)
-      ├── _usage_cache_splits.py ← process-local `(task, provider, route identity, review surface)` last-observed prompt-cache split; non-durable — a lost entry only re-prices a full cache write (§6 Budget tracking)
-      ├── skill_review_usage.py ← Read-only cached projection of final physical-attempt rows for one exact `(review_skill, review_wave_id)`; no second ledger or persisted totals
-      ├── usage_ledger.py      ← Monetary substrate: lock, append+fsync, validation and torn-tail quarantine; imported by accounting (§6 Usage ledger substrate vs. accounting policy)
+      ├── usage_accounting.py  ← Physical attempts: reserved→dispatched→settled|unresolved, reserved→released; global/root/group admission, candidate/manifest, raw `local_answer_owner_pid` (§6)
+      ├── _usage_response.py   ← Accounting usage normalizer; adapters also read raw usage (§6)
+      ├── usage_admission.py   ← Whole-work group binding/admission and review-wave fit (§6)
+      ├── _usage_rows.py       ← Pure summaries, limits/integrity, call counts, breakdowns and Skill Review projections
+      ├── _usage_rows_memo.py  ← Shared strict generation: sparse validation, finals, root/group cash, fold times; cold parse/render outside lock, detached public rows, display-only stale reads
+      ├── _usage_money.py      ← Precision-60 Decimal cash; six-place half-even admission; raw literals retained
+      ├── _usage_wait.py       ← Owned pre-send lock slices and joined async bridge; existing controls/custody
+      ├── _usage_cache_splits.py ← Process-local cache split by task/provider/route/review; a missing entry prices full cache write (§6)
+      ├── skill_review_usage.py ← Read-only final-row projection for `(review_skill, review_wave_id)`; no second ledger (§6)
+      ├── usage_ledger.py      ← Money lock, append/fsync, validation and tail quarantine; imported by accounting (§6)
       ├── usage_compaction.py, usage_legacy_import.py ← Seq-preserving ledger compaction and one-time legacy import (§6 Budget tracking; docs/USAGE_COMPACTION.md)
       ├── cost_projection.py   ← The ONE projection of task cost for every producer: `accounted_upper_bound_usd`, null as None (never $0.00), `COST_OPENNESS_FIELDS` beside every amount (the optional scoped `cost_presentation` carrier among them); the retired `cost_usd[_with_children]` spellings are read-only tolerance (a diverged stored pair resolves deprecated-wins) (§6 Budget tracking)
       ├── delegate_custody.py  ← Delegated-run custody: `delegate_run_*`, `containment_faults.jsonl`, OWNED/FOREIGN/UNKNOWN, `Idempotency-Key`/`retry_of`, typed cancel, `daemon_says_absent`, patch-apply intent and ownership refusals (§6 Delegated subagents)

@@ -285,7 +285,8 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   that maintenance and its torn-quarantine residual: ARCHITECTURE §6
   "Delegated subagents (Claudexor transport + the nanny)"; owner-aware
   `usage_attempts.lock` recovery: ARCHITECTURE §1 "Platform substrate"; money
-  waits 45 s on it with a 90 s stale grace (`ouroboros/usage_ledger.py`).
+  maintenance waits at most 45 s (90 s stale grace); pre-send policy is in
+  `_usage_wait.py`.
   Every ledger state, absence included, goes through that reader.
 - `task_constraint` boolean parsing is strict (`"false"` is false); deadlines
   only narrow, delegation budgets only reduce, absent depth requests stay
@@ -643,13 +644,12 @@ and what enforces each.
   it; never in usage, events, progress or task cards. Opt-in is gated on the last SUCCESSFUL handshake's version —
   not the next-spawn pin, not a liveness projection a failed probe can blank (WHY:
   ARCHITECTURE §6 "The live turn slot"; the `llm_claudexor.py` docstring).
-- Pass `model_role` and the captured account explicitly at every helper/reviewer seam
-  (Main and Light may share a model name with different pins; account evidence stays
-  source/profile/fingerprint-bound). Manual context sizing is not scope authority; a
-  scope ACK binds the actual route; a changed model's token-density observation never
-  becomes the old model's evidence. A physical attempt limit returns a claim only after
-  a successful, positive never-dispatched release; unknown or dispatched claims stay
-  charged.
+- Pass `model_role` and captured account at every helper/reviewer seam: shared model
+  names do not share pins; account evidence remains source/profile/fingerprint-bound.
+  Manual context sizing grants no scope authority; ACK binds the actual route.
+  Density evidence never crosses models. Proven no-send returns the local attempt
+  claim even if bounded ledger release fails; the reservation and capture then remain.
+  Unknown or dispatched claims stay charged.
 - Resource refusals wait inside the live call, before helper catch-all blocks, on the
   existing task owner, mailbox, clocks and settings writer. Reviewer calls use their
   panel's operation wait (§6 Already-paid operations), preserving original task money

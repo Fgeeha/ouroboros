@@ -167,8 +167,7 @@ export {
 };
 
 const PROJECT_ROW_TYPES = new Set(['project_started', 'project_handoff', 'project_completion_summary']);
-// The host's card placement values and the timeline phase each one reads as: a
-// custody fact warns, a settled review reads as a result.
+// Host card phases: custody warns; settled reviews show results.
 const CARD_ROW_PHASES = new Map([['timeline', 'warn'], ['reviews', 'result']]);
 const CHAT_STORAGE_KEY = 'ouro_chat';
 const CHAT_DRAFT_KEY = 'ouro_chat_draft';
@@ -1836,7 +1835,7 @@ export function createChatInstance({
         return withStableViewport(() => finishLiveCardMutation(groupId, phase));
     }
 
-    // Author controls end here; exact paid-review waits retain their own lifetime.
+    // Author controls end; paid-review waits retain their own lifetime.
     function settleLiveCard(record, phase, wasFinished) {
         record.root.dataset.finished = '1';
         cancelableTaskIds.delete(record.groupId);
@@ -1980,6 +1979,7 @@ export function createChatInstance({
     }
 
     function updateLiveCardFromProgressMessage(msg, { grantCancelAuthority = true } = {}) {
+        if (msg?.system_type === 'task_checkpoint') return updateLiveCardFromLogEvent({ ...msg, type: 'task_checkpoint', is_progress: false });
         const taskId = msg?.task_id || '';
         const rawTs = msg?.ts || new Date().toISOString();
         const review = attachReviewFromRow(msg, rawTs);
@@ -1988,44 +1988,43 @@ export function createChatInstance({
         modelWaits.observe(taskId, msg);
         let changed = false;
         // Only host-attested progress grants Stop authority.
-        if (grantCancelAuthority && msg?.cancelable === true && msg?.task_id) {
-            changed = markTaskCancelable(String(msg.task_id));
+        if (grantCancelAuthority && msg.cancelable === true) {
+            changed = markTaskCancelable(String(taskId));
         }
-        const lifecycleParent = taskKey(msg?.parent_task_id);
-        if (msg?.subagent_event && lifecycleParent) {
+        const lifecycleParent = taskKey(msg.parent_task_id);
+        if (msg.subagent_event && lifecycleParent) {
             const updated = updateSubagentCardFromEvent(msg, rawTs);
             if (updated !== undefined) return Boolean(changed || updated);
         }
         if (subagentChildParents.has(taskId)) {
-            const updated = routeSubagentProgressToCard(taskId, msg);
-            return Boolean(changed || updated);
+            return Boolean(routeSubagentProgressToCard(taskId, msg) || changed);
         }
         const summary = summarizeChatLiveEvent({
             type: 'send_message',
             is_progress: true,
-            content: msg?.content || msg?.text || '',
-            text: msg?.content || msg?.text || '',
+            content: msg.content || msg.text || '',
+            text: msg.content || msg.text || '',
             task_id: taskId,
             ...Object.fromEntries(['subagent_event', 'subagent_task_id', 'root_task_id',
                 'parent_task_id', 'delegation_role', 'subagent_role', 'status', 'result',
-                'trace_summary', 'error', 'artifact_status'].map((key) => [key, msg?.[key] || ''])),
+                'trace_summary', 'error', 'artifact_status'].map((key) => [key, msg[key] || ''])),
             ...cardMetaKeys(msg),
-            lifecycle: msg?.lifecycle || null,
+            lifecycle: msg.lifecycle || null,
             // The frame's voice, live and on replay; absent stays absent.
-            narration: msg?.narration,
+            narration: msg.narration,
         });
         if (!summary) return changed;
         const presented = withTaskCostMeta(summary, msg, { rawTs });
-        changed = Boolean(queueTaskLiveUpdate(
+        changed = queueTaskLiveUpdate(
             presented, taskId, normalizeLogTs(rawTs), presented.dedupeKey || '', rawTs,
-        )) || changed;
-        noteDirectTurn(liveCardRecords.get(taskId), msg?._is_direct_chat);
+        ) || changed;
+        noteDirectTurn(liveCardRecords.get(taskId), msg._is_direct_chat);
         // History may carry the coined name that live frames deliver separately.
-        if (msg?.suggested_name) changed = applySuggestedName(taskId, msg.suggested_name) || changed;
+        if (msg.suggested_name) changed = applySuggestedName(taskId, msg.suggested_name) || changed;
         // Outcome survives a lost summary even while post-work keeps controls live.
         if (
-            (msg?.task_phase === 'finalizing' || taskDoneIsTerminal(msg))
-            && (msg?.outcome_axes || msg?.review_projection || msg?.reason_code)
+            (msg.task_phase === 'finalizing' || taskDoneIsTerminal(msg))
+            && (msg.outcome_axes || msg.review_projection || msg.reason_code)
         ) {
             changed = appendTaskSummaryToLiveCard(msg) || changed;
         }

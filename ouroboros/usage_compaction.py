@@ -26,7 +26,6 @@ from __future__ import annotations
 
 import base64
 import contextlib
-import decimal
 import hashlib
 import json
 import logging
@@ -36,8 +35,8 @@ import stat
 import threading
 import time
 import uuid
-from decimal import Decimal, DecimalException, InvalidOperation
-from typing import Any, Callable, Dict, Iterator, Optional, Tuple
+from decimal import Decimal, DecimalException
+from typing import Any, Callable, Dict, Optional, Tuple
 
 from ouroboros._usage_rows import _breakdown_bucket, _summary, _processing_summary, _merge_processing_summary, row_ts_epoch
 from ouroboros.runtime_limits import USAGE_LEDGER_FOLD_MIN_AGE_SEC
@@ -107,34 +106,8 @@ _CHAIN_UNION_CACHE_MAX = 4
 _CHAIN_UNION_CACHE: Dict[Tuple[Tuple[str, str], ...], frozenset] = {}
 
 
-# Money is summed in an EXPLICIT context, never the ambient one. The default
-# 28-digit precision silently rounds a large-magnitude sum, and both the group
-# row and the self-check that approves it are computed the same way — so a
-# rounded total verifies against itself and the lost cent commits. Sixty
-# digits is far past any real ledger; ``Inexact`` is trapped so that even past
-# it the pass ABORTS instead of writing an approximation.
-MONEY_PRECISION = 60
-
-
-@contextlib.contextmanager
-def _exact_money() -> Iterator[None]:
-    """Decimal arithmetic that cannot silently lose a digit of money."""
-    with decimal.localcontext() as context:
-        context.prec = MONEY_PRECISION
-        context.traps[decimal.Inexact] = True
-        yield
-
-
-def _decimal_of(value: Any) -> Decimal:
-    """Exact decimal of a ledger monetary value (Decimal, int, or string).
-
-    Construction is context-free by language rule, so the literal is captured
-    exactly; only the arithmetic over these values needs ``_exact_money``."""
-    if isinstance(value, bool):
-        raise InvalidOperation
-    if isinstance(value, Decimal):
-        return value
-    return Decimal(str(value))
+# Shared exact arithmetic; the literal-exact compaction self-check stays independent.
+from ouroboros._usage_money import exact_money as _exact_money, decimal_of as _decimal_of
 
 
 class _Abort(Exception):
@@ -515,16 +488,9 @@ class _Group:
             )
 
 
-# The money keys every ``_summary`` carries — and therefore every
-# ``_breakdown_bucket``, which STARTS as one (``_usage_rows.py``). They are
-# projected out of the comparison below because ``_summary`` accumulates
-# dollars in BINARY floats and rounds at six places: the same history summed
-# as N per-row floats and as one exact per-group Decimal can round to either
-# side of the last digit. On the owner's live ledger that put 13 roots (51
-# buckets, 153 values) exactly 1e-6 apart and aborted a CORRECT fold every
-# time, holding the file at 77.8 MB against an 8 MB trigger. The answer is
-# not a tolerance: money is compared EXACTLY, one guard below, as decimals of
-# the literals actually stored.
+# Rendered cash intentionally rounds to six places. It is not a proof of
+# monetary equality, even with shared exact accumulation: the independent raw
+# Decimal self-check below remains mandatory alongside NON-MONEY equality.
 _FINGERPRINT_MONEY_KEYS = frozenset({
     "settled_usd", "confirmed_usd", "estimated_usd", "reserved_usd",
     "unresolved_upper_bound_usd", "accounted_usd",
@@ -584,7 +550,16 @@ def _render_fingerprint(finals: list) -> Dict[str, Any]:
             _without_money(_breakdown_bucket(unattributed)),
         )
 
+    from ouroboros._usage_money import billing_group_key
+    from ouroboros._usage_rows import _projection_from_final
+
+    group_rows = {}
+    for row in finals:
+        if group := billing_group_key(row):
+            group_rows.setdefault(group, []).append(row)
     return {
+        "by_group": {group: _without_money(_projection_from_final(
+            group_rows[group], False, billing_group_id=group)) for group in sorted(group_rows)},
         "summary": _without_money(_summary(finals)),
         "by_root": per_root,
         "breakdown": _without_money(_breakdown_bucket(finals)),
@@ -609,42 +584,29 @@ def _parse_ledger_lines(raw: bytes) -> Tuple[list, list]:
     return float_rows, decimal_rows
 
 
-def _attempt_is_recent(row: Dict[str, Any], now_ts: float) -> bool:
-    """Whether a final attempt row is younger than the fold horizon (an absent or
-    unparseable ``ts`` cannot prove recency and folds as before)."""
+def fold_eligible_at(row: Dict[str, Any]) -> Optional[float]:
+    """Earliest fold time for a plain closed attempt, or None if retained.
+
+    Shared with the generation-bound writer index: eligibility is maintenance
+    policy only, never an accounting or late-receipt authority.
+    """
+    if (str(row.get("kind") or "attempt") != "attempt"
+            or row.get("state") not in _FOLDABLE_FINAL_STATES
+            or is_abandoned_settlement(row)
+            or any(str(row.get(key) or "") for key in _REVIEW_KEYS)
+            or isinstance(row.get("cost_usd"), bool)
+            or isinstance(row.get("reservation_upper_bound_usd"), bool)):
+        return None
     ts = row_ts_epoch(row)
-    return ts is not None and now_ts - ts < USAGE_LEDGER_FOLD_MIN_AGE_SEC
+    return float("-inf") if ts is None else ts + USAGE_LEDGER_FOLD_MIN_AGE_SEC
 
 
 def _foldable_attempt_ids(records: list, *, now_ts: Optional[float] = None) -> set:
-    """Attempt ids whose whole chain folds: terminal, plain ``attempt`` kind,
-    no pending late receipt or review attribution, older than the fold horizon
-    (``now_ts`` defaults to ``_fold_clock()``) — plus prior baseline rows. Old
-    unresolved groups remain aggregates; they cannot recreate individual ids."""
-    finals = _final_rows(records)
+    """Closed non-review attempts past the horizon, plus prior baseline rows."""
     clock = _fold_clock() if now_ts is None else float(now_ts)
-    foldable: set = set()
-    for attempt_id, row in finals.items():
-        kind = str(row.get("kind") or "attempt")
-        if kind in _BASELINE_KINDS:
-            foldable.add(attempt_id)
-            continue
-        if kind != "attempt":
-            continue
-        if str(row.get("state") or "") not in _FOLDABLE_FINAL_STATES:
-            continue
-        if is_abandoned_settlement(row):
-            continue
-        if _attempt_is_recent(row, clock):
-            continue  # the allowance window still needs this row's own ts
-        if any(str(row.get(key) or "") for key in _REVIEW_KEYS):
-            continue
-        if isinstance(row.get("cost_usd"), bool) or isinstance(
-            row.get("reservation_upper_bound_usd"), bool
-        ):
-            continue  # fail-safe: malformed monetary value never folds
-        foldable.add(attempt_id)
-    return foldable
+    return {identity for identity, row in _final_rows(records).items()
+            if str(row.get("kind") or "attempt") in _BASELINE_KINDS
+            or ((eligible := fold_eligible_at(row)) is not None and eligible <= clock)}
 
 
 def _build_candidate(
@@ -875,19 +837,25 @@ def compact_usage_ledger_locked(
                 raise _Abort("aggregation fingerprint mismatch")
             beat()
 
-            def decimal_totals(rows: list) -> Tuple[Decimal, Decimal]:
+            def decimal_totals(rows: list) -> tuple:
+                from ouroboros._usage_money import billing_group_key, monetary_scope_key
+
                 cost = Decimal(0)
                 bound = Decimal(0)
+                scopes = {}
                 for row in _final_rows(rows).values():
                     if str(row.get("kind") or "") == "usage_baseline":
                         continue
                     value = row.get("cost_usd")
-                    if value is not None and str(row.get("state") or "") == "settled":
-                        cost += _decimal_of(value)
+                    paid = _decimal_of(value) if value is not None and row.get("state") == "settled" else Decimal(0)
                     upper = row.get("reservation_upper_bound_usd")
-                    if upper is not None:
-                        bound += _decimal_of(upper)
-                return cost, bound
+                    held = _decimal_of(upper) if upper is not None else Decimal(0)
+                    cost += paid
+                    bound += held
+                    for axis, identity in (("root", monetary_scope_key(row)), ("group", billing_group_key(row))):
+                        previous = scopes.get((axis, identity), (Decimal(0), Decimal(0)))
+                        scopes[axis, identity] = (previous[0] + paid, previous[1] + held)
+                return cost, bound, scopes
 
             if decimal_totals(decimal_rows) != decimal_totals(candidate_decimals):
                 raise _Abort("decimal money totals mismatch")
