@@ -285,7 +285,8 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   that maintenance and its torn-quarantine residual: ARCHITECTURE §6
   "Delegated subagents (Claudexor transport + the nanny)"; owner-aware
   `usage_attempts.lock` recovery: ARCHITECTURE §1 "Platform substrate"; money
-  waits 45 s on it with a 90 s stale grace (`ouroboros/usage_ledger.py`).
+  maintenance waits at most 45 s (90 s stale grace); pre-send policy is in
+  `_usage_wait.py`.
   Every ledger state, absence included, goes through that reader.
 - `task_constraint` boolean parsing is strict (`"false"` is false); deadlines
   only narrow, delegation budgets only reduce, absent depth requests stay

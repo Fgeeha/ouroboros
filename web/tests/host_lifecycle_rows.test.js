@@ -97,3 +97,21 @@ test('#1073 the worker readiness frames render their own fields in Logs', () => 
         assert.equal(summarizeChatLiveEvent({ type }).visible, false);
     }
 });
+
+
+test('accounting wait phases remain distinct visible host checkpoints in chat and Logs', () => {
+    const frame = { type: 'task_checkpoint', task_id: 't1', checkpoint_kind: 'usage_lock_wait', round: 3 };
+    const entered = { ...frame, phase: 'entered' };
+    const ended = { ...frame, phase: 'ended' };
+    const first = summarizeChatLiveEvent(entered);
+    const last = summarizeChatLiveEvent(ended);
+    assert.equal(first.headline, 'Waiting for accounting access');
+    assert.equal(last.headline, 'Accounting wait ended');
+    assert.notEqual(first.dedupeKey, last.dedupeKey);
+    for (const [event, view] of [[entered, first], [ended, last]]) {
+        assert.equal(view.visible, true);
+        assert.equal(view.promote, false);
+        assert.equal(view.terminal, false);
+        assert.equal(summarizeLogEvent(event).headline, view.headline);
+    }
+});

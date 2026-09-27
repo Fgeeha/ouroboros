@@ -118,7 +118,7 @@ def _legacy_snapshot(root: pathlib.Path) -> Tuple[list[Dict[str, Any]], Dict[str
 
 
 def ensure_legacy_imported(
-    drive_root: Optional[pathlib.Path] = None,
+    drive_root: Optional[pathlib.Path] = None, *, acquisition=None,
 ) -> Dict[str, Any]:
     """One resumable import of legacy usage telemetry and the state cost delta."""
     root = _drive_root(drive_root)
@@ -128,7 +128,7 @@ def ensure_legacy_imported(
     # Separate from the hot budget lock: source snapshot/archive may do I/O,
     # while concurrent startup importers still serialize on one generation.
     with _named_lock(root, "usage_import.lock", timeout_sec=60.0, stale_sec=600.0):
-        return _ensure_legacy_imported_locked(root)
+        return _ensure_legacy_imported_locked(root, acquisition=acquisition)
 
 
 def _completed_import_watermark(root: pathlib.Path) -> Optional[Dict[str, Any]]:
@@ -140,7 +140,7 @@ def _completed_import_watermark(root: pathlib.Path) -> Optional[Dict[str, Any]]:
 
 
 def _ensure_legacy_imported_locked(
-    root: pathlib.Path,
+    root: pathlib.Path, *, acquisition=None,
 ) -> Dict[str, Any]:
     watermark = root / IMPORT_REL
     existing = _completed_import_watermark(root)
@@ -257,7 +257,7 @@ def _ensure_legacy_imported_locked(
             }
         )
 
-    with _usage()._locked(root):
+    with (acquisition(root) if acquisition else _usage()._locked(root)):
         current_watermark = _completed_import_watermark(root)
         if current_watermark is not None:
             return current_watermark

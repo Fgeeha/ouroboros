@@ -907,3 +907,48 @@ def test_streaming_progress_fires_only_once(ctx, patch_env, mock_openai):
     _web_search(ctx, "multi-search query")
 
     assert ctx.emit_progress_fn.call_count == 1
+
+
+def test_direct_search_dispatch_failure_releases_same_unsent_reservation(ctx, patch_env, mock_openai, monkeypatch):
+    from ouroboros import usage_accounting as ua
+    from ouroboros.usage_ledger import UsageLockUnavailable
+    reservations = []
+    original = search_module.reserve_attempt
+    def reserve(request):
+        result = original(request)
+        reservations.append(result)
+        return result
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "openai")
+    monkeypatch.setattr(search_module, "reserve_attempt", reserve)
+    def refused(*args, **kwargs):
+        raise UsageLockUnavailable("synthetic kernel failure", reason="kernel_refused")
+    monkeypatch.setattr(search_module, "mark_dispatched", refused)
+    with pytest.raises(ua.PhysicalAttemptPreparationFailed) as error:
+        _web_search(ctx, "one query")
+    assert error.value.physical_attempt_capture.state == "released"
+    mock_openai.responses.create.assert_not_called()
+    assert len(reservations) == 1
+    with ua._locked(reservations[0].drive_root):
+        records = ua._read_records_locked_cached(reservations[0].drive_root)
+    chain = [row for row in records if row["attempt_id"] == reservations[0].attempt_id]
+    assert [row["state"] for row in chain] == ["reserved", "released"]
+
+
+def test_direct_search_failed_cleanup_retains_reservation_and_refuses_fallback(ctx, patch_env, mock_openai, monkeypatch):
+    from ouroboros import usage_accounting as ua
+    original = search_module._responses_search_candidate
+    def candidate(*args, **kwargs):
+        target, payload, request, before = original(*args, **kwargs)
+        def fail(held):
+            raise RuntimeError("synthetic preparation failure")
+        return target, payload, request, fail
+    monkeypatch.setattr(search_module, "_responses_search_candidate", candidate)
+    def release(*args, **kwargs):
+        raise ua.UsageLockUnavailable("synthetic failed cleanup", reason="contention")
+    monkeypatch.setattr(ua, "release_attempt", release)
+    monkeypatch.setattr(search_module, "_web_search_openrouter", lambda *a, **k: pytest.fail("competing fallback"))
+    monkeypatch.setattr(search_module, "_web_search_anthropic", lambda *a, **k: pytest.fail("competing fallback"))
+    with pytest.raises(ua.PhysicalAttemptPreparationFailed) as error:
+        _web_search(ctx, "one query")
+    assert error.value.physical_attempt_capture.state == "reserved"
+    mock_openai.responses.create.assert_not_called()

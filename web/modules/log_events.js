@@ -1436,7 +1436,7 @@ function summarizeChatLiveEventView(evt) {
             headline: lowRetry ? 'Context rebuilt in Low mode — retrying the same model once'
                 : taskCheckpointLabel(evt),
             visible: !checkpointHasProgressRow(evt),
-            dedupeKey: key(evt.checkpoint_kind || '', evt.checkpoint_number || evt.round || ''),
+            dedupeKey: key(evt.checkpoint_kind || '', evt.checkpoint_kind === 'usage_lock_wait' ? evt.phase : evt.checkpoint_number || evt.round || ''),
         });
     }
 

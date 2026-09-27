@@ -585,17 +585,11 @@ def _web_search(
                 ensure_ascii=False, indent=2,
             )
         for backend_name, backend in (
-            (
-                "openrouter_server_tool",
-                lambda: _web_search_openrouter(
-                    ctx, query, model=model, search_context_size=search_context_size,
-                    processing_preference=preference,
-                ),
-            ),
-            (
-                "anthropic_server_tool",
-                lambda: _web_search_anthropic(ctx, query, model=model, processing_preference=preference),
-            ),
+            ("openrouter_server_tool", lambda: _web_search_openrouter(
+                ctx, query, model=model, search_context_size=search_context_size,
+                processing_preference=preference)),
+            ("anthropic_server_tool", lambda: _web_search_anthropic(
+                ctx, query, model=model, processing_preference=preference)),
             ("ddgs", lambda: _web_search_ddgs(query)),
         ):
             try:
@@ -625,6 +619,7 @@ def _web_search(
     reservation = None
     dispatched = False
     explicit_provider_failure = False
+    manifest = None
     try:
         from ouroboros.config import get_finalization_grace_sec
         from ouroboros.net_transport import web_search_openai_client
@@ -795,6 +790,12 @@ def _web_search(
                 mark_unresolved(reservation, f"{type(e).__name__}: {e}")
             except Exception:
                 log.exception("Failed to mark OpenAI Responses search unresolved")
+        if reservation is not None and not was_dispatched:
+            from ouroboros.usage_accounting import _pre_dispatch_failure
+
+            failure = _pre_dispatch_failure(reservation, request, e, candidate_manifest_ref=manifest)
+            if isinstance(e, UsageAccountingError) or failure.physical_attempt_capture.state != "released":
+                raise failure from e
         if isinstance(e, UsageAccountingError):
             raise
         detail = sanitize_tool_result_for_log(str(e))[:500]
