@@ -15,11 +15,12 @@ fingerprint (provider + base_url + model + headers/beta + relevant options):
 
 ``unknown`` (unprobeable | failed | no record) keeps sizing evidence unknown.
 
-Probes are opportunistic and cached (24h for confirmed, 10 min for failed). Gate
+Remote probes are opportunistic and cached (24h for confirmed, 10 min for failed). Gate
 readers pass ``allow_fetch=False`` so the hot path never blocks on a network
 call. A provider outage marks evidence stale; it never erases a prior confirmed/
 asserted record. The owner-ack is route-fingerprinted and NEVER a repo-wide
-"trust this model" flag.
+"trust this model" flag. Local capacity is read from the current owned serving
+instance in memory, never from training metadata or the persistent probe cache.
 """
 
 from __future__ import annotations
@@ -1119,10 +1120,11 @@ def _provider_metadata_window(
 
 
 def _local_health_window(model: str) -> int:
-    """Local lane window from the running local model (n_ctx). 0 if unavailable."""
+    """Confirmed window of the current serving instance; 0 says nothing about health."""
     try:
         from ouroboros.local_model import get_manager
-        return int(get_manager().get_context_length() or 0)
+        evidence = get_manager().serving_context_evidence() or {}
+        return max(0, int(evidence.get("context_window") or 0)) if evidence.get("confirmed") is True else 0
     except Exception:
         return 0
 
@@ -1212,9 +1214,9 @@ def probe(
 ) -> CapabilityEvidence:
     """Resolve Capability Evidence for a route, using the cache unless ``force``.
 
-    Order: fresh cache -> owner-ack (asserted) -> provider metadata / local health
-    (confirmed) -> unprobeable. Network probing is skipped when allow_fetch=False
-    (hot-path callers) — a stale or absent record then reads as unknown."""
+    Owner-ack wins; local capacity is read in-process on every call. Remote routes
+    use fresh cache -> provider metadata -> unprobeable. Network probing is skipped
+    when allow_fetch=False (hot-path callers)."""
     fp = route_fingerprint(provider=provider, base_url=base_url, model=model, headers=headers, options=options)
     data = _load(drive_root)
     account_options = options if isinstance(options, dict) else {}
@@ -1233,6 +1235,16 @@ def probe(
             source_id=str(account_options.get("source_id") or ""),
             credential_profile_id=str(account_options.get("credential_profile_id") or ""),
             account_fingerprint=str(account_options.get("account_fingerprint") or ""),
+        )
+
+    if use_local:
+        # Stored local rows have no serving-instance binding and may contain
+        # training metadata or an invented fallback. Keep them as history only.
+        window = _local_health_window(model)
+        return CapabilityEvidence(
+            window, STATUS_CONFIRMED if window > 0 else STATUS_UNPROBEABLE,
+            SOURCE_LOCAL_HEALTH if window > 0 else SOURCE_NONE, fp, model, provider,
+            ts=utc_now_iso(), detail="live serving window" if window > 0 else "serving window unknown",
         )
 
     cached = data.get("probes", {}).get(fp)
@@ -1286,10 +1298,6 @@ def probe(
     # Live probe.
     window = 0
     source = SOURCE_NONE
-    if use_local:
-        window = _local_health_window(model)
-        if window > 0:
-            source = SOURCE_LOCAL_HEALTH
     if window <= 0:
         meta = _provider_metadata_window(provider, model, base_url, allow_fetch=allow_fetch, api_key=api_key)
         if meta > 0:
