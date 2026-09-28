@@ -20,7 +20,8 @@ readers pass ``allow_fetch=False`` so the hot path never blocks on a network
 call. A provider outage marks evidence stale; it never erases a prior confirmed/
 asserted record. The owner-ack is route-fingerprinted and NEVER a repo-wide
 "trust this model" flag. Local capacity is read from the current owned serving
-instance in memory, never from training metadata or the persistent probe cache.
+instance (a worker reads its owner's published, identity-checked binding), never
+from training metadata or the persistent probe cache.
 """
 
 from __future__ import annotations
@@ -1214,9 +1215,9 @@ def probe(
 ) -> CapabilityEvidence:
     """Resolve Capability Evidence for a route, using the cache unless ``force``.
 
-    Owner-ack wins; local capacity is read in-process on every call. Remote routes
-    use fresh cache -> provider metadata -> unprobeable. Network probing is skipped
-    when allow_fetch=False (hot-path callers)."""
+    Owner-ack wins; local capacity is read from the serving instance on every
+    call. Remote routes use fresh cache -> provider metadata -> unprobeable.
+    Network probing is skipped when allow_fetch=False (hot-path callers)."""
     fp = route_fingerprint(provider=provider, base_url=base_url, model=model, headers=headers, options=options)
     data = _load(drive_root)
     account_options = options if isinstance(options, dict) else {}

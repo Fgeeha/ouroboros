@@ -49,7 +49,7 @@ SESSION_ROUTE_PROVIDER = "agent_session"
 # HOW OFTEN a route may be fetched at all is deliberately NOT answered here.
 # ``capability_evidence.probe`` owns remote fetches through the TTL on the record it stores
 # (confirmed 24h / failed 10 min) and returns the cache without touching the network
-# inside it; local capacity is read from the current serving instance in memory.
+# inside it; local capacity is read from the current serving instance.
 # A process-lifetime ``_LAZY_WINDOW_PROBED`` memo used to answer it here
 # too, and because the memo never expired while the evidence did, a healthy install
 # that stayed up past the 24h TTL read its own reviewers as EXPIRED forever: every
@@ -184,7 +184,7 @@ def resolve_reviewer_window(
     a paid call — so an env-only pin can become known through a path it would
     otherwise never reach, and it stays re-confirmable for as long as the process
     lives: remote probes serve the cache inside its TTL and reach the network once
-    it expires; local probes read the current serving instance in memory (see the
+    it expires; local probes read the current serving instance (see the
     module-level note on ``_LAZY_ROUTE_LOCKS``).
 
     ``use_local=None`` (the default) derives the EFFECTIVE route from

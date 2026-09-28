@@ -185,3 +185,225 @@ def test_actual_local_connection_error_is_not_a_synthetic_overflow(manager, monk
                     model="local-fixture", max_tokens=65536, use_local=True)
     assert caught.value is error
     create.assert_called_once()
+
+
+_STAND_IN_SERVER = '''
+"""Loopback stand-in for ouroboros.local_model_server; it loads no model."""
+import json, os, sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from ouroboros.local_model_server import input_fingerprint
+
+PORT, N_CTX = (int(sys.argv[sys.argv.index(flag) + 1]) for flag in ("--port", "--n_ctx"))
+
+
+class Handler(BaseHTTPRequestHandler):
+    def reply(self, body):
+        data = json.dumps(body).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def do_GET(self):  # /v1/models reports training metadata only.
+        self.reply({"data": [{"id": "local-fixture", "meta": {"n_ctx_train": 131072}}]})
+
+    def do_POST(self):
+        body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        with open(os.environ["LOCAL_STAND_IN_LOG"], "a", encoding="utf-8") as log:
+            log.write(json.dumps({"path": self.path, "pid": os.getpid(), "body": body}) + "\\n")
+        if self.path == "/extras/measure_chat":
+            self.reply({"supported": True, "input_is_exact": True, "input_tokens": 100,
+                        "context_window": N_CTX, "process_id": os.getpid(),
+                        "native_input_sha256": input_fingerprint(body), "output_limit_enforced": True,
+                        "reasoning_included_in_limit": True, "reason": None})
+        else:
+            self.reply({"id": "fixture", "object": "chat.completion", "created": 0, "model": "local-model",
+                        "choices": [{"index": 0, "finish_reason": "stop",
+                                     "message": {"role": "assistant", "content": "local answer"}}],
+                        "usage": {"prompt_tokens": 100, "completion_tokens": 2, "total_tokens": 102}})
+
+    def log_message(self, *args):
+        pass
+
+
+ThreadingHTTPServer(("127.0.0.1", PORT), Handler).serve_forever()
+'''
+
+
+def _spawned_worker(requests, results, data_dir):
+    """A separate spawned process which, like worker_main, owns no local server."""
+    import os
+    import pathlib
+
+    os.environ["OUROBOROS_IN_WORKER"] = "1"
+    config.DATA_DIR = pathlib.Path(data_dir)
+    for port, chat in iter(requests.get, None):
+        os.environ["LOCAL_MODEL_PORT"] = str(port)
+        try:
+            manager = local_model.get_manager()
+            probe = ce.probe(config.DATA_DIR, provider="local", model="local-fixture",
+                             use_local=True, allow_fetch=False)
+            reply = None
+            if chat:
+                message, usage = LLMClient(api_key="unused").chat(
+                    messages=[{"role": "user", "content": "hello"}], model="local-fixture",
+                    max_tokens=65536, use_local=True)
+                reply = (message.get("content"), usage.get("provider"))
+            results.put({"pid": os.getpid(), "owns_server": manager._proc is not None,
+                         "evidence": manager.serving_context_evidence(),
+                         "limits": local_context_limits(65536),
+                         "probe": (probe.window_tokens, probe.status, probe.source), "reply": reply})
+        except Exception as error:  # Report consumer failures instead of hanging the parent.
+            results.put({"error": repr(error)})
+
+
+@pytest.fixture
+def offline_manager(monkeypatch, tmp_path):
+    manager = local_model.LocalModelManager()
+    monkeypatch.setattr(local_model, "_manager", manager)
+    monkeypatch.setattr(config, "DATA_DIR", tmp_path)
+    monkeypatch.setattr(manager, "check_runtime", lambda: True)
+    yield manager
+    manager.stop_server()
+
+
+@pytest.mark.parametrize("source", ["", "   ", "fixture/source"])
+def test_autostart_guard_admits_only_a_configured_source(offline_manager, monkeypatch, caplog, source):
+    from ouroboros.local_model_autostart import auto_start_local_model
+
+    download = Mock(return_value="/models/fixture.gguf")
+    start = Mock()
+    monkeypatch.setattr(offline_manager, "download_model", download)
+    monkeypatch.setattr(offline_manager, "start_server", start)
+    auto_start_local_model({"LOCAL_MODEL_SOURCE": source, "LOCAL_MODEL_FILENAME": "fixture.gguf",
+                            "LOCAL_MODEL_PORT": 9123, "LOCAL_MODEL_N_GPU_LAYERS": 7,
+                            "LOCAL_MODEL_CONTEXT_LENGTH": 8192, "LOCAL_MODEL_CHAT_FORMAT": "chatml"})
+    if source.strip():
+        download.assert_called_once_with("fixture/source", "fixture.gguf")
+        start.assert_called_once_with("/models/fixture.gguf", port=9123, n_gpu_layers=7, n_ctx=8192,
+                                      chat_format="chatml", source="fixture/source", filename="fixture.gguf")
+        assert "LOCAL_MODEL_SOURCE is empty" not in caplog.text
+    else:
+        download.assert_not_called()
+        start.assert_not_called()
+        assert "LOCAL_MODEL_SOURCE is empty" in caplog.text
+
+
+def test_spawned_worker_reads_the_serving_instance_its_server_process_owns(
+    offline_manager, monkeypatch, tmp_path,
+):
+    """Workers are spawned processes; the owned server lives in the server process."""
+    import json
+    import multiprocessing
+    import os
+    import socket
+    import subprocess
+    import time
+
+    from ouroboros.local_model_autostart import auto_start_local_model
+    from ouroboros.server_process import read_service_bindings
+
+    stand_in = tmp_path / "stand_in_server.py"
+    stand_in.write_text(_STAND_IN_SERVER, encoding="utf-8")
+    real_popen, real_run = subprocess.Popen, subprocess.run
+
+    def popen(cmd, **kwargs):  # Only the vendor server is replaced; the launched argv is kept.
+        assert cmd[1:3] == ["-m", "ouroboros.local_model_server"]
+        return real_popen([cmd[0], str(stand_in), *cmd[3:]], **kwargs)
+
+    def run(cmd, **kwargs):  # llama-cpp-python is not installed here.
+        if cmd[1:] == ["-c", "import llama_cpp"]:
+            return subprocess.CompletedProcess(cmd, 0, "", "")
+        return real_run(cmd, **kwargs)
+
+    monkeypatch.setattr(local_model, "subprocess", SimpleNamespace(**{
+        **vars(subprocess), "Popen": popen, "run": run}))
+    monkeypatch.setattr(offline_manager, "download_model", lambda source, filename: str(tmp_path / filename))
+    log_path = tmp_path / "stand_in.jsonl"
+    monkeypatch.setenv("LOCAL_STAND_IN_LOG", str(log_path))
+
+    def free_port():
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    def autostart(port, n_ctx):
+        auto_start_local_model({"LOCAL_MODEL_SOURCE": "fixture/source", "LOCAL_MODEL_FILENAME": "fixture.gguf",
+                                "LOCAL_MODEL_PORT": port, "LOCAL_MODEL_CONTEXT_LENGTH": n_ctx})
+        deadline = time.monotonic() + 30
+        while not offline_manager.is_running and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert offline_manager.is_running, offline_manager.status_dict()
+        return offline_manager.serving_context_evidence()
+
+    ctx = multiprocessing.get_context("spawn")
+    requests, results = ctx.Queue(), ctx.Queue()
+    worker = ctx.Process(target=_spawned_worker, args=(requests, results, str(tmp_path)), daemon=True)
+    worker.start()
+
+    def ask(port, chat=False):
+        requests.put((port, chat))
+        seen = results.get(timeout=60)
+        assert "error" not in seen, seen
+        assert seen["pid"] == worker.pid != os.getpid() and not seen["owns_server"]
+        return seen
+
+    unknown_probe = (0, ce.STATUS_UNPROBEABLE, ce.SOURCE_NONE)
+    try:
+        port = free_port()
+        owned = autostart(port, 16384)
+        seen = ask(port, chat=True)
+        assert seen["evidence"]["confirmed"] is True, seen
+        assert (seen["evidence"]["context_window"], seen["evidence"]["process_id"]) == (
+            16384, owned["process_id"])
+        assert seen["limits"] == (16384, 4096)
+        assert seen["probe"] == (16384, ce.STATUS_CONFIRMED, ce.SOURCE_LOCAL_HEALTH)
+        assert seen["reply"] == ("local answer", "local")
+        sent = [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+        assert [row["path"] for row in sent] == ["/extras/measure_chat", "/v1/chat/completions"]
+        assert {row["pid"] for row in sent} == {owned["process_id"]}
+        assert sent[-1]["body"]["max_tokens"] == 4096
+
+        elsewhere = ask(free_port())  # This worker would dispatch to another endpoint.
+        assert elsewhere["evidence"]["confirmed"] is False and elsewhere["limits"] == (0, 2048)
+        assert elsewhere["probe"] == unknown_probe
+
+        offline_manager.stop_server()
+        stopped = ask(port)
+        assert stopped["evidence"]["confirmed"] is False and stopped["limits"] == (0, 2048)
+        assert stopped["probe"] == unknown_probe
+
+        restarted = autostart(port, 8192)  # The same worker holds no stale window.
+        assert restarted["process_id"] != owned["process_id"]
+        seen = ask(port)
+        assert (seen["evidence"]["context_window"], seen["evidence"]["process_id"]) == (
+            8192, restarted["process_id"])
+        assert seen["limits"] == (8192, 2048) and seen["probe"][:2] == (8192, ce.STATUS_CONFIRMED)
+
+        bindings_path = tmp_path / "state" / "server_port.bindings.json"
+        published = bindings_path.read_text(encoding="utf-8")
+        reused = json.loads(published)  # The pid now names a process born after the published one.
+        fingerprint = reused["local_model"]["fingerprint"]
+        fingerprint.update({key: "0" for key in ("start_time", "creation_time") if key in fingerprint})
+        bindings_path.write_text(json.dumps(reused), encoding="utf-8")
+        foreign = ask(port)
+        assert foreign["evidence"]["confirmed"] is False and foreign["probe"] == unknown_probe
+        bindings_path.write_text(published, encoding="utf-8")
+
+        offline_manager._proc.kill()  # A crash leaves the published binding behind.
+        offline_manager._proc.wait(timeout=10)
+        assert read_service_bindings(tmp_path)["local_model"]["pid"] == restarted["process_id"]
+        crashed = ask(port)
+        assert crashed["evidence"]["confirmed"] is False and crashed["limits"] == (0, 2048)
+        assert crashed["probe"] == unknown_probe
+    finally:
+        requests.put(None)
+        worker.join(timeout=10)
+        if worker.is_alive():
+            worker.terminate()
+            worker.join(timeout=5)
+        for channel in (requests, results):
+            channel.close()
+            channel.cancel_join_thread()
