@@ -12,7 +12,8 @@ import pytest
 from ouroboros import delegate_custody as custody
 from ouroboros.task_results import load_task_result, write_task_result
 from tests.test_delegate_retry_consumers import (
-    bind_gateway, call, durable_run, isolated_retry_state, queue_snapshot, retry_context,
+    bind_gateway, call, durable_run, queue_snapshot, retry_context,
+    isolated_retry_state as isolated_retry_state,  # re-export the autouse pytest fixture
 )
 from tests.test_delegated_directory import DirectoryEngine
 
