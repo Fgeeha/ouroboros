@@ -59,7 +59,7 @@ def test_main_loop_shares_one_install_affinity_across_executions_on_claudexor(tm
     assert captured[2]["cache_affinity"] == ""
 
 
-def test_main_loop_projects_claudexor_options_outside_the_route(tmp_path):
+def test_main_loop_keeps_claudexor_options_in_exact_call_log(tmp_path):
     class LLM:
         def chat(self, **_kwargs):
             return ({"content": "done", "tool_calls": [], "finish_reason": "stop"}, {
@@ -79,11 +79,10 @@ def test_main_loop_projects_claudexor_options_outside_the_route(tmp_path):
                         logs, "task", 1, queue.Queue(), usage)
 
     assert usage["_model_route"] == {"credentialProfileId": "account-a"}
-    # The options carry the route that reported them, so a later round that
-    # rewrites `_model_route` alone cannot be paired with these values.
-    assert usage["_options"] == {
-        "requested_options": {"reasoningEffort": "high"},
-        "applied_options": {"reasoningEffort": "medium"},
-        "options_honored": "mismatch",
-        "route": {"credentialProfileId": "account-a"},
-    }
+    assert "_options" not in usage  # No second, stale copy for automatic chat notices.
+    import json
+
+    rounds = [json.loads(line) for line in (logs / "events.jsonl").read_text().splitlines()
+              if json.loads(line).get("type") == "llm_round"]
+    assert rounds[-1]["claudexor"]["requested_options"] == {"reasoningEffort": "high"}
+    assert rounds[-1]["claudexor"]["applied_options"] == {"reasoningEffort": "medium"}

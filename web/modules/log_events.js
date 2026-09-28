@@ -5,6 +5,7 @@ export { taskCheckpointLabel } from './task_checkpoints.js';
 import { harnessPresentation } from './harness_presentation.js';
 import { acceptanceIncidentClauses } from './acceptance_incident_presentation.js';
 import { historyRetentionView } from './history_retention.js';
+import { effortEvidenceText } from './effort_evidence.js';
 import {
     classifyReviewLifecycle,
     classifyReviewLifecyclePointer,
@@ -26,11 +27,7 @@ export const LOG_CATEGORIES = {
     consciousness: { label: 'Consciousness', color: 'var(--accent)' },
 };
 
-// Logs phases that file a row under the Errors filter (#323). They are the
-// typed failure outcomes summarizeLogEvent already derives — a failed task_done,
-// a tool that errored/was killed/timed out, an LLM call failure, a review
-// lifecycle error — so the category and the phase pill of one row can never
-// disagree, live or on replay.
+// The Errors filter follows the same typed failure phases on live and replay rows.
 const ERROR_LOG_PHASES = new Set(['error', 'timeout', 'lifecycle_error']);
 
 export function categorizeLogEvent(evt, view = summarizeLogEvent(evt)) {
@@ -820,12 +817,11 @@ export function summarizeLogEvent(evt) {
 
     if (t === 'llm_round_finished' || t === 'llm_round') {
         return view('done', `LLM round ${evt.round || ''} finished`.trim(), {
+            body: effortEvidenceText(evt),
             meta: taskMeta(
                 evt.model || '',
                 formatLogTokens(evt),
-                // ABI-3: /api/logs backfill rows carry the honest name; live
-                // frames still say cost_usd/cost — resolve the pair via the
-                // SSOT helper, then the live-frame `cost` spelling.
+                // Backfill uses accounted upper bounds; live frames may carry cost.
                 formatLogMoney(accountedUpperBound(evt) ?? evt.cost),
                 evt.response_kind === 'tool_calls' ? `${evt.tool_call_count || 0} tool calls` : evt.response_kind || '',
             ),
@@ -847,6 +843,7 @@ export function summarizeLogEvent(evt) {
 
     if (t === 'llm_usage') {
         return view('usage', 'LLM usage recorded', {
+            body: effortEvidenceText(evt),
             meta: taskMeta(
                 evt.model || '',
                 formatLogTokens(evt),
@@ -1080,7 +1077,7 @@ export function summarizeLogEvent(evt) {
     // only a name visible under Errors, and it is pinned as a remainder, not a taxonomy.
     const level = String(evt.level || '').toLowerCase();
     const body = shortText(
-        evt.error || evt.message || evt.text || evt.result_preview
+        evt.error || evt.message || evt.text || evt.result_preview || effortEvidenceText(evt)
             || compactJson(evt.args || evt.task || evt.checks, 260), 260,
     );
     if (evt.ok === true) {

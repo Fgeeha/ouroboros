@@ -276,18 +276,19 @@ class _LocalLaneMixin:
         max_tokens: int, tool_choice: str, timeout: Optional[float] = None,
         processing_preference: Optional[str] = None,
         context_mode: Optional[str] = None,
+        reasoning_effort: Optional[str] = None,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Send exactly the previously prepared complete local candidate."""
         client = self._get_local_client()
         local_target, candidate = self._build_local_candidate(
             messages, tools, max_tokens, tool_choice, timeout, processing_preference, context_mode)
+        local_target["requested_reasoning_effort"] = reasoning_effort
         from ouroboros.send_clock import stamp_clock_note
 
         # ONE clock line per call, sampled before both finalizations: the serving
         # instance measures exactly the bytes that are then sealed and sent.
         candidate = self._finalize_local_candidate(local_target, stamp_clock_note(candidate))
         clean_tools = candidate.get("tools")
-        preference = local_target["processing_preference"]
         # ONE physical attempt per call. Re-sending here spent the caller's
         # physical-attempt budget without the caller authorising it, so a
         # transient local failure now surfaces to the single retry policy that
@@ -354,8 +355,7 @@ class _LocalLaneMixin:
         finish_reason = first_choice.get("finish_reason")
         if isinstance(finish_reason, str) and finish_reason.strip():
             usage["response_finish_reason"] = finish_reason.strip()[:64]
-        if preference:
-            from ouroboros._usage_response import processing_receipt
+        from ouroboros.llm_attempt import attach_processing_receipt
 
-            usage["processing"] = processing_receipt("local", usage, requested=preference)
+        attach_processing_receipt(local_target, usage)
         return msg, usage

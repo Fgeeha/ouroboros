@@ -154,6 +154,10 @@ def usage_from_response(response: Any) -> Tuple[Dict[str, Any], Optional[float],
         "cached_tokens": cache_read,
         "cache_write_tokens": cache_write,
     }
+    # Candidate facts and validated engine reports come from their host owners,
+    # never arbitrary extensions inside a provider's token-usage block.
+    normalized.pop("effort", None)
+    normalized.pop("effort_resolution", None)
     if isinstance(payload, dict):
         if "service_tier" in payload:
             normalized["service_tier"] = payload["service_tier"]

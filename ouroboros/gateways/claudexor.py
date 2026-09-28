@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
 import httpx
+from ouroboros.effort_evidence import validated_effort_resolution
 
 from ouroboros.config import (
     CLAUDEXOR_MIN_VERSION,
@@ -653,10 +654,14 @@ class ClaudexorGateway:
         return ref
 
     def create_model_operation(self, request_ref: Dict[str, Any], *,
-                               idempotency_key: str, capture_failure_evidence: bool = False) -> Dict[str, Any]:
+                               idempotency_key: str, capture_failure_evidence: bool = False,
+                               capture_effort_evidence: bool = False) -> Dict[str, Any]:
         """Create or rejoin exactly one caller-identified generation; never mint a retry key."""
         key = _model_idempotency_key(idempotency_key)
-        path = "/v2/model-operations" + ("?captureFailureEvidence=true" if capture_failure_evidence else "")
+        query = "&".join(f"{name}=true" for name, enabled in (
+            ("captureFailureEvidence", capture_failure_evidence),
+            ("captureEffortEvidence", capture_effort_evidence)) if enabled)
+        path = "/v2/model-operations" + (f"?{query}" if query else "")
         return _model_operation(self._request(
             "POST", path, json_body={"request": _model_payload_ref(request_ref)},
             headers={"Idempotency-Key": key},
@@ -674,14 +679,10 @@ class ClaudexorGateway:
     def get_model_result(self, operation_id: str, *, expected_ref: Dict[str, Any],
                          timeout_sec: Optional[float] = None,
                          raw_bytes: bool = False) -> Dict[str, Any] | bytes:
-        """Read and verify the complete result, without ACK, redaction or artifact caps.
-
-        The expected reference comes from this operation's ready custody record.
-        Failure preserves that handle: only another read of the same operation is
-        appropriate here, never a new generation. The caller acknowledges after
-        it has retained the returned result under its own custody contract.
-        ``raw_bytes`` retains the exact verified JSON encoding for that custody;
-        it never skips the size, digest, UTF-8 or object validation below.
+        """Verify the complete result against ready custody; no ACK, redaction or caps.
+        Failure preserves the handle: re-read this operation, never regenerate.
+        The caller ACKs after retaining the result under its own custody contract.
+        ``raw_bytes`` keeps exact JSON encoding; size, digest, UTF-8 and object checks apply.
         """
         from urllib.parse import quote
 
@@ -1438,8 +1439,8 @@ def attempt_containment(run_dir: str) -> List[AttemptContainment]:
     return applied
 
 
-def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, str]:
-    """Read the final attempt's route facts from engine-owned telemetry.
+def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, Any]:
+    """Read the final attempt's route and effort facts from engine-owned telemetry.
 
     The summary's model and harnesses echo the request; its route/authRoute
     projections may borrow facts from earlier attempts. Only the unique row
@@ -1468,13 +1469,16 @@ def final_attempt_facts(detail: Dict[str, Any], run_id: str) -> Dict[str, str]:
     if len(matching) != 1:
         return {}
     row = matching[0]
-    return {
+    facts = {
         target: row.get(source) if isinstance(row.get(source), str) else ""
         for target, source in (
             ("attempt_id", "attempt_id"), ("harness_id", "harness_id"),
             ("model", "observed_model"), ("profile_id", "profile_id"),
         )
     }
+    if "effort_resolution" in row:
+        facts["effort_resolution"] = validated_effort_resolution(row["effort_resolution"])
+    return facts
 
 
 __all__ = [

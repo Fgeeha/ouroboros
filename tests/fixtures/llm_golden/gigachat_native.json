@@ -145,7 +145,15 @@
             "provider": "gigachat",
             "resolved_model": "gigachat/GigaChat-3-Pro",
             "cost": null,
-            "cost_final": false
+            "cost_final": false,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            }
           },
           "ledger_attempt_count": 1
         },
@@ -294,7 +302,15 @@
             "provider": "gigachat",
             "resolved_model": "gigachat/GigaChat-3-Pro",
             "cost": null,
-            "cost_final": false
+            "cost_final": false,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            }
           },
           "ledger_attempt_count": 1
         },
@@ -399,7 +415,15 @@
             "provider": "gigachat",
             "resolved_model": "gigachat/GigaChat-3-Pro",
             "cost": null,
-            "cost_final": false
+            "cost_final": false,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            }
           },
           "ledger_attempt_count": 1
         },
