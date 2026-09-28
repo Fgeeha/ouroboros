@@ -436,6 +436,8 @@ def acceptance_skip_applied(
         {"trigger": "owner_hurry", "skipped": "owner_hurry"},
     )
     set_decision(llm_trace, skip)
+    from ouroboros.acceptance_history import seed_acceptance_history
+    seed_acceptance_history(ctx, llm_trace, REASON_OWNER_HURRY)
     root = getattr(ctx, "budget_drive_root", "") or drive_root
     if root:
         record_effect(

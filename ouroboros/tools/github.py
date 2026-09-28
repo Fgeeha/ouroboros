@@ -160,8 +160,17 @@ def _gh_run(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Op
             status = _GH_STATUS_RE.search(err)
             head = " | ".join([line.strip() for line in err.splitlines() if line.strip()][:3])
             head = truncate_within_limit(head, 600)
+            # gh's canMerge refusal precedes its mutation (pkg/cmd/pr/merge).
+            # HTTP status alone proves nothing about which CLI step failed.
+            pre_effect = (args[:2] == ["pr", "merge"] and not res.stdout.strip() and re.fullmatch(
+                r"X Pull request [\w.-]+/[\w.-]+#\d+ is not mergeable: "
+                r"(?:the base branch policy prohibits the merge|the head branch is not up to date with the base branch)\.\n"
+                r"To have the pull request merged after all the requirements have been met, add the `--auto` flag\.\n"
+                r"To use administrator privileges to immediately merge the pull request, add the `--admin` flag\.",
+                err.strip()) is not None)
             return GhResult(False, "⚠️ GH_ERROR: " + head, res.returncode,
-                            int(status.group(1) or status.group(2)) if status else None, "exit")
+                            int(status.group(1) or status.group(2)) if status else None,
+                            "pre_effect" if pre_effect else "exit")
         return GhResult(True, res.stdout.strip(), res.returncode, None, "")
     except FileNotFoundError as e:
         missing = str(getattr(e, "filename", "") or "")
@@ -448,6 +457,52 @@ def _comment_on_pr(ctx: ToolContext, number: int, body: str, repo: str = "") -> 
     return f"✅ Comment added to PR #{number}."
 
 
+def _pr_merge(ctx: ToolContext, number: int, expected_head_sha: str, method: str,
+              review_task_ids: Optional[List[str]] = None, reviewed_head_sha: str = "",
+              reviewed_base_sha: str = "", review_scope: str = "full", review_verdict: str = "",
+              repo: str = "") -> str:
+    """Thin transport binding; the receipt contract lives in ``merge_receipts``."""
+    from ouroboros.merge_receipts import REVIEW_SCOPES, _VERDICT_RE, _sha, run_pr_merge
+    from ouroboros.tool_access import canonical_data_root
+
+    if review_scope not in REVIEW_SCOPES or (review_verdict and not _VERDICT_RE.fullmatch(review_verdict)):
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: review_scope is full|delta; review_verdict is a short word such as PASS.")
+    declared = ({"reviewed_head_sha": _sha(reviewed_head_sha), "reviewed_base_sha": _sha(reviewed_base_sha),
+                 "scope": review_scope, "verdict": review_verdict}
+                if (reviewed_head_sha or review_verdict or review_task_ids) else None)
+    receipt = run_pr_merge(
+        ctx, lambda args, **kw: _gh_run(args, ctx, repo=repo, **kw), lambda args, **kw: _gh_run(args, ctx, **kw),
+        drive_root=canonical_data_root(ctx), task_id=str(ctx.task_id or ""), number=int(number or 0),
+        expected_head_sha=expected_head_sha, method=method,
+        review={"declared": declared, "task_ids": list(review_task_ids or [])})
+    if receipt.get("refused"):
+        code = "TOOL_ARG_ERROR" if receipt["refused"] == "arguments" else "TOOL_ERROR"
+        return _refuse(ctx, f"⚠️ PR_MERGE_REFUSED: {receipt['refused']} — {receipt.get('detail', '')}", code)
+    from ouroboros.merge_receipts import card_row_text
+
+    status = (receipt.get("outcome") or {}).get("status", "unknown")
+    lines = [card_row_text(receipt), f"receipt_id={receipt['receipt_id']} (task result: merge_receipts)"]
+    if receipt.get("readback_only"):
+        lines.append("An earlier request for this PR had no confirmed outcome, so this call only read GitHub back "
+                     "and sent no new merge request. Unknown and queued requests remain observation-only.")
+    if receipt.get("republished"):
+        lines.append("Receipt publication retried; the merge was not repeated.")
+    publication = receipt.get("publication") or {}
+    if receipt.get("receipt_write_gap"):
+        lines.append("⚠️ Merge receipt persistence is unknown after the external effect: "
+                     + receipt["receipt_write_gap"])
+    if status in ("merged", "queued") and (publication.get("body") or {}).get("status") != "published":
+        lines.append("⚠️ The PR-body receipt block was not confirmed; call pr_merge again to retry publication only.")
+    card = publication.get("card") or {}
+    if status in ("merged", "queued") and card.get("status") not in ("owed", "delivered"):
+        lines.append("⚠️ The task-card receipt is not confirmed: " + str(card.get("reason") or "publication unknown")
+                     + "; call pr_merge again for observation/publication only.")
+    text = "\n".join(lines)
+    if status in ("merged", "queued"):
+        return text
+    return _refuse(ctx, f"⚠️ PR_MERGE_{status.upper()}: " + text, "TOOL_ERROR")
+
+
 def _create_issue(ctx: ToolContext, title: str, body: str = "", labels: str = "", repo: str = "") -> str:
     if not title or not title.strip():
         return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue title cannot be empty.")
@@ -515,6 +570,30 @@ def get_tools() -> List[ToolEntry]:
                 "body": {"type": "string", "description": "Comment text (markdown)"},
             }, "required": ["number", "body"]},
         }, _comment_on_pr),
+
+        ToolEntry("pr_merge", {
+            "name": "pr_merge",
+            "description": (
+                "Merge a GitHub pull request so a receipt exists: states the exact head you expect "
+                "and the method (never auto-merge or admin), records what review you declare beside "
+                "what the host observes, reads GitHub back, and writes the receipt to this task's "
+                "record, its card and the PR body. A missing review is recorded loudly, never a lock. "
+                "An unknown or queued merge stays observation/publication-only on repeat calls; no resend. "
+                "Distinct from stage_pr_merge, which stages a local merge for a reviewed commit."
+            ),
+            "parameters": {"type": "object", "properties": {
+                "number": {"type": "integer", "description": "PR number"},
+                "expected_head_sha": {"type": "string", "description": "The PR head you intend to merge; GitHub refuses if it moved"},
+                "method": {"type": "string", "enum": ["merge", "squash", "rebase"]},
+                "review_task_ids": {"type": "array", "items": {"type": "string"}, "default": [],
+                                    "description": "Task ids of the reviews you rely on; the host records what it can observe of each"},
+                "reviewed_head_sha": {"type": "string", "default": "", "description": "The head those reviews covered (declared)"},
+                "reviewed_base_sha": {"type": "string", "default": "", "description": "The base those reviews covered (declared)"},
+                "review_scope": {"type": "string", "enum": ["full", "delta"], "default": "full",
+                                 "description": "delta = only the change since an earlier review; never counted as whole-PR coverage"},
+                "review_verdict": {"type": "string", "default": "", "description": "The declared verdict word, e.g. PASS"},
+            }, "required": ["number", "expected_head_sha", "method"]},
+        }, _pr_merge),
 
         ToolEntry("list_github_issues", {
             "name": "list_github_issues",

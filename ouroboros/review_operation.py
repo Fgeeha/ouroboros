@@ -60,7 +60,8 @@ OPERATIONS_FIELD = "review_operations"
 # Another surface's pointer only proves liveness and is removed when it closes.
 OPERATION_RETAINED, OPERATION_DISPATCHED, OPERATION_CLOSED = "retained", "dispatched", "closed"
 OPERATION_UNPUBLISHED, OPERATION_COLLECTED = "unpublished", "collected"
-_OPEN_STATES = frozenset({OPERATION_RETAINED, OPERATION_DISPATCHED})
+OPERATION_PREPARING = "preparing"
+_OPEN_STATES = frozenset({OPERATION_PREPARING, OPERATION_RETAINED, OPERATION_DISPATCHED})
 # Typed per-slot collection facts (never a verdict): a pending producer is not a
 # never-dispatched one, and neither is an unknown outcome.
 COLLECTED, DEFERRED, UNAVAILABLE, NEVER_DISPATCHED, SETTLED = (
@@ -198,9 +199,11 @@ class ReviewOperation:
         self.owner_id = f"review-operation-{uuid.uuid4().hex}"
         self.surface = str(getattr(request, "surface", "") or "")
         self.retry_key = str(getattr(request, "retry_key", "") or "")
+        self.historical_purpose = copy.deepcopy((getattr(request, "policy", None) or {}).get("historical_acceptance"))
         self.identity = controller_identity()
         self.result_root = pathlib.Path(result_root)
         self.checkpointed = False
+        self.preparing = False
         self.closed = False
         self.control_state = ""
         self._drains = 0
@@ -249,6 +252,11 @@ class ReviewOperation:
         if not self._control and now - self._checked_at >= _CONTROL_RECHECK_SEC:
             self._checked_at = now
             self.control_state = _operation_stop_state(self.result_root, self.task_id)
+            if self.historical_purpose:
+                from ouroboros.acceptance_late import historical_operation_controls
+
+                if historical_operation_controls(self.result_root, self.historical_purpose, unstarted=not self._dispatched):
+                    self.control_state = "cancelled"
             if self.control_state in {"panic", "cancelled"}:
                 self._control = self.control_state
         return self._control or None
@@ -289,7 +297,10 @@ class ReviewOperation:
             return
         from ouroboros.acceptance_settlement import late_publication_owed
 
-        state = OPERATION_UNPUBLISHED if late_publication_owed(self.task_id, self.retry_key) else OPERATION_CLOSED
+        # A historical panel owes its FIRST supplement even if every actor
+        # answered before the drain returned. Only the settlement publisher can
+        # consume that duty; crashing before its first call stays recoverable.
+        state = OPERATION_UNPUBLISHED if self.historical_purpose or late_publication_owed(self.task_id, self.retry_key) else OPERATION_CLOSED
         _mark_operation(self.result_root, self.task_id, self.owner_id, state, from_states=_OPEN_STATES)
 
 
@@ -303,6 +314,104 @@ class OperationBinding:
 
 def current_review_operation() -> Optional[ReviewOperation]:
     return _BOUND.get()
+
+
+def prepare_historical_operation(*, root: Any, purpose: dict, event_queue: Any,
+                                 work: Callable, background: bool) -> dict:
+    """Own historical preparation BEFORE starting it; never a ready/paid checkpoint.
+
+    The same operation upgrades its intent to a complete canonical request at
+    the ordinary dispatch seam. Its drain owns the preparation worker, so Stop,
+    calendar limits and crash visibility exist before expensive source work.
+    Panic never joins this worker. Recovery of an abandoned intent buys nothing.
+    """
+    from ouroboros.artifacts import store_actor_source_bytes
+    from ouroboros.model_wait import operation_wait_scope
+
+    retry_key = 'task_acceptance:' + hashlib.sha256(purpose['debt_id'].encode()).hexdigest()
+    task = {'id': purpose['task_id'], '_attempt': purpose['task_attempt'],
+            'chat_id': purpose['confirmed_delivery']['chat_id'],
+            'metadata': {'root_task_id': purpose['accounting_root_task_id']}}
+    parent = TaskModelWait(task=task, drive_root=root, event_queue=event_queue, worker_slot_held=False)
+    request = SimpleNamespace(surface='task_acceptance', retry_key=retry_key,
+                              policy={'historical_acceptance': purpose})
+    operation = ReviewOperation(parent=parent, request=request, task_id=task['id'], result_root=pathlib.Path(root))
+    parent.close()
+    operation.preparing = True
+    operation.enter()
+    with _LOCK:
+        _LIVE[operation.owner_id] = operation
+    try:
+        intent = {'schema_version': 1, 'kind': 'historical_acceptance_preparation_intent',
+                  'owner_id': operation.owner_id, 'controller': operation.identity, 'purpose': purpose}
+        ref = store_actor_source_bytes(root, task['id'], category='context_checkpoints',
+            source_id='historical-acceptance-intent', extension='json',
+            data=json.dumps(intent, sort_keys=True, ensure_ascii=False).encode())
+        operation.intent_ref = ref
+        entry = {'surface': 'task_acceptance', 'retry_key': retry_key, 'task_attempt': purpose['task_attempt'],
+                 'controller': operation.identity, 'state': OPERATION_PREPARING, 'intent_ref': ref,
+                 'recorded_at': utc_now_iso()}
+        def admit(rows: dict) -> dict:
+            if any(row.get('retry_key') == retry_key and (purpose['automatic']
+                   or row.get('state') != 'preparation_refused') for row in rows.values()):
+                raise ValueError('historical acceptance operation already retained')
+            return {**rows, operation.owner_id: entry}
+        written = _update_operations(root, task['id'], admit, create=True)
+        if (written.get(OPERATIONS_FIELD) or {}).get(operation.owner_id) != entry:
+            raise ValueError('historical preparation intent not retained')
+        _link_historical_controls(operation, entry)
+    except BaseException:
+        operation.preparing = False
+        operation.drain_returned()
+        raise
+
+    def prepare() -> dict:
+        token = _BOUND.set(operation)
+        try:
+            with operation_wait_scope(operation.wait):
+                result = work(operation)
+            if operation.checkpointed and result.get('status') == 'owed':
+                _update_operations(root, task['id'], lambda rows: {**rows, operation.owner_id: {
+                    **rows[operation.owner_id], 'predispatch_refusal': result}})
+            if not operation.checkpointed:
+                def refused(rows: dict) -> dict:
+                    row = rows.get(operation.owner_id) or {}
+                    return {**rows, operation.owner_id: {**row, 'state': ('preparation_unknown' if row.get('source_ref') else 'preparation_refused'),
+                            'preparation_outcome': result, 'finished_at': utc_now_iso()}}
+                _update_operations(root, task['id'], refused)
+            return result
+        except BaseException:
+            # A crash/unknown preparation is NOT an absent operation. No boot
+            # recovery or repeated receipt may buy from this intent.
+            _mark_operation(root, task['id'], operation.owner_id, 'preparation_unknown',
+                            from_states={OPERATION_PREPARING})
+            if not background:
+                raise
+            log.exception('Historical acceptance preparation failed for %s', task['id'])
+            return {'status': 'unknown', 'reason': 'historical_preparation_failed', 'dispatched': None}
+        finally:
+            operation.preparing = False
+            _BOUND.reset(token)
+            operation.drain_returned()
+
+    if not background:
+        return prepare()
+    # This is the existing operation's preparation worker, retained and live
+    # before start, holding its drain until request handoff or typed refusal.
+    from ouroboros.settings_integrity import copy_task_settings_context
+    settings_context = contextvars.Context()
+    copy_task_settings_context(settings_context)
+    operation.preparation_worker = threading.Thread(target=settings_context.run, args=(prepare,),
+        name=f'review-prepare-{operation.owner_id}', daemon=True)
+    try:
+        operation.preparation_worker.start()
+    except BaseException:
+        _mark_operation(root, task['id'], operation.owner_id, 'preparation_unknown', from_states={OPERATION_PREPARING})
+        operation.preparing = False
+        operation.drain_returned()
+        raise
+    return {'status': 'preparing', 'reason': 'historical_operation_retained', 'owner_id': operation.owner_id,
+            'task_id': task['id'], 'debt_id': purpose['debt_id'], 'dispatched': False}
 
 
 def release_review_operation(entry: Any) -> None:
@@ -354,7 +463,13 @@ def review_operation_scope(*, request: Any, slots: List[Any], usage_ctx: Any,
     relayed = {id(op): op for kind, op in plan.values() if kind == "relay" and op is not None and not op.closed}
     binding = OperationBinding()
     restore = None
-    if not sends and len(relayed) == 1:
+    preparing = current_review_operation()
+    root = _result_root(usage_ctx, parent)
+    if (preparing is not None and preparing.preparing and preparing.task_id == str(task_id)
+            and preparing.retry_key == request.retry_key and preparing.result_root == root):
+        binding.operation = preparing
+        binding.refused, restore = _retain_before_dispatch(preparing, request, slots, sends, usage_ctx, root)
+    elif not sends and len(relayed) == 1:
         binding.operation = next(iter(relayed.values()))
     else:
         root = _result_root(usage_ctx, parent)
@@ -395,11 +510,10 @@ def _retain_before_dispatch(operation: ReviewOperation, request: Any, slots: Lis
     A panel whose every row is refused at $0 sends nothing and owes nothing.
     """
     from ouroboros.observability import new_call_id
-    from ouroboros.review_dispatch import task_acceptance_zero_physical_refusal
+    from ouroboros.review_dispatch import task_acceptance_row_refusal
 
     acceptance = operation.surface == "task_acceptance"
-    if acceptance and all(task_acceptance_zero_physical_refusal(getattr(request, "evidence", None),
-                                                                retrieving=bool(getattr(slot, "retrieves", False)))
+    if acceptance and all(task_acceptance_row_refusal(request, slot)
                           for slot in slots if str(slot.slot_id) in sends):
         return {}, None
     reserved_elsewhere = (getattr(usage_ctx, "_review_reserved_operations", None) or {}).get(operation.surface)
@@ -410,7 +524,8 @@ def _retain_before_dispatch(operation: ReviewOperation, request: Any, slots: Lis
     try:
         if usage_ctx is None or root is None:
             raise ValueError("the operation has no task-result root to retain its checkpoint")
-        _write_operation_pointer(operation, request, slots, owned, retain_source=acceptance)
+        _write_operation_pointer(operation, request, slots, owned, retain_source=acceptance,
+                                 paid_authority=getattr(usage_ctx, "_review_paid_authority", None))
     except Exception as exc:
         if not acceptance:
             log.debug("Review operation %s has no durable pointer", operation.owner_id, exc_info=True)
@@ -428,28 +543,83 @@ def _retain_before_dispatch(operation: ReviewOperation, request: Any, slots: Lis
 
 
 def _write_operation_pointer(operation: ReviewOperation, request: Any, slots: List[Any],
-                             owned: Dict[str, str], *, retain_source: bool) -> None:
+                             owned: Dict[str, str], *, retain_source: bool, paid_authority: Any = None) -> None:
     """Write the pointer (and, for a checkpoint, its immutable source), then prove it landed."""
     entry = {"surface": operation.surface, "retry_key": operation.retry_key, "task_attempt": operation.wait.attempt,
              "controller": dict(operation.identity), "operations": dict(owned), "recorded_at": utc_now_iso(),
              "state": OPERATION_RETAINED}
+    if operation.historical_purpose:
+        entry["intent_ref"] = copy.deepcopy(operation.intent_ref)
     if retain_source:
         from ouroboros.artifacts import store_actor_source_bytes
         from ouroboros.observability import redact_projection
 
         source = {"schema_version": 1, "owner_id": operation.owner_id, "task_id": operation.task_id, **entry,
                   "request": asdict(request), "slot_roster": [asdict(slot) for slot in slots]}
+        if paid_authority:
+            source["paid_authority"] = copy.deepcopy(paid_authority)
         source.pop("state")
         raw = json.dumps(redact_projection(source).value, ensure_ascii=False, sort_keys=True,
                          default=str).encode("utf-8")
         entry["source_ref"] = store_actor_source_bytes(
             operation.result_root, operation.task_id, category="context_checkpoints",
             source_id="acceptance-operation", data=raw, extension="json")
-    written = _update_operations(operation.result_root, operation.task_id,
-                                 lambda rows: {**rows, operation.owner_id: entry}, create=True)
+    def admit(rows: Dict[str, Any]) -> Dict[str, Any]:
+        # One debt keeps one operation even before its first paid stamp. The
+        # canonical pointer is the existing handoff owner; a concurrent/new
+        # rationale cannot replace it or turn an unknown send into an empty slot.
+        if operation.historical_purpose and any(row.get('retry_key') == operation.retry_key
+                and row.get('state') != 'preparation_refused'
+                for owner, row in rows.items() if owner != operation.owner_id):
+            raise ValueError('historical acceptance operation already retained')
+        return {**rows, operation.owner_id: entry}
+    written = _update_operations(operation.result_root, operation.task_id, admit, create=True)
     stored = (written.get(OPERATIONS_FIELD) or {}).get(operation.owner_id)
     if not isinstance(stored, dict) or any(stored.get(key) != entry.get(key) for key in ("recorded_at", "source_ref")):
         raise ValueError("the operation checkpoint pointer did not land in the task result")
+    _link_historical_controls(operation, entry)
+
+
+def _link_historical_controls(operation: ReviewOperation, entry: dict) -> None:
+    purpose = operation.historical_purpose or {}
+    for control_task in {purpose.get("caller_task_id"), purpose.get("accounting_root_task_id")} - {None, "", operation.task_id}:
+        # Stop may address either owner after its author ended. This is only an
+        # address to the existing operation, never another collectible panel.
+        link = {"control_only": True, "subject_task_id": operation.task_id,
+                "controller": entry["controller"], "source_ref": entry.get("source_ref"),
+                "intent_ref": entry.get("intent_ref")}
+        linked = _update_operations(operation.result_root, control_task,
+                                   lambda rows: {**rows, operation.owner_id: link}, create=True)
+        if (linked.get(OPERATIONS_FIELD) or {}).get(operation.owner_id) != link:
+            raise ValueError("the operation control address did not land")
+
+
+def task_has_live_review_operation(root: Any, task_id: str, *, exclude_owner_id: str = '') -> bool:
+    """One task's exact operation/control addresses, for terminal Stop ingress."""
+    from ouroboros.task_results import load_task_result
+
+    row = load_task_result(root, task_id, strict=True) or {}
+    for owner, entry in (row.get(OPERATIONS_FIELD) or {}).items():
+        if owner == exclude_owner_id:
+            continue
+        if entry.get("control_only"):
+            target = load_task_result(root, entry.get("subject_task_id"), strict=True) or {}
+            primary = (target.get(OPERATIONS_FIELD) or {}).get(owner) or {}
+            # The immutable intent survives the upgrade; Stop must remain
+            # addressable between primary-pointer and control-link writes.
+            keys = ("controller", "intent_ref") if entry.get("intent_ref") else ("controller", "source_ref")
+            if any(primary.get(key) != entry.get(key) for key in keys):
+                continue
+            entry = primary
+        if entry.get("state") not in _OPEN_STATES:
+            continue
+        with _LOCK:
+            live = _LIVE.get(owner)
+        if live is not None and not live.closed:
+            return True
+        if controller_state(entry.get("controller")) in {"alive", "unknown"}:
+            return True
+    return False
 
 
 def _update_operations(root: Any, task_id: str, transform: Callable[[Dict[str, Any]], Any], *,
@@ -489,6 +659,16 @@ def _mark_operation(root: Any, task_id: str, owner_id: str, state: Optional[str]
         _update_operations(root, task_id, transform)
     except Exception:
         log.warning("Review operation %s could not record %s", owner_id, state, exc_info=True)
+
+
+def historical_publication_retained(root: Any, task_id: str, retry_key: str) -> None:
+    """The one settlement publisher has read back the supplement and its outbox custody."""
+    def transform(rows: Dict[str, Any]) -> Dict[str, Any]:
+        return {owner: {**row, 'state': OPERATION_COLLECTED, 'collected_at': utc_now_iso()}
+                if row.get('surface') == 'task_acceptance' and row.get('retry_key') == retry_key
+                and row.get('state') in _OPEN_STATES | {OPERATION_UNPUBLISHED, OPERATION_CLOSED}
+                else row for owner, row in rows.items()}
+    _update_operations(root, task_id, transform)
 
 
 # --- exact live controller recognition (gateway decisions, supervisor events) ---
@@ -951,29 +1131,79 @@ def run_from_checkpoint(root: Any, task_id: str, entry: Dict[str, Any], owner_id
     under host authority.
     """
     from ouroboros.artifacts import read_actor_source_bytes
-    from ouroboros.task_results import TASK_ACCEPTANCE_REVIEW_STATE_KEY
+    from ouroboros.task_results import load_task_acceptance_review_state, load_task_result, resolve_task_lineage
 
     retry_key = str(entry.get("retry_key") or "")
-    claims = (((result or {}).get(TASK_ACCEPTANCE_REVIEW_STATE_KEY) or {}).get("claims_by_binding") or {})
-    claim = next((dict(row) for row in claims.values() if isinstance(row, dict) and row.get("paid_identity")
-                  and retry_key == f"task_acceptance:{row['paid_identity']}"), None)
-    if claim is None:
-        return None
     source = json.loads(read_actor_source_bytes(root, task_id, entry.get("source_ref")))
     request = source.get("request") if isinstance(source, dict) else None
-    if not isinstance(request, dict) or not source.get("slot_roster"):
+    if (not isinstance(request, dict) or source.get("schema_version") != 1
+            or source.get("owner_id") != owner_id or source.get("task_id") != task_id
+            or source.get("surface") != "task_acceptance" or request.get("surface") != "task_acceptance"
+            or request.get("task_id") != task_id or request.get("retry_key") != retry_key
+            or any(source.get(key) != entry.get(key) for key in (
+                "retry_key", "task_attempt", "controller", "operations"))
+            or source.get("task_attempt") != request.get("task_attempt")
+            or not source.get("slot_roster")):
+        return None
+    if "paid_authority" in source:
+        authority = source["paid_authority"]
+        if not isinstance(authority, dict) or authority.get("schema_version") != 1 or authority.get("authority") != "host_root":
+            return None
+        lineage = authority.get("lineage") or {}
+        validated = resolve_task_lineage(task_id, metadata=lineage)
+        if lineage != validated or not validated["is_root_task"]:
+            return None
+        binding = authority.get("binding") or {}
+    else:
+        # Landed checkpoints predate paid_authority. Only positive canonical
+        # SAME-physical-root lineage and its actual claim can qualify them.
+        # Never follow a mutable retry alias or rewrite the immutable source.
+        canonical = load_task_result(root, task_id, strict=True) or {}
+        metadata = canonical.get("metadata") or {}
+        keys = ("root_task_id", "parent_task_id", "delegation_role", "original_task_id", "timeout_retry_from")
+        if any(key in canonical and key in metadata and canonical[key] != metadata[key] for key in keys):
+            return None
+        validated = resolve_task_lineage(task_id, metadata=metadata, **{key: canonical.get(key) for key in keys})
+        pointer = (canonical.get(OPERATIONS_FIELD) or {}).get(owner_id) or {}
+        if (canonical.get("task_id") != task_id or validated["root_task_id"] != task_id
+                or validated["delegation_role"] != "root" or not validated["is_root_task"]
+                or validated["original_task_id"] or validated["timeout_retry_from"]
+                or not (canonical.get("root_task_id") or metadata.get("root_task_id"))
+                or any(pointer.get(key) != entry.get(key) for key in (
+                    "source_ref", "retry_key", "task_attempt", "controller", "operations"))):
+            return None
+        binding = None
+    claims = load_task_acceptance_review_state(
+        root, validated["root_task_id"], require_root_result=True)["claims_by_binding"]
+    if binding is None:
+        matching = [claim for claim in claims.values() if claim.get("paid_identity")
+                    and retry_key == f"task_acceptance:{claim['paid_identity']}"]
+        if len(matching) != 1:
+            return None
+        binding = matching[0]
+    claim = claims.get(binding.get("binding_hash"))
+    if (not claim or claim.get("claimed_by_task_id") != task_id
+            or not binding.get("paid_identity") or retry_key != f"task_acceptance:{binding['paid_identity']}"
+            or any(claim.get(key) != binding.get(key) for key in (
+                "binding_hash", "candidate_hash", "evidence_revision", "fence_hash", "paid_identity"))
+            or binding.get("candidate_hash") != hashlib.sha256(str(request.get("subject") or "").encode()).hexdigest()):
         return None
     models = {str(row.get("slot_id")): str(row.get("model") or "") for row in source["slot_roster"]}
+    if (len(models) != len(source["slot_roster"]) or not all(models)
+            or not source.get("operations") or not set(source["operations"]).issubset(models)
+            or not all(isinstance(value, str) and value for value in source["operations"].values())):
+        return None
     actors = [{"slot_id": slot_id, "model": models.get(slot_id, ""), "status": "error",
                "error": "Checkpointed before its controller ended; not yet collected.",
                "operation_id": operation_id, "operation_state": "pending_dispatch", "late_result_pending": True,
                "usage": {"review_controller": {**dict(source.get("controller") or {}), "owner_id": owner_id}}}
               for slot_id, operation_id in (source.get("operations") or {}).items()]
     return {"authority": "host_root", "request": request, "slot_roster": source["slot_roster"],
-            "actors": actors, "aggregate_signal": "DEGRADED", "panel_id": f"panel_{owner_id[-16:]}",
+            "actors": actors, "aggregate_signal": "DEGRADED", "panel_id": f"panel_{binding['binding_hash'][:16]}",
             "candidate_hash": str(claim.get("candidate_hash") or "")
             or hashlib.sha256(str(request.get("subject") or "").encode("utf-8")).hexdigest(),
             "binding_hash": str(claim.get("binding_hash") or ""), "paid_identity": str(claim["paid_identity"]),
+            "accounting_root_task_id": validated["root_task_id"],
             "task_attempt": source.get("task_attempt"), "operation_checkpoint_ref": entry.get("source_ref")}
 
 
@@ -1027,12 +1257,18 @@ def recover_orphaned_acceptance_operations(drive_root: Any, *, stop: Optional[Ca
                 continue
             with _LOCK:
                 registered = owner_id in _LIVE
-            controller = controller_state(entry.get("controller"))
+            controller = ("dead" if not registered and entry.get("controller") == controller_identity()
+                          else controller_state(entry.get("controller")))
             if registered or (state != OPERATION_UNPUBLISHED and controller in {"alive", "unknown"}):
                 if controller == "unknown" and not registered:
                     report["deferred"].append({"task_id": path.stem, "owner_id": owner_id,
                                                "reason": "controller_unverifiable"})
                 continue
+            if state == OPERATION_PREPARING:
+                _mark_operation(root, path.stem, owner_id, 'preparation_unknown', from_states={OPERATION_PREPARING})
+                report['pending'].append({'task_id': path.stem, 'owner_id': owner_id,
+                                          'reason': 'preparation_controller_ended_before_request'})
+                continue  # an intent is never a ready request or a paid claim
             ctx = SimpleNamespace(task_id=path.stem, task_attempt=entry.get("task_attempt"), drive_root=root,
                                   budget_drive_root=root, task_metadata={}, event_queue=None)
             try:

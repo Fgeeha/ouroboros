@@ -237,6 +237,7 @@ class UsageScope:
     root_cost_ceiling_usd: Optional[float] = None
     global_limit_source: str = ""
     global_limit_revision: Optional[str] = None
+    root_limit_source: str = ""  # Original None + provenance is unlimited, not a new default.
 @dataclass(frozen=True)
 class PhysicalAttemptContext:
     profile: Literal["owner_max", "owner_low", "owner_nano", "task_local_low"]
@@ -679,6 +680,7 @@ def review_wave_admission(
     remaining_usd_override: float | None = None,
     task_id: str = "",
     root_limit_usd: float | None = None,
+    root_limit_source: str = "",
     global_limit_usd: float | None = None,
     categories: str | Sequence[str] = "",
     slot_ids: str | Sequence[str] = "",
@@ -688,14 +690,12 @@ def review_wave_admission(
 
     Standalone callers may supply remaining_usd_override. Otherwise the tighter
     global/root remainder binds, including every in-flight hold; unknown prices
-    stay unknown. An explicit root_limit_usd is the caller's current fence,
-    otherwise the ledger's historical minimum governs. Global None resolves
-    settings; a non-positive configured limit is unbounded.
+    stay unknown. A supplied root cap binds (None + root_limit_source means
+    original unlimited); otherwise use the ledger minimum. Global None resolves
+    settings; non-positive global limits are unbounded.
 
-    Input sizes, outputs, categories, slots and processing can be scalar or
-    aligned per-slot values. Price each seat under its own sending scope, so the
-    caller's warm cache split cannot stand in for a reviewer's cold prefix.
-    Returned per-slot bounds and both remainders disclose the binding cause.
+    Inputs may be scalar or per-slot. Price each seat under its own sending scope,
+    never the caller's warm cache; bounds and remainders disclose admission.
     """
     result: Dict[str, Any] = {
         "fits": True,
@@ -726,7 +726,7 @@ def review_wave_admission(
             projection = usage_projection(drive_root, root_task_id=root_task_id)
             limit = (
                 max(0.0, float(root_limit_usd)) if root_limit_usd is not None
-                else _number(projection.get("limit_usd"))
+                else None if root_limit_source else _number(projection.get("limit_usd"))
             )
             accounted = _number(projection.get("accounted_usd"))
             if limit is not None and accounted is not None:

@@ -425,3 +425,95 @@ def test_saved_child_row_with_canonical_sources_retains_original_owner_before_di
     result = run_review_request(request, slots=[native], usage_ctx=ctx, drive_root=author, llm=Reader())
     assert result.actors[0]['status'] == 'ok', result.actors[0]
     assert reads == [True] and not author.exists()
+
+
+@pytest.mark.parametrize('delivery', ['native', 'session'])
+@pytest.mark.parametrize('paged', [False, True])
+def test_packet_custody_and_closed_work_order_precede_operation_freeze(tmp_path, monkeypatch, delivery, paged):
+    """The merged coordinator freezes final source addresses, not author pointers."""
+    from tests.test_acceptance_delivery import _fake_session
+    from ouroboros.acceptance_retrieving import retain_review_source
+
+    canonical, author, repo, request, native, session, ctx = _retrieving(tmp_path)
+    request.retry_key = f'merge-freeze-{delivery}-{paged}'
+    session = dataclasses.replace(session, model='fake-small', session_target='fake-review=fake-small')
+    slot = native if delivery == 'native' else session
+    if paged:
+        request.evidence['__immutable_core_overflow__'] = {'reason': 'exercise compact delivery'}
+    checked = []
+
+    def inspect():
+        pointer = next(iter(load_task_result(canonical, request.task_id)['review_operations'].values()))
+        checkpoint = json.loads(artifacts.read_actor_source_bytes(canonical, request.task_id, pointer['source_ref']))
+        frozen = checkpoint['request']
+        current = request.slot_source_delivery[slot.slot_id]
+        # Send-size telemetry may change at actual dispatch, but no source
+        # identity/address or work order may be rebound after this checkpoint.
+        for key in ('source', 'source_root', 'custody_source', 'custody_root', 'source_path', 'reader_root'):
+            assert frozen['slot_source_delivery'][slot.slot_id][key] == current[key]
+        from ouroboros.observability import redact_projection
+        assert frozen['slot_session_tasks'][slot.slot_id] == redact_projection(
+            request.slot_session_tasks[slot.slot_id]).value
+        assert current['external_ref_closure'] == 'retained'
+        assert current['status'] == ('paged' if paged else 'inline')
+        root = pathlib.Path(request.policy['native_data_root'])
+        source = json.loads(artifacts.read_actor_source_bytes(canonical, request.task_id, current['source']))
+        assert source['retrieval_sources'] == request.policy['review_source_closure']
+        rows = source['retrieval_sources']['sources']
+        for row in rows:
+            if row['status'] == 'retained':
+                assert row['retained_path'] in request.slot_session_tasks[slot.slot_id]
+        shutil.rmtree(author)
+        registry, _, _ = inspection_registry(str(repo), root, request.task_id)
+        result_source = next(row for row in rows if row['name'] == 'task-result')['source_ref']
+        assert 'original task record' in registry.execute_result('read_file', result_source['read']['arguments']).text
+        before = dataclasses.asdict(request)
+        retain_review_source(request, slot.slot_id, canonical)
+        assert dataclasses.asdict(request) == before  # revalidation, not rebinding
+        checked.append(True)
+
+    if delivery == 'session':
+        fake = _fake_session(monkeypatch)
+        start = fake.start_run
+        def started(self, wire, **kwargs):
+            inspect()
+            return start(self, wire, **kwargs)
+        monkeypatch.setattr(fake, 'start_run', started)
+        model = SimpleNamespace(chat=lambda **kwargs: pytest.fail('session used API fallback'))
+    else:
+        class Model:
+            def chat(self, **kwargs):
+                inspect()
+                return {'content': json.dumps({'verdict': 'PASS', 'findings': [], 'summary': 'retained'})}, {}
+        model = Model()
+    with model_wait.task_model_wait_scope(task={'id': request.task_id, 'chat_id': 7, '_attempt': 1},
+            drive_root=canonical, event_queue=queue.Queue(), worker_slot_held=False):
+        result = run_review_request(request, slots=[slot], usage_ctx=ctx, drive_root=author, llm=model)
+    assert result.actors[0]['status'] == 'ok', json.dumps(result.actors, ensure_ascii=False, indent=2)
+    assert checked == [True]
+
+
+def test_wide_closure_map_is_retained_in_compact_packet_not_copied_into_first_send(tmp_path, monkeypatch):
+    from ouroboros import review_native_episode
+    from ouroboros.review_source_closure import retain_review_request_sources
+
+    canonical, author, repo, request, native, _session, _ctx = _retrieving(tmp_path)
+    for index in range(210):
+        artifacts.store_task_artifact_bytes(author, request.task_id, f'evidence-{index}.txt', str(index).encode())
+    retain_review_request_sources(request, source_root=author, custody_root=canonical)
+    root = pathlib.Path(request.policy['native_data_root'])
+    monkeypatch.setattr(review_native_episode, 'native_episode_transcript_bound', lambda *a, **k: 120_000)
+    acceptance_retrieving_work_order(request, [native], session_root=str(repo), data_root=root)
+    delivery = request.slot_source_delivery[native.slot_id]
+    assert delivery['status'] == 'paged'
+    assert delivery['first_send_chars'] < delivery['first_send_ceiling'] < delivery['inline_first_send_chars']
+    order = request.slot_session_tasks[native.slot_id]
+    assert 'read key `retrieval_sources`' in order
+    assert 'evidence-209.txt' not in order
+    source = json.loads(artifacts.read_actor_source_bytes(root, request.task_id, delivery['source']))
+    closure = source['retrieval_sources']
+    assert closure == request.policy['review_source_closure']
+    row = next(row for row in closure['sources'] if row['name'] == 'artifact:evidence-209.txt')
+    shutil.rmtree(author)
+    registry, _, _ = inspection_registry(str(repo), root, request.task_id)
+    assert '209' in registry.execute_result('read_file', row['source_ref']['read']['arguments']).text

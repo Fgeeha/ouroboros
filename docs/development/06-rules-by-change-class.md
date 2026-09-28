@@ -400,10 +400,9 @@ The imperatives:
   cancellation authority stay separate (`test_zombie_prevention.py`,
   `test_startup_terminal_files.py`, `test_cancel_origin.py`,
   `test_truthful_card_presentation.py`, `web/tests/cancel_origin.test.js`).
-- An owed terminal message whose send was never confirmed is disclosed as "not
-  confirmed", with its saved copy named a copy of that message; only the matching
-  receipt's recorded destination for the same delivery id retires the owner notice,
-  never a bare id (`tests/test_cancel_pending_outbox.py`).
+- Disclose unconfirmed terminal sends as "not confirmed", naming saved copies as
+  copies. Only a same-delivery receipt for the recorded destination retires the
+  notice, never a bare id (`tests/test_cancel_pending_outbox.py`).
 - Cancel INTENT is never a status value: every cancel ingress writes a durable
   intent through `ouroboros/cancel_intents.request_cancel`, fails closed when
   that write fails, checks live physical ownership (a settled RESULT does not
@@ -902,8 +901,8 @@ and what enforces each.
   in-flight reviewer never counts as final quorum under either enforcement mode; a
   `pending_dispatch` row (released at the barrier) is neither quorum nor a paid fact
   until its settled row proves the send.
-- Every zero-physical acceptance refusal (unresolvable partial source, immutable-core
-  overflow, a slot window too small for the rendered prompt) records a typed
+- Every zero-physical acceptance refusal (packet core overflow/partial source,
+  unreadable retrieving source, or a whole first send exceeding its window) records a typed
   `$0 not_dispatched` row with its cause in `error` and folds the aggregate to
   `DEGRADED` (the one $0 shape: ARCHITECTURE §6 "Review stack"; instances: "Task
   acceptance").
@@ -1075,7 +1074,7 @@ and what enforces each.
   (`task_pacing.review_launch_allowed`, `task_acceptance_paid_dispatch_stamp._claim`),
   the clamps on a running panel and the deadline-cut residual are stated once in
   ARCHITECTURE §6 "Task acceptance". Format-repair resends are packet-row only; child
-  and `off`-mode acceptance run packet rows only.
+  and `off`-mode acceptance preserve delivery, children selecting at most one configured row.
 - The host acceptance decision is written ONLY by
   `loop_acceptance._set_acceptance_decision` (re-exported from `loop`): three
   owner-facing states, each with a typed reason from the closed set, unknown fails

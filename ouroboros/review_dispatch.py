@@ -42,13 +42,29 @@ SCOPE_SLOT_ID_PREFIX = "scope_slot"
 PLAN_SLOT_ID_PREFIX = "plan_slot"
 
 
-def task_acceptance_zero_physical_refusal(evidence: Any, *, retrieving: bool = False) -> dict[str, str]:
+def task_acceptance_zero_physical_refusal(
+    evidence: Any, *, retrieving: bool = False, delivery: Any = None,
+) -> dict[str, str]:
     """Describe an acceptance refusal that needs no reviewer transport.
 
     A retrieving row (native episode, agent session) reads the exact source
-    itself, so a partial tool-result PROJECTION does not refuse it; the
-    immutable-core overflow refuses every delivery — no owner requirement is
-    truncated for any reviewer."""
+    itself, so a partial tool-result PROJECTION does not refuse it. The
+    immutable-core overflow refuses every PACKET row — no owner requirement is
+    truncated for any reviewer — but a retrieving row only when its work order
+    found no exact packet source it can open (``delivery``, one row of
+    ``ReviewRequest.slot_source_delivery``): the packet ceiling sizes a
+    delivery, it never grants or removes a reader's right to review (#1329)."""
+    delivery = delivery if isinstance(delivery, dict) else {}
+    if retrieving and delivery.get("status") == "unavailable":
+        preparation = delivery.get("preparation_error")
+        if isinstance(preparation, dict):
+            return {"status": str(preparation.get("code") or "review_source_preparation_failed"),
+                    "summary": "Retrieving reviewer preparation failed; nothing was sent. " + str(delivery.get("reason") or "")}
+        return {
+            "status": "degraded_source_unreachable",
+            "summary": ("This retrieving reviewer has no exact source of the complete acceptance "
+                        "packet it can open; nothing was sent. " + str(delivery.get("reason") or "")).strip(),
+        }
     packet = evidence if isinstance(evidence, dict) else {}
     # Only a genuinely UNAVAILABLE source withholds the panel. A row the budget
     # ladder shed still has a durable, actor-resolvable source ref, so it is a
@@ -69,7 +85,7 @@ def task_acceptance_zero_physical_refusal(evidence: Any, *, retrieving: bool = F
             ),
         }
     overflow = packet.get("__immutable_core_overflow__")
-    if overflow:
+    if overflow and not (retrieving and delivery.get("status") == "paged"):
         reason = str((overflow if isinstance(overflow, dict) else {}).get("reason") or "").strip()
         return {
             "status": "degraded_core_overflow",
@@ -80,6 +96,13 @@ def task_acceptance_zero_physical_refusal(evidence: Any, *, retrieving: bool = F
             ),
         }
     return {}
+
+
+def task_acceptance_row_refusal(request: Any, slot: Any) -> dict[str, str]:
+    """The zero-physical refusal of ONE panel row, with its own source delivery."""
+    return task_acceptance_zero_physical_refusal(
+        request.evidence, retrieving=bool(getattr(slot, "retrieves", False)),
+        delivery=(getattr(request, "slot_source_delivery", None) or {}).get(str(getattr(slot, "slot_id", ""))))
 
 
 def acceptance_slot_fit(
@@ -116,11 +139,7 @@ def run_zero_physical_task_acceptance(
     """Return the substrate's synthetic refusal when EVERY row would be refused
     free, or ``None`` for physical work — a mixed panel refuses its packet rows
     inside `_run_slot` ($0) and runs its retrieving rows."""
-    if not all(
-        task_acceptance_zero_physical_refusal(
-            request.evidence, retrieving=bool(getattr(slot, "retrieves", False)))
-        for slot in slots
-    ):
+    if not all(task_acceptance_row_refusal(request, slot) for slot in slots):
         return None
     from ouroboros.review_substrate import run_review_request
 
@@ -204,6 +223,14 @@ def task_acceptance_preclaim_refusal(ctx: Any) -> Any:
     from ouroboros.review_substrate import ReviewRunResult
     from ouroboros.task_results import project_task_acceptance_review_capacity
 
+    if getattr(ctx, "historical_purpose", None):
+        from ouroboros.acceptance_late import historical_preclaim_refusal
+
+        reason = historical_preclaim_refusal(ctx)
+        if reason:
+            return ReviewRunResult(request={"surface": "task_acceptance", "task_id": str(ctx.task_id)},
+                actors=[], parsed_findings=[], aggregate_signal="DEGRADED", degraded=True,
+                degraded_reasons=[f"{reason} (no reviewer was called)"])
     projection = project_task_acceptance_review_capacity(
         ctx.tools._ctx,
         binding_hash=str((ctx.review_binding or {}).get("binding_hash") or ""),
@@ -211,6 +238,7 @@ def task_acceptance_preclaim_refusal(ctx: Any) -> Any:
         # A-material: refuse a PAID dispatch whose material the tree already
         # bought, even when the binding hash moved (a cosmetic tool call moves it).
         paid_identity=str((ctx.review_binding or {}).get("paid_identity") or ""),
+        purpose=str(getattr(ctx, "purpose", "") or ""),
     )
     if projection.get("state") == "available" and not projection.get("binding_seen"):
         return None
@@ -335,15 +363,24 @@ def bind_task_acceptance_paid_dispatch(ctx: Any) -> Iterator[Any]:
         or getattr(tools_ctx, "drive_root", ".")
     ))
     prior = getattr(tools_ctx, "_review_paid_stamp", None)
+    prior_authority = getattr(tools_ctx, "_review_paid_authority", None)
     if prior is not None:
         raise TaskAcceptanceDispatchUnavailable("review_dispatch_stamp_already_bound")
     tools_ctx._review_paid_stamp = task_acceptance_paid_dispatch_stamp(
         ctx, accounting_root, root_task_id, ctx.task_id, ctx.review_binding,
     )
+    # The immutable operation checkpoint retains the wallet binding before the
+    # physical seam claims it. A missing claim still never authorizes recovery.
+    tools_ctx._review_paid_authority = ({
+        "schema_version": 1, "authority": "host_root", "lineage": dict(lineage),
+        "binding": {key: ctx.review_binding.get(key) for key in (
+            "binding_hash", "candidate_hash", "evidence_revision", "fence_hash", "paid_identity")},
+    } if lineage.get("is_root_task") else None)
     try:
         yield tools_ctx
     finally:
         tools_ctx._review_paid_stamp = prior
+        tools_ctx._review_paid_authority = prior_authority
 
 
 def invoke_review_paid_stamp(stamp: Any) -> None:

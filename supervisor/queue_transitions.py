@@ -658,6 +658,10 @@ def task_subtree_is_live(task_id: str, *, ignore_intents: bool = False) -> bool:
     # cascade intent and the per-stage gate loses the Stop it was waiting on.
     if post_task_synthesis_in_flight(q.DRIVE_ROOT, task_id):
         return True
+    from ouroboros.review_operation import task_has_live_review_operation
+
+    if task_has_live_review_operation(q.DRIVE_ROOT, task_id):
+        return True
     if ignore_intents:
         return False
     try:
@@ -839,7 +843,7 @@ def _live_retry_target_locked(q: Any, task_id: str) -> Tuple[str, str]:
     return requested, ""
 
 
-def task_has_live_ownership(task_id: str) -> bool:
+def task_has_live_ownership(task_id: str, *, ignore_review_operation: str = '') -> bool:
     """Whether live PHYSICAL ownership remains for this task: a RUNNING row, a
     busy worker slot, the in-process direct-chat turn or its still-billing
     post-task synthesis (GR6-1, the one predicate behind the class rule).
@@ -861,6 +865,13 @@ def task_has_live_ownership(task_id: str) -> bool:
     task_id = str(task_id or "").strip()
     if not task_id:
         return False
+    from ouroboros.review_operation import task_has_live_review_operation
+
+    try:
+        if task_has_live_review_operation(q.DRIVE_ROOT, task_id, exclude_owner_id=ignore_review_operation):
+            return True
+    except (OSError, ValueError, TypeError):
+        return True  # unreadable ownership must not turn terminal Stop into a no-op
     with q._queue_lock:
         if task_id in q.RUNNING:
             return True

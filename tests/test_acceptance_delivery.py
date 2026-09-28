@@ -8,8 +8,8 @@ carries every row's own delivery, effort, credential pin, configured-subagent
 binding and stable slot id instead of an api-pinned projection. A malformed
 structured configuration refuses acceptance typed (DEGRADED) exactly as it
 refuses plan and skill review; a legacy comma-key config reproduces today's
-panel byte for byte; child-task and ``off``-mode acceptance buy no retrieving
-row.
+panel rows; child-task and ``off``-mode acceptance follow the configured rows'
+delivery (a child with at most one row, #1334).
 """
 
 import json
@@ -182,7 +182,8 @@ def test_malformed_structured_config_refuses_acceptance_typed(structured_env, tm
 def test_legacy_comma_config_reproduces_todays_api_panel(monkeypatch, tmp_path):
     """The GAIA/CLB/SWE-Pro class: no structured key, a comma list — the panel is
     the same three api rows with the legacy `slot_N` ids and the configured
-    Review effort, exactly what the projection used to hand acceptance."""
+    Review effort; since #1334 the shipped default rows read the work themselves
+    (native delivery on the same models) instead of receiving the packet."""
     from ouroboros import loop as loop_mod
     from ouroboros.config import resolve_effort
 
@@ -198,13 +199,15 @@ def test_legacy_comma_config_reproduces_todays_api_panel(monkeypatch, tmp_path):
         ("slot_2", "openai/b", ReviewRouteKind.API_CHAT),
         ("slot_3", "openai/c", ReviewRouteKind.API_CHAT),
     ]
-    assert all(s.effort == resolve_effort("review") and not s.retrieves for s in slots)
+    assert all(s.effort == resolve_effort("review") and s.native_retrieval and not s.subagent_id for s in slots)
 
 
-def test_child_and_off_acceptance_run_packet_rows_only(structured_env, tmp_path):
-    """Child-task and `off`-mode acceptance is advisory evidence: it buys no
-    retrieving panel (no agent session, no native episode) — it runs the
-    configured PACKET rows, and refuses typed when none remain."""
+def test_child_and_off_acceptance_follow_the_configured_rows(structured_env, tmp_path):
+    """Child-task and `off`-mode acceptance is advisory evidence (#1334): every
+    row keeps its configured delivery. An off-mode root's explicit call runs the
+    configured panel's breadth; a child reviews with at most ONE row, named when
+    several are configured and checked for membership by the host. A refusal is
+    typed and calls nobody."""
     import ouroboros.review_substrate as rs
     from ouroboros import review_evidence as re_mod
     from ouroboros.tools.review import _handle_task_acceptance_review
@@ -215,32 +218,42 @@ def test_child_and_off_acceptance_run_packet_rows_only(structured_env, tmp_path)
     structured_env.setattr(rs, "dissent_findings", lambda _result: [])
 
     def fake_run(request, **kwargs):
-        calls.append([s.slot_id for s in kwargs["slots"]])
+        calls.append(([s.slot_id for s in kwargs["slots"]], dict(request.slot_session_tasks)))
         return SimpleNamespace(aggregate_signal="PASS", actors=[], parsed_findings=[])
 
     structured_env.setattr(rs, "run_review_request", fake_run)
     structured_env.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
-    ctx = SimpleNamespace(
+    root = SimpleNamespace(
         drive_root=str(tmp_path), task_id="root", root_task_id="root",
         task_metadata={"root_task_id": "root"}, task_contract={},
     )
-    # Mixed triad: only the api row is dispatched; the session and the actor
-    # row are dropped without being called.
-    json.loads(_handle_task_acceptance_review(ctx, claim="root done"))
-    assert calls == [["t_api"]]
+    # Off-mode root: the whole configured panel, retrieving rows with their work order.
+    json.loads(_handle_task_acceptance_review(root, claim="root done"))
+    (slot_ids, orders), = calls
+    assert slot_ids == ["t_api", "t_sess", "t_actor"] and set(orders) == {"t_sess", "t_actor"}
 
-    # All-retrieving triad: a typed not_dispatched result, no reviewer called.
-    all_retrieving = {**_TRIAD, "triad": _TRIAD["triad"][1:]}
-    structured_env.setenv(REVIEWER_SLOTS_ENV, json.dumps(all_retrieving))
-    payload = json.loads(_handle_task_acceptance_review(ctx, claim="root done"))
-    assert payload["status"] == "not_dispatched" and payload["reason"] == "no_packet_reviewer_rows"
-    assert calls == [["t_api"]]
+    child = SimpleNamespace(
+        drive_root=str(tmp_path), task_id="child", root_task_id="root",
+        task_metadata={"root_task_id": "root", "parent_task_id": "root"}, task_contract={},
+    )
+    payload = json.loads(_handle_task_acceptance_review(child, claim="child done"))
+    assert payload["status"] == "not_dispatched" and payload["reason"] == "reviewer_selection_required"
+    assert [row["slot_id"] for row in payload["reviewer_rows"]] == ["t_api", "t_sess", "t_actor"]
+    payload = json.loads(_handle_task_acceptance_review(child, claim="child done", reviewer_slot_id="nope"))
+    assert payload["reason"] == "reviewer_slot_unknown" and len(calls) == 1
+    _handle_task_acceptance_review(child, claim="child done", reviewer_slot_id="t_actor")
+    assert calls[-1][0] == ["t_actor"] and set(calls[-1][1]) == {"t_actor"}
+
+    # A single configured row needs no name.
+    structured_env.setenv(REVIEWER_SLOTS_ENV, json.dumps({**_TRIAD, "triad": _TRIAD["triad"][1:2]}))
+    _handle_task_acceptance_review(child, claim="child done")
+    assert calls[-1][0] == ["t_sess"]
 
     # Malformed configuration: the same typed refusal, never a default panel.
     structured_env.setenv(REVIEWER_SLOTS_ENV, "{broken")
-    payload = json.loads(_handle_task_acceptance_review(ctx, claim="root done"))
+    payload = json.loads(_handle_task_acceptance_review(root, claim="root done"))
     assert payload["status"] == "not_dispatched" and "invalid reviewer-slot configuration" in payload["error"]
-    assert calls == [["t_api"]]
+    assert len(calls) == 3
 
 
 def _consume_acceptance_results(results):
@@ -255,7 +268,7 @@ def _consume_acceptance_results(results):
 
 
 def test_a_typed_predispatch_refusal_is_tool_evidence_not_a_degraded_review_run(structured_env, tmp_path):
-    """#1318: the child/off refusal the REAL tool returns reaches the ordinary
+    """#1318: the child-selection refusal the REAL tool returns reaches the ordinary
     tool-result consumer; no reviewer ran, so it is recorded as this call's tool
     result and never as a review run that alone degrades the review axis. A
     dispatched run -- malformed, overflowed or degraded -- still counts."""
@@ -264,9 +277,12 @@ def test_a_typed_predispatch_refusal_is_tool_evidence_not_a_degraded_review_run(
 
     structured_env.setenv("OUROBOROS_TASK_REVIEW_MODE", "off")
     structured_env.setenv(REVIEWER_SLOTS_ENV, json.dumps({**_TRIAD, "triad": _TRIAD["triad"][1:]}))
-    ctx = SimpleNamespace(drive_root=str(tmp_path), task_id="root", root_task_id="root",
-                          task_metadata={"root_task_id": "root"}, task_contract={})
-    refused = _handle_task_acceptance_review(ctx, claim="root done")
+    # #1334 now permits the off-mode ROOT's full configured panel. A child
+    # facing multiple rows still needs a selection and is genuinely zero-run.
+    ctx = SimpleNamespace(drive_root=str(tmp_path), task_id="child", root_task_id="root",
+                          task_metadata={"root_task_id": "root", "parent_task_id": "root"}, task_contract={})
+    refused = _handle_task_acceptance_review(ctx, claim="child done")
+    assert json.loads(refused)["reason"] == "reviewer_selection_required"
     structured_env.setenv(REVIEWER_SLOTS_ENV, "{broken")
     misconfigured = _handle_task_acceptance_review(ctx, claim="root done")
     trace = _consume_acceptance_results([refused, misconfigured])
@@ -606,7 +622,7 @@ def test_wave_budget_gate_prices_only_the_api_money(structured_env, tmp_path):
     assert len(gate_calls) == 1
 
 
-def test_partial_source_refusal_spares_retrieving_rows_and_core_overflow_refuses_all(monkeypatch, tmp_path):
+def test_partial_source_refusal_spares_retrieving_rows_and_core_overflow_refuses_packet_rows(monkeypatch, tmp_path):
     from ouroboros import loop as loop_mod
 
     _offline_env(monkeypatch, _ROW_API, _ROW_NATIVE)
@@ -627,14 +643,21 @@ def test_partial_source_refusal_spares_retrieving_rows_and_core_overflow_refuses
     assert "partial" in str(by_id["t_api"]["error"])
     assert by_id["t_actor"]["parsed"]["verdict"] == "PASS"
     assert len(llm.calls) == 1 and "tools" in llm.calls[0]
-    # The immutable-core overflow refuses EVERY delivery: no owner requirement is truncated for anyone.
+    # The immutable-core overflow refuses every PACKET row (no owner requirement is
+    # truncated for anyone); the native row reads the complete packet as one exact
+    # source instead of inheriting that refusal (#1329, tests/test_acceptance_source_first.py).
+    fresh = tmp_path / "overflow"  # a separate task wallet: the panel above spent this one's cycle
+    fresh.mkdir()
+    governance, workspace = _roots(fresh)
+    llm.script.append({"content": json.dumps(_CLEAN_VERDICT)})
     overflow = {**_ACCEPTANCE_PACKET, "__immutable_core_overflow__": True}
     result = loop_mod._execute_task_acceptance_panel(_acceptance_ctx(
-        tmp_path, evidence=overflow, repo_dir=str(governance),
+        fresh, evidence=overflow, repo_dir=str(governance),
         workspace_root=str(workspace), workspace_mode="project"))
-    assert [a["status"] for a in result.actors] == ["not_dispatched", "not_dispatched"]
-    assert all(a["parsed"] is None and "overflow" in str(a["error"]) for a in result.actors)
-    assert len(llm.calls) == 1  # nothing further was sent
+    by_id = {a["slot_id"]: a for a in result.actors}
+    assert by_id["t_api"]["status"] == "not_dispatched" and "overflow" in str(by_id["t_api"]["error"])
+    assert by_id["t_actor"]["parsed"]["verdict"] == "PASS"
+    assert len(llm.calls) == 2 and "tools" in llm.calls[1]  # the packet row sent nothing
 
 
 def test_retrieving_row_gets_no_format_repair_resend(monkeypatch, tmp_path):

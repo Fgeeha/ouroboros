@@ -20,10 +20,10 @@ paths — is read from that one checkout):
   or diff byte, serialized as ``_multi_model_review_async`` sends it: the
   constitutional head + the stable prefix + the governance tail and dynamic
   scaffolding rendered with an empty pack and diff + the fixed user turn — the
-  quorum input limit of the rows that RECEIVE the packet (the ``api_chat`` rows
-  without a configured-subagent binding, filtered exactly as ``review`` filters
-  them before ``fit_triad_prompt``; a session row or a subagent api row
-  retrieves with its own tools and never constrains the ladder), and the
+  quorum input limit of the rows that RECEIVE the packet (resolved by
+  ``row_plan_retrieves``, exactly as ``review`` filters them before
+  ``fit_triad_prompt``; native and session rows retrieve with their own tools
+  and never constrain the ladder), and the
   headroom that limit leaves for the pack + diff. A panel whose every row
   retrieves gets the explicit "no API pack is assembled for this panel" instead
   of a number.
@@ -70,7 +70,7 @@ FIT_UNITS = ("chars/4 (utils.estimate_tokens) — the unit review_admission.fit_
              "compares against the quorum limit")
 NO_API_PACK_NOTE = (
     "no API pack is assembled for this panel: every configured row retrieves the subject with its "
-    "own tools (agent_session rows and configured-subagent api rows), so there is no quorum input "
+    "own tools (session and native API rows), so there is no quorum input "
     "limit and no headroom to report")
 
 
@@ -148,20 +148,16 @@ def _require_index_is_worktree(porcelain: str) -> None:
 
 
 def _panel_rows(plan: dict) -> list[dict]:
-    """Every configured triad row with its delivery class, decided exactly as
-    ``review`` decides it before ``fit_triad_prompt``: an ``api_chat`` row with
-    no configured-subagent binding RECEIVES the api pack; a session row and a
-    subagent api row retrieve with their own tools (``delivery_retrieves`` — the
-    one delivery-class predicate) and neither constrain the fit ladder nor get
-    the pack (5.2/5.7). The aligned vectors are ``commit_triad_delivery``'s."""
-    from ouroboros.review_execution import delivery_retrieves
+    """Use commit_triad_delivery's resolved delivery, including direct native
+    API rows. Only packet recipients constrain the fit ladder and get a pack."""
+    from ouroboros.reviewer_slot_config import row_plan_retrieves
 
     actors = list(plan.get("subagent_ids") or [])
     rows = []
     for i, (model, route) in enumerate(zip(plan["models"], plan["routes"])):
         actor = str(actors[i] if i < len(actors) else "")
         rows.append({"model": model, "route": str(getattr(route, "value", route)), "subagent_id": actor,
-                     "receives_pack": not delivery_retrieves(route, actor)})
+                     "receives_pack": not row_plan_retrieves(plan, i)})
     return rows
 
 

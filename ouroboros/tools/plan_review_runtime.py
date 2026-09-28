@@ -1230,6 +1230,14 @@ def plan_reviewer_config_fingerprint(slots: list) -> str:
     if any(actor_ids):
         for row, actor in zip(rows, actor_ids):
             row.append(actor)
+    # Legacy API rows without actor bindings meant packet. Preserve those
+    # historical bytes; a direct native delivery adds explicit identity.
+    delivery_changes = [bool(getattr(s, "native_retrieval", False)) != (
+                        bool(actor) and str(getattr(getattr(s, "route", None), "value", "")) == "api_chat")
+                        for s, actor in zip(slots or [], actor_ids)]
+    if any(delivery_changes):
+        for row, slot in zip(rows, slots):
+            row.append("native" if getattr(slot, "native_retrieval", False) else "packet")
     return sha256(json.dumps(rows, ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
