@@ -1,4 +1,5 @@
-import { refreshModelCatalog } from './settings_catalog.js';
+import { refreshModelCatalog, watchAccountModelCatalog } from './settings_catalog.js';
+export { accountCatalogRefreshKey } from './settings_catalog.js';
 import { getNotifier } from './notifications.js';
 import { bindEffortSegments, syncEffortSegments, readCustomSecretDraft, collectCustomSecretDraft, paintSettingsFieldErrors, settingsWriteFailure } from './settings_controls.js';
 import { bindLocalModelControls } from './settings_local_model.js';
@@ -37,6 +38,7 @@ const INPUT_FIELDS = [
     ['s-openai-base-url', 'OPENAI_BASE_URL'], ['s-openai-compatible-base-url', 'OPENAI_COMPATIBLE_BASE_URL'], ['s-cloudru-base-url', 'CLOUDRU_FOUNDATION_MODELS_BASE_URL'],
     ['s-gigachat-scope', 'GIGACHAT_SCOPE'], ['s-gigachat-user', 'GIGACHAT_USER'], ['s-gigachat-base-url', 'GIGACHAT_BASE_URL'], ['s-gigachat-verify-ssl', 'GIGACHAT_VERIFY_SSL_CERTS'],
     ['s-minimax-region', 'MINIMAX_REGION'],
+    ['s-zai-plan', 'ZAI_PLAN'],
     ['s-server-host', 'OUROBOROS_SERVER_HOST', '127.0.0.1'],
     // 6.1: OUROBOROS_REVIEW_MODELS / OUROBOROS_SCOPE_REVIEW_MODELS are no
     // longer authored here — the Review lanes section composes the ONE
@@ -45,12 +47,15 @@ const INPUT_FIELDS = [
     // deep self-review row lives in Review lanes; the key is the backend's
     // invisible migration source for that row.
     ['s-skills-repo-path', 'OUROBOROS_SKILLS_REPO_PATH'],
+    ['s-extra-ca-bundle', 'OUROBOROS_EXTRA_CA_BUNDLE'],
     ['s-clawhub-registry-url', 'OUROBOROS_CLAWHUB_REGISTRY_URL'], ['s-websearch-model', 'OUROBOROS_WEBSEARCH_MODEL'], ['s-gh-repo', 'GITHUB_REPO'],
     ['s-local-source', 'LOCAL_MODEL_SOURCE'], ['s-local-filename', 'LOCAL_MODEL_FILENAME'], ['s-local-chat-format', 'LOCAL_MODEL_CHAT_FORMAT'],
     ['s-subagent-worktree-root', 'OUROBOROS_SUBAGENT_WORKTREE_ROOT'], ['s-subagent-projects-root', 'OUROBOROS_SUBAGENT_PROJECTS_ROOT'],
     ['s-evo-budget', 'OUROBOROS_POST_TASK_EVOLUTION_BUDGET_USD', '0'],
     ['s-consciousness-daily-usd', 'OUROBOROS_CONSCIOUSNESS_DAILY_USD', '20'],  // float: NUMBER_FIELDS would truncate 20.5 to 20
     ['s-evo-objective', 'OUROBOROS_EVOLUTION_PERSISTENT_OBJECTIVE', ''],
+    // Optional task bounds: a positive integer or "unlimited" (SSOT: ouroboros/settings_scales.py); a blank is refused by the server.
+    ['s-max-rounds', 'OUROBOROS_MAX_ROUNDS', 'unlimited'], ['s-task-lifetime', 'OUROBOROS_TASK_ABS_CEILING_SEC', 'unlimited'],
 ];
 const VALUE_FIELDS = [
     // 6.3: Review / Scope Review efforts are per-slot rows in Agents → Review
@@ -82,6 +87,13 @@ function setupModelSlots() {
 
 function byId(id) {
     return document.getElementById(id);
+}
+
+// A stored 0 is a value, not an absence: `fallback && !value` rendered a saved
+// 0 (e.g. OUROBOROS_CONSCIOUSNESS_DAILY_USD) as its fallback, and the next save
+// of ANY tab wrote the fallback back. Only a missing value takes the fallback.
+export function storedOrFallback(value, fallback) {
+    return fallback && (value === undefined || value === null || value === '') ? fallback : value;
 }
 
 function applyInputValue(id, value) {
@@ -398,12 +410,13 @@ function collectSecretValue(id, body) {
  * Exported for dependency-free node tests.
  */
 export function moreProvidersCredentialConfigured({
-    cloudruKey = '', minimaxKey = '', deepseekKey = '', gigachatCredentials = '', gigachatUser = '', gigachatPassword = '',
+    cloudruKey = '', minimaxKey = '', deepseekKey = '', zaiKey = '', gigachatCredentials = '', gigachatUser = '', gigachatPassword = '',
 } = {}) {
     const has = (v) => Boolean(String(v ?? '').trim());
     return has(cloudruKey)
         || has(minimaxKey)
         || has(deepseekKey)
+        || has(zaiKey)
         || has(gigachatCredentials)
         || (has(gigachatUser) && has(gigachatPassword));
 }
@@ -664,7 +677,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
         page.querySelectorAll('[data-provider-test-status]').forEach((el) => setInlineStatus(el, '', 'muted'));
         applySecretInputs(page, s);
-        INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, fallback && !s[key] ? fallback : s[key]));
+        INPUT_FIELDS.forEach(([id, key, fallback = '']) => applyInputValue(id, storedOrFallback(s[key], fallback)));
         VALUE_FIELDS.forEach(([id, key, fallback]) => { byId(id).value = s[key] || fallback; });
         modelRoles.load(s, { ...setupContract, modelSlots: setupModelSlots().map((slot) => ({
             ...slot, inputId: slot.settingsInputId,
@@ -754,6 +767,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             cloudruKey: value('s-cloudru-key'),
             minimaxKey: value('s-minimax-key'),
             deepseekKey: value('s-deepseek-key'),
+            zaiKey: value('s-zai-key'),
             gigachatCredentials: value('s-gigachat-credentials'),
             gigachatUser: value('s-gigachat-user'),
             gigachatPassword: value('s-gigachat-password'),
@@ -848,6 +862,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
                     'warn'
                 );
             }
+            // Catalog readiness is independent of Settings GET completion:
+            // a superseding page-show load may still be waiting for its document.
+            // Arm after discovery so its settled Accounts snapshot stays quiet.
+            accountModelCatalog.arm();
         } catch (error) {
             if (reloadSequence !== loadSequence) return;
             settingsLoaded = false;
@@ -1155,10 +1173,20 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
             refreshSettingsAfterExtensionChange(action);
         });
     }
-    const disposeRestartReconnect = ws?.on?.('open', refreshRestartState);
+    // A confirmed Accounts facet is the existing status-store seam for login
+    // completion. It refreshes the catalog only on a changed/rehydrated account
+    // answer, while modelRoles.adoptCatalog keeps unsaved assignments intact.
+    const accountModelCatalog = watchAccountModelCatalog();
+    const disposeRestartReconnect = ws?.on?.('open', () => {
+        refreshRestartState();
+        if (settingsLoaded) void refreshModelCatalog();
+    });
 
     window.addEventListener('ouro:page-shown', (event) => {
-        if (event.detail?.page === 'settings') refreshSettingsAfterExtensionChange('settings page shown');
+        if (event.detail?.page === 'settings') {
+            refreshSettingsAfterExtensionChange('settings page shown');
+            if (settingsLoaded) void refreshModelCatalog();
+        }
     });
 
     const onModelCatalog = (event) => modelRoles.adoptCatalog(event.detail);
@@ -1173,6 +1201,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         window.removeEventListener('beforeunload', beforeUnload);
         disposeLocalModel();
         disposeRestartReconnect?.();
+        accountModelCatalog.dispose();
         restartReadSequence += 1;
         baselineSettleDisposer?.();
         modelRoles.destroy();

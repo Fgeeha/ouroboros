@@ -56,6 +56,11 @@ def full_loop(tmp_path, monkeypatch):
     monkeypatch.setattr(review_substrate, "triad_delivery_slots", lambda **_kw: slots)
     registry = ToolRegistry(repo_dir=tmp_path / "repo", drive_root=tmp_path / "data")
     registry._ctx.repo_dir.mkdir()
+    # Acceptance now distinguishes an unreadable repository from a clean one.
+    import subprocess
+    for args in (["init"], ["-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                           "commit", "--allow-empty", "-m", "fixture baseline"]):
+        subprocess.run(["git", *args], cwd=registry._ctx.repo_dir, check=True, capture_output=True)
     ctx = registry._ctx
     task_id = "async-loop-root"
     _seed_acceptance_root(ctx.drive_root, task_id, ctx)
@@ -73,7 +78,7 @@ def full_loop(tmp_path, monkeypatch):
                               model_inputs=[], review_requests=[], review_snapshots=[], review_sends=[],
                               entered=threading.Event(), release=threading.Event(), settled=threading.Event(),
                               waits=[], progress=[], model_step=0, condition=threading.Condition(),
-                              settled_count=0, reviewer_verdict="PASS", slots=slots)
+                              settled_count=0, settled_operations=set(), reviewer_verdict="PASS", slots=slots)
     original_settle = review_custody._settle_review_attempt
     def settle(*a, **kw):
         try:
@@ -81,6 +86,7 @@ def full_loop(tmp_path, monkeypatch):
         finally:
             fixture.settled.set()
             with fixture.condition:
+                fixture.settled_operations.add(a[0].operation_id)
                 fixture.settled_count += 1
                 fixture.condition.notify_all()
     monkeypatch.setattr(review_custody, "_settle_review_attempt", settle)
@@ -124,10 +130,18 @@ def full_loop(tmp_path, monkeypatch):
 
     monkeypatch.setattr(review_substrate, "_review_route_executor", lambda assignment, **_kw: HeldExecutor(assignment))
     def park(_ctx, checkpoint):
+        from ouroboros.acceptance_settlement import panel_awaiting_this_turn
+
         fixture.waits.append(copy.deepcopy(checkpoint))
+        run = panel_awaiting_this_turn(_ctx, _ctx._execution_trace)
+        assert run is not None, "review wait has no pending panel"
+        expected = {actor["operation_id"] for actor in run["actors"]}
+        assert expected and all(expected), "pending panel has no operation identity"
         fixture.release.set()
         with fixture.condition:
-            assert fixture.condition.wait_for(lambda: fixture.settled_count >= len(fixture.review_sends), timeout=10), "review did not settle"
+            assert fixture.condition.wait_for(
+                lambda: expected <= fixture.settled_operations, timeout=10,
+            ), "awaited review operations did not settle"
     ctx.owner_wait_callback = park
     fixture.park = park
     fixture.run_args = dict(
@@ -502,8 +516,13 @@ def test_a_panel_that_settles_after_the_loop_exited_is_attached_through_the_reme
     result, _usage, trace = f.run()
     assert result == ANSWER and trace["review_decision"]["review_pending"] is True
     assert getattr(f.ctx, "_execution_trace", None) is None, "the loop exit detached the live trace"
-    # The pipeline seals the task before the straggler answers.
+    # The pipeline seals the task before the straggler answers, and the send
+    # handler's receipt of the bytes it sent (text, routed chat) is the proof.
     write_task_result(f.ctx.drive_root, f.ctx.task_id, "completed", chat_id=1, result=ANSWER)
+    from supervisor.terminal_delivery import delivery_id_for, register_delivery
+
+    assert register_delivery(f.ctx.drive_root, delivery_id_for(f.ctx.task_id, ANSWER),
+                             emitted={"text": ANSWER, "chat_id": 1, "task_id": f.ctx.task_id})
     f.release.set()
     with f.condition:
         assert f.condition.wait_for(lambda: f.settled_count >= 1, timeout=10)
@@ -511,7 +530,7 @@ def test_a_panel_that_settles_after_the_loop_exited_is_attached_through_the_reme
     rows = [e for e in events if e.get("system_type") == "acceptance_late_settlement"]
     assert len(rows) == 1, [e.get("type") for e in events]
     assert rows[0]["task_id"] == f.ctx.task_id and rows[0]["chat_id"] == 1
-    assert rows[0]["text"].startswith("Reviewers later passed this answer. They reviewed the answer that was delivered.")
+    assert rows[0]["text"].startswith("On the delivered version of this answer, reviewers later passed it.")
     assert "- acceptance-one: PASS" in rows[0]["text"]
     stored = load_task_result(f.ctx.drive_root, f.ctx.task_id)
     assert stored["status"] == "completed"
@@ -519,8 +538,10 @@ def test_a_panel_that_settles_after_the_loop_exited_is_attached_through_the_reme
     actor = panel["actors"][0]
     assert actor["transport_status"] == "success" and actor["parse_status"] == "valid"
     # The panel reviewed the bytes that shipped, so its settlement says so.
-    assert panel["late_settlement"] == {"note": rows[0]["text"], "reviewed_revision": "delivered",
-                                        "settled_after_terminal": True}
+    late = panel["late_settlement"]
+    assert {key: late[key] for key in ("note", "reviewed_revision", "settled_after_terminal")} == {
+        "note": rows[0]["text"], "reviewed_revision": "delivered", "settled_after_terminal": True}
+    assert late["reviewed_is_emitted"] is True and late["emitted_answer"]["state"] == "delivered"
     assert rows[0]["progress_meta"]["card_row"] == "reviews"
     assert len(f.review_sends) == 1, "the supplement bought nothing"
     assert not getattr(f.ctx, "_acceptance_settlement_traces", {}), "a settled wave releases its remembered trace"
@@ -932,6 +953,10 @@ def test_cyber_final_response_never_waits_for_or_obeys_critic_veto(full_loop, mo
     result, _usage, trace = f.run()
     assert result == ANSWER
     assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
+    if failure == "evidence_unavailable":
+        assert trace["acceptance_decision"]["reason"] == "acceptance_preparation_failed"
+        assert not trace.get("review_runs") and not f.waits
+        return  # local preparation is not a synthetic DEGRADED critic
     assert trace["acceptance_decision"]["reason"] == "author_finish"
     assert trace["acceptance_decision"]["author_disposition"]["source"] == "author_final_response"
     assert not f.waits

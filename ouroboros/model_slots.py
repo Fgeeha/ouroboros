@@ -394,7 +394,20 @@ def get_consciousness_model() -> str:
     return str(runtime_setting("OUROBOROS_MODEL_CONSCIOUSNESS", "") or "").strip() or _main_model()
 
 
-def get_deep_self_review_model() -> str:
-    """Return the configured deep self-review model slot."""
-    return (str(runtime_setting("OUROBOROS_MODEL_DEEP_SELF_REVIEW", "") or "").strip()
-            or str(SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"]))
+def get_deep_self_review_model(settings: dict | None = None, *, authored_panel: bool = False) -> str:
+    """Use Main only for a positively unauthored compatible-only deep default.
+
+    Empty means default, including after settings merges. Every nonempty model
+    stays pinned, even one equal to a shipped model; a saved panel without a
+    deep row keeps its unknown legacy provenance.
+    """
+    from ouroboros.provider_models import compatible_only_main_model
+    from ouroboros.settings_defaults import OPENROUTER_DEFAULTS
+    from ouroboros.settings_integrity import runtime_environ
+
+    source = runtime_environ() if settings is None else settings
+    key = "OUROBOROS_MODEL_DEEP_SELF_REVIEW"
+    chosen = str(source.get(key) or "").strip()
+    if not chosen and not authored_panel and not source.get("OUROBOROS_REVIEWER_SLOTS"):
+        chosen = compatible_only_main_model(source)
+    return chosen or str(OPENROUTER_DEFAULTS["deep_self_review"])

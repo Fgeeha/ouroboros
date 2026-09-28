@@ -31,7 +31,7 @@ def test_live_task_message_marker_uses_my_human_wording():
     assert "[Message from my human]" in system
     # The drained mailbox text (plus its optional surface note) must still go
     # through the owner-marking wrapper before injection.
-    assert "_owner_marked_content(noted_owner_text(owner_ctx, entry, dmsg))" in loop
+    assert "_owner_marked_content(noted_owner_text(owner_ctx, entry, " in loop
     # Addressed task-tree messages are peer/ancestor/peer-root communication,
     # not owner dialogue, and must never borrow the owner's priority marker.
     # Ask the render ladder itself: every provenance it can frame — including
@@ -76,13 +76,25 @@ def test_system_prompt_carries_outcome_honesty_and_capability_acquisition():
     text = (pathlib.Path(__file__).parent.parent / "prompts" / "SYSTEM.md").read_text(encoding="utf-8")
     assert "### Outcome honesty" in text
     # Whitespace-normalized: the doctrine sentence is line-wrapped in the file.
-    assert "the only real failure mode" in " ".join(text.split())
+    normalized = " ".join(text.split())
+    assert "I do not abandon an owed answer" in normalized
+    assert "Presence observation may deliberately end silently without leaving accepted work unfinished" in normalized
     assert "blocked_with_evidence" not in text
     assert "best_effort" not in text
     # Whitespace-normalized: a line-wrapped "FINAL\nANSWER" must not slip past.
     assert "FINAL ANSWER" not in " ".join(text.split())
     assert "## Capability Acquisition" in text
     assert "NOT a \"broad fallback or shim\"" in text
+    # #1323: the owner-approved generic opening, byte for byte, replaces the narrow
+    # "acquisition step, not a blocker" opening; the concrete dependency means stay.
+    section = text.split("## Capability Acquisition", 1)[1].split("\n## ", 1)[0]
+    assert section.strip().startswith(
+        "Before declaring a task blocked, establish what capability or resource is actually missing, "
+        "using evidence available within the task\u2019s scope. Distinguish unavailability from lack of "
+        "authority to use it. When an authorized means is available, use it; otherwise name the specific "
+        "blocker and the next action. Availability alone grants no permission.")
+    assert "not a blocker" not in section
+    assert "(`pip`/`uv`/`pip3`/`brew`/`apt`)" in section and "credential" not in section.lower()
 
 
 def test_public_publishing_still_requires_creator_permission():

@@ -164,8 +164,7 @@ def observe_review_usage(observer: Any, usage: Optional[Dict[str, Any]]) -> None
 def observe_failed_review_send(observer: Any, exc: BaseException) -> None:
     """Rows for every physically dispatched attempt behind a failed reviewer send."""
     from ouroboros.usage_accounting import (
-        POSITIVE_PHYSICAL_ATTEMPT_STATES, _drive_root, _final_rows, _locked,
-        _read_records_locked_cached, current_usage_scope,
+        POSITIVE_PHYSICAL_ATTEMPT_STATES, _drive_root, read_usage_records, current_usage_scope,
     )
 
     capture = getattr(exc, "physical_attempt_capture", None)
@@ -177,8 +176,7 @@ def observe_failed_review_send(observer: Any, exc: BaseException) -> None:
     try:
         scope = current_usage_scope()
         root = _drive_root(getattr(scope, "drive_root", None))
-        with _locked(root):
-            finals = _final_rows(_read_records_locked_cached(root))
+        finals = {str(row["attempt_id"]): row for row in read_usage_records(root, final_only=True)}
         rows = {attempt_id: finals[attempt_id] for attempt_id in attempt_ids if attempt_id in finals}
     except Exception:
         log.debug("failed to resolve review attempt states", exc_info=True)

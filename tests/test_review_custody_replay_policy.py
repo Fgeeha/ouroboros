@@ -656,7 +656,8 @@ def test_frozen_reconciliation_preserves_typed_custody_facts(tmp_path):
     assert actor.usage["provider_status_code"] == 503
 
 
-def test_pre_dispatch_route_refusal_is_retryable_not_sticky(tmp_path, monkeypatch):
+@pytest.mark.parametrize('code', ['api_chat_unavailable', 'degraded_source_unreachable'])
+def test_pre_dispatch_route_refusal_is_retryable_not_sticky(tmp_path, monkeypatch, code):
     """A typed route admission refusal is $0 and can be retried on recovery."""
     from types import SimpleNamespace
 
@@ -682,7 +683,7 @@ def test_pre_dispatch_route_refusal_is_retryable_not_sticky(tmp_path, monkeypatc
         def execute(self):
             self.calls += 1
             if self.calls == 1:
-                raise ReviewRouteUnavailable("transport unavailable", code="api_chat_unavailable")
+                raise ReviewRouteUnavailable("transport unavailable", code=code)
             from ouroboros.review_execution import ReviewAttemptResult
             return ReviewAttemptResult(message={"content": "[]"}, usage={}, raw_text="[]")
 

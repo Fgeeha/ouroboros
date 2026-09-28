@@ -45,7 +45,7 @@ def test_native_agent_returns_durable_result_before_synthesis_and_retry_reuses_i
 
     monkeypatch.setattr(pipeline, "_run_chat_consolidation", consolidate)
     monkeypatch.setattr(pipeline, "_run_scratchpad_consolidation", lambda *_a: stages.append("scratchpad"))
-    monkeypatch.setattr(pipeline, "_run_task_summary", lambda *_a, **_k: stages.append("summary"))
+    monkeypatch.setattr(pipeline, "_record_task_facts", lambda *_a, **_k: stages.append("facts"))
     monkeypatch.setattr(pipeline, "_run_reflection", lambda *_a, **_k: stages.append("reflection"))
     monkeypatch.setattr(pipeline, "_apply_reflection_memory_actions", lambda *_a, **_k: stages.append("memory"))
     monkeypatch.setattr(loop, "call_llm_with_retry", lambda *_a, **_k: (_call(outcome, "Reply" if outcome == "message" else ""), 0.0))
@@ -100,7 +100,7 @@ def test_native_agent_returns_durable_result_before_synthesis_and_retry_reuses_i
         release.set()
         for thread in set(threading.enumerate()) - threads_before:
             thread.join(timeout=5)
-    assert stages.count("summary") == stages.count("reflection") == 2
+    assert stages.count("facts") == stages.count("reflection") == 2
     for task_id in (first.task_id, second.task_id):
         row = load_task_result(tmp_path, task_id)
         assert row["root_phase_checkpoint"]["post_task_synthesis"] == "completed"
@@ -139,5 +139,7 @@ def test_pending_finish_cannot_hide_a_failed_empty_agent_result(tmp_path, monkey
     events = agent._handle_task_scoped({"id": "failed", "chat_id": 7, "type": "presence", "_presence_turn": True,
         "_is_direct_chat": True, "_skip_post_task_synthesis": True, "text": "Go"})
     result = next(row for row in events if row["type"] == "presence_result")
-    assert result["outcome"] == "message" and "empty response" in result["text"]
-    assert load_task_result(tmp_path, "failed")["status"] == "failed"
+    assert result["outcome"] == "silent" and result["text"] == ""
+    stored = load_task_result(tmp_path, "failed")
+    assert stored["status"] == "failed" and "empty response" in stored["result"]
+    assert stored["terminal_origin"] == "host_notice"

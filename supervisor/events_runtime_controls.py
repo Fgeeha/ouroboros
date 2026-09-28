@@ -186,6 +186,94 @@ def _drive_cancel_task_event(evt: Dict[str, Any], ctx: Any) -> None:
         role="system", system_type="cancellation_notice")
 
 
+EVOLUTION_CONTROL_KEYS = ("evolution_mode_enabled", "evolution_owner_stopped",
+                          "evolution_stop_source", "post_task_autostop")
+
+
+def owner_evolution_stop_controls(reason: str) -> str:
+    """The owner Stop's control half (#1307): the live latch and the durable campaign
+    ``stop_intent`` first, then the state flags — each attempted whatever the other
+    did, none waiting on cancellation. Returns "" or a disclosure of what did not
+    persist (the Stop still holds in this process)."""
+    from supervisor.evolution_lifecycle import record_evolution_stop_intent
+    from supervisor.state import StateUnavailable, update_state
+
+    # A failed campaign filesystem/lock operation cannot skip the independent state
+    # decision or the caller's cancellation. The latch is set before either write.
+    from supervisor.evolution_lifecycle import _STOP_LATCH
+
+    _STOP_LATCH["stopped"] = True
+    missing = []
+    try:
+        if not record_evolution_stop_intent("owner", reason):
+            missing.append("campaign stop intent")
+    except Exception as exc:
+        missing.append(f"campaign stop intent ({type(exc).__name__})")
+
+    def _owner_stop(live: Dict[str, Any]) -> None:
+        live["evolution_mode_enabled"] = False
+        live["evolution_owner_stopped"] = True
+        live.pop("evolution_stop_source", None)  # an owner stop: no agent source may un-stick it
+        live["post_task_autostop"] = False
+
+    try:
+        update_state(_owner_stop, confirm=EVOLUTION_CONTROL_KEYS)
+    except (StateUnavailable, OSError) as exc:
+        missing.append(f"runtime state ({getattr(exc, 'reason', type(exc).__name__)})")
+    return ("" if not missing else
+            f" The Stop holds in this process, but {' and '.join(missing)} did not persist.")
+
+
+def _enable_evolution_controls(live: Dict[str, Any]) -> None:
+    """The common state projection after either authorized campaign start."""
+    live.update(evolution_mode_enabled=True, evolution_consecutive_failures=0,
+                evolution_owner_stopped=False, post_task_autostop=False)
+    live.pop("evolution_stop_source", None)
+
+
+def owner_evolution_start(objective: str, *, source: str = "owner_chat", origin: Any = None) -> str:
+    """The owner's authorized start: clears the owner stop (GR4-6: BEFORE the campaign
+    is minted), starts the campaign (which alone clears a recorded stop intent), then
+    enables the projection. Returns "" on success or the owner-visible refusal."""
+    from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
+    from supervisor.state import StateUnavailable, control_value, mark_unconfirmed, update_state
+
+    block = evolution_block_reason()
+    if block:
+        return block
+    prior: Dict[str, Any] = {}
+
+    def _clear_owner_stop(live: Dict[str, Any]) -> None:
+        prior["known"], prior["value"] = control_value(live, "evolution_owner_stopped")
+        live["evolution_owner_stopped"] = False
+        live.pop("evolution_stop_source", None)
+
+    def _restore(live: Dict[str, Any]) -> None:
+        # GR5-1: a failed start restores exactly what it cleared — an unknown stays unknown.
+        live["evolution_owner_stopped"] = prior.get("value")
+        if not prior.get("known"):
+            mark_unconfirmed(live, "evolution_owner_stopped")
+
+    try:
+        update_state(_clear_owner_stop, confirm=("evolution_owner_stopped", "evolution_stop_source"))
+    except StateUnavailable as exc:
+        return f"🧬 Evolution stayed OFF: runtime state is unavailable ({exc.reason}); no campaign was started."
+    try:
+        started = start_evolution_campaign(objective, source=source, **({"origin": origin} if origin else {}))
+    except Exception:
+        log.warning("Failed to start evolution campaign", exc_info=True)
+        started = {}
+    try:
+        if not started:
+            update_state(_restore)
+            return "🧬 Evolution stayed OFF: campaign state could not be created."
+        update_state(_enable_evolution_controls, confirm=EVOLUTION_CONTROL_KEYS)
+    except StateUnavailable as exc:
+        owner_evolution_stop_controls("owner Start could not persist activation")
+        return f"🧬 Evolution did not turn on: runtime state became unavailable ({exc.reason})."
+    return ""
+
+
 def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
     """Toggle evolution mode from an LLM tool call (or an owner-sourced event).
 
@@ -194,94 +282,77 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
     OWNER placed (``/evolve off``, panic, an owner-sourced toggle — every stop without
     an ``evolution_stop_source`` of ``agent_tool``); an ``agent_tool`` enable against
     such a stop is refused with the same typed shape as the light-mode block. A stop
-    the agent placed itself stays undoable by the agent, as it always was.
+    the agent placed itself stays undoable by the agent, as it always was. An UNKNOWN
+    stop (state unavailable or recovered) is never read as the agent's own (#1307).
     """
+    from supervisor.state import StateUnavailable, control_value, update_state
+
     enabled = bool(evt.get("enabled"))
     owner_sourced = str(evt.get("source") or "") == "owner_chat"
-    stop_source = str(ctx.load_state().get("evolution_stop_source") or "")
-    agent_may_clear = not owner_sourced and stop_source == "agent_tool"
+    st = ctx.load_state()
+    owner_chat = int(st.get("owner_chat_id") or 0)  # a notice route (display), not an authority
+
+    def _notify(text: str) -> None:
+        if owner_chat:
+            ctx.send_with_budget(owner_chat, text, role="system", system_type="evolution_notice")
+
     if enabled:
-        from supervisor.evolution_lifecycle import evolution_block_reason, start_evolution_campaign
+        from supervisor.evolution_lifecycle import evolution_block_reason, evolution_stop_reason, start_evolution_campaign
         from ouroboros.consciousness_authority import consciousness_origin_metadata
 
-        block = evolution_block_reason()
-        if not block and not owner_sourced and not agent_may_clear and bool(ctx.load_state().get("evolution_owner_stopped")):
-            block = (
-                "🧬 Evolution stayed OFF: the owner stopped evolution (/evolve off), and that stop "
-                "is sticky against toggle_evolution. Only the owner's /evolve start re-arms it; "
-                "no campaign was started."
-            )
-        if block:
-            st = ctx.load_state()
-            if st.get("owner_chat_id"):
-                ctx.send_with_budget(int(st["owner_chat_id"]), block, role="system", system_type="evolution_notice")
-            return
-        # GR4-6: an OWNER start clears the durable owner-stop flag BEFORE the
-        # campaign is minted. The old order (campaign first, flag cleared in a
-        # later state write) left a window where the owner-stop backstop — fired
-        # by an old evolution task settling — read flag=True + campaign=active and
-        # closed the FRESH campaign. GR5-1: the prior value is captured in the same
-        # locked write so a failed start can restore it. An agent-tool start
-        # reaches this point only with the flag already clear (checked above), so
-        # it clears nothing.
-        from supervisor.state import update_state as _update_state
-
-        _prior_owner_stop = {"value": False}
-
-        def _clear_owner_stop(live: Dict[str, Any]) -> None:
-            _prior_owner_stop["value"] = bool(live.get("evolution_owner_stopped"))
-            live["evolution_owner_stopped"] = False
-            live.pop("evolution_stop_source", None)
-
-        if owner_sourced or agent_may_clear:
-            _update_state(_clear_owner_stop)
         origin = consciousness_origin_metadata(evt)
-        source = "owner_chat" if owner_sourced else "agent_tool"
-        try:
-            if not start_evolution_campaign(str(evt.get("objective") or ""), source=source,
-                                            **({"origin": origin} if origin else {})):
-                raise RuntimeError("campaign write was refused")
-        except Exception:
-            log.warning("Failed to start evolution campaign from agent tool", exc_info=True)
-            # GR5-1: the start FAILED, so the pre-mint clear was not an
-            # owner-authorized state change after all. Restore the CAPTURED
-            # prior value — leaving it cleared would let the post-task
-            # promotion pipeline (apply_pending_request reads the flag)
-            # autonomously re-arm evolution the owner believes is off, and an
-            # unconditional True would invent a stop that never happened.
-            _update_state(lambda live: live.__setitem__(
-                "evolution_owner_stopped", _prior_owner_stop["value"]))
-            st = ctx.load_state()
-            if st.get("owner_chat_id"):
-                ctx.send_with_budget(
-                    int(st["owner_chat_id"]),
-                    "🧬 Evolution stayed OFF: campaign state could not be created.",
-                    role="system", system_type="evolution_notice")
-            return
-    from supervisor.state import update_state
-
-    def _toggle_evolution(live: Dict[str, Any]) -> None:
-        live["evolution_mode_enabled"] = enabled
-        if enabled:
-            live["evolution_consecutive_failures"] = 0
-        # Owner stop is AUTHORITATIVE against the post-task pipeline (mirrors /evolve): set
-        # the durable evolution_owner_stopped flag on disable, clear it on enable (this is an
-        # owner-authorized clear). This is what apply_pending_request reads to refuse re-arm.
-        # The stop remembers who placed it, and the key never outlives the stop it describes:
-        # an absent source on a set flag is an OWNER stop (/evolve off, panic, an owner-sourced
-        # toggle), so an agent stop placed on top of an owner's keeps the owner's, and every
-        # clear drops the key. Only an agent's own stop is undoable by the agent.
-        owner_stop_stands = bool(live.get("evolution_owner_stopped")) and live.get("evolution_stop_source") != "agent_tool"
-        live["evolution_owner_stopped"] = (not enabled)
-        if enabled or owner_sourced or owner_stop_stands:
-            live.pop("evolution_stop_source", None)
+        if owner_sourced:
+            refusal = owner_evolution_start(str(evt.get("objective") or ""), origin=origin)
+            if refusal:
+                _notify(refusal)
+                return
         else:
-            live["evolution_stop_source"] = "agent_tool"
-        # Symmetry with the owner /evolve path: an explicit toggle must not inherit a
-        # stale post-task one-shot autostop that would disable the campaign after one cycle.
-        live["post_task_autostop"] = False
+            stopped_known, stopped = control_value(st, "evolution_owner_stopped")
+            source_known, stop_source = control_value(st, "evolution_stop_source")
+            agent_may_clear = stopped_known and source_known and stop_source == "agent_tool"
+            block = evolution_block_reason()
+            if not block and (not stopped_known or (stopped and not agent_may_clear) or evolution_stop_reason()):
+                block = (
+                    "🧬 Evolution stayed OFF: the owner stopped evolution (/evolve off), and that stop "
+                    "is sticky against toggle_evolution. Only the owner's /evolve start re-arms it; "
+                    "no campaign was started." if stopped_known else
+                    "🧬 Evolution stayed OFF: whether the owner stopped evolution is unknown right now "
+                    "(runtime state unavailable); only the owner's /evolve start re-arms it."
+                )
+            if block:
+                _notify(block)
+                return
+            try:
+                if not start_evolution_campaign(str(evt.get("objective") or ""), source="agent_tool",
+                                                **({"origin": origin} if origin else {})):
+                    raise RuntimeError("campaign write was refused")
+            except Exception:
+                log.warning("Failed to start evolution campaign from agent tool", exc_info=True)
+                _notify("🧬 Evolution stayed OFF: campaign state could not be created.")
+                return
+    persisted = ""
+    if enabled and not owner_sourced:
+        try:
+            update_state(_enable_evolution_controls, confirm=EVOLUTION_CONTROL_KEYS)
+        except StateUnavailable as exc:
+            persisted = f" — not persisted: runtime state unavailable ({exc.reason})"
+    elif not enabled and owner_sourced:
+        persisted = owner_evolution_stop_controls("disabled via owner toggle")
+    elif not enabled:
+        def _agent_stop(live: Dict[str, Any]) -> None:
+            # The stop remembers who placed it, and the key never outlives the stop it
+            # describes: an owner stop already standing keeps the owner's (absent) source.
+            owner_stop_stands = bool(live.get("evolution_owner_stopped")) and live.get("evolution_stop_source") != "agent_tool"
+            live.update(evolution_mode_enabled=False, evolution_owner_stopped=True, post_task_autostop=False)
+            if owner_stop_stands:
+                live.pop("evolution_stop_source", None)
+            else:
+                live["evolution_stop_source"] = "agent_tool"
 
-    st = update_state(_toggle_evolution)
+        try:
+            update_state(_agent_stop, confirm=("evolution_mode_enabled", "post_task_autostop"))
+        except StateUnavailable as exc:
+            persisted = f" — not persisted: runtime state unavailable ({exc.reason})"
     stop_lines: list = []
     stop_incomplete = False
     if not enabled:
@@ -292,9 +363,9 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
         # custody (GR2-13) — the old in-place prune left them with no intent, no
         # terminal result and no task_done, and intent-write failures vanished from
         # the caller's view while Evolution was still declared stopped.
-        from supervisor.queue import evolution_stop_report, stop_evolution_tasks
         from ouroboros.post_task_evolution import drop_pending_request
         from supervisor import state as _evo_state
+        from supervisor.queue import evolution_stop_report, stop_evolution_tasks
 
         drop_pending_request(_evo_state.DRIVE_ROOT)
         stopped = stop_evolution_tasks("disabled via agent tool")
@@ -306,9 +377,9 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
 
         if not enabled:
             if stop_incomplete:
-                # GR3-3: an INCOMPLETE stop leaves the campaign OPEN — the
-                # durable evolution_owner_stopped flag already blocks new
-                # cycles, and the settle-time owner-stop backstop below
+                # GR3-3: an INCOMPLETE stop leaves the campaign OPEN — the durable
+                # stop (state flag and/or campaign stop_intent) already blocks new
+                # cycles, and the settle-time owner-stop backstop
                 # (_close_campaign_after_owner_stop) closes the campaign once
                 # the live task settles. Closing it now would declare a clean
                 # terminal over still-live evolution work.
@@ -321,40 +392,47 @@ def _handle_toggle_evolution(evt: Dict[str, Any], ctx: Any) -> None:
                 complete_evolution_campaign("disabled via agent tool", status="stopped")
     except Exception:
         log.debug("Failed to update evolution campaign toggle state", exc_info=True)
-    if st.get("owner_chat_id"):
-        owner_chat = int(st["owner_chat_id"])
-        for line in stop_lines:
-            ctx.send_with_budget(owner_chat, line, role="system", system_type="evolution_notice")
-        if enabled:
-            state_str = "ON"
-        elif stop_incomplete:
-            state_str = ("OFF (mode disabled) — but the stop is INCOMPLETE: see the "
-                         "still-live task(s) above. The campaign stays open until "
-                         "they settle. Post-task auto-evolution stays paused until "
-                         "/evolve start")
-        else:
-            state_str = "OFF — post-task auto-evolution also paused until /evolve start"
-        ctx.send_with_budget(owner_chat, f"🧬 Evolution: {state_str} (via agent tool)", role="system", system_type="evolution_notice")
+    for line in stop_lines:
+        _notify(line)
+    if enabled:
+        state_str = "ON"
+    elif stop_incomplete:
+        state_str = ("OFF (mode disabled) — but the stop is INCOMPLETE: see the "
+                     "still-live task(s) above. The campaign stays open until "
+                     "they settle. Post-task auto-evolution stays paused until "
+                     "/evolve start")
+    else:
+        state_str = "OFF — post-task auto-evolution also paused until /evolve start"
+    _notify(f"🧬 Evolution: {state_str} (via agent tool){persisted}")
 
 
 def _handle_toggle_consciousness(evt: Dict[str, Any], ctx: Any) -> None:
     """Toggle background consciousness from LLM tool call."""
-    from supervisor.state import update_state
     action = str(evt.get("action") or "status")
-    if action in ("start", "on"):
-        result = ctx.consciousness.start()
-        update_state(lambda st: st.__setitem__("bg_consciousness_enabled", True))
-    elif action in ("stop", "off"):
-        result = ctx.consciousness.stop()
-        update_state(lambda st: st.__setitem__("bg_consciousness_enabled", False))
+    if action in ("start", "on", "stop", "off"):
+        on = action in ("start", "on")
+        result = ctx.consciousness.start() if on else ctx.consciousness.stop()
+        result = f"{result}{persist_consciousness_choice(on)}"
     else:
-        snapshot = ctx.consciousness.status_snapshot()
-        result = (f"Background consciousness: {'enabled' if snapshot.get('enabled') else 'disabled'}; "
-                  f"next wake-up at {snapshot.get('next_wake_at') or '?'}; "
-                  f"last outcome: {snapshot.get('last_wake_outcome') or 'none yet'}")
+        # Status is answered to its caller by the tool itself; reading it is not
+        # an event the owner is told about (#1324). Only start/stop publish.
+        return
     st = ctx.load_state()
     if st.get("owner_chat_id"):
         ctx.send_with_budget(int(st["owner_chat_id"]), f"🧠 {result}", role="system", system_type="consciousness_notice")
+
+
+def persist_consciousness_choice(enabled: bool) -> str:
+    """Persist a background-consciousness decision as a KNOWN control; "" or a
+    disclosure that it holds only in this process (#1307)."""
+    from supervisor.state import StateUnavailable, update_state
+
+    try:
+        update_state(lambda st: st.__setitem__("bg_consciousness_enabled", bool(enabled)),
+                     confirm=("bg_consciousness_enabled",))
+    except StateUnavailable as exc:
+        return f" (not persisted: runtime state unavailable, {exc.reason})"
+    return ""
 
 
 def _handle_owner_message_injected(evt: Dict[str, Any], ctx: Any) -> None:

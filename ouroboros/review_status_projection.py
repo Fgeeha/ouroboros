@@ -334,7 +334,7 @@ def _review_status_message(projection: Dict[str, Any]) -> str:
     if ca and ca.status in ("blocked", "failed"):
         reason_map = {
             "no_advisory": "No fresh advisory review found. Run preflight_review first.",
-            "critical_findings": "Reviewers found critical issues. Fix all issues listed, then re-run advisory.",
+            "critical_findings": "Reviewers found critical issues. Repair or rebut (review_rebuttal) the findings listed, then re-run advisory.",
             "review_quorum": "Not enough review models responded. Retry — usually transient.",
             "parse_failure": "Review models could not produce parseable output. Retry the commit.",
             "infra_failure": "Infrastructure failure. Check block_details.",

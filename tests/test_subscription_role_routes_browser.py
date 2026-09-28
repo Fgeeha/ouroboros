@@ -142,7 +142,11 @@ def test_subscription_accounts_roundtrip_existing_editors(role_ui, width):
         "els => els.filter(e => !e.hidden).map(e => {const b=e.getBoundingClientRect();return {x:b.x,y:b.y,w:b.width,h:b.height}})")
     assert all(b["x"] >= 0 and b["x"] + b["w"] <= width for b in boxes)
     if width > 1000:
-        assert max(b["y"] + b["h"] / 2 for b in boxes) - min(b["y"] + b["h"] / 2 for b in boxes) < 2, boxes
+        # Direct triad delivery adds a second line; every control remains
+        # reachable and no pair overlaps, including the trailing Remove.
+        assert all(a["x"] + a["w"] <= b["x"] or b["x"] + b["w"] <= a["x"]
+                   or a["y"] + a["h"] <= b["y"] or b["y"] + b["h"] <= a["y"]
+                   for i, a in enumerate(boxes) for b in boxes[i + 1:]), boxes
     capture(page, f"role-reviewers-{width}")
     raw.scroll_into_view_if_needed()
     capture(page, f"role-actors-{width}")

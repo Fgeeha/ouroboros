@@ -489,7 +489,7 @@ def test_supervisor_grace_toast_is_not_the_task_answering_it(monkeypatch, tmp_pa
     assert meta["finalization_requested_at"] == 2000.0
     tick(2000.5)  # the toast is dispatched here, exactly as the loop does it
 
-    assert any("reached idle_timeout" in line for line in tick.delivered), (
+    assert any("Task t-narration: The task made no progress for too long." in line for line in tick.delivered), (
         "the harness never drained the bus — the toast under test was never dispatched"
     )
     assert meta["last_progress_at"] == 1000.0, "host narration counted as the task's work"
@@ -858,9 +858,10 @@ def test_salvage_without_a_durable_copy_keeps_everything_in_the_note(tmp_path):
 def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
     monkeypatch, tmp_path,
 ):
-    """End to end through the REAL cancel path: publication deletes the child
-    drive, so the full blob must already have a copy on the canonical drive and
-    the terminal result must point at it (XG-7B.1, BIBLE P1)."""
+    """End to end through the REAL cancel path: the child drive goes later, through the
+    off-loop settlement (``task_custody.settle_child_drive``), so the full blob must already
+    have a copy on the canonical drive and the terminal result must point at it (XG-7B.1,
+    BIBLE P1)."""
     from ouroboros import observability
     from ouroboros.headless import HEADLESS_TASKS_DIR
     from ouroboros.task_results import load_task_result
@@ -905,7 +906,9 @@ def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
 
     assert q.cancel_task_custody(task_id) == q.CANCEL_CANCELLED
 
-    assert not child_drive.exists(), "publication no longer deletes the child drive?"
+    from tests._cancel_intents_shared import settled_off_loop
+
+    assert not settled_off_loop(tmp_path, task_id, child_drive), "history remains custodied until background retention"
     result = load_task_result(tmp_path, task_id)
     assert result["status"] == "cancelled"
     assert "full copy preserved at " in result["result"]
@@ -914,6 +917,11 @@ def test_cancelling_a_subagent_preserves_the_full_output_on_the_canonical_drive(
     )
     assert tmp_path in preserved.parents, "the full copy must live on the canonical drive"
     assert preserved.read_text(encoding="utf-8") == full
+    from ouroboros.headless import retry_child_task_refs
+
+    retry_child_task_refs(tmp_path, child_drive, task_id)
+    assert settled_off_loop(tmp_path, task_id, child_drive)
+    assert not child_drive.exists() and preserved.read_text(encoding="utf-8") == full
 
 
 def test_the_bind_host_is_never_stamped_from_settings_over_the_environment(monkeypatch):

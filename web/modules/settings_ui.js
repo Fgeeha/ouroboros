@@ -136,6 +136,16 @@ const PROVIDER_CARDS = [
         note: 'Pick DeepSeek as the source in Models or Agents, then choose deepseek-v4-pro or deepseek-v4-flash.',
     },
     {
+        id: 'zai', title: 'Z.ai (GLM)', icon: '', hint: 'Direct OpenAI-compatible runtime', advanced: true,
+        fields: [
+            { id: 's-zai-key', settingKey: 'ZAI_API_KEY', label: 'API Key', placeholder: 'sk-...' },
+            { id: 's-zai-plan', label: 'Plan', placeholder: 'payg or coding' },
+        ],
+        testProvider: 'zai',
+        testInputs: { 's-zai-key': 'ZAI_API_KEY', 's-zai-plan': 'ZAI_PLAN' },
+        note: 'Pick Z.ai as the source in Models or Agents, then choose glm-5.3 or glm-5.3-flash. Coding Plan subscribers: set Plan to <code>coding</code>; the default <code>payg</code> is pay-as-you-go, and a Coding Plan key tested there reports No credits.',
+    },
+    {
         id: 'gigachat', title: 'GigaChat', icon: '/static/providers/gigachat.svg', hint: 'Sber GigaChat via the gigachat library', advanced: true,
         fields: [
             { id: 's-gigachat-credentials', settingKey: 'GIGACHAT_CREDENTIALS', label: 'Authorization Key', placeholder: 'Base64 client_id:secret (OAuth)' },
@@ -230,6 +240,7 @@ export const SECRET_KEYS = [
     ['ANTHROPIC_API_KEY', 'Anthropic API Key', 'sk-ant-...'],
     ['MINIMAX_API_KEY', 'MiniMax API Key', 'MiniMax key'],
     ['DEEPSEEK_API_KEY', 'DeepSeek API Key', 'sk-...'],
+    ['ZAI_API_KEY', 'Z.ai API Key (GLM)', 'Z.ai key'],
     ['GITHUB_TOKEN', 'GitHub Token', 'ghp_...'],
     ['OUROBOROS_NETWORK_PASSWORD', 'Network Password', 'Required for LAN/Docker binds'],
 ];
@@ -662,7 +673,7 @@ export function renderSettingsPage() {
                             <label>Consciousness Autonomy</label>
                             <input id="s-consciousness-autonomy" type="hidden" value="act">
                             ${renderSegmentedField({ target: 's-consciousness-autonomy', options: [{ value: 'observe', label: 'Observe' }, { value: 'act', label: 'Act' }, { value: 'full', label: 'Full' }] })}
-                            <div class="settings-inline-note"><strong>Observe:</strong> think, keep memory and knowledge, write to you &mdash; start nothing. <strong>Act (default):</strong> everything the runtime mode allows except editing Ouroboros's own code and prompts, evolution, restart and settings. <strong>Full:</strong> everything the runtime mode allows, evolution included.</div>
+                            <div class="settings-inline-note"><strong>Observe:</strong> research, internal memory and task/project notes, read-only research children it can also stop, schedule controls and replies to you; no shell, user-file, source, skill/settings or publication changes. <strong>Act (default):</strong> everything the runtime mode allows except editing Ouroboros's own code and prompts, evolution, restart and settings. <strong>Full:</strong> everything the runtime mode allows, evolution included.</div>
                         </div>
                         <div class="form-row">
                             <div class="form-field ui-field">
@@ -786,6 +797,7 @@ export function renderSettingsPage() {
                                 <button type="button" class="btn btn-default btn-sm" data-notify-test>Send a test notification</button>
                             </div>
                             <div class="settings-inline-note" data-notify-status role="status" aria-live="polite"></div>
+                            <div class="settings-inline-note" data-notify-attention-status role="status" aria-live="polite"></div>
                         </div>
                     </div>
                 </section>
@@ -828,6 +840,18 @@ export function renderSettingsPage() {
                             <div class="form-field ui-field">
                                 <label for="s-gh-repo">GitHub Repo</label>
                                 <input id="s-gh-repo" placeholder="owner/repo-name" class="ui-control" name="s-gh-repo" type="text">
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="form-section">
+                        <h3>Extra CA Certificates</h3>
+                        <div class="settings-section-copy">Only for a network whose TLS certificates the default bundle does not trust: a TLS-inspecting proxy, or an endpoint behind a national CA such as GigaChat's. Ouroboros adds the file to its defaults for every provider call; everything else keeps working.</div>
+                        <div class="form-row">
+                            <div class="form-field ui-field">
+                                <label for="s-extra-ca-bundle">Extra CA bundle (PEM)</label>
+                                <input id="s-extra-ca-bundle" placeholder="/path/to/extra-ca.pem" class="ui-control" name="s-extra-ca-bundle" type="text" aria-describedby="s-extra-ca-bundle-help">
+                                <div class="settings-inline-note ui-field-help" id="s-extra-ca-bundle-help">Absolute or <code>~</code>-prefixed path to a PEM file on the machine that runs Ouroboros (its own filesystem, not the device showing this page). Leave empty unless a provider fails with a certificate error.</div>
                             </div>
                         </div>
                     </div>
@@ -883,11 +907,19 @@ export function renderSettingsPage() {
                              Agents → Delegation (D-10): they bound the agents,
                              not the process pool. Max Workers stays: it is
                              runtime worker processes, not an agent setting. -->
-                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the absolute ceiling, and the reaper. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
+                        <div class="settings-section-copy">Workers control parallel task capacity. Task liveness is governed automatically by progress, deadlines, the idle rail and the reaper; the per-task round and lifetime limits are optional — a positive number, or <code>unlimited</code> for none (the fresh-install default). A settings file from an earlier release that never set them keeps the finite limits it ran under until you change them here; startup names the values once. Budget limits control runtime cost thresholds. How many subagents a task may run, and how deep they may nest, live in <code>Agents</code>.</div>
                         <div class="form-grid two">
                             <div class="form-field ui-field">
                                 <label for="s-workers">Max Workers</label>
                                 <input id="s-workers" type="number" min="1" max="50" value="10" class="ui-control" name="s-workers">
+                            </div>
+                            <div class="form-field ui-field">
+                                <label for="s-max-rounds">Max Rounds per Task</label>
+                                <input id="s-max-rounds" type="text" inputmode="numeric" value="unlimited" placeholder="unlimited" class="ui-control" name="s-max-rounds">
+                            </div>
+                            <div class="form-field ui-field">
+                                <label for="s-task-lifetime">Task Lifetime Limit (s)</label>
+                                <input id="s-task-lifetime" type="text" inputmode="numeric" value="unlimited" placeholder="unlimited" class="ui-control" name="s-task-lifetime">
                             </div>
                             <div class="form-field ui-field">
                                 <label for="s-presence-max-active">Concurrent Presence Conversations</label>

@@ -83,6 +83,148 @@ def test_unreadable_archive_keeps_recent_messages_and_retries_real_history(
         archive.chmod(mode)
 
 
+# Issue #1102 (defect 3). The shared observer only faults PAGED reads; the first
+# read of a room has no cursor, so it gets its own switch. Installed before
+# `_open` adds the observer, it sits beneath it: the observer still records the
+# read, and sees it as unfinished while held and as an error when it fails.
+#
+# A failing room reads more than once on its own (the instance bootstrap asks
+# again after the open transaction failed), so the fault is lifted by the Retry
+# click itself, in the capture phase before the button's handler runs. Nothing
+# but the reader's Retry can then be the read that succeeds.
+_FAULT_RECENT_READ = """() => {
+    const fetch = window.fetch.bind(window);
+    window.__recentFault = null;
+    window.fetch = async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+        const fault = window.__recentFault;
+        if (url.pathname !== '/api/chat/history' || url.searchParams.get('cursor') || !fault
+                || Number(url.searchParams.get('chat_id') || 1) !== fault.chatId) return fetch(input, init);
+        if (fault.mode === 'fail') throw new TypeError('injected recent-read failure');
+        await new Promise(resolve => { window.__releaseRecent = resolve; });
+        return fetch(input, init);
+    };
+    document.addEventListener('click', event => {
+        if (window.__recentFault?.mode !== 'fail' || !event.target.closest?.('.chat-load-older button')) return;
+        window.__recentFault = null;
+        window.__readsAtRetry = window.__historyReads.length;
+    }, true);
+}"""
+_RECENT_STATE = """feed => {
+    const root = document.querySelector(feed);
+    const controls = root?.querySelector('.chat-load-older');
+    const button = controls?.querySelector('button');
+    const note = controls?.querySelector('.chat-load-older-note');
+    const shown = node => Boolean(node) && node.getClientRects().length > 0
+        && getComputedStyle(node).visibility !== 'hidden';
+    return {
+        busy: controls?.getAttribute('aria-busy') === 'true',
+        button: shown(button) ? button.textContent : '',
+        disabled: Boolean(button?.disabled),
+        note: shown(note) ? note.textContent : '',
+        messages: root ? root.querySelectorAll('.message').length : -1,
+    };
+}"""
+
+
+def _click_project(page, project):
+    """`_open_project` without its settle: the read under test is still in flight."""
+    row = page.locator(f'.nav-project-row[data-project-id="{project["id"]}"]')
+    row.wait_for(state="attached", timeout=30_000)
+    mobile_toggle = page.locator('#page-chat [data-mobile-nav-toggle]')
+    if mobile_toggle.is_visible() and not page.locator('#primary-sidebar').evaluate(
+            "node => node.classList.contains('open')"):
+        mobile_toggle.click()
+    row.click()
+    feed = f'#pchat-{project["id"]}-messages'
+    page.locator(feed).wait_for(state="visible", timeout=30_000)
+    return feed
+
+
+def _wait_recent_state(page, feed, predicate):
+    page.wait_for_function(f"feed => {{ const s = ({_RECENT_STATE})(feed); return {predicate}; }}",
+                           arg=feed, timeout=30_000)
+    return page.evaluate(_RECENT_STATE, feed)
+
+
+def _is_seen_ack(project):
+    def match(request):
+        body = request.post_data or ""
+        return (request.method == "POST" and request.url.endswith("/api/ui/preferences")
+                and "project_seen_revision" in body and project["id"] in body)
+    return match
+
+
+@pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
+def test_project_panel_shows_a_slow_first_read_as_loading_and_a_failed_one_as_retry(
+    direct_server_with_data, browser_engine, tmp_path,
+):
+    from playwright.sync_api import sync_playwright
+    from ouroboros.projects_registry import create_project
+
+    root, url = direct_server_with_data["data_dir"], direct_server_with_data["url"]
+    slow = create_project(root, "history-slow", name="Slow history room")
+    failing = create_project(root, "history-failing", name="Failing history room")
+    _write(root / "logs" / "chat.jsonl", [
+        *[_human(index, slow["chat_id"]) for index in range(1, 6)],
+        *[_human(index, failing["chat_id"]) for index in range(11, 16)],
+    ])
+    with sync_playwright() as pw:
+        browser = getattr(pw, browser_engine).launch(headless=True)
+        try:
+            page = browser.new_page(viewport={"width": 1280, "height": 850})
+            acked = []
+            page.on("request", lambda request: acked.extend(
+                project["id"] for project in (slow, failing) if _is_seen_ack(project)(request)))
+            page.add_init_script(f"({_FAULT_RECENT_READ})()")
+            _open(page, url)
+
+            # Slow: the response is withheld, and the panel must already say so.
+            page.evaluate("id => { window.__recentFault = {chatId: id, mode: 'hold'}; }", slow["chat_id"])
+            feed = _click_project(page, slow)
+            loading = _wait_recent_state(page, feed, "s.busy && s.button === 'Loading…'")
+            assert loading["disabled"] and loading["messages"] == 0, loading
+            assert [read for read in _reads(page, slow["chat_id"]) if not read["done"]], \
+                "the loading state is asserted while the read is provably unanswered"
+            assert slow["id"] not in acked, "an unpainted revision is never acknowledged"
+            _screenshot(page, tmp_path, f"project-first-read-loading-{browser_engine}")
+
+            with page.expect_request(_is_seen_ack(slow), timeout=30_000):
+                page.evaluate("() => { window.__recentFault = null; window.__releaseRecent(); }")
+            _idle(page, feed)
+            loaded = page.evaluate(_RECENT_STATE, feed)
+            assert not loaded["busy"] and loaded["button"] != "Loading…", loaded
+            assert page.locator(f"{feed} .message").filter(has_text="history-human-0005").count() == 1
+            _screenshot(page, tmp_path, f"project-first-read-loaded-{browser_engine}")
+
+            # Failed: the same panel chrome carries the error and the existing Retry.
+            page.evaluate("id => { window.__recentFault = {chatId: id, mode: 'fail'}; }", failing["chat_id"])
+            feed = _click_project(page, failing)
+            failed = _wait_recent_state(page, feed, "!s.busy && s.button === 'Retry loading messages'")
+            assert not failed["disabled"] and failed["messages"] == 0, failed
+            assert failed["note"].startswith("Could not load messages: "), failed
+            assert failing["id"] not in acked, "a failed read is never acknowledged"
+            _screenshot(page, tmp_path, f"project-first-read-failed-{browser_engine}")
+
+            # The reader's own click, on the visible control, is the recovery.
+            with page.expect_request(_is_seen_ack(failing), timeout=30_000):
+                page.locator(f"{feed} .chat-load-older button").click()
+            _idle(page, feed)
+            retried = page.evaluate(
+                "id => window.__historyReads.slice(window.__readsAtRetry).filter(read => read.chatId === id)",
+                failing["chat_id"])
+            assert len(retried) == 1, "Retry is one read: the open transaction, not a second fetch beside it"
+            assert retried[0]["cursor"] is None and retried[0]["status"] == 200
+            recovered = page.evaluate(_RECENT_STATE, feed)
+            assert recovered["button"] != "Retry loading messages", recovered
+            assert "Could not load" not in recovered["note"], recovered
+            assert page.locator(f"{feed} .message").filter(has_text="history-human-0015").count() == 1
+            _assert_unique_rows(page, feed)
+            _screenshot(page, tmp_path, f"project-first-read-recovered-{browser_engine}")
+        finally:
+            browser.close()
+
+
 def _pin_reading_selection(page, feed):
     return page.locator(feed).evaluate("""root => {
         const rows = [...root.querySelectorAll('[data-history-id]')];

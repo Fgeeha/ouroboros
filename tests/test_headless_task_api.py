@@ -686,6 +686,49 @@ def test_task_api_rejects_negative_depth_before_reservation_or_queue(tmp_path, m
     assert captured == []
 
 
+@pytest.mark.parametrize("selection", ["declared", "shared", ["declared"]])
+def test_task_api_refuses_reserved_input_selection_before_any_admission_effect(tmp_path, monkeypatch, selection):
+    from ouroboros.gateway import tasks
+    from supervisor import queue
+
+    data, repo, workspace = (tmp_path / name for name in ("data", "repo", "workspace"))
+    for path in (data, repo, workspace):
+        path.mkdir()
+    source = workspace / "source.txt"
+    source.write_text("unchanged workspace\n")
+    calls = []
+
+    def observe(owner, name):
+        original = getattr(owner, name)
+
+        def wrapped(*args, **kwargs):
+            calls.append(name)
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(owner, name, wrapped)
+
+    observe(queue, "reserve_task_admission")
+    for name in ("prepare_task_drive", "stage_initial_task_attachments", "collect_workspace_preflight"):
+        observe(tasks, name)
+    monkeypatch.setattr(queue, "enqueue_task", lambda task: calls.append("enqueue_task") or task)
+    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda **_: True)
+    app = Starlette(routes=[Route("/api/tasks", endpoint=api_tasks_create, methods=["POST"])])
+    app.state.drive_root, app.state.repo_dir = data, repo
+    before = sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*"))
+
+    response = TestClient(app).post("/api/tasks", json={
+        "task_id": "reserved-selection", "description": "root task", "workspace_root": str(workspace),
+        "metadata": {"input_sources": selection}, "attachments": [{"path": str(source)}],
+    })
+
+    assert (response.status_code, calls) == (400, []), response.text
+    assert response.json()["reason_code"] == "input_source_selection_unsupported"
+    assert "metadata.input_sources is reserved" in response.json()["error"]
+    assert "reserved-selection" not in queue.ADMISSION_RESERVATIONS
+    assert sorted(str(path.relative_to(tmp_path)) for path in tmp_path.rglob("*")) == before
+    assert source.read_text() == "unchanged workspace\n"
+
+
 def test_large_input_manifest_survives_real_queue_snapshot_restore(tmp_path, monkeypatch):
     from ouroboros.artifacts import resolve_attachment_manifest
     from supervisor import queue

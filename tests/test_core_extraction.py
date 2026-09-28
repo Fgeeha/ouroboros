@@ -115,10 +115,28 @@ def test_core_catalog_schema_bytes_and_handler_owners_are_stable():
     # bound joins its parameters. Rolled again for the owner's "autonomy first" decision:
     # the escalate description states when waiting is worth it (an irreversible or costly
     # next step, or a choice that is the owner's to make) and that waiting questions of one
-    # batch share one wait, ended by the first incoming message; 935 -> 932 bytes. Diffing the
-    # whole catalog base to head shows exactly those edits and nothing else.
+    # batch share one wait, ended by the first incoming message; 935 -> 932 bytes. Rolled
+    # again for owner decision 7A: the read_file description states that an absolute path
+    # with no root selects the permitted root holding it (one sentence replaced, 103 -> 100
+    # bytes). Rolled again for serial addressed turns: the forward_to_worker description
+    # names its peer addressees (your own parent or a sibling, delivered as a message from a
+    # peer task naming the relation; relay refused there), the 8000-char body bound and the
+    # await_messages companion (395 -> 698 bytes); the `message` parameter description states
+    # the bound. Rolled again for the truthful owner-question work (PR1, owner 1D/2A): the
+    # escalate description and its nine field descriptions were replaced (the card is written
+    # for a reader outside the room, names the source of the fork, and the question has no
+    # quiz-specific length cap); schema shape, types, defaults and required keys are unchanged,
+    # and the entry's literal moved beside its validator in core_artifacts (byte-identical
+    # serialization). Rolled again for TZ-2 B1 (zero-option questions) and owner V13: the
+    # escalate description offers 0-6 alternatives (none for an open question answered in the
+    # human's own words), states that a shared wait ends on any incoming message and that a
+    # plain-text clarification ends the turn while a waited question keeps it alive; the
+    # `options` description says optional 0-6 and `options` leaves the required keys. Rolled
+    # again for TZ-1 V10: forward_to_worker also writes into a queued task's mailbox, so its
+    # description and `task_id` description say "running or queued" and when each reads it.
+    # Diffing the whole catalog base to head shows exactly those edits and nothing else.
     assert hashlib.sha256(schema_bytes).hexdigest() == (
-        "0f72df2827a90d691d5c3fd1107170b050489061e9d55201a1feda0da647f82b"
+        "968eecad1c04b7f8a265d17bdb5dc42a8a5239373a0a5724ad8c8d5489d06ef3"
     )
     assert {
         entry.name: (entry.handler.__module__, entry.handler.__name__)

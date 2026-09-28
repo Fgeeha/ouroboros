@@ -198,6 +198,34 @@ def _mirror_progress_enabled(settings: Dict[str, Any]) -> bool:
     return raw in ("on", "true", "1", "yes")
 
 
+def _child_row_held_for_root(api, event: Dict[str, Any]) -> bool:
+    """Whether a child's card-internal host row stays out of this chat for now.
+
+    The web renders such a row inside the child's card. Here the owner hears
+    about a child from its root, so the row is not sent while the root is
+    unfinished. Only typed lifecycle facts decide: the row's lineage, its card
+    placement or incident type, and the root's durable status. A root whose
+    status cannot be read counts as unfinished; a row naming no root is not held.
+    """
+    if str(event.get("delegation_role") or "").strip().lower() != "subagent":
+        return False
+    if not event.get("card_row") and str(event.get("system_type") or "") != "terminal_incident":
+        return False
+    root = str(event.get("root_task_id") or event.get("parent_task_id") or "").strip()
+    if not root:
+        return False
+    from ouroboros.task_results import task_result_path
+    from ouroboros.task_status import FINAL_STATUSES
+
+    try:
+        path = task_result_path(_data_dir(api), root, create=False)
+    except ValueError:
+        return False
+    stored = _read_json_file(path)
+    status = str(stored.get("status") or "").strip().lower() if isinstance(stored, dict) else ""
+    return status not in FINAL_STATUSES
+
+
 _SUBAGENT_ICONS = {
     "scheduled": "🔵", "running": "🟡", "update": "🟡", "progress": "🟡",
     "completed": "✅", "completed_warn": "⚠️", "failed": "❌",
@@ -243,8 +271,21 @@ def _subagent_card_text(event: Dict[str, Any], sub_event: str, lang: str) -> str
         cost = 0.0
     if sub_event in _SUBAGENT_TERMINAL and cost > 0:
         header += f" · ${cost:.2f}"
-    # Live work commentary: the in-flight note, or the result/summary on finish.
+    # Live work commentary: the in-flight note, or the result/summary on finish. A
+    # delegated run's observation carries its typed parts: the card then leads with the
+    # executor's attributed latest words (an earlier one when this batch had none), then
+    # problems and the technical-event count, instead of the frame's joined labels.
+    activity = event.get("delegated_activity")
     note = str(event.get("text") or event.get("result") or event.get("trace_summary") or "").strip()
+    if isinstance(activity, dict) and activity.get("parts") is not None:
+        from ouroboros.delegate_activity import card_text
+
+        body = card_text(activity, 650).strip()
+        if body:
+            # The shared renderer already bounds speech around its diagnostic
+            # tail. Never cut that tail again or lose the complete-source cue.
+            full_ref = child_ref or str(activity.get("task_id") or "").strip()
+            return f"{header}\n{body}" + (f"\nFull ref: task {full_ref}" if full_ref else "")
     if note:
         preview = truncate_review_artifact(note, 700)
         if preview != note and child_ref:

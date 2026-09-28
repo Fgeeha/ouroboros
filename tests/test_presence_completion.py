@@ -72,7 +72,7 @@ def test_explicit_finish_uses_one_model_round_and_real_tool_batch(turn, outcome,
     assert usage["presence_completion_outcome"] == outcome
     assert usage["terminal_origin"] == "model_final"
     assert len(trace["tool_calls"]) == 2
-    result = build_presence_result_event({"id": "parent1"}, text, registry._ctx)
+    result = build_presence_result_event({"id": "parent1"}, text, registry._ctx, terminal_origin=usage.get("terminal_origin", ""))
     assert result["outcome"] == outcome
     assert result["text"] == (message if outcome in {"message", "deferred"} else "")
     assert derive_loop_outcome(text, usage, trace)["outcome_axes"]["execution"]["status"] == "ok"
@@ -101,7 +101,7 @@ def test_review_hold_drops_old_outcome_and_uses_replacement(turn, monkeypatch):
     assert len(calls) == 2 and reviews == ["Old answer", "Revised answer"]
     assert registry._ctx._presence_completion is None
     assert "presence_completion_outcome" not in usage
-    result = build_presence_result_event({"id": "parent1"}, text, registry._ctx)
+    result = build_presence_result_event({"id": "parent1"}, text, registry._ctx, terminal_origin=usage.get("terminal_origin", ""))
     assert (result["outcome"], result["text"]) == ("message", "Revised answer")
 
 
@@ -164,7 +164,7 @@ def test_owner_followup_invalidates_finish_before_or_during_final_gate(turn, tmp
     assert len(calls) == 2 and text == "With the new detail"
     assert any("new detail" in str(row.get("content")) for row in calls[-1])
     assert "presence_completion_outcome" not in usage
-    assert build_presence_result_event({"id": "parent1"}, text, registry._ctx)["outcome"] == "message"
+    assert build_presence_result_event({"id": "parent1"}, text, registry._ctx, terminal_origin=usage.get("terminal_origin", ""))["outcome"] == "message"
 
 
 @pytest.mark.parametrize("reason", ["cancel", "budget"])
@@ -194,8 +194,9 @@ def test_control_or_budget_tail_precedes_pending_finish(turn, tmp_path, monkeypa
     assert "presence_completion_outcome" not in usage
     assert registry._ctx._presence_completion_accepted is False
     assert usage["execution_status"] == "failed"
-    result = build_presence_result_event({"id": "parent1"}, text, registry._ctx)
-    assert result["outcome"] == "message" and result["text"] != "Old answer"
+    result = build_presence_result_event({"id": "parent1"}, text, registry._ctx, terminal_origin=usage.get("terminal_origin", ""))
+    assert result["outcome"] == "silent" and result["text"] == ""
+    assert usage["terminal_origin"] == "host_notice"
     if reason == "budget":
         assert tail == ["budget"] and len(calls) == 1
     else:
@@ -209,18 +210,35 @@ def test_ordinary_empty_and_failed_silent_outcomes_remain_failed():
         assert outcome["outcome_axes"]["execution"]["status"] in {"failed", "infra_failed"}
 
 
-def test_pending_children_still_require_absorption(turn, tmp_path):
+_DECLARED = json.dumps({"delivery_control": "replace", "full_answer": "Best available; child1 still running",
+                        "presence_finish": {"outcome": "message", "message": "Here is what I have so far."}})
+
+
+@pytest.mark.parametrize("forced,outcome,spoken", [
+    # Owner Q4: the forced answer is the internal record; undeclared prose never becomes speech.
+    ("Best available; child1 still running", "silent", ""),
+    (_DECLARED, "message", "Here is what I have so far."),
+])
+def test_pending_children_still_require_absorption(turn, tmp_path, forced, outcome, spoken):
     from ouroboros.task_results import write_task_result, STATUS_RUNNING
 
     _registry, calls, run = turn
+    # A real turn carries its Presence metadata; the ceiling alone does not arm the protocol.
+    _registry._ctx.task_metadata = {"presence": {"binding_id": "a" * 32, "event": {"conversation_key": "k"}}}
     write_task_result(tmp_path, "child1", STATUS_RUNNING, parent_task_id="parent1",
                       root_task_id="parent1", delegation_role="subagent", role="reviewer", result="Still running")
     text, usage, _trace = run([
         _call("silent", "Premature"),
         {"content": '{"delivery_control":"keep"}'},
-        {"content": "Best available"}, {"content": "Best available"},
+        {"content": "Best available"}, {"content": forced},
     ])
     assert len(calls) > 1
     assert usage["reason_code"] == "children_unabsorbed"
     assert "presence_completion_outcome" not in usage
-    assert build_presence_result_event({"id": "parent1"}, text, _registry._ctx)["outcome"] == "message"
+    assert text == "Best available; child1 still running"  # the internal record keeps the child facts
+    assert "[PRESENCE_DELIVERY]" in str(calls[-1][-1]["content"])
+    assert "name the unabsorbed" not in str(calls[-1][-1]["content"])
+    task = {"id": "parent1"}
+    result = build_presence_result_event(task, text, _registry._ctx, terminal_origin=usage.get("terminal_origin", ""))
+    assert (result["outcome"], result["text"]) == (outcome, spoken)
+    assert task["metadata"]["presence_declaration"]["status"] == ("declared" if spoken else "missing")

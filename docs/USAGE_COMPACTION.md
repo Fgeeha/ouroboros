@@ -8,13 +8,12 @@ in-flight attempts and historical joins.
 ## 1. Problem
 
 `state/usage_attempts.jsonl` is the append-only monetary authority
-(`ouroboros/usage_ledger.py`). Every reservation re-reads it under the
-cross-process monetary lock; a ~20 MB ledger costs ~0.5 s per full re-read
-under that lock. `USAGE_LEDGER_WARN_BYTES` in
-`ouroboros/context_budget.py` warns at that measured degradation point.
-The in-process warm caches bound the *steady-state* cost,
-but every cold read (process start, refold on any doubt) still replays the
-whole file. Without compaction the live file grows without bound: each
+(`ouroboros/usage_ledger.py`). Historical full replay under its monetary lock
+caused contention as the file grew. Current writers incrementally validate and
+account touched attempts; cold/replaced generations prepare outside the lock
+and reconcile under it. `USAGE_LEDGER_WARN_BYTES` in `ouroboros/context_budget.py`
+still warns about retained history and maintenance cost. Full-record maintenance
+and exceptional corruption repair can still require a complete locked replay. Without compaction the live file grows without bound: each
 physical attempt appends a 2–4 row lifecycle chain that remains after it is terminal.
 
 ## 2. Compacted representation
@@ -114,6 +113,21 @@ every existing aggregation exact while remaining one atomic, stamped unit.
 
 Monetary equality is defined **on decimals, never on float accumulation**:
 
+- Exact decoding preserves finite accepted monetary scalars,
+  including legacy JSON booleans (`true` = 1, `false` = 0) and numeric strings.
+  The shared `_usage_money.decimal_of` conversion applies to replay, incremental
+  cash and compaction; rejecting a valid historical boolean would erase money.
+  Validation and fold eligibility remain with their existing owners.
+- Nonfinite monetary values (`Infinity`, `-Infinity`, `NaN`, including strings)
+  raise `UsageNonFiniteMoney`, a `UsageAccountingError` distinct from torn-row
+  corruption. Validation, exact cash decoding and legacy-source import fail
+  closed: strict projection/admission and compaction cannot price that evidence
+  as zero or drop it through tail quarantine. Existing ledger/archive bytes and
+  reservations remain intact; a refused import retains its source archive and
+  does not publish a completed watermark. This intentionally narrows the former
+  numeric grammar (which accepted positive infinity): the data remains, but
+  strict accounting requires repair of the nonfinite source. Finite scalar
+  conversion, six-place rounding and counter semantics are unchanged.
 - The compactor parses the source segment with `parse_float=Decimal` and sums
   each group's `cost_usd` / `reservation_upper_bound_usd` as exact `Decimal`s
   of the literals actually stored in the file.
@@ -128,9 +142,9 @@ Monetary equality is defined **on decimals, never on float accumulation**:
   context-free by language rule, so stored literals are always captured
   exactly; only arithmetic needs the context.
 - Group sums are stored as exact-decimal **JSON strings** (`"cost_usd":
-  "12.3456789"`, `format(dec, "f")`, no exponent). `_number()` — the single
-  row-level monetary parser used by validation, `_summary`, and every
-  projection — already accepts numeric strings, so no reader changes shape.
+  "12.3456789"`, `format(dec, "f")`, no exponent). Validation accepts numeric
+  strings; `_usage_money` consumes them directly as Decimal, without float
+  conversion. Ordinary public row/projection shapes remain compatible.
   A float re-serialization would round the exact sum to the nearest double;
   the string keeps the invariant byte-checkable forever, including across
   re-compactions (group merges sum the decimal strings exactly).
@@ -151,8 +165,15 @@ Monetary equality is defined **on decimals, never on float accumulation**:
   equality gate.
 
 The stored decimal money and non-money projections are preserved before the
-swap. Existing readers still accumulate and round floats, so their displayed
-money can differ across a fold even when the exact ledger sums are identical.
+swap. Full replay and incremental cash now share exact reversible Decimal
+contributions under the same precision-60/Inexact-trapping context. Each cash
+bucket rounds half-even to six places before the accounted sum, as admission
+requires; its `1e-9` allowance remains. This deliberately corrects the old
+float ordering artifact: exact `1.9542475 + 0.513341 = 2.4675885` renders
+`2.467588` both before and after compaction, instead of occasionally `2.467589`.
+Historical charge literals remain unchanged. The independent compaction money
+self-check remains required; agreement between two renderers is not proof of
+exactness. Raw numeric monetary literals retain precision across transitions.
 
 ## 6. seq policy
 
@@ -479,21 +500,55 @@ exactly the per-row branch taken `weight` times with the sums pre-added.
   because they report a lost race the next pass simply repeats rather than a
   cause an operator has to diagnose. A structurally corrupt ledger still fails
   in the normal read path with the normal error.
-- Thrash guard: a per-process memo of the last attempted (inode, size); after
-  ANY pass — unprofitable (nothing foldable / no shrink / verify-abort) or
-  committed — the next pass runs only once the file grows by
-  `…_RETRY_GROWTH_BYTES` beyond the size that pass left, or the file is
-  replaced by someone else. A success arms the memo with the COMPACTED size
-  and the new inode, because the threshold alone is no brake: the unfoldable
-  residue (group rows, retained idempotent and review-attributed rows) only
-  grows, so once it reaches the trigger every reservation would run a full
-  rewrite of the authority under the held lock and copy the whole live file
-  into a new archive segment for a gain of a few kilobytes. Profitability is
-  not the question the guard asks; a pass is worth its cost only after real
+- Thrash guard, in two parts, and a pass runs only past both. The threshold
+  alone is no brake: the unfoldable residue (group rows, retained idempotent
+  and review-attributed rows, terminal rows younger than the fold horizon)
+  only grows, so once it reaches the trigger every reservation would run a
+  full rewrite of the authority under the held lock and copy the whole live
+  file into a new archive segment for a gain of a few kilobytes. Profitability
+  is not the question the guard asks; a pass is worth its cost only after real
   growth.
+  - **The floor is the ledger's own, so it holds across processes.** The
+    header the last committed pass stamped into line 1 records
+    `source_size_bytes`, the size that pass READ, and no pass runs until the
+    live file reaches it plus `…_RETRY_GROWTH_BYTES`. Read lock-free by
+    `_live_baseline_header` (one `readline`; appends never touch line 1 and
+    the swap is atomic), so every process answers from the same number. This
+    is what a per-process memo cannot do: a committed pass REPLACES the file,
+    so at that instant every other process's memo stops matching and re-enters
+    a pass, and a freshly started process has no memo at all while the residue
+    holds the file above the trigger for good. Measured on the owner's live
+    install before this floor: 100 passes archiving 2.37 GB in three days for
+    4.88 MB of live-file gain, 93 of 99 consecutive passes entered after less
+    than 1 MB of growth. **Disclosed cost:** the stamp names the PRE-pass
+    size, so after a high-gain fold the next pass waits until the file
+    outgrows what the last one read — deliberately conservative, and the 20 MB
+    tripwire below is what watches it. No floor is claimed when the ledger
+    states none: no stamp (nothing has folded here yet), a leading row that
+    cannot be read at all (the caller's own read reports that corruption — the
+    guard neither raises it early nor stands in for the pass), or a recorded
+    size that is not a positive count.
+  - **The per-process memo remains, for the pass that changed nothing.** It
+    holds the last attempted (inode, size) and arms after ANY pass —
+    unprofitable (nothing foldable / no shrink / verify-abort) or committed,
+    where it takes the COMPACTED size and the new inode. An abort leaves the
+    bytes untouched, so the ledger's own floor still names the window that let
+    that pass in; only the memo can throttle the retry. It is also the whole
+    guard on a ledger that states no floor.
+  - **No fresh foldable attempt, no opportunistic pass.** The generation-bound
+    writer view indexes final attempt eligibility and its age horizon using the
+    compactor's predicate. Superseded entries are discarded incrementally. A
+    baseline-only residue with young/retained attempts cannot launch repeated
+    full `no byte gain` passes in each worker. Crossing the horizon admits a
+    pass without rescanning history; explicit maintenance still runs the full
+    compactor. Committed swaps still force outside-lock writer re-preparation.
 - `USAGE_LEDGER_WARN_BYTES` (20 MB) stays as the regression tripwire above the
-  mechanism, exactly like the rotation-bounded log warns: it now fires only if
-  compaction is broken or the unfoldable residue itself reaches 20 MB.
+  mechanism, exactly like the rotation-bounded log warns: it fires if
+  compaction is broken, if the unfoldable residue itself reaches 20 MB, or if
+  the floor above is still holding a ledger that has not outgrown what its
+  last pass read. The startup note on `state/usage_attempts.jsonl`
+  (`agent_startup_checks._hot_store_thresholds`) names all three, because the
+  last one is declined before the pass and so leaves no typed event.
 
 ## 10. History readers: model-send reconciliation and audits
 
@@ -675,19 +730,12 @@ tests/fixtures_usage_compaction.py)
    the NON-money projection of `usage_projection` (global + per-root incl.
    limits) and of `usage_breakdown` (all axes) renders equal dicts: state
    counts and folded weights, physical calls, token sums, finality,
-   subscription sessions, per-root limits, every axis shape. The float dollars
-   those renders carry are deliberately NOT part of that equality.
-   Readers round money at six places, so one history summed per row and summed
-   per group can land on either side of that boundary. The regression fixture
-   in `tests/test_usage_compaction_fingerprint.py` observes a 1e-6 USD shift,
-   a ten-thousandth of a cent: `settled_usd` 2.467588 becomes 2.467589 while
-   the exact decimal sum is unchanged. This observation is not a universal
-   float-drift bound enforced by the compactor.
-   Comparing the float view as well would abort correct folds forever instead
-   of protecting a cent; the money itself stays exact by the decimal check
-   that runs beside it. A sum needing more than the ambient 28 digits
-   (10²⁸ + 1) keeps its last digit — pinned by an oracle summing in its own,
-   wider context.
+   subscription sessions, per-root limits, every axis shape. Exact cash is
+   checked independently of six-place rendered values. The historical
+   `2.4675885` float-ordering example now renders `2.467588` on both sides;
+   tests deliberately pin the corrected half-even result and unchanged exact
+   charges. A sum needing more than ambient 28 digits (10²⁸ + 1) retains its
+   last digit, checked with an independent wider-context oracle.
 2. **Correctable attempts never fold**: reserved/dispatched/unresolved and
    administratively abandoned chains survive verbatim (modulo seq). The exact
    attempt accepts its valid terminal transition after compaction, while an actual
@@ -730,7 +778,11 @@ tests/fixtures_usage_compaction.py)
 6. **Idempotency survives**: subscription/external replays after compaction
    dedup (no double charge) and still conflict-check; legacy import stays
    correct with and without its watermark.
-7. **Trigger policy**: no compaction below threshold; thrash guard holds;
+7. **Trigger policy**: no compaction below threshold; the growth guard holds
+   ACROSS processes — the floor a pass stamps into the ledger throttles every
+   other process and every freshly started one, and the per-process memo still
+   throttles a pass that aborted, a ledger that states no floor, and one whose
+   leading row cannot be read (which stays the normal read's error to report);
    verify-abort leaves the ledger untouched; the pass is entered with the
    monetary lock demonstrably HELD *and* with that lock's heartbeat wired
    through — the parameter is required, so a caller that drops it raises
@@ -785,3 +837,37 @@ tests/fixtures_usage_compaction.py)
     than the live file's own (bar an uncommitted orphan of it, proven by
     still being a prefix of that file), whether or not the live file carries
     a stamp.
+
+## Writer continuity and qualification
+
+`usage_ledger.py` owns one cross-process lock for validation/reservation/transition/append/fsync; accounting imports it, never vice versa. Warm writers borrow one generation-bound `_usage_rows_memo` view: only unseen/appended rows and touched IDs/roots update validation (including late-receipt rights), final IDs and exact cash. Cold/replaced views parse a captured newline-aligned extent outside the lock, then prove file identity and cache generation and reconcile the suffix inside; replacement, including committed compaction, releases and reprepares. Strict projection, root refresh, review-wave, seal audit and custody maintenance readers reuse this SAME prepared source: they capture private immutable row references and a scalar generation under lock, then copy/render outside it. `read_usage_records(final_only=...)` supplies detached nested snapshots; full-record import remains atomic under its original lock. Seal manifest selection precedes the snapshot; maintenance retains sequence rechecks and review/late-owner policies. Display memo/render generations never retain mutable writer indexes or resume-state maps. Public full-record/resume readers retain snapshots. Cache publication follows durable append; append/fsync uncertainty invalidates it. Resume trusts the validated prefix without rereading it: within one inode, rows are only appended under the lock (locked quarantine truncates only a rejected tail), and history changes only by atomic replacement. Its new inode, like a shrink or a same-size rewrite with a new `mtime_ns`, forces preparation and full validation. A same-inode rewrite that grows the file (an editor saving in place, say) is outside this protocol: the warm view parses only the bytes past its offset, which may happen to be valid, so rewritten history can stay unseen until the next replacement or cold preparation. Rehashing history on each warm write would restore the per-append full-history cost this view removes. Full, incremental and cold preparation share `_decode_record`: UTF-8 JSON objects, with only real empty line separators ignored (whitespace-only or alternate-encoding records are invalid). Exceptional tail quarantine remains locked and loud; middle corruption fails closed. Display `allow_stale` never authorizes admission.
+
+`_usage_money.py` shares reversible precision-60 Decimal cash contributions with full replay and compaction, trapping unintended rounding. Baseline strings/raw monetary number literals retain precision. `monetary_scope_key` defines root selection once for replay and the incremental index; absent/None/empty roots retain their existing meaning, and future metadata gains no invented authority. Admission keeps six-place half-even bucket rounding and the existing `1e-9` allowance; the historical float ordering artifact at exact `2.4675885` now consistently renders `2.467588`. Historical charges are not rewritten. Rich subscription/window/non-money projections retain full replay. The same writer view indexes fold eligibility using compactor policy and timestamps: baseline-only residue cannot repeatedly launch an unprofitable full pass, while eligible attempts still use the existing locked durable compaction.
+
+`_usage_wait.py` retries only positive pre-send acquisition contention on the same stack. Typed platform outcomes distinguish contention (including observed O_EXCL name existence followed by ENOENT at the probe) from kernel/name-tier refusal, unreadable identity, permission failure and unknown. Managed operations check existing cancellation, deadline, lifetime, budget/fence controls between short slices; ordinary chat and Presence use the existing interactive idle wait window, narrowed by any explicit deadline. Time keeps running. Each acquisition has a stable episode ID with entered/ended checkpoints; the existing event and progress histories retain both episodes across Chat/Logs reload without budget-pause semantics or cancellation of supervising external runs. Reservation admission rechecks fresh caps; a reserved-unsent wait preserves its manifest, paid stamp and one physical claim. Proven no-send interruption returns that local claim even if bounded release fails; unresolved cleanup retains reserved capture/bound. Async mutation preserves ContextVars and joins on cancellation. Post-response settlement remains bounded: the original answer/usage/candidate returns once, an unsuccessful settlement retains dispatched/unresolved custody, and no settled-only learning or resend occurs. Cancellation after receipt joins accounting (including its unresolved fallback), adopts the final capture, and retains the exact response representation through `llm_observability.retain_cancelled_response` in the existing private call CAS before propagating cancellation. The ordinary `read_call_payload` consumer can recover it; native wire custody remains with its transport. Stop/deadline never resumes caller execution. Retention I/O failure is logged and attached to the cancellation with the original response, never reported as successful persistence. Search's physical-send fact is monotonic: an empty completed response's fallback runs outside that backend's cleanup scope. Search and review share these contracts; review rows are excluded from generic abandoned sweeping, so automatic eventual release is not promised.
+### Serial scale runner
+
+Run SERIAL, with fake providers and synthetic data only:
+
+```sh
+python -I -S scripts/safe_test.py --temp-parent /tmp -- .venv/bin/python -m tests.usage_writer_scale --writers 10 24 --seconds 60 --owned
+```
+
+The default fixture creates 92k meaningful transitions with candidate, token,
+processing and root provenance (~140 MB), then actually compacts to an active
+85k-row/~130 MB generation. Each spawned process performs real reserve,
+dispatch, local stub send and settlement with fsync. Each cycle starts with a strict `usage_projection(root_task_id="dominant")`; observed reads/second are reported for EACH process. A separate cold audit process reads and validates every record, runs real seal reconciliation and abandoned-usage maintenance, and repeats at a five-second target cadence (actual cadence, waits and holds reported). Warm, simultaneous cold and
+committed compaction/replacement phases record each writer's stage wait/hold,
+preparation/parse counts, completed cycles, longest gap, RSS and exit status;
+separate send-ID files detect duplicate sends. A precision-200 raw-Decimal
+oracle checks quiescent cash, every final row including unknown/future metadata, root/global counts, finality, subscriptions/windows and processing facts. Every writer must progress without a 45 s gap AND keep its raw acquisition maximum below 45 s; ordinary sliced wait episodes are counted separately from actual acquisition episodes over 45 s, and any such continuity extension fails; a single legal compaction exceeding that hold fails explicitly.
+`--owned` binds each writer to the existing `TaskModelWait` with native controls, a populated queue snapshot (running shared-root tasks, 32 pending tasks, one active sibling-root fence), and actual global/root caps. It reports control/fence checks inside and outside the monetary lock; the fixture grants no control bypass. Omit the flag for unowned comparison. Small `--attempts 300 --writers 2 --seconds 2` runs are smoke checks only.
+All runtime/control Python sources, file modes and relevant scrubbed mode environment are pinned, including `platform_layer` and the launcher. Results and candidate hashes remain in the launcher's retained temporary tree,
+never product history. Measurements must identify the source generation; old
+PR measurements are not evidence for a new candidate. Do not run this workload
+against live data or alongside another scale run.
+
+For a baseline, `--worker-source` accepts a read-only base archive inside the
+same launcher temporary root and `--worker-ref` labels that exact reference.
+Worker/audit initialization failures publish explicit readiness failures and retained error reports rather than leaving the barrier waiting. A baseline without `_usage_wait` is labelled as lacking that instrumentation. Each worker records its imported accounting source path; the result also hashes
+the base source. Fixture construction, initial compaction, the measured phase compactor and the independent oracle still belong to the current runner. The receipt explicitly marks baseline compaction qualification UNSUPPORTED; a baseline-worker run must never be labelled a fresh unmodified-baseline compaction measurement. Report this distinction and expected baseline failures.

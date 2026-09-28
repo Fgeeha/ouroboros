@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import copy
 from typing import Any, Dict
 
 from ouroboros.depth_evidence import parse_task_depth
+from ouroboros.dialogue_provenance import PRESENCE_BINDING_AUTHORITY_KEY, presence_binding_authority_metadata
 
 
 def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
@@ -50,6 +52,11 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
     directory_options = {key: fields[key] for key in ("directory_strategy", "scope_paths") if key in fields}
     # A child of a consciousness turn/tree inherits its origin label, category and level.
     origin_metadata = fields.get("origin_metadata") if isinstance(fields.get("origin_metadata"), dict) else {}
+    # A child of a Presence-bound task inherits only the binding it acts for, never the speaker's
+    # ``metadata.presence``; a malformed carrier stays a Presence one and narrows to nothing.
+    carrier = ({PRESENCE_BINDING_AUTHORITY_KEY: fields[PRESENCE_BINDING_AUTHORITY_KEY]}
+               if PRESENCE_BINDING_AUTHORITY_KEY in fields else {})
+    binding_authority = presence_binding_authority_metadata(carrier, task_contract=task_contract)
     task: Dict[str, Any] = {
         "id": tid,
         "type": "task",
@@ -91,6 +98,7 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
         "parent_cognitive_route": parent_cognitive_route,
         **directory_options,
         "metadata": {
+            "resource_intent": copy.deepcopy(fields.get("resource_intent") or {}),
             "parent_task_id": parent_id,
             "root_task_id": root_task_id,
             "session_id": session_id,
@@ -118,6 +126,7 @@ def build_scheduled_task_payload(fields: Dict[str, Any]) -> Dict[str, Any]:
             **directory_options,
             "root_cost_ceiling_usd": root_cost_ceiling_usd,
             **origin_metadata,
+            **binding_authority,
         },
     }
     if not drive_root:

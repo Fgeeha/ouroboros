@@ -12,6 +12,7 @@ import logging
 import threading
 from typing import Any, Dict, Optional
 
+from ouroboros.dialogue_provenance import presence_root_carrier
 from ouroboros.task_results import STATUS_FAILED, STATUS_SCHEDULED, write_task_result
 from ouroboros.utils import utc_now_iso
 
@@ -256,6 +257,20 @@ def _rollback_promoted_pending(
     return removed
 
 
+def _own_emitted_stub(ctx: Any, task_id: str, routing_token: str) -> bool:
+    """Whether the row on disk is THIS promote's emitted pre-receipt (#1160). A
+    refusal that writes no result of its own must still replace it, or the
+    reconciliation read answers "admission pending" for ever."""
+    try:
+        from ouroboros.routing_wait import is_own_admission_stub
+        from ouroboros.task_results import load_task_result
+
+        return is_own_admission_stub(load_task_result(ctx.DRIVE_ROOT, task_id), routing_token)
+    except Exception:
+        log.warning("promote: emitted-stub lookup failed for %s", task_id, exc_info=True)
+        return False
+
+
 def _persist_promote_rejection(
     ctx: Any,
     evt: Dict[str, Any],
@@ -303,6 +318,7 @@ def _prepare_promote_source_off_loop(evt: Dict[str, Any], ctx: Any) -> None:
             ctx,
             str(evt.get("source") or ""),
             str(evt.get("project_id") or ""),
+            project_name=str(evt.get("project_name") or ""),
         )
         continuation["project_id"] = project_id
         continuation["_source_note"] = note
@@ -406,7 +422,7 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
                 "task_id": task_id,
                 "reservation_owned": False,
             }
-            if blocked["reason"] != "duplicate_task_id":
+            if blocked["reason"] != "duplicate_task_id" or _own_emitted_stub(ctx, task_id, routing_token):
                 _persist_promote_rejection(ctx, evt, blocked)
             _emit_routing_receipt(
                 ctx,
@@ -482,6 +498,7 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
                 else "unconfirmed"
             )
             transfer = outcome.pop("force_plan_transfer", None)
+            carrier = presence_root_carrier(evt, task_contract=evt.get("task_contract"))
             stored = write_task_result(
                 ctx.DRIVE_ROOT,
                 str(outcome.get("task_id") or task_id),
@@ -512,6 +529,10 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
                     else "Task is scheduled, but its owner-facing routing receipt was not confirmed."
                 ),
                 attachment_manifest=list(outcome.get("attachment_manifest") or []),
+                # A Presence promotion's host-carried provenance is canonical from
+                # admission, so its binding finds, polls and controls the work while
+                # it is still queued (the worker's running write keeps the same value).
+                **({"metadata": carrier, "source": "presence_promote"} if carrier else {}),
             )
             admission = stored.get("promotion_admission") if isinstance(stored, dict) else {}
             if (
@@ -529,6 +550,9 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
                     "status": "unconfirmed",
                     "reason": str(receipt.get("reason") or "routing_receipt_persist_failed"),
                 }
+            from ouroboros.project_handoff import enqueue_project_handoff
+
+            enqueue_project_handoff(ctx.DRIVE_ROOT, str(outcome.get("task_id") or task_id))
             _publish_routing_ack(
                 ctx,
                 evt,
@@ -563,7 +587,8 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
             reason="promote_chat_to_task_rejected",
         )
         supervisor_queue.release_task_admission(task_id, routing_token)
-        if str(outcome.get("reason") or "") != "attachment_admission_rejected":
+        if (str(outcome.get("reason") or "") != "attachment_admission_rejected"
+                or _own_emitted_stub(ctx, task_id, routing_token)):
             _persist_promote_rejection(ctx, evt, outcome)
         _emit_routing_receipt(
             ctx,
@@ -716,6 +741,10 @@ def _handle_ensure_project_scope(evt: Dict[str, Any], ctx: Any) -> None:
     if not isinstance(outcome, dict):
         outcome = {"status": "unconfirmed", "reason": "handler_returned_no_outcome"}
     target = str(outcome.get("project_id") or evt.get("project_id") or "")
+    if outcome.get("status") == "delivered":
+        from ouroboros.project_handoff import enqueue_project_handoff
+
+        enqueue_project_handoff(ctx.DRIVE_ROOT, str(evt.get("task_id") or ""))
     label = ""
     try:
         from ouroboros.projects_registry import get_project

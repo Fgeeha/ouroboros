@@ -26,6 +26,10 @@ WARNING/CRITICAL trigger is deliberately NOT implemented: nothing emits a health
 (``build_health_invariants`` is read-side), so health is visible in the next wake's context.
 Panic and ``/bg stop`` arrive through ``stop()``, which arms a graceful stop of a live wake
 off-thread. The legacy observation inbox, if present, is moved once to the archive unread.
+What a wake OBSERVES is not this clock's business: it starts after the chat-chain position and
+the task-result transition state the last admitted wake observed
+(``consciousness_observation_boundary``, persisted only once the lane admits the wake;
+``consciousness_wake.observe_wake``), never at a finish time.
 """
 
 from __future__ import annotations
@@ -33,6 +37,7 @@ from __future__ import annotations
 import datetime as _dt
 import logging
 import math
+import os
 import pathlib
 import threading
 import time
@@ -48,7 +53,7 @@ from ouroboros.config import (
 )
 from ouroboros.consciousness_allowance import STATUS_EXHAUSTED, STATUS_UNKNOWN, allowance_window
 from ouroboros.consciousness_authority import is_consciousness_origin
-from ouroboros.consciousness_wake import render_wake_message, wake_task_metadata
+from ouroboros.consciousness_wake import bind_wake_observation, observe_wake, render_wake_message, wake_task_metadata
 from ouroboros.deadline_utils import parse_deadline_ts
 from ouroboros.task_pacing import COST_PLANNING_MARGIN_USD
 from ouroboros.utils import append_jsonl, utc_now_iso
@@ -58,6 +63,8 @@ log = logging.getLogger(__name__)
 NEXT_WAKE_STATE_KEY = "consciousness_next_wake_at"
 INTERVAL_STATE_KEY = "consciousness_next_interval_sec"
 LAST_WAKE_STATE_KEY = "consciousness_last_wake_at"
+OBSERVATION_STATE_KEY = "consciousness_observation_boundary"  # chat position + transition state the last ACCEPTED wake observed
+OBSERVATION_BOOTSTRAP_STATE_KEY = "consciousness_observation_bootstrap_since"
 LEGACY_INBOX_REL = pathlib.Path("state") / "consciousness_observations.jsonl"
 ARCHIVED_INBOX_REL = pathlib.Path("archive") / "consciousness_observations.jsonl"
 HEARTBEAT = "heartbeat"
@@ -71,6 +78,24 @@ def _iso(ts: float) -> str:
     return _dt.datetime.fromtimestamp(float(ts), tz=_dt.timezone.utc).isoformat() if ts else ""
 
 
+def panic_blocks_wake(drive_root: Any) -> bool:
+    """A kept Panic intent bars all automatic wake grants. Only a proven absence of the flag
+    (``confirm_absent``) permits one: a dangling link is present, and an unreadable flag or
+    an absence no directory ancestor proves is unknown, so it bars too."""
+    from supervisor.state_initialization import confirm_absent
+
+    path = pathlib.Path(drive_root) / "state" / "panic_stop.flag"
+    try:
+        try:
+            os.lstat(path)  # lstat, not stat: a dangling link IS present
+        except FileNotFoundError:
+            confirm_absent(path)
+            return False
+        return True
+    except OSError:
+        return True
+
+
 class BackgroundConsciousness:
     """The alarm clock; one instance per supervisor, ticked from its loop."""
 
@@ -82,7 +107,10 @@ class BackgroundConsciousness:
         self._routing_metadata_fn = routing_metadata_fn
         self._booted_at = time.time() if now is None else float(now)
         state = self._read_state()
-        self._enabled = bool(state.get("bg_consciousness_enabled"))
+        from supervisor.state import control_is
+
+        self._stopped = panic_blocks_wake(self._drive_root)  # unknown is suspension, Panic is a stop
+        self._enabled = not self._stopped and control_is(state, "bg_consciousness_enabled", True)  # unknown is not on (#1307)
         try:
             persisted = float(state.get(NEXT_WAKE_STATE_KEY) or 0.0)
         except (TypeError, ValueError):
@@ -109,6 +137,13 @@ class BackgroundConsciousness:
         self._last_wake_at, self._last_wake_task_id, self._last_wake_outcome, self._last_error = (
             persisted_last_wake, "", "", ""
         )
+        try:
+            bootstrap = float(state.get(OBSERVATION_BOOTSTRAP_STATE_KEY, persisted_last_wake or self._booted_at))
+            if not math.isfinite(bootstrap) or not 0 <= bootstrap <= self._booted_at:
+                raise ValueError("invalid observation bootstrap")
+        except (TypeError, ValueError):
+            bootstrap = persisted_last_wake or self._booted_at
+        self._observation_bootstrap_since = bootstrap
         self._last_skip_at = 0.0  # a skipped wake debounces the next event like a wake does
         self._backoff, self._allowance = 1, (0.0, {})
         self._archive_legacy_inbox()
@@ -142,9 +177,21 @@ class BackgroundConsciousness:
         from supervisor import state
 
         try:
-            state.update_state(lambda st: st.__setitem__(LAST_WAKE_STATE_KEY, float(at)))
+            # Even if the first bootstrap write failed, alarm completion may
+            # never persist without the observation lower bound beside it.
+            state.update_state(lambda st: st.update({LAST_WAKE_STATE_KEY: float(at),
+                OBSERVATION_BOOTSTRAP_STATE_KEY: self._observation_bootstrap_since}))
         except Exception:
-            log.debug("consciousness: last wake time not persisted", exc_info=True)
+            log.debug("consciousness: wake completion not persisted", exc_info=True)
+
+    @staticmethod
+    def _set_state(key: str, value: Any) -> None:
+        from supervisor import state
+
+        try:
+            state.update_state(lambda st: st.__setitem__(key, value))
+        except Exception:
+            log.debug("consciousness: %s not persisted", key, exc_info=True)
 
     def _interval(self) -> int:
         """The model's chosen interval (``set_next_wakeup``) or the default, clamped."""
@@ -185,6 +232,12 @@ class BackgroundConsciousness:
         """One supervisor pass; never blocks on a wake. Returns the typed decision."""
         now = time.time() if now is None else float(now)
         with self._lock:
+            from supervisor.state import control_is
+
+            if panic_blocks_wake(self._drive_root):
+                self._stopped, self._enabled = True, False
+                return "panic_stop"
+            self._enabled = not self._stopped and control_is(self._read_state(), "bg_consciousness_enabled", True)
             if not self._enabled:
                 return "disabled"
             wake, owner_live = self.live_turns()
@@ -231,20 +284,36 @@ class BackgroundConsciousness:
         ceiling = min(per_task_cap, remaining) if per_task_cap > 0 else remaining
         metadata = {**self._routing_facts(chat_id),
                     **wake_task_metadata(level, reason, root_cost_ceiling_usd=ceiling)}
-        text = render_wake_message(
-            self._drive_root, self._repo_dir, reason=reason, last_wake_at=self._last_wake_at,
-            since=self._last_wake_at or self._booted_at, now=now, level=level,
-            disabled_tools=list(metadata.get("disabled_tools") or []), spent_usd=window.get("accounted_usd"),
-            spent_is_floor=int(window.get("unknown_unmetered") or 0) > 0,
-            daily_usd=window.get("limit_usd") or 0.0, running=self._running_roots(),
-            max_tasks=get_consciousness_max_tasks(), interval=self._interval(), exclude_task_id=self._last_wake_task_id)
+        # Everything since the last ACCEPTED observation — chain positions and transition
+        # identities, not this alarm's finish time. Before a verified boundary,
+        # the bootstrap survives source failure, completion and restart.
+        self._set_state(OBSERVATION_BOOTSTRAP_STATE_KEY, self._observation_bootstrap_since)
+        observation = observe_wake(self._drive_root, boundary=self._read_state().get(OBSERVATION_STATE_KEY),
+                                   since=self._observation_bootstrap_since, now=now, reason=reason)
+
+        def render(events: str) -> str:
+            return render_wake_message(
+                self._repo_dir, reason=reason, last_wake_at=self._last_wake_at, now=now, level=level,
+                disabled_tools=list(metadata.get("disabled_tools") or []), spent_usd=window.get("accounted_usd"),
+                spent_is_floor=int(window.get("unknown_unmetered") or 0) > 0,
+                daily_usd=window.get("limit_usd") or 0.0, running=self._running_roots(),
+                max_tasks=get_consciousness_max_tasks(), interval=self._interval(), events=events)
+
+        accepted_boundary = None
+
+        def bind_input(task):
+            nonlocal accepted_boundary
+            accepted_boundary = bind_wake_observation(self._drive_root, task, observation, render)
+
         # Check-and-register under the lane's own re-entrant gate lock: atomic with the census.
         with workers._repo_writer_gate_lock:
             wake, owner_live = self.live_turns()
             if wake or owner_live:
                 self._pending_reason = self._pending_reason or reason
                 return "wake_live" if wake else "owner_turn_live"
-            receipt = workers.handle_wake_direct(chat_id, text, metadata, on_finished=self._wake_finished)
+            receipt = workers.handle_wake_direct(
+                chat_id, render(observation.full_text()), metadata, on_finished=self._wake_finished,
+                bind_input=bind_input)
         if not receipt.get("admitted"):
             why = str(receipt.get("reason") or "refused")
             self._last_wake_outcome, self._last_skip_at = f"rejected:{why}", now  # an event never undoes this backoff below the floor
@@ -260,6 +329,11 @@ class BackgroundConsciousness:
             self._record("consciousness_wake_rejected", reason=why, wake_reason=reason)
             return f"rejected:{why}"
         self._last_wake_task_id, self._last_wake_outcome, self._last_error = str(receipt["task_id"]), "running", ""
+        # Accepted: the running wake owns this observation, so the next one starts
+        # after it. A refused launch above consumed nothing; a crash before this
+        # write replays the same window (at-least-once, never a silent skip).
+        if accepted_boundary is not None:
+            self._set_state(OBSERVATION_STATE_KEY, accepted_boundary)
         self._record("consciousness_wake_started", task_id=self._last_wake_task_id, wake_reason=reason,
                      level=level, root_cost_ceiling_usd=ceiling)
         return "launched"
@@ -288,15 +362,18 @@ class BackgroundConsciousness:
 
     def start(self) -> str:
         with self._lock:
+            if panic_blocks_wake(self._drive_root):
+                return "Background consciousness stays disabled while Panic controls await persistence."
             if self._enabled:
                 return "Background consciousness is already enabled."
-            self._enabled = True
+            self._stopped, self._enabled = False, True
             # The clock did not advance while disabled: never announce a wake in the past.
             self._set_next_wake(max(self._next_wake_at, time.time()))
             return f"Background consciousness enabled; next wake-up at {time.strftime('%H:%M', time.localtime(self._next_wake_at))}."
 
     def stop(self) -> str:
         with self._lock:
+            self._stopped = True
             was_enabled, self._enabled = self._enabled, False
         wake, _owner = self.live_turns()
         if wake:
@@ -329,7 +406,7 @@ class BackgroundConsciousness:
         if not fresh and cached and now - cached_at < ALLOWANCE_VIEW_TTL_SEC:
             return cached
         try:
-            window = allowance_window(self._drive_root, now=now)
+            window = allowance_window(self._drive_root, now=now, allow_stale=not fresh)  # status shows; a wake admits
         except Exception as exc:  # the reader types every failure; this is the last net
             window = {"status": STATUS_UNKNOWN, "error": f"{type(exc).__name__}: {exc}"}
         self._allowance = (now, window)

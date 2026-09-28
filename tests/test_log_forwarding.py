@@ -26,6 +26,8 @@ WORKER_BASELINE_TYPES = frozenset(
 WORKER_SAME_TYPE_PAIRS = frozenset({
     "provider_incomplete_response", "llm_empty_response", "provider_body_error",
     "review_cycles_exhausted", "plan_review_advisory_open",
+    # #1316: the durable tool-call start / wait-ended row IS the live frame's payload.
+    "tool_call_started", "tool_call_timeout",
 })
 # Every one of these has a dedicated ctx.bridge.push_log at its supervisor
 # handler (events.py / cognitive_operations.py / gateway/tasks.py /

@@ -8,6 +8,7 @@ cost three tasks their final answer in one night. This module drives
 the only place where the two payloads can honestly be compared."""
 from __future__ import annotations
 
+import copy
 import queue
 from types import SimpleNamespace
 
@@ -18,6 +19,7 @@ from ouroboros import task_pacing, usage_accounting
 from ouroboros.contracts.task_contract import normalize_budget_profile
 from ouroboros.llm import LLMClient
 from ouroboros.llm_claudexor import cache_key_for_model
+from ouroboros.llm_messages import HOST_CONTEXT_NOTICE_BEFORE_TASK, STABLE_PREFIX_BLOCKS_KEY
 from ouroboros.loop import _check_budget_limits
 from ouroboros.loop_llm_call import call_llm_with_retry
 from ouroboros.task_pacing import main_loop_wire_options
@@ -26,6 +28,16 @@ from tests.test_tree_cost_ceiling import _ctx, _patch_execute_candidate
 
 _IDENTITY = ("model", "provider", "candidate_raw_sha256", "candidate_raw_size_bytes")
 _MESSAGES = [{"role": "system", "content": "policy"}, {"role": "user", "content": "wrap up"}]
+# The Main context builder's shape: a 3-block system declaring ONE byte-stable block
+# (context_fit.ContextFitProjection.system_message).
+_DECLARED_MESSAGES = [
+    {"role": "system", "content": [
+        {"type": "text", "text": "policy", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "memory", "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": "evidence"},
+    ], STABLE_PREFIX_BLOCKS_KEY: 1},
+    {"role": "user", "content": "wrap up"},
+]
 _TOOLS = [{"type": "function", "function": {
     "name": "probe", "description": "probe", "parameters": {"type": "object", "properties": {}},
 }}]
@@ -35,6 +47,7 @@ _ROUTES = [
     ("anthropic/claude-test", {"OPENROUTER_API_KEY": "unused"}),
     ("anthropic::claude-test", {"ANTHROPIC_API_KEY": "unused"}),
 ]
+_OPENAI_FAMILY_ROUTES = _ROUTES[:2]
 
 
 @pytest.fixture(autouse=True)
@@ -79,6 +92,67 @@ def test_prospective_wrapup_candidate_is_the_candidate_the_main_loop_sends(monke
         key: getattr(prospective, key) for key in _IDENTITY}
 
 
+@pytest.mark.parametrize("model,env", _OPENAI_FAMILY_ROUTES)
+def test_declared_system_prefix_split_is_projected_once_inside_the_candidate_builder(monkeypatch, tmp_path, model, env):
+    """The prospective wrap-up candidate and the real send agree on the SPLIT copy, and
+    the split happens INSIDE ``_build_remote_kwargs`` (llm_openai_compatible.py, the
+    ``openai_family_route`` block before the direct/OpenRouter branch split): the spy sees
+    the canonical declared 3-block system ENTER the builder and the split copy LEAVE it,
+    on the priced build and on the sent build alike. A split that ran earlier (in the
+    canonical transcript or ``chat()``) would show an already-split system entering; one
+    that ran later (``_finalized_physical_candidate``) would show a whole system leaving;
+    removing the block keeps the identity parity but fails every wire-shape assertion."""
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    builds, captured = [], {}
+    real_build = LLMClient._build_remote_kwargs
+
+    def spy(self, target, messages, *args, **kwargs):
+        entering = copy.deepcopy(messages)
+        payload = real_build(self, target, messages, *args, **kwargs)
+        builds.append((entering, copy.deepcopy(payload["messages"]), copy.deepcopy(target.get("wire_layout"))))
+        return payload
+
+    monkeypatch.setattr(LLMClient, "_build_remote_kwargs", spy)
+
+    def execute(request, send, before_dispatch):
+        captured["request"] = request
+        raise _Captured()
+
+    _patch_execute_candidate(monkeypatch, llm_module, execute)
+    client = LLMClient(api_key="unused")
+    logs = tmp_path / "logs"
+    logs.mkdir()
+    canonical = copy.deepcopy(_DECLARED_MESSAGES)
+    with usage_accounting.usage_scope(usage_accounting.UsageScope(
+        drive_root=tmp_path, task_id="parity", root_task_id="parity",
+    )):
+        prospective = task_pacing.prospective_wrapup_attempt_request(
+            llm=client, messages=_DECLARED_MESSAGES, model=model, reasoning_effort="high",
+            tools=_TOOLS, cache_affinity=cache_key_for_model(model),
+        )
+        try:
+            call_llm_with_retry(client, _DECLARED_MESSAGES, model, _TOOLS, "high", 1, logs, "parity", 1,
+                                queue.Queue(), {}, initial_messages=_DECLARED_MESSAGES)
+        except _Captured:
+            pass
+    assert _DECLARED_MESSAGES == canonical, "the canonical transcript is never mutated"
+    assert "request" in captured, "the real send never reached the physical executor"
+    assert {key: getattr(captured["request"], key) for key in _IDENTITY} == {
+        key: getattr(prospective, key) for key in _IDENTITY}
+    assert len(builds) == 2, "exactly one priced build and one sent build"
+    for entering, wire, layout in builds:
+        assert entering[0][STABLE_PREFIX_BLOCKS_KEY] == 1 and len(entering[0]["content"]) == 3, \
+            "the canonical declared system enters the builder: nothing split it earlier"
+        assert wire[0] == {"role": "system", "content": [{"type": "text", "text": "policy"}]}
+        assert wire[1]["role"] == "user"
+        assert wire[1]["content"] == "[SYSTEM NOTICE]\n" + HOST_CONTEXT_NOTICE_BEFORE_TASK + "\n\nmemory\n\nevidence"
+        assert wire[2] == {"role": "user", "content": "wrap up"}
+        assert all(STABLE_PREFIX_BLOCKS_KEY not in message for message in wire)
+        assert layout == {"system_prefix_split": True, "moved_blocks": 2}
+    assert builds[0][1] == builds[1][1], "the priced copy and the sent copy are one wire"
+
+
 def test_every_wire_option_of_the_send_reaches_the_priced_copy():
     """The one owner: what the send declares is what the prospective builder is handed."""
     options = main_loop_wire_options("openai/gpt-test", allow_server_web_search=True)
@@ -97,7 +171,8 @@ def _last_fit_rail(monkeypatch, tmp_path, execute):
     """Drive the whole rail: last-fit decision -> admitted candidate -> the real send."""
     monkeypatch.setenv("OPENROUTER_API_KEY", "unused")
     monkeypatch.setattr("ouroboros.loop._loop_tree_accounting", lambda **_k: {"accounted_usd": 20.0})
-    answers = iter((True, False, True, False, True, False))   # proxy, exact probe, prepared: one fits, two do not
+    # proxy, exact probe, prepared: one fits, two do not; then the FRESH send's own admission fits.
+    answers = iter((True, False, True, False, True, False, True))
     monkeypatch.setattr(task_pacing, "wrapup_reservation_fits", lambda **_kwargs: next(answers))
     _patch_execute_candidate(monkeypatch, llm_module, execute)
     logs = tmp_path / "logs"
@@ -143,7 +218,7 @@ def test_a_drifted_admitted_candidate_is_sent_once_more_instead_of_losing_the_an
     calls, events = [], []
     real_once = loop_module._call_forced_model_once
 
-    def once(ctx, *, initial_messages=None, admitted_request=None):
+    def once(ctx, *, initial_messages=None, admitted_request=None, admission=None):
         calls.append(admitted_request is not None)
         if admitted_request is not None:
             raise usage_accounting.PhysicalAttemptPreconditionFailed(
@@ -169,7 +244,7 @@ def test_a_closed_dispatch_window_is_a_deadline_not_drift(monkeypatch, tmp_path)
 
     calls = []
 
-    def once(ctx, *, initial_messages=None, admitted_request=None):
+    def once(ctx, *, initial_messages=None, admitted_request=None, admission=None):
         calls.append(admitted_request is not None)
         raise PhysicalDispatchInterrupted("dispatch window closed")
 

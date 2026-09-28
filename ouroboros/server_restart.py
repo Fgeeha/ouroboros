@@ -34,14 +34,24 @@ def _perform_owner_restart(ctx: Any, reply=None) -> tuple[bool, str]:
     state_dir = DATA_DIR / "state"
     owner_restart_flag = state_dir / "owner_restart_no_resume.flag"
     stable_skip_flag = state_dir / "panic_stop.flag"
+    # A Panic flag still owed its durable disabled controls (#1307) is never replaced
+    # or removed here: boot consumes it only after those controls are saved.
+    try:
+        panic_kept = stable_skip_flag.read_text(encoding="utf-8").strip() != "owner_restart_no_resume"
+    except FileNotFoundError:
+        panic_kept = False
+    except Exception:
+        panic_kept = True  # unreadable: unknown, so kept
     try:
         state_dir.mkdir(parents=True, exist_ok=True)
         owner_restart_flag.write_text("owner_restart", encoding="utf-8")
-        # Pair owner flag with panic_stop for stable-build auto-resume compatibility.
-        stable_skip_flag.write_text("owner_restart_no_resume", encoding="utf-8")
+        if not panic_kept:
+            # Pair owner flag with panic_stop for stable-build auto-resume compatibility.
+            stable_skip_flag.write_text("owner_restart_no_resume", encoding="utf-8")
     except Exception:
         owner_restart_flag.unlink(missing_ok=True)
-        stable_skip_flag.unlink(missing_ok=True)
+        if not panic_kept:
+            stable_skip_flag.unlink(missing_ok=True)
         log.warning("Failed to write owner restart no-resume flag", exc_info=True)
         return False, "could not write restart state."
     # Everything reversible is behind us (checkout landed, no-resume

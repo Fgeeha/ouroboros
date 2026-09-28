@@ -126,20 +126,24 @@ def _handle_evolution_task_done(
         or objective_status in {"fail", "degraded"}
         or artifact_status in {"failed", "missing"}
     )
+    from supervisor.state import StateUnavailable, update_state
+
     if not failed_by_axes and (rounds or 0) >= 1:
-        from supervisor.state import update_state
-
-        update_state(lambda live: live.update(evolution_consecutive_failures=0))
+        try:
+            update_state(lambda live: live.update(evolution_consecutive_failures=0))
+        except StateUnavailable:
+            log.warning("evolution failure counter not reset: runtime state unavailable", exc_info=True)
     else:
-        from supervisor.state import update_state
-
         failures_box: Dict[str, int] = {}
 
         def _bump_failures(live: Dict[str, Any]) -> None:
             failures_box["n"] = int(live.get("evolution_consecutive_failures") or 0) + 1
             live["evolution_consecutive_failures"] = failures_box["n"]
 
-        update_state(_bump_failures)
+        try:
+            update_state(_bump_failures)
+        except StateUnavailable:  # the tracked row below still records the failure
+            log.warning("evolution failure counter not bumped: runtime state unavailable", exc_info=True)
         ctx.append_jsonl(
             ctx.DRIVE_ROOT / "logs" / "supervisor.jsonl",
             {

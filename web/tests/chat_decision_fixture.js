@@ -30,8 +30,11 @@ export class NodeStub {
     set textContent(value) { this._text = String(value ?? ''); }
     get textContent() { return this._text; }
     append(...nodes) { nodes.forEach((node) => { node.parentNode = this; this.children.push(node); }); }
+    // A parentless node stands in for a mounted root until it is removed.
+    get isConnected() { return this.parentNode ? this.parentNode.isConnected : !this.detached; }
     remove() {
         const parent = this.parentNode;
+        this.detached = true;
         if (!parent) return;
         const i = parent.children.indexOf(this);
         if (i >= 0) parent.children.splice(i, 1);
@@ -49,6 +52,7 @@ export class NodeStub {
         node.parentNode = parent;
         parent.children.splice(parent.children.indexOf(this), 1, node);
         this.parentNode = null;
+        this.detached = true;
     }
     get nextElementSibling() {
         const siblings = this.parentNode?.children || [];
@@ -115,7 +119,7 @@ export function fixture({ fetchImpl, renderMarkdown, enhanceMarkdown, onDomWrite
                 ...(sent.comment ? { comment: sent.comment } : {}) }) };
         },
         frameNode,
-        renderMarkdown,
+        mountMarkdown: renderMarkdown ? (host, text) => { host.innerHTML = renderMarkdown(text); } : null,
         enhanceMarkdown: enhanceMarkdown || (renderMarkdown ? () => {} : null),
         showToast: (text, tone) => toasts.push({ text, tone }),
         onDomWrite,

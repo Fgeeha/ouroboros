@@ -43,6 +43,7 @@ from ouroboros.tools.review_helpers import (
     check_worktree_readiness,
     check_worktree_version_sync as _check_worktree_version_sync_shared,
     CRITICAL_FINDING_CALIBRATION,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
+    REVIEW_REPAIR_JUDGMENT,
     get_advisory_runtime_diagnostics as _get_runtime_diagnostics,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
     format_advisory_error as _format_advisory_error,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
     load_governance_doc,  # noqa: F401 -- facade import surface; leaves read it through the call-time handle
@@ -166,10 +167,12 @@ def _same_model_payable_spelling(model: str) -> str:
 
 
 def _advisory_default_model() -> str:
-    """The shipped advisory default on a route this install can actually pay."""
+    """The shipped advisory default on a route this install can actually pay —
+    Main's own route on an OpenAI-compatible-only install (#1116)."""
     from ouroboros.provider_models import OPENROUTER_REVIEW_DEFAULTS
+    from ouroboros.review_model_routes import compatible_only_review_model
 
-    return _same_model_payable_spelling(str(OPENROUTER_REVIEW_DEFAULTS["advisory"]))
+    return compatible_only_review_model() or _same_model_payable_spelling(str(OPENROUTER_REVIEW_DEFAULTS["advisory"]))
 
 
 def _advisory_native_model(slot=None) -> str:
@@ -345,25 +348,6 @@ def _advisory_review_diff(
     return _get_staged_diff(repo_dir, paths=paths), paths, None, False
 
 
-def _prompt_oversize_skip_warning(prompt_chars: int, managed: bool) -> str:
-    """The 1.6M prompt gate's non-blocking skip text. ``managed=True`` (the
-    diff under review is a managed resolution delta) drops the split advice —
-    a managed merge stages the whole two-parent tree by contract — and states
-    what is actually possible instead."""
-    tokens_approx = max(1, prompt_chars // 4)
-    remedy = (
-        f"A managed update merge {_MANAGED_SKIP_NOTE}; the "
-        "skip is audited and non-blocking."
-        if managed else "Consider splitting the commit."
-    )
-    return (
-        f"⚠️ ADVISORY_SKIPPED: advisory prompt too large "
-        f"({prompt_chars:,} chars, ~{tokens_approx:,} tokens > "
-        f"{_ADVISORY_PROMPT_MAX_CHARS:,} char limit). "
-        f"Advisory review skipped — non-blocking. {remedy}"
-    )
-
-
 def _api_window_skip_warning(model: str, prompt: str, managed: bool, slot=None) -> str:
     """The api route's admission verdict against its REAL window, or ``""`` to proceed.
 
@@ -436,26 +420,6 @@ def _overflow_failure_text(*texts: object) -> bool:
     )
 
 
-def _overflow_skip_warning(route: str, prompt_chars: int, failure_head: str) -> str:
-    """Typed non-blocking skip for a provider/harness context-window rejection.
-
-    ``reason=context_window_exceeded``, carrying the delivery route and the
-    measured prompt size. No host-side retry or split — advisory is fail-open
-    by design; the pre-dispatch gates own prevention, this path owns honesty
-    (previously this failure was misfiled as a crashed harness inviting a
-    doomed retry of the identical oversize prompt)."""
-    tokens_approx = max(1, (int(prompt_chars) + 3) // 4)
-    head = " ".join(str(failure_head or "").split())
-    head = (head[:200] + "…") if len(head) > 200 else head
-    return (
-        "⚠️ ADVISORY_SKIPPED: context_window_exceeded — the advisory prompt "
-        f"exceeded the {route} route's context window at dispatch "
-        f"({prompt_chars:,} chars, ~{tokens_approx:,} estimated tokens). "
-        "Advisory review skipped — non-blocking and audited; no host-side retry "
-        f"or split. Provider signal: {head}"
-    )
-
-
 def _stamp_advisory_skip_meta(ctx: ToolContext, meta: Optional[dict], skip_reason: str) -> None:
     """Record a typed advisory skip on the ctx meta snapshot (best-effort).
 
@@ -492,7 +456,21 @@ def _predispatch_size_skip(
     if prompt_chars > _ADVISORY_PROMPT_MAX_CHARS:
         log.warning("Advisory skipped — prompt too large: %d chars", prompt_chars)
         _stamp_advisory_skip_meta(ctx, None, "prompt_ceiling_exceeded")
-        return [], _prompt_oversize_skip_warning(prompt_chars, managed), model, prompt_chars
+        # The 1.6M prompt gate's non-blocking skip text. ``managed`` (the diff under
+        # review is a managed resolution delta) drops the split advice — a managed
+        # merge stages the whole two-parent tree by contract — and states what is
+        # actually possible instead.
+        remedy = (
+            f"A managed update merge {_MANAGED_SKIP_NOTE}; the "
+            "skip is audited and non-blocking."
+            if managed else "Consider splitting the commit."
+        )
+        return [], (
+            f"⚠️ ADVISORY_SKIPPED: advisory prompt too large "
+            f"({prompt_chars:,} chars, ~{max(1, prompt_chars // 4):,} tokens > "
+            f"{_ADVISORY_PROMPT_MAX_CHARS:,} char limit). "
+            f"Advisory review skipped — non-blocking. {remedy}"
+        ), model, prompt_chars
     if delegated_route:
         return None
     window_skip = _api_window_skip_warning(model, prompt, managed, slot=slot)
@@ -553,7 +531,21 @@ def _maybe_overflow_skip(
         route_name, verb, prompt_chars,
     )
     _stamp_advisory_skip_meta(ctx, meta, "context_window_exceeded")
-    return [], _overflow_skip_warning(route_name, prompt_chars, str(failure or "")), model, prompt_chars
+    # Typed non-blocking skip (``reason=context_window_exceeded``) carrying the
+    # delivery route and the measured prompt size. No host-side retry or split —
+    # advisory is fail-open by design; the pre-dispatch gates own prevention, this
+    # path owns honesty (previously this failure was misfiled as a crashed harness
+    # inviting a doomed retry of the identical oversize prompt).
+    tokens_approx = max(1, (int(prompt_chars) + 3) // 4)
+    head = " ".join(str(failure or "").split())
+    head = (head[:200] + "…") if len(head) > 200 else head
+    return [], (
+        "⚠️ ADVISORY_SKIPPED: context_window_exceeded — the advisory prompt "
+        f"exceeded the {route_name} route's context window at dispatch "
+        f"({prompt_chars:,} chars, ~{tokens_approx:,} estimated tokens). "
+        "Advisory review skipped — non-blocking and audited; no host-side retry "
+        f"or split. Provider signal: {head}"
+    ), model, prompt_chars
 
 
 def run_advisory_critic(*args, **kwargs):
@@ -568,21 +560,6 @@ def run_advisory_critic(*args, **kwargs):
 
 
 # -- Audit logging --
-
-def _audit_bypass(ctx: ToolContext, snapshot_hash: str, commit_message: str,
-                  bypass_reason: str, task_id: str) -> None:
-    try:
-        append_jsonl(ctx.drive_logs() / "events.jsonl", {
-            "ts": utc_now_iso(),
-            "type": "advisory_review_bypassed",
-            "snapshot_hash": snapshot_hash,
-            "commit_message": commit_message,  # full — no [:200] truncation
-            "bypass_reason": bypass_reason,
-            "task_id": task_id,
-        })
-    except Exception:
-        pass
-
 
 def _identical_diff_cap_note() -> str:
     """Schema-build-time NOTE about Max-Review-Cycles semantics on the commit
@@ -647,7 +624,17 @@ def _record_bypass(ctx: ToolContext, state: "AdvisoryReviewState", snapshot_hash
                    drive_root: pathlib.Path,
                    snapshot_paths: Optional[List[str]] = None) -> str:
     """Audit, record, and save a bypassed advisory run. Returns JSON response."""
-    _audit_bypass(ctx, snapshot_hash, commit_message, reason, task_id)
+    try:
+        append_jsonl(ctx.drive_logs() / "events.jsonl", {
+            "ts": utc_now_iso(),
+            "type": "advisory_review_bypassed",
+            "snapshot_hash": snapshot_hash,
+            "commit_message": commit_message,  # full — no [:200] truncation
+            "bypass_reason": reason,
+            "task_id": task_id,
+        })
+    except Exception:
+        pass
     repo_key = make_repo_key(pathlib.Path(ctx.repo_dir))
 
     def _mutate(bypass_state: "AdvisoryReviewState") -> None:
@@ -805,7 +792,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             parts.append(f"{len(open_debts)} commit-readiness debt item(s) surfaced by review_status")
         return (" ".join(parts) + ". ") if parts else ""
 
-    regroup = "After the first blocked review, stop patching one finding at a time: re-read the full diff, group obligations by root cause, rewrite the plan, finish all remaining edits, then run preflight_review(commit_message='...')."
+    open_review_work = f"{REVIEW_REPAIR_JUDGMENT} When your edits are complete, run preflight_review(commit_message='...')."
 
     def _with_choices(message: str) -> str:
         return f"{message.rstrip()} {ADVISORY_REVIEW_CHOICE_GUIDANCE}"
@@ -819,7 +806,8 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
 
     if not effective_is_fresh:
         status = str(getattr(latest, "status", "") or "")
-        if latest and status in {"tests_preflight_blocked", "preflight_blocked"} and not stale_from_edit:
+        if latest and not stale_from_edit and (status in {"tests_preflight_blocked", "preflight_blocked"} or
+                                              latest.reason_kind == "release_metadata_unavailable"):
             if status == "tests_preflight_blocked":
                 problem = "test preflight: pytest failed before the paid critic call"
                 fix = "Fix the failing tests and re-run preflight_review. Use preflight_review(skip_tests=True) only for intentional WIP code."
@@ -831,8 +819,11 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
                 if reason_kind == "syntax":
                     problem = "syntax preflight: a staged .py file has a SyntaxError"
                     fix = "See raw_result for file:line:msg, fix it, and re-run preflight_review."
+                elif reason_kind == "release_metadata_unavailable":
+                    problem = "unavailable release metadata evidence, not a candidate verdict"
+                    fix = "Restore access to the sources named in raw_result and re-run preflight_review."
                 elif reason_kind == "release_metadata":
-                    problem = "release metadata preflight: version/README release carriers failed the deterministic check"
+                    problem = "release metadata preflight: inspect all findings with preflight_review(commit_message='...', deterministic_only=True, source='worktree' or 'index')"
                     fix = "See raw_result for the exact carrier mismatch, fix it, and re-run preflight_review."
                 else:
                     problem = "a deterministic preflight check (see raw_result for the exact cause)"
@@ -842,7 +833,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             )
         if latest and status == "parse_failure" and not stale_from_edit:
             suffix = (
-                regroup + " Or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+                open_review_work + " Or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
                 if (open_obs or open_debts)
                 else "Re-run: preflight_review(commit_message='...'), or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
             )
@@ -851,7 +842,7 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
             )
         if open_obs or open_debts:
             prefix = f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. " if stale_from_edit else "Advisory is stale or missing for the current snapshot. "
-            return _with_choices(prefix + _debt_hint() + regroup)
+            return _with_choices(prefix + _debt_hint() + open_review_work)
         if stale_from_edit:
             return _with_choices(
                 f"Advisory was invalidated by a worktree edit at {stale_from_edit_ts}. Complete ALL remaining edits, then run: preflight_review(commit_message='...')"
@@ -864,10 +855,10 @@ def _next_step_guidance(latest: Optional["AdvisoryRunRecord"], state: "AdvisoryR
     if open_obs or open_debts:
         if enforcement == "blocking":
             return _with_choices(
-                f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. Re-read the full diff, group obligations by root cause, and rewrite the plan. Fix the issues, re-run preflight_review so it marks them PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
+                f"Advisory is current but unresolved review debt remains. {_debt_hint()}commit_reviewed will be blocked until that debt is cleared. {REVIEW_REPAIR_JUDGMENT} Then re-run preflight_review so it can mark addressed items PASS, or bypass: commit_reviewed(skip_advisory_review=True) (audited)."
             )
         return _with_choices(
-            f"Advisory is current and unresolved review debt remains recorded durably. {_debt_hint()}Enforcement is advisory: you decide which findings to apply — commit_reviewed is available. Re-read the full diff, group obligations by root cause, and rewrite the plan; re-run preflight_review so addressed items are marked PASS."
+            f"Advisory is current and unresolved review debt remains recorded durably. {_debt_hint()}Enforcement is advisory: you decide which findings to apply — commit_reviewed is available. {REVIEW_REPAIR_JUDGMENT} Re-running preflight_review lets it mark addressed items PASS."
         )
 
     if latest and latest.status == "skipped":
@@ -948,6 +939,7 @@ def _advisory_pre_sdk_gate(
     paths: Optional[List[str]],
     skip_tests: bool,
     review_rebuttal: str = "",
+    prepared: bool = False,
 ):
     """Run cheap pre-SDK gates and return warnings/status/early JSON exit."""
     repo_key = make_repo_key(repo_dir)
@@ -1012,16 +1004,20 @@ def _advisory_pre_sdk_gate(
             ),
         })
 
-    release_preflight_err = _release_metadata_preflight(repo_dir, commit_message, paths)
+    release_preflight_err = (_release_metadata_preflight(repo_dir, commit_message, paths, source="index")
+                             if prepared else _release_metadata_preflight(repo_dir, commit_message, paths))
     if release_preflight_err:
+        from ouroboros.commit_admission import preflight_evidence_unavailable
+        unavailable = preflight_evidence_unavailable(release_preflight_err)
+        status = "error" if unavailable else "preflight_blocked"
         ctx.emit_progress_fn(release_preflight_err)
         _persist_preflight_record(
             ctx=ctx,
             snapshot_hash=snapshot_hash,
             commit_message=commit_message,
             record={
-                "status": "preflight_blocked",
-                "reason_kind": "release_metadata",
+                "status": status,
+                "reason_kind": "release_metadata_unavailable" if unavailable else "release_metadata",
                 "raw_result": release_preflight_err,
                 "paths": paths,
                 "duration_sec": 0.0,
@@ -1029,7 +1025,7 @@ def _advisory_pre_sdk_gate(
             },
         )
         return readiness_warnings, changed_files, _json_response({
-            "status": "preflight_blocked",
+            "status": status,
             "snapshot_hash": snapshot_hash,
             "error": release_preflight_err,
             "readiness_warnings": readiness_warnings,
@@ -1105,8 +1101,17 @@ def _handle_advisory_pre_review(
     skip_tests: bool = False,
     review_rebuttal: str = "",
     prepared: bool = False,
+    deterministic_only: bool = False,
+    source: str = "",
 ) -> str:
-    """Run an advisory pre-commit review through the configured read-only route."""
+    """Run release diagnostics or advisory review through the configured read-only route."""
+    if deterministic_only:
+        from ouroboros.commit_admission import release_metadata_diagnostics
+        if source not in ("worktree", "index"):
+            return _json_response({"status": "error", "failure_code": "PREFLIGHT_SOURCE_REQUIRED",
+                                   "message": "deterministic_only requires explicit source=worktree or source=index."})
+        return _json_response({**release_metadata_diagnostics(ctx.repo_dir, paths, source=source),
+                               "deterministic_only": True, "review_freshness": False})
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
     repo_dir = pathlib.Path(ctx.repo_dir)
     drive_root = pathlib.Path(ctx.drive_root)
@@ -1195,7 +1200,7 @@ def _handle_advisory_pre_review(
             commit_message=commit_message,
             paths=paths,
             skip_tests=skip_tests,
-            review_rebuttal=review_rebuttal,
+            review_rebuttal=review_rebuttal, prepared=prepared,
         )
         if early_exit is not None:
             return early_exit
@@ -1433,6 +1438,8 @@ def _preflight_review_params() -> dict:
             "scope": _schema_param("string", "Declared scope boundary. Issues outside scope are advisory-only."),
             "review_rebuttal": _schema_param("string", "Counter-argument to previous review findings, delivered in full to this preflight reviewer."),
             "paths": _schema_param("array", "Explicit list of changed file paths. Auto-detected from git status if omitted.", items={"type": "string"}),
+            "deterministic_only": _schema_param("boolean", "Only diagnose release metadata; requires explicit source. No sync, staging, tests, providers, review-state reads/writes or freshness. Returns all applicable findings and unavailable-source errors separately. Default: False.", default=False),
+            "source": _schema_param("string", "Required for deterministic_only: worktree reads current files; index reads staged blobs. Ignored for ordinary review (standalone uses worktree; prepared uses index).", enum=["worktree", "index"]),
             "skip_tests": _schema_param("boolean", "Skip the preflight pytest run. Default: False (tests run by default). Use True only for intentionally incomplete WIP code where test failures are expected. Tests are run before the paid critic call — in a hermetic worktree, as the same two passes CI runs (parallel 'not serial' then serial) — to catch broken code early and avoid wasting review budget.", default=False),
         },
         "required": ["commit_message"],
@@ -1445,11 +1452,14 @@ def _preflight_tool_timeout_sec() -> float:
     Tests precede the critic. Cover their resolved total plus the existing
     task/transport envelope; do not create or replace the critic's own deadline.
     """
-    from ouroboros.config import get_llm_transport_read_timeout_sec, get_task_abs_ceiling_sec
+    from ouroboros.config import (
+        get_llm_transport_read_timeout_sec, get_task_abs_ceiling_sec, operation_window_sec,
+    )
     from ouroboros.preflight_runner import _resolve_preflight_timeout
 
     grace = get_finalization_grace_sec()
-    review_envelope = max(get_task_abs_ceiling_sec(), get_llm_transport_read_timeout_sec() + grace)
+    review_envelope = max(operation_window_sec(get_task_abs_ceiling_sec()),
+                          get_llm_transport_read_timeout_sec() + grace)
     return _resolve_preflight_timeout() + review_envelope + grace
 
 
@@ -1463,7 +1473,8 @@ def get_tools() -> list:
                 "description": (
                     "Run the preflight pre-commit review (formerly `advisory_review`) "
                     "through the configured read-only route. "
-                    "Returns structured JSON findings; any edit afterward makes the result stale. "
+                    "Use deterministic_only=True with explicit source=worktree or index for release diagnostics without effects or review freshness. "
+                    "Ordinary review returns structured JSON findings; any edit afterward makes the result stale. "
                     f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} "
                     f"{_identical_diff_cap_note()}"
                 ),
@@ -1491,7 +1502,7 @@ def get_tools() -> list:
             schema={
                 "name": "review_status",
                 "description": (
-                    "Show recent advisory pre-review run history. Read-only diagnostic — use to check advisory freshness before commit_reviewed. Also shows: last commit attempt state (reviewing/blocked/succeeded/failed) with block reason and actionable guidance; whether advisory is stale because of a worktree edit; open obligations from previous blocking rounds; open commit-readiness debt (durable repo-scoped anti-thrashing signal with fields `commit_readiness_debts`, `commit_readiness_debts_count`); `repo_commit_ready` (an advisory-readiness projection only: a fresh/bypassed/skipped advisory and no open advisory obligations or debt, not the full commit gate); `retry_anchor` (non-null, currently `commit_readiness_debt`, when debt is open — start the next retry from that record instead of patching one obligation at a time); and a concrete next_step recommendation. "
+                    "Show recent advisory pre-review run history. Read-only diagnostic — use to check advisory freshness before commit_reviewed; deterministic-only release diagnostics confer no freshness and create no history. Also shows: last commit attempt state (reviewing/blocked/succeeded/failed) with block reason and actionable guidance; whether advisory is stale because of a worktree edit; open obligations from previous blocking rounds; open commit-readiness debt (durable repo-scoped anti-thrashing signal with fields `commit_readiness_debts`, `commit_readiness_debts_count`); `repo_commit_ready` (an advisory-readiness projection only: a fresh/bypassed/skipped advisory and no open advisory obligations or debt, not the full commit gate); `retry_anchor` (non-null, currently `commit_readiness_debt`, when debt is open — names the durable record that consolidates repeated blockers; how the next attempt uses it is the author's judgment); and a concrete next_step recommendation. "
                     f"{ADVISORY_REVIEW_CHOICE_GUIDANCE} "
                     "Pass include_raw=true to surface the full per-actor evidence (triad_raw_results, scope_raw_result) for the targeted attempt."
                 ),

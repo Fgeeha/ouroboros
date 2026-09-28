@@ -579,7 +579,7 @@ class TestGlobalOnlyTreeAccounting:
 
         monkeypatch.setattr(
             usage_accounting, "refresh_root_accounting",
-            lambda drive_root, root_task_id, max_age_sec: {"accounted_usd": 7.5, "root": root_task_id},
+            lambda drive_root, root_task_id, max_age_sec, strict=False: {"accounted_usd": 7.5, "root": root_task_id},
         )
         with usage_accounting.usage_scope(usage_accounting.UsageScope(
             drive_root=tmp_path, task_id="child", root_task_id="root1", global_limit_usd=100.0,
@@ -1023,7 +1023,8 @@ class TestWrapupAffordabilityRail:
         monkeypatch.setattr(
             "ouroboros.loop._loop_tree_accounting", lambda **_k: {"accounted_usd": 20.0},
         )
-        answers = iter((True, False, True, False, True, False))
+        # proxy, exact probe, prepared; then the fresh request's own admission at its own price.
+        answers = iter((True, False, True, False, True, False, True))
         monkeypatch.setattr(
             task_pacing, "wrapup_reservation_fits", lambda **_kwargs: next(answers),
         )
@@ -1042,9 +1043,12 @@ class TestWrapupAffordabilityRail:
             dispatched["messages"] = kwargs["initial_messages"]
             from ouroboros.llm import _attempt_request, _finalized_physical_candidate
             from ouroboros.request_wire_recovery import request_wire_call_scope
+            from ouroboros.send_clock import MainSendClock, stamp_clock_note
 
             target = ctx.llm._resolve_remote_target(ctx.active_model)
-            with request_wire_call_scope():
+            # The real Main send seals a FRESH clock line into this candidate
+            # (``send_clock``); the admission compares everything but its digits.
+            with MainSendClock(kwargs["send_clock_policy"]).bound(), request_wire_call_scope():
                 candidate = ctx.llm._build_remote_candidate(
                     target, kwargs["initial_messages"], ctx.active_effort,
                     built["request"].max_completion_tokens, "auto", None, ctx.tool_schemas,
@@ -1052,12 +1056,12 @@ class TestWrapupAffordabilityRail:
                 )
                 ctx.llm._normalize_payload_cache_ttl(target, candidate)
                 candidate = _finalized_physical_candidate(
-                    target, candidate,
+                    target, stamp_clock_note(candidate, blocks=target.get("provider") == "anthropic"),
                     "messages" if target.get("provider") == "anthropic" else "chat.completions",
                 )
-            actual = _attempt_request(target, candidate)
+                actual = _attempt_request(target, candidate)
             dispatched["accepted"] = kwargs["candidate_predicate"](actual)
-            dispatched["sha256"] = actual.candidate_raw_sha256
+            dispatched["sha256"] = actual.candidate_clock_free_sha256
             return {"content": "wrapped up"}, 0.0
 
         monkeypatch.setattr(loop_module, "call_llm_with_retry", call)
@@ -1067,7 +1071,7 @@ class TestWrapupAffordabilityRail:
         assert result is not None
         assert dispatched["messages"] is built["messages"]
         assert dispatched["accepted"] is True
-        assert dispatched["sha256"] == built["request"].candidate_raw_sha256
+        assert dispatched["sha256"] and dispatched["sha256"] == built["request"].candidate_clock_free_sha256
         assert built["messages"][0]["content"][1] == {
             "type": "text", "text": "[image caption: wire caption]",
         }

@@ -157,7 +157,8 @@ def test_provider_base_url_keys_apply_on_the_next_task_not_restart(monkeypatch, 
 
     for key in ("OPENAI_BASE_URL", "OPENAI_COMPATIBLE_BASE_URL",
                 "CLOUDRU_FOUNDATION_MODELS_BASE_URL", "MINIMAX_REGION",
-                "GIGACHAT_SCOPE", "GIGACHAT_BASE_URL", "GIGACHAT_VERIFY_SSL_CERTS"):
+                "GIGACHAT_SCOPE", "GIGACHAT_BASE_URL", "GIGACHAT_VERIFY_SSL_CERTS",
+                "OUROBOROS_EXTRA_CA_BUNDLE"):
         assert key not in _RESTART_REQUIRED_KEYS
     data = _save(monkeypatch, isolated_settings, {"OPENAI_BASE_URL": "https://example.test/v1"})
     assert not data.get("restart_required")
@@ -174,6 +175,25 @@ def test_consciousness_wake_bounds_apply_without_a_restart(monkeypatch, isolated
     data = _save(monkeypatch, isolated_settings, {"OUROBOROS_BG_WAKEUP_MIN": "1200", "OUROBOROS_BG_WAKEUP_MAX": "7200"})
     assert not data.get("restart_required")
     assert not ({"OUROBOROS_BG_WAKEUP_MIN", "OUROBOROS_BG_WAKEUP_MAX"} & set(data.get("restart_keys") or []))
+
+
+def test_unrelated_save_migrates_a_legacy_wakeup_min_to_the_effective_floor(
+    monkeypatch, isolated_settings,
+):
+    """A legacy 30-second raw value must not make an otherwise unrelated
+    Settings save fail HTML min=60 validation; the write carries the same
+    normalized value the runtime already uses, without changing it to 900."""
+    isolated_settings.write_text(json.dumps({
+        "OUROBOROS_BG_WAKEUP_MIN": 30,
+        "OUROBOROS_BG_WAKEUP_MAX": 7200,
+    }), encoding="utf-8")
+    _save(monkeypatch, isolated_settings, {"TOTAL_BUDGET": 123.0})
+    from ouroboros import config as cfg
+
+    persisted = json.loads(isolated_settings.read_text(encoding="utf-8"))
+    assert persisted["OUROBOROS_BG_WAKEUP_MIN"] == 60
+    assert persisted["OUROBOROS_BG_WAKEUP_MAX"] == 7200
+    assert cfg.load_settings()["OUROBOROS_BG_WAKEUP_MIN"] == 60
 
 
 def test_host_service_port_requires_a_restart(monkeypatch, isolated_settings):

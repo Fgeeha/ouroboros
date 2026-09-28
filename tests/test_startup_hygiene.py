@@ -256,11 +256,25 @@ def test_verify_restart_reports_corrupt_claim_json(tmp_path):
     assert events[-1]["error"] == "pending_restart_verify_invalid"
 
 
+def _known_evolution_controls(tmp_path):
+    """Seed a positively initialized, owner-authorized campaign fixture.
+
+    Missing state after #1307 is unknown, not proof the owner did not Stop.
+    Call this before any transaction/claim history is written.
+    """
+    from supervisor import state
+
+    state.init(tmp_path)
+    state.save_state({"owner_chat_id": 1, "evolution_mode_enabled": True,
+                      "evolution_owner_stopped": False})
+
+
 def test_verify_restart_closes_promoted_backlog_only_on_absorb(tmp_path):
     import ouroboros.improvement_backlog as ib
 
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
+    _known_evolution_controls(tmp_path)
     ib.append_backlog_items(tmp_path, [{
         "summary": "promoted fix", "category": "c", "source": "post_task",
         "evidence": "e", "fingerprint": "fp-x", "id": "ibl-x",
@@ -293,6 +307,7 @@ def test_verify_restart_absorb_persists_cycle_outcome_and_owner_report(tmp_path)
     """
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
+    _known_evolution_controls(tmp_path)
     (tmp_path / "state" / "pending_restart_verify.json").write_text(
         json.dumps({"expected_sha": "goodsha"}), encoding="utf-8")
     (tmp_path / "state" / "evolution_campaign.json").write_text(json.dumps({
@@ -319,6 +334,7 @@ def test_verify_restart_absorb_persists_cycle_outcome_and_owner_report(tmp_path)
 def test_verify_restart_rejects_stale_claim_against_active_evolution_transaction(tmp_path):
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
+    _known_evolution_controls(tmp_path)
     (tmp_path / "state" / "pending_restart_verify.json").write_text(
         json.dumps({"expected_sha": "oldsha"}),
         encoding="utf-8",
@@ -354,6 +370,7 @@ def test_verify_restart_rejects_stale_claim_against_active_evolution_transaction
 def test_verify_restart_reconciles_reachable_dangling_evolution_transaction(tmp_path, monkeypatch):
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
+    _known_evolution_controls(tmp_path)
     (tmp_path / "state" / "evolution_campaign.json").write_text(
         json.dumps({
             "status": "active",
@@ -397,6 +414,7 @@ def test_verify_restart_reconciles_reachable_dangling_evolution_transaction(tmp_
 def test_verify_restart_abandons_unreachable_dangling_evolution_transaction(tmp_path, monkeypatch):
     (tmp_path / "state").mkdir(parents=True)
     (tmp_path / "logs").mkdir(parents=True)
+    _known_evolution_controls(tmp_path)
     (tmp_path / "state" / "evolution_campaign.json").write_text(
         json.dumps({
             "status": "active",

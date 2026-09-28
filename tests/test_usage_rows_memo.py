@@ -192,7 +192,7 @@ def _install_full_read_counter(monkeypatch):
     return calls
 
 
-def test_warm_display_reads_do_zero_full_replays_cold_exactly_one(data_root, monkeypatch):
+def test_display_reads_share_writer_preparation_without_locked_full_replay(data_root, monkeypatch):
     reservation = ua.reserve_attempt(_request(data_root))
     ua.mark_dispatched(reservation)
     ua.settle_attempt(reservation, {"prompt_tokens": 5}, cost_usd=0.01, cost_final=True)
@@ -201,20 +201,20 @@ def test_warm_display_reads_do_zero_full_replays_cold_exactly_one(data_root, mon
     _clear_memo(data_root)
 
     ua.usage_projection(data_root)
-    assert calls["full"] == 1, "cold read must replay the ledger exactly once"
+    assert calls["full"] == 0, "cold display memo must reuse the prepared writer source"
     for _ in range(5):
         ua.usage_projection(data_root)
         ua.usage_breakdown(data_root)
         ua.usage_breakdown(data_root, task_id="child")
         ua.usage_projection(data_root, root_task_id="root")
-    assert calls["full"] == 1, "warm repeat display reads must do zero full replays"
+    assert calls["full"] == 0, "warm repeat display reads must do zero full replays"
 
     # A same-process append advances the memo incrementally on the next read,
     # and the write path itself reads through its warm in-lock cache (#129):
     # neither the write nor the display read after it adds a full replay.
     ua.release_attempt(ua.reserve_attempt(_request(data_root, task_id="next")))
     after_write = calls["full"]
-    assert after_write == 1, "warm write-path reads must not full-replay the ledger"
+    assert after_write == 0, "warm write-path reads must not full-replay the ledger"
     projection = ua.usage_projection(data_root)
     assert calls["full"] == after_write, "post-append display read must resume, not replay"
     assert projection["attempt_counts"]["released"] == 1

@@ -79,7 +79,7 @@ def _capture_failed_refusal(rid: str, cap_status: str, note: str) -> str:
 
 
 def _capture_at_disposition(
-    drive: Any, entry: Any, rid: str, manifest_path: pathlib.Path,
+    drive: Any, entry: Any, rid: str, manifest_path: pathlib.Path, decision: str = "apply",
 ) -> str:
     """Capture-on-demand (C1-R2) for a run that settled without terminal proof.
 
@@ -100,6 +100,20 @@ def _capture_at_disposition(
     """
     if entry.patch_captured and _manifest_capture_status(manifest_path) in _READY_CAPTURE_STATUSES:
         return ""
+    if str(decision or "").lower() == "reject":
+        try:
+            saved = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError, ValueError):
+            saved = {}
+        if (isinstance(saved, dict) and saved.get("status") == "failed"
+                and saved.get("authority_drift_source_status") == ARTIFACT_STATUS_READY_NO_CHANGES
+                and isinstance(saved.get("authority_drift"), dict)
+                and (saved.get("authority_drift", {}).get("paths")
+                     or saved.get("authority_drift", {}).get("error"))):
+            # The private snapshot is known to contain no child changes. A
+            # reject only discards that empty result, so it remains safe and
+            # prevents a neighboring edit from wedging custody forever.
+            return ""
     from ouroboros.tools.delegate_integration import capture_terminal_patch_for_drive
 
     try:
@@ -128,8 +142,9 @@ def _delegated_disposition_refusal(status: str, entry: Any, rid: str,
     if status != custody.OWNED or entry is None:
         return (
             f"⚠️ INTEGRATE_DELEGATED_NOT_OWNED: run {rid!r} is {status} to this task. "
-            "Only the task that started a delegated run may integrate its patch while that task "
-            "is LIVE; once the owner is terminal, a live TOP-LEVEL task whose active root (Git lane) "
+            "The starter or its host-confirmed retry successor may dispose a completed result; "
+            "retry authority does not include live control; once the owner is terminal, a live "
+            "TOP-LEVEL task whose active root (Git lane) "
             "or fresh payload binding (payload lane) is the run's recorded target — or contains it as "
             "a host-minted project tree — may dispose the orphan."
         )
@@ -279,6 +294,7 @@ def _drift_refusal(
 def _locked_apply(
     ctx: ToolContext, target: pathlib.Path, patch_path: pathlib.Path,
     ordered_touched: List[str], baseline_sha: str, *, file_changes=None, file_baseline=None,
+    admission_check=None,
 ) -> Dict[str, Any]:
     """Apply one captured patch under the repo git lock — mechanics only.
 
@@ -323,6 +339,9 @@ def _locked_apply(
             except Exception as exc:
                 result["drift_error"] = f"file results could not be prepared: {type(exc).__name__}: {exc}"
                 return result
+        if admission_check and (refusal := admission_check()):
+            result["admission_refusal"] = refusal
+            return result
         # WORKING-TREE apply, not --3way/--index: the baseline deliberately
         # snapshots the target's DIRTY state (that is the whole point of C1), so the
         # patch's preimage is the live working tree — while `--3way` implies index
@@ -395,6 +414,64 @@ def _integrate_delegated_patch(
     acknowledge_ambiguous: bool = False,
     paths: List[str] | None = None,
 ) -> str:
+    """Serialize a captured run's disposition across owners and retry successors.
+
+    The canonical capture address keeps every caller on the same lock even with
+    separate task drives. Admission is repeated inside it; a stale custody object
+    must never authorize a second materialization or an obsolete starter.
+    """
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_shared import orphan_disposition_status
+    from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
+
+    rid = str(run_id or "").strip()
+    if not rid:
+        return "⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): run_id is required."
+    decision = str(decision or "apply").strip().lower()
+    if decision not in {"apply", "reject"}:
+        return "⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): decision must be 'apply' or 'reject'."
+    drive = custody.custody_root(ctx)
+    status, entry, _ = orphan_disposition_status(ctx, drive, rid)
+    if status != custody.OWNED or entry is None:
+        return _delegated_disposition_refusal(status, entry, rid, acknowledge_ambiguous)
+    lock_path = custody.delegated_capture_dir(
+        drive, entry.task_id, entry.snapshot_id or rid) / "disposition.lock"
+    try:
+        lock_fd = acquire_exclusive_file_lock(lock_path, timeout_sec=20.0, owner_aware_stale=True)
+    except Exception as exc:
+        return f"⚠️ INTEGRATE_LOCK_TIMEOUT: could not lock the captured result: {type(exc).__name__}: {exc}."
+    if lock_fd is None:
+        return "⚠️ INTEGRATE_LOCK_TIMEOUT: another disposition holds this captured result; retry after it completes."
+    try:
+        result = _integrate_delegated_patch_locked(ctx, rid, decision, reason, acknowledge_ambiguous, paths)
+        from ouroboros.delegate_terminal import refresh_disposed_reconciliation
+
+        try:
+            refresh_disposed_reconciliation(drive, rid, reader_task_id=str(getattr(ctx, "task_id", "") or ""))
+        except Exception:
+            log.warning("Disposed custody disclosure refresh failed for run %s", rid, exc_info=True)
+        return result
+    finally:
+        release_exclusive_file_lock(lock_path, lock_fd)
+
+
+def _current_disposition_refusal(ctx: ToolContext, rid: str) -> str:
+    """Revalidate authority after capture/preparation, allowing this call's intent."""
+    from ouroboros import delegate_custody as custody
+    from ouroboros.delegate_shared import orphan_disposition_status
+
+    status, entry, _ = orphan_disposition_status(ctx, custody.custody_root(ctx), rid)
+    return _delegated_disposition_refusal(status, entry, rid, acknowledge_ambiguous=True)
+
+
+def _integrate_delegated_patch_locked(
+    ctx: ToolContext,
+    run_id: str = "",
+    decision: str = "apply",
+    reason: str = "",
+    acknowledge_ambiguous: bool = False,
+    paths: List[str] | None = None,
+) -> str:
     """The C1 explicit acceptance seam: apply or reject ONE delegated run's captured patch.
 
     A mutating delegated run executed in a PRIVATE execution snapshot; its diff was
@@ -414,12 +491,7 @@ def _integrate_delegated_patch(
     from ouroboros import delegate_custody as custody, delegate_source_coverage
     from ouroboros.delegate_shared import orphan_disposition_status
 
-    rid = str(run_id or "").strip()
-    if not rid:
-        return "⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): run_id is required."
-    decision = str(decision or "apply").strip().lower()
-    if decision not in {"apply", "reject"}:
-        return "⚠️ TOOL_ARG_ERROR (integrate_delegated_patch): decision must be 'apply' or 'reject'."
+    rid = run_id
     drive = custody.custody_root(ctx)
     status, entry, orphan_of = orphan_disposition_status(ctx, drive, rid)
     orphan_note = f"(orphan of terminal task {orphan_of}) " if orphan_of else ""
@@ -436,7 +508,8 @@ def _integrate_delegated_patch(
             with read_owned_gateway() as gateway:
                 return integrate_directory_result(ctx, entry, decision, reason, gateway,
                                                   acknowledge_ambiguous=acknowledge_ambiguous,
-                                                  paths=paths, orphan=bool(orphan_of))
+                                                  paths=paths, orphan=bool(orphan_of),
+                                                  admission_check=lambda: _current_disposition_refusal(ctx, rid))
         except Exception as exc:
             return f"⚠️ INTEGRATE_DELEGATED_APPLY_UNCONFIRMED: {type(exc).__name__}: {exc}. Retain this run; no replacement was started."
     # Directory selections have their own semantics. On whole-capture paths,
@@ -452,9 +525,11 @@ def _integrate_delegated_patch(
     cap_dir = custody.delegated_capture_dir(drive, entry.task_id, snapshot_key)
     manifest_path = cap_dir / "workspace_patch.json"
     patch_path = cap_dir / "workspace.patch"
-    capture_refusal = _si()._capture_at_disposition(drive, entry, rid, manifest_path)
+    capture_refusal = _si()._capture_at_disposition(drive, entry, rid, manifest_path, decision)
     if capture_refusal:
         return capture_refusal
+    if refusal := _current_disposition_refusal(ctx, rid):
+        return refusal
     manifest: Dict[str, Any] = {}
     if manifest_path.exists():
         try:
@@ -506,8 +581,17 @@ def _integrate_git_capture(ctx, entry, decision, reason, manifest, cap_dir, orph
 
     capture_status = str(manifest.get("status") or "")
     if decision == "reject":
-        # A reject RELEASES the snapshot (the child's only copy): ready-only.
-        if capture_status not in _READY_CAPTURE_STATUSES:
+        drifted_no_change = (
+            capture_status == "failed"
+            and manifest.get("authority_drift_source_status") == ARTIFACT_STATUS_READY_NO_CHANGES
+            and isinstance(manifest.get("authority_drift"), dict)
+            and (manifest["authority_drift"].get("paths")
+                 or manifest["authority_drift"].get("error"))
+        )
+        # A reject releases a ready capture. It may also release a failed
+        # no-change capture whose only private fact is the durable authority
+        # drift record: there are no child bytes to discard in that shape.
+        if capture_status not in _READY_CAPTURE_STATUSES and not drifted_no_change:
             return _capture_failed_refusal(
                 rid, capture_status, "a reject would release the snapshot over it")
         verdict_path = _si()._write_verdict(
@@ -623,7 +707,12 @@ def _integrate_git_capture(ctx, entry, decision, reason, manifest, cap_dir, orph
         from ouroboros.subagent_worktrees import find_execution_snapshot
         snapshot = find_execution_snapshot(entry.snapshot_id) or {}
         file_options = {"file_changes": file_changes, "file_baseline": snapshot.get("file_baseline") or {}}
-    outcome = _si()._locked_apply(ctx, target, patch_path, ordered_touched, entry.baseline_sha, **file_options)
+    outcome = _si()._locked_apply(
+        ctx, target, patch_path, ordered_touched, entry.baseline_sha,
+        admission_check=lambda: _current_disposition_refusal(ctx, rid), **file_options)
+    if outcome.get("admission_refusal"):
+        custody.record_patch_apply_resolved(drive, entry, reason="authority_changed")
+        return outcome["admission_refusal"]
     if outcome.get("lock_error"):
         custody.record_patch_apply_resolved(drive, entry, reason="lock_error")
         return (

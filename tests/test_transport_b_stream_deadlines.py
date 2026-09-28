@@ -948,19 +948,24 @@ def test_late_complete_stream_settles_original_attempt(isolated, monkeypatch):
     assert [row["state"] for row in rows(isolated)] == ["reserved", "dispatched", "settled"]
 
 
-def test_cancelled_control_during_recovery_keeps_paid_custody(isolated, monkeypatch):
+def test_cancelled_control_during_recovery_keeps_paid_custody(isolated):
     reason = [None]
-    owner = SimpleNamespace(control_reason=lambda: reason[0])
-    monkeypatch.setattr(model_wait, "current_model_wait", lambda: owner)
     calls = []
     def send(**kw):
         calls.append(kw)
         reason[0] = "cancelled"
         raise Rejected("temperature unsupported")
-    with pytest.raises(PhysicalDispatchInterrupted) as caught:
-        run_driver(send, payload(temperature=0.2), target())
+    with model_wait.task_model_wait_scope(
+        task={"id": "stream-task"}, drive_root=isolated, event_queue=None,
+        worker_slot_held=False, owner_control=lambda: reason[0],
+    ) as owner:
+        assert owner.control_reason() is None
+        with pytest.raises(PhysicalDispatchInterrupted) as caught:
+            run_driver(send, payload(temperature=0.2), target())
+        assert owner.control_reason() == "cancelled"
     assert len(calls) == 1 and caught.value.control_reason == "cancelled"
     assert caught.value.physical_attempt_capture.state == "unresolved"
+    assert [row["state"] for row in rows(isolated)] == ["reserved", "dispatched", "unresolved"]
 
 
 @pytest.mark.parametrize("no_proxy", [False, True])

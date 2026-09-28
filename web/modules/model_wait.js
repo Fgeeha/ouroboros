@@ -50,10 +50,12 @@ export function mergeModelWaits(previous = {}, incoming = {}) {
 }
 
 export function activeModelWaits(waits = {}, finished = false, currentAttempt = 0) {
-    if (finished) return [];
     const rows = Object.values(waits);
     const attempt = currentAttempt || Math.max(0, ...rows.map((row) => row.task_attempt));
-    return rows.filter((row) => row.state === 'waiting' && row.task_attempt === attempt);
+    return rows.filter((row) => row.state === 'waiting' && row.task_attempt === attempt
+        && (!finished || (row.review_operation?.owner_id
+            && row.review_operation.owner_id === row.model_wait_owner_id
+            && row.review_operation.retry_key && row.review_operation.slot_id)));
 }
 
 export function modelWaitAction(taskId, row, action, fields, requestId) {
@@ -102,7 +104,7 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
             // A block without work carries no title placeholder while it waits: the chrome
             // follows the work it stands on, never the lane (and no lane is always shown).
             const phase = desiredLiveCardPhase(record);
-            setLiveCardPhase(record, phase.phase, phase.text, phase.className);
+            setLiveCardPhase(record, phase.phase, phase.text, phase.className, phase.secondary);
         }
         onChange(taskId, waiting);
     }
@@ -165,25 +167,26 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
         if (taskOnlyLocal) persist.checked = false;
         node.querySelector('[data-wait-scope]').textContent = taskOnlyLocal
             ? 'Local applies to all fallbacks in Settings. This change is task-only; edit Models for a permanent change.'
-            : 'This role changes until the task ends.';
+            : row.review_operation ? 'This role changes for this review operation.' : 'This role changes until the task ends.';
     }
 
     function paint(taskId) {
         if (destroyed) return false;
         const task = tasks.get(taskId);
         if (!task) return false;
-        const active = activeModelWaits(task.waits, task.finished, task.attempt);
+        const record = getRecord(taskId, false);
+        const active = activeModelWaits(task.waits, task.finished || record?.finished, task.attempt);
         if (!active.length) { clearViews(task); syncPhase(taskId, false); return true; }
-        const record = getRecord(taskId);
-        if (!record?.root || record.finished) { clearViews(task); return false; }
-        if (task.host?.parentElement !== record.root) {
+        const card = record || getRecord(taskId);
+        if (!card?.root) { clearViews(task); return false; }
+        if (task.host?.parentElement !== card.root) {
             if (!task.host) {
                 task.host = getDoc().createElement('section');
                 task.host.className = 'model-waits';
                 task.host.setAttribute('aria-label', 'Subscription access');
                 task.host.innerHTML = '<div data-wait-rows></div><div class="model-wait-footnote" data-wait-slot></div>';
             }
-            record.timelineEl.before(task.host);
+            card.timelineEl.before(task.host);
             const focused = task.focused;
             task.focused = null;
             if (focused) requestAnimationFrame(() => {
@@ -219,7 +222,6 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
             ...Object.values(next).map((row) => row.task_attempt));
         const attemptChanged = nextAttempt > task.attempt;
         if (attemptChanged) { task.attempt = nextAttempt; task.finished = false; }
-        if (task.finished) return false;
         if (!attemptChanged && task.host?.isConnected && Object.keys(next).every((id) => next[id] === task.waits[id])) return false;
         task.waits = next;
         return onDomWrite(() => paint(taskId));
@@ -347,8 +349,9 @@ export function createModelWaitController({ getRecord, onDomWrite = (fn) => fn()
             const attempt = Number.isInteger(value?.task_attempt) ? value.task_attempt : 0;
             if (attempt && attempt < (tasks.get(taskId)?.attempt || 0)) return false;
             if (taskId && taskDoneIsTerminal(value)) {
-                if (value?.model_waits || isModelWaitReference(value)) taskEntry(taskId);
-                this.finish(taskId); return false;
+                const changed = adopt(taskId, value?.model_waits || (isModelWaitReference(value) && value.wait_id
+                    ? { [value.wait_id]: value } : {}), attempt);
+                this.finish(taskId); return changed;
             }
             if (value?.model_waits) return adopt(taskId, value.model_waits, attempt);
             if (isModelWaitReference(value) && value.wait_id) return adopt(taskId, { [value.wait_id]: value }, attempt);

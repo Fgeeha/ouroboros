@@ -10,7 +10,7 @@ export function clientSurfaceField() {
 
 export function clientSurfaceSnapshot() {
     try {
-        return {
+        const snapshot = {
             pywebview: Boolean(window.pywebview?.api),
             ua: String(navigator.userAgent || ''),
             viewport: { w: Number(window.innerWidth) || 0, h: Number(window.innerHeight) || 0 },
@@ -18,7 +18,21 @@ export function clientSurfaceSnapshot() {
             coarse_pointer: window.matchMedia('(pointer: coarse)').matches,
             captured_at: new Date().toISOString(),
         };
+        // The sender's IANA zone: the host names it beside UTC in Main's clock line
+        // (owner 7A). A browser that cannot report one sends none — never a guess.
+        const timezone = sendingTimeZone();
+        if (timezone) snapshot.timezone = timezone;
+        return snapshot;
     } catch {
         return null;  // absence is an honest gap; never a guessed default
+    }
+}
+
+function sendingTimeZone() {
+    try {
+        const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+        return typeof zone === 'string' ? zone : '';
+    } catch {
+        return '';
     }
 }

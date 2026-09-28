@@ -170,7 +170,7 @@ def _build_recent_tool_trace(
 
 def _maybe_inject_self_check(
     round_idx: int,
-    max_rounds: int,
+    max_rounds: Optional[int],
     messages: List[Dict[str, Any]],
     accumulated_usage: Dict[str, Any],
     emit_progress: Callable[[str], None],
@@ -181,9 +181,11 @@ def _maybe_inject_self_check(
     cost_ceiling: Optional["task_pacing.CostCeiling"] = None,
     llm_trace: Optional[Dict[str, Any]] = None,
 ) -> bool:
-    """Inject a normal user-turn self-check and emit one checkpoint event."""
+    """Inject a normal user-turn self-check and emit one checkpoint event. Without a round
+    limit (``max_rounds is None``) it names the rounds used and no invented remainder."""
     REMINDER_INTERVAL = 15
-    if round_idx <= 1 or round_idx % REMINDER_INTERVAL != 0 or round_idx >= max_rounds:
+    if (round_idx <= 1 or round_idx % REMINDER_INTERVAL != 0
+            or (max_rounds is not None and round_idx >= max_rounds)):
         return False
     # Non-incrementing round re-entries (e.g. free redials): one self-check per round.
     if accumulated_usage.get("_self_check_round") == round_idx:
@@ -216,10 +218,13 @@ def _maybe_inject_self_check(
 
     tool_trace = _build_recent_tool_trace(messages, llm_trace=llm_trace)
 
+    round_text, remaining_text = f"round {round_idx}", ""
+    if max_rounds is not None:
+        round_text += f"/{max_rounds}"
+        remaining_text = f" | Rounds remaining: {max_rounds - round_idx}"
     reminder = (
-        f"[CHECKPOINT {checkpoint_num} — round {round_idx}/{max_rounds}]\n"
-        f"Context: ~{ctx_tokens} tokens | Cost so far: {cost_text} | "
-        f"Rounds remaining: {max_rounds - round_idx}\n"
+        f"[CHECKPOINT {checkpoint_num} — {round_text}]\n"
+        f"Context: ~{ctx_tokens} tokens | Cost so far: {cost_text}{remaining_text}\n"
         f"{tree_line}"
     )
     if tool_trace:
@@ -329,6 +334,37 @@ def _maybe_inject_cost_budget_milestone(
     return True
 
 
+def _own_round_cost_sentence(ctx: Any, cost: float) -> tuple[str, str]:
+    """The reminder's money sentence from COST EVIDENCE first: a positive priced
+    delta (provider-reported or estimated cost of the nanny's own rounds) is
+    metered money; no price is an unknown cash cost, never zero. The latest round's
+    route is named only as context, and a fallback clause appears only when a
+    fallback chain is actually configured (a paid round is no proof the next is)."""
+    usage = getattr(ctx, "_accumulated_usage", None)
+    meta = usage.get("_last_llm_call_meta") if isinstance(usage, dict) else None
+    meta = meta if isinstance(meta, dict) else {}
+    model = str(meta.get("resolved_model") or meta.get("model") or "")
+    route = " / ".join(item for item in (str(meta.get("provider") or ""), model) if item)
+    if cost > 0:
+        cost_class, sentence = "priced", (
+            "Your own rounds here reported a price, so that spend is metered money")
+    else:
+        cost_class, sentence = "unpriced", (
+            "No provider price reached this task for your own rounds here: an unknown "
+            "cash cost, not a zero one")
+    sentence += f" (latest round: {route})." if route else "."
+    try:
+        from ouroboros.model_slots import get_fallback_models
+
+        fallbacks = get_fallback_models(str(meta.get("model") or ""))
+    except Exception:
+        fallbacks = []
+    if fallbacks:
+        sentence += (f" If this route stops serving, the configured fallback ({', '.join(fallbacks[:3])}) "
+                     "may take over, and a fallback round may be metered.")
+    return cost_class, sentence
+
+
 def _maybe_inject_nanny_economics_reminder(
     round_idx: int,
     messages: List[Dict[str, Any]],
@@ -373,13 +409,13 @@ def _maybe_inject_nanny_economics_reminder(
     # BR1-3: never an unconditional "$0" claim — the owner's wording law is
     # typed cost classes: known-zero only on a settled $0 spend, never "free"
     # unqualified (estimated/undisclosed spend is never zero).
+    cost_class, cost_sentence = _own_round_cost_sentence(ctx, cost)
     reminder = (
         "[NANNY ECONOMICS REMINDER]\n"
         f"You are a harness-dispatched NANNY and you have spent {_nanny_burn_phrase(rounds, cost)} "
         f"{since_phrase}. A subscription-lane delegated run has known-zero "
         "marginal cost only when its settled spend reports $0 (estimated or "
-        "undisclosed spend is never zero); every round you think yourself is "
-        "metered API money.\n"
+        f"undisclosed spend is never zero). {cost_sentence}\n"
         "This is a reminder, not a stop. Consider: delegate the remaining work "
         "(delegate_start / delegate_wait — follow-up work and fixes are delegated too), "
         "and keep your own rounds for judgment: acceptance, integration, honest "
@@ -395,6 +431,7 @@ def _maybe_inject_nanny_economics_reminder(
         "round": round_idx,
         "metered_rounds_since_delegate_activity": rounds,
         "metered_cost_since_delegate_activity_usd": round(cost, 4),
+        "own_round_cost_class": cost_class,
     })
     return True
 
@@ -402,7 +439,7 @@ def _maybe_inject_nanny_economics_reminder(
 def _inject_round_checkpoints(
     *,
     round_idx: int,
-    max_rounds: int,
+    max_rounds: Optional[int],
     messages: List[Dict[str, Any]],
     accumulated_usage: Dict[str, Any],
     emit_progress: Callable[[str], None],
@@ -648,6 +685,52 @@ def _maybe_inject_finalization_nudges(
         emit_progress(note)
         llm_trace["reasoning_notes"].append(note)
         return True
+
+    # A host-driven route change hands an already-active authoring turn to a
+    # new model.  The successor sees the canonical transcript, but without this
+    # typed reminder its first short status response can look like an ordinary
+    # final.  One recovery round is bounded by the existing loop/deadline/budget
+    # rails; a second tool-less response is retained with a degraded execution
+    # fact rather than silently painting a clean Done.
+    handover = (getattr(tools._ctx, "_authoring_handover", None)
+                or llm_trace.get("authoring_handover_incomplete"))
+    if isinstance(handover, dict):
+        baseline = int(handover.get("tool_calls_at_handover") or 0)
+        current = len(llm_trace.get("tool_calls") or [])
+        if current > baseline:
+            handover["status"] = "recovered"
+            incomplete = llm_trace.pop("authoring_handover_incomplete", None)
+            if isinstance(incomplete, dict):
+                incomplete["status"] = "recovered"
+            tools._ctx._authoring_handover = None
+            usage = getattr(tools._ctx, "_accumulated_usage", {})
+            if usage.get("reason_code") == "authoring_handover_incomplete":
+                usage.pop("execution_status", None)
+                usage.pop("reason_code", None)
+        elif baseline > 0 and content and str(content).strip():
+            if not bool(handover.get("recovery_prompted")):
+                handover["recovery_prompted"] = True
+                from_model = str(handover.get("from_model") or "the previous model")
+                to_model = str(handover.get("to_model") or "the current model")
+                return _inject(
+                    f"A host-driven model handover occurred ({from_model} → {to_model}) "
+                    "after the previous model had already used tools. Continue the owner's "
+                    "open task from the preserved plan and tool results. Use tools for the "
+                    "next substantive step or state a concrete blocker; do not stop at a "
+                    "work-in-progress status update.",
+                    "Authoring handover recovery nudge injected before final response.",
+                )
+            tools._ctx._authoring_handover = None
+            handover["status"] = "incomplete"
+            handover["incomplete_observed"] = True
+            usage = getattr(tools._ctx, "_accumulated_usage", None)
+            if isinstance(usage, dict):
+                usage["execution_status"] = "degraded"
+                usage["reason_code"] = "authoring_handover_incomplete"
+            llm_trace["authoring_handover_incomplete"] = handover
+            # Existing one-shot readiness/verification nudges and acceptance
+            # can still continue the task. Later tool work heals only this
+            # warning; the history row retains the handover and its recovery.
 
     if (getattr(tools._ctx, "_nanny_route_dispatched", False)
             and not getattr(tools._ctx, "_nanny_finalization_injected", False)):

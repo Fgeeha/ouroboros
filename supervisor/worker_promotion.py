@@ -147,8 +147,12 @@ def _canonical_promoted_repair_constraint(value: Any) -> tuple[Optional[dict], s
     }, ""
 
 
-def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
-    """Fail closed if a promoted id is already live, durable, or uncheckable."""
+def _promote_duplicate_reason(task_id: str, ctx: Any, *, admission_token: str) -> str:
+    """Fail closed if a promoted id is already live, durable, or uncheckable.
+
+    A row that is only THIS admission's emitted stub (#1160) is its own
+    pre-receipt, not a second owner of the id, so it is read around here.
+    """
     pending = getattr(ctx, "PENDING", _pool().PENDING)
     running = getattr(ctx, "RUNNING", _pool().RUNNING)
     with _queue_lock:
@@ -157,12 +161,14 @@ def _promote_duplicate_reason(task_id: str, ctx: Any) -> str:
             for row in list(pending or [])
         ) or task_id in (running or {})
     try:
+        from ouroboros.routing_wait import is_own_admission_stub
         from ouroboros.task_results import load_task_result
 
-        stored_duplicate = bool(
-            load_task_result(
-                getattr(ctx, "DRIVE_ROOT", _pool().DRIVE_ROOT), task_id, strict=True,
-            )
+        stored = load_task_result(
+            getattr(ctx, "DRIVE_ROOT", _pool().DRIVE_ROOT), task_id, strict=True,
+        )
+        stored_duplicate = bool(stored) and not is_own_admission_stub(
+            stored, admission_token,
         )
     except Exception:
         log.warning("promote: duplicate-id lookup failed for %s", task_id, exc_info=True)
@@ -175,6 +181,13 @@ def _promoted_force_plan_metadata(evt: dict) -> dict:
         return {}
     source = str(evt.get("force_plan_source") or "operator").strip() or "operator"
     return {"metadata": {"force_plan": True, "force_plan_source": source}}
+
+
+def _presence_promotion(evt: dict) -> bool:
+    """A promote carrying Presence authority: a speaker's, or a delegated descendant's binding."""
+    from ouroboros.dialogue_provenance import presence_root_carrier
+
+    return bool(presence_root_carrier(evt, task_contract=evt.get("task_contract")))
 
 
 def _promote_project_scope(evt: dict) -> str:
@@ -193,7 +206,7 @@ def _promote_project_scope(evt: dict) -> str:
     cannot choose a Project. Fail-open: an unreadable store leaves the scope exactly
     as the event stated it."""
     explicit = str(evt.get("project_id") or "")
-    if explicit or evt.get("presence") or not isinstance(evt.get("source_ref"), dict):
+    if explicit or _presence_promotion(evt) or not isinstance(evt.get("source_ref"), dict):
         return explicit
     try:
         from ouroboros.projects_registry import origin_claim_lock, project_id_for_origin
@@ -405,7 +418,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         return {"status": "needs_manual_target", "reason": "empty_objective", "task_id": tid}
     # Reject before project/source/workspace side effects. enqueue_task repeats
     # the check atomically for the tiny race before queue insertion.
-    duplicate_reason = _promote_duplicate_reason(tid, ctx)
+    duplicate_reason = _promote_duplicate_reason(tid, ctx, admission_token=admission_token)
     if duplicate_reason:
         return {
             "status": "needs_manual_target",
@@ -421,7 +434,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
     # assignment below turns that answer into the event's stated scope.
     implicit_scope = (
         not str(evt.get("project_id") or "")
-        and not evt.get("presence")
+        and not _presence_promotion(evt)
         and isinstance(evt.get("source_ref"), dict)
     )
     effective_pid = evt["project_id"] = _promote_project_scope(evt)
@@ -460,6 +473,8 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         "title": title,
         "suggested_name": suggested_name,
         "source": "promote_chat_to_task",
+        "objective_author": dict(evt.get("objective_author") or {}),
+        "owner_corpus": list(evt.get("owner_corpus") or []),
         "_require_unique_task_id": True,
         "_require_worker_pool": True,
         "_admission_token": admission_token,
@@ -510,6 +525,12 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         task["origin_message_ref"] = dict(evt["source_ref"])
         if isinstance(evt.get("source_text"), str) and evt.get("source_text"):
             task["origin_message_text"] = evt["source_text"]
+    elif evt.get("origin_suppressed") is True:
+        # The door's other stamp (an owner message it never logged) rides the root
+        # in METADATA, where run_origin reads it, the way a ref rides by value.
+        task.setdefault("metadata", {})["origin_suppressed"] = True
+    if task.get("objective_author"):
+        task.setdefault("metadata", {})["objective_author"] = dict(task["objective_author"])
     if isinstance(evt.get("predecessor_authority_source"), dict):
         task["predecessor_authority_source"] = dict(evt["predecessor_authority_source"])
     # Owner Surface Fact: the promoting turn's sending-surface fact lands in
@@ -656,7 +677,7 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         workspace_repair_hint,
     )
 
-    if task.get("_presence_origin"):
+    if _presence_promotion(evt):
         # Keep the admitted folder from the inherited contract, never a public
         # event's replacement. Presence retains its canonical shared memory.
         workspace = task["task_contract"].get("workspace") or {}
@@ -732,6 +753,17 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         explicit_workspace=str(evt.get("workspace_root") or "").strip(),
         workspace_sentinel=str(evt.get("workspace") or ""),
     )
+    # The resource CHOICE (#1315), stamped where it is known so a follow-up carries it by
+    # value: the room's default folder, an explicit folder, an explicit "no folder", or
+    # ordinary self-work over the system repository.
+    explicit_root = bool(str(evt.get("workspace_root") or "").strip())
+    opted_out = str(evt.get("workspace") or "").strip().lower() == WORKSPACE_NONE
+    stamped = evt.get("resource_intent") if isinstance(evt.get("resource_intent"), dict) else {}
+    task.setdefault("metadata", {})["resource_intent"] = (
+        {"kind": "system_repo"} if stamped.get("kind") == "system_repo" or not (pid or explicit_root)
+        else {"kind": "explicit_resource", "root": resolved_ws} if explicit_root
+        else {"kind": "explicit_none", "project_id": pid} if opted_out
+        else {"kind": "room_default", "project_id": pid})
     if ws_error:
         return {
             "status": "needs_manual_target", "reason": "workspace_unusable", "task_id": tid,
@@ -744,6 +776,18 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
         task["workspace_root"] = resolved_ws
         task["workspace_mode"] = "external"
         task["memory_mode"] = "forked"
+        if pid and str(evt.get("workspace_root") or "").strip():
+            # An explicit folder for a room that has none yet becomes the room's
+            # folder: the same validated canonical path this task runs in, written
+            # only while `working_dir` is still empty (compare-and-set under the
+            # registry lock), so a set value is never overwritten and the room's
+            # later direct turns are not blind to where the work went.
+            try:
+                from ouroboros.projects_registry import update_project
+
+                update_project(_pool().DRIVE_ROOT, pid, working_dir=resolved_ws, only_if_empty=("working_dir",))
+            except Exception:
+                log.warning("promote: could not record working_dir for project %s", pid, exc_info=True)
         # The lease lane keys off task["project_id"]: for a project room it is already
         # set; for a bare workspace promote, resolve it (registry-first → derived hash)
         # so one folder is one serialized lane on EVERY entry path (slice 0 invariant).
