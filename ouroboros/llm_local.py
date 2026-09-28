@@ -282,6 +282,10 @@ class _LocalLaneMixin:
         client = self._get_local_client()
         local_target, candidate = self._build_local_candidate(
             messages, tools, max_tokens, tool_choice, timeout, processing_preference, context_mode)
+        # The shared finalizer removes SDK transport options from the measured
+        # and sealed payload. Preserve the builder's positive caller override
+        # separately for the actual send, including chat_async's local thread.
+        transport_kwargs = {"timeout": candidate["timeout"]} if "timeout" in candidate else {}
         local_target["requested_reasoning_effort"] = reasoning_effort
         from ouroboros.send_clock import stamp_clock_note
 
@@ -312,7 +316,7 @@ class _LocalLaneMixin:
 
             resp = _execute_candidate(
                 request,
-                lambda: client.chat.completions.create(**candidate),
+                lambda: client.chat.completions.create(**candidate, **transport_kwargs),
                 check_instance,
             )
         except UsageAccountingError:

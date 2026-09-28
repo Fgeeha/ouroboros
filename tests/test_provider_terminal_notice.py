@@ -254,7 +254,7 @@ def test_failed_round_route_never_borrows_the_previous_applied_options(tmp_path,
 
     def served(route, requested, applied):
         return {"role": "assistant", "content": "done"}, {"claudexor": {
-            "route": dict(route), "options_honored": "mismatch",
+            "route": dict(route), "applied_options_source": "provider_response",
             "requested_options": {"reasoningEffort": requested},
             "applied_options": {"reasoningEffort": applied}}}
 
@@ -278,7 +278,9 @@ def test_failed_round_route_never_borrows_the_previous_applied_options(tmp_path,
     rows = [json.loads(line) for line in (logs / "events.jsonl").read_text().splitlines()]
     rounds = [row for row in rows if row.get("type") == "llm_round"]
     assert [row["claudexor"]["route"] for row in rounds] == [route_a, route_b]
+    assert [row["claudexor"]["requested_options"]["reasoningEffort"] for row in rounds] == ["xhigh", "high"]
     assert [row["claudexor"]["applied_options"]["reasoningEffort"] for row in rounds] == ["low", "medium"]
+    assert all(row["claudexor"]["applied_options_source"] == "provider_response" for row in rounds)
 
 
 def test_mismatch_round_never_calls_the_one_argument_tool_context_emitter(tmp_path, monkeypatch):

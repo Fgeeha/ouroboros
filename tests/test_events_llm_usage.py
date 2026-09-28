@@ -327,7 +327,8 @@ def test_llm_usage_serializer_carries_web_search_sources():
     assert "web_search_sources" in src
 
 
-def test_effort_facts_survive_durable_and_live_logs_without_notices(tmp_path):
+def test_effort_facts_with_legacy_option_status_survive_logs_without_notices(tmp_path):
+    """An old option_status stays in both logs without creating a notice."""
     from types import SimpleNamespace
     from supervisor import events
 

@@ -835,14 +835,18 @@ def _classify_action(
         from ouroboros.config import effort_one_step_down, effort_rank
         if current_effort in evidence.allowed:
             return None  # This constraint does not reject the candidate's value.
-        supported = [t for t in evidence.allowed if effort_rank(t) >= effort_rank("low")]
+        # Any positively advertised reasoning tier is comparable, minimal
+        # included; "none" disables reasoning and unknown tokens have no rank.
+        supported = [t for t in evidence.allowed if effort_rank(t) >= effort_rank("minimal")]
         prescribed = [t for t in supported if effort_rank(t) < effort_rank(current_effort)]
         # A positive enum owns the minimum when every supported tier is higher;
         # mandatory wording alone retains the legacy low-floor behavior above.
         next_effort = (max(prescribed, key=effort_rank) if prescribed else
                        min(supported, key=effort_rank) if supported else
                        "" if evidence.allowed else effort_one_step_down(current_effort))
-        if effort_rank(next_effort) >= effort_rank("low") and next_effort != current_effort:
+        # An unadvertised prose walk still stops at low.
+        floor = "minimal" if supported else "low"
+        if effort_rank(next_effort) >= effort_rank(floor) and next_effort != current_effort:
             exact_profile = _profile(
                 registered.target,
                 payload,

@@ -56,6 +56,9 @@ def _exception(error):
         "medium", id="all-higher-structured"),
     pytest.param("low", _error('reasoning.effort: expected one of "high"|"medium"'),
         "medium", id="all-higher-text"),
+    pytest.param("medium", _error(
+        "Invalid option", param="reasoning.effort", allowed_values=["minimal", "ultra"]),
+        "minimal", id="advertised-minimal-below"),
 ])
 def test_enum_without_scalar_echo_reaches_driver_and_learns_only_after_success(
     evidence_root, tmp_path, asynchronous, body_error, requested, error, applied,
@@ -199,6 +202,48 @@ def test_positive_constraints_are_bound_to_field_and_ignore_negative_quotes(evid
         sent = prepare_wire_payload_for_send(target, source, api_surface="messages" if carrier == "anthropic" else "chat.completions")
         retry = plan_next_wire_retry(sent, error=error if body_error else _exception(error), body_error=body_error)
         assert payload_effort(retry) == "xhigh"
+
+
+@pytest.mark.parametrize("body_error", [False, True])
+@pytest.mark.parametrize("carrier", ["top", "nested"])
+@pytest.mark.parametrize("requested,error,applied", [
+    pytest.param("medium", _error("Invalid option", param="{field}", enum=["minimal", "ultra"]),
+                 "minimal", id="strongest-at-or-below-is-minimal"),
+    pytest.param("medium", _error("Invalid option", param="{field}", enum=["minimal"]),
+                 "minimal", id="only-minimal"),
+    pytest.param("medium", _error('{field}: expected one of "minimal"|"ultra"'),
+                 "minimal", id="text-minimal"),
+    pytest.param("none", _error("Reasoning is mandatory", param="{field}", enum=["minimal", "high"]),
+                 "minimal", id="mandatory-floor-minimal"),
+    pytest.param("medium", _error("Invalid option", param="{field}", enum=["none", "high"]),
+                 "high", id="none-is-not-comparable"),
+    pytest.param("medium", _error("{field} value 'medium' is not supported; 'minimal' is not "
+                                  "supported. Supported values are: 'ultra'"),
+                 "ultra", id="negative-minimal-not-advertised"),
+    pytest.param("minimal", _error("Invalid option", param="{field}", enum=["minimal", "high"]),
+                 None, id="exact-minimal-accepted"),
+    pytest.param("medium", _error("Invalid option", param="{field}", enum=["none"]),
+                 None, id="only-none"),
+    pytest.param("medium", _error("Invalid option", param="{field}", enum=["future", "turbo"]),
+                 None, id="unknown-tiers"),
+    pytest.param("medium", _error("Invalid option", param="temperature", enum=["minimal"]),
+                 None, id="foreign-field"),
+    pytest.param("low", _error("{field} value 'low' is not supported"),
+                 None, id="unadvertised-walk-stops-at-low"),
+])
+def test_advertised_minimal_is_a_comparable_tier(evidence_root, carrier, body_error, requested, error, applied):
+    field = {"top": "reasoning_effort", "nested": "reasoning.effort"}[carrier]
+    error = {key: value.format(field=field) if isinstance(value, str) else value for key, value in error.items()}
+    target = _target()
+    source = _value_payload(carrier, target, requested)
+    with request_wire_call_scope():
+        sent = prepare_wire_payload_for_send(target, source, api_surface="chat.completions")
+        failure = error if body_error else _exception(error)
+        if not body_error:
+            failure.physical_attempt_capture = _capture(sent, target)
+        retry = plan_next_wire_retry(sent, error=failure, body_error=body_error)
+    assert (payload_effort(retry) if retry is not None else None) == applied
+    assert _store(evidence_root) is None  # Planning alone never learns a contract.
 
 
 @pytest.mark.parametrize("error", [

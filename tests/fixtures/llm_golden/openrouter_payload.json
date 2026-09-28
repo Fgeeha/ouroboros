@@ -3111,8 +3111,8 @@
       }
     },
     {
-      "id": "openrouter.dispatch.effort_clamp_disclosure",
-      "route": "a learned ceiling clamp rides THIS call's usage as reasoning_effort_clamped",
+      "id": "openrouter.dispatch.legacy_ceiling_does_not_clamp_xhigh",
+      "route": "requested xhigh reaches the transport unchanged despite a legacy learned ceiling, with exact sent-effort usage and no clamp disclosure",
       "spec": {
         "env": {
           "OPENROUTER_API_KEY": "or-fixture-key"
