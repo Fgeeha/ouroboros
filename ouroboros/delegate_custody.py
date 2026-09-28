@@ -167,6 +167,9 @@ class RunCustody:
     output_complete: bool = False
     output_sha: str = ""
     output_consumed: bool = False
+    # Immutable pairs keep custody memo copies independent. Aggregate consumption
+    # settles work debt; each reader still owes its own receipt for the current hash.
+    output_reader_receipts: Tuple[Tuple[str, str], ...] = ()
     # C1 isolation binding for a MUTATING run: private execution root, diff
     # baseline commit, AUTHORITY target tree. ``snapshot_id`` keys the
     # worktree-service registry entry (= the provisioning invocation id). All
@@ -415,6 +418,7 @@ def _merge_started_into(entry: RunCustody, previous: RunCustody) -> None:
     """
     for attr in _STARTED_PROGRESS_FLAGS:
         setattr(entry, attr, getattr(previous, attr))
+    entry.output_reader_receipts = previous.output_reader_receipts
     entry.patch_apply_key = previous.patch_apply_key
     entry.project_owned = previous.project_owned and entry.project_owned
     entry.project_persistent = previous.project_persistent or entry.project_persistent
@@ -501,6 +505,10 @@ def _apply(state: Dict[str, RunCustody], row: Dict[str, Any]) -> None:
         # A stale ack row (older than the current staging) must not bless new bytes.
         if not ack_sha or not custody.output_sha or ack_sha == custody.output_sha:
             custody.output_consumed = True
+            reader = str(row.get("reader_task_id") or custody.task_id)
+            custody.output_reader_receipts = tuple(
+                pair for pair in custody.output_reader_receipts if pair[0] != reader
+            ) + ((reader, ack_sha),)
     elif kind == PATCH_CAPTURED:
         custody.patch_captured = True
     elif kind == PATCH_APPLY_STARTED:
@@ -896,12 +904,12 @@ def record_started(drive_root: Any, custody: RunCustody,
 
 def record_output_consumed(drive_root: Any, custody: RunCustody, *,
                            artifact: str, byte_length: int, sha256: str,
-                           chars: int, lines: int) -> bool:
+                           chars: int, lines: int, reader_task_id: str = "") -> bool:
     from ouroboros.delegate_output import record_output_consumed as _record
 
     return _record(
         drive_root, custody, artifact=artifact, byte_length=byte_length,
-        sha256=sha256, chars=chars, lines=lines,
+        sha256=sha256, chars=chars, lines=lines, reader_task_id=reader_task_id,
     )
 
 

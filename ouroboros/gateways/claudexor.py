@@ -896,6 +896,10 @@ class ClaudexorGateway:
         body = self._request("GET", f"/v2/runs/{run_id}", timeout_sec=timeout_sec)
         return body if isinstance(body, dict) else {}
 
+    def open_run_events(self, run_id: str, after_seq: int, timeout_sec: float) -> Any:
+        """``GET /v2/runs/:id/events`` resumed after ``after_seq``: an open SSE stream (``gateways.claudexor_run_events`` reads it)."""
+        return self._client.stream("GET", f"/v2/runs/{run_id}/events", headers={"Last-Event-ID": str(int(after_seq))}, timeout=httpx.Timeout(timeout_sec, connect=min(_CONNECT_TIMEOUT_SEC, timeout_sec)))
+
     def get_run_artifact(self, run_id: str, path: str) -> bytes:
         """GET /v2/runs/:id/artifacts/<path> — the FULL artifact body, raw bytes.
 

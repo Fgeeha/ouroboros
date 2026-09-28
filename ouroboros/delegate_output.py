@@ -1,11 +1,8 @@
 """Staged output for delegated runs, and the durable receipt that it was READ.
 
-Extracted from ``ouroboros/tools/delegate.py`` when that module crossed its size gate:
-this is one coherent concern with no dependency on authority, containment or transport
-— a terminal payload too large for the tool budget is written whole to the task drive,
-and D7's acknowledgement records that the model actually received every character of
-it. ``tools.delegate`` re-exports these names, so every existing reference (and the
-convergence census) still finds them there.
+Terminal payloads too large for the tool budget are written whole to the task drive.
+D7's acknowledgement records which authorized reader received every character of
+which content. ``tools.delegate`` re-exports this delivery surface.
 """
 
 from __future__ import annotations
@@ -98,8 +95,8 @@ def _stage_full_output(ctx: ToolContext, run_id: str, text: str,
     }
 
 
-# Proven-coverage ledger for staged artifacts: merged, sorted [start, end] line
-# intervals actually SERVED to the reader, keyed by path plus CONTENT hash — a re-wait
+# Proven-coverage ledger for staged artifacts: merged, sorted character intervals
+# actually SERVED to the reader, keyed by path, content hash and successor identity. A re-wait
 # re-stages the identical payload and must not void an honest reader's partial proof,
 # while changed content honestly resets it. Process-local by design: the DURABLE fact
 # is the acknowledgement row itself; a restarted worker re-proves coverage by
@@ -110,20 +107,22 @@ _READ_COVERAGE_MAX_KEYS = 128
 
 def record_output_consumed(drive_root: Any, custody: _RunCustody, *,
                            artifact: str, byte_length: int, sha256: str,
-                           chars: int, lines: int) -> bool:
+                           chars: int, lines: int, reader_task_id: str = "") -> bool:
     """Record the D7 acknowledgement for one fully read staged artifact."""
 
     if not custody.output_complete:
         return False
     if custody.output_sha and str(sha256 or "") != custody.output_sha:
         return False
-    if custody.output_consumed:
+    reader = str(reader_task_id or custody.task_id)
+    if output_consumed_by_reader(custody, reader):
         return True
     from ouroboros import delegate_custody as custody_module
 
     landed = custody_module.emit(drive_root, custody_module.OUTPUT_CONSUMED, {
         "run_id": custody.run_id,
         "task_id": custody.task_id,
+        "reader_task_id": reader,
         "artifact": str(artifact or ""),
         "bytes": int(byte_length),
         "sha256": str(sha256 or ""),
@@ -132,7 +131,21 @@ def record_output_consumed(drive_root: Any, custody: _RunCustody, *,
     })
     if landed:
         custody.output_consumed = True
+        custody.output_reader_receipts = tuple(
+            pair for pair in custody.output_reader_receipts if pair[0] != reader
+        ) + ((reader, str(sha256 or "")),)
     return landed
+
+
+def output_consumed_by_reader(entry: _RunCustody, reader_task_id: str) -> bool:
+    """A predecessor's receipt never proves delivery to its retry successor."""
+    receipts = dict(entry.output_reader_receipts)
+    reader = str(reader_task_id or "")
+    if reader in receipts:
+        return bool(entry.output_complete and receipts[reader] == entry.output_sha)
+    # Compatibility for pre-receipt in-process entries; replay attributes old
+    # OUTPUT_CONSUMED rows to their immutable starter explicitly.
+    return bool(not receipts and reader == entry.task_id and entry.output_consumed)
 
 
 def output_disposition(custody: _RunCustody) -> Dict[str, Any]:
@@ -188,7 +201,7 @@ def acknowledge_staged_output_read(ctx: ToolContext, target: Any, content: str,
     exceeds that budget is credited only for the prefix that survives the cut — a line
     the delivery layer cut is NOT covered, whatever the line range said. (The reader
     reaches the cut-off remainder through ``start_char``, the sub-line cursor.) The
-    durable ``delegate_run_output_consumed`` row is written (once per run) exactly when
+    durable ``delegate_run_output_consumed`` row is written per reader/content when
     the delivered ranges have covered every character, contiguously. It carries the
     byte length and content hash of what was staged, measured from the bytes on disk,
     which ARE what was staged because the file is written atomically and never
@@ -231,24 +244,36 @@ def acknowledge_staged_output_read(ctx: ToolContext, target: Any, content: str,
         abs_start = window_start + offset
         abs_end = abs_start + min(body_full, delivered_body)
         total = len(content)
-        identity = f"{resolved}|{hashlib.sha256(content.encode('utf-8', 'replace')).hexdigest()}"
-        if not _covered_whole(identity, abs_start, abs_end, total):
-            return                       # served, recorded, but not yet read WHOLE
         task_id = str(getattr(ctx, "task_id", "") or "")
         wanted = path.name
         drive = custody.custody_root(ctx)
 
         def _match(candidates: Any) -> Optional[_RunCustody]:
             return next((c for c in candidates
-                         if c.task_id == task_id
-                         and _safe_run_filename(c.run_id) + ".json" == wanted), None)
+                         if _safe_run_filename(c.run_id) + ".json" == wanted), None)
 
         # Memo first; a restarted worker (empty or unrelated memo) falls through to the
         # durable replay, the same authority every other custody question consults.
         entry = _match(list(custody._CUSTODY.values())) or _match(custody.replay(drive).values())
-        if entry is None or entry.output_consumed:
+        if entry is None:
+            return
+        successor = entry.task_id != task_id
+        if successor:
+            from ouroboros.delegate_shared import retry_result_status
+
+            status, entry, predecessor = retry_result_status(ctx, drive, entry.run_id)
+            if status != custody.OWNED or entry is None or not predecessor:
+                return
+        identity = f"{resolved}|{hashlib.sha256(content.encode('utf-8', 'replace')).hexdigest()}"
+        if successor:
+            identity += f"|reader:{task_id}"
+        if not _covered_whole(identity, abs_start, abs_end, total):
+            return
+        if output_consumed_by_reader(entry, task_id):
             return
         raw = path.read_bytes()
+        if raw != content.encode("utf-8", "replace"):
+            return  # A concurrent replacement is not the body this call delivered.
         custody.record_output_consumed(
             drive, entry,
             artifact=f"{_ARTIFACT_SUBDIR}/{wanted}",
@@ -256,6 +281,7 @@ def acknowledge_staged_output_read(ctx: ToolContext, target: Any, content: str,
             sha256=hashlib.sha256(raw).hexdigest(),
             chars=len(content),
             lines=total_lines,
+            reader_task_id=task_id,
         )
     except Exception:
         log.warning("coverage acknowledgement for a staged delegated output failed", exc_info=True)

@@ -16,6 +16,9 @@ from tests._delegated_transport_shared import (
 )
 
 
+pytestmark = pytest.mark.serial
+
+
 @pytest.mark.parametrize('selected,expected', [(None, 'workspace_write'), ('workspace_write', 'workspace_write'), ('full', 'full')])
 def test_selected_access_applies_only_to_mutating_assignments(selected, expected):
     kwargs = {} if selected is None else {'access': selected}
@@ -32,14 +35,17 @@ def test_invalid_access_is_not_silently_widened():
 @pytest.fixture
 def full_run(tmp_path, monkeypatch):
     from ouroboros import claudexor_daemon
+    from ouroboros.gateways import claudexor_run_events
 
+    monkeypatch.setattr(claudexor_run_events, '_SUPPORT', {})
     monkeypatch.setenv('OUROBOROS_SUBAGENT_HARNESS', 'some-route=selected-model:max')
     monkeypatch.setenv('OUROBOROS_DATA_DIR', str(tmp_path / 'data'))
     monkeypatch.setenv('OUROBOROS_SUBAGENT_WORKTREE_ROOT', str(tmp_path / 'snapshots'))
     ctx = _delegating_ctx(tmp_path, acting=True)
     target = str(Path(ctx.workspace_root).resolve())
     facts = {'requests': [], 'trust_posts': [], 'allow': False, 'recorded': False,
-             'lost_start': False, 'fail_trust': False, 'selected_access': 'full'}
+             'lost_start': False, 'fail_trust': False, 'selected_access': 'full',
+             'terminal_reads': 0}
     state = {'repoRoot': target, 'path': '/fixture/trust/project.yaml',
              'allowFullAccess': False, 'accessDefault': 'workspace_write', 'testCommandGrantCount': 0}
 
@@ -61,6 +67,8 @@ def full_run(tmp_path, monkeypatch):
                                           'accessProfilesSupported': ['readonly', 'workspace_write', 'full']}]})
         if path == '/v2/quota':
             return httpx.Response(200, json={'snapshots': [], 'absences': []})
+        if path == '/v2/operations':
+            return httpx.Response(200, json={'operations': []})
         if path == '/v2/projects':
             return httpx.Response(200, json={'projects': [{'id': 'stable-project', 'root': target}]})
         if path == '/v2/trust':
@@ -84,6 +92,11 @@ def full_run(tmp_path, monkeypatch):
             if facts['lost_start']:
                 raise httpx.ReadTimeout('start response lost')
             return httpx.Response(200, json={'runId': 'full-run', 'runDir': str(tmp_path / 'run')})
+        if path == '/v2/runs/full-run' and request.method == 'GET':
+            facts['terminal_reads'] += 1
+            return httpx.Response(200, json={'lastSeq': 1, 'primaryOutput': 'Implemented the fixture.',
+                                          'summary': {'state': 'succeeded', 'effectiveAccess': 'full',
+                                                      'spendUsd': 0.0, 'spendEstimated': False}})
         raise AssertionError((request.method, path))
 
     def connect():
@@ -96,6 +109,7 @@ def full_run(tmp_path, monkeypatch):
 
 
 def test_full_start_http_contract_and_real_snapshot_capture(full_run):
+    from ouroboros import claudexor_daemon
     from ouroboros.tools.subagent_integration import _integrate_delegated_patch
 
     ctx, target, facts = full_run
@@ -126,12 +140,27 @@ def test_full_start_http_contract_and_real_snapshot_capture(full_run):
     row = custody.replay(custody.custody_root(ctx))['full-run']
     assert row.access == 'full' and row.project_persistent and row.snapshot_id == key
     assert row.execution_binding_fingerprint
+    # A process-local flag is not settlement: disposition refreshes durable custody.
     row.settled = True
     custody._CUSTODY['full-run'] = row
-    capture = delegate._capture_terminal_patch(ctx, row)
+    premature = _integrate_delegated_patch(ctx, 'full-run', 'apply', 'Not settled durably.')
+    assert 'INTEGRATE_DELEGATED_NOT_TERMINAL' in premature, premature
+    assert not (Path(target) / 'native-result.py').exists()
+    assert not custody.replay(custody.custody_root(ctx))['full-run'].settled
+    gateway = claudexor_daemon.ensure_owned_gateway()
+    try:
+        terminal = json.loads(delegate._delegate_wait(ctx, 'full-run', wait_sec=1, gateway=gateway))
+    finally:
+        gateway.close()
+    assert terminal['status'] == 'terminal' and terminal['settlement']['settled']
+    assert terminal['primary_output'] == 'Implemented the fixture.' and facts['terminal_reads'] == 1
+    capture = terminal['workspace_capture']
     assert capture['status'] == 'ready_with_changes'
     assert capture['authority_target_root'] == target
     assert not (Path(target) / 'native-result.py').exists()
+    custody._CUSTODY.clear()  # Integration must also work after a worker loses its memo.
+    replayed = custody.replay(custody.custody_root(ctx))['full-run']
+    assert replayed.settled and replayed.terminal_state == 'succeeded' and replayed.patch_captured
     outcome = _integrate_delegated_patch(ctx, 'full-run', 'apply', 'Fixture verified.')
     assert '✅ Integrated' in outcome, outcome
     assert (Path(target) / 'native-result.py').read_text(encoding='utf-8') == 'result = 42\n'

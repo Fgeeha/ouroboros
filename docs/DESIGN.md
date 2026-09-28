@@ -813,6 +813,17 @@ with `ensure_project_scope` lives there; Main retains its Started annotation.
 `N notes` in the collapsed header counts timeline items, the evidence row
 among them.
 
+Delegated executor activity keeps its own attributed voice in the root or child
+timeline. Messages lead; thinking stays folded in its own details, and routine
+technical events collapse into counts with per-event detail under Expand.
+Problems, unread ranges and omitted previews stay visible with a full-source
+reference. Preview limits include serialized size; they never erase the carrier
+or its source. Overlapping reads deduplicate by sequence identity, retaining any
+unseen tail's omission notice; equal words alone are not duplicates. A stream end
+before the observed cursor states unresolved coverage. Live, reconnect and replay
+use the same projection. Telegram reserves room for problems and incompleteness
+beside its disclosed speech preview and keeps the complete task reference.
+
 The block's chrome follows the work it stands on
 (`web/modules/chat.js::blockHasWork`, the presence facts minus open attention
 and minus a bare terminal outcome), never the lane that ran the turn (owner
