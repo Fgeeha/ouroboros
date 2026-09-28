@@ -148,7 +148,7 @@ def _canonical_payload_text(
 def canonicalize_session_verdict(
     raw_text: str, *, conformance_passed: bool, contract: str = "", llm: Any = None,
     deadline_at: Any = None, transport_timeout_sec: Any = None, shape: str = "array",
-    array_validator: Optional[Callable[[list], bool]] = None,
+    array_validator: Optional[Callable[[list], bool]] = None, allow_extraction: bool = True,
 ) -> tuple[str, str, Dict[str, Any]]:
     """Return ``(canonical_text, method, extraction_usage)`` for a session answer.
 
@@ -172,6 +172,10 @@ def canonicalize_session_verdict(
     An array surface may supply its existing row validator. Shape-valid but
     contract-invalid rows then reach the same extraction rail; the host never
     guesses a verdict or severity. Other surfaces keep their own parsing rules.
+
+    ``allow_extraction=False`` is pure collection of an already-paid answer: a
+    narrative that the trusted/strict branches cannot read is returned WHOLE
+    with method ``parse_unavailable``; no Light model is called for it.
     """
     text = str(raw_text or "")
     if shape == "report":
@@ -189,6 +193,8 @@ def canonicalize_session_verdict(
         # discloses the delta.
     if _strictly_parseable(text, shape, array_validator):
         return text, "strict", {}
+    if not allow_extraction:
+        return text, "parse_unavailable", {}
     if len(text) > _EXTRACT_MAX_CHARS:
         return text, "extraction_incomplete", {}
     canonical, usage = _extract_verdict_via_light_model(
@@ -218,6 +224,13 @@ def _extract_verdict_via_light_model(
     model = get_light_model()
     if owner_deadline_exhausted(deadline_at=deadline_at, reserve_sec=get_finalization_grace_sec()):
         return None, {"model": model, "reason_code": "deadline_exhausted", "dispatch": "not_dispatched"}
+    from ouroboros.budget_pause import dispatch_fenced
+    from ouroboros.usage_accounting import current_usage_scope as _scope_now
+
+    if dispatch_fenced(getattr(_scope_now(), "task_id", "")):
+        # Observation-only while the owning task pauses (#1196): the raw
+        # answer is kept verbatim; no Light call canonicalizes it on the way out.
+        return None, {"model": model, "reason_code": "budget_pausing_no_extraction", "dispatch": "not_dispatched"}
     template = _SESSION_EXTRACT_OBJECT_PROMPT if shape == "object" else _SESSION_EXTRACT_PROMPT
     prompt = template.format(
         contract=contract or default_output_contract(shape),
@@ -246,6 +259,7 @@ def _extract_verdict_via_light_model(
         _scope = _replace(current_usage_scope() or UsageScope(), source="review_substrate.extraction")
         chat_kwargs = dict(
             messages=[{"role": "user", "content": prompt}], model=model,
+            model_role="light",
             max_tokens=8192, reasoning_effort="low", no_proxy=True,
         )
         transport = review_transport_timeout(model, transport_timeout_sec, deadline_at)
@@ -254,6 +268,8 @@ def _extract_verdict_via_light_model(
         with physical_attempt_limit(1), usage_scope(_scope):
             message, usage = llm.chat(**chat_kwargs)
     except Exception as exc:
+        from ouroboros.llm_claudexor import propagate_model_error
+        propagate_model_error(exc)
         log.warning("Review session verdict extraction failed: %s", exc)
         return None, {}
     content = message.get("content") if isinstance(message, dict) else ""

@@ -40,14 +40,14 @@ def test_public_contributor_flow_is_agent_first_and_route_neutral():
     assert "separate agent context" in guide
     assert "Reviewing in the authoring conversation does not count" in guide
     assert "Mark the review `NOT_RUN`" in guide
-    # The script lane is honest about its budget shape instead of failing
-    # contributors by surprise (#395).
-    assert "maintainer / large-window tooling" in guide
+    # The script lane states what a scope reviewer is owed (a change-relative
+    # required-source floor) instead of a window requirement (#395).
+    assert "maintainer tooling" in guide
     assert "SCOPE_REVIEW_BLOCKED" in guide
-    # The honest budget-shape paragraph names the full required pack and the
-    # session route's own window requirement (sol round-1).
-    assert "prompts, contracts, canonical docs" in guide
-    assert "confirmed 200K+ window" in guide
+    assert "change-relative" in guide
+    assert "does not depend on a very large reviewer window" in guide
+    assert "Reading coverage is diagnostic" in guide
+    assert "never remove a responding reviewer from quorum" in guide
     assert "SHAPE, not truth" in guide
     assert "--contributor" in guide
     assert "--base-ref upstream/ouroboros" in guide
@@ -246,3 +246,25 @@ def test_scope_receipt_validator_cli_edges(tmp_path, capsys):
 
     assert main(["validate", str(tmp_path / "absent.json")]) == 1
     assert "cannot read receipt" in capsys.readouterr().err
+
+
+def test_scope_receipt_survives_trailing_markdown_checkboxes(tmp_path, capsys):
+    import json
+    from scripts.validate_scope_receipt import main
+    from ouroboros.tools.scope_review_contract import SCOPE_REQUIRED_ITEMS
+    from ouroboros.triad_review import extract_json_array
+
+    rows = [{"item": item, "verdict": "FAIL" if i == 0 else "PASS", "severity": "advisory",
+             "reason": f"Checked the concrete {item} source and its consumers."}
+            for i, item in enumerate(sorted(SCOPE_REQUIRED_ITEMS))]
+    path = tmp_path / "receipt.md"
+    for prefix, suffix in [("", "\n- [ ] Follow up"), ("- [ ] Before\n", "\n[]\n- [ ] After"), ("```json\n", "\n```\n- [ ] Remaining")]:
+        path.write_text(prefix + json.dumps(rows) + suffix)
+        assert main(["validate", str(path)]) == 0
+        assert "1 FAIL row(s)" in capsys.readouterr().out
+    # Whole JSON objects are not repaired by selecting a nested valid array.
+    path.write_text(json.dumps({"nested": rows}))
+    assert main(["validate", str(path)]) == 1
+    path.write_text("- [ ] Only a checkbox")
+    assert main(["validate", str(path)]) == 1
+    assert extract_json_array("[]") == []

@@ -1,5 +1,7 @@
 """Codebase health tool — complexity metrics and self-assessment."""
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import logging
 import pathlib
 
@@ -11,10 +13,11 @@ log = logging.getLogger(__name__)
 def _codebase_health(ctx: ToolContext) -> str:
     """Compute and format codebase health report."""
     try:
-        from ouroboros.review import compute_repo_complexity_metrics
+        from ouroboros.review import collect_size_ratchet_inventory, compute_repo_complexity_metrics, size_headroom_lines
 
         repo_dir = pathlib.Path(ctx.repo_dir)
-        metrics = compute_repo_complexity_metrics(repo_dir)
+        inventory = collect_size_ratchet_inventory(repo_dir)
+        metrics = compute_repo_complexity_metrics(repo_dir, inventory=inventory)
         stats = {
             "files": metrics["total_files"],
             "chars": metrics["total_bytes"],
@@ -40,6 +43,8 @@ def _codebase_health(ctx: ToolContext) -> str:
         lines.append(f"**Functions:** {metrics['total_functions']}")
         lines.append(f"**Avg function length:** {metrics['avg_function_length']} lines")
         lines.append(f"**Max function length:** {metrics['max_function_length']} lines")
+        lines.append("\n### Size Headroom (information; official CI enforces the limits)")
+        lines.extend(size_headroom_lines(inventory))
 
         from ouroboros.review import (
             MAX_FUNCTION_LINES,
@@ -129,7 +134,7 @@ def _codebase_health(ctx: ToolContext) -> str:
         try:
             from ouroboros.review import validate_size_ratchet
 
-            ratchet_findings = validate_size_ratchet(repo_dir)
+            ratchet_findings = validate_size_ratchet(repo_dir, inventory=inventory)
         except Exception as ratchet_exc:
             lines.append(f"\n### Size-Ratchet Findings\n  ⚠️ validator unavailable: {ratchet_exc}")
         else:
@@ -144,7 +149,7 @@ def _codebase_health(ctx: ToolContext) -> str:
 
     except Exception as e:
         log.warning("codebase_health failed: %s", e, exc_info=True)
-        return f"⚠️ Failed to compute codebase health: {e}"
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ERROR", text=(f"⚠️ Failed to compute codebase health: {e}")))
 
 
 def get_tools():

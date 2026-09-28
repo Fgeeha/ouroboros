@@ -3,14 +3,14 @@ fresh regeneration and their resolution invariants hold — staleness = red.
 
 The generator half is ``python scripts/regenerate_inventories.py``:
 
-- ``docs/v7next/FROZEN_CONTRACTS_INVENTORY.md`` — ARCHITECTURE §11.1 rows,
+- ``docs/inventories/FROZEN_CONTRACTS_INVENTORY.md`` — ARCHITECTURE §11.1 rows,
   every referenced owner/anchor path resolved against the tree, plus the
   ``ouroboros/contracts/`` package-coverage gap list (pinned here: growth of
   the gap is red even after regeneration);
-- ``docs/v7next/DATA_LAYOUT_INVENTORY.md`` — the ARCHITECTURE "Data layout"
+- ``docs/inventories/DATA_LAYOUT_INVENTORY.md`` — the ARCHITECTURE "Data layout"
   tree probed entry-by-entry against tracked paths / runtime source literals
   (zero UNRESOLVED entries pinned here);
-- ``docs/v7next/FACADE_INVENTORY.md`` — the AST-derived ``noqa: F401``
+- ``docs/inventories/FACADE_INVENTORY.md`` — the AST-derived ``noqa: F401``
   re-export facade inventory over the domain manifest population.
 
 Synthetic tests prove the red branches (missing file, unresolvable entry,
@@ -69,6 +69,53 @@ def test_data_layout_inventory_is_byte_identical(layout):
 
 def test_facade_inventory_is_byte_identical(facades):
     _assert_identical(inv.FACADE_OUT, facades[0])
+
+
+def test_ui_control_text_inventory_is_byte_identical():
+    _assert_identical(inv.UI_CONTROLS_OUT, inv.build_ui_control_inventory()[0])
+
+
+def test_ui_control_scan_lists_fixed_text_and_only_counts_the_rest():
+    from scripts.ui_control_inventory import scan_controls
+
+    rows, interpolated = scan_controls(
+        """
+        <button class="btn btn-default btn-sm" type="button">Retry</button>
+        <button class="chat-attach-btn" aria-label="Attach file"><svg viewBox="0 0 1 1"></svg></button>
+        <button class="btn ${tone}" type="button"><span>Save &amp; close</span></button>
+        <button class="btn">${escapeHtml(label)}</button>
+        <button class="icon-only"><svg></svg></button>
+        <button class="btn btn-default" type="button"
+            ${rows.length >= MAX_ROWS ? 'disabled' : ''}>Add subagent</button>
+        const go = document.createElement('button');
+        go.className = 'btn btn-xs btn-default';
+        go.textContent = 'Turn into project';
+        const dynamic = document.createElement('button');
+        dynamic.textContent = labelFor(row);
+        """
+    )
+    # Fixed text is listed with its classes; an icon-only control is named by its fixed
+    # accessible name; an interpolated class is shown as a gap, never guessed.
+    assert rows == [
+        ("Retry", "btn btn-default btn-sm"),
+        ("[icon] Attach file", "chat-attach-btn"),
+        ("Save & close", "btn …"),
+        # A comparison inside a templated attribute is not the end of the tag.
+        ("Add subagent", "btn btn-default"),
+        ("Turn into project", "btn btn-xs btn-default"),
+    ]
+    # Run-time text, a nameless icon and a computed label are counted, not invented.
+    assert interpolated == 3
+
+
+def test_ui_control_inventory_keeps_siblings_adjacent_and_names_the_one_raiser():
+    rendered = inv.build_ui_control_inventory()[0]
+    table = [line for line in rendered.splitlines() if line.startswith("| ") and not line.startswith("| text")]
+    refresh = [index for index, line in enumerate(table) if line.startswith("| Refresh |")]
+    # The point of the sort: every control that says the same thing is one contiguous block.
+    assert len(refresh) >= 2 and refresh == list(range(refresh[0], refresh[0] + len(refresh)))
+    # An owner intent with a door is raised by exactly one module.
+    assert "| `ouro:open-project` | modules/project_reference.js |" in rendered
 
 
 # ---------------------------------------------------------------------------
@@ -180,3 +227,76 @@ def test_noqa_f401_marker_detection():
     nodes = ast.parse(src).body
     flags = [inv._statement_has_noqa_f401(lines, n) for n in nodes]
     assert flags == [True, False, True, False]
+
+
+def _chapter_book():
+    from ouroboros.reference_books import load_reference_book
+
+    frozen = (
+        "## 11.1 What is frozen\n\n"
+        "| Contract | File | Anchored by |\n|---|---|---|\n"
+        "| `Thing` | `ouroboros/contracts/tool_abi.py` | `tests/test_contracts.py` |\n"
+    )
+    layout = (
+        "## Data layout (`~/Ouroboros/`)\n\n````\n~/Ouroboros/\n"
+        "├── data/\n│   ├── settings.json\n│   └── queue_snapshot.json\n````\n"
+    )
+    # Filenames carry no topic meaning; membership and actual headings own it.
+    corpus = {
+        "docs/ARCHITECTURE.md": b"# Book\n\nThe body and its reasons.\n\n## Chapters\n\n- [First](architecture/alpha.md)\n- [Second](architecture/omega.md)\n",
+        "docs/architecture/alpha.md": ("# Contracts\n\nWHY: old consumers must retain their contract.\n\n" + frozen).encode(),
+        "docs/architecture/omega.md": ("# Storage\n\nWHY: retained sources must remain discoverable.\n\n" + layout).encode(),
+    }
+    book = load_reference_book(pathlib.Path("/unused"), "architecture", corpus.__getitem__)
+    legacy_text = "# Book\n\nSame complete sources.\n\n" + frozen + "\n" + layout
+    legacy = load_reference_book(pathlib.Path("/unused"), "architecture", lambda _: legacy_text.encode())
+    return book, legacy, corpus
+
+
+@pytest.mark.parametrize("builder", ["build_frozen_inventory", "build_layout_inventory"])
+def test_chapter_migration_preserves_complete_inventory_and_physical_provenance(builder):
+    import hashlib
+
+    book, legacy, corpus = _chapter_book()
+    chapter_text, findings = getattr(inv, builder)(book)
+    old_text, old_findings = getattr(inv, builder)(legacy)
+    assert findings == old_findings == []
+    without_source = chapter_text.splitlines(keepends=True)
+    index = next(i for i, line in enumerate(without_source) if line.startswith("Source: "))
+    del without_source[index:index + 2]
+    assert "".join(without_source) == old_text
+    title = "11.1 What is frozen" if builder == "build_frozen_inventory" else "Data layout (`~/Ouroboros/`)"
+    view = inv.read_book_section(book, title)
+    ref = view.sources[0]
+    raw = corpus[ref.path]
+    assert ref.sha256 == hashlib.sha256(raw).hexdigest()
+    assert raw[ref.span.start_byte:ref.span.end_byte].decode() == view.text
+    assert f"`{ref.path}`, physical LF lines {ref.span.start_line}-{ref.span.end_line}" in chapter_text
+    assert ref.sha256 in chapter_text
+
+
+def test_data_layout_cannot_borrow_a_fence_from_another_section():
+    with pytest.raises(ValueError, match="one fenced tree"):
+        inv.layout_block("# Book\n\n## Data layout (`~/Ouroboros/`)\n\nMissing.\n\n## Other\n\n```\n├── wrong.json\n```\n")
+
+
+def test_frozen_section_uses_markdown_headings_not_fenced_examples():
+    text = (
+        "# Book\n\n```md\n### 11.1 What is frozen\nFake content\n```\n\n"
+        "## 11.1 What is frozen\n\nActual content\n\n## Next\n\nOutside\n"
+    )
+    section = inv.frozen_section_text(text)
+    assert "Actual content" in section
+    assert "Fake content" not in section and "Outside" not in section
+
+
+def test_missing_member_refuses_generator_before_partial_inventory(tmp_path, monkeypatch):
+    docs = tmp_path / "docs"
+    docs.mkdir()
+    (docs / "ARCHITECTURE.md").write_text(
+        "# Book\n\nPurpose.\n\n## Chapters\n\n- [Missing](architecture/missing.md)\n"
+    )
+    monkeypatch.setattr(inv, "REPO_ROOT", tmp_path)
+    for builder in (inv.build_frozen_inventory, inv.build_layout_inventory):
+        with pytest.raises(FileNotFoundError, match="missing.md"):
+            builder()

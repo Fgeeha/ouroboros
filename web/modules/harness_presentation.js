@@ -90,3 +90,29 @@ export function harnessAccountIdentityMarkup(harnessId, {
     const identity = harnessIdentityMarkup(harnessId, { label, className });
     return identity + (profile ? ` (${escapeHtml(profile)})` : '');
 }
+
+// The meta line's separator is TEXT, not a CSS gap: it has to survive a copy
+// out of the page and be read aloud, and a flex gap does neither. One rule for
+// every part boundary, here and in `renderLiveCardMeta`, which joins its own
+// parts with the same string and receives this block as one of them.
+export const META_PART_SEPARATOR = ' \u00b7 ';
+
+export function joinMetaParts(parts) {
+    return parts.filter(Boolean).join(META_PART_SEPARATOR);
+}
+
+/** Card identity consumes projected facts; it does not infer execution from marks. */
+export function executorIdentityMarkup(chip, { agentModel = '' } = {}) {
+    const identity = chip
+        ? `<span class="harness-chip chat-live-executor-chip" title="${escapeHtml(chip.title || '')}">`
+            + harnessIdentityMarkup(chip.harness, { label: chip.label || '', className: 'chat-live-executor-identity' }) + '</span>'
+        : '';
+    const facts = [
+        agentModel ? `${chip ? 'Coordinator' : 'Agent model'}: ${agentModel}` : '',
+        chip?.observedModels?.length ? `Observed: ${chip.observedModels.join(', ')}` : '',
+    ];
+    return joinMetaParts([
+        identity,
+        ...facts.filter(Boolean).map(text => `<span class="chat-live-meta-text">${escapeHtml(text)}</span>`),
+    ]);
+}

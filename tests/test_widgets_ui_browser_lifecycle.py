@@ -15,6 +15,7 @@ import json
 import os
 import pathlib
 import textwrap
+import time
 
 import pytest
 
@@ -489,7 +490,7 @@ def test_ui_smoke_widget_launch_policy_and_ordered_stop(direct_server_with_data,
                 assert facade_height == 360, facade_height
                 page.screenshot(path=str(evidence_dir / f"widget-lifecycle-cards-{browser_name}.png"), full_page=True)
                 page.locator(f"{card('manual')} [data-widget-menu-trigger]").click()
-                page.locator(f"{card('manual')} [data-widget-start-mode=\"manual\"]").wait_for(state="visible", timeout=5_000)
+                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"manual\"]").wait_for(state="visible", timeout=5_000)
                 page.screenshot(path=str(evidence_dir / f"widget-lifecycle-menu-{browser_name}.png"), full_page=True)
                 page.keyboard.press("Escape")
                 page.locator(f"{card('manual')} [data-widget-start-mode=\"manual\"]").wait_for(state="hidden", timeout=5_000)
@@ -577,7 +578,7 @@ def test_ui_smoke_widget_launch_policy_and_ordered_stop(direct_server_with_data,
                 # Owner override from the card menu: Manual program → Auto starts it now and
                 # persists the whole map through the preferences API.
                 page.locator(f"{card('manual')} [data-widget-menu-trigger]").click()
-                page.locator(f"{card('manual')} [data-widget-start-mode=\"auto\"]").click()
+                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"auto\"]").click()
                 wait_frame(page, "manual", True)
                 prefs = page.evaluate("async () => (await fetch('/api/ui/preferences')).json()")
                 assert prefs["widget_start_mode"] == {f"{skill}:manual": "auto"}, prefs
@@ -848,11 +849,21 @@ def test_ui_smoke_widget_retain_keeps_running_across_pages(direct_server_with_da
 
                 # Leave, then disable the skill while Widgets is hidden: the kept frame
                 # is force-stopped without a visit; the return finds the cards gone.
+                # The read is HELD across dashboard -> skills: unrelated navigation must not cancel it.
                 _click_nav(page, "dashboard")
                 wait_active(page, False)
                 page.wait_for_timeout(300)
                 assert frame_count(page, "kept") == 1
+                held = []
+                page.route("**/api/widgets", lambda route: held.append(route))
                 assert toggle(page, False) == 200
+                deadline = time.monotonic() + 10
+                while not held and time.monotonic() < deadline: page.wait_for_timeout(50)
+                assert held, "the disable did not start the hidden retention read"
+                _click_nav(page, "skills")
+                page.wait_for_timeout(300)
+                assert frame_count(page, "kept") == 1, "the read is still held; nothing may stop yet"
+                [route.continue_() for route in held]; page.unroute("**/api/widgets")
                 wait_frame(page, "kept", False, timeout=15_000)
                 wait_active(page, False)
                 _click_nav(page, "widgets")

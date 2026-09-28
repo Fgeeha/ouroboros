@@ -114,6 +114,30 @@ def test_writer_refuses_a_row_owned_by_a_newer_schema(tmp_path):
 # -------------------------------------------------------------------- readers
 
 
+@pytest.mark.parametrize("strict", [False, True])
+def test_missing_read_is_not_reclassified_when_a_result_appears(tmp_path, monkeypatch, strict):
+    """A FileNotFound observation and a later publication are different snapshots."""
+    write_task_result(tmp_path, "race", "scheduled")
+    path = _results_dir(tmp_path) / "race.json"
+    read_text = pathlib.Path.read_text
+    missed = False
+
+    def publish_after_missing_open(selected, *args, **kwargs):
+        nonlocal missed
+        if selected == path and not missed:
+            missed = True
+            write_task_result(tmp_path, "race", "completed", result="published concurrently")
+            raise FileNotFoundError(str(path))
+        return read_text(selected, *args, **kwargs)
+
+    monkeypatch.setattr(pathlib.Path, "read_text", publish_after_missing_open)
+    assert load_task_result(tmp_path, "race", strict=strict) is None
+    assert missed
+    assert load_task_result(tmp_path, "race", strict=True)["result"] == "published concurrently"
+    assert not _quarantine_files(tmp_path)
+    assert not _quarantine_events(tmp_path)
+
+
 def test_unstamped_history_is_quarantined_not_converted(tmp_path):
     legacy = {"task_id": "t5", "status": "completed", "result": "pre-7.0"}
     path = _write_raw(tmp_path, "t5", legacy)
@@ -234,6 +258,7 @@ def test_state_save_stamps_and_an_unstamped_state_loads_unchanged(tmp_path, monk
     monkeypatch.setattr(state, "STATE_PATH", tmp_path / "state" / "state.json")
     monkeypatch.setattr(state, "STATE_LAST_GOOD_PATH", tmp_path / "state" / "state.last_good.json")
     monkeypatch.setattr(state, "STATE_LOCK_PATH", tmp_path / "locks" / "state.lock")
+    monkeypatch.setattr(state, "DRIVE_ROOT", tmp_path)  # a fresh root: the first whole-state write may mint
 
     state.save_state({"spent_usd": 1.25})
     for path in (state.STATE_PATH, state.STATE_LAST_GOOD_PATH):

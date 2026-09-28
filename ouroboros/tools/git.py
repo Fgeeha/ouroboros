@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+
 import copy
 import json
 import hashlib  # noqa: F401
@@ -14,6 +16,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple
 
 from ouroboros.config import get_runtime_mode  # noqa: F401
+from ouroboros.tools.review_helpers import review_enforcement_blocks
 from ouroboros.runtime_mode_policy import (
     core_patch_notice,  # noqa: F401
     format_protected_paths,  # noqa: F401
@@ -48,6 +51,7 @@ from ouroboros.tools.commit_gate import (
     _current_review_tool_name,
     _invalidate_advisory,  # noqa: F401
     _record_commit_attempt,
+    record_bound_commit_success, prepare_author_commit_request,
     check_identical_verdict_refusal,
     check_review_cycles_ceiling,
     classify_review_block,  # noqa: F401
@@ -115,6 +119,8 @@ def _free_cycle_gate(
     disclosure and WITHOUT buying another review."""
     from ouroboros.config import get_review_enforcement
 
+    if getattr(ctx, "_review_cyber_pending", "") and not review_enforcement_blocks("blocking"):
+        return {"advisory_replay": ctx._review_cyber_pending, "replay_reason": "review_pending"}
     fp = pre_fingerprint.get("fingerprint", "")
     rebuttal_sha = compute_rebuttal_sha256(review_rebuttal)
     contract_fp = commit_review_contract_fingerprint()
@@ -167,7 +173,7 @@ def _free_cycle_gate(
             cycles_paid=int(ceiling["cycles_paid"]), cap=int(ceiling["cap"]),
             enforcement=enforcement, root_task_id=root_task_id, fingerprint=str(fp),
         )
-    if enforcement != "blocking":
+    if not review_enforcement_blocks(enforcement):
         # ADVISORY: neither state hard-blocks a commit — disclose loudly (typed
         # event + result message) and reuse the recorded outcome for free.
         # The identical-replay half of this branch is structurally near-dead
@@ -396,14 +402,14 @@ def _tests_preflight_block_message(managed_needs_proof: bool, test_err: str) -> 
 
 def _managed_candidate_needs_proof(ctx: ToolContext) -> bool:
     """Managed single-run mandate (Q10): True when the authorized resolver's
-    CURRENT candidate tree carries no recorded green-suite proof (advisory ran
+    CURRENT candidate workload carries no recorded green-suite proof (advisory ran
     with skip_tests, or the tree changed since) — the compensating preflight
     must then run PRE-commit, before paid review and before any commit exists,
     regardless of skip_tests/doc-only, so a red candidate is fixed in place
     instead of committed and rolled back.
 
     AUTHORITY (synthesis F2): the proof consulted here is the PROCESS-HELD ctx
-    record pinned by ``record_managed_tests_proof`` when the host itself ran
+    record pinned by the hermetic runner when the host itself ran
     the suite — never the durable ``tests_evidence`` tx copy, which is a plain
     resolver-writable file (forensic only; a forged tree there must not
     suppress the mandatory run). A restart between the proof run and the
@@ -411,11 +417,9 @@ def _managed_candidate_needs_proof(ctx: ToolContext) -> bool:
     if not _authorized_managed_update_resolver(ctx):
         return False
     try:
-        from supervisor.update_merge import worktree_snapshot_tree
+        from ouroboros.commit_admission import preflight_test_proof_matches
 
-        cand_tree, _cand_err = worktree_snapshot_tree("HEAD")
-        proofs = getattr(ctx, "_managed_tests_proof_trees", None) or ()
-        return not (cand_tree and cand_tree in proofs)
+        return not preflight_test_proof_matches(ctx, ctx.repo_dir)
     except Exception:
         log.debug("managed proof check failed; running the preflight", exc_info=True)
         return True
@@ -573,6 +577,12 @@ def _advisory_and_tests_gate(
             ctx, runner=lambda c, **kw: _run_review_preflight_tests(c, **kw))
         if test_err:
             msg = _tests_preflight_block_message(_managed_needs_proof, test_err)
+            if not review_enforcement_blocks("blocking"):
+                from ouroboros.tools.review import _handle_review_block_or_warning
+
+                ctx._last_review_block_reason = "tests_preflight_blocked"
+                _handle_review_block_or_warning(ctx, True, msg, "")
+                return None
             try:
                 run_cmd(["git", "reset", "HEAD"], cwd=ctx.repo_dir)
             except Exception:
@@ -710,6 +720,7 @@ def _run_pre_push_tests(ctx: ToolContext, force: bool = False) -> Optional[str]:
         return run_hermetic_pytest(
             pathlib.Path(ctx.repo_dir),
             max_output=MAX_TEST_OUTPUT,
+            ctx=ctx,
         )
     except Exception as e:
         log.warning(f"Pre-push tests failed with exception: {e}", exc_info=True)
@@ -817,36 +828,21 @@ def _managed_post_commit_tests_gate(
     suite rolls the assisted merge back instead of shipping a warning (ordinary
     commits keep the warning-only contract later in the flow). The gate is
     MANDATORY: neither the caller's skip_tests nor OUROBOROS_PRE_PUSH_TESTS=0
-    can wave a managed merge through untested — but the mandate is "the full
-    suite provably ran green on the exact committed tree", not "run it twice":
-    when the resolver's pre-commit run (advisory preflight or the compensating
-    bypass preflight) pinned a PROCESS-HELD proof for a tree byte-identical to
-    the committed one, that proof is reused and the duplicate run is skipped
-    (Q10). The authority is the host-written ctx record (synthesis F2) — the
+    can wave a managed merge through untested. The shared runner reuses a
+    PROCESS-HELD proof only when candidate files, source index, HEAD and the
+    effective test/environment contract match, after the distinct post-commit
+    baseline checks. A commit changes HEAD and requires a fresh run; repeated
+    checks of the same subject may reuse it. The authority is the ctx record;
     durable ``tests_evidence`` tx copy is resolver-writable forensics and a
-    forged tree there never suppresses this run; a restart between the proof
-    and the commit re-runs the suite once. The terminal record carries the
+    forged tree there never suppresses this run; a restart loses the proof
+    and requires a fresh run. The terminal record carries the
     same review metadata/fingerprints as every sibling failure record, so an
     operator can reconstruct WHICH reviewed revision the gate rejected."""
     if not managed_tx:
         return None
     del skip_tests  # deliberately ignored for managed merges
-    try:
-        committed_tree = run_cmd(
-            ["git", "rev-parse", "HEAD^{tree}"], cwd=ctx.repo_dir
-        ).strip()
-    except Exception:
-        committed_tree = ""
-    proofs = getattr(ctx, "_managed_tests_proof_trees", None) or ()
-    if committed_tree and committed_tree in proofs:
-        try:
-            ctx.emit_progress_fn(
-                "Managed post-commit tests: reusing the green pre-commit hermetic "
-                "run (exact tree match) — no duplicate suite run."
-            )
-        except Exception:
-            pass
-        return None
+    # The shared runner rechecks the post-commit baseline before comparing the
+    # complete workload. A tree-only fast path here would skip both checks.
     post_test_error = _post_commit_result(
         ctx, commit_message, False, test_warning_ref, force=True,
     )
@@ -976,6 +972,24 @@ def _check_ci_status_after_push(repo_dir: pathlib.Path) -> str:
         )
     except Exception:
         return ""
+
+
+def _publish_post_commit_test_fact(ctx, result: str, test_warning: str) -> str:
+    """Carry "the post-commit tests failed" as a TYPED fact beside the text.
+
+    A commit whose post-commit verification failed is PRESERVED and reported as
+    a success with a warning appended, so nothing about the call is an error and
+    nothing may make it one. The failing tests are still the most reflection
+    worthy thing the task did, and a reader that had to find the word in the
+    result body was a keyword gate standing in for a fact the producer holds
+    here. The text is returned byte-identical, which the registry's publication
+    rule requires.
+    """
+    if test_warning:
+        _publish_tool_result(ctx, ToolResult(
+            status="ok", code="OK", text=result, meta={"post_commit_tests": "failed"},
+        ))
+    return result
 
 
 def _format_commit_result(ctx, commit_message, push_status, test_warning):
@@ -1136,7 +1150,7 @@ def _publish_reviewed_commit(
                 result += f"\n⚠️ WARNING: untracked files remain: {files}"
         except Exception:
             pass
-    return result + ci_note
+    return _publish_post_commit_test_fact(ctx, result + ci_note, test_warning)
 
 
 def _repo_commit_push(ctx: ToolContext, commit_message: str,
@@ -1146,13 +1160,17 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                        skip_advisory_review: bool = False,
                        skip_advisory_pre_review: bool = False,
                        goal: str = "",
-                       scope: str = "") -> str:
+                       scope: str = "", review_reference: Optional[dict] = None,
+                       author_disposition: Optional[dict] = None) -> str:
     """Stage, review, and commit files with unified pre-commit review."""
     skip_advisory_pre_review = bool(skip_advisory_review or skip_advisory_pre_review)
     _reset_commit_review_state(ctx)
+    error = prepare_author_commit_request(ctx, review_reference, author_disposition, review_rebuttal)
+    if error:
+        return error
     _commit_start = time.time()
     if not commit_message.strip():
-        return "⚠️ ERROR: commit_message must be non-empty."
+        return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("⚠️ ERROR: commit_message must be non-empty.")))
     ctx._current_review_commit_message = commit_message
     # A managed marker authorizes exactly one reviewed two-parent resolution.
     from supervisor.update_merge import managed_assisted_tx_for
@@ -1190,7 +1208,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
             phase="preflight",
         )
         return overlap_err
-    preflight_pending = _reconcile_advisory_before_preparation(
+    preflight_pending = "" if ctx._author_commit_source is not None else _reconcile_advisory_before_preparation(
         ctx, commit_message, goal=goal, scope=scope, paths=paths, review_rebuttal=review_rebuttal,
         skip_advisory_review=skip_advisory_pre_review,
     )
@@ -1401,17 +1419,7 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                 )
             except Exception:
                 log.warning("mutation baseline advance failed after commit", exc_info=True)
-        _record_commit_attempt(ctx, commit_message, "succeeded",
-                               duration_sec=time.time() - _commit_start,
-                               phase="commit",
-                               pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
-                               post_review_fingerprint=post_fingerprint.get("fingerprint", ""),
-                               fingerprint_status="matched",
-                               triad_models=getattr(ctx, "_last_triad_models", []),
-                               scope_model=getattr(ctx, "_last_scope_model", ""),
-                               triad_raw_results=getattr(ctx, "_last_triad_raw_results", []),
-                               scope_raw_result=getattr(ctx, "_last_scope_raw_result", {}),
-                               degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []))
+        record_bound_commit_success(ctx, commit_message, _commit_start, pre_fingerprint, post_fingerprint)
         ctx._scope_review_history = {}  # Clear on success — next commit starts fresh
     finally:
         _release_git_lock(lock)
@@ -1429,7 +1437,11 @@ def _repo_commit_push(ctx: ToolContext, commit_message: str,
                                    block_reason="managed_update_smoke_failed", block_details=_msg_pc,
                                    duration_sec=time.time() - _commit_start)
             return _msg_pc
-        return _format_commit_result(ctx, commit_message, "", test_warning_ref[0]) + "\n\n" + _msg_pc
+        return _publish_post_commit_test_fact(
+            ctx,
+            _format_commit_result(ctx, commit_message, "", test_warning_ref[0]) + "\n\n" + _msg_pc,
+            test_warning_ref[0],
+        )
     if not evolution_claim:
         push_status = _auto_push(ctx.repo_dir)
     return _publish_reviewed_commit(
@@ -1465,39 +1477,23 @@ def get_tools() -> List[ToolEntry]:
         "Choose the audited advisory-only skip for this call. "
         f"{ADVISORY_REVIEW_CHOICE_GUIDANCE}"
     )
+    commit_properties = {
+        "commit_message": {"type": "string"},
+        "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of task-attributed paths. Omitted computes candidates; empty never stages the whole tree."},
+        "skip_tests": {"type": "boolean", "default": False, "description": "Skip pre-commit tests."},
+        "review_rebuttal": {"type": "string", "default": "", "description": "A NEW content-hashed counter-argument buys one paid re-review within capacity; repeating it is free-refused."},
+        "skip_advisory_review": {"type": "boolean", "default": False, "description": skip_advisory_description},
+        "goal": {"type": "string", "default": "", "description": "High-level goal of this change. Used by scope reviewer to judge completeness."}, "scope": {"type": "string", "default": "", "description": "Declared scope boundary. Issues outside scope are advisory-only for scope reviewer."},
+        "review_reference": {"type": "object", "description": "Exact reference returned by this task's prior commit review, for free informed Advisory continuation."},
+        "author_disposition": {"type": "object", "additionalProperties": False,
+            "properties": {"disposition": {"type": "string", "enum": ["accepted", "rejected", "partial", "deferred"]}, "rationale": {"type": "string"}},
+            "required": ["disposition", "rationale"], "description": "Explicitly accept the current attributed candidate after reading the referenced outcome. Never overrides Blocking."},
+    }
     return [
-        ToolEntry("commit_reviewed", {
-            "name": "commit_reviewed",
-            "description": reviewed_commit_description,
-            "parameters": {"type": "object", "properties": {
-                "commit_message": {"type": "string"},
-                "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of task-attributed clean-at-baseline paths. Omitted computes the full attributed candidate set; an empty set never stages the whole tree."},
-                "skip_tests": {"type": "boolean", "default": False, "description": "Skip pre-commit tests."},
-                "review_rebuttal": {"type": "string", "default": "",
-                    "description": "If the previous commit was blocked by reviewers and you disagree, include a counter-argument. The rebuttal is identified by CONTENT: a rebuttal new to the current identical-diff streak buys exactly ONE paid re-review of the unchanged diff; resubmitting the same rebuttal (or none) is refused for free, quoting the recorded verdict."},
-                "skip_advisory_review": {"type": "boolean", "default": False,
-                    "description": skip_advisory_description},
-                "goal": {"type": "string", "default": "",
-                    "description": "High-level goal of this change. Used by scope reviewer to judge completeness."},
-                "scope": {"type": "string", "default": "",
-                    "description": "Declared scope boundary. Issues outside scope are advisory-only for scope reviewer."},
-            }, "required": ["commit_message"]},
-        }, _repo_commit_push, is_code_tool=True),
-        ToolEntry("vcs_commit_reviewed", {
-            "name": "vcs_commit_reviewed",
-            "description": reviewed_commit_description,
-            "parameters": {"type": "object", "properties": {
-                "commit_message": {"type": "string"},
-                "paths": {"type": "array", "items": {"type": "string"}, "description": "Optional subset of task-attributed clean-at-baseline paths. Omitted computes candidates; empty never means git add -A."},
-                "skip_tests": {"type": "boolean", "default": False, "description": "Skip pre-commit tests."},
-                "review_rebuttal": {"type": "string", "default": "",
-                    "description": "Content-hashed counter-argument to a prior review block: a NEW rebuttal buys exactly one paid re-review of an unchanged diff; a repeated one is refused free."},
-                "skip_advisory_review": {"type": "boolean", "default": False,
-                    "description": skip_advisory_description},
-                "goal": {"type": "string", "default": ""},
-                "scope": {"type": "string", "default": ""},
-            }, "required": ["commit_message"]},
-        }, _repo_commit_push, is_code_tool=True),
+        ToolEntry("commit_reviewed", {"name": "commit_reviewed", "description": reviewed_commit_description,
+            "parameters": {"type": "object", "properties": commit_properties, "required": ["commit_message"]}}, _repo_commit_push, is_code_tool=True),
+        ToolEntry("vcs_commit_reviewed", {"name": "vcs_commit_reviewed", "description": reviewed_commit_description,
+            "parameters": {"type": "object", "properties": commit_properties, "required": ["commit_message"]}}, _repo_commit_push, is_code_tool=True),
         ToolEntry("vcs_status", {
             "name": "vcs_status",
             "description": "git status --porcelain for the selected repository.",
@@ -1509,9 +1505,11 @@ def get_tools() -> List[ToolEntry]:
         }, _git_status, is_code_tool=True),
         ToolEntry("vcs_diff", {
             "name": "vcs_diff",
-            "description": "git diff for the selected repository (use staged=true to see staged changes after git add).",
+            "description": "Local git diff. Omit refs for unstaged/staged changes. Base compares to worktree or index; base+head compares two trees, not their merge base. No fetch.",
             "parameters": {"type": "object", "properties": {
                 "root": {"type": "string", "enum": ["active_workspace", "system_repo"], "default": "active_workspace", "description": "Omit for the active project workspace; use system_repo for Ouroboros source."},
+                "base": {"type": "string", "default": "", "description": "Optional local base ref, resolved once to an exact tree."},
+                "head": {"type": "string", "default": "", "description": "Optional local second tree; requires base and staged=false."},
                 "staged": {"type": "boolean", "default": False, "description": "If true, show staged changes (--staged)"},
                 "path": {"type": "string", "default": "", "description": "Optional path filter relative to the selected repository"},
                 "stat": {"type": "boolean", "default": False, "description": "If true, show --stat output"},

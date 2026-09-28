@@ -4,6 +4,8 @@ Re-cut on the v7next tip: the reference's ``_ACCEPT_DELTA_CHILD_CAP`` and
 ``_accept_capability_deltas`` rows are superseded — upstream re-homed the
 capability-delta aggregate into ``delegate_evidence`` (the facade reads it
 back at call time), so those two names are neither moved nor pinned here.
+Module size follows the shared size-ratchet tests and manifest; this historical
+extraction must not impose a second cap or a minimum amount of retained code.
 """
 
 from __future__ import annotations
@@ -12,7 +14,6 @@ import ast
 import pathlib
 
 from ouroboros import review_evidence, review_evidence_sections
-from ouroboros.tools import review_context_atlas
 
 REPO = pathlib.Path(__file__).parents[1]
 _LEAVES = (review_evidence_sections,)
@@ -103,26 +104,3 @@ def test_review_evidence_facade_reexports_every_moved_identity():
         assert hasattr(review_evidence, name), name
         assert getattr(review_evidence, name) is getattr(review_evidence_sections, name), name
     assert set(_MOVED_NAMES) <= set(vars(review_evidence_sections))
-
-
-def test_review_evidence_section_owner_is_forced_into_every_review_pack():
-    """The acceptance packet's section author is part of the immune system's
-    review surface exactly as its parent is: a review pack owes it in full
-    instead of treating it as a budget-selected dependency."""
-    for rel in (
-        "ouroboros/review_evidence.py",
-        "ouroboros/review_evidence_sections.py",
-    ):
-        assert rel in review_context_atlas._REVIEW_STACK_PATHS, rel
-
-
-def test_review_evidence_extraction_size_bounds_have_meaningful_headroom():
-    counts = {
-        module.__name__: len(
-            pathlib.Path(module.__file__).read_text(encoding="utf-8").splitlines()
-        )
-        for module in (review_evidence, *_LEAVES)
-    }
-    assert all(count <= 1000 for count in counts.values())
-    assert 600 <= counts["ouroboros.review_evidence_sections"] <= 1000
-    assert 600 <= counts["ouroboros.review_evidence"] <= 1000

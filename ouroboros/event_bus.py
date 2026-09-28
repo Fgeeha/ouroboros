@@ -19,8 +19,10 @@ CHAT_VIDEO = "chat.video"
 CHAT_DOCUMENT = "chat.document"
 CHAT_LINKS = "chat.links"
 CHAT_QUIZ = "chat.quiz"
+CHAT_QUIZ_STATE = "chat.quiz_state"
 SKILL_LIFECYCLE = "skill.lifecycle"
-VALID_TOPICS = frozenset({CHAT_OUTBOUND, CHAT_TYPING, CHAT_PHOTO, CHAT_VIDEO, CHAT_DOCUMENT, CHAT_LINKS, CHAT_QUIZ, SKILL_LIFECYCLE})
+VALID_TOPICS = frozenset({CHAT_OUTBOUND, CHAT_TYPING, CHAT_PHOTO, CHAT_VIDEO, CHAT_DOCUMENT, CHAT_LINKS,
+                          CHAT_QUIZ, CHAT_QUIZ_STATE, SKILL_LIFECYCLE})
 
 
 @dataclass
@@ -136,6 +138,7 @@ __all__ = [
     "CHAT_OUTBOUND",
     "CHAT_PHOTO",
     "CHAT_QUIZ",
+    "CHAT_QUIZ_STATE",
     "CHAT_TYPING",
     "CHAT_VIDEO",
     "EventBus",

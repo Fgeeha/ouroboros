@@ -10,11 +10,14 @@ import re
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.cost_projection import (
-    COST_ALIAS_PAIRS,
-    COST_OPENNESS_FIELDS,
+    COST_ALIAS_PAIRS, COST_OPENNESS_FIELDS,
     normalize_task_result_cost_planes,
 )
 from ouroboros.utils import read_json_dict, update_json_locked, utc_now_iso
+# Read-side custody of a published review projection belongs with the projection
+# owner; the historical name stays resolvable through this module.
+from ouroboros.review_projection import merge_review_projection as merge_review_projection
+from ouroboros.review_records import validate_author_disposition
 
 log = logging.getLogger(__name__)
 
@@ -27,9 +30,7 @@ STATUS_FAILED = "failed"
 STATUS_INTERRUPTED = "interrupted"
 STATUS_CANCELLED = "cancelled"
 
-# ABI 7.0 (Q8=B) schema admission lives in ouroboros/task_result_schema.py
-# (module-size split); re-exported: every caller and test reaches the stamp,
-# the classifier and the quarantine through this module (F401 intended).
+# ABI 7.0 (Q8=B): re-export schema admission, stamping and quarantine for callers.
 from ouroboros.task_result_schema import (  # noqa: F401
     QUARANTINED_SCHEMA_REASON, TASK_RESULT_QUARANTINE_DIR, TASK_RESULT_SCHEMA_VERSION,
     emit_quarantine_event as _emit_quarantine_event,
@@ -60,25 +61,22 @@ def effective_task_acceptance_review_cycles(
     profile: Dict[str, Any], *,
     required_blocking: bool = False,
 ) -> Optional[int]:
-    """Project paid panels from the existing improvement-pass semantics."""
+    """Paid capacity is independent of the author's last response opportunity.
 
-    from ouroboros.task_pacing import effective_max_improvement_passes
+    Explicit task-local pass profiles retain their established p+1 paid ceiling.
+    """
+    from ouroboros.review_cycles import review_max_cycles
 
-    passes = effective_max_improvement_passes(
-        profile,
-        required_blocking=required_blocking,
-    )
-    return None if passes is None else max(1, int(passes) + 1)
+    passes = profile.get("max_improvement_passes")
+    return review_max_cycles() if passes is None else max(1, int(passes) + 1)
 
 
 def _root_task_acceptance_review_cap(
     root_result: Dict[str, Any],
 ) -> Optional[int]:
-    """Resolve one tree cap from the canonical root result.
-
-    Claimants never supply a fallback: descendants could otherwise widen the
-    shared wallet with their own deadline, and a deleted root could be silently
-    recreated from process-local state.
+    """Resolve the cap only from the canonical root result: no claimant fallback.
+    Otherwise a descendant's deadline could widen the shared wallet, or
+    process-local state could silently recreate a deleted root.
     """
 
     if not root_result or "task_contract" not in root_result:
@@ -122,15 +120,11 @@ def _root_task_acceptance_review_cap(
 
 
 def task_acceptance_required_blocking() -> bool:
-    """The Required+Blocking acceptance lane, derived ONCE for every reader.
-
-    Byte-for-byte the real gate's predicate (``loop_acceptance``:
-    ``ctx.mode == "required" and get_review_enforcement() == "blocking"``) —
-    ``ctx.mode`` is ``config.get_task_review_mode()``, captured by
-    ``loop._run_task_acceptance_review_once`` at the acceptance launch, and
-    ``loop.get_review_enforcement`` IS ``config.get_review_enforcement``. The
-    cap reader and the capacity projection share this one derivation so no
-    second spelling can drift from the gate it projects."""
+    """Shared Required+Blocking predicate for the cap and capacity readers.
+    It matches ``loop_acceptance``: ``ctx.mode == 'required'`` (captured from
+    ``config.get_task_review_mode()`` at ``_run_task_acceptance_review_once``)
+    and ``loop.get_review_enforcement() == 'blocking'``. That getter is the
+    same config getter used here, so these projections cannot drift apart."""
     from ouroboros import config
 
     return bool(
@@ -159,7 +153,7 @@ def _claim_for_paid_identity(claims: Any, paid_identity: str) -> Optional[Dict[s
 
 
 def project_task_acceptance_review_capacity(
-    ctx: Any, *, binding_hash: str = "", task_id: str = "", paid_identity: str = "",
+    ctx: Any, *, binding_hash: str = "", task_id: str = "", paid_identity: str = "", purpose: str = "",
 ) -> Dict[str, Any]:
     """Read the canonical root's paid acceptance-wallet projection.
 
@@ -204,7 +198,7 @@ def project_task_acceptance_review_capacity(
         "binding_seen": False,
         "dedupe": "task_acceptance_binding_sha256",
     }
-    if config.get_task_review_mode() == "off":
+    if config.get_task_review_mode() == "off" and purpose != "owner_historical_acceptance":
         return {
             **base,
             "state": "unavailable",
@@ -270,33 +264,21 @@ def project_task_acceptance_review_capacity(
             "reason": f"review_capacity_unknown:{type(exc).__name__}",
         }
 
-# Intent latch: the agent/owner asked to cancel, but the supervisor has not yet
-# torn the task down. Ranks above running so a late running/scheduled mirror
-# cannot resurrect it, but below the truly-terminal statuses so the eventual
-# STATUS_CANCELLED write still lands.
+# Cancel intent outranks running mirrors but not terminal states: stale progress
+# cannot resurrect the task, and the supervisor's final CANCELLED write still lands.
 STATUS_CANCEL_REQUESTED = "cancel_requested"
 
-# The flat task-scope cost fields shared by live task events, progress-row
-# replay, task_summary chat rows, and the persisted result written here (v6.82
-# P1) — one home, so no consumer grows a divergent literal list.
-# DERIVED from the cost SSOT (``ouroboros/cost_projection.py``) rather than
-# re-typed: the HONEST names only (ABI 7.0/ABI-3: the retired
-# ``cost_usd[_with_children]`` aliases are read-tolerance, never carried
-# forward — a consumer copying by this list from a possibly-legacy source must
-# resolve the pair with ``carry_cost_meta`` instead of a key loop) and EVERY
-# accounting openness/integrity marker. Hand-maintained copies are how a
-# marker reaches one surface and not the next: ``non_final_rows`` rides with
-# ``cost_final`` because it is that flag's DISCLOSED CAUSE (v6.89.0 panel D2),
-# and ``ledger_integrity_degraded`` was produced by the authority but named in
-# no list at all, so it never reached any surface.
+# Events, progress replay, chat summaries and results share the cost-projection
+# SSOT's current names and ALL openness/integrity markers. Legacy cost_usd aliases
+# are read-only compatibility: use carry_cost_meta, not a key loop, to copy them.
+# In particular, non_final_rows explains cost_final; omitting it or
+# ledger_integrity_degraded would silently lose the authority's uncertainty.
 TASK_COST_META_FIELDS = tuple(dict.fromkeys(
     [new for new, _old in COST_ALIAS_PAIRS] + list(COST_OPENNESS_FIELDS)
 ))
 
-# Monotonic lifecycle ordering. A write that would move a task *backwards* past
-# the cancel-intent latch or a terminal status is ignored, so a stale
-# scheduled/running mirror can never clobber a cancel/terminal outcome
-# (the "ghost subagent" class). Unknown statuses are unranked and never block.
+# Monotonic lifecycle: stale scheduled/running mirrors cannot overwrite cancellation
+# or terminal outcomes (the ghost-subagent class). Unknown statuses never block.
 _TRULY_TERMINAL_STATUSES = frozenset({
     STATUS_COMPLETED,
     STATUS_FAILED,
@@ -645,22 +627,11 @@ def resolve_task_lineage(
     resolved_role = _field(delegation_role, "delegation_role").lower()
     resolved_original_id = _field(original_task_id, "original_task_id")
     resolved_retry_from = _field(timeout_retry_from, "timeout_retry_from")
-    is_regular_root = bool(
-        resolved_task_id
-        and resolved_root_id == resolved_task_id
-        and not resolved_parent_id
-        and resolved_role != "subagent"
-    )
-    is_retry_root = bool(
-        resolved_task_id
-        and resolved_root_id
-        and resolved_root_id != resolved_task_id
-        and not resolved_parent_id
-        and resolved_role == "root"
-        and resolved_original_id
-        and resolved_original_id == resolved_retry_from
-        and resolved_original_id != resolved_task_id
-    )
+    is_regular_root = bool(resolved_task_id and resolved_root_id == resolved_task_id
+                           and not resolved_parent_id and resolved_role != "subagent")
+    is_retry_root = bool(resolved_task_id and resolved_root_id and resolved_root_id != resolved_task_id
+                         and not resolved_parent_id and resolved_role == "root" and resolved_original_id
+                         and resolved_original_id == resolved_retry_from and resolved_original_id != resolved_task_id)
     return {
         "task_id": resolved_task_id,
         "root_task_id": resolved_root_id,
@@ -710,6 +681,42 @@ def _is_status_regression(existing_status: str, new_status: str) -> bool:
     return False
 
 
+def is_reconciled_presence_placeholder(row: Dict[str, Any]) -> bool:
+    """The orphan reconciler's failed mark on a lost presence turn: no terminal of its own ever ran."""
+    meta = row.get("metadata") if isinstance(row.get("metadata"), dict) else {}
+    return (row.get("status") == STATUS_FAILED and not row.get("terminal_origin")
+            and row.get("status_reconciled_from") in {STATUS_RUNNING, STATUS_INTERRUPTED}
+            and row.get("reason_code") in {"orphaned_running_after_worker_restart", "interrupted_retry_lost"}
+            and (meta.get("source") == "presence" or isinstance(meta.get("presence"), dict)))
+
+
+def reopen_reconciled_presence_placeholder(drive_root: Any, task_id: str) -> bool:
+    """Return a placeholder to ``running`` for its re-run; the host mark moves to ``superseded_placeholder``."""
+    path, reopened = task_result_path(drive_root, task_id), []
+    # The terminal-projection bookkeeping of the placeholder's failed transition goes with it: the
+    # re-run's own terminal transition must originate its own room row, never inherit a failed one.
+    projection = ("canonical_terminal_projection", "canonical_terminal_projection_ready",
+                  "canonical_terminal_projection_origin")
+    cleared = {"reason_code", "outcome_axes", "artifact_status", "artifact_bundle", "result",
+               "status_reconciled_from", *projection}
+
+    def _reopen(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        if not is_reconciled_presence_placeholder(existing):
+            return None
+        require_writable_task_result_schema(existing, path)
+        mark = {key: existing.get(key) for key in ("status", "reason_code", "status_reconciled_from", "ts", *projection)
+                if key in existing}
+        reopened.append(utc_now_iso())
+        return stamp_task_result_schema({
+            **{key: value for key, value in existing.items() if key not in cleared},
+            "status": STATUS_RUNNING, "ts": reopened[0], "updated_at": reopened[0],
+            "superseded_placeholder": {**mark, "result": str(existing.get("result") or "")[-500:]},
+        })
+
+    update_json_locked(path, _reopen, strict_existing_dict=True)
+    return bool(reopened)
+
+
 def validate_task_id(task_id: Any) -> str:
     text = str(task_id or "").strip()
     if not _TASK_ID_RE.fullmatch(text):
@@ -718,14 +725,10 @@ def validate_task_id(task_id: Any) -> str:
 
 
 def task_results_dir(drive_root: Any, *, create: bool = True) -> pathlib.Path:
-    """Resolve ``<drive_root>/task_results``.
+    """Resolve ``<drive_root>/task_results``; writers create it, readers pass ``create=False``.
 
-    ``create`` controls the mkdir side effect: WRITE callers leave it True so the
-    directory exists before the write; READ/LIST callers pass ``create=False`` so a
-    scan of a never-provisioned (or stubbed) root returns nothing instead of
-    MATERIALISING the directory. The latter previously let an unguarded scan with a
-    MagicMock-derived root create a stray ``MagicMock/.../task_results`` tree in cwd.
-    """
+    A read-side mkdir once let a scan with a MagicMock-derived root create a stray
+    ``MagicMock/.../task_results`` tree in cwd, so a never-provisioned root reads as empty."""
     path = pathlib.Path(drive_root) / "task_results"
     if create:
         path.mkdir(parents=True, exist_ok=True)
@@ -736,22 +739,49 @@ def task_result_path(drive_root: Any, task_id: str, *, create: bool = True) -> p
     return task_results_dir(drive_root, create=create) / f"{validate_task_id(task_id)}.json"
 
 
+def _normalize_swarm_efficiency(data: Dict[str, Any]) -> Dict[str, Any]:
+    """Read the two retired fan-out names without rewriting historical records."""
+    value = data.get("swarm_efficiency")
+    if not isinstance(value, dict):
+        return data
+    value = dict(value)
+    for old, new in (("wave_count", "fanout_count"),
+                     ("inter_wave_latency_sec_total", "fanout_interval_sec_total")):
+        if old in value:
+            value.setdefault(new, value.pop(old))
+    return {**data, "swarm_efficiency": value}
+
+
+def _admit_task_result(
+    path: pathlib.Path, data: Any, task_id: str, *, strict: bool, noun: str,
+) -> tuple[Optional[Dict[str, Any]], str]:
+    """Schema admission shared by exact and scan reads: ``(row or None, refusal when quarantined)``.
+
+    Fail-soft refusal quarantines; strict refusal raises without moving, so
+    unreadable identities cannot be readmitted."""
+    refusal = task_result_schema_refusal(data)
+    if refusal and strict:  # "malformed" keeps the pre-ABI-2 strict message for unreadable rows
+        raise ValueError(f"{noun} is unreadable or invalid: {path}" if refusal == "malformed" else
+                         f"task result schema is inadmissible ({QUARANTINED_SCHEMA_REASON}: {refusal}): {path}")
+    if refusal:
+        outcome = _quarantine_task_result(path, refusal)
+        data = read_json_dict(path) if outcome == "kept_admissible" else None
+        if data is None or task_result_schema_refusal(data):
+            return None, refusal if outcome == "moved" else ""
+    if strict and (str(data.get("task_id") or "") != task_id or not isinstance(data.get("status"), str)
+                   or not str(data.get("status") or "").strip()):
+        raise ValueError(f"{noun} is unreadable or invalid: {path}")
+    return data, ""
+
+
 def load_task_result(
     drive_root: Any, task_id: str, *, strict: bool = False,
 ) -> Optional[Dict[str, Any]]:
-    """Read one exact task result.
+    """Read one exact result through schema admission, tolerating old fan-out names.
 
-    Observational callers retain the historical fail-soft default.  Admission
-    callers pass ``strict=True`` so an existing unreadable row cannot be
-    reinterpreted as an unused task identity.
-
-    Schema admission (ABI 7.0, Q8=B): an inadmissible stored row — see
-    ``task_result_schema_refusal`` — is QUARANTINED by the fail-soft path
-    (moved under ``task_results/quarantine/``, one batched durable event) and
-    the read reports no result; the strict path raises WITHOUT moving, so an
-    authority probe never mutates storage. Admissible rows are returned as
-    stored, without projecting their deliverables or independent state axes.
-    """
+    Fail-soft refusal quarantines with a batched event and returns None; strict
+    refusal raises without moving, so unreadable identities cannot be readmitted.
+    Neither mode materializes deliverables or independent state axes."""
     try:
         tid = validate_task_id(task_id)
         path = task_result_path(drive_root, tid, create=False)
@@ -759,34 +789,16 @@ def load_task_result(
         if strict:
             raise
         return None
-    data = read_json_dict(path)
-    if data is None and not path.is_file():
-        return None  # plainly absent — nothing stored, nothing to admit
-    refusal = task_result_schema_refusal(data)
-    if refusal:
-        if strict:
-            if refusal == "malformed":
-                # Pre-ABI-2 strict contract for unreadable rows, kept stable.
-                raise ValueError(f"task result authority is unreadable or invalid: {path}")
-            raise ValueError(
-                f"task result schema is inadmissible ({QUARANTINED_SCHEMA_REASON}: {refusal}): {path}"
-            )
-        outcome = _quarantine_task_result(path, refusal)
-        if outcome == "kept_admissible":
-            data = read_json_dict(path)
-            if task_result_schema_refusal(data):
-                return None
-        else:
-            if outcome == "moved":
-                _emit_quarantine_event(drive_root, [{"task_id": tid, "reason": refusal}])
-            return None
-    if strict and (
-        str(data.get("task_id") or "") != tid
-        or not isinstance(data.get("status"), str)
-        or not str(data.get("status") or "").strip()
-    ):
-        raise ValueError(f"task result authority is unreadable or invalid: {path}")
-    return data
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None  # This read saw absence even if a writer publishes immediately after it.
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        data = None
+    data, moved = _admit_task_result(path, data, tid, strict=strict, noun="task result authority")
+    if moved:
+        _emit_quarantine_event(drive_root, [{"task_id": tid, "reason": moved}])
+    return _normalize_swarm_efficiency(data) if data is not None else None
 
 
 def list_task_results(
@@ -813,70 +825,14 @@ def list_task_results(
         data = read_json_dict(path)
         if data is None and not path.is_file():
             continue  # vanished mid-scan — nothing to admit or quarantine
-        refusal = task_result_schema_refusal(data)
-        if refusal:
-            if strict:
-                if refusal == "malformed":
-                    # Pre-ABI-2 strict contract for unreadable rows, kept stable.
-                    raise ValueError(f"task result is unreadable or invalid: {path}")
-                raise ValueError(
-                    f"task result schema is inadmissible ({QUARANTINED_SCHEMA_REASON}: {refusal}): {path}"
-                )
-            outcome = _quarantine_task_result(path, refusal)
-            if outcome == "kept_admissible":
-                data = read_json_dict(path)
-                if task_result_schema_refusal(data):
-                    continue
-            else:
-                if outcome == "moved":
-                    quarantined.append({"task_id": path.stem, "reason": refusal})
-                continue
-        if strict and (
-            str(data.get("task_id") or "") != path.stem
-            or not isinstance(data.get("status"), str)
-            or not str(data.get("status") or "").strip()
-        ):
-            raise ValueError(f"task result is unreadable or invalid: {path}")
-        if wanted and str(data.get("status") or "") not in wanted:
+        data, moved = _admit_task_result(path, data, path.stem, strict=strict, noun="task result")
+        if moved:
+            quarantined.append({"task_id": path.stem, "reason": moved})
+        if data is None or (wanted and str(data.get("status") or "") not in wanted):
             continue
         results.append(data)
     _emit_quarantine_event(drive_root, quarantined)
     return results
-
-
-def merge_review_projection(previous: Any, incoming: Any) -> Any:
-    """Keep newer host publication facts when a delayed task snapshot arrives.
-
-    This is read-side custody, never review authority. Attempt identity comes
-    from the task; publication_revision only orders snapshots of the SAME
-    panel. Supersession cannot be reversed by a stale or replayed projection.
-    """
-    if not isinstance(previous, dict) or not isinstance(incoming, dict):
-        return incoming
-    old_rows, new_rows = previous.get("panels"), incoming.get("panels")
-    if not isinstance(old_rows, list) or not isinstance(new_rows, list):
-        return incoming
-    if not any(isinstance(row, dict) and row.get("publication_revision") for row in old_rows + new_rows):
-        return incoming  # unchanged legacy merge semantics
-    def rank(value: Dict[str, Any]) -> tuple:
-        return (bool(value.get("superseded")),
-                value.get("publication_revision") if type(value.get("publication_revision")) is int else 0)
-
-    merged: Dict[tuple, Dict[str, Any]] = {}
-    for index, row in enumerate(old_rows + new_rows):
-        if not isinstance(row, dict):
-            continue
-        key = (str(row.get("surface") or ""), str(row.get("task_attempt") or ""),
-               str(row.get("panel_id") or f"legacy:{index}"), row.get("panel_index"))
-        prior = merged.get(key)
-        if prior is None or rank(row) > rank(prior):
-            merged[key] = copy.deepcopy(row)
-    rows = list(merged.values())
-    rows.sort(key=lambda row: (
-        row.get("task_attempt") if type(row.get("task_attempt")) is int else 0,
-        row.get("panel_index") if type(row.get("panel_index")) is int else 0,
-    ))
-    return {**previous, **incoming, "panels": rows}
 
 
 def write_task_result(
@@ -884,29 +840,32 @@ def write_task_result(
     task_id: str,
     status: str,
     *,
-    _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = None,
+    _field_projector: Optional[Callable[[Dict[str, Any], Dict[str, Any]], Optional[Dict[str, Any]]]] = None,
     strict_existing_dict: bool = False,
+    create_only: bool = False,
     **fields: Any,
 ) -> Dict[str, Any]:
     """Merge-write a task result under a per-file lock.
 
-    Worker processes, the supervisor thread, and gateway handlers all read-modify-write
-    the same ``task_results/<id>.json``; the lock evaluates the monotonic-status guard
-    against the CURRENT on-disk status, so the winner of
-    a concurrent terminal race is decided by the monotonic reducer, not timing.
-    Terminal statuses are sticky: natural completion WINS a late cancel (owner
-    decision 4=A) — there is deliberately no override that lets a cancellation
-    replace an already-completed result (discarding a result is a separate
-    explicit parent action, ``discard_child_result``). ``_field_projector`` is the narrow
-    custody seam for fields and status that depend on CURRENT; it runs under this same lock.
-    ``strict_existing_dict`` is reserved for authority-preserving callers:
-    when true, an existing malformed/non-object or wrong-schema result raises
-    instead of being treated as an empty row and overwritten.  The check
-    happens inside the same file lock as the merge, so a malformed authority
-    cannot slip in between a caller's probe and its terminal write.
+    Workers, supervisor and gateways share CURRENT under this lock: the monotonic
+    reducer decides terminal races, so natural completion wins a late cancel.
+    Discarding a result remains the separate explicit ``discard_child_result``.
+    ``_field_projector`` runs after review-publication selection under the same
+    lock, deriving fields/status from CURRENT or publishing its verified refs;
+    repeating the incoming-review merge afterward would undo that handoff.
+    ``strict_existing_dict`` refuses malformed/non-object, empty, wrong-identity
+    or wrong-schema authority under the write lock, never replacing it with {}.
+    ``create_only`` aborts on an existing nonempty row after those checks, before
+    projection, normalization or timestamps. Pair it with strict validation to
+    initialize only absence while preserving unknown bytes.
     """
     path = task_result_path(results_drive_root, task_id)
     explicit_ts = str(fields.pop("ts", "") or "")
+    from ouroboros.task_custody import capture_unread_mail, merge_unread_mail
+
+    # TZ-1 V10: the mailbox bytes are read BEFORE the row lock (a bounded union happens
+    # under it); a terminal write that the projector turns terminal captures under it.
+    captured = capture_unread_mail(results_drive_root, task_id) if status in _TRULY_TERMINAL_STATUSES else None
 
     def _merge(existing: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         if strict_existing_dict and existing and (
@@ -917,35 +876,53 @@ def write_task_result(
             raise ValueError(
                 f"task result authority is unreadable or invalid: {path}"
             )
-        # ABI 7.0: every write stamps the row; a row another schema version
-        # owns (a rollback survivor) is never silently downgraded.
+        # ABI 7.0: every write stamps the row; another schema's row is never downgraded.
         require_writable_task_result_schema(existing, path)
-        projected_fields = _field_projector(existing, {**fields, "status": status}) if _field_projector else dict(fields)
+        if create_only and existing:
+            return None
+        prepared_fields = dict(fields)
+        from ouroboros.acceptance_history import preserve_acceptance_history
+        prepared_fields = preserve_acceptance_history(existing, prepared_fields)
+        if "review_projection" in prepared_fields:
+            prepared_fields["review_projection"] = merge_review_projection(
+                existing.get("review_projection"), prepared_fields["review_projection"],
+            )
+        projected_fields = _field_projector(existing, {**prepared_fields, "status": status}) if _field_projector else prepared_fields
+        if projected_fields is None:  # projector saw a terminal/stale row: no mutation
+            return None
         projected_status = str(projected_fields.pop("status", status))
         # Monotonic lifecycle: no stale mirror may overwrite a terminal outcome.
         existing_status = str(existing.get("status") or "")
         if existing and _is_status_regression(existing_status, projected_status):
-            # Surface the blocked transition: when debugging a "stuck" task this
-            # is the only signal that a stale/late write was intentionally dropped.
+            # Debugging a "stuck" task: the only signal that a stale/late write was dropped.
             log.debug("Blocked status regression %s -> %s for task %s",
                       existing.get("status"), projected_status, task_id)
             return None
-        if "review_projection" in projected_fields:
-            projected_fields["review_projection"] = merge_review_projection(
-                existing.get("review_projection"), projected_fields["review_projection"],
-            )
+        # Only this accepted transition can originate terminal delivery debt:
+        # enrichment/replica fields cannot adopt historical terminal rows or
+        # erase provenance persisted before the separate readiness write.
+        projected_fields.pop("canonical_terminal_projection_origin", None)
+        if projected_status in _TRULY_TERMINAL_STATUSES and existing_status not in _TRULY_TERMINAL_STATUSES:
+            merged = {**existing, **projected_fields}
+            lineage_keys = ("root_task_id", "parent_task_id", "delegation_role", "original_task_id", "timeout_retry_from")
+            if resolve_task_lineage(task_id, metadata=merged.get("metadata"),
+                                    **{key: merged.get(key) for key in lineage_keys})["is_root_task"]:
+                projected_fields["canonical_terminal_projection_origin"] = "terminal_transition"
+            # TZ-1 V10: this accepted transition keeps the mail no attempt read (no ACK written);
+            # later late mail joins through settlement, never through a rejected write.
+            projected_fields["unread_mailbox"] = merge_unread_mail(
+                projected_fields.get("unread_mailbox"),
+                captured if status in _TRULY_TERMINAL_STATUSES else capture_unread_mail(results_drive_root, task_id))
+        # Unread-mail custody only grows: no replica or partial write can shrink it.
+        projected_fields["unread_mailbox"] = merge_unread_mail(
+            existing.get("unread_mailbox"), projected_fields.get("unread_mailbox"))
+        if projected_fields["unread_mailbox"] is None:
+            projected_fields.pop("unread_mailbox")
         now = utc_now_iso()
-        # ABI-3 write seam: the merge BASE is the existing row normalized onto
-        # the honest cost names (its own legacy spelling wins its own pair,
-        # then is stripped) so a stored alias can neither survive the rewrite
-        # nor outrank this write's fresh honest value at the final
-        # normalization below; a legacy spelling arriving IN the write itself
-        # (a legacy mutator's edit) still wins that final resolution and
-        # leaves under the honest name only. Fix-round-3: BOTH passes use the
-        # shared deep normalizer, so the nested public cost planes (the
-        # subagent envelope + its usage snapshot, the loop-outcome usage)
-        # are rewritten onto honest names too — whichever side of the merge
-        # the nested dict came from.
+        # ABI-3 write seam: the merge BASE is normalized onto honest cost names first, so a stored alias
+        # neither survives nor outranks this write's fresh value; a legacy spelling IN this write still
+        # wins the final pass and leaves under the honest name. Both passes use the shared deep
+        # normalizer, so nested cost planes (subagent envelope, loop-outcome usage) are rewritten too.
         return stamp_task_result_schema(normalize_task_result_cost_planes({
             **normalize_task_result_cost_planes(existing),
             **projected_fields,
@@ -955,10 +932,8 @@ def write_task_result(
             "updated_at": now,
         }))
 
-    # Never fall back to an unlocked read/merge/write. Every task-result write is
-    # lifecycle authority; accepting stale state here makes the winner of a
-    # completed-vs-cancelled race depend on timing rather than the monotonic
-    # reducer above. Callers may retry or fail their transition explicitly.
+    # Never fall back to an unlocked read/merge/write: stale state would let timing, not the monotonic
+    # reducer, pick a completed-vs-cancelled winner. Callers retry or fail their transition explicitly.
     return update_json_locked(
         path,
         _merge,
@@ -967,18 +942,12 @@ def write_task_result(
     )
 
 
-# --------------------------------------------------------------------------- plan review state
-#
-# ``plan_review_state`` v2 (plan-review redesign, 2026-08-15): the durable record of
-# every ``plan_task`` cycle of ONE task. Task level: ``series_id`` (fresh per first v2
-# wave), ``cycles_paid`` (paid reviewer panels — the shared cap ``review_max_cycles()``
-# binds it), ``need_evidence_seen`` (per-task memory: one locator may be requested once),
-# ``current_attempt`` (the fingerprint the gate projects + open|unavailable|rail_degraded),
-# ``waves`` (bounded: the last ``_PLAN_REVIEW_FULL_WAVES`` in full, older ones compacted,
-# ``waves_omitted`` beyond ``_PLAN_REVIEW_MAX_WAVES``). A v1 record is READ-ONLY: it
-# loads without error under ``legacy_v1``; an open v1 wave projects as
-# ``legacy_open_requires_resubmission`` (S5 — never auto-closed) until a NEW plan_task
-# call starts a fresh v2 series.
+# plan_review_state v2 records each task's plan_task cycles: a fresh series_id,
+# cycles_paid bounded by review_max_cycles(), need_evidence_seen (one request per
+# locator), and current_attempt (fingerprint + open/unavailable/rail_degraded).
+# Keep _PLAN_REVIEW_FULL_WAVES whole, compact older waves and count waves_omitted
+# beyond _PLAN_REVIEW_MAX_WAVES. v1 remains read-only under legacy_v1; an open wave
+# requires resubmission until a new plan_task starts v2, never automatic closure.
 
 _PLAN_REVIEW_FULL_WAVES = 8
 _PLAN_REVIEW_MAX_WAVES = 64
@@ -1031,11 +1000,7 @@ def legacy_plan_review_projection(value: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
-    """Return a private, bounded, shape-checked copy of the host-owned planning state.
-
-    v2 records are validated; a v1 record (``schema_version: 1``) is wrapped read-only:
-    the returned v2 state carries it under ``legacy_v1`` and its projection under
-    ``legacy_v1_projection`` — nothing is migrated, nothing is auto-closed."""
+    """Validate bounded v2 state; wrap v1 read-only without migrating authority."""
     if value in (None, {}):
         return _empty_plan_review_state()
     if not isinstance(value, dict):
@@ -1070,6 +1035,10 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: full wave needs spec and findings")
             if not isinstance(wave.get("dispositions", []), list):
                 raise ValueError("PLAN_REVIEW_STATE_INVALID: dispositions must be a list")
+        if "author_disposition" in wave and validate_author_disposition(
+            wave["author_disposition"], subject_hash=fingerprint,
+        ) is None:
+            raise ValueError("PLAN_REVIEW_STATE_INVALID: author_disposition is malformed or stale")
         seen.add(fingerprint)
     cycles_paid = value.get("cycles_paid", 0)
     if not isinstance(cycles_paid, int) or isinstance(cycles_paid, bool) or cycles_paid < 0:
@@ -1081,12 +1050,18 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
     if not isinstance(attempt, dict):
         raise ValueError("PLAN_REVIEW_STATE_INVALID: current_attempt must be an object")
     if attempt:
-        if set(attempt) != {"fingerprint", "status", "reason"}:
+        if set(attempt) - {"fingerprint", "status", "reason", "author_subject"} or not {"fingerprint", "status", "reason"} <= set(attempt):
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current_attempt shape is invalid")
         if not _PLAN_REVIEW_HASH_RE.fullmatch(str(attempt.get("fingerprint") or "")):
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt fingerprint is invalid")
         if str(attempt.get("status") or "") not in _PLAN_REVIEW_ATTEMPT_STATUSES:
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt status is invalid")
+        if "author_subject" in attempt:
+            subject = attempt["author_subject"]
+            if (not isinstance(subject, dict) or not isinstance(subject.get("source_ref"), dict)
+                    or not _PLAN_REVIEW_HASH_RE.fullmatch(str(subject.get("review_fingerprint") or ""))
+                    or validate_author_disposition(subject.get("author_disposition"), subject_hash=attempt["fingerprint"]) is None):
+                raise ValueError("PLAN_REVIEW_STATE_INVALID: current author subject is invalid")
         if len(str(attempt.get("reason") or "")) > _PLAN_REVIEW_REASON_MAX_CHARS:
             raise ValueError("PLAN_REVIEW_STATE_INVALID: current attempt reason is too large")
     if len(json.dumps(copied, ensure_ascii=False, default=str).encode("utf-8")) > _PLAN_REVIEW_STATE_MAX_BYTES:
@@ -1095,13 +1070,20 @@ def _validated_plan_review_state(value: Any) -> Dict[str, Any]:
 
 
 def load_plan_review_state(results_drive_root: Any, task_id: str) -> Dict[str, Any]:
+    """Read bounded state, then resolve the full specs used by decision consumers."""
     path = task_result_path(results_drive_root, task_id, create=False)
     if not path.is_file():
         return _empty_plan_review_state()
-    result = read_json_dict(path)
-    if result is None:
-        raise ValueError("PLAN_REVIEW_STATE_INVALID: parent task result JSON is malformed")
-    return _validated_plan_review_state(result.get(PLAN_REVIEW_STATE_KEY))
+    # Share the writer's lock: Windows may deny reads during atomic replacement.
+    try:
+        result = update_json_locked(path, lambda _: None, strict_existing_dict=True)
+    except ValueError as exc:
+        raise ValueError("PLAN_REVIEW_STATE_INVALID: parent task result JSON is malformed") from exc
+    from ouroboros.tools.plan_review_artifacts import authority_state
+
+    return authority_state(
+        results_drive_root, task_id, _validated_plan_review_state(result.get(PLAN_REVIEW_STATE_KEY)),
+    )
 
 
 def plan_review_wave(state: Dict[str, Any], fingerprint: str) -> Optional[Dict[str, Any]]:
@@ -1113,25 +1095,20 @@ def plan_review_wave(state: Dict[str, Any], fingerprint: str) -> Optional[Dict[s
 
 
 def current_plan_review_wave(state: Any) -> Optional[Dict[str, Any]]:
-    """The wave the gate projects: the ``current_attempt`` fingerprint's wave, else the
-    latest recorded wave (private copy)."""
+    """Copy the current fingerprint's wave; only an absent fingerprint selects the latest."""
     if not isinstance(state, dict):
         return None
     attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
     fingerprint = str(attempt.get("fingerprint") or "")
-    wave = plan_review_wave(state, fingerprint) if fingerprint else None
-    if wave is None:
-        waves = state.get("waves") if isinstance(state.get("waves"), list) else []
-        wave = copy.deepcopy(waves[-1]) if waves and not fingerprint else None
-    return wave
+    if fingerprint:
+        return plan_review_wave(state, fingerprint)
+    waves = state.get("waves") if isinstance(state.get("waves"), list) else []
+    return copy.deepcopy(waves[-1]) if waves else None
 
 
 def _legacy_projection_of(state: Any) -> Dict[str, Any]:
-    if not isinstance(state, dict):
-        return {}
-    if state.get("schema_version") == 1:
-        return legacy_plan_review_projection(state)
-    projection = state.get("legacy_v1_projection")
+    state = state if isinstance(state, dict) else {}
+    projection = legacy_plan_review_projection(state) if state.get("schema_version") == 1 else state.get("legacy_v1_projection")
     return projection if isinstance(projection, dict) else {}
 
 
@@ -1141,25 +1118,18 @@ def plan_review_gate_projection(
     *,
     hard_rail: str = "",
 ) -> Dict[str, Any]:
-    """Project one plan-review finalization decision from existing authority.
+    """Project finalization permission without changing the durable review facts.
 
-    ``plan_review_state`` is the durable SSOT; the ``current_attempt`` pointer keeps a
-    newer fingerprint from falling back to an older closed wave. Statuses: ``closed``
-    (allow) · ``rail_degraded`` (a task-wide rail released the hold — allow) ·
-    ``advisory_open`` (advisory enforcement proceeds under loud disclosure) ·
-    ``cycles_exhausted`` (the shared cap is spent on an OPEN wave: finalization is
-    released so the task can terminalize honestly as blocked — owner D27 — while
-    the wave itself stays open) · ``open`` / ``unavailable`` / ``pending`` /
-    ``legacy_open_requires_resubmission`` (blocking hold; EXCEPT an ``open`` wave
-    whose ``quorum_unreachable`` typed fact holds — B2b — which releases
-    finalization the same honest-blocked way while staying open) · ``absent``. Accepts a v2
-    state, a loaded v1 wrapper, or a raw v1 record (read-only projection)."""
+    Current-attempt identity prevents stale closure. Blocking holds open reviews;
+    spent cycles, unreachable quorum and hard rails permit honest blocked exits.
+    Advisory/Cyber allow is not closure or PASS. Accepts v2 and raw/wrapped v1.
+    """
     policy = "blocking" if str(enforcement or "").lower() == "blocking" else "advisory"
     control: Dict[str, Any] = {}
     attempted = False
+    attempt = state.get("current_attempt") if isinstance(state, dict) and isinstance(state.get("current_attempt"), dict) else {}
     if isinstance(state, dict):
         legacy = _legacy_projection_of(state)
-        attempt = state.get("current_attempt") if isinstance(state.get("current_attempt"), dict) else {}
         wave = current_plan_review_wave(state) if state.get("schema_version") != 1 else None
         if wave is not None or (attempt and state.get("schema_version") != 1):
             attempted = True
@@ -1171,18 +1141,16 @@ def plan_review_gate_projection(
                 control = {"status": "rail_degraded", "reason": str(attempt.get("reason") or ""),
                            "outcome": outcome}
             elif wave is not None:
+                # B2b typed fact: a wave whose own rows prove no re-dispatch can meet
+                # quorum (structurally dead lanes) carries its earliest recorded reset.
                 control = {
-                    "status": "cycles_exhausted" if wave.get("cycles_exhausted") else "open",
+                    "status": "cycles_exhausted" if wave.get("cycles_exhausted") or (attempt.get("status") == "cycles_exhausted" and not wave.get("custody_pending")) else "open",
                     "outcome": outcome, "closed": False,
                     "fingerprint": str(wave.get("request_fingerprint") or ""),
-                    "reviewer_slots_degraded": outcome == "DEGRADED",
+                    "reviewer_slots_degraded": outcome == "DEGRADED", "custody_pending": bool(wave.get("custody_pending")),
+                    **({"quorum_unreachable": True, "earliest_reset": str(wave.get("earliest_reset") or "")}
+                       if wave.get("quorum_unreachable") else {}),
                 }
-                if wave.get("quorum_unreachable"):
-                    # B2b typed fact: the wave's own rows prove the quorum cannot be
-                    # met by any re-dispatch (structurally dead lanes), with the
-                    # earliest recorded reset when one was named.
-                    control["quorum_unreachable"] = True
-                    control["earliest_reset"] = str(wave.get("earliest_reset") or "")
             else:
                 control = {"status": str(attempt.get("status") or "open"),
                            "reason": str(attempt.get("reason") or "")}
@@ -1207,10 +1175,31 @@ def plan_review_gate_projection(
     else:
         control = {"status": "invalid"}
 
+    subject = attempt.get("author_subject") or {}
+    author = validate_author_disposition(subject.get("author_disposition"), subject_hash=str(attempt.get("fingerprint") or ""))
+    if author and attempt.get("reason") in {"author_current_plan", "author_stop"}:
+        # Follow historical criticism only here, never in current_plan_review_wave: its
+        # closed_plan_review_wave consumer binds CURRENT acceptance authority. EVIDENCE
+        # into a GAP only: it never moves this attempt's lifecycle or outcome (§6 why).
+        critic = plan_review_wave(state, str(subject.get("review_fingerprint") or ""))
+        if critic is not None and not control.get("outcome"):
+            outcome = str(critic.get("aggregate") or "")
+            control.update(outcome=outcome, historical_critic=True,
+                           custody_pending=bool(critic.get("custody_pending")),
+                           reviewer_slots_degraded=outcome == "DEGRADED")
+    if author and author.get("action") == "stop":
+        control.update(status="author_stopped", reason="author_stop", closed=False)
     status = str(control.get("status") or "unavailable")
     closed = bool(control.get("closed"))
+    from ouroboros.tools.review_helpers import review_enforcement_blocks
+
+    cyber = not review_enforcement_blocks("blocking")
     if status == "closed" and closed:
         gate_status, allow = "closed", True
+    elif status == "author_stopped":
+        gate_status, allow = "author_stopped", True
+    elif cyber:
+        gate_status, allow = "advisory_open", True
     elif hard_rail or status == "rail_degraded":
         gate_status, allow = "rail_degraded", True
     elif policy == "advisory" and status in {
@@ -1232,18 +1221,23 @@ def plan_review_gate_projection(
         gate_status, allow = status, False
     return {
         "enforcement": policy,
+        **({"decision_authority": "cyber_pro", "review_status": status} if cyber else {}),
         "status": gate_status,
         "allow": allow,
         "attempted": attempted,
         "outcome": str(control.get("outcome") or ""),
+        "historical_critic": bool(control.get("historical_critic")),  # whose verdict: label it, never this plan's own
         "closed": closed,
+        "review_capacity_reason": "review_cycles_exhausted" if attempt.get("status") == "cycles_exhausted" else "",
         "reviewer_slots_degraded": bool(control.get("reviewer_slots_degraded")),
+        "custody_pending": bool(control.get("custody_pending")),  # reviewers still working: read before aggregate
         "quorum_unreachable": bool(control.get("quorum_unreachable")),
         "earliest_reset": str(control.get("earliest_reset") or ""),
         "reason": str(hard_rail or control.get("reason") or ""),
         "cycles_paid": int((state or {}).get("cycles_paid") or 0) if isinstance(state, dict) else 0,
         "legacy_v1": bool(control.get("legacy_v1")),
         "source": "durable_state",
+        "author_action": str(author.get("action") or "") if author else "",
     }
 
 
@@ -1255,10 +1249,9 @@ def closed_plan_review_wave(state: Any) -> Optional[Dict[str, Any]]:
     so ``effective_acceptance_claims``' v1 fallback still binds those claims."""
     if not isinstance(state, dict):
         return None
-    if state.get("schema_version") != 1:
-        wave = current_plan_review_wave(state)
-        if wave is not None:
-            return wave if bool(wave.get("closed")) else None
+    wave = current_plan_review_wave(state) if state.get("schema_version") != 1 else None
+    if wave is not None:
+        return wave if bool(wave.get("closed")) else None
     legacy = _legacy_projection_of(state)
     if legacy.get("status") == "closed":
         return {"legacy_v1": True, "request_fingerprint": legacy["fingerprint"],
@@ -1274,6 +1267,7 @@ def record_plan_review_attempt(
     fingerprint: str,
     status: str = "open",
     reason: str = "",
+    author_subject: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Select one canonical plan fingerprint as current (open | unavailable | rail_degraded)."""
     if not _PLAN_REVIEW_HASH_RE.fullmatch(str(fingerprint or "")):
@@ -1287,6 +1281,8 @@ def record_plan_review_attempt(
             "status": status,
             "reason": str(reason or "")[:_PLAN_REVIEW_REASON_MAX_CHARS],
         }
+        if author_subject is not None:
+            state["current_attempt"]["author_subject"] = copy.deepcopy(author_subject)
         return state
 
     return _update_plan_review_state(results_drive_root, task_id, _record)
@@ -1311,21 +1307,14 @@ def mark_current_plan_review_unavailable(
 
 
 def _fit_plan_review_state(state: Dict[str, Any]) -> Dict[str, Any]:
-    """Last resort (gate advisory, 39c3a195; W3 rounds 6-9): make the state persistable.
+    """Fit every hot-index write so paid cycles and closure/cap stamps can persist.
 
-    One maximal PAID wave can exceed the limit by itself — finding texts, locators,
-    disclosures, the normalized spec, the manifest rows, dispositions and the per-task
-    request memory are all bounded strings, and 10 slots x 32 findings x 600 four-byte
-    chars of each fill 1 MB many times over. A refused write would mean the panel was paid
-    and `cycles_paid` never advanced (the panel would be re-paid), or a closure / cap stamp
-    could not be recorded. So EVERY writer runs this: older full waves are compacted first
-    (the existing mechanism); then every free-text leaf of the newest wave is cut on shared
-    tiers with a visible marker while identity (ids, classes, breaks, hashes, fingerprints,
-    aggregate, the goal and the acceptance claims that bind task acceptance) is never
-    touched, and the wave is stamped ``spec_body_truncated`` when its frozen spec was cut
-    (its hashes then name the ORIGINAL body; the next cycle's spec delta is unavailable
-    and says so). A cut locator no longer resolves and the next packet names it as an
-    omission."""
+    A refused paid-state write could rebill the panel. Full specs stay source-backed;
+    compact older waves, then tier-cut newest-wave text and request memory with markers.
+    Preserve ids/classes/breaks/hashes/fingerprints, verdicts and paid state, plus
+    legacy inline goal/acceptance claims. Mark cut legacy specs: original hashes
+    cannot imply complete delta input; cut locators become named omissions.
+    """
     def _size() -> int:
         return len(json.dumps(state, ensure_ascii=False, default=str).encode("utf-8"))
 
@@ -1398,23 +1387,9 @@ def _update_plan_review_state(
 
 
 def _compact_plan_review_wave(wave: Dict[str, Any]) -> Dict[str, Any]:
-    """Bounded summary of an older wave (S2): identity, outcome, counts, closure."""
-    findings = wave.get("findings") if isinstance(wave.get("findings"), list) else []
-    return {
-        "compact": True,
-        "cycle_index": wave.get("cycle_index"),
-        "request_fingerprint": str(wave.get("request_fingerprint") or ""),
-        "aggregate": str(wave.get("aggregate") or ""),
-        "counts": {
-            "findings": int(wave.get("findings_total") or len(findings)),
-            "dispositions": len(wave.get("dispositions") or []),
-            "blocking": int(wave["counts"].get("blocking") or 0) if isinstance(wave.get("counts"), dict) and "blocking" in wave["counts"] else sum(1 for f in findings if isinstance(f, dict) and f.get("class") == "blocking"),
-        },
-        "closed": bool(wave.get("closed")),
-        "paid": bool(wave.get("paid")),
-        "wave_artifact": copy.deepcopy(wave.get("wave_artifact") or {}),
-        **({"reviewed_at": str(wave["reviewed_at"])} if wave.get("reviewed_at") else {}),
-    }
+    from ouroboros.tools.plan_review_artifacts import compact_wave
+
+    return compact_wave(wave)
 
 
 def plan_review_authority_core(state: Dict[str, Any], *, source_ref: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
@@ -1432,6 +1407,8 @@ _PLAN_REVIEW_IDENTITY_KEYS = frozenset({
     "previous_fingerprint", "spec_hash", "evidence_manifest_hash", "plan_prose_hash", "sha256",
     "model", "request_model", "route", "host_file_read_attestation", "reason", "decision", "kind",
     "goal", "acceptance_claims", "cycle_index", "series_id", "schema_version", "retry_key",
+    "wave_artifact", "previous_wave_artifact", "spec_source_ref", "dialogue_source_ref", "dialogue_chat_id", "author_request_fingerprint",
+    "historical_supplements",
 })
 
 
@@ -1463,20 +1440,18 @@ def record_plan_review_wave(
     *,
     need_evidence_seen: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
-    """Append one reviewed v2 wave, make it current, pay its cycle, bound the history.
+    """Retain a reviewed wave and charge only physical dispatch, including failed panels.
 
-    ``wave["paid"]`` decides whether ``cycles_paid`` advances — the engine sets it iff
-    at least one reviewer slot was physically dispatched (B2: a dispatched DEGRADED
-    panel pays; only a nothing-dispatched wave of typed $0 skip rows stays unpaid);
-    ``need_evidence_seen`` replaces the task-level locator memory; the first v2
-    wave of a task mints ``series_id`` (a fresh series supersedes any open v1 record).
-    Older waves compact to summaries beyond ``_PLAN_REVIEW_FULL_WAVES``; entries beyond
-    ``_PLAN_REVIEW_MAX_WAVES`` are dropped with ``waves_omitted`` counting them (S2)."""
+    Free collection preserves a separately selected author plan. Existing paid
+    cycles, full-wave history and exact source handles remain the authority.
+    """
     fingerprint = str(wave.get("request_fingerprint") or "")
     if not _PLAN_REVIEW_HASH_RE.fullmatch(fingerprint):
         raise ValueError("PLAN_REVIEW_STATE_INVALID: wave fingerprint is invalid")
 
     def _record(state: Dict[str, Any]) -> Dict[str, Any]:
+        selected = state.get("current_attempt") or {}
+        retained_author = (selected.get("author_subject") or {}).get("review_fingerprint") == fingerprint
         previous = [w for w in state.get("waves") or [] if str(w.get("request_fingerprint") or "") == fingerprint]
         # D2, deliberately NARROWED by B2 (explicit wave-record authority change): only an
         # UNPAID wave — one in which NOTHING was physically dispatched (typed $0 skip rows
@@ -1487,7 +1462,7 @@ def record_plan_review_wave(
         # like any other paid wave: it replaces the predecessor and charges its cycle.
         # The degraded_retries counter therefore now counts only nothing-dispatched
         # attempts; the caller still renders the attempt it was handed.
-        if not wave.get("paid") and any(w.get("paid") for w in previous):
+        if not wave.get("paid") and not wave.get("custody_pending") and any(w.get("paid") for w in previous):
             for w in state.get("waves") or []:
                 if str(w.get("request_fingerprint") or "") == fingerprint and w.get("paid"):
                     w["degraded_retries"] = int(w.get("degraded_retries") or 0) + 1
@@ -1499,19 +1474,22 @@ def record_plan_review_wave(
                         w["quorum_unreachable"] = True
                         w["structurally_dead_slots"] = list(wave.get("structurally_dead_slots") or [])
                         w["earliest_reset"] = str(wave.get("earliest_reset") or "")
-            state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}
+            state["current_attempt"] = selected if retained_author else {"fingerprint": fingerprint, "status": "open", "reason": ""}
             if need_evidence_seen is not None:
                 state["need_evidence_seen"] = sorted({str(s) for s in need_evidence_seen if str(s)})
             return state
         waves = [w for w in state.get("waves") or [] if str(w.get("request_fingerprint") or "") != fingerprint]
-        waves.append(copy.deepcopy(wave))
+        recorded = copy.deepcopy(wave)
+        history = [item for prior in previous for item in prior.get("historical_supplements") or []]
+        if history:
+            recorded["historical_supplements"] = copy.deepcopy(history)
+            if any(prior.get("paid") and prior.get("cycle_index") == wave.get("cycle_index") for prior in previous):
+                recorded["paid"] = True
+        waves.append(recorded)
         if not state.get("series_id"):
             state["series_id"] = fingerprint[:16]
-        # C-07: the cap counts PAID CYCLES, not writes. Two concurrent identical calls
-        # (agent + operator script) each dispatch a panel, but the second write replaces
-        # the first wave and must not charge a second cycle — UNLESS it is the earned
-        # delta cycle of a fully-rejected wave, which advances cycle_index and is a new
-        # paid panel by design (final-gate finding, 4e133c8a).
+        # C-07: replacement writes don't charge again; an addressed answer advances
+        # cycle_index and charges its new physical panel.
         already_paid = any(
             w.get("paid") and int(w.get("cycle_index") or 0) >= int(wave.get("cycle_index") or 0)
             for w in previous
@@ -1522,21 +1500,35 @@ def record_plan_review_wave(
             state["need_evidence_seen"] = sorted({str(s) for s in need_evidence_seen if str(s)})
         full_from = max(0, len(waves) - _PLAN_REVIEW_FULL_WAVES)
         waves = [
-            (_compact_plan_review_wave(w) if idx < full_from and not w.get("compact") else w)
+            (_compact_plan_review_wave(w) if idx < full_from and not w.get("compact") and not w.get("custody_pending") else w)
             for idx, w in enumerate(waves)
         ]
         overflow = max(0, len(waves) - _PLAN_REVIEW_MAX_WAVES)
-        if overflow:
-            state["waves_omitted"] = int(state.get("waves_omitted") or 0) + overflow
-            waves = waves[overflow:]
+        if overflow:  # the newest PAID wave stays reachable: the next dispatch judges against it
+            keep = next((i for i in range(len(waves) - 1, -1, -1) if waves[i].get("paid")), None)
+            dropped = set([i for i in range(len(waves)) if i != keep][:overflow])
+            state["waves_omitted"] = int(state.get("waves_omitted") or 0) + len(dropped)
+            waves = [w for i, w in enumerate(waves) if i not in dropped]
         # I-02: size-fitting (older-wave compaction, then the last-resort text cut) runs for
         # EVERY writer in `_update_plan_review_state` → `_fit_plan_review_state`.
         state["waves"] = waves
-        state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}
+        state["current_attempt"] = selected if retained_author else {"fingerprint": fingerprint, "status": "open", "reason": ""}
         return state
 
     state = _update_plan_review_state(results_drive_root, task_id, _record)
     return plan_review_wave(state, fingerprint) or {}
+
+
+def plan_review_notes_are_annotatable(wave: Dict[str, Any]) -> bool:
+    """Optional notes remain discussable after automatic closure, not new authority.
+
+    A note-only wave is recorded GREEN (notes never change the verdict); older
+    records carry it as a closed REVIEW_REQUIRED, and both stay annotatable."""
+    findings = wave.get("findings") or []
+    return bool(findings) and wave.get("aggregate") in {"GREEN", "REVIEW_REQUIRED"} and all(
+        finding.get("class") == "note" for finding in findings
+    )
+
 
 def record_plan_review_dispositions(
     results_drive_root: Any,
@@ -1545,29 +1537,46 @@ def record_plan_review_dispositions(
     fingerprint: str,
     dispositions: List[Dict[str, Any]],
     closed: bool,
+    aggregate: str = "",
     closure_notes: Optional[List[str]] = None,
     wave_artifact: Optional[Dict[str, Any]] = None,
     recorded_at: str = "",
+    author_disposition: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Store the agent's dispositions on one FULL wave and its resulting closure.
-    A wave that is already closed is immutable (``PLAN_REVIEW_DISPOSITION_IMMUTABLE``);
-    a GREEN/REVISE_PLAN/DEGRADED wave never becomes closed here (the closure table in
-    ``plan_spec.closure_after_disposition`` is the caller's authority)."""
+    """Record this call's answers MERGED into one FULL wave's answers by ``finding_id``
+    (``plan_spec.merge_dispositions``: a later answer supersedes only its own id) and the
+    resulting closure. Only note-only closed waves accept annotations. Closure authority remains
+    ``plan_spec.closure_after_disposition`` (``aggregate`` is the verdict that
+    table says to record — GREEN when a REVIEW_REQUIRED open set emptied); this
+    writer is rule-free. Other closed waves are immutable."""
 
     def _record(state: Dict[str, Any]) -> Dict[str, Any]:
         wave = next((w for w in state["waves"] if str(w.get("request_fingerprint") or "") == fingerprint), None)
         if wave is None or wave.get("compact"):
             raise ValueError("PLAN_REVIEW_DISPOSITION_UNBINDABLE: no full wave holds this fingerprint")
-        if wave.get("closed"):
+        current = state.get("current_attempt") or {}
+        if current.get("fingerprint") and current["fingerprint"] != fingerprint:
+            raise ValueError("PLAN_REVIEW_DISPOSITION_STALE: a newer attempt supersedes this wave")
+        if wave.get("closed") and not plan_review_notes_are_annotatable(wave):
             raise ValueError("PLAN_REVIEW_DISPOSITION_IMMUTABLE: a closed wave cannot be changed")
-        wave["dispositions"] = copy.deepcopy(list(dispositions))
+        from ouroboros.tools.plan_spec import merge_dispositions
+
+        wave["dispositions"] = merge_dispositions(wave.get("dispositions"), dispositions)
         wave["disposition_recorded_at"] = recorded_at or utc_now_iso()
         if closure_notes is not None:
             wave["closure_notes"] = list(closure_notes)
         if wave_artifact is not None:
             wave["wave_artifact"] = copy.deepcopy(wave_artifact)
+        if author_disposition is not None:
+            author = validate_author_disposition(
+                author_disposition,
+                subject_hash=fingerprint,
+            )
+            if author is None:
+                raise ValueError("PLAN_REVIEW_AUTHOR_DISPOSITION_INVALID: stale or malformed record")
+            wave["author_disposition"] = author
         if closed and str(wave.get("aggregate") or "") == "REVIEW_REQUIRED":
-            wave["closed"] = True
+            wave.update(closed=True, aggregate=aggregate or wave["aggregate"])
         state["current_attempt"] = {"fingerprint": fingerprint, "status": "open", "reason": ""}
         return state
 

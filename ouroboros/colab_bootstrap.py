@@ -14,7 +14,9 @@ import urllib.parse
 import urllib.request
 from typing import Any, Callable, Dict, Optional
 
-from ouroboros.config import SETTINGS_DEFAULTS, normalize_settings_raw, serialize_settings
+from ouroboros.config import (
+    SETTINGS_DEFAULTS, defaults_for_settings_document, normalize_settings_raw, serialize_settings,
+)
 from ouroboros.update_channels import get_managed_update_fetch_timeout_sec, normalize_update_channel
 from ouroboros.utils import atomic_write_json, write_text_atomic
 
@@ -22,7 +24,7 @@ DEFAULT_COLAB_APP_ROOT = "/content/drive/MyDrive/Ouroboros"
 DEFAULT_COLAB_REPO_DIR = "/content/ouroboros_repo"
 DEFAULT_OFFICIAL_REPO_URL = "https://github.com/razzant/ouroboros.git"
 
-_SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN")
+_SECRET_KEYS = ("OPENROUTER_API_KEY", "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "ZAI_API_KEY", "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GITHUB_TOKEN", "TELEGRAM_BOT_TOKEN")
 
 
 def _run_colab_git_network(args: list[str], *, cwd: pathlib.Path | None = None) -> str:
@@ -85,7 +87,7 @@ def collect_colab_secrets() -> Dict[str, str]:
     """
     # Providers the one-click Colab launch can auto-route models for via
     # apply_runtime_provider_defaults (OpenRouter is the default aggregator;
-    # OpenAI/Anthropic/MiniMax/DeepSeek/Cloud.ru have direct model defaults). OpenAI-compatible
+    # OpenAI/Anthropic/MiniMax/DeepSeek/Z.ai/Cloud.ru have direct model defaults). OpenAI-compatible
     # endpoints have no universal model default and need explicit OUROBOROS_MODEL_*
     # config, so they are an advanced manual path, not part of the quick launch.
     provider_keys = (
@@ -94,6 +96,7 @@ def collect_colab_secrets() -> Dict[str, str]:
         "ANTHROPIC_API_KEY",
         "MINIMAX_API_KEY",
         "DEEPSEEK_API_KEY",
+        "ZAI_API_KEY",
         "CLOUDRU_FOUNDATION_MODELS_API_KEY",
     )
     out: Dict[str, str] = {}
@@ -122,6 +125,7 @@ def build_colab_settings(
     models: Dict[str, str] | None = None,
     network_password: str = "",
     existing: Optional[Dict[str, Any]] = None,
+    drive_document_present: Optional[bool] = None,
 ) -> Dict[str, Any]:
     """Build a Drive-persisted settings payload for Colab.
 
@@ -130,8 +134,12 @@ def build_colab_settings(
     explicitly — a pinned ``TELEGRAM_CHAT_ID``, tweaked model slots, an auto-grant
     preference — survive instead of being reset to defaults. The launch knobs
     below (secrets, budget, runtime mode, workers, host, repo) then win.
+    ``drive_document_present`` says whether that Drive file existed (default: a
+    non-empty ``existing``): an existing document keeps the finite optional bounds it
+    ran under when it lacks them (``config.defaults_for_settings_document``).
     """
-    settings = dict(SETTINGS_DEFAULTS)
+    present = bool(existing) if drive_document_present is None else bool(drive_document_present)
+    settings = defaults_for_settings_document(present)
     if existing:
         # The Drive document is an install's settings document, so it is read the way
         # every reader reads one: the raw-stage normalization (coercion, retention fold,

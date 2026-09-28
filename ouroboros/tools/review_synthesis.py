@@ -28,8 +28,9 @@ _MIN_CLAIMS_FOR_SYNTHESIS = 2
 
 _SYNTHESIS_PROMPT_TEMPLATE = (
     "You are a code-review claim synthesizer. You receive a list of raw findings\n"
-    "from multiple independent reviewers (triad diff-reviewers + one Atlas-backed\n"
-    "scope reviewer). Your job is to produce a deduplicated canonical list.\n"
+    "from multiple independent reviewers (triad diff-reviewers + the\n"
+    "whole-repository scope reviewer). Your job is to produce a deduplicated\n"
+    "canonical list.\n"
     "\n"
     "## Rules\n"
     "\n"
@@ -192,6 +193,8 @@ def synthesize_to_canonical_issues(
     try:
         raw_response = _call_synthesis_llm(prompt, ctx=ctx)
     except Exception as exc:
+        from ouroboros.llm_claudexor import propagate_model_error
+        propagate_model_error(exc)
         log.warning("review_synthesis: LLM call raised exception: %s — using original findings", exc)
         return critical_findings
 
@@ -226,6 +229,7 @@ def _call_synthesis_llm(prompt: str, *, ctx: Any = None) -> Optional[str]:
         msg, usage = client.chat(
             messages=[{"role": "user", "content": prompt}],
             model=model,
+            model_role="light",
             max_tokens=16384,
             reasoning_effort="low",
             no_proxy=True,
@@ -258,6 +262,8 @@ def _call_synthesis_llm(prompt: str, *, ctx: Any = None) -> Optional[str]:
         return str(content) if content else None
 
     except Exception as exc:
+        from ouroboros.llm_claudexor import propagate_model_error
+        propagate_model_error(exc)
         log.warning("review_synthesis: LLM call failed: %s", exc)
         return None
 
@@ -300,27 +306,39 @@ def per_slot_input_token_limits(
     context_window: Optional[int] = None,
     output_reserve: int,
     tokenizer_margin: int,
+    slots: Any = None,
 ) -> Dict[str, int]:
     """Per-slot calibrated input caps for a prompt fanned across mixed families.
 
     ``context_window=None`` (the default) resolves each slot's REAL window from
     Capability Evidence and scales the reserves to it, so a sub-1M slot gets a
     fit-sized pack instead of a prompt sized for a window it does not have.
-    An explicit window stays honoured for callers that pin one deliberately."""
-    from ouroboros.reviewer_window import reviewer_context_window, window_scaled_reserves
+    An explicit window stays honoured for callers that pin one deliberately.
+    Frozen ``slots`` return caps keyed by stable slot ID; legacy model-only
+    callers retain model keys. Equal models may have different account limits."""
+    from ouroboros.reviewer_window import reviewer_context_window, reviewer_window_binding, window_scaled_reserves
     from ouroboros.tools.review_helpers import calibrated_input_token_limit
 
     limits: Dict[str, int] = {}
-    for model in (models or []):
+    models = list(models or [])
+    rows = list(slots) if slots is not None else None
+    if rows is not None and len(rows) != len(models):
+        raise ValueError("Reviewer capacity rows must align with their frozen models")
+    for index, model in enumerate(models):
+        row = rows[index] if rows is not None else None
+        binding = reviewer_window_binding(row) if row is not None else {}
+        key = binding.get("model_role", "").removeprefix("reviewer:") if row is not None else str(model)
+        if not key or (key in limits and row is not None):
+            raise ValueError("Reviewer capacity requires unique stable slot IDs")
         window = (
             int(context_window)
             if context_window is not None
-            else reviewer_context_window(str(model))
+            else reviewer_context_window(str(model), **binding)
         )
         slot_output_reserve, slot_margin = window_scaled_reserves(
             window, output_reserve=output_reserve, tokenizer_margin=tokenizer_margin,
         )
-        limits[str(model)] = max(0, calibrated_input_token_limit(
+        limits[key] = max(0, calibrated_input_token_limit(
             str(model),
             context_window=window,
             output_reserve=slot_output_reserve,
@@ -339,18 +357,19 @@ def build_scope_review_prompt(
     diff_text: str,
     repo_pack_placeholder: str,
     critical_calibration: str,
+    task_evidence_section: str = "",
 ) -> tuple:
-    # STABLE-FIRST for provider prompt caching: instructions, checklist and
-    # canonical docs are byte-stable across commits and form the cache-marked
-    # prefix; goal/scope/history/diff/atlas are the per-commit tail. The
-    # boundary is recorded in _SCOPE_STABLE_PREFIX_LEN (later placeholder
-    # substitution and touched-file degradation only edit the dynamic tail).
+    # STABLE-FIRST for provider prompt caching: instructions, checklist and the
+    # always-inline governance tier are byte-stable across commits and form the
+    # cache-marked prefix; goal/scope/history/diff/index are the per-commit
+    # tail. The returned boundary is the length of that prefix.
     stable = f"""\
 {REVIEW_PREAMBLE}
 
 ## Your role
 
-You are the Atlas-backed whole-repository reviewer. Diff reviewers cover line-level mistakes;
+You are the whole-repository reviewer, and you REACH the repository with your own
+read-only tools. Diff reviewers cover line-level mistakes;
 you cover cross-module contracts, forgotten touchpoints, hidden regressions,
 prompt/doc sync, architecture fit, and end-to-end intent completeness.
 
@@ -418,8 +437,9 @@ Do NOT invent a new id for the same root cause.
 
 ## Canonical Documentation Context
 
-These files are always included explicitly. Do not treat their absence from the
-wider repository pack as omission.
+These rules are inlined for every review of every change. Every other governance
+document is named in the navigation below and is one read away; none of them is
+omitted.
 
 {canonical_docs}
 """
@@ -428,13 +448,14 @@ wider repository pack as omission.
 
 {history_block}
 
-## Current touched files (post-change — what the file looks like NOW)
+{task_evidence_section}
 
-Files deleted by this diff appear here with an explicit `DELETED` marker and
-their HEAD content inlined unless a typed marker states otherwise (suppressed
-content, or a budget-degraded snapshot); other removed lines are visible via
-the staged diff below. HEAD versions of modified files are not sent as a
-separate section — the staged diff below already shows every `-` line.
+## Touched files
+
+The manifest below names every path this change touches, with what happened to
+it and how large it is in the candidate tree. No file body is inlined: the
+staged diff carries every added and removed line, and you read any file itself
+with your own tools.
 
 {current_files_section}
 

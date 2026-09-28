@@ -1,10 +1,10 @@
 """Review-history evidence a skill reviewer reads.
 
 Owns the rendered history and accepted-rebuttal sections carried into the next
-prompt as inert reference data, and the convergence hint that tells the author
-to stop re-running a review that keeps producing rotating advisory findings.
-The accepted-rebuttal ledger itself (paths, loads, flips) lives upstream in
-``ouroboros/skill_review_cycles.py``.
+prompt as inert reference data, and the author-facing convergence hint: the
+facts of an advisory-only warnings streak or a repeated finding signature, with
+the response left to the author (BIBLE P13). The accepted-rebuttal ledger itself
+(paths, loads, flips) lives upstream in ``ouroboros/skill_review_cycles.py``.
 """
 
 from __future__ import annotations
@@ -38,10 +38,14 @@ def _build_skill_review_history_section(
     if not history:
         return ""
     lines = ["\n## Previous skill review attempts (anti-thrashing context)\n"]
-    for idx, entry in enumerate(history[-3:], start=1):
+    for entry in history[-3:]:
         content_hash = str(entry.get("content_hash") or "")[:12]
         status = entry.get("status", "?")
-        lines.append(f"### Attempt {idx}: status={status}, content_hash={content_hash}")
+        ordinal = entry.get("review_round", "unknown")
+        snapshot = entry.get("snapshot_attempt", "unknown")
+        revised = entry.get("snapshot_revised", "unknown")
+        lines.append(f"### Review round {ordinal}, snapshot attempt {snapshot}: "
+                     f"status={status}, content_hash={content_hash}, snapshot_revised={revised}")
         fail_findings = entry.get("fail_findings") or []
         if fail_findings:
             lines.append("FAIL findings (concrete reasons):")
@@ -85,12 +89,13 @@ def _convergence_hint(
     )
     if warnings_streak >= WARNINGS_CONVERGENCE_ROUNDS:
         return (
-            f"This skill produced advisory-only warnings for {warnings_streak} "
-            "consecutive review rounds. Warnings do not block execution or "
-            "publication; stop re-running the review to chase rotating advisory "
-            "findings. Accept the warnings (the skill is executable and "
-            "publishable as-is), fix one specific advisory issue you judge worth "
-            "it, or ask the owner — do not spend another full review round."
+            f"This skill's review returned advisory-only warnings for {warnings_streak} "
+            "consecutive rounds; the recorded findings stand, and another round may "
+            "surface new advisory findings rather than converge. The warnings "
+            "verdict itself blocks neither execution nor publication; every other "
+            "execution and publication check still applies. Whether to accept the "
+            "warnings, repair or rebut the findings you judge worth it, change "
+            "approach, review again, or ask the owner is your judgment."
         )
     current = _finding_signature(findings)
     if not current or len(history) < 2:
@@ -98,9 +103,10 @@ def _convergence_hint(
     previous = [entry.get("failure_signature") or [] for entry in history[-2:]]
     if all(sig == current for sig in previous):
         return (
-            "Same skill review finding signature appeared across three attempts. "
-            "Fix the repeated issue, provide review_rebuttal if it is a false "
-            "positive, or ask the owner before spending another review round."
+            "The same skill review finding signature appeared in this review and "
+            "the two before it; the recorded findings stand. Whether to repair the "
+            "underlying issue, rebut a false positive with review_rebuttal, change "
+            "approach, review again, or ask the owner is your judgment."
         )
     return ""
 

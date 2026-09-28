@@ -3,6 +3,8 @@ from types import SimpleNamespace
 
 from starlette.testclient import TestClient
 
+from ouroboros.task_results import write_task_result
+
 from ouroboros.gateway.host_service import AUTH_TOKEN_FILENAME, create_host_service_app
 from ouroboros.event_bus import CHAT_OUTBOUND, publish_event
 from ouroboros.skill_loader import compute_content_hash, save_enabled, save_review_state, save_skill_grants, SkillReviewState
@@ -266,6 +268,7 @@ def test_presence_turn_resolves_binding_and_returns_typed_result(tmp_path: pathl
         "text": "Hello back",
         "turn_ref": "turn-1",
         "work_ref": "",
+        "delivery_reporting_version": 0,
     }
     assert captured["admission"].transport_skill == "telegram-bot"
     assert captured["event"].actor["platform_actor_id"] == "user-7"
@@ -297,6 +300,7 @@ def test_presence_turn_attachment_refusal_returns_complete_typed_manifest(
     class Agent:
         def handle_task(self, task):
             agent_calls.append(task)
+            write_task_result(tmp_path, task["id"], "completed", metadata=task["metadata"], result="ok")
             return [{"type": "presence_result", "outcome": "message", "text": "ok"}]
 
     def run_real_presence(**kwargs):
@@ -368,6 +372,7 @@ def test_presence_turn_host_passes_attachment_limit_to_canonical_staging_owner(
     class Agent:
         def handle_task(self, task):
             agent_calls.append(task)
+            write_task_result(tmp_path, task["id"], "completed", metadata=task["metadata"], result="ok")
             return [{"type": "presence_result", "outcome": "message", "text": "ok"}]
 
     def run_real_presence(**kwargs):
@@ -440,6 +445,7 @@ def test_presence_turn_host_passes_internal_missing_and_directory_to_staging_own
     class Agent:
         def handle_task(self, task):
             agent_calls.append(task)
+            write_task_result(tmp_path, task["id"], "completed", metadata=task["metadata"], result="ok")
             return [{"type": "presence_result", "outcome": "message", "text": "ok"}]
 
     def run_real_presence(**kwargs):
@@ -646,6 +652,7 @@ def test_presence_work_returns_only_correlated_terminal_result(tmp_path: pathlib
         "outcome": "message",
         "text": "late answer",
         "work_ref": work_ref,
+        "delivery_reporting_version": 0,
     }
 
     atomic_write_json(

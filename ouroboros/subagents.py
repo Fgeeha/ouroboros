@@ -17,17 +17,22 @@ cheapest model to the strongest reasoning and no rule reconciled them). And a
 harness route carries its OWN effort, so a parent asking ``low`` against a route
 pinned to ``xhigh`` had no rule for who wins. It is removed rather than ranked
 against the lane (BIBLE P2: remove the class). The owner still controls effort
-exactly as before, through ``config.resolve_effort(task_type)``.
+exactly as before, through ``config.resolve_effort(task_type)``. The ONE
+caller-facing strength axis lives elsewhere: a plan review order may declare
+its reviewer panel's effort as the default rung of each row's ladder
+(``plan_task.reviewer_effort`` → ``plan_review_runtime.plan_review_slots``);
+that is a review panel, not a subagent.
 """
 
 from __future__ import annotations
 
 import logging
-import os
 from dataclasses import dataclass, field, replace as dataclass_replace
 from datetime import datetime, timezone  # noqa: F401
 from typing import Any, Dict, List, Mapping
 
+from ouroboros.config import runtime_setting
+from ouroboros.configured_subagents import SESSION_ACCESS_PROFILES
 from ouroboros.config import (
     SETTINGS_DEFAULTS,
     get_heavy_model,
@@ -112,9 +117,9 @@ def normalize_subagent_executor(value: Any) -> str:
 class DelegatedRunShape:
     """The complete run shape a child's own authority entitles it to.
 
-    Not a knob: every field follows from the ONE question ``delegated_run_shape``
-    asks, and none of them appears in any tool schema, so the model has nothing to
-    widen. It is derived here rather than at each consumer because the consumers are
+    The model may lower native access, never widen the captured task authority.
+    Every other field follows from the ONE question ``delegated_run_shape`` asks.
+    It is derived here rather than at each consumer because the consumers are
     not one — the DISPATCHER health-checks the route before a token is spent and the
     NANNY builds the wire request — and a shape re-derived at each of them drifts:
     a change to the access profile that forgets the isolation, or to the isolation
@@ -127,13 +132,14 @@ class DelegatedRunShape:
     delegated: bool = False
 
 
-def delegated_run_shape(acting: bool) -> DelegatedRunShape:
+def delegated_run_shape(acting: bool, access: str = "workspace_write") -> DelegatedRunShape:
     """The run shape for an acting (mutating) child, or for a read-only one.
 
-    A MUTATING child runs ``live``: Claudexor edits the nanny's OWN worktree in place,
-    so the nanny's existing workspace-patch capture sees the harness's edits with no
-    new plumbing, and the same capture invalidates itself if the harness dared to
-    commit. In place is also the ONE shape where Claudexor would otherwise hand the
+    A MUTATING child runs ``live`` in the host's private execution snapshot;
+    captured changes still require explicit integration. The selected immutable
+    session supplies its captured access; old snapshots keep workspace_write.
+    This changes the harness's OS powers, not the task's assignment or write target.
+    In place is also the ONE shape where Claudexor would otherwise hand the
     harness the operator's real ``$HOME`` — which holds the daemon control token — so
     ``delegated`` travels with it, inseparably, in the same record.
 
@@ -141,9 +147,10 @@ def delegated_run_shape(acting: bool) -> DelegatedRunShape:
     envelope, which is scoped already and needs no marker: that is one transport with
     one derived difference, not a second pipeline.
     """
-    if acting:
-        return DelegatedRunShape(access="workspace_write", mode="agent",
-                                 isolation="live", delegated=True)
+    if acting and access != "readonly":
+        if access not in SESSION_ACCESS_PROFILES:
+            raise ValueError("Delegated session access must be workspace_write or full")
+        return DelegatedRunShape(access=access, mode="agent", isolation="live", delegated=True)
     return DelegatedRunShape(access="readonly", mode="ask")
 
 
@@ -234,7 +241,7 @@ def get_subagent_harness() -> DelegationRoute | None:
     pricing, and bench provenance.
     """
     raw = str(
-        os.environ.get("OUROBOROS_SUBAGENT_HARNESS", "")
+        runtime_setting("OUROBOROS_SUBAGENT_HARNESS", "")
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_HARNESS", "")
     ).strip()
     route = parse_subagent_harness(raw)
@@ -253,7 +260,7 @@ def get_subagent_harness() -> DelegationRoute | None:
     # spelling, and this is the ONLY reader of the pin key. Empty = the
     # engine's quota-aware rotation pool (D28).
     profile = str(
-        os.environ.get("OUROBOROS_SUBAGENT_PROFILE", "")
+        runtime_setting("OUROBOROS_SUBAGENT_PROFILE", "")
         or SETTINGS_DEFAULTS.get("OUROBOROS_SUBAGENT_PROFILE", "")
     ).strip()
     if profile:
@@ -270,68 +277,9 @@ def get_subagent_harness() -> DelegationRoute | None:
 # only — nothing routes off it, and absence is shown as absence.
 # ---------------------------------------------------------------------------
 
-LAST_DELEGATION_FILENAME = "subagent_last_delegation.json"
-
-
-def _last_delegation_path():
-    import pathlib
-
-    from ouroboros.config import DATA_DIR
-
-    return pathlib.Path(DATA_DIR) / "state" / LAST_DELEGATION_FILENAME
-
-
-def record_last_delegation(*, route: str, requested_model: str,
-                           applied_model: str, run_id: str,
-                           selected_subagent_id: str = "",
-                           requested_profile: str = "",
-                           applied_profile: str = "") -> None:
-    """Record the last delegated run's route + requested/applied model + account.
-
-    Best-effort and atomic, in the CANONICAL data plane beside the saved
-    settings (the reviewer-slot projection's own rule): this is UI state, not
-    per-task forensics — those live in the custody event log and the ledger.
-    ``applied_model`` and ``applied_profile`` come from the same final attempt
-    in the engine's telemetry, '' when that attempt disclosed no such fact.
-    Neither the requested model nor a prior attempt supplies missing evidence;
-    ``requested_profile`` is the pin the request carried ('' = rotation) — the
-    two stay separate so a requested-vs-ran mismatch is disclosable, never
-    rewritten.
-    """
-    import json
-
-    from ouroboros.utils import utc_now_iso, write_text_atomic
-
-    try:
-        path = _last_delegation_path()
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # Idempotent per run: a re-read of an ALREADY-terminal run must not
-        # re-stamp `ts`, or the "N ago" line would call an old run fresh.
-        if subagent_last_delegation().get("run_id") == str(run_id or ""):
-            return
-        write_text_atomic(path, json.dumps({
-            "ts": utc_now_iso(),
-            "route": str(route or ""),
-            "requested_model": str(requested_model or ""),
-            "applied_model": str(applied_model or ""),
-            "requested_profile": str(requested_profile or ""),
-            "applied_profile": str(applied_profile or ""),
-            "selected_subagent_id": str(selected_subagent_id or ""),
-            "run_id": str(run_id or ""),
-        }, ensure_ascii=False, indent=1))
-    except Exception:
-        log.debug("subagent last-delegation projection write failed", exc_info=True)
-
-
-def subagent_last_delegation() -> Dict[str, Any]:
-    """Read the projection ({} on any read problem — disclosure only)."""
-    import json
-
-    try:
-        data = json.loads(_last_delegation_path().read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except (OSError, ValueError):
-        return {}
+from ouroboros.subagent_history import (  # noqa: F401
+    LAST_DELEGATION_FILENAME, record_last_delegation, subagent_last_delegation,
+)
 
 
 @dataclass(frozen=True)
@@ -549,7 +497,7 @@ def normalize_subagent_model_lane(value: Any) -> str:
 
 
 def _slot_model(key: str) -> str:
-    return str(os.environ.get(key, "") or SETTINGS_DEFAULTS.get(key, "") or "").strip()
+    return str(runtime_setting(key, "") or SETTINGS_DEFAULTS.get(key, "") or "").strip()
 
 
 _LANE_SLOT_KEYS = {
@@ -574,7 +522,7 @@ def lane_ran_on_main(lane: str, model: str) -> bool:
     """
     if lane not in {"heavy", "light"}:
         return False
-    env_slot = str(os.environ.get(_LANE_SLOT_KEYS[lane][0], "") or "").strip()
+    env_slot = str(runtime_setting(_LANE_SLOT_KEYS[lane][0], "") or "").strip()
     return not env_slot or bool(model and model != env_slot)
 
 
@@ -587,13 +535,13 @@ def _use_local_for_lane(lane: str, model: str) -> bool:
         # Follows Main's local flag, so USE_LOCAL_MAIN governs the effective model
         # rather than being silently ignored.
         return _use_local_for_lane("main", model)
-    slot_value = str(os.environ.get(model_key, "") or "").strip()
+    slot_value = str(runtime_setting(model_key, "") or "").strip()
     if lane == "main":
         slot_value = slot_value or str(SETTINGS_DEFAULTS.get(model_key, "") or "").strip()
     return (
         bool(model)
         and model == slot_value
-        and str(os.environ.get(local_key, "") or "").strip().lower() in {"1", "true", "yes", "on"}
+        and str(runtime_setting(local_key, "") or "").strip().lower() in {"1", "true", "yes", "on"}
     )
 
 
@@ -885,9 +833,10 @@ SUBAGENT_INTENT_FIELDS: tuple[str, ...] = (
 # a load never fails over one (BIBLE P1: no silent loss, and no crash either).
 LEGACY_SUBAGENT_FIELDS: Dict[str, str] = {
     "reasoning_effort": (
-        "effort is no longer an owner-facing axis: it is derived from the owner's "
-        "configured effort for this task type, because a public effort was a second "
-        "knob for the question model_lane already answers"
+        "effort is not a subagent axis: it is derived from the owner's configured "
+        "effort for this task type, because a public effort was a second knob for "
+        "the question model_lane already answers (a plan review order declares its "
+        "panel's strength through plan_task.reviewer_effort instead)"
     ),
 }
 

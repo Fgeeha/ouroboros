@@ -118,10 +118,10 @@ def test_review_launch_allowed_above_reserve(monkeypatch):
 
 
 def test_improvement_passes_bounded_by_count_without_deadline():
-    profile = normalize_budget_profile({})
+    profile = normalize_budget_profile({"max_improvement_passes": 1})
     snap = task_pacing.build_budget_snapshot(SimpleNamespace(task_metadata={}, task_contract={}))
     ok, _ = task_pacing.improvement_pass_allowed(snap, 0, profile)
-    assert ok  # default max passes = 1, first pass allowed
+    assert ok  # the explicit author cap permits exactly one pass
     ok2, reason2 = task_pacing.improvement_pass_allowed(snap, 1, profile)
     assert not ok2 and reason2 == "improvement_passes_exhausted"
 
@@ -131,8 +131,11 @@ def test_improvement_pass_blocked_when_time_exhausted_mid_cycle(monkeypatch):
     monkeypatch.setenv("OUROBOROS_FINALIZATION_GRACE_SEC", "120")
     monkeypatch.setenv("OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC", "90")
     profile = normalize_budget_profile({"max_improvement_passes": 5})
-    ctx = _deadline_ctx(remaining_sec=150.0)  # spendable=30 <= floor=200
+    ctx = _deadline_ctx(remaining_sec=150.0)  # 30 seconds of ordinary author time
     snap = task_pacing.build_budget_snapshot(ctx)
+    assert task_pacing.improvement_pass_allowed(snap, 0, profile)[0]
+    assert not task_pacing.review_launch_allowed(snap)[0]  # critic floor remains
+    snap = task_pacing.build_budget_snapshot(_deadline_ctx(remaining_sec=119.0))
     ok, reason = task_pacing.improvement_pass_allowed(snap, 0, profile)
     assert not ok and reason == "improvement_window_inside_reserve"
 
@@ -532,7 +535,7 @@ def _acceptance_harness(monkeypatch, tmp_path, review_result, *, enforcement="bl
         result="Task is running.",
     )
     ctx = SimpleNamespace(
-        _task_acceptance_reviewed=False, is_direct_chat=False,
+        _task_acceptance_reviewed=False, is_direct_chat=False, task_id="t",
         drive_root=str(tmp_path), root_task_id="t", delegation_role="root",
         task_metadata={**meta, "root_task_id": "t", "budget_drive_root": str(tmp_path)},
         task_contract=contract,
@@ -545,7 +548,7 @@ def _acceptance_harness(monkeypatch, tmp_path, review_result, *, enforcement="bl
     tools = SimpleNamespace(_ctx=ctx)
     out = loop_mod._run_task_acceptance_review_once(
         tools=tools, content="done", task_id="t", task_type="task",
-        llm_trace=trace, drive_root=None, messages=messages, emit_progress=lambda _m, *, incident=None: None,
+        llm_trace=trace, drive_root=tmp_path, messages=messages, emit_progress=lambda _m, *, incident=None: None,
     )
     return out, ctx, trace, messages
 
@@ -648,10 +651,10 @@ def test_required_blocking_bare_fail_abstains_without_false_veto(monkeypatch, tm
     out, _ctx, trace, messages = _acceptance_harness(
         monkeypatch, tmp_path, panel, enforcement="blocking",
     )
-    assert out is False
-    assert len(messages) == 2  # no empty or fabricated revision capsule
-    assert trace["acceptance_decision"]["status"] == "finalized_unaccepted"
-    assert trace["acceptance_decision"]["reason"] == "review_degraded"
+    assert out is True  # expose the typed unavailable outcome once, never PASS
+    assert len(messages) == 4 and "No clean acceptance" in messages[-1]["content"]
+    assert trace["acceptance_decision"]["status"] == "revision_requested"
+    assert trace["review_runs"][-1]["aggregate_signal"] == "DEGRADED"
     assert trace["acceptance_obligations"] == []
 
 
@@ -839,6 +842,7 @@ def test_degraded_re_review_keeps_obligations_open_without_false_pass(monkeypatc
     ]}
     out, ctx, trace, _messages = _acceptance_harness(
         monkeypatch, tmp_path, degraded, prior_trace=prior,
+        budget_profile={"max_improvement_passes": 0},
     )
     assert out is False
     ob = trace["acceptance_obligations"][0]
@@ -968,7 +972,8 @@ def test_agent_tool_payload_carries_dissent_noted(monkeypatch, tmp_path):
         ],
         parsed_findings=[], aggregate_signal="PASS",
     )
-    monkeypatch.setattr(rs, "triad_delivery_slots", lambda **k: [object(), object(), object()])
+    monkeypatch.setattr(rs, "triad_delivery_slots",
+                        lambda **k: [rs.ReviewSlot(slot_id=f"s{i}", model="m") for i in (1, 2, 3)])
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: result)
     monkeypatch.setattr(
         "ouroboros.review_evidence.build_task_acceptance_evidence",
@@ -979,7 +984,8 @@ def test_agent_tool_payload_carries_dissent_noted(monkeypatch, tmp_path):
         task_metadata={"root_task_id": "root", "parent_task_id": "root"},
         task_contract={},
     )
-    out = _handle_task_acceptance_review(ctx, claim="done", goal="g")
+    # A child names its one reviewer row when several are configured (#1334).
+    out = _handle_task_acceptance_review(ctx, claim="done", goal="g", reviewer_slot_id="s3")
     assert '"dissent_noted": true' in out
 
 

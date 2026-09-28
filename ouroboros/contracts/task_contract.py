@@ -461,6 +461,22 @@ def normalize_resource_policy(value: Any) -> Dict[str, Any]:
     return out
 
 
+def normalize_input_sources(value: Any) -> str:
+    """An explicit source selection is closed; malformed selections never become shared."""
+    if not isinstance(value, str) or value not in {"shared", "declared"}:
+        raise ValueError("input_sources must be shared or declared")
+    return value
+
+
+def task_input_sources(task: Mapping[str, Any]) -> str:
+    """Read the persisted selection at every composition boundary; absence stays shared."""
+    metadata = task.get("metadata") if isinstance(task.get("metadata"), Mapping) else {}
+    for source in (task.get("task_contract"), metadata.get("task_contract"), task, metadata):
+        if isinstance(source, Mapping) and "input_sources" in source:
+            return normalize_input_sources(source["input_sources"])
+    return "shared"
+
+
 def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
     task = task or {}
     metadata = task.get("metadata") if isinstance(task.get("metadata"), Mapping) else {}
@@ -619,6 +635,11 @@ def build_task_contract(task: Mapping[str, Any] | None) -> Dict[str, Any]:
             else (task.get("answer_protocol") or metadata.get("answer_protocol"))
         ),
     }
+    # Additive only: ordinary contracts keep their exact historical shape/hashes.
+    for source in (merged, task, metadata):
+        if "input_sources" in source:
+            contract["input_sources"] = normalize_input_sources(source["input_sources"])
+            break
     attachment_ref = merged.get("attachment_manifest_ref", task.get("attachment_manifest_ref"))
     if attachment_ref is not None:
         if not isinstance(attachment_ref, Mapping):
@@ -834,4 +855,4 @@ def attach_task_contract(task: Dict[str, Any]) -> Dict[str, Any]:
     return task
 
 
-__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_allowed_origins", "normalize_browser_origin", "normalize_answer_protocol", "normalize_attachment_manifest", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_depth_provenance", "normalize_disabled_tools", "normalize_resource_policy"]
+__all__ = ["answer_protocol_active", "attach_task_contract", "build_task_contract", "effective_acceptance_claims", "normalize_acceptance_claims", "normalize_allowed_resources", "normalize_allowed_origins", "normalize_browser_origin", "normalize_answer_protocol", "normalize_attachment_manifest", "normalize_bool", "normalize_budget_profile", "normalize_delegation_budget", "normalize_depth_provenance", "normalize_disabled_tools", "normalize_input_sources", "normalize_resource_policy", "task_input_sources"]

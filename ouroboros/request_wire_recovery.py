@@ -126,6 +126,8 @@ def _safe_target(target: Mapping[str, Any]) -> Dict[str, Any]:
         key: copy.deepcopy(target.get(key))
         for key in (
             "provider", "resolved_model", "usage_model", "base_url", "contract_headers",
+            "processing_preference",
+            "processing_native_origin",
         )
         if target.get(key) is not None
     }
@@ -477,6 +479,39 @@ def _prepare_durable_candidate(
     )
 
 
+def refresh_wire_clock(payload: Dict[str, Any], *, api_surface: str) -> Dict[str, Any]:
+    """Refresh a NEW physical candidate without losing its canonical recovery source.
+
+    Recognition precedes stamping: a projected custom-tool payload is not the
+    source from which its effort/dialect actions were derived. Rebuild through
+    the original factory and prove that only this call's clock changed. Same
+    invocation rejoins never enter this preparation seam.
+    """
+    from ouroboros.send_clock import split_clock_note, stamp_clock_note
+
+    digest = physical_candidate_sha256(payload)
+    registered = next((item for item in reversed(_WIRE_CALL_STATE.get().registered)
+                       if item.candidate.candidate_sha256 == digest), None)
+    if registered is None:
+        return stamp_clock_note(payload, blocks=api_surface == "messages")
+    source = stamp_clock_note(dict(registered.source_payload), blocks=api_surface == "messages")
+    if source == registered.source_payload:
+        return payload  # no Main policy, or the clock sample is byte-identical
+    prior = registered.candidate
+    refreshed = bind_wire_candidate(
+        target=registered.target, api_surface=prior.source_profile.api_surface,
+        source_payload=source, candidate_spec=prior.candidate_spec,
+        requested_effort=prior.requested_effort, ladder_ordinal=prior.ladder_ordinal,
+        applied_actions=prior.applied_actions,
+    )
+    physical = refreshed.physical_payload()
+    note, clock_free = split_clock_note(physical)
+    if note != split_clock_note(source)[0] or clock_free != split_clock_note(payload)[1]:
+        raise ValueError("clock refresh changed unrelated physical input")
+    register_wire_candidate(refreshed, source_payload=source, target=registered.target)
+    return physical
+
+
 def prepare_wire_payload_for_send(
     target: Mapping[str, Any],
     payload: Mapping[str, Any],
@@ -732,13 +767,17 @@ def _classify_action(
     compact = low.replace(".", "_")
     for field in (*OPTIONAL_REQUEST_FIELDS, NESTED_REASONING_FIELD):
         aliases = {field, field.replace(".", "_"), field.split(".")[-1]}
-        if _field_is_present(payload, field) and any(alias in low or alias in compact for alias in aliases):
+        implicated = (field in error_tokens if field in {"stream", "stream_options"}
+                      else any(alias in low or alias in compact for alias in aliases))
+        if _field_is_present(payload, field) and implicated:
             if value_implicated or (
                 field != NESTED_REASONING_FIELD
                 and _names_exact_scalar_value(low, payload.get(field))
             ):
                 return None
             named.append(field)
+    if "stream" in named and "stream_options" in payload and "stream_options" not in named:
+        named.append("stream_options")
     if not named:
         return None
     return PendingWireAction(profile, {
@@ -888,9 +927,12 @@ def plan_nonlearning_optional_retry(
     named = [
         field for field in _NON_REASONING_OPTIONAL_FIELDS
         if field in payload and (
-            field in low or field.replace("_", ".") in low
+            (field in _error_tokens(low)) if field in {"stream", "stream_options"}
+            else (field in low or field.replace("_", ".") in low)
         )
     ]
+    if "stream" in named and "stream_options" in payload and "stream_options" not in named:
+        named.append("stream_options")
     if not named:
         return None
     repaired = copy.deepcopy(dict(payload))
@@ -913,13 +955,64 @@ def plan_wire_retry_from_body_error(error: Any) -> Optional[Dict[str, Any]]:
     return _plan_retry(status, str(error.get("message") or ""))
 
 
+def _processing_retry(payload: Mapping[str, Any], error: Any,
+                      target: Optional[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
+    """One ordinary-speed retry after a released, typed no-start receipt."""
+    from ouroboros.llm_attempt import ProcessingNotStarted
+    from ouroboros.request_wire_receipts import rebind_processing_candidate
+
+    capture = getattr(error, "physical_attempt_capture", None)
+    if not isinstance(error, ProcessingNotStarted) or getattr(capture, "state", None) != "released":
+        return None
+    registered = _WIRE_CALL_STATE.get().current
+    route = registered.target if registered is not None else target or {}
+    provider, preference = route.get("provider"), route.get("processing_preference")
+    if route.get("processing_native_origin") != "preference":
+        return None
+    current = registered.candidate.physical_payload() if registered is not None else copy.deepcopy(dict(payload))
+    if capture.candidate_raw_sha256 != physical_candidate_sha256(current):
+        return None
+    if provider in {"openai", "openrouter"}:
+        field, standard = "service_tier", "default"
+        allowed = {"fast": {"fast", "priority"}, "economy": {"flex"}}.get(preference, set())
+        # An explicit extra_body override has precedence and must not be
+        # accidentally replaced by the top-level advisory projection.
+        if isinstance(current.get("extra_body"), dict) and "service_tier" in current["extra_body"]:
+            return None
+    elif provider == "anthropic":
+        field, standard = "speed", "standard"
+        allowed = {"fast"} if preference == "fast" else set()
+    else:
+        return None
+    if current.get(field) not in allowed:
+        return None
+    if registered is None:
+        current[field] = standard
+        return current
+    try:
+        candidate, source = rebind_processing_candidate(
+            registered.candidate, target=route, source_payload=registered.source_payload,
+            field_name=field, standard_value=standard,
+        )
+    except (TypeError, ValueError):
+        return None  # The original provider refusal remains the caller's fact.
+    register_wire_candidate(candidate, source_payload=source, target=route)
+    return candidate.physical_payload()
+
+
 def plan_next_wire_retry(
     payload: Mapping[str, Any],
     *,
     error: Any,
     body_error: bool = False,
+    target: Optional[Mapping[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
     """One exception/body-parity entrypoint for the bounded transport drivers."""
+    if getattr(error, "stream_incomplete", False):
+        return None
+    processing = _processing_retry(payload, error, target)
+    if processing is not None:
+        return processing
     planned = (
         plan_wire_retry_from_body_error(error)
         if body_error else

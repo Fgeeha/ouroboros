@@ -99,8 +99,9 @@ _REVIEW_SUBSTRATE_PATHS = frozenset({
     "ouroboros/tools/review.py", "ouroboros/tools/review_multi_model.py", "ouroboros/tools/review_context_atlas.py",
     "ouroboros/tools/review_helpers.py", "ouroboros/tools/review_prompt_text.py", "ouroboros/tools/review_file_pack.py",
     "ouroboros/tools/review_revalidation.py", "ouroboros/tools/review_binary_context.py", "ouroboros/tools/release_sync.py",
-    "ouroboros/tools/review_synthesis.py", "ouroboros/tools/scope_review.py", "ouroboros/tools/scope_review_pack.py",
-    "ouroboros/tools/scope_review_budget.py", "ouroboros/tools/scope_review_contract.py", "ouroboros/tools/scope_review_session.py",
+    "ouroboros/tools/review_synthesis.py", "ouroboros/tools/scope_review.py", "ouroboros/tools/scope_review_contract.py",
+    "ouroboros/tools/scope_review_session.py", "ouroboros/tools/scope_required_sources.py",
+    "ouroboros/tools/governance_context.py", "ouroboros/review_session_reads.py",
     "ouroboros/tools/scope_window.py", "ouroboros/claudexor_daemon.py", "ouroboros/delegate_custody.py",
     "ouroboros/delegate_custody_usage.py", "ouroboros/delegate_output.py", "ouroboros/gateways/claudexor.py",
     "ouroboros/review_evidence.py", "ouroboros/review_evidence_sections.py", "ouroboros/subagents.py",
@@ -551,22 +552,19 @@ def _create_isolated_checkout(
     if add.returncode != 0:
         raise RuntimeError(f"worktree add failed: {add.stderr.strip()}")
     if staged_patch.strip():
-        # TEXT stdin on purpose, symmetric with the text-mode capture that produced
-        # `staged_patch` (see the `git diff --cached --binary` capture sites and the
-        # test's helper): this exact pairing is the configuration Windows CI was
-        # green with through v6.87.5, and switching only this side to bytes broke
-        # CRLF worktrees there. On POSIX text mode is an identity. A staged BINARY
-        # file on a CRLF-translating platform can still fail the roundtrip — that
-        # failure is loud (RuntimeError with git's stderr), never silent.
+        # Capture and apply stay byte-paired: Windows text stdin translates LF,
+        # while text capture loses CRLF. Changing only stdin cannot repair bytes
+        # already normalized at capture. The public patch remains a str using
+        # the contributor snapshot's reversible UTF-8/surrogateescape contract.
         apply = subprocess.run(
             ["git", "apply", "--index", "--whitespace=nowarn", "--binary"],
-            cwd=str(checkout), input=staged_patch,
-            capture_output=True, text=True, timeout=120,
+            cwd=str(checkout), input=staged_patch.encode("utf-8", errors="surrogateescape"),
+            capture_output=True, timeout=120,
         )
         if apply.returncode != 0:
             raise RuntimeError(
                 "staged diff did not apply to the isolated checkout: "
-                f"{(apply.stderr or '').strip()}"
+                f"{(apply.stderr or b'').decode('utf-8', errors='replace').strip()}"
             )
     return checkout_root, checkout
 
@@ -747,6 +745,7 @@ def _resolved_review_config(*, profile: str = "production_commit_gate") -> dict:
             "route": route,
             "effort": row_effort(row, surface),
             **({"subagent_id": row.subagent_id} if row.subagent_id else {}),
+            **({"delivery": row.delivery} if row.delivery else {}),
         }
 
     triad_slots = [_project(row, "review") for row in config.triad]
@@ -1035,21 +1034,23 @@ def _write_contributor_packet(
 def _diff_size_refusal(args, resolved_config: dict, reviewable_chars: int, cap: int) -> bool:
     """The cap binds packet recipients; configured retrieving actors read files.
 
-    The non-contributor advisory flow keeps its existing hard cap. Native
-    API actors remain paid seats even though they do not receive a packet.
+    Scope rows always retrieve; only triad rows can receive a packet. The
+    non-contributor advisory flow keeps its existing hard cap. Native API
+    actors remain paid seats even though they do not receive a packet.
     """
-    from ouroboros.review_execution import delivery_retrieves
+    from ouroboros.reviewer_slot_config import row_plan_retrieves
 
     if reviewable_chars <= cap:
         return False
     if not getattr(args, "contributor", False):
         return True
     return any(
-        not delivery_retrieves((row.get("route") or {}).get("kind"), row.get("subagent_id"))
-        for row in [
-            *list(resolved_config.get("triad_slots") or []),
-            *list(resolved_config.get("scope_slots") or []),
-        ]
+        not row_plan_retrieves({
+            "routes": [(row.get("route") or {}).get("kind")],
+            "subagent_ids": [row.get("subagent_id")],
+            **({"retrieves": [row["delivery"] == "native"]} if row.get("delivery") else {}),
+        }, 0)
+        for row in resolved_config.get("triad_slots") or []
     )
 
 
@@ -1293,12 +1294,9 @@ def main() -> int:
     staged = (
         str(contributor_snapshot["patch"])
         if contributor_snapshot is not None
-        else subprocess.run(
-            ["git", "diff", "--cached", "--binary"],
-            cwd=str(REPO),
-            capture_output=True,
-            text=True,
-        ).stdout
+        else _git_bytes(["diff", "--cached", "--binary"]).decode(
+            "utf-8", errors="surrogateescape",
+        )
     )
     if not staged.strip():
         message = (
@@ -1451,10 +1449,9 @@ def main() -> int:
                 ["git", "add", "-A"],
                 cwd=str(checkout), capture_output=True, text=True, timeout=120,
             )
-            post_tree = subprocess.run(
-                ["git", "diff", "--cached", "--binary"],
-                cwd=str(checkout), capture_output=True, text=True, timeout=120,
-            ).stdout
+            post_tree = _git_bytes(
+                ["diff", "--cached", "--binary"], cwd=checkout,
+            ).decode("utf-8", errors="surrogateescape")
             if post_tree.strip() != staged.strip():
                 print(
                     "WARN: the reviewed checkout tree drifted from the staged "
@@ -1462,8 +1459,8 @@ def main() -> int:
                     "worktree before committing what was reviewed.",
                     file=sys.stderr,
                 )
-                (output_dir / "reviewed-tree-drift.diff").write_text(
-                    post_tree, encoding="utf-8",
+                (output_dir / "reviewed-tree-drift.diff").write_bytes(
+                    post_tree.encode("utf-8", errors="surrogateescape"),
                 )
                 if args.contributor:
                     outcome = {

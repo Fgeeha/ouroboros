@@ -1,16 +1,10 @@
-"""Staging, advisory/triad/scope review and reviewed-material binding for the
-commit gate, split out of ``ouroboros/tools/git.py`` (v7 module-size
-discipline). Every span is extracted VERBATIM from the parent's tip bytes by
-scripts/v7next_transplant.py; the parent re-exports every moved name.
-Parent-scope helpers the monolith read as module globals — including the
-post-cutoff paid-cycle gate family — are read through the call-time handle
-``_git()`` — never a from-import — so the facade binding stays the one tests
-monkeypatch. ``_sanitize_git_error`` is the one f-string-read exception (the
-byte gate cannot rewrite f-string internals): it binds the plumbing owner at
-import time.
-"""
+"""Commit staging, review, continuation and binding. ``tools.git`` re-exports
+these functions; ``_git()`` preserves its patchable facade bindings, while
+neutral plumbing imports bind their own owner."""
 
 from __future__ import annotations
+
+from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
 import hashlib
 import json
@@ -21,22 +15,15 @@ import time
 from typing import Any, Dict, List, Optional
 
 from ouroboros.tools.registry import ToolContext
-from ouroboros.tools.git_plumbing import _sanitize_git_error
-from ouroboros.tools.git_plumbing import _publish_git_error, _publish_review_blocked
+from ouroboros.tools.git_plumbing import _sanitize_git_error, _publish_git_error, _publish_review_blocked
+from ouroboros.tools.review_helpers import review_enforcement_blocks
 
-# The parent's logger name is pinned so moved log records keep their %(name)s
-# in server.log/stdout — the same logger object the parent binds.
+# Keep the public facade's logger name in server/stdout records.
 log = logging.getLogger("ouroboros.tools.git")
 
 
 def _git():
-    """The parent module, read at call time.
-
-    The parent owns the rebindable module state and the members tests
-    monkeypatch there; reading them through the module at each call keeps
-    one binding, where a from-import would freeze the value this leaf saw
-    at import time (the owner-approved D18/D33 mechanical exception).
-    """
+    """Read the public facade at call time so monkeypatches keep one binding."""
     from ouroboros.tools import git
 
     return git
@@ -59,15 +46,21 @@ def _review_custody_pending(ctx: ToolContext) -> bool:
         return True
     triad = list(getattr(ctx, "_last_triad_raw_results", []) or [])
     scope_raw = getattr(ctx, "_last_scope_raw_result", {}) or {}
-    scope_rows = list(scope_raw.get("raw_results") or []) if isinstance(scope_raw, dict) else []
-    if not scope_rows and isinstance(scope_raw, dict) and scope_raw:
-        scope_rows = [scope_raw]
+    scope_rows = list(scope_raw.get("raw_results") or [scope_raw]) if isinstance(scope_raw, dict) else []
     return any(
         bool(row.get("late_result_pending"))
         or str(row.get("operation_state") or "") in {"in_flight", "custody_lost"}
         for row in [*triad, *scope_rows]
         if isinstance(row, dict)
     )
+
+
+def _release_review_evidence_if_settled(ctx: ToolContext) -> None:
+    """The existing review-custody boundary owns temporary session-file lifetime."""
+    from ouroboros.review_evidence import release_commit_review_session_view
+
+    if not _review_custody_pending(ctx):
+        release_commit_review_session_view(getattr(ctx, "_commit_review_evidence", None) or {})
 
 
 def _fingerprint_staged_diff(repo_dir: pathlib.Path) -> Dict[str, Any]:
@@ -268,8 +261,11 @@ def _finalize_pending_review(
     *,
     pre_fingerprint: Dict[str, Any],
     post_fingerprint: Dict[str, Any],
-) -> str:
-    """Persist the non-terminal wave and leave its exact retry fail-closed."""
+) -> Optional[str]:
+    """Retain non-terminal custody; Cyber may continue without closing the wave."""
+    if getattr(ctx, "_review_cyber_pending", "") and not review_enforcement_blocks("blocking"):
+        # The pending row belongs to an earlier invocation, not this free continuation.
+        return None
     custody_lost = bool(getattr(ctx, "_review_custody_lost", False))
     message = (
         "⚠️ REVIEW_CUSTODY_LOST: the paid review wave is still unresolved, but "
@@ -304,6 +300,13 @@ def _finalize_pending_review(
         degraded_reasons=list(getattr(ctx, "_review_degraded_reasons", []) or []),
         review_retry_key=str(getattr(ctx, "_current_review_retry_key", "") or ""),
     )
+    if not review_enforcement_blocks("blocking"):
+        from ouroboros.tools.review import _handle_review_block_or_warning
+
+        ctx._last_review_block_reason = "review_late_result_pending"
+        _handle_review_block_or_warning(ctx, True,
+            "Physical review remains pending; its source and invocation are retained for collection.", "")
+        return None
     # The index is part of this live wave's identity. Retain it for exact
     # reconciliation; rebuilding it from the worktree could review new bytes.
     return message
@@ -347,7 +350,6 @@ def _finalize_blocked_review(
         warning = f"⚠️ GIT_WARNING (reset): {_sanitize_git_error(str(e))}"
         return f"{combined_msg}\n\n---\n{warning}"
     return combined_msg
-
 
 _DOC_ONLY_EXTENSIONS = (".md", ".txt", ".rst")
 
@@ -547,6 +549,9 @@ def _reset_commit_review_state(ctx):
     ctx._last_triad_models = []
     ctx._last_scope_model = ""
     ctx._last_triad_raw_results = []
+    ctx._last_review_critical_findings = []
+    ctx._last_review_block_reason = ""
+    ctx._last_review_advisory_findings = []
     ctx._last_scope_raw_result = {}
     ctx._review_degraded_reasons = []
     ctx._current_review_tool_name = "commit_reviewed"
@@ -555,6 +560,10 @@ def _reset_commit_review_state(ctx):
     ctx._review_frozen_rows = {}
     ctx._review_custody_lost = False
     ctx._current_review_attempt_number = None
+    ctx._author_commit_source = None
+    ctx._author_commit_decision = None
+    ctx._author_commit_record = None
+    ctx._commit_review_status = "unknown"
 
 
 def _reconcile_advisory_before_preparation(ctx, commit_message, *, goal, scope, paths, review_rebuttal,
@@ -563,6 +572,9 @@ def _reconcile_advisory_before_preparation(ctx, commit_message, *, goal, scope, 
     from ouroboros.tools.preflight_review_run import pending_advisory_execution
 
     ctx._advisory_reconciled = False
+    if not review_enforcement_blocks("blocking"):
+        # Commit continuation leaves each old critic's source/custody with its invocation.
+        return ""
     try:
         execution, _ = pending_advisory_execution(
             ctx, commit_message, goal=goal, scope=scope, paths=paths, review_rebuttal=review_rebuttal,
@@ -583,6 +595,9 @@ def _reconcile_advisory_before_preparation(ctx, commit_message, *, goal, scope, 
     except Exception as exc:
         return f"⚠️ REVIEW_PENDING: preflight custody could not be reconciled: {exc}"
     return ""
+
+
+from ouroboros.tools.commit_gate import _return_commit_feedback  # noqa: E402
 
 
 def _run_reviewed_stage_cycle(
@@ -670,12 +685,20 @@ def _run_reviewed_stage_cycle(
             "post_fingerprint": {},
         }
     # Free-cycle identity runs before advisory freshness and any paid dispatch.
-    gate_outcome = _git()._free_cycle_gate(
-        ctx, commit_message, commit_start,
-        pre_fingerprint=pre_fingerprint, review_rebuttal=review_rebuttal,
-        goal=goal, scope=scope,
+    author_source = getattr(ctx, "_author_commit_source", None)
+    gate_outcome = None if author_source is not None else _git()._free_cycle_gate(
+        ctx, commit_message, commit_start, pre_fingerprint=pre_fingerprint,
+        review_rebuttal=review_rebuttal, goal=goal, scope=scope,
     )
     advisory_replay: Optional[Dict[str, Any]] = None
+    if author_source is not None:
+        from ouroboros.tools.commit_gate import bind_author_commit_candidate
+        preflight = bind_author_commit_candidate(ctx, commit_message, pre_fingerprint)
+        if preflight:
+            from ouroboros.commit_admission import preflight_evidence_unavailable
+            return {"status": "blocked", "message": preflight, "block_reason": "infra_failure" if preflight_evidence_unavailable(preflight) else "preflight"}
+        advisory_replay = {"advisory_replay": "Explicit current-author continuation; original reviewer facts retained.", "replay_reason": "author_finish"}
+        skip_advisory_pre_review = True
     if gate_outcome is not None:
         if "advisory_replay" in gate_outcome:
             advisory_replay = gate_outcome
@@ -710,6 +733,12 @@ def _run_reviewed_stage_cycle(
     from ouroboros.review_state import compute_snapshot_hash
 
     prepared_snapshot = compute_snapshot_hash(pathlib.Path(ctx.repo_dir), commit_message, paths=advisory_paths)
+    from ouroboros.review_evidence import capture_commit_review_evidence, pending_commit_review_evidence
+
+    if not getattr(ctx, "_advisory_reconciled", False):
+        ctx._commit_review_evidence = (
+            pending_commit_review_evidence(ctx) if getattr(ctx, "_review_reconcile_only", False)
+            else capture_commit_review_evidence(ctx) if advisory_replay is None else {})
     advisory_gate_outcome = None
     if not bool(getattr(ctx, "_review_reconcile_only", False)):
         advisory_gate_outcome = _git()._advisory_and_tests_gate(
@@ -723,6 +752,7 @@ def _run_reviewed_stage_cycle(
             goal=goal, scope=scope,
         )
     if advisory_gate_outcome is not None:
+        _release_review_evidence_if_settled(ctx)
         return advisory_gate_outcome
     if not bool(getattr(ctx, "_review_reconcile_only", False)):
         after_preflight = _git()._fingerprint_staged_diff(pathlib.Path(ctx.repo_dir))
@@ -731,6 +761,7 @@ def _run_reviewed_stage_cycle(
             ctx, commit_message, commit_start, pre_fingerprint, after_preflight, worktree_changed=changed,
         )
         if revalidation is not None:
+            _release_review_evidence_if_settled(ctx)
             return revalidation
     _git()._record_commit_attempt(
         ctx,
@@ -740,8 +771,6 @@ def _run_reviewed_stage_cycle(
         phase="review",
         pre_review_fingerprint=pre_fingerprint.get("fingerprint", ""),
         fingerprint_status="pending",
-        # PAID lands write-ahead only at the first physical dispatch; assembly
-        # refusals and advisory free replays remain unpaid.
         rebuttal_sha256=str(getattr(ctx, "_current_review_rebuttal_sha256", "") or ""),
         review_contract_fingerprint=str(
             getattr(ctx, "_current_review_contract_fingerprint", "") or ""
@@ -750,37 +779,13 @@ def _run_reviewed_stage_cycle(
         late_result_pending=bool(getattr(ctx, "_review_reconcile_only", False)),
     )
 
-    if advisory_replay is not None:
-        # ADVISORY free outcome: disclose loudly and let the commit proceed
-        # without buying another triad+scope run. Honest wording per cause
-        # (wording-3): an identical-diff replay REUSES a recorded verdict; a
-        # ceiling exhaustion on NEW bytes has no verdict to reuse — the diff
-        # ships without a fresh review and the disclosure must say so.
+    if author_source is not None:
         review_err, scope_result, triad_block_reason, triad_advisory = None, None, "", []
-        replay_reason = str(advisory_replay.get("replay_reason") or "")
-        if replay_reason == _git().IDENTICAL_DIFF_BLOCK_REASON:
-            progress_note = (
-                "Max Review Cycles: identical staged diff — reusing the recorded "
-                "review verdict, no paid triad+scope dispatch."
-            )
-        else:
-            progress_note = (
-                "Max Review Cycles: paid-cycle ceiling exhausted — no review outcome "
-                "exists for this diff; the commit proceeds without a fresh triad+scope "
-                "review under advisory enforcement."
-            )
-        disclosure = (
-            "Review enforcement=Advisory: no new triad+scope review was bought for "
-            f"this commit ({replay_reason}); no fresh automatic preflight was bought. "
-            + str(advisory_replay.get("advisory_replay") or "")
-        )
-        advisory_list = getattr(ctx, "_review_advisory", None)
-        if isinstance(advisory_list, list):
-            advisory_list.append(disclosure)
-        try:
-            ctx.emit_progress_fn(progress_note)
-        except Exception:
-            pass
+        ctx._review_advisory.append("Explicit Advisory author continuation; no fresh reviewer approval was created.")
+    elif advisory_replay is not None:
+        review_err, scope_result, triad_block_reason, triad_advisory = None, None, "", []
+        from ouroboros.tools.commit_gate import disclose_commit_review_replay
+        disclose_commit_review_replay(ctx, advisory_replay)
     else:
         _git()._install_paid_dispatch_stamp(ctx, commit_message, commit_start, pre_fingerprint)
         try:
@@ -794,6 +799,7 @@ def _run_reviewed_stage_cycle(
             )
         finally:
             _git()._reconcile_and_clear_review_roster(ctx)
+            _release_review_evidence_if_settled(ctx)
     blocked, combined_msg, block_reason, combined_findings, scope_advisory = _git()._aggregate_review_verdict(
         review_err,
         scope_result,
@@ -809,16 +815,15 @@ def _run_reviewed_stage_cycle(
         if isinstance(advisory_list, list):
             advisory_list.extend(scope_advisory)
     post_fingerprint = _git()._fingerprint_staged_diff(pathlib.Path(ctx.repo_dir))
-    if _git()._review_custody_pending(ctx):
+    if author_source is None and _git()._review_custody_pending(ctx) and (pending_message := _git()._finalize_pending_review(
+            ctx, commit_message, commit_start,
+            pre_fingerprint=pre_fingerprint, post_fingerprint=post_fingerprint)):
+        from ouroboros.config import get_review_enforcement
+        if get_review_enforcement() == "advisory" and review_enforcement_blocks("blocking"):
+            return _return_commit_feedback(ctx, commit_message, commit_start, pre_fingerprint, post_fingerprint, pending=True)
         return {
             "status": "blocked",
-            "message": _git()._finalize_pending_review(
-                ctx,
-                commit_message,
-                commit_start,
-                pre_fingerprint=pre_fingerprint,
-                post_fingerprint=post_fingerprint,
-            ),
+            "message": pending_message,
             "block_reason": (
                 "review_custody_lost"
                 if bool(getattr(ctx, "_review_custody_lost", False))
@@ -840,13 +845,20 @@ def _run_reviewed_stage_cycle(
 
     if review_retry_cancelled(ctx) or owner_deadline_exhausted_for_context(ctx):
         blocked, combined_msg, block_reason = True, "⚠️ REVIEW_STOPPED: owner cancellation or deadline prevents this commit.", "owner_stopped"
+    from ouroboros.config import get_review_enforcement
+    material = (blocked or combined_findings or getattr(ctx, "_last_review_critical_findings", [])
+                or getattr(ctx, "_last_review_advisory_findings", []) or scope_advisory
+                or getattr(ctx, "_last_review_block_reason", "") or triad_block_reason
+                or getattr(ctx, "_review_degraded_reasons", []) or advisory_replay is not None)
+    if (author_source is None and get_review_enforcement() == "advisory" and review_enforcement_blocks("blocking")
+            and material and block_reason != "owner_stopped"):
+        return _return_commit_feedback(ctx, commit_message, commit_start, pre_fingerprint, post_fingerprint,
+                                       reason=block_reason or triad_block_reason or getattr(ctx, "_last_review_block_reason", "") or "author_decision_required", findings=combined_findings or [
+                *getattr(ctx, "_last_review_critical_findings", []),
+                *(scope_result.critical_findings if scope_result is not None else [])])
     if blocked:
-        # Typed block-row classification (Q16/Δ5): a reviewer VERDICT builds
-        # the identical-diff refusal streak; an INFRA fact (fit/quorum/
-        # transport/sub-floor) never does and retries freely. Money is a
-        # separate axis: paid was stamped at PHYSICAL dispatch, so a
-        # dispatched-then-infra-blocked wave still counts toward the ceiling,
-        # while an assembly-refused (undispatched) infra block stays free.
+        # Verdicts extend the identical-diff refusal streak; infrastructure does
+        # not. Either outcome retains the physical dispatch's paid-cycle fact.
         block_class = _git().classify_review_block(
             triad_blocked=bool(review_err),
             triad_block_reason=str(triad_block_reason or ""),
@@ -869,6 +881,9 @@ def _run_reviewed_stage_cycle(
             "post_fingerprint": post_fingerprint,
             "combined_findings": combined_findings,
         }
+    ctx._commit_review_status = ("author_continued" if author_source is not None else
+        "passed" if advisory_replay is None and not material and scope_result is not None
+        and getattr(scope_result, "status", "") == "responded" and getattr(ctx, "_last_triad_raw_results", []) else "not_confirmed")
     return {
         "status": "passed",
         "message": "",
@@ -893,7 +908,7 @@ def _run_non_committing_review_cycle(
     _git()._reset_commit_review_state(ctx)
     commit_start = time.time()
     if not commit_message.strip():
-        return {"status": "failed", "message": "⚠️ ERROR: commit_message must be non-empty."}
+        return {"status": "failed", "message": _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text="⚠️ ERROR: commit_message must be non-empty."))}
     ctx._current_review_commit_message = commit_message
     overlap_err = _git()._check_overlapping_review_attempt(ctx)
     if overlap_err:
@@ -963,10 +978,13 @@ def _run_non_committing_review_cycle(
             )
             ctx._scope_review_history = {}
             outcome["message"] = (
+                "Cyber Pro: review-only operation completed; independent failures and pending work remain recorded. "
+                if not review_enforcement_blocks("blocking") else
                 "Review-only cycle completed under advisory enforcement; failed or missing review remains recorded. "
                 if "review_technical_failure_advisory" in (getattr(ctx, "_review_degraded_reasons", []) or [])
                 else "Review-only cycle passed. "
-            ) + "Commit was not created and the index was unstaged."
+            ) + ("Commit was not created; the index is retained while review custody is pending."
+                 if _git()._review_custody_pending(ctx) else "Commit was not created and the index was unstaged.")
         return outcome
     finally:
         try:
@@ -977,7 +995,6 @@ def _run_non_committing_review_cycle(
         except Exception as exc:
             unstage_warning = f"⚠️ GIT_WARNING (reset): {_sanitize_git_error(str(exc))}"
         _git()._release_git_lock(lock)
-        if unstage_warning:
-            if 'outcome' in locals():
-                message = str(outcome.get("message", "") or "")
-                outcome["message"] = f"{message}\n\n---\n{unstage_warning}" if message else unstage_warning
+        if unstage_warning and 'outcome' in locals():
+            message = str(outcome.get("message", "") or "")
+            outcome["message"] = f"{message}\n\n---\n{unstage_warning}" if message else unstage_warning

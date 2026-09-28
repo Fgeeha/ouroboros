@@ -41,7 +41,7 @@ def test_prepare_onboarding_settings_requires_runnable_config():
     prepared, error = prepare_onboarding_settings(_base_payload(), {})
 
     assert prepared == {}
-    assert "Configure OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, MiniMax, DeepSeek, Anthropic, or a local model" in error
+    assert error == "Connect Codex, an API provider, or a local model before continuing."
 
 
 def test_prepare_onboarding_settings_accepts_openai_only_setup():
@@ -332,13 +332,13 @@ def test_prepare_onboarding_settings_rejects_openai_compatible_key_without_base_
     prepared, error = prepare_onboarding_settings(payload, {})
 
     assert prepared == {}
-    assert "Configure OpenRouter, OpenAI, OpenAI-compatible, Cloud.ru, MiniMax, DeepSeek, Anthropic, or a local model" in error
+    assert error == "Connect Codex, an API provider, or a local model before continuing."
 
 
 def test_onboarding_frontend_uses_base_url_first_compatible_validation():
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
 
-    assert "!['OPENAI_COMPATIBLE_API_KEY', 'MINIMAX_REGION'].includes(field.settingKey)" in source
+    assert "!['OPENAI_COMPATIBLE_API_KEY', 'MINIMAX_REGION', 'ZAI_PLAN'].includes(field.settingKey)" in source
     assert "const hasRemote = keyValues.some(([, value]) => value);" not in source
 
 
@@ -370,6 +370,17 @@ def test_onboarding_bootstrap_cannot_break_out_of_its_inline_script():
     assert "\\u003c/script>\\u003cb>" in html
 
 
+def test_bootstrap_freshness_is_explicit_display_provenance():
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+
+    settings = {"OUROBOROS_MODEL": SETTINGS_DEFAULTS["OUROBOROS_MODEL"]}
+    assert build_setup_bootstrap(settings)["freshInstall"] is False
+    fresh = build_setup_bootstrap({}, fresh_install=True)
+    assert fresh["freshInstall"] is True
+    assert fresh["initialState"]["mainModel"] == settings["OUROBOROS_MODEL"]
+    assert '"freshInstall": true' in build_onboarding_html({}, fresh_install=True)
+
+
 def test_onboarding_wizard_module_keeps_its_multistep_contract():
     source = (REPO / "web/modules/onboarding_wizard.js").read_text(encoding="utf-8")
     draft_source = (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
@@ -396,8 +407,8 @@ def test_onboarding_steps_and_stylesheet_keep_their_owner_facing_shape():
     rails = {step["railCopy"] for step in contract["steps"]}
     css = (REPO / "web" / "onboarding.css").read_text(encoding="utf-8")
 
-    assert {"Add your access", "Choose models", "Choose review mode", "Set your budget"} <= titles
-    assert {"Keys + local", "model slots"} <= rails
+    assert {"Connect your accounts", "Choose models", "Choose review mode", "Review limits"} <= titles
+    assert {"Subscriptions + API", "model slots"} <= rails
     assert "@media (max-width: 720px)" in css
     assert "scroll-snap-type: x proximity;" in css
 
@@ -417,22 +428,14 @@ def test_setup_contract_exports_active_model_slots_only():
 # --------------------------------------------------------------------------
 
 
-def test_agents_step_follows_access_and_never_uses_the_retired_wording():
-    """It sits right after access — the step that explains what the access the
-    owner just typed already bought, and what an agent plan adds on top. Named
-    "agents" (D-10): these agents also build presentations and run ordinary
-    tasks, so "coding agents" is wrong in owner-facing copy."""
+def test_agents_share_accounts_in_the_five_step_onboarding():
+    """Subscriptions and API access share the first step, then the same role editors."""
     contract = build_setup_contract("web")
     ids = [step["id"] for step in contract["steps"]]
-    step = next(item for item in contract["steps"] if item["id"] == "agents")
-
-    assert ids.index("agents") == ids.index("providers") + 1
-    assert ids == ["providers", "agents", "models", "review_mode", "budget", "summary"]
+    assert ids == ["accounts", "models", "review_mode", "budget", "summary"]
     assert build_setup_bootstrap({}, "web")["stepOrder"] == ids
     assert "coding agent" not in repr(contract).lower()
-    # The step announces its own skippability where the owner reads it.
-    assert "Optional" in step["copy"] or "Optional" in step["railCopy"]
-    assert "Skippable" in step["footer"]
+    assert contract["steps"][0]["title"] == "Connect your accounts"
 
 
 def test_agents_step_is_skippable_and_cannot_block_completion():
@@ -449,13 +452,12 @@ def test_agents_step_is_skippable_and_cannot_block_completion():
 
 
 def test_agents_step_ladder_states_the_startup_gate_honestly():
-    """The rung that sells the subscription is the SAME rung that says a
-    subscription cannot run the main agent, and the footnote refuses both easy
-    lies ("free", "all reviewers move")."""
+    """Codex can start Models; other subscriptions remain agent connections."""
     source = (REPO / "web/modules/onboarding_agents_step.js").read_text(encoding="utf-8")
 
-    assert "keeps using the API key or local model" in source
-    assert "a plan cannot run it" in source
+    assert "Run models and agents without an API key" in source
+    assert "Claude Code, Cursor, and Antigravity remain agent connections" in source
+    assert "a plan cannot run it" not in source
     assert "not free" in source
     assert "Task acceptance stays on the API" not in source
     assert "commit, plan, skill review and task acceptance each follow their configured" in source
@@ -521,12 +523,12 @@ def test_wizard_declares_the_subscription_intent_the_endpoint_expects():
     assert f"{SUBSCRIPTIONS_CONNECTED_FIELD}: state.agentsConnected.length > 0" in source
     assert f"{SKIP_SUBSCRIPTION_PRESETS_FIELD}: state.skipSubscriptionPresets" in source
     assert 'id="skip-presets-btn"' in source
-    assert "Finish without subscription presets" in source
-    assert "saveWizard({ skipPresets: true })" in source
+    assert "Use Main for reviewers" in source
+    recovery = source.split("async function prepareMainReviewers", 1)[1].split("async function saveWizard", 1)[0]
+    assert "await agentsStep?.setSkipPresets(true, { replaceReviewers: true })" in recovery
+    assert "render()" in recovery and "completeOnboardingAtomically" not in recovery
     save = source.split("async function saveWizard", 1)[1]
-    assert save.index("await agentsStep?.setSkipPresets(true)") < save.index(
-        "const providersError = validateProvidersStep()"
-    )
+    assert "setSkipPresets(true)" not in save
 
 
 def test_a_browser_owner_is_told_when_the_saved_runtime_mode_needs_a_restart():
@@ -615,6 +617,8 @@ def test_setup_contract_groups_rarely_used_providers():
         "MINIMAX_API_KEY": "more",
         "MINIMAX_REGION": "more",
         "DEEPSEEK_API_KEY": "more",
+        "ZAI_API_KEY": "more",
+        "ZAI_PLAN": "more",
         "ANTHROPIC_API_KEY": "primary",
         "OPENAI_COMPATIBLE_BASE_URL": "more",
         "OPENAI_COMPATIBLE_API_KEY": "more",
@@ -689,6 +693,7 @@ _SECRET_CANARIES = {
     "CLOUDRU_FOUNDATION_MODELS_API_KEY": "cloudru-SECRETCANARY126",
     "MINIMAX_API_KEY": "minimax-SECRETCANARY127",
     "DEEPSEEK_API_KEY": "sk-ds-SECRETCANARY133",
+    "ZAI_API_KEY": "sk-zai-SECRETCANARY134",
     "ANTHROPIC_API_KEY": "sk-ant-SECRETCANARY128",
     "GIGACHAT_CREDENTIALS": "giga-SECRETCANARY129",
     "GIGACHAT_PASSWORD": "gigapw-SECRETCANARY130",

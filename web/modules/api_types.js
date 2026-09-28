@@ -1,6 +1,16 @@
 /** Dependency-free JSDoc mirror of `ouroboros.gateway.contracts`. */
 
 /**
+ * @typedef {Object} CostPresentation
+ * @property {'own'|'root_tree'} scope
+ * @property {?number} tracked_amount
+ * @property {boolean} has_unpriced
+ * @property {boolean} tracked_final
+ * @property {boolean} accounting_open
+ * @property {boolean} has_rows
+ */
+
+/**
  * @typedef {Object} StateResponse
  * @property {number} uptime
  * @property {number} workers_alive
@@ -12,11 +22,12 @@
  * @property {?number} budget_pct
  * @property {string} branch
  * @property {string} sha
- * @property {boolean} evolution_enabled
- * @property {boolean} bg_consciousness_enabled
+ * @property {?boolean} evolution_enabled  // null: the control is unknown (state unavailable/recovering)
+ * @property {?boolean} bg_consciousness_enabled  // null: unknown, never "off"
+ * @property {{quality: string, source: string, unconfirmed: Array<string>}} state_quality  // #1307 read quality of state.json
  * @property {number} evolution_cycle
  * @property {Object} evolution_state
- * @property {Object} bg_consciousness_state
+ * @property {BgConsciousnessState} bg_consciousness_state  // the alarm clock's snapshot + server projection (status/detail)
  * @property {?number} spent_calls
  * @property {boolean} supervisor_ready
  * @property {?string} supervisor_error
@@ -29,13 +40,40 @@
  * @property {Object} accounting  // physical-attempt ledger projection
  * @property {Array<Object>} projects  // active/deleting ProjectEntry sidebar projection
  * @property {Array<number>} project_chat_ids  // complete (uncapped) project chat_ids — WS fan-out isolation SSOT (v6.32.0)
- * @property {Object<string, {project_id: string, chat_id: number}>} task_bindings  // bound task -> its project: suppress the stray "turn into project" button (v6.33.0 P2) + render a pointer that opens the project panel (v6.33.0 F4)
+ * @property {Object<string, {project_id: string, chat_id: number, origin_bound?: boolean}>} task_bindings  // bound task -> its project: suppress the stray "turn into project" button (v6.33.0 P2) + render a pointer that opens the project panel (v6.33.0 F4). origin_bound marks a task the host included because its OWNER MESSAGE already has a project (#902), so one message cannot keep a second convertible card
  * @property {ActiveDirectTurn[]=} active_direct_turns  // active direct/ephemeral chat turns snapshot
+ * @property {boolean=} active_chat_activities_complete
  * @property {ActiveChatActivity[]=} active_chat_activities  // combined snapshot: direct/ephemeral turns + root managed queue tasks
  */
 
 /**
+ * Background Consciousness alarm-clock snapshot (server._describe_bg_consciousness_state over
+ * consciousness.status_snapshot). A wake-up is an ordinary Main turn; its liveness is the direct-activity census, never a flag here.
+ * @typedef {Object} BgConsciousnessState
+ * @property {boolean} enabled
+ * @property {string} status  // disabled | stopped | thinking | sleeping | waiting_for_first_conversation | allowance_exhausted | allowance_unknown | wake_rejected | wake_failed
+ * @property {string} detail  // one honest owner-readable line (e.g. "Sleeping until 14:05.")
+ * @property {string} level  // observe | act | full
+ * @property {string} next_wake_at  // ISO instant; "" when unknown
+ * @property {string} pending_reason  // the event that will wake it early, "" when none
+ * @property {string} last_wake_at  // ISO instant; "" before the first wake of this process
+ * @property {string} last_wake_task_id
+ * @property {string} last_wake_outcome  // running | done | failed | rejected:<reason> | skipped:<reason>
+ * @property {string} last_error
+ * @property {?number} spent_24h_usd  // null when the ledger could not be read
+ * @property {?number} daily_usd
+ * @property {string} allowance_resets_at  // ISO instant the oldest counted spend leaves the 24 h window
+ * @property {number} tasks_running  // live roots consciousness started
+ * @property {number} max_tasks
+ * @property {string} live_wake_task_id  // "" when no wake-up is running
+ * @property {number} unknown_unmetered  // window rows without a price: spent_24h_usd is then a floor ("at least")
+ * @property {boolean} integrity_degraded  // the ledger was quarantined/repaired; the numbers are best-effort
+ */
+
+/**
  * @typedef {Object} ActiveDirectTurn
+ * @property {Object.<string,Object>=} model_waits
+ * @property {number=} task_attempt
  * @property {string} activity_id
  * @property {number} chat_id
  * @property {string} project_id
@@ -47,12 +85,16 @@
 
 /**
  * @typedef {Object} ActiveChatActivity
+ * @property {Object=} required_question  // read-only pointer to the current required Project quiz
+ * @property {boolean=} required_question_unavailable  // a recorded owner-question wait whose detail could not be read: possibly blocked, never "no question"
+ * @property {Object.<string,Object>=} model_waits
+ * @property {number=} task_attempt
  * @property {string} activity_id
  * @property {number} chat_id
  * @property {string} project_id
  * @property {string} client_message_id  // empty for managed queue rows
- * @property {string} kind  // direct_chat | ephemeral_decision | managed_task
- * @property {string} phase  // managed rows: queued | working | finalizing
+ * @property {string} kind  // direct_chat | managed_task — presentational label; membership in this census, not kind, decides liveness
+ * @property {string} phase  // managed rows: queued | budget_pausing | budget_paused | working | finalizing; direct rows: thinking or unknown; budget-paused direct turns retain their ID/kind and use the managed phases after parking
  * @property {number} started_at
  */
 
@@ -100,7 +142,7 @@
 /**
  * @typedef {Object} AvailableSubagentItem
  * @property {string} subagent_id
- * @property {string} name
+ * @property {boolean=} enabled - Omitted means true; false withdraws new selections.
  * @property {string} recommended_use
  * @property {AvailableSubagentRoute} route
  * @property {string=} effort
@@ -125,6 +167,16 @@
  * @property {string[]=} custom_secret_keys
  * @property {Object=} setup_contract
  * @property {AvailableSubagentsSettingsMeta=} available_subagents
+ * @property {SettingsPolicyState=} policy_state
+ * @property {{restart_required:boolean,restart_keys:string[],restart_source_unknown_keys:string[],unknown_keys:string[],local_model:Object,summary:string}=} restart_state Component application and source uncertainty.
+ */
+
+/**
+ * @typedef {Object} SettingsPolicyState
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,restart_required:boolean,applies:string}} access
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,pending:boolean,applies:string,active_task_snapshot:boolean}} supervisor
+ * @property {{configured:string,effective:string,current_process:string,next_task:string,pending:boolean,applies:string,active_task_snapshot:boolean}} review
+ * @property {boolean} running_task_snapshot
  */
 
 /**
@@ -219,7 +271,7 @@
  * @property {Array<Object>=} attachments  // [{filename, display_name, mime}] — image uploads become native blocks (v6.26.0)
  * @property {number=} chat_id     // multi-project thread routing (v6.32.0); main chat = 1
  * @property {string=} project_id  // per-project memory scope (v6.32.0)
- * @property {Object=} client_surface  // raw sending-surface observables measured at send time (pywebview/ua/viewport/matchMedia/captured_at)
+ * @property {Object=} client_surface  // raw sending-surface observables measured at send time (pywebview/ua/viewport/matchMedia/captured_at; optional IANA timezone)
  */
 
 /**
@@ -230,16 +282,38 @@
 
 /**
  * @typedef {Object} ChatOutbound
+ * @property {string=} quiz_id
+ * @property {string=} quiz_state
+ * @property {number=} project_chat_id
+ * @property {string=} source_status
+ * @property {string=} owner_wait_state
+ * @property {string=} owner_wait_resume_reason
+ * @property {boolean=} wait_for_answer
+ * @property {string=} wait_ended_at
+ * @property {string=} question
+ * @property {string[]=} options
+ * @property {string[]=} option_details
+ * @property {string=} stake
+ * @property {string=} assumption
+ * @property {number=} recommended_index
+ * @property {number=} answered_index
+ * @property {string=} comment
+ * @property {string=} host_facts
  * @property {"chat"} type
  * @property {"user"|"assistant"|"system"} role
  * @property {string} content
  * @property {string} ts
+ * @property {boolean=} ingress_accepted Canonical inbound row saved; not proof of task start or model delivery.
  * @property {boolean=} markdown
  * @property {boolean=} is_progress
  * @property {string=} task_id
  * @property {Object=} origin_message_ref
  *   Host-captured inbound identity for a correlated operation's terminal reply.
  * @property {boolean=} ephemeral_decision
+ * @property {number=} tool_calls
+ * @property {number=} rounds
+ * @property {string=} suggested_name
+ * @property {Object=} model_execution
  * @property {string=} task_phase
  *   "finalizing" on a root's early final answer: post-task synthesis still
  *   runs, so the frame is not the task's terminal conclusion.
@@ -281,6 +355,20 @@
  *   subagent (delegated routes only) — the route it was sent to, not a receipt
  *   from the engine saying where it landed. Absent/empty = the ordinary native
  *   path; no chip is drawn.
+ * @property {Object=} executor_observation
+ *   Latest observed progress actor, bound to own task/attempt/run/revision.
+ *   model_source distinguishes requested and observed; not a terminal receipt.
+ * @property {Object=} delegated_activity
+ *   One host progress observation: {v, task_id, run_id, after_seq,
+ *   through_seq, source{kind: run_events|timeline_window, read_through?, ref?,
+ *   provisional?}, parts[{kind: message|thinking|problem, actor, text, seq?,
+ *   last_seq?, cuts?[[seq, Unicode code-point offset]], cuts_truncated?, chars?,
+ *   truncated?}], technical?{count, labels, recent, seqs?, seqs_truncated?},
+ *   gaps?[{after_seq, through_seq, reason, final?}],
+ *   omitted?, latest_message?}. Identity is (run_id, seq); host progress about
+ *   the executor, never narration or execution evidence; `source.ref` names
+ *   retained redacted JSONL (confined task-file `?source=`, 503 where unsupported).
+ *   Incomplete preview identity is disclosed; a preview is not the whole journal.
  * @property {Object=} execution_evidence
  *   The completion-seam EVIDENCE the route decision is reconciled against:
  *   {delegated_runs_started, delegated_runs_settled, delegated_runs_succeeded,
@@ -302,6 +390,21 @@
  * @property {string=} task_group_id
  * @property {string=} task_event
  * @property {string=} status
+ * @property {boolean=} _is_direct_chat
+ *   The lane fact of a direct conversation turn, stamped by the host on the
+ *   turn's own progress/tool frames and on every task_done; the chat block
+ *   reads it before any census lists the turn.
+ * @property {boolean=} narration
+ *   The VOICE of a progress frame, stamped by the worker on every note it
+ *   emits: true only for the model's own round narration, false for every
+ *   host-authored note (checkpoints, fallback, plan, acceptance, nudge,
+ *   transport, density). Both stay visible rows; only narration may claim the
+ *   card title and the collapsed activity line. Absent = a frame that predates
+ *   the fact (an older worker, a supervisor note, a stored row), which keeps
+ *   the legacy reading that promoted every progress frame.
+ * @property {string=} initiator
+ *   The turn's origin label: "consciousness" on every frame and row of a
+ *   self-initiated wake-up (and the roots it starts); absent on an owner's turn.
  * @property {boolean=} cancelable
  *   v6.82 (P5): host-attested — this frame's task is a supervisor-queue task that
  *   POST /api/tasks/{id}/cancel can force-cancel: a lineage-resolved pooled root or
@@ -323,6 +426,11 @@
  *   v6.87.48: the count of OPEN ledger rows — the disclosed cause of `cost_final: false`,
  *   which can hold with every dollar bucket at zero (an estimated $0.00, or a dispatched
  *   row whose reservation is exactly zero).
+ * @property {?CostPresentation=} cost_presentation
+ *   #498: the facts that EXPLAIN the amount beside it, bound to the scope whose ledger
+ *   rows produced them (`own` or `root_tree`). `tracked_amount` is null unless a priced
+ *   or bounded row actually evidenced it, so an empty ledger and an all-unpriced one
+ *   never read as a measured zero. Null when the ledger could not be read.
  * @property {?boolean=} ledger_integrity_degraded
  *   C12: the ledger's INTEGRITY marker, produced by the cost authority all along but
  *   named in no carry list — an amount computed over a degraded ledger used to reach the
@@ -348,7 +456,21 @@
  *   bounded with an explicit omission marker, at most 8 rows per actor) and
  *   actors[].findings_omitted (exact count, 0 included). Both are emitted only
  *   when that reviewer produced a parsed response; their absence is a
- *   transport/parse hole, never "zero findings".
+ *   transport/parse hole, never "zero findings". panels[].late_settlement
+ *   ({note, settled_after_terminal, settled_at, reviewed_subject, reviewed_superseded,
+ *   reviewed_revision: "delivered"|"different"|"unknown", reviewed_is_emitted: true|false|null,
+ *   reviewer_outputs, emitted_answer}) binds original critique and subject to emitted bytes.
+ *   reviewer_outputs[].response_ref and emitted receipts' source_ref retain full sources;
+ *   emitted_answer.state is "delivered"|"owed"|"unknown", with delivered receipts,
+ *   unverified ids and owed ids. Receipt basis "send_handler_returned" proves producer
+ *   return, not human receipt. The Reviews group prints the note verbatim. `acceptance_incident`
+ *   ({incident_id, status: "failed"|"resolved", stage, attempts, source_known,
+ *   feedback_delivered, failure_kind?, failure_detail?, retry?, prior_incidents?})
+ *   is the host's own LOCAL acceptance-preparation failure — published even when
+ *   there is no panel at all, keyed by its stable incident id, with the REAL host
+ *   attempt count; absent when no preparation ever failed. The Reviews group is
+ *   its only carrier (no card row, no toast); a `resolved` status clears the
+ *   active warning and keeps the row as history.
  * @property {boolean=} worker_saturation_warning
  * @property {string=} source
  * @property {string=} sender_label
@@ -356,9 +478,18 @@
  * @property {string=} client_message_id
  * @property {Object=} transport
  * @property {string=} system_type
+ * @property {"timeline"|"reviews"=} card_row
+ *   A host-stamped placement fact for a task-keyed System row: "timeline" = a
+ *   timeline item of the task's card, "reviews" = the card's Reviews group
+ *   carries the fact (the row is still attached to the card); absent = an
+ *   ordinary row.
+ * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
+ * @property {number=} card_row_revision  // canonical source order, independent of delivery timestamp
  * @property {string=} target_label
  * @property {string=} project_id
  * @property {string=} project_name
+ * @property {string=} handoff_id  // immutable origin/destination receipt identity
+ * @property {string=} completion_answer  // a Project root's model-authored final answer, mirrored into Main
  * @property {number=} chat_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
  */
@@ -372,7 +503,7 @@
  * @property {string=} activity_id
  * @property {string=} client_message_id
  * @property {string=} phase
- * @property {string=} kind  // stamped only for direct-registry-tracked turns; absent for queued managed tasks (snapshot has no deletion authority over them)
+ * @property {string=} kind  // direct_chat | managed_task, empty for children and untracked tasks; kept for wire compatibility, no in-repo client reads it. A typing frame is a submission receipt, never liveness: only the /api/state census inserts into the header live-set
  */
 
 /**
@@ -440,6 +571,7 @@
  * @typedef {Object} QuizOption
  * @property {string} label
  * @property {string=} detail
+ * @property {boolean=} recommended
  */
 
 /**
@@ -451,10 +583,12 @@
  * @property {QuizOption[]} options
  * @property {string} stake
  * @property {string} assumption
+ * @property {boolean=} wait_for_answer
  * @property {string} state
  * @property {string} ts
  * @property {number=} answered_index
  * @property {string=} comment
+ * @property {string=} host_facts
  * @property {number=} chat_id
  * @property {string=} task_id
  * @property {boolean=} project_thread
@@ -474,38 +608,55 @@
  * @property {number=} answered_index
  * @property {string=} comment
  *   The owner's recorded free-text answer, when one was recorded.
+ * @property {boolean=} wait_for_answer
+ *   False once a bounded wait closed and the task resumed; the card stays open and answerable.
  * @property {number=} chat_id
  */
 
 /**
  * POST /api/decisions body — the ONE answer ingress for owner decision cards
- * (decision families quiz:/routing:/interaction:). request_id is the
+ * (decision families quiz:/routing:/interaction:/model_wait:). request_id is the
  * idempotency key; a replay returns the recorded confirmation. option_index is
- * optional for the quiz family only: an owner who takes none of the offered
- * options sends a non-empty comment and no index.
+ * optional for a quiz free answer and for typed model_wait actions. A quiz
+ * free answer sends a non-empty comment; model_wait sends revision and action.
  * @typedef {Object} DecisionRequest
  * @property {string} request_id
  * @property {string} decision_id
  * @property {number=} option_index
  * @property {string=} comment
+ * @property {number=} revision
+ * @property {string=} action
+ * @property {boolean=} auto_continue
+ * @property {string=} model
+ * @property {string=} credential_profile_id
+ * @property {boolean=} use_local
+ * @property {boolean=} persist_role
  */
 
 /**
  * Answer-ingress reply; 409 carries the card's truthful lifecycle state so a
  * late click settles the card instead of inviting retries.
  * @typedef {Object} DecisionResponse
+ * @property {string=} request_id
+ * @property {boolean=} applied
+ * @property {(boolean|null)=} saved
+ * @property {Object=} wait
+ * @property {string=} reason_code
  * @property {boolean=} ok
  * @property {string=} decision_id
  * @property {string=} state
  * @property {number=} answered_index
  * @property {string=} comment
  * @property {boolean=} duplicate
+ * @property {boolean=} answered_after_terminal
+ * @property {boolean=} forwarded
  * @property {string=} error
  * @property {string=} dispatched
  * @property {string=} task_id
  * @property {string=} latest_status
  * @property {string=} reason
  * @property {string=} detail
+ * @property {string=} cause  // the owner-facing sentence for a refused routing act (409 dispatch_rejected)
  */
 
 /**
@@ -557,10 +708,13 @@
  * @property {string} action
  * @property {string=} target
  * @property {string=} target_label
+ * @property {string=} project_id
+ * @property {number=} project_chat_id
  * @property {string} status
  * @property {Array<Object>=} options
  * @property {AttachmentManifestEntry[]=} attachment_manifest
  * @property {string=} routing_token
+ * @property {string=} cause  // host-authored owner sentence for a REFUSED act; absent on scheduled/delivered/pending and on the picker frame
  * @property {boolean} suppress_bubble
  * @property {string=} ts
  */
@@ -587,6 +741,8 @@
  * @typedef {Object} TaskOutcomeHistoryFields
  * @property {"working"|"done"|"warn"|"error"|"cancelled"=} outcome_phase  // canonical display phase; "working" is not terminal
  * @property {boolean=} outcome_final  // true only after the canonical task outcome settles; false marks a pre-finalization narrative
+ * @property {{status: string, phase: string, ts: string, provenance: string, model_execution?: Object}=} historical_terminal
+ * @property {Object=} model_execution
  */
 
 /**
@@ -675,7 +831,7 @@
  * @typedef {Object} TaskNamedOutbound
  * @property {"task_named"} type
  * @property {string} task_id
- * @property {string} suggested_name  // proactively-coined project name; client sets the live card title (v6.40.0)
+ * @property {string} suggested_name  // admission-coined name of a managed task; client sets the live card title
  */
 
 /**
@@ -725,11 +881,13 @@
  * @property {string=} payload_root
  * @property {string=} review_status
  * @property {boolean=} review_stale
- * @property {{status: string, stale: boolean, executable_review: boolean, blocking_reason: string, review_enforcement: string, summary: string, preflight_failed: (boolean|undefined), preflight_failed_stale: (boolean|undefined)}=} review_gate
+ * @property {{status: string, stale: boolean, executable_review: boolean, blocking_reason: string, review_enforcement: string, summary: string, author_accepted: (boolean|undefined), reviewed_content_hash: (string|undefined), author_disposition: (Object|undefined), preflight_failed: (boolean|undefined), preflight_failed_stale: (boolean|undefined)}=} review_gate
+ * @property {string=} reviewed_content_hash
+ * @property {Object=} author_disposition
  * @property {boolean=} executable_review
  * @property {string=} review_profile
- * @property {boolean=} official_hub_verified
- * @property {boolean=} owner_attestable
+ * @property {boolean|null=} official_hub_verified null = no fresh hub catalog view yet (the page re-reads)
+ * @property {boolean|null=} owner_attestable
  * @property {{visible: boolean, publication_ready: boolean, task_start_allowed: boolean, disabled: boolean, state: "ready"|"warnings"|"needs_attention"|"repairable"|"hard_block", reason: string}=} submit_hub
  * @property {{current: Object, history: Object[], history_omitted: number=}=} skill_review
  * @property {boolean=} is_self_authored
@@ -861,6 +1019,7 @@
  * @typedef {Object} OwnerSkillPresenceRuntimeRequest
  * @property {string} expected_state_fingerprint
  * @property {{model_slot: ("main"|"light"|null), inline_max_rounds: (number|null)}} runtime_overrides
+ * @property {string=} workspace_root
  */
 
 /**
@@ -1017,7 +1176,17 @@
  * intent is the SOFT stop ("finalize_then_cancel") — the UI shows
  * "Finalizing…" and offers the hard escalation; absent on immediate intents.
  * @typedef {Object} TaskDetailResponse
+ * @property {Array<{name:string, path?:string, relpath?:string, size?:number, measured?:boolean, status?:string, errors?:string[]}>=} artifacts
+ *   Recorded result rows; a nested file keeps its store-relative `relpath`, and `measured: false`
+ *   marks a stat-only listing, not a verified capture.
+ * @property {Object.<string, {name:string, files:number, size:number, excluded:number, available:boolean}>=} artifact_archives
+ *   Per top-level result directory, what `?archive=<dir>` would stream now (members from one
+ *   confined stat each, rows left out counted); a folder offers its `.zip` only when `available`.
+ * @property {Object.<string,Object>=} model_waits
  * @property {TaskCostBreakdown=} cost_breakdown
+ * @property {{status: 'pending'|'problem'|'complete', pending_count: number, problem_count: number, promoted_ref_count: number, promoted_source_handle_count: number, problem_reasons?: Array<{reason:string,count:number}>}=} history_retention
+ *   Background history placement, separate from task outcome. Routine progress is detail-only;
+ *   only a problem appears on the collapsed card.
  * @property {string=} cancel_state
  * @property {string=} cancel_reason
  * @property {string=} stop_policy
@@ -1057,8 +1226,20 @@
  * @property {string=} applied_model
  * @property {string=} requested_profile
  * @property {string=} applied_profile
+ * @property {Object=} observed_route Actual API attempt route; never the task's mutable last route.
  * @property {string=} run_id
  * @property {string=} ts
+ * @property {string=} occurred_at
+ * @property {string=} observed_at
+ * @property {string=} outcome
+ * @property {string=} failure_code
+ * @property {string=} reset_at
+ * @property {Object=} identity
+ * @property {Object<string, SubagentLastDelegation>=} latest_by_subagent
+ * @property {string=} task_id
+ * @property {string=} invocation_id
+ * @property {string=} attempt_id
+ * @property {Object=} fallback
  */
 
 /**
@@ -1122,18 +1303,35 @@
  */
 
 /**
+ * Mirrors `gateway/schedule_contracts.py`, which states what each field means.
  * @typedef {Object} ScheduledTasksResponse
  * @property {number} schema_version
- * @property {Object[]} tasks
+ * @property {Object[]} tasks  // each row carries status/retained/restorable
  */
 
 /**
  * @typedef {Object} ScheduleUpsertResponse
- * @property {boolean} ok
+ * @property {boolean} ok  // follows schedule.audit: an incomplete audit is not ok
  * @property {Object} schedule
  */
 
 /**
+ * @typedef {Object} ScheduleActionResponse
+ * @property {boolean} ok  // the requested state was ACHIEVED and both audit records landed (restored_not_ready: changed, not ok)
+ * @property {boolean} changed  // the durable fact, whatever the audit did
+ * @property {string} status
+ * @property {string} schedule_id
+ * @property {string=} operation_id
+ * @property {?boolean=} running_or_queued  // already admitted; null = unknown
+ * @property {('recorded'|'incomplete'|'not_written')} audit
+ * @property {string=} detail
+ * @property {Object=} schedule
+ * @property {string[]=} allowed
+ */
+
+/**
+ * Legacy name for the DELETE response: the subset every previous caller read of
+ * what that endpoint now answers as a ScheduleActionResponse.
  * @typedef {Object} ScheduleDeleteResponse
  * @property {boolean} ok
  */
@@ -1295,6 +1493,25 @@
  */
 
 /**
+ * Process-local execution observation on /api/update/status; not recovery authority.
+ * @typedef {Object} UpdateProgress
+ * @property {string} operation_id
+ * @property {string} generation
+ * @property {string} stage
+ * @property {string} started_at
+ * @property {string} stage_started_at
+ * @property {boolean} active
+ * @property {string} result
+ * @property {string} error
+ * @property {boolean} restart_required
+ */
+
+/**
+ * @typedef {Object} UpdateProgressChangedOutbound
+ * @property {'update_progress_changed'} type
+ */
+
+/**
  * @typedef {Object} UpdateStatusReadyOutbound
  * @property {'update_status_ready'} type
  * @property {boolean} available
@@ -1328,4 +1545,24 @@ export const MAX_QUIZ_OPTIONS = 6;
 // REFUSES a longer comment (it is delivered verbatim, never truncated), so
 // the card must not offer to send one.
 export const MAX_DECISION_COMMENT = 2000;
-export const GATEWAY_CONTRACT_VERSION = '7.0.0-rc.15';
+export const GATEWAY_CONTRACT_VERSION = '7.5.1';
+
+/**
+ * @typedef {Object} ChatHistoryPosition
+ * @property {'chat'|'progress'} source
+ * @property {number} offset Physical byte offset in the retained source chain.
+ *
+ * @typedef {Object} ChatHistoryResponse
+ * @property {Array<Object>} messages Rows and hidden typed quiz/terminal replay evidence.
+ * @property {boolean} has_more Older bytes remain or a disclosed source gap prevents establishing EOF.
+ * @property {string|null} next_cursor Opaque room-bound older continuation.
+ * @property {string|null} page_cursor Replays a frozen page; null for an unavailable source boundary.
+ * @property {{complete:boolean,truncated_by:Array<string>}} window Whole-history coverage.
+ * @property {string} [next_before_ts] Legacy field retained for compatibility.
+ * @property {string} [error]
+ * @property {string} [reason_code]
+ *
+ * Physical messages and folded review attempts may additionally carry
+ * history_id:string and history_position:ChatHistoryPosition. They identify
+ * stored source records, never current task or review authority.
+ */

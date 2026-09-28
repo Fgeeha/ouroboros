@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 import logging
 import os
 import pathlib
@@ -25,6 +26,7 @@ from ouroboros.utils import (
     update_json_locked,
     utc_now_iso,
 )
+from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
 
@@ -93,6 +95,11 @@ def task_result_authority_projection(
         for key, value in row.items()
         if key not in _TASK_RESULT_PROCESS_EVIDENCE_FIELDS
     }
+    from ouroboros.task_finalization import terminal_host_notice_text
+
+    notice = terminal_host_notice_text(row)
+    if notice:
+        authority["terminal_host_notice"] = notice
     contract = row.get("task_contract")
     if isinstance(contract, dict):
         authority["task_contract"] = copy.deepcopy(contract)
@@ -108,6 +115,12 @@ def task_result_authority_projection(
     receipts = _authority_verification_receipts(row, drive_root)
     if receipts:
         authority["verification_receipts"] = copy.deepcopy(receipts)
+    if isinstance(authority.get("plan_review_state"), dict):
+        from ouroboros.tools.plan_review_artifacts import authority_state
+
+        authority["plan_review_state"] = authority_state(
+            drive_root, str(row.get("task_id") or row.get("id") or ""), authority["plan_review_state"],
+        )
     return authority
 
 
@@ -283,14 +296,12 @@ def persist_early_origin_stub(
 ) -> None:
     """Merge-persist ingress authority before the convertible task card exists.
 
-    Ephemeral/origin-less turns write nothing. A storage failure is loud but
+    Origin-less turns write nothing. A storage failure is loud but
     non-fatal: the owner's task outlives its start message, and the subsequent
     full RUNNING write will encounter the same storage fault. ``write_result``
     preserves the existing agent test seam while production uses the canonical
     task-result writer.
     """
-    if bool(task.get("_ephemeral_turn")):
-        return
     ref = task.get("origin_message_ref")
     if not (isinstance(ref, dict) and ref):
         return
@@ -515,42 +526,21 @@ def check_budget(env: Any) -> Tuple[dict, int]:
 def check_review_continuations(env: Any) -> Tuple[dict, int]:
     try:
         from ouroboros.task_continuation import list_review_continuations
-        from ouroboros.task_results import (
-            STATUS_CANCELLED,
-            STATUS_COMPLETED,
-            STATUS_FAILED,
-            STATUS_INTERRUPTED,
-            STATUS_REJECTED_DUPLICATE,
-            STATUS_REQUESTED,
-            STATUS_RUNNING,
-            STATUS_SCHEDULED,
-            list_task_results,
-        )
+        from ouroboros.task_results import STATUS_INTERRUPTED, load_task_result
 
         continuations, corrupt = list_review_continuations(env.drive_root)
-        task_rows = list_task_results(
-            env.drive_root,
-            statuses=[
-                STATUS_REQUESTED,
-                STATUS_SCHEDULED,
-                STATUS_RUNNING,
-                STATUS_INTERRUPTED,
-                STATUS_COMPLETED,
-                STATUS_FAILED,
-                STATUS_CANCELLED,
-                STATUS_REJECTED_DUPLICATE,
-            ],
-        )
-        task_by_id = {
-            str(item.get("task_id") or ""): item
-            for item in task_rows
-            if str(item.get("task_id") or "").strip()
-        }
+
+        def _status(task_id: str) -> str:
+            # One row read per continuation (TZ-1 A): a startup check never walks the store.
+            try:
+                return str((load_task_result(env.drive_root, task_id) or {}).get("status") or "")
+            except (OSError, ValueError):
+                return ""
 
         rows = []
         interrupted = []
         for item in continuations:
-            task_status = str((task_by_id.get(item.task_id) or {}).get("status") or "")
+            task_status = _status(item.task_id)
             row = {
                 "task_id": item.task_id,
                 "task_status": task_status or "missing",
@@ -718,7 +708,6 @@ def check_stray_server_processes(env: Any) -> Tuple[Dict[str, Any], int]:
 def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
     from ouroboros.context_budget import (
         EVENTS_LOG_WARN_BYTES,
-        BG_OBSERVATIONS_WARN_BYTES,
         PROGRESS_LOG_WARN_BYTES,
         SCHEDULED_TASKS_WARN_BYTES,
         SKILL_REVIEW_ROOT_TASKS_WARN_BYTES,
@@ -735,23 +724,18 @@ def _hot_store_thresholds() -> Tuple[Tuple[str, int, str], ...]:
     )
     return (
         (
-            "state/consciousness_observations.jsonl",
-            BG_OBSERVATIONS_WARN_BYTES,
-            "Background consciousness replays this append-only inbox on wake; "
-            "acknowledged rows past GC retention fold into an archive segment "
-            "at startup (unacknowledged rows never) — growth past this size "
-            "means a large unacknowledged backlog or a gap-blocked fold.",
-        ),
-        (
             "state/usage_attempts.jsonl",
             USAGE_LEDGER_WARN_BYTES,
-            "Every reservation re-reads the ledger under the monetary lock "
-            "(~0.5s hold at 20MB — see usage_ledger.py); size-triggered "
-            "compaction (usage_compaction.py, CPL4-C6) should hold the file "
-            "far below this — growth past it means compaction is broken, the "
-            "unfoldable residue itself is this large, or the lock directory "
-            "takes no kernel locks so compaction refuses on the name tier "
-            "(see the usage_ledger_compaction_refused event in events.jsonl).",
+            "Warm reservations validate only appended rows under the monetary lock; "
+            "cold/replaced views prepare history outside it (_usage_rows_memo.py). "
+            "Size-triggered compaction (usage_compaction.py, CPL4-C6) should hold the file "
+            "far below this — growth can mean broken compaction, a large "
+            "unfoldable residue, a policy abort, refusal on the name tier "
+            "(no kernel locks), or a file that has not yet outgrown the floor "
+            "its last committed pass stamped into the ledger header (declined "
+            "before the pass, so no event). Check usage_ledger_compaction_refused or "
+            "usage_ledger_compaction_skipped in events.jsonl; the two snapshot-race "
+            "exits before archive/swap only log warnings, without a typed event.",
         ),
         ("logs/events.jsonl", EVENTS_LOG_WARN_BYTES, rotation_expected),
         ("logs/tools.jsonl", TOOLS_LOG_WARN_BYTES, rotation_expected),
@@ -786,9 +770,9 @@ def hot_store_growth_notes(env: Any) -> list:
 
     Reused live by context.py::build_health_invariants (the
     check_stray_server_processes pattern). Deliberately NOT TTL-cached
-    (contrast context._STRAY_PROBE_CACHE): nine os.stat calls per task turn
-    are orders of magnitude cheaper than the pgrep probe that cache exists
-    for, and a stale reading would delay the regression signal."""
+    (contrast context._STRAY_PROBE_CACHE): eight os.stat calls plus two shallow
+    iterdir passes per task turn are orders of magnitude cheaper than the pgrep
+    probe that cache exists for, and a stale reading would delay the signal."""
     from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
 
     drive_root = pathlib.Path(getattr(env, "drive_root", None) or env.drive_path("state").parent)
@@ -844,9 +828,30 @@ def hot_store_growth_notes(env: Any) -> list:
         notes.append(
             "WARNING: HOT STORE GROWTH — the events chain (logs/events.jsonl + "
             f"archive/events_*.jsonl) totals {events_chain_size / 1_000_000:.1f} MB "
-            f"(threshold {EVENTS_ARCHIVE_SCAN_WARN_BYTES // 1_000_000} MB). Custody "
-            "replay scans this chain on ownership questions. Investigate chain "
-            "indexing/compaction; archives are durable history and are never deleted."
+            f"(threshold {EVENTS_ARCHIVE_SCAN_WARN_BYTES // 1_000_000} MB). Each process's "
+            "first custody read folds this whole chain into its row memo (later reads fold "
+            "only appended bytes); forensic and retirement scans still walk it. Legacy "
+            "segments retain inline delegated request bodies; new start rows reference the "
+            "observability store, without shrinking existing history. Investigate a durable "
+            "compact custody projection; archives are durable history and are never deleted."
+        )
+    from ouroboros.context_budget import RETAINED_EXECUTION_DRIVES_WARN_COUNT
+    from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR
+    retained_drive_count = 0
+    for retained_root in (
+        drive_root / HEADLESS_TASKS_DIR,
+        drive_root / TASK_DRIVES_DIR,
+    ):
+        try:
+            retained_drive_count += sum(path.is_dir() for path in retained_root.iterdir())
+        except OSError:
+            pass
+    if retained_drive_count > RETAINED_EXECUTION_DRIVES_WARN_COUNT:
+        notes.append(
+            "WARNING: HOT STORE GROWTH — retained execution drives under "
+            f"state/headless_tasks and task_drives total {retained_drive_count} "
+            f"(threshold {RETAINED_EXECUTION_DRIVES_WARN_COUNT}). Terminal-task retention "
+            "or pruning is lagging; inspect lifecycle GC without recursively sizing drives."
         )
     return notes
 
@@ -906,7 +911,7 @@ def verify_system_state(env: Any, git_sha: str) -> None:
         issues += 1
         log.warning("WORLD.md missing — environment profile not available")
 
-    configured_model = os.environ.get("OUROBOROS_MODEL", "")
+    configured_model = runtime_setting("OUROBOROS_MODEL", "")
     checks["model"] = {"configured": configured_model or "(not set)"}
     if not configured_model:
         issues += 1
@@ -956,9 +961,8 @@ def verify_system_state(env: Any, git_sha: str) -> None:
         "git_sha": git_sha,
     }
     append_jsonl(drive_logs / "events.jsonl", event)
-
-    if issues > 0:
-        log.warning(f"Startup verification found {issues} issue(s): {checks}")
+    # No stdlib WARNING beside the durable ``startup_verification`` row: the row and the Logs
+    # panel carry every check (#1184); a fact with a durable row gets no second line.
 
 
 def _reconcile_review_attempts_on_startup(env: Any) -> Dict[str, Any]:
@@ -994,6 +998,23 @@ def _record_pending_owner_report(campaign: Dict[str, Any], tx: Dict[str, Any]) -
         "commit_sha": str(tx.get("commit_sha") or "").strip(),
         "abandoned_reason": str(tx.get("abandoned_reason") or ""),
     }
+
+
+def _native_restart_error(git_sha: str) -> str:
+    # The outer launcher verified the installed native inputs before spawning
+    # this core. Workers inherit that generation's fact, not a persisted PASS.
+    # No APK/signature subprocess runs under the campaign's state lock.
+    if not os.environ.get("OUROBOROS_EXTERNAL_HOST_UPDATE"):
+        return ""
+    try:
+        native = json.loads(os.environ.get("OUROBOROS_EXTERNAL_HOST_RESULT", "{}"))
+        if (native.get("status") == "verified" and native.get("source_commit") == git_sha
+                and all(isinstance(native.get(key), str) and len(native[key]) == 64
+                        for key in ("input_sha256", "apk_sha256", "signer_sha256"))):
+            return ""
+    except (ValueError, TypeError, AttributeError):
+        pass
+    return "native_update_failed_or_unverified"
 
 
 def verify_restart(env: Any, git_sha: str) -> None:
@@ -1082,7 +1103,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
             or claim is not None
         )
         if not strict:
-            return ""
+            return _native_restart_error(git_sha)
         if require_claim and not isinstance(claim, dict):
             return "restart_claim_missing" if claim is None else "restart_claim_invalid"
         expected = {
@@ -1097,7 +1118,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
             return "restart_claim_mismatch"
         from supervisor.evolution_lifecycle import evolution_commit_receipt_error
 
-        return evolution_commit_receipt_error(tx, **expected)
+        return evolution_commit_receipt_error(tx, **expected) or _native_restart_error(git_sha)
 
     def _boot_reconcile_generation() -> str:
         from supervisor.evolution_lifecycle import current_evolution_boot_generation
@@ -1149,9 +1170,12 @@ def verify_restart(env: Any, git_sha: str) -> None:
             def _mutate(campaign: Dict[str, Any]):
                 if not isinstance(campaign, dict):
                     return None
-                live_state = read_json_dict(state_path) or {}
+                from supervisor.state import control_in_copy
+
+                stop_known, stopped = control_in_copy(state_path, "evolution_owner_stopped")
                 if (
-                    bool(live_state.get("evolution_owner_stopped"))
+                    not stop_known or bool(stopped)  # an unknown owner stop is not "not stopped" (#1307)
+                    or isinstance(campaign.get("stop_intent"), dict)  # a Stop recorded beside state (#1307)
                     or campaign.get("status") not in {"active", "paused"}
                 ):
                     return None
@@ -1285,7 +1309,7 @@ def verify_restart(env: Any, git_sha: str) -> None:
         except Exception:
             log.debug("Failed to reconcile dangling evolution transaction", exc_info=True)
 
-    mark_error: Dict[str, str] = {}
+    mark_error: Dict[str, str] = {"reason": _native_restart_error(git_sha)}
 
     def _mark_campaign_restart_verified(
         expected_sha: str, observed_sha: str, ok: bool, claim: Any = None,
@@ -1309,9 +1333,11 @@ def verify_restart(env: Any, git_sha: str) -> None:
                     mark_error["durable"] = "1"
                     return False
                 mark_error["durable"] = "1"
-                return bool(ok)
-            live_state = read_json_dict(env.drive_path("state") / "state.json") or {}
-            if bool(live_state.get("evolution_owner_stopped")):
+                return bool(ok and not mark_error.get("reason"))
+            from supervisor.state import control_in_copy
+
+            stop_known, stopped = control_in_copy(env.drive_path("state") / "state.json", "evolution_owner_stopped")
+            if not stop_known or bool(stopped) or isinstance(campaign.get("stop_intent"), dict):
                 mark_error["reason"] = "owner_stopped"
                 mark_error["durable"] = "1"
                 return False

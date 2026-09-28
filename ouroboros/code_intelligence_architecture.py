@@ -10,7 +10,7 @@ Five pure queries whose consumer #1 is Ouroboros itself (self-evolution):
   per ``docs/PERSISTENCE.md``;
 - ``protected_contracts_affected(diff)`` — the protected surfaces
   (``runtime_mode_policy`` inventories) and frozen-contract rows
-  (``docs/v7next/FROZEN_CONTRACTS_INVENTORY.md``) a change set touches.
+  (``docs/inventories/FROZEN_CONTRACTS_INVENTORY.md``) a change set touches.
 
 Everything here is a pure function over data the repository already pins as
 SSOT — the domain manifest, the generated inventories, and the protected-path
@@ -18,8 +18,7 @@ inventories. No LLM, no caches, no ledgers: every reader takes an explicit
 ``repo_root``, reads the carrier files fresh, and raises a teaching
 ``ValueError`` when a carrier is missing or an argument is malformed. The
 model consumes these through the existing ``query_code`` tool
-(``op=architecture``) — the seam decision is recorded in the campaign ledger
-(``docs/v7next/LEDGER_CORRECTIONS.md``, F5 lane C section).
+(``op=architecture``), so code and architecture facts share one query surface.
 """
 
 from __future__ import annotations
@@ -34,7 +33,7 @@ from ouroboros.code_intelligence import CodeInventory, _resolve_relative_import
 
 DOMAIN_MANIFEST_RELPATH = "ouroboros/domains.toml"
 PERSISTENCE_DOC_RELPATH = "docs/PERSISTENCE.md"
-FROZEN_INVENTORY_RELPATH = "docs/v7next/FROZEN_CONTRACTS_INVENTORY.md"
+FROZEN_INVENTORY_RELPATH = "docs/inventories/FROZEN_CONTRACTS_INVENTORY.md"
 
 ARCHITECTURE_FACTS = (
     "owner_of",
@@ -302,7 +301,9 @@ def facade_reexports(
     return facades
 
 
-def facade_consumers(repo_root: pathlib.Path, sym: str) -> Tuple[FacadeConsumer, ...]:
+def facade_consumers(
+    repo_root: pathlib.Path, sym: str, *, reexports: Dict[str, Dict[str, str]] | None = None,
+) -> Tuple[FacadeConsumer, ...]:
     """Who imports through a facade — for a facade module, or one re-exported name.
 
     ``sym`` may be a facade module (path or dotted) — every import of that
@@ -311,10 +312,14 @@ def facade_consumers(repo_root: pathlib.Path, sym: str) -> Tuple[FacadeConsumer,
     facades that re-export it. Attribute access on a plain module import
     (``import ouroboros.llm`` then ``llm.chat``) is deliberately out of scope:
     only import statements are counted.
+
+    ``reexports`` accepts an already-built facade map of this same root instead
+    of walking the population for it again — the optional-reuse seam ``owner_of``
+    and ``facade_reexports`` already carry for their own inputs.
     """
     root = pathlib.Path(repo_root)
     manifest = load_domain_manifest(root)
-    reexports = facade_reexports(root, manifest)
+    reexports = facade_reexports(root, manifest) if reexports is None else reexports
     text = str(sym or "").strip().replace("\\", "/")
     if not text:
         raise ValueError("facade_consumers requires a facade module or a re-exported name")
@@ -325,7 +330,7 @@ def facade_consumers(repo_root: pathlib.Path, sym: str) -> Tuple[FacadeConsumer,
         if not targets:
             raise ValueError(
                 f"{text} is not a facade module (no top-level noqa:F401 re-exports); "
-                "see docs/v7next/FACADE_INVENTORY.md for the facade list"
+                "see docs/inventories/FACADE_INVENTORY.md for the facade list"
             )
     else:
         dotted_map = {_module_dotted(path): path for path in reexports}

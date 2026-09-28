@@ -1,7 +1,7 @@
 # Ouroboros CI — Five-tier cross-platform testing and release pipeline
 #
 # Tier 1 (Quick):       Push to ouroboros or PR targeting ouroboros                   → Ubuntu-only tests (~1 min)
-# Tier 2 (Full):        Push to ouroboros-stable / manual / tag                       → Full 3-OS matrix          (~5 min)
+# Tier 2 (Full):        Every PR → Windows/macOS; stable / manual / tag → full 3-OS matrix (~5 min)
 # Tier 2.5 (Integration): Push to main / ouroboros / ouroboros-stable / manual / tag  → Real-provider tests       (~2 min)
 # Tier 2.6 (Skill smoke): Push to ouroboros-stable / manual / tag                     → LIVE OuroborosHub official-skill install smoke (3-OS, ~5 min) + review→grant→enable-persistence flow on one cheap reviewer slot (ubuntu-only step, OPENROUTER_API_KEY, ~$1.2/run)
 # Tier 3 (Build+Release): Tag v*                                                       → PyInstaller + GitHub Release (~15 min)
@@ -17,6 +17,10 @@ name: CI
 
 # Two separate push triggers: branches have path filters, tags do not.
 # This ensures tag pushes always fire (even if only VERSION/README changed).
+# The browser lane is the ONE exception that must see every `ouroboros` push,
+# including a Makefile/spec/requirements-only one: it lives in its own
+# `ui-browser-push.yml`, which calls the SAME reusable `ui-browser.yml` job
+# this workflow calls for pull requests, manual runs and tags.
 on:
   push:
     branches: [main, ouroboros, ouroboros-stable]
@@ -41,6 +45,7 @@ on:
       - 'scripts/**'
       - 'devtools/**'
       - 'packaging/**'
+      - 'android/**'
       - 'VERSION'
       - 'README.md'
       - 'CONTRIBUTING.md'
@@ -50,13 +55,12 @@ on:
     tags:
       - 'v*'
   # Fork-safe PR validation: no provider secrets and no pull_request_target.
-  # Only the deterministic quick-test job matches pull_request refs below.
+  # Only fork-safe jobs match pull_request refs, including full host UI proof.
   pull_request:
     branches: [ouroboros]
-  # A plain dispatch (the pre-tag 3-OS matrix: `gh workflow run CI --ref <branch>`)
-  # never spends money: the paid e2e-live lane runs only when its opt-in input is
-  # set (`-f e2e_live=true`). Inputs do not change `github.event_name`, so every
-  # job gated on the bare `workflow_dispatch` event is unaffected by this block.
+  # Plain dispatch retains the provider and skill-review jobs and can spend
+  # money. The separate paid e2e-live stand additionally requires its opt-in
+  # input (`-f e2e_live=true`); all other dispatch gates stay unchanged.
   workflow_dispatch:
     inputs:
       e2e_live:
@@ -108,26 +112,33 @@ jobs:
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-python-env
+        id: setup_python
       - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        if: ${{ !cancelled() }}
+        id: setup_pnpm
         with:
           version: 11.9.0
           run_install: false
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: ${{ !cancelled() }}
+        id: setup_node
         with:
           node-version: '22'
-          cache: 'pnpm'
-          cache-dependency-path: site/pnpm-lock.yaml
+      # Independent checks keep running after a red sibling; setup outcomes suppress cascaded noise.
       - name: Verify generated Pages output
+        if: ${{ !cancelled() && steps.setup_pnpm.outcome == 'success' && steps.setup_node.outcome == 'success' }}
         run: |
           pnpm --dir site install --frozen-lockfile
           pnpm --dir site build
           test -z "$(git status --porcelain --untracked-files=all -- docs/)"
           git diff --exit-code -- docs/
       - name: Lint (deterministic F-rule gate — catches the NameError-under-except class)
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         run: python -m ruff check . --select F
       # The hermetic commit gate runs this exact suite (ouroboros/preflight_node.py);
       # keeping the step here keeps gate and CI mirrored in both directions.
       - name: Run browser-module tests (node --test — mirrored by the hermetic commit gate)
+        if: ${{ !cancelled() && steps.setup_node.outcome == 'success' }}
         shell: bash
         run: cd web && node --test tests/*.test.js
       # ESLint `no-undef` is the second, independent layer of the browser no-undef
@@ -135,14 +146,17 @@ jobs:
       # acorn walker in the suite above; this layer is CI-only, lockfile-frozen
       # (`npm ci` on web/package-lock.json) and exact-pinned in web/package.json.
       - name: Lint browser modules (ESLint no-undef — CI-only second layer of the acorn gate)
+        if: ${{ !cancelled() && steps.setup_node.outcome == 'success' }}
         shell: bash
         run: cd web && npm ci --no-audit --no-fund && npm run lint:undef
       # NOTE: a command-line `-m` REPLACES the pyproject `addopts` markexpr, so the default
       # `not integration and not browser ...` exclusions must be repeated here, then ANDed with
       # the serial split. --timeout guards against a hung test blocking the whole job.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short
       - name: Run tests (serial — real subprocess/port/global-state suites that flake under -n)
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short
       # OFFICIAL-CI-ONLY enforcement of the repository size gates: manifest
       # exactness against this tree plus the pairwise base-vs-tip shrink-only
@@ -155,10 +169,12 @@ jobs:
       # degrades to the tip's tree-verified parent manifest — never a skip;
       # a resolvable base without the manifest fails closed.
       - name: Run tests (size-ratchet lane — blocking here, warning-only locally)
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         env:
           OURO_SIZE_RATCHET_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: python -m pytest tests/ -m size_ratchet -q --tb=short
       - name: Guard extracted transport imports stay out of core
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         run: python -m pytest tests/test_no_core_a2a_telegram_imports.py -q
 
   # ──────────────────────────────────────────────────────────────────
@@ -197,17 +213,18 @@ jobs:
         run: python -m pytest tests/test_devtools_benchmarks.py devtools/benchmarks -m "not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" --timeout=300 --timeout-method=thread -q --tb=short
 
   # ──────────────────────────────────────────────────────────────────
-  # Tier 2: Full matrix (stable branch, manual, or tag push)
+  # Tier 2: Ordinary tests on PR Windows/macOS; full 3-OS stable/manual/tag matrix
   # ──────────────────────────────────────────────────────────────────
   full-test:
     if: |
       github.ref == 'refs/heads/ouroboros-stable'
       || github.event_name == 'workflow_dispatch'
       || startsWith(github.ref, 'refs/tags/v')
+      || (github.event_name == 'pull_request' && github.base_ref == 'ouroboros')
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
+        os: ${{ fromJSON(github.event_name == 'pull_request' && '["windows-latest","macos-latest"]' || '["ubuntu-latest","windows-latest","macos-latest"]') }}
     runs-on: ${{ matrix.os }}
     env:
       # Same contract as quick-test: this job provisions the parallel-pass
@@ -221,12 +238,31 @@ jobs:
         with:
           fetch-depth: 0
       - uses: ./.github/actions/setup-python-env
+        id: setup_python
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        if: ${{ !cancelled() }}
+        id: setup_node
         with:
           node-version: '22'
+      - name: Set up Windows POSIX test utilities
+        if: ${{ !cancelled() && runner.os == 'Windows' }}
+        id: posix_tools
+        uses: msys2/setup-msys2@66cd2cce69caa17b53920067426061ca1de3a884 # v2
+        with:
+          msystem: MSYS
+          release: false
+          update: true
+          install: rsync
+      - name: Select Windows POSIX test utilities
+        id: select_posix_tools
+        if: ${{ !cancelled() && runner.os == 'Windows' && steps.posix_tools.outcome == 'success' }}
+        shell: pwsh
+        run: '"${{ steps.posix_tools.outputs.msys2-location }}\usr\bin" >> $env:GITHUB_PATH'
+      # Independent checks keep running after a red sibling; setup outcomes suppress cascaded noise.
       # The hermetic commit gate runs this exact suite (ouroboros/preflight_node.py);
       # `shell: bash` keeps the glob working on the Windows runner too.
       - name: Run browser-module tests (node --test — mirrored by the hermetic commit gate)
+        if: ${{ !cancelled() && steps.setup_node.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         shell: bash
         run: cd web && node --test tests/*.test.js
       # ESLint `no-undef` is the second, independent layer of the browser no-undef
@@ -234,24 +270,29 @@ jobs:
       # acorn walker in the suite above; this layer is CI-only, lockfile-frozen
       # (`npm ci` on web/package-lock.json) and exact-pinned in web/package.json.
       - name: Lint browser modules (ESLint no-undef — CI-only second layer of the acorn gate)
+        if: ${{ !cancelled() && steps.setup_node.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         shell: bash
         run: cd web && npm ci --no-audit --no-fund && npm run lint:undef
       # A command-line `-m` REPLACES the pyproject addopts markexpr, so repeat the default
       # marker-lane exclusions and AND them with the serial split. --timeout guards hangs.
       - name: Run tests (parallel — excludes the costly marker lanes AND the serial real-process suites)
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         run: python -m pytest tests/ -m "not serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -n auto --dist loadscope --max-worker-restart=0 --timeout=300 --timeout-method=thread -q --tb=short
       - name: Run tests (serial — real subprocess/port/global-state suites that flake under -n)
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         run: python -m pytest tests/ -m "serial and not integration and not browser and not ui_browser and not ui_browser_docker and not portable_detail and not skill_smoke and not size_ratchet" -q --tb=short
       # Same size-ratchet enforcement contract as quick-test (see its comment).
-      # full-test triggers: stable pushes carry event.before; dispatch runs leave
+      # PRs carry their base SHA; stable pushes carry event.before; dispatch runs leave
       # the env empty and tag pushes carry an all-zeros before — both degrade to
       # the tip's parent manifest (never a skip: a skip would let a recreated
       # branch grandfather debt in one green run).
       - name: Run tests (size-ratchet lane — blocking here, warning-only locally)
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         env:
           OURO_SIZE_RATCHET_BASE_REF: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event.before }}
         run: python -m pytest tests/ -m size_ratchet -q --tb=short
       - name: Guard extracted transport imports stay out of core
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' && (runner.os != 'Windows' || (steps.posix_tools.outcome == 'success' && steps.select_posix_tools.outcome == 'success')) }}
         run: python -m pytest tests/test_no_core_a2a_telegram_imports.py -q
 
   # Fork-safe PR proof for the one native secret-scanner dependency. This job
@@ -422,7 +463,9 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-python-env
+        id: setup_python
       - name: Guard non-empty browser marker lanes
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         run: |
           set -euo pipefail
           python -m pytest tests/ --collect-only -m browser -q | tee /tmp/browser-collect.txt
@@ -434,6 +477,7 @@ jobs:
           ! grep -q "no tests collected" /tmp/ui-docker-collect.txt
           ! grep -q "no tests collected" /tmp/portable-collect.txt
       - name: Guard non-empty serial marker lane
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         run: |
           set -euo pipefail
           # The full-suite CI runs a PARALLEL pass (-m "not serial ...") + a SERIAL pass
@@ -447,6 +491,7 @@ jobs:
           python -m pytest tests/ --collect-only -m serial -q | tee /tmp/serial-collect.txt
           grep -q "tests/test_workspace_executor.py" /tmp/serial-collect.txt
       - name: Guard non-empty skill_smoke marker lane
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         run: |
           set -euo pipefail
           # Same positive-anchor pattern as the serial guard above: under -q an
@@ -455,6 +500,7 @@ jobs:
           python -m pytest tests/ --collect-only -m skill_smoke -q | tee /tmp/skill-smoke-collect.txt
           grep -q "tests/test_skill_smoke_official.py" /tmp/skill-smoke-collect.txt
       - name: Guard non-empty size_ratchet marker lane
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         run: |
           set -euo pipefail
           # Same positive-anchor pattern as the skill_smoke guard above. This
@@ -465,24 +511,17 @@ jobs:
           grep -q "tests/test_smoke.py" /tmp/size-ratchet-collect.txt
           grep -q "tests/test_repo_health_smoke.py" /tmp/size-ratchet-collect.txt
 
+  # Pushes are deliberately NOT matched here: this workflow keeps the base path
+  # filter, so a Makefile/spec-only push would silently skip the browser lane.
+  # `.github/workflows/ui-browser-push.yml` owns that trigger and shares this job.
   ui-smoke:
     if: |
-      github.event_name == 'workflow_dispatch'
+      github.event_name == 'pull_request'
+      || github.event_name == 'workflow_dispatch'
       || startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: ./.github/actions/setup-python-env
-      - name: Install UI smoke browser binaries
-        run: python -m playwright install --with-deps chromium webkit
-      - name: Run host UI smoke
-        env:
-          OUROBOROS_RUN_UI_SMOKE: "1"
-        run: python -m pytest tests/ -m ui_browser -q --tb=short
-      - name: Run browser tools Chromium/WebKit smoke
-        env:
-          OUROBOROS_EXPECT_BROWSER_ENGINES: chromium,webkit
-        run: python -m pytest tests/test_browser_tools_smoke.py -m browser -q --tb=short
+    uses: ./.github/workflows/ui-browser.yml
+    permissions:
+      contents: read
 
   docker-ui-smoke:
     if: |
@@ -492,21 +531,27 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build Docker image
+        id: docker_build
         run: docker build -t ouroboros-web:test .
       - uses: ./.github/actions/setup-python-env
+        id: setup_python
       - name: Install UI smoke browser binaries
+        id: install_browsers
+        if: ${{ !cancelled() && steps.docker_build.outcome == 'success' && steps.setup_python.outcome == 'success' }}
         run: python -m playwright install --with-deps chromium webkit
       - name: Run Docker UI smoke
+        if: ${{ !cancelled() && steps.docker_build.outcome == 'success' && steps.setup_python.outcome == 'success' && steps.install_browsers.outcome == 'success' }}
         env:
           OUROBOROS_RUN_DOCKER_UI_SMOKE: "1"
           OUROBOROS_DOCKER_UI_IMAGE: ouroboros-web:test
         run: python -m pytest tests/test_ui_smoke_playwright.py -m ui_browser_docker -q --tb=short
       - name: Run Docker browser tools Chromium/WebKit smoke
+        if: ${{ !cancelled() && steps.docker_build.outcome == 'success' && steps.setup_python.outcome == 'success' && steps.install_browsers.outcome == 'success' }}
         run: |
           docker run --rm --entrypoint sh \
             -e OUROBOROS_EXPECT_BROWSER_ENGINES=chromium,webkit \
             ouroboros-web:test -c \
-            "PLAYWRIGHT_BROWSERS_PATH=0 python -m pytest tests/test_browser_tools_smoke.py -m browser -q --tb=short"
+            "python -m pytest tests/test_browser_tools_smoke.py -m browser -q --tb=short"
 
   docker-portable-test:
     if: |
@@ -520,7 +565,7 @@ jobs:
       - name: Run portable detail tests in Docker
         run: |
           docker run --rm --entrypoint sh -e OUROBOROS_EXPECT_HEADLESS_SHELL=1 ouroboros-web:test -c \
-            "PLAYWRIGHT_BROWSERS_PATH=0 python -m playwright install --only-shell chromium && python -m pytest tests/ -m portable_detail -q --tb=short"
+            "python -m pytest tests/ -m portable_detail -q --tb=short"
 
   # ──────────────────────────────────────────────────────────────────
   # Scheduled: the KEYLESS system_e2e scenario lane (tests/system_e2e/).
@@ -548,27 +593,32 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/setup-python-env
+        id: setup_python
       # -o addopts="" replaces the pyproject default markexpr wholesale: the
       # lane's own `integration` marker is exactly what that default excludes.
       - name: Run the keyless system E2E scenario lane (real isolated servers)
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         env:
+          PYTHONUNBUFFERED: "1"
           OUROBOROS_E2E_DEEP: mock
           OUROBOROS_APP_ROOT: ${{ runner.temp }}/ouroboros-system-e2e/app
           OUROBOROS_REPO_DIR: ${{ runner.temp }}/ouroboros-system-e2e/repo
           OUROBOROS_DATA_DIR: ${{ runner.temp }}/ouroboros-system-e2e/data
           OUROBOROS_SETTINGS_PATH: ${{ runner.temp }}/ouroboros-system-e2e/data/settings.json
-        run: python -m pytest tests/system_e2e/ -o addopts="" -q
+        run: python -m pytest tests/system_e2e/ -o addopts="" -o faulthandler_timeout=540 -q
       # The cancellation E-suite mock lane (18 scenarios + 4 mock-only) ran only on
       # operator hosts before 7.0; on the same isolated roots it is keyless too
       # (owner decision, batch №13 item 16, 2026-09-02).
       - name: Run the cancellation E-suite mock lane
+        if: ${{ !cancelled() && steps.setup_python.outcome == 'success' }}
         env:
+          PYTHONUNBUFFERED: "1"
           OUROBOROS_E2E_CANCEL: mock
           OUROBOROS_APP_ROOT: ${{ runner.temp }}/ouroboros-e2e-cancel/app
           OUROBOROS_REPO_DIR: ${{ runner.temp }}/ouroboros-e2e-cancel/repo
           OUROBOROS_DATA_DIR: ${{ runner.temp }}/ouroboros-e2e-cancel/data
           OUROBOROS_SETTINGS_PATH: ${{ runner.temp }}/ouroboros-e2e-cancel/data/settings.json
-        run: python -m pytest tests/test_e2e_cancellation_scenarios.py -o addopts="" -q
+        run: python -m pytest tests/test_e2e_cancellation_scenarios.py -o addopts="" -o faulthandler_timeout=540 -q
 
   # ──────────────────────────────────────────────────────────────────
   # Scheduled (paid): the LIVE E2E stand (devtools/e2e_live/run_live_lanes.py)
@@ -747,6 +797,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: e2e-live-run
+          overwrite: true
           path: |
             ${{ runner.temp }}/e2e_live/run_manifest.json
             ${{ runner.temp }}/e2e_live/result_index.jsonl
@@ -758,13 +809,387 @@ jobs:
   # ──────────────────────────────────────────────────────────────────
   # Tier 3: Build & Release (tag push only)
   # ──────────────────────────────────────────────────────────────────
-  release-preflight:
+  # Android source tests live outside the ordinary tests/ collection. This
+  # fork-safe lane compiles a real host with an explicitly disposable key;
+  # its output is never used as a publisher-signed release artifact.
+  android-test:
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    outputs:
+      android_changed: ${{ steps.android_changes.outputs.changed }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Select Android emulator coverage
+        id: android_changes
+        env:
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BASE: ${{ github.event.before }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          HEAD_SHA="${PR_HEAD:-$GITHUB_SHA}"
+          BASE_SHA="${PR_BASE:-$PUSH_BASE}"
+          if [ -z "$BASE_SHA" ] || [[ "$BASE_SHA" =~ ^0+$ ]]; then
+            BASE_SHA="$(git rev-parse "$HEAD_SHA^" 2>/dev/null || true)"
+          fi
+          if [ -n "$BASE_SHA" ]; then
+            CHANGED="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA" -- android/)"
+          else
+            CHANGED="$(git diff-tree --root --no-commit-id --name-only -r "$HEAD_SHA" -- android/)"
+          fi
+          if [ -n "$CHANGED" ]; then echo 'changed=true' >> "$GITHUB_OUTPUT";
+          else echo 'changed=false' >> "$GITHUB_OUTPUT"; fi
+      - uses: ./.github/actions/setup-python-env
+        id: setup_python
+      - name: Expose runner Android SDK path for caching
+        id: android_env
+        shell: bash
+        run: echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+      - name: Cache Android build dependencies
+        id: android_cache
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ${{ env.ANDROID_HOME }}/platforms/android-36
+            ${{ env.ANDROID_HOME }}/build-tools/36.0.0
+          key: android-sdk-${{ runner.os }}-api36-build36.0.0
+      - name: Prepare Android compiler
+        id: prepare_android
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          echo "$JAVA_HOME_17_X64/bin" >> "$GITHUB_PATH"
+          test -x "$JAVA_HOME_17_X64/bin/java"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            'platforms;android-36' 'build-tools;36.0.0'
+      - name: Run Android source and release contract tests
+        if: ${{ !cancelled() && steps.android_changes.outcome == 'success' && steps.setup_python.outcome == 'success' }}
+        env:
+          OUROBOROS_DATA_DIR: ${{ runner.temp }}/android-test-data
+          OUROBOROS_SETTINGS_PATH: ${{ runner.temp }}/android-test-data/settings.json
+        run: python -m pytest android/tests tests/test_android_release.py -q --tb=short
+      - name: Compile and verify explicitly test-signed Android host
+        if: ${{ !cancelled() && steps.android_changes.outcome == 'success' && steps.setup_python.outcome == 'success' && steps.android_env.outcome == 'success' && steps.android_cache.outcome == 'success' && steps.prepare_android.outcome == 'success' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TEST_ROOT="$(mktemp -d "$RUNNER_TEMP/android-test.XXXXXX")"
+          trap 'rm -rf "$TEST_ROOT"' EXIT
+          printf '%s' 'ci-test-only' > "$TEST_ROOT/password"
+          python android/host/build.py --sdk "$ANDROID_HOME" \
+            --java-home "$JAVA_HOME_17_X64" --out "$TEST_ROOT/build" \
+            --keystore "$TEST_ROOT/test.keystore" --key-alias ouroboros-host \
+            --keystore-pass-file "$TEST_ROOT/password" --create-development-key \
+            --version-code "$GITHUB_RUN_NUMBER" --version-name "$(cat VERSION)"
+          "$JAVA_HOME_17_X64/bin/java" -jar "$ANDROID_HOME/build-tools/36.0.0/lib/apksigner.jar" \
+            verify --verbose "$TEST_ROOT/build/Ouroboros.apk"
+
+  # Install/start smoke across the supported minSdk and representative Android
+  # releases. This is an emulator compatibility signal, not a substitute for
+  # rooted ARM64, SELinux, launcher, WebView and physical-device qualification.
+  android-emulator-smoke:
+    needs: android-test
+    if: github.event_name != 'schedule' && (startsWith(github.ref, 'refs/tags/v') || needs.android-test.outputs.android_changed == 'true')
+    name: Android emulator smoke (API ${{ matrix.api-level }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        api-level: [26, 29, 30, 33, 36]
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+        with:
+          packages: platform-tools
+      - name: Install emulator API and compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          AVD_HOME="$RUNNER_TEMP/android-avd"
+          USER_HOME="$RUNNER_TEMP/android-user-home"
+          mkdir -p "$AVD_HOME" "$USER_HOME"
+          echo "ANDROID_AVD_HOME=$AVD_HOME" >> "$GITHUB_ENV"
+          echo "ANDROID_USER_HOME=$USER_HOME" >> "$GITHUB_ENV"
+          export ANDROID_AVD_HOME="$AVD_HOME" ANDROID_USER_HOME="$USER_HOME"
+          IMAGE="system-images;android-${{ matrix.api-level }};default;x86_64"
+          # API 26's default image has no loadable WebView; use Chromium's Oreo test image.
+          if [ "${{ matrix.api-level }}" = "26" ]; then IMAGE="system-images;android-26;google_apis;x86"; fi
+          sdkmanager "platform-tools" "platforms;android-36" "build-tools;36.0.0" \
+            "emulator" "$IMAGE"
+          echo "no" | avdmanager create avd --force --name "obo-api-${{ matrix.api-level }}" \
+            --package "$IMAGE" \
+            --device "pixel_2"
+          "$ANDROID_HOME/emulator/emulator" -list-avds
+      - name: Build disposable test APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          ROOT="$RUNNER_TEMP/android-smoke"
+          mkdir -p "$ROOT"
+          printf '%s' 'ci-test-only' > "$ROOT/password"
+          python android/host/build.py --sdk "$ANDROID_HOME" --java-home "$JAVA_HOME" \
+            --out "$ROOT/build" --keystore "$ROOT/test.keystore" --key-alias ouroboros-host \
+            --keystore-pass-file "$ROOT/password" --create-development-key \
+            --version-code "$GITHUB_RUN_NUMBER" --version-name "$(cat VERSION)"
+          python android/host/build.py --sdk "$ANDROID_HOME" --java-home "$JAVA_HOME" \
+            --out "$ROOT/device" --project android/tests/device \
+            --keystore "$ROOT/test.keystore" --key-alias ouroboros-host \
+            --keystore-pass-file "$ROOT/password" \
+            --version-code "$GITHUB_RUN_NUMBER" --version-name "$(cat VERSION)"
+      - name: Enable emulator hardware acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          "$ANDROID_HOME/emulator/emulator" -accel-check
+
+      - name: Boot emulator and smoke install/start
+        shell: bash
+        run: |
+          set -euo pipefail
+          export ANDROID_AVD_HOME="$RUNNER_TEMP/android-avd" ANDROID_USER_HOME="$RUNNER_TEMP/android-user-home"
+          export ANDROID_SERIAL=emulator-5554
+          AVD="obo-api-${{ matrix.api-level }}"
+          LOG="$RUNNER_TEMP/android-smoke/emulator.log"
+          "$ANDROID_HOME/emulator/emulator" -avd "$AVD" -no-window -no-audio -no-boot-anim \
+            -port 5554 \
+            -no-snapshot -gpu swiftshader_indirect -accel on >"$LOG" 2>&1 &
+          emulator_pid=$!
+          # Retain startup crashes even when UI checks fail before instrumentation.
+          trap 'timeout 15s adb logcat -d > "$RUNNER_TEMP/android-smoke/logcat.txt" 2>&1 || true; cat "$LOG"; kill "$emulator_pid" 2>/dev/null || true' EXIT
+          for attempt in $(seq 1 180); do
+            kill -0 "$emulator_pid" 2>/dev/null || { wait "$emulator_pid"; exit 1; }
+            [ "$(timeout 5s adb get-state 2>/dev/null)" = "device" ] && break
+            sleep 2
+          done
+          test "$(timeout 5s adb get-state)" = "device"
+          for attempt in $(seq 1 120); do
+            kill -0 "$emulator_pid" 2>/dev/null || { wait "$emulator_pid"; exit 1; }
+            [ "$(timeout 5s adb shell getprop sys.boot_completed 2>/dev/null | tr -d "\r")" = "1" ] && break
+            sleep 2
+          done
+          test "$(adb shell getprop sys.boot_completed | tr -d "\r")" = "1"
+          adb install -r "$RUNNER_TEMP/android-smoke/build/Ouroboros.apk"
+          adb install -r "$RUNNER_TEMP/android-smoke/device/app.apk"
+          adb shell input keyevent KEYCODE_WAKEUP
+          adb shell wm dismiss-keyguard
+          adb shell am start -n ai.ouroboros.android/.MainActivity
+          sleep 2
+          # Real native UI on a fresh emulator; no provisioned core or fake backend.
+          # PNGs require visual review. XML text presence does not prove no clipping.
+          SCREENSHOTS="$RUNNER_TEMP/android-smoke/screenshots"
+          mkdir -p "$SCREENSHOTS"
+          capture_native_ui() {
+            local capture_status=1
+            # A newly displayed window can briefly have no accessibility root.
+            for attempt in $(seq 1 5); do
+              rm -f "$SCREENSHOTS/$1.xml"
+              if timeout 10s adb shell rm -f /data/local/tmp/obo-native-ui.xml \
+                && timeout 20s adb shell uiautomator dump /data/local/tmp/obo-native-ui.xml \
+                && timeout 10s adb pull /data/local/tmp/obo-native-ui.xml "$SCREENSHOTS/$1.xml" \
+                && test -s "$SCREENSHOTS/$1.xml"; then
+                capture_status=0
+                break
+              else
+                capture_status=$?
+              fi
+              sleep 1
+            done
+            # Keep the actual screen even when every XML capture failed.
+            timeout 10s adb exec-out screencap -p > "$SCREENSHOTS/$1.png"
+            test -s "$SCREENSHOTS/$1.png"
+            return "$capture_status"
+          }
+          capture_native_ui 01-access-setup
+          grep -Fq 'text="Ouroboros access to your phone"' "$SCREENSHOTS/01-access-setup.xml"
+          adb shell input keyevent KEYCODE_BACK
+          capture_native_ui 02-native-main
+          python - "$SCREENSHOTS/02-native-main.xml" <<'PY'
+          import subprocess, sys, xml.etree.ElementTree as ET
+          menu = next(node for node in ET.parse(sys.argv[1]).iter("node")
+                      if node.get("package") == "ai.ouroboros.android"
+                      and node.get("content-desc") == "Application menu")
+          x1, y1, x2, y2 = map(int, menu.attrib["bounds"].replace("][", ",").strip("[]").split(","))
+          subprocess.run(["adb", "shell", "input", "tap", str((x1+x2)//2), str((y1+y2)//2)], check=True)
+          PY
+          capture_native_ui 03-application-menu
+          for label in 'Start core' 'Refresh view' 'Core status' 'Stop agent' \
+            'Android permissions' 'Set as Android assistant'; do
+            grep -Fq "text=\"$label\"" "$SCREENSHOTS/03-application-menu.xml"
+          done
+          adb shell pm path ai.ouroboros.android
+          adb shell dumpsys package ai.ouroboros.android | grep -E 'versionName|versionCode'
+          adb shell am force-stop ai.ouroboros.android
+          adb logcat -c || true
+          set +e
+          timeout 60s adb shell am instrument -w ai.ouroboros.android.device.smoke/ai.ouroboros.android.device.DeviceSdkSmoke >"$RUNNER_TEMP/android-smoke/instrument.txt" 2>&1
+          instrument_status=$?
+          set -e
+          cat "$RUNNER_TEMP/android-smoke/instrument.txt"
+          adb logcat -d -s OuroborosDeviceSdkSmoke:I '*:S' | tee "$RUNNER_TEMP/android-smoke/device-log.txt"
+          grep -q 'OBO_DEVICE_SDK_SMOKE=PASS' "$RUNNER_TEMP/android-smoke/instrument.txt" \
+            || grep -q 'OBO_DEVICE_SDK_SMOKE=PASS' "$RUNNER_TEMP/android-smoke/device-log.txt"
+          test "$instrument_status" -eq 0
+      - name: Upload native Android UI evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: android-native-ui-api-${{ matrix.api-level }}
+          overwrite: true
+          path: |
+            ${{ runner.temp }}/android-smoke/screenshots/
+            ${{ runner.temp }}/android-smoke/emulator.log
+            ${{ runner.temp }}/android-smoke/instrument.txt
+            ${{ runner.temp }}/android-smoke/device-log.txt
+            ${{ runner.temp }}/android-smoke/logcat.txt
+          if-no-files-found: warn
+
+  # The publisher key is used only on the trusted tag path. Root/boot/device
+  # acceptance is separate from these exact-byte artifact checks.
+  android-build:
     if: startsWith(github.ref, 'refs/tags/v')
+    needs: [android-test, android-emulator-smoke, release-preflight]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      # Match desktop packaging: checkout may leave a commit at the tag ref.
+      - name: Ensure annotated tag object is fetched
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG_REF="refs/tags/$GITHUB_REF_NAME"
+          git update-ref -d "$TAG_REF" || true
+          git fetch origin "$TAG_REF:$TAG_REF"
+          test "$(git cat-file -t "$TAG_REF")" = "tag"
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.10'
+      - name: Expose runner Android SDK path for caching
+        shell: bash
+        run: echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+      - name: Cache Android release build dependencies
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          path: |
+            ${{ env.ANDROID_HOME }}/platforms/android-36
+            ${{ env.ANDROID_HOME }}/build-tools/36.0.0
+          key: android-sdk-${{ runner.os }}-api36-build36.0.0
+      - name: Prepare Android release compiler and source branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -x "$JAVA_HOME_17_X64/bin/java"
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            'platforms;android-36' 'build-tools;36.0.0'
+          if git merge-base --is-ancestor HEAD origin/ouroboros; then
+            branch=ouroboros
+          else
+            branches="$(git branch -r --contains HEAD --format='%(refname:short)' \
+              | sed -n 's#^origin/##p' | grep -v '^HEAD$' || true)"
+            count="$(printf '%s\n' "$branches" | sed '/^$/d' | wc -l | tr -d ' ')"
+            test "$count" = 1 || { echo 'Cannot resolve one managed source branch' >&2; exit 1; }
+            branch="$branches"
+          fi
+          echo "OUROBOROS_MANAGED_SOURCE_BRANCH=$branch" >> "$GITHUB_ENV"
+      - name: Build and verify publisher-signed Android release assets
+        id: android_assets
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          test -n "$ANDROID_KEYSTORE_BASE64" && test -n "$ANDROID_KEYSTORE_PASSWORD" \
+            && test -n "$ANDROID_KEY_ALIAS" || { echo 'Android publisher signing credentials are required' >&2; exit 1; }
+          ANDROID_STORE="$RUNNER_TEMP/android-publisher.keystore"
+          ANDROID_PASSWORD_FILE="$RUNNER_TEMP/android-publisher.password"
+          trap 'rm -f "$ANDROID_STORE" "$ANDROID_PASSWORD_FILE"' EXIT
+          umask 077
+          printf '%s' "$ANDROID_KEYSTORE_BASE64" | base64 --decode > "$ANDROID_STORE"
+          printf '%s' "$ANDROID_KEYSTORE_PASSWORD" > "$ANDROID_PASSWORD_FILE"
+          python scripts/build_android_release.py --sdk "$ANDROID_HOME" \
+            --java-home "$JAVA_HOME_17_X64" --keystore "$ANDROID_STORE" \
+            --key-alias "$ANDROID_KEY_ALIAS" --keystore-pass-file "$ANDROID_PASSWORD_FILE" \
+            --version-code "$GITHUB_RUN_NUMBER" --source-branch "$OUROBOROS_MANAGED_SOURCE_BRANCH" \
+            --out dist --work "$RUNNER_TEMP" --github-output "$GITHUB_OUTPUT"
+      - name: Generate Android source and APK CycloneDX inventories
+        shell: bash
+        run: |
+          set -euo pipefail
+          SYFT_ARCHIVE="$RUNNER_TEMP/syft-android.tar.gz"
+          curl --fail --location --silent --show-error \
+            https://github.com/anchore/syft/releases/download/v1.50.0/syft_1.50.0_linux_amd64.tar.gz \
+            --output "$SYFT_ARCHIVE"
+          printf '%s  %s\n' bf7b29ff57f06da30918266a0e1c2885a8f99784798d1bdb1628886aa015d788 "$SYFT_ARCHIVE" | sha256sum --check
+          SYFT_ROOT="$(mktemp -d "$RUNNER_TEMP/android-syft.XXXXXX")"
+          tar -xzf "$SYFT_ARCHIVE" -C "$SYFT_ROOT"
+          "$SYFT_ROOT/syft" "dir:${{ steps.android_assets.outputs.sbom_path }}" \
+            --output cyclonedx-json=dist/sbom-android-arm64.cdx.json
+          APK_ROOT="$(mktemp -d "$RUNNER_TEMP/android-apk-sbom.XXXXXX")"
+          unzip -q "${{ steps.android_assets.outputs.apk }}" -d "$APK_ROOT"
+          "$SYFT_ROOT/syft" "dir:$APK_ROOT" --output cyclonedx-json=dist/sbom-android-apk.cdx.json
+      - name: Attest Android build provenance
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: |
+            ${{ steps.android_assets.outputs.archive }}
+            ${{ steps.android_assets.outputs.apk }}
+      - name: Attest Android source SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ steps.android_assets.outputs.archive }}
+          sbom-path: dist/sbom-android-arm64.cdx.json
+      - name: Attest Android APK SBOM
+        uses: actions/attest@508db95dd578ae2727ebd6217d5ba78e4fbda05d # v4.2.1
+        with:
+          subject-path: ${{ steps.android_assets.outputs.apk }}
+          sbom-path: dist/sbom-android-apk.cdx.json
+      - name: Upload Android release artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ouroboros-android
+          overwrite: true
+          path: |
+            ${{ steps.android_assets.outputs.archive }}
+            ${{ steps.android_assets.outputs.apk }}
+            dist/release-smoke-android-arm64.json
+            dist/release-smoke-android-apk.json
+            dist/sbom-android-arm64.cdx.json
+            dist/sbom-android-apk.cdx.json
+          if-no-files-found: error
+          retention-days: 30
+
+  release-preflight:
+    # Keep the job alive after failed needs so tag identity and diagnostic build state remain observable.
+    if: ${{ always() && !cancelled() && startsWith(github.ref, 'refs/tags/v') }}
     # system-e2e-mock joined the release bar with the v7 campaign (batch №13 item 4).
     needs: [full-test, integration-test, system-e2e-mock]
     runs-on: ubuntu-latest
     outputs:
       is_prerelease: ${{ steps.release_meta.outputs.is_prerelease }}
+      tag_valid: ${{ steps.release_meta.outputs.tag_valid }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -772,11 +1197,6 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.10'
-      - name: v7next adoption release bar
-        # The campaign ledger's release gate (every transplanted delta done or an
-        # explicit post-release row with its authority) runs on the tag path itself,
-        # not only inside the pytest wrapper (batch №13 item 4).
-        run: python scripts/v7next_adoption.py --release
       - name: Validate tag matches VERSION
         id: release_meta
         run: |
@@ -789,17 +1209,38 @@ jobs:
           version = pathlib.Path("VERSION").read_text(encoding="utf-8").strip()
           tag = os.environ["GITHUB_REF_NAME"].strip()
           expected_tag = f"v{version}"
+          output = pathlib.Path(os.environ["GITHUB_OUTPUT"])
           if tag != expected_tag:
+              with output.open("a", encoding="utf-8") as fh:
+                  fh.write("tag_valid=false\nis_prerelease=false\n")
               raise SystemExit(f"Release tag mismatch: {tag} != {expected_tag}")
           if not is_release_version(version):
+              with output.open("a", encoding="utf-8") as fh:
+                  fh.write("tag_valid=false\nis_prerelease=false\n")
               raise SystemExit(f"VERSION is not a supported release version: {version!r}")
           is_prerelease = bool(re.search(r'(?:rc|alpha|beta|a|b)\.?\d+$', version, re.IGNORECASE))
-          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as fh:
+          with output.open("a", encoding="utf-8") as fh:
               fh.write(f"is_prerelease={'true' if is_prerelease else 'false'}\n")
+              fh.write("tag_valid=true\n")
           PY
+      - name: Require test prerequisites for publication
+        if: ${{ !cancelled() }}
+        env:
+          FULL_TEST_RESULT: ${{ needs.full-test.result }}
+          INTEGRATION_RESULT: ${{ needs.integration-test.result }}
+          SYSTEM_E2E_RESULT: ${{ needs.system-e2e-mock.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$FULL_TEST_RESULT" != success || "$INTEGRATION_RESULT" != success || "$SYSTEM_E2E_RESULT" != success ]]; then
+            echo "Required release prerequisites did not all succeed: full-test=$FULL_TEST_RESULT integration-test=$INTEGRATION_RESULT system-e2e-mock=$SYSTEM_E2E_RESULT" >&2
+            exit 1
+          fi
 
+
+  # A valid tag may rehearse desktop artifacts after a red test bar; release still requires preflight success.
   build:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: ${{ always() && !cancelled() && startsWith(github.ref, 'refs/tags/v') && needs.release-preflight.outputs.tag_valid == 'true' }}
     needs: [full-test, release-preflight]
     permissions:
       contents: read
@@ -883,7 +1324,12 @@ jobs:
       # gate runs.
       - name: Ensure annotated tag object is fetched
         shell: bash
-        run: git fetch origin --tags --force
+        run: |
+          set -euo pipefail
+          TAG_REF="refs/tags/$GITHUB_REF_NAME"
+          git update-ref -d "$TAG_REF" || true
+          git fetch origin "$TAG_REF:$TAG_REF"
+          test "$(git cat-file -t "$TAG_REF")" = "tag"
 
       - uses: ./.github/actions/setup-python-env
         with:
@@ -1472,6 +1918,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ouroboros-${{ matrix.os }}
+          overwrite: true
           path: |
             ${{ steps.release_asset.outputs.path }}
             dist/release-smoke-${{ matrix.proof_id }}.json
@@ -1550,8 +1997,13 @@ jobs:
   # Release: Create GitHub Release with all artifacts
   # ──────────────────────────────────────────────────────────────────
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build, release-preflight, marker-guards, ui-smoke, docker-ui-smoke, docker-portable-test, skill-smoke]
+    if: >-
+      ${{ always() && !cancelled() && startsWith(github.ref, 'refs/tags/v') &&
+          needs.build.result == 'success' && needs.release-preflight.result == 'success' &&
+          needs.marker-guards.result == 'success' && needs.ui-smoke.result == 'success' &&
+          needs.docker-ui-smoke.result == 'success' && needs.docker-portable-test.result == 'success' &&
+          needs.skill-smoke.result == 'success' }}
+    needs: [build, android-build, release-preflight, marker-guards, ui-smoke, docker-ui-smoke, docker-portable-test, skill-smoke]
     runs-on: ubuntu-latest
     concurrency:
       group: release-${{ github.ref }}
@@ -1576,7 +2028,52 @@ jobs:
           path: release-artifacts/
           merge-multiple: true
 
+      - name: Verify artifact attestations
+        id: verify_artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ANDROID_BUILD_RESULT: ${{ needs.android-build.result }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PYCODE' > "$RUNNER_TEMP/attestation-targets.tsv"
+          import os, pathlib, runpy
+          registry = runpy.run_path("ouroboros/tools/release_sync.py")
+          version = pathlib.Path("VERSION").read_text(encoding="utf-8").strip()
+          ids = list(registry["DESKTOP_DOWNLOAD_IDS"])
+          if os.environ["ANDROID_BUILD_RESULT"] == "success":
+              ids.extend(registry["ANDROID_DOWNLOAD_IDS"])
+          for proof_id in ids:
+              name = registry["release_asset_name"](proof_id, version)
+              print(proof_id + "\t" + str(pathlib.Path("release-artifacts") / name))
+          PYCODE
+          SOURCE_ARGS=(
+            --repo "$GITHUB_REPOSITORY"
+            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml"
+            --source-digest "$GITHUB_SHA"
+            --source-ref "$GITHUB_REF"
+          )
+          ANDROID_RESULT=not_run
+          if [ "$ANDROID_BUILD_RESULT" = success ]; then ANDROID_RESULT=success; fi
+          while IFS=$'\t' read -r proof_id file; do
+            if [[ "$proof_id" == android-* ]]; then
+              if ! gh attestation verify "$file" "${SOURCE_ARGS[@]}" ||
+                 ! gh attestation verify "$file" "${SOURCE_ARGS[@]}" --predicate-type https://cyclonedx.org/bom; then
+                ANDROID_RESULT=failure
+                echo "::warning::Experimental Android verification failed for $file; neither Android asset will be published."
+              fi
+            else
+              gh attestation verify "$file" "${SOURCE_ARGS[@]}"
+              gh attestation verify "$file" "${SOURCE_ARGS[@]}" --predicate-type https://cyclonedx.org/bom
+            fi
+          done < "$RUNNER_TEMP/attestation-targets.tsv"
+          echo "android_result=$ANDROID_RESULT" >> "$GITHUB_OUTPUT"
+
       - name: Assemble release proof capsule and notes
+        id: release_proof
+        env:
+          ANDROID_BUILD_RESULT: ${{ needs.android-build.result }}
+          ANDROID_ATTESTATION_RESULT: ${{ steps.verify_artifacts.outputs.android_result }}
         shell: bash
         run: |
           set -euo pipefail
@@ -1589,32 +2086,11 @@ jobs:
             --tag "$GITHUB_REF_NAME" \
             --commit "$GITHUB_SHA" \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID" \
+            --android-build-result "$ANDROID_BUILD_RESULT" \
+            --android-attestation-result "$ANDROID_ATTESTATION_RESULT" \
+            --github-output "$GITHUB_OUTPUT" \
             --notes-output release-notes.md \
             "${ARGS[@]}"
-
-      - name: Verify artifact attestations
-        env:
-          GH_TOKEN: ${{ github.token }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          for file in release-artifacts/Ouroboros-*.dmg \
-                      release-artifacts/Ouroboros-*-linux-x86_64.tar.gz \
-                      release-artifacts/Ouroboros-*-linux-x86_64.AppImage \
-                      release-artifacts/ouroboros_*_amd64.deb \
-                      release-artifacts/ouroboros-*-1.x86_64.rpm \
-                      release-artifacts/ouroboros-*-1.red80.x86_64.rpm \
-                      release-artifacts/Ouroboros-*-windows-x64.zip; do
-            SOURCE_ARGS=(
-              --repo "$GITHUB_REPOSITORY"
-              --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/ci.yml"
-              --source-digest "$GITHUB_SHA"
-              --source-ref "$GITHUB_REF"
-            )
-            gh attestation verify "$file" "${SOURCE_ARGS[@]}"
-            gh attestation verify "$file" "${SOURCE_ARGS[@]}" \
-              --predicate-type https://cyclonedx.org/bom
-          done
 
       - name: Require an unpublished release slot
         env:
@@ -1658,7 +2134,8 @@ jobs:
             echo "Remote tag $GITHUB_REF_NAME is missing or is not annotated." >&2
             exit 1
           fi
-          git fetch origin "$TAG_REF:$TAG_REF" --force
+          git update-ref -d "$TAG_REF" || true
+          git fetch origin "$TAG_REF:$TAG_REF"
           test "$(git cat-file -t "$TAG_REF")" = "tag"
           LOCAL_PEELED="$(git rev-parse "$PEELED_REF")"
           if [ "$LOCAL_PEELED" != "$GITHUB_SHA" ] || [ "$PEELED_SHA" != "$GITHUB_SHA" ]; then
@@ -1669,30 +2146,7 @@ jobs:
       - name: Create draft GitHub Release
         uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
-          files: |
-            release-artifacts/Ouroboros-*.dmg
-            release-artifacts/Ouroboros-*-linux-x86_64.tar.gz
-            release-artifacts/Ouroboros-*-linux-x86_64.AppImage
-            release-artifacts/ouroboros_*_amd64.deb
-            release-artifacts/ouroboros-*-1.x86_64.rpm
-            release-artifacts/ouroboros-*-1.red80.x86_64.rpm
-            release-artifacts/Ouroboros-*-windows-x64.zip
-            release-artifacts/release-smoke-macos-arm64.json
-            release-artifacts/release-smoke-linux-x86_64.json
-            release-artifacts/release-smoke-linux-appimage-x86_64.json
-            release-artifacts/release-smoke-linux-deb-amd64.json
-            release-artifacts/release-smoke-linux-rpm-x86_64.json
-            release-artifacts/release-smoke-linux-rpm-red80-x86_64.json
-            release-artifacts/release-smoke-windows-x64.json
-            release-artifacts/sbom-macos-arm64.cdx.json
-            release-artifacts/sbom-linux-x86_64.cdx.json
-            release-artifacts/sbom-linux-appimage-x86_64.cdx.json
-            release-artifacts/sbom-linux-deb-amd64.cdx.json
-            release-artifacts/sbom-linux-rpm-x86_64.cdx.json
-            release-artifacts/sbom-linux-rpm-red80-x86_64.cdx.json
-            release-artifacts/sbom-windows-x64.cdx.json
-            release-artifacts/SHA256SUMS
-            release-artifacts/release-evidence.json
+          files: ${{ fromJSON(steps.release_proof.outputs.files_json) }}
           body_path: release-notes.md
           fail_on_unmatched_files: true
           # The existing annotated tag is exact-SHA verified above. Passing an
@@ -1727,7 +2181,8 @@ jobs:
             echo "Remote tag $GITHUB_REF_NAME is missing or is not annotated." >&2
             exit 1
           fi
-          git fetch origin "$TAG_REF:$TAG_REF" --force
+          git update-ref -d "$TAG_REF" || true
+          git fetch origin "$TAG_REF:$TAG_REF"
           test "$(git cat-file -t "$TAG_REF")" = "tag"
           LOCAL_PEELED="$(git rev-parse "$PEELED_REF")"
           if [ "$LOCAL_PEELED" != "$GITHUB_SHA" ] || [ "$PEELED_SHA" != "$GITHUB_SHA" ]; then

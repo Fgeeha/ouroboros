@@ -1,10 +1,9 @@
-"""CPL4-C6 pins: the archive reader of the compacted monetary ledger.
+"""Pins the archive reader of the compacted monetary ledger.
 
-Design contract: docs/v7next/DESIGN_USAGE_COMPACTION.md. The invariants
-pinned here are the reader-side half of the same monetary-authority set
-(owner sanction 1A):
+Design contract: docs/USAGE_COMPACTION.md. The invariants
+pinned here are the reader-side half of the same monetary-authority set:
 
-5. every pre-compaction attempt_id stays resolvable (live ∪ archive; the CPL-5 join) across chained compactions, tamper-evident;
+5. every pre-compaction attempt_id stays resolvable (live ∪ archive; the model-send join) across chained compactions, tamper-evident;
 8. baseline rows are legal only as the leading block.
 
 The pass side — invariants 1, 2, 3, 4, 6 and 7 — lives in
@@ -57,7 +56,7 @@ def _rewrite_header(data_root, header):
     uc._CHAIN_UNION_CACHE.clear()
 
 
-# --- 5: CPL-5 join surface ---------------------------------------------------
+# --- 5: model-send join surface ----------------------------------------------
 
 def test_every_attempt_id_stays_resolvable_across_chained_compactions(data_root):
     _seed_mixed_ledger(data_root)
@@ -320,12 +319,21 @@ def test_an_archive_entry_the_anchor_cannot_open_is_typed_corruption(data_root, 
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous)
     if held_dir_fd:  # the root handle is opened only on the dir-fd shape
-        data_root.chmod(0o111)  # traversable, unreadable: fd exhaustion reads the same
-        try:
-            with pytest.raises(UsageLedgerCorrupt):
+        real_open = os.open
+        denied = PermissionError(errno.EACCES, "root directory unavailable", str(data_root))
+
+        def refuse_root_open(path, flags, *args, **kwargs):
+            if path == str(data_root) and flags & os.O_DIRECTORY:
+                raise denied
+            return real_open(path, flags, *args, **kwargs)
+
+        # chmod does not make this open fail for UID 0; inject the actual
+        # filesystem error so root and ordinary-user runs test the same contract.
+        with monkeypatch.context() as unavailable:
+            unavailable.setattr(os, "open", refuse_root_open)
+            with pytest.raises(UsageLedgerCorrupt, match="root is not readable") as caught:
                 uc.archived_attempt_ids(data_root)
-        finally:
-            data_root.chmod(0o755)
+            assert caught.value.__cause__ is denied
     planted = archive_dir / "segment_ep0009_planted.jsonl"
     planted.symlink_to(data_root / "nowhere.jsonl")  # dangling: unopenable either way
     with pytest.raises(UsageLedgerCorrupt, match="could not complete"):
@@ -468,7 +476,8 @@ def test_a_path_inspection_the_reader_cannot_make_is_typed_corruption(data_root,
     """pathlib re-raises every OSError but ENOENT/ENOTDIR/EBADF/ELOOP and turns a
     symlink LOOP into RuntimeError, so the reader's bounds — both archive levels, the
     named segment, its resolution — must type EACCES/EIO/a loop themselves or a bare
-    error escapes the CPL-5 sweep's UNKNOWN mapping. Real shape first: a segment directory readable but not searchable."""
+    error escapes the model-send reconciliation sweep's UNKNOWN mapping.
+    Real shape first: a segment directory readable but not searchable."""
     _, segment = compacted
     if not (platform_layer.IS_WINDOWS or getattr(os, "geteuid", lambda: 1)() == 0):
         segment.parent.chmod(0o600)
@@ -496,7 +505,7 @@ def test_unreadable_leading_row_is_typed_corruption_not_absence(data_root, compa
                     encoding="utf-8")
     with pytest.raises(UsageLedgerCorrupt):
         uc.archived_attempt_ids(data_root)
-    # The CPL-5 join must reach UNKNOWN, never "no attempt row" (orphan seal).
+    # The model-send join must reach UNKNOWN, never "no attempt row" (orphan seal).
     with pytest.raises(UsageLedgerCorrupt):
         uc.usage_attempt_recorded(data_root, folded[0], live_ids=set())
 

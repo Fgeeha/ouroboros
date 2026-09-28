@@ -1,13 +1,18 @@
 """WS3 — chat-lane wedge resilience (v6.34.0).
 
-A dedicated watchdog thread (outside the supervisor loop) surfaces TWO silent-wedge
-classes as observable owner alerts instead of silent hours: a supervisor loop stall
-(new-message intake starvation) and a heartbeat-silent in-process direct-chat turn.
-New-message intake is reordered EARLY in the loop so a blocking step can't starve it.
-The watchdog cannot kill a hung thread or free the chat-agent lock (a wedged turn
-holds it for its whole duration; out-of-process kill was deferred per owner), so it
-detects + reports + recommends /restart rather than force-recovering in-process; WS10
-ephemeral decision turns keep the chat responsive meanwhile.
+A dedicated watchdog thread (outside the supervisor loop) observes TWO silent-wedge
+classes instead of silent hours, and the two are reported DIFFERENTLY. A
+heartbeat-silent in-process direct-chat turn still alerts the owner, because
+/restart is a recovery they can actually perform. A supervisor loop stall is
+JOURNAL ONLY (owner decision 4C): the durable `supervisor_loop_stall` row with the
+phase facts the loop published, its `supervisor_loop_stall_end` closer and the
+`log.error` — no owner chat row and no toast, because a stall the owner cannot act
+on is an alarm rather than information. New-message intake is reordered EARLY in
+the loop so a blocking step can't starve it. The watchdog cannot kill a hung thread
+or free the chat-agent lock (a wedged turn holds it for its whole duration;
+out-of-process kill was deferred per owner), so it detects + reports rather than
+force-recovering in-process; WS10 ephemeral decision turns keep the chat responsive
+meanwhile.
 """
 
 from __future__ import annotations
@@ -48,34 +53,41 @@ def test_watchdog_noop_when_disabled(monkeypatch):
     assert threading.active_count() == before  # no watchdog thread spawned
 
 
-def test_watchdog_alerts_owner_once_on_stall(monkeypatch):
+def test_watchdog_journals_a_stall_without_an_owner_message_or_toast(monkeypatch):
+    """Owner decision 4C, both directions: the episode is durable — one
+    `supervisor_loop_stall` row carrying the facts the loop published with its last
+    stamp, and one `supervisor_loop_stall_end` once the loop ticks again — and the
+    owner's chat stays silent: no message, no `task_incident`, no toast."""
     import server
 
     monkeypatch.setenv("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC", "1")
-    alerts = []
+    from supervisor.active_activity import get_direct_activity_registry
 
-    class _Bridge:
-        def send_message(self, chat_id, text, *a, **k):
-            alerts.append((chat_id, text, k))
-            return (True, "")
-
-    monkeypatch.setattr("supervisor.message_bus.get_bridge", lambda: _Bridge())
-    monkeypatch.setattr("supervisor.state.load_state", lambda: {"owner_chat_id": 5})
-    monkeypatch.setattr("supervisor.state.append_jsonl", lambda *a, **k: None)
+    get_direct_activity_registry().clear()  # isolate the stall half
+    alerts = _collect_alerts(monkeypatch, 5)
+    rows: list = []
+    monkeypatch.setattr("supervisor.state.append_jsonl",
+                        lambda path, row: rows.append(row) or True)
+    # The liveness tick is a MONOTONIC stamp (OB-03) — seed it on the same clock.
+    liveness = [time.monotonic() - 100, {"phase": "maintenance"}, 0.0, None]
     stop = threading.Event()  # local per-test token; do NOT touch the global restart flag
     try:
-        # The liveness tick is a MONOTONIC stamp (OB-03) — seed it on the same clock.
-        server._start_supervisor_liveness_watchdog([time.monotonic() - 100], stop)  # already stale
-        end = time.time() + 6
-        while not alerts and time.time() < end:
-            time.sleep(0.1)
+        server._start_supervisor_liveness_watchdog(liveness, stop)  # already stale
+        _wait_until(lambda: any(r["type"] == "supervisor_loop_stall" for r in rows))
+
+        def recovered() -> bool:
+            liveness[0] = time.monotonic()  # the loop ticks again, and keeps ticking
+            return any(r["type"] == "supervisor_loop_stall_end" for r in rows)
+
+        _wait_until(recovered)
+        episode = list(rows)  # a later iteration re-stalls the frozen stamp
     finally:
         _stop_watchdog(stop)  # join it too: a leaked in-flight iteration outlives the monkeypatch
-    assert len(alerts) == 1
-    assert alerts[0][0] == 5 and "stalled" in alerts[0][1]
-    assert alerts[0][2]["is_progress"] is True
-    assert alerts[0][2]["progress_meta"]["task_incident"] == "supervisor_loop_stall"
-    assert alerts[0][2]["progress_meta"]["toast_once"].startswith("supervisor-loop-stall:")
+    assert [row["type"] for row in episode] == [
+        "supervisor_loop_stall", "supervisor_loop_stall_end"], episode
+    assert episode[0]["phase"] == "maintenance" and episode[0]["stalled_sec"] >= 100
+    assert episode[1]["phase"] == "maintenance" and episode[1]["stalled_sec"] >= 100
+    assert alerts == [], "a loop stall is journal only — no owner row, no toast"
 
 
 def test_chat_turn_wedged_detection():
@@ -89,30 +101,27 @@ def test_chat_turn_wedged_detection():
     assert server._chat_turn_wedged(True, now - 100, now, 0) is False    # 0 = disabled
 
 
-def test_chat_turn_liveness_reads_agent_without_taking_the_lock(monkeypatch):
+def test_chat_turn_liveness_reads_all_actors_without_taking_admission_lock(monkeypatch):
     import types
-
     import supervisor.workers as w
+    from supervisor.active_activity import get_direct_activity_registry
 
-    monkeypatch.setattr(w, "_chat_agent", None)
-    assert w.chat_turn_liveness() == (False, None, None)
-
-    monkeypatch.setattr(w, "_chat_agent", types.SimpleNamespace(
-        _busy=True, _current_task_id="t1", _last_activity_ts=1234.0))
-    # Hold _chat_agent_lock to prove the liveness read never blocks on it (a wedged
-    # turn holds the lock for its whole duration — the watchdog must not deadlock).
-    assert w._chat_agent_lock.acquire(blocking=False)
+    registry = get_direct_activity_registry()
+    assert w.chat_turn_liveness() == []
+    for tid, stamp in (("t1", 1234.0), ("t2", 2345.0)):
+        registry.register(tid, 1, actor=types.SimpleNamespace(
+            _busy=True, _current_task_id=tid, _last_activity_ts=stamp))
+    assert w._repo_writer_gate_lock.acquire(blocking=False)
     try:
-        assert w.chat_turn_liveness() == (True, "t1", 1234.0)
+        assert w.chat_turn_liveness() == [("t1", 1234.0), ("t2", 2345.0)]
     finally:
-        w._chat_agent_lock.release()
+        w._repo_writer_gate_lock.release()
 
 
 def test_watchdog_alerts_on_chat_turn_wedge(monkeypatch):
     import types
 
     import server
-    import supervisor.workers as w
 
     monkeypatch.setenv("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC", "1")
     alerts = []
@@ -126,7 +135,9 @@ def test_watchdog_alerts_on_chat_turn_wedge(monkeypatch):
     monkeypatch.setattr("supervisor.state.load_state", lambda: {"owner_chat_id": 7})
     monkeypatch.setattr("supervisor.state.append_jsonl", lambda *a, **k: None)
     # The heartbeat stamp is MONOTONIC (OB-03) — seed it on the same clock.
-    monkeypatch.setattr(w, "_chat_agent", types.SimpleNamespace(
+    from supervisor.active_activity import get_direct_activity_registry
+
+    get_direct_activity_registry().register("wedged1", 1, actor=types.SimpleNamespace(
         _busy=True, _current_task_id="wedged1", _last_activity_ts=time.monotonic() - 100))
     stop = threading.Event()  # local per-test token
     try:
@@ -144,6 +155,7 @@ def test_watchdog_alerts_on_chat_turn_wedge(monkeypatch):
     assert wedge[2]["progress_meta"] == {
         "task_incident": "chat_turn_wedge",
         "toast_once": "wedged1:chat_turn_wedge",
+        "narration": False,
     }
 
 
@@ -219,15 +231,20 @@ def test_wall_clock_jump_neither_fabricates_nor_masks_a_supervisor_stall(monkeyp
     The liveness tick and its comparison used to both be ``time.time()``, so an
     ordinary wall-clock step — NTP correction, DST/timezone change, manual set, a
     resumed VM — was indistinguishable from an unresponsive supervisor loop. Both
-    directions are pinned: a forward jump must not INVENT a stall, and a backward
+    directions are pinned on the surface a stall still has (4C: the journal, never
+    the owner's chat): a forward jump must not INVENT a stall row, and a backward
     jump must not MASK a real one.
     """
     import server
-    import supervisor.workers as w
 
     monkeypatch.setenv("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC", "1")
-    monkeypatch.setattr(w, "_chat_agent", None)  # isolate the stall half
+    from supervisor.active_activity import get_direct_activity_registry
+
+    get_direct_activity_registry().clear()  # isolate the stall half
     alerts = _collect_alerts(monkeypatch, 11)
+    rows: list = []
+    monkeypatch.setattr("supervisor.state.append_jsonl",
+                        lambda path, row: rows.append(row) or True)
 
     boot_mono = 500.0
     wall = 1_700_000_000.0
@@ -242,18 +259,18 @@ def test_wall_clock_jump_neither_fabricates_nor_masks_a_supervisor_stall(monkeyp
         # Now the wall clock steps an hour forward while the loop keeps ticking.
         clock.wall = wall + 3600.0
         _wait_until(lambda: clock.ticks >= 3)
-        assert alerts == [], "a wall-clock jump must not fabricate a supervisor stall"
+        assert rows == [], "a wall-clock jump must not fabricate a supervisor stall"
 
         # A genuine stall (100s of MONOTONIC silence) is still caught, and a
         # backward wall step cannot hide it.
         clock.wall = wall - 86_400.0
         clock.mono = boot_mono + 100.0
-        _wait_until(lambda: alerts)
+        _wait_until(lambda: rows)
     finally:
         _stop_watchdog(stop)
-    assert len(alerts) == 1
-    assert alerts[0][0] == 11 and "stalled" in alerts[0][1]
-    assert alerts[0][2]["progress_meta"]["task_incident"] == "supervisor_loop_stall"
+    assert [row["type"] for row in rows] == ["supervisor_loop_stall"]
+    assert rows[0]["stalled_sec"] == 100.0
+    assert alerts == [], "the stall never speaks in the owner's chat"
 
 
 def test_wall_clock_jump_neither_fabricates_nor_masks_a_chat_turn_wedge(monkeypatch):
@@ -264,7 +281,6 @@ def test_wall_clock_jump_neither_fabricates_nor_masks_a_chat_turn_wedge(monkeypa
     import types
 
     import server
-    import supervisor.workers as w
 
     monkeypatch.setenv("OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC", "1")
     alerts = _collect_alerts(monkeypatch, 13)
@@ -277,7 +293,9 @@ def test_wall_clock_jump_neither_fabricates_nor_masks_a_chat_turn_wedge(monkeypa
     monkeypatch.setattr(server_liveness, "time", clock)
     agent_stub = types.SimpleNamespace(
         _busy=True, _current_task_id="wedged-mono", _last_activity_ts=boot_mono)
-    monkeypatch.setattr(w, "_chat_agent", agent_stub)
+    from supervisor.active_activity import get_direct_activity_registry
+
+    get_direct_activity_registry().register("wedged-mono", 1, actor=agent_stub)
     stop = threading.Event()  # local per-test token
     try:
         server._start_supervisor_liveness_watchdog([boot_mono], stop)

@@ -71,6 +71,9 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "supervisor.events_worker_reports", "ouroboros/agent.py"),
     "budget_pause": _handled(
         "supervisor.events_budget", "ouroboros/agent.py"),
+    "budget_resume_child": _handled(
+        # #1196 (owner Q9): the resumed root's model selects one paused child.
+        "supervisor.events_budget", "ouroboros/tools/join_ledger.py"),
     "budget_root_fence": _handled(
         # v7 L-B split: the loop's fence emitter lives in the budget leaf.
         "supervisor.events_budget", "ouroboros/agent.py", "ouroboros/loop_budget.py"),
@@ -85,7 +88,7 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     "external_wait_lease": _handled(
         "supervisor.events_worker_reports", "ouroboros/delegate_progress.py"),
     "llm_usage": _handled(
-        "supervisor.events_budget", "ouroboros/agent.py", "ouroboros/consciousness.py",
+        "supervisor.events_budget", "ouroboros/agent.py",
         "ouroboros/pricing.py", "ouroboros/tools/search.py", "ouroboros/tools/vision.py",
         "ouroboros/tools/skill_publish.py"),
     "log_event": _handled(
@@ -98,6 +101,7 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     "owner_message_injected": _handled(
         # v7 L-B split: the drain that emits the receipt lives in the round-limits leaf.
         "supervisor.events_runtime_controls", "ouroboros/loop_round_limits.py"),
+    "owner_wait": _handled("supervisor.worker_owner_wait", "ouroboros/owner_wait.py"),
     "project_digest": _handled(
         "supervisor.events_project_routing", "ouroboros/agent_task_pipeline.py"),
     "promote_chat_to_task": _handled(
@@ -118,8 +122,7 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "supervisor.events_chat_delivery", "ouroboros/tools/core_artifacts.py"),
     "send_message": _handled(
         "supervisor.events_chat_delivery", "ouroboros/agent.py",
-        "ouroboros/consciousness.py", "supervisor/task_reaper.py",
-        "supervisor/terminal_delivery.py"),
+        "supervisor/task_reaper.py", "supervisor/terminal_delivery.py"),
     "send_photo": _handled(
         "supervisor.events_chat_delivery", "ouroboros/tools/core_artifacts.py"),
     "send_quiz": _handled(
@@ -135,11 +138,15 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
         "ouroboros/gateway/routing_decision.py"),
     "task_dispatch_resolved": _handled(
         "supervisor.events_worker_reports", "ouroboros/agent_dispatch.py"),
+    "task_focus_updated": _handled(
+        "supervisor.events_worker_reports", "ouroboros/tools/project_journal.py"),
     "task_done": _handled(
         "supervisor.events_task_done", "ouroboros/agent_task_pipeline.py",
         "supervisor/queue.py", "supervisor/task_reaper.py", "supervisor/worker_health.py"),
     "task_heartbeat": _handled(
         "supervisor.events_worker_reports", "ouroboros/agent.py"),
+    "task_model_wait": _handled(
+        "supervisor.task_model_wait", "ouroboros/model_wait.py"),
     "task_metrics": _handled(
         "supervisor.events_worker_reports", "ouroboros/agent_task_pipeline.py"),
     "toggle_consciousness": _handled(
@@ -162,6 +169,10 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
     "review_density_probe": _telemetry(
         "ouroboros/tools/review_admission.py",
         note="one bounded exact-model send that calibrates tokenizer density before a size refusal"),
+    "review_scope_delivery_migrated": _telemetry(
+        "ouroboros/tools/review_admission.py",
+        note="one-time disclosure that a stored bare api scope row now delivers by retrieval "
+             "(a bounded native inspection episode) instead of the retired packet"),
     "review_scope_lead_unobserved": _telemetry(
         "ouroboros/tools/parallel_review.py",
         note="the commit gate's scope-first hold ended without observing the scope seat's own reservation"),
@@ -182,10 +193,11 @@ EVENT_DISPOSITIONS: Dict[str, EventDisposition] = {
 
     # --- server_intercept -----------------------------------------------------
     "restart_request": EventDisposition(
-        SERVER_INTERCEPT, "server.py",
+        SERVER_INTERCEPT, "ouroboros.server_liveness",
         ("ouroboros/agent_task_pipeline.py", "supervisor/evolution_lifecycle.py"),
         "restarting the process is not something the supervisor thread can do to "
-        "itself, so the server's drain loop answers this one before dispatch",
+        "itself, so the loop's bounded drain routes this one to the server's restart "
+        "handler before dispatch",
     ),
 
     # --- nested_log_event -----------------------------------------------------

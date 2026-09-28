@@ -33,7 +33,12 @@ export async function fetchJson(url, init = {}, options = {}) {
     let data = null;
     try {
         data = await response.json();
-    } catch {
+    } catch (error) {
+        // A body read cut by the caller's own cancellation is a cancellation,
+        // not a reply: swallowing it here once turned a navigation-aborted
+        // Widgets list into a resolved "error object" that a consumer read as
+        // an EMPTY authoritative list and stopped kept-running frames on.
+        if (error?.name === 'AbortError' || init?.signal?.aborted) throw error;
         data = { error: `non-json response (HTTP ${response.status})` };
     }
     if (!response.ok || (options.rejectOkFalse && data && data.ok === false)) {
@@ -97,20 +102,43 @@ export function cancelTask(taskId, { cascade = false, stopPolicy = '' } = {}) {
     return Object.keys(body).length ? jsonPost(url, body) : fetchJson(url, { method: 'POST' });
 }
 
-/** Canonical task-file address shared by live delivery, replay and source links. */
-export function taskArtifactDownloadUrl(taskId, name) {
-    if (!/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(String(taskId || ''))
+const TASK_ID_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/;
+const plainSegments = (text) => typeof text === 'string' && !!text && !text.includes('\\') && !text.includes('\0')
+    && text.split('/').every((part) => part && part !== '.' && part !== '..');
+// Python quote(safe='') spelling of one path segment.
+const encodeSegment = (text) => encodeURIComponent(text).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
+
+/**
+ * Canonical task-file address shared by live delivery, replay and source links. A nested
+ * result file (`relpath` = its store-relative path, ending in `name`) is addressed exactly
+ * with `?relpath=`; the bare name only ever selects a top-level file.
+ */
+export function taskArtifactDownloadUrl(taskId, name, relpath = '') {
+    if (!TASK_ID_RE.test(String(taskId || ''))
         || typeof name !== 'string' || !name || name.startsWith('.') || /[/\\]/.test(name)) return '';
-    const encodedName = encodeURIComponent(name).replace(/[!'()*]/g, char => `%${char.charCodeAt(0).toString(16).toUpperCase()}`);
-    return `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodedName}`;
+    const url = `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeSegment(name)}`;
+    if (!relpath || relpath === name) return url;
+    if (!plainSegments(relpath) || relpath.split('/').at(-1) !== name) return '';
+    return `${url}?relpath=${encodeURIComponent(relpath)}`;
 }
 
-/** URL for one published immutable source handle. */
+/**
+ * Address of the on-demand ZIP of one recorded result directory (store-relative, plain
+ * segments): `{basename}.zip?archive={directory}` on the task-file route; '' for a
+ * directory the route would refuse.
+ */
+export function taskArtifactArchiveUrl(taskId, directory) {
+    if (!TASK_ID_RE.test(String(taskId || '')) || !plainSegments(directory)) return '';
+    const name = `${directory.split('/').at(-1)}.zip`;
+    return `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeSegment(name)}?archive=${encodeURIComponent(directory)}`;
+}
+
+/** URL for one published immutable source handle (a delegated run's journal range included). */
 export function taskSourceDownloadUrl(taskId, ref) {
     const path = typeof ref?.path === 'string' ? ref.path : '';
     if (!taskId || ref?.root !== 'artifact_store' || ref?.kind !== 'task_source'
         || !/^[0-9a-f]{64}$/.test(ref?.sha256 || '')
-        || !/^source_handles\/(tool_results|context_checkpoints)\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path)
+        || !/^source_handles\/(tool_results|context_checkpoints|delegated_activity)\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path)
         || !Number.isSafeInteger(ref?.size) || ref.size < 0) return '';
     const name = path.split('/').at(-1);
     const url = taskArtifactDownloadUrl(taskId, name);
@@ -196,13 +224,21 @@ export function updateStrategyForPlan(plan = {}) {
 }
 
 export const apiClient = {
+    /** Read a recent window or replay one opaque, room-bound history page. */
+    chatHistory: ({ chatId = 1, cursor = null, signal } = {}) => {
+        const params = new URLSearchParams();
+        if (chatId !== 1) params.set('chat_id', String(chatId));
+        if (cursor) params.set('cursor', cursor);
+        const query = params.toString();
+        return fetchJson(`/api/chat/history${query ? `?${query}` : ''}`, { cache: 'no-store', signal });
+    },
     /** @returns {Promise<import('./api_types.js').HealthResponse>} */
     health: () => fetchJson('/api/health', { cache: 'no-store' }),
     /** @returns {Promise<import('./api_types.js').StateResponse>} */
     state: () => fetchJson('/api/state', { cache: 'no-store' }),
     settings: () => fetchJson('/api/settings', { cache: 'no-store' }),
     /** @returns {Promise<import('./api_types.js').UiPreferencesResponse>} */
-    uiPreferences: () => fetchJson('/api/ui/preferences', { cache: 'no-store' }),
+    uiPreferences: (init = {}) => fetchJson('/api/ui/preferences', { cache: 'no-store', ...init }),
     saveUiPreferences: (payload) => jsonPost('/api/ui/preferences', payload),
     saveSettings: (payload) => fetchJson('/api/settings', {
         method: 'POST',
@@ -246,7 +282,7 @@ export const apiClient = {
      * payload `revision`.
      * @returns {Promise<import('./api_types.js').WidgetsResponse>}
      */
-    widgets: () => fetchJson('/api/widgets', { cache: 'no-store' }),
+    widgets: (init = {}) => fetchJson('/api/widgets', { cache: 'no-store', ...init }),
     skillPublishPreflight,
     createTask,
     skillLifecycleQueue: () => fetchJson('/api/skills/lifecycle-queue', { cache: 'no-store' }),
@@ -267,7 +303,7 @@ export const apiClient = {
         `/api/owner/skills/${encodeURIComponent(skill)}/presence-runtime`,
         payload,
     ),
-    projectFromTask: (taskId, id, name, objectiveHint = '') => jsonPost('/api/projects/from-task', { task_id: taskId, id, name, objective_hint: objectiveHint }),
+    projectFromTask: (taskId, id, name) => jsonPost('/api/projects/from-task', { task_id: taskId, id, name }),
     /** @param {import('./api_types.js').ProjectCreateRequest} payload */
     projectCreate: (payload) => jsonPost('/api/projects', payload),
     projectUpdate: (projectId, name) => jsonPost(`/api/projects/${encodeURIComponent(projectId)}/update`, { name }),

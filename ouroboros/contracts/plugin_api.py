@@ -37,7 +37,7 @@ LEGACY_PLUGIN_API_GENERATION = "1.3"
 FORBIDDEN_SKILL_SETTINGS: frozenset[str] = frozenset({
     "OPENROUTER_API_KEY", "OPENAI_API_KEY", "OPENAI_COMPATIBLE_API_KEY",
     "CLOUDRU_FOUNDATION_MODELS_API_KEY", "GIGACHAT_CREDENTIALS", "GIGACHAT_PASSWORD",
-    "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "GITHUB_TOKEN",
+    "ANTHROPIC_API_KEY", "MINIMAX_API_KEY", "DEEPSEEK_API_KEY", "ZAI_API_KEY", "GITHUB_TOKEN",
     "OUROBOROS_NETWORK_PASSWORD",
 })
 
@@ -384,6 +384,12 @@ class PluginAPI(Protocol):
         ``render`` is host-owned declarative UI, iframe, or a reviewed sandboxed
         module served only for a live tab and bridged to this skill's route prefix.
         Same-origin SPA modules are outside this contract.
+
+        A module may declare ``render.appearance`` as ``host``, ``independent`` or
+        ``fixed`` for author/reviewer intent. The declaration does not style the
+        frame or gate legacy payloads: a module that wants the resolved host
+        palette opts into ``OuroborosWidget.onTheme(callback)``. Declarative
+        widgets already inherit host appearance; route iframes have no bridge.
 
         ``render.start`` declares the card's launch policy: ``"auto"`` starts when
         the Widgets page is shown and stops when the owner leaves; ``"manual"``

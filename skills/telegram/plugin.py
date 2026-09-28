@@ -30,7 +30,7 @@ from .lib.telegram_state import (
     _state_file, _load_settings, _is_silent_mode_enabled,
     _get_silent_msg, _set_silent_msg, _clear_silent_msg, _subagent_cards_enabled,
     _mirror_progress_enabled, _render_subagent_card, _data_dir,
-    _jsonl_tail, _load_runtime_state, _read_json_file,
+    _jsonl_tail, _load_runtime_state, _read_json_file, _child_row_held_for_root,
 )
 from .lib import telegram_inbound, telegram_quiz
 from .lib.telegram_health import _collect_health, _build_menu_tasks
@@ -70,6 +70,16 @@ _VALID_COMMAND_MODES = frozenset({_COMMAND_MODE_STRICT, _COMMAND_MODE_SAFE, _COM
 
 # Which translation keys are available in safe mode (full_access forwards raw)
 _SAFE_TRANSLATION_KEYS = frozenset({"/status", "/bg status", "/bg"})
+
+# The exact keys the declarative Settings form owns: POST accepts only these and
+# the GET that hydrates the form returns only these. The bot token belongs to
+# Secrets and is deliberately absent from both directions.
+_SETTINGS_FORM_KEYS = (
+    "TELEGRAM_CHAT_ID", "TELEGRAM_MAX_UPDATES_PER_POLL", "TELEGRAM_MIRROR_MODE",
+    "TELEGRAM_COMMAND_MODE", "TELEGRAM_LANGUAGE", "TELEGRAM_SILENT_MODE",
+    "TELEGRAM_SUBAGENT_CARDS", "TELEGRAM_MIRROR_PROGRESS", "TELEGRAM_NOTIFY_TASKS",
+    "TELEGRAM_NOTIFY_BUDGET", "TELEGRAM_MINIAPP_ENABLED",
+)
 
 def _setting_int(settings: Dict[str, Any], key: str, default: int, *, minimum: int = 1, maximum: int = 100) -> int:
     try:
@@ -260,6 +270,17 @@ def _build_language_keyboard(lang: str = "en") -> tuple[str, list[list[dict]]]:
 
 def _make_settings_save(api):
     async def _settings_save(request):
+        if str(getattr(request, "method", "POST") or "POST").upper() == "GET":
+            # Hydration read for the Settings form: only the form's own keys
+            # that are actually stored, as strings, so the UI shows what is
+            # saved instead of the schema's first option.
+            try:
+                stored = _load_settings(api)
+            except TelegramSettingsError as exc:
+                return JSONResponse({"ok": False, "message": str(exc)}, status_code=409)
+            return JSONResponse(
+                {key: str(stored[key]) for key in _SETTINGS_FORM_KEYS if key in stored}
+            )
         try:
             data = await request.json()
         except (TypeError, ValueError):
@@ -272,8 +293,7 @@ def _make_settings_save(api):
                 {"ok": False, "message": "Invalid Telegram settings payload."},
                 status_code=400,
             )
-        allowed = {"TELEGRAM_CHAT_ID", "TELEGRAM_MAX_UPDATES_PER_POLL", "TELEGRAM_MIRROR_MODE", "TELEGRAM_COMMAND_MODE", "TELEGRAM_LANGUAGE", "TELEGRAM_SILENT_MODE", "TELEGRAM_SUBAGENT_CARDS", "TELEGRAM_MIRROR_PROGRESS", "TELEGRAM_NOTIFY_TASKS", "TELEGRAM_NOTIFY_BUDGET", "TELEGRAM_MINIAPP_ENABLED"}
-        payload = {key: data.get(key) for key in allowed if key in data}
+        payload = {key: data.get(key) for key in _SETTINGS_FORM_KEYS if key in data}
         owner_ignored = False
         if "TELEGRAM_CHAT_ID" in payload and not request_may_change_owner(request):
             payload.pop("TELEGRAM_CHAT_ID", None)
@@ -1018,6 +1038,14 @@ def _make_outbound(api):
                     await _render_subagent_card(api, client, chat_id, event, sub_event, lang)
                 return
 
+            # Card-internal host rows: the web shows them inside a task card, and
+            # this transport has none. A child's row stays out while its root is
+            # unfinished (the lifecycle bubble above keeps saying `failed`, the
+            # root accounts for its children). A root's own placed row is an
+            # ordinary progress note here and follows the progress toggle below.
+            if _child_row_held_for_root(api, event):
+                return
+
             # Generic (non-subagent) progress telemetry → dropped by default; the
             # typing indicator already signals "working". Opt in via the toggle.
             if event.get("is_progress") and not _mirror_progress_enabled(local_settings):
@@ -1039,7 +1067,7 @@ def _make_outbound(api):
                 labels = [label for label in labels if label][:8]
                 if not labels:
                     return
-                lines = ["I couldn't pick a destination for your last message. Options:"]
+                lines = ["Choose a target for the last message:"]
                 lines.extend(f"{index}. {label}" for index, label in enumerate(labels, 1))
                 if len(raw_options) > len(labels):
                     lines.append(f"…and {len(raw_options) - len(labels)} more in the web chat.")
@@ -1056,7 +1084,8 @@ def _make_outbound(api):
             # formatting; an absent/True hint renders markdown→HTML as before.
             parse_mode = "" if event.get("markdown") is False else "HTML"
 
-            silent_on = _is_silent_mode_enabled(local_settings)
+            # A host receipt must neither replace nor become the tracked agent reply.
+            silent_on = _is_silent_mode_enabled(local_settings) and event.get("role") != "system"
             tracked_msg_id = _get_silent_msg(api, chat_id) if silent_on else 0
 
             # Silent mode: try to edit the previously tracked message in-place.
@@ -1278,15 +1307,12 @@ def _make_quiz(api):
                 return
             question = str(event.get("question") or "").strip()
             raw_options = event.get("options") if isinstance(event.get("options"), list) else []
-            labels = []
-            for option in raw_options:
-                if isinstance(option, dict):
-                    label = str(option.get("label") or "").strip()
-                    if label:
-                        labels.append(label)
             # Shared quiz contract cap: ouroboros.tools.core._MAX_QUIZ_OPTIONS.
-            labels = labels[:6]
-            if not question or len(labels) < 2:
+            plain_labels, details, recommended_index = telegram_quiz.card_options(raw_options, limit=6)
+            # Buttons and the remembered record keep the starred caption; an open
+            # question (no options) is a card without buttons (TZ-2 B1).
+            labels = telegram_quiz.button_labels(plain_labels, recommended_index)
+            if not question:
                 return
             task_id = str(event.get("task_id") or "").strip()
             quiz_id = str(event.get("quiz_id") or "").strip()
@@ -1296,20 +1322,60 @@ def _make_quiz(api):
             stake = str(event.get("stake") or "").strip()
             assumption = str(event.get("assumption") or "").strip()
             lang = _poller_preferences(api)[4]
-            body = telegram_quiz.render_quiz_text(question, labels, stake, assumption)
+            wait_for_answer = event.get("wait_for_answer") is True
+            # Both optional: events from an older host carry neither.
+            project_name = str(event.get("project_name") or "").strip()
+            host_facts = str(event.get("host_facts") or "").strip()
+            card = {
+                "project_name": project_name, "option_details": details,
+                "recommended_index": recommended_index, "host_facts": host_facts, "lang": lang,
+            }
+            body = telegram_quiz.render_quiz_text(
+                question, plain_labels, stake, assumption, wait_for_answer=wait_for_answer, **card)
+            compact = telegram_quiz.render_compact_text(
+                plain_labels, project_name=project_name, recommended_index=recommended_index, lang=lang)
             token = telegram_quiz.mint_token(task_id, quiz_id)
             # One button per option; a reply to the card is a free-form answer.
-            # Both reach the host's decision ingress (#472).
-            message_id = await client.send_message_with_inline_keyboard(
-                chat_id, f"{body}\n{telegram_quiz.hint(lang)}",
-                telegram_quiz.quiz_keyboard(token, labels), parse_mode="",
-            )
-            telegram_quiz.remember_quiz(api, token, {
-                "task_id": task_id, "quiz_id": quiz_id, "chat_id": chat_id,
-                "message_id": int(message_id or 0), "options": labels, "text": body,
-            })
+            # Both reach the host's decision ingress (#472). An overflowing card
+            # arrives as plain parts followed by the compact keyboard message.
+            # Creation holds the card's lock so a lifecycle fact cannot edit (or
+            # miss) a card mid-send.
+            async with telegram_quiz.card_lock(token):
+                message_id, overflowed = await telegram_quiz.send_quiz_card(
+                    client, chat_id, body=body, compact=compact,
+                    hint_text=telegram_quiz.hint(lang) if labels else telegram_quiz.hint_open(lang),
+                    keyboard=telegram_quiz.quiz_keyboard(token, labels),
+                )
+                if overflowed:
+                    settled_text = compact
+                elif wait_for_answer:
+                    # The answer edit keeps optional history, not a live waiting claim.
+                    settled_text = telegram_quiz.render_quiz_text(question, plain_labels, stake, "", **card)
+                else:
+                    settled_text = body
+                telegram_quiz.remember_quiz(api, token, {
+                    "task_id": task_id, "quiz_id": quiz_id, "chat_id": chat_id,
+                    "message_id": int(message_id or 0), "options": labels,
+                    "text": settled_text,
+                })
+                await telegram_quiz.apply_retained_fact(api, token, lang, client_factory=lambda: client)
         except Exception as exc:
             api.log("error", f"Telegram quiz error: {exc}")
+    return handle
+
+
+def _make_quiz_state(api):
+    """Telegram has no reload: a sent card follows its question's lifecycle (TZ-2 B2),
+    one fact at a time per card and never before the card itself is remembered."""
+    async def handle(event: Dict[str, Any]) -> None:
+        try:
+            await telegram_quiz.follow_lifecycle(
+                api, event, _poller_preferences(api)[4],
+                client_factory=lambda: TelegramClient(
+                    api.get_settings(["TELEGRAM_BOT_TOKEN"]).get("TELEGRAM_BOT_TOKEN", ""),
+                    trust_env=_HONOR_ENV_PROXIES))
+        except Exception as exc:
+            api.log("error", f"Telegram quiz state error: {exc}")
     return handle
 
 
@@ -1323,7 +1389,9 @@ def register(api):
     api.subscribe_event("chat.document", _make_document(api))
     api.subscribe_event("chat.links", _make_links(api))
     api.subscribe_event("chat.quiz", _make_quiz(api))
-    api.register_route("settings/save", handler=_make_settings_save(api), methods=("POST",))
+    api.subscribe_event("chat.quiz_state", _make_quiz_state(api))
+    # GET hydrates the declarative form with what is stored; POST saves it.
+    api.register_route("settings/save", handler=_make_settings_save(api), methods=("GET", "POST"))
     api.register_route("miniapp/status", handler=_make_status(api), methods=("POST",))
     api.register_settings_section(
         "telegram",
@@ -1355,10 +1423,12 @@ def register(api):
                          "placeholder": "en"},
                         {"name": "TELEGRAM_COMMAND_MODE", "label": "Command mode", "type": "select",
                          "options": [
-                             {"value": "full_access", "label": "Full access (default) — raw owner commands incl. /panic, /restart"},
-                             {"value": "safe_commands", "label": "Safe — allow /status, /bg status only"},
-                             {"value": "strict", "label": "Strict — block all slash commands from Telegram"},
+                             {"value": "full_access", "label": "Full access (default)"},
+                             {"value": "safe_commands", "label": "Safe commands only"},
+                             {"value": "strict", "label": "Strict"},
                          ],
+                         "help": "Full access forwards raw owner commands including /panic and /restart. "
+                                 "Safe allows /status and /bg status only. Strict blocks every slash command from Telegram.",
                          "placeholder": "full_access"},
                         {"name": "TELEGRAM_MIRROR_MODE", "label": "Mirror mode", "type": "select",
                          "options": [
@@ -1370,21 +1440,24 @@ def register(api):
                         {"name": "TELEGRAM_MAX_UPDATES_PER_POLL", "label": "Max updates per poll", "type": "number", "placeholder": "20"},
                         {"name": "TELEGRAM_SILENT_MODE", "label": "Silent mode (edit-in-place)", "type": "select",
                          "options": [
-                             {"value": "off", "label": "Off — each thought is a new message"},
-                             {"value": "on", "label": "On — replace the previous thought in-place"},
+                             {"value": "off", "label": "Off"},
+                             {"value": "on", "label": "On (edit in place)"},
                          ],
+                         "help": "On replaces the previous thought in place instead of sending a new message.",
                          "placeholder": "off"},
                         {"name": "TELEGRAM_SUBAGENT_CARDS", "label": "Subagent cards", "type": "select",
                          "options": [
-                             {"value": "on", "label": "On — one updating message per subagent"},
-                             {"value": "off", "label": "Off — hide subagent activity"},
+                             {"value": "on", "label": "On"},
+                             {"value": "off", "label": "Off"},
                          ],
+                         "help": "One updating message per subagent.",
                          "placeholder": "on"},
                         {"name": "TELEGRAM_MIRROR_PROGRESS", "label": "Mirror progress telemetry", "type": "select",
                          "options": [
-                             {"value": "off", "label": "Off (default) — replies only (clean chat)"},
-                             {"value": "on", "label": "On — stream the main agent's progress"},
+                             {"value": "off", "label": "Off (default)"},
+                             {"value": "on", "label": "On"},
                          ],
+                         "help": "On streams the main agent's progress; Off keeps replies only.",
                          "placeholder": "off"},
                         {"name": "TELEGRAM_MINIAPP_ENABLED", "label": "Telegram Mini App", "type": "select",
                          "options": [
@@ -1394,9 +1467,11 @@ def register(api):
                          "placeholder": "on"},
                         {"name": "TELEGRAM_NOTIFY_TASKS", "label": "Notify on task completion", "type": "select",
                          "options": [
-                             {"value": "off", "label": "Off"},
+                             {"value": "off", "label": "Off — non-clean finishes only"},
                              {"value": "on", "label": "On — ✅ Task done · cost · rounds"},
                          ],
+                         "help": "A task that ends with warnings, fails or is cancelled always sends one short "
+                                 "line, because Telegram has no task card. On adds the clean finishes.",
                          "placeholder": "off"},
                         {"name": "TELEGRAM_NOTIFY_BUDGET", "label": "Notify on budget thresholds", "type": "select",
                          "options": [

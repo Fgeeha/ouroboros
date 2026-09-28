@@ -12,9 +12,9 @@ _EXPECTED_TOP_LEVEL_POLICY = {
     "active_workspace": {"read", "list", "search", "write", "edit", "shell", "vcs", "review", "service"},
     "system_repo": {"read", "list", "search", "write", "edit", "shell", "vcs", "review", "service"},
     "runtime_data": {"read", "list", "search", "write", "edit"},
-    "task_drive": {"read", "list", "write", "edit", "shell", "service"},
+    "task_drive": {"read", "list", "search", "write", "edit", "shell", "service"},
     "skill_payload": {"read", "list", "search", "write", "edit", "review", "shell"},
-    "artifact_store": {"read", "list", "write", "shell", "service"},
+    "artifact_store": {"read", "list", "search", "write", "edit", "shell", "service"},
     "user_files": {"read", "list", "search", "write", "edit", "shell", "service"},
     "subagent_projects": {"read", "list", "search"},
     "deliverables": {"read", "list", "search"},
@@ -36,7 +36,8 @@ def test_shared_top_level_principal_does_not_widen_specialized_profiles():
     assert "skill_repair" not in _POLICY
     assert "skill_payload" not in _POLICY["acting_subagent"]
     for profile in ("local_readonly_subagent", "acting_subagent"):
-        assert "search" not in _POLICY[profile]["runtime_data"]
+        assert {"read", "list", "search"} <= _POLICY[profile]["runtime_data"]
+        assert not {"write", "edit"} & _POLICY[profile]["runtime_data"]
     assert "delegate" in _POLICY["operator_control"]["active_workspace"]
 
 
@@ -170,7 +171,8 @@ def test_binding_collision_blocks_mutation_but_exact_read_stays_inspectable(tmp_
     assert not (data / "state" / "skills" / "same").exists()
 
 
-def test_binding_preserves_project_room_read_lens_but_not_write_target(tmp_path):
+@pytest.mark.parametrize("operation", ["read", "list", "search", "write", "edit", "shell", "vcs"])
+def test_binding_preserves_the_project_room_target_for_every_operation(tmp_path, operation):
     repo = tmp_path / "repo"
     data = tmp_path / "data"
     room = tmp_path / "room"
@@ -183,15 +185,11 @@ def test_binding_preserves_project_room_read_lens_but_not_write_target(tmp_path)
         task_metadata={"_project_room_dir": str(room)},
     )
 
-    read_binding = build_resolved_resource_binding(
-        ctx, root="active_workspace", operation="read", path="README.md"
-    )
-    write_binding = build_resolved_resource_binding(
-        ctx, root="active_workspace", operation="write", path="README.md"
+    binding = build_resolved_resource_binding(
+        ctx, root="active_workspace", operation=operation, path="README.md"
     )
 
-    assert read_binding.base_path == room.resolve()
-    assert write_binding.base_path == repo.resolve()
+    assert binding.base_path == room.resolve()
 
 
 def test_binding_synthesizes_only_manifest_first_external_write_target(tmp_path):

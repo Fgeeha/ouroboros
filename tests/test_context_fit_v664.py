@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import inspect
 import json
+import math
 from types import SimpleNamespace
 
 import pytest
+
+from ouroboros.context_budget import RECLAIM_LOW_WATER_DIVISOR
 
 
 def _projection(mode: str):
@@ -126,8 +129,87 @@ def test_confirmed_window_below_target_wins_even_when_target_fits(monkeypatch, t
     measurement = disposition.measurement
     assert measurement.target_deficit_tokens == 0
     assert measurement.capacity_deficit_tokens > 0
-    assert measurement.reclaim_goal_tokens == measurement.capacity_deficit_tokens
+    # Deficit-triggered, low-water-sized: the goal carries an eighth of the BINDING
+    # boundary (the 65,550 window, not the 200K target) above the deficit.
+    assert measurement.low_water_margin_tokens == math.ceil(65_550 / RECLAIM_LOW_WATER_DIVISOR)
+    assert measurement.reclaim_goal_tokens == (
+        measurement.capacity_deficit_tokens + measurement.low_water_margin_tokens
+    )
     assert disposition.action == "reclaim_once"
+
+
+@pytest.mark.parametrize("profile,preferred,window,known,boundary", [
+    ("owner_max", "max", 70_000, True, 70_000),  # capacity binds a Max route
+    ("owner_low", "low", 500_000, True, 200_000),  # the economy target binds Low
+    ("owner_low", "low", 0, False, 200_000),  # unknown capacity: the target alone binds
+])
+def test_low_water_margin_follows_the_binding_boundary(
+    monkeypatch, tmp_path, profile, preferred, window, known, boundary,
+):
+    plan = _plan(preferred=preferred, window=window, known=known)
+    messages = plan.messages_for(preferred) + [{"role": "user", "content": "x" * 600_000}]
+    disposition = _measure(
+        monkeypatch, tmp_path, plan=plan, profile=profile, mode=preferred, messages=messages,
+    )
+    measurement = disposition.measurement
+    deficit = max(value for value in (
+        measurement.target_deficit_tokens, measurement.capacity_deficit_tokens,
+    ) if value is not None)
+    assert deficit > 0
+    assert measurement.low_water_margin_tokens == math.ceil(boundary / RECLAIM_LOW_WATER_DIVISOR)
+    assert measurement.reclaim_goal_tokens == deficit + measurement.low_water_margin_tokens
+    assert disposition.action == "reclaim_once"
+    # The margin sizes the pass; it never re-arms the route+round latch.
+    after = _measure(
+        monkeypatch, tmp_path, plan=plan, profile=profile, mode=preferred, messages=messages,
+        used=True,
+    )
+    assert after.action != "reclaim_once"
+    assert after.measurement.low_water_margin_tokens == measurement.low_water_margin_tokens
+
+
+@pytest.mark.parametrize("profile,preferred,window,known", [
+    ("owner_max", "max", 0, False),
+    ("owner_max", "max", 500_000, True),
+    ("owner_low", "low", 500_000, True),
+    ("task_local_low", "low", 500_000, True),
+])
+def test_no_deficit_means_no_margin_and_no_goal(monkeypatch, tmp_path, profile, preferred, window, known):
+    plan = _plan(preferred=preferred, window=window, known=known)
+    disposition = _measure(
+        monkeypatch, tmp_path, plan=plan, profile=profile, mode=preferred,
+        messages=plan.messages_for(preferred),
+    )
+    assert disposition.measurement.low_water_margin_tokens == 0
+    assert disposition.measurement.reclaim_goal_tokens == 0
+    assert disposition.action == "send"
+
+
+def test_low_water_divisor_is_the_one_knob_in_both_directions(monkeypatch, tmp_path):
+    from ouroboros import context_budget as cb
+
+    plan = _plan(window=70_000, known=True)
+    messages = plan.messages_for("max") + [{"role": "user", "content": "x" * 40_000}]
+    base = _measure(
+        monkeypatch, tmp_path, plan=plan, profile="owner_max", mode="max", messages=messages,
+    ).measurement
+    deficit = base.capacity_deficit_tokens
+    assert deficit > 0 and base.low_water_margin_tokens == math.ceil(70_000 / 8)
+
+    monkeypatch.setattr(cb, "RECLAIM_LOW_WATER_DIVISOR", 4)
+    wider = _measure(
+        monkeypatch, tmp_path, plan=plan, profile="owner_max", mode="max", messages=messages,
+    ).measurement
+    assert wider.low_water_margin_tokens == math.ceil(70_000 / 4)
+    assert wider.reclaim_goal_tokens == deficit + wider.low_water_margin_tokens
+
+    monkeypatch.setattr(cb, "RECLAIM_LOW_WATER_DIVISOR", 10 ** 9)  # the margin removed
+    removed = _measure(
+        monkeypatch, tmp_path, plan=plan, profile="owner_max", mode="max", messages=messages,
+    ).measurement
+    assert removed.low_water_margin_tokens == 1
+    assert removed.reclaim_goal_tokens == deficit + 1
+    assert removed.capacity_deficit_tokens == deficit  # the trigger never moved
 
 
 def test_task_local_low_does_not_inherit_owner_economy_target(monkeypatch, tmp_path):
@@ -238,6 +320,62 @@ def test_route_rebind_keeps_owner_projection_on_small_confirmed_route(monkeypatc
     assert mode == "max"
     assert messages[0] == rebound.max_projection.system_message()
     assert rebound.route_fp == "small-route"
+
+
+@pytest.mark.parametrize("window,estimated,expected_fit", [
+    (80_000, 35_000, True),
+    (500_000, 40_000, False),
+])
+def test_route_rebind_preserves_nano_on_model_account_fallback(
+    monkeypatch, tmp_path, window, estimated, expected_fit,
+):
+    from dataclasses import replace
+
+    from ouroboros import context, context_fit, loop
+    from ouroboros.tools.registry import ToolRegistry
+
+    plan = replace(
+        _plan(preferred="nano"),
+        nano_projection=replace(_projection("nano"), estimated_tokens=estimated),
+    )
+    registry = ToolRegistry(repo_dir=tmp_path, drive_root=tmp_path)
+    registry._ctx.task_id = "nano-fallback"
+    registry._ctx.event_queue = None
+    monkeypatch.setattr(
+        context,
+        "_context_fit_route",
+        lambda task, **_kw: (
+            {"model": task["model"], "provider": "claudexor", "use_local": False},
+            SimpleNamespace(
+                status="confirmed", stale=False, window_tokens=window,
+                route_fp="fallback-account-route", source_id="codex",
+                credential_profile_id="account-b", account_fingerprint="acct-fp",
+            ),
+        ),
+    )
+    monkeypatch.setattr(context_fit, "_route_calibration_ratio", lambda *_a, **_kw: 2.0)
+    messages = plan.messages_for("nano")
+
+    rebound, mode = loop._rebind_context_fit_plan(
+        plan,
+        registry,
+        messages,
+        model="claudexor::codex=fallback-model",
+        use_local=False,
+        preferred_mode="nano",
+        tool_schemas=[],
+        model_role="fallback:0",
+        credential_profile_id="account-b",
+    )
+
+    assert mode == "nano"
+    assert rebound.preferred_mode == rebound.initial_mode == "nano"
+    assert rebound.nano_projection is not None
+    assert rebound.nano_projection.calibrated_tokens == estimated * 2
+    assert rebound.nano_projection.fits_known_window is expected_fit
+    assert messages[0] == rebound.nano_projection.system_message()
+    assert rebound.model == "claudexor::codex=fallback-model"
+    assert rebound.model_route["credentialProfileId"] == "account-b"
 
 
 def test_route_rebind_a_b_a_forgets_the_old_a_cache_split(monkeypatch, tmp_path):

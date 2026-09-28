@@ -5,14 +5,10 @@ from __future__ import annotations
 import json
 from hashlib import sha256
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Dict, Mapping, Optional
 
-from ouroboros.subagent_work_order import (
-    WorkOrderBudgetExceeded,
-    build_work_order_source_request,
-    compile_external_work_order,
-    route_source_request_channel,
-)
+from ouroboros.subagent_history import snapshot_handle
+from ouroboros.subagent_work_order import compile_external_work_order
 
 
 def _with_coordination_context(ctx: Any, raw: str) -> str:
@@ -88,12 +84,23 @@ def _startup_refusal_definite(payload: Mapping[str, Any]) -> bool:
     )
 
 
+def refusal_facts(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    """The producer's typed refusal facts present on ``payload`` (never a handle)."""
+    from ouroboros.delegate_shared import REFUSAL_FACT_KEYS
+
+    return {key: payload[key] for key in REFUSAL_FACT_KEYS if key in payload}
+
+
 def _record_startup_refusal(
     ctx: Any, task: Mapping[str, Any], *, reason: str, reset_at: str = "",
+    detail: str = "", facts: Optional[Mapping[str, Any]] = None,
 ) -> None:
-    """Stash the typed unrun refusal for the caller's zero-spend terminal."""
+    """Stash the typed unrun refusal for the caller's zero-spend terminal — with
+    the producer's detail and facts (a busy lock's holder), so the parent-facing
+    outcome says WHY instead of a bare reason code."""
 
     from ouroboros.subagent_runtime import current_subagent_alternatives
+    from ouroboros.utils import utc_now_iso
 
     snapshot = task.get("configured_subagent") if isinstance(task.get("configured_subagent"), dict) else {}
     alternatives = current_subagent_alternatives(
@@ -103,13 +110,18 @@ def _record_startup_refusal(
         "reason": str(reason or "configured_session_unavailable"),
         "reset_at": str(reset_at or ""),
         "requested": "harness",
+        "detail": str(detail or ""),
+        **dict(facts or {}),
     }
     availability = dict(task.get("subagent_availability") or {}) if isinstance(
         task.get("subagent_availability"), dict) else {}
     availability.update({
+        "observed_at": utc_now_iso(),
         "status": "unavailable",
         "reason": str(reason or "configured_session_unavailable"),
         "reset_at": str(reset_at or ""),
+        "detail": str(detail or ""),
+        **dict(facts or {}),
         "alternatives": alternatives,
         "host_fallback": False,
         "route_kind": "agent_session",
@@ -139,6 +151,7 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
         return ""
     snapshot = task.get("configured_subagent") if isinstance(task.get("configured_subagent"), dict) else {}
     route = snapshot.get("route") if isinstance(snapshot.get("route"), dict) else {}
+    ctx._configured_subagent_route_kind = str(route.get("kind") or "")
     if str(route.get("kind") or "") != "agent_session":
         return ""
     # Hydrate immutable route/work-order authority before every recovery
@@ -150,6 +163,41 @@ def bootstrap_before_context(ctx: Any, task: Mapping[str, Any], dispatch: Any) -
         return _with_coordination_context(ctx, recovery)
     actor_bootstrap = getattr(ctx, "_configured_actor_bootstrap", {})
     actor_bootstrap = actor_bootstrap if isinstance(actor_bootstrap, dict) else {}
+    if isinstance(task.get("_budget_pause_resume"), dict):
+        # Same-ID budget continuation (#1196): the paused attempt's own episode
+        # already decided this leaf's physical start and the restored transcript
+        # carries its receipts. The host hydrates the durable custody facts and
+        # mints NO second invocation over a settled or disposed leaf — a
+        # replacement start is the model's explicit decision after admission.
+        from ouroboros import delegate_custody as custody
+        from ouroboros.delegate_evidence import task_execution_evidence
+
+        try:
+            evidence = task_execution_evidence(
+                custody.custody_root(ctx), str(getattr(ctx, "task_id", "") or task.get("id") or ""))
+        except Exception:
+            evidence = {"evidence_read_failed": True}
+        evidence = evidence if isinstance(evidence, dict) else {"evidence_read_failed": True}
+        started = int(evidence.get("delegated_runs_started") or 0)
+        if started:
+            _mark_physical_activity(ctx)
+        elif evidence.get("evidence_read_failed"):
+            # Unreadable custody may hide a prior run: UNKNOWN fences a new start.
+            actor_bootstrap.update({
+                "zero_run_evidence_status": "unknown",
+                "zero_run_evidence_gaps": ["custody_evidence_unreadable"],
+                "exact_start_pending": False,
+            })
+        try:
+            payload = json.loads(actor_ready)
+        except (TypeError, ValueError):
+            payload = {}
+        payload["status"] = "configured_session_budget_continuation"
+        payload["continuation"] = {
+            "delegated_runs_started": started, "physical_start": "not_repeated",
+            "custody_read": "failed" if evidence.get("evidence_read_failed") else "ok",
+        }
+        return _with_coordination_context(ctx, json.dumps(payload, ensure_ascii=False, indent=2))
     fenced = (
         bool(actor_bootstrap.get("zero_run_receipt_recorded"))
         or str(actor_bootstrap.get("zero_run_evidence_status") or "") == "unknown"
@@ -210,14 +258,21 @@ def _pre_start_leaf(
     waiting is the model's own ``delegate_wait`` decision, so owner messages,
     hurry controls and parallel children stay live for the whole run."""
 
+    from ouroboros.delegate_shared import delegate_payload
     from ouroboros.subagent_runtime import delegate_start_entry
 
-    started_raw = delegate_start_entry(ctx, "")
+    # The start wrapper answers with the family's NATIVE result; the receipt below
+    # carries the producer's own payload, never a stringified result object. An
+    # UNREADABLE payload proves nothing about the run's absence, so it wakes the
+    # model with the fault rather than claiming a $0 unrun terminal.
+    started = delegate_start_entry(ctx, "", **{
+        key: actor_bootstrap[key] for key in ("directory_strategy", "scope_paths")
+        if key in actor_bootstrap
+    })
     try:
-        payload = json.loads(started_raw) if isinstance(started_raw, str) else {}
-    except (TypeError, ValueError):
+        payload = delegate_payload(started)
+    except (AttributeError, TypeError, ValueError):
         payload = {}
-    payload = payload if isinstance(payload, dict) else {}
     status = str(payload.get("status") or "")
     if status in {"started", "started_uncustodied"}:
         # Idempotent beside the start wrapper's own marker: the host episode
@@ -239,6 +294,8 @@ def _pre_start_leaf(
             ctx, task,
             reason=str(payload.get("reason") or ""),
             reset_at=str(payload.get("reset_at") or ""),
+            detail=str(payload.get("detail") or ""),
+            facts=refusal_facts(payload),
         )
         return ""
     # Everything else — started_uncustodied, fence refusals raced in by the
@@ -626,41 +683,9 @@ def _prepare_actor_first_bootstrap(
     """Freeze exact actor authority while keeping a new physical start pending."""
     snapshot = task.get("configured_subagent") if isinstance(task.get("configured_subagent"), dict) else {}
     route = snapshot.get("route") if isinstance(snapshot.get("route"), dict) else {}
-    try:
-        work_order = compile_external_work_order(task)
-        work_order_fingerprint = sha256(work_order.encode("utf-8")).hexdigest()
-        work_order_chars = len(work_order)
-        source_prompt = ""
-        source_request: dict[str, Any] = {}
-        source_channel: dict[str, Any] = {}
-    except WorkOrderBudgetExceeded as exc:
-        source_prompt, source_request = build_work_order_source_request(task, exc)
-        source_channel = {"status": "unverified", "reason": "not_checked"}
-        route_id = str(route.get("target_id") or "")
-        resolved_route = getattr(getattr(dispatch, "executor_resolution", None), "route", None)
-        channel_route_id = str(getattr(resolved_route, "route_id", "") or route_id)
-        gateway = None
-        try:
-            from ouroboros.claudexor_daemon import ensure_owned_gateway
-
-            gateway = ensure_owned_gateway()
-            source_channel = route_source_request_channel(gateway, channel_route_id)
-        except Exception as channel_error:  # noqa: BLE001 - unknown is typed
-            source_channel = {
-                "status": "unverified",
-                "reason": "capability_probe_failed",
-                "detail": type(channel_error).__name__,
-                "route": channel_route_id,
-            }
-        finally:
-            if gateway is not None:
-                try:
-                    gateway.close()
-                except Exception:
-                    pass
-        work_order = ""
-        work_order_fingerprint = exc.sha256
-        work_order_chars = exc.chars
+    work_order = compile_external_work_order(task)
+    work_order_fingerprint = sha256(work_order.encode("utf-8")).hexdigest()
+    work_order_chars = len(work_order)
 
     route_id = str(route.get("target_id") or "")
     ctx._configured_actor_bootstrap = {
@@ -670,14 +695,13 @@ def _prepare_actor_first_bootstrap(
         "selected_subagent_id": str(snapshot.get("selected_subagent_id") or ""),
         "config_fingerprint": str(snapshot.get("config_fingerprint") or ""),
         "canonical_work_order": work_order,
-        "source_prompt": source_prompt,
-        "source_request": source_request,
-        "source_channel": source_channel,
         "work_order_fingerprint": work_order_fingerprint,
         "work_order_chars": work_order_chars,
         "route_available": not bool(getattr(dispatch, "blocked", False)),
         "exact_start_pending": True,
         "physical_started": False,
+        **{key: task[key] if key == "directory_strategy" else list(task[key])
+           for key in ("directory_strategy", "scope_paths") if key in task},
     }
     zero_run_evidence_gaps: set[str] = set()
     durable_zero_run = _durable_zero_run_receipt(
@@ -707,12 +731,12 @@ def _prepare_actor_first_bootstrap(
                 "zero_run_evidence_unknown"
                 if zero_run_evidence_gaps and not durable_zero_run else "pending"
             ),
-            "selected_subagent_id": str(snapshot.get("selected_subagent_id") or ""),
+            # Model-facing name: the snapshot's own handle, never the stored key.
+            "selected_subagent_id": snapshot_handle(snapshot),
             "route": route_id,
             "work_order_fingerprint": work_order_fingerprint,
             "work_order_chars": work_order_chars,
             "work_order_complete": bool(work_order),
-            **({"source_channel": source_channel} if source_channel else {}),
             "actor_first": True,
             "exact_start_pending": not bool(
                 durable_zero_run or zero_run_evidence_gaps

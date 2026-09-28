@@ -19,21 +19,35 @@ export function desiredLiveCardPhase(record = {}, terminalPhase = 'done') {
         };
     }
     if (record.finalizingHold) {
+        // #1110: when the outcome is already observed, it OWNS the chip and the
+        // hold states itself beside it. A card whose task had failed used to read
+        // only "Finalizing…", so the failure had to be smuggled into the title.
+        const observed = String(record.observedOutcome || '');
+        if (observed) {
+            const presentation = taskPresentation(observed);
+            return {
+                phase: presentation.phase,
+                text: presentation.headline,
+                className: `chat-live-phase ${presentation.phase}`,
+                secondary: 'Finalizing…',
+            };
+        }
         return {
             phase: 'working',
             text: 'Finalizing…',
             className: 'chat-live-phase working finalizing',
         };
     }
+    if (record.modelWaiting) return {
+        phase: 'working', text: 'Waiting for access', className: 'chat-live-phase working waiting',
+    };
     return { phase: 'working', text: 'Working', className: 'chat-live-phase working' };
 }
 
 // A replayed final may preserve only an already-terminal phase. Ordinary DOM
 // progress is presentation state, not terminal outcome truth.
-export function replayTerminalPhase(taskState, record) {
-    return taskState?.completedPhase
-        || (record?.finished ? record?.phaseEl?.dataset?.phase : '')
-        || 'done';
+export function replayTerminalPhase(record) {
+    return (record?.finished ? record?.phaseEl?.dataset?.phase : '') || 'done';
 }
 
 // Preserve the authoritative unfinished phase fact across an optimistic owner
@@ -43,6 +57,7 @@ export function captureLiveCardPhaseState(record = {}) {
     return {
         phase: String(record?.phaseEl?.dataset?.phase || 'working'),
         finalizingHold: Boolean(record?.finalizingHold),
+        observedOutcome: String(record?.observedOutcome || ''),
     };
 }
 
@@ -50,17 +65,21 @@ export function restoreLiveCardPhaseState(record, snapshot) {
     if (!record || !snapshot || record.finished) return null;
     record.cancelPendingPolicy = '';
     record.finalizingHold = Boolean(snapshot.finalizingHold);
+    record.observedOutcome = String(snapshot.observedOutcome || '');
     return desiredLiveCardPhase(record, snapshot.phase || 'working');
 }
 
 // One writer for the stable factual task/subagent phase chip. Technical
 // nonterminal diagnostics stay in the card timeline/details.
-export function setLiveCardPhase(record, phase = 'working', text = '', className = '') {
+export function setLiveCardPhase(record, phase = 'working', text = '', className = '', secondary = '') {
     if (!record?.phaseEl) return false;
     const activePhase = String(phase || 'working');
     const activeText = String(text || taskPresentation(activePhase).headline);
     const activeClassName = className || `chat-live-phase ${activePhase}`;
-    const activeLabel = `${record.isSubagent ? 'Subagent' : 'Task'} status: ${activeText}`;
+    const secondaryText = String(secondary || '');
+    const activeLabel = `${record.isSubagent ? 'Subagent' : 'Task'} status: ${activeText}`
+        + (secondaryText ? `, ${secondaryText}` : '');
+    const secondaryChanged = setLiveCardPhaseSecondary(record, secondaryText);
     const phaseEl = record.phaseEl;
     const changed = phaseEl.dataset.phase !== activePhase
         || phaseEl.className !== activeClassName
@@ -73,5 +92,63 @@ export function setLiveCardPhase(record, phase = 'working', text = '', className
     if (phaseEl.getAttribute('aria-live') !== 'polite') phaseEl.setAttribute('aria-live', 'polite');
     if (phaseEl.getAttribute('aria-atomic') !== 'true') phaseEl.setAttribute('aria-atomic', 'true');
     if (phaseEl.getAttribute('aria-label') !== activeLabel) phaseEl.setAttribute('aria-label', activeLabel);
-    return changed;
+    return setLiveCardTypingVisible(record, !record.finished) || changed || secondaryChanged;
+}
+
+// The secondary chip is a SEPARATE fact beside the outcome, never a second
+// status word: only the finalization hold writes it, and the primary chip's
+// accessible name states both so the pair is read as one status.
+export function setLiveCardPhaseSecondary(record, text = '') {
+    if (!record) return false;
+    if (record.phaseSecondaryEl === undefined) {
+        record.phaseSecondaryEl = record.root?.querySelector?.('[data-live-phase-secondary]') || null;
+    }
+    const el = record.phaseSecondaryEl;
+    if (!el) return false;
+    const next = String(text || '');
+    const hidden = !next || Boolean(record.phaseEl?.hidden);
+    if (el.textContent === next && el.hidden === hidden) return false;
+    el.textContent = next;
+    el.hidden = hidden;
+    return Boolean(el.isConnected);
+}
+
+// Phase and activity share this one animation writer. A subscription wait
+// remains unfinished without pretending the paused role is doing computation.
+export function setLiveCardTypingVisible(record, visible) {
+    if (!record?.inlineTypingEl) return false;
+    const display = visible && !record.modelWaiting && !record.reviewAnchor && !record.historicalUnavailable && !record.historicalUnconfirmed ? '' : 'none';
+    if (record.inlineTypingEl.style.display === display) return false;
+    record.inlineTypingEl.style.display = display;
+    return Boolean(record.inlineTypingEl.isConnected);
+}
+
+// Shared inert anatomy; the caller retains the reason (review or missing
+// historical outcome), and no runtime lifecycle status is invented.
+export function setInertCardPresentation(record, enabled) {
+    if (!record?.phaseEl) return;
+    record.phaseEl.hidden = enabled;
+    setLiveCardPhaseSecondary(record, enabled ? '' : desiredLiveCardPhase(record).secondary);
+    if (record.root?.dataset) record.root.dataset.inert = enabled ? '1' : '0';
+    setLiveCardTypingVisible(record, !enabled && !record.finished);
+}
+
+export function setHistoricalUnavailable(record, enabled) {
+    if (!record || (Boolean(record.historicalUnavailable) === enabled && !record.historicalUnconfirmed)) return false;
+    record.historicalUnavailable = enabled;
+    record.historicalUnconfirmed = false;
+    setInertCardPresentation(record, enabled || Boolean(record.reviewAnchor));
+    if (!enabled && !record.reviewAnchor) {
+        const desired = desiredLiveCardPhase(record);
+        setLiveCardPhase(record, desired.phase, desired.text, desired.className, desired.secondary);
+    }
+    return true;
+}
+
+export function setHistoricalUnconfirmed(record) {
+    if (!record || record.finished || record.reviewAnchor || record.historicalUnavailable
+            || record.historicalUnconfirmed) return false;
+    record.historicalUnconfirmed = true;
+    setInertCardPresentation(record, true);
+    return true;
 }

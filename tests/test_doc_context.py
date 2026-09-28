@@ -21,6 +21,7 @@ SYSTEM + BIBLE are tier-0 and always full.
 import os
 import pathlib
 import tempfile
+from tests._governance_docs_shared import governance_doc_text
 
 # Unique sentinel placed inside the ARCHITECTURE body so we can prove the full
 # body is inlined (max) vs replaced by a structure-only nav map (low).
@@ -91,7 +92,7 @@ def test_plan_review_docs_pin_fail_closed_exact_artifact_custody():
     repo = pathlib.Path(__file__).resolve().parents[1]
 
     for relative in ("docs/ARCHITECTURE.md", "docs/DEVELOPMENT.md"):
-        text = (repo / relative).read_text(encoding="utf-8")
+        text = governance_doc_text(relative, repo)
         assert "plan_review_exact_artifact_unavailable" in text, relative
         assert "only when no exact artifact reference exists" in text, relative
 
@@ -175,6 +176,29 @@ def test_forked_context_uses_canonical_global_cognition_not_child_noise():
     assert "CANONICAL_DEEP_REVIEW" in rendered
     assert "CHILD_PATTERN_NOISE" not in rendered
     assert "CHILD_DEEP_NOISE" not in rendered
+
+
+def test_deep_review_is_historical_without_shrinking_its_existing_excerpt(tmp_path):
+    import json
+
+    from ouroboros.context import build_llm_messages
+    from ouroboros.utils import truncate_review_artifact
+
+    env, memory = _make_env_and_memory(tmp_path)
+    path = env.drive_root / "memory" / "deep_review.md"
+    for prefix in ("LEGACY REPORT\n", "<!-- deep-review provenance: generated_at=2026-01-01T00:00:00Z, source_revision=unknown -->\n"):
+        original = prefix + "retained historical reasoning " * 400
+        path.write_text(original, encoding="utf-8")
+        # A recent file mtime is not a review date, even on a copied old report.
+        os.utime(path, (1900000000, 1900000000))
+        messages, _ = build_llm_messages(
+            env=env, memory=memory, task={"id": "history", "type": "task", "text": "continue"},
+        )
+        rendered = json.dumps(messages, ensure_ascii=False)
+        assert json.dumps(truncate_review_artifact(original, limit=8000), ensure_ascii=False)[1:-1] in rendered
+        assert "not a verdict on the current tree" in rendered
+        assert "unrecorded date or source revision is unknown" in rendered
+        assert path.read_text(encoding="utf-8") == original
 
 
 def test_current_plan_and_open_dispositions_enter_actual_model_request():
@@ -380,7 +404,7 @@ def test_max_mode_external_workspace_keeps_arch_full_but_drops_development():
     assert contract_false["context_requires_self_body_docs"] is False
 
 
-def test_low_mode_external_workspace_gets_nav_arch_and_dev_pointer():
+def test_low_mode_external_workspace_gets_both_book_navigation_views():
     external = _build_system_text(
         {
             "workspace_root": "/tmp/example-workspace",
@@ -392,7 +416,7 @@ def test_low_mode_external_workspace_gets_nav_arch_and_dev_pointer():
     )
     assert "navigation map" in external
     assert _ARCH_BODY_SENTINEL not in external
-    assert "## DEVELOPMENT.md" not in external
+    assert "## DEVELOPMENT.md (navigation map)" in external
 
 
 def test_max_mode_evolution_task_keeps_arch_and_development_full():
@@ -409,7 +433,7 @@ def test_max_mode_evolution_task_keeps_arch_and_development_full():
     review_text = _build_system_text({"type": "deep_self_review"}, context_mode="max")
     assert _ARCH_BODY_SENTINEL in review_text
 
-    # In low mode evolution stays on the cheap form: nav ARCH + full DEV.
+    # Low retains navigation to both books; Max's full bodies stay unchanged.
     low_text = _build_system_text({"type": "evolution"}, context_mode="low")
     assert "navigation map" in low_text
     assert _ARCH_BODY_SENTINEL not in low_text
@@ -500,19 +524,18 @@ def test_low_mode_architecture_is_navigation_map_not_full_body():
     assert _ARCH_BODY_SENTINEL not in text  # full body NOT inlined in low
 
 
-def test_low_mode_development_full_for_direct_chat_tasks_unless_explicitly_disabled():
+def test_low_mode_development_navigation_for_task_and_direct_chat():
     code_text = _build_system_text({"type": "task"}, context_mode="low")
-    assert "## DEVELOPMENT.md" in code_text  # code / self-mod task → full
+    assert "## DEVELOPMENT.md (navigation map)" in code_text
 
     chat_text = _build_system_text({"_is_direct_chat": True}, context_mode="low")
-    assert "## DEVELOPMENT.md" in chat_text  # chat can still be code / self-mod work
+    assert "## DEVELOPMENT.md (navigation map)" in chat_text
 
     pure_chat_text = _build_system_text(
         {"_is_direct_chat": True, "context_requires_development": False},
         context_mode="low",
     )
-    assert "## DEVELOPMENT.md" not in pure_chat_text
-    assert "DEVELOPMENT.md" in pure_chat_text  # but named in the on-demand pointer
+    assert "## DEVELOPMENT.md (navigation map)" in pure_chat_text
 
 
 # Predicted route pressure no longer changes the document projection. The
@@ -522,3 +545,33 @@ def test_predicted_route_downgrade_authority_is_absent():
     from ouroboros import loop
 
     assert not hasattr(loop, "_maybe_downgrade_max_unconfirmed")
+
+
+def test_an_empty_seed_is_a_blank_drive_not_a_blank_context():
+    """#1321: memory_mode=empty seeds nothing onto the child's own drive, yet the
+    child's context is still the canonical governance and shared memory -- the
+    schema says exactly that instead of "starts blank"."""
+    import json
+
+    from ouroboros.context import build_llm_messages
+    from ouroboros.headless import prepare_task_drive
+    from ouroboros.memory import Memory
+    from ouroboros.tools.control_subagent_spec import schedule_subagent_properties
+
+    tmpdir = pathlib.Path(tempfile.mkdtemp())
+    env, canonical_memory = _make_env_and_memory(tmpdir)
+    canonical_memory.logs_path("chat.jsonl").write_text(
+        '{"chat_id": 1, "direction": "in", "text": "CANONICAL_SHARED_DIALOGUE"}\n', encoding="utf-8")
+    child = prepare_task_drive(env.drive_root, "emptychild1", "empty")
+    assert child is not None and not (child / "memory" / "identity.md").exists()
+    forked = prepare_task_drive(env.drive_root, "forkedchild1", "forked")
+    assert (forked / "memory" / "identity.md").read_text(encoding="utf-8") == "I am Ouroboros."
+    task = {"id": "emptychild1", "type": "task", "text": "verify", "parent_task_id": "root1",
+            "root_task_id": "root1", "delegation_role": "subagent", "memory_mode": "empty",
+            "drive_root": str(child), "budget_drive_root": str(env.drive_root)}
+    messages, _ = build_llm_messages(env=env, memory=Memory(child, repo_dir=env.repo_dir), task=task)
+    rendered = json.dumps(messages, ensure_ascii=False)
+    assert "I am Ouroboros." in rendered and "Principle 0: Agency" in rendered
+    description = schedule_subagent_properties()["memory_mode"]["description"]
+    assert "starts blank" not in description and "not a blank context" in description
+    assert "canonical governance" in description and "empty seeds that drive with nothing" in description

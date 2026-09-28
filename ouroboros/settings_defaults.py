@@ -71,14 +71,24 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "GIGACHAT_BASE_URL": "https://api.giga.chat/v1",
     "GIGACHAT_VERIFY_SSL_CERTS": "true",
     "GIGACHAT_PROFANITY_CHECK": "",
+    # PEM file with CA certificates ADDED to the default trust bundle for every
+    # first-party provider call (net_transport.extra_ca_bundle); "" = defaults only.
+    "OUROBOROS_EXTRA_CA_BUNDLE": "",
     "ANTHROPIC_API_KEY": "",
     "MINIMAX_API_KEY": "",
     "MINIMAX_REGION": "",
     "DEEPSEEK_API_KEY": "",
+    "ZAI_API_KEY": "",
+    "ZAI_PLAN": "",
     "OUROBOROS_NETWORK_PASSWORD": "",
     "OUROBOROS_SERVER_HOST": "127.0.0.1",
     "OUROBOROS_HOST_SERVICE_PORT": 8767,
     "OUROBOROS_MODEL": OPENROUTER_DEFAULTS["main"],
+    # Role-owned choices; empty account and zero window mean Auto, not healthy/known.
+    "OUROBOROS_MODEL_ACCOUNTS": "{}",
+    "OUROBOROS_MODEL_CONTEXT_WINDOWS": "{}",
+    "OUROBOROS_PROCESSING_PREFERENCE": "",
+    "OUROBOROS_MODEL_PROCESSING_PREFERENCES": "{}",
     # Worker lanes; empty means "use OUROBOROS_MODEL" (one model by default, per-lane
     # override optional). HEAVY = mutative first-level subagents; LIGHT = auto/deep bulk.
     "OUROBOROS_MODEL_HEAVY": OPENROUTER_DEFAULTS["heavy"],
@@ -87,11 +97,14 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_IMAGE_INPUT_MODE": "auto",
     # Background consciousness is a high-horizon loop, not a cheap helper lane.
     "OUROBOROS_MODEL_CONSCIOUSNESS": OPENROUTER_DEFAULTS["consciousness"],
-    # Cross-model resilience CHAIN (comma-separated, ordered). A single model is a
-    # 1-element chain; empty disables cross-model fallback. Resilience slot — keeps a
-    # real default, unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
+    # Cross-model resilience CHAIN (comma-separated, ordered). A single model is a 1-element
+    # chain; empty disables cross-model fallback. Resilience slot — keeps a real default,
+    # unlike the worker lanes. (Renamed from the singular MODEL_FALLBACK.)
     "OUROBOROS_MODEL_FALLBACKS": OPENROUTER_DEFAULTS["fallback"],
-    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": OPENROUTER_DEFAULTS["deep_self_review"],
+    "OUROBOROS_SERVED_MODEL_REDOS": 2,  # redos of a round another model answered (`llm_substitution.py`)
+    # Empty preserves an unauthored default through settings merges/projection.
+    # The getter chooses the reachable default; existing nonempty choices stay pinned.
+    "OUROBOROS_MODEL_DEEP_SELF_REVIEW": "",
     "OUROBOROS_MAX_WORKERS": 10, "OUROBOROS_PRESENCE_MAX_ACTIVE": 2,
     "OUROBOROS_MAX_ACTIVE_SUBAGENTS_PER_ROOT": 6,
     "OUROBOROS_MAX_SUBAGENT_DEPTH": 3,
@@ -116,8 +129,8 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_RUB_USD_RATE": "",
     # Live-pricing (OpenRouter + cloud.ru catalog) refetch interval; prices/FX drift.
     "OUROBOROS_PRICING_TTL_SEC": 21600,
-    # Main-loop round ceiling (was an inline literal in loop.py — hot-reloadable now).
-    "OUROBOROS_MAX_ROUNDS": 200,
+    # Optional main-loop round limit: a positive int or "unlimited" (legacy: settings_scales).
+    "OUROBOROS_MAX_ROUNDS": "unlimited",
     # Same-model attempt budget for TRANSIENT provider failure classes
     # (finish_reason=null, 429/5xx/overloaded); floored at the caller's base
     # retry budget. Permanent classes fail fast regardless.
@@ -150,19 +163,23 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # same custody pass runs on the supervisor sweep, so this stays short.
     "OUROBOROS_DIRECT_TURN_STOP_WAIT_SEC": 2,
     # Activity-based liveness (the flat wall-clock pair it replaced is RETIRED below):
-    # idle window = no real progress AND no progressing subtree; abs ceiling = the
-    # unconditional per-task backstop (budget/cost stays a separate hard axis).
+    # idle window = no real progress AND no progressing subtree; abs ceiling = the optional
+    # per-task lifetime, "unlimited" or seconds (budget/cost stays a separate hard axis).
     "OUROBOROS_TASK_IDLE_TIMEOUT_SEC": 900,
-    "OUROBOROS_TASK_ABS_CEILING_SEC": 21600,
+    "OUROBOROS_TASK_ABS_CEILING_SEC": "unlimited",
     "OUROBOROS_PER_CALL_TIMEOUT_CEILING_SEC": 1800,
     "OUROBOROS_FINALIZATION_GRACE_SEC": FINALIZATION_GRACE_DEFAULT_SEC,
     "OUROBOROS_SUPERVISOR_LIVENESS_DEADLINE_SEC": SUPERVISOR_LIVENESS_DEADLINE_DEFAULT_SEC,
     "OUROBOROS_PACING_INTERVAL_SEC": PACING_INTERVAL_DEFAULT_SEC,
     "OUROBOROS_TOOL_TIMEOUT_SEC": 600,
     "OUROBOROS_VISION_CAPTION_TIMEOUT_SEC": 90,
-    "OUROBOROS_BG_MAX_ROUNDS": 10,
-    "OUROBOROS_BG_WAKEUP_MIN": 30,
-    "OUROBOROS_BG_WAKEUP_MAX": 7200,
+    # Consciousness: MIN/MAX bound the wake-up interval the MODEL picks (set_next_wakeup); autonomy is what a
+    # wake may do; DAILY_USD is its rolling-24h spend ceiling (0 = may not spend), MAX_TASKS its concurrent roots (0 = none).
+    "OUROBOROS_BG_WAKEUP_MIN": 900,
+    "OUROBOROS_BG_WAKEUP_MAX": 14400,
+    "OUROBOROS_CONSCIOUSNESS_AUTONOMY": "act",
+    "OUROBOROS_CONSCIOUSNESS_DAILY_USD": 20.0,
+    "OUROBOROS_CONSCIOUSNESS_MAX_TASKS": 2,
     # Post-task self-evolution envelope (V4). Owner-enabled capability whose
     # CONTENT stays LLM-first; default OFF. When enabled, after a qualifying task
     # the worker may promote one high-value code-class backlog item into the
@@ -228,7 +245,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_RESTART_DRAIN_MAX_SEC": 120,
     # Runtime mode: light | advanced | pro; pro still requires review gates.
     "OUROBOROS_RUNTIME_MODE": "advanced",
-    # Context mode: low | max. Owner-only working-context size profile. max = full always-on docs +
+    # Context mode: nano | low | max. Owner-only working-context size profile. max = full always-on docs +
     # current memory granularity; low = ARCHITECTURE as a navigation map + deeper memory consolidation,
     # sized for ~200k / local models. Cognitive-horizon knob (BIBLE P1): the agent cannot lower it
     # (owner-only), and it never changes model / reasoning-effort / output-token budgets.
@@ -273,7 +290,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     # acceptance admission floor, clamped to >=200 s by task_pacing.
     "OUROBOROS_ACCEPTANCE_REVIEW_EST_SEC": 200,
     # Shared paid-review-cycle cap (SSOT + per-gate meaning: ouroboros/review_cycles.py):
-    # STRING "N"|"unlimited": plan review, acceptance (passes = cycles - 1), commit gate and skill review (paid cycles per root task / manual snapshot); identical material is never re-reviewed for pay on any gate.
+    # STRING "N"|"unlimited": paid plan/acceptance/commit/skill waves; final feedback still permits author response. Explicit task-local author limits and free identical-material replay remain separate.
     "OUROBOROS_REVIEW_MAX_CYCLES": "2",
     "OUROBOROS_ACCEPTANCE_RESERVE_PCT": 5,
     # Prompt-cache TTL, one honest GLOBAL override (owner decision 2026-08-08, batch #2 Q2=A): applied to
@@ -289,7 +306,7 @@ SETTINGS_DEFAULTS = {**UPDATE_SETTINGS_DEFAULTS,
     "OUROBOROS_EFFORT_REVIEW": "high",
     "OUROBOROS_EFFORT_SCOPE_REVIEW": "high",
     "OUROBOROS_EFFORT_DEEP_SELF_REVIEW": "high",
-    "OUROBOROS_EFFORT_CONSCIOUSNESS": "high",
+    "OUROBOROS_EFFORT_CONSCIOUSNESS": "",  # empty = the Task / Chat effort (a wake-up is an ordinary Main turn)
     "OUROBOROS_RETURN_REASONING": True,
     "OUROBOROS_REASONING_SUMMARY": "auto",
     "GITHUB_TOKEN": "",
@@ -368,6 +385,7 @@ RETIRED_SETTING_KEYS: tuple[str, ...] = (
     "OUROBOROS_SOFT_TIMEOUT_SEC",
     "OUROBOROS_HARD_TIMEOUT_SEC",
     "OUROBOROS_REVIEW_NATIVE_MAX_ROUNDS",  # a ceiling on rounds; bounds are transcript/deadline/ledger
+    "OUROBOROS_BG_MAX_ROUNDS",  # a wake is an ordinary Main turn: the per-task cost cap (+ any OUROBOROS_MAX_ROUNDS) bounds it
 )
 
 
@@ -436,8 +454,8 @@ def retired_setting_keys_notice(dropped: tuple[str, ...], *, reviewer_slots: tup
         elif state == "invalid":
             panel = (
                 "NO reviewer panel: that setting is malformed, so reviews are refused "
-                "(commit review blocks; under Advisory enforcement it warns and commits "
-                "unreviewed) until it is repaired on the Settings page — %s" % parse_error)
+                "(Blocking prevents committing; Advisory returns the failure for an explicit "
+                "author decision) until it is repaired on the Settings page — %s" % parse_error)
         else:
             panel = "the SHIPPED default reviewer panel until that setting is authored (Settings page)"
         clauses.append(

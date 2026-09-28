@@ -65,7 +65,9 @@ def test_a_fresh_subagent_row_invites_and_only_a_save_attempt_makes_it_red() -> 
     host = _read(MODULES / "settings.js")
     # Every Save click is an attempt — including one another field's validation
     # then aborts — so the stamp precedes the cadence check's early return.
-    assert host.index("noteSubagentsSaveAttempt();") < host.index("Every-N cadence needs")
+    save = host[host.index("byId('btn-save-settings').addEventListener"):]
+    assert save.index("noteSubagentsSaveAttempt();") < save.index("const { messages: errors, subject } = renderValidation();")
+    assert "Every-N cadence needs" in host
     assert "agentsStep?.noteSaveAttempt?.();" in _read(MODULES / "onboarding_wizard.js")
     # Errors name the card the way its heading does, never a bare "Row N".
     assert "`Subagent ${index + 1} ${text}`" in editor
@@ -92,7 +94,11 @@ def test_heavy_card_is_gone_but_provider_test_contract_and_controls_remain() -> 
     assert "s-model-heavy" not in ui
     assert "OUROBOROS_MODEL_HEAVY" not in host
     light_copy = "Fast summaries, lightweight internal work, reflections, and the default Fast scout. Empty uses Main."
-    assert light_copy in ui
+    # Role labels and copy come from the shared setup contract, not a second
+    # hand-maintained card table in Settings.
+    assert "modelRolesHost('settings-model-roles')" in ui
+    assert "modelRoles.load(s," in host
+    assert "slot.note" in _read(MODULES / "model_roles.js")
     assert light_copy in setup
     assert "all deep subagents" not in ui
     assert "all deep subagents" not in setup
@@ -176,9 +182,32 @@ def test_effort_choice_mirrors_track_the_python_scale() -> None:
     assert values == [tier for tier in EFFORT_SCALE if tier != "minimal"]
 
 
-def test_every_status_tone_the_card_emits_has_a_rule_in_both_sheets() -> None:
-    # The card head puts data-tone="neutral" on .settings-inline-status. A tone the
-    # code emits must have a rule (docs/DESIGN.md §4) — in the main sheet and in the
-    # wizard's standalone sheet alike — or it silently falls through to body text.
-    for sheet in ("style.css", "onboarding.css"):
-        assert '.settings-inline-status[data-tone="neutral"]' in _read(ROOT / "web" / sheet), sheet
+def test_every_status_tone_the_card_emits_has_a_shared_rule_in_both_documents() -> None:
+    # The emitted tone resolves in the one shared source actually loaded by both hosts.
+    assert '.settings-inline-status[data-tone="neutral"]' in _read(ROOT / "web" / "ui.css")
+    for document in ("index.html", "onboarding_template.html"):
+        assert 'href="/static/ui.css"' in _read(ROOT / "web" / document), document
+
+
+def test_the_per_row_switch_is_one_shared_checkbox_saved_by_the_common_save() -> None:
+    """docs/DESIGN.md §3 "Controls and editable choices" + "List editors": the
+    per-row owner switch is the shared `.ui-checkbox` primitive with its own
+    accessible name and hit target, it leads the card head BEFORE the title, and
+    it is held as a draft that the section's ONE Save writes — no instant-save
+    request, and no dimming of the card it switches off."""
+    editor = _read(MODULES / "subagents_settings.js")
+    head = editor[editor.index('class="available-subagent-head"'):
+                  editor.index("available-subagent-purpose")]
+    assert head.index('data-subagent-field="enabled"') < head.index("available-subagent-heading")
+    assert 'class="available-subagent-enable"' in head
+    assert 'class="ui-checkbox" type="checkbox" data-subagent-field="enabled"' in head
+    assert 'aria-label="Subagent ${ordinal} enabled for new work"' in head
+    # One writer: the editor never posts by itself, and `false` is the only
+    # value it stores (an enabled row keeps its existing canonical bytes).
+    assert "apiClient" not in editor and "fetch(" not in editor
+    assert "row?.enabled === false ? { enabled: false } : {}" in editor
+    for shell in ("settings.css", "onboarding.css"):
+        sheet = _read(ROOT / "web" / shell)
+        assert ".available-subagent-enable {" in sheet, shell
+        assert "opacity" not in sheet[sheet.index(".available-subagent-enable {"):
+                                      sheet.index(".available-subagent-enable {") + 240], shell

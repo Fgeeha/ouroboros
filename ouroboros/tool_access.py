@@ -16,10 +16,12 @@ from typing import Any, Iterable, Literal, Optional  # noqa: F401 — historical
 
 from ouroboros.artifacts import (delegated_capture_read_target,
                                  task_artifact_dir_path, task_id_for_artifacts)
+from ouroboros.headless import task_state_dir
 from ouroboros.tool_capabilities import ACTING_SUBAGENT_MODE, LOCAL_READONLY_SUBAGENT_MODE  # noqa: F401 — historical facade surface
 from ouroboros.contracts.task_constraint import VALID_WRITE_SURFACES, normalize_task_constraint  # noqa: F401 — historical facade surface
 from ouroboros import deliverables_paths as _deliverables_paths
 from ouroboros.shell_parse import is_absolute_path_text
+from ouroboros.task_results import validate_task_id
 from ouroboros.utils import safe_relpath
 
 _deliverables_root_lexical = _deliverables_paths._deliverables_root_lexical
@@ -62,7 +64,7 @@ from ouroboros.tool_access_roots import (  # noqa: F401 — re-exported moved su
     _is_subagent_ctx,
     _skill_payload_base,
     active_tool_profile,
-    binding_targets_system_repo,
+    binding_targets_system_repo, folderless_scratch_dir,
     is_external_workspace,
     load_bound_skill,
     predicted_subagent_profile,
@@ -71,17 +73,17 @@ from ouroboros.tool_access_roots import (  # noqa: F401 — re-exported moved su
 )
 from ouroboros.tool_access_user_files import (  # noqa: F401 — re-exported moved surface
     UserFilesPathBlockedError,
+    _delegated_capture_read_hint,
     _subagent_projects_read_hint,
     resolve_user_file_path,
     user_files_path_block_reason,
 )
 
 
-# Deferral 1: orchestrator-visible READ-ONLY roots — durable subagent (genesis) projects
-# and the unnamed-deliverables container. Only ever granted {read,list,search}; NEVER
-# write/edit/shell/vcs (no mutation, no shell-cwd — deliberately absent from
-# resolve_shell_cwd candidates) and NEVER to acting/readonly subagents (a child must not
-# read sibling projects). operator_control is capped to read-only on these too.
+# Orchestrator READ-ONLY roots (subagent projects, the Deliverables container): only ever
+# {read,list,search}, never a shell cwd, read-only even for operator_control. A child never
+# reads `subagent_projects` (parallel candidates stay independent); it reads owner-visible
+# `deliverables` and, by the lineage rule below, its parent's and root's task files (T4=A).
 
 def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = "") -> str:
     """Compact, human-readable summary of a subagent's EFFECTIVE tool profile
@@ -89,10 +91,13 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
     _POLICY matrix (the same SSOT active_tool_profile resolves), so the parent sees
     at schedule time (and the child sees first line of its context) what the child
     CAN and CANNOT do. Prevents the wasted rounds where a prober child hit
-    workspace_blocked on run_script because neither side knew shell was off."""
-    matrix = _POLICY.get(profile, {})
+    workspace_blocked on run_script because neither side knew shell was off.
+    The second line names what the child can READ (incl. its parent's and root's
+    task files, never a sibling's) and which roots stay invisible to it."""
+    matrix = _POLICY.get(_effective_policy_profile(profile), {})
     shell_roots = sorted(root for root, ops in matrix.items() if "shell" in ops)
     write_roots = sorted(root for root, ops in matrix.items() if ops & {"write", "edit"})
+    read_roots = sorted(root for root, ops in matrix.items() if "read" in ops)
     has_shell = bool(shell_roots)
     bits = [
         f"profile={profile}",
@@ -102,7 +107,88 @@ def summarize_subagent_profile(profile: ToolProfile, *, effective_lane: str = ""
     lane = str(effective_lane or "").strip()
     if lane:
         bits.append(f"model_lane={lane}")
-    return "child capabilities — " + " · ".join(bits)
+    lineage = (" (task_drive/artifact_store: its own, its parent's, its root task's and, when its"
+               " contract names one, its predecessor's files, never a sibling's)" if "task_drive" in read_roots else "")
+    return (
+        "child capabilities — " + " · ".join(bits)
+        + f"\nreadable={', '.join(read_roots) or 'none'}{lineage}"
+        + f" · unreadable={', '.join(sorted(_ALL_ROOTS - set(read_roots))) or 'none'}"
+    )
+
+
+def lineage_task_ids(ctx: Any) -> tuple[str, ...]:
+    """Task ids whose ``task_drive``/``artifact_store`` this actor may READ: its own, its parent's
+    and its root's (own lineage fields, T4=A #1105) and the ONE predecessor its contract names
+    (``task_contract.predecessor_authority.source.task_id``, one hop, #1232; a child carrying the
+    envelope reads it too) — never a sibling's, nothing found by walking the disk, malformed ids dropped."""
+    meta, contract = (v if isinstance(v, dict) else {} for v in (
+        getattr(ctx, "task_metadata", None), getattr(ctx, "task_contract", None)))
+    authority = (contract or meta).get("predecessor_authority")
+    source = authority.get("source") if isinstance(authority, dict) else None
+    ids = [task_id_for_artifacts(ctx)]
+    for raw in (meta.get("parent_task_id"), meta.get("root_task_id"),
+                source.get("task_id") if isinstance(source, dict) else None):
+        try:
+            ids.append(validate_task_id(raw))
+        except ValueError:
+            continue
+    return tuple(dict.fromkeys(ids))
+
+
+def _task_root_drives(ctx: Any) -> list[pathlib.Path]:
+    """The data drives a task's own task roots are enumerated on."""
+    meta = getattr(ctx, "task_metadata", {})
+    meta = meta if isinstance(meta, dict) else {}
+    values = (getattr(ctx, "drive_root", ""), *(meta.get(key) for key in (
+        "drive_root", "child_drive_root", "headless_child_drive_root")))
+    return list(dict.fromkeys(pathlib.Path(raw).resolve(strict=False) for raw in values if raw))
+
+
+def lineage_read_roots(ctx: Any, root: ResourceRoot) -> tuple[pathlib.Path, ...]:
+    """Enumerate only the same host-attested lineage containers used by native reads."""
+    if root not in {"task_drive", "artifact_store"} or not hasattr(ctx, "drive_root"):
+        return ()
+    canonical = canonical_data_root(ctx)
+    drives = [canonical] + [drive for drive in _task_root_drives(ctx) if drive != canonical]
+    task_ids = lineage_task_ids(ctx)
+    pairs = [(drive, task_id, False) for drive in drives for task_id in task_ids]
+    pairs += [(task_state_dir(canonical, task_id) / "data", task_id, True) for task_id in task_ids]
+    bases = []
+    for drive, task_id, headless in pairs:
+        lexical = (drive / "task_drives" / task_id if root == "task_drive"
+                   else task_artifact_dir_path(drive, task_id, create=False))
+        base = lexical.resolve(strict=False)
+        if (base == lexical or not headless) and base not in bases:
+            bases.append(base)
+    return tuple(bases)
+
+
+def lineage_read_base(ctx: Any, root: ResourceRoot, target: pathlib.Path) -> pathlib.Path | None:
+    """Containing lineage base for a READ; never a sibling or an external runtime root."""
+    candidate = pathlib.Path(target).resolve(strict=False)
+    return next((base for base in lineage_read_roots(ctx, root)
+                 if path_is_relative_to(candidate, base)), None)
+
+
+def _effective_policy_profile(profile: ToolProfile) -> ToolProfile:
+    """Map an acting child to the existing full matrix only in Cyber Pro."""
+    if profile != "acting_subagent":
+        return profile
+    try:
+        from ouroboros.config import get_runtime_mode
+        from ouroboros.runtime_mode_policy import runtime_mode_at_least
+
+        if runtime_mode_at_least(get_runtime_mode(), "cyber_pro"):
+            return "operator_control"
+    except Exception:
+        pass
+    return profile
+
+
+def operation_roots(profile: ToolProfile, operation: Operation) -> str:
+    """The roots ``profile`` may ``operation`` — the one vocabulary every refusal names."""
+    matrix = _POLICY.get(_effective_policy_profile(profile), {})
+    return ", ".join(sorted(root for root, ops in matrix.items() if operation in ops)) or "(none)"
 
 
 def decide_tool_access(
@@ -111,14 +197,15 @@ def decide_tool_access(
     root: ResourceRoot,
     operation: Operation,
 ) -> ToolAccessDecision:
-    allowed = operation in _POLICY.get(profile, {}).get(root, set())
+    effective_profile = _effective_policy_profile(profile)
+    allowed = operation in _POLICY.get(effective_profile, {}).get(root, set())
     if allowed:
-        return ToolAccessDecision(True, guard=f"{profile}:{root}:{operation}")
-    allowed_roots = ", ".join(sorted(r for r, ops in _POLICY.get(profile, {}).items() if operation in ops)) or "(none)"
+        return ToolAccessDecision(True, guard=f"{effective_profile}:{root}:{operation}")
     return ToolAccessDecision(
         False,
-        reason=f"profile={profile} cannot {operation} root={root}. Roots your profile can {operation}: {allowed_roots}.",
-        guard=f"{profile}:{root}:{operation}",
+        reason=f"profile={effective_profile} cannot {operation} root={root}. "
+        f"Roots your profile can {operation}: {operation_roots(profile, operation)}.",
+        guard=f"{effective_profile}:{root}:{operation}",
     )
 
 
@@ -131,7 +218,7 @@ def subagent_profile_satisfies(profile: ToolProfile, needs: Iterable[str]) -> tu
     operation on at least one root.
     """
 
-    ops_by_root = _POLICY.get(profile, {})
+    ops_by_root = _POLICY.get(_effective_policy_profile(profile), {})
     available_ops = {op for ops in ops_by_root.values() for op in ops}
     missing: list[str] = []
     for need in needs or []:
@@ -167,17 +254,20 @@ def _process_root_candidates(
     bucket: str = "",
     skill_name: str = "",
     include_skill: bool = False,
+    require_active: bool = True,
 ) -> list[tuple[ResourceRoot, pathlib.Path, str, str]]:
     """Return side-effect-free ``(root, base, source, skill)`` candidates."""
 
     profile = active_tool_profile(ctx)
-    active = resource_root_path(ctx, "active_workspace")
     candidates: list[tuple[ResourceRoot, pathlib.Path, str, str]] = []
-    room = project_room_lens_dir(ctx)
-    if room is not None:
-        candidates.append(("active_workspace", room, "active_workspace", ""))
+    try:
+        active = resource_root_path(ctx, "active_workspace")
+    except ValueError:
+        if require_active:
+            raise
+    else:
+        candidates.append(("active_workspace", active, "active_workspace", ""))
     candidates += [
-        ("active_workspace", active, "active_workspace", ""),
         ("system_repo", resource_root_path(ctx, "system_repo"), "system_repo", ""),
     ]
 
@@ -189,14 +279,8 @@ def _process_root_candidates(
         ])
 
     if hasattr(ctx, "drive_root"):
-        _add_task_roots(pathlib.Path(ctx.drive_root).resolve(strict=False))
-        meta = getattr(ctx, "task_metadata", {})
-        meta = meta if isinstance(meta, dict) else {}
-        for key in ("drive_root", "child_drive_root", "headless_child_drive_root"):
-            if not meta.get(key):
-                continue
-            _add_task_roots(pathlib.Path(meta[key]).resolve(strict=False))
-    if hasattr(ctx, "drive_root"):
+        for drive in _task_root_drives(ctx):
+            _add_task_roots(drive)
         candidates.append(("user_files", resource_root_path(ctx, "user_files"), "user_files", ""))
     if include_skill:
         base, source, selected_name = _skill_payload_base(
@@ -241,7 +325,7 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
     """
 
     profile = active_tool_profile(ctx)
-    policy = _POLICY.get(profile, {})
+    policy = _POLICY.get(_effective_policy_profile(profile), {})
     # H2 (capinv-447): a root is writable iff a MUTATING operation is granted on
     # it. Grouping "vcs" as write-like claimed writable roots for the read-only
     # child profile (status/diff-only vcs), contradicting summarize_subagent_profile.
@@ -311,19 +395,17 @@ def filesystem_affordance_map(ctx: Any, *, runtime_mode: str = "") -> dict[str, 
     return result
 
 
-def profile_readable_root_paths(ctx: Any) -> list[tuple[str, pathlib.Path]]:
-    """Project readable ``(label, path)`` pairs from the policy SSOT.
-
-    ``skill_payload`` needs selectors and is omitted; individual resolution is
-    fail-soft so one unavailable root cannot hide the rest.
-    """
+def profile_readable_root_paths(ctx: Any, *, operation: Operation = "read") -> list[tuple[str, pathlib.Path]]:
+    """Project the ``(label, path)`` pairs this profile may ``operation`` from the
+    policy SSOT. ``skill_payload`` needs selectors and is omitted; individual
+    resolution is fail-soft so one unavailable root cannot hide the rest."""
     out: list[tuple[str, pathlib.Path]] = []
     try:
-        policy = _POLICY.get(active_tool_profile(ctx), {})
+        policy = _POLICY.get(_effective_policy_profile(active_tool_profile(ctx)), {})
     except Exception:
         return out
     for root, ops in sorted(policy.items()):
-        if "read" not in ops or root == "skill_payload":
+        if operation not in ops or root == "skill_payload":
             continue
         try:
             out.append((root, pathlib.Path(resource_root_path(ctx, root)).resolve(strict=False)))
@@ -457,6 +539,9 @@ def _select_process_target(
         raise ValueError("cwd=skill_payload[/subdir] requires bucket and skill_name")
     candidate_records = _process_root_candidates(
         ctx, operation, bucket=bucket, skill_name=skill_name, include_skill=include_skill,
+        require_active=(reserved_root == "active_workspace" or (
+            not reserved_root and not is_absolute_path_text(text) and not text.startswith("~")
+        )),
     )
     allowed = [(label, root) for label, root, _source, _name in candidate_records]
     if not candidate_records:
@@ -591,28 +676,26 @@ def _resolve_target_in_selected_base(
             try:
                 path_text = candidate.relative_to(resolved_base).as_posix()
             except ValueError:
-                if root == "artifact_store" and operation in _READ_OPS:
-                    canonical = task_artifact_dir_path(
-                        canonical_data_root(ctx), task_id_for_artifacts(ctx), create=False,
-                    )
-                    try:
-                        relative = candidate.relative_to(canonical).as_posix()
-                    except ValueError:
-                        relative = ""
-                    if relative:
-                        anchored = delegated_capture_read_target(
-                            canonical_data_root(ctx), task_id_for_artifacts(ctx), relative, resolved_base,
-                        )
+                if operation in _READ_OPS:
+                    # Cross-prefix READS: the lineage rule (own id on every drive, the
+                    # parent's and the root's task files), then the ORPHAN capture rule,
+                    # which the custody authority alone answers.
+                    if lineage_read_base(ctx, root, candidate) is not None:
+                        return candidate
+                    if root == "artifact_store":
+                        from ouroboros.delegate_shared import orphan_capture_read_target
+
+                        anchored = orphan_capture_read_target(ctx, candidate)
                         if anchored is not None:
                             return anchored
         if is_absolute_path_text(path_text):
             raise ValueError(
-                f"absolute path {path!r} is outside selected root={root} ({resolved_base}); "
-                "use a path inside that root or select the corresponding resource "
-                "(root='user_files' for authorized external files)"
+                f"absolute path {path!r} is outside selected root={root} ({resolved_base}). "
+                f"Roots your profile can {operation}: "
+                f"{operation_roots(active_tool_profile(ctx), operation)}."
             )
     if root == "artifact_store" and operation in _READ_OPS:
-        # C1 delegated captures (CR1-2): written on the CANONICAL drive, read from
+        # Delegated captures and activity: written on the CANONICAL drive, read from
         # a CHILD drive_root — re-anchor (see `delegated_capture_read_target`).
         anchored = delegated_capture_read_target(
             canonical_data_root(ctx), task_id_for_artifacts(ctx),
@@ -677,6 +760,7 @@ def build_resolved_resource_binding(
         normalized == "runtime_data" and operation in {"write", "edit"}
     ) or (
         normalized == "active_workspace" and operation == "edit" and not workspace_active
+        and project_room_lens_dir(ctx) is None and folderless_scratch_dir(ctx) is None
     )
     if legacy_data_form:
         from ouroboros.contracts.skill_payload_policy import (
@@ -724,11 +808,7 @@ def build_resolved_resource_binding(
 
     source = str(normalized)
     selected_name = ""
-    room = (
-        project_room_lens_dir(ctx)
-        if normalized == "active_workspace" and operation in {"read", "list", "search", "shell"}
-        else None
-    )
+    room = project_room_lens_dir(ctx) if normalized == "active_workspace" else None
     if normalized == "skill_payload":
         selected_bucket = str(bucket or "").strip()
         selected_skill = str(skill_name or "").strip()
@@ -772,20 +852,24 @@ def build_resolved_resource_binding(
         path=path,
         operation=operation,
     )
-    # An absolute user_files target may intentionally land in the configured
-    # Deliverables container outside the user's ordinary home.  The binding's
-    # physical base must follow that selected container; otherwise an exact
-    # Presence path-prefix check treats a valid deliverable as outside the
-    # binding merely because the default user_files home is a sibling.
+    # The physical base follows the container holding the target: an absolute
+    # user_files target may land in the configured Deliverables container outside the
+    # home (else an exact Presence path-prefix check calls a valid deliverable outside
+    # the binding), and a lineage READ lands in the parent's or root's task root.
     logical_base_path = None
+    container = None
     if normalized == "user_files":
         try:
             deliverables = _deliverables_root()
             if path_is_relative_to(target, deliverables) or _path_is_relative_to_casefold(target, deliverables):
-                logical_base_path = pathlib.Path(base).resolve(strict=False)
-                base = deliverables
+                container = deliverables
         except (OSError, TypeError, ValueError, RuntimeError):
             pass
+    elif operation in _READ_OPS and not path_is_relative_to(target, base):
+        container = lineage_read_base(ctx, normalized, target)
+    if container is not None:
+        logical_base_path = pathlib.Path(base).resolve(strict=False)
+        base = container
     return ResolvedResourceBinding(
         profile=profile,
         root=normalized,

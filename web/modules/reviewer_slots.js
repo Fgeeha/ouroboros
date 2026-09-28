@@ -6,16 +6,16 @@
 // Shape rules are the owner's:
 //  * ONE flat picker per row (decision 1=B replaced the earlier two-level
 //    source+route pair): the roster rows from Available subagents lead as
-//    references, then the inline channels — "API model" plus one entry per
-//    login-capable harness — never the full flat model catalog (hundreds of
-//    options made the list unusable, finding #6). A referenced row's route/
+//    references, then the inline sources — one entry per subscription model
+//    source, one per API provider whose key is stored, one per login-capable
+//    harness — never the full flat model catalog (hundreds of options made the
+//    list unusable, finding #6). A referenced row's route/
 //    model/effort/account are shown as READ-ONLY derived facts (the roster
 //    stays their SSOT); the stored forms are mutually exclusive:
 //    {slot_id, route, effort} XOR {slot_id, subagent_id, effort}.
-//  * On the API route the model id is a FREE-TEXT input with a datalist of
-//    catalog suggestions — the same catalog-assisted entry the model cards
-//    use. On a harness route the MODEL is a dropdown fed by Claudexor
-//    discovery. No invalid combinations can be composed.
+//  * Model ids use the same editable chooser as Models and Available subagents.
+//    Source/account/effort remain short native selects. Catalogs suggest values;
+//    they never assign one or erase an undiscovered saved selection.
 //  * The provider shown for a delegated row is the HARNESS NAME (codex,
 //    claude, cursor, …) — never "Claudexor", and never a `provider::model`
 //    string syntax.
@@ -25,15 +25,18 @@
 // Pure helpers live at the top and are node-tested without a DOM.
 
 import { apiFetch } from './api_client.js';
-import { bindStatusSurface, boundedStatusRefresh, claudexorStatus } from './claudexor_status_store.js';
-import { harnessIdentityMarkup } from './harness_presentation.js';
+import { accountRows, bindStatusSurface, boundedStatusRefresh, claudexorStatus } from './claudexor_status_store.js';
+import { harnessIdentityMarkup, harnessPresentation } from './harness_presentation.js';
 import { formatRelativeAge, revealNewRow } from './ui_helpers.js';
 import * as routeEditor from './route_editor_primitives.js';
+import { sessionRouteVerdict } from './subagent_status_primitives.js';
 import {
     availableSubagentsLoadValue,
     parseAvailableSubagentsSetting,
 } from './subagents_settings.js';
 import { escapeHtmlAttr as escapeHtml } from './utils.js';
+import { modelChooserHtml, bindModelChoosers } from './model_chooser.js';
+import { mergeModelCatalog, catalogReadNote, mergeHarnessModelCatalog } from './settings_catalog.js';
 
 export const ROUTE_KIND_API = 'api_chat';
 export const ROUTE_KIND_SESSION = routeEditor.ROUTE_KIND_AGENT_SESSION;
@@ -41,12 +44,26 @@ export const ROUTE_KIND_SESSION = routeEditor.ROUTE_KIND_AGENT_SESSION;
 // Select-value prefix marking a configured-subagent reference in the one
 // flat reviewer picker (decision 1=B); everything else is a route choice.
 export const SUBAGENT_CHOICE_PREFIX = 'subagent:';
-// The route select's single API entry. The target model id never lives in
-// the select — display always matches the stored target (finding #6c: a
-// fresh row used to DISPLAY the first catalog model while storing '').
+// The legacy single API entry, kept as an accepted input spelling. Every
+// encoder now emits `api:<provider>`; the target model id never lives in the
+// select — display always matches the stored target (finding #6c: a fresh row
+// used to DISPLAY the first catalog model while storing '').
 export const API_ROUTE_CHOICE = routeEditor.API_ROUTE_CHOICE;
+export const API_CHOICE_PREFIX = routeEditor.API_CHOICE_PREFIX;
 
 export const EFFORT_CHOICES = routeEditor.EFFORT_CHOICES;
+
+export function reviewerProcessingInheritance(row, globalPreference, rolePreferences = null, resolved = {}) {
+    if (row.synthesizedFrom && !row.materialized) {
+        if (rolePreferences !== null) return rolePreferences.deep_review || globalPreference;
+        return resolved.deep_review_slot_1 ?? globalPreference;
+    }
+    return globalPreference;
+}
+
+function processingInheritance(row) {
+    return reviewerProcessingInheritance(row, state.processingPreference, state.roleProcessingPreferences, state.resolvedProcessingPreferences);
+}
 
 // ---------------------------------------------------------------------------
 // Pure helpers.
@@ -87,8 +104,14 @@ export function splitSessionTarget(target) {
 // owner's saved value is almost certainly still there. The two facets are
 // INDEPENDENT: a failed account read must not silence the catalog's own honest
 // verdict.
-export function routeChoiceGroups({ harnesses = [], currentChoice = '', catalogKnown = true, apiLabel } = {}) {
-    return routeEditor.routeChoiceGroups({ harnesses, currentChoice, catalogKnown, apiLabel });
+export function routeChoiceGroups({
+    harnesses = [], modelSources = [], providers = [], currentChoice = '',
+    catalogKnown = true, accountsKnown = true, providerProfiles = {},
+} = {}) {
+    return routeEditor.routeChoiceGroups({
+        harnesses, modelSources, providers, currentChoice,
+        catalogKnown, accountsKnown, providerProfiles,
+    });
 }
 
 export function indexProfilesByHarness(payload) {
@@ -96,13 +119,20 @@ export function indexProfilesByHarness(payload) {
 }
 
 // One index entry, whichever spelling it arrived in: the index emits
-// `{id, enabled}` objects; older call sites and tests still hand plain id
-// strings, which read as enabled (the same fail-open rule as the index).
+// `{id, enabled, name}` objects; older call sites and tests still hand plain id
+// strings, which read as enabled and named by their id (the same fail-open
+// rule as the index).
 function profileEntry(entry) {
     return routeEditor.profileEntry(entry);
 }
 
+// A direct api_chat TRIAD row's saved delivery (#1334); a row loaded without it is a
+// pre-#1334 packet row and stays bare unless the owner switches it.
+export const DELIVERY_NATIVE = 'native', DELIVERY_PACKET = 'packet';
+
 export function buildReviewerSlotsSetting(state) {
+    const triadOut = (row) => ({ ...rowOut(row), ...(!row.subagent_id && row.route?.kind !== ROUTE_KIND_SESSION
+        && [DELIVERY_NATIVE, DELIVERY_PACKET].includes(row.delivery) ? { delivery: row.delivery } : {}) });
     const rowOut = (row) => {
         // The two stored forms are mutually exclusive: a configured-subagent
         // reference never duplicates route knobs (the roster row is their
@@ -124,6 +154,7 @@ export function buildReviewerSlotsSetting(state) {
             }),
         };
         if (row.effort) out.effort = String(row.effort);
+        if (row.processing_preference) out.processing_preference = String(row.processing_preference);
         return out;
     };
     const advisory = state.advisory || {};
@@ -141,29 +172,25 @@ export function buildReviewerSlotsSetting(state) {
         // spellings) still parses server-side but is never WRITTEN again.
         advisoryOut = {
             enabled: advisory.enabled !== false,
-            route: { kind: advisory.route?.kind === ROUTE_KIND_SESSION ? ROUTE_KIND_SESSION : ROUTE_KIND_API,
-                     target_id: String(advisory.route?.target_id || '') },
+            route: routeEditor.serializeRouteSpec(advisory.route, {
+                apiKind: ROUTE_KIND_API, credentialField: 'profile_id',
+            }),
             effort: advisory.route?.kind === ROUTE_KIND_SESSION
                 ? String(advisory.effort || '') : (advisory.effort || 'low'),
         };
-        if (advisoryOut.route.kind === ROUTE_KIND_SESSION && advisory.route?.profile_id) {
-            advisoryOut.route.profile_id = String(advisory.route.profile_id);
-        }
+        if (advisory.processing_preference) advisoryOut.processing_preference = String(advisory.processing_preference);
     }
     const setting = {
-        triad: (state.triad || []).map(rowOut),
+        triad: (state.triad || []).map(triadOut),
         scope: (state.scope || []).map(rowOut),
         advisory: advisoryOut,
     };
-    // The deep self-review singleton is OPTIONAL server-side (absent = the
-    // packed row synthesized from OUROBOROS_MODEL_DEEP_SELF_REVIEW). An
-    // UNTOUCHED synthesized or empty placeholder (`materialized: false`) is
-    // OMITTED: the runtime then synthesizes the identical row, and an
-    // unrelated save never writes the key's value into the setting behind the
-    // owner's back. Editing the row (or loading a SAVED one) materializes it.
-    // Same two stored forms as every row, minus slot_id (fixed identity) and
-    // minus `enabled` (no standing gate to switch off).
-    if (state.deepReview && state.deepReview.materialized !== false) {
+    // First materialization of a default panel preserves its displayed deep row:
+    // synthesis may change once the panel has saved provenance. Unrelated Save
+    // still omits the whole untouched panel in reviewerSlotsSavePayload. Existing
+    // structured panels and repair placeholders keep their legacy omission.
+    if (state.deepReview && (state.deepReview.materialized !== false
+        || (state.source === 'default' && state.deepReview.synthesizedFrom))) {
         setting.deep_review = rowOut({ ...state.deepReview, slot_id: '' });
         delete setting.deep_review.slot_id;
     }
@@ -171,12 +198,12 @@ export function buildReviewerSlotsSetting(state) {
 }
 
 export function deepReviewMetaNotes(row) {
-    // The deep row's two owner-facing facts beside its badge: an untouched
-    // synthesized row is shown but not written, and a blanked model box is a
+    // The deep row's two owner-facing facts beside its badge: a synthesized
+    // row has not been saved yet, and a blanked model box is a
     // typed save refusal (owner fork 3 = A) — said HERE, before the 400.
     const notes = [];
     if (row?.synthesizedFrom && row.materialized === false) {
-        notes.push(`Not saved as a row yet — shown from ${row.synthesizedFrom}; edit it to store it as the deep_review row (an untouched row is not written)`);
+        notes.push(`Not saved as a row yet — shown from ${row.synthesizedFrom}; stored when edited or when the default panel is first saved`);
     }
     if (row?.materialized !== false && !row?.subagent_id && row?.route?.kind !== ROUTE_KIND_SESSION
         && !String(row?.route?.target_id || '').trim()) {
@@ -185,11 +212,12 @@ export function deepReviewMetaNotes(row) {
     return notes;
 }
 
-export function deepReviewDeliveryNote(row, { roster = [], rosterKnown = true, harnesses = {}, catalogKnown = true } = {}) {
-    // The deep-review row's ONE difference from the advisory, said where the
-    // owner picks: an API MODEL here is the packed review (one large-context
-    // call carrying the Atlas + memory), not an inspection episode; only a
-    // configured subagent on an API model runs the native episode.
+const DEEP_NATIVE_NOTE = 'Native inspection episode — reads the repository with host read-only tools (reads host-observed); the memory whitelist reaches it inline byte-exact';
+
+export function deepReviewDeliveryNote(row, { roster = [], rosterKnown = true, harnesses = {}, catalogKnown = true, routeStatus = true } = {}) {
+    // Delivery is the same class the advisory row picks from: an API MODEL —
+    // a bare route or a configured subagent — runs the bounded native
+    // inspection episode; an agent reads with its own tools in a session.
     if (row?.subagent_id) {
         const ref = (roster || []).find((item) => String(item.subagent_id || '') === String(row.subagent_id || ''));
         if (!ref) {
@@ -199,12 +227,12 @@ export function deepReviewDeliveryNote(row, { roster = [], rosterKnown = true, h
         }
         return ref.route?.kind === ROUTE_KIND_SESSION
             ? 'Agent session — reads the repository with its own tools (reads not host-observed); the memory whitelist reaches it inline byte-exact'
-            : 'Native inspection episode — reads the repository with host read-only tools (reads host-observed); the memory whitelist reaches it inline byte-exact';
+            : DEEP_NATIVE_NOTE;
     }
     if (row?.route?.kind === ROUTE_KIND_SESSION) {
-        return `${capabilityBadge(row, harnesses, { catalogKnown })} — reads not host-observed`;
+        return `${capabilityBadge(row, harnesses, { catalogKnown, routeStatus })} — reads not host-observed`;
     }
-    return 'One packed review — the repository Atlas plus the full memory whitelist in a single large-context call (the advisory’s API model runs an inspection episode instead)';
+    return DEEP_NATIVE_NOTE;
 }
 
 // ---------------------------------------------------------------------------
@@ -232,8 +260,8 @@ export function encodeReviewerChoice(row) {
 }
 
 export function reviewerChoiceGroups({
-    roster = [], rosterKnown = true, row = {}, harnesses = [],
-    catalogKnown = true, apiLabel,
+    roster = [], rosterKnown = true, row = {}, harnesses = [], modelSources = [],
+    providers = [], catalogKnown = true, accountsKnown = true, providerProfiles = {}, processingPreference = '',
 } = {}) {
     // Decision 1=B: ONE flat picker — the Available-subagents references lead
     // (facts-first labels, decision 2=A), then the inline channels. A saved
@@ -242,28 +270,23 @@ export function reviewerChoiceGroups({
     // its own choice down so an undiscovered harness stays displayable too.
     const groups = [];
     const savedId = String(row?.subagent_id || '');
-    const rosterOptions = subagentOptionsFor(roster, savedId, { rosterKnown })
+    const rosterOptions = subagentOptionsFor(roster, savedId, { rosterKnown, processingPreference })
         .map((option) => ({ ...option, value: SUBAGENT_CHOICE_PREFIX + option.value }));
     if (rosterOptions.length) {
         groups.push({ label: 'Available subagents', options: rosterOptions });
     }
     const currentChoice = savedId ? '' : encodeRouteChoice(row);
-    groups.push(...routeChoiceGroups({ harnesses, currentChoice, catalogKnown, apiLabel }));
+    groups.push(...routeChoiceGroups({
+        harnesses, modelSources, providers, currentChoice,
+        catalogKnown, accountsKnown, providerProfiles,
+    }));
     return groups;
 }
 
-export function subagentOptionLabel(row) {
-    const route = row?.route || {};
-    const parts = [`#${String(row?.subagent_id || '')}`];
-    if (route.kind === ROUTE_KIND_SESSION) {
-        const split = splitSessionTarget(route.target_id);
-        parts.push(split.harness || 'agent session');
-        if (split.model) parts.push(split.model);
-    } else {
-        parts.push('API');
-        if (route.target_id) parts.push(route.target_id);
-    }
-    if (row?.effort) parts.push(row.effort);
+export function subagentOptionLabel(row, handle = routeEditor.subagentHandle(row)) {
+    // The owner's row switch is a FACT, so it rides with the facts: after the
+    // caption it would read as part of the owner's own prose.
+    const facts = row?.enabled === false ? `${handle} · switched off` : handle;
     // Free text is a caption, never identity: one line, bounded, with the
     // characters that could visually reorder or break the facts stripped
     // (bidi controls, newlines).
@@ -274,24 +297,31 @@ export function subagentOptionLabel(row) {
     // Code POINTS, not UTF-16 units: a slice must never split a surrogate pair.
     const points = Array.from(use);
     const hint = points.length > 48 ? `${points.slice(0, 45).join('')}…` : use;
-    return parts.join(' · ') + (hint ? ` — ${hint}` : '');
+    return facts + (hint ? ` — ${hint}` : '');
 }
 
-export function subagentOptionsFor(roster, savedId, { rosterKnown = true } = {}) {
+export function subagentOptionsFor(roster, savedId, { rosterKnown = true, processingPreference = '' } = {}) {
     // Same survive-the-save rule as profileOptionsFor: the select's value must
     // EXIST as an option, or the browser silently redraws the row as the first
     // roster entry and the next Save really rewires the reviewer. And the
     // absence claim follows provenance: only a roster that was actually READ
     // may say a saved reference is not in it.
-    // Label contract (owner decision 2=A): DERIVED FACTS lead — channel first,
-    // then target and effort — so the delivery is visible BEFORE selection and
-    // free-text intent can never disguise it; the description is a trimmed,
-    // sanitized single-line caption after the facts.
-    const options = (roster || []).map((row) => ({
-        value: String(row.subagent_id || ''),
-        label: subagentOptionLabel(row),
-    }));
+    // Label contract: the row's HANDLE leads — its route target plus its own
+    // effective facets, the same name Ouroboros sees — so the delivery is visible
+    // BEFORE selection and no stored label can disguise it; the description is
+    // a trimmed, sanitized single-line caption after it. The stored id is the
+    // option VALUE only (the reviewer reference follows the row through it).
+    // An owner-disabled roster row is withdrawn from NEW choices (the parser
+    // refuses a fresh reference to it); an already-selected one stays visible
+    // and annotated rather than being silently cleared.
+    const handles = routeEditor.rosterHandles(roster, processingPreference);
     const saved = String(savedId || '');
+    const options = (roster || [])
+        .filter((row) => row.enabled !== false || String(row.subagent_id || '') === saved)
+        .map((row) => ({
+            value: String(row.subagent_id || ''),
+            label: subagentOptionLabel(row, handles.get(String(row.subagent_id || ''))),
+        }));
     if (saved && !options.some((option) => option.value === saved)) {
         options.push({
             value: saved,
@@ -301,7 +331,7 @@ export function subagentOptionsFor(roster, savedId, { rosterKnown = true } = {})
     return options;
 }
 
-export function describeSubagentReference(subagentId, roster, { rosterKnown = true } = {}) {
+export function describeSubagentReference(subagentId, roster, { rosterKnown = true, processingPreference = '' } = {}) {
     // The DERIVED facts, disclosed read-only (never editable knobs): the
     // roster row is the SSOT for a referenced reviewer's route/model/effort/
     // account, so this line only reports what that row says.
@@ -318,12 +348,18 @@ export function describeSubagentReference(subagentId, roster, { rosterKnown = tr
         const split = splitSessionTarget(route.target_id);
         parts.push(split.harness ? `${split.harness} session` : 'agent session');
         if (split.model) parts.push(split.model);
-        if (route.credential_profile_id) parts.push(`account ${route.credential_profile_id}`);
     } else {
-        parts.push(route.target_id ? `API model ${route.target_id}` : 'API model (unset)');
+        const fields = routeEditor.routeModelFields(route);
+        parts.push(fields.subscription ? `${fields.source} model · ${fields.model}`
+            : (route.target_id ? `API model ${route.target_id}` : 'API model (unset)'));
     }
+    if (routeEditor.routeSupportsAccount(route) && route.credential_profile_id) parts.push(`account ${route.credential_profile_id}`);
     if (row.effort) parts.push(`effort ${row.effort}`);
-    return `Runs as ${parts.join(' · ')} — from its roster row under Available subagents`;
+    parts.push(`processing ${routeEditor.processingIntentLabel(row.processing_preference, processingPreference)}`);
+    const off = row.enabled === false
+        ? '. That row is switched off, so this reference is refused at save rather than rerouted — choose another reviewer or turn the row back on'
+        : '';
+    return `Runs as ${parts.join(' · ')} — from its roster row under Available subagents${off}`;
 }
 
 export function describeLastExecution(entry) {
@@ -354,8 +390,76 @@ export function describeLastExecution(entry) {
     const deltas = Array.isArray(entry.capability_delta) ? entry.capability_delta.length : 0;
     if (deltas) parts.push(`${deltas} capability delta${deltas === 1 ? '' : 's'} disclosed`);
     const when = formatRelativeAge(Date.parse(entry.ts || ''), 'just now');
+    const processing = routeEditor.processingExecutionText(effective.processing || entry.processing);
+    if (processing) parts.push(processing);
     if (when) parts.push(when);
     return parts.join(' · ');
+}
+
+/**
+ * Whether the receipt was produced by a DIFFERENT route than the row now holds.
+ * A receipt older than the `requested` field carries no comparison subject, so
+ * it claims nothing: absence of evidence is not evidence of a change.
+ */
+export function lastRunRouteChanged(entry, row) {
+    const requested = entry?.requested;
+    if (!requested || typeof requested !== 'object') return false;
+    const wasReference = String(requested.subagent_id || '');
+    const isReference = String(row?.subagent_id || '');
+    if (wasReference || isReference) return wasReference !== isReference;
+    const wasSession = String(requested.route_kind || '') === ROUTE_KIND_SESSION;
+    const isSession = row?.route?.kind === ROUTE_KIND_SESSION;
+    if (wasSession !== isSession) return true;
+    // A session is bound to its harness; the model it ran is APPLIED evidence,
+    // not the row's assignment, so a model edit alone is not a route change.
+    if (wasSession) {
+        return splitSessionTarget(requested.session_target).harness
+            !== splitSessionTarget(row?.route?.target_id).harness;
+    }
+    return String(requested.model || '') !== String(row?.route?.target_id || '');
+}
+
+/** The earlier route, named the way the owner picked it. */
+function lastRunRanAs(entry, { harnesses = {}, modelSources = [], providerProfiles = {} } = {}) {
+    const requested = entry?.requested || {};
+    if (requested.subagent_id) {
+        // Named from the receipt's OWN recorded route, never from today's roster.
+        const session = String(requested.route_kind || '') === ROUTE_KIND_SESSION;
+        const handle = routeEditor.subagentHandle({
+            route: {
+                kind: requested.route_kind,
+                target_id: session ? requested.session_target : requested.model,
+                credential_profile_id: requested.profile_id,
+            },
+            effort: requested.effort, processing_preference: requested.processing_preference,
+        });
+        return handle ? `the configured subagent ${handle}` : 'a configured subagent';
+    }
+    if (String(requested.route_kind || '') === ROUTE_KIND_SESSION) {
+        const { harness } = splitSessionTarget(requested.session_target);
+        const label = harnessPresentation(harness, {
+            label: String(harnesses?.[harness]?.display_name || ''),
+        }).label;
+        return harness ? `a ${label} session` : 'an agent session';
+    }
+    const fields = routeEditor.routeModelFields(
+        { kind: ROUTE_KIND_API, target_id: String(requested.model || '') },
+        modelSources, { providerProfiles },
+    );
+    return fields.subscription
+        ? `a model on ${fields.sourceLabel || fields.source}`
+        : `an API model on ${fields.providerLabel}`;
+}
+
+/**
+ * The meta line's own prefix for a last-run receipt. A receipt earned under a
+ * route the row no longer holds is still shown — it is the last thing that
+ * really ran — but it may not read as evidence about the current assignment.
+ */
+export function lastRunMetaPrefix(entry, row, context = {}) {
+    return lastRunRouteChanged(entry, row)
+        ? `Last run, before this row changed (it ran as ${lastRunRanAs(entry, context)})`
+        : 'Last run';
 }
 
 function lastRunMetaTitle(entry) {
@@ -408,7 +512,7 @@ export function profileOptionsFor(profiles, savedPin, { accountsKnown = true } =
 }
 
 export function pinnedAccountWarning({ triad = [], scope = [], advisory = null, deepReview = null,
-                                       profilesByHarness = {}, accountsKnown = false } = {}) {
+                                       profilesByHarness = {}, modelSources = [], accountsKnown = false } = {}) {
     // A removed (or signed-out) account must not silently reroute the row that
     // pinned it. `profileOptionsFor` already keeps such a pin selectable, so
     // the row itself never changes under the owner — this is the ONE actionable
@@ -426,10 +530,11 @@ export function pinnedAccountWarning({ triad = [], scope = [], advisory = null, 
         // roster row is that route's SSOT, checked on its own surface.
         if (row?.subagent_id) continue;
         const route = row?.route || {};
-        if (route.kind !== ROUTE_KIND_SESSION) continue;
+        if (!routeEditor.routeSupportsAccount(route)) continue;
         const pin = String(route.profile_id || '');
         if (!pin) continue;
-        const harness = splitSessionTarget(route.target_id).harness;
+        const { harness } = routeEditor.routeModelFields(route, modelSources);
+        if (!harness) continue;
         if ((profilesByHarness[harness] || []).some((entry) => profileEntry(entry).id === pin)) continue;
         const label = `${harness} · ${pin}`;
         if (!missing.includes(label)) missing.push(label);
@@ -441,7 +546,9 @@ export function pinnedAccountWarning({ triad = [], scope = [], advisory = null, 
         + 'account or automatic rotation below, or sign that account back in under Accounts.';
 }
 
-export function capabilityBadge(row, harnessesById, { catalogKnown = true } = {}) {
+export function capabilityBadge(row, harnessesById, {
+    catalogKnown = true, modelSources = [], providerProfiles = {}, routeStatus = true,
+} = {}) {
     // DISPLAY-only facts: never a control (6.2).
     if (row.route.kind === ROUTE_KIND_SESSION) {
         // "route not discovered" is a claim about the ROUTE; with no successful
@@ -450,37 +557,44 @@ export function capabilityBadge(row, harnessesById, { catalogKnown = true } = {}
         if (!catalogKnown) return 'agent session — retrieves context with its own tools';
         const harness = harnessesById?.[splitSessionTarget(row.route.target_id).harness];
         const status = harness ? (harness.status || 'unknown') : 'not discovered';
-        return `agent session — retrieves context with its own tools · route ${status}`;
+        // The harness status tail yields to a row verdict: one availability claim per line.
+        return `agent session — retrieves context with its own tools${routeStatus ? ` · route ${status}` : ''}`;
     }
-    return 'API delivery';
+    // An API row names the credential it spends, not a generic channel: the
+    // owner chose a provider, so the badge says which key pays for the call.
+    const fields = routeEditor.routeModelFields(row.route, modelSources, { providerProfiles });
+    return fields.subscription ? 'Model call through subscription'
+        : `${fields.providerLabel} API key`;
+}
+
+/** The advisory's one delivery difference, said beside the row that picks it. */
+export function advisoryDeliveryNote(row, harnessesById, {
+    catalogKnown = true, modelSources = [], providerProfiles = {}, routeStatus = true,
+} = {}) {
+    const badge = capabilityBadge(row, harnessesById, { catalogKnown, modelSources, providerProfiles, routeStatus });
+    return row?.route?.kind === ROUTE_KIND_SESSION ? badge
+        : `${badge} — runs a bounded inspection episode`;
 }
 
 export function advisoryRouteTransition(prev, decoded, memory = {}) {
-    // Route-kind switching must not WIPE a stored target (finding #7c): the
-    // old handler wrote target_id:'' on every change, so flipping to a
-    // session and back — or just touching the select — silently discarded the
-    // saved advisory target on the next Save. Each kind remembers the last
-    // route it held; a kind the user returns to is restored, and the stored
-    // route only changes when the user actually picks something else.
+    // Restore each source's own model/account when the owner returns to it.
+    // A new source starts empty; it must not inherit another source's pin.
+    // Legacy api/session memory remains readable for existing callers.
+    //
+    // The key is the FULL encoded choice, provider included: memory is written
+    // under `encodeRouteChoice` (`api:openai`), so a bare `api` key looked up
+    // nothing and every return to an API provider silently dropped the target
+    // the owner had drafted for it.
     const current = (prev && typeof prev === 'object' && prev.kind)
         ? prev : { kind: ROUTE_KIND_API, target_id: '' };
-    const next = { ...memory };
-    if (decoded.kind === ROUTE_KIND_SESSION) {
-        const prevHarness = current.kind === ROUTE_KIND_SESSION
-            ? splitSessionTarget(current.target_id).harness : '';
-        if (prevHarness === decoded.harness) return { route: current, memory: next };
-        if (current.kind === ROUTE_KIND_SESSION) next.session = { ...current };
-        else next.api = { ...current };
-        const stash = next.session;
-        const route = (stash && splitSessionTarget(stash.target_id).harness === decoded.harness)
-            ? { ...stash }
-            : { kind: ROUTE_KIND_SESSION, target_id: decoded.harness };
-        return { route, memory: next };
-    }
-    if (current.kind !== ROUTE_KIND_SESSION) return { route: current, memory: next };
-    next.session = { ...current };
+    const choice = decoded.kind === ROUTE_KIND_SESSION ? `session:${decoded.harness}`
+        : decoded.source ? `subscription:${decoded.source}`
+            : `${API_CHOICE_PREFIX}${decoded.provider || routeEditor.DEFAULT_API_PROVIDER}`;
+    const next = { ...memory, [encodeRouteChoice({ route: current })]: { ...current } };
+    const stash = next[choice] || next[decoded.kind === ROUTE_KIND_SESSION ? 'session' : 'api'];
     return {
-        route: next.api ? { ...next.api } : { kind: ROUTE_KIND_API, target_id: '' },
+        route: stash && encodeRouteChoice({ route: stash }) === choice ? { ...stash }
+            : routeEditor.changeRouteChoice(current, choice, { apiKind: ROUTE_KIND_API }),
         memory: next,
     };
 }
@@ -491,6 +605,8 @@ export function advisoryRouteTransition(prev, decoded, memory = {}) {
 
 const state = {
     loaded: false,
+    loadedDraft: null,
+    loadedSetting: '',
     configError: '',
     loadError: '',
     source: '',
@@ -503,6 +619,17 @@ const state = {
     limits: { triad: 10, scope: 4, advisory: 1, deep_review: 1 },
     lastExecutions: {},
     catalogModels: [],
+    modelSources: [],
+    // The API providers this install can actually send to, and the setup
+    // contract's names for them. Both come from the loaded settings document
+    // (setReviewerSourceContext); an unread document offers no provider, so a
+    // saved one is rescued as "(no key)" rather than silently swapped.
+    providers: [],
+    providerProfiles: {},
+    modelCatalogNote: '',
+    processingPreference: '',
+    roleProcessingPreferences: null,
+    resolvedProcessingPreferences: {},
     harnesses: [],
     profilesByHarness: {},
     // The configured-subagent roster (OUROBOROS_SUBAGENTS items) the reference
@@ -517,8 +644,13 @@ const state = {
     // "(not in discovery)" label.
     catalogKnown: false,
     accountsKnown: false,
+    // The live session verdict reads accounts and quota, not just the catalog.
+    quotaKnown: false,
+    snapshot: null,
     store: claudexorStatus,
     disposers: [],
+    disposeChoosers: () => {},
+    saveAttempted: false,
     onChange: () => {},
 };
 
@@ -536,18 +668,23 @@ const SINGLETONS = {
     advisory: {
         attr: 'advisory', stateKey: 'advisory', lastKey: 'advisory_slot_1', ariaName: 'Advisory',
         rowId: 'reviewer-advisory-row', enabledToggle: true, apiEffortDefault: 'low', apiEffortLabel: 'low',
-        apiLabel: 'API model (inspection episode)', apiPlaceholder: 'provider/model-id — empty = default',
+        // An empty advisory model is legal (the route default decides), so the
+        // placeholder says that instead of dictating an id spelling.
+        modelPlaceholder: 'Empty uses the default model',
         memory: advisoryRouteMemory, badgeOnReference: false,
-        badge: (row) => capabilityBadge({ route: row.route || {} }, harnessesById(), { catalogKnown: state.catalogKnown }),
+        badge: (row, opts = {}) => advisoryDeliveryNote({ route: row.route || {} }, harnessesById(), {
+            catalogKnown: state.catalogKnown, modelSources: state.modelSources,
+            providerProfiles: state.providerProfiles, ...opts,
+        }),
         extraMeta: () => [],
     },
     deepReview: {
         attr: 'deep-review', stateKey: 'deepReview', lastKey: 'deep_review_slot_1', ariaName: 'Deep self-review',
         rowId: 'reviewer-deep-review-row', enabledToggle: false, apiEffortDefault: '', apiEffortLabel: 'deep self-review effort',
-        apiLabel: 'API model (one packed review)', apiPlaceholder: 'provider/model-id',
+        modelPlaceholder: 'Choose a model',
         memory: deepReviewRouteMemory, badgeOnReference: true, materializeOnEdit: true,
-        badge: (row) => deepReviewDeliveryNote(row, {
-            roster: state.roster, rosterKnown: state.rosterKnown, harnesses: harnessesById(), catalogKnown: state.catalogKnown,
+        badge: (row, opts = {}) => deepReviewDeliveryNote(row, {
+            roster: state.roster, rosterKnown: state.rosterKnown, harnesses: harnessesById(), catalogKnown: state.catalogKnown, ...opts,
         }),
         extraMeta: deepReviewMetaNotes,
     },
@@ -591,13 +728,13 @@ export function renderReviewerSlotsSection() {
                 Rows routed to a subscription never fall back to API spend: if every eligible window
                 is exhausted, the review waits for capacity. Commit, plan, scope, advisory, skill
                 review and task acceptance all follow their configured rows — task acceptance runs
-                the triad rows on their own delivery (API packet, configured-subagent inspection
-                episode, or agent session), so an all-subscription triad puts every substantive
+                the triad rows on their own delivery (API packet or native inspection,
+                configured-subagent inspection, or agent session), so an all-subscription triad puts every substantive
                 task's acceptance panel on the subscription as well.
             </div>
             <div id="reviewer-slots-error" class="ui-status" data-tone="error" hidden></div>
+            <div id="reviewer-model-catalog-status" class="ui-status" data-tone="warn" role="status" hidden></div>
             <div id="reviewer-slots-pins" class="settings-inline-status" data-tone="warn" hidden></div>
-            <datalist id="reviewer-api-model-catalog"></datalist>
             <div class="reviewer-slots-group">
                 <div class="reviewer-slots-head">
                     <h4 class="reviewer-slots-heading">Triad slots <span class="muted" id="reviewer-triad-limit" title="The commit gate's real ceiling"></span></h4>
@@ -610,9 +747,11 @@ export function renderReviewerSlotsSection() {
                     <h4 class="reviewer-slots-heading">Scope slots <span class="muted" id="reviewer-scope-limit" title="The scope pool's real width"></span></h4>
                     <button type="button" class="btn btn-default" id="btn-add-scope-slot">Add scope slot</button>
                 </div>
-                <div class="settings-inline-note">An agent row reads the repository with its own read-only tools instead of
-                    being handed one assembled pack. Its verdict is authoritative once that agent's context window is
-                    confirmed at 200K or more; Ouroboros does not attest which files the agent opened.</div>
+                <div class="settings-inline-note">Every scope row reads the repository itself instead of being handed one
+                    assembled pack. An API model runs a bounded inspection episode with host read-only tools, and
+                    Ouroboros records which sources it read. An agent reads with its own tools; those reads are
+                    recovered from the harness run journal when it records them, and disclosed as unobserved when it
+                    does not. Read coverage is diagnostic and does not invalidate the review.</div>
                 <div id="reviewer-scope-rows" class="reviewer-slot-rows"></div>
             </div>
             <div class="reviewer-slots-group">
@@ -626,16 +765,19 @@ export function renderReviewerSlotsSection() {
             </div>
             <div class="reviewer-slots-group">
                 <h4 class="reviewer-slots-heading">Deep self-review</h4>
-                <div class="settings-inline-note">
-                    Who runs <code>/review</code>, the whole-system review against BIBLE.md. An API model here
-                    receives ONE packed review — the repository Atlas plus the full memory whitelist in a single
-                    large-context call (unlike the advisory, whose API model runs an inspection episode). A
-                    configured subagent on an API model reads the repository itself in a native
-                    inspection episode with host-observed reads; an agent on your subscription reads it in its
+                <details class="settings-subsection">
+                <summary>How whole-system review works</summary>
+                <div class="settings-inline-note settings-subsection-body">
+                    Who runs <code>/review</code>, the whole-system review against BIBLE.md. Delivery is the same
+                    as the advisory's: an API model here — a model you name or a configured subagent — reads the
+                    repository itself in a bounded native
+                    inspection episode with host-observed reads, core rules supplied inline and reference books available on demand; an
+                    agent on your subscription reads it in its
                     own session (reads not host-observed). Either way the memory whitelist reaches the reviewer
                     inline byte-exact — memory is never receipt-checked. The row's effort outranks the Behavior-tab deep
                     self-review effort; every report starts with a provenance header naming the delivery.
                 </div>
+                </details>
                 <div id="reviewer-deep-review-row" class="reviewer-slot-rows"></div>
             </div>
         </div>
@@ -652,6 +794,12 @@ function selectHtml(attrs, groups, selected) {
     return routeEditor.selectHtml(attrs, groups, selected);
 }
 
+/** How a direct API triad row receives the work: it reads it, or it gets the packet. */
+export const deliverySelectHtml = (attrs, row) => selectHtml(attrs, [{ label: '', options: [
+    { value: DELIVERY_NATIVE, label: 'Reads the work itself' },
+    { value: DELIVERY_PACKET, label: 'Packet — for models without tool calling' },
+] }], row?.delivery === DELIVERY_NATIVE ? DELIVERY_NATIVE : DELIVERY_PACKET);
+
 function effortSelectHtml(attrs, selected, surfaceDefault) {
     // Compact closed state (owner feedback on field proportions): the wordy
     // "Default (scope review effort)" label made this select as wide as the
@@ -659,95 +807,179 @@ function effortSelectHtml(attrs, selected, surfaceDefault) {
     return routeEditor.effortSelectHtml(attrs, selected, surfaceDefault);
 }
 
+/**
+ * The chip names the SOURCE, never the channel alone (owner decision 4A): an
+ * API row says which provider serves it, a subscription row its model source,
+ * a session row the agent. The mark stays the harness's own.
+ */
 export function reviewerRouteIdentityMarkup(route, harnesses = {}, {
-    catalogKnown = false,
+    catalogKnown = false, modelSources = [], providerProfiles = {},
 } = {}) {
+    const fields = routeEditor.routeModelFields(route, modelSources, { providerProfiles });
+    const label = (descriptors) => routeEditor.sourceIdentityLabel(route, {
+        modelSources, providerProfiles, harnesses: descriptors,
+    });
+    if (fields.subscription) return harnessIdentityMarkup(fields.harness || fields.source, {
+        label: label([]), className: 'reviewer-slot-route-identity',
+    });
     if (route?.kind !== ROUTE_KIND_SESSION) {
         return harnessIdentityMarkup('api', {
             channel: 'api',
+            label: label([]),
             className: 'reviewer-slot-route-identity',
         });
     }
     const split = splitSessionTarget(route.target_id);
     const harness = harnesses?.[split.harness];
-    return harnessIdentityMarkup(split.harness, {
+    // A retained daemon name is evidence only while the catalog read is known;
+    // during a gap the presentation catalog supplies the stable product name.
+    const display = harnessPresentation(split.harness, {
         label: catalogKnown ? String(harness?.display_name || '') : '',
+    }).label;
+    return harnessIdentityMarkup(split.harness, {
+        label: label([{ id: split.harness, display_name: display }]),
         className: 'reviewer-slot-route-identity',
     });
 }
 
-function reviewerPickerHtml(attrs, row, { apiLabel } = {}) {
+function reviewerPickerHtml(attrs, row) {
     // The one flat reviewer picker (decision 1=B): roster references first,
-    // then the inline channels.
+    // then the inline sources.
     const groups = reviewerChoiceGroups({
         roster: state.roster,
         rosterKnown: state.rosterKnown,
         row,
         harnesses: state.harnesses,
+        modelSources: state.modelSources,
+        providers: state.providers,
+        providerProfiles: state.providerProfiles,
         catalogKnown: state.catalogKnown,
-        apiLabel,
+        accountsKnown: state.accountsKnown,
+        processingPreference: state.processingPreference,
     });
     return selectHtml(attrs, groups, encodeReviewerChoice(row));
 }
 
+function identityContext() {
+    return {
+        catalogKnown: state.catalogKnown,
+        modelSources: state.modelSources,
+        providerProfiles: state.providerProfiles,
+    };
+}
+
+/** The exact stored spelling, disclosed where it can inform but not instruct. */
+export function savedTargetNote(row) {
+    const route = row?.route || {};
+    if (route.kind === ROUTE_KIND_SESSION) return '';
+    const target = String(route.target_id || '').trim();
+    // An empty draft (`openai::` with no model yet) has nothing to disclose.
+    if (!target || !routeEditor.routeModelFields(route).model.trim()) return '';
+    return `stored as ${target}`;
+}
+
+/**
+ * The meta line: badge facts, then the stored id in its own span (patched live
+ * while the owner types a model), then the last-run projection.
+ */
+function metaLineHtml(parts, row, last) {
+    const saved = savedTargetNote(row);
+    const lastRun = lastRunParts(last, row);
+    return `<div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(parts.join(' · '))}<span data-saved-target>${saved ? escapeHtml(` · ${saved}`) : ''}</span>${lastRun.length ? escapeHtml(` · ${lastRun.join(' · ')}`) : ''}</div>`;
+}
+
+/** Keep the disclosed stored id current without repainting the row (and losing the caret). */
+function refreshSavedTarget(element, row) {
+    const span = element?.querySelector?.('[data-saved-target]');
+    if (!span) return;
+    const note = savedTargetNote(row);
+    span.textContent = note ? ` · ${note}` : '';
+}
+
+function lastRunParts(entry, row) {
+    if (!entry) return [];
+    const text = describeLastExecution(entry);
+    if (!text) return [];
+    return [`${lastRunMetaPrefix(entry, row, {
+        harnesses: harnessesById(),
+        modelSources: state.modelSources,
+        providerProfiles: state.providerProfiles,
+    })}: ${text}`];
+}
+
 function subagentIdentityMarkup(row) {
-    // Identity follows the DERIVED roster route: a session reference shows its
-    // harness, anything else the API channel — same shared markup direct rows use.
+    // Identity follows the DERIVED roster route without changing its delivery.
     const rosterRow = (state.roster || []).find(
         (item) => String(item.subagent_id || '') === String(row.subagent_id || ''));
-    const route = rosterRow?.route?.kind === ROUTE_KIND_SESSION
-        ? { kind: ROUTE_KIND_SESSION, target_id: rosterRow.route.target_id }
-        : { kind: ROUTE_KIND_API, target_id: '' };
-    return reviewerRouteIdentityMarkup(route, harnessesById(), { catalogKnown: state.catalogKnown });
+    const route = rosterRow?.route || { kind: ROUTE_KIND_API, target_id: '' };
+    return reviewerRouteIdentityMarkup(route, harnessesById(), identityContext());
+}
+
+/** Everything a status tick can change on screen: facets, catalogs, pins, and each session row's verdict. */
+export function repaintSignature(view = state) {
+    const rows = [...(view.triad || []), ...(view.scope || []), view.advisory, view.deepReview];
+    return JSON.stringify([view.catalogKnown, view.accountsKnown, view.quotaKnown, view.harnesses, view.profilesByHarness,
+        accountRows(view.snapshot), view.snapshot?.quota || [], rows.map((row) => sessionVerdictNote(row, view))]);
+}
+
+/** The same live verdict the Available-subagents cards show, for a session row. */
+export function sessionVerdictNote(row, view = state) {
+    if (row?.route?.kind !== ROUTE_KIND_SESSION) return '';
+    return sessionRouteVerdict(row, { snapshot: { ...(view.snapshot || {}), harnesses: view.harnesses },
+        catalogKnown: view.catalogKnown, accountsKnown: view.accountsKnown, quotaKnown: view.quotaKnown }).text;
 }
 
 function rowHtml(row, group) {
     const { catalogKnown, accountsKnown } = state;
+    const label = `${group === 'triad' ? 'Triad' : 'Scope'} reviewer ${categoryRows(group).indexOf(row) + 1}`;
     if (row.subagent_id) {
         const last = state.lastExecutions[row.slot_id];
-        const lastText = last ? describeLastExecution(last) : '';
-        const metaParts = [describeSubagentReference(row.subagent_id, state.roster, { rosterKnown: state.rosterKnown })];
-        if (lastText) metaParts.push(`Last run: ${lastText}`);
+        const metaParts = [
+            describeSubagentReference(row.subagent_id, state.roster, { rosterKnown: state.rosterKnown, processingPreference: state.processingPreference }),
+        ];
         return `
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
             ${subagentIdentityMarkup(row)}
             <div class="reviewer-slot-controls">
-                ${reviewerPickerHtml('data-slot-route aria-label="Reviewer"', row)}
-                ${effortSelectHtml('data-slot-effort aria-label="Reasoning effort"', row.effort || '', 'subagent default')}
+                ${reviewerPickerHtml(`data-slot-route aria-label="${label} source"`, row)}
+                ${effortSelectHtml(`data-slot-effort aria-label="${label} reasoning effort"`, row.effort || '', 'subagent default')}
                 <button type="button" class="btn btn-default" data-slot-remove title="Remove this slot">Remove</button>
             </div>
-            <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
+            ${metaLineHtml(metaParts, row, last)}
         </div>
     `;
     }
     const session = row.route.kind === ROUTE_KIND_SESSION;
-    const split = session ? splitSessionTarget(row.route.target_id) : { harness: '', model: '' };
-    const harness = session ? harnessesById()[split.harness] : null;
+    const split = routeEditor.routeModelFields(row.route, state.modelSources);
+    const harness = session ? routeEditor.accountScopedModelCatalog(harnessesById()[split.harness], row.route.profile_id) : null;
     const modelOptions = sessionModelOptions(harness, split.model, { catalogKnown });
-    const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
-    const profileOptions = profileOptionsFor(profiles, row.route.profile_id, { accountsKnown });
+    const profiles = state.profilesByHarness[split.harness] || [];
+    const profileOptions = profileOptionsFor(profiles, row.route.profile_id, { accountsKnown: accountsKnown && Boolean(split.harness) });
     const last = state.lastExecutions[row.slot_id];
-    const lastText = last ? describeLastExecution(last) : '';
-    // ONE quiet meta line per row (owner feedback): the delivery badge and the
-    // last-run projection share it; nothing is dropped — the raw route + ISO
-    // timestamp live in the tooltip.
-    const metaParts = [capabilityBadge(row, harnessesById(), { catalogKnown })];
+    // ONE quiet meta line per row (owner feedback): the delivery badge, the
+    // exact stored id and the last-run projection share it; nothing is dropped
+    // — the raw route + ISO timestamp live in the tooltip.
+    const verdict = sessionVerdictNote(row);
+    const metaParts = [capabilityBadge(row, harnessesById(), {
+        catalogKnown, modelSources: state.modelSources, providerProfiles: state.providerProfiles, routeStatus: !verdict,
+    }), verdict].filter(Boolean);
     const modelsGap = session ? modelsGapNote(harness, catalogKnown) : '';
     if (modelsGap) metaParts.push(modelsGap);
-    if (lastText) metaParts.push(`Last run: ${lastText}`);
     const surfaceDefault = CATEGORIES[group]?.surfaceDefault || 'review effort';
     return `
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
-            ${reviewerRouteIdentityMarkup(row.route, harnessesById(), { catalogKnown })}
+            ${reviewerRouteIdentityMarkup(row.route, harnessesById(), identityContext())}
             <div class="reviewer-slot-controls">
-                ${reviewerPickerHtml('data-slot-route aria-label="Reviewer"', row)}
-                ${session ? '' : `<input data-slot-custom-api list="reviewer-api-model-catalog" placeholder="provider/model-id" value="${escapeHtml(row.route.target_id || '')}" spellcheck="false" aria-label="API model id">`}
-                ${session ? selectHtml('data-slot-model aria-label="Harness model"', [{ label: '', options: modelOptions }], split.model) : ''}
-                ${session && profileOptions.length > 1 ? selectHtml('data-slot-profile aria-label="Credential account"', [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
-                ${effortSelectHtml('data-slot-effort aria-label="Reasoning effort"', row.effort, surfaceDefault)}
+                ${reviewerPickerHtml(`data-slot-route aria-label="${label} source"`, row)}
+                ${session ? modelChooserHtml(`data-slot-model aria-label="${label} agent model"`, split.model, `reviewer-${row.slot_id}-models`, modelOptions, { placeholder: 'Engine default model' })
+                    : routeEditor.routeModelInputHtml(`data-slot-custom-api aria-label="${label} model"`, row.route, state.catalogModels, `reviewer-${row.slot_id}-models`)}
+                ${routeEditor.routeSupportsAccount(row.route) ? selectHtml(`data-slot-profile aria-label="${label} account"`, [{ label: '', options: profileOptions }], row.route.profile_id || '') : ''}
+                ${effortSelectHtml(`data-slot-effort aria-label="${label} reasoning effort"`, row.effort, surfaceDefault)}
+                ${group === 'triad' && !session ? deliverySelectHtml(`data-slot-delivery aria-label="${label} delivery"`, row) : ''}
                 <button type="button" class="btn btn-default" data-slot-remove title="Remove this slot">Remove</button>
             </div>
-            <div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(metaParts.join(' · '))}</div>
+            ${routeEditor.processingDetailsHtml(`data-slot-processing aria-label="${label} processing"`, row.processing_preference, state.processingPreference)}
+            ${metaLineHtml(metaParts, row, last)}
         </div>
     `;
 }
@@ -761,18 +993,16 @@ function singletonHtml(spec) {
     const { catalogKnown, accountsKnown } = state;
     const a = spec.attr;
     const last = state.lastExecutions[spec.lastKey];
-    const lastText = last ? describeLastExecution(last) : '';
     const enabled = spec.enabledToggle
-        ? `<label class="local-toggle"><input type="checkbox" data-${a}-enabled ${row.enabled !== false ? 'checked' : ''}> Enabled</label>`
+        ? `<label class="local-toggle ui-field ui-field-inline"><input class="ui-checkbox" type="checkbox" data-${a}-enabled aria-label="${spec.ariaName} enabled" ${row.enabled !== false ? 'checked' : ''}> Enabled</label>`
         : '';
-    const meta = (parts) => `<div class="reviewer-slot-meta muted"${last ? ` title="${escapeHtml(lastRunMetaTitle(last))}"` : ''}>${escapeHtml(parts.join(' · '))}</div>`;
+    const meta = (parts) => metaLineHtml(parts, row, last);
     if (row.subagent_id) {
         const metaParts = [
-            describeSubagentReference(row.subagent_id, state.roster, { rosterKnown: state.rosterKnown }),
+            describeSubagentReference(row.subagent_id, state.roster, { rosterKnown: state.rosterKnown, processingPreference: state.processingPreference }),
             ...(spec.badgeOnReference ? [spec.badge(row)] : []),
             ...spec.extraMeta(row),
         ];
-        if (lastText) metaParts.push(`Last run: ${lastText}`);
         return `
         <div class="reviewer-slot-row" data-${a}-row>
             ${subagentIdentityMarkup(row)}
@@ -789,42 +1019,126 @@ function singletonHtml(spec) {
     // agent_session), labeled neutrally, never a vendor name (the retired
     // Claude-SDK 'api' kind is parse-only migration now).
     const session = row.route?.kind === ROUTE_KIND_SESSION;
-    const split = session ? splitSessionTarget(row.route.target_id) : { harness: '', model: '' };
+    const split = routeEditor.routeModelFields(row.route, state.modelSources);
     // Session branch: the SAME model-options fragment the triad rows use —
     // rewriting it here would lose the "(not in discovery)" guard and let a
     // Save with the daemon down erase the owner's model. Api branch: the same
     // catalog-assisted free-text entry the triad rows use.
-    const modelOptions = session
-        ? sessionModelOptions(harnessesById()[split.harness], split.model, { catalogKnown }) : [];
-    const profiles = session ? (state.profilesByHarness[split.harness] || []) : [];
-    const profileOptions = session
-        ? profileOptionsFor(profiles, row.route?.profile_id, { accountsKnown }) : [];
-    const metaParts = [spec.badge(row), ...spec.extraMeta(row)];
-    const modelsGap = session ? modelsGapNote(harnessesById()[split.harness], catalogKnown) : '';
+    const harness = routeEditor.accountScopedModelCatalog(harnessesById()[split.harness], row.route?.profile_id);
+    const modelOptions = session ? sessionModelOptions(harness, split.model, { catalogKnown }) : [];
+    const profiles = state.profilesByHarness[split.harness] || [];
+    const profileOptions = profileOptionsFor(profiles, row.route?.profile_id, { accountsKnown: accountsKnown && Boolean(split.harness) });
+    const verdict = sessionVerdictNote(row);
+    const metaParts = [spec.badge(row, { routeStatus: !verdict }), verdict, ...spec.extraMeta(row)].filter(Boolean);
+    const modelsGap = session ? modelsGapNote(harness, catalogKnown) : '';
     if (modelsGap) metaParts.push(modelsGap);
-    if (lastText) metaParts.push(`Last run: ${lastText}`);
     return `
         <div class="reviewer-slot-row" data-${a}-row>
-            ${reviewerRouteIdentityMarkup(row.route, harnessesById(), { catalogKnown })}
+            ${reviewerRouteIdentityMarkup(row.route, harnessesById(), identityContext())}
             <div class="reviewer-slot-controls">
                 ${enabled}
-                ${reviewerPickerHtml(`data-${a}-route aria-label="${spec.ariaName} reviewer"`, row, { apiLabel: spec.apiLabel })}
+                ${reviewerPickerHtml(`data-${a}-route aria-label="${spec.ariaName} reviewer"`, row)}
                 ${session
-                    ? selectHtml(`data-${a}-model aria-label="${spec.ariaName} harness model"`, [{ label: '', options: modelOptions }], split.model)
-                    : `<input data-${a}-api-model list="reviewer-api-model-catalog" placeholder="${spec.apiPlaceholder}" value="${escapeHtml(row.route?.target_id || '')}" spellcheck="false" aria-label="${spec.ariaName} model id">`}
-                ${session && profileOptions.length > 1 ? selectHtml(`data-${a}-profile aria-label="${spec.ariaName} credential account"`, [{ label: '', options: profileOptions }], row.route?.profile_id || '') : ''}
+                    ? modelChooserHtml(`data-${a}-model aria-label="${spec.ariaName} agent model"`, split.model, `${a}-models`, modelOptions, { placeholder: 'Engine default model' })
+                    : routeEditor.routeModelInputHtml(`data-${a}-api-model aria-label="${spec.ariaName} model"`, row.route, state.catalogModels, `${a}-models`, { placeholder: split.subscription ? 'Choose a model' : spec.modelPlaceholder })}
+                ${routeEditor.routeSupportsAccount(row.route) ? selectHtml(`data-${a}-profile aria-label="${spec.ariaName} credential account"`, [{ label: '', options: profileOptions }], row.route?.profile_id || '') : ''}
                 ${effortSelectHtml(
                     `data-${a}-effort aria-label="${spec.ariaName} effort"`,
                     session ? row.effort : (row.effort === spec.apiEffortDefault ? '' : row.effort),
                     session ? 'route default' : spec.apiEffortLabel,
                 )}
             </div>
+            ${routeEditor.processingDetailsHtml(`data-${a}-processing aria-label="${spec.ariaName} processing"`, row.processing_preference, processingInheritance(row))}
             ${meta(metaParts)}
         </div>
     `;
 }
 
-function renderRows() {
+function reviewerRowError(row, allowEmpty = false) {
+    const none = { message: '', field: '' };
+    if (row.subagent_id) return none;
+    const route = row.route || {};
+    if (row.processing_preference && !routeEditor.PROCESSING_CHOICES.includes(row.processing_preference)) return { message: 'Choose Standard, Fast, Economy or inherited processing.', field: 'processing' };
+    if (!allowEmpty && !String(route.target_id || '').trim()) return { message: 'Choose a model or reviewer source.', field: 'model' };
+    if (routeEditor.routeModelFields(route).subscription && !routeEditor.routeModelFields(route).model.trim()) return { message: 'Choose a subscription model.', field: 'model' };
+    const conflict = route.kind === ROUTE_KIND_SESSION
+        ? routeEditor.compoundSessionEffortConflict(route.target_id, row.effort) : '';
+    return conflict ? { message: `Reasoning effort conflicts with the model’s ${conflict} effort.`, field: 'effort' } : none;
+}
+
+function reviewerValidationRows(draft) {
+    return [
+        ...['triad', 'scope'].flatMap((group) => (draft[group] || []).map((row, index) => ({
+            row, key: row.slot_id, label: `${group === 'triad' ? 'Triad' : 'Scope'} reviewer ${index + 1}`,
+        }))),
+        ...(draft.advisory ? [{ row: draft.advisory, key: 'advisory', label: 'Advisory', allowEmpty: true }] : []),
+        ...(draft.deepReview && draft.deepReview.materialized !== false
+            ? [{ row: draft.deepReview, key: 'deep-review', label: 'Deep self-review' }] : []),
+    ];
+}
+
+export function reviewerSlotsDraftErrors(draft) {
+    if (!draft.loaded) return [];
+    const errors = ['triad', 'scope'].filter((group) => !draft[group]?.length)
+        .map((group) => `Add at least one ${group} reviewer.`);
+    for (const { row, label, allowEmpty } of reviewerValidationRows(draft)) {
+        const { message: error } = reviewerRowError(row, allowEmpty);
+        if (error) errors.push(`${label}: ${error}`);
+    }
+    return errors;
+}
+
+export function validateReviewerSlots() { return reviewerSlotsDraftErrors(state); }
+
+export function noteReviewerSlotsSaveAttempt() {
+    state.saveAttempted = true;
+    reviewerValidationRows(state).forEach(({ row }) => { row._uiAttempted = true; });
+    paintReviewerValidation();
+}
+
+function paintReviewerValidation() {
+    if (typeof document === 'undefined') return;
+    const section = document.getElementById('reviewer-slots-section');
+    if (!section) return;
+    for (const { row, key, allowEmpty } of reviewerValidationRows(state)) {
+        const el = [...section.querySelectorAll('[data-slot-id]')].find((node) => node.dataset.slotId === key)
+            || section.querySelector(`[data-${key}-row]`);
+        if (!el) continue;
+        const { message: error, field: invalidField } = row._uiAttempted ? reviewerRowError(row, allowEmpty) : { message: '', field: '' };
+        const processingSummary = el.querySelector('[data-processing-summary]');
+        if (processingSummary) processingSummary.textContent = routeEditor.processingIntentLabel(row.processing_preference, processingInheritance(row));
+        let message = el.querySelector('[data-reviewer-validation]');
+        if (!message) { message = document.createElement('div'); message.dataset.reviewerValidation = ''; message.className = 'ui-status ui-field-help'; el.appendChild(message); }
+        message.id = `reviewer-${key}-error`;
+        Object.assign(message, { textContent: error, hidden: !error });
+        message.dataset.tone = 'error';
+        el.toggleAttribute('data-invalid', Boolean(error));
+        const meta = el.querySelector('.reviewer-slot-meta');
+        if (meta) meta.id = `reviewer-${key}-meta`;
+        el.querySelectorAll('input, select').forEach((field) => {
+            field.setAttribute('aria-describedby', `${meta?.id || ''} ${message.id}`.trim());
+            const isModel = field.hasAttribute('data-model-chooser');
+            const isEffort = field.matches('[data-slot-effort], [data-advisory-effort], [data-deep-review-effort]');
+            const isProcessing = field.matches('[data-slot-processing], [data-advisory-processing], [data-deep-review-processing]');
+            field.setAttribute('aria-invalid', String(Boolean(error) && (invalidField === 'model' ? isModel : invalidField === 'processing' ? isProcessing : isEffort)));
+        });
+    }
+    if (state.saveAttempted && !state.loadError && !state.configError) {
+        const box = document.getElementById('reviewer-slots-error');
+        const errors = validateReviewerSlots();
+        if (box) Object.assign(box, { textContent: errors.join(' '), hidden: !errors.length });
+    }
+}
+
+function renderRows({ discoveryOnly = false } = {}) {
+    const catalogStatus = document.getElementById('reviewer-model-catalog-status');
+    if (catalogStatus) Object.assign(catalogStatus, { hidden: !state.modelCatalogNote, textContent: state.modelCatalogNote });
+    const active = document.activeElement;
+    const owner = active?.closest?.('.reviewer-slot-row');
+    const marker = owner && active.getAttributeNames().find((name) => name.startsWith('data-'));
+    const rowAttrs = owner ? [...owner.attributes].filter((attr) => attr.name.startsWith('data-')) : [];
+    const selection = marker && typeof active.selectionStart === 'number'
+        ? [active.selectionStart, active.selectionEnd] : null;
     const errorBox = document.getElementById('reviewer-slots-error');
     if (errorBox) {
         errorBox.hidden = !(state.configError || state.loadError);
@@ -848,6 +1162,26 @@ function renderRows() {
     const singles = Object.values(SINGLETONS).map((spec) => [spec, document.getElementById(spec.rowId)]);
     const boxes = Object.entries(CATEGORIES).map(([group, cat]) => [group, cat, document.getElementById(cat.rowsId)]);
     if (singles.some(([, box]) => !box) || boxes.some(([, , box]) => !box)) return;
+    const updateDiscovery = (current, html) => {
+        if (!current) return;
+        const template = document.createElement('template');
+        template.innerHTML = html;
+        const desired = template.content.firstElementChild;
+        routeEditor.updateRouteControlOptions(current, desired);
+        for (const selector of ['.reviewer-slot-meta', '.reviewer-slot-route-identity']) {
+            const before = current.querySelector(selector), after = desired.querySelector(selector);
+            if (before && after) { before.innerHTML = after.innerHTML; before.title = after.title; }
+        }
+    };
+    if (discoveryOnly) {
+        for (const [group, , box] of boxes) for (const row of categoryRows(group)) {
+            updateDiscovery([...box.querySelectorAll('[data-slot-id]')].find((node) => node.dataset.slotId === row.slot_id), rowHtml(row, group));
+        }
+        for (const [spec, box] of singles) updateDiscovery(box.firstElementChild, singletonHtml(spec));
+        paintReviewerValidation();
+        return;
+    }
+    state.disposeChoosers();
     for (const [group, cat, box] of boxes) {
         box.innerHTML = categoryRows(group).map((row) => rowHtml(row, group)).join('')
             || `<div class="muted">${cat.empty}</div>`;
@@ -859,12 +1193,16 @@ function renderRows() {
         if (addEl) addEl.disabled = categoryRows(group).length >= state.limits[cat.limitKey];
     }
     for (const [spec, box] of singles) box.innerHTML = singletonHtml(spec);
-    const datalist = document.getElementById('reviewer-api-model-catalog');
-    if (datalist) {
-        datalist.innerHTML = state.catalogModels
-            .map((id) => `<option value="${escapeHtml(id)}"></option>`).join('');
-    }
     bindRowEvents();
+    state.disposeChoosers = bindModelChoosers(document.getElementById('reviewer-slots-section'));
+    paintReviewerValidation();
+    if (marker) {
+        const row = [...document.querySelectorAll('.reviewer-slot-row')]
+            .find((element) => rowAttrs.every((attr) => element.getAttribute(attr.name) === attr.value));
+        const field = row?.querySelector(`[${marker}]`);
+        field?.focus({ preventScroll: true });
+        if (selection && field?.setSelectionRange) field.setSelectionRange(...selection);
+    }
 }
 
 function findRow(group, slotId) {
@@ -890,36 +1228,43 @@ function bindRowEvents() {
             }
             row.subagent_id = '';
             if (!row.route?.kind) row.route = { kind: ROUTE_KIND_API, target_id: '' };
-            const decoded = decodeRouteChoice(value);
-            if (decoded.kind === ROUTE_KIND_SESSION) {
-                const prevHarness = row.route.kind === ROUTE_KIND_SESSION
-                    ? splitSessionTarget(row.route.target_id).harness : '';
-                if (prevHarness !== decoded.harness) {
-                    row.route = { kind: ROUTE_KIND_SESSION, target_id: decoded.harness, profile_id: '' };
-                }
-            } else if (row.route.kind !== ROUTE_KIND_API) {
-                // A session spec is not an API model id: the input starts
-                // empty (placeholder visible), display matching state.
-                row.route = { kind: ROUTE_KIND_API, target_id: '' };
-            }
+            const next = advisoryRouteTransition(row.route, decodeRouteChoice(value), row.routeMemory);
+            row.route = next.route;
+            row.routeMemory = next.memory;
             renderRows();
             state.onChange();
         });
         rowEl.querySelector('[data-slot-custom-api]')?.addEventListener('input', (event) => {
-            row.route.target_id = String(event.target.value || '').trim();
+            const previous = encodeRouteChoice(row);
+            row.route.target_id = routeEditor.routeTargetFromModel(row.route, event.target.value);
+            if (previous !== encodeRouteChoice(row)) {
+                delete row.route.profile_id;
+                renderRows();
+            } else refreshSavedTarget(rowEl, row);
             state.onChange();
         });
-        rowEl.querySelector('[data-slot-model]')?.addEventListener('change', (event) => {
+        rowEl.querySelector('[data-slot-model]')?.addEventListener('input', (event) => {
             const split = splitSessionTarget(row.route.target_id);
             row.route.target_id = composeSessionTarget(split.harness, event.target.value);
             state.onChange();
         });
         rowEl.querySelector('[data-slot-profile]')?.addEventListener('change', (event) => {
             row.route.profile_id = String(event.target.value || '');
+            renderRows({ discoveryOnly: true });
             state.onChange();
         });
         rowEl.querySelector('[data-slot-effort]')?.addEventListener('change', (event) => {
             row.effort = String(event.target.value || '');
+            state.onChange();
+        });
+        // Only an explicit switch writes delivery; a model or account change never does.
+        rowEl.querySelector('[data-slot-delivery]')?.addEventListener('change', (event) => {
+            row.delivery = event.target.value === DELIVERY_NATIVE ? DELIVERY_NATIVE : DELIVERY_PACKET;
+            state.onChange();
+        });
+        rowEl.querySelector('[data-slot-processing]')?.addEventListener('change', (event) => {
+            if (event.target.value) row.processing_preference = event.target.value;
+            else delete row.processing_preference;
             state.onChange();
         });
         rowEl.querySelector('[data-slot-remove]')?.addEventListener('click', () => {
@@ -977,17 +1322,23 @@ function bindSingletonEvents(section, spec) {
     // Mirrors of the triad-row model/api/profile handlers. These controls
     // exist only on their own kind's branch of singletonHtml, so each
     // querySelector binds at most one of them per render.
-    el.querySelector(`[data-${a}-model]`)?.addEventListener('change', (event) => {
+    el.querySelector(`[data-${a}-model]`)?.addEventListener('input', (event) => {
         const split = splitSessionTarget(row.route?.target_id);
         row.route.target_id = composeSessionTarget(split.harness, event.target.value);
         edited();
     });
     el.querySelector(`[data-${a}-api-model]`)?.addEventListener('input', (event) => {
-        row.route.target_id = String(event.target.value || '').trim();
+        const previous = encodeRouteChoice(row);
+        row.route.target_id = routeEditor.routeTargetFromModel(row.route, event.target.value);
+        if (previous !== encodeRouteChoice(row)) {
+            delete row.route.profile_id;
+            renderRows();
+        } else refreshSavedTarget(el, row);
         edited();
     });
     el.querySelector(`[data-${a}-profile]`)?.addEventListener('change', (event) => {
         row.route.profile_id = String(event.target.value || '');
+        renderRows({ discoveryOnly: true });
         edited();
     });
     el.querySelector(`[data-${a}-effort]`)?.addEventListener('change', (event) => {
@@ -997,6 +1348,11 @@ function bindSingletonEvents(section, spec) {
         // route/roster-row default on a session or subagent reference.
         row.effort = selected
             || (row.subagent_id || row.route?.kind === ROUTE_KIND_SESSION ? '' : spec.apiEffortDefault);
+        edited();
+    });
+    el.querySelector(`[data-${a}-processing]`)?.addEventListener('change', (event) => {
+        if (event.target.value) row.processing_preference = event.target.value;
+        else delete row.processing_preference;
         edited();
     });
 }
@@ -1012,6 +1368,8 @@ function addRow(group) {
         route: { kind: ROUTE_KIND_API, target_id: '' },
         subagent_id: '',
         effort: '',
+        // #1334: a new API triad row reads the work itself; Packet is a choice.
+        ...(group === 'triad' ? { delivery: DELIVERY_NATIVE } : {}),
     });
     renderRows();
     // The Add button sits in the group's header while the new row lands at
@@ -1022,55 +1380,75 @@ function addRow(group) {
     state.onChange();
 }
 
-export async function reloadReviewerSlots() {
+// One projection for both persisted settings and the unsaved setup compiler.
+export function applyReviewerSlotsDraft(data) {
+    state.loadedDraft = structuredClone(data);
+    state.saveAttempted = false;
+    state.loadError = '';
+    state.configError = String(data.config_error || '');
+    state.source = String(data.source || '');
+    state.limits = data.limits || state.limits;
+    state.lastExecutions = data.last_executions || {};
+    state.resolvedProcessingPreferences = data.resolved_processing_preferences || {};
+    // Rows spread as-is so a subagent_id reference rides along; a direct
+    // route gets its own object. The advisory's non-session kind is
+    // normalized to the shared api_chat spelling here — the retired legacy
+    // 'api' (Claude-SDK) kind is parse-only server-side and this UI never
+    // writes it again.
+    const rowIn = (row) => ({ ...row, _uiAttempted: false, route: { ...(row.route || {}) } });
+    state.triad = Array.isArray(data.triad) ? data.triad.map(rowIn) : [];
+    state.scope = Array.isArray(data.scope) ? data.scope.map(rowIn) : [];
+    state.advisory = data.advisory ? rowIn(data.advisory) : state.advisory;
+    if (state.advisory.route?.kind !== ROUTE_KIND_SESSION) {
+        state.advisory.route = { ...(state.advisory.route || {}), kind: ROUTE_KIND_API };
+    }
+    // The deep self-review singleton: the server answers with the saved row
+    // or, unsaved, the row synthesized from the legacy model key (labeled
+    // so); beside a config_error that synthesized row is a legacy-derived
+    // REPAIR PLACEHOLDER — no row is effective until the setting is repaired.
+    // The label rides the state, never the saved bytes.
+    const deep = data.deep_review ? rowIn(data.deep_review) : {};
+    state.deepReview = {
+        route: deep.route?.kind === ROUTE_KIND_SESSION ? deep.route : { ...(deep.route || {}), kind: ROUTE_KIND_API },
+        effort: String(deep.effort || ''),
+        processing_preference: String(deep.processing_preference || ''),
+        subagent_id: String(deep.subagent_id || ''),
+        synthesizedFrom: String(deep.synthesized_from || ''),
+        // Only a SAVED row is materialized on load; a synthesized one (or
+        // no row at all, e.g. beside a config_error on an older server)
+        // stays synthesized until edited or its default panel is first saved.
+        materialized: Boolean(data.deep_review) && !deep.synthesized_from,
+    };
+    // Reload is an explicit discard: source drafts belong to this loaded form,
+    // never to a previous Settings document or a different account's choice.
+    for (const spec of Object.values(SINGLETONS)) {
+        for (const key of Object.keys(spec.memory)) delete spec.memory[key];
+        const route = state[spec.stateKey].route;
+        spec.memory[encodeRouteChoice({ route })] = { ...route };
+    }
+    // The VIEW loaded even when the saved value is invalid — that is exactly the
+    // state the owner repairs from, and treating it as "not loaded" made the
+    // save drop the repair (see collectReviewerSlots).
+    state.loaded = true;
+    // The panel exactly as loaded: an untouched shipped default is not written.
+    state.loadedSetting = buildReviewerSlotsSetting(state);
+    renderRows();
+}
+
+/** Explicit discard returns to the last loaded view, including unsaved defaults. */
+export function discardReviewerSlotsDraft() {
+    if (state.loadedDraft) applyReviewerSlotsDraft(state.loadedDraft);
+}
+
+export async function reloadReviewerSlots({ isCurrent = () => true } = {}) {
     try {
         const resp = await apiFetch('/api/reviewer-slots', { cache: 'no-store' });
         const data = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-        state.loadError = '';
-        state.configError = String(data.config_error || '');
-        state.source = String(data.source || '');
-        state.limits = data.limits || state.limits;
-        state.lastExecutions = data.last_executions || {};
-        // Rows spread as-is so a subagent_id reference rides along; a direct
-        // route gets its own object. The advisory's non-session kind is
-        // normalized to the shared api_chat spelling here — the retired legacy
-        // 'api' (Claude-SDK) kind is parse-only server-side and this UI never
-        // writes it again.
-        const rowIn = (row) => ({ ...row, route: { ...(row.route || {}) } });
-        state.triad = Array.isArray(data.triad) ? data.triad.map(rowIn) : [];
-        state.scope = Array.isArray(data.scope) ? data.scope.map(rowIn) : [];
-        state.advisory = data.advisory ? rowIn(data.advisory) : state.advisory;
-        if (state.advisory.route?.kind !== ROUTE_KIND_SESSION) {
-            state.advisory.route = { ...(state.advisory.route || {}), kind: ROUTE_KIND_API };
-        }
-        // Seed the per-kind route memory with the SAVED route, so switching
-        // the advisory select away and back restores it (finding #7c).
-        advisoryRouteMemory[state.advisory.route?.kind === ROUTE_KIND_SESSION ? 'session' : 'api']
-            = { ...(state.advisory.route || {}) };
-        // The deep self-review singleton: the server answers with the saved row
-        // or, unsaved, the row synthesized from the legacy model key (labeled
-        // so); beside a config_error that synthesized row is a legacy-derived
-        // REPAIR PLACEHOLDER — no row is effective until the setting is repaired.
-        // The label rides the state, never the saved bytes.
-        const deep = data.deep_review ? rowIn(data.deep_review) : {};
-        state.deepReview = {
-            route: deep.route?.kind === ROUTE_KIND_SESSION ? deep.route : { ...(deep.route || {}), kind: ROUTE_KIND_API },
-            effort: String(deep.effort || ''),
-            subagent_id: String(deep.subagent_id || ''),
-            synthesizedFrom: String(deep.synthesized_from || ''),
-            // Only a SAVED row is materialized on load; a synthesized one (or
-            // no row at all, e.g. beside a config_error on an older server)
-            // stays an omitted placeholder until the owner edits it.
-            materialized: Boolean(data.deep_review) && !deep.synthesized_from,
-        };
-        deepReviewRouteMemory[state.deepReview.route?.kind === ROUTE_KIND_SESSION ? 'session' : 'api']
-            = { ...(state.deepReview.route || {}) };
-        // The VIEW loaded even when the saved value is invalid — that is exactly the
-        // state the owner repairs from, and treating it as "not loaded" made the
-        // save drop the repair (see collectReviewerSlots).
-        state.loaded = true;
+        if (!isCurrent()) return;
+        applyReviewerSlotsDraft(data);
     } catch (error) {
+        if (!isCurrent()) return;
         // A transport failure is NOT a verdict on the saved configuration: the
         // config-error banner accuses the owner's settings of blocking review, and
         // a network blip must never say that. Separate field, separate sentence.
@@ -1088,7 +1466,7 @@ export async function reloadReviewerSlots() {
     // surface binding repaints these rows when the snapshot lands.
     await boundedStatusRefresh(state.store);
     adoptStatusSnapshot();
-    renderRows();
+    renderRows({ discoveryOnly: true });
 }
 
 function adoptStatusSnapshot() {
@@ -1099,8 +1477,11 @@ function adoptStatusSnapshot() {
     // sentence about it; a facet that WAS read keeps its authoritative list.
     state.catalogKnown = state.store.catalogKnown;
     state.accountsKnown = state.store.accountsKnown;
+    state.quotaKnown = state.store.quotaKnown;
     const snapshot = state.store.snapshot || {};
-    state.harnesses = state.catalogKnown && Array.isArray(snapshot.harnesses) ? snapshot.harnesses : [];
+    state.snapshot = snapshot;
+    state.harnesses = state.catalogKnown && Array.isArray(snapshot.harnesses)
+        ? snapshot.harnesses.map((harness) => mergeHarnessModelCatalog(state.harnesses.find((old) => old.id === harness.id), harness)) : state.harnesses;
     state.profilesByHarness = state.accountsKnown ? indexProfilesByHarness(snapshot) : {};
 }
 
@@ -1113,12 +1494,30 @@ export function adoptSubagentRoster(settings) {
     const parsed = parseAvailableSubagentsSetting(availableSubagentsLoadValue(settings));
     state.roster = parsed.setting ? parsed.setting.items : [];
     state.rosterKnown = Boolean(parsed.setting);
-    renderRows();
+    renderRows({ discoveryOnly: true });
+}
+
+/**
+ * The API providers this install can send to, derived from the SAME settings
+ * document the rows were loaded from (Settings) or the wizard's live draft.
+ * A masked secret such as `***set***` is a stored credential; only an absent
+ * or blank value withdraws a provider from the picker.
+ */
+export function setReviewerSourceContext({ settings = {}, providerProfiles = {} } = {}) {
+    state.providerProfiles = providerProfiles || {};
+    state.providers = routeEditor.configuredApiProviders(settings, state.providerProfiles);
+    if (typeof document !== 'undefined') renderRows({ discoveryOnly: true });
+}
+
+export function setReviewerProcessingPreference(value, rolePreferences) {
+    state.processingPreference = String(value || '');
+    if (rolePreferences !== undefined) state.roleProcessingPreferences = { ...rolePreferences };
+    if (typeof document !== 'undefined') renderRows({ discoveryOnly: true });
 }
 
 export function initReviewerSlots({ onChange, store = claudexorStatus } = {}) {
     destroyReviewerSlots();
-    state.onChange = typeof onChange === 'function' ? onChange : () => {};
+    state.onChange = () => { paintReviewerValidation(); if (typeof onChange === 'function') onChange(); };
     state.store = store;
     // Seed from whatever the shared store already holds, so a render triggered
     // before the first notify (the model-catalog event) is not rendered from a
@@ -1137,29 +1536,30 @@ export function initReviewerSlots({ onChange, store = claudexorStatus } = {}) {
         includeModels: true,
         listener: () => {
             adoptStatusSnapshot();
-            const next = JSON.stringify([state.catalogKnown, state.accountsKnown,
-                state.harnesses, state.profilesByHarness]);
+            const next = repaintSignature();
             if (next === signature) return;
             signature = next;
-            renderRows();
+            renderRows({ discoveryOnly: true });
         },
     }));
     for (const [group, cat] of Object.entries(CATEGORIES)) {
         document.getElementById(cat.addId)?.addEventListener('click', () => addRow(group));
     }
     const onCatalog = (event) => {
-        const items = event?.detail?.items || [];
-        state.catalogModels = items.map((item) => String(item.value || item.id || '')).filter(Boolean);
-        renderRows();
+        const catalog = mergeModelCatalog({ items: state.catalogModels, model_sources: state.modelSources }, event?.detail);
+        state.modelSources = catalog.model_sources;
+        state.catalogModels = catalog.items;
+        state.modelCatalogNote = catalogReadNote(catalog);
+        renderRows({ discoveryOnly: true });
     };
     document.addEventListener('settings-model-catalog:updated', onCatalog);
     state.disposers.push(() => document.removeEventListener('settings-model-catalog:updated', onCatalog));
-    // The initial load is driven by settings.js loadSettings(), which awaits
-    // reloadReviewerSlots() BEFORE taking the clean-draft baseline — otherwise
-    // the async arrival of the rows would read as an unsaved edit.
+    // Settings makes the loaded document usable immediately. Late reviewer
+    // enrichment updates its baseline only while that draft remains clean.
 }
 
 export function destroyReviewerSlots() {
+    state.disposeChoosers();
     for (const dispose of state.disposers.splice(0)) {
         try { dispose(); } catch (err) { /* a broken disposer must not block the rest */ }
     }
@@ -1169,14 +1569,17 @@ export function destroyReviewerSlots() {
 // Never author the setting from an UNLOADED view (an unrelated save must not
 // overwrite the owner's configuration with an empty page), and a transport
 // failure is not a verdict on the saved value either. But a LOADED view always
-// sends what it shows — including an empty triad/scope. The old empty-set
-// guard silently dropped the key, so deleting every row Saved "successfully"
-// while saving nothing; now the backend's own 400 («triad needs at least one
-// slot») surfaces through the existing failed-save status. Validation SSOT
-// stays on the backend — no client-side duplicate.
-export function reviewerSlotsSavePayload({ loaded = false, loadError = '', triad = [], scope = [], advisory, deepReview } = {}) {
+// serializes what it shows, including empty groups. Settings validates the
+// current draft before submitting; this pure serializer never hides invalid
+// rows. Backend validation remains authoritative for every other caller.
+// An UNTOUCHED shipped default panel (`source: 'default'`, unchanged since load) is omitted
+// like the deep-review placeholder: an unrelated save never materializes it (#1334).
+export function reviewerSlotsSavePayload({ loaded = false, loadError = '', source = '', loadedSetting = '',
+    triad = [], scope = [], advisory, deepReview } = {}) {
     if (loadError || !loaded) return {};
-    return { OUROBOROS_REVIEWER_SLOTS: buildReviewerSlotsSetting({ triad, scope, advisory, deepReview }) };
+    const setting = buildReviewerSlotsSetting({ source, triad, scope, advisory, deepReview });
+    if (source === 'default' && loadedSetting && setting === loadedSetting) return {};
+    return { OUROBOROS_REVIEWER_SLOTS: setting };
 }
 
 export function collectReviewerSlots() {

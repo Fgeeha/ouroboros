@@ -173,7 +173,7 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
     version = (pathlib.Path(__file__).resolve().parent.parent / "VERSION").read_text(encoding="utf-8").strip()
     assert f"GATEWAY_CONTRACT_VERSION = '{version}'" in text
     settings_meta_fields = {
-        "custom_secret_keys", "setup_contract", "available_subagents",
+        "custom_secret_keys", "setup_contract", "available_subagents", "policy_state", "restart_state",
     }
     assert settings_meta_fields <= set(SettingsMeta.__annotations__)
     assert _js_typedef_fields(text, "SettingsMeta") == settings_meta_fields
@@ -360,22 +360,28 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
 
     assert UpdatePreflightResponse.__required_keys__ == frozenset({"merge_plan"})
     # In-flight turn ABI: field-set parity alone would accept requiredness
-    # drift. Snapshot rows always emit every field (required); typing frames
+    # drift. Snapshot rows always emit the base fields (required); typing frames
     # stamp the typed fields only for registry-tracked turns (optional).
     # (__required_keys__ ignores NotRequired on some 3.10 setups, so inspect
     # the declared annotations instead.)
-    assert _notrequired_fields(ActiveDirectTurn) == set(), (
-        "ActiveDirectTurn snapshot rows always emit every field: keep them all required"
+    assert _notrequired_fields(ActiveDirectTurn) == {"model_waits", "task_attempt"}, (
+        "ActiveDirectTurn keeps its required base; waits and attempt are optional live-owner facts"
     )
-    assert _notrequired_fields(ActiveChatActivity) == set(), (
-        "ActiveChatActivity snapshot rows always emit every field: keep them all required"
-    )
-    assert get_type_hints(ActiveChatActivity, include_extras=True) == get_type_hints(ActiveDirectTurn, include_extras=True), (
+    assert _notrequired_fields(ActiveChatActivity) == {
+        "model_waits", "task_attempt", "required_question", "required_question_unavailable",
+    }, "ActiveChatActivity keeps the same required base and optional wait/attempt/question facts"
+    activity_fields = get_type_hints(ActiveChatActivity, include_extras=True)
+    question_keys = {"required_question", "required_question_unavailable"}
+    assert {key: value for key, value in activity_fields.items() if key not in question_keys} == get_type_hints(ActiveDirectTurn, include_extras=True), (
         "ActiveChatActivity must mirror ActiveDirectTurn's field shape so one client reducer hydrates both"
     )
     from ouroboros.gateway.schema import json_schema_for
 
-    assert json_schema_for(ActiveChatActivity) == json_schema_for(ActiveDirectTurn), (
+    activity_schema = json_schema_for(ActiveChatActivity)
+    assert activity_schema["properties"].pop("required_question")["type"] == "object"
+    assert activity_schema["properties"].pop("required_question_unavailable")["type"] == "boolean"
+    assert not question_keys & set(activity_schema["required"])
+    assert activity_schema == json_schema_for(ActiveDirectTurn), (
         "the shared activity shape must preserve flat keys, types and requiredness"
     )
     assert _notrequired_fields(TypingOutbound) == {
@@ -383,8 +389,10 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "project_thread",
     }, "TypingOutbound typed fields are stamped only for registry-tracked turns: keep them optional"
     turn_decl = re.search(r"@typedef \{Object\} ActiveDirectTurn\b([\s\S]*?)\*/", text)
-    assert turn_decl and not re.search(r"@property \{[^}]*=\}", turn_decl.group(1)), (
-        "ActiveDirectTurn browser mirror must declare every field required"
+    assert turn_decl and set(re.findall(
+        r"@property \{[^}]*=\} (\w+)", turn_decl.group(1)
+    )) == {"model_waits", "task_attempt"}, (
+        "ActiveDirectTurn browser mirror keeps wait/attempt facts optional"
     )
     typing_decl = re.search(r"@typedef \{Object\} TypingOutbound\b([\s\S]*?)\*/", text)
     assert typing_decl
@@ -422,6 +430,14 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "artifact_status",
     ):
         assert re.search(rf"@property \{{string=\}} {field}\b", text), f"ChatOutbound missing {field}"
+    # The HOST names where a task-keyed System row belongs inside the task's card, so the
+    # browser reads one typed fact instead of keeping its own list of system types. Pin the
+    # literal set and the row identity beside it in BOTH mirrors: a placement only one side
+    # knows is a row the client silently drops back beside the card.
+    card_row_hint = get_type_hints(ChatOutbound, include_extras=True)["card_row"]
+    assert get_args(get_args(card_row_hint)[0]) == ("timeline", "reviews")
+    assert re.search(r'@property \{"timeline"\|"reviews"=\} card_row\b', text), "ChatOutbound missing card_row"
+    assert re.search(r"@property \{string=\} card_row_id\b", text), "ChatOutbound missing card_row_id"
     assert re.search(r"@property \{\?number=\} accounted_upper_bound_usd\b", text), (
         "ChatOutbound accounted_upper_bound_usd must be nullable"
     )
@@ -448,7 +464,10 @@ def test_gateway_contract_endpoint_index_matches_router_and_types(tmp_path):
         "action",
         "target",
         "target_label",
+        "project_id",
+        "project_chat_id",
         "routing_token",
+        "cause",
         "status",
         "options",
         "attachment_manifest",
@@ -618,7 +637,8 @@ def test_decision_comment_limit_and_optional_index_pinned_across_python_and_js()
         name for name, annotation in DecisionRequest.__annotations__.items()
         if (getattr(annotation, "__forward_arg__", None) or str(annotation)).startswith("NotRequired[")
     }
-    assert optional == {"option_index", "comment"}
+    assert optional == {"option_index", "comment", "revision", "action", "auto_continue",
+                        "model", "credential_profile_id", "use_local", "persist_role"}
     request_decl = re.search(r"@typedef \{Object\} DecisionRequest\b([\s\S]*?)\*/", text)
     assert request_decl
     assert "@property {number=} option_index" in request_decl.group(1)
@@ -645,3 +665,32 @@ def test_max_link_actions_pinned_across_python_and_js():
     match = re.search(r"^export const MAX_LINK_ACTIONS = (\d+);", text, flags=re.MULTILINE)
     assert match, "api_types.js missing MAX_LINK_ACTIONS"
     assert int(match.group(1)) == _MAX_LINK_ACTIONS
+
+
+def test_quiz_option_recommendation_is_an_additive_optional_field_in_both_languages():
+    """The asker marks its recommendation on the option itself (owner batch 1, Q7=B):
+    QuizOption grows by ONE optional field in the frozen gateway contract and its
+    api_types.js typedef mirror; nothing is renamed or removed and no version moves."""
+    from ouroboros.gateway.contracts import QuizOption
+
+    optional = {
+        name for name, annotation in QuizOption.__annotations__.items()
+        if (getattr(annotation, "__forward_arg__", None) or str(annotation)).startswith("NotRequired[")
+    }
+    assert set(QuizOption.__annotations__) == {"label", "detail", "recommended"} and optional == {"detail", "recommended"}
+    text = (pathlib.Path(__file__).resolve().parent.parent / "web" / "modules" / "api_types.js").read_text(
+        encoding="utf-8"
+    )
+    option_decl = re.search(r"@typedef \{Object\} QuizOption\b([\s\S]*?)\*/", text)
+    assert option_decl and "@property {boolean=} recommended" in option_decl.group(1)
+
+
+def test_cost_presentation_has_a_closed_nullable_wire_shape():
+    from typing import get_args, get_type_hints
+    from ouroboros.cost_projection import CostPresentation
+
+    hints = get_type_hints(CostPresentation)
+    assert set(hints) == {'scope', 'tracked_amount', 'has_unpriced', 'tracked_final', 'accounting_open', 'has_rows'}
+    assert set(get_args(hints['scope'])) == {'own', 'root_tree'}
+    assert _contains_none(hints['tracked_amount'])
+    assert _contains_none(get_type_hints(ChatOutbound, include_extras=True)['cost_presentation'])

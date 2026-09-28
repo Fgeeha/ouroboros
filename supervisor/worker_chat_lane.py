@@ -1,7 +1,12 @@
-"""The direct and ephemeral chat lanes, and the resume after a restart.
+"""The direct chat lane and its resume after a restart.
 
-A chat turn runs on the single long-lived agent under its own lock; an ephemeral
-turn gets a throwaway one. Both are refused while the repo-writer gate is closed
+Each chat turn owns a fresh native agent and a registered execution. A turn
+is admitted (``_admit_chat_task``: the seed, the census registration, the
+actor, the start receipt) and then executed (``_execute_chat_task``); the
+owner's message runs both in one call (``handle_chat_direct``), while a
+self-initiated wake-up (``handle_wake_direct``) admits synchronously and
+answers with a typed receipt before the body runs on its own thread.
+Turns are refused while the repo-writer gate is closed
 for a DESTRUCTIVE update window (apply/replace prologue, materialization,
 rollback), so a managed update never races a turn that could touch the checkout
 mid-reset. While the ONE authorized assisted resolver holds the repository
@@ -18,10 +23,9 @@ from __future__ import annotations
 import logging
 import json
 import pathlib
-import sys
 import time
 import uuid
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Callable, Dict, Optional, Tuple, Union
 from supervisor.state import append_jsonl
 from ouroboros.utils import utc_now_iso
 
@@ -78,6 +82,14 @@ def conversation_admitted_during_update(gate_reason: str) -> bool:
     if reason.startswith("managed_update_tx:"):
         return True
     return reason == assisted_writer_gate_reason(tx)
+
+
+def wake_gate_open() -> bool:
+    """The owner-conversation gate for a consciousness wake-up, WITHOUT the owner's lock
+    notice: a refused wake is the alarm's typed ``repo_writer_gate_closed``, retried quietly,
+    never a "🔒" line in Main at every attempt."""
+    reason = _pool().repo_writer_admission_closed()
+    return not reason or conversation_admitted_during_update(reason)
 
 
 def owner_conversation_admitted(chat_id: int) -> bool:
@@ -143,16 +155,12 @@ def handle_chat_direct(
     task_constraint: Optional[dict] = None,
     task_metadata: Optional[dict] = None,
 ) -> None:
-    with _pool()._chat_agent_lock:
-        if not owner_conversation_admitted(chat_id):
-            return
-        _handle_chat_direct_locked(
-            chat_id,
-            text,
-            image_data,
-            task_constraint=task_constraint,
-            task_metadata=task_metadata,
-        )
+    if not owner_conversation_admitted(chat_id):
+        return
+    _handle_chat_direct_locked(
+        chat_id, text, image_data,
+        task_constraint=task_constraint, task_metadata=task_metadata,
+    )
 
 
 def _handle_chat_direct_locked(
@@ -167,18 +175,18 @@ def _handle_chat_direct_locked(
     try:
         remaining = budget_remaining(load_state(), strict=True)
     except Exception:
-        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta)
+        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta, role="system", system_type="task_admission_notice")
         return
     if remaining <= 0:
         try:
-            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta)
+            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta, role="system", system_type="task_admission_notice")
         except Exception:
             pass
         return
 
     _run_chat_task(
-        _pool()._get_chat_agent(), chat_id, text, image_data,
-        task_constraint=task_constraint, task_metadata=task_metadata, ephemeral=False,
+        None, chat_id, text, image_data,
+        task_constraint=task_constraint, task_metadata=task_metadata,
     )
 
 
@@ -192,7 +200,7 @@ def _host_operation_failure(metadata: Optional[dict]) -> dict:
 
 
 def _broadcast_task_named(msg: dict) -> None:
-    """Bridge broadcast callback for the proactive namer (kept tiny + fail-soft)."""
+    """Bridge broadcast callback for admission naming (kept tiny + fail-soft)."""
     try:
         from supervisor.message_bus import get_bridge
 
@@ -208,15 +216,37 @@ def _run_chat_task(
     image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None,
     task_constraint: Optional[dict] = None,
     task_metadata: Optional[dict] = None,
-    *,
-    ephemeral: bool = False,
 ) -> None:
     """Build the direct-chat task and run it on the given agent, draining events.
 
-    ``ephemeral`` marks a SHORT-LIVED same-route turn (run on a separate agent
-    instance while the shared chat agent is busy): it carries _ephemeral_turn so
-    the task pipeline skips long-term memory / reflection / evolution writes."""
-    task: Optional[dict] = None
+    Main/Project turns use the full native task/result/delivery lifecycle:
+    admission (``_admit_chat_task``) then execution (``_execute_chat_task``)."""
+    admitted = _admit_chat_task(
+        agent, chat_id, text, image_data,
+        task_constraint=task_constraint, task_metadata=task_metadata,
+    )
+    if admitted is not None:
+        _execute_chat_task(admitted)
+
+
+def _admit_chat_task(
+    agent: Any,
+    chat_id: int,
+    text: str,
+    image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None,
+    task_constraint: Optional[dict] = None,
+    task_metadata: Optional[dict] = None,
+) -> Optional[Dict[str, Any]]:
+    """Build and REGISTER one direct turn; ``None`` when it was refused.
+
+    Everything that happens before the model runs: the seed task, the census
+    registration under the repo-writer gate (one transaction with the update
+    owner), the actor, the origin/attachment/project layering, the task
+    contract and the authoritative start receipt. The returned bundle is a
+    registered execution that ``_execute_chat_task`` MUST run (it owns the
+    unregister); a refusal or an admission failure has already unregistered
+    itself and, for a failure, reported it to the chat.
+    """
     client_msg_id = ""
     if task_metadata:
         _cmid_ref = task_metadata.get("origin_message_ref")
@@ -224,7 +254,7 @@ def _run_chat_task(
             client_msg_id = str(_cmid_ref.get("client_message_id") or "")
         if not client_msg_id:
             client_msg_id = str(task_metadata.get("client_message_id") or "")
-    kind = "ephemeral_decision" if ephemeral else "direct_chat"
+    kind = "direct_chat"
     task: Dict[str, Any] = {
         "id": uuid.uuid4().hex[:8],
         "type": "task",
@@ -232,15 +262,51 @@ def _run_chat_task(
         "text": text,
         "_is_direct_chat": True,
     }
+    from supervisor.active_activity import get_direct_activity_registry
+
+    registry = get_direct_activity_registry()
+    # Close/check/register is one short transaction with the update owner.
+    # The registered execution includes agent construction, attachment staging,
+    # the whole native lifecycle and event delivery, not just its LLM rounds.
+    from ouroboros.consciousness_authority import is_consciousness_origin
+
+    quiet = is_consciousness_origin(task_metadata)  # a wake: the alarm reports the refusal, not the chat
+    with _pool()._repo_writer_gate_lock:
+        if not (wake_gate_open() if quiet else owner_conversation_admitted(chat_id)):
+            return None
+        activity = registry.register(
+            task["id"], chat_id,
+            client_message_id=client_msg_id,
+            project_id=str((task_metadata or {}).get("project_id") or ""),
+            kind=kind, origin_message_ref=(task_metadata or {}).get("origin_message_ref"),
+            actor=agent,
+        )
+    admitted: Dict[str, Any] = {
+        "task": task, "agent": agent, "activity": activity, "registry": registry,
+        "chat_id": chat_id, "client_msg_id": client_msg_id, "kind": kind,
+        "task_metadata": task_metadata,
+    }
     try:
+        if agent is None:
+            agent = _pool()._get_chat_agent()
+            activity.actor = agent
+            admitted["agent"] = agent
+        from ouroboros.consciousness_authority import apply_consciousness_authority
         from ouroboros.contracts.task_contract import attach_task_contract
 
-        if ephemeral:
-            task["_ephemeral_turn"] = True
         if task_constraint:
             task["task_constraint"] = dict(task_constraint)
         if task_metadata:
             task["metadata"] = dict(task_metadata)
+            if task_metadata.get("late_answer") is not None:
+                # A LATE quiz answer: the owner's row holds only their words; the
+                # model reads the card they answered, rebuilt from the stored
+                # block (disclosed when unreadable) -- the one shared builder.
+                from ouroboros.owner_quiz import late_answer_model_text
+
+                task["text"] = late_answer_model_text(
+                    _pool().DRIVE_ROOT, task_metadata.get("late_answer"), str(text or ""),
+                )
             # The ingress-captured origin identity rides on the TASK RECORD so a
             # later post-hoc "Turn into project" reads it from the persisted
             # result instead of re-deriving identity from content.
@@ -296,8 +362,9 @@ def _run_chat_task(
                     chat_id,
                     f"⚠️ Task not started: every attachment was rejected.\n{rendered}",
                     **_host_operation_failure(task_metadata),
-                )
-                return
+                    role="system", system_type="attachment_notice")
+                registry.unregister(task["id"])
+                return None
             from ouroboros.artifacts import attachment_manifest_projection
             authority = attachment_manifest_projection(_pool().DRIVE_ROOT, str(task["id"]), manifest)
             rendered = _render_attachment_lines(authority)
@@ -306,7 +373,7 @@ def _run_chat_task(
                     chat_id,
                     "⚠️ Some declared attachments could not be staged; the task "
                     f"starts with the rest.\n{rendered}",
-                )
+                    role="system", system_type="attachment_notice")
             if manifest:
                 manifest = [dict(row) for row in manifest]
                 task["drive_root"] = str(_pool().DRIVE_ROOT)
@@ -323,7 +390,7 @@ def _run_chat_task(
         # A rejected initial UI task must leave no partial project assignment.
         # Bind only after all declared attachments have passed admission.
         pid = str(task.get("project_id") or "").strip()
-        if pid and not ephemeral:
+        if pid:
             try:
                 from ouroboros.projects_registry import bind_task_to_project
 
@@ -337,150 +404,270 @@ def _run_chat_task(
                 _pool()._report_binding_failure(task["id"], pid, exc, path="direct_project_turn")
         if not task["text"]:
             task["text"] = "(image attached)" if image_data else ""
-        # Cluster B: proactively coin a project name for a fresh MAIN-CHAT direct card
-        # (not an ephemeral decision turn, not an already-bound project-thread task) so
-        # the card shows a human title up front and turn-into-project reuses it.
-        if not ephemeral and not task.get("project_id"):
-            from ouroboros.project_naming import spawn_proactive_namer
-
-            spawn_proactive_namer(
-                _pool().DRIVE_ROOT, str(task["id"]), task["text"], broadcast=_broadcast_task_named
-            )
+        # A Main turn is named lazily: the turn queue below fires the namer on
+        # the first non-addressing tool call (owner decision Q7=A, 16.09), so a
+        # greeting costs no naming call and a working turn gets a title as its
+        # block becomes the task card. A Project-room turn is named by its room.
+        # Managed promotes keep their admission names
+        # (worker_promotion._admitted_suggested_name).
+        # A consciousness wake-up derives its level's disabled_tools and mode cap
+        # here, before the contract reads them (consciousness_authority).
+        apply_consciousness_authority(task)
         attach_task_contract(task)
 
-        pid = str(task.get("project_id") or "")
+        # Announce the authoritative start immediately (owner decision 2A):
+        # the client's `Sending...` retires on this receipt (once the census
+        # read it triggers has answered), not on a socket echo; the census row
+        # carries the same activity<->client_message_id link, and a turn the
+        # census never lists is still settled by that read.
+        try:
+            from supervisor.message_bus import get_bridge
 
-        from supervisor.active_activity import track_direct_activity
+            get_bridge().send_chat_action(
+                int(chat_id or 0),
+                "typing",
+                activity_id=str(task["id"]),
+                client_message_id=client_msg_id,
+                phase="thinking",
+                kind=kind,
+            )
+        except Exception:
+            log.debug("Direct-turn start typing announce failed", exc_info=True)
+    except Exception as e:
+        _report_direct_chat_error(admitted, e)
+        registry.unregister(task["id"])
+        return None
+    return admitted
 
-        with track_direct_activity(
-            activity_id=str(task["id"]),
-            chat_id=int(chat_id or 0),
-            client_message_id=client_msg_id,
-            project_id=pid,
-            kind=kind,
-            phase="thinking",
-            origin_message_ref=task.get("origin_message_ref"),
-        ):
-            # Announce the authoritative start immediately (owner decision 2A):
-            # the client's `Sending...` retires on this frame, not on a socket
-            # echo, and the frame carries the activity<->client_message_id link
-            # so even a turn that fails before its first LLM round concludes
-            # cleanly via its keyed error final.
+
+def _execute_chat_task(admitted: Dict[str, Any]) -> bool:
+    """Run a registered direct turn to its end, draining its events.
+
+    Returns True when the actor's run and the event hand-off completed, False
+    when the runner failed (the failure has been reported to the chat). The
+    registry entry is released here, whichever way the turn ends.
+    """
+    task, agent, chat_id = admitted["task"], admitted["agent"], admitted["chat_id"]
+    registry = admitted["registry"]
+    ok = False
+    try:
+        # The turn's live emits (loop_llm_call and friends publish
+        # straight to the agent's event queue DURING handle_task) and its
+        # returned events can be consumed after this registry entry is gone:
+        # stamp the authoritative chat identity before handing them off.
+        on_first_work = None
+        if not task.get("project_id"):
+            from ouroboros.project_naming import spawn_turn_namer
+
+            on_first_work = lambda: spawn_turn_namer(  # noqa: E731
+                _pool().DRIVE_ROOT, str(task["id"]), task["text"], broadcast=_broadcast_task_named,
+            )
+        turn_queue = _TurnEventQueue(
+            _pool().get_event_q(), task["id"], chat_id,
+            initiator=str((admitted.get("task_metadata") or {}).get("initiator") or ""),
+            on_first_work=on_first_work,
+        )
+        prev_queue = getattr(agent, "_event_queue", None)
+        agent._event_queue = turn_queue
+        try:
+            events = agent.handle_task(task)
+        finally:
+            agent._event_queue = prev_queue
+        # An exact budget pause of THIS turn is parked here, in-process and
+        # synchronously, while the registry entry below still owns the id (#1196).
+        # The turn's ``budget_pause`` event carries its own task record (a direct
+        # turn was never in RUNNING). Handing that event to the supervisor loop
+        # and unregistering the actor races: between the unregister and the park
+        # the SAME id is nowhere — not live, not queued — and a restart in that
+        # window fences a saved pause. The direct lane runs inside the supervisor
+        # process, so it parks the record itself through the ONE park owner
+        # (``events_budget.install_exact_budget_pause``) against the same queue
+        # state, under the queue lock, and drops the event from the hand-off. A
+        # park that fails leaves the event on the ordinary path (typed, logged),
+        # never a silently lost pause. Either way the turn's LOCAL dispatch fence
+        # is released: the actor has unwound and the durable row (parked here or
+        # by the supervisor loop) owns the hold, so a fence left closed in this
+        # process would refuse the resumed turn's sends under the same id. Every
+        # other event passes through unchanged.
+        remaining: list = []
+        for event in list(events or []):
+            checkpoint = ((event.get("resource_limit") or {}).get("checkpoint")
+                          if isinstance(event, dict) and isinstance(event.get("resource_limit"), dict) else None)
+            if not (isinstance(event, dict) and str(event.get("type") or "") == "budget_pause"
+                    and event.get("_is_direct_chat") and isinstance(checkpoint, dict)):
+                remaining.append(event)
+                continue
+            task_id = str(event.get("task_id") or task.get("id") or "")
+            try:
+                from types import SimpleNamespace
+
+                from supervisor import queue as queue_mod
+                from supervisor.events_budget import install_exact_budget_pause
+                from supervisor.message_bus import get_bridge
+
+                pool = _pool()
+                shim = SimpleNamespace(
+                    RUNNING=pool.RUNNING, PENDING=pool.PENDING, WORKERS=pool.WORKERS, DRIVE_ROOT=pool.DRIVE_ROOT,
+                    sort_pending=queue_mod.sort_pending, persist_queue_snapshot=queue_mod.persist_queue_snapshot,
+                    bridge=get_bridge(),
+                )
+                install_exact_budget_pause(shim, task_id, checkpoint, evt=event, source="direct_turn_inline_park")
+                append_jsonl(
+                    pool.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+                    {"ts": utc_now_iso(), "type": "direct_turn_budget_pause_parked_inline",
+                     "task_id": task_id, "chat_id": event.get("chat_id"),
+                     "pause_id": str(checkpoint.get("pause_id") or "")},
+                )
+            except Exception:
+                log.error("Direct turn %s could not be parked inline; its pause event takes the ordinary path",
+                          task_id, exc_info=True)
+                remaining.append(event)
+            finally:
+                from ouroboros.budget_pause import end_dispatch_fence
+
+                end_dispatch_fence(task_id)  # quiescent actor unwound; the durable row owns the dispatch hold
+        for e in remaining:
+            _pool().get_event_q().put(turn_queue.stamp(e))
+        ok = True
+    except Exception as e:
+        _report_direct_chat_error(admitted, e)
+    finally:
+        registry.unregister(task["id"])
+    return ok
+
+
+def _report_direct_chat_error(admitted: Dict[str, Any], e: BaseException) -> None:
+    """Record a direct-turn failure and conclude the turn in the chat."""
+    import traceback
+    task, chat_id, kind = admitted["task"], admitted["chat_id"], admitted["kind"]
+    client_msg_id, task_metadata = admitted["client_msg_id"], admitted.get("task_metadata")
+    err_msg = f"⚠️ Error: {type(e).__name__}: {e}"
+    append_jsonl(
+        _pool().DRIVE_ROOT / "logs" / "supervisor.jsonl",
+        {
+            "ts": utc_now_iso(),
+            "type": "direct_chat_error",
+            "task_id": str(task.get("id") or ""),
+            "chat_id": int(chat_id or 0),
+            "error": repr(e),
+            "traceback": str(traceback.format_exc())[:2000],
+        },
+    )
+    try:
+        # Key the error final with the turn's activity id so the client
+        # concludes exactly this turn (active set, 4A) instead of leaving
+        # its `Sending.../Thinking...` state to an unkeyed sweep. If the
+        # failure happened before the start announce was broadcast, announce
+        # it first: the receipt's census read settles the linked `Sending...`
+        # and the keyed final right after concludes the turn's census row.
+        failed_task_id = str(task.get("id") or "") if isinstance(task, dict) else ""
+        if failed_task_id and client_msg_id:
             try:
                 from supervisor.message_bus import get_bridge
 
                 get_bridge().send_chat_action(
                     int(chat_id or 0),
                     "typing",
-                    activity_id=str(task["id"]),
+                    activity_id=failed_task_id,
                     client_message_id=client_msg_id,
                     phase="thinking",
                     kind=kind,
                 )
             except Exception:
-                log.debug("Direct-turn start typing announce failed", exc_info=True)
-            # The turn's live emits (loop_llm_call and friends publish
-            # straight to the agent's event queue DURING handle_task) and its
-            # returned events are both drained after the registry entry is
-            # gone: route them through the turn-scoped addressing proxy.
-            turn_queue = _TurnEventQueue(_pool().get_event_q(), task["id"], chat_id)
-            prev_queue = getattr(agent, "_event_queue", None)
-            agent._event_queue = turn_queue
-            try:
-                events = agent.handle_task(task)
-            finally:
-                agent._event_queue = prev_queue
-            for e in events:
-                _pool().get_event_q().put(turn_queue.stamp(e))
-    except Exception as e:
-        import traceback
-        err_msg = f"⚠️ Error: {type(e).__name__}: {e}"
-        append_jsonl(
-            _pool().DRIVE_ROOT / "logs" / "supervisor.jsonl",
-            {
-                "ts": utc_now_iso(),
-                "type": "direct_chat_error",
-                "task_id": str(task.get("id") or ""),
-                "chat_id": int(chat_id or 0),
-                "error": repr(e),
-                "traceback": str(traceback.format_exc())[:2000],
-            },
-        )
-        try:
-            # Key the error final with the turn's activity id so the client
-            # concludes exactly this turn (active set, 4A) instead of leaving
-            # its `Sending.../Thinking...` state to an unkeyed sweep. If the
-            # failure happened before the start announce was broadcast, the
-            # client has no activity<->client_message_id link yet, so announce
-            # it first: the keyed final right after then retires both the
-            # activity and its linked `Sending...` submission.
-            failed_task_id = str(task.get("id") or "") if isinstance(task, dict) else ""
-            if failed_task_id and client_msg_id:
-                try:
-                    from supervisor.message_bus import get_bridge
-
-                    get_bridge().send_chat_action(
-                        int(chat_id or 0),
-                        "typing",
-                        activity_id=failed_task_id,
-                        client_message_id=client_msg_id,
-                        phase="thinking",
-                        kind=kind,
-                    )
-                except Exception:
-                    log.debug("Failed-turn typing announce failed", exc_info=True)
-            failure_meta = _host_operation_failure(task_metadata)
-            progress_meta = {"task_terminal_status": "failed"}
-            if failure_meta:
-                progress_meta["origin_message_ref"] = failure_meta["progress_meta"]["origin_message_ref"]
-            _pool().send_with_budget(
-                chat_id,
-                err_msg,
-                task_id=failed_task_id,
-                progress_meta=progress_meta,
-            )
-        except Exception:
-            log.debug("Suppressed exception", exc_info=True)
+                log.debug("Failed-turn typing announce failed", exc_info=True)
+        failure_meta = _host_operation_failure(task_metadata)
+        progress_meta = {"task_terminal_status": "failed"}
+        if failure_meta:
+            progress_meta["origin_message_ref"] = failure_meta["progress_meta"]["origin_message_ref"]
+        initiator = str((task_metadata or {}).get("initiator") or "")
+        if initiator:
+            progress_meta["initiator"] = initiator
+        _pool().send_with_budget(
+            chat_id,
+            err_msg,
+            task_id=failed_task_id,
+            progress_meta=progress_meta,
+            role="system", system_type="task_error")
+    except Exception:
+        log.debug("Suppressed exception", exc_info=True)
 
 
-def handle_chat_ephemeral(
+def handle_wake_direct(
     chat_id: int,
     text: str,
-    image_data: Optional[Union[Tuple[str, str], Tuple[str, str, str]]] = None,
-    task_constraint: Optional[dict] = None,
-    task_metadata: Optional[dict] = None,
-) -> None:
-    """The "turn = decision" path (v6.33.0 WS10): when the shared chat agent is
-    busy, a new main-chat message runs as a SHORT-LIVED turn on a SEPARATE agent
-    instance — bypassing _chat_agent_lock so it never freezes/injects into the
-    running turn, while keeping the SAME ROUTE (same make_agent config: model /
-    mode / effort, not a cheaper lane). Ephemeral turns are serialized among
-    themselves and are barred from long-term memory/reflection/evolution writes."""
-    from supervisor.state import budget_remaining, load_state
-    failure_meta = _host_operation_failure(task_metadata)
-    try:
-        remaining = budget_remaining(load_state(), strict=True)
-    except Exception:
-        _pool().send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", **failure_meta)
-        return
-    if remaining <= 0:
-        try:
-            _pool().send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", **failure_meta)
-        except Exception:
-            pass
-        return
-    if not getattr(sys, 'frozen', False):
-        sys.path.insert(0, str(_pool().REPO_DIR))
-    from ouroboros.agent import make_agent
+    task_metadata: Optional[dict],
+    on_finished: Optional[Callable[[str, bool], None]] = None,
+    bind_input: Optional[Callable[[Dict[str, Any]], None]] = None,
+) -> Dict[str, Any]:
+    """Start a self-initiated Main turn (a consciousness wake-up) as an
+    ordinary direct turn, and answer with a typed receipt.
 
-    with _pool()._ephemeral_chat_lock:
-        if not owner_conversation_admitted(chat_id):
-            return
-        agent = make_agent(repo_dir=str(_pool().REPO_DIR), drive_root=str(_pool().DRIVE_ROOT), event_queue=_pool().get_event_q())
-        _run_chat_task(
-            agent, chat_id, text, image_data,
-            task_constraint=task_constraint, task_metadata=task_metadata, ephemeral=True,
-        )
+    The same gates as ``handle_chat_direct`` decide admission, but a refused
+    wake gets ``{"admitted": False, "task_id": "", "reason": <typed>}``
+    synchronously instead of a chat notice. An admitted wake is REGISTERED
+    before this returns (the census lists it, Stop reaches it, the liveness
+    read sees it) and its body runs on a daemon thread; the receipt carries
+    the registered ``task_id``. ``on_finished(task_id, ok)`` fires once the
+    turn has ended, ``ok=False`` when the runner failed, so the alarm clock
+    can back off after a failure too. The wake's ``task_metadata`` (its
+    origin label, ledger category, reason, autonomy level, model role) rides
+    verbatim on ``task["metadata"]``; nothing here pauses or resumes the
+    legacy background loop. ``bind_input(task)`` runs once the wake is
+    registered (its id exists) and before its thread starts — the alarm binds
+    its immutable observation source there; a binder failure leaves the
+    complete text as the wake's only input.
+    """
+    if not wake_gate_open():
+        return {"admitted": False, "task_id": "", "reason": "repo_writer_gate_closed"}
+    from supervisor.state import budget_remaining, control_is, load_state
+    from ouroboros.consciousness import panic_blocks_wake
+
+    current = load_state()
+    if panic_blocks_wake(_pool().DRIVE_ROOT) or not control_is(current, "bg_consciousness_enabled", True):
+        return {"admitted": False, "task_id": "", "reason": "consciousness_disabled_or_unknown"}
+    try:
+        remaining = budget_remaining(current, strict=True)
+    except Exception:
+        return {"admitted": False, "task_id": "", "reason": "cost_accounting_unavailable"}
+    if remaining <= 0:
+        return {"admitted": False, "task_id": "", "reason": "budget_exhausted"}
+    admitted = _admit_chat_task(
+        None, int(chat_id), str(text or ""), None,
+        task_constraint=None, task_metadata=dict(task_metadata or {}),
+    )
+    if admitted is None:
+        # The gate can close between the check above and the registration — a silent
+        # refusal, nothing in the chat; every other None the lane already reported.
+        reason = "repo_writer_gate_closed" if not wake_gate_open() else "admission_failed"
+        return {"admitted": False, "task_id": "", "reason": reason}
+    task_id = str(admitted["task"]["id"])
+    if bind_input is not None:
+        try:
+            bind_input(admitted["task"])
+        except Exception:
+            log.warning("wake %s input binding failed; the complete text stays its input", task_id, exc_info=True)
+
+    def _run() -> None:
+        ok = False
+        try:
+            ok = _execute_chat_task(admitted)
+        finally:
+            if on_finished is not None:
+                try:
+                    on_finished(task_id, ok)
+                except Exception:
+                    log.debug("wake on_finished callback failed", exc_info=True)
+
+    import threading
+
+    try:
+        threading.Thread(target=_run, name=f"wake-turn-{task_id}", daemon=True).start()
+    except Exception:
+        # A registered turn nobody runs would read as a live owner turn forever.
+        log.warning("wake turn %s could not start its thread", task_id, exc_info=True)
+        admitted["registry"].unregister(task_id)
+        return {"admitted": False, "task_id": "", "reason": "admission_failed"}
+    return {"admitted": True, "task_id": task_id, "reason": ""}
 
 
 def auto_resume_after_restart() -> None:
@@ -498,19 +685,31 @@ def auto_resume_after_restart() -> None:
             except Exception:
                 log.debug("Failed to consume owner restart compatibility flag", exc_info=True)
             log.info("Owner restart flag detected — skipping auto-resume.")
-            return
+            if not (_pool().DRIVE_ROOT / "state" / "panic_stop.flag").exists():
+                return  # a kept Panic flag still owes its durable controls below
 
-        # Panic/owner-restart flags suppress auto-resume and are consumed.
+        # Panic/owner-restart flags suppress auto-resume. The Panic flag is consumed
+        # only AFTER its disabled controls are durably known in state (#1307): if that
+        # write fails, the flag stays and every boot grant keeps reading it.
         panic_flag = _pool().DRIVE_ROOT / "state" / "panic_stop.flag"
         if panic_flag.exists():
+            from ouroboros.server_control import PANIC_CONTROL_KEYS, _panic_controls
+            from supervisor.state import StateUnavailable, update_state
+
+            try:
+                update_state(_panic_controls, confirm=PANIC_CONTROL_KEYS)
+            except StateUnavailable as exc:
+                log.warning("Panic flag kept: its disabled controls are not durable yet (%s)", exc)
+                return
             panic_flag.unlink(missing_ok=True)
             log.info("Panic flag detected — skipping auto-resume.")
             return
 
-        st = _pool().load_state()
-        chat_id = st.get("owner_chat_id")
-        if not chat_id:
-            return
+        from supervisor.state import control_value
+
+        chat_known, chat_id = control_value(_pool().load_state(), "owner_chat_id")
+        if not chat_known or chat_id in (None, "", 0):
+            return  # an autonomous resume turn needs a KNOWN owner chat (#1307)
 
         restart_verify_path = _pool().DRIVE_ROOT / "state" / "pending_restart_verify.json"
         recent_restart = False
@@ -550,8 +749,7 @@ def auto_resume_after_restart() -> None:
                 return
 
         time.sleep(2)  # Let everything initialize
-        agent = _pool()._get_chat_agent()
-        if not agent._busy:
+        if not _pool().chat_turn_liveness():
             import threading
             threading.Thread(
                 target=handle_chat_direct,
@@ -583,8 +781,8 @@ DIRECT_TURN_STOP_LIVE = "live"        # armed, still inside a step (the sweep re
 def stop_direct_chat_turn(task_id: str, turn: Dict[str, Any], *, deliver: bool = True) -> str:
     """Stop the in-process direct-chat turn COOPERATIVELY; a typed outcome.
 
-    There is no worker process to kill: the turn runs on the long-lived chat
-    agent inside the supervisor. The lane writes the typed ``finalize_now``
+    There is no worker process to kill: the turn owns a native actor
+    inside the supervisor. The lane writes the typed ``finalize_now``
     control (``REASON_OWNER_STOPPED_DIRECT_TURN``) to the canonical drive's
     owner mailbox — the one the turn's loop drains at every round boundary,
     where it ends the turn with ZERO further model calls — then waits the
@@ -603,11 +801,11 @@ def stop_direct_chat_turn(task_id: str, turn: Dict[str, Any], *, deliver: bool =
     ``deliver=False`` (a cascade sweep, which speaks for the tree once)
     suppresses the owner toast.
     """
+    from ouroboros.config import get_direct_turn_stop_wait_sec
     from supervisor import queue as q
     from supervisor import workers
     from supervisor.owner_stop import REASON_OWNER_STOPPED_DIRECT_TURN
     from supervisor.task_reaper import request_finalization_grace
-    from ouroboros.config import get_direct_turn_stop_wait_sec
 
     if turn.get("stop_control_msg_id"):
         return DIRECT_TURN_STOP_LIVE if workers.direct_chat_turn(task_id) is not None else DIRECT_TURN_STOP_ENDED

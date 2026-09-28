@@ -2,8 +2,10 @@
 
 The drive root it was launched against, the ``server`` logger every server
 module writes to, and the restart-request signals plus the setter that raises
-them. These live below the composition root so a leaf can read them without
-importing ``server`` back.
+them, and the two uvicorn shapes that decide who owns the process signals
+(``_SignalStopServer`` for the main server, ``_embedded_uvicorn_server`` for a server
+hosted inside its loop). These live below the composition root so a leaf can read
+them without importing ``server`` back.
 """
 
 from __future__ import annotations
@@ -13,7 +15,10 @@ import os
 import pathlib
 import re
 import threading
+from contextlib import nullcontext
 from typing import Callable
+
+import uvicorn
 
 from ouroboros.utils import read_json_dict, update_json_locked
 
@@ -31,12 +36,54 @@ _restart_requested = threading.Event()
 # the shutdown itself never counts as a loop crash (no false "died after 3
 # consecutive crashes" alarm on a graceful window close / SIGTERM).
 _supervisor_stop = threading.Event()
+# Set by the main uvicorn server's signal handler (server._SignalStopServer): the
+# PROCESS is exiting. Unlike ``_supervisor_stop`` it is never cleared — a settings
+# save that lands mid-teardown must not revive a supervisor generation (#1142).
+_exit_signalled = threading.Event()
 
 
 # Set only when the OWNER asked for the restart (the chat Restart button, and the
 # control endpoints that restart on the owner's behalf). The single fact the
 # re-exec needs to decide whether the runtime-mode ratchet pin rides along.
 _owner_restart_requested = threading.Event()
+
+# Confirmed inputs of the components this process started. Settings saves may
+# replace os.environ, so it is not an applied-state baseline. Never persisted.
+_applied_restart_settings: dict = {}
+_applied_server_host_source = "unknown"
+_applied_settings_lock = threading.Lock()
+
+
+def record_applied_restart_settings(values: dict, *, server_host_source: str | None = None) -> None:
+    """Publish only known startup inputs, after their component starts."""
+    from ouroboros.settings_scales import RESTART_REQUIRED_SETTINGS
+
+    global _applied_server_host_source
+    with _applied_settings_lock:
+        _applied_restart_settings.update({key: value for key, value in values.items()
+                                         if key in RESTART_REQUIRED_SETTINGS})
+        if "OUROBOROS_SERVER_HOST" in values:
+            _applied_server_host_source = server_host_source or "unknown"
+
+
+def applied_restart_settings() -> dict:
+    """Return process facts without deriving them from mutable saved intent."""
+    with _applied_settings_lock:
+        return dict(_applied_restart_settings)
+
+
+def applied_server_host_source(drive_root: pathlib.Path) -> str:
+    """Resolve launcher provenance on read: its PID record may arrive after bind."""
+    with _applied_settings_lock:
+        source = _applied_server_host_source
+    if source != "launcher":
+        return source
+    record = read_json_dict(pathlib.Path(drive_root) / "state" / "server_process.json") or {}
+    server_path = pathlib.Path(__file__).resolve().parents[1] / "server.py"
+    if record.get("pid") != os.getpid() or record.get("server_path") != str(server_path):
+        return "unknown"
+    source = record.get("server_host_source")
+    return source if source in ("environment", "settings") else "unknown"
 
 
 def _request_restart_exit(owner: bool = False) -> None:
@@ -271,3 +318,36 @@ def runtime_service_identity(drive_root: pathlib.Path, port: int,
     if snapshot_live("local_model"):
         return ""  # a verified manager owns another endpoint; its custody row is the same process
     return _custodied_local_model(drive_root, port, host_matches)
+
+
+class _SignalStopServer(uvicorn.Server):
+    """uvicorn.Server whose SIGTERM/SIGINT handler stops the supervisor loop AT THE SIGNAL.
+
+    The launcher's stop may SIGTERM the whole server process group, so the multiprocessing
+    Manager and pooled workers can be gone before uvicorn's drain reaches the lifespan
+    teardown (#1142). Setting the stop event here, not only in the lifespan ``finally``,
+    makes the loop leave its tick and keeps a torn-Manager BrokenPipe from counting as a
+    supervisor crash — the false "Supervisor loop died" owner alarm. A restart request
+    (``should_exit`` without a signal) is unchanged: ``_restart_requested`` already ends
+    the loop, and the lifespan ``finally`` still sets the event on every path.
+    """
+
+    def handle_exit(self, sig: int, frame) -> None:
+        _exit_signalled.set()
+        _supervisor_stop.set()
+        super().handle_exit(sig, frame)
+
+
+def _embedded_uvicorn_server(config: "uvicorn.Config") -> "uvicorn.Server":
+    """A uvicorn.Server hosted INSIDE the main server's event loop (the Host Service).
+
+    ``Server.serve()`` installs the process signal handlers whenever it runs on the main
+    thread and forwards a captured signal to the previous handler only after it has
+    finished — so an embedded server would take SIGTERM away from ``_SignalStopServer``
+    and hold it behind its own unbounded drain (#1142). The instance-level
+    ``nullcontext`` keeps the main server the one signal owner; the lifespan teardown
+    still stops this server through ``should_exit``.
+    """
+    server = uvicorn.Server(config)
+    server.capture_signals = nullcontext  # type: ignore[method-assign]
+    return server

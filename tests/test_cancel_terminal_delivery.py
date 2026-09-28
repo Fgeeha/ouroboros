@@ -9,6 +9,9 @@ from __future__ import annotations
 import hashlib
 import json
 import types
+from collections import deque
+
+import pytest
 from ouroboros import cancel_intents as ci
 from ouroboros.task_results import (
     STATUS_COMPLETED,
@@ -395,3 +398,302 @@ def test_fast_settled_reentry_delivers_idempotently_and_settles_with_the_claim(
     assert int(settle_row.get("generation") or 0) >= 1, (
         "the settle must ride the claimed generation, not an unfenced removal"
     )
+
+
+@pytest.mark.serial
+def test_one_cancel_leaves_exactly_one_salvaged_paragraph_in_the_chat(tmp_path, monkeypatch):
+    """Owner item spam L: the stop receipt OWNS the preserved paragraph.
+
+    A cancel used to put the same salvaged text in the chat three times: the
+    receipt quoted it, the terminal task row quoted it again, and the project
+    summary quoted it a third time. The receipt keeps its bounded preview and
+    its durable full-copy facts; the rows that follow name what the bytes are
+    and point at the untruncated copy instead of repeating it.
+    """
+    from ouroboros.project_dialogue import (
+        SALVAGE_EXCERPT_LABEL, append_terminal_task_projection,
+    )
+    from supervisor import terminal_delivery as td
+
+    salvage = "Rewrote the atlas builder and reran the suite."
+    preserved = tmp_path / "full.txt"
+    preserved.write_text(salvage, encoding="utf-8")
+    write_task_result(
+        tmp_path, "stopped-one", "cancelled", result=salvage, chat_id=7,
+        terminal_origin="host_salvage", reason_code="owner_requested_cancel",
+    )
+    queue = _CaptureQueue()
+    assert td.deliver_unreviewed_salvage(
+        tmp_path, {"chat_id": 7}, "stopped-one", outcome="cancelled",
+        salvaged_text=salvage, preserved_path=str(preserved), event_queue=queue,
+    ) is True
+    (receipt,) = queue.events
+    assert salvage in receipt["text"]
+
+    from supervisor import events_chat_delivery as delivery
+    from ouroboros.utils import append_jsonl
+
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
+    sent = []
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING={}, append_jsonl=append_jsonl,
+        send_with_budget=lambda chat, text, **_kw: sent.append((chat, text)),
+    )
+    delivery._handle_send_message(receipt, ctx)
+    assert sent == [(7, receipt["text"])]
+    stored = load_task_result(tmp_path, "stopped-one")
+    assert stored["cancel_receipt"]["salvage"]["preserved"] is True
+    assert append_terminal_task_projection(
+        tmp_path, "stopped-one", {"id": "stopped-one", "chat_id": 7}, stored,
+        {"status": "cancelled", "chat_id": 7},
+    )
+    row = next(
+        json.loads(line)
+        for line in (tmp_path / "logs" / "chat.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    )
+    assert f"{SALVAGE_EXCERPT_LABEL}." in row["text"]
+    assert salvage not in row["text"]
+    assert "get_task_result" not in row["text"]
+    assert row["text"].startswith("Cancelled. Root task stopped-one.")
+
+
+@pytest.mark.serial
+def test_cascade_receipt_dedups_the_actual_destination_and_preserves_main(qenv, monkeypatch):
+    """A settled root borrows child lineage, then send-time binding wins.
+
+    The cascade does not re-emit a settled root's task_done or rewrite older
+    chat rows. A later terminal projection consumes the confirmed receipt.
+    """
+    from ouroboros.observability import preserve_salvaged_output
+    from ouroboros.project_dialogue import (
+        SALVAGE_EXCERPT_LABEL, _completion_excerpt, append_terminal_task_projection,
+        enqueue_project_completion_summary,
+    )
+    from ouroboros.projects_registry import create_project, bind_task_to_project
+    from ouroboros.utils import append_jsonl
+    from supervisor import events_chat_delivery as delivery
+
+    queue = _CaptureQueue()
+    monkeypatch.setattr(qenv.workers, "get_event_q", lambda: queue)
+    monkeypatch.setattr(qenv.q, "_emit_cancel_task_done", lambda *_a, **_k: None)
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
+    text = "Rewrote the atlas builder and reran the suite."
+    write_task_result(
+        qenv.drive, "settled-root", "failed", result=text,
+        terminal_origin="host_salvage", reason_code="budget_exhausted",
+    )
+    preserve_salvaged_output(qenv.drive, "settled-root", text)
+    qenv.q.PENDING[:] = [{
+        "id": "live-kid", "chat_id": 77,
+        "parent_task_id": "settled-root", "root_task_id": "settled-root",
+    }]
+    write_task_result(
+        qenv.drive, "live-kid", "scheduled",
+        parent_task_id="settled-root", root_task_id="settled-root",
+    )
+    assert qenv.tl.cancel_task_by_id("settled-root", cascade=True)
+    event = next(e for e in queue.events if e.get("system_type") == "cancel_receipt")
+    assert event["chat_id"] == 77 and text in event["text"]
+    before = load_task_result(qenv.drive, "settled-root")
+    assert "chat_id" not in before
+    assert text in _completion_excerpt(before, chat_id=77)
+
+    project = create_project(qenv.drive, "receipt-destination", name="Receipt destination")
+    bind_task_to_project(
+        qenv.drive, "settled-root", project["id"], project["chat_id"],
+        origin={"absent": "system"},
+    )
+    sent = []
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=qenv.drive, RUNNING={}, append_jsonl=append_jsonl,
+        send_with_budget=lambda chat, body, **_kw: sent.append((chat, body)),
+    )
+    delivery._handle_send_message(event, ctx)
+    assert sent == [(project["chat_id"], event["text"])]
+    stored = load_task_result(qenv.drive, "settled-root")
+    assert stored["cancel_receipt"]["delivered_chat_id"] == project["chat_id"]
+    assert _completion_excerpt(stored, chat_id=project["chat_id"]) == f"{SALVAGE_EXCERPT_LABEL}."
+    assert text in _completion_excerpt(stored, chat_id=77)
+    assert text in _completion_excerpt(stored, chat_id=1)
+    task = {"id": "settled-root", "project_id": project["id"], "chat_id": project["chat_id"]}
+    assert append_terminal_task_projection(
+        qenv.drive, "settled-root", task, stored,
+        {"status": "failed", "chat_id": project["chat_id"]},
+    )
+    terminal = next(
+        row for row in map(json.loads, (qenv.drive / "logs/chat.jsonl").read_text().splitlines())
+        if row.get("type") == "task_summary"
+    )
+    assert text not in terminal["text"] and SALVAGE_EXCERPT_LABEL in terminal["text"]
+    assert "get_task_result" not in terminal["text"]
+    queue.events.clear()
+    assert enqueue_project_completion_summary(
+        qenv.drive, {}, "settled-root", task, stored, {"status": "failed"},
+    )
+    summary = next(e for e in queue.events if e.get("system_type") == "project_completion_summary")
+    assert summary["chat_id"] == 1 and text in summary["text"]
+    assert summary["text"].endswith("Open the Project for details.")
+
+
+@pytest.mark.serial
+def test_unsent_receipts_and_new_stop_episodes_do_not_inherit_delivery(tmp_path, monkeypatch):
+    """An origin address, failed send and duplicate skip prove no new delivery."""
+    from ouroboros.project_dialogue import _completion_excerpt, SALVAGE_EXCERPT_LABEL
+    from ouroboros.utils import append_jsonl
+    from supervisor import terminal_delivery as td, events_chat_delivery as delivery
+
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
+    bound = {"chat": 9}
+    monkeypatch.setattr(delivery, "_bound_project_chat_id", lambda *_a: bound["chat"])
+    text = "Preserved applied output."
+    write_task_result(
+        tmp_path, "origin-seven", "cancelled", result=text,
+        chat_id=7, terminal_origin="host_salvage",
+    )
+
+    def build(did):
+        return td.build_unreviewed_salvage_event(
+            tmp_path, {"chat_id": 7}, "origin-seven", outcome="cancelled",
+            salvaged_text=text, delivery_id=did,
+        )
+
+    def stored():
+        return load_task_result(tmp_path, "origin-seven")
+
+    def fail(*_a, **_k):
+        raise RuntimeError("transport rejected")
+
+    event = build("cancel:origin-seven:one")
+    assert text in _completion_excerpt(stored(), chat_id=7)
+    ctx = types.SimpleNamespace(
+        DRIVE_ROOT=tmp_path, RUNNING={}, send_with_budget=fail, append_jsonl=append_jsonl,
+    )
+    delivery._handle_send_message(event, ctx)
+    assert "delivered_chat_id" not in stored()["cancel_receipt"]
+    assert text in _completion_excerpt(stored(), chat_id=9)
+    sent = []
+    ctx.send_with_budget = lambda chat, body, **_k: sent.append((chat, body))
+    delivery._handle_send_message(event, ctx)
+    assert len(sent) == 1 and sent[0][0] == 9
+    assert _completion_excerpt(stored(), chat_id=9) == f"{SALVAGE_EXCERPT_LABEL}."
+    assert text in _completion_excerpt(stored(), chat_id=7)
+    bound["chat"] = 1
+    delivery._handle_send_message(event, ctx)
+    assert len(sent) == 1
+    assert stored()["cancel_receipt"]["delivered_chat_id"] == 9
+    assert text in _completion_excerpt(stored(), chat_id=1)
+    build("cancel:origin-seven:one")
+    assert stored()["cancel_receipt"]["delivered_chat_id"] == 9
+    new_event = build("cancel:origin-seven:two")
+    assert "delivered_chat_id" not in stored()["cancel_receipt"]
+    assert text in _completion_excerpt(stored(), chat_id=9)
+    # A late actual send for the older episode cannot attest the newer receipt.
+    monkeypatch.setattr(delivery, "_DELIVERED_MESSAGE_IDS", deque(maxlen=256))
+    monkeypatch.setattr(td, "already_delivered", lambda *_a: False)
+    delivery._handle_send_message(event, ctx)
+    assert "delivered_chat_id" not in stored()["cancel_receipt"]
+    delivery._handle_send_message(new_event, ctx)
+    assert stored()["cancel_receipt"]["delivered_chat_id"] == 1
+    assert _completion_excerpt(stored(), chat_id=1) == f"{SALVAGE_EXCERPT_LABEL}."
+
+def test_receipt_names_the_stop_cause_before_and_after_the_settle(tmp_path):
+    """The technical stop facts in the DETAILS panel name the cause the owner
+    actually made. While the intent is live the receipt reads it there; once
+    custody has settled, the intent row is gone and the same scalars live on the
+    stored ``cancel_origin``, so a receipt built then is not suddenly causeless."""
+    from supervisor import terminal_delivery as td
+
+    write_task_result(tmp_path, "task-live-cause", STATUS_RUNNING, chat_id=1)
+    intent = ci.request_cancel(tmp_path, "task-live-cause", reason="server_shutdown",
+                               source="snapshot_restore")
+    td._persist_cancel_receipt(
+        tmp_path, "task-live-cause",
+        settled_status="cancelled", outcome="cancelled",
+        delivery_id="d-live", preserved_path="", preview_omitted=0,
+    )
+    live = load_task_result(tmp_path, "task-live-cause")["cancel_receipt"]
+    assert live["stop_reason"] == "server_shutdown"
+    assert live["stop_requested_at"] == intent["requested_at"]
+
+    # A task whose custody already settled: no intent row is left to read.
+    origin = {"reason": "server_shutdown", "source": "snapshot_restore",
+              "requested_at": "2026-09-19T23:41:07+00:00"}
+    write_task_result(tmp_path, "task-settled-cause", "cancelled", chat_id=1,
+                      result="stopped", cancel_origin=origin)
+    assert ci.active_intent(tmp_path, "task-settled-cause") is None
+
+    td._persist_cancel_receipt(
+        tmp_path, "task-settled-cause",
+        settled_status="cancelled", outcome="cancelled",
+        delivery_id="d-settled", preserved_path="", preview_omitted=0,
+    )
+    settled = load_task_result(tmp_path, "task-settled-cause")["cancel_receipt"]
+    assert settled["stop_reason"] == "server_shutdown"
+    assert settled["stop_requested_at"] == origin["requested_at"]
+
+    # Quiet direction: a task that was never cancelled gets no stop cause at all.
+    write_task_result(tmp_path, "task-no-cause", STATUS_COMPLETED, chat_id=1, result="done")
+    td._persist_cancel_receipt(
+        tmp_path, "task-no-cause",
+        settled_status="completed", outcome="completed",
+        delivery_id="d-none", preserved_path="", preview_omitted=0,
+    )
+    plain = load_task_result(tmp_path, "task-no-cause")["cancel_receipt"]
+    assert "stop_reason" not in plain and "stop_requested_at" not in plain
+
+
+def test_salvage_receipt_states_files_rescued_even_without_salvageable_text(tmp_path):
+    """TZ-2 C2: "(no salvageable agent output ...)" must not read as "no files". The
+    receipt states the artifact-store count from the shared unmeasured listing — positive,
+    zero or unknown — and that no hashes were computed; the typed fact rides
+    ``cancel_receipt``. The count is a mutable disclosure, never part of the
+    content-derived delivery identity, and staged inputs or receipts never raise it."""
+    from ouroboros.headless import task_artifacts_dir
+    from ouroboros.outcome_receipt_store import verification_receipts_path
+    from supervisor import terminal_delivery as td
+
+    def build(tid, task=None):
+        return td.build_unreviewed_salvage_event(
+            tmp_path, task or {"chat_id": 4}, tid, outcome="cancelled", settled_status="cancelled")
+
+    write_task_result(tmp_path, "files-1", STATUS_RUNNING, result="working")
+    store = task_artifacts_dir(tmp_path, "files-1")
+    (store / "draft.docx").write_bytes(b"x")
+    event = build("files-1")
+    assert "(no salvageable agent output was found for this task)" in event["text"]
+    assert "Files rescued: 1 " in event["text"] and "hashes not computed" in event["text"], event["text"]
+    receipt = load_task_result(tmp_path, "files-1")["cancel_receipt"]
+    assert receipt["files_rescued"] == {"count": 1, "state": "positive", "hash_computed": False,
+                                        "stores": [{"store": str(store), "count": 1, "readable": True}]}
+    (store / "more.txt").write_bytes(b"y")
+    rebuilt = build("files-1")
+    assert rebuilt["delivery_id"] == event["delivery_id"] and "Files rescued: 2 " in rebuilt["text"]
+    assert load_task_result(tmp_path, "files-1")["cancel_receipt"]["files_rescued"]["count"] == 2
+    (store / "attachments").mkdir()
+    (store / "attachments" / "brief.pdf").write_bytes(b"input")
+    verification_receipts_path(tmp_path, "files-1").write_text('{"check": "x"}\n', encoding="utf-8")
+    inputs_only = build("files-1")
+    assert inputs_only["delivery_id"] == event["delivery_id"] and "Files rescued: 2 " in inputs_only["text"]
+
+    write_task_result(tmp_path, "files-0", STATUS_RUNNING, result="working")
+    task_artifacts_dir(tmp_path, "files-0")
+    zero = build("files-0")
+    assert "Files rescued: none" in zero["text"] and "hashes not computed" in zero["text"], zero["text"]
+    assert load_task_result(tmp_path, "files-0")["cancel_receipt"]["files_rescued"]["state"] == "zero"
+
+    write_task_result(tmp_path, "files-x", STATUS_RUNNING, result="working")
+    task_artifacts_dir(tmp_path, "files-x", create=False).write_text("not a directory", encoding="utf-8")
+    unknown = build("files-x")
+    assert "Files rescued: unknown" in unknown["text"], unknown["text"]
+    assert load_task_result(tmp_path, "files-x")["cancel_receipt"]["files_rescued"]["state"] == "unknown"
+
+    # A split root: the child drive named on the task row is walked beside the canonical store.
+    child = tmp_path / "child-drive"
+    write_task_result(tmp_path, "files-s", STATUS_RUNNING, result="working")
+    (task_artifacts_dir(child, "files-s") / "out.txt").write_bytes(b"o")
+    split = build("files-s", {"chat_id": 4, "child_drive_root": str(child)})
+    assert "Files rescued: 1 " in split["text"], split["text"]
+    stores = load_task_result(tmp_path, "files-s")["cancel_receipt"]["files_rescued"]["stores"]
+    assert [row["store"] for row in stores] == [str(task_artifacts_dir(tmp_path, "files-s", create=False)),
+                                                str(task_artifacts_dir(child, "files-s", create=False))]

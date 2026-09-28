@@ -9,6 +9,7 @@ provenance auditable.
 from __future__ import annotations
 
 import contextlib
+import copy
 import hashlib
 import json
 import os
@@ -19,7 +20,6 @@ import time
 import urllib.request
 from collections.abc import Iterator, Mapping
 from typing import Any
-
 
 _SUBPROCESS_RUN = subprocess.run
 
@@ -51,6 +51,15 @@ CAMPAIGN_FATAL_PROVENANCE_REASONS = frozenset({
     "seed_head_unreadable",
 })
 
+# Non-secret role routing/options, not model IDs. Keep these in the manifest
+# vocabulary without parsing their JSON values as comma-separated model lists.
+MODEL_ROUTE_OPTION_KEYS = (
+    "OUROBOROS_MODEL_ACCOUNTS",
+    "OUROBOROS_MODEL_CONTEXT_WINDOWS",
+    "OUROBOROS_PROCESSING_PREFERENCE",
+    "OUROBOROS_MODEL_PROCESSING_PREFERENCES",
+)
+
 # Active projection used by every NEW run manifest and preflight. Heavy is not an
 # execution slot after Available subagents and must not leak in from ambient env/settings.
 ACTIVE_MODEL_SLOT_KEYS = (
@@ -68,6 +77,7 @@ ACTIVE_MODEL_SLOT_KEYS = (
     "OUROBOROS_EFFORT_TASK",
     "OUROBOROS_EFFORT_REVIEW",
     "OUROBOROS_EFFORT_SCOPE_REVIEW",
+    *MODEL_ROUTE_OPTION_KEYS,
 )
 
 # Historical READ vocabulary. Old durable manifests can still carry Heavy and retain
@@ -407,7 +417,7 @@ def openrouter_account_credits(api_key: str, *, timeout: int = 10) -> float | No
 
 def model_slot_snapshot(settings_path: pathlib.Path | None = None, *,
                         env_overrides: bool = True) -> dict[str, str]:
-    """Return configured model/review slots without exposing provider secrets.
+    """Return configured model/review slots and role options, without provider secrets.
 
     ``env_overrides`` models how the server being described gets its configuration. A server
     started in THIS process's environment reads settings.json but lets the environment win, so
@@ -429,7 +439,8 @@ def model_slot_snapshot(settings_path: pathlib.Path | None = None, *,
         if value is None:
             value = settings.get(key)
         if value not in (None, ""):
-            slots[key] = str(value)
+            slots[key] = (json.dumps(value, ensure_ascii=False)
+                          if key in MODEL_ROUTE_OPTION_KEYS and isinstance(value, dict) else str(value))
     return slots
 
 
@@ -516,6 +527,38 @@ def admit_benchmark_run(manifest_path: pathlib.Path, **manifest_kwargs: Any) -> 
     return manifest
 
 
+class _RunManifestFinalizer(dict[str, Any]):
+    """Terminal outcome mapping with an explicit non-terminal recovery checkpoint."""
+
+    def __init__(
+        self,
+        manifest_path: pathlib.Path,
+        manifest: dict[str, Any],
+        *,
+        outcome: str,
+        exit_code: int,
+    ) -> None:
+        super().__init__(outcome=outcome, exit_code=exit_code)
+        self._manifest_path = pathlib.Path(manifest_path)
+        self._manifest = manifest
+
+    def checkpoint(self, phase: str) -> None:
+        """Persist current recovery authority without publishing a terminal outcome."""
+        phase = str(phase or "").strip()
+        if not phase:
+            raise ValueError("run manifest checkpoint phase must be non-empty")
+        snapshot = copy.deepcopy(self._manifest)
+        snapshot.setdefault("extra", {}).update({
+            "outcome": "running",
+            "exit_code": None,
+            "recovery_checkpoint": {
+                "phase": phase,
+                "created_at_unix": time.time(),
+            },
+        })
+        write_json(self._manifest_path, snapshot)
+
+
 @contextlib.contextmanager
 def finalize_run_manifest(
     manifest_path: pathlib.Path,
@@ -537,7 +580,12 @@ def finalize_run_manifest(
     the process really exits with.
     """
     default_outcome = str(outcome)
-    final: dict[str, Any] = {"outcome": default_outcome, "exit_code": int(exit_code)}
+    final = _RunManifestFinalizer(
+        manifest_path,
+        manifest,
+        outcome=default_outcome,
+        exit_code=int(exit_code),
+    )
     try:
         yield final
     except BaseException as exc:

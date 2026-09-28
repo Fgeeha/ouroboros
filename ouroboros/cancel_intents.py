@@ -116,7 +116,7 @@ def cancellation_projection_lock(drive_root: Any) -> Iterator[None]:
 
     path = _intents_path(drive_root)
     lock_path = path.with_name(path.name + ".lock")
-    lock_fd = acquire_exclusive_file_lock(lock_path)
+    lock_fd = acquire_exclusive_file_lock(lock_path, owner_aware_stale=True)
     if lock_fd is None:
         raise TimeoutError("cancel-intent projection lock unavailable")
     try:
@@ -385,7 +385,9 @@ def request_cancel(
     its descendants kept running.
     """
     tid = _valid_task_id(task_id)
-    reason_text = " ".join(str(reason or "").split())[:500]
+    # The whole stated cause is the durable record (``cancel_origin.reason``
+    # carries it on); a surface that shows less labels its preview as one.
+    reason_text = " ".join(str(reason or "").split())
     policy_text = str(requested_stop_policy or "").strip()
     minted: Dict[str, Any] = {}
     scope_text = str(scope or "").strip()

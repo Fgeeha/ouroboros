@@ -1,6 +1,79 @@
-// perf2 P4 (RENDER-BATCH): pure helpers behind chat.js's rebuildAll replay
-// batch and the "Load older" window escalation. Dependency-free at import time
-// so node tests can exercise them directly.
+// Chat timeline ordering, keyed item reconciliation and reading anchors.
+// These helpers own no history source, navigation or task authority.
+import { compareHistoryPosition } from './chat_history_replay.js';
+import { appendDelegatedItem, reconcileDelegatedItems } from './delegated_activity.js';
+
+const nodePosition = node => node?.dataset?.historySource
+    ? { source: node.dataset.historySource, offset: Number(node.dataset.historyOffset) } : null;
+
+/**
+ * History chrome only; the chat instance retains navigation and reading state.
+ *
+ * There is no "Load newer" control. Whether a newer page is cached is a fact
+ * about the bounded page cache, not about what the reader can see, so a button
+ * driven by it appeared under a fully visible transcript and asked for one click
+ * per cached page. Loading newer pages is automatic at the bottom edge; the
+ * floating scroll-to-latest button remains the only return-to-present control.
+ */
+export function createHistoryControls(messagesDiv) {
+    const doc = messagesDiv.ownerDocument;
+    const root = doc.createElement('div');
+    root.className = 'chat-load-older';
+    const button = doc.createElement('button');
+    button.type = 'button';
+    button.className = 'chat-load-older-btn';
+    const note = doc.createElement('span');
+    note.className = 'chat-load-older-note';
+    root.append(button, note);
+    // The recent-window read is the chat's own request, not a pager page, so its
+    // in-flight and failed states are carried here and drawn by the same control
+    // (issue #1102: an empty feed under a green header read as a dead app, and a
+    // failed read looked identical to a slow one).
+    let recent = null;
+    const feedIsEmpty = () => Array.from(messagesDiv.children)
+        .every(node => node === root || node.classList.contains('typing-bubble'));
+    return {
+        olderButton: button,
+        // Only an EMPTY feed (or a failure already on screen) gets the loading
+        // state: an ordinary refresh never puts chrome over a painted transcript.
+        // Returns whether there is a state to draw, so a painted feed costs nothing.
+        beginRecent() {
+            if (recent?.error || feedIsEmpty()) recent = { loading: true };
+            return Boolean(recent);
+        },
+        // A failure is shown where the loading state was; elsewhere the reader
+        // keeps the transcript they have and the next sync reconciles it.
+        endRecent(error = null) { recent = error && recent ? { error } : null; },
+        recentFailed: () => Boolean(recent?.error),
+        render(snapshot, windows) {
+            const error = recent?.error || snapshot.error;
+            const hydrating = Boolean(recent?.loading);
+            const loading = hydrating || Boolean(snapshot.loading);
+            const changedView = error?.body?.reason_code === 'history_view_changed';
+            const noteText = hydrating ? ''
+                : recent?.error ? `Could not load messages: ${recent.error.message || recent.error}`
+                : error ? String(error.message || error)
+                : snapshot.olderExhausted ? 'Beginning of saved history' : '';
+            const buttonHidden = !error && !snapshot.canOlder && !hydrating;
+            const fields = [
+                [button, { textContent: loading ? 'Loading…'
+                    : changedView ? 'Refresh history' : error ? 'Retry loading messages' : 'Load older messages',
+                    disabled: loading, hidden: buttonHidden }],
+                [note, { textContent: noteText, hidden: !noteText }],
+                [root, { hidden: buttonHidden && !noteText }],
+            ];
+            for (const [node, values] of fields) {
+                for (const [key, value] of Object.entries(values)) if (node[key] !== value) node[key] = value;
+            }
+            if (hydrating) root.setAttribute('aria-busy', 'true'); else root.removeAttribute('aria-busy');
+            if ((snapshot.initialized || error || hydrating) && !root.isConnected) messagesDiv.prepend(root);
+            const hasGaps = [...windows].some(value => (value?.truncated_by || [])
+                .some(cause => !['quota', 'archive_floor', 'lineage_cap', 'page'].includes(cause)));
+            return { complete: Boolean(snapshot.initialized && snapshot.olderExhausted
+                && !snapshot.canNewer && !hasGaps && !error), truncated_by: hasGaps ? ['read_gap'] : [] };
+        },
+    };
+}
 
 /**
  * The Main chat's live-card bound (issue #135). Main never runs destroy(), so its
@@ -109,6 +182,32 @@ export function createHistoryResyncScheduler({
  * Equal timestamps preserve arrival order; timestamp-free nodes append.
  * (Moved verbatim from chat.js — that module sits at its byte ceiling.)
  */
+// A focused text control keeps its own caret; Chromium mirrors it into the
+// document Selection, so clearing and rebuilding document ranges around a
+// timeline move collapses that caret (a typed wait-picker draft lost its
+// selection on every reconnect). While such a control is focused, the document
+// ranges are that mirror: leave them alone and restore the control's caret.
+function textControlCaret(active) {
+    const tag = String(active?.tagName || active?.nodeName || '').toUpperCase();
+    if (tag !== 'INPUT' && tag !== 'TEXTAREA') return null;
+    try {
+        const { selectionStart, selectionEnd, selectionDirection } = active;
+        if (selectionStart == null || selectionEnd == null) return null;
+        return { selectionStart, selectionEnd, selectionDirection: selectionDirection || 'none' };
+    } catch {
+        return null; // input types without a caret (number, email, ...) throw on read
+    }
+}
+
+function restoreTextControlCaret(active, caret) {
+    if (!caret || typeof active?.setSelectionRange !== 'function') return;
+    try {
+        active.setSelectionRange(caret.selectionStart, caret.selectionEnd, caret.selectionDirection);
+    } catch {
+        // The control changed type or lost its value between capture and restore.
+    }
+}
+
 export function insertTimelineNode(messages, node, typing = null) {
     const rawNodeTs = node?.dataset?.ts;
     const nodeTs = rawNodeTs == null || rawNodeTs === '' ? NaN : Number(rawNodeTs);
@@ -118,100 +217,35 @@ export function insertTimelineNode(messages, node, typing = null) {
             if (child === node || child === typing) continue;
             const rawChildTs = child?.dataset?.ts;
             const childTs = rawChildTs == null || rawChildTs === '' ? NaN : Number(rawChildTs);
-            if (Number.isFinite(childTs) && childTs > nodeTs) {
+            if (Number.isFinite(childTs) && (childTs > nodeTs
+                    || childTs === nodeTs && compareHistoryPosition(nodePosition(child), nodePosition(node)) > 0)) {
                 before = child;
                 break;
             }
         }
     }
-    if (before) messages.insertBefore(node, before);
-    else if (typing && typing.parentNode === messages) messages.insertBefore(node, typing);
+    const target = before || (typing?.parentNode === messages ? typing : null);
+    if (node.parentNode === messages && node.nextElementSibling === target) return { before };
+    const doc = messages.ownerDocument;
+    const active = doc?.activeElement;
+    const caret = textControlCaret(active);
+    const selection = caret ? null : doc?.getSelection?.();
+    const ranges = Array.from({ length: selection?.rangeCount || 0 }, (_, index) => {
+        const range = selection.getRangeAt(index);
+        return [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
+    });
+    if (target) messages.insertBefore(node, target);
     else messages.appendChild(node);
+    if (active && node.contains?.(active) && doc.activeElement !== active) active.focus({ preventScroll: true });
+    if (caret) restoreTextControlCaret(active, caret);
+    if (ranges.length && ranges.every(([start, , end]) => start.isConnected && end.isConnected)) {
+        selection.removeAllRanges();
+        for (const [start, startOffset, end, endOffset] of ranges) {
+            const range = doc.createRange();
+            range.setStart(start, startOffset); range.setEnd(end, endOffset); selection.addRange(range);
+        }
+    }
     return { before };
-}
-
-/**
- * Sort key for a top-level timeline node: its stamped `data-ts` epoch, or
- * +Infinity for timestamp-free nodes so they keep the historical "append at
- * the end (before typing)" placement of insertTimelineNode.
- */
-export function timelineNodeSortKey(node) {
-    const raw = node?.dataset?.ts;
-    const ts = raw == null || raw === '' ? NaN : Number(raw);
-    return Number.isFinite(ts) ? ts : Infinity;
-}
-
-/**
- * Stable chronological order for a batch of collected timeline nodes: key is
- * the stamped ts, tie-break is collection (arrival) order. This reproduces
- * insertTimelineNode's semantics over an initially-empty feed — equal
- * timestamps preserve arrival order (chat_chronology pin), undated nodes land
- * at the end in arrival order.
- */
-export function orderBatchNodes(nodes) {
-    return nodes
-        .map((node, index) => ({ node, index, key: timelineNodeSortKey(node) }))
-        .sort((a, b) => {
-            if (a.key === b.key) return a.index - b.index;
-            return a.key < b.key ? -1 : 1;
-        })
-        .map((entry) => entry.node);
-}
-
-/**
- * One rebuildAll replay batch: collects top-level nodes destined for the feed
- * (instead of per-row live-DOM chronological insertion), remembers which live
- * cards need their one final meta/count/layout pass, and defers the per-frame
- * typing-indicator write to a single application after the mount (the header
- * badge is written only by chat.js's status reducer, once after the batch).
- *
- * mount() performs the ONE DOM insertion of the whole replay: a stable sort,
- * one detached fragment, one insertBefore ahead of the typing indicator
- * (typing stays last). No awaits happen between the feed clearing and this
- * mount — the caller keeps the whole section synchronous [GPT#14].
- *
- * A collected node that pass 2 has since moved INTO another card (a child
- * card appended to its parent's subagent container) has left the holding
- * fragment; mount() leaves it where the lineage placed it instead of tearing
- * it back out as a top-level card below the whole feed (#636).
- */
-export function createRebuildBatch(doc = null) {
-    const nodes = [];
-    const seen = new Set();
-    const touched = new Set();
-    let holding = null;
-    return {
-        touched,
-        typingHidden: false,
-        collect(node) {
-            if (!node || seen.has(node)) return;
-            seen.add(node);
-            nodes.push(node);
-            // Parent collected nodes in arrival (chronological) order inside a
-            // detached holding fragment so adjacency-sensitive consumers
-            // (chat_media gallery grouping) observe the same feed shape during
-            // a rebuild replay as on the live feed. mount() reparents them.
-            const ownerDoc = doc || node.ownerDocument || globalThis.document;
-            if (ownerDoc?.createDocumentFragment) {
-                holding = holding || ownerDoc.createDocumentFragment();
-                holding.appendChild(node);
-            }
-        },
-        touch(record) {
-            if (record) touched.add(record);
-        },
-        mount(messages, typing = null) {
-            if (!messages) return;
-            const ordered = orderBatchNodes(nodes);
-            const ownerDoc = doc || messages.ownerDocument || globalThis.document;
-            const fragment = ownerDoc.createDocumentFragment();
-            for (const node of ordered) {
-                if (!holding || node.parentNode === holding) fragment.appendChild(node);
-            }
-            if (typing && typing.parentNode === messages) messages.insertBefore(fragment, typing);
-            else messages.appendChild(fragment);
-        },
-    };
 }
 
 // Small, bounded projection used to decide whether an existing live-card
@@ -252,31 +286,112 @@ export function syncLiveCardToggle(record) {
 // Incremental timeline DOM writes share the Chat viewport boundary but own no
 // scroll state. Keeping them here also keeps the byte-capped instance factory
 // focused on event projection rather than HTML replacement mechanics.
-export function createLiveCardTimelineRenderer({ withStableViewport, buildTimelineItemHtml }) {
-    const defer = (record) => {
-        if (!record?.isSubagent || record.root?.dataset?.expanded === '1') return false;
-        record._timelineDirty = true;
+export function createLiveCardTimelineRenderer({ withStableViewport, buildTimelineItemHtml, isReplayActive = () => false }) {
+    // Remember generated markup, not the enhanced DOM: a timestamp update must
+    // not undo markdown controls or replace a body the reader has selected.
+    const rendered = new WeakMap();
+    const markup = (node) => node.outerHTML ?? node.nodeValue;
+    const remember = (node) => {
+        rendered.set(node, markup(node));
+        for (const child of Array.from(node.childNodes || [])) remember(child);
+        return node;
+    };
+    const patchNode = (current, next) => {
+        const source = markup(next);
+        if (rendered.get(current) === source) return false;
+        if (markup(current) === source) {
+            remember(current);
+            return false;
+        }
+        if (current.nodeType !== next.nodeType || current.nodeName !== next.nodeName) {
+            current.parentNode.replaceChild(remember(next), current);
+            return true;
+        }
+        if (current.nodeType !== 1) {
+            current.nodeValue = next.nodeValue;
+        } else {
+            for (const attr of Array.from(current.attributes)) {
+                if (!next.hasAttribute(attr.name)) current.removeAttribute(attr.name);
+            }
+            for (const attr of Array.from(next.attributes)) {
+                if (current.getAttribute(attr.name) !== attr.value) current.setAttribute(attr.name, attr.value);
+            }
+            const children = Array.from(next.childNodes);
+            children.forEach((child, index) => {
+                const own = current.childNodes[index];
+                if (own) patchNode(own, child);
+                else current.appendChild(remember(child));
+            });
+            while (current.childNodes.length > children.length) current.lastChild.remove();
+        }
+        rendered.set(current, source);
         return true;
     };
-    const render = (record) => {
-        if (defer(record)) return false;
-        record._timelineDirty = false;
-        return withStableViewport(() => {
-            const el = record.timelineEl;
-            const html = record.items.map((item) => buildTimelineItemHtml(item, record)).join('');
-            if (el.innerHTML === html) return false;
-            const pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
-            const prevTop = el.scrollTop;
-            el.innerHTML = html;
-            el.scrollTop = pinned ? el.scrollHeight : prevTop;
-            return Boolean(el.isConnected);
-        });
+    const defer = (record) => {
+        if (!isReplayActive() && (!record?.isSubagent || record.root?.dataset?.expanded === '1')) return false;
+        record._timelineDirty = true;
+        return true;
     };
     const nodeFor = (item, record) => {
         const doc = record.timelineEl?.ownerDocument || globalThis.document;
         const wrapper = doc.createElement('div');
         wrapper.innerHTML = buildTimelineItemHtml(item, record).trim();
         return wrapper.firstElementChild;
+    };
+    const render = (record) => {
+        if (defer(record)) return false;
+        record._timelineDirty = false;
+        reconcileDelegatedItems(record); // replay, page release and reorders re-project per seq
+        return withStableViewport(() => {
+            const el = record.timelineEl;
+            const pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
+            const prevTop = el.scrollTop;
+            const byKey = new Map(Array.from(el.children).map((node) => [node.dataset.liveLineKey, node]));
+            const active = el.ownerDocument?.activeElement;
+            const caret = textControlCaret(active);
+            const selection = caret ? null : el.ownerDocument?.getSelection?.();
+            const ranges = Array.from({ length: selection?.rangeCount || 0 }, (_, index) => {
+                const range = selection.getRangeAt(index);
+                return [range.startContainer, range.startOffset, range.endContainer, range.endOffset];
+            });
+            let changed = false;
+            let moved = false;
+            record.items.forEach((item, index) => {
+                const next = nodeFor(item, record);
+                if (!next) return;
+                const current = byKey.get(String(item.lineKey || ''));
+                const node = current || remember(next);
+                if (current) {
+                    byKey.delete(String(item.lineKey || ''));
+                    changed = patchNode(current, next) || changed;
+                }
+                if (el.children[index] !== node) {
+                    moved = moved || node.parentNode === el;
+                    el.insertBefore(node, el.children[index] || null);
+                    changed = true;
+                }
+            });
+            for (const node of byKey.values()) {
+                node.remove();
+                changed = true;
+            }
+            if (moved) {
+                if (el.contains(active) && el.ownerDocument.activeElement !== active) active.focus({ preventScroll: true });
+                if (caret) restoreTextControlCaret(active, caret);
+                const intact = ranges.filter(([start, , end]) => start.isConnected && end.isConnected);
+                if (intact.length) {
+                    selection.removeAllRanges();
+                    for (const [start, startOffset, end, endOffset] of intact) {
+                        const range = el.ownerDocument.createRange();
+                        range.setStart(start, startOffset);
+                        range.setEnd(end, endOffset);
+                        selection.addRange(range);
+                    }
+                }
+            }
+            if (changed) el.scrollTop = pinned ? el.scrollHeight : prevTop;
+            return changed && Boolean(el.isConnected);
+        });
     };
     const append = (item, record) => {
         if (defer(record)) return false;
@@ -285,7 +400,7 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
             - record.timelineEl.scrollTop - record.timelineEl.clientHeight <= 24;
         const node = nodeFor(item, record);
         if (!node) return false;
-        record.timelineEl.appendChild(node);
+        record.timelineEl.appendChild(remember(node));
         if (record.root.dataset.expanded === '1' && pinned) {
             record.timelineEl.scrollTop = record.timelineEl.scrollHeight;
         }
@@ -295,8 +410,7 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
         if (defer(record)) return false;
         if (record._timelineDirty || !current) return render(record);
         const node = nodeFor(item, record);
-        if (!node || node.outerHTML === current.outerHTML) return false;
-        record.timelineEl.replaceChild(node, current);
+        if (!node || !patchNode(current, node)) return false;
         return Boolean(record.timelineEl.isConnected);
     };
     return {
@@ -306,52 +420,10 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
             item, record, record.timelineEl.lastElementChild,
         ),
         patchTimelineItemAt: (item, record) => {
-            const key = String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '');
-            const current = key
-                ? record.timelineEl.querySelector(`[data-live-line-key="${key}"]`) : null;
+            const current = Array.from(record.timelineEl.children)
+                .find((node) => node.dataset.liveLineKey === String(item.lineKey || ''));
             return replace(item, record, current);
         },
-    };
-}
-
-// "Load older" quota escalation ladder (perf2 P4.5): the DEFAULT request sends
-// no quota params (the server window governs); each click asks for explicitly
-// larger n_human/n_progress until the server-side caps (1500/600).
-export const LOAD_OLDER_QUOTA_STEPS = [
-    { n_human: 400, n_progress: 240 },
-    { n_human: 1500, n_progress: 600 },
-];
-
-/** Next explicit-quota step above `current` (null = server default window). */
-export function nextQuotaEscalation(current = null) {
-    const currentHuman = Number(current?.n_human) || 0;
-    return LOAD_OLDER_QUOTA_STEPS.find((step) => step.n_human > currentHuman) || null;
-}
-
-/**
- * Presentation state for the top-of-feed "Load older" control, driven by the
- * SERVER's window truncation verdict (window.complete / window.truncated_by,
- * perf2 P3.2 [Fable#2]) — never by a client guess:
- * - hidden: the window is complete (or the server predates the field);
- * - button: quota-truncated AND a larger explicit quota is still available;
- * - notice: nothing more can be loaded from here — the honest boundary text
- *   names BOTH the on-disk archive floor and the subagent lineage cap
- *   [GPT#11], so a short-history user is never told about phantom archives.
- */
-export function loadOlderControlState(windowInfo = null, quota = null) {
-    if (!windowInfo || typeof windowInfo !== 'object' || windowInfo.complete === true) {
-        return { mode: 'hidden', label: '' };
-    }
-    const causes = Array.isArray(windowInfo.truncated_by)
-        ? windowInfo.truncated_by.map(String)
-        : [];
-    if (causes.includes('quota') && nextQuotaEscalation(quota)) {
-        return { mode: 'button', label: 'Load older messages' };
-    }
-    return {
-        mode: 'notice',
-        label: 'Older messages stay in on-disk archives, and deep subagent lineage '
-            + 'is capped per window — this view is at its maximum depth.',
     };
 }
 
@@ -372,7 +444,7 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 && !node.classList.contains('chat-load-older')
         );
         const messagesRect = messagesDiv.getBoundingClientRect();
-        const topNode = nodes.find((item) => {
+        let topNode = nodes.find((item) => {
             const rect = item.getBoundingClientRect();
             return rect.bottom > messagesRect.top && rect.top < messagesRect.bottom;
         }) || null;
@@ -421,6 +493,18 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 .filter(({ rect }) => rect.top <= messagesRect.top && rect.bottom > messagesRect.top)
                 .sort((a, b) => b.depth - a.depth);
             node = belowTop[0]?.node || crossing[0]?.node || topNode;
+            if (node === topNode && topNode.getBoundingClientRect().top < messagesRect.top) {
+                // The card's visible part holds nothing anchorable (a wait row, a
+                // block without work): keep the reader's view of what FOLLOWS the
+                // card. Pinning the card's own top, far above the viewport, would let
+                // the card's shrink or growth move the content the reader is on.
+                const following = nodes.find((item) => {
+                    if (item === topNode) return false;
+                    const rect = item.getBoundingClientRect();
+                    return rect.top >= messagesRect.top && rect.top < messagesRect.bottom;
+                });
+                if (following) { topNode = following; node = following; }
+            }
         }
 
         const cardChain = [];
@@ -515,4 +599,103 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
     }
 
     return { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor };
+}
+
+/** Update one live timeline item using the same keys the card's producer owns.
+ * Historical source-addressed insertions use mergeHistoricalTimelineItem; live
+ * lifecycle notes keep their existing in-place semantics and disclosure key.
+ */
+export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKey, headline, inPlaceByKey }) {
+    // A delegated observation is its own source record; its projection is per seq.
+    if (summary.activity) return appendDelegatedItem(record, summary, { ts, rawTs, syntheticKey, headline });
+    let timelineUpdate = 'none', patchIndex = -1;
+    const lastIdx = record.items.length - 1;
+    // Full-array dedup keeps routine history syncs from growing Notes.
+    const existingIdx = record.items.findIndex((it) => it.dedupeKey === syntheticKey);
+    if (existingIdx !== -1 && inPlaceByKey) {
+        const it = record.items[existingIdx];
+        if (Number.isSafeInteger(it.cardRowRevision)
+            && (!Number.isSafeInteger(summary.cardRowRevision) || summary.cardRowRevision <= it.cardRowRevision)) {
+            return { timelineUpdate: 'duplicate-skip', patchIndex };
+        }
+        const patch = {
+            cardRowRevision: summary.cardRowRevision,
+            phase: summary.phase || it.phase,
+            headline: headline || it.headline,
+            fullHeadline: summary.fullHeadline || headline || it.fullHeadline,
+            body: summary.body || '',
+            fullBody: summary.fullBody || summary.body || it.fullBody || '',
+            fullRef: summary.fullRef || it.fullRef || '',
+            truncated: summary.truncated || it.truncated || false,
+            // A call's failure frame replaces its receipt start: the row is
+            // content again once it reports an error.
+            receipt: Boolean(summary.receipt),
+            ts: ts || it.ts,
+            // Replay compares the child's current status with older pages.
+            // Its source time advances with the live status, not with narration.
+            ...(syntheticKey.startsWith('subagent-lifecycle:') && rawTs ? { sourceTs: rawTs } : {}),
+        };
+        if (Object.entries(patch).some(([key, value]) => it[key] !== value)) {
+            Object.assign(it, patch);
+            patchIndex = existingIdx;
+            timelineUpdate = 'patch-at';
+        } else {
+            timelineUpdate = 'duplicate-skip';
+        }
+    } else if (existingIdx === lastIdx && existingIdx !== -1) {
+        const it = record.items[existingIdx];
+        const patch = {
+            ts: ts || it.ts,
+            fullHeadline: summary.fullHeadline || it.fullHeadline || it.headline,
+            fullBody: summary.fullBody || it.fullBody || it.body,
+            fullRef: summary.fullRef || it.fullRef || '',
+            truncated: summary.truncated || it.truncated || false,
+        };
+        if (Object.entries(patch).every(([key, value]) => it[key] === value)) {
+            timelineUpdate = 'duplicate-skip';
+        } else {
+            Object.assign(it, patch);
+            it.count += 1;
+            timelineUpdate = 'patch-last';
+        }
+    } else if (existingIdx !== -1) {
+        // An older duplicate only refreshes its timestamp.
+        const it = record.items[existingIdx];
+        it.ts = ts || it.ts;
+        timelineUpdate = 'duplicate-skip';
+    } else {
+        const lineKey = `line-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+        record.items.push({
+            cardRowRevision: summary.cardRowRevision,
+            phase: summary.phase || 'working',
+            headline: headline || 'Update',
+            fullHeadline: summary.fullHeadline || headline || 'Update',
+            body: summary.body || '',
+            fullBody: summary.fullBody || summary.body || '',
+            fullRef: summary.fullRef || '',
+            truncated: summary.truncated || false,
+            receipt: Boolean(summary.receipt),
+            ts: ts || '',
+            sourceTs: rawTs,
+            count: 1,
+            dedupeKey: syntheticKey,
+            lineKey,
+        });
+        timelineUpdate = 'append';
+    }
+    return { timelineUpdate, patchIndex };
+}
+
+/** The block's folded tool evidence row. Live frames and the host's metrics
+ * reach it through the same keyed in-place upsert, so neither route can mint a
+ * second row, and the row keeps the position and timestamp of its first frame.
+ */
+export function upsertToolFoldRow(record, view, ts, rawTs) {
+    const syntheticKey = `tools|${record.groupId}`;
+    // Stationary: the row keeps the place and the time of the first frame it
+    // counted, so a burst of calls never walks it down the timeline.
+    const first = !record.items.some((item) => item.dedupeKey === syntheticKey);
+    return updateLiveTimelineItem(record, view, {
+        ts: first ? ts : '', rawTs, syntheticKey, headline: view.headline, inPlaceByKey: true,
+    });
 }

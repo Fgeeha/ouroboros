@@ -1,107 +1,106 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { NodeStub, countPropertyWrites, fixture, turn, WS_MSG } from './chat_decision_fixture.js';
+test('targeted detail preserves normalized option details, single-flight, and the existing answer form', async () => {
+    let calls = 0;
+    const block = { ...WS_MSG, options: ['Yes', 'No'], option_details: ['Immediate release', 'Wait for CI'], asked_at: WS_MSG.ts };
+    const fx = fixture({ fetchDetail: async () => {
+        calls += 1;
+        return { task_id: 't-1', project_id: 'p1', owner_quiz: { 'qz-1': block } };
+    } });
+    try {
+        const [question, same] = await Promise.all([
+            fx.decision.readQuestion('t-1', 'qz-1', 'p1'), fx.decision.readQuestion('t-1', 'qz-1', 'p1'),
+        ]);
+        assert.equal(calls, 1);
+        assert.deepEqual(question, same);
+        const card = fx.decision.buildQuizCard(question);
+        assert.deepEqual(card.querySelectorAll('.chat-quiz-option-detail').map((node) => node.textContent),
+            ['Immediate release', 'Wait for CI']);
+        const field = card.querySelector('.chat-quiz-comment');
+        field.value = 'keep my draft';
+        assert.equal(fx.decision.buildQuizCard({ ...question, ts: 'later-history' }), null);
+        assert.equal(card.querySelector('.chat-quiz-comment'), field);
+        card.querySelectorAll('.chat-quiz-option')[1].click();
+        await new Promise((resolve) => setImmediate(resolve));
+        assert.equal(JSON.parse(fx.calls[0].init.body).option_index, 1);
+        assert.equal(JSON.parse(fx.calls[0].init.body).comment, 'keep my draft');
+        assert.equal(card.dataset.state, 'answered');
+        assert.equal(await fx.decision.readQuestion('t-1', 'qz-1', 'wrong-project'), null);
+    } finally { fx.restore(); }
+});
 
-import { createChatDecision } from '../modules/chat_decision.js';
+test('a finished task keeps its card answerable and legacy labels disclose missing details', async () => {
+    const fx = fixture({ fetchDetail: async () => ({ task_id: 't-1', project_id: 'p1', owner_quiz: {
+        'qz-1': { ...WS_MSG, state: 'expired_terminal', options: ['Yes', 'No'] },
+    } }) });
+    try {
+        const question = await fx.decision.readQuestion('t-1', 'qz-1', 'p1');
+        const card = fx.decision.buildQuizCard(question);
+        assert.ok(card.querySelectorAll('.chat-quiz-option').every((button) => !button.disabled));
+        assert.match(card.querySelector('.chat-quiz-details-unavailable').textContent, /not retained/);
+    } finally { fx.restore(); }
+});
 
-class Classes {
-    constructor() { this.values = new Set(); }
-    set(value) { this.values = new Set(String(value || '').split(/\s+/).filter(Boolean)); }
-    add(...values) { values.forEach((value) => this.values.add(value)); }
-    contains(value) { return this.values.has(value); }
-    toggle(value, force) {
-        const enabled = force === undefined ? !this.contains(value) : Boolean(force);
-        if (enabled) this.add(value); else this.values.delete(value);
-        return enabled;
-    }
-}
+test('a late targeted question read cannot steal a newer navigation or a hidden room', async () => {
+    const pending = new Map();
+    const fx = fixture({ fetchDetail: (taskId) => new Promise((resolve) => pending.set(taskId, resolve)) });
+    const appended = [];
+    const append = (msg) => { appended.push(msg.task_id); fx.decision.buildQuizCard(msg); };
+    let visible = true;
+    const detail = (taskId) => ({ task_id: taskId, project_id: 'p1', owner_quiz: {
+        'qz-1': { ...WS_MSG, options: ['Yes', 'No'], option_details: ['', 'Wait for CI'] },
+    } });
+    try {
+        const old = fx.decision.revealQuestion('old', 'qz-1', 'p1', 23, append, () => visible);
+        const next = fx.decision.revealQuestion('new', 'qz-1', 'p1', 23, append, () => visible);
+        await Promise.resolve();
+        pending.get('new')(detail('new'));
+        assert.equal(await next, true);
+        pending.get('old')(detail('old'));
+        assert.equal(await old, false);
+        assert.deepEqual(appended, ['new']);
+        const hidden = fx.decision.revealQuestion('hidden', 'qz-1', 'p1', 23, append, () => visible);
+        await Promise.resolve();
+        visible = false;
+        pending.get('hidden')(detail('hidden'));
+        assert.equal(await hidden, false);
+        assert.deepEqual(appended, ['new']);
+    } finally { fx.restore(); }
+});
 
-class NodeStub {
-    constructor(tag = 'div') {
-        this.tagName = tag.toUpperCase();
-        this.children = [];
-        this.dataset = {};
-        this.classList = new Classes();
-        this.disabled = false;
-        this.listeners = new Map();
-        this.type = '';
-        this._text = '';
-    }
-    set className(value) { this.classList.set(value); }
-    get className() { return [...this.classList.values].join(' '); }
-    set textContent(value) { this._text = String(value ?? ''); }
-    get textContent() { return this._text; }
-    append(...nodes) { nodes.forEach((node) => { node.parentNode = this; this.children.push(node); }); }
-    remove() {
-        const parent = this.parentNode;
-        if (!parent) return;
-        const i = parent.children.indexOf(this);
-        if (i >= 0) parent.children.splice(i, 1);
-        this.parentNode = null;
-    }
-    before(node) {
-        const parent = this.parentNode;
-        if (!parent) return;
-        node.parentNode = parent;
-        parent.children.splice(parent.children.indexOf(this), 0, node);
-    }
-    addEventListener(type, handler) { this.listeners.set(type, handler); }
-    click() { const handler = this.listeners.get('click'); if (handler) handler(); }
-    matchesClass(name) { return this.classList.contains(name); }
-    collect(name, out = []) {
-        if (this.matchesClass(name)) out.push(this);
-        this.children.forEach((child) => child.collect(name, out));
-        return out;
-    }
-    querySelector(selector) { return this.collect(selector.replace(/^\./, ''))[0] || null; }
-    querySelectorAll(selector) { return this.collect(selector.replace(/^\./, '')); }
-}
+test('required question renders waiting identically from live and stored frames', () => {
+    const fx = fixture();
+    try {
+        const live = { ...WS_MSG, quiz_id: 'required-live', wait_for_answer: true, assumption: '' };
+        const card = fx.decision.buildQuizCard(live);
+        assert.match(card.querySelector('.chat-quiz-assumption').textContent, /Waiting for your answer/);
+        const stored = { task_id: 't-1', text: live.question, quiz: { ...live, quiz_id: 'required-replay' } };
+        const replay = fx.decision.buildQuizCard(stored);
+        assert.equal(replay.querySelector('.chat-quiz-assumption').textContent,
+                     card.querySelector('.chat-quiz-assumption').textContent);
+    } finally { fx.restore(); }
+});
 
-function countPropertyWrites(target, key) {
-    let value = target[key];
-    let writes = 0;
-    Object.defineProperty(target, key, {
-        configurable: true,
-        get: () => value,
-        set: (next) => { writes += 1; value = next; },
-    });
-    return () => writes;
-}
-
-function fixture({ fetchImpl, renderMarkdown, onDomWrite } = {}) {
-    const prior = { document: globalThis.document, crypto: globalThis.crypto };
-    globalThis.document = { createElement: (tag) => new NodeStub(tag) };
-    if (!globalThis.crypto || !globalThis.crypto.randomUUID) {
-        Object.defineProperty(globalThis, 'crypto', {
-            configurable: true, value: { randomUUID: () => 'fixed-request-id' },
-        });
-    }
-    const toasts = [];
-    const calls = [];
-    const decision = createChatDecision({
-        apiFetch: async (url, init) => {
-            calls.push({ url, init });
-            if (fetchImpl) return fetchImpl(url, init);
-            return { ok: true, status: 200 };
-        },
-        frameNode: (_msg, node) => node,
-        renderMarkdown,
-        enhanceMarkdown: renderMarkdown ? () => {} : null,
-        showToast: (text, tone) => toasts.push({ text, tone }),
-        onDomWrite,
-    });
-    return { decision, toasts, calls, restore: () => {
-        globalThis.document = prior.document;
-        Object.defineProperty(globalThis, 'crypto', { configurable: true, value: prior.crypto });
-    } };
-}
-
-const WS_MSG = {
-    type: 'quiz', role: 'assistant', quiz_id: 'qz-1', task_id: 't-1',
-    question: 'Merge now?', stake: 'release timing',
-    assumption: 'continuing with the merge', state: 'open',
-    options: [{ label: 'Yes' }, { label: 'No', detail: 'wait for CI' }],
-    ts: '2026-08-31T10:00:00Z',
-};
+test('required waiting copy ends when the answer settles, including history replay', async () => {
+    const fx = fixture();
+    try {
+        const required = { ...WS_MSG, wait_for_answer: true, assumption: '' };
+        const card = fx.decision.buildQuizCard(required);
+        card.querySelectorAll('.chat-quiz-option')[0].click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(card.dataset.state, 'answered');
+        assert.equal(card.querySelector('.chat-quiz-assumption'), null);
+        assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => btn.disabled));
+        for (const state of ['answered', 'expired_terminal', 'superseded']) {
+            const replay = fx.decision.buildQuizCard({
+                task_id: 't-1', text: required.question,
+                quiz: { ...required, state, wait_for_answer: false, wait_ended_at: "earlier", quiz_id: `closed-${state}` },
+            });
+            assert.equal(replay.querySelector('.chat-quiz-assumption'), null);
+        }
+    } finally { fx.restore(); }
+});
 
 test('quiz card renders full anatomy from a WS frame', () => {
     const fx = fixture();
@@ -112,7 +111,7 @@ test('quiz card renders full anatomy from a WS frame', () => {
         assert.equal(card.querySelector('.chat-quiz-question').textContent, 'Merge now?');
         assert.match(card.querySelector('.chat-quiz-stake').textContent, /At stake: release timing/);
         assert.match(card.querySelector('.chat-quiz-assumption').textContent, /Continuing meanwhile: continuing with the merge/);
-        assert.equal(card.querySelector('.chat-quiz-status-text').textContent, 'Awaiting answer');
+        assert.equal(card.querySelector('.chat-quiz-status-text').textContent, 'Unanswered · an answer is still accepted');
         const buttons = card.querySelectorAll('.chat-quiz-option');
         assert.equal(buttons.length, 2);
         assert.equal(buttons[1].querySelector('.chat-quiz-option-detail').textContent, 'wait for CI');
@@ -120,8 +119,12 @@ test('quiz card renders full anatomy from a WS frame', () => {
     } finally { fx.restore(); }
 });
 
-test('quiz card renders the replay shape and settled states disable buttons', () => {
-    const fx = fixture();
+test('a finished task leaves its card answerable; only a settled one is a record', async () => {
+    const fx = fixture({ fetchImpl: async () => ({
+        ok: true, status: 200,
+        json: async () => ({ ok: true, state: 'answered', answered_index: 1,
+            answered_after_terminal: true, forwarded: true }),
+    }) });
     try {
         const replayMsg = {
             msg_type: 'quiz', role: 'assistant', task_id: 't-1',
@@ -135,10 +138,41 @@ test('quiz card renders the replay shape and settled states disable buttons', ()
         const card = fx.decision.buildQuizCard(replayMsg);
         assert.ok(card);
         assert.equal(card.dataset.state, 'expired_terminal');
-        assert.match(card.querySelector('.chat-quiz-status-text').textContent, /question expired/);
-        assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => btn.disabled));
+        assert.match(card.querySelector('.chat-quiz-status-text').textContent, /a late answer is accepted/);
+        assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => !btn.disabled));
+        const field = card.querySelector('.chat-quiz-comment');
+        assert.ok(field);
         // The assumption line survives settlement: it is the record of the path taken.
         assert.match(card.querySelector('.chat-quiz-assumption').textContent, /merging meanwhile/);
+
+        field.value = 'late but decided';
+        card.querySelectorAll('.chat-quiz-option')[1].click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(JSON.parse(fx.calls[0].init.body).option_index, 1);
+        assert.equal(JSON.parse(fx.calls[0].init.body).comment, 'late but decided');
+        // Answered IS settled: the draft field goes and the buttons close.
+        assert.equal(card.dataset.state, 'answered');
+        assert.equal(card.querySelector('.chat-quiz-comment'), null);
+        assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => btn.disabled));
+
+        const superseded = fx.decision.buildQuizCard({
+            ...replayMsg, quiz: { ...replayMsg.quiz, quiz_id: 'qz-3', state: 'superseded' },
+        });
+        assert.ok(superseded.querySelectorAll('.chat-quiz-option').every((btn) => btn.disabled));
+        assert.equal(superseded.querySelector('.chat-quiz-comment'), null);
+    } finally { fx.restore(); }
+});
+
+test('a required card that outlived its task stops claiming the task is waiting', () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard({
+            ...WS_MSG, quiz_id: 'qz-wait-expired', wait_for_answer: true,
+            assumption: '', state: 'expired_terminal',
+        });
+        assert.equal(card.querySelector('.chat-quiz-wait'), null);
+        assert.ok(card.querySelector('.chat-quiz-comment'));
+        assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => !btn.disabled));
     } finally { fx.restore(); }
 });
 
@@ -159,10 +193,32 @@ test('an accepted answer marks the chosen option; degenerate cards refuse to ren
         assert.ok(buttons[1].classList.contains('chosen'));
         assert.ok(buttons.every((btn) => btn.disabled));
 
-        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, options: [{ label: 'only' }] }), null);
+        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'one', options: [{ label: 'only' }] })
+            .querySelectorAll('.chat-quiz-option').length, 1);
         assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: '' }), null);
         // An anonymous quiz has no answer address: refuse to render buttons.
         assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, task_id: '' }), null);
+    } finally { fx.restore(); }
+});
+
+test('an open question offers a free-text answer without fabricated options', async () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'open', options: [] });
+        assert.ok(card);
+        assert.equal(card.querySelectorAll('.chat-quiz-option').length, 0);
+        const answer = card.querySelector('.chat-quiz-comment');
+        assert.ok(answer);
+        answer.value = 'I would take a different route.';
+        answer.listeners.get('input')();
+        card.querySelector('.chat-quiz-send').click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const body = JSON.parse(fx.calls[0].init.body);
+        assert.equal(body.comment, 'I would take a different route.');
+        assert.equal(Object.hasOwn(body, 'option_index'), false);
+        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'absent', options: undefined }), null);
+        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'too-many',
+            options: Array.from({ length: 7 }, (_, i) => ({ label: `Choice ${i}` })) }), null);
     } finally { fx.restore(); }
 });
 
@@ -199,7 +255,7 @@ test('a second click while the first answer is in flight is ignored', async () =
         const buttons = card.querySelectorAll('.chat-quiz-option');
         buttons[0].click();
         buttons[1].click();
-        resolveFetch({ ok: true, status: 200 });
+        resolveFetch({ ok: true, status: 200, json: async () => ({ ok: true, state: 'answered', answered_index: 0 }) });
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.equal(fx.calls.length, 1);
         assert.equal(card.dataset.state, 'answered');
@@ -238,14 +294,20 @@ test('a 409 settles the card by the BODY state — a lost race reads answered, n
     } finally { fx.restore(); }
 });
 
-test('a bodyless 409 still settles the card as expired', async () => {
+test('a bodyless 409 no longer invents an expiry the card would obey', async () => {
+    // An expired card is still answerable, so a refusal without a state is not
+    // evidence of anything: report the failed attempt and keep the card as it is.
     const fx = fixture({ fetchImpl: async () => ({ ok: false, status: 409 }) });
     try {
         const card = fx.decision.buildQuizCard(WS_MSG);
         card.querySelectorAll('.chat-quiz-option')[0].click();
         await new Promise((resolve) => setTimeout(resolve, 0));
-        assert.equal(card.dataset.state, 'expired_terminal');
-        assert.match(fx.toasts[0].text, /no longer open/);
+        assert.equal(card.dataset.state, 'open');
+        assert.match(fx.toasts[0].text, /Could not record the answer \(409\)/);
+        // The pending latch is released: the owner can try again.
+        card.querySelectorAll('.chat-quiz-option')[0].click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(fx.calls.length, 2);
     } finally { fx.restore(); }
 });
 
@@ -273,14 +335,10 @@ test('a retry reuses the SAME request_id (stable idempotency key)', async () => 
 
 test('applyQuizStateFrame settles an existing card and ignores unknown ids', async () => {
     const fx = fixture({ fetchImpl: async () => ({ ok: true, status: 200 }) });
-    if (!globalThis.CSS) globalThis.CSS = { escape: (v) => String(v) };
     try {
         const card = fx.decision.buildQuizCard(WS_MSG);
-        const inner = card.children[0] || card; // frameNode wraps the card
-        const quizCard = inner.matchesClass && inner.matchesClass('chat-quiz-card') ? inner : card;
-        const root = {
-            querySelector: (sel) => (sel.includes('qz-1') ? quizCard : null),
-        };
+        const quizCard = card;
+        const root = {};
         // The live lifecycle frame (WS quiz_state) settles the card in place.
         const applied = fx.decision.applyQuizStateFrame(root, {
             quiz_id: 'qz-1', task_id: 't-1', state: 'answered', answered_index: 0,
@@ -314,11 +372,9 @@ test('applyQuizStateFrame settles an existing card and ignores unknown ids', asy
 
 test('a live quiz_state frame carries the owner comment onto the card like replay does (#471)', () => {
     const fx = fixture();
-    if (!globalThis.CSS) globalThis.CSS = { escape: (v) => String(v) };
     try {
         const card = fx.decision.buildQuizCard(WS_MSG);
-        const inner = card.children[0] || card;
-        const quizCard = inner.matchesClass && inner.matchesClass('chat-quiz-card') ? inner : card;
+        const quizCard = card;
         const root = { querySelector: (sel) => (sel.includes('qz-1') ? quizCard : null) };
         // The owner rejected every option and answered in their own words: the
         // frame carries no answered_index and the recorded comment.
@@ -421,6 +477,69 @@ test('an over-long answer is refused client-side, not truncated', async () => {
     } finally { fx.restore(); }
 });
 
+const pressEnter = (field, init = {}) => {
+    const event = { key: 'Enter', preventDefault() { event.defaultPrevented = true; }, ...init };
+    field.listeners.get('keydown')(event);
+    return event;
+};
+
+test('Enter sends an optionless answer through Send; Shift+Enter, composition and an empty field do not', async () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard({ ...WS_MSG, options: [] });
+        const { field } = commentParts(card);
+        assert.equal(field.enterKeyHint, 'send');
+        assert.equal(pressEnter(field).defaultPrevented, true, 'an empty answer neither sends nor becomes a line');
+        field.value = 'Friday';
+        field.listeners.get('input')();
+        assert.equal(pressEnter(field, { shiftKey: true }).defaultPrevented, undefined, 'Shift+Enter is the line break');
+        field.value = 'Friday\nand say it is provisional';
+        field.listeners.get('input')();
+        assert.equal(pressEnter(field, { isComposing: true }).defaultPrevented, undefined);
+        assert.equal(pressEnter(field, { keyCode: 229 }).defaultPrevented, undefined, 'WebKit commits IME this way');
+        await turn();
+        assert.equal(fx.calls.length, 0);
+        pressEnter(field);
+        await turn();
+        const body = JSON.parse(fx.calls[0].init.body);
+        assert.deepEqual([fx.calls.length, body.comment, 'option_index' in body], [1, 'Friday\nand say it is provisional', false]);
+        assert.equal(card.dataset.state, 'answered');
+        assert.equal(card.querySelector('.chat-quiz-comment-box'), null);
+        assert.equal(pressEnter(field).defaultPrevented, undefined, 'the settled card takes no key');
+        await turn();
+        assert.equal(fx.calls.length, 1);
+    } finally { fx.restore(); }
+});
+
+test('held Enter and an Enter/click race record one answer; a refusal keeps the draft for the same retry', async () => {
+    const replies = [];
+    const fx = fixture({ fetchImpl: () => new Promise((resolve) => replies.push(resolve)) });
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const { field, send } = commentParts(card);
+        field.value = 'wait for CI, then merge';
+        field.listeners.get('input')();
+        pressEnter(field);
+        assert.equal(pressEnter(field, { repeat: true }).defaultPrevented, true);
+        pressEnter(field);
+        send.click();
+        await turn();
+        assert.equal(fx.calls.length, 1, "the card's pending answer is the one gate");
+        replies.shift()({ ok: false, status: 503, json: async () => ({}) });
+        await turn();
+        assert.deepEqual([card.dataset.state, fx.toasts.at(-1).text], ['open', 'Could not record the answer (503).']);
+        assert.equal(card.querySelector('.chat-quiz-comment'), field);
+        assert.equal(field.value, 'wait for CI, then merge', 'the draft survives the refusal');
+        pressEnter(field);
+        await turn();
+        const [first, retry] = fx.calls.map((call) => JSON.parse(call.init.body));
+        assert.deepEqual([fx.calls.length, retry.request_id], [2, first.request_id], 'the retry replays the same request');
+        replies.shift()({ ok: true, status: 200, json: async () => ({ ok: true, state: 'answered', comment: retry.comment }) });
+        await turn();
+        assert.equal(card.dataset.state, 'answered');
+    } finally { fx.restore(); }
+});
+
 test('a settled replayed card shows the owner answer and offers no field', () => {
     const fx = fixture();
     try {
@@ -437,12 +556,17 @@ test('a settled replayed card shows the owner answer and offers no field', () =>
             "Owner's answer: neither — revert first");
         assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => btn.disabled));
         assert.ok(card.querySelectorAll('.chat-quiz-option').every((btn) => !btn.classList.contains('chosen')));
+        const replay = { ...WS_MSG, quiz_id: 'qz-3', state: 'answered' };
+        fx.decision.buildQuizCard(replay);
+        assert.match(card.querySelector('.chat-quiz-answer').textContent, /neither — revert first/);
+        fx.decision.buildQuizCard({ ...replay, answered_index: 0, comment: '' });
+        assert.equal(card.querySelector('.chat-quiz-answer'), null);
+        assert.ok(card.querySelectorAll('.chat-quiz-option')[0].classList.contains('chosen'));
     } finally { fx.restore(); }
 });
 
 test('a live state frame for an open card never wipes the typed draft', () => {
     const fx = fixture();
-    if (!globalThis.CSS) globalThis.CSS = { escape: (v) => String(v) };
     try {
         const card = fx.decision.buildQuizCard(WS_MSG);
         const { field } = commentParts(card);
@@ -509,6 +633,48 @@ test('an actionable refusal renders the picker card; other statuses fall back to
     } finally { fx.restore(); }
 });
 
+test('a refusal with a token but no options renders the host cause as the plain line, never a card', () => {
+    // The incident shape (client_message_id + routing_token, NO options): the
+    // host sends `cause`, the owner reads a sentence, and nothing is clickable.
+    const cause = 'Not started: the working folder can\'t be used';
+    const fx = fixture();
+    try {
+        const bubble = routingBubble('cm-refused');
+        const refused = {
+            action: 'promote_chat_to_task', status: 'needs_manual_target', routing_token: 'tok-r',
+            target: 'never-started', target_label: 'Аудит', cause,
+        };
+        assert.equal(fx.decision.renderRoutingDecision(bubble, refused), true);
+        assert.equal(bubble.querySelector('.chat-routing-card'), null);
+        const note = bubble.querySelector('.msg-routing-annotation');
+        assert.equal(note.textContent, cause);
+        assert.equal(note.dataset.annotationStatus, 'needs_manual_target');
+        assert.equal(bubble.dataset.chatAnnotationStatus, 'needs_manual_target');
+        assert.equal(fx.decision.renderRoutingDecision(bubble, refused), false);
+    } finally { fx.restore(); }
+});
+
+test('a routing 409 that reopens the card names the host cause before the raw reason', async () => {
+    const cause = 'Not started: the working folder can\'t be used';
+    const fx = fixture({
+        fetchImpl: async () => ({
+            ok: false, status: 409,
+            json: async () => ({ state: 'open', reason: 'workspace_unusable', cause }),
+        }),
+    });
+    try {
+        const bubble = routingBubble('cm-5');
+        fx.decision.renderRoutingDecision(bubble, ROUTING_ANNOTATION);
+        const card = bubble.querySelector('.chat-routing-card');
+        card.querySelectorAll('.chat-quiz-option')[0].click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        assert.equal(card.dataset.state, 'open');
+        assert.equal(fx.toasts.length, 1);
+        assert.equal(fx.toasts[0].text, `Not routed: ${cause} — pick again.`);
+        assert.equal(fx.toasts[0].text.includes('workspace_unusable'), false);
+    } finally { fx.restore(); }
+});
+
 test('a routing click posts the routing decision id with a STABLE request id', async () => {
     const fx = fixture();
     try {
@@ -571,22 +737,25 @@ test('more than eight options hide behind a show-all control', () => {
     } finally { fx.restore(); }
 });
 
-test('a duplicate confirmation renders the recorded free answer, not the retried click', async () => {
-    const fx = fixture({ fetchImpl: async () => ({
-        ok: true, status: 200,
-        json: async () => ({ ok: true, state: 'answered', duplicate: true, comment: 'my own plan' }),
-    }) });
-    try {
-        const card = fx.decision.buildQuizCard(WS_MSG);
-        const area = card.querySelector('.chat-quiz-comment');
-        area.value = 'rewritten retry';
-        card.querySelectorAll('.chat-quiz-option')[1].click();
-        await new Promise((resolve) => setTimeout(resolve, 0));
-        assert.equal(card.dataset.state, 'answered');
-        assert.equal(card.dataset.ownerComment, 'my own plan');
-        // No option is fabricated for a recorded free answer.
-        assert.ok(!card.querySelectorAll('.chat-quiz-option')[1].classList.contains('chosen'));
-    } finally { fx.restore(); }
+test('quiz success and duplicate retry use recorded confirmation, never the attempted answer', async () => {
+    for (const body of [null, 'malformed', {}, { ok: true, state: 'answered' },
+        { ok: true, state: 'answered', answered_index: 99 },
+        { ok: true, state: 'answered', answered_index: 0 },
+        { ok: true, state: 'answered', duplicate: true, comment: 'my own plan' }]) {
+        const fx = fixture({ fetchImpl: async () => ({ ok: true, status: 200,
+            json: async () => { if (body === 'malformed') throw new Error('bad JSON'); return body; } }) });
+        try {
+            const card = fx.decision.buildQuizCard(WS_MSG);
+            card.querySelector('.chat-quiz-comment').value = 'unconfirmed retry draft';
+            card.querySelectorAll('.chat-quiz-option')[1].click();
+            await new Promise((resolve) => setTimeout(resolve, 0));
+            const valid = body?.answered_index === 0 || body?.duplicate === true;
+            assert.deepEqual([card.dataset.state, card.dataset.ownerComment, fx.toasts.length],
+                [valid ? 'answered' : 'open', body?.comment, valid ? 0 : 1]);
+            assert.deepEqual(card.querySelectorAll('.chat-quiz-option').map(b => b.classList.contains('chosen')),
+                [body?.answered_index === 0, false]);
+        } finally { fx.restore(); }
+    }
 });
 
 test('a 409 loser adopts the winning comment over its local draft', async () => {
@@ -602,5 +771,168 @@ test('a 409 loser adopts the winning comment over its local draft', async () => 
         await new Promise((resolve) => setTimeout(resolve, 0));
         assert.equal(card.dataset.state, 'answered');
         assert.equal(card.dataset.ownerComment, 'winning note');
+    } finally { fx.restore(); }
+});
+
+test('the recommended option carries a badge on the live card and on the targeted-detail replay', async () => {
+    const fx = fixture({ fetchDetail: async () => ({ task_id: 't-1', project_id: 'p1', owner_quiz: {
+        'qz-2': { ...WS_MSG, quiz_id: 'qz-2', options: ['Yes', 'No'], option_details: ['', 'wait for CI'],
+            recommended_index: 1, asked_at: WS_MSG.ts },
+    } }) });
+    const badges = (card) => card.querySelectorAll('.chat-quiz-option')
+        .map((button) => button.querySelectorAll('.chat-quiz-option-recommended').length);
+    try {
+        const live = fx.decision.buildQuizCard({ ...WS_MSG, options: [{ label: 'Yes', recommended: true }, { label: 'No' }] });
+        assert.deepEqual(badges(live), [1, 0]);
+        assert.equal(live.querySelector('.chat-quiz-option-recommended').textContent, 'recommended');
+        // A history row that lost the option details carries no badge; the targeted detail
+        // (durable recommended_index) adds it in place, exactly like the option details.
+        const stale = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-2', options: ['Yes', 'No'] });
+        assert.deepEqual(badges(stale), [0, 0]);
+        const question = await fx.decision.readQuestion('t-1', 'qz-2', 'p1');
+        assert.equal(fx.decision.buildQuizCard(question), null);
+        assert.deepEqual(badges(stale), [0, 1]);
+        assert.equal(fx.decision.buildQuizCard(question), null);
+        assert.deepEqual(badges(stale), [0, 1], 'the badge is added once');
+        // A fresh card built straight from the projection carries the same badge; a plain card none.
+        assert.deepEqual(badges(fx.decision.buildQuizCard({ ...question, quiz_id: 'qz-5' })), [0, 1]);
+        assert.deepEqual(badges(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-3' })), [0, 0]);
+    } finally { fx.restore(); }
+});
+
+test('a bounded wait that closed stops saying waiting while the card stays answerable', () => {
+    const fx = fixture({ fetchImpl: async () => ({ ok: true, status: 200 }) });
+    try {
+        const card = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-w', wait_for_answer: true });
+        const quizCard = card;
+        assert.match(quizCard.querySelector('.chat-quiz-wait').textContent, /Waiting for your answer/);
+        const root = { querySelector: (sel) => (sel.includes('qz-w') ? quizCard : null) };
+        const applied = fx.decision.applyQuizStateFrame(root, { quiz_id: 'qz-w', task_id: 't-1', state: 'open', wait_for_answer: false });
+        assert.equal(applied, true);
+        assert.equal(quizCard.querySelector('.chat-quiz-wait'), null);
+        assert.match(quizCard.querySelector('.chat-quiz-assumption').textContent, /wait ended/);
+        assert.equal(quizCard.dataset.state, 'open');
+        // History replay renders the ended wait from the projection (wait_ended_at, no wait_for_answer).
+        const replayed = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-r', wait_ended_at: '2026-08-31T10:05:00Z' });
+        const rcard = replayed;
+        assert.match(rcard.querySelector('.chat-quiz-assumption').textContent, /wait ended/);
+        assert.equal(rcard.querySelector('.chat-quiz-wait'), null);
+    } finally { fx.restore(); }
+});
+
+test('reconciling a replayed row into an existing card projects the closed bound', () => {
+    const fx = fixture({ fetchImpl: async () => ({ ok: true, status: 200 }) });
+    try {
+        const card = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-m', wait_for_answer: true });
+        const quizCard = card;
+        assert.match(quizCard.querySelector('.chat-quiz-wait').textContent, /Waiting for your answer/);
+        // The owner was disconnected during the timeout: no frame arrived, history replays the row
+        // with the closed bound and reconciles it into the SAME card.
+        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-m', wait_ended_at: '2026-08-31T10:05:00Z' }), null);
+        assert.equal(quizCard.querySelector('.chat-quiz-wait'), null);
+        assert.match(quizCard.querySelector('.chat-quiz-assumption').textContent, /wait ended/);
+    } finally { fx.restore(); }
+});
+
+test('a detail read begun before a live answer enriches the source, never the state', async () => {
+    let resolve;
+    const fx = fixture({ fetchDetail: () => new Promise((done) => { resolve = done; }) });
+    try {
+        const read = fx.decision.readQuestion('t-1', 'qz-1', 'p1');
+        await turn();
+        fx.decision.applyQuizStateFrame({}, { task_id: 't-1', quiz_id: 'qz-1', state: 'answered', answered_index: 0, comment: 'Actual answer' });
+        resolve({ task_id: 't-1', project_id: 'p1', owner_quiz: { 'qz-1': { ...WS_MSG, wait_for_answer: true } },
+            owner_wait: { quiz_id: 'qz-1', state: 'waiting' } });
+        const question = await read;
+        assert.equal(question.state, 'answered');
+        assert.equal(question.comment, 'Actual answer');
+        assert.equal(question.question, 'Merge now?');
+        const card = fx.decision.buildQuizCard(question);
+        assert.equal(card.querySelector('.chat-quiz-status-text').textContent, 'You answered');
+        assert.ok(card.querySelectorAll('.chat-quiz-option')[0].classList.contains('chosen'));
+        assert.equal(card.querySelector('.chat-quiz-wait'), null);
+        fx.decision.destroy();
+        assert.equal(await fx.decision.readQuestion('t-1', 'qz-1', 'p1'), null);
+    } finally { fx.restore(); }
+});
+
+test('the Project card reads the wait facts history attaches: a wait resumed by owner input stops waiting', async () => {
+    const fx = fixture({ fetchDetail: async () => ({ task_id: 't-1', project_id: 'p1',
+        owner_quiz: { 'qz-d': { ...WS_MSG, quiz_id: 'qz-d', wait_for_answer: true, options: ['Yes', 'No'] } },
+        owner_wait: { quiz_id: 'another', state: 'waiting' } }) });
+    try {
+        const replayed = fx.decision.buildQuizCard({ task_id: 't-1', text: 'Merge now?',
+            quiz: { ...WS_MSG, quiz_id: 'qz-o', wait_for_answer: true, owner_wait_state: 'resumed', assumption: '' } });
+        assert.equal(replayed.querySelector('.chat-quiz-wait'), null);
+        assert.match(replayed.querySelector('.chat-quiz-assumption').textContent, /wait ended without an answer/);
+        assert.equal(replayed.querySelector('.chat-quiz-status-text').textContent, 'Unanswered · the task continued; an answer is still accepted');
+        assert.ok(replayed.querySelectorAll('.chat-quiz-option').every((btn) => !btn.disabled));
+        // A detail read whose wait record moved on to another quiz proves this wait ended too.
+        const detail = fx.decision.buildQuizCard(await fx.decision.readQuestion('t-1', 'qz-d', 'p1'));
+        assert.equal(detail.querySelector('.chat-quiz-status-text').textContent, 'Unanswered · the task continued; an answer is still accepted');
+        // A bounded wait that ended under an assumption names the path the task took.
+        const assumed = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-a', wait_for_answer: true, wait_ended_at: 'x' });
+        assert.match(assumed.querySelector('.chat-quiz-assumption').textContent, /under its assumption \(continuing with the merge\)/);
+    } finally { fx.restore(); }
+});
+
+test('a late answer says where it went', async () => {
+    for (const forwarded of [true, false]) {
+        const fx = fixture({ fetchImpl: async () => ({ ok: true, status: 200, json: async () => ({
+            ok: true, state: 'answered', answered_index: 0, answered_after_terminal: true, forwarded }) }) });
+        try {
+            const card = fx.decision.buildQuizCard({ ...WS_MSG, state: 'expired_terminal' });
+            card.querySelectorAll('.chat-quiz-option')[0].click();
+            await turn();
+            assert.equal(card.dataset.state, 'answered');
+            assert.deepEqual(fx.toasts.map((toast) => toast.tone), ['info']);
+            assert.match(fx.toasts[0].text, forwarded ? /delivered to its chat as your message/ : /nothing is waiting on it/);
+        } finally { fx.restore(); }
+    }
+});
+
+test('the host facts line sits under the question when the card carries it and is absent otherwise', () => {
+    const fx = fixture();
+    const facts = 'Asked by task t-1, started by your message of 2026-09-25 00:21 UTC; '
+        + 'your last message in this chat: 2026-09-25 00:21 UTC (47 minutes before this question).';
+    try {
+        const card = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-facts', host_facts: facts });
+        const line = card.querySelector('.chat-quiz-host-facts');
+        assert.equal(line.textContent, facts);
+        // Plain text directly under the question, never through the markdown pipeline.
+        assert.equal(line.innerHTML, undefined);
+        const question = card.querySelector('.chat-quiz-question');
+        assert.equal(question.nextElementSibling, line);
+        // A stored history row nests the quiz; the sentence rides the nested block.
+        const replay = fx.decision.buildQuizCard({ task_id: 't-1', text: WS_MSG.question,
+            quiz: { ...WS_MSG, quiz_id: 'qz-facts-replay', host_facts: facts } });
+        assert.equal(replay.querySelector('.chat-quiz-host-facts').textContent, facts);
+        const bare = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-bare' });
+        assert.equal(bare.querySelector('.chat-quiz-host-facts'), null);
+        const empty = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-empty', host_facts: '' });
+        assert.equal(empty.querySelector('.chat-quiz-host-facts'), null);
+        // A later, richer delivery of an already rendered card adds the line once.
+        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-bare', host_facts: facts }), null);
+        assert.equal(bare.querySelectorAll('.chat-quiz-host-facts').length, 1);
+        assert.equal(bare.querySelector('.chat-quiz-question').nextElementSibling.textContent, facts);
+        fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-bare', host_facts: facts });
+        assert.equal(bare.querySelectorAll('.chat-quiz-host-facts').length, 1);
+    } finally { fx.restore(); }
+});
+
+test('a Main mirror of a Project question carries the host facts line from its pointer row', () => {
+    const column = new NodeStub();
+    const fx = fixture({ isMain: true,
+        frameNode: (_msg, card) => { const bubble = new NodeStub(); bubble.append(card); return bubble; },
+        insertMessageNode: (node) => { column.append(node); return true; } });
+    const row = { role: 'system', system_type: 'project_question_pointer', task_id: 't-9', quiz_id: 'qz-9',
+        project_id: 'p1', project_chat_id: 23, project_name: 'Storage', ts: '2026-09-25T00:00:00+00:00',
+        quiz_state: 'open', question: 'Merge now?', options: ['Yes', 'No'] };
+    try {
+        assert.ok(fx.decision.appendQuestionPointer({ ...row, host_facts: 'Asked by task t-9, origin unknown.' }));
+        const card = column.children[0].children[0];
+        assert.equal(card.querySelector('.chat-quiz-host-facts').textContent, 'Asked by task t-9, origin unknown.');
+        assert.ok(fx.decision.appendQuestionPointer({ ...row, task_id: 't-10' }));
+        assert.equal(column.children[1].children[0].querySelector('.chat-quiz-host-facts'), null);
     } finally { fx.restore(); }
 });

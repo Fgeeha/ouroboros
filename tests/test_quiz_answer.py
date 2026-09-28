@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import types
 
+import pytest
 
 from ouroboros.owner_quiz import (
     STATE_ANSWERED,
@@ -55,6 +56,33 @@ def test_projection_lifecycle_first_answer_wins(tmp_path):
     assert late["state"] == STATE_ANSWERED
 
 
+def test_projection_admits_the_late_answer_only_under_the_explicit_flag(tmp_path):
+    """В17a=A at the projection layer: an expired block is answerable when the
+    caller says the author is gone, and the acceptance is auditable. Without the
+    flag the expiry still refuses, and an ANSWERED block always does."""
+    record_asked(tmp_path, "t1", quiz_id="q1", question="Which?", options=["A", "B"],
+                 assumption="assume A", chat_id=7, max_wait_minutes=20)
+    block = quiz_states(tmp_path, "t1")["q1"]
+    assert block["chat_id"] == 7 and block["max_wait_minutes"] == 20
+    assert reconcile_terminal(tmp_path, "t1") == ["q1"]
+
+    refused = record_answered(tmp_path, "t1", quiz_id="q1", option_index=0, request_id="r0")
+    assert refused["ok"] is False and refused["error"] == "quiz_closed"
+    assert refused["state"] == STATE_EXPIRED_TERMINAL
+
+    late = record_answered(tmp_path, "t1", quiz_id="q1", option_index=1,
+                           request_id="r1", comment="B, please", allow_expired=True)
+    assert late["ok"] is True and late["state"] == STATE_ANSWERED
+    assert late["block"]["answered_after_terminal"] is True
+    assert late["block"]["answered_index"] == 1 and late["block"]["comment"] == "B, please"
+
+    # First-wins survives: another id cannot overwrite the recorded answer.
+    second = record_answered(tmp_path, "t1", quiz_id="q1", option_index=0,
+                             request_id="r2", allow_expired=True)
+    assert second["ok"] is False and second["state"] == STATE_ANSWERED
+    assert quiz_states(tmp_path, "t1")["q1"]["answered_index"] == 1
+
+
 def test_projection_refuses_out_of_range_and_unknown(tmp_path):
     record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A", "B"])
     out = record_answered(tmp_path, "t1", quiz_id="q1", option_index=7, request_id="r")
@@ -81,6 +109,47 @@ def test_structural_expiry_flips_open_only(tmp_path):
     assert states["q2"]["state"] == STATE_ANSWERED
     # Idempotent: a second reconcile changes nothing and reports nothing.
     assert reconcile_terminal(tmp_path, "t1") == []
+
+
+def test_structural_expiry_closes_the_paired_owner_wait(tmp_path):
+    record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A"])
+    path = _result_path(tmp_path, "t1")
+    row = json.loads(path.read_text())
+    row["owner_wait"] = {"quiz_id": "q1", "wait_id": "w1", "state": "waiting"}
+    path.write_text(json.dumps(row))
+
+    assert reconcile_terminal(tmp_path, "t1") == ["q1"]
+    updated = json.loads(path.read_text())
+    assert updated["owner_quiz"]["q1"]["state"] == STATE_EXPIRED_TERMINAL
+    assert updated["owner_wait"]["state"] == STATE_EXPIRED_TERMINAL
+    assert updated["owner_wait"]["reconciled_at"]
+
+
+def test_structural_expiry_repairs_wait_after_partial_pair_write_failure(tmp_path, monkeypatch):
+    import ouroboros.owner_quiz as owner_quiz
+    from ouroboros.utils import update_json_locked as real_update_json_locked
+
+    record_asked(tmp_path, "t1", quiz_id="q1", question="?", options=["A"])
+    path = _result_path(tmp_path, "t1")
+    row = json.loads(path.read_text())
+    row["owner_wait"] = {"quiz_id": "q1", "wait_id": "w1", "state": "waiting"}
+    path.write_text(json.dumps(row))
+    calls = {"count": 0}
+
+    def fail_pair_write(*args, **kwargs):
+        calls["count"] += 1
+        if calls["count"] == 2:
+            raise OSError("simulated paired projection failure")
+        return real_update_json_locked(*args, **kwargs)
+
+    monkeypatch.setattr(owner_quiz, "update_json_locked", fail_pair_write)
+    with pytest.raises(OSError):
+        reconcile_terminal(tmp_path, "t1")
+    assert json.loads(path.read_text())["owner_quiz"]["q1"]["state"] == STATE_EXPIRED_TERMINAL
+
+    monkeypatch.setattr(owner_quiz, "update_json_locked", real_update_json_locked)
+    assert reconcile_terminal(tmp_path, "t1") == []
+    assert json.loads(path.read_text())["owner_wait"]["state"] == STATE_EXPIRED_TERMINAL
 
 
 def test_projection_survives_concurrent_result_fields(tmp_path):
@@ -185,29 +254,6 @@ def test_ingress_answers_a_live_quiz_end_to_end(tmp_path, monkeypatch):
     assert len([e for e in entries if e.get("kind") == KIND_QUIZ_ANSWER]) == 1
 
 
-def test_ingress_late_answer_is_an_honest_409(tmp_path, monkeypatch):
-    record_asked(tmp_path, "task-1", quiz_id="q1", question="?", options=["A", "B"])
-    reconcile_terminal(tmp_path, "task-1")  # the task settled
-    app = _decision_app(tmp_path, monkeypatch, live_task=None)
-    resp = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1",
-                       "option_index": 0})
-    assert resp.status_code == 409
-    assert resp.json()["state"] == "expired_terminal"
-
-
-def test_ingress_heals_an_unreconciled_quiz_of_a_dead_task(tmp_path, monkeypatch):
-    """Crash window: the author died before the task-done seam expired its
-    open quiz. A late answer must NOT be recorded into a mailbox nobody
-    drains — the ingress reconciles first and answers the honest 409."""
-    record_asked(tmp_path, "task-1", quiz_id="q1", question="?", options=["A", "B"])
-    app = _decision_app(tmp_path, monkeypatch, live_task=None)
-    resp = _post(app, {"request_id": "r1", "decision_id": "quiz:task-1:q1",
-                       "option_index": 0})
-    assert resp.status_code == 409
-    assert resp.json()["state"] == "expired_terminal"
-    assert quiz_states(tmp_path, "task-1")["q1"]["state"] == STATE_EXPIRED_TERMINAL
-
-
 def test_ingress_refusals_are_typed(tmp_path, monkeypatch):
     app = _decision_app(tmp_path, monkeypatch, live_task=None)
     assert _post(app, {"decision_id": "quiz:t:q", "option_index": 0}).status_code == 400
@@ -298,11 +344,12 @@ def _escalate(ctx, **kw):
     from ouroboros.tools.core import _escalate as impl
 
     return impl(ctx, kw.pop("question"), kw.pop("options"),
-                kw.pop("stake", ""), kw.pop("assumption", ""))
+                kw.pop("stake", ""), kw.pop("assumption", ""), **kw)
 
 
-def test_escalate_root_records_projection_and_emits_quiz(tmp_path):
-    ctx = _tool_ctx(tmp_path)
+@pytest.mark.parametrize("role", ["", "root"])
+def test_escalate_root_records_projection_and_emits_quiz(tmp_path, role):
+    ctx = _tool_ctx(tmp_path, role=role)
     out = _escalate(ctx, question="Which db?", options=["sqlite", "postgres"],
                     assumption="sqlite meanwhile")
     assert out.startswith("OK: quiz ")
@@ -314,6 +361,26 @@ def test_escalate_root_records_projection_and_emits_quiz(tmp_path):
     states = quiz_states(tmp_path, "root-1")
     assert list(states.values())[0]["state"] == STATE_OPEN
     assert states[evt["quiz_id"]]["options"] == ["sqlite", "postgres"]
+
+
+def test_required_root_question_records_wait_without_default_answer(tmp_path):
+    ctx = _tool_ctx(tmp_path, role="root")
+    ctx.owner_wait_callback = lambda *_: None
+    result = _escalate(ctx, question="Which destination?", options=["A", "B"],
+                       wait_for_answer=True)
+    assert result.startswith("OK: quiz")
+    assert ctx._owner_wait_requested
+    event = ctx.pending_events[0]
+    assert event["wait_for_answer"] is True and event["assumption"] == ""
+    assert quiz_states(tmp_path, "root-1")[ctx._owner_wait_requested]["wait_for_answer"] is True
+
+
+def test_required_question_refuses_unaddressable_machine_chat(tmp_path):
+    ctx = _tool_ctx(tmp_path, role="root", chat_id=-1)
+    ctx.owner_wait_callback = lambda *_: None
+    result = _escalate(ctx, question="Which?", options=["A", "B"], wait_for_answer=True)
+    assert "no owner question delivery" in result
+    assert not ctx.pending_events and not quiz_states(tmp_path, "root-1")
 
 
 def test_escalate_subagent_writes_parent_mailbox_frame(tmp_path, monkeypatch):
@@ -331,10 +398,12 @@ def test_escalate_subagent_writes_parent_mailbox_frame(tmp_path, monkeypatch):
                         lambda root, tid: {"status": "running",
                                            "drive_root": str(tmp_path)})
     ctx = _tool_ctx(tmp_path, task_id="child-9", parent="root-1")
+    # A child cannot wait, so a habit-filled bound is ignored — and the receipt says so.
     out = _escalate(ctx, question="Delete the flaky test?",
                     options=[{"label": "delete"}, {"label": "quarantine"}],
-                    stake="CI health", assumption="quarantine meanwhile")
+                    stake="CI health", assumption="quarantine meanwhile", max_wait_minutes=1)
     assert out.startswith("OK: escalated to parent task root-1")
+    assert "max_wait_minutes ignored: it applies only to wait_for_answer=true" in out
     entries = drain_owner_entries(tmp_path, "root-1", set())
     assert entries and entries[0]["provenance"] == "descendant_task"
     text = entries[0]["text"]
@@ -343,6 +412,10 @@ def test_escalate_subagent_writes_parent_mailbox_frame(tmp_path, monkeypatch):
     assert "forward_to_worker(task_id=child-9" in text
     # No owner card, no projection for the child hop.
     assert not [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    # A habit-filled bound is disclosed on the child's receipt too, never sent up the chain.
+    out = _escalate(ctx, question="Again?", options=["a", "b"], assumption="keep going.", max_wait_minutes=1)
+    assert out.endswith("assumption: keep going. (max_wait_minutes ignored: it applies only to wait_for_answer=true)")
+    assert "max_wait_minutes" not in drain_owner_entries(tmp_path, "root-1", set())[-1]["text"]
     assert quiz_states(tmp_path, "child-9") == {}
 
 
@@ -356,26 +429,15 @@ def test_escalate_settled_parent_is_a_typed_dead_end(tmp_path, monkeypatch):
     assert out.startswith("⚠️ ESCALATE_PARENT_SETTLED")
 
 
-def test_escalate_background_refused(tmp_path):
-    ctx = _tool_ctx(tmp_path, task_id="bg-consciousness", role="background")
-    out = _escalate(ctx, question="?", options=["a", "b"], assumption="a")
-    assert out.startswith("⚠️ ESCALATE_UNAVAILABLE")
-
-
 def test_escalate_invalid_payload_is_typed(tmp_path):
     ctx = _tool_ctx(tmp_path)
-    out = _escalate(ctx, question="?", options=["only-one"], assumption="a")
+    out = _escalate(ctx, question="?", options=["a"] * 7, assumption="a")
     assert out.startswith("⚠️ QUIZ_OPTIONS_INVALID")
     out = _escalate(ctx, question="?", options=["a", "b"], assumption="")
     assert out.startswith("⚠️ QUIZ_ASSUMPTION_REQUIRED")
+    assert "what you do meanwhile" in out  # the refusal names its own repair
 
 
-def test_escalate_absent_from_ephemeral_allowlist():
-    """A decision turn cannot escalate — the structural default-deny refusal
-    comes free, exactly like forward_to_worker."""
-    from ouroboros.tools.registry import _EPHEMERAL_ALLOWED_TOOLS
-
-    assert "escalate" not in _EPHEMERAL_ALLOWED_TOOLS
 
 
 def test_escalate_in_all_three_tool_profiles():
@@ -631,8 +693,10 @@ def test_own_answer_needs_no_option_index(tmp_path, monkeypatch):
 
     entries = drain_owner_entries(tmp_path, "task-1", set())
     frame_text = [e for e in entries if e.get("kind") == KIND_QUIZ_ANSWER][0]["text"]
-    assert ("The owner rejected all offered options and answered verbatim: "
-            "neither — use duckdb") in frame_text
+    assert ("The owner answered in their own words without choosing an offered "
+            "option. Verbatim: neither — use duckdb") in frame_text
+    # The host never words the free answer as a rejection the owner did not state.
+    assert "rejected" not in frame_text
     assert "chose option" not in frame_text
 
 
@@ -786,15 +850,105 @@ def test_quiz_state_frame_carries_the_comment_only_when_recorded():
     """#471: `send_quiz_state` puts the owner's free-text answer on the live
     `quiz_state` frame when one was recorded and leaves the key absent
     otherwise (an option-only answer, an expiry, a supersede)."""
+    from ouroboros import event_bus
     from supervisor.message_bus import LocalChatBridge
 
     frames = []
+    bus = event_bus.init_global_event_bus()
+    published = []
+    bus.subscribe("test-transport", event_bus.CHAT_QUIZ_STATE, published.append)
     bridge = LocalChatBridge.__new__(LocalChatBridge)
     bridge._broadcast_fn = frames.append
-    bridge.send_quiz_state("q1", "t1", "answered", answered_index=1)
+    bridge._chat_transports = {7: {"provider": "telegram"}}
+    bridge.send_quiz_state("q1", "t1", "answered", answered_index=1, chat_id=7)
     bridge.send_quiz_state("q1", "t1", "answered", comment="neither — use duckdb")
     bridge.send_quiz_state("q1", "t1", "expired_terminal", comment="")
     assert [("comment" in f, f.get("comment")) for f in frames] == [
         (False, None), (True, "neither — use duckdb"), (False, None),
     ]
     assert frames[0]["answered_index"] == 1 and "answered_index" not in frames[1]
+    # TZ-2 B2: the same lifecycle fact reaches transport skills through the event
+    # bus (the WebSocket reaches only the SPA), carrying the chat's transport so a
+    # skill can edit the card it already delivered instead of waiting for a reload.
+    assert [e["state"] for e in published] == ["answered", "answered", "expired_terminal"]
+    assert published[0]["transport"] == {"provider": "telegram"} and published[1]["transport"] == {}
+    assert published[0]["chat_id"] == 7 and "chat_id" not in published[1]
+    assert published[2]["topic"] == event_bus.CHAT_QUIZ_STATE
+
+
+def test_recommended_option_rides_the_card_the_projection_and_the_parent_frame(tmp_path, monkeypatch):
+    """Owner batch 1 Q7=B / В8=A: the asker marks ONE option as its recommendation. The
+    shared validator carries the flag only when it is literally true, the owner card and
+    the durable projection keep it (the web badge and the Telegram star read them), and a
+    subagent's frame to its parent names it."""
+    from ouroboros.owner_quiz import quiz_states
+    from ouroboros.tools.core_artifacts import validate_quiz_payload
+
+    payload = validate_quiz_payload("Which db?", [
+        {"label": "sqlite", "detail": "cheap, single file", "recommended": True},
+        {"label": "postgres", "recommended": "yes"}, "mysql",
+    ], "", "sqlite meanwhile")
+    assert payload["options"] == [
+        {"label": "sqlite", "detail": "cheap, single file", "recommended": True}, {"label": "postgres"}, {"label": "mysql"},
+    ]
+    ctx = _tool_ctx(tmp_path)
+    out = _escalate(ctx, question="Which db?", options=payload["options"], assumption="sqlite meanwhile")
+    assert out.startswith("OK: quiz ")
+    [event] = [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    assert event["options"][0]["recommended"] is True and "recommended" not in event["options"][1]
+    [block] = quiz_states(tmp_path, "root-1").values()
+    assert block["recommended_index"] == 0 and block["options"] == ["sqlite", "postgres", "mysql"]
+    plain = _escalate(_tool_ctx(tmp_path, task_id="root-2"), question="?", options=["a", "b"], assumption="a")
+    assert plain.startswith("OK: quiz ")
+    assert "recommended_index" not in list(quiz_states(tmp_path, "root-2").values())[0]
+    # The subagent hop: the parent's frame names the recommended option.
+    import ouroboros.task_status as ts
+    from ouroboros.owner_mailbox import drain_owner_entries
+
+    monkeypatch.setattr(ts, "load_effective_task_result", lambda root, tid: {"status": "running"})
+    child = _tool_ctx(tmp_path, task_id="child-9", parent="root-1")
+    _escalate(child, question="Which db?", options=payload["options"], assumption="sqlite meanwhile")
+    [frame] = drain_owner_entries(tmp_path, "root-1", set())
+    assert "1. sqlite — cheap, single file [recommended]\n2. postgres\n3. mysql" in frame["text"]
+
+
+def test_escalate_refusals_are_typed_per_branch_and_a_headless_root_still_asks(tmp_path):
+    """Verification only: the real refusal branches as the predicate is written.
+    A live direct conversation (including one with no continuation owner) is refused;
+    REQUIRED waiting without a live continuation owner is refused. A headless root
+    without owner_wait_callback is NOT refused for an optional question: it mints the
+    ordinary card and continues under its assumption. (A consciousness wake-up is an
+    ordinary root here — nothing refuses it by role.)"""
+    direct = _tool_ctx(tmp_path)
+    direct.is_direct_chat = True
+    out = _escalate(direct, question="?", options=["a", "b"], assumption="a")
+    assert out.startswith("⚠️ ESCALATE_UNAVAILABLE: this is a live owner conversation")
+    headless = _tool_ctx(tmp_path)  # a queued root: not a direct chat, no owner_wait_callback
+    assert _escalate(headless, question="?", options=["a", "b"], assumption="a").startswith("OK: quiz ")
+    required = _escalate(headless, question="?", options=["a", "b"], assumption="", wait_for_answer=True)
+    assert required == ("⚠️ ESCALATE_UNAVAILABLE: required owner waiting needs a root task with a live "
+                        "continuation owner.")
+
+
+def test_two_recommended_options_are_refused_and_one_survives_live_and_replay_alike(tmp_path):
+    """Fix cycle 2, 2d: a two-recommendation payload is a typed refusal before any card
+    or projection exists; a single recommendation is the same option on the live card
+    (event) and in the durable block the replay reads (recommended_index)."""
+    from ouroboros.owner_quiz import quiz_states
+
+    ctx = _tool_ctx(tmp_path)
+    out = _escalate(ctx, question="Which db?",
+                    options=[{"label": "sqlite", "recommended": True}, {"label": "postgres", "recommended": True}],
+                    assumption="sqlite meanwhile")
+    assert out == ("⚠️ QUIZ_RECOMMENDED_INVALID: mark at most one option as recommended. "
+                   "The quiz was not sent.")
+    assert not [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    assert quiz_states(tmp_path, "root-1") == {}
+    out = _escalate(ctx, question="Which db?",
+                    options=[{"label": "sqlite"}, {"label": "postgres", "recommended": True}],
+                    assumption="sqlite meanwhile")
+    assert out.startswith("OK: quiz ")
+    [event] = [e for e in ctx.pending_events if e.get("type") == "send_quiz"]
+    live = [index for index, option in enumerate(event["options"]) if option.get("recommended")]
+    [block] = quiz_states(tmp_path, "root-1").values()
+    assert live == [1] and block["recommended_index"] == 1  # live and replay agree on the one option

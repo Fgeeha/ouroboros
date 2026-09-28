@@ -5,24 +5,23 @@ evidence): the system prompt carries the findings-only stance, the domain-free
 rubric, the blocking rule, the convergence rule (cycle ≥2), the checklist
 section verbatim, and the governance pack (W3: BIBLE.md + ARCHITECTURE.md in full for a
 self-modification plan, their navigation maps otherwise); the user content carries
-TASK OBJECTIVE · SPEC · PLAN PROSE · EVIDENCE (+ OMISSIONS) · ROOT EXPLORATION
-LOG · PRIOR CYCLES in that order. String bounds are ``PACKET_*_CHARS`` (plan_spec) via
-``utils.truncate_review_artifact`` — visible marker, never silent. The
+TASK OBJECTIVE · SPEC · PLAN PROSE · EVIDENCE · OWN ROOM DIALOGUE · RELATED
+ROOM POINTERS · ROOT EXPLORATION LOG · PRIOR CYCLES in that order. The full
+redacted dialogue uses task source custody and route-sized projections; only
+exploration and prior-cycle summaries retain independent display bounds. The
 ``PLAN_REVIEW_CONTROL_JSON`` control line is NOT emitted here (Phase C owns it).
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any, Mapping, Optional
 
 from ouroboros.tools.plan_spec import (
     PACKET_EXPLORATION_CHARS,
     bounded_json,
-    PACKET_OBJECTIVE_CHARS,
     PACKET_PRIOR_CYCLES_CHARS,
     PACKET_PRIOR_FINDING_SUMMARY_CHARS,
-    PACKET_PROSE_CHARS,
-    PACKET_SPEC_CHARS,
     PLAN_FINDINGS_ARRAY_CONTRACT,
     bounded_text,
     spec_with_ids,
@@ -43,24 +42,38 @@ _RUBRIC = (
     "4. Deferrals — is an expensive-to-reverse decision hiding inside `deferred`?",
     "5. Evidence sufficiency — is the attached evidence enough to judge 1–4? If not, ask for "
     "exactly what is missing with a `need_evidence` finding naming its locator (the host attaches "
-    "what its evidence policy allows on the next cycle and names every absence); do not invent a gap.",
+    "what its evidence policy allows on the next cycle and names every absence). When what is "
+    "missing is the AUTHOR's judgment rather than a document, ask the author: a `need_evidence` "
+    "finding whose `breaks` names the spec id the question is about, no locator needed; Ouroboros "
+    "answers it in its disposition or escalates it. Do not invent a gap.",
+    "6. Subtraction — what could the spec drop (a claim, decision, invariant, deferral, path or "
+    "guard) without losing the goal? Say it as a `note` naming the element id; removing is advice "
+    "as legitimate as adding.",
 )
 
 _BLOCKING_RULE = (
     "A finding is `blocking` iff being wrong about it AFTER the work starts would invalidate work "
     "already done, violate a declared commitment, or make an acceptance claim unverifiable — and it "
     "MUST name `breaks`: the id of the spec element it breaks (goal for the intention as a whole, claim_N, invariant_N, decision_N, "
-    "deferred_N). Everything else is a `note`. If missing evidence makes a claim STRUCTURALLY "
-    "unverifiable, that is `blocking` with `breaks=<claim id>`, not `need_evidence`."
+    "deferred_N). Everything else is a `note`. A claim you cannot check as written is a question to "
+    "the author (`need_evidence` with the claim id in `breaks`) or a `note`, not a blocker."
 )
 
 _CONVERGENCE_RULE = (
-    "CONVERGENCE RULE (cycle ≥2): a reformulation of a prior finding is not a new finding; a new "
-    "`blocking` finding must state why it was invisible in the previous cycle; a prior `blocking` "
-    "finding that is still open must be re-emitted (same id, summary starting `still-open:`); a "
-    "resolved one is simply not repeated. Spec ids may have SHIFTED between cycles (positional ids "
-    "renumber when an element is dropped or reordered): re-target `breaks` against the CURRENT spec "
-    "ids using the Spec delta (`renumbered: [{from, to, text}]`), never against the old ids."
+    "CONVERGENCE RULE (cycle ≥2) — adjudicate your OWN earlier findings first. They are the rows "
+    "below whose finding_id starts with your panel seat (named at the end of this packet). Read the "
+    "author's dispositions and the Spec delta as the author's argument, and for each `blocking` "
+    "finding and `need_evidence` you raised decide: RESOLVED — the delta or the rationale answers "
+    "it: do not repeat it; SUPERSEDED — the element it targeted was removed or replaced: do not "
+    "repeat it; STILL OPEN — re-emit it (same id and class, summary starting `still-open:`) naming "
+    "the residual the answer does not cover. `still-open` holds only while the goal is unchanged: "
+    "when the host says the goal changed, judge the new intention afresh — an earlier finding "
+    "survives only where it still breaks a CURRENT element. Then review what changed: a "
+    "reformulation of an earlier finding is not a new finding, and a NEW `blocking` finding must "
+    "state why it was invisible in the previous cycle. Spec ids may have SHIFTED between cycles "
+    "(positional ids renumber when an element is dropped or reordered): re-target `breaks` against "
+    "the CURRENT spec ids using the Spec delta (`renumbered: [{from, to, text}]`), never against "
+    "the old ids."
 )
 
 
@@ -78,8 +91,8 @@ def build_plan_review_system_prompt(
     architecture_nav_map: Optional[str] = None,
     governance_by_retrieval: bool = False,
 ) -> str:
-    """Findings-only reviewer stance for ONE independent slot (no competing plan,
-    no issue quota, no 'your own approach'). Governance pack per the owner-approved
+    """Findings-only reviewer stance with optional brainstorming, not a competing
+    plan or an issue quota. Governance pack per the owner-approved
     W3 wording: a self-modification plan (``constitutional``) carries BIBLE.md in
     full AND ARCHITECTURE.md inline; every other plan carries the BIBLE navigation
     map, the ARCHITECTURE navigation map and named on-demand pointers (the caller
@@ -100,14 +113,23 @@ def build_plan_review_system_prompt(
         "## The one question\n\n"
         "Is this spec sufficient to START the work safely? — not whether everything is specified.\n\n"
         "## Stance — findings only\n\n"
-        "Report findings against the spec; do not write a competing plan or propose an alternative "
-        "of your own, and do not fill a quota — an empty findings array with NO_FINDINGS is a "
-        "legitimate result. Name the exact spec id, locator, or evidence line behind each finding.\n\n"
+        "Report findings against the spec; do not write a compulsory competing plan, and do not "
+        "fill a quota — an empty findings array with NO_FINDINGS is a legitimate result. "
+        "Name the exact spec id, locator, or evidence line behind each finding.\n\n"
+        "Planning review is also an important brainstorming opportunity: challenge the premise "
+        "and suggest a simpler or more general alternative when useful. Express this advice as "
+        "optional `note` findings; Ouroboros decides whether to adopt it, without a required "
+        "disposition. A preference, premise challenge, or repeated suggestion alone is never "
+        "a blocker. Independently demonstrated failures still follow the blocking rule below. "
+        "A question the plan leaves open is returned to its author, not filed as advice: "
+        "`need_evidence` with the spec id in `breaks` asks Ouroboros, who authors the plan and is "
+        "the addressee of everything this review produces, to answer, escalate, or defer it openly "
+        "in its disposition.\n\n"
         "## Rubric (domain-free)\n\n" + "\n".join(_RUBRIC) + "\n",
     ]
     if constitutional:
         parts.append(
-            "6. Governance (this plan touches Ouroboros's own body): does the spec contradict "
+            "7. Governance (this plan touches Ouroboros's own body): does the spec contradict "
             "BIBLE.md or a frozen contract? Cite the principle.\n"
         )
     parts.append(f"\n## Blocking rule\n\n{_BLOCKING_RULE}\n")
@@ -172,10 +194,12 @@ def build_plan_review_system_prompt(
     return "\n".join(parts)
 
 
-def _json_block(payload: Any, limit: int) -> str:
-    """Fenced JSON bounded STRUCTURALLY (whole items, disclosed counts + full-set hash) —
-    never clipped mid-string (S-B07/S-B08)."""
-    text, notes = bounded_json(payload, limit)
+def _json_block(payload: Any, limit: Optional[int] = None) -> str:
+    """Complete fenced JSON, or a disclosed historical projection when bounded."""
+    text, notes = (
+        bounded_json(payload, limit) if limit is not None
+        else (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True, default=str), [])
+    )
     block = f"```json\n{text}\n```"
     if notes:
         block += "\n⚠️ OMISSION NOTE (structural): " + "; ".join(notes)
@@ -208,11 +232,17 @@ def _render_prior_cycles(prior_cycles: list[dict], dispositions: list[dict], spe
         cycle = cycle if isinstance(cycle, Mapping) else {}
         lines.append(
             f"### Cycle {cycle.get('cycle_index', '?')} — aggregate {cycle.get('aggregate', '?')}: "
-            "findings (blocking first; summaries bounded)\n\n"
+            f"findings (blocking first; summaries bounded to {PACKET_PRIOR_FINDING_SUMMARY_CHARS} chars)\n\n"
             + _json_block(_prior_findings_projection(cycle), PACKET_PRIOR_CYCLES_CHARS) + "\n"
         )
     lines.append("### Agent dispositions\n\n" + _json_block(dispositions or [], PACKET_PRIOR_CYCLES_CHARS) + "\n")
     lines.append("### Spec delta\n\n" + _json_block(spec_delta or {}, PACKET_PRIOR_CYCLES_CHARS) + "\n")
+    # ONE host fact from the delta the host already computed: `still-open` holds only while the
+    # goal is unchanged. `unknown` when the previous frozen spec body was truncated (no delta).
+    goal_changed = (spec_delta or {}).get("goal_changed")
+    previous = (prior_cycles[-1] if isinstance(prior_cycles[-1], Mapping) else {}).get("cycle_index", "?") if prior_cycles else "?"
+    lines.append(f"Goal changed since cycle {previous}: "
+                 f"{'unknown' if not isinstance(goal_changed, bool) else 'yes' if goal_changed else 'no'}\n")
     return "\n".join(lines)
 
 
@@ -280,20 +310,23 @@ def build_plan_review_user_content(
     root_exploration_log: Optional[str],
     cycle_index: int = 1,
 ) -> str:
-    """Deterministic reviewer packet: TASK OBJECTIVE · SPEC · PLAN PROSE · EVIDENCE
-    (+ OMISSIONS) [cache-stable prefix] · ROOT EXPLORATION LOG · PRIOR CYCLES (all reviewers' prior
-    findings as a compact blocking-first projection + agent dispositions + spec
-    delta on cycle ≥2). String bounds are the ``PACKET_*_CHARS`` constants via
-    ``truncate_review_artifact`` (visible marker, never silent); the SPEC JSON
-    block is bounded by ``PACKET_SPEC_CHARS`` (worst case ~1M chars otherwise)."""
+    """Keep operative inputs complete and attach the exact recorded room source.
+
+    The delivery layer selects a newest source range only when the actual route
+    cannot fit the complete dialogue beside governance and the operative plan.
+    Exploration and prior cycles retain their existing disclosed display bounds.
+    """
+    from ouroboros.tools.plan_dialogue import render_dialogue
+
     view = spec_with_ids(spec)
     if goal and not view.get("goal"):
         view["goal"] = goal
     sections = [
-        "## TASK OBJECTIVE\n\n" + (bounded_text(objective, PACKET_OBJECTIVE_CHARS) or "(none declared)") + "\n",
-        "## SPEC (ids are the only valid `breaks` targets)\n\n" + _json_block(view, PACKET_SPEC_CHARS) + "\n",
-        "## PLAN PROSE\n\n" + (bounded_text(plan_prose, PACKET_PROSE_CHARS) or "(none)") + "\n",
+        "## TASK OBJECTIVE\n\n" + (objective or "(none declared)") + "\n",
+        "## SPEC (ids are the only valid `breaks` targets)\n\n" + _json_block(view) + "\n",
+        "## PLAN PROSE\n\n" + (plan_prose or "(none)") + "\n",
         "## EVIDENCE\n\n" + _render_evidence(manifest),
+        render_dialogue(manifest),
         "## ROOT EXPLORATION LOG\n\n"
         + (bounded_text(root_exploration_log, PACKET_EXPLORATION_CHARS) or "(not provided by host)") + "\n",
     ]

@@ -233,9 +233,9 @@ def test_ui_smoke_widget_changed_card_and_reconnect_reconcile(direct_server_with
 
                 page.route("**/api/ui/preferences", hold_reads)
                 page.locator(f"{card('manual')} [data-widget-menu-trigger]").click()
-                page.locator(f"{card('manual')} [data-widget-start-mode=\"auto\"]").click()
+                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"auto\"]").click()
                 page.locator(f"{card('hang')} [data-widget-menu-trigger]").click()
-                page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]").click()
+                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"manual\"]").click()
                 wait_held(1)
                 page.wait_for_timeout(400)
                 assert len(held) == 1, "the second change must wait for the first write"
@@ -255,13 +255,16 @@ def test_ui_smoke_widget_changed_card_and_reconnect_reconcile(direct_server_with
                     timeout=10_000,
                 )
                 wait_frame(page, "manual", True)
-                assert page.locator(f"{card('manual')} [data-widget-start-mode=\"auto\"]").get_attribute("aria-checked") == "true"
-                assert page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]").get_attribute("aria-checked") == "true"
+                # The persisted map can be visible before the client receives the
+                # write response and paints its policy controls.
+                from playwright.sync_api import expect
+                expect(page.locator(f"{card('manual')} [data-widget-start-mode=\"auto\"]")).to_have_attribute("aria-checked", "true")
+                expect(page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]")).to_have_attribute("aria-checked", "true")
                 assert hang_frame_kept(page), "Manual changes nothing until Stop"
 
                 # (4) Escape closes the menu and returns focus to the ⋮ trigger.
                 page.locator(f"{card('hang')} [data-widget-menu-trigger]").click()
-                page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]").wait_for(state="visible", timeout=5_000)
+                page.locator("body > .skills-card-menu-dialog[open] [data-widget-start-mode=\"manual\"]").wait_for(state="visible", timeout=5_000)
                 assert page.evaluate("() => document.activeElement?.hasAttribute('data-widget-start-mode')")
                 page.keyboard.press("Escape")
                 page.locator(f"{card('hang')} [data-widget-start-mode=\"manual\"]").wait_for(state="hidden", timeout=5_000)

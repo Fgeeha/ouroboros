@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
-"""Regenerate the three CPL-2 gen/verify inventories (plan §7.2).
+"""Regenerate the generated inventories (the three CPL-2 gen/verify ones, plan §7.2, and the UI one).
 
 Each inventory is a generated document whose staleness turns CI red
 (``tests/test_generated_inventories.py`` pins byte-identity against a fresh
 in-memory regeneration, plus the resolution invariants below):
 
-1. ``docs/v7next/FROZEN_CONTRACTS_INVENTORY.md`` — machine extraction of the
+1. ``docs/inventories/FROZEN_CONTRACTS_INVENTORY.md`` — machine extraction of the
    ARCHITECTURE §11.1 frozen-contracts table: per row the contract label, the
    owner files, and the anchoring suites, every referenced repo path resolved
    against the tree (a row whose owner or anchor file disappeared = red), plus
    the ``ouroboros/contracts/`` package coverage (a contracts module never
    referenced by §11.1 is listed as a gap — growth of that list = red).
-2. ``docs/v7next/DATA_LAYOUT_INVENTORY.md`` — machine extraction of the
+2. ``docs/inventories/DATA_LAYOUT_INVENTORY.md`` — machine extraction of the
    ARCHITECTURE "Data layout (`~/Ouroboros/`)" tree (the closest thing this
    tree has to the reference's PERSISTENCE_OWNERS carrier): every entry is
    probed against reality — repo entries must exist as tracked paths, data-
    plane entries must appear as a literal in the runtime sources that
    construct them (a renamed/removed durable file whose tree row survived =
    red).
-3. ``docs/v7next/FACADE_INVENTORY.md`` — AST-derived facade inventory: every
+3. ``docs/inventories/FACADE_INVENTORY.md`` — AST-derived facade inventory: every
    runtime module whose top-level ``from <population module> import ...``
    statements carry the ``noqa: F401`` re-export marker (the codebase's
    declared "this binding exists for compatibility" convention, per the
    reference FACADE_CONSUMERS method), with its leaves, name counts and
    domain from ``ouroboros/domains.toml``.
+
+4. ``docs/inventories/UI_CONTROL_TEXT_INVENTORY.md`` — the fixed control text of the web UI sorted
+   by text, and every ``ouro:*`` CustomEvent with the modules that raise it, so that the siblings
+   of a new control appear next to it in the diff (builder and rationale:
+   ``scripts/ui_control_inventory.py``; staleness is its only red).
 
 Convention follows the ratchet/domain-manifest pairs: generator in scripts/,
 deterministic output (no timestamps, no HEAD SHAs), verify test in tests/.
@@ -46,9 +51,17 @@ from scripts.domain_graph import (  # noqa: E402
     module_name,
     tracked_population,
 )
+from ouroboros.markdown_source import parse_markdown_source  # noqa: E402
+from ouroboros.reference_books import (  # noqa: E402
+    BookView,
+    ReferenceBook,
+    load_reference_book,
+    read_book_section,
+)
 
-ARCHITECTURE = REPO_ROOT / "docs" / "ARCHITECTURE.md"
-OUT_DIR = REPO_ROOT / "docs" / "v7next"
+from scripts.ui_control_inventory import UI_CONTROLS_OUT, build_ui_control_inventory  # noqa: E402
+
+OUT_DIR = REPO_ROOT / "docs" / "inventories"
 FROZEN_OUT = OUT_DIR / "FROZEN_CONTRACTS_INVENTORY.md"
 LAYOUT_OUT = OUT_DIR / "DATA_LAYOUT_INVENTORY.md"
 FACADE_OUT = OUT_DIR / "FACADE_INVENTORY.md"
@@ -65,8 +78,7 @@ def _tracked_all() -> set[str]:
 
 
 def _split_row(line: str) -> list[str]:
-    """Split one markdown table row on unescaped pipes (adoption-validator
-    convention)."""
+    """Split one markdown table row on unescaped pipes."""
     body = line.strip().strip("|")
     cells, cur, escaped = [], [], False
     for ch in body:
@@ -90,11 +102,22 @@ def _split_row(line: str) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def frozen_section_text(arch_text: str) -> str:
-    m = re.search(r"^### 11\.1 What is frozen$(.*?)^### 11\.2 ",
-                  arch_text, re.MULTILINE | re.DOTALL)
-    if not m:
-        raise ValueError("ARCHITECTURE.md has no `### 11.1 What is frozen` section")
-    return m.group(1)
+    source = parse_markdown_source(arch_text.encode("utf-8"), "docs/ARCHITECTURE.md")
+    sections = [h for h in source.headings if h.title == "11.1 What is frozen"]
+    if len(sections) != 1:
+        raise ValueError("Architecture needs one `11.1 What is frozen` section")
+    heading = sections[0]
+    return source.raw[heading.span.end_byte:heading.section.end_byte].decode("utf-8")
+
+
+def _chapter_source_note(book: ReferenceBook, view: BookView) -> list[str]:
+    # Legacy generation stays byte-identical; after migration the original
+    # physical file and its revision remain independently inspectable.
+    if book.legacy:
+        return []
+    ref = view.sources[0]
+    return [f"Source: `{ref.path}`, physical LF lines {ref.span.start_line}-{ref.span.end_line}; "
+            f"UTF-8 SHA-256 `{ref.sha256}`.", ""]
 
 
 def _row_paths(cell: str) -> list[str]:
@@ -137,10 +160,11 @@ def parse_frozen_rows(section: str) -> list[dict]:
     return rows
 
 
-def build_frozen_inventory() -> tuple[str, list[str]]:
+def build_frozen_inventory(book: ReferenceBook | None = None) -> tuple[str, list[str]]:
     """Returns (rendered document, hard findings)."""
-    arch_text = ARCHITECTURE.read_text(encoding="utf-8")
-    section = frozen_section_text(arch_text)
+    book = book or load_reference_book(REPO_ROOT, "architecture")
+    view = read_book_section(book, "11.1 What is frozen")
+    section = frozen_section_text(view.text)
     rows = parse_frozen_rows(section)
     tracked = _tracked_all()
     findings: list[str] = []
@@ -170,11 +194,12 @@ def build_frozen_inventory() -> tuple[str, list[str]]:
     L.append("")
     L.append("Machine extraction of `docs/ARCHITECTURE.md` §11.1 (the frozen-ABI"
              " SSOT), regenerated by `python scripts/regenerate_inventories.py`."
-             " Do not edit — edit §11.1 and regenerate;"
+             " Do not edit — edit the owning chapter named in the Source line and regenerate;"
              " `tests/test_generated_inventories.py` pins byte-identity and the"
              " resolution invariants (a §11.1 row whose owner or anchor file"
              " disappeared from the tree = red).")
     L.append("")
+    L.extend(_chapter_source_note(book, view))
     L.append(f"- table rows: **{len(rows)}**")
     L.append(f"- browser-envelope prose owners: {', '.join(f'`{p}`' for p in prose_paths)}")
     L.append("")
@@ -215,11 +240,15 @@ _TREE_ENTRY = re.compile(r"[├└]──\s+(.+?)(?:\s+←.*)?$")
 
 
 def layout_block(arch_text: str) -> str:
-    m = re.search(r"^### Data layout \(`~/Ouroboros/`\)$.*?```(.*?)```",
-                  arch_text, re.MULTILINE | re.DOTALL)
-    if not m:
-        raise ValueError("ARCHITECTURE.md has no Data layout fenced tree")
-    return m.group(1)
+    source = parse_markdown_source(arch_text.encode("utf-8"), "docs/ARCHITECTURE.md")
+    sections = [h for h in source.headings if h.title == "Data layout (`~/Ouroboros/`)"]
+    if len(sections) != 1:
+        raise ValueError("Architecture needs one Data layout section")
+    section = sections[0].section
+    blocks = [b for b in source.code_blocks if section.start_byte <= b.start_byte < section.end_byte]
+    if len(blocks) != 1:
+        raise ValueError("Architecture Data layout needs one fenced tree")
+    return source.text_at(blocks[0])
 
 
 def parse_layout_entries(block: str) -> list[str]:
@@ -237,9 +266,10 @@ def _probe_token(entry: str) -> str | None:
     return literal[-1] if literal else None
 
 
-def build_layout_inventory() -> tuple[str, list[str]]:
-    arch_text = ARCHITECTURE.read_text(encoding="utf-8")
-    entries = parse_layout_entries(layout_block(arch_text))
+def build_layout_inventory(book: ReferenceBook | None = None) -> tuple[str, list[str]]:
+    book = book or load_reference_book(REPO_ROOT, "architecture")
+    view = read_book_section(book, "Data layout (`~/Ouroboros/`)")
+    entries = parse_layout_entries(layout_block(view.text))
     tracked = _tracked_all()
     tracked_dirs: set[str] = set()
     for p in tracked:
@@ -285,6 +315,7 @@ def build_layout_inventory() -> tuple[str, list[str]]:
              " removed in code while its tree row survives = red"
              " (`tests/test_generated_inventories.py`).")
     L.append("")
+    L.extend(_chapter_source_note(book, view))
     n_kinds = {}
     for _, _, kind in rows:
         n_kinds[kind] = n_kinds.get(kind, 0) + 1
@@ -401,6 +432,7 @@ BUILDERS = {
     FROZEN_OUT: build_frozen_inventory,
     LAYOUT_OUT: build_layout_inventory,
     FACADE_OUT: build_facade_inventory,
+    UI_CONTROLS_OUT: build_ui_control_inventory,
 }
 
 
@@ -426,6 +458,7 @@ def main(argv: list[str] | None = None) -> int:
             if on_disk != rendered:
                 stale.append(str(rel))
         else:
+            out_path.parent.mkdir(parents=True, exist_ok=True)
             out_path.write_text(rendered, encoding="utf-8")
             print(f"wrote {rel}")
 

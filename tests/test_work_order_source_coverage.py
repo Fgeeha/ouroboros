@@ -1,4 +1,4 @@
-"""Production-shaped custody and acceptance checks for over-budget work orders."""
+"""Custody and acceptance checks for historical partial-source work orders."""
 
 from __future__ import annotations
 
@@ -6,11 +6,11 @@ import json
 import hashlib
 from types import SimpleNamespace
 
+import pytest
+
 
 def _fixture(tmp_path):
     from ouroboros.subagent_work_order import (
-        WorkOrderBudgetExceeded,
-        build_work_order_source_request,
         canonical_work_order_source,
         compile_external_work_order,
     )
@@ -31,15 +31,22 @@ def _fixture(tmp_path):
         "workspace_root": str(repo),
         "workspace_mode": "external_workspace",
     }
-    overflow = None
-    try:
-        compile_external_work_order(task)
-    except WorkOrderBudgetExceeded as exc:
-        overflow = exc
-    else:  # pragma: no cover - the fixture must exercise the over-budget branch
-        raise AssertionError("fixture unexpectedly fits the work-order budget")
-    assert overflow is not None
-    prompt, request = build_work_order_source_request(task, overflow)
+    # Historical rows remain readable after new work stopped producing partial
+    # source lenses. Build the stored shape directly, without a live size policy.
+    rendered = compile_external_work_order(task)
+    request = {
+        "schema": 1, "kind": "complete_work_order", "coverage": "partial",
+        "complete_chars": len(rendered),
+        "complete_sha256": hashlib.sha256(rendered.encode("utf-8")).hexdigest(),
+        "wire_budget_chars": 250_000,
+        "source": {
+            "kind": "task_result", "task_id": task["id"], "tool": "get_task_result",
+            "arguments": {"task_id": task["id"], "include_authority": True,
+                          "include_work_order_source": True},
+            "projection": "canonical_work_order",
+        },
+    }
+    prompt = "WORK ORDER SOURCE REQUEST\n" + json.dumps(request)
     ctx = ToolContext(
         repo_dir=repo,
         drive_root=tmp_path,
@@ -55,7 +62,7 @@ def _fixture(tmp_path):
     )
     full_text, reason = canonical_work_order_source(ctx, request)
     assert not reason
-    assert len(full_text) == overflow.chars
+    assert full_text == rendered
     return ctx, request, full_text, prompt
 
 
@@ -71,7 +78,6 @@ def _started_entry(tmp_path, request, sha):
         work_order_fingerprint=sha,
         work_order_coverage="partial",
         work_order_source_request=request,
-        settled=True,
         execution_root=str(tmp_path / "snapshot"),
         target_root=str(tmp_path / "repo"),
     )
@@ -92,33 +98,15 @@ def _source_response(request, text, start, end):
     }
 
 
-def test_route_source_request_channel_fails_closed_on_unknown_manifest():
-    from ouroboros.subagent_work_order import route_source_request_channel
-
-    class Gateway:
-        def harnesses(self):
-            return [{"id": "route", "manifest": {"capabilities": {}}}]
-
-    assert route_source_request_channel(Gateway(), "route") == {
-        "status": "unverified",
-        "reason": "interactive_capability_missing",
-        "route": "route",
-    }
-
-
-def test_actor_first_coordination_appendix_refuses_without_truncation(monkeypatch):
+def test_actor_first_coordination_appendix_preserves_complete_text():
     import ouroboros.tools.delegate as delegate
 
-    authority = SimpleNamespace(delegated=False)
-    monkeypatch.setattr(delegate, "_host_instructions", lambda *_a, **_k: "base")
-    monkeypatch.setattr(delegate, "_ASSIGNMENT_FIELD_CHARS", 32)
-    instructions, refusal = delegate._build_start_instructions(
-        authority, coordination_context="x" * 100,
-    )
-    assert instructions == ""
-    payload = json.loads(refusal)
-    assert payload["reason"] == "coordination_context_over_budget"
-    assert payload["coordination_context_chars"] == 100
+    authority = SimpleNamespace(delegated=False, access="readonly")
+    context = " \n" + "яё𐍈🚀\n" * 55_000 + "DECISIVE_TAIL\n "
+    instructions = delegate._host_instructions(authority, coordination_context=context)
+    assert instructions.endswith(context)
+    assert "git commit" in instructions
+    assert "OMISSION NOTE" not in instructions
 
 
 def test_started_replay_keeps_partial_request_and_verified_ranges(tmp_path):
@@ -279,7 +267,7 @@ def test_source_answer_is_verified_before_delivery_and_replayed(tmp_path, monkey
         ctx, entry.run_id, "interaction-1",
         [{"question_id": "q1", "free_text": "Here is the requested range."}],
         first,
-    ))
+    ).text)
     assert out["status"] == "delivered"
     assert out["work_order_verification"]["status"] == "cannot_verify"
     assert "[SOURCE_RESPONSE]" in calls[0][2][0]["freeText"]
@@ -288,7 +276,7 @@ def test_source_answer_is_verified_before_delivery_and_replayed(tmp_path, monkey
         ctx, entry.run_id, "interaction-2",
         [{"question_id": "q1", "free_text": "The remaining range."}],
         second,
-    ))
+    ).text)
     assert out["work_order_verification"]["status"] == "complete"
     custody = __import__("ouroboros.delegate_custody", fromlist=["replay"])
     custody._CUSTODY.clear()
@@ -329,14 +317,14 @@ def test_source_receipt_retries_after_delivery_when_first_append_fails(tmp_path,
     first = json.loads(delegate._delegate_answer(
         ctx, entry.run_id, "interaction-retry",
         [{"question_id": "q1", "free_text": "range"}], response,
-    ))
+    ).text)
     assert first["status"] == "delivered"
     assert first["work_order_verification"]["status"] == "cannot_verify"
     custody._CUSTODY.clear()
     second = json.loads(delegate._delegate_answer(
         ctx, entry.run_id, "interaction-retry",
         [{"question_id": "q1", "free_text": "range"}], response,
-    ))
+    ).text)
     assert second["status"] == "already_resolved"
     assert next(append_results, None) is None
 
@@ -366,7 +354,7 @@ def test_already_resolved_without_prior_delivery_keeps_source_unverified(tmp_pat
     out = json.loads(delegate._delegate_answer(
         ctx, entry.run_id, "interaction-timeout",
         [{"question_id": "q1", "free_text": "range"}], response,
-    ))
+    ).text)
     assert calls == [True]
     assert out["status"] == "already_resolved"
     assert out["work_order_verification"]["status"] == "cannot_verify"
@@ -396,28 +384,41 @@ def test_invalid_source_answer_never_posts_to_engine(tmp_path, monkeypatch):
     bad["complete_sha256"] = "0" * 64
     out = json.loads(delegate._delegate_answer(
         ctx, entry.run_id, "interaction-1", [{"question_id": "q1"}], bad,
-    ))
+    ).text)
     assert out["reason"] == "source_response_invalid"
     assert calls == []
     fractional = _source_response(request, full_text[:20], 0.0, 20)
     out = json.loads(delegate._delegate_answer(
         ctx, entry.run_id, "interaction-1", [{"question_id": "q1"}], fractional,
-    ))
+    ).text)
     assert out["reason"] == "source_response_invalid"
     assert calls == []
 
 
-def test_terminal_partial_is_cannot_verify_and_apply_is_refused_but_reject_remains(tmp_path):
+@pytest.mark.parametrize("resolution", ["reject", "complete_then_apply"])
+def test_terminal_partial_is_cannot_verify_and_apply_is_refused_but_reject_remains(tmp_path, resolution):
     from ouroboros import delegate_custody as custody
+    from ouroboros.headless import ARTIFACT_STATUS_READY_NO_CHANGES
     from ouroboros.tools.delegate import _delivered_terminal_payload
     from ouroboros.tools.subagent_integration import _integrate_delegated_patch
 
     ctx, request, _full_text, _prompt = _fixture(tmp_path)
     entry = _started_entry(tmp_path, request, request["complete_sha256"])
+    detail = {"summary": {"state": "succeeded", "model": "claude-fable-5", "effectiveAccess": "readonly"}, "lastSeq": 1}
+    assert custody.settle_run(tmp_path, None, entry, detail)["settled"]
+    # Disposition replays custody under its lock. A process-local settled flag
+    # is not terminal proof, and rejecting a result needs a usable capture.
+    cap_dir = custody.delegated_capture_dir(tmp_path, entry.task_id, entry.run_id)
+    cap_dir.mkdir(parents=True, exist_ok=True)
+    (cap_dir / "workspace_patch.json").write_text(json.dumps({"status": ARTIFACT_STATUS_READY_NO_CHANGES}))
+    assert custody.record_patch_captured(tmp_path, entry)
+    custody._CUSTODY.clear()
+    entry = custody.replay(tmp_path)[entry.run_id]
+    assert entry.settled and entry.terminal_state == "succeeded"
     terminal = _delivered_terminal_payload(
         ctx,
         entry.run_id,
-        {"summary": {"state": "succeeded", "model": "claude-fable-5", "effectiveAccess": "readonly"}, "lastSeq": 1},
+        detail,
         SimpleNamespace(access="readonly", delegated=False),
         entry,
         None,
@@ -426,8 +427,12 @@ def test_terminal_partial_is_cannot_verify_and_apply_is_refused_but_reject_remai
     assert terminal["acceptance_status"] == "cannot_verify"
     apply_out = _integrate_delegated_patch(ctx, entry.run_id, "apply", "")
     assert "SOURCE_UNRESOLVED" in apply_out
-    reject_out = _integrate_delegated_patch(ctx, entry.run_id, "reject", "not accepted")
-    assert "SOURCE_UNRESOLVED" not in reject_out
+    assert not custody.replay(tmp_path)[entry.run_id].patch_disposed
+    if resolution == "reject":
+        reject_out = _integrate_delegated_patch(ctx, entry.run_id, "reject", "not accepted")
+        assert "Rejected delegated run" in reject_out
+        assert custody.replay(tmp_path)[entry.run_id].patch_disposed == "rejected"
+        return
     # Once the durable interval union is complete, the source gate opens and the
     # normal capture/apply guards own the next answer (there is no false permanent
     # refusal just because this was once over budget).
@@ -442,5 +447,6 @@ def test_terminal_partial_is_cannot_verify_and_apply_is_refused_but_reject_remai
         text_chars=request["complete_chars"],
     )
     apply_after_complete = _integrate_delegated_patch(ctx, entry.run_id, "apply", "")
-    assert "SOURCE_UNRESOLVED" not in apply_after_complete
+    assert "no captured file changes to apply" in apply_after_complete
+    assert custody.replay(tmp_path)[entry.run_id].patch_disposed == "applied"
     custody._CUSTODY.clear()

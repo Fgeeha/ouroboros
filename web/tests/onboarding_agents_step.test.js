@@ -59,22 +59,17 @@ test('the ladder is three rungs and states the launch gate honestly', () => {
     assert.equal(VALUE_LADDER.length, 3);
 
     const [runs, better, best] = VALUE_LADDER;
-    // Rung 1: the access step ALREADY satisfied the requirement.
-    assert.match(runs.title, /API key/i);
-    assert.match(runs.body, /Ouroboros runs/i);
-    // Rung 2: the benefit and the D-1 limit in the same breath — a plan moves
-    // delegated work and configured review rows, and CANNOT run the main agent.
-    assert.match(better.body, /delegated subagents/i);
-    assert.match(better.body, /commit, plan, and skill review and task acceptance/i);
-    assert.match(better.body, /main\s+agent keeps using the API key or local model/i);
-    assert.match(better.body, /a plan cannot run it/i);
+    assert.match(runs.title, /Codex subscription/i);
+    assert.match(runs.body, /models and agents without an API key/i);
+    assert.match(better.body, /API keys and local models work on their own/i);
+    assert.match(better.body, /Claude Code, Cursor, and Antigravity remain agent connections/i);
     // Rung 3: rotation, in the owner's own terms.
     assert.match(best.body, /rotate/i);
     assert.match(best.body, /window is spent/i);
 
-    // No rung may imply a subscription is what starts Ouroboros.
+    // Access is subscription-backed, not a promise of unlimited free service.
     for (const rung of VALUE_LADDER) {
-        assert.doesNotMatch(rung.body, /(subscription|plan) (alone )?(is enough|starts Ouroboros)/i);
+        assert.doesNotMatch(rung.body, /guaranteed free|unlimited/i);
     }
 });
 
@@ -159,8 +154,8 @@ test('nothing connected: no declaration, and the outcome says so plainly', () =>
         subscriptionsConnected: false, skipSubscriptionPresets: false,
     });
     const text = agentsOutcomeText([]);
-    assert.match(text, /No agent account connected/i);
-    assert.match(text, /Settings → Agents/);
+    assert.match(text, /Connect Codex to start without an API key/i);
+    assert.match(text, /Other subscriptions remain available for agents/);
 });
 
 test('one connected account declares the preset request and promises nothing certain', () => {
@@ -176,7 +171,7 @@ test('one connected account declares the preset request and promises nothing cer
     assert.match(text, /Available subagents/);
     // Conditional by construction: the compiler may still refuse a seat.
     assert.match(text, /will try to/);
-    assert.match(text, /nothing is changed/);
+    assert.match(text, /Main still needs Codex, an API key, or a local model/);
     assert.doesNotMatch(text, /guarantee|always/i);
 });
 
@@ -916,4 +911,129 @@ test('the skip choice refreshes a failed subscription preview before completion'
 
     step.detach();
     store.dispose();
+});
+
+test('preview status exposes the typed cause and explicit recovery replacement lasts one request', async () => {
+    const dom = fakeDom();
+    const calls = [];
+    const notices = [];
+    let fail = true;
+    const response = { source: 'api_default', diagnostics: [], available_subagents: { enabled: true, items: [] },
+        reviewer_slots: { scope: [{ route: { kind: 'api_chat', target_id: 'claudexor::codex=owner-main' } }] } };
+    const step = createAgentsStep({
+        doc: dom.doc,
+        previewPayload: () => ({ OUROBOROS_MODEL: 'claudexor::codex=owner-main' }),
+        previewTransport: async () => {
+            if (fail) throw Object.assign(new Error('Generic failure; see detail below.'), {
+                body: { code: 'models_unavailable', detail: 'The selected account returned no models.', can_skip: true },
+            });
+            return response;
+        },
+        onPreviewStatus: () => notices.push({ pending: step.previewPending, error: step.previewError }),
+        onSetupPreview: (_, options) => calls.push(options),
+    });
+    assert.equal(await step.refreshSubagentsPreview(), false);
+    assert.deepEqual(step.previewFailure, { code: 'models_unavailable', canSkip: true,
+        detail: 'The selected account returned no models.' });
+    assert.deepEqual(notices.at(-1), { pending: false, error: 'The selected account returned no models.' });
+    fail = false;
+    assert.equal(await step.setSkipPresets(true, { replaceReviewers: true }), true);
+    assert.equal(await step.refreshSubagentsPreview({ force: true }), true);
+    assert.deepEqual(calls, [{ replaceReviewers: true }, { replaceReviewers: false }]);
+    step.detach();
+});
+
+test('explicit reviewer recovery sends the visible clean roster and adopts the returned owner draft', async () => {
+    const dom = fakeDom(), requests = [];
+    const actor = { subagent_id: 'original', recommended_use: 'Inspect the task.',
+        route: { kind: 'api_model', target_id: 'claudexor::codex=original' }, effort: 'high' };
+    const recoveryActor = { ...actor, subagent_id: 'main-reviewer',
+        route: { kind: 'api_model', target_id: 'claudexor::codex=main' } };
+    const generated = { enabled: true, items: [actor] };
+    const recovered = { enabled: true, items: [actor, recoveryActor] };
+    const step = createAgentsStep({ doc: dom.doc,
+        previewTransport: async (payload) => {
+            requests.push(payload);
+            return { source: 'onboarding_default', available_subagents:
+                requests.length === 2 || requests.length === 4 ? recovered : generated };
+        } });
+    assert.equal(await step.refreshSubagentsPreview(), true);
+    assert.equal(await step.setSkipPresets(true, { replaceReviewers: true }), true);
+    assert.deepEqual(requests[1].OUROBOROS_SUBAGENTS, generated, 'clean visible actors are part of explicit recovery');
+    assert.deepEqual(step.availableSubagents, recovered);
+    assert.equal(await step.refreshSubagentsPreview({ force: true }), true);
+    assert.deepEqual(step.availableSubagents, recovered, 'ordinary generation cannot remove the owner recovery actor');
+    assert.equal(await step.setSkipPresets(true, { replaceReviewers: true }), true);
+    assert.deepEqual(requests[3].OUROBOROS_SUBAGENTS, recovered, 'reprepare includes the already authored roster');
+    step.detach();
+});
+
+test('a late preview settlement cannot notify or apply after the wizard detaches', async () => {
+    const dom = fakeDom();
+    let resolvePreview;
+    let notifications = 0;
+    let applied = 0;
+    const step = createAgentsStep({ doc: dom.doc,
+        previewTransport: () => new Promise((resolve) => { resolvePreview = resolve; }),
+        onPreviewStatus: () => { notifications += 1; }, onSetupPreview: () => { applied += 1; } });
+    const pending = step.refreshSubagentsPreview();
+    assert.equal(notifications, 1);
+    step.detach();
+    resolvePreview({ available_subagents: { enabled: true, items: [] } });
+    assert.equal(await pending, false);
+    assert.equal(notifications, 1);
+    assert.equal(applied, 0);
+});
+
+test('the wizard roster offers the providers whose keys the owner has typed so far', async () => {
+    // docs/DESIGN.md §7: a source is CHOSEN. The wizard's keys are typed on the
+    // Accounts step, so the provider list is derived from the CURRENT draft on
+    // every entry into a step that shows these rows — never once at
+    // construction, when no key exists yet.
+    const store = createClaudexorStatusStore({
+        fetchImpl: async () => json(200, snapshotWith([])),
+        doc: { hidden: false, addEventListener() {}, removeEventListener() {} },
+        pollMs: 5000,
+    });
+    const dom = fakeDom();
+    const draft = { OUROBOROS_MODEL: 'openai/gpt-5.6-sol' };
+    const step = createAgentsStep({
+        doc: dom.doc,
+        store,
+        providerProfiles: { openai: { label: 'OpenAI' } },
+        previewPayload: () => ({ ...draft }),
+        previewTransport: async () => ({
+            source: 'onboarding_default',
+            diagnostics: [],
+            available_subagents: { enabled: true, items: [{
+                subagent_id: 'api_scout', recommended_use: 'Research.',
+                route: { kind: 'api_model', target_id: 'openai/gpt-5.6-luna' },
+            }] },
+        }),
+    });
+
+    try {
+        step.mount();
+        await flush();
+        await flush();
+        const html = () => dom.nodes.get('onboarding-available-subagents').innerHTML;
+        // No key typed yet: the group offers nothing but the pointer to Accounts,
+        // and the row's own OpenRouter spelling is rescued rather than swapped.
+        assert.match(html(), /<option value="" disabled>Add a key in Accounts for more<\/option>/);
+        assert.doesNotMatch(html(), /value="api:openai"/);
+        assert.match(html(), /value="api:openrouter" selected>OpenRouter \(no key\)</);
+
+        // The owner types an OpenAI key on Accounts and comes back: the provider
+        // is offered now, under the setup contract's name for it.
+        draft.OPENAI_API_KEY = 'sk-not-a-secret';
+        step.mount();
+        await flush();
+        assert.match(html(), /<option value="api:openai">OpenAI<\/option>/);
+        assert.doesNotMatch(html(), /value="api:anthropic"/);
+    } finally {
+        // A failed assertion must not leave the store polling: the runner would
+        // wait for that timer instead of reporting the failure.
+        step.detach();
+        store.dispose();
+    }
 });

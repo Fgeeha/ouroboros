@@ -1,5 +1,11 @@
 import { accountedUpperBound, accountedUpperBoundWithChildren, formatUsd4, joinMarkdownHeadings } from './utils.js';
+import { cancelCauseClauses } from './cancel_presentation.js';
+import { taskCheckpointLabel, checkpointHasProgressRow } from './task_checkpoints.js';
+export { taskCheckpointLabel } from './task_checkpoints.js';
 import { harnessPresentation } from './harness_presentation.js';
+import { acceptanceIncidentClauses } from './acceptance_incident_presentation.js';
+import { historyRetentionView } from './history_retention.js';
+import { delegatedActivityView } from './delegated_activity.js';
 import {
     classifyReviewLifecycle,
     classifyReviewLifecyclePointer,
@@ -30,15 +36,18 @@ const ERROR_LOG_PHASES = new Set(['error', 'timeout', 'lifecycle_error']);
 
 export function categorizeLogEvent(evt, view = summarizeLogEvent(evt)) {
     const t = evt.type || evt.event || '';
+    // A wake-up's rows carry the turn's origin label (`initiator`).
+    const wake = evt.initiator === 'consciousness';
     if (evt.is_progress) {
-        return evt.task_id === 'bg-consciousness' ? 'consciousness' : 'tasks';
+        return wake ? 'consciousness' : 'tasks';
     }
     // Severity comes from the typed projection, never from the event name; the
     // name substrings below only pick the domain family of a non-error row.
     if (ERROR_LOG_PHASES.has(String(view?.phase || ''))) return 'errors';
+    if (wake) return 'consciousness';
     if (t.includes('llm') || t.includes('model')) return 'llm';
     if (t.includes('tool') || evt.tool) return 'tools';
-    if (t.includes('task') || t.includes('evolution') || t.includes('review')) return 'tasks';
+    if (t === 'history_retention' || t.includes('task') || t.includes('evolution') || t.includes('review')) return 'tasks';
     if (t.includes('consciousness') || t.includes('bg_')) return 'consciousness';
     return 'system';
 }
@@ -123,6 +132,23 @@ const SUBSTRATE_NOTE = {
 };
 
 export function executorChip(evt) {
+    const raw = evt?.executor_observation;
+    const observation = raw && raw.task_id === String(evt?.subagent_task_id || evt?.task_id || '')
+        && raw.run_id && raw.attempt_id && raw.harness_id && Number.isInteger(raw.revision)
+        ? raw : null;
+    if (observation && !evt?.execution_evidence) {
+        const name = harnessPresentation(observation.harness_id).label;
+        const model = observation.model_source === 'observed' || observation.model_source === 'requested'
+            ? compactModel(observation.model) : '';
+        return {
+            harness: observation.harness_id,
+            hasEvidence: false,
+            observation,
+            sourceTs: Date.parse(evt?.ts || evt?.timestamp || '') || 0,
+            label: `${name}${model ? ` · ${model} (${observation.model_source})` : ' · model unconfirmed'} · last update`,
+            title: `Latest observed activity: ${name}, run ${observation.run_id}, attempt ${observation.attempt_id}, revision ${observation.revision}. This is progress, not a terminal execution receipt.`,
+        };
+    }
     const route = String(evt?.executor_route || '').trim();
     if (!route) return null;
     // The route id is OPAQUE (`harness` or `harness=model`): print the harness
@@ -130,7 +156,7 @@ export function executorChip(evt) {
     const harness = route.split('=')[0].trim().toLowerCase();
     if (!harness) return null;
     const name = harnessPresentation(harness).label;
-    const base = { harness, label: name };
+    const base = { harness, label: name, sourceTs: Date.parse(evt?.ts || evt?.timestamp || '') || 0 };
     // LAYERED TRUTH, label-level. Identity (mark + product name) comes from the
     // harness_presentation SSOT; the run STATE stays on this label. The route is
     // a DISPATCH decision; whether a delegated run actually happened is
@@ -258,6 +284,8 @@ export function executorChip(evt) {
         ...base,
         hasEvidence: true,
         label: counted ? `${name} · ${okPart}${unresolvedPart}` : `${name} · ${runsPart}${unresolvedPart}`,
+        observedModels: Array.isArray(evidence.harness_models)
+            ? [...new Set(evidence.harness_models.filter((model) => typeof model === 'string' && model))] : [],
         title: withSubstrate(`Delegated to your ${name} account — ${runsPart} settled${counted ? ` (${okPart})` : ''}, ${costPart}`) + unresolvedTitle + accessPart,
     };
 }
@@ -272,7 +300,7 @@ function subagentHeadline(sid = '', role = '', label = '', model = '', { full = 
     const cleanRole = String(role || '').trim() || 'Subagent';
     const suffix = full && label ? ` — ${label}` : '';
     // Show the resolved model compactly NEXT TO the role (e.g. "planning-scout · gemini-3.5-flash").
-    const modelPart = compactModel(model) ? ` · ${compactModel(model)}` : '';
+    const modelPart = full && compactModel(model) ? ` · agent model ${compactModel(model)}` : '';
     return `${cleanRole}${modelPart}${shortId && full ? ` (${shortId})` : ''}${suffix}`;
 }
 
@@ -325,6 +353,25 @@ function extractCommandText(args) {
     return '';
 }
 
+// Legacy observations lack host identity: retain them separately rather than
+// guessing a call from a reused provider id, tool name or target.
+const legacyToolObservations = new WeakMap();
+let nextLegacyToolObservation = 0;
+function toolCallKey(evt, groupId) {
+    if (evt.invocation_id) return `tool:${groupId}:${evt.invocation_id}`;
+    if (evt.history_id) return `tool:${groupId}:history:${evt.history_id}`;
+    if (evt.event_id) return `tool:${groupId}:event:${evt.event_id}`;
+    if (!legacyToolObservations.has(evt)) legacyToolObservations.set(evt, ++nextLegacyToolObservation);
+    return `tool:${groupId}:observation:${legacyToolObservations.get(evt)}`;
+}
+
+const toolObservation = (evt, groupId, status) => ({
+    key: toolCallKey(evt, groupId), status, receipt: Boolean(evt.routing_action), tool: evt.tool || '',
+    fact: (evt.type || evt.event) === 'tool_call_started' ? 'started'
+        : ['tool_call_timeout', 'tool_timeout'].includes(evt.type || evt.event) ? 'wait_ended' : 'settled',
+    hostError: evt.status === 'host_error', live: evt._live_tool_frame === true,
+});
+
 function describeStartupChecks(checks) {
     if (!checks || typeof checks !== 'object') return '';
     const parts = [];
@@ -364,40 +411,204 @@ export function taskStoppedWithSummary(evt) {
     return String(evt?.reason_code || '') === 'owner_requested_finalization';
 }
 
-// The typed degradation causes a card can state in the owner's words. The record
-// keeps the machine code (Logs, task detail, benchmark ledgers); only the card
-// speaks. An UNKNOWN code stays raw on purpose: a reason we have no sentence for
-// must read as itself rather than as a wrong sentence.
-const TASK_REASON_PHRASES = {
-    plan_review_advisory: 'plan review never closed; the work continued under advisory enforcement',
-    host_child_status_suffix: 'a child task had not settled when the answer was delivered',
-    invalid_delivery_control_after_repair: 'the delivery control object was still malformed after repair',
-    budget_exhausted: 'the task ran out of budget before it could finish cleanly',
-    delivery_control_degraded: 'delivery finished in a degraded control state',
+// The typed causes a card can state in the owner's words, keyed on the CODE alone. The
+// record keeps the machine code (Logs, task detail, benchmark ledgers); only the card
+// speaks. An UNKNOWN code stays raw on purpose: a reason we have no sentence for must read
+// as itself rather than as a wrong sentence. The byte-identical twin of
+// project_dialogue.TASK_CAUSE_PHRASES; web/tests/fixtures/outcome_phase_parity.json pins both.
+const TASK_CAUSE_PHRASES = {
+    previous_revision_accepted: "The reviewers approved an earlier version of this answer; the current version was not re-reviewed.",
+    admission_close_unconfirmed: "Reviewers approved this answer; the supervisor did not confirm that task admission was closed.",
+    author_stop: "Ouroboros stopped with unfinished work; no review approval was granted.",
+    review_outcome_received: "Ouroboros received the reviewers' outcome and finished on that.",
+    author_finish: "Ouroboros delivered this answer on its own judgement; the reviewers had not signed it off.",
+    review_degraded: "The reviewers did not reach a verdict on this answer.",
+    infra_failure: "The review could not run because of an infrastructure failure, so there is no verdict.",
+    acceptance_preparation_failed: "Ouroboros could not assemble the evidence for this answer's review, so this preparation attempt dispatched no new reviewers; the work itself is kept.",
+    dialogue_terminal: "The reviewers and Ouroboros could not agree, and both positions were kept.",
+    improvement_capsule: "The reviewers asked for one more pass and Ouroboros was given their notes.",
+    fence_reopen_failed: "The requested extra pass could not be started, so the answer stands as it was.",
+    review_cycles_exhausted: "The task used up its review rounds before the answer was signed off.",
+    open_obligations: "The answer was delivered with reviewer requests still open.",
+    improvement_window_closed: "There was no room left for another pass, so the answer stands as it was.",
+    capsule_spent: "The one allowed improvement pass was already used.",
+    reviewer_fail_no_capsule: "A reviewer rejected the answer and suggested nothing to change.",
+    no_actionable_changes: "The re-review was not clean and suggested nothing to change.",
+    identical_acceptance_refused: "Nothing had changed since the last review, so the recorded verdict stands.",
+    review_skipped_deadline_reserve: "There was not enough time left to review the answer.",
+    delivery_binding_superseded: "The answer or its evidence changed, so the earlier review no longer covered it.",
+    owner_followup: "A new message from you arrived, so the review was set aside for it.",
+    evidence_refresh: "The work changed after the review was frozen, so it no longer covered the answer.",
+    revision_unavailable_on_forced_rail: "The task had to stop, so the requested rework never happened.",
+    owner_hurry: "You asked me to hurry, so no further review was started.",
+    unspecified: "The answer was not signed off, and no cause was recorded.",
+    acceptance_bypassed_budget_exhausted: "The task ran out of budget before the answer could be reviewed.",
+    acceptance_bypassed_round_limit: "The task hit its round limit before the answer could be reviewed.",
+    acceptance_bypassed_deadline: "The task ran out of time before the answer could be reviewed.",
+    acceptance_bypassed_provider_unavailable: "The model provider was unavailable, so the answer was never reviewed.",
+    acceptance_bypassed_context_overflow: "The task outgrew its context before the answer could be reviewed.",
+    acceptance_bypassed_children_unabsorbed: "Some sub-tasks had not been folded in, so the answer was never reviewed.",
+    plan_review_advisory: "The plan review was never closed; the work went on with what the reviewers said.",
+    plan_review_awaiting: "Not every plan reviewer had answered when the task ended.",
+    // The plan review's outcome CLASS at delivery (outcome_axes.execution.plan_review) picks one of these.
+    plan_review_unanswered: "Only some of the plan reviewers answered; the work went on with their notes.",
+    plan_review_none_answered: "None of the plan reviewers answered; the work went on without their notes.",
+    plan_review_answered_open: "The plan reviewers answered, but the review was never closed; the work went on with their notes.",
+    plan_review_quorum_unreachable: "Too few plan reviewers could answer, so the work was held.",
+    host_child_status_suffix: "A child task had not settled when the answer was delivered",
+    invalid_delivery_control_after_repair: "Ouroboros's final delivery instruction could not be read even after repair, so the answer stands as delivered.",
+    budget_exhausted: "The task ran out of budget before it could finish cleanly",
+    // The other forced-finalization rails (outcomes.BEST_EFFORT_REASON_CODES / ACCEPTANCE_BYPASS_REASON_BY_RAIL keys).
+    round_limit: "The task hit its round limit before it could finish cleanly",
+    finalization_grace: "The task hit a time limit and had to wrap up before it could finish cleanly",
+    deadline_local: "The task reached its deadline before it could finish cleanly",
+    context_overflow: "The task outgrew its context before it could finish cleanly",
+    children_unabsorbed: "Some sub-task results were never folded in, so the task had to wrap up",
+    // The supervisor's timeout rails (queue_timeouts.TIMEOUT_TERMINAL_REASONS): the reaper's task_done reason_code.
+    absolute_ceiling: "The task reached its maximum running time",
+    deadline: "The task reached its deadline",
+    idle_timeout: "The task made no progress for too long",
+    // The reason codes outcomes.derive_loop_outcome stamps from typed terminal facts.
+    provider_failure: "The model provider failed to answer, so the task could not finish",
+    empty_final_text: "The task ended without a final answer",
+    deep_self_review_unavailable: "The deep self-review could not run",
+    deep_self_review_error: "The deep self-review stopped on an error",
+    // #869: the provider-death rail's terminal words (twin of project_dialogue.TASK_CAUSE_PHRASES).
+    provider_unavailable: "The model provider stopped answering, so the task could not finish",
+    accounting_wait_expired: "Accounting access did not recover within this turn’s wait window",
+    delivery_control_degraded: "Ouroboros's final delivery instruction could not be applied, so the answer stands as delivered.",
+    authoring_handover_incomplete: "The replacement model stopped before resuming tool work.",
+    delegated_custody_unreconciled: "Some delegated work was never reconciled.",
+    // The one non-reason-code key: the task-result FIELD terminal_plan_review_open, a standing limitation.
+    terminal_plan_review_open: "The plan review was still open when this answer was delivered",
+    child_results_deferred: "Some sub-task results were deferred instead of being folded into this answer",
+    tool_failure: "A tool this task used failed and nothing recovered it",
+    task_exception: "The task stopped on an internal error",
 };
 
 export function taskReasonPhrase(code) {
     const raw = String(code || '');
-    return TASK_REASON_PHRASES[raw] || raw;
+    return TASK_CAUSE_PHRASES[raw] || raw;
 }
 
+// The custody overlay stamps this code as the row's reason_code while a
+// delegated run is still unreconciled, and the debt then heals from the WRITE
+// side while the stored code may not be rewritten. So the code outlives the
+// fact, and the debt list the record CARRIES is the only fresh truth. ONE rule
+// from ONE source on every surface: a non-empty list names the debt beside the
+// execution reason, while an empty list or none at all leaves the execution
+// reason standing alone. Nothing is inferred from absence, because the live
+// task_done event carries the stored list too (agent_task_pipeline
+// ._custody_debt_event_fields), so a record without one is a record that states
+// nothing about the debt. The browser twin of
+// project_dialogue._custody_debt_reason: the debt is a warning BESIDE the rail
+// cause, never a replacement, and any other code passes through untouched.
+const CUSTODY_DEBT_REASON = 'delegated_custody_unreconciled';
+
+function custodyDebtReason(record) {
+    const raw = String(record?.reason_code || '');
+    if (raw !== CUSTODY_DEBT_REASON) return [raw, ''];
+    const debt = record?.delegated_runs_unreconciled;
+    return [
+        String(record?.outcome_axes?.execution?.reason_code || ''),
+        Array.isArray(debt) && debt.length ? CUSTODY_DEBT_REASON : '',
+    ];
+}
+
+// The plan review's outcome class at delivery (outcome_axes.execution.plan_review, a
+// closed vocabulary) picks the owner sentence; a record naming no class keeps the
+// fallback key. Read by presence of a sentence, never by the class word itself.
+function planReviewKey(record, fallback) {
+    const key = `plan_review_${String(record?.outcome_axes?.execution?.plan_review || '')}`;
+    return Object.hasOwn(TASK_CAUSE_PHRASES, key) ? key : fallback;
+}
+
+// The browser twin of project_dialogue._join_cause_clauses: one line, one
+// clause per distinct fact; a clause that is not last drops its own full stop.
+function joinCauseClauses(clauses) {
+    const kept = [];
+    for (const clause of clauses) if (clause && !kept.includes(clause)) kept.push(clause);
+    return kept
+        .map((clause, index) => (index < kept.length - 1 && clause.endsWith('.')
+            ? clause.slice(0, -1) : clause))
+        .join(' · ');
+}
+
+// The explicit author stop (TZ-2 C4): the typed author_stop, or the structured stop recorded under its TRUE
+// cause when the review rounds ran out. The twin of review_records.recorded_author_stop.
+const explicitAuthorStop = (d) => d?.reason === 'author_stop' || (d?.reason === 'review_cycles_exhausted'
+    && d.author_action === 'stop' && d.author_disposition?.action === 'stop');
+// Its AUTHOR's reason beside the typed sentence (never a finish's or reviewer prose). Twin: project_dialogue._author_stop_rationale.
+const authorStopRationale = (d) => (explicitAuthorStop(d) ? String(d.author_disposition?.rationale || '').split(/\s+/).filter(Boolean).join(' ') : '');
+
+// Standing limitations of the delivered answer, from facts already on the
+// record: deferred children, and a plan review still open at delivery (the
+// result's terminal_plan_review_open flag), worded by its class when one is
+// named. The twin of project_dialogue._terminal_limitations.
+// The open-review classes that state a standing limitation (never the merely awaited case).
+const PLAN_REVIEW_OPEN_CLASSES = new Set(['plan_review_unanswered', 'plan_review_none_answered', 'plan_review_answered_open']);
+
+function terminalLimitations(record, reason, held = false) {
+    const deferred = Number(record?.outcome_axes?.objective?.deferred_count || 0) > 0;
+    const planKey = reason === 'plan_review_advisory' ? reason : 'terminal_plan_review_open';
+    // The class rides the live event and the replayed row where the result-only flag does not;
+    // a HELD task states the hold as its primary cause and never a limitation of work that went on.
+    const open = !held && (record?.terminal_plan_review_open === true
+        || PLAN_REVIEW_OPEN_CLASSES.has(`plan_review_${String(record?.outcome_axes?.execution?.plan_review || '')}`));
+    return [deferred ? taskReasonPhrase('child_results_deferred') : '', open ? taskReasonPhrase(planReviewKey(record, planKey)) : ''];
+}
+
+// Every simultaneous cause the record holds, as ONE line: the primary cause is what
+// ENDED the task; a deferred child, a plan review still open at delivery and an
+// unreconciled custody debt are standing limitations of the SAME answer, stated
+// BESIDE it instead of replacing it or being replaced by it. Nothing ranks or folds;
+// equivalent clauses state themselves once. The twin of project_dialogue._completion_verdict.
 export function taskReasonDetail(evt) {
-    // An owner-requested stop is a success and carries its own marker instead.
-    if (taskStoppedWithSummary(evt)) return '';
-    // A warning caused by REVIEW must not be explained by the execution reason
-    // that happens to sit beside it: the host's acceptance decision is the
-    // cause, and it speaks in its own stored words. A hard failure or a
-    // cancellation keeps explaining itself by its execution reason.
     const record = normalizeTaskTerminalRecord(evt);
     const decision = record.outcome_axes?.review?.acceptance_decision
         ?? record.review_status?.acceptance_decision;
     const severity = taskOutcomeSeverity(evt);
-    if (severity !== 'error' && severity !== 'cancelled' && decision?.status && decision.status !== 'accepted') {
-        const rationale = String(decision.rationale || '').split(/\s+/).filter(Boolean).join(' ');
-        return `Acceptance: ${decision.status}${rationale ? ` — ${rationale}` : ''}`;
+    const decisionCause = String(decision?.reason || '');
+    const objective = record.outcome_axes?.objective;
+    // A healed debt is never restored: naming it again would state a debt the
+    // same record shows as empty. Resolved once for every branch.
+    const [reason, custody] = custodyDebtReason(record);
+    const origin = record.cancel_origin;
+    const held = severity === 'error' && String(objective?.source || '').startsWith('plan_review_');
+    let clause;
+    if (taskStoppedWithSummary(evt)) {
+        // An owner-requested stop is a success and carries its own marker instead.
+        clause = '';
+    } else if (((severity !== 'error' && severity !== 'cancelled') || (explicitAuthorStop(decision) && severity === 'error'))
+        && decision?.status && (decision.status !== 'accepted' || Object.hasOwn(TASK_CAUSE_PHRASES, decisionCause))) {
+        // A REVIEW-caused warning, or the explicit author stop that ended a red card, speaks through the
+        // decision's TRUE typed reason (an accepted one only with a sentence); reviewer prose stays in the card.
+        clause = taskReasonPhrase(decisionCause);
+    } else if (severity === "cancelled" && origin && typeof origin === "object"
+        && !Array.isArray(origin) && Object.keys(origin).length) {
+        clause = joinCauseClauses(cancelCauseClauses(origin, record));
+    } else if (held) {
+        // A task HELD by a blocking plan review states the objective's own reason, so it
+        // never reads as work that went on.
+        clause = taskReasonPhrase(String(objective.reason || ''));
+    } else if (!evt?.reason_code || evt.reason_code === 'final_message') {
+        // A clean finish over a plan review that was only awaited states that fact; an amber
+        // or red card owes its colour to something else, so the fact never sits in its cause slot.
+        clause = severity === 'done' && record.outcome_axes?.execution?.plan_review === 'awaiting'
+            ? taskReasonPhrase('plan_review_awaiting') : '';
+    } else {
+        // The current execution reason speaks when there is one (the open plan review by its
+        // class), otherwise the row states no cause and leaves the headline to its own axis.
+        const receiptVeto = objective?.receipt_veto;
+        clause = !reason ? '' : receiptVeto?.reason === reason && receiptVeto.detail
+            ? String(receiptVeto.detail).split(/\s+/).filter(Boolean).join(' ')
+            : taskReasonPhrase(reason === 'plan_review_advisory' ? planReviewKey(record, reason) : reason);
     }
-    if (!evt?.reason_code) return '';
-    return `Reason: ${taskReasonPhrase(evt.reason_code)}`;
+    const line = joinCauseClauses([clause, authorStopRationale(decision), ...acceptanceIncidentClauses(decision, reason, TASK_CAUSE_PHRASES),
+        ...terminalLimitations(record, reason, held), custody ? taskReasonPhrase(custody) : '']);
+    // Cancellation's host/browser sentence has identical punctuation. Other
+    // cause policy stays with the runtime owner of this shared seam.
+    return severity === 'cancelled' && line && !/[.!?…)\u2026]$/.test(line) ? `${line}.` : line;
 }
 
 // S3 (HQ1): the ONE shared projection of a typed owner_hurry event for the
@@ -438,13 +649,14 @@ export function taskOutcomeSeverity(evt) {
     const execution = String(record.outcome_axes?.execution?.status || '').toLowerCase();
     const objective = String(record.outcome_axes?.objective?.status || '').toLowerCase();
     const review = String(record.outcome_axes?.review?.status || record.review_status?.status || '').toLowerCase();
+    const authorFinished = objective === 'pass' && record.outcome_axes?.objective?.source === 'author_acceptance';
     const artifacts = String(record.outcome_axes?.artifacts?.status || record.artifact_bundle?.status || record.artifact_status || '').toLowerCase();
     const artifactStatus = String(record.artifact_bundle?.status || record.artifact_status || '').toLowerCase();
     if (
         lifecycle === 'failed'
         || ['failed', 'infra_failed'].includes(execution)
         || objective === 'fail'
-        || review === 'fail'
+        || (review === 'fail' && !authorFinished)
         || ['failed', 'missing'].includes(artifacts)
         || artifactStatus === 'failed'
     ) {
@@ -459,7 +671,7 @@ export function taskOutcomeSeverity(evt) {
         lifecycle === 'rejected_duplicate'
         || ['degraded', 'best_effort'].includes(execution)
         || ['degraded', 'best_effort'].includes(objective)
-        || review === 'degraded'
+        || (review === 'degraded' && !authorFinished)
         || Boolean(record.outcome_axes?.objective?.warning)
     ) {
         return 'warn';
@@ -485,13 +697,15 @@ export function taskTerminalPhase(evt) {
 const TERMINAL_TASK_DETAIL_STATUSES = new Set([
     'completed', 'failed', 'cancelled', 'rejected_duplicate',
 ]);
+// Statuses that make the OUTCOME known, whether or not the card may close yet.
+const OBSERVED_OUTCOME_STATUSES = new Set([...TERMINAL_TASK_DETAIL_STATUSES, 'done', 'cancel_requested']);
 const OPEN_POST_TASK_SYNTHESIS_STATUSES = new Set(['pending_once', 'running']);
 
 export function isTerminalTaskDetail(record) {
     const status = String(record?.status || '').toLowerCase();
     const synthesis = String(record?.root_phase_checkpoint?.post_task_synthesis || '').toLowerCase();
     return TERMINAL_TASK_DETAIL_STATUSES.has(status)
-        && !(status === 'completed' && OPEN_POST_TASK_SYNTHESIS_STATUSES.has(synthesis));
+        && !(['completed', 'failed'].includes(status) && OPEN_POST_TASK_SYNTHESIS_STATUSES.has(synthesis));
 }
 
 // A task_done normally mirrors durable task detail. Keep the detail predicate
@@ -540,12 +754,13 @@ export function summarizeLogEvent(evt) {
     const taskMeta = (...items) => [evt.task_id ? `task=${evt.task_id}` : '', ...items];
 
     if (evt.is_progress || t === 'send_message') {
+        const narration = describeText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240, { markdown: true });
         if (isSubagentEvent(evt)) {
             const sid = subagentId(evt);
             const event = String(evt.subagent_event || 'update').toLowerCase();
             const role = String(evt.subagent_role || '').trim();
             return view(event === 'completed' ? 'done' : event === 'failed' || event === 'rejected' ? 'warn' : 'progress', subagentHeadline(sid, role, event, evt.model, { full: true }), {
-                body: shortText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240),
+                body: narration.preview,
                 meta: [
                     sid ? `task=${sid}` : '',
                     role ? `role=${role}` : '',
@@ -556,11 +771,7 @@ export function summarizeLogEvent(evt) {
                 ],
             });
         }
-        return view(
-            evt.task_id === 'bg-consciousness' ? 'thought' : 'progress',
-            shortText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240) || 'Progress update',
-            { meta: [evt.task_id === 'bg-consciousness' ? 'background' : 'task'] },
-        );
+        return view('progress', narration.preview || 'Progress update', { meta: ['task'] });
     }
 
     if (t === 'task_started') {
@@ -646,24 +857,10 @@ export function summarizeLogEvent(evt) {
         });
     }
 
-    if (t === 'tool_call_started') {
-        return view('start', `Running ${evt.tool || 'tool'}`, {
+    if (t === 'tool_call_started') {  // processing began; a replayed start alone is no liveness claim
+        return view('start', `Started ${evt.tool || 'tool'}`, {
             body: compactJson(evt.args, 260),
             meta: taskMeta(evt.timeout_sec ? `timeout ${evt.timeout_sec}s` : ''),
-        });
-    }
-
-    if (t === 'tool_call_finished') {
-        // A child killed by a signal (typed signal name / negative exit code)
-        // is a failure even when the handler rendered a normal result (T11).
-        const signalDeath = Boolean(evt.signal) || (typeof evt.exit_code === 'number' && evt.exit_code < 0);
-        const isError = Boolean(evt.is_error) || signalDeath;
-        const label = signalDeath ? `killed (${evt.signal || evt.exit_code})`
-            : evt.is_error ? 'failed'
-            : 'finished';
-        return view(isError ? 'error' : 'done', `${evt.tool || 'tool'} ${label}`, {
-            body: shortText(evt.result_preview, 260),
-            meta: taskMeta(formatLogDuration(evt.duration_sec)),
         });
     }
 
@@ -674,15 +871,17 @@ export function summarizeLogEvent(evt) {
         });
     }
 
-    if (t === 'tool_call' || evt.tool) {
+    if (t === 'tool_call' || t === 'tool_call_finished' || evt.tool) {
         // The durable tools.jsonl row (replay/backfill) carries the same typed
         // failure facts as the live tool_call_finished frame — is_error plus the
         // signal/exit facts — so a failed call reads the same after a reload.
         const signalDeath = Boolean(evt.signal) || (typeof evt.exit_code === 'number' && evt.exit_code < 0);
         const failed = Boolean(evt.is_error) || signalDeath;
-        const label = signalDeath ? `killed (${evt.signal || evt.exit_code})` : failed ? 'failed' : 'result';
-        return view(failed ? 'error' : 'result', `${evt.tool || 'tool'} ${label}`, {
-            body: shortText(evt.result_preview || compactJson(evt.args, 220), 260),
+        const finished = t === 'tool_call_finished';
+        const label = signalDeath ? `killed (${evt.signal || evt.exit_code})`
+            : failed ? 'failed' : finished ? 'finished' : 'result';
+        return view(failed ? 'error' : finished ? 'done' : 'result', `${evt.tool || 'tool'} ${label}`, {
+            body: shortText(evt.result_preview || (finished ? '' : compactJson(evt.args, 220)), 260),
             meta: taskMeta(formatLogDuration(evt.duration_sec)),
         });
     }
@@ -694,6 +893,11 @@ export function summarizeLogEvent(evt) {
             body: shortText(evt.error, 260),
             meta: taskMeta('runs on the previously applied configuration'),
         });
+    }
+
+    if (t === 'history_retention') {
+        const retention = historyRetentionView(evt);
+        if (retention) return view(retention.phase, retention.headline, { body: retention.body, meta: taskMeta(...retention.meta) });
     }
 
     if (t === 'owner_hurry') {
@@ -712,11 +916,38 @@ export function summarizeLogEvent(evt) {
         });
     }
 
+    if (t === 'task_message_injected') {
+        // A message from another task landed in THIS task's transcript (its
+        // timeline groups on task_id). The sender is named by value; the
+        // provenance says how it was framed (ancestor / relayed peer /
+        // independent task / system / escalation).
+        const source = evt.source_task_id ? String(evt.source_task_id) : 'another task';
+        return view('info', `Message from task ${source}`, {
+            body: shortText(evt.text_preview, 200),
+            meta: taskMeta(
+                evt.provenance ? `provenance=${evt.provenance}` : '',
+                evt.relayed_from_task_id ? `relayed=${evt.relayed_from_task_id}` : '',
+            ),
+        });
+    }
+
+    if (t === 'task_message_routed') {
+        // The SENDER's row for a task-authored message (task_id is the author):
+        // written to the target's mailbox, or refused with the host's reason.
+        const target = evt.target_task_id ? String(evt.target_task_id) : 'task';
+        const written = String(evt.status || '') === 'written';
+        return view(written ? 'info' : 'warn', written ? `Message sent to task ${target}` : `Message to task ${target} refused`, {
+            body: written ? '' : shortText(evt.reason, 160),
+            meta: taskMeta(`target=${target}`, evt.status ? String(evt.status) : ''),
+        });
+    }
+
     if (t === 'task_metrics_event' || t === 'task_eval') {
         return view('metrics', 'Task metrics', {
             meta: taskMeta(
                 evt.task_type || '',
                 ...taskOutcomeMeta(evt),
+                modelExecutionLabel(evt.model_execution),
                 evt.reason_code || '',
                 formatLogDuration(evt.duration_sec),
                 evt.tool_calls != null ? `${evt.tool_calls} tools` : '',
@@ -728,7 +959,8 @@ export function summarizeLogEvent(evt) {
 
     if (t === 'task_done') {
         const terminal = taskDoneIsTerminal(evt);
-        const presentation = taskPresentation(terminal ? taskTerminalPhase(evt) : 'working');
+        const outcome = taskTerminalPhase(evt);
+        const presentation = taskPresentation(terminal || outcome === 'error' ? outcome : 'working');
         const reasonCode = evt.reason_code ? String(evt.reason_code) : '';
         const artifactStatus = evt.artifact_bundle?.status || evt.artifact_status || '';
         const reviewDetails = formatReviewProjection(evt.review_projection);
@@ -743,6 +975,7 @@ export function summarizeLogEvent(evt) {
             body: reviewDetails,
             meta: taskMeta(
                 ...taskOutcomeMeta(evt),
+                modelExecutionLabel(evt.model_execution),
                 // №8/Q3: the owner-requested soft stop shows the honest marker
                 // instead of the raw machine reason code.
                 taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : reasonCode,
@@ -775,9 +1008,16 @@ export function summarizeLogEvent(evt) {
         });
     }
 
-    if (t === 'worker_spawn_start') {
-        return view('start', `Spawning ${evt.count || '?'} workers`, { meta: [evt.start_method || ''] });
-    }
+    // One row per worker-lifecycle frame, naming the fields it carries: the two
+    // readiness frames fell through to the unknown-name remainder and rendered as a
+    // bare event name with no fields, so a stalled spawn wave was unreadable (#1073).
+    if (t === 'worker_spawn_start') return view('start', `Spawning ${evt.count || '?'} workers`, { meta: [evt.start_method || ''] });
+    if (t === 'worker_starting') return view('start', 'Worker starting', { meta: [
+        evt.worker_id != null ? `worker ${evt.worker_id}` : '', evt.pid ? `pid ${evt.pid}` : '', evt.phase ? `phase ${evt.phase}` : ''] });
+    if (t === 'worker_ready_window_extended') return view('warn', 'Worker readiness window extended', { meta: [
+        Array.isArray(evt.worker_ids) && evt.worker_ids.length ? `workers ${evt.worker_ids.join(', ')}` : '',
+        evt.attempt != null ? `attempt ${evt.attempt}` : '', evt.window_sec != null ? `window ${evt.window_sec}s` : '',
+        evt.ceiling_sec != null ? `ceiling ${evt.ceiling_sec}s` : ''] });
 
     if (t === 'worker_sha_verify') {
         return view(evt.ok ? 'ok' : 'warn', evt.ok ? 'Worker SHA verified' : 'Worker SHA mismatch', {
@@ -789,11 +1029,8 @@ export function summarizeLogEvent(evt) {
         });
     }
 
-    if (t === 'worker_boot') {
-        return view('boot', 'Worker booted', {
-            meta: [evt.pid ? `pid ${evt.pid}` : '', evt.git_sha ? String(evt.git_sha).slice(0, 8) : ''],
-        });
-    }
+    if (t === 'worker_boot') return view('boot', 'Worker booted', {
+        meta: [evt.pid ? `pid ${evt.pid}` : '', evt.git_sha ? String(evt.git_sha).slice(0, 8) : ''] });
 
     if (t === 'deps_sync_ok') {
         return view('ok', 'Dependencies in sync', { meta: [evt.reason || '', shortText(evt.source, 60)] });
@@ -809,23 +1046,11 @@ export function summarizeLogEvent(evt) {
         });
     }
 
-    if (t === 'task_checkpoint') {
-        if (evt.checkpoint_kind === 'context_fit_low_retry') {
-            return view('warn', 'Context rebuilt in Low mode', {
-                meta: taskMeta(
-                    evt.model ? compactModel(evt.model) : '',
-                    evt.round ? `r${evt.round}` : '',
-                    'same-model retry',
-                ),
-            });
-        }
-        const cpNum = evt.checkpoint_number || Math.floor((evt.round || 0) / 15);
-        return view('thinking', `Checkpoint ${cpNum}`, {
-            meta: taskMeta(
-                evt.round ? `r${evt.round}` : '',
-                evt.context_tokens ? `~${evt.context_tokens} tok` : '',
-                formatLogMoney(evt.task_cost),
-            ),
+    if (t === 'task_checkpoint' || t === 'context_reclaim') {
+        return view(evt.checkpoint_kind === 'context_fit_low_retry' ? 'warn' : 'thinking', taskCheckpointLabel(evt), {
+            meta: taskMeta(evt.model ? compactModel(evt.model) : '', evt.round ? `r${evt.round}` : '',
+                evt.checkpoint_kind === 'context_fit_low_retry' ? 'same-model retry' : '', evt.context_tokens ? `~${evt.context_tokens} tok` : '',
+                formatLogMoney(evt.task_cost)),
         });
     }
 
@@ -844,16 +1069,16 @@ export function summarizeLogEvent(evt) {
                 evt.role ? `role=${evt.role}` : '',
                 evt.requested_model_lane ? `lane=${evt.requested_model_lane}` : '',
                 evt.depth != null ? `depth=${evt.depth}` : '',
-                evt.inter_wave_latency_sec != null ? `Δ=${evt.inter_wave_latency_sec}s` : '',
+                ('fanout_interval_sec' in evt ? evt.fanout_interval_sec : evt.inter_wave_latency_sec) != null
+                    ? `since previous fan-out ${'fanout_interval_sec' in evt ? evt.fanout_interval_sec : evt.inter_wave_latency_sec}s` : '',
             ],
         });
     }
 
-    // Typed severity carried by host/extension frames (`ok`, logging `level`)
-    // outranks the event name. The name-substring test that follows is the
-    // NON-EXPANDING remainder for an unknown name that carries no typed fact:
-    // it keeps a genuine producer-side failure with only a name visible under
-    // Errors, and it is pinned as a remainder, not a taxonomy.
+    // Typed severity carried by host/extension frames (`ok`, logging `level`) outranks the
+    // event name. The name-substring test that follows is the NON-EXPANDING remainder for an
+    // unknown name that carries no typed fact: it keeps a genuine producer-side failure with
+    // only a name visible under Errors, and it is pinned as a remainder, not a taxonomy.
     const level = String(evt.level || '').toLowerCase();
     const body = shortText(
         evt.error || evt.message || evt.text || evt.result_preview
@@ -894,17 +1119,16 @@ function chatView({
     fullRef = '',
     truncated = false,
     chip = null,
+    model = '',
+    receipt = false,
+    toolCall = null,
 } = {}) {
-    const out = {
-        phase,
-        headline,
-        body,
-        visible,
-        promote,
-        terminal,
-        human,
-        dedupeKey,
-    };
+    const out = { phase, headline, body, visible, promote, terminal, human, dedupeKey };
+    // A receipt row renders inside a block but is not content the block can
+    // stand on: the fact it reports lives elsewhere (the owner message's
+    // routing annotation for an addressing call).
+    if (receipt) out.receipt = true;
+    if (toolCall) out.toolCall = toolCall;  // folded into the block's one evidence row
     if (fullBody) out.fullBody = fullBody;
     if (fullHeadline) out.fullHeadline = fullHeadline;
     // Explicit emptiness is part of the presentation contract: a review-only
@@ -916,24 +1140,91 @@ function chatView({
     // genuinely-full output on demand instead of showing only the capped preview.
     if (fullRef) out.fullRef = String(fullRef);
     if (truncated) out.truncated = true;
+    if (model) out.model = model;
     // Phase 6: the executor chip rides the projection so live and replay routes
     // paint the same fact; absent stays absent (no placeholder chip).
     if (chip) out.executorChip = chip;
     return out;
 }
 
+// Final chat, task_done and replay share one logical completion note.
+export function taskTerminalSummary(evt = {}) {
+    const terminal = evt.task_phase !== 'finalizing' && evt.outcome_final !== false
+        && (evt.outcome_final === true || evt.system_type === 'task_summary'
+            || taskDoneIsTerminal(evt));
+    const outcome = taskTerminalPhase(evt);
+    // Terminality and outcome knowledge are two facts (#1110): the lifecycle status
+    // can settle while post-task finalization still runs. Painting the whole frame
+    // 'error' put Failed where only a terminal frame may, so the title carried it.
+    // The stamp (`task_terminal_status`/`status`) is the producer's word; a row
+    // that carries only the canonical axes still knows its lifecycle, so a
+    // settled `outcome_axes.lifecycle.status` counts too (as taskOutcomeSeverity
+    // already reads it) — an unstamped finalizing replay of a Failed root must
+    // not hide the Failed behind "Finalizing…".
+    const record = normalizeTaskTerminalRecord(evt);
+    const knownStatus = String(record?.status || record?.outcome_axes?.lifecycle?.status || '').toLowerCase();
+    const observedOutcome = OBSERVED_OUTCOME_STATUSES.has(knownStatus) ? outcome : '';
+    const presentation = taskPresentation(terminal ? outcome : 'working');
+    const body = [taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : '', taskReasonDetail(evt)]
+        .filter(Boolean).join('\n');
+    const cause = terminal ? taskReasonDetail(evt) : '';
+    return {
+        ...chatView({
+            phase: presentation.phase, headline: presentation.headline, body,
+            visible: true, promote: true, terminal,
+            dedupeKey: `task_done|${evt.task_id || ''}`,
+            // A task that ends with a cause states it on the collapsed line (DESIGN, activity block).
+            ...(cause ? { activityPreview: cause } : {}),
+        }),
+        ...(observedOutcome ? { observedOutcome } : {}),
+        ...(evt.model_execution && typeof evt.model_execution === 'object'
+            ? { modelExecution: evt.model_execution } : {}),
+        ...(Number.isInteger(evt.tool_calls) ? { toolCalls: evt.tool_calls } : {}),
+        ...(evt.initiator ? { initiator: String(evt.initiator) } : {}),
+    };
+}
+
+// Requested route, usable solve route and provider-reported name are distinct.
+export function modelExecutionLabel(fact) {
+    if (!fact || typeof fact !== 'object') return '';
+    const requested = compactModel(fact.requested_model || '');
+    if (fact.source !== 'usable_solve_response') {
+        return requested ? `Requested ${requested} · execution not observed` : 'Execution not observed';
+    }
+    const used = String(fact.used_model || '');
+    const reported = String(fact.reported_model || '');
+    const requestDiffers = String(fact.requested_model || '') !== used
+        || fact.requested_use_local !== fact.used_local;
+    const initial = requested && requestDiffers
+        ? ` (initial request: ${requested}${fact.requested_use_local ? ' · local' : ''})` : '';
+    return [`Last solve response: ${compactModel(reported || used)}${initial}`,
+        fact.used_local === true ? 'local' : '', fact.provider || '',
+        reported && reported !== used ? `route: ${used}` : ''].filter(Boolean).join(' · ');
+
+}
+
+// The turn's origin label rides every projected frame of the turn (progress,
+// tool, heartbeat, terminal) so the block's meta line can name it whichever
+// frame minted the card; the projection branches below stay label-blind.
 export function summarizeChatLiveEvent(evt) {
+    const view = summarizeChatLiveEventView(evt);
+    if (view && evt?.initiator) view.initiator = String(evt.initiator);
+    return view;
+}
+
+function summarizeChatLiveEventView(evt) {
     const t = evt.type || evt.event || 'unknown';
     const groupId = getLogTaskGroupId(evt);
     const progressText = describeText(String(evt.content || evt.text || '').replace(/^💬\s*/, ''), 240, { markdown: true });
     const key = (...parts) => [t, groupId, ...parts].join(':');
 
+    if (t === 'history_retention') return chatView({ visible: false, dedupeKey: key(evt.status || '') });
+
     if (t === 'owner_hurry') {
-        // S3 (HQ1) EXPLICIT hide branch: the typed hurry control family never
-        // renders a chat timeline row or bubble — chat.js paints only a compact
-        // card status from ownerHurryProjection, and the durable facts live in
-        // the task detail. Explicit (not the fallthrough) so a future default
-        // change cannot silently surface the family in chat.
+        // S3 (HQ1) EXPLICIT hide branch: the typed hurry control family never renders a chat
+        // timeline row or bubble — chat.js paints only a compact card status from
+        // ownerHurryProjection, and the durable facts live in the task detail. Explicit (not
+        // the fallthrough) so a future default change cannot silently surface it in chat.
         return chatView({ visible: false, dedupeKey: key(evt.phase || '', evt.request_id || '') });
     }
 
@@ -967,6 +1258,8 @@ export function summarizeChatLiveEvent(evt) {
         });
     }
 
+    const delegated = delegatedActivityView(evt); // a delegated run's typed observation, root or child
+    if (delegated) return Object.assign(chatView({ ...delegated, chip: executorChip(evt), model: evt.model }), { activity: delegated.activity });
     if ((evt.is_progress || t === 'send_message') && isSubagentEvent(evt)) {
         const sid = subagentId(evt);
         const rawEvent = String(evt.subagent_event || '').toLowerCase();
@@ -975,7 +1268,14 @@ export function summarizeChatLiveEvent(evt) {
         const resultText = describeText(evt.result || '', 320, { markdown: true });
         const traceText = describeText(evt.trace_summary || '', 320);
         const errorText = describeText(evt.error || '', 220);
-        const reasonDetail = evt.reason_code ? `Reason: ${taskReasonPhrase(evt.reason_code)}` : '';
+        const cancelDetail = evt.cancel_origin && (rawEvent === 'cancelled'
+            || (rawEvent === 'completed' && taskOutcomeSeverity(evt) === 'cancelled'))
+            // The child's OWN lineage rides along, so the cancel clause can prove the
+            // parent relation instead of naming the swept root as an initiator (#1061).
+            ? taskReasonDetail({ status: 'cancelled', cancel_origin: evt.cancel_origin,
+                task_id: evt.subagent_task_id || evt.task_id,
+                parent_task_id: evt.parent_task_id, root_task_id: evt.root_task_id }) : '';
+        const reasonDetail = cancelDetail || (evt.reason_code ? taskReasonPhrase(evt.reason_code) : '');
         const detailParts = [
             progressText.full,
             resultText.full ? `[RESULT]\n${resultText.full}` : '',
@@ -983,9 +1283,9 @@ export function summarizeChatLiveEvent(evt) {
             errorText.full ? `[ERROR]\n${errorText.full}` : '',
             reasonDetail,
         ].filter(Boolean);
-        // A generic "completed" event still carries authoritative outcome axes.
-        // Normalize it once here so every live/replay route gets the same label,
-        // phase and terminal truth from the canonical projector.
+        // A generic "completed" event still carries authoritative outcome axes: normalize it
+        // once here so every live/replay route takes label, phase and terminal truth from the
+        // canonical projector.
         const completionSeverity = rawEvent === 'completed' ? taskOutcomeSeverity(evt) : 'done';
         const event = rawEvent === 'completed'
             ? (completionSeverity === 'cancelled' ? 'cancelled'
@@ -1003,6 +1303,10 @@ export function summarizeChatLiveEvent(evt) {
                             : event === 'scheduled' ? 'start'
                                 : 'working';
         const terminal = ['completed', 'completed_warn', 'failed', 'cancelled', 'rejected'].includes(event);
+        // A child's own note carries the same voice fact (the progress branch below): a host
+        // note inside the child's turn is a visible row that never claims the card's collapsed
+        // line. The lifecycle, result and error frames state no voice, so they keep leading.
+        const promoted = terminal || evt.narration === true || evt.narration === undefined;
         const label = terminal
             ? taskPresentation(phase).headline
             : (SUBAGENT_CARD_LABEL[event] || 'Working');
@@ -1021,23 +1325,20 @@ export function summarizeChatLiveEvent(evt) {
         return chatView({
             phase,
             headline: subagentHeadline(sid, role, label, evt.model),
-            body: activity.preview || '',
+            body: cancelDetail || activity.preview || '',
             fullBody: detailParts.join('\n\n'),
-            activityPreview: activity.preview || '',
+            activityPreview: cancelDetail || activity.preview || '',
             visible: true,
-            promote: true,
-            human: true,
+            promote: promoted,
+            human: promoted,
             terminal,
             // P3: the WS result/trace were capped at 4000 server-side; expose the
             // subagent task id so "show full" can fetch the genuinely-full output.
             fullRef: sid,
             truncated: Boolean(evt.result_truncated || evt.trace_summary_truncated),
-            meta: [
-                evt.write_surface ? `write=${evt.write_surface}` : '',
-                status ? `status=${status}` : '',
-            ],
             // «ТУТ … субагент на codex» — the child's own executor chip.
             chip: executorChip(evt),
+            model: evt.model,
             dedupeKey: `subagent:${sid}:${label}:${status}:${progressText.full || resultText.full || errorText.full || ''}`,
         });
     }
@@ -1045,32 +1346,31 @@ export function summarizeChatLiveEvent(evt) {
     if (evt.is_progress || t === 'send_message') {
         const lifecycleTerminal = String(evt.task_id || '').startsWith('skill_lifecycle_')
             && /\s—\s(completed|failed)\b/i.test(progressText.full);
-        // Background consciousness has no task_result; the backend signals end-of-cycle
-        // with a structured `consciousness_state` marker (and history replay annotates
-        // the latest entry with `task_terminal_status`). Both are structured, not text.
-        const bgConsciousness = evt.task_id === 'bg-consciousness';
-        const bgState = String(evt.consciousness_state || '');
-        const bgErrored = bgState === 'error_backoff' || bgState === 'error';
-        const bgTerminal = bgConsciousness
-            && (Boolean(bgState) || Boolean(evt.task_terminal_status));
-        const bgPhase = bgTerminal ? (bgErrored ? 'lifecycle_error' : 'done') : 'thinking';
+        // Voice, not wording (P5): the worker stamps `narration` on every note; a
+        // host note is a typed fact, never a text match. Both stay visible rows; only
+        // narration is promoted (title, collapsed line). ABSENT = predates the fact.
+        const narration = evt.narration === true || evt.narration === undefined;
         return chatView({
-            phase: bgConsciousness
-                ? bgPhase
-                : (lifecycleTerminal ? (/failed\b/i.test(progressText.full) ? 'lifecycle_error' : 'done') : 'working'),
-            // The bg end-of-cycle marker carries no text; pass an empty headline so
-            // the card keeps its last thought as the title instead of "Working...".
-            headline: (bgTerminal && !progressText.preview) ? '' : (progressText.preview || 'Working...'),
+            phase: lifecycleTerminal ? (/failed\b/i.test(progressText.full) ? 'lifecycle_error' : 'done') : 'working',
+            headline: progressText.preview || 'Working...',
             fullHeadline: progressText.full || '',
             activityPreview: progressText.preview || '',
             visible: Boolean(progressText.preview),
-            promote: true,
-            human: true,
+            promote: narration,
+            human: narration,
             // «ТУТ бабл … на codex» — an ordinary progress bubble carries the chip
             // too whenever the frame disclosed a delegated executor.
             chip: executorChip(evt),
+            model: evt.model,
             dedupeKey: progressText.full ? `progress:${progressText.full}` : `progress:${evt.task_id || ''}`,
         });
+    }
+
+    if (t === 'llm_usage') {
+        // A helper call can share the task id. Only the task's own loop
+        // supplies its coordinating model.
+        const ownLoop = Number.isInteger(evt.round);
+        return chatView({ model: ownLoop ? evt.model : '', visible: false, dedupeKey: key(evt.round || '') });
     }
 
     if (t === 'task_started' || t === 'task_received') {
@@ -1093,27 +1393,47 @@ export function summarizeChatLiveEvent(evt) {
         return chatView({ phase: 'thinking', headline: 'Thinking', dedupeKey: key(evt.round || '', evt.attempt || '') });
     }
 
-    if (t === 'tool_call_started') {
-        return chatView({ headline: 'Working through the next step', dedupeKey: key(evt.tool || '') });
+    if (t === 'task_message_injected') {
+        // A message from another task landed in this task's transcript: a
+        // visible row in the receiver's block (owner 5=A), named by value.
+        const source = evt.source_task_id ? String(evt.source_task_id) : 'another task';
+        const preview = String(evt.text_preview || '');
+        return chatView({
+            phase: 'info',
+            headline: `Message from task ${source}`,
+            body: shortText(preview, 200),
+            fullBody: preview,
+            visible: true,
+            dedupeKey: key(source, evt.ts || ''),
+        });
     }
 
-    if (t === 'task_checkpoint') {
-        if (evt.checkpoint_kind === 'context_fit_low_retry') {
-            return chatView({
-                phase: 'warn',
-                headline: 'Context rebuilt in Low mode — retrying the same model once',
-                visible: true,
-                dedupeKey: key(evt.checkpoint_kind, evt.round || ''),
-            });
-        }
-        // Not visible in chat live card — the emit_progress message is the visible source
-        // for the chat timeline (avoids duplicate timeline entries). This event remains
-        // visible in the Logs tab via summarizeLogEvent.
-        const cpNum = evt.checkpoint_number || Math.floor((evt.round || 0) / 15);
+    if (t === 'tool_call_started' || (['tool_call_finished', 'tool_call'].includes(t) && !evt.is_error)) {
+        // A successful call is execution evidence, not narration: start and finish feed the
+        // block's ONE folded row (counts; tools behind Expand), a receipt while every counted
+        // call is a host-stamped addressing act (`routing_action`, reported by the owner
+        // message's annotation). A failure keeps its own error row and still counts. `done` is
+        // the TASK's phase; a finished CALL is `ok`.
+        const status = t === 'tool_call_started' ? (evt._live_tool_frame ? 'calling' : 'unknown') : 'ok';
         return chatView({
-            phase: 'thinking',
-            headline: `Checkpoint ${cpNum} — periodic self-check`,
-            dedupeKey: key(cpNum),
+            phase: status,
+            headline: '',
+            visible: true,
+            receipt: Boolean(evt.routing_action),
+            dedupeKey: `tools|${groupId}`,
+            toolCall: toolObservation(evt, groupId, status),
+        });
+    }
+
+    if (t === 'task_checkpoint' || t === 'context_reclaim') {
+        // Visible in the expanded timeline, with no narration/title promotion.
+        const lowRetry = evt.checkpoint_kind === 'context_fit_low_retry';
+        return chatView({
+            phase: lowRetry ? 'warn' : 'thinking',
+            headline: taskCheckpointLabel(evt) + (lowRetry ? ' — retrying the same model once' : ''),
+            visible: !checkpointHasProgressRow(evt),
+            dedupeKey: key(evt.checkpoint_kind || '', evt.checkpoint_kind === 'usage_lock_wait'
+                ? `${evt.episode_id || evt.ts || ''}:${evt.phase}` : evt.checkpoint_number || evt.round || ''),
         });
     }
 
@@ -1147,14 +1467,16 @@ export function summarizeChatLiveEvent(evt) {
 
     if (t === 'tool_call_timeout' || t === 'tool_timeout') {
         return chatView({
-            phase: 'error',
-            headline: 'One of the steps took too long',
+            phase: 'warn',
+            headline: `Tool wait ended; operation may still settle${evt.tool ? ` · ${evt.tool}` : ''}`,
             visible: true,
-            dedupeKey: key(evt.tool || ''),
+            dedupeKey: toolCallKey(evt, groupId),
+            toolCall: toolObservation(evt, groupId, 'wait_ended'),
         });
     }
 
-    if (t === 'tool_call_finished' && evt.is_error) {
+    if (['tool_call_finished', 'tool_call'].includes(t) && evt.is_error) {
+        const failed = toolObservation(evt, groupId, 'error');
         const commandText = describeText(extractCommandText(evt.args), 120);
         const errorResult = describeText(evt.result_preview || evt.error, 220);
         const bodyParts = [];
@@ -1171,62 +1493,30 @@ export function summarizeChatLiveEvent(evt) {
                 body: shortText(bodyParts.join(' '), 220),
                 fullBody: fullBodyParts.join('\n\n'),
                 visible: true,
-                dedupeKey: key(evt.tool || '', evt.status || '', evt.exit_code || '', commandText.full || errorResult.full),
+                dedupeKey: toolCallKey(evt, groupId),
+                toolCall: failed,
             });
         }
         return chatView({
             phase: 'error',
-            headline: 'One of the steps failed',
+            headline: `One of the steps failed${evt.tool ? ` · ${evt.tool}` : ''}`,
             body: shortText(bodyParts.join(' '), 220),
             fullBody: fullBodyParts.join('\n\n'),
             visible: true,
-            dedupeKey: key(evt.tool || '', evt.status || '', evt.exit_code || '', commandText.full || errorResult.full),
+            dedupeKey: toolCallKey(evt, groupId),
+            toolCall: failed,
         });
     }
 
-    if (t === 'task_done') {
-        const terminal = taskDoneIsTerminal(evt);
-        const presentation = taskPresentation(terminal ? taskTerminalPhase(evt) : 'working');
-        const unavailable = evt.cost_accounting_status === 'unavailable';
-        // C13: the SHARED accessor and its null policy — same alias precedence as
-        // chat.js and the Python seams, and a REAL $0 prints instead of vanishing.
-        const ownValue = accountedUpperBound(evt) ?? (evt.cost ?? null);
-        const ownCost = unavailable
-            ? 'cost unavailable'
-            : (ownValue != null ? `${formatLogMoney(ownValue)}${evt.cost_final === false ? ' (pending)' : ''}` : '');
-        const childrenCost = (accountedUpperBoundWithChildren(evt) ?? -1) > (ownValue ?? 0)
-            ? `+children=${formatLogMoney(accountedUpperBoundWithChildren(evt))}${evt.cost_with_children_partial ? ' (partial)' : ''}`
-            : '';
-        // №8/Q3: an owner-requested soft stop keeps 'done' severity but carries
-        // its own headline and the owner-request marker in the details meta.
-        const softStopped = taskStoppedWithSummary(evt);
-        const reasonDetail = taskReasonDetail(evt);
-        return chatView({
-            phase: presentation.phase,
-            headline: presentation.headline,
-            body: reasonDetail,
-            visible: true,
-            promote: true,
-            terminal,
-            meta: [softStopped ? OWNER_STOP_DETAIL_MARKER : '', ownCost, childrenCost].filter(Boolean),
-            dedupeKey: key(
-                JSON.stringify(evt.outcome_axes || {}),
-                JSON.stringify(evt.review_projection || {}),
-                evt.status || '',
-                evt.reason_code || '',
-            ),
-        });
-    }
-
+    if (t === 'task_done') return taskTerminalSummary(evt);
 
     if (t === 'task_cost_finalized') {
         const unavailable = evt.cost_accounting_status === 'unavailable';
         const ownCost = unavailable ? 'cost unavailable' : formatLogMoney(accountedUpperBound(evt));
         const subtreeCost = unavailable ? '' : formatLogMoney(accountedUpperBoundWithChildren(evt));
-        // A cost checkpoint is bookkeeping, never the task's conclusion: only
-        // the settled task_done resolves the card. On the blocking lane this
-        // frame precedes task_done; treating it as terminal closed the card
-        // early, and a live card mid-"Finalizing…" must absorb it quietly.
+        // A cost checkpoint is bookkeeping, never the task's conclusion: only the settled
+        // task_done resolves the card. On the blocking lane this frame precedes task_done;
+        // treating it as terminal closed the card early — a live card mid-"Finalizing…" absorbs it.
         return chatView({
             phase: unavailable ? 'warn' : 'usage',
             headline: unavailable ? 'Cost accounting unavailable' : 'Cost finalized',
@@ -1293,5 +1583,15 @@ export function isGroupedTaskEvent(evt) {
 // (receipt) chip is never downgraded by a later evidence-less (dispatch)
 // frame — the history sync after justFinished anchors on a mid-run row.
 export function keepStickyExecutorChip(prior, next) {
-    return !!(prior && prior.hasEvidence && next && !next.hasEvidence);
+    if (!prior || !next) return false;
+    if (prior.sourceTs && next.sourceTs && next.sourceTs < prior.sourceTs) return true;
+    const before = prior.observation, after = next.observation;
+    if (before && after) {
+        return before.task_id === after.task_id && before.task_attempt === after.task_attempt
+            && before.run_id === after.run_id && after.revision < before.revision;
+    }
+    // A typed live observation outranks any later evidence-less dispatch label,
+    // even when the route name changes while the same card is reconciled.
+    if (before && !after && !next.hasEvidence) return true;
+    return Boolean(prior.hasEvidence && !next.hasEvidence);
 }

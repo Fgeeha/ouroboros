@@ -20,12 +20,67 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import types
+from contextlib import contextmanager
 
 from starlette.requests import Request
 
 from ouroboros import usage_accounting as ua
 from ouroboros import usage_ledger
+from ouroboros import _usage_rows_memo as memo
+
+
+def test_retained_execution_drive_tripwire_counts_both_roots(tmp_path, monkeypatch):
+    from ouroboros import context_budget
+    from ouroboros.agent_startup_checks import hot_store_growth_notes
+    from ouroboros.headless import HEADLESS_TASKS_DIR, TASK_DRIVES_DIR
+    from supervisor.state import ISOLATED_BENCHMARK_SENTINEL
+
+    monkeypatch.setattr(context_budget, "RETAINED_EXECUTION_DRIVES_WARN_COUNT", 2)
+    env = types.SimpleNamespace(
+        drive_root=tmp_path,
+        drive_path=lambda rel: tmp_path / rel,
+    )
+    headless = tmp_path / HEADLESS_TASKS_DIR
+    task_drives = tmp_path / TASK_DRIVES_DIR
+    (headless / "headless-1").mkdir(parents=True)
+    (task_drives / "drive-1").mkdir(parents=True)
+
+    assert hot_store_growth_notes(env) == []
+
+    (task_drives / "drive-2").mkdir()
+    notes = hot_store_growth_notes(env)
+    assert len(notes) == 1
+    assert "retained execution drives" in notes[0]
+    assert "total 3 (threshold 2)" in notes[0]
+
+    (tmp_path / ISOLATED_BENCHMARK_SENTINEL).write_text("isolated\n", encoding="utf-8")
+    assert hot_store_growth_notes(env) == []
+
+
+def test_observability_write_failure_warns_once_and_stays_nonfatal(tmp_path, caplog):
+    from ouroboros.llm_observability import persist_observed_call
+
+    def fail_write(*args, **kwargs):
+        raise OSError("test write failure")
+
+    with caplog.at_level(logging.WARNING, logger="ouroboros.llm_observability"):
+        result = persist_observed_call(
+            tmp_path,
+            payload={"model": "claudexor/test"},
+            writer=fail_write,
+            task_id="task-1",
+        )
+
+    assert result == {}
+    records = [
+        record for record in caplog.records
+        if record.name == "ouroboros.llm_observability"
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].getMessage() == "Failed to persist LLM observability payload"
 
 
 def _seeded_accounting_root(tmp_path, monkeypatch):
@@ -55,6 +110,10 @@ def _seeded_accounting_root(tmp_path, monkeypatch):
         global_limit_usd=7.5, drive_root=root, task_id="reserved",
         root_task_id="root-1", category="task", source="test.perf",
     ))
+    # Seeding uses real writers, which now share the reader's prepared source.
+    # Evict this isolated root so the first endpoint really exercises a cold read.
+    with memo._LEDGER_READ_CACHE_LOCK:
+        memo._LEDGER_READ_CACHE.pop(str(root.resolve()), None)
     return root
 
 
@@ -137,42 +196,24 @@ def test_api_state_warm_path_replays_ledger_zero_times_and_projects_once(
     monkeypatch.setattr(queue, "load_state", lambda: {"current_branch": "ouroboros"})
     monkeypatch.setattr(queue, "_read_evolution_campaign", lambda: {})
 
-    full_reads: list = []
-    real_full_read = usage_ledger._read_records_locked
-
-    def counted_full_read(target_root):
-        full_reads.append(str(target_root))
-        return real_full_read(target_root)
-
-    monkeypatch.setattr(usage_ledger, "_read_records_locked", counted_full_read)
-    # usage_accounting re-binds the substrate name at import; the memo resolves
-    # it in its own namespace, so the counter must cover both bindings.
-    monkeypatch.setattr(ua, "_read_records_locked", counted_full_read)
-
-    projections: list = []
-    real_projection = ua.usage_projection
-
-    def counted_projection(*args, **kwargs):
-        projections.append(kwargs)
-        return real_projection(*args, **kwargs)
-
-    monkeypatch.setattr(ua, "usage_projection", counted_projection)
+    counters = _install_ledger_read_counters(monkeypatch)
 
     cold = asyncio.run(api_state(_state_request(root)))
     assert cold.status_code == 200
-    assert len(full_reads) == 1  # cold memo fill = exactly one full replay
+    assert counters["preparations"] == [str(root)]  # one parse outside the money lock
+    assert counters["full_reads"] == []
 
-    full_reads.clear()
-    projections.clear()
+    counters["preparations"].clear()
+    counters["projections"].clear()
     warm = asyncio.run(api_state(_state_request(root)))
     payload = json.loads(warm.body)
 
     assert warm.status_code == 200
-    assert full_reads == []  # warm path: ZERO full ledger replays
+    assert counters["preparations"] == counters["full_reads"] == []
     # One projection for the whole request; budget_remaining consumed it inside
     # the evolution snapshot instead of recomputing (a second entry here would
     # be the de-triplication regression this test exists to catch).
-    assert len(projections) == 1
+    assert len(counters["projections"]) == 1
     assert "budget_reserve_usd" in payload["evolution_state"]  # real snapshot ran
     assert payload["spent_usd"] == 1.25  # settled 0.25 + reserved bound 1.0
     assert payload["accounting"]["authority"] == "physical_attempt_ledger"
@@ -186,6 +227,8 @@ def test_chat_history_reads_bounded_progress_tail_with_zero_artifact_work(
     — never the whole file — and its terminal-truth annotation must perform
     zero artifact collection/copies and zero disposition-hash lookups."""
     from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros import jsonl_tail
+    from contextlib import contextmanager
     from ouroboros.task_results import write_task_result
 
     logs = tmp_path / "logs"
@@ -205,23 +248,157 @@ def test_chat_history_reads_bounded_progress_tail_with_zero_artifact_work(
     assert progress_size > 3_000_000  # much larger than the 512KB start window
     write_task_result(tmp_path, "t1", "completed", result="done", ts="2026-08-08T05:00:00Z")
 
-    tail_calls = _install_tail_read_counter(monkeypatch)
+    # The pager feeds the shared parser an already-bounded borrowed buffer.
+    # Count actual source bytes, rather than the old parser's tail_bytes hint.
+    reads = []
+    chain_handles = jsonl_tail.jsonl_chain_handles
+
+    class CountedHandle:
+        def __init__(self, path, handle):
+            self.path, self.handle = path, handle
+
+        def __getattr__(self, name):
+            return getattr(self.handle, name)
+
+        def read(self, size=-1):
+            start = self.handle.tell()
+            data = self.handle.read(size)
+            reads.append((self.path, start, len(data)))
+            return data
+
+    @contextmanager
+    def counted_handles(*args, **kwargs):
+        with chain_handles(*args, **kwargs) as handles:
+            yield [(path, CountedHandle(path, handle)) for path, handle in handles]
+
+    monkeypatch.setattr(jsonl_tail, "jsonl_chain_handles", counted_handles)
     artifact_counters = _install_artifact_counters(monkeypatch)
 
     endpoint = make_chat_history_endpoint(tmp_path)
     response = asyncio.run(endpoint(types.SimpleNamespace(query_params={})))
     messages = json.loads(response.body)["messages"]
 
-    progress_reads = [c for c in tail_calls if c[0].endswith("progress.jsonl")]
+    progress_reads = [(start, size) for path, start, size in reads if path.name == "progress.jsonl"]
     assert progress_reads  # the bounded reader actually served the endpoint
-    assert all(tail is not None for _path, tail in progress_reads)  # no full read
-    assert sum(tail for _path, tail in progress_reads) < progress_size
+    assert all(start >= progress_size - 512 * 1024 - 1 and size > 0 for start, size in progress_reads)
+    # One alignment lookahead and one parsed window, plus newline probes.
+    assert sum(size for _start, size in progress_reads) <= 2 * 512 * 1024 + 2 < progress_size
+    progress_rows = [row for row in messages if row.get("is_progress")]
+    assert len(progress_rows) == 60
+    assert progress_rows[-1]["text"] == "telemetry-15999"
     # Annotation ran on the emitted window (terminal truth landed on rows)...
     annotated = [m for m in messages if m.get("task_terminal_status") == "completed"]
     assert annotated
     # ...as a status/cost projection only: zero artifact materialization and
     # zero disposition-hash lookups on the GET path.
     assert artifact_counters == {"collect": 0, "copy": 0, "disposition": 0}
+
+
+def _install_ledger_read_counters(monkeypatch):
+    """Count cold preparations, locked replays and both live projections."""
+    counters: dict = {"preparations": [], "full_reads": [], "projections": [], "breakdowns": []}
+    real_prepare, real_lock = memo._prepare_writer, ua._locked
+    lock_depth = 0
+    real_full_read = usage_ledger._read_records_locked
+    real_projection = ua.usage_projection
+    real_breakdown = ua.usage_breakdown
+
+    @contextmanager
+    def counted_lock(*args, **kwargs):
+        nonlocal lock_depth
+        with real_lock(*args, **kwargs) as heartbeat:
+            lock_depth += 1
+            try:
+                yield heartbeat
+            finally:
+                lock_depth -= 1
+
+    def counted_preparation(target_root):
+        assert lock_depth == 0, "cold parsing must stay outside the monetary lock"
+        counters["preparations"].append(str(target_root))
+        return real_prepare(target_root)
+
+    def counted_full_read(target_root):
+        counters["full_reads"].append(str(target_root))
+        return real_full_read(target_root)
+
+    def counted_projection(*args, **kwargs):
+        counters["projections"].append(kwargs)
+        return real_projection(*args, **kwargs)
+
+    def counted_breakdown(*args, **kwargs):
+        counters["breakdowns"].append(kwargs)
+        return real_breakdown(*args, **kwargs)
+
+    monkeypatch.setattr(usage_ledger, "_read_records_locked", counted_full_read)
+    monkeypatch.setattr(usage_ledger, "_locked", counted_lock)
+    monkeypatch.setattr(ua, "_locked", counted_lock)
+    monkeypatch.setattr(memo, "_prepare_writer", counted_preparation)
+    # usage_accounting re-binds the substrate name at import; the memo resolves
+    # it in its own namespace, so the counter must cover both bindings.
+    monkeypatch.setattr(ua, "_read_records_locked", counted_full_read)
+    monkeypatch.setattr(ua, "usage_projection", counted_projection)
+    monkeypatch.setattr(ua, "usage_breakdown", counted_breakdown)
+    return counters
+
+
+def test_live_root_surfaces_replay_the_ledger_zero_times_when_warm(
+    tmp_path, monkeypatch,
+):
+    """The two surfaces a project chat actually opens on a LIVE root: chat
+    history (which projects a non-final root's subtree cost for the newest
+    progress row) and GET /api/tasks/{id} (which derives cost_breakdown). The
+    sibling budgets above seed a COMPLETED task, so neither live branch runs
+    there. Warm, each surface asks its projection exactly ONCE and the
+    memo/render cache answers it: ZERO full ledger replays under the monetary
+    lock, which is what made an oversized ledger cost seconds per open."""
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros.gateway.tasks import _task_get_response
+    from ouroboros.task_results import write_task_result
+
+    root = _seeded_accounting_root(tmp_path, monkeypatch)
+    (root / "logs" / "chat.jsonl").write_text(
+        json.dumps({"ts": "2026-08-08T00:00:00Z", "direction": "in", "text": "hello"}) + "\n",
+        encoding="utf-8",
+    )
+    with (root / "logs" / "progress.jsonl").open("w", encoding="utf-8") as handle:
+        for i in range(5):
+            handle.write(json.dumps({
+                "ts": f"2026-08-08T00:00:{i:02d}Z", "content": f"step-{i}", "task_id": "root-1",
+            }) + "\n")
+    # NON-final: `live` in history.py is `status not in FINAL_STATUSES`.
+    write_task_result(root, "root-1", "running", result="working", ts="2026-08-08T00:00:00Z")
+
+    history = make_chat_history_endpoint(root)
+    request = types.SimpleNamespace(
+        path_params={"task_id": "root-1"},
+        query_params={},
+        app=types.SimpleNamespace(state=types.SimpleNamespace(drive_root=root)),
+    )
+    counters = _install_ledger_read_counters(monkeypatch)
+    asyncio.run(history(request))  # cold: fills the rows memo
+    assert counters["preparations"] == [str(root)]  # one parse outside the money lock
+    assert counters["full_reads"] == []
+    counters["preparations"].clear()
+    counters["projections"].clear()
+
+    messages = json.loads(asyncio.run(history(request)).body)["messages"]
+    live_rows = [m for m in messages if m.get("cost_with_children_partial")]
+
+    assert live_rows  # the live-root branch really ran (not a vacuous budget)
+    assert live_rows[-1]["cost_accounting_status"] == "available"
+    assert counters["preparations"] == counters["full_reads"] == []
+    assert len(counters["projections"]) == 1  # one live-root projection, cached
+    assert counters["projections"][0]["root_task_id"] == "root-1"
+
+    counters["projections"].clear()
+    payload = json.loads(_task_get_response(request).body)
+
+    assert payload["cost_breakdown"]["authority"] == "physical_attempt_ledger"
+    assert counters["preparations"] == counters["full_reads"] == []
+    assert len(counters["breakdowns"]) == 1  # one subtree breakdown, cached
+    assert counters["breakdowns"][0]["root_task_id"] == "root-1"
+    assert counters["projections"] == []  # the detail path reads no projection
 
 
 def test_logs_tail_reads_bounded_events_tail(tmp_path, monkeypatch):

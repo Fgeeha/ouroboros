@@ -32,6 +32,46 @@ def _workflow() -> dict:
     return yaml.safe_load(CI_PATH.read_text(encoding="utf-8"))
 
 
+def test_pull_requests_and_ouroboros_pushes_share_one_full_browser_lane():
+    """The PR lane is no longer the narrow Publish proof: it is the whole marker lane.
+
+    `ci.yml` matches pull requests, manual runs and tags and delegates to the
+    reusable lane; every `ouroboros` push reaches the SAME job through its own
+    path-filter-free workflow. Nothing here may pull the costly system-e2e
+    scenarios into a pull request.
+    """
+    shared_path = REPO_ROOT / ".github" / "workflows" / "ui-browser.yml"
+    push_path = REPO_ROOT / ".github" / "workflows" / "ui-browser-push.yml"
+    caller = _workflow()["jobs"]["ui-smoke"]
+    assert " ".join(caller["if"].split()) == (
+        "github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'"
+        " || startsWith(github.ref, 'refs/tags/v')"
+    )
+    assert caller["uses"] == "./.github/workflows/ui-browser.yml"
+    assert "steps" not in caller, "the browser steps belong to the shared lane"
+
+    push = yaml.safe_load(push_path.read_text(encoding="utf-8"))
+    assert _triggers(push) == {"push": {"branches": ["ouroboros"]}}
+    assert push["jobs"]["ui-smoke"]["uses"] == caller["uses"]
+
+    shared = yaml.safe_load(shared_path.read_text(encoding="utf-8"))
+    assert list(_triggers(shared)) == ["workflow_call"]
+    steps = {step.get("name"): step for step in shared["jobs"]["ui-smoke"]["steps"] if step.get("name")}
+    full = steps["Run complete host UI lane with collection and availability guards"]
+    assert full["if"] == "${{ !cancelled() && steps.install_browsers.outcome == 'success' }}"
+    assert full["run"].endswith(
+        "python -m pytest tests/ -m ui_browser --require-ui-browser -q --tb=short")
+    assert full["env"]["OUROBOROS_RUN_UI_SMOKE"] == "1"
+    assert full["env"]["OUROBOROS_EXPECT_BROWSER_ENGINES"] == "chromium,webkit"
+    assert steps["Run browser tools Chromium/WebKit smoke"]["if"] == (
+        "${{ !cancelled() && steps.install_browsers.outcome == 'success'"
+        " && (github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/v')) }}")
+    for text in (_job_text("ui-smoke"), shared_path.read_text(encoding="utf-8"),
+                 push_path.read_text(encoding="utf-8")):
+        assert "secrets." not in text
+        assert "system_e2e" not in text and "OUROBOROS_E2E_DEEP" not in text
+
+
 def _triggers(workflow: dict) -> dict:
     # YAML 1.1 reads a bare `on:` key as the boolean True; PyYAML follows it.
     return workflow.get("on") or workflow.get(True) or {}
@@ -99,17 +139,22 @@ def test_the_scheduled_lane_runs_the_keyless_suite_on_a_throwaway_root():
     assert [step.get("uses") for step in steps][:2] == [
         "actions/checkout@v4", "./.github/actions/setup-python-env",
     ]
-    run_step = next(step for step in steps if "run" in step)
-    assert run_step["run"].strip() == (
-        'python -m pytest tests/system_e2e/ -o addopts="" -q'
-    )
-    env = run_step["env"]
-    assert env["OUROBOROS_E2E_DEEP"] == "mock"
+    run_steps = [step for step in steps if "run" in step]
+    assert len(run_steps) == 2
+    expected = [("tests/system_e2e/", "OUROBOROS_E2E_DEEP"),
+                ("tests/test_e2e_cancellation_scenarios.py", "OUROBOROS_E2E_CANCEL")]
     # All four roots, all under the runner's temp: a scenario server that
     # escaped its isolation could otherwise write into the checkout.
     roots = ["OUROBOROS_APP_ROOT", "OUROBOROS_REPO_DIR", "OUROBOROS_DATA_DIR",
              "OUROBOROS_SETTINGS_PATH"]
-    assert all("runner.temp" in str(env[name]) for name in roots), env
+    for run_step, (target, lane) in zip(run_steps, expected):
+        assert run_step["run"].strip() == (
+            f'python -m pytest {target} -o addopts="" -o faulthandler_timeout=540 -q'
+        )
+        env = run_step["env"]
+        assert env[lane] == "mock"
+        assert env["PYTHONUNBUFFERED"] == "1"
+        assert all("runner.temp" in str(env[name]) for name in roots), env
 
 
 def test_the_scheduled_lane_asks_for_no_secret():

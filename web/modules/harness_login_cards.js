@@ -44,7 +44,8 @@ import {
     claudexorStatus,
     familyLabel,
 } from './claudexor_status_store.js';
-import { copyTextWithToast } from './ui_helpers.js';
+import { copyTextWithToast, openExternalViaHostBridge } from './ui_helpers.js';
+import { showToast } from './toast.js';
 import { escapeHtmlAttr as escapeHtml, safeExternalHrefAttr } from './utils.js';
 
 const JOB_POLL_MS = 3000;
@@ -504,7 +505,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
             <div class="harness-code-entry" data-profile-name-entry>
                 <label for="harness-profile-name-input">Name for the ${escapeHtml(active.needsProfile.familyLabel || active.harness)} account (e.g. work, backup). Lowercase letters, digits, "-" and "_" — anything else becomes "-".</label>
                 <div class="harness-code-entry-row">
-                    <input type="text" id="harness-profile-name-input" data-profile-name-input autocomplete="off" spellcheck="false"
+                    <input class="ui-control" type="text" id="harness-profile-name-input" data-profile-name-input autocomplete="off" spellcheck="false"
                         placeholder="account name" value="${escapeHtml(active.profileNameValue || '')}">
                     <button type="button" class="btn btn-primary" data-profile-name-submit>Add account &amp; connect</button>
                 </div>
@@ -567,7 +568,7 @@ export function loginCardHtml(active, nowMs = Date.now(), { mode = LOGIN_CARD_FU
             <div class="harness-code-entry" data-code-entry>
                 <label for="harness-code-input">If the browser shows a code instead of finishing, paste it here (otherwise the sign-in completes on its own):</label>
                 <div class="harness-code-entry-row">
-                    <input type="text" id="harness-code-input" data-login-code-input autocomplete="off" spellcheck="false"
+                    <input class="ui-control ui-control-code" type="text" id="harness-code-input" data-login-code-input autocomplete="off" spellcheck="false"
                         placeholder="sign-in code" value="${escapeHtml(active.inputValue || '')}"${active.inputSent ? ' disabled' : ''}>
                     <button type="button" class="btn btn-default" data-login-code-submit${busy ? ' disabled' : ''}>${active.inputBusy ? 'Sending…' : (active.inputSent ? 'Code sent' : 'Submit code')}</button>
                 </div>
@@ -833,6 +834,17 @@ export function createLoginCardController({
     }
 
     function wireLoginCard(hostEl, active) {
+        hostEl.querySelector('[data-open-signin]')?.addEventListener('click', (event) => {
+            // Keep modifier clicks native; handle Enter/touch before shell interception.
+            if (event.defaultPrevented || (event.button != null && event.button !== 0)
+                || event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+            event.preventDefault();
+            const disclosure = deviceCodeDisclosure(active.envelope || {});
+            const doc = getDoc();
+            void openExternalViaHostBridge(disclosure?.url || '', {
+                win: doc?.defaultView || window, doc,
+            }).catch((error) => showToast(`Could not open sign-in link: ${error?.message || error}`, 'error'));
+        });
         hostEl.querySelector('[data-login-retry]')?.addEventListener('click', () => {
             // NO preemptive stopJobPolling() here: if the C7 guard inside
             // start refuses (cancel unproven, job still live), the old poll

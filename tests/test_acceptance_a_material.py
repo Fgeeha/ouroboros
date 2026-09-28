@@ -225,8 +225,10 @@ def test_junk_continue_abstains_so_a_single_terminal_vote_terminalizes(
     _no_fence(monkeypatch)
     trace: dict = {"tool_calls": [], "review_runs": []}
     ctx = _ctx(tmp_path, trace=trace)
-    assert _apply_task_acceptance_result(ctx, result, record_run=False) is False
-    assert trace["acceptance_decision"]["reason"] == "dialogue_terminal"
+    assert _apply_task_acceptance_result(ctx, result) is True
+    assert trace["acceptance_decision"]["status"] == ACCEPTANCE_REVISION_REQUESTED
+    assert "unreachable_here" in ctx.messages[-1]["content"]
+    assert trace["review_runs"][-1]["aggregate_signal"] == "FAIL"
 
 
 def test_degraded_panel_lone_terminal_vote_does_not_shadow_the_degraded_causes(
@@ -252,10 +254,10 @@ def test_degraded_panel_lone_terminal_vote_does_not_shadow_the_degraded_causes(
     _no_fence(monkeypatch)
     trace: dict = {"tool_calls": [], "review_runs": []}
     ctx = _ctx(tmp_path, trace=trace)
-    assert _apply_task_acceptance_result(ctx, result, record_run=False) is False
-    decision = trace["acceptance_decision"]
-    assert decision["reason"] == "review_degraded"
-    assert decision["degraded_reasons"] == ["slot_0 transport_failed: 502 from provider"]
+    assert _apply_task_acceptance_result(ctx, result) is True
+    assert trace["acceptance_decision"]["status"] == ACCEPTANCE_REVISION_REQUESTED
+    assert trace["review_runs"][-1]["degraded_reasons"] == ["slot_0 transport_failed: 502 from provider"]
+    assert "502 from provider" in ctx.messages[-1]["content"]
 
 
 # ---------------------------------------------------------------------------
@@ -521,3 +523,93 @@ def test_superseded_clean_pass_replays_into_refusal_never_reaccepts(monkeypatch,
     assert _apply_task_acceptance_result(ctx, result, reused=True, record_run=False) is False
     decision = trace["acceptance_decision"]
     assert decision["reason"] == "identical_acceptance_refused"
+
+
+def test_a_revision_names_its_pass_and_causes_not_the_aggregate_word(monkeypatch, tmp_path):
+    """Owner item spam E: the aggregate word is not an explanation.
+
+    A DEGRADED wave that DID feed an improvement capsule back printed
+    "Task acceptance review: DEGRADED - improvement note fed back", where
+    DEGRADED elsewhere means "no settled verdict". The row now names the pass being
+    started and the causes the wave actually recorded; the degraded terminal
+    keeps the same causes through the one shared clause.
+    """
+    _no_fence(monkeypatch)
+    emitted: list = []
+    trace: dict = {"tool_calls": [], "review_runs": []}
+    ctx = _ctx(tmp_path, trace=trace, passes_done=1)
+    ctx.emit_progress = lambda message, *, incident=None: emitted.append(message)
+    # A deliberate DEGRADED verdict still supplies a capsule, so this wave DOES
+    # feed an improvement note back while its aggregate word says the opposite.
+    result = ReviewRunResult(
+        request={"surface": "task_acceptance", "policy": {"min_successful_slots": 1}},
+        actors=[_actor("s0", "DEGRADED", {
+            "verdict": "DEGRADED", "outcome_tier": "best_effort",
+            "completion_coach": "tighten the parser",
+            "dialogue_status": "continue_actionable",
+        })],
+        parsed_findings=[],
+        aggregate_signal="DEGRADED",
+        degraded_reasons=["s1 window_exhausted", "s2 transport_error"],
+    )
+
+    assert _apply_task_acceptance_result(ctx, result, record_run=False) is True
+
+    assert trace["acceptance_decision"]["status"] == ACCEPTANCE_REVISION_REQUESTED
+    (line,) = emitted
+    assert line == (
+        "Task acceptance review: improvement note fed back for pass 2."
+        " Causes: s1 window_exhausted; s2 transport_error"
+    )
+    assert "DEGRADED" not in line
+
+
+def test_the_degraded_terminal_keeps_its_wording_and_its_causes(monkeypatch, tmp_path):
+    """The shared clause did not change what a real no-quorum terminal says."""
+    _no_fence(monkeypatch)
+    emitted: list = []
+    trace: dict = {"tool_calls": [], "review_runs": []}
+    ctx = _ctx(tmp_path, trace=trace)
+    ctx.budget_profile["max_improvement_passes"] = 0  # explicit author rail, not critic dialogue
+    ctx.emit_progress = lambda message, *, incident=None: emitted.append(message)
+    result = ReviewRunResult(
+        request={"surface": "task_acceptance", "policy": {"min_successful_slots": 1}},
+        actors=[_actor("s0", "FAIL", {"verdict": "FAIL", "outcome_tier": "best_effort"})],
+        parsed_findings=[],
+        aggregate_signal="DEGRADED",
+        degraded_reasons=["s1 window_exhausted"],
+    )
+
+    assert _apply_task_acceptance_result(ctx, result, record_run=False) is False
+
+    assert trace["acceptance_decision"]["reason"] == "review_degraded"
+    assert emitted[-1] == (
+        "Task acceptance review: DEGRADED (no settled verdict; not recorded as PASS)."
+        " Causes: s1 window_exhausted"
+    )
+
+
+def test_a_revision_with_no_recorded_causes_says_so_beside_the_verdict(monkeypatch, tmp_path):
+    """Absence of causes is stated, not implied by a bare verdict word.
+
+    `degraded_reasons` is empty for the ordinary case: a FAIL verdict that built
+    an improvement capsule and reached the revision branch. Dropping the
+    aggregate word left "improvement note fed back for pass N." and nothing
+    else, which is less than the line it replaced; putting the bare word back
+    would make it the explanation again, which is what this rule removed. The
+    row names the verdict AND says that no causes were recorded.
+    """
+    _no_fence(monkeypatch)
+    emitted: list = []
+    trace: dict = {"tool_calls": [], "review_runs": []}
+    ctx = _ctx(tmp_path, trace=trace, passes_done=1)
+    ctx.emit_progress = lambda message, *, incident=None: emitted.append(message)
+
+    assert _apply_task_acceptance_result(ctx, _fail_result(), record_run=False) is True
+
+    assert trace["acceptance_decision"]["status"] == ACCEPTANCE_REVISION_REQUESTED
+    (line,) = emitted
+    assert line == (
+        "Task acceptance review: improvement note fed back for pass 2 "
+        "(verdict FAIL; no causes recorded)."
+    )

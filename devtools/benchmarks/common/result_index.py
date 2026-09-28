@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import pathlib
 import time
 from typing import Any
@@ -14,6 +15,22 @@ def append_result_index(run_dir: pathlib.Path, row: dict[str, Any]) -> None:
     run_dir.mkdir(parents=True, exist_ok=True)
     with (run_dir / "result_index.jsonl").open("a", encoding="utf-8") as fh:
         fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+
+
+def read_result_index(run_dir: pathlib.Path) -> list[dict[str, Any]]:
+    """Read object rows from an append-only result index."""
+    path = run_dir / "result_index.jsonl"
+    if not path.exists():
+        return []
+    rows: list[dict[str, Any]] = []
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if line.strip():
+            value = json.loads(line)
+            if isinstance(value, dict):
+                rows.append(value)
+    return rows
 
 
 # Reason codes on which the RUNTIME stopped a task for a reason that is not "the task is
@@ -111,7 +128,10 @@ def task_result_row(
 
     Pass ``runtime_result=<task result payload>`` (metadata or keyword) wherever the adapter
     holds one: ``runtime_outcome`` then discloses why the RUNTIME stopped, independently of
-    the adapter-stage ``reason_code`` this row's ``status`` describes."""
+    the adapter-stage ``reason_code`` this row's ``status`` describes.
+
+    An omitted or empty ``official_eval_status`` is ``unreported``: the caller made no claim.
+    ``not_run`` asserts the official evaluator never ran, so only an explicit value says it."""
     meta = dict(metadata or {})
     for key, value in overrides.items():
         if value is not None:
@@ -125,7 +145,7 @@ def task_result_row(
         "reason_code": str(meta.get("reason_code") or ""),
         "runtime_outcome": runtime_terminal_disclosure(meta.get("runtime_result")),
         "prediction_written": bool(meta.get("prediction_written")),
-        "official_eval_status": str(meta.get("official_eval_status") or "not_run"),
+        "official_eval_status": str(meta.get("official_eval_status") or "unreported"),
         "output_paths": meta.get("output_paths") or {},
         "error": str(meta.get("error") or ""),
         "details": meta.get("details") or {},

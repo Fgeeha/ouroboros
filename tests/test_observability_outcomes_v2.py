@@ -304,11 +304,12 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
 
     runtime_error = derive_loop_outcome(
         "⚠️ Error during processing: RuntimeError: boom",
-        {"rounds": 1},
+        {"rounds": 1, "execution_status": "infra_failed", "reason_code": "task_exception"},
         {"tool_calls": []},
     )
     assert runtime_error["outcome_axes"]["execution"]["status"] == EXECUTION_INFRA_FAILED
     assert runtime_error["reason_code"] == "task_exception"
+    assert runtime_error["failure"]["kind"] == "runtime"
 
     deep_unavailable = derive_loop_outcome(
         "❌ Deep self-review unavailable: no key",
@@ -328,10 +329,11 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
             "result": "⚠️ ARTIFACT_OUTPUT_ERROR: command succeeded but declared output registration failed.",
         }]},
     )
-    assert tool_failure["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
-    assert tool_failure["reason_code"] == "tool_failure"
-    assert tool_failure["failure"]["kind"] == "tool"
-    assert tool_failure["failure"]["tool_errors"][0]["status"] == "artifact_output_error"
+    assert tool_failure["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert tool_failure["reason_code"] == "final_message"
+    assert tool_failure["failure"] is None
+    assert tool_failure["outcome_axes"]["execution"]["unresolved_tool_errors"][0]["status"] == "artifact_output_error"
+    assert tool_failure["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
 
     answer_with_tool_error = derive_loop_outcome(
         "FINAL ANSWER: 42",
@@ -343,8 +345,8 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
             "result": "bad probe",
         }]},
     )
-    assert answer_with_tool_error["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
-    assert answer_with_tool_error["outcome_axes"]["execution"]["reason_code"] == "tool_failure"
+    assert answer_with_tool_error["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert answer_with_tool_error["outcome_axes"]["execution"]["reason_code"] == "final_message"
     assert answer_with_tool_error["reason_code"] == "final_message"
     assert answer_with_tool_error["failure"] is None
     assert answer_with_tool_error["final_answer"] == "42"
@@ -364,7 +366,7 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
         },
     )
     assert stale_latch["final_answer"] == ""
-    assert stale_latch["reason_code"] == "tool_failure"
+    assert stale_latch["reason_code"] == "final_message"
 
     # A2 (v6.50.2): an access-policy block on a READ-ONLY exploratory tool is honest
     # telemetry, not a degraded execution — the agent simply could not look there. It is
@@ -411,8 +413,8 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
     assert policy_write_block["failure"] is None
     assert execution["policy_denials"][0]["status"] == "resource_policy_blocked"
 
-    # Boundary: a GENUINE tool/exec error (not a policy refusal) on a write/shell tool
-    # STILL degrades — the policy_denials demotion is scoped to `*_blocked` refusals.
+    # A real tool error remains unresolved evidence; the delivered answer's
+    # execution status is not inferred from the number of unsuccessful calls.
     real_error = derive_loop_outcome(
         "Done.",
         {"rounds": 1},
@@ -423,8 +425,56 @@ def test_loop_outcome_distinguishes_success_empty_and_provider_failure():
             "result": "⚠️ unexpected error",
         }]},
     )
-    assert real_error["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
-    assert real_error["reason_code"] == "tool_failure"
+    assert real_error["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert real_error["reason_code"] == "final_message"
+    assert real_error["outcome_axes"]["execution"]["unresolved_tool_errors"][0]["status"] == "error"
+
+
+def test_a_listing_miss_then_a_success_elsewhere_leaves_execution_ok(tmp_path):
+    """Owner item I27: a read-only discovery miss does not colour the outcome.
+
+    The live case listed a folder whose name carried a non-breaking space, got a
+    first-class LIST_FILES_ERROR, found the right spelling on the very next call
+    and STILL finished as tool_failure / "Done with warnings": the recovery scan
+    credits a later success only for the SAME target signature, and a differently
+    spelled path can never match it. The producer names the miss instead, so no
+    failure is recorded to recover from and the scan stays untouched.
+
+    Run through the real registry, so this pins the producer and the outcome
+    together rather than a hand-written trace row."""
+    from ouroboros.loop_tool_execution import _typed_execution_failure
+    from ouroboros.project_dialogue import completion_status_label
+    from ouroboros.tools.registry import ToolRegistry
+
+    repo = tmp_path / "repo"
+    (repo / "ML Conf 2").mkdir(parents=True)
+    drive = tmp_path / "drive"
+    drive.mkdir()
+    tools = ToolRegistry(repo_dir=repo, drive_root=drive)
+
+    # The exact live shape: a NON-BREAKING space instead of a space.
+    nbsp_spelling = "ML\u00a0Conf 2"
+    miss = tools.execute_result("list_files", {"path": nbsp_spelling})
+    assert miss.text.startswith("⚠️ LIST_FILES_NOT_FOUND:")
+    assert (miss.status, miss.code) == ("ok", "LEGACY_WARNING")
+    assert _typed_execution_failure(True, miss) is False
+    found = tools.execute_result("list_files", {"path": "ML Conf 2"})
+    assert found.status == "ok" and not found.text.startswith("⚠️")
+
+    outcome = derive_loop_outcome(
+        "FINAL ANSWER: the deck folder is empty",
+        {"rounds": 2},
+        {"tool_calls": [
+            {"tool": "list_files", "args": {"path": nbsp_spelling}, "result": miss.text,
+             "status": miss.status, "is_error": _typed_execution_failure(True, miss)},
+            {"tool": "list_files", "args": {"path": "ML Conf 2"}, "result": found.text,
+             "status": found.status, "is_error": _typed_execution_failure(True, found)},
+        ]},
+    )
+    assert outcome["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert outcome["outcome_axes"]["execution"]["reason_code"] != "tool_failure"
+    assert outcome["failure"] is None
+    assert completion_status_label({"status": "completed", **outcome}, {}) == "Done"
 
 
 def test_forced_finalization_with_answer_is_best_effort():
@@ -741,7 +791,7 @@ def test_normalize_outcome_axes_canonicalizes_partial_and_unknown_legacy():
 
 
 def test_t4_cosmetic_partition_guards():
-    # A GENUINE tool error STILL degrades (partition is structural).
+    # A genuine error keeps its unresolved classification and unreviewed warning.
     blocking = derive_loop_outcome(
         "Done",
         {"rounds": 2},
@@ -753,7 +803,9 @@ def test_t4_cosmetic_partition_guards():
             "result": "⚠️ unexpected write error",
         }]},
     )
-    assert blocking["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
+    assert blocking["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert blocking["outcome_axes"]["execution"]["unresolved_tool_errors"][0]["status"] == "error"
+    assert blocking["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
 
     # v6.57.0 (1.3): a POLICY refusal (`write_file_blocked`) is NOT degrading — it lands in
     # policy_denials telemetry (the runtime declined the write; the deliverable, if any, is
@@ -808,14 +860,12 @@ def test_t4_cosmetic_partition_guards():
 
 
 def test_signal_death_is_not_cosmetic_but_plain_exit_still_is():
-    """D7 (node-runtime sprint): the NEW contract for the cosmetic demotion.
+    """A killed child remains unresolved, never cosmetic or silently clean.
 
-    A run_command/run_script child KILLED BY A SIGNAL (typed meta: exit_code<0
-    or a signal name — e.g. the macOS kernel-CODESIGNING SIGKILL of a broken
-    node, an OOM kill, an external `kill -9`) is a REAL execution-degrading
-    tool error, symmetric with the timeout exclusion. A plain non-zero exit
-    (exit_code=1 probe/teardown noise) REMAINS cosmetic — that half of the T4
-    contract is deliberately unchanged."""
+    SIGKILL/OOM is an actual tool error even when a later answer is delivered.
+    It stays visible in execution evidence and warns when no acceptance review
+    judged the result. A plain non-zero exit remains cosmetic.
+    """
     killed = derive_loop_outcome(
         "Done.",
         {"rounds": 2},
@@ -830,10 +880,12 @@ def test_signal_death_is_not_cosmetic_but_plain_exit_still_is():
         }]},
     )
     execution = killed["outcome_axes"]["execution"]
-    assert execution["status"] == EXECUTION_DEGRADED
-    assert execution["reason_code"] == "tool_failure"
-    assert execution["failure"]["tool_errors"][0]["signal"] == "SIGKILL"
+    assert execution["status"] == EXECUTION_OK
+    assert execution["reason_code"] == "final_message"
+    assert execution["failure"] is None
+    assert execution["unresolved_tool_errors"][0]["signal"] == "SIGKILL"
     assert not execution["cosmetic_tool_errors"]
+    assert killed["outcome_axes"]["objective"]["warning"] == "residual_tool_errors_without_review"
 
     plain = derive_loop_outcome(
         "Done.",
@@ -896,13 +948,13 @@ def test_cancel_panic_kill_never_reaches_user_verdict_as_tool_failure(tmp_path):
     assert axes["execution"]["reason_code"] == "cancelled"
     assert "tool_failure" not in json.dumps(axes)
 
-    # 2) The honest OTHER half of the contract: had the SAME trace terminated
-    #    naturally (no cancel), the signal death IS a real degradation.
+    # 2) A natural completion retains the signal death as unresolved evidence
+    #    and discloses the unreviewed result without deriving execution failure.
     late = derive_loop_outcome("done", {}, sigkill_trace)
-    assert late["outcome_axes"]["execution"]["status"] == EXECUTION_DEGRADED
-    assert late["outcome_axes"]["execution"]["reason_code"] == "tool_failure"
+    assert late["outcome_axes"]["execution"]["status"] == EXECUTION_OK
+    assert late["outcome_axes"]["execution"]["unresolved_tool_errors"][0]["signal"] == "SIGKILL"
 
-    # 3) A LATE worker write carrying that degraded outcome cannot clobber the
+    # 3) A LATE worker write carrying that completed outcome cannot clobber the
     #    cancelled verdict: terminal statuses are sticky (monotonic guard).
     write_task_result(
         tmp_path, "t-cancel", "completed",
@@ -1312,3 +1364,78 @@ def test_refreshing_an_omitted_ledger_stub_is_an_identity():
         assert refresh_verification_ledger_artifacts(
             dict(stub), {"status": status, "artifacts": [], "errors": []},
         ) == stub
+
+
+def test_task_exception_publishes_the_loop_s_accumulated_evidence(monkeypatch, tmp_path):
+    """The outer agent catch owns the terminal projection, not the evidence.
+
+    A lifecycle failure after real rounds must publish the loop's accumulated
+    trace and usage — never a ``0 calls`` projection built from the untouched
+    pre-loop defaults — and must not call an internal error a provider failure.
+    """
+    from ouroboros import agent as agent_module
+    from ouroboros import agent_task_pipeline
+    from ouroboros.agent import Env, OuroborosAgent
+    from ouroboros.task_results import STATUS_FAILED, load_task_result
+
+    repo, drive = tmp_path / "repo", tmp_path / "drive"
+    repo.mkdir()
+    drive.mkdir()
+    monkeypatch.setattr(OuroborosAgent, "_log_worker_boot_once", lambda self: None)
+    monkeypatch.setattr(agent_module, "build_llm_messages", lambda **_kwargs: ([], {}))
+    # The durable result is written before post-task cognition starts; the
+    # reflection thread is not this seam's subject.
+    monkeypatch.setattr(
+        agent_task_pipeline, "_run_post_task_processing_async", lambda *_a, **_kw: None)
+
+    def die_after_real_work(**_kwargs):
+        # Exactly what ``run_llm_loop`` attaches on an unexpected exit: the SAME
+        # in-memory accumulators the loop was filling.
+        exc = RuntimeError("owner wait refused a terminal continuation")
+        exc._ouroboros_loop_usage = {
+            "rounds": 7, "prompt_tokens": 4321, "completion_tokens": 210,
+            "execution_id": "exec_lifecycle_failure",
+        }
+        exc._ouroboros_loop_trace = {
+            "reasoning_notes": ["planned the edit"],
+            "tool_calls": [{
+                "tool": "write_file", "tool_call_id": "call-1", "result": "ok",
+                "trace_ref": {"call_id": "tool_write_file_1"},
+            }],
+        }
+        raise exc
+
+    monkeypatch.setattr(agent_module, "run_llm_loop", die_after_real_work)
+    agent = OuroborosAgent(Env(repo_dir=repo, drive_root=drive))
+    events = agent._handle_task_scoped({
+        "id": "lifecycle-fail", "type": "task", "chat_id": 1, "text": "do it",
+        "drive_root": str(drive), "budget_drive_root": str(drive),
+    })
+
+    stored = load_task_result(drive, "lifecycle-fail")
+    assert stored["status"] == STATUS_FAILED
+    assert stored["reason_code"] == "task_exception"
+    # The published trace counts the call that really happened.
+    assert stored["trace_summary"].startswith("## Tool trace (1 calls")
+    assert stored["trace_refs"]["execution_id"] == "exec_lifecycle_failure"
+    assert [ref["call_id"] for ref in stored["trace_refs"]["tool_call_refs"]] == [
+        "tool_write_file_1"]
+    # The loop's own tally rides the honest loop plane; an internal lifecycle
+    # error is a runtime failure, not a provider one.
+    assert stored["loop_outcome"]["usage"]["total_rounds"] == 7
+    assert stored["loop_outcome"]["usage"]["prompt_tokens"] == 4321
+    assert stored["loop_outcome"]["usage"]["completion_tokens"] == 210
+    execution = stored["outcome_axes"]["execution"]
+    assert execution["status"] == EXECUTION_INFRA_FAILED
+    assert execution["failure"] == {"kind": "runtime", "reason_code": "task_exception"}
+    # The original exception stays the evidence of what failed.
+    assert "RuntimeError: owner wait refused a terminal continuation" in stored["result"]
+    error_events = [
+        json.loads(line)
+        for line in (drive / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    task_error = next(row for row in error_events if row.get("type") == "task_error")
+    assert "owner wait refused a terminal continuation" in task_error["error"]
+    assert "die_after_real_work" in task_error["traceback"]
+    assert any(event.get("type") == "task_done" for event in events)

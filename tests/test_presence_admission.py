@@ -134,7 +134,19 @@ def test_admission_freezes_reviewed_behavior_runtime_digests_and_authority(tmp_p
     assert admission.origin == binding.origin
     assert admission.destination == binding.destination
     assert admission.capability_ceiling.skill_name == "community-helper"
-    assert [grant.name for grant in admission.capability_ceiling.tool_grants] == ["chat_history"]
+    # The reviewed profile selected chat_history; the rest is the constant
+    # cognitive baseline plus the own-work baseline every new ceiling carries.
+    assert [grant.name for grant in admission.capability_ceiling.tool_grants] == [
+        "chat_history",
+        "get_task_result",
+        "knowledge_list",
+        "knowledge_read",
+        "knowledge_write",
+        "recent_tasks",
+        "steer_task",
+        "update_identity",
+        "update_scratchpad",
+    ]
     assert admission.capability_ceiling.skill_content_hash == admission.skill_content_hash
     assert admission.capability_ceiling.profile_fingerprint == admission.profile_fingerprint
     assert admission.capability_ceiling.state_fingerprint == admission.state_fingerprint
@@ -199,4 +211,54 @@ def test_admission_rejects_selected_but_unavailable_required_target(tmp_path):
     with pytest.raises(PresenceAdmissionError) as caught:
         _admit(drive_root, binding)
 
+    assert caught.value.code == "presence_required_capability_unavailable"
+
+
+def _select_mcp(drive_root, skill_dir, *, name: str, provider: str) -> None:
+    loaded = load_skill(skill_dir, drive_root)
+    profile = parse_presence_profile(loaded.manifest, skill_dir)
+    state = PresenceState((PresenceSelection(
+        presence_request_fingerprint(profile.capability_requests[0]),
+        PresenceToolTarget("mcp", name, provider),
+    ),))
+    save_presence_state(drive_root, loaded.name, state,
+                        expected_state_fingerprint=presence_state_fingerprint(PresenceState()))
+
+
+def _serve_mcp_tools(monkeypatch, tools: dict) -> None:
+    from types import SimpleNamespace
+
+    from ouroboros import mcp_client
+
+    monkeypatch.setattr(mcp_client, "ensure_configured_from_settings", lambda **_kw: None)
+    monkeypatch.setattr(mcp_client, "get_manager", lambda: SimpleNamespace(
+        get_tool=lambda name: {"name": name, "server_id": tools[name]} if name in tools else None))
+
+
+WIRE = "mcp_my_company_b762e68c1ef1__list_files"
+
+
+@pytest.mark.parametrize("provider", ["my_company_b762e68c1ef1", "my_company__b762e68c1ef1"])
+def test_mcp_grant_is_ready_for_its_exact_or_pre_fixed_point_provider(tmp_path, monkeypatch, provider):
+    # #1328: a grant stored before the fixed-point id kept the unconverged
+    # provider; the same wire tool on the one server it now names is that grant.
+    drive_root = tmp_path / "data"
+    skill_dir = _install_behavior(drive_root)
+    _select_mcp(drive_root, skill_dir, name=WIRE, provider=provider)
+    _serve_mcp_tools(monkeypatch, {WIRE: "my_company_b762e68c1ef1"})
+    admission = _admit(drive_root, _binding(drive_root))
+    assert WIRE in [grant.name for grant in admission.capability_ceiling.tool_grants]
+
+
+@pytest.mark.parametrize("tools", [
+    {},  # an ambiguous id serves no tools at all
+    {WIRE: "another_server"},  # the wire name now belongs to a different server
+])
+def test_mcp_grant_is_refused_when_its_server_is_not_the_named_one(tmp_path, monkeypatch, tools):
+    drive_root = tmp_path / "data"
+    skill_dir = _install_behavior(drive_root)
+    _select_mcp(drive_root, skill_dir, name=WIRE, provider="my_company__b762e68c1ef1")
+    _serve_mcp_tools(monkeypatch, tools)
+    with pytest.raises(PresenceAdmissionError) as caught:
+        _admit(drive_root, _binding(drive_root))
     assert caught.value.code == "presence_required_capability_unavailable"

@@ -28,13 +28,13 @@ def _make_event(etype: str, **kwargs):
 
 
 def _make_completed_event(input_tokens: int = 100, output_tokens: int = 50):
-    usage_obj = MagicMock()
-    usage_obj.model_dump.return_value = {
-        "input_tokens": input_tokens,
-        "output_tokens": output_tokens,
-    }
-    resp_obj = MagicMock()
-    resp_obj.usage = usage_obj
+    usage = {"input_tokens": input_tokens, "output_tokens": output_tokens}
+    # SDK model_dump returns finite data. An unconstrained MagicMock instead
+    # creates another model_dump mock recursively during citation extraction.
+    resp_obj = types.SimpleNamespace(
+        usage=types.SimpleNamespace(model_dump=lambda: dict(usage)),
+        model_dump=lambda: {"usage": dict(usage), "output": []},
+    )
     return _make_event("response.completed", response=resp_obj)
 
 
@@ -101,6 +101,37 @@ def test_web_search_reports_unavailable_without_any_backend(monkeypatch):
 
     assert result["error"].startswith("web_search unavailable")
     assert "backend_errors" in result
+
+
+def test_responses_flex_refusal_reprices_standard_and_keeps_original_intent(ctx, patch_env, mock_openai, monkeypatch):
+    from ouroboros import usage_accounting as ua
+
+    monkeypatch.setenv("OUROBOROS_PROCESSING_PREFERENCE", "economy")
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "openai")
+    prepared, holds = [], []
+    original_reserve = search_module.reserve_attempt
+
+    def reserve(request):
+        prepared.append(request)
+        hold = original_reserve(request)
+        holds.append(hold)
+        return hold
+
+    monkeypatch.setattr(search_module, "reserve_attempt", reserve)
+    error = RuntimeError("Resource unavailable")
+    error.status_code = 429
+    error.body = {"error": {"code": "resource_unavailable", "param": "service_tier"}}
+    mock_openai.responses.create.side_effect = [error, _FakeStream([
+        _make_event("response.output_text.delta", delta="answer"), _make_completed_event()])]
+    result = json.loads(_web_search(ctx, "same query"))
+    assert result["answer"] == "answer"
+    assert [call.kwargs["service_tier"] for call in mock_openai.responses.create.call_args_list] == ["flex", "default"]
+    assert [request.processing_preference for request in prepared] == ["economy", "economy"]
+    assert prepared[0].candidate_raw_sha256 != prepared[1].candidate_raw_sha256
+    with ua._locked(holds[0].drive_root):
+        records = ua._read_records_locked_cached(holds[0].drive_root)
+    matching = [row for row in records if row.get("candidate_raw_sha256") == prepared[0].candidate_raw_sha256]
+    assert matching[-1]["state"] == "released"
 
 
 def test_web_search_uses_official_openai_responses(monkeypatch):
@@ -876,3 +907,48 @@ def test_streaming_progress_fires_only_once(ctx, patch_env, mock_openai):
     _web_search(ctx, "multi-search query")
 
     assert ctx.emit_progress_fn.call_count == 1
+
+
+def test_direct_search_dispatch_failure_releases_same_unsent_reservation(ctx, patch_env, mock_openai, monkeypatch):
+    from ouroboros import usage_accounting as ua
+    from ouroboros.usage_ledger import UsageLockUnavailable
+    reservations = []
+    original = search_module.reserve_attempt
+    def reserve(request):
+        result = original(request)
+        reservations.append(result)
+        return result
+    monkeypatch.setenv("OUROBOROS_WEBSEARCH_BACKEND", "openai")
+    monkeypatch.setattr(search_module, "reserve_attempt", reserve)
+    def refused(*args, **kwargs):
+        raise UsageLockUnavailable("synthetic kernel failure", reason="kernel_refused")
+    monkeypatch.setattr(search_module, "mark_dispatched", refused)
+    with pytest.raises(ua.PhysicalAttemptPreparationFailed) as error:
+        _web_search(ctx, "one query")
+    assert error.value.physical_attempt_capture.state == "released"
+    mock_openai.responses.create.assert_not_called()
+    assert len(reservations) == 1
+    with ua._locked(reservations[0].drive_root):
+        records = ua._read_records_locked_cached(reservations[0].drive_root)
+    chain = [row for row in records if row["attempt_id"] == reservations[0].attempt_id]
+    assert [row["state"] for row in chain] == ["reserved", "released"]
+
+
+def test_direct_search_failed_cleanup_retains_reservation_and_refuses_fallback(ctx, patch_env, mock_openai, monkeypatch):
+    from ouroboros import usage_accounting as ua
+    original = search_module._responses_search_candidate
+    def candidate(*args, **kwargs):
+        target, payload, request, before = original(*args, **kwargs)
+        def fail(held):
+            raise RuntimeError("synthetic preparation failure")
+        return target, payload, request, fail
+    monkeypatch.setattr(search_module, "_responses_search_candidate", candidate)
+    def release(*args, **kwargs):
+        raise ua.UsageLockUnavailable("synthetic failed cleanup", reason="contention")
+    monkeypatch.setattr(ua, "release_attempt", release)
+    monkeypatch.setattr(search_module, "_web_search_openrouter", lambda *a, **k: pytest.fail("competing fallback"))
+    monkeypatch.setattr(search_module, "_web_search_anthropic", lambda *a, **k: pytest.fail("competing fallback"))
+    with pytest.raises(ua.PhysicalAttemptPreparationFailed) as error:
+        _web_search(ctx, "one query")
+    assert error.value.physical_attempt_capture.state == "reserved"
+    mock_openai.responses.create.assert_not_called()

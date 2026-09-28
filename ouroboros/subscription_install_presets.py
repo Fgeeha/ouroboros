@@ -149,6 +149,7 @@ class SubscriptionInstallPreset:
     diagnostics: Tuple[Dict[str, Any], ...] = ()
     receipt: Dict[str, Any] = field(default_factory=dict)
     refusal: Optional[PresetRefusal] = None
+    model_settings: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def ok(self) -> bool:
@@ -300,16 +301,6 @@ def _session_target(harness: str, model_id: str) -> str:
     return f"{harness}={model_id}"
 
 
-def _row_effort(seat: PresetSeat) -> str:
-    """A row's ``effort`` field.
-
-    Present on EVERY harness on purpose. On cursor the compound slug is what the
-    vendor honours, but the review/delegation surfaces materialize an effort
-    regardless — leaving the field empty would send the surface's global default
-    alongside a slug that says something else."""
-    return seat.effort
-
-
 def _resolved_row(seat: PresetSeat, model_id: str) -> Dict[str, Any]:
     return {
         "surface": seat.surface,
@@ -376,6 +367,8 @@ def _inline_reviewer_slots_json(triad: Sequence[Mapping[str, Any]],
             "effort": str(advisory["effort"]),
         },
     }
+    if scope:
+        payload["deep_review"] = {"route": {"kind": "agent_session", "target_id": str(scope[0]["target_id"])}, "effort": str(scope[0]["effort"])}
     return json.dumps(payload, ensure_ascii=False, sort_keys=False)
 
 
@@ -451,6 +444,10 @@ def _reference_reviewer_rows(
     adv = _slot(SURFACE_ADVISORY, dict(advisory) | {"position": 1})
     adv.pop("slot_id", None)
     payload["advisory"] = {"enabled": True, **adv}
+    if scope:
+        deep = _slot(SURFACE_SCOPE, scope[0])
+        deep.pop("slot_id", None)
+        payload["deep_review"] = deep
     extended = make_configured_subagents(items, enabled=available.enabled)
     return extended, json.dumps(payload, ensure_ascii=False, sort_keys=False), diagnostics
 
@@ -616,6 +613,135 @@ def compile_available_subagents(
     return make_configured_subagents(actors), tuple(diagnostics)
 
 
+def compile_model_settings(model_catalog: Sequence[Mapping[str, Any]],
+                           settings: Mapping[str, Any]) -> Dict[str, Any]:
+    """Suggest a complete zero-key setup from exact raw-route catalog evidence.
+
+    Existing usable/custom choices win. The model's backend default supplies
+    the proposal, not an invented model family or a CLI alias table.
+    """
+    from ouroboros.model_slots import MODEL_ROLE_SETTINGS
+    from ouroboros.settings_defaults import SETTINGS_DEFAULTS
+
+    main = str(settings.get("OUROBOROS_MODEL") or "")
+    if main and (model_has_credentials_in_settings(main, dict(settings))
+                 or main != SETTINGS_DEFAULTS["OUROBOROS_MODEL"]):
+        return {}
+    default = next((row for row in model_catalog if row.get("is_default") and row.get("value")), None)
+    if default is None:
+        return {}
+    vision = next((row for row in model_catalog if "image" in (row.get("input_modalities") or [])
+                   and row.get("value")), default)
+    proposed = {}
+    for role, key in MODEL_ROLE_SETTINGS.items():
+        if role == "websearch":
+            continue  # Provider-owned web-search tools are a separate capability.
+        current = str(settings.get(key) or "")
+        if current and current != str(SETTINGS_DEFAULTS.get(key) or ""):
+            continue
+        proposed[key] = "" if role == "fallback" else str((vision if role == "vision" else default)["value"])
+    return proposed
+
+
+def preview_api_reviewer_slots(settings: Mapping[str, Any]) -> str:
+    """Project ordinary API/local defaults for an unsaved wizard without mutating env.
+
+    The existing provider-normalization helpers own model policy. This is only
+    the structured editor representation of the same defaults, not a new panel.
+    """
+    from ouroboros.model_slots import get_deep_self_review_model
+    from ouroboros.provider_models import compatible_only_main_model
+    from ouroboros.server_runtime import (
+        _exclusive_direct_remote_provider,
+        _normalize_direct_review_models,
+        _normalize_direct_scope_review_models,
+        has_remote_provider,
+    )
+    from ouroboros.settings_defaults import OPENROUTER_REVIEW_DEFAULTS
+
+    authored = str(settings.get(REVIEWER_SLOTS_KEY) or "")
+    if authored:
+        return authored
+    provider = _exclusive_direct_remote_provider(dict(settings))
+    triad = list(OPENROUTER_REVIEW_DEFAULTS["triad"])
+    scope = list(OPENROUTER_REVIEW_DEFAULTS["scope"])
+    advisory_target = ""
+    if provider:
+        triad = _normalize_direct_review_models(dict(settings), provider).split(",")
+        scope = _normalize_direct_scope_review_models(dict(settings), provider).split(",")
+    elif compatible := compatible_only_main_model(settings):  # #1116: the one reachable route
+        triad, scope, advisory_target = [compatible] * len(triad), [compatible] * len(scope), compatible
+    if not has_remote_provider(dict(settings)) and str(settings.get("USE_LOCAL_MAIN")).lower() in {"true", "1"}:
+        triad = [str(settings.get("OUROBOROS_MODEL") or "")] * len(triad)
+        scope = [str(settings.get("OUROBOROS_MODEL") or "")] * len(scope)
+    def rows(models, surface):
+        # #1334: fresh triad rows read the work themselves; scope rows always read.
+        delivery = {"delivery": "native"} if surface == SURFACE_TRIAD else {}
+        return [{"slot_id": _slot_id(surface, i + 1),
+                 "route": {"kind": "api_chat", "target_id": model}, "effort": "", **delivery}
+                for i, model in enumerate(models) if model]
+    return json.dumps({
+        "triad": rows(triad, SURFACE_TRIAD), "scope": rows(scope, SURFACE_SCOPE),
+        "advisory": {"enabled": True, "route": {"kind": "api_chat", "target_id": advisory_target}, "effort": "low"},
+        "deep_review": {"route": {"kind": "api_chat", "target_id": get_deep_self_review_model(dict(settings))}, "effort": ""},
+    }, ensure_ascii=False)
+
+
+def preview_main_reviewer_slots(settings: Mapping[str, Any]) -> Tuple[str, str]:
+    """Rebind a visible review draft to Main, preserving effort and inspection.
+
+    Original task actors stay unchanged. A retrieving triad row becomes a direct
+    Main API row saved with ``delivery: native`` (#1334) — it keeps reading the
+    work itself with no roster actor minted for it; its effective effort stays
+    an independent row override. Other review surfaces already retrieve by
+    their surface contract. The returned reviewer and actor drafts are shown
+    together before the completion write.
+    """
+    from ouroboros.configured_subagents import normalize_configured_subagents
+    from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, resolve_processing_preference
+    from ouroboros.provider_models import provider_for_model
+    from ouroboros.reviewer_slot_config import DELIVERY_NATIVE, parse_reviewer_slots, roster_env_override
+    from ouroboros.route_spec import compound_session_effort
+
+    main, _light = _effective_api_models(settings)
+    if not main:
+        raise ValueError("Choose a Main model with access in this setup before using it for reviews.")
+    profile = str(model_role_option(MODEL_ACCOUNTS_KEY, "main", settings=dict(settings)))
+    if profile and provider_for_model(main) != "claudexor":
+        raise ValueError("A Main account pin requires a managed model source.")
+    processing = resolve_processing_preference("main", settings=dict(settings))
+    roster, roster_raw = normalize_configured_subagents(settings[SUBAGENTS_SETTING])
+    raw = preview_api_reviewer_slots(settings)
+    with roster_env_override(roster_raw, environ=dict(settings)):
+        resolved = parse_reviewer_slots(raw)
+    payload = json.loads(raw)
+    payload["advisory"] = payload.get("advisory") or {"enabled": True}
+    payload["deep_review"] = payload.get("deep_review") or {}
+    pairs = [*((row, slot, slot.retrieves) for row, slot in zip(payload["triad"], resolved.triad)),
+             *((row, slot, False) for row, slot in zip(payload["scope"], resolved.scope)),
+             (payload["advisory"], resolved.advisory, False),
+             (payload["deep_review"], resolved.deep_review, False)]
+    for row, original, retrieving in pairs:
+        effort = original.effort if original else ""
+        if original and not effort and original.kind == "agent_session":
+            effort = compound_session_effort(RouteSpec(ROUTE_KIND_AGENT_SESSION, original.target_id))
+        for key in ("subagent_id", "route", "processing_preference", "delivery"):
+            row.pop(key, None)
+        row["effort"] = effort
+        row["route"] = {"kind": "api_chat", "target_id": main}
+        if profile:
+            row["route"]["profile_id"] = profile
+        if processing:
+            row["processing_preference"] = processing
+        if retrieving:
+            row["delivery"] = DELIVERY_NATIVE
+    raw, roster_raw = json.dumps(payload, ensure_ascii=False), serialize_configured_subagents(roster)
+    refusal = _validate_against_parser(raw, roster_raw)
+    if refusal:
+        raise ValueError(refusal.message)
+    return raw, roster_raw
+
+
 def compile_install_preset(
     discoveries: Sequence[HarnessDiscovery],
     *,
@@ -623,6 +749,7 @@ def compile_install_preset(
     configured_subagents: Optional[ConfiguredSubagents] = None,
     source: str = SOURCE_ONBOARDING_DEFAULT,
     capability: Optional[Mapping[str, Any]] = None,
+    model_catalog: Sequence[Mapping[str, Any]] = (),
 ) -> SubscriptionInstallPreset:
     """Compile the install-time preset for the connected harnesses.
 
@@ -634,6 +761,8 @@ def compile_install_preset(
     can route.
     """
     settings = settings or {}
+    model_settings = compile_model_settings(model_catalog, settings)
+    settings = {**settings, **model_settings}
     connected = connected_preset_harnesses(discoveries)
     discovery = {str(d.harness_id): d for d in discoveries}
     required_models = (
@@ -731,6 +860,7 @@ def compile_install_preset(
         source=source,
         diagnostics=diagnostics,
         receipt=receipt,
+        model_settings=model_settings,
     )
 
 

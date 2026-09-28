@@ -963,6 +963,114 @@ test('task acceptance adapts only task_acceptance panels; advisory and commit st
     assert.deepEqual(reviewGroupsFromTaskDetail(detail).map((item) => item.surface), ['task_acceptance']);
 });
 
+test('a late acceptance settlement is printed verbatim in the Reviews group', () => {
+    const note = 'Reviewers later returned no settled verdict on this answer — 1 reviewer’s outcome is still'
+        + ' unknown. They reviewed the answer that was delivered.\n- a: PASS — model/a says PASS';
+    const groupOf = (extra = {}) => taskAcceptanceGroupFromTaskDetail({
+        task_id: 'root',
+        review_projection: { panels: [{ panel_id: 'accept', surface: 'task_acceptance',
+            aggregate_signal: 'DEGRADED', reason: 'quorum not reached', actors: [], ...extra }] },
+    });
+    const plain = groupOf().attempts[0];
+    const group = groupOf({ late_settlement: { note, reviewed_revision: 'delivered', settled_after_terminal: true } });
+    const late = group.attempts[0];
+    assert.equal(plain.label, 'panel accept');
+    assert.equal(plain.summary, 'quorum not reached');
+    assert.ok(plain.detailText.startsWith('Review panel accept:'));
+    // A republished panel is the same attempt: the settlement may not split the row.
+    assert.deepEqual([late.id, late.verdict, late.tone], [plain.id, plain.verdict, plain.tone]);
+    assert.equal(late.label, 'panel accept · settled after the task ended');
+    assert.equal(late.summary, note);
+    // The renderer shows detailText over summary, so the note has to lead it.
+    assert.equal(late.detailText, `${note}\n${plain.detailText}`);
+    const html = renderReviewsSection([group], { sectionExpanded: true,
+        expandedGroups: new Set([group.id]), expandedAttempts: new Set([`${group.id}:${late.id}`]) });
+    assert.match(html, /settled after the task ended/);
+    assert.match(html, /Reviewers later returned no settled verdict on this answer/);
+});
+
+test('author finish is shown beside raw reviewer signal without becoming PASS', () => {
+    const fingerprint = 'a'.repeat(64);
+    const plan = planReviewGroupFromTaskDetail({
+        task_id: 'root',
+        plan_review_state: {
+            current_attempt: { fingerprint, status: 'closed' },
+            waves: [{
+                request_fingerprint: fingerprint,
+                aggregate: 'REVIEW_REQUIRED',
+                closed: true,
+                author_disposition: {
+                    disposition: 'partial',
+                    rationale: 'Fixed the defect and deferred cosmetic notes.',
+                    reviewer_signal: 'REVIEW_REQUIRED',
+                    subject_hash: fingerprint,
+                },
+            }],
+        },
+    });
+    const attemptKey = `${plan.id}:${plan.attempts[0].id}`;
+    const html = renderReviewsSection([plan], {
+        sectionExpanded: true,
+        expandedGroups: new Set([plan.id]),
+        expandedAttempts: new Set([attemptKey]),
+    });
+    assert.match(html, /Author finish: partial/);
+    assert.match(html, /reviewer signal=REVIEW_REQUIRED/);
+    assert.match(html, /Fixed the defect and deferred cosmetic notes/);
+    assert.match(html, /REVIEW_REQUIRED/);
+});
+
+for (const action of ['finish', 'stop']) test(`task acceptance shows the explicit author ${action}`, () => {
+    const detail = {
+        task_id: 'root',
+        review_projection: { panels: [{
+            panel_id: 'accept', surface: 'task_acceptance', aggregate_signal: 'REVIEW_REQUIRED',
+        }] },
+        review_status: { acceptance_decision: {
+            status: 'finalized_unaccepted',
+            reason: 'author_finish',
+            author_disposition: {
+                action,
+                disposition: 'partial',
+                rationale: 'Fixed the defect; deferred the remaining note.',
+                subject_hash: 'binding-123',
+                reviewer_signal: 'REVIEW_REQUIRED',
+                source: 'author',
+            },
+        } },
+    };
+    const group = taskAcceptanceGroupFromTaskDetail(detail);
+    const attemptKey = `${group.id}:${group.attempts[0].id}`;
+    const html = renderReviewsSection([group], {
+        sectionExpanded: true,
+        expandedGroups: new Set([group.id]),
+        expandedAttempts: new Set([attemptKey]),
+    });
+    assert.match(html, new RegExp(`Author ${action}: partial`));
+    assert.match(html, /subject_hash=binding-123/);
+    assert.match(html, /reviewer signal=REVIEW_REQUIRED/);
+    assert.match(html, /REVIEW_REQUIRED/);
+    assert.doesNotMatch(html, /verdict=PASS/);
+});
+test('a revised task author decision is shown once and never attached to historical panels', () => {
+    const detail = {
+        task_id: 'root',
+        review_projection: { panels: [
+            { panel_id: 'old', surface: 'task_acceptance', aggregate_signal: 'FAIL', binding_hash: 'h0', superseded_by_revision: true },
+            { panel_id: 'new', surface: 'task_acceptance', aggregate_signal: 'FAIL', binding_hash: 'h1' },
+        ] },
+        review_status: { acceptance_decision: {
+            status: 'finalized_unaccepted', reason: 'author_finish',
+            author_disposition: { disposition: 'partial', rationale: 'Current h2 accepted by author.', subject_hash: 'h2', reviewer_signal: 'FAIL', source: 'author' },
+        } },
+    };
+    const group = taskAcceptanceGroupFromTaskDetail(detail);
+    assert.match(group.authorDecisionText, /subject_hash=h2/);
+    for (const attempt of group.attempts) assert.doesNotMatch(attempt.detailText, /subject_hash=h2/);
+    const html = renderReviewsSection([group], { sectionExpanded: true, expandedGroups: new Set([group.id]), expandedAttempts: new Set(group.attempts.map(a => `${group.id}:${a.id}`)) });
+    assert.equal((html.match(/Current h2 accepted by author/g) || []).length, 1);
+    assert.equal((html.match(/data-review-author-decision/g) || []).length, 1);
+});
 test('renderer is quiet, accessible and never invents review dollars', () => {
     const group = reviewGroupFromHistoryRow(groupedSkillRow());
     const html = renderReviewsSection([group], {
@@ -1094,7 +1202,7 @@ test('initiator detail is omitted when it is the owner', () => {
 
 test('review updates never change owner disclosure state', () => {
     const host = { innerHTML: '', addEventListener() {} };
-    const summary = { hidden: true, textContent: '' };
+    const summary = { hidden: true, textContent: '', dataset: {} };
     const disclosure = { sectionExpanded: false, expandedGroups: new Set(), expandedAttempts: new Set() };
     let domWrites = 0;
     const controller = createReviewPresentationController({
@@ -1152,7 +1260,7 @@ test('an open exact Skill detail survives a review re-render while its read is i
     };
     const controller = createReviewPresentationController({
         host,
-        summary: { hidden: true, textContent: '' },
+        summary: { hidden: true, textContent: '', dataset: {} },
         disclosure,
         onLoadSkillDetail(detail) {
             loads.push(loadSkillReviewDetail(detail, {
@@ -1329,7 +1437,7 @@ test('review re-render restores keyboard focus to the equivalent disclosure cont
         },
         get innerHTML() { return this._html || ''; },
     };
-    const summary = { hidden: true, textContent: '' };
+    const summary = { hidden: true, textContent: '', dataset: {} };
     const disclosure = { sectionExpanded: false, expandedGroups: new Set(), expandedAttempts: new Set() };
     const controller = createReviewPresentationController({ host, summary, disclosure });
     controller.update(reviewGroupFromHistoryRow(groupedSkillRow()));
@@ -1452,7 +1560,7 @@ test('Retry keeps keyboard focus on the live detail status while refetching', ()
     };
     createReviewPresentationController({
         host,
-        summary: { hidden: true, textContent: '' },
+        summary: { hidden: true, textContent: '', dataset: {} },
         disclosure: {},
         onLoadSkillDetail(_detail, options) { retryOptions = options; },
     });

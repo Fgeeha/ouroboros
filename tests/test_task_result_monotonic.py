@@ -11,6 +11,8 @@ Pins the "ghost subagent" / status-corruption protections:
 - normal forward progress and same-status enrichment are unaffected
 """
 
+import json
+
 import pytest
 
 from ouroboros import task_results as tr
@@ -57,6 +59,71 @@ def test_same_terminal_status_enrichment_allowed(drive):
     assert data["trace_summary"] == "trace"
 
 
+@pytest.mark.parametrize("previous", [None, tr.STATUS_RUNNING])
+@pytest.mark.parametrize("terminal", [
+    tr.STATUS_COMPLETED, tr.STATUS_FAILED, tr.STATUS_CANCELLED, tr.STATUS_REJECTED_DUPLICATE,
+])
+def test_first_accepted_root_terminal_write_originates_projection_debt(drive, previous, terminal):
+    if previous is not None:
+        tr.write_task_result(drive, "root", previous)
+    stored = tr.write_task_result(drive, "root", terminal)
+    assert stored["canonical_terminal_projection_origin"] == "terminal_transition"
+    assert "canonical_terminal_projection_ready" not in stored
+    assert tr.load_task_result(drive, "root", strict=True) == stored
+    enriched = tr.write_task_result(drive, "root", terminal,
+                                   canonical_terminal_projection_origin=None, result="enriched")
+    assert enriched["canonical_terminal_projection_origin"] == "terminal_transition"
+
+
+@pytest.mark.parametrize("lineage", [
+    {"parent_task_id": "parent", "root_task_id": "parent", "delegation_role": "subagent"},
+    {"metadata": {"parent_task_id": "parent", "root_task_id": "parent", "delegation_role": "subagent"}},
+    {"root_task_id": "other"},
+])
+def test_child_or_unproven_lineage_cannot_originate_projection_debt(drive, lineage):
+    tr.write_task_result(drive, "child", tr.STATUS_RUNNING, **lineage)
+    stored = tr.write_task_result(drive, "child", tr.STATUS_COMPLETED,
+                                 canonical_terminal_projection_origin="terminal_transition")
+    assert "canonical_terminal_projection_origin" not in stored
+
+
+def test_root_retry_transition_uses_merged_lineage(drive):
+    tr.write_task_result(drive, "retry", tr.STATUS_RUNNING, root_task_id="logical-root",
+                        parent_task_id="", delegation_role="root", original_task_id="previous",
+                        timeout_retry_from="previous")
+    stored = tr.write_task_result(drive, "retry", tr.STATUS_COMPLETED)
+    assert stored["canonical_terminal_projection_origin"] == "terminal_transition"
+
+
+@pytest.mark.parametrize("projector", ["plain", "replica", "enrichment"])
+def test_terminal_enrichment_cannot_adopt_a_historical_result(drive, projector):
+    from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+
+    path = tr.task_result_path(drive, "historical")
+    path.write_text(json.dumps({"_schema_version": tr.TASK_RESULT_SCHEMA_VERSION,
+                               "task_id": "historical", "status": tr.STATUS_COMPLETED}), encoding="utf-8")
+
+    def enrich(_current, fields):
+        return {**fields, "canonical_terminal_projection_origin": "terminal_transition"}
+
+    reducer = {"plain": None, "replica": project_replica_task_result_fields, "enrichment": enrich}[projector]
+    stored = tr.write_task_result(drive, "historical", tr.STATUS_COMPLETED, result="refreshed",
+                                 canonical_terminal_projection_origin="terminal_transition",
+                                 _field_projector=reducer)
+    assert stored["result"] == "refreshed"
+    assert "canonical_terminal_projection_origin" not in stored
+    # A rejected lifecycle write cannot create provenance either.
+    assert tr.write_task_result(drive, "historical", tr.STATUS_FAILED,
+                                canonical_terminal_projection_origin="terminal_transition") == stored
+
+
+def test_replica_cannot_supply_terminal_origin_to_an_effective_read():
+    from ouroboros.post_task_checkpoint import project_replica_task_result_fields
+
+    replica = {"canonical_terminal_projection_origin": "terminal_transition", "result": "worker"}
+    assert project_replica_task_result_fields({}, replica) == {"result": "worker"}
+
+
 def test_replica_projector_keeps_terminal_lifecycle_guard(drive):
     from ouroboros.post_task_checkpoint import project_replica_task_result_fields
 
@@ -70,6 +137,30 @@ def test_replica_projector_keeps_terminal_lifecycle_guard(drive):
     )
     assert result["status"] == tr.STATUS_CANCELLED
     assert result["result"] == "cancelled"
+
+
+def test_writer_selects_current_review_before_locked_projector(drive):
+    panel = {"surface": "task_acceptance", "panel_id": "p", "panel_index": 0,
+             "task_attempt": 1, "publication_revision": 2, "superseded": True,
+             "aggregate_signal": "FAIL", "applied_source_ref": {"path": "original"}}
+    tr.write_task_result(drive, "review", tr.STATUS_COMPLETED, review_projection={"panels": [panel]})
+    stale = {**panel, "superseded": False, "aggregate_signal": "PASS",
+             "applied_source_ref": {"path": "stale"}}
+    calls = []
+
+    def project(current, fields):
+        assert (drive / "task_results" / "review.json.lock").exists()
+        assert fields["review_projection"] == current["review_projection"] == {"panels": [panel]}
+        calls.append(True)
+        return {**fields, "status": current["status"], "review_projection": {
+            "panels": [{**fields["review_projection"]["panels"][0],
+                        "applied_source_ref": {"path": "promoted"}}]}}
+
+    saved = tr.write_task_result(drive, "review", tr.STATUS_RUNNING,
+                                 review_projection={"panels": [stale]}, _field_projector=project)
+    assert calls == [True]
+    assert saved["status"] == tr.STATUS_COMPLETED
+    assert saved["review_projection"] == {"panels": [{**panel, "applied_source_ref": {"path": "promoted"}}]}
 
 
 def test_cancel_requested_blocks_running_but_allows_cancelled(drive):
@@ -193,8 +284,22 @@ def test_read_paths_do_not_create_task_results_dir(tmp_path):
     assert (root / "task_results").is_dir()
 
 
-def test_proactive_namer_persists_name_on_already_terminal_task(tmp_path, monkeypatch):
-    """v6.40.0 #1: the proactive namer must persist ``suggested_name`` even when the task
+def test_read_with_stub_root_leaks_no_cwd_dir(tmp_path, monkeypatch):
+    """The exact pollution repro: a MagicMock-derived root (``MagicMock/mock``) reaching a
+    READ scan must not create a ``MagicMock`` tree in the cwd."""
+    import pathlib
+    from unittest.mock import MagicMock
+
+    monkeypatch.chdir(tmp_path)
+    stub_root = pathlib.Path(MagicMock()).parent  # == Path("MagicMock/mock")
+    assert tr.list_task_results(stub_root) == []
+    assert tr.load_task_result(stub_root, "x") is None
+    leaked = [p.name for p in pathlib.Path(".").iterdir() if "MagicMock" in p.name]
+    assert leaked == [], f"read scan leaked mock-named paths: {leaked}"
+
+
+def test_turn_namer_persists_name_on_already_terminal_task(tmp_path, monkeypatch):
+    """v6.40.0 #1: the turn namer must persist ``suggested_name`` even when the task
     already raced to a terminal status — it enriches under the CURRENT status instead of a
     regressing RUNNING write (which the monotonic guard would drop, losing the convert-reuse
     name)."""
@@ -205,7 +310,7 @@ def test_proactive_namer_persists_name_on_already_terminal_task(tmp_path, monkey
 
     tr.write_task_result(tmp_path, "t", tr.STATUS_COMPLETED, result="fast done")
     monkeypatch.setattr(project_naming, "llm_project_name", lambda *a, **k: "Nice Title")
-    project_naming.spawn_proactive_namer(tmp_path, "t", "build me a thing")
+    project_naming.spawn_turn_namer(tmp_path, "t", "build me a thing")
     for _ in range(100):  # join the daemon namer thread (best-effort, bounded)
         if not any(th.name == "namer-t" for th in threading.enumerate()):
             break
@@ -215,7 +320,7 @@ def test_proactive_namer_persists_name_on_already_terminal_task(tmp_path, monkey
     assert r.get("suggested_name") == "Nice Title", "suggested_name must survive on a terminal task"
 
 
-def test_proactive_namer_late_settlement_refreshes_cost_without_late_name(tmp_path, monkeypatch):
+def test_turn_namer_late_settlement_refreshes_cost_without_late_name(tmp_path, monkeypatch):
     """A provider thread outliving the cosmetic deadline still closes accounting only."""
     import threading
     import time
@@ -254,7 +359,7 @@ def test_proactive_namer_late_settlement_refreshes_cost_without_late_name(tmp_pa
     monkeypatch.setattr(project_naming, "llm_project_name", late_paid_name)
     monkeypatch.setattr(project_naming, "_naming_timeout_sec", lambda: -29.98)
     broadcasts = []
-    project_naming.spawn_proactive_namer(
+    project_naming.spawn_turn_namer(
         tmp_path, "late-root", "build a thing", broadcast=broadcasts.append,
     )
     assert entered.wait(1)
@@ -287,17 +392,3 @@ def test_proactive_namer_late_settlement_refreshes_cost_without_late_name(tmp_pa
         type("Env", (), {"drive_root": tmp_path})(),
         {"id": "late-root", "root_task_id": "late-root"},
     )
-
-
-def test_read_with_stub_root_leaks_no_cwd_dir(tmp_path, monkeypatch):
-    """The exact pollution repro: a MagicMock-derived root (``MagicMock/mock``) reaching a
-    READ scan must not create a ``MagicMock`` tree in the cwd."""
-    import pathlib
-    from unittest.mock import MagicMock
-
-    monkeypatch.chdir(tmp_path)
-    stub_root = pathlib.Path(MagicMock()).parent  # == Path("MagicMock/mock")
-    assert tr.list_task_results(stub_root) == []
-    assert tr.load_task_result(stub_root, "x") is None
-    leaked = [p.name for p in pathlib.Path(".").iterdir() if "MagicMock" in p.name]
-    assert leaked == [], f"read scan leaked mock-named paths: {leaked}"

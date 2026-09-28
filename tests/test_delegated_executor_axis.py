@@ -27,7 +27,8 @@ from tests._delegated_transport_shared import (  # noqa: F401  (autouse fixture 
 )
 
 
-NANNY_TOOLS = {"delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer"}
+NANNY_TOOLS = {"delegate_start", "delegate_wait", "delegate_cancel", "delegate_answer",
+               "delegate_message"}
 
 
 def test_subagent_harness_key_stays_out_of_the_model_key_sweep():
@@ -166,7 +167,7 @@ def test_delegate_start_refuses_typed_when_no_route_is_configured(tmp_path, monk
 
     monkeypatch.setenv("OUROBOROS_SUBAGENT_HARNESS", "")
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
-    payload = json.loads(_delegate_start(ctx, "do a thing"))
+    payload = json.loads(_delegate_start(ctx, "do a thing").text)
     assert payload["status"] == "refused"
     assert payload["reason"] == "subagent_selection_required"
 

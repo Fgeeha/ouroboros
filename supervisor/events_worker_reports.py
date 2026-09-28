@@ -35,6 +35,9 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
         task = meta.get("task") if isinstance(meta.get("task"), dict) else {}
         started_at = float(meta.get("started_at") or 0.0)
         runtime_sec = round(max(0.0, time.time() - started_at), 1) if started_at > 0 else None
+        from supervisor.task_model_wait import quota_waited_seconds
+
+        quota_wait_sec = quota_waited_seconds(meta, time.time())
         # Stamp the project thread so the live heartbeat routes to the project
         # panel (and not default-to-main); post-hoc bound tasks fall back to the
         # binding. Heartbeats themselves carry no chat_id from the worker. A
@@ -54,6 +57,9 @@ def _handle_task_heartbeat(evt: Dict[str, Any], ctx: Any) -> None:
                 "chat_id": _hb_chat_id,
                 "phase": phase or meta.get("heartbeat_phase") or "running",
                 "runtime_sec": runtime_sec,
+                "execution_sec": max(0.0, runtime_sec - quota_wait_sec) if runtime_sec is not None else None,
+                "quota_wait_sec": quota_wait_sec,
+                **({"model_waits": task["model_waits"]} if task.get("model_waits") else {}),
                 "subagent_event": evt.get("subagent_event", ""),
                 "subagent_task_id": evt.get("subagent_task_id", ""),
                 "root_task_id": evt.get("root_task_id", ""),
@@ -98,6 +104,49 @@ def _handle_task_dispatch_resolved(evt: Dict[str, Any], ctx: Any) -> None:
     ctx.persist_queue_snapshot(reason="dispatch_resolved")
 
 
+def _handle_task_focus_updated(evt: Dict[str, Any], ctx: Any) -> None:
+    """Project a root-authored focus into the existing RUNNING snapshot."""
+    from ouroboros.focus import compact_focus
+    from supervisor.queue import _queue_lock
+
+    task_id = str(evt.get("task_id") or "").strip()
+    focus = compact_focus(evt.get("focus"))
+    if not task_id or focus is None or str(focus.get("author_task_id") or "") != task_id:
+        return
+    changed = False
+    with _queue_lock:
+        meta = ctx.RUNNING.get(task_id)
+        task = meta.get("task") if isinstance(meta, dict) else None
+        if not isinstance(task, dict):
+            return
+        if str(task.get("parent_task_id") or "").strip() or str(task.get("delegation_role") or "") == "subagent":
+            return
+        # The event is advisory transport.  The canonical result remains the
+        # lifecycle authority, so a focus queued just before completion cannot
+        # resurrect a terminal task in the queue projection.
+        drive_root = meta.get("budget_drive_root") if isinstance(meta, dict) else None
+        drive_root = drive_root or task.get("budget_drive_root") or getattr(ctx, "DRIVE_ROOT", None)
+        if drive_root:
+            try:
+                from ouroboros.task_results import STATUS_RUNNING, load_task_result
+
+                durable = load_task_result(drive_root, task_id)
+                if not isinstance(durable, dict) or str(durable.get("status") or "") != STATUS_RUNNING:
+                    return
+                durable_focus = compact_focus(durable.get("focus"))
+                if durable_focus != focus:
+                    return
+            except Exception:
+                return
+        prior_task = compact_focus(task.get("focus"))
+        if prior_task and str(prior_task.get("authored_at") or "") >= str(focus.get("authored_at") or ""):
+            return
+        task["focus"] = focus
+        changed = True
+    if changed:
+        ctx.persist_queue_snapshot(reason="task_focus_updated")
+
+
 def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:
     payload = {
         "ts": str(evt.get("ts") or utc_now_iso()),
@@ -105,13 +154,16 @@ def _handle_task_metrics(evt: Dict[str, Any], ctx: Any) -> None:
         "task_id": str(evt.get("task_id") or ""),
         "task_type": str(evt.get("task_type") or ""),
         "duration_sec": round(float(evt.get("duration_sec") or 0.0), 3),
-        "tool_calls": int(evt.get("tool_calls") or 0),
-        "tool_errors": int(evt.get("tool_errors") or 0),
+        "tool_calls": None if evt.get("tool_calls") is None else int(evt["tool_calls"]),
+        "tool_errors": None if evt.get("tool_errors") is None else int(evt["tool_errors"]),
         "outcome_axes": normalize_outcome_axes(evt),
         "reason_code": str(evt.get("reason_code") or ""),
     }
-    if bool(evt.get("ephemeral_decision")):
-        payload["ephemeral_decision"] = True
+    if "routing_tool_calls" in evt:
+        payload["routing_tool_calls"] = None if evt["routing_tool_calls"] is None else int(evt["routing_tool_calls"])
+    if "tool_call_counts" in evt:
+        counts = evt["tool_call_counts"]
+        payload["tool_call_counts"] = dict(counts) if isinstance(counts, dict) else None
     if evt.get("chat_id") is not None:
         payload["chat_id"] = evt["chat_id"]
     _address_ctx(ctx, payload)
@@ -141,6 +193,8 @@ def _handle_log_event(evt: Dict[str, Any], ctx: Any) -> None:
     if data.get("type") in ("task_checkpoint", "task_start_settings_reload_failed"):
         try:
             ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "events.jsonl", payload)
+            if payload.get("system_type") == "task_checkpoint":
+                ctx.append_jsonl(ctx.DRIVE_ROOT / "logs" / "progress.jsonl", payload)
         except Exception:
             log.debug("Failed to persist %s event to events.jsonl", data.get("type"), exc_info=True)
 
@@ -166,10 +220,14 @@ def _handle_skill_lifecycle(evt: Dict[str, Any], ctx: Any) -> None:
 
 
 def _handle_acceptance_fence(evt: Dict[str, Any], ctx: Any) -> None:
-    """Apply a worker's acceptance fence under the supervisor queue lock, then ack."""
-    token = str(evt.get("token") or "").strip().lower()
-    if not token or len(token) > 64 or any(ch not in "0123456789abcdef" for ch in token):
-        log.warning("Rejected malformed acceptance-fence token")
+    """Apply a worker's acceptance fence under the supervisor queue lock, then ack.
+
+    The ack belongs to ONE request: ``<token>.<req>.json``. begin/inspect/end share
+    the fence token, so a late answer must never be readable as another request's.
+    """
+    token, req = (str(evt.get(key) or "").strip().lower() for key in ("token", "req"))
+    if any(not part or len(part) > 64 or any(ch not in "0123456789abcdef" for ch in part) for part in (token, req)):
+        log.warning("Rejected malformed acceptance-fence token or request id")
         return
     try:
         from supervisor.queue import transition_acceptance_fence
@@ -189,7 +247,7 @@ def _handle_acceptance_fence(evt: Dict[str, Any], ctx: Any) -> None:
         log.warning("Acceptance-fence transition failed", exc_info=True)
         result = {"ok": False, "status": "error", "error": f"{type(exc).__name__}: {exc}"}
     ack_dir = pathlib.Path(ctx.DRIVE_ROOT) / "state" / "acceptance_fence_acks"
-    ack_path = ack_dir / f"{token}.json"
+    ack_path = ack_dir / f"{token}.{req}.json"
     try:
         now = time.time()
         prior = sorted(ack_dir.glob("*.json"), key=lambda path: path.stat().st_mtime, reverse=True)

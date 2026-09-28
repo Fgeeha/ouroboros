@@ -10,6 +10,9 @@ from types import SimpleNamespace
 
 import pytest
 
+from ouroboros.delegate_shared import _fail, delegate_result
+from ouroboros.tools.tool_result import ToolResult
+
 from tests.test_available_subagents_runtime import _session_row, _settings, _snapshot
 
 
@@ -24,6 +27,10 @@ from tests.test_available_subagents_runtime import _session_row, _settings, _sna
     # engine-reason frozenset still terminal at $0.
     ("task_deadline_expired", {"definitely_unrun": True}),
     ("start_request_row_unwritable", {"definitely_unrun": True}),
+    # #882: an argument the host judged BEFORE the daemon call. The reason stays
+    # OUT of the frozenset on purpose — the same string is also returned after a
+    # gateway call, where a run may exist and only the marker separates the two.
+    ("directory_execution_unavailable", {"definitely_unrun": True}),
 ])
 def test_definite_configured_session_start_refusal_terminalizes_before_llm(
     monkeypatch, tmp_path, reason, extra,
@@ -35,10 +42,10 @@ def test_definite_configured_session_start_refusal_terminalizes_before_llm(
     import ouroboros.subagent_runtime as runtime
     from ouroboros.subagent_bootstrap import bootstrap_before_context
 
-    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: json.dumps({
-        "status": "refused", "reason": reason, "reset_at": "2030-01-01T00:00:00Z",
-        **extra,
-    }))
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: _fail(
+        "delegate_start", reason, "the route refused this start",
+        reset_at="2030-01-01T00:00:00Z", **extra,
+    ))
     monkeypatch.setattr(
         runtime, "current_subagent_alternatives", lambda _exclude: [],
     )
@@ -81,8 +88,9 @@ def test_startup_refusal_classifier_preserves_ambiguous_wakes(
     import ouroboros.subagent_runtime as runtime
     from ouroboros.subagent_bootstrap import bootstrap_before_context
 
-    raw = payload if isinstance(payload, str) else json.dumps(payload)
-    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: raw)
+    started = (delegate_result(payload) if isinstance(payload, dict)
+               else ToolResult(status="ok", code="OK", text=payload))
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: started)
     snapshot = _snapshot(_settings(_session_row()), "session-builder")
     ctx = SimpleNamespace(
         task_id="child-ambiguous", drive_root=tmp_path,
@@ -143,6 +151,7 @@ def test_blocked_session_bootstrap_terminals_unrun_with_alternatives(monkeypatch
         "reason": "subscription_window_exhausted",
         "reset_at": "2030-01-01T00:00:00Z",
         "requested": "harness",
+        "detail": "",  # a blocked route carries no producer sentence; a refused provision does (#1241)
     }
     availability = task["subagent_availability"]
     assert {key: availability[key] for key in (
@@ -224,10 +233,10 @@ def test_definite_refusal_reaches_the_zero_dollar_terminal_without_a_model_round
     monkeypatch.setattr(agent_module, "run_llm_loop", lambda **kw: (
         calls.append(kw) or ("model ran", {}, {"reasoning_notes": [], "tool_calls": []})
     ))
-    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: _json.dumps({
-        "status": "refused", "reason": "credential_pool_exhausted",
-        "reset_at": "2030-01-01T00:00:00Z",
-    }))
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, _prompt, _spec: _fail(
+        "delegate_start", "credential_pool_exhausted", "no credential profile is available",
+        reset_at="2030-01-01T00:00:00Z",
+    ))
     monkeypatch.setattr(runtime, "current_subagent_alternatives", lambda _x: [])
     import ouroboros.subagents as subagents
     monkeypatch.setattr(subagents, "route_health", lambda *_a, **_k: ("", ""))
@@ -383,16 +392,74 @@ def test_precustody_refusals_leave_a_durable_start_blocked_row(tmp_path):
         _configured_actor_bootstrap={"selected_subagent_id": "session-builder"},
     )
     out = runtime.delegate_start_entry(ctx, "do work", root="skill_payload")
-    assert "configured_actor_resource_mismatch" in out
+    assert "configured_actor_resource_mismatch" in out.text
     reasons = [row["reason"] for row in _rows(tmp_path)]
     assert reasons == ["configured_actor_resource_mismatch"]
 
     out = runtime.delegate_start_entry(ctx, "do work", subagent_id="someone-else")
-    assert "configured_actor_route_mismatch" in out
+    assert "configured_actor_route_mismatch" in out.text
     reasons = [row["reason"] for row in _rows(tmp_path)]
     assert reasons[-1] == "configured_actor_route_mismatch"
 
     out = runtime.delegate_start_entry(ctx, "do work")
-    assert "configured_work_order_unavailable" in out
+    assert "configured_work_order_unavailable" in out.text
     reasons = [row["reason"] for row in _rows(tmp_path)]
     assert reasons[-1] == "configured_work_order_unavailable"
+
+
+def test_a_budget_continuation_never_pre_starts_the_leaf_again_and_hydrates_custody(monkeypatch, tmp_path):
+    """#1196 review finding 1: a configured ``agent_session`` nanny that paused
+    AFTER its leaf settled and its patch was disposed used to reach
+    ``_pre_start_leaf`` again on Resume (no crash handoff, no unsettled custody),
+    minting a second invocation with the original canonical assignment before
+    the grant was consumed or the transcript restored. A same-ID budget
+    continuation now bypasses the physical start, hydrates the durable custody
+    facts onto the actor bootstrap and leaves any replacement to the model."""
+    import ouroboros.delegate_evidence as evidence_mod
+    import ouroboros.subagent_runtime as runtime
+    from ouroboros.subagent_bootstrap import bootstrap_before_context
+
+    starts = []
+    monkeypatch.setattr(runtime, "exact_start", lambda _ctx, prompt, _spec: (
+        starts.append(prompt) or _fail("delegate_start", "start_probe", "probe")))
+    monkeypatch.setattr(evidence_mod, "task_execution_evidence", lambda _root, _tid: {
+        "delegated_runs_started": 1, "delegated_runs_settled": 1, "delegated_runs_succeeded": 1})
+    snapshot = _snapshot(_settings(_session_row()), "session-builder")
+    dispatch = SimpleNamespace(
+        executor="harness", blocked=False,
+        executor_resolution=SimpleNamespace(route=SimpleNamespace(route_id="codex")),
+    )
+
+    def _ctx():
+        return SimpleNamespace(task_id="child-resumed", drive_root=tmp_path,
+                               budget_drive_root=str(tmp_path), task_metadata={})
+
+    task = {"id": "child-resumed", "configured_subagent": snapshot,
+            "task_contract": {"objective": "Build"},
+            "_budget_pause_resume": {"pause_id": "p1", "grant_id": "g1", "grant_generation": 1}}
+    ctx = _ctx()
+    receipt = json.loads(bootstrap_before_context(ctx, task, dispatch))
+    assert starts == []  # no second physical invocation
+    assert receipt["status"] == "configured_session_budget_continuation"
+    assert receipt["continuation"] == {
+        "delegated_runs_started": 1, "physical_start": "not_repeated", "custody_read": "ok"}
+    bootstrap = ctx._configured_actor_bootstrap
+    assert bootstrap["physical_started"] is True and bootstrap["exact_start_pending"] is False
+    assert ctx._nanny_physical_activity_seed is True  # nanny economics see the adopted run
+    assert not hasattr(ctx, "_configured_startup_refusal")  # never an unrun $0 terminal
+
+    # Unreadable custody may hide a prior run: still no start, typed UNKNOWN fence.
+    def _boom(_root, _tid):
+        raise OSError("custody log unreadable")
+    monkeypatch.setattr(evidence_mod, "task_execution_evidence", _boom)
+    ctx_unknown = _ctx()
+    receipt_unknown = json.loads(bootstrap_before_context(ctx_unknown, task, dispatch))
+    assert starts == [] and receipt_unknown["continuation"]["custody_read"] == "failed"
+    unknown = ctx_unknown._configured_actor_bootstrap
+    assert unknown["zero_run_evidence_status"] == "unknown" and unknown["exact_start_pending"] is False
+    assert unknown["physical_started"] is False
+
+    # Control: the same task WITHOUT the continuation handoff pre-starts the exact leaf.
+    task.pop("_budget_pause_resume")
+    bootstrap_before_context(_ctx(), task, dispatch)
+    assert len(starts) == 1 and "Build" in starts[0]

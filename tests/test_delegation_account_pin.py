@@ -114,7 +114,7 @@ def _waited_run(tmp_path, monkeypatch, summary, requested_model="m",
     monkeypatch.setattr(gw, "ClaudexorGateway", lambda *a, **k: _Stub())
     delegate._CUSTODY.clear()
     delegate._CUSTODY["run-1"] = delegate._RunCustody(
-        task_id="t-a", route_id="r", model=requested_model,
+        run_id="run-1", task_id="t-a", route_id="r", model=requested_model,
         profile_id=requested_profile, selected_subagent_id=selected_subagent_id,
         project_id="p", project_owned=False)
     ctx = ToolContext(repo_dir=tmp_path, drive_root=tmp_path)
@@ -134,7 +134,7 @@ def test_the_receipt_carries_the_requested_and_applied_account(tmp_path, monkeyp
     writes '', never the request dressed up as the applied account."""
     from ouroboros.subagents import subagent_last_delegation
 
-    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path / "acct-data")
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path / "acct")
     _waited_run(tmp_path / "acct", monkeypatch,
                 {"state": "succeeded", "spendUsd": 0.0, "model": "m",
                  "authRoute": {"profileId": "previous-profile"}},
@@ -155,7 +155,7 @@ def test_the_receipt_carries_the_requested_and_applied_account(tmp_path, monkeyp
     assert subagent_last_delegation() == record
 
     # A summary echo cannot replace the missing final-attempt receipt.
-    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path / "acct-data-2")
+    monkeypatch.setattr("ouroboros.config.DATA_DIR", tmp_path / "acct2")
     _waited_run(tmp_path / "acct2", monkeypatch,
                 {"state": "succeeded", "spendUsd": 0.0, "model": "m",
                  "authRoute": {"profileId": "previous-profile"}},
@@ -268,7 +268,7 @@ def test_a_retry_health_check_judges_the_stored_pin_not_the_current_setting(
 
     # 1. The intended start stores its canonical body — pin included — then the
     #    POST's outcome is lost, leaving the invocation pending.
-    lost = json.loads(delegate._delegate_start(_plain_ctx(tmp_path), "the intended work"))
+    lost = json.loads(delegate._delegate_start(_plain_ctx(tmp_path), "the intended work").text)
     assert lost["reason"] == "daemon_unreachable"
     token = lost["pending_invocation_id"]
     assert bodies[0]["credentialProfileId"] == "stored-pin"
@@ -282,7 +282,7 @@ def test_a_retry_health_check_judges_the_stored_pin_not_the_current_setting(
     quota["snapshots"] = [_snap("stored-pin", spent=True, reset="2099-08-20T00:00:00Z"),
                           _snap("drifted-pin", spent=False, reset="2099-08-21T00:00:00Z")]
     blocked = json.loads(delegate._delegate_start(_plain_ctx(tmp_path), "the intended work",
-                                                  retry_of=token))
+                                                  retry_of=token).text)
     assert blocked["reason"] == "subscription_window_exhausted", blocked
     assert blocked["reset_at"] == "2099-08-20T00:00:00Z"
     assert len(bodies) == 1, "a health-refused retry must never reach the wire"
@@ -293,7 +293,7 @@ def test_a_retry_health_check_judges_the_stored_pin_not_the_current_setting(
     quota["snapshots"] = [_snap("stored-pin", spent=False, reset="2099-08-20T00:00:00Z"),
                           _snap("drifted-pin", spent=True, reset="2099-08-21T00:00:00Z")]
     retried = json.loads(delegate._delegate_start(_plain_ctx(tmp_path), "the intended work",
-                                                  retry_of=token))
+                                                  retry_of=token).text)
     assert retried["status"] == "started", retried
     assert bodies[-1] == bodies[0], "the retry replays the RECORDED body"
     assert bodies[-1]["credentialProfileId"] == "stored-pin"

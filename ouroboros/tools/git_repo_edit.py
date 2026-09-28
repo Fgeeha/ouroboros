@@ -1,10 +1,8 @@
-"""Uncommitted repo write and exact-match edit surface, split out of
-``ouroboros/tools/git.py`` (v7 module-size discipline). Every span is
-extracted VERBATIM from the parent's tip bytes by
-scripts/v7next_transplant.py; the parent re-exports every moved name.
-Parent-scope helpers the monolith read as module globals are read through
-the call-time handle ``_git()`` — never a from-import — so the facade
-binding stays the one tests monkeypatch.
+"""Uncommitted repo write and exact-match edit surface.
+
+The ``ouroboros/tools/git.py`` facade re-exports these definitions. Shared
+helpers are read through the call-time handle ``_git()`` so the facade binding
+stays the one tests monkeypatch.
 """
 
 from __future__ import annotations
@@ -23,7 +21,7 @@ def _git():
     The parent owns the rebindable module state and the members tests
     monkeypatch there; reading them through the module at each call keeps
     one binding, where a from-import would freeze the value this leaf saw
-    at import time (the owner-approved D18/D33 mechanical exception).
+    at import time.
     """
     from ouroboros.tools import git
 
@@ -39,7 +37,9 @@ def _check_shrink_guard(
     force: bool = False,
 ) -> Optional[str]:
     """Block likely accidental tracked-file truncation unless force=True."""
-    if force:
+    from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
+
+    if force or mode_has_unrestricted_agency(_git()._current_runtime_mode()):
         return None
     try:
         target = binding.target_path
@@ -144,7 +144,7 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     # P3: the force bypass is never silent — a forced write of invalid content
     # still discloses what the guard found in the success message.
     syntax_bypass_notes: List[str] = []
-    from ouroboros.tools.edit_ops import _syntax_check
+    from ouroboros.tools.edit_ops import _syntax_check, workspace_edit_note
 
     if mode != "append":  # an append chunk is not a full file — the guard would block every chunk
         for e, binding in zip(write_list, binding_items):
@@ -164,6 +164,9 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     written = []
     written_paths: List[str] = []
     overwrite_diffs: List[str] = []
+    capture_notes: List[str] = []
+    from ouroboros.workspace_file_outputs import capture_known_workspace_outputs
+
     for e, binding in zip(write_list, binding_items):
         rel_path = _git()._binding_repo_rel(binding)
         # Append can only grow a file, so the truncation shrink-guard does not apply.
@@ -178,15 +181,20 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
                     mutation_root=binding_items[0].base_path,
                     source_tool="write_file",
                 )
-            return shrink_warning
+            return "\n".join([shrink_warning, *([f"Successfully written: {', '.join(written)}"] if written else []), *capture_notes])
         try:
             target = binding.target_path
             target.parent.mkdir(parents=True, exist_ok=True)
             if mode == "append":
-                with target.open("a", encoding="utf-8") as fh:
+                with target.open("a", encoding="utf-8", newline="") as fh:
                     fh.write(e["content"])  # append is intentionally NOT atomized
                 written.append(f"{display_root}:{rel_path} (+{len(e['content'])} chars appended)")
                 written_paths.append(rel_path)
+                note = capture_known_workspace_outputs(
+                    ctx, binding.base_path, [rel_path], source_tool="write_file", include_preamble=not capture_notes,
+                )
+                if note:
+                    capture_notes.append(note)
                 continue
             old_content: Optional[str] = None
             if target.exists():
@@ -197,6 +205,11 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             _git().write_text(target, e["content"])
             written.append(f"{display_root}:{rel_path} ({len(e['content'])} chars)")
             written_paths.append(rel_path)
+            note = capture_known_workspace_outputs(
+                ctx, binding.base_path, [rel_path], source_tool="write_file", include_preamble=not capture_notes,
+            )
+            if note:
+                capture_notes.append(note)
             if old_content is not None and old_content != e["content"]:
                 from ouroboros.tools.edit_ops import _unified_diff
 
@@ -213,6 +226,7 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
             return (
                 f"⚠️ FILE_WRITE_ERROR on '{e['path']}': {exc}\n"
                 f"Successfully written before error: {already}"
+                + ("\n" + "\n".join(capture_notes) if capture_notes else "")
             )
 
     _git()._invalidate_advisory(
@@ -223,10 +237,17 @@ def _repo_write(ctx: ToolContext, path: str = "", content: str = "",
     )
     summary = ", ".join(written)
     system_target = _git()._binding_targets_system_repo(ctx, binding_items[0])
-    if ctx.is_workspace_mode() and not system_target:
+    if capture_notes:
+        result = f"✅ Written {len(written)} file(s): {summary}\n" + "\n".join(capture_notes)
+    elif ctx.is_workspace_mode() and not system_target:
         result = (
             f"✅ Written {len(written)} file(s): {summary}\n"
-            "Files are on disk in the active workspace. Do not commit; the headless runner will emit a patch artifact."
+            "Files are on disk in the active workspace. " + workspace_edit_note(ctx)
+        )
+    elif not system_target:
+        result = (
+            f"✅ Written {len(written)} file(s): {summary}\n"
+            "Files are on disk in the active workspace."
         )
     else:
         result = (
@@ -398,6 +419,11 @@ def _str_replace_editor(
         _git().write_text(target, new_content)
     except Exception as e:
         return f"⚠️ STR_REPLACE_ERROR: write failed for {path}: {e}"
+    from ouroboros.workspace_file_outputs import capture_known_workspace_outputs
+
+    capture_note = capture_known_workspace_outputs(
+        ctx, binding.base_path, [rel_path], source_tool="edit_text",
+    ) if binding is not None else ""
     if _repair_cas_constraint is not None:
         from ouroboros.skill_repair_admission import advance_repair_expected_hash
 
@@ -427,11 +453,14 @@ def _str_replace_editor(
         result += f"\nResolved root: {binding.base_path}"
     if short_form is not None and short_form.ignored_reason:
         result += f"\n⚠️ SKILL_SHORT_FORM_IGNORED: {short_form.ignored_reason}."
-    if data_skill_target is None and ctx.is_workspace_mode() and not system_target:
-        result += "\nDo not commit; the headless runner will emit a patch artifact."
-    elif data_skill_target is None:
+    if capture_note:
+        result += "\n" + capture_note
+    elif data_skill_target is None and ctx.is_workspace_mode() and not system_target:
+        from ouroboros.tools.edit_ops import workspace_edit_note
+        result += "\n" + workspace_edit_note(ctx)
+    elif system_target:
         result += "\nRun commit_reviewed when ready.\n⚠️ Advisory pre-review is now stale — run preflight_review before commit_reviewed."
-    else:
+    elif data_skill_target is not None:
         result += "\nRun skill_review for this skill before enabling or declaring it ready."
     if system_target and pathlib.PurePosixPath(rel_path).parts[:1] == ("skills",):
         result += (

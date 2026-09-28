@@ -83,17 +83,23 @@ def qenv(tmp_path, monkeypatch):
 
 def _patch_open_delegated_run(monkeypatch, task_id: str, run_id: str = "run-open"):
     """Custody rows say one delegated run is still open for ``task_id``."""
+    from ouroboros.delegate_custody import RunCustody
+
     calls: list = []
     monkeypatch.setattr(
         "ouroboros.delegate_custody.reconcile_task_runs",
         lambda root, tid, **kw: calls.append(str(tid)) or [],
     )
+    # `state` is part of these projections' contract: the terminal audit shares
+    # one custody replay across them, so a double must accept the keyword. The
+    # row is a REAL RunCustody: the audit reads its owner kind (`review_owned`)
+    # as well as its ids, and a partial double answers for neither.
     monkeypatch.setattr(
         "ouroboros.delegate_custody.open_runs",
-        lambda root: [types.SimpleNamespace(task_id=task_id, run_id=run_id)],
+        lambda root, state=None: [RunCustody(task_id=task_id, run_id=run_id)],
     )
     monkeypatch.setattr(
-        "ouroboros.delegate_custody.pending_invocations", lambda root: [],
+        "ouroboros.delegate_custody.pending_invocations", lambda root, rows=None: [],
     )
     return calls
 
@@ -118,6 +124,7 @@ def test_gr5_1_toggle_start_failure_restores_a_prior_owner_stop(tmp_path, monkey
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(
         owner_chat_id=7, evolution_owner_stopped=True,
     ))
@@ -128,7 +135,11 @@ def test_gr5_1_toggle_start_failure_restores_a_prior_owner_stop(tmp_path, monkey
     )
     sent: list = []
 
-    events_mod._handle_toggle_evolution({"enabled": True, "objective": "x"}, _toggle_ctx(state, sent))
+    # An OWNER start reaches the mint (В12: the agent tool is refused outright
+    # while the flag stands — pinned in test_post_task_evolution).
+    events_mod._handle_toggle_evolution(
+        {"enabled": True, "objective": "x", "source": "owner_chat"}, _toggle_ctx(state, sent),
+    )
 
     assert bool(state.load_state().get("evolution_owner_stopped")) is True, (
         "GR5-1: a failed start must restore the captured owner-stop flag"
@@ -144,6 +155,7 @@ def test_gr5_1_toggle_start_failure_with_no_prior_stop_stays_false(tmp_path, mon
     from supervisor import evolution_lifecycle as el
 
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     state.update_state(lambda live: live.update(
         owner_chat_id=7, evolution_owner_stopped=False,
     ))
@@ -160,30 +172,23 @@ def test_gr5_1_toggle_start_failure_with_no_prior_stop_stays_false(tmp_path, mon
 
 
 def test_gr5_1_server_evolve_start_failure_restores_the_captured_flag():
-    """The owner-chat `/evolve` ingress runs inside the bridge drain loop; the
-    capture → clear → (failure) restore ordering is pinned at the source (the
-    same style as the GR4-6 ordering pin)."""
+    """The owner-chat `/evolve` ingress runs the shared owner start transaction; its
+    capture -> clear -> (failure) restore ordering is pinned at the source, and the
+    restore puts back an UNKNOWN prior as unknown (#1307)."""
+    import inspect
+
+    from supervisor.events_runtime_controls import owner_evolution_start
+
     src = (REPO_ROOT / "server.py").read_text(encoding="utf-8")
-    capture_at = src.index(
-        '_prior_owner_stop = bool(ctx.load_state().get("evolution_owner_stopped"))'
-    )
-    clear_at = src.index(
-        '_evo_update_state(lambda live: live.__setitem__("evolution_owner_stopped", False))'
-    )
-    fail_at = src.index('log.warning("Failed to start evolution campaign", exc_info=True)')
-    restore_at = src.index(
-        '_evo_update_state(lambda live, _v=_prior_owner_stop: live.__setitem__('
-    )
-    stayed_off_at = src.index("Evolution stayed OFF: campaign state could not be created.")
-    assert capture_at < clear_at < fail_at < restore_at < stayed_off_at, (
-        "GR5-1: /evolve start must capture the flag before the clear and restore "
-        "the CAPTURED value inside the failure branch"
-    )
-
-
-# --------------------------------------------------------------------------
-# GR5-2 — the timeout reaper reconciles delegated runs and discloses
-# --------------------------------------------------------------------------
+    assert 'owner_evolution_start(objective, source="owner_chat")' in src
+    body = inspect.getsource(owner_evolution_start)
+    capture_at = body.index('prior["known"], prior["value"] = control_value(live, "evolution_owner_stopped")')
+    clear_at = body.index("update_state(_clear_owner_stop")
+    start_at = body.index("start_evolution_campaign(")
+    restore_at = body.index("update_state(_restore)")
+    stayed_off_at = body.index("Evolution stayed OFF: campaign state could not be created.")
+    assert capture_at < clear_at < start_at < restore_at < stayed_off_at
+    assert 'mark_unconfirmed(live, "evolution_owner_stopped")' in body
 
 
 def test_gr5_2_reap_reconciles_delegated_runs_and_discloses(qenv, monkeypatch):

@@ -11,7 +11,7 @@ import json
 import logging
 import pathlib
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.config import adaptive_quorum, get_auto_grant_enabled
 from ouroboros.reviewer_slot_config import commit_triad_delivery, reviewer_slot_config_error
@@ -307,59 +307,61 @@ def _admission_gate(
     )
 
 
+def _hub_file_hashes(files: Any) -> Dict[str, str]:
+    return {str(item.get("path") or ""): str(item.get("sha256") or "").strip().lower()
+            for item in (files or []) if isinstance(item, dict)}
+
+
 def _official_hub_review_profile(skill: Any) -> str:
-    """Return official_hub only when local payload matches its Hub sidecar hashes."""
+    """Return official_hub only when the payload matches the LIVE catalog (fresh read)."""
+    from ouroboros.marketplace import ouroboroshub
+
+    fresh = lambda slug: ouroboroshub.info(slug).files  # noqa: E731
+    return "official_hub" if hub_payload_matches(skill, fresh) else ""
+
+
+def hub_payload_matches(skill: Any, catalog_files_for: Callable[[str], Any]) -> bool:
+    """Sidecar, catalog row and local files agree on every path and SHA-256.
+
+    ``catalog_files_for(slug)`` supplies the catalog row's ``files``: review and
+    owner attestation pass a fresh read; the listing hint passes a display view."""
     if str(getattr(skill, "source", "") or "") != "ouroboroshub":
-        return ""
+        return False
     marker = pathlib.Path(skill.skill_dir) / ".ouroboroshub.json"
     try:
         data = json.loads(marker.read_text(encoding="utf-8"))
     except Exception:
-        return ""
+        return False
     if not isinstance(data, dict) or str(data.get("source") or "") != "ouroboroshub":
-        return ""
+        return False
     marker_name = str(data.get("sanitized_name") or data.get("slug") or "").strip()
     if marker_name and marker_name != str(getattr(skill, "name", "") or ""):
-        return ""
+        return False
     slug = str(data.get("slug") or marker_name or getattr(skill, "name", "") or "").strip()
     try:
-        from ouroboros.marketplace import ouroboroshub
-
-        catalog_summary = ouroboroshub.info(slug)
-        catalog_files = {
-            str(item.get("path") or ""): str(item.get("sha256") or "").strip().lower()
-            for item in (catalog_summary.files or [])
-            if isinstance(item, dict)
-        }
+        catalog_files = _hub_file_hashes(catalog_files_for(slug))
     except Exception:
-        return ""
+        return False
     files = data.get("files") if isinstance(data.get("files"), list) else []
-    if not files:
-        return ""
-    sidecar_files = {
-        str(item.get("path") or ""): str(item.get("sha256") or "").strip().lower()
-        for item in files
-        if isinstance(item, dict)
-    }
-    if sidecar_files != catalog_files:
-        return ""
+    if not files or _hub_file_hashes(files) != catalog_files:
+        return False
     root = pathlib.Path(skill.skill_dir).resolve()
     for item in files:
         if not isinstance(item, dict):
-            return ""
+            return False
         rel = pathlib.PurePosixPath(str(item.get("path") or ""))
         expected = str(item.get("sha256") or "").strip().lower()
         if not rel.parts or rel.is_absolute() or ".." in rel.parts or not expected:
-            return ""
+            return False
         path = (root / pathlib.Path(*rel.parts)).resolve(strict=False)
         try:
             path.relative_to(root)
         except ValueError:
-            return ""
+            return False
         if not path.is_file():
-            return ""
+            return False
         if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
-            return ""
+            return False
     # Reject any EXTRA local runtime-reachable file not covered by the catalog.
     # Without this, a locally-added file (e.g. evil.py) would still earn the
     # official_hub fast-path. Provenance/control sidecars are install-time
@@ -375,19 +377,17 @@ def _official_hub_review_profile(skill: Any) -> str:
             manifest_scripts=list(getattr(manifest, "scripts", []) or []),
         )
     except Exception:
-        return ""
+        return False
     local_relset = set()
     for path in local_files:
         try:
             rel = path.relative_to(root).as_posix()
         except ValueError:
-            return ""
+            return False
         if rel in SKILL_PAYLOAD_CONTROL_FILENAMES:
             continue
         local_relset.add(rel)
-    if local_relset != set(catalog_files.keys()):
-        return ""
-    return "official_hub"
+    return local_relset == set(catalog_files)
 
 
 def is_official_hub_payload_verified(skill: Any) -> bool:
@@ -408,19 +408,16 @@ def _skill_cycles_gate(
     content_hash: str,
     *,
     persist: bool = True,
+    file_packs: Optional[List[str]] = None,
 ) -> tuple[Optional["SkillReviewOutcome"], str, str, str]:
-    """Max Review Cycles on the skill gate (Q17/Q23), run BEFORE any paid
-    panel: a byte-identical snapshot with a recorded substantive verdict under
-    the same panel contract replays for FREE, and the shared knob bounds PAID
-    panel cycles per ceiling key (root task for task-driven groups; the manual
-    lane per content_hash). Returns ``(early_outcome_or_None,
-    contract_fingerprint, rebuttal_sha256, review_profile)`` — the resolved
-    profile is part of the panel-contract identity and is computed ONCE here
-    for the whole review."""
+    """Select exact late reconciliation or free substantive replay before paid
+    admission. The shared cap counts per root task, or per manual content hash.
+    Return (early outcome, contract fingerprint, rebuttal hash, shared profile)."""
     from ouroboros.skill_review_cycles import (
         free_replay_outcome,
         skill_review_contract_fingerprint,
         skill_review_cycles_refusal,
+        skill_review_wave_binding, select_skill_review_resume,
     )
     from ouroboros.tools.commit_gate import compute_rebuttal_sha256
 
@@ -431,6 +428,10 @@ def _skill_cycles_gate(
     )
     rebuttal_sha = compute_rebuttal_sha256(review_rebuttal)
     group_id = str(getattr(ctx, "_skill_review_group_id", "") or "") or f"manual:{skill.name}"
+    if file_packs is not None and select_skill_review_resume(ctx, skill, drive_root,
+            skill_review_wave_binding(ctx, skill, drive_root, content_hash, contract_fp,
+                                      rebuttal_sha, file_packs)):
+        return None, contract_fp, rebuttal_sha, review_profile
     replayed = free_replay_outcome(
         skill, drive_root=drive_root, group_id=group_id, content_hash=content_hash,
         contract_fingerprint=contract_fp, rebuttal_sha256=rebuttal_sha,
@@ -666,6 +667,7 @@ def review_skill(
     models = list(delivery["models"])
     early_outcome, contract_fp, rebuttal_sha, review_profile = _skill_cycles_gate(
         ctx, skill, drive_root, models, delivery, review_rebuttal, content_hash, persist=persist,
+        file_packs=file_packs,
     )
     if early_outcome is not None:
         return early_outcome
@@ -689,7 +691,7 @@ def review_skill(
     ]
     budget_block = (
         _review_wave_budget_block(ctx, skill.name, file_packs, api_models)
-        if api_models else None
+        if api_models and not getattr(ctx, "_skill_review_resume", None) else None
     )
     if budget_block is not None:
         return SkillReviewOutcome(skill_name=skill.name, status=STATUS_PENDING,

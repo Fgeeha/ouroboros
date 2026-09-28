@@ -1,9 +1,7 @@
 """Who is acting and where each resource root physically lives.
 
-Every span is extracted VERBATIM from the parent's tip bytes by
-scripts/v7next_transplant.py (D18/D33 module-handle split, proof-checked);
-the parent re-exports every moved name, so historical imports and
-monkeypatch targets keep working unchanged.
+The facade re-exports these definitions so existing imports and monkeypatch
+targets retain the same bindings.
 """
 
 from __future__ import annotations
@@ -27,7 +25,7 @@ def _tool_access():
     The parent owns the rebindable module state and the members tests
     monkeypatch there; reading them through the module at each call keeps
     one binding, where a from-import would freeze the value this leaf saw
-    at import time (the owner-approved D18/D33 mechanical exception).
+    at import time.
     """
     from ouroboros import tool_access
 
@@ -105,10 +103,12 @@ def predicted_subagent_profile(*, write_surface: str = "") -> ToolProfile:
 
 
 def project_room_lens_dir(ctx: Any) -> Optional[pathlib.Path]:
-    """Return a direct-chat room's verified project cwd, otherwise ``None``.
+    """Return a direct-chat room's selected folder, otherwise ``None``.
 
     Promoted/workspace/subagent tasks carry their own workspace; only a direct
-    chat without one may use the injected existing ``_project_room_dir``.
+    chat without one may use the host's ``_project_room_dir``. Its address stays
+    selected if the folder disappears: existence is an operation's concern,
+    never permission to switch back to the system repository.
     """
     if not bool(getattr(ctx, "is_direct_chat", False)):
         return None
@@ -117,12 +117,39 @@ def project_room_lens_dir(ctx: Any) -> Optional[pathlib.Path]:
     meta = getattr(ctx, "task_metadata", None)
     raw = str(meta.get("_project_room_dir") or "").strip() if isinstance(meta, dict) else ""
     if not raw:
+        note = str(meta.get("_project_room_note") or "") if isinstance(meta, dict) else ""
+        if note:
+            raise ValueError(note)
         return None
-    try:
-        candidate = pathlib.Path(raw).resolve(strict=False)
-        return candidate if candidate.is_dir() else None
-    except OSError:
+    return pathlib.Path(raw).resolve(strict=False)
+
+
+def folderless_scratch_dir(ctx: Any) -> Optional[pathlib.Path]:
+    """Project work WITHOUT a folder: the task's OWN scratch is its default cwd (#1315).
+
+    Project-scoped work with no workspace and no room folder (or an explicit
+    "no folder" intent) no longer defaults to the Ouroboros repository. This is a
+    default location only — never a workspace: no external-workspace or delegated
+    write authority, no change to what the profile may reach (the system repo stays
+    one explicit ``root``/``cwd`` away). Main self-work, Presence and an explicit
+    ``system_repo`` intent keep today's default."""
+    if getattr(ctx, "workspace_root", None):
         return None
+    meta = getattr(ctx, "task_metadata", None)
+    meta = meta if isinstance(meta, dict) else {}
+    intent = meta.get("resource_intent") if isinstance(meta.get("resource_intent"), dict) else {}
+    kind = str(intent.get("kind") or "")
+    project = str(getattr(ctx, "project_id", "") or meta.get("project_id") or "").strip()
+    if (kind == "system_repo" or (not project and kind != "explicit_none")
+            or meta.get("_project_room_dir") or meta.get("_project_room_note")):
+        return None
+    from ouroboros.dialogue_provenance import presence_metadata_binding
+
+    if presence_metadata_binding(meta) is not None:
+        return None
+    scratch = resource_root_path(ctx, "task_drive")
+    scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
 
 
 def load_bound_skill(binding: ResolvedResourceBinding) -> Any:
@@ -171,12 +198,7 @@ def resource_root_path(
 ) -> pathlib.Path:
     if root == "active_workspace":
         active = getattr(ctx, "active_repo_dir", None)
-        candidate = None
-        if callable(active):
-            try:
-                candidate = active()
-            except Exception:
-                candidate = None
+        candidate = active() if callable(active) else (project_room_lens_dir(ctx) or folderless_scratch_dir(ctx))
         if candidate is None or candidate.__class__.__module__.startswith("unittest.mock"):
             candidate = getattr(ctx, "repo_dir")
         return pathlib.Path(candidate).resolve(strict=False)

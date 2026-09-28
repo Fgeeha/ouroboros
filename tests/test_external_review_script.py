@@ -37,6 +37,36 @@ from scripts.run_external_review import (
 )
 
 
+@pytest.mark.parametrize('delivery,refused', [('native', False), ('packet', True), ('', True)])
+def test_contributor_config_roundtrip_keeps_direct_api_delivery(monkeypatch, delivery, refused):
+    from scripts.run_external_review import _diff_size_refusal, _slot_plan_payload
+    from ouroboros.reviewer_slot_config import parse_reviewer_slots, triad_delivery_slots
+
+    row = {'slot_id': 't', 'route': {'kind': 'api_chat', 'target_id': 'openai/test'}}
+    if delivery:
+        row['delivery'] = delivery
+    monkeypatch.setenv('OUROBOROS_REVIEWER_SLOTS', json.dumps({
+        'triad': [row], 'scope': [{'slot_id': 's', 'route': row['route']}]}))
+    resolved = _resolved_review_config()
+    assert resolved['triad_slots'][0].get('delivery', '') == delivery
+    stored = parse_reviewer_slots(json.dumps(_slot_plan_payload(resolved)))
+    assert triad_delivery_slots(config=stored)[0].retrieves is (not refused)
+    assert _diff_size_refusal(SimpleNamespace(contributor=True), resolved, 101, 100) is refused
+    assert _diff_size_refusal(SimpleNamespace(contributor=True), resolved, 100, 100) is False
+    assert _diff_size_refusal(SimpleNamespace(contributor=False), resolved, 101, 100) is True
+
+
+def test_contributor_mixed_panel_keeps_packet_limit():
+    from scripts.run_external_review import _diff_size_refusal
+
+    rows = [{'route': {'kind': 'api_chat'}, 'delivery': 'native'},
+            {'route': {'kind': 'agent_session'}},
+            {'route': {'kind': 'api_chat'}, 'subagent_id': 'reader'}]
+    args = SimpleNamespace(contributor=True)
+    assert not _diff_size_refusal(args, {'triad_slots': rows}, 101, 100)
+    assert _diff_size_refusal(args, {'triad_slots': rows + [{'route': {'kind': 'api_chat'}}]}, 101, 100)
+
+
 def test_contributor_trust_boundary_covers_functional_review_dependencies():
     from ouroboros.tools.scope_review import _CANONICAL_CONTEXT_DOCS
 
@@ -1223,10 +1253,11 @@ def test_normal_key_probe_stays_single_model_but_contributor_probes_all(monkeypa
 
 
 def _git(repo: Path, *args: str) -> str:
+    patch = args[:1] == ("diff",) and "--binary" in args
     proc = subprocess.run(
-        ["git", *args], cwd=str(repo), capture_output=True, text=True, check=True,
+        ["git", *args], cwd=str(repo), capture_output=True, text=not patch, check=True,
     )
-    return proc.stdout
+    return proc.stdout.decode("utf-8", errors="surrogateescape") if patch else proc.stdout
 
 
 def test_isolated_checkout_freezes_the_reviewed_tree(tmp_path, monkeypatch):

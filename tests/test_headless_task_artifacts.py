@@ -17,6 +17,7 @@ from starlette.applications import Starlette
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
+from ouroboros.gateway import task_archive
 from ouroboros.gateway.tasks import (
     api_task_artifact,
 )
@@ -37,6 +38,16 @@ from tests._headless_cli_shared import (  # noqa: F401  (autouse fixture applies
     _init_repo_with_file,
     _managed_worker_pool_available,
 )
+
+
+def _assert_file_response(response, content: bytes) -> None:
+    # Owner-approved #1297: platforms without confined opens return a typed 503.
+    if task_archive.CONFINED:
+        assert response.status_code == 200
+        assert response.content == content
+    else:
+        assert response.status_code == 503
+        assert response.json()["reason_code"] == "artifact_unavailable"
 
 
 def test_copy_child_result_cannot_overwrite_finalized_accounting(tmp_path):
@@ -386,7 +397,7 @@ def test_task_artifact_endpoint_serves_only_declared_artifacts(tmp_path):
     app.state.drive_root = data
     client = TestClient(app)
 
-    assert client.get("/api/tasks/task-artifact/artifacts/workspace.patch").text.startswith("diff --git")
+    _assert_file_response(client.get("/api/tasks/task-artifact/artifacts/workspace.patch"), b"diff --git a/a b/a\n")
     assert client.get("/api/tasks/task-artifact/artifacts/missing.patch").status_code == 404
     assert client.get("/api/tasks/task-artifact/artifacts/bad%5Cname").status_code == 400
 
@@ -415,15 +426,15 @@ def test_task_artifact_endpoint_serves_manifest_artifact_after_status_repair(tmp
 
     response = TestClient(app).get("/api/tasks/orphaned/artifacts/report.html")
 
-    assert response.status_code == 200
-    assert response.text == "<h1>ok</h1>"
+    _assert_file_response(response, b"<h1>ok</h1>")
 
 
-def test_task_artifact_endpoint_rebases_child_drive_artifact_after_status_repair(tmp_path):
+def test_task_artifact_endpoint_serves_child_drive_artifact_read_only_after_status_repair(tmp_path):
     from ouroboros.artifacts import collect_task_artifact_records, copy_file_to_task_artifacts
 
     data = tmp_path / "data"
-    child = tmp_path / "child"
+    # The task's OWN headless drive (host layout); a drive merely named by the row is no authority.
+    child = data / "state" / "headless_tasks" / "childart" / "data"
     source_dir = tmp_path / "Desktop"
     source_dir.mkdir()
     source = source_dir / "report.html"
@@ -456,10 +467,9 @@ def test_task_artifact_endpoint_rebases_child_drive_artifact_after_status_repair
 
     response = TestClient(app).get("/api/tasks/childart/artifacts/report.html")
 
-    parent_artifact = task_artifacts_dir(data, "childart", create=False) / "report.html"
-    assert response.status_code == 200
-    assert response.text == "<h1>child</h1>"
-    assert parent_artifact.read_text(encoding="utf-8") == "<h1>child</h1>"
+    # The own child store is read when supported; neither outcome copies or creates it.
+    _assert_file_response(response, b"<h1>child</h1>")
+    assert not task_artifacts_dir(data, "childart", create=False).exists()
 
 
 def test_task_artifact_endpoint_rejects_metadata_name_path_mismatch(tmp_path):
@@ -517,7 +527,7 @@ def test_startup_prune_removes_only_old_terminal_child_drives(tmp_path):
     os.utime(pending_dir, (old, old))
     os.utime(fresh_timestamp_dir, (old, old))
 
-    report = prune_headless_task_drives(data, retention_days=7, now=now)
+    report = prune_headless_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
 
     assert [item["task_id"] for item in report["pruned"]] == ["oldterminal"]
     assert not terminal_dir.exists()
@@ -527,7 +537,7 @@ def test_startup_prune_removes_only_old_terminal_child_drives(tmp_path):
     assert any(item["task_id"] == "freshresult" and item["reason"] == "younger_than_retention" for item in report["skipped"])
 
 
-def test_startup_prune_uses_effective_terminal_status(tmp_path):
+def test_prune_settles_only_durably_terminal_rows_never_a_projection(tmp_path):
     data = tmp_path / "data"
     task_drive = data / "task_drives" / "stalerun"
     child_dir = data / "state" / "headless_tasks" / "stalechild"
@@ -559,8 +569,18 @@ def test_startup_prune_uses_effective_terminal_status(tmp_path):
     os.utime(task_drive, (old, old))
     os.utime(child_dir, (old, old))
 
-    direct_report = prune_task_drives(data, retention_days=7, now=now)
-    child_report = prune_headless_task_drives(data, retention_days=7, now=now)
+    # A projection is not custody: only the DURABLE row settles a drive (TZ-1 A).
+    direct_report = prune_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
+    child_report = prune_headless_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
+    assert [item["reason"] for item in direct_report["skipped"]] == ["task_not_terminal"]
+    assert [item["reason"] for item in child_report["skipped"]] == ["parent_not_terminal"]
+    assert task_drive.exists() and child_dir.exists()
+
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+
+    assert reconcile_orphaned_running_tasks(data) == 2  # the reconciler persists what the projection says
+    direct_report = prune_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
+    child_report = prune_headless_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
 
     assert [item["task_id"] for item in direct_report["pruned"]] == ["stalerun"]
     assert [item["task_id"] for item in child_report["pruned"]] == ["stalechild"]
@@ -588,7 +608,7 @@ def test_startup_prune_removes_only_old_terminal_task_scratch(tmp_path):
     os.utime(old_pending, (old, old))
     os.utime(fresh_terminal, (old, old))
 
-    report = prune_task_drives(data, retention_days=7, now=now)
+    report = prune_task_drives(data, retention_days=7, now=now, live=lambda _task: False)
 
     assert [item["task_id"] for item in report["pruned"]] == ["oldterminal"]
     assert not old_terminal.exists()
@@ -653,8 +673,7 @@ def test_task_artifact_endpoint_serves_exact_chat_media_without_task_result(tmp_
     client = TestClient(app)
 
     response = client.get(f"/api/tasks/ephemeral1/artifacts/{stored['name']}")
-    assert response.status_code == 200
-    assert response.content == b"photo-bytes"
+    _assert_file_response(response, b"photo-bytes")
     assert collect_task_artifact_records(data, "ephemeral1") == []
 
     assert client.get("/api/tasks/ephemeral1/artifacts/chat-media-bad.png").status_code == 404

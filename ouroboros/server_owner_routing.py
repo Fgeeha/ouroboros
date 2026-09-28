@@ -118,7 +118,9 @@ def _route_project_chat_to_running_task(
         direct_agent = None
         direct_lock = None
         if candidate.get("direct_chat"):
-            direct_agent = ctx.get_chat_agent()
+            from supervisor.workers import get_direct_chat_agent
+
+            direct_agent = get_direct_chat_agent(tid)
             direct_lock = getattr(direct_agent, "_owner_message_admission_lock", None)
             if direct_lock is None:
                 return ""
@@ -222,6 +224,15 @@ def _route_project_chat_to_running_task(
                 )
                 if live_meta is None and not still_pending:
                     return ""
+                # A worker may remain RUNNING to finish paid post-work after its
+                # answer/result settled. Its solve loop no longer drains this
+                # mailbox; accepting an owner follow-up here would label it
+                # delivered, then terminal cleanup would erase it unread. One
+                # predicate with the quiz ingress (TZ-2 D15).
+                from ouroboros.owner_mailbox import mailbox_drain_ended
+
+                if mailbox_drain_ended(task_drive, tid):
+                    return ""
                 # Phase A: a task whose cancellation is PENDING must not accept a
                 # new owner message — same refusal the steer_task route makes,
                 # checked inside this admission transaction. Falling through to
@@ -237,12 +248,18 @@ def _route_project_chat_to_running_task(
                     return ""
             if not write_owner_message(
                 task_drive, f"{message}{attachment_note}", tid, msg_id=msg_id,
+                # This delivery IS the owner's message; the id is the caller's
+                # parameter, never parsed back out of ``msg_id``.
+                client_message_id=client_message_id,
                 client_surface=(
                     dict(task_metadata["client_surface"])
                     if isinstance(task_metadata, dict) and isinstance(task_metadata.get("client_surface"), dict)
                     else None
                 ),
                 attachment_manifest=staged_manifest if staged_manifest else None,
+                late_answer=(
+                    task_metadata.get("late_answer") if isinstance(task_metadata, dict) else None
+                ),
             ):
                 return ""
             message_written = True
@@ -282,7 +299,7 @@ def _route_project_chat_to_running_task(
                     chat_id,
                     f"📎 Attachment staging report for {target_label or 'Task'}:\n"
                     f"{attachment_report}",
-                )
+                    role="system", system_type="attachment_notice")
             except Exception:
                 log.debug("Mailbox attachment report notice failed for %s", tid, exc_info=True)
         return tid
@@ -302,6 +319,11 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
     intent, no terminal result and no ``task_done``, and a stop with still-live
     leftovers was declared clean.
     """
+    from supervisor.events_runtime_controls import owner_evolution_stop_controls
+
+    # The control half first (#1307): latch, durable campaign stop intent, state flags —
+    # none of them waits for cancellation and none skips another's failure.
+    not_persisted = owner_evolution_stop_controls("disabled via owner chat")
     stop_incomplete = False
     try:
         from supervisor.queue import evolution_stop_report, stop_evolution_tasks
@@ -309,13 +331,16 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
 
         # Fast path: drop any queued post-task promotion so it cannot re-arm on
         # the next boot tick (the evolution_owner_stopped flag is the durable backstop).
-        drop_pending_request(ctx.DRIVE_ROOT)
+        try:
+            drop_pending_request(ctx.DRIVE_ROOT)
+        except Exception:
+            log.warning("Pending evolution request could not be dropped; cancellation still attempted", exc_info=True)
         stopped = stop_evolution_tasks("disabled via owner chat")
         ctx.sort_pending()
         ctx.persist_queue_snapshot(reason="evolve_off")
         stop_lines, stop_incomplete = evolution_stop_report(stopped)
         for line in stop_lines:
-            ctx.send_with_budget(chat_id, line)
+            ctx.send_with_budget(chat_id, line, role="system", system_type="evolution_notice")
     except Exception:
         log.warning("Evolution stop transaction failed", exc_info=True)
         stop_incomplete = True
@@ -342,8 +367,8 @@ def _owner_evolution_stop(ctx: Any, chat_id: int) -> str:
     if stop_incomplete:
         return ("OFF (mode disabled) — but the stop is INCOMPLETE: see the "
                 "still-live task(s) above. The campaign stays open until they "
-                "settle. Post-task auto-evolution stays paused until /evolve start")
-    return "OFF — post-task auto-evolution also paused until /evolve start"
+                "settle. Post-task auto-evolution stays paused until /evolve start" + not_persisted)
+    return "OFF — post-task auto-evolution also paused until /evolve start" + not_persisted
 
 
 def _record_routing_receipt(
@@ -358,14 +383,20 @@ def _record_routing_receipt(
     status: str,
     persist: bool = True,
     options: Optional[list] = None,
+    reason: str = "",
     detail: str = "",
     attachment_manifest: Optional[list] = None,
 ) -> None:
     """Emit a typed bubble-free ack and optionally persist its presentation state."""
+    from ouroboros.project_dialogue import routing_refusal_cause
+
     if target and not str(target_label or "").strip():
         from ouroboros.project_dialogue import routing_target_label
 
         target_label = routing_target_label(ctx.DRIVE_ROOT, action, target)
+    # Q3=A: this parallel producer reads the SAME host table, so a refusal it
+    # writes carries the owner's sentence instead of leaning on a client label.
+    cause = routing_refusal_cause(action, status, reason, options)
     if persist:
         try:
             from ouroboros.project_dialogue import append_chat_annotation
@@ -377,6 +408,8 @@ def _record_routing_receipt(
                 target=target,
                 target_label=target_label,
                 status=status,
+                reason=reason,
+                cause=cause,
                 detail=detail,
                 attachment_manifest=attachment_manifest,
             )
@@ -396,6 +429,8 @@ def _record_routing_receipt(
                 ack_kwargs["options"] = options
             if attachment_manifest is not None:
                 ack_kwargs["attachment_manifest"] = attachment_manifest
+            if cause:
+                ack_kwargs["cause"] = cause
             ack(
                 chat_id,
                 **ack_kwargs,
@@ -418,6 +453,8 @@ def _record_routing_receipt(
                     payload["options"] = options
                 if attachment_manifest is not None:
                     payload["attachment_manifest"] = attachment_manifest
+                if cause:
+                    payload["cause"] = cause
                 broadcast(payload)
     except Exception:
         log.debug("Routing receipt broadcast failed", exc_info=True)
@@ -442,11 +479,8 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         # An explicit selected-skill development request already asks for a
         # managed task. Preserve its source/caller facts while ordinary promotion
         # validates the payload and records the admitted revision.
-        from supervisor.events import _handle_promote_chat_to_task
+        from supervisor.events import _handle_promote_chat_to_task, _notify_host_initiated_refusal
 
-        ctx.consciousness.inject_observation(
-            f"Message from my human: {incoming.get('log_text') or ''}"
-        )
         task_id = uuid.uuid4().hex[:16]
         event = {
             "type": "promote_chat_to_task",
@@ -457,6 +491,10 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
             "client_message_id": client_message_id,
             "task_constraint": task_constraint,
             "routed_from_main": True,
+            # The host issued this promote (skill card), so no model turn waits on
+            # the receipt: a refusal is told to the owner by ONE typed System row
+            # from the promote handler, in the chat the owner wrote in.
+            "host_initiated": True,
         }
         metadata = task_metadata if isinstance(task_metadata, dict) else {}
         if isinstance(metadata.get("client_surface"), dict):
@@ -479,6 +517,8 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
                 "reason": "repair_promotion_failed",
                 "task_id": task_id,
             }
+            # Minted OUTSIDE the handler, so its publication boundary never saw it.
+            _notify_host_initiated_refusal(ctx, event, outcome)
         outcome = outcome if isinstance(outcome, dict) else {"status": "scheduled", "task_id": task_id}
         outcome_status = str(outcome.get("status") or "needs_manual_target")
         if outcome_status == "scheduled":
@@ -486,18 +526,11 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
                 ctx.send_with_budget(
                     chat_id,
                     f"✅ Repair task {task_id} was accepted and durably scheduled.",
-                )
+                    role="system", system_type="task_admission_notice")
             except Exception:
                 log.debug("Repair promotion success notification failed", exc_info=True)
-        else:
-            reason = str(outcome.get("reason") or outcome_status)
-            try:
-                ctx.send_with_budget(
-                    chat_id,
-                    f"⚠️ Repair task was not started ({reason}). Please retry from the skill card.",
-                )
-            except Exception:
-                log.debug("Repair promotion refusal notification failed", exc_info=True)
+        # A refusal is already told by the promote handler's typed System row
+        # (host_initiated) plus the receipt under the owner's message.
         return
     reserved_project = _reserved_project_for_chat(ctx, chat_id)
     project_id = (
@@ -514,13 +547,12 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
             action="project_route",
             target=str(reserved_project.get("id") or ""),
             status="project_unavailable",
+            reason="project_unavailable",
         )
         return
-    ctx.consciousness.inject_observation(f"Message from my human: {incoming.get('log_text') or ''}")
+    # An owner message never wakes consciousness (owner decision В13): Main answers it itself.
     task_metadata = _scoped_task_metadata(project_id, task_metadata)
-    swarm_intent = bool(
-        isinstance(task_metadata, dict) and task_metadata.get("force_plan")
-    )
+    task_metadata = {**(task_metadata or {}), "client_message_id": client_message_id}
     # The turn's origin identity rides UNCONDITIONALLY (not only when the
     # decision lane runs): a bare direct turn with no projects/roots yet — the
     # first-ever project creation — must still carry it so promote/route/bind
@@ -538,7 +570,8 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         task_metadata = {**(task_metadata or {}), "origin_suppressed": True}
     # Owner Surface Fact channel fallback: a non-web ingress (telegram/skill
     # transports) carries no browser observables, but its channel IS the
-    # surface fact. Host-stamped here, never overwriting a real descriptor;
+    # surface fact, with the common ingress receipt stamp (``received_at``,
+    # ``enqueue_local_message``). Host-stamped here, never overwriting a real descriptor;
     # source=="web" stays an honest absence (an old SPA sends no fact), and a
     # synthetic A2A chat (negative id) is machine traffic — no owner sent it,
     # so it must never wear an owner_client fact.
@@ -550,8 +583,52 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
         and not _is_a2a(chat_id)
         and not isinstance(task_metadata.get("client_surface"), dict)
     ):
-        task_metadata = {**task_metadata, "client_surface": {"channel": _ingress_source}}
-    if project_id and not swarm_intent:
+        received = {"received_at": str(incoming["received_at"])} if incoming.get("received_at") else {}
+        task_metadata = {**task_metadata, "client_surface": {"channel": _ingress_source, **received}}
+    if task_metadata.get("force_plan"):
+        from supervisor.worker_chat_lane import owner_conversation_admitted
+        from supervisor.state import budget_remaining, load_state
+        from supervisor.events import _handle_promote_chat_to_task
+        from ouroboros.gateway.routing_decision import _derived_identity
+
+        if not owner_conversation_admitted(chat_id):
+            return
+        try:  # bridge intake runs on the supervisor loop: same pre-check contract as assignment
+            remaining = budget_remaining(load_state(), strict=True, allow_stale=True)
+        except Exception:
+            ctx.send_with_budget(chat_id, "⚠️ Cost accounting is unavailable. Task was not dispatched; retry after ledger recovery.", role="system", system_type="task_admission_notice")
+            return
+        if remaining <= 0:
+            try:
+                ctx.send_with_budget(chat_id, "🚫 Budget exhausted. Task rejected. Please increase TOTAL_BUDGET in settings.", role="system", system_type="task_admission_notice")
+            except Exception:
+                pass
+            return
+        routing_token, task_id = (
+            _derived_identity(client_message_id, "swarm", 0)
+            if client_message_id else (uuid.uuid4().hex, uuid.uuid4().hex[:16])
+        )
+        event = {
+            "type": "promote_chat_to_task", "task_id": task_id,
+            "routing_token": routing_token, "objective": text or image_caption,
+            "chat_id": chat_id, "project_id": project_id,
+            "client_message_id": client_message_id, "task_constraint": task_constraint,
+            "force_plan": True, "force_plan_source": task_metadata.get("force_plan_source"),
+            "attachment_uploads": list(task_metadata.get("chat_attachment_uploads") or []),
+            # Swarm: the host promotes with no model turn waiting on the receipt,
+            # so a refusal reaches the owner as the handler's typed System row.
+            "host_initiated": True,
+        }
+        if isinstance(task_metadata.get("client_surface"), dict):
+            event["client_surface"] = dict(task_metadata["client_surface"])
+        if isinstance(origin_ref, dict) and origin_ref:
+            event["source_ref"] = dict(origin_ref)
+            event["source_text"] = task_metadata["origin_message_text"]
+        else:
+            event["origin_suppressed"] = True
+        _handle_promote_chat_to_task(event, ctx)
+        return
+    if project_id:
         routed_to_task = _route_project_chat_to_running_task(
             ctx,
             chat_id,
@@ -592,30 +669,18 @@ def _route_owner_message(bridge: Any, ctx: Any, incoming: Dict[str, Any]) -> Non
     except Exception:
         log.warning("Unable to inspect Projects for owner routing", exc_info=True)
         has_projects = True
-    needs_decision_lane = swarm_intent or bool(project_id) or has_projects or bool(global_roots)
+    needs_decision_lane = bool(project_id) or has_projects or bool(global_roots)
     if needs_decision_lane:
         task_metadata = _decision_turn_metadata(ctx, chat_id, client_message_id, task_metadata)
-    agent = ctx.get_chat_agent()
 
     def _run_direct() -> None:
-        try:
-            ctx.handle_chat_direct(
-                chat_id,
-                text or image_caption,
-                image_data,
-                task_constraint=task_constraint,
-                task_metadata=task_metadata,
-            )
-        finally:
-            ctx.consciousness.resume()
+        # The alarm clock reads the direct-activity census itself; nothing pauses it here.
+        ctx.handle_chat_direct(
+            chat_id,
+            text or image_caption,
+            image_data,
+            task_constraint=task_constraint,
+            task_metadata=task_metadata,
+        )
 
-    if needs_decision_lane or agent._busy:
-        threading.Thread(
-            target=ctx.handle_chat_ephemeral,
-            args=(chat_id, text or image_caption, image_data),
-            kwargs={"task_constraint": task_constraint, "task_metadata": task_metadata},
-            daemon=True,
-        ).start()
-    else:
-        ctx.consciousness.pause()
-        threading.Thread(target=_run_direct, daemon=True).start()
+    threading.Thread(target=_run_direct, daemon=True).start()

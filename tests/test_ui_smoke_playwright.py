@@ -9,13 +9,33 @@ import sys
 import textwrap
 import time
 import urllib.request
+from collections import deque
 
 import pytest
 
+from tests.candidate_checkout import (
+    assert_served_candidate as _assert_served_candidate,
+    candidate_checkout, require_candidate_interpreter, verify_checkout,
+)
+from ouroboros.test_environment import isolated_environment
 from tests.fixtures_mock_llm import MockLLMServer
-from tests.ui_chat_viewport_smoke import _CAPTURE_TEST_SOCKET, _emit_ws_frame
+from tests.ui_chat_viewport_smoke import (
+    _CAPTURE_TEST_SOCKET, _OBSERVE_STATE_READS, _emit_ws_frame, _wait_socket_open_quiescent,
+)
 
 REPO_ROOT = os.path.dirname(os.path.dirname(__file__))
+
+
+def _fixture_interpreter() -> str:
+    """Use the real Windows interpreter, bypassing the venv PID redirector."""
+    if os.name == "nt":
+        return str(getattr(sys, "_base_executable", sys.executable))
+    return sys.executable
+
+
+def _fixture_python() -> str:
+    """Launch target; Settings may wrap it."""
+    return _fixture_interpreter()
 
 
 def _open_review_checkpoint(card, *, open_card=True):
@@ -189,14 +209,36 @@ def _run_docker_ui_assertions(url: str) -> None:
         with sync_playwright() as pw:
             browser = pw.chromium.launch(headless=True)
             page = browser.new_page(viewport={"width": 390, "height": 844})
+            events = deque(maxlen=40)
+            page.on("console", lambda msg: events.append(["console", msg.type, msg.text[:1000]]))
+            page.on("pageerror", lambda error: events.append(["pageerror", str(error)[:1000]]))
+            page.on("requestfailed", lambda req: events.append(["requestfailed", req.url, req.failure]))
+            page.on("response", lambda res: events.append(["response", res.status, res.url])
+                    if res.request.resource_type in {"document", "script"} or res.status >= 400 else None)
+            response = None
             try:
-                page.goto(url, wait_until="domcontentloaded", timeout=30_000)
+                response = page.goto(url, wait_until="domcontentloaded", timeout=30_000)
                 if page.locator("#onboarding-overlay").count():
                     overlay_text = page.locator("#onboarding-overlay").inner_text(timeout=5_000)
                     if "Ouroboros" in overlay_text:
                         return
                 page.wait_for_selector("#page-chat", timeout=30_000)
                 assert page.locator("#page-chat").count() == 1
+            except Exception:
+                print("DOCKER_UI_BROWSER_EVENTS " + json.dumps(list(events)), file=sys.stderr)
+                try:
+                    print("DOCKER_UI_PAGE " + json.dumps({
+                        "url": page.url, "title": page.title(),
+                        "document_status": response.status if response is not None else None,
+                        "nodes": {selector: {"count": page.locator(selector).count(),
+                                             "visible": page.locator(selector).is_visible()}
+                                  for selector in ("#page-chat", "#onboarding-overlay", ".onboarding-frame")},
+                        "body": page.locator("body").inner_text(timeout=1000)[:4000],
+                        "html": page.content()[:8000],
+                    }), file=sys.stderr)
+                except Exception as diagnostic_error:
+                    print(f"DOCKER_UI_PAGE unavailable: {diagnostic_error}", file=sys.stderr)
+                raise
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -209,85 +251,87 @@ def _run_docker_ui_assertions(url: str) -> None:
 def direct_server_with_data(tmp_path):
     if os.environ.get("OUROBOROS_RUN_UI_SMOKE") != "1":
         pytest.skip("set OUROBOROS_RUN_UI_SMOKE=1 to run browser UI smoke")
-    with MockLLMServer() as llm:
+    checkout = tmp_path / "repo"
+    # Static/VERSION sentinels prove each boot's origin.
+    with candidate_checkout(pathlib.Path(REPO_ROOT), checkout, origin_proof=True) as candidate, \
+            MockLLMServer() as llm:
         port = _free_port()
         data_dir = tmp_path / "data"
         data_dir.mkdir(parents=True)
-        model = "openai-compatible::mock-model"
-        (data_dir / "settings.json").write_text(
-            json.dumps(
-                {
-                    "OPENAI_COMPATIBLE_API_KEY": "ui-smoke-key",
-                    "OPENAI_COMPATIBLE_BASE_URL": llm.base_url,
-                    "OUROBOROS_MODEL": model,
-                    "OUROBOROS_MODEL_HEAVY": model,
-                    "OUROBOROS_MODEL_LIGHT": model,
-                    "OUROBOROS_MODEL_FALLBACKS": model,
-                    # Every smoke case is single-task or deterministic log replay;
-                    # a ten-process default pool adds only process churn and makes
-                    # sequential browser history fetches flaky on shared hosts.
-                    "OUROBOROS_MAX_WORKERS": 1,
-                    "OUROBOROS_RUNTIME_MODE": "light",
-                }
-            ),
-            encoding="utf-8",
+        settings = dict.fromkeys(
+            ("OUROBOROS_MODEL", "OUROBOROS_MODEL_LIGHT", "OUROBOROS_MODEL_FALLBACKS"),
+            "openai-compatible::mock-model",
         )
-        env = {
-            **os.environ,
-            "OUROBOROS_APP_ROOT": str(tmp_path),
-            "OUROBOROS_DATA_DIR": str(data_dir),
-            "OUROBOROS_SETTINGS_PATH": str(data_dir / "settings.json"),
-            "OUROBOROS_REPO_DIR": REPO_ROOT,
+        settings.update(
+            OPENAI_COMPATIBLE_API_KEY="ui-smoke-key", OPENAI_COMPATIBLE_BASE_URL=llm.base_url,
+            # Single-task cases and deterministic replay need only one worker;
+            # extra workers churn processes and make shared-host history flaky.
+            OUROBOROS_MAX_WORKERS=1, OUROBOROS_RUNTIME_MODE="light",
+        )
+        (data_dir / "settings.json").write_text(json.dumps(settings), encoding="utf-8")
+        env = isolated_environment(tmp_path, checkout)
+        env.update({
             "OUROBOROS_SERVER_HOST": "127.0.0.1",
             "OUROBOROS_SERVER_PORT": str(port),
-            "OUROBOROS_HOST_SERVICE_PORT": str(port + 1),
+            "OUROBOROS_HOST_SERVICE_PORT": str(_free_port()),
             "OUROBOROS_NETWORK_PASSWORD": "ui-smoke-password",
-        }
+        })
+        if os.name == "nt":
+            site = pathlib.Path(sys.executable).resolve().parent.parent / "Lib" / "site-packages"
+            if site.is_dir():
+                env["PYTHONPATH"] = os.pathsep.join([str(site), env.get("PYTHONPATH", "")])
+        # Probe the actual child, not the parent venv.
+        require_candidate_interpreter(_fixture_interpreter(), env, checkout)
         url = f"http://127.0.0.1:{port}"
-        active_proc = None
+        active_proc = active_container = None
 
         def stop_server() -> None:
-            nonlocal active_proc
-            if active_proc is None or active_proc.poll() is not None:
+            nonlocal active_proc, active_container
+            proc, container = active_proc, active_container
+            active_proc = active_container = None
+            if container is None:
                 return
-            from ouroboros.platform_layer import IS_WINDOWS, kill_process_tree
-
-            # Windows terminate() is an immediate TerminateProcess, so the parent
-            # can disappear before its worker tree and bypass the timeout cleanup.
-            # taskkill /T must own that path from the start.
-            if IS_WINDOWS:
-                kill_process_tree(active_proc)
-                active_proc.wait(timeout=5)
-                active_proc = None
-                return
-            active_proc.terminate()
             try:
-                active_proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                # A timed-out UI-smoke server still owns its worker pool. Killing
-                # only the parent leaks ten orphan workers into later smoke tests,
-                # producing suite-order history/card timeouts. The server starts in
-                # its own process group below, so the shared cross-platform helper
-                # can close the complete tree without touching pytest.
-                kill_process_tree(active_proc)
-                active_proc.wait(timeout=5)
+                if proc is not None and proc.poll() is None:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        pass  # Reap descendants below.
             finally:
-                active_proc = None
+                try:
+                    # Parent exit alone is insufficient.
+                    error = container.reap()
+                finally:
+                    container.close()
+                if error:
+                    if proc is not None:
+                        proc.poll()  # Preserve the reap failure.
+                    raise RuntimeError(f"UI fixture process cleanup failed: {error}")
+                if proc is not None:
+                    proc.wait(timeout=5)
+            # Only proven teardown releases the copy.
+            candidate.release()
 
         def start_server() -> None:
-            nonlocal active_proc
-            from ouroboros.platform_layer import subprocess_new_group_kwargs
+            nonlocal active_proc, active_container
+            from ouroboros.process_containment import ProcessContainer
 
-            active_proc = subprocess.Popen(
-                [sys.executable, "server.py"],
-                cwd=REPO_ROOT,
+            # Reap consumes custody: restart needs a new container.
+            verify_checkout(checkout, candidate)
+            active_container = ProcessContainer()
+            # Pin before spawn.
+            candidate.hold()
+            active_proc = active_container.spawn(
+                [_fixture_python(), "server.py"],
+                cwd=checkout,
                 env=env,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
-                **subprocess_new_group_kwargs(),
             )
             _wait_health(url)
             _wait_supervisor_ready(url)
+            _assert_served_candidate(url, checkout, data_dir, active_proc.pid, candidate)
 
         def restart_server() -> None:
             stop_server()
@@ -295,7 +339,15 @@ def direct_server_with_data(tmp_path):
 
         try:
             start_server()
-            yield {"url": url, "data_dir": data_dir, "restart_server": restart_server}
+            yield {
+                "url": url, "data_dir": data_dir, "restart_server": restart_server,
+                "repo_dir": checkout, "candidate_identity": candidate.identity,
+                # Static and Python origin proof.
+                "candidate_sentinel": candidate.sentinel_bytes,
+                "candidate_version": candidate.version_text,
+                # Seed only while stopped: live ticks overwrite snapshots.
+                "stop_server": stop_server, "start_server": start_server,
+            }
         finally:
             stop_server()
 
@@ -924,12 +976,9 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
                         has_touch=mobile,
                     )
                     page = context.new_page()
-                    page.add_init_script(f"({_CAPTURE_TEST_SOCKET})()")
+                    page.add_init_script(f"({_CAPTURE_TEST_SOCKET})();({_OBSERVE_STATE_READS})()")
                     page.goto(url, wait_until="domcontentloaded", timeout=30_000)
-                    page.wait_for_function(
-                        "() => window.__testSockets?.some(socket => socket.readyState === WebSocket.OPEN)",
-                        timeout=30_000,
-                    )
+                    _wait_socket_open_quiescent(page)  # the frames below live on the test socket only
                     named = page.locator('.chat-live-card[data-task-id="named-act"]')
                     named.wait_for(state="attached", timeout=30_000)
                     unnamed = page.locator('.chat-live-card[data-task-id="unnamed-act"]')
@@ -973,7 +1022,7 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
                         }"""
                     )
                     assert geometry["title"]["lines"] <= 2.2, geometry
-                    assert geometry["activity"]["lines"] <= 2.2, geometry
+                    assert geometry["activity"]["lines"] <= 3.2, geometry
                     assert geometry["scrollWidth"] <= geometry["clientWidth"] + 1, geometry
                     named_meta = named.locator('[data-live-meta]').inner_text().split()
                     # Final ledger: the plain amount, never the open-ledger ceiling.
@@ -1007,18 +1056,18 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
                     assert bands["named-act"]["finished"] is True, bands
                     assert bands["unnamed-act"]["finished"] is False, bands
                     assert bands["running-act"]["finished"] is False, bands
-                    for slot, low in (("title", 0.9), ("activity", 1.9)):
-                        heights = [bands[task_id][slot]["height"] for task_id in bands]
-                        assert max(heights) - min(heights) <= 1, bands
-                        assert all(low <= bands[task_id][slot]["lines"] <= low + 0.3 for task_id in bands), bands
-                    assert bands["unnamed-act"]["activity"]["display"] != "none", bands
-                    assert bands["unnamed-act"]["activity"]["visibility"] == "hidden", bands
-                    # D23 (owner, 2026-09-02): a FINISHED card folds an empty activity
-                    # band; a running card keeps the two-line reserve (31.08 seam).
+                    assert all(0.9 <= bands[task_id]["title"]["lines"] <= 1.2 for task_id in bands), bands
+                    assert 2.9 <= bands["named-act"]["activity"]["lines"] <= 3.2, bands
+                    assert 0.9 <= bands["running-act"]["activity"]["lines"] <= 1.2, bands
+                    assert bands["unnamed-act"]["activity"]["display"] == "none", bands
+                    # Useful root activity sizes naturally up to three lines; empty activity
+                    # reserves no band on either running or finished cards. An uncoined turn
+                    # promotes its only note to the title, so the collapsed line stays empty
+                    # while the block still stands on that row of work.
                     _emit_ws_frame(page, {
                         "type": "chat", "role": "assistant", "is_progress": True,
-                        "chat_id": 1, "task_id": "done-empty", "suggested_name": "Quick task",
-                        "content": "", "ts": "2026-07-29T10:00:03+00:00",
+                        "chat_id": 1, "task_id": "done-empty",
+                        "content": "Quick task", "ts": "2026-07-29T10:00:03+00:00",
                     })
                     done_empty = page.locator('.chat-live-card[data-task-id="done-empty"]')
                     done_empty.wait_for(state="attached", timeout=30_000)
@@ -1168,6 +1217,13 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                 )
                 mounted_anchor.wait_for(state="attached", timeout=30_000)
                 assert mounted_anchor.is_visible()
+                # Establish build: unknown SHA deliberately reloads.
+                page.wait_for_function(
+                    "() => typeof window.__ouroWs?._lastSha === 'string'"
+                    " && window.__ouroWs._lastSha.length > 0",
+                    timeout=30_000,
+                )
+                page.evaluate("() => { window.__chronologyDocument = {}; }")
 
                 t1 = {
                     "ts": "2025-07-18T10:00:01+00:00",
@@ -1185,22 +1241,10 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                     "format": "markdown",
                 }
                 disconnected_summary = {
+                    **anchor_summary,
                     "ts": "2025-07-18T10:00:02.500000+00:00",
-                    "direction": "system",
-                    "type": "task_summary",
-                    "system_type": "task_summary",
                     "task_id": "chronology-disconnected",
-                    "chat_id": 1,
                     "text": "Disconnected summary-only card.",
-                    "tool_calls": 1,
-                    "rounds": 2,
-                    "outcome_axes": {
-                        "lifecycle": {"status": "completed"},
-                        "execution": {"status": "ok"},
-                        "objective": {"status": "pass"},
-                        "review": {"status": "pass"},
-                        "artifacts": {"status": "ready"},
-                    },
                 }
                 t4 = {
                     "ts": "2025-07-18T10:00:04+00:00",
@@ -1277,8 +1321,11 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                     timeout=30_000,
                 )
                 state = page.evaluate(
+                    # The paged-history control heads the list and carries no
+                    # timestamp of its own: it is chrome, not a transcript row.
                     """() => [...document.querySelector('#chat-messages').children]
                         .filter((node) => !node.classList.contains('typing-bubble')
+                            && !node.classList.contains('chat-load-older')
                             && !node.textContent.includes('Reconnected'))
                         .map((node) => ({
                             text: node.textContent,
@@ -1287,6 +1334,7 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                             taskId: node.dataset.taskId || '',
                         }))"""
                 )
+                assert page.locator("#chat-messages > .chat-load-older").count() == 1
                 assert [item["card"] for item in state] == [
                     False, True, True, False, True, False, False,
                 ]
@@ -1318,6 +1366,7 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                         };
                     }"""
                 )
+                assert page.evaluate("() => Boolean(window.__chronologyDocument)")
                 assert abs(scroll_after["anchorTop"] - scroll_before["anchorTop"]) <= 6
                 page.locator("#chat-messages").evaluate("(messages) => { messages.scrollTop = 0; }")
                 page.screenshot(
@@ -1350,6 +1399,7 @@ def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_serve
                 )
 
                 page.goto(f"{url}/?_ouro_reason=sha-change", wait_until="domcontentloaded", timeout=30_000)
+                assert page.evaluate("() => typeof window.__chronologyDocument === 'undefined'")
                 page.get_by_text("Restart complete").wait_for(state="visible", timeout=30_000)
                 first = page.locator(".chat-bubble", has_text="First historical message.").first
                 first.wait_for(state="attached", timeout=30_000)
@@ -1689,6 +1739,8 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 assert "compared output" in expanded_text
                 assert "done" in expanded_text.lower()
                 assert "Scheduled subagent child1" not in expanded_text
+                assert "Subagent child1 running" not in expanded_text
+                assert child.locator('[data-live-line-key="terminal-subagent-lifecycle-child1"]').count() == 1
                 assert child_summary.get_attribute("aria-expanded") == "true"
                 assert child.locator("[data-live-timeline]").first.get_attribute("id")
                 assert result_toggle.get_attribute("aria-controls")
@@ -1729,9 +1781,15 @@ def test_ui_smoke_direct_mode_nests_subagent_child_cards(direct_server_with_data
                 replay_progress.locator(".chat-live-line-toggle").click()
                 assert child_activity_early in replay_progress.inner_text()
                 assert child_activity_tail in replay_progress.inner_text()
+                assert "Scheduled subagent child1" not in replay_child.inner_text()
+                assert "Subagent child1 running" not in replay_child.inner_text()
+                assert replay_child.locator('[data-live-line-key="terminal-subagent-lifecycle-child1"]').count() == 1
                 page.wait_for_timeout(900)  # cover the routine background history sync
                 assert replay_child.locator('.chat-live-line-repeat:not([hidden])').count() == 0
                 page.screenshot(path=str(data_dir.parent / "review-truth-child-reconnect.png"), full_page=True)
+                replay_progress.locator(".chat-live-line-toggle").click()
+                replay_child.scroll_into_view_if_needed()
+                page.screenshot(path=str(data_dir.parent / "lifecycle-current-status.png"), full_page=True)
                 assert page.locator(".chat-bubble.progress").count() == 0
                 assert page.locator(".chat-bubble", has_text="Final child answer should stay inside the child card.").count() == 0
 
@@ -2221,6 +2279,15 @@ def test_ui_smoke_docker_mode_loads_health():
         url = f"http://127.0.0.1:{port}"
         _wait_health(url, timeout_sec=45)
         _run_docker_ui_assertions(url)
+    except Exception:
+        try:
+            logs = subprocess.run(["docker", "logs", "--tail", "100", cid],
+                                  capture_output=True, text=True, timeout=10)
+            print(f"DOCKER_UI_CONTAINER {cid} logs_exit={logs.returncode}\n"
+                  f"{logs.stdout[-10000:]}\n{logs.stderr[-10000:]}", file=sys.stderr)
+        except Exception as diagnostic_error:
+            print(f"DOCKER_UI_CONTAINER logs unavailable: {diagnostic_error}", file=sys.stderr)
+        raise
     finally:
         subprocess.run(["docker", "stop", cid], capture_output=True, text=True, timeout=30)
 
@@ -2334,6 +2401,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
             messageWidth: usableMessageWidth,
             rootWidth: root.getBoundingClientRect().width,
             deepestWidth: deepest.getBoundingClientRect().width,
+            rootMainTop: main.top,
             rootMainBottom: main.bottom,
             rootSideTop: side.top,
             rootSideBottom: side.bottom,
@@ -2358,13 +2426,19 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
         assert facts["rootWidth"] - facts["deepestWidth"] <= 40, facts
         # Narrow regime: the side controls share the chip row, the title takes its own
         # full-width row below both.
-        assert facts["rootSideTop"] < facts["rootMainBottom"], facts
+        # Main and side controls start on one flex row. A terminal projection may
+        # make the main box zero-height; their shared top still distinguishes it
+        # from a real wrap, whose row gap would move the side down.
+        assert abs(facts["rootSideTop"] - facts["rootMainTop"]) <= 1, facts
         assert facts["rootTitleTop"] >= max(facts["rootMainBottom"], facts["rootSideBottom"]) - 1, facts
         assert all(card["scrollWidth"] <= card["clientWidth"] + 1 for card in facts["cardFacts"]), facts
         assert min(card["titleWidth"] for card in facts["cardFacts"]) >= 160, facts
         assert 0.9 <= min(card["titleLines"] for card in facts["cardFacts"]), facts
         assert max(card["titleLines"] for card in facts["cardFacts"]) <= 2.2, facts
-        assert max(card["activityLines"] for card in facts["cardFacts"]) <= 2.2, facts
+        assert max(card["activityLines"] for card in facts["cardFacts"]
+                   if not card["collapsedChild"]) <= 3.2, facts
+        assert max(card["activityLines"] for card in facts["cardFacts"]
+                   if card["collapsedChild"]) <= 1.2, facts
         # #623: a collapsed child keeps its identity row — the title beside the
         # chip, the summary at most two bands (the side wraps under only when a
         # 160px title cannot share the row), never a third band for the title.
@@ -2374,7 +2448,9 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert card["summaryBottom"] - card["mainTop"] <= 2.2 * card["titleHeight"] + 8, card
         assert all(card["activityTitle"] is None for card in facts["cardFacts"]), facts
         deepest = page.locator('.chat-live-card[data-task-id="layout-child-10"]')
-        assert "pty-tests · gemini-3.6-flash" in deepest.inner_text()
+        assert deepest.locator(':scope > .chat-live-summary-button [data-live-title]').inner_text() == "pty-tests"
+        assert "Agent model: gemini-3.6-flash" in deepest.locator(
+            ':scope > .chat-live-summary-button [data-live-meta]').inner_text()
         deepest.locator(":scope > [data-live-summary-button]").click()
         line_toggle = deepest.locator(":scope > [data-live-timeline] .chat-live-line-toggle").last
         line_toggle.wait_for(state="visible", timeout=5_000)
@@ -2389,13 +2465,14 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                     lineClient: line.clientWidth,
                     lineScroll: line.scrollWidth,
                     titleWidth: title.getBoundingClientRect().width,
+                    titleScrollWidth: title.scrollWidth,
                     text: line.innerText,
                 };
             }"""
         )
         assert expanded["cardScroll"] <= expanded["cardClient"] + 1, expanded
         assert expanded["lineScroll"] <= expanded["lineClient"] + 1, expanded
-        assert expanded["titleWidth"] >= 150, expanded
+        assert expanded["titleWidth"] >= min(expanded["titleScrollWidth"], 150) - 1, expanded
         assert long_url in expanded["text"], expanded
 
     def assert_jump_geometry(page, scope_selector, *, require_overflow=True):
@@ -2520,14 +2597,13 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert wide_facts[2]["left"] - wide_facts[1]["left"] >= 30, wide_facts
                 assert all(card["scroll"] <= card["client"] + 1 for card in wide_facts), wide_facts
                 for card in wide_facts[:2]:
-                    assert min(card["mainBottom"], card["sideBottom"]) \
-                        > max(card["mainTop"], card["sideTop"]), wide_facts
+                    assert abs(card["mainTop"] - card["sideTop"]) <= 1, wide_facts
                 # #623: the depth-2 collapsed child is in the 560px container regime
                 # (wrap allowed) yet keeps ONE identity row: chip, title, side controls.
                 deep = wide_facts[2]
                 assert deep["wrap"] == "wrap", wide_facts
                 assert abs(deep["titleTop"] - deep["mainTop"]) <= 4, wide_facts
-                assert deep["sideTop"] < deep["mainBottom"], wide_facts
+                assert abs(deep["mainTop"] - deep["sideTop"]) <= 1, wide_facts
 
                 # The 620-700px column (laptop with the project panel open): the root
                 # card takes up to 620px there and keeps its single-row header.
@@ -2630,6 +2706,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                             cardScroll: card.scrollWidth,
                             titleWidth: title.width,
                             titleTop: title.top,
+                            mainTop: main.top,
                             mainBottom: main.bottom,
                             sideTop: side.top,
                             sideBottom: side.bottom,
@@ -2640,7 +2717,7 @@ def test_ui_smoke_live_cards_keep_usable_geometry_at_depth_and_in_project_panel(
                 assert panel_facts["cardWidth"] >= panel_facts["panelWidth"] * 0.9, panel_facts
                 assert panel_facts["cardScroll"] <= panel_facts["cardClient"] + 1, panel_facts
                 assert panel_facts["titleWidth"] >= 180, panel_facts
-                assert panel_facts["sideTop"] < panel_facts["mainBottom"], panel_facts
+                assert abs(panel_facts["mainTop"] - panel_facts["sideTop"]) <= 1, panel_facts
                 assert panel_facts["titleTop"] >= max(panel_facts["mainBottom"], panel_facts["sideBottom"]) - 1, panel_facts
                 assert_jump_geometry(
                     wide, "#panel-pchat-layout-project", require_overflow=False
@@ -2916,16 +2993,17 @@ def test_ui_smoke_v679_subagent_depth_zero_round_trips_through_settings(direct_s
             pytest.skip(str(exc))
         raise
 @pytest.mark.ui_browser
-def test_ui_owner_context_mode_and_scope_review_ack(direct_server_with_data):
-    """Owner context intent and scope-review ack, driven in a real browser.
+def test_ui_owner_context_mode_and_scope_slot_save(direct_server_with_data):
+    """Owner context intent and a scope-slot save, driven in a real browser.
 
-    Two claimed-complete owner flows that source-string tests cannot certify:
+    Two owner flows that source-string tests cannot certify:
 
     1. OWNER MAX. Switching an explicit Low to Max succeeds without a Main-route
        context-window confirmation; the frozen compatibility field remains false.
-    2. SCOPE-REVIEW CAPABILITY ACK. Saving a scope-review slot whose route has no >=1M evidence
-       must raise the owner confirm and, on accept, persist a route-scoped capability ack and say
-       so in the settings status line.
+    2. SCOPE SLOT. Saving a scope row whose route has no window evidence at all
+       completes with no confirmation: window size is not a condition of scope
+       authority (owner decision 2026-09-17), so there is nothing to confirm and
+       no ack is written.
     """
     pytest.importorskip("playwright.sync_api", reason="Playwright is not installed")
     from playwright.sync_api import Error as PlaywrightError
@@ -2979,10 +3057,9 @@ def test_ui_owner_context_mode_and_scope_review_ack(direct_server_with_data):
                 assert after["context_mode"] == "max"
                 assert after["context_mode_auto_low"] is False
 
-                # 2. Scope-review capability notice -> owner confirm -> route-scoped ack.
-                # 6.2: the scope route is a review-lane row — pick the API-model
-                # route in the grouped combobox and type the id. D-10 moved the
-                # lanes out of Models into their own Agents tab.
+                # 2. A scope slot saves with no window question anywhere.
+                # Select the fixture's configured provider, then edit its model;
+                # the grouped combobox uses provider-specific API choices.
                 page.click('[data-nav-page="settings"]')
                 page.wait_for_selector("#s-context-mode", state="attached", timeout=30_000)
                 page.locator('[data-settings-tab="agents"]').click()
@@ -2991,37 +3068,32 @@ def test_ui_owner_context_mode_and_scope_review_ack(direct_server_with_data):
                     '#reviewer-scope-rows .reviewer-slot-row [data-slot-route]'
                 ).first
                 scope_route.wait_for(state="visible", timeout=30_000)
-                scope_route.select_option("api")
+                scope_route.select_option("api:openai-compatible")
+                assert scope_route.input_value() == "api:openai-compatible"
                 custom_input = page.locator(
                     '#reviewer-scope-rows .reviewer-slot-row [data-slot-custom-api]'
                 ).first
                 custom_input.wait_for(state="visible", timeout=30_000)
-                custom_input.fill("openai-compatible::scope-reviewer-x")
+                custom_input.fill("scope-reviewer-x")
                 page.locator("#btn-save-settings").click()
-                # The capability ack is an in-app dialog since the native-dialog
-                # class ban (tests/test_web_dialogs_static.py); Playwright's
-                # page.on("dialog") hook only fires for window.alert/confirm/prompt.
-                ack_dialog = page.locator(".confirm-dialog")
-                ack_dialog.wait_for(state="visible", timeout=60_000)
-                ack_text = ack_dialog.inner_text()
-                page.screenshot(path=str(evidence_dir / "v6800-scope-review-ack.png"), full_page=True)
-                ack_dialog.locator("[data-confirm-ok]").last.click()
                 page.wait_for_function(
-                    "() => (document.querySelector('#settings-status')?.textContent || '')"
-                    ".includes('scope-review route')",
+                    "() => !document.querySelector('#btn-save-settings').disabled",
                     timeout=60_000,
                 )
+                page.screenshot(path=str(evidence_dir / "scope-slot-save-no-window-question.png"),
+                                full_page=True)
 
-                assert "1,000,000-token context window" in ack_text
-                assert "openai-compatible::scope-reviewer-x" in ack_text, "the ack must name the exact route"
+                # No dialog of any kind: the owner is never asked to confirm a
+                # reviewer's window, so a route with no evidence saves silently.
+                assert page.locator(".confirm-dialog").count() == 0
                 status_text = page.locator("#settings-status").inner_text()
-                assert "Confirmed the required context window for 1 scope-review route(s)." in status_text
-                evidence = json.loads((data_dir / "state" / "capability_evidence.json").read_text(encoding="utf-8"))
-                acked = [
-                    entry for entry in (evidence.get("acks") or evidence.get("probes") or {}).values()
-                    if str(entry.get("model") or "") == "openai-compatible::scope-reviewer-x"
-                ]
-                assert acked, "no route-scoped capability evidence was stored for the acked reviewer"
+                assert "context window" not in status_text, status_text
+                assert "Settings saved" in status_text or "No changes" in status_text, status_text
+                saved_slots = json.loads(settings_path.read_text(encoding="utf-8"))["OUROBOROS_REVIEWER_SLOTS"]
+                assert "scope-reviewer-x" in json.dumps(saved_slots)
+                evidence_path = data_dir / "state" / "capability_evidence.json"
+                evidence = json.loads(evidence_path.read_text(encoding="utf-8")) if evidence_path.exists() else {}
+                assert not (evidence.get("owner_acks") or {}), "a scope slot save wrote an owner window ack"
             finally:
                 browser.close()
     except PlaywrightError as exc:
@@ -3571,9 +3643,13 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
     data_dir = direct_server_with_data["data_dir"]
     logs_dir = data_dir / "logs"
     logs_dir.mkdir(parents=True, exist_ok=True)
+    # Seed while no server runs (the live loop rewrites the queue snapshot every tick).
+    direct_server_with_data["stop_server"]()
     (logs_dir / "chat.jsonl").write_text("", encoding="utf-8")
     rows = [
-        # Pooled live root: carries the supervisor's host-attested marker.
+        # Pooled live root: carries the supervisor's host-attested marker AND is
+        # genuinely running (dispatched at boot, held in its first model call) so
+        # the census vouches for it (the 09.09 rule).
         {"ts": "2026-07-29T10:00:00+00:00", "chat_id": 1, "task_id": "live-root",
          "content": "Working on the big thing", "cancelable": True},
         # Direct-chat-turn shape: same card shape, NO marker -> no button.
@@ -3586,9 +3662,6 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
          "subagent_event": "scheduled", "subagent_task_id": "sub-child1",
          "parent_task_id": "live-root", "subagent_role": "researcher",
          "cancelable": True},
-        # Reusable background-consciousness slot: never eligible.
-        {"ts": "2026-07-29T10:00:03+00:00", "chat_id": 1, "task_id": "bg-consciousness",
-         "content": "Background thinking", "cancelable": True},
         # A root that was force-cancelled before this reload.
         {"ts": "2026-07-29T10:00:04+00:00", "chat_id": 1, "task_id": "gone-root",
          "content": "Was working before the cancel", "cancelable": True},
@@ -3608,6 +3681,10 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
             "execution": {"status": "cancelled"},
         },
     }) + "\n", encoding="utf-8")
+    from tests.test_s3_task_control_browser import _hold_live_root, _release_mock_model
+
+    _hold_live_root(data_dir, "live-root")
+    direct_server_with_data["start_server"]()
 
     try:
         with sync_playwright() as pw:
@@ -3620,9 +3697,9 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                 cancel_btn = live.locator('[data-cancel-run]')
                 cancel_btn.wait_for(state="attached", timeout=30_000)
                 assert cancel_btn.inner_text().strip() == "Stop…"
-                # Marker-less direct-turn shape, subagent child, reusable slot,
-                # and the finished cancelled root must NOT offer the action.
-                for absent_id in ("direct-turn", "sub-child1", "bg-consciousness", "gone-root"):
+                # Marker-less direct-turn shape, subagent child and the
+                # finished cancelled root must NOT offer the action.
+                for absent_id in ("direct-turn", "sub-child1", "gone-root"):
                     card = page.locator(f'.chat-live-card[data-task-id="{absent_id}"]')
                     card.wait_for(state="attached", timeout=30_000)
                     assert card.locator('[data-cancel-run]').count() == 0, absent_id
@@ -3645,6 +3722,7 @@ def test_ui_smoke_cancel_run_button_eligibility_and_cancelled_state(direct_serve
                 page.screenshot(path=str(data_dir.parent / "cancel-run.png"), full_page=True)
             finally:
                 browser.close()
+                _release_mock_model()
     except PlaywrightError as exc:
         if "Executable doesn't exist" in str(exc) or "playwright install" in str(exc).lower():
             pytest.skip(str(exc))

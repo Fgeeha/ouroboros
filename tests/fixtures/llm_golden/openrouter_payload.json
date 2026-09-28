@@ -176,10 +176,9 @@
                   }
                 }
               }
-            ],
-            "tool_choice": "auto"
+            ]
           },
-          "value_sha256": "fe14f72abfa7b6c0ef43ced5b56a33ea01c1ca3285a481834c5e7c9332924971"
+          "value_sha256": "62f5abe098c360c7e3fde2a71518f98fdb88953d58f86f96f42edc5181b85660"
         },
         "sends": [],
         "unused_script_steps": 0
@@ -303,10 +302,9 @@
                   }
                 }
               }
-            ],
-            "tool_choice": "auto"
+            ]
           },
-          "value_sha256": "9e0d96f20e3a6b1a39f2426a99d1a5a7ef4ec4024cf1b850e14cbd01b63038e5"
+          "value_sha256": "e4804aeb77658b2d38a8e81e603478dda0d5b1ca38d040998025a48803d03ee5"
         },
         "sends": [],
         "unused_script_steps": 0
@@ -975,10 +973,9 @@
                   "max_total_results": 7
                 }
               }
-            ],
-            "tool_choice": "auto"
+            ]
           },
-          "value_sha256": "3c47f4ea71be851bcf4b5c1b8140fff1c50e31b256e7392eab9e4eb81c7a3238"
+          "value_sha256": "8ce93e0e8ce4b3478c4980a4b9844f4b02429571f5a97837514a6656bea470f1"
         },
         "sends": [],
         "unused_script_steps": 0
@@ -1397,6 +1394,89 @@
       }
     },
     {
+      "id": "openrouter.payload.openai_family_system_prefix_split",
+      "route": "OpenRouter openai/ family: a builder-declared 3-block system keeps only its stable block on the wire, the remaining blocks ride as ONE [SYSTEM NOTICE] user message before the task, and the sticky session is prefix-only (measured 2026-09-25: OpenAI's public API reuses a prompt cache for the whole leading system section as one unit under one routing key)",
+      "spec": {
+        "env": {
+          "OPENROUTER_API_KEY": "or-fixture-key"
+        },
+        "call": {
+          "kind": "build_kwargs",
+          "model": "openai/gpt-6-sol",
+          "args": {
+            "messages": [
+              {
+                "role": "system",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "stable policy prefix",
+                    "cache_control": {
+                      "type": "ephemeral"
+                    }
+                  },
+                  {
+                    "type": "text",
+                    "text": "semi-stable memory block",
+                    "cache_control": {
+                      "type": "ephemeral"
+                    }
+                  },
+                  {
+                    "type": "text",
+                    "text": "mutable task evidence"
+                  }
+                ],
+                "_stable_prefix_blocks": 1
+              },
+              {
+                "role": "user",
+                "content": "hello"
+              }
+            ],
+            "reasoning_effort": "high"
+          }
+        }
+      },
+      "expected": {
+        "returned": {
+          "value": {
+            "model": "openai/gpt-6-sol",
+            "messages": [
+              {
+                "role": "system",
+                "content": [
+                  {
+                    "type": "text",
+                    "text": "stable policy prefix"
+                  }
+                ]
+              },
+              {
+                "role": "user",
+                "content": "[SYSTEM NOTICE]\nHost context for this turn: memory, knowledge index, runtime facts and recent activity, rendered by the runtime as a continuation of the system prompt. Not written by my human and not a message to answer; the message to act on follows next.\n\nsemi-stable memory block\n\nmutable task evidence"
+              },
+              {
+                "role": "user",
+                "content": "hello"
+              }
+            ],
+            "max_tokens": 1024,
+            "extra_body": {
+              "reasoning": {
+                "effort": "high",
+                "exclude": false
+              },
+              "session_id": "ouroboros-session-254615c202ffb1309fea7d9e5316083e"
+            }
+          },
+          "value_sha256": "28234a3882088dedab5cef719fcac76f9011787c5724318d7ab3a55dc5651810"
+        },
+        "sends": [],
+        "unused_script_steps": 0
+      }
+    },
+    {
       "id": "openrouter.dispatch.happy_path",
       "route": "chat -> OpenRouter: cached client, sticky session, usage/cost projection",
       "spec": {
@@ -1517,9 +1597,9 @@
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
-              "source_profile_fingerprint": "5d373718d25f9f9b058436981c1df603a8a71050bfb2beb44f0d802c9594d456",
-              "accepted_profile_fingerprint": "5d373718d25f9f9b058436981c1df603a8a71050bfb2beb44f0d802c9594d456",
-              "candidate_sha256": "7240a94793b0c91d2b7667b20adcb07f990ede3498972a3cd92e6f5c5644dfca",
+              "source_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
+              "accepted_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
+              "candidate_sha256": "dfa3b4af80ed25e9ddc9fb9e71f7eb7b15b354522b071a86f2c8556d4644e644",
               "ladder_ordinal": 1,
               "applied_actions": [],
               "task_local": false,
@@ -1573,7 +1653,6 @@
                 }
               ],
               "model": "anthropic/claude-sonnet-4.6",
-              "tool_choice": "auto",
               "tools": [
                 {
                   "function": {
@@ -1606,7 +1685,7 @@
                 }
               ]
             },
-            "payload_sha256": "7240a94793b0c91d2b7667b20adcb07f990ede3498972a3cd92e6f5c5644dfca"
+            "payload_sha256": "dfa3b4af80ed25e9ddc9fb9e71f7eb7b15b354522b071a86f2c8556d4644e644"
           }
         ],
         "physical_attempts": [
@@ -1614,8 +1693,8 @@
             "source": "llm.chat",
             "model": "anthropic/claude-sonnet-4.6",
             "provider": "openrouter",
-            "candidate_raw_sha256": "7240a94793b0c91d2b7667b20adcb07f990ede3498972a3cd92e6f5c5644dfca",
-            "candidate_raw_size_bytes": 728,
+            "candidate_raw_sha256": "dfa3b4af80ed25e9ddc9fb9e71f7eb7b15b354522b071a86f2c8556d4644e644",
+            "candidate_raw_size_bytes": 707,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",
@@ -2031,7 +2110,7 @@
               "reason_code": "requested_wire_form",
               "source_profile_fingerprint": "19c811f5ac19e7306291f6772dff68541a405d7d1b31d3065e4f812783667bf5",
               "accepted_profile_fingerprint": "19c811f5ac19e7306291f6772dff68541a405d7d1b31d3065e4f812783667bf5",
-              "candidate_sha256": "d84fb776e88a4b00cd851b3665626b0474aed02c389ab10b667aceb203036e37",
+              "candidate_sha256": "f1b47abdc717d4734c08a823b6396cdd0d044f43637f54b397556190e9daadd1",
               "ladder_ordinal": 1,
               "applied_actions": [],
               "task_local": false,
@@ -2083,8 +2162,8 @@
             "source": "llm.chat",
             "model": "x-ai/grok-4.5",
             "provider": "openrouter",
-            "candidate_raw_sha256": "d84fb776e88a4b00cd851b3665626b0474aed02c389ab10b667aceb203036e37",
-            "candidate_raw_size_bytes": 286,
+            "candidate_raw_sha256": "f1b47abdc717d4734c08a823b6396cdd0d044f43637f54b397556190e9daadd1",
+            "candidate_raw_size_bytes": 271,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",
@@ -2218,9 +2297,9 @@
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
-              "source_profile_fingerprint": "2ae5f0e09375d06dc4f897db3d195b8a452ed50bb34d481d5d22096ea9f068da",
-              "accepted_profile_fingerprint": "2ae5f0e09375d06dc4f897db3d195b8a452ed50bb34d481d5d22096ea9f068da",
-              "candidate_sha256": "12f7d016544f4f15cd359030e13c678f193ffbc804c823fd45d2f745579e07b9",
+              "source_profile_fingerprint": "b3665fdf2866b600747bc031a414a4bb341b2d4663904da97f5ffebcbeabe844",
+              "accepted_profile_fingerprint": "b3665fdf2866b600747bc031a414a4bb341b2d4663904da97f5ffebcbeabe844",
+              "candidate_sha256": "41e784c12495bc22d0d006fb393905cbb6d9b82e05563fee57a175e3698a50f8",
               "ladder_ordinal": 1,
               "applied_actions": [],
               "task_local": false,
@@ -2262,7 +2341,6 @@
                 }
               ],
               "model": "x-ai/grok-4.5",
-              "tool_choice": "auto",
               "tools": [
                 {
                   "function": {
@@ -2291,7 +2369,7 @@
                 }
               ]
             },
-            "payload_sha256": "12f7d016544f4f15cd359030e13c678f193ffbc804c823fd45d2f745579e07b9"
+            "payload_sha256": "41e784c12495bc22d0d006fb393905cbb6d9b82e05563fee57a175e3698a50f8"
           }
         ],
         "physical_attempts": [
@@ -2299,8 +2377,8 @@
             "source": "llm.chat",
             "model": "x-ai/grok-4.5",
             "provider": "openrouter",
-            "candidate_raw_sha256": "12f7d016544f4f15cd359030e13c678f193ffbc804c823fd45d2f745579e07b9",
-            "candidate_raw_size_bytes": 557,
+            "candidate_raw_sha256": "41e784c12495bc22d0d006fb393905cbb6d9b82e05563fee57a175e3698a50f8",
+            "candidate_raw_size_bytes": 536,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",
@@ -2752,9 +2830,9 @@
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
-              "source_profile_fingerprint": "5d373718d25f9f9b058436981c1df603a8a71050bfb2beb44f0d802c9594d456",
-              "accepted_profile_fingerprint": "5d373718d25f9f9b058436981c1df603a8a71050bfb2beb44f0d802c9594d456",
-              "candidate_sha256": "1ffbf50339b4041d15b47f8ee7582ec66b70a4a5686452623f5dc9b9ba2c2179",
+              "source_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
+              "accepted_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
+              "candidate_sha256": "9451eeb0c00429e0c3b5e88d3ec0795aa56ed2818e36b1f238ff30669cd22b22",
               "ladder_ordinal": 1,
               "applied_actions": [],
               "task_local": false,
@@ -2785,7 +2863,7 @@
                   "effort": "medium",
                   "exclude": false
                 },
-                "session_id": "ouroboros-session-e8e49f8c93db5babc27cd74e553a4242"
+                "session_id": "ouroboros-session-f706174fa3ad320daf733cb9d635fe32"
               },
               "max_tokens": 65536,
               "messages": [
@@ -2843,7 +2921,6 @@
                 }
               ],
               "model": "anthropic/claude-sonnet-4.6",
-              "tool_choice": "auto",
               "tools": [
                 {
                   "cache_control": {
@@ -2866,7 +2943,7 @@
                 }
               ]
             },
-            "payload_sha256": "1ffbf50339b4041d15b47f8ee7582ec66b70a4a5686452623f5dc9b9ba2c2179"
+            "payload_sha256": "9451eeb0c00429e0c3b5e88d3ec0795aa56ed2818e36b1f238ff30669cd22b22"
           }
         ],
         "physical_attempts": [
@@ -2874,8 +2951,8 @@
             "source": "llm.chat",
             "model": "anthropic/claude-sonnet-4.6",
             "provider": "openrouter",
-            "candidate_raw_sha256": "1ffbf50339b4041d15b47f8ee7582ec66b70a4a5686452623f5dc9b9ba2c2179",
-            "candidate_raw_size_bytes": 891,
+            "candidate_raw_sha256": "9451eeb0c00429e0c3b5e88d3ec0795aa56ed2818e36b1f238ff30669cd22b22",
+            "candidate_raw_size_bytes": 870,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",
@@ -3142,9 +3219,9 @@
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
-              "source_profile_fingerprint": "5d373718d25f9f9b058436981c1df603a8a71050bfb2beb44f0d802c9594d456",
-              "accepted_profile_fingerprint": "5d373718d25f9f9b058436981c1df603a8a71050bfb2beb44f0d802c9594d456",
-              "candidate_sha256": "302021c92dbbdbd340fdaa45091fec0449b052d6b3c5cf5fea83067f8d34e507",
+              "source_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
+              "accepted_profile_fingerprint": "760c6157eb99a45072ed50ff3f02dda60fc887c3534865f85fbad14fcca919d1",
+              "candidate_sha256": "59c91042eda38434e8d30fa8df23731bb5d0d79cef37adef46d3c3b1178c7f0f",
               "ladder_ordinal": 1,
               "applied_actions": [],
               "task_local": false,
@@ -3198,7 +3275,6 @@
                 }
               ],
               "model": "anthropic/claude-sonnet-4.6",
-              "tool_choice": "auto",
               "tools": [
                 {
                   "cache_control": {
@@ -3220,7 +3296,7 @@
                 }
               ]
             },
-            "payload_sha256": "302021c92dbbdbd340fdaa45091fec0449b052d6b3c5cf5fea83067f8d34e507"
+            "payload_sha256": "59c91042eda38434e8d30fa8df23731bb5d0d79cef37adef46d3c3b1178c7f0f"
           }
         ],
         "physical_attempts": [
@@ -3228,8 +3304,8 @@
             "source": "llm.chat",
             "model": "anthropic/claude-sonnet-4.6",
             "provider": "openrouter",
-            "candidate_raw_sha256": "302021c92dbbdbd340fdaa45091fec0449b052d6b3c5cf5fea83067f8d34e507",
-            "candidate_raw_size_bytes": 592,
+            "candidate_raw_sha256": "59c91042eda38434e8d30fa8df23731bb5d0d79cef37adef46d3c3b1178c7f0f",
+            "candidate_raw_size_bytes": 571,
             "candidate_measurement_kind": "canonical_json_v1",
             "states": [
               "reserved",

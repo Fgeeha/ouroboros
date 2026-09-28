@@ -24,7 +24,7 @@ from ouroboros.presence_capabilities import (
     resolve_presence_profile_state,
 )
 from ouroboros.presence_profile import PresenceProfileError, parse_presence_profile
-from ouroboros.skill_loader import find_skill, review_status_allows_execution
+from ouroboros.skill_loader import find_skill
 
 
 class PresenceAdmissionError(ValueError):
@@ -54,6 +54,7 @@ class PresenceAdmission:
     state_fingerprint: str
     selection_fingerprint: str
     capability_ceiling: PresenceCapabilityCeiling
+    workspace_root: str = ""
 
 
 def _component_error(exc: Any) -> PresenceAdmissionError:
@@ -99,11 +100,15 @@ def _required_selection_ready(root: Path, profile: Any, resolution: Any) -> None
                 and is_extension_live(target.provider, root)
             )
         elif isinstance(target, PresenceToolTarget):
-            from ouroboros.mcp_client import ensure_configured_from_settings, get_manager
+            from ouroboros.mcp_client import canonical_server_id, ensure_configured_from_settings, get_manager
 
             ensure_configured_from_settings(refresh=False)
             tool = get_manager().get_tool(target.name)
-            ready = bool(tool and str(tool.get("server_id") or "") == target.provider)
+            server = str(tool.get("server_id") or "") if tool else ""
+            # The same wire tool on the one server its stored provider names —
+            # exactly, or through the fixed-point id a pre-#1328 grant stored
+            # unconverged. An ambiguous id serves no tools, so it never matches.
+            ready = bool(server) and server in {target.provider, canonical_server_id(target.provider)}
         elif isinstance(target, PresenceScriptTarget):
             script_skill = find_skill(root, target.skill)
             scripts = {
@@ -123,7 +128,7 @@ def admit_presence_turn(
     drive_root: Path,
     authenticated_transport_skill: str,
     binding_id: str,
-    global_max_rounds: int,
+    global_max_rounds: int | None,  # None = no task round limit; the inline cap stays finite
     repo_path: str | None = None,
 ) -> PresenceAdmission:
     """Resolve one opaque binding into a frozen, reviewed admission snapshot."""
@@ -154,12 +159,13 @@ def admit_presence_turn(
             "presence_behavior_skill_disabled",
             "binding.behavior_skill",
         )
-    if skill.review.is_stale_for(skill.content_hash):
+    gate = skill.review.gate_for(skill.content_hash)
+    if gate["blocking_reason"] == "review_stale":
         raise PresenceAdmissionError(
             "presence_behavior_review_stale",
             "binding.behavior_skill",
         )
-    if not review_status_allows_execution(skill.review.status):
+    if not gate["executable_review"]:
         raise PresenceAdmissionError(
             "presence_behavior_review_not_executable",
             "binding.behavior_skill",
@@ -173,6 +179,18 @@ def admit_presence_turn(
                 "binding.behavior_skill",
             )
         state = load_presence_state(root, skill.name)
+        from ouroboros.workspace_admission import WorkspaceRootError, validate_workspace_root
+
+        try:
+            workspace = validate_workspace_root(
+                state.workspace_root,
+                system_repo_dir=Path(__file__).resolve().parents[1],
+                drive_root=root,
+            )
+        except WorkspaceRootError as exc:
+            raise PresenceAdmissionError(
+                "presence_workspace_unusable", "presence_state.workspace_root", str(exc),
+            ) from exc
         state_digest = presence_state_fingerprint(state)
         resolution = resolve_presence_profile_state(
             profile,
@@ -206,6 +224,7 @@ def admit_presence_turn(
         state_fingerprint=state_digest,
         selection_fingerprint=resolution.selection_fingerprint,
         capability_ceiling=ceiling,
+        workspace_root=str(workspace) if workspace is not None else "",
     )
 
 
