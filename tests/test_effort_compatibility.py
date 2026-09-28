@@ -59,6 +59,15 @@ def _exception(error):
     pytest.param("medium", _error(
         "Invalid option", param="reasoning.effort", allowed_values=["minimal", "ultra"]),
         "minimal", id="advertised-minimal-below"),
+    pytest.param("ultra", _error("reasoning.effort value 'ultra' is not supported. "
+                                 "Supported values are: 'low', 'medium', or 'high'."),
+        "high", id="serial-or-conjunction"),
+    pytest.param("ultra", _error("reasoning.effort value 'ultra' is not supported. "
+                                 "Supported values are: 'low', 'medium', and 'high'."),
+        "high", id="serial-and-conjunction"),
+    pytest.param("ultra", _error("reasoning.effort: Input should be 'low', 'medium' or 'high' "
+                                 "and xhigh requires a pro plan"),
+        "high", id="conjunction-stops-at-prose"),
 ])
 def test_enum_without_scalar_echo_reaches_driver_and_learns_only_after_success(
     evidence_root, tmp_path, asynchronous, body_error, requested, error, applied,
@@ -191,17 +200,21 @@ def test_minimum_recovery_preserves_legacy_aliases_and_requires_positive_evidenc
 
 @pytest.mark.parametrize("body_error", [False, True])
 @pytest.mark.parametrize("carrier", ["top", "nested", "anthropic"])
-def test_positive_constraints_are_bound_to_field_and_ignore_negative_quotes(evidence_root, carrier, body_error):
+@pytest.mark.parametrize("supported,applied", [
+    # The old parser accepted the negative 'max' as the highest prescription.
+    ("; 'max' is not supported. Supported values are: 'low', 'medium', 'high', 'xhigh'.", "xhigh"),
+    # The old parser read the serial conjunction as a value 'or' and lost 'high'.
+    (". Supported values are: 'low', 'medium', or 'high'.", "high"),
+])
+def test_positive_constraints_are_bound_to_field_and_ignore_negative_quotes(evidence_root, carrier, body_error, supported, applied):
     target = _target("anthropic" if carrier == "anthropic" else "openrouter")
     field = {"top": "reasoning_effort", "nested": "reasoning.effort", "anthropic": "output_config.effort"}[carrier]
     source = _value_payload(carrier, target, "ultra")
-    # The old parser accepted the negative 'max' as the highest prescription.
-    error = _error(f"{field} value 'ultra' is not supported; 'max' is not supported. "
-                   "Supported values are: 'low', 'medium', 'high', 'xhigh'.")
+    error = _error(f"{field} value 'ultra' is not supported{supported}")
     with request_wire_call_scope():
         sent = prepare_wire_payload_for_send(target, source, api_surface="messages" if carrier == "anthropic" else "chat.completions")
         retry = plan_next_wire_retry(sent, error=error if body_error else _exception(error), body_error=body_error)
-        assert payload_effort(retry) == "xhigh"
+        assert payload_effort(retry) == applied
 
 
 @pytest.mark.parametrize("body_error", [False, True])
@@ -215,6 +228,8 @@ def test_positive_constraints_are_bound_to_field_and_ignore_negative_quotes(evid
                  "minimal", id="text-minimal"),
     pytest.param("none", _error("Reasoning is mandatory", param="{field}", enum=["minimal", "high"]),
                  "minimal", id="mandatory-floor-minimal"),
+    pytest.param("none", _error('{field} is mandatory: supported values are "high", "medium", or "minimal"'),
+                 "minimal", id="mandatory-text-conjunction-minimal"),
     pytest.param("medium", _error("Invalid option", param="{field}", enum=["none", "high"]),
                  "high", id="none-is-not-comparable"),
     pytest.param("medium", _error("{field} value 'medium' is not supported; 'minimal' is not "
@@ -255,6 +270,8 @@ def test_advertised_minimal_is_a_comparable_tier(evidence_root, carrier, body_er
     _error("reasoning.effort: invalid option", param="reasoning.effort", code="invalid_option"),
     _error("reasoning.effort value 'ultra' invalid; temperature expected one of 'low', 'high'"),
     _error("reasoning.effort value 'high' invalid; expected one of 'low', 'medium'"),
+    _error("reasoning.effort value 'ultra' invalid; temperature expected one of 'low', or 'high'"),
+    _error("reasoning.effort value 'high' invalid; supported values are 'low', 'medium', or 'xhigh'"),
     _error(ENUM_MESSAGE, param="reasoning.effort", value="high"),
 ])
 @pytest.mark.parametrize("body_error", [False, True])
@@ -276,6 +293,20 @@ def test_structured_enum_and_parameter_survive_sdk_exception_projection(evidence
         retry = plan_next_wire_retry(sent, error=_exception(_error(
             "Invalid option", param="reasoning.effort", code="invalid_option", allowed_values=["low", "high"])))
     assert payload_effort(retry) == "high"
+
+
+@pytest.mark.parametrize("body_error", [False, True])
+@pytest.mark.parametrize("message,allowed", [
+    ('reasoning_effort: expected one of "and"|"or"', ("and", "or")),
+    ("reasoning_effort: allowed values are 'low', 'or', or 'high'", ("low", "or", "high")),
+    ("reasoning_effort: allowed values are low, medium, or high", ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are 'low' or higher", ("low",)),
+])
+def test_enum_conjunction_keeps_quoted_literals_and_stops_at_prose(body_error, message, allowed):
+    from ouroboros.request_wire_recovery import _wire_rejection
+
+    error = _error(message)
+    assert _wire_rejection(error if body_error else _exception(error)).allowed == allowed
 
 
 def test_rejection_from_another_physical_candidate_cannot_change_this_one(evidence_root):
@@ -320,6 +351,7 @@ def test_carrierless_repair_requires_its_prepared_logical_and_physical_input(evi
 @pytest.mark.parametrize("body_error", [False, True])
 @pytest.mark.parametrize("error,omitted", [
     (_error("thinking.type: Input should be 'adaptive'"), True),
+    (_error("thinking.type: Input should be 'enabled', 'adaptive', or 'disabled'"), False),
     (_error("Invalid type", param="thinking.type", enum=["adaptive"], value="disabled"), True),
     (_error("Invalid type", param="thinking.type", enum=["adaptive", "disabled"]), False),
     (_error("Invalid type", param="thinking.type", enum=["adaptive"], value="enabled"), False),

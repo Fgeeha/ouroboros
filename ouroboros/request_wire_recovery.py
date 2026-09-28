@@ -653,13 +653,17 @@ def _wire_rejection(error: Any) -> _WireRejection:
                 param = next((name for name in reversed(named) if name in fields), "")
             # Consume the list itself, stopping at prose (including a negative
             # clause). This accepts quoted JSON/Zod enums and plain comma lists.
+            # A conjunction ("a, b, or c") joins only a literal quoted like its
+            # predecessor: a quoted 'or' stays a value and bare prose ends the list.
             tail = message[clause.end():].lstrip(" :[=({")
             tail = re.sub(r"^(?:are|is)\b", "", tail).lstrip(" :[=({")
             tokens = []
-            while match := re.match(r"[\"']?([a-z][a-z0-9_-]*)[\"']?", tail):
-                tokens.append(match.group(1))
+            while match := re.match(r"([\"']?)([a-z][a-z0-9_-]*)[\"']?", tail):
+                tokens.append(match.group(2))
                 tail = tail[match.end():]
-                separator = re.match(r"\s*(?:[,|]|\bor\b)\s*", tail)
+                lead = match.group(1) or "[\"']?"
+                separator = (re.match(rf"\s*,?\s*\b(?:or|and)\b\s*(?={lead}[a-z])", tail)
+                             or re.match(r"\s*[,|]\s*", tail))
                 if not separator:
                     break
                 tail = tail[separator.end():]
