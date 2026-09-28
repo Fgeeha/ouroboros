@@ -171,15 +171,20 @@ def announce_acceptance_settlement(usage_ctx: Any, request: Any, wave: Dict[str,
     if usage_ctx is None or not getattr(usage_ctx, "drive_root", None):
         return
     task_id = str(getattr(request, "task_id", "") or "")
-    # A mailbox notice is not canonical consumption. Keep the operation's
-    # reconciliation duty through the author's final-collection/terminal-write
-    # gap; physical closure persists it as ``unpublished`` for maintenance.
-    _unpublished(task_id, str(getattr(request, "retry_key", "") or ""), "unpublished")
     try:
         from ouroboros.task_results import load_task_result
 
         row = load_task_result(_result_root(usage_ctx), task_id) or {}
-        if acceptance_actor_ended(usage_ctx, task_id, row):
+        ended = acceptance_actor_ended(usage_ctx, task_id, row)
+        if ended and not all((wave.get("slots") or {}).values()):
+            # A delayed quorum callback may collect the final actors but still
+            # carry pending lines. Only the complete roster owns the terminal
+            # notice; a stale wake must not reopen its publication duty either.
+            return
+        # A mailbox notice is not canonical consumption. Keep the operation's
+        # duty through the author's terminal-write gap for maintenance.
+        _unpublished(task_id, str(getattr(request, "retry_key", "") or ""), "unpublished")
+        if ended:
             attach_late_acceptance_settlement(usage_ctx, request, wave, result=row)
             return
         from ouroboros.owner_mailbox import write_task_message
