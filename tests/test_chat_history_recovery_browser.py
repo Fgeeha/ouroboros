@@ -114,7 +114,7 @@ _RECENT_STATE = """feed => {
     const root = document.querySelector(feed);
     const controls = root?.querySelector('.chat-load-older');
     const button = controls?.querySelector('button');
-    const note = controls?.querySelector('.chat-load-older-note');
+    const note = root.parentElement.querySelector('.chat-load-older-note');
     const shown = node => Boolean(node) && node.getClientRects().length > 0
         && getComputedStyle(node).visibility !== 'hidden';
     return {

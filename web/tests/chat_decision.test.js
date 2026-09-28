@@ -69,6 +69,29 @@ test('a late targeted question read cannot steal a newer navigation or a hidden 
     } finally { fx.restore(); }
 });
 
+test('question intent cancels the bookmark before I/O and yields to a later viewport intent', async () => {
+    let finish, started = 0, current = true;
+    const fx = fixture({ fetchDetail: () => new Promise(resolve => { finish = resolve; }) });
+    const appended = [];
+    const begin = () => { started++; return () => current; };
+    try {
+        const pending = fx.decision.revealQuestion('t-1', 'qz-1', 'p1', 23,
+            msg => appended.push(msg), () => true, begin);
+        assert.equal(started, 1, 'saved restoration is cancelled synchronously');
+        await Promise.resolve();
+        current = false; // wheel or latest while detail is in flight
+        finish({ task_id: 't-1', project_id: 'p1', owner_quiz: { 'qz-1': WS_MSG } });
+        assert.equal(await pending, false);
+        assert.deepEqual(appended, []);
+        current = true;
+        const unavailable = fx.decision.revealQuestion('missing', 'qz-1', 'p1', 23,
+            msg => appended.push(msg), () => true, begin);
+        assert.equal(started, 2);
+        await Promise.resolve(); finish(null);
+        assert.equal(await unavailable, false);
+    } finally { fx.restore(); }
+});
+
 test('required question renders waiting identically from live and stored frames', () => {
     const fx = fixture();
     try {

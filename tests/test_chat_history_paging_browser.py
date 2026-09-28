@@ -22,6 +22,7 @@ HISTORY_URL = "/api/chat/history"
 _FRAMES = "() => new Promise(done => requestAnimationFrame(() => requestAnimationFrame(done)))"
 _EDGE_SCROLL = """(root, direction) => {
     root.scrollTop = direction === 'older' ? 0 : root.scrollHeight;
+    root.dispatchEvent(new WheelEvent('wheel', {deltaY: direction === 'older' ? -1 : 1}));
     root.dispatchEvent(new Event('scroll'));
 }"""
 _OBSERVE_HISTORY = """() => {
@@ -128,13 +129,13 @@ def _reads(page, chat_id=1):
 
 def _step(page, feed, direction="older", *, automatic=False):
     before = page.evaluate("() => window.__historyReads.length")
-    if automatic:
+    if automatic and direction == "older":
         page.locator(feed).evaluate(_EDGE_SCROLL, direction)
     else:
-        assert direction == "older", "`Load older messages` is the only paging button"
+        # Mixed cards have no physical edge: the common button fills the known gap.
         # This exercises the visible button's handler without changing a reader's
         # selection or forcing an off-screen control into the reading viewport.
-        page.locator(f"{feed} .chat-load-{direction} button").evaluate("node => node.click()")
+        page.locator(f"{feed} .chat-load-older button").evaluate("node => node.click()")
     page.wait_for_function("n => window.__historyReads.length > n", arg=before, timeout=30_000)
     _idle(page, feed)
 
@@ -142,8 +143,10 @@ def _step(page, feed, direction="older", *, automatic=False):
 def _to_beginning(page, feed):
     for _ in range(80):
         _idle(page, feed)
-        if page.locator(f"{feed} .chat-load-older button").is_hidden():
-            assert page.locator(f"{feed} .chat-load-older-note").inner_text() == "Beginning of saved history"
+        latest = page.evaluate("() => window.__historyReads.filter(read => read.done && read.body).at(-1)?.body")
+        if latest and latest.get("has_more") is False:
+            note = page.locator(feed).locator('..').locator('.chat-load-older-note').inner_text()
+            assert note in {"Beginning of saved history", "Some saved history is not loaded. Shown messages may have gaps."}
             return
         _step(page, feed, automatic=True)
     pytest.fail("archive navigation did not reach its physical beginning")
@@ -169,7 +172,7 @@ def _open_project(page, project):
 def _screenshot(page, tmp_path, name):
     root = Path(os.environ.get("HISTORY_UI_EVIDENCE_DIR") or tmp_path / "history-ui-evidence")
     root.mkdir(parents=True, exist_ok=True)
-    page.screenshot(path=str(root / f"{name}.png"), full_page=False)
+    page.screenshot(path=str(root / f"{name}.png"), full_page=False, animations="disabled")
 
 
 def _assert_main_beginning_visible(page):
@@ -178,7 +181,7 @@ def _assert_main_beginning_visible(page):
     bounds = page.evaluate("""() => {
         const root = document.querySelector('#chat-messages');
         const first = [...root.querySelectorAll('.message')].find(node => node.textContent === 'history-human-0000');
-        const note = root.querySelector('.chat-load-older-note');
+        const note = root.parentElement.querySelector('.chat-load-older-note');
         const header = document.querySelector('#page-chat .chat-page-header');
         const box = root.getBoundingClientRect();
         return {top: first?.getBoundingClientRect().top, noteTop: note?.getBoundingClientRect().top,
@@ -188,7 +191,7 @@ def _assert_main_beginning_visible(page):
     assert bounds["scrollTop"] <= 1, bounds
     assert bounds["floor"] - 2 <= bounds["top"] < bounds["bottom"], bounds
     assert bounds["floor"] - 2 <= bounds["noteTop"] < bounds["bottom"], bounds
-    assert bounds["note"] == "Beginning of saved history", bounds
+    assert bounds["note"] in {"Beginning of saved history", "Some saved history is not loaded. Shown messages may have gaps."}, bounds
 
 
 @pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
@@ -292,7 +295,7 @@ def test_history_archive_navigation_rotation_retry_and_sparse_project(
                         _idle(page, feed)
                     assert len(_reads(page, project["chat_id"])) == settled, "a settled sparse room must not refetch"
                     assert page.locator(f"{feed} .message").filter(has_text="SPARSE_FIRST_SAVED_MESSAGE").count() == 1
-                    assert "OTHER_ROOM_ONLY" not in page.locator(feed).inner_text()
+                    assert "OTHER_ROOM_ONLY" not in page.locator(feed).locator('..').inner_text()
                     assert any(read.get("body", {}).get("messages") == [] and read["body"]["has_more"]
                                for read in _reads(page, project["chat_id"]) if read.get("cursor"))
                     _screenshot(page, tmp_path, f"sparse-beginning-{browser_engine}-{width}")

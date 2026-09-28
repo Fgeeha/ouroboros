@@ -697,3 +697,14 @@ def test_wake_scan_reads_each_result_and_project_registry_once(tmp_path, monkeyp
     assert len(observed.events) == total
     assert len(reads) == total and set(reads.values()) == {1}
     assert project_reads == [True]
+
+
+def test_first_wake_uses_late_publication_when_old_readiness_debt_remains(tmp_path):
+    _write(tmp_path, "late", status="failed", ts=_iso(T0 - 86400), updated_at=_iso(T0 - 10),
+           canonical_terminal_projection_ready={"task_done_ts": _iso(T0 - 86400)},
+           canonical_terminal_projection={"written_at": _iso(T0 - 10)},
+           terminal_time={"occurred_at": _iso(T0 - 86400), "source": "executor_terminal"})
+    first = _wake(tmp_path, None, T0)
+    assert len(first.events) == 1 and first.events[0][0] == "task_terminal"
+    assert "task late failed" in first.events[0][2]
+    assert _wake(tmp_path, first.boundary, T0 + 600).events == ()

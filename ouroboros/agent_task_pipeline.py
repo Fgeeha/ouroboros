@@ -1131,6 +1131,7 @@ def _store_task_result(env: Any, task: Dict[str, Any], text: str,
             env.drive_root,
             str(task.get("id") or ""),
             status,
+            _terminal_observed=True,
             reason_code=reason_code,
             outcome_axes=outcome_axes,
             # Compatibility mirror consumed by the gateway and task_done event.

@@ -285,7 +285,7 @@ test('plain project row renders escaped text with the Project reference and no m
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
         assert.equal(message.contains(actions), false);
-        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
         assert.ok(actions, 'system-message-actions container present');
         // The row points at its Project with the one reference, never a button of its own.
         assert.deepEqual(referenceShape(actions.children[0]), LAUNCH_REFERENCE);
@@ -322,7 +322,7 @@ test('a completion row carrying the answer renders as an ordinary Ouroboros mess
         assert.doesNotMatch(bubble.innerHTML, /Open the Project for details|Completed/);
         const message = bubble.querySelector('.message');
         const actions = bubble.children.find((node) => node.classList.contains('system-message-actions'));
-        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 1);
+        assert.equal(bubble.children.indexOf(actions), bubble.children.indexOf(message) + 2);
         // One control, and the SAME one the System row carries: the voice of a row never
         // chooses how the UI points at its Project.
         assert.equal(actions.children.length, 1);
@@ -402,7 +402,7 @@ test('the fold is CSS over the complete answer: clamp always, fade only when fol
     assert.match(rules, /\.chat-bubble\.project-answer\.is-folded > \.message \{[^}]*mask-image/);
     assert.doesNotMatch(rules, /user-select|font-size: \d|#[0-9a-fA-F]{3,6}\b/);
     // chat.js stays a caller: the decoration lives in its own module.
-    assert.match(chatSource, /decorateProjectRow\(bubble, \{ role, projectId, projectName \}\)/);
+    assert.match(chatSource, /decorateProjectRow\(bubble, \{ role, projectId, projectName,/);
 });
 
 test('plain system row renders identically live and after history reload', async () => {

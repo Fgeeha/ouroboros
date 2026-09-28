@@ -477,6 +477,7 @@
  * @property {string=} project_id
  * @property {string=} project_name
  * @property {string=} handoff_id  // immutable origin/destination receipt identity
+ * @property {Object=} terminal_time  // host-owned occurrence; ts remains publication time
  * @property {string=} completion_answer  // a Project root's model-authored final answer, mirrored into Main
  * @property {number=} chat_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
@@ -1545,7 +1546,8 @@ export const GATEWAY_CONTRACT_VERSION = '7.5.1';
  * @property {boolean} has_more Older bytes remain or a disclosed source gap prevents establishing EOF.
  * @property {string|null} next_cursor Opaque room-bound older continuation.
  * @property {string|null} page_cursor Replays a frozen page; null for an unavailable source boundary.
- * @property {{complete:boolean,truncated_by:Array<string>}} window Whole-history coverage.
+ * @property {{complete:boolean,truncated_by:Array<string>}} window Bounds/gaps of this response.
+ * @property {{v:1,view:string,upper:Object,spans:Object}=} coverage Delivered physical byte spans, after deferrals.
  * @property {string} [next_before_ts] Legacy field retained for compatibility.
  * @property {string} [error]
  * @property {string} [reason_code]

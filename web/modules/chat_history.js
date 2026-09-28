@@ -1,5 +1,62 @@
 import { isReplayEvidenceRow } from './chat_activity.js';
 
+/** Mixed cards have no trustworthy physical boundary. Their navigation stays
+ * on the common keyboard-accessible button, never a timestamp separator. */
+export function historyIslandAtEdge(feed, ids, historyNodes) {
+    const roots = [...ids].flatMap(historyNodes).map(node => node.closest('.chat-live-card') || node);
+    const unambiguous = roots.length && roots.every(root =>
+        [...root.querySelectorAll('[data-history-id]')].every(node => ids.has(node.dataset.historyId)));
+    const bottom = Math.max(...roots.map(node => node.getBoundingClientRect().bottom));
+    const rect = feed.getBoundingClientRect();
+    return unambiguous && bottom >= rect.top && bottom <= rect.bottom + 80;
+}
+
+/** Coverage is byte delivery, never chronology, shared row identity or EOF.
+ * The recent read supplies the horizon. A clean overlapping re-read can heal
+ * a failed span; evicted bodies and saved descriptors cannot certify bytes.
+ */
+export function historyCoverage(recent, pages = []) {
+    let complete = true, gaps = pages.some(value => value?.v !== 1 || value.view !== recent?.view), horizonGap = false;
+    if (recent?.v !== 1) return { complete: false, gaps: true, horizonGap: false };
+    for (const source of ['chat', 'progress']) {
+        const horizon = recent.upper?.[source], head = recent.spans?.[source];
+        if (!Number.isSafeInteger(horizon) || !head) { complete = false; gaps = true; continue; }
+        const delivered = [recent, ...pages].filter(value => value?.v === 1 && value.view === recent.view)
+            .map(value => value.spans?.[source]);
+        const valid = span => span && span.chain === head.chain && Array.isArray(span.gaps)
+                && Number.isSafeInteger(span.from) && Number.isSafeInteger(span.to)
+                && span.from >= 0 && span.from <= span.to;
+        // A formerly empty source owns no retained bytes. Its first write
+        // changes the chain witness without invalidating an older fragment.
+        const knownEmpty = span => span?.chain === 'empty' && span.from === 0 && span.to === 0
+            && Array.isArray(span.gaps) && !span.gaps.length;
+        if (delivered.some(span => !valid(span) && !knownEmpty(span))) gaps = true;
+        const spans = delivered.filter(span => valid(span) && !span.gaps.length)
+            .sort((a, b) => a.from - b.from);
+        const clean = [];
+        let end = null, start = null;
+        for (const span of spans) {
+            if (span.from > horizon) continue;
+            if (end !== null && span.from > end) gaps = true;
+            if (start === null) start = span.from;
+            if (!clean.length || span.from > clean.at(-1).to) clean.push({ ...span });
+            else clean.at(-1).to = Math.max(clean.at(-1).to, span.to);
+            end = Math.max(end ?? 0, Math.min(horizon, span.to));
+        }
+        // A failed read remains visible until a compatible clean read actually
+        // covers its bytes; simply dropping it cannot certify the fragment.
+        if (delivered.some(span => valid(span) && span.gaps.length
+            && !clean.some(range => range.from <= span.from && range.to >= span.to))) gaps = true;
+        if (end !== horizon) gaps = true;
+        if (start !== 0 || end !== horizon) complete = false;
+        const oldEnds = pages.filter(value => value?.view === recent.view)
+            .map(value => value?.spans?.[source]).filter(span => span?.chain === head.chain)
+            .map(span => span.to);
+        if (oldEnds.length && head.from > Math.max(...oldEnds)) horizonGap = true;
+    }
+    return { complete: complete && !gaps, gaps, horizonGap };
+}
+
 /** Chat's bounded archive-page owner. DOM, reading protection and live rows stay
  * with the chat instance; only fetchPage is asynchronous. Cursors are opaque.
  */
@@ -27,7 +84,7 @@ export function createChatHistoryPager({
     // A landed page that contributed no rows owns nothing to mount or restore, so
     // the window steps over it: it is a boundary the reader already crossed, not a
     // gap. Only a NON-EMPTY page missing from the cache is a real hole above/below.
-    const held = page => cache.has(page.id) || page.rows === 0;
+    const held = page => cache.has(page.id) || (page.rows === 0 && page.loaded);
     function bounds() {
         if (!pages.length) return { first: 0, last: 0 };
         let first = focus, last = focus;
@@ -54,6 +111,9 @@ export function createChatHistoryPager({
             firstPage: initialized ? pages[first] : null,
             lastPage: initialized ? pages[last] : null,
             cachedPages: [...cache.values()].map(entry => entry.page),
+            coverage: [...new Map([...cache.values()].map(entry => [entry.page.id, entry.page])
+                .concat(pages.filter(page => page.rows === 0 && page.loaded).map(page => [page.id, page])))
+                .values()].map(page => page.coverage),
         };
     }
     const publish = () => { if (alive()) onState(getState()); };
@@ -115,12 +175,17 @@ export function createChatHistoryPager({
         const messageCount = data.messages.filter(row => !isReplayEvidenceRow(row)).length;
         // Re-reading a page refreshes its row count, never its frozen boundaries.
         const prior = newChain ? null : pages[index];
-        const page = prior?.rows === messageCount ? prior : Object.freeze(prior
-            ? { ...prior, rows: messageCount }
-            : { id: `history-page-${nextChain}-${index}`, chain: nextChain, index,
+        const baseId = `history-page-${nextChain}-${index}`;
+        let id = baseId, suffix = 0;
+        while (!prior && (pages.some(page => page.id === id) || cache.has(id))) {
+            id = `${baseId}-${++suffix}`;
+        }
+        const page = Object.freeze(prior
+            ? { ...prior, rows: messageCount, loaded: true, coverage: data.coverage ?? null }
+            : { id, chain: nextChain, index,
                 requestCursor: data.page_cursor, nextCursor: data.next_cursor ?? null,
-                hasMore: data.has_more, rows: messageCount });
-        applyPage(data.messages, { ...page, direction, window: data.window ?? null });
+                hasMore: data.has_more, rows: messageCount, loaded: true, coverage: data.coverage ?? null });
+        applyPage(data.messages, { ...page, direction, window: data.window ?? null, recentVersion: data.recentVersion });
         if (!alive()) return { status: 'disposed' };
         if (newChain) { chain = nextChain; pages = [page]; }
         else pages[index] = page;
@@ -164,6 +229,12 @@ export function createChatHistoryPager({
         getState,
         exportResume(pageId = '') {
             const chosen = pages.findIndex(page => page.id === pageId);
+            // A protected page from an older chain can remain mounted after
+            // latest() replaces the navigable window. Save its own frozen
+            // boundary, rather than silently switching the bookmark to latest.
+            if (pageId && chosen < 0 && cache.has(pageId)) {
+                return { pages: [cache.get(pageId).page], focus: 0 };
+            }
             return pages.length ? { pages: [...pages], focus: chosen >= 0 ? chosen : focus } : null;
         },
         // A resume written before pages carried `rows` restores unchanged: an
@@ -173,7 +244,9 @@ export function createChatHistoryPager({
                 || !Number.isInteger(saved.focus) || !saved.pages[saved.focus]
                 || !saved.pages.every(page => typeof page.requestCursor === 'string'
                     && typeof page.hasMore === 'boolean')) return Promise.resolve({ status: 'unavailable' });
-            pages = saved.pages.map(page => Object.freeze({ ...page }));
+            pages = saved.pages.map((page, index) => Object.freeze({
+                ...page, index, loaded: false, coverage: null,
+            }));
             focus = saved.focus;
             chain = pages[focus].chain;
             return request('restore', focus, pages[focus].requestCursor);
@@ -189,6 +262,7 @@ export function createChatHistoryPager({
                 publish();
                 return { status: 'error', error: sourceError, cursor: null };
             }
+            if (!sourceError && failure?.direction === 'recent') { failure = null; publish(); }
             if (pages.length || pending) return { status: 'ignored' };
             try {
                 const result = land(data, { index: 0, direction: 'recent', newChain: true });
@@ -219,6 +293,7 @@ export function createChatHistoryPager({
         // Explicit return to latest starts a new snapshot only after success.
         // Old protected pages remain mounted until the reader unpins them.
         latest: () => request('latest', 0, null, true),
+        whenIdle: () => pending?.promise || Promise.resolve(),
         retry() {
             if (!failure) return Promise.resolve({ status: 'unavailable' });
             const { direction, index, cursor, newChain } = failure;

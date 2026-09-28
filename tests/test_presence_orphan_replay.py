@@ -110,7 +110,11 @@ def test_reopen_moves_the_host_mark_aside_exactly_once(tmp_path, monkeypatch, st
         "ts": row["ts"], "result": row["result"][-500:],
         # the failed transition's terminal-projection provenance goes aside with the mark
         "canonical_terminal_projection_origin": "terminal_transition",
+        "terminal_time": {"v": 1, "occurred_at": None, "source": "unknown",
+                          "attempt": dict.fromkeys(("task_attempt", "_attempt", "started_at",
+                                                    "metadata_attempt", "metadata_task_attempt"))},
     }
+    assert "terminal_time" not in reopened  # reopening cannot inherit the failed attempt's clock
     for cleared in ("reason_code", "outcome_axes", "artifact_status", "artifact_bundle", "result",
                     "status_reconciled_from", "canonical_terminal_projection_origin"):
         assert cleared not in reopened

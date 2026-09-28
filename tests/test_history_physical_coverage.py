@@ -1,0 +1,91 @@
+"""Coverage uses delivered physical boundaries of the real history endpoint."""
+from tests.test_chat_history_paging import isolated_runtime, write, row, request, pages  # noqa: F401
+from ouroboros.gateway.history_paging import decode_cursor
+
+
+def test_coverage_excludes_quota_deferred_backdated_row(tmp_path):
+    write(tmp_path / 'logs/chat.jsonl', [row(0), row(1), row(2, direction='system',
+        type='task_summary', task_id='old', ts='2020-01-01T00:00:00Z', text='deferred')])
+    loaded = list(pages(tmp_path, n_human='1'))
+    recent = loaded[0]['coverage']
+    cursor = decode_cursor(loaded[0]['next_cursor'], 1, recent['view'])
+    assert recent['spans']['chat']['from'] == cursor['before']['chat']
+    assert recent['spans']['chat']['from'] == recent['spans']['chat']['to'], 'last physical row was deferred'
+    assert any(item['text'] == 'deferred' for page in loaded[1:] for item in page['messages'])
+    assert loaded[-1]['coverage']['spans']['chat']['from'] == 0
+
+
+def test_coverage_discloses_disabled_source_and_parse_gap(tmp_path):
+    write(tmp_path / 'logs/chat.jsonl', [row(1)])
+    with (tmp_path / 'logs/chat.jsonl').open('a') as stream:
+        stream.write('malformed\n')
+    _, page = request(tmp_path, n_progress='0')
+    assert page['coverage']['spans']['progress'] is None
+    assert page['coverage']['spans']['chat']['gaps']
+
+
+def test_root_witness_survives_rotation_but_not_prefix_replacement(tmp_path):
+    live = tmp_path / 'logs/chat.jsonl'
+    write(live, [row(1)])
+    _, first = request(tmp_path)
+    archive = tmp_path / 'archive/chat_20260901T000000.jsonl'
+    archive.parent.mkdir(); live.rename(archive)
+    write(live, [row(2)])
+    _, second = request(tmp_path)
+    assert first['coverage']['spans']['chat']['chain'] == second['coverage']['spans']['chat']['chain']
+    replacement = archive.with_suffix('.replacement')
+    write(replacement, [row(3)])
+    replacement.replace(archive)
+    _, third = request(tmp_path)
+    assert third['coverage']['spans']['chat']['chain'] != first['coverage']['spans']['chat']['chain']
+
+
+def test_sparse_global_archives_empty_pages_and_retained_origin(tmp_path):
+    from ouroboros.projects_registry import create_project, bind_task_to_project
+    from ouroboros.project_dialogue import build_owner_message_ref
+
+    project = create_project(tmp_path, 'sparse', name='Sparse continuity')
+    origin = 'Original request'
+    bind_task_to_project(tmp_path, 'sparse-root', project['id'], origin={
+        'ref': build_owner_message_ref(chat_id=1, client_message_id='origin',
+            ts='2026-09-01T10:00:00Z', text=origin), 'text': origin})
+    write(tmp_path / 'archive/chat_20260902T000000.jsonl', [row(0, chat_id=project['chat_id'],
+        direction='out', text='Later answer', ts='2026-09-02T10:00:00Z')])
+    for index in range(5):
+        write(tmp_path / f'archive/chat_20260903T00000{index}.jsonl', [row(i, text='foreign' + 'x' * 2000) for i in range(350)])
+    write(tmp_path / 'logs/chat.jsonl', [row(9)])
+    loaded = list(pages(tmp_path, chat_id=str(project['chat_id'])))
+    assert loaded[0]['messages'][0]['origin_projected']
+    assert loaded[0]['coverage']['spans']['chat']['from'] > 0
+    assert any(not page['messages'] and page['has_more'] for page in loaded[1:])
+    found = [item for page in loaded[1:] for item in page['messages'] if item['text'] == 'Later answer']
+    assert len(found) == 1 and found[0]['ts'] > loaded[0]['messages'][0]['ts']
+    spans = sorted((page['coverage']['spans']['chat'] for page in loaded), key=lambda span: span['from'])
+    assert spans[0]['from'] == 0
+    assert all(a['to'] >= b['from'] for a, b in zip(spans, spans[1:]))
+
+
+def test_legacy_origin_identity_survives_source_label_and_cmid_absence(tmp_path):
+    import json
+    from ouroboros.projects_registry import create_project, bind_task_to_project
+    from ouroboros.project_dialogue import build_owner_message_ref
+
+    project = create_project(tmp_path, 'origin', name='Retained context')
+    canonical = row(1, direction='in', source='web', text='Original request', client_message_id='')
+    ref = build_owner_message_ref(chat_id=1, client_message_id='', ts=canonical['ts'], text=canonical['text'])
+    # Current admission requires a client id; retained legacy bindings predate it.
+    bind_task_to_project(tmp_path, 'origin-root', project['id'], origin={
+        'ref': {**ref, 'client_message_id': 'before-legacy-fixture'}, 'text': canonical['text']})
+    path = tmp_path / 'state/project_task_bindings.json'
+    bindings = json.loads(path.read_text())
+    bindings['bindings']['origin-root']['source_ref']['client_message_id'] = ''
+    path.write_text(json.dumps(bindings))
+    _, first = request(tmp_path, chat_id=str(project['chat_id']))
+    fallback = first['messages'][0]
+    assert fallback['origin_projected'] and fallback['origin_id']
+    write(tmp_path / 'logs/chat.jsonl', [canonical])
+    _, second = request(tmp_path, chat_id=str(project['chat_id']))
+    assert len(second['messages']) == 1
+    adopted = second['messages'][0]
+    assert adopted['history_id'] and not adopted.get('origin_projected')
+    assert adopted['origin_id'] == fallback['origin_id']

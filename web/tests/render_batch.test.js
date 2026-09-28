@@ -12,7 +12,37 @@ import { ElementStub } from './chat_dom_fixture.js';
 
 const chatSource = readFileSync(new URL('../modules/chat.js', import.meta.url), 'utf8');
 
-test('the history chrome is one Load-older control; no Load-newer element is ever built', () => {
+test('one history status stays in persistent chrome for gaps, failure and approximate restoration', () => {
+    const doc = { byId: new Map(), createElement: tag => new ElementStub(tag, doc) };
+    const messages = new ElementStub('div', doc), chrome = new ElementStub('div', doc);
+    messages.isConnected = chrome.isConnected = true;
+    const controls = createHistoryControls(messages, chrome);
+    const snapshot = { initialized: true, canOlder: true };
+    controls.render(snapshot, { gaps: true }, true);
+    const note = chrome.querySelector('.chat-history-status');
+    assert.match(note.textContent, /Shown messages may have gaps.*could not be restored exactly/);
+    assert.equal(messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note'), null);
+    controls.render({ ...snapshot, error: new Error('read failed') }, {}, true);
+    assert.equal(chrome.querySelector('.chat-history-status'), note);
+    assert.match(note.textContent, /could not be loaded.*could not be restored exactly/);
+    controls.render(snapshot, { complete: true }, false);
+    assert.equal(chrome.children.length, 0);
+    assert.equal(messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note'), note);
+    assert.equal(note.textContent, 'Beginning of saved history');
+});
+
+test('a status moved into persistent chrome leaves no empty history control padding', () => {
+    const doc = { byId: new Map(), createElement: tag => new ElementStub(tag, doc) };
+    const messages = new ElementStub('div', doc), chrome = new ElementStub('div', doc);
+    messages.isConnected = chrome.isConnected = true;
+    const controls = createHistoryControls(messages, chrome);
+    controls.render({ initialized: true, canOlder: false, canNewer: false }, { gaps: true });
+    assert.equal(controls.olderButton.hidden, true);
+    assert.equal(chrome.querySelector('.chat-history-status')?.hidden, false);
+    assert.equal(messages.querySelector('.chat-load-older')?.hidden, true);
+});
+
+test('history chrome shares one control and derives completeness from physical coverage', () => {
     const doc = { byId: new Map(), createElement: (tag) => new ElementStub(tag, doc) };
     const messages = new ElementStub('div', doc);
     messages.isConnected = true;
@@ -20,12 +50,14 @@ test('the history chrome is one Load-older control; no Load-newer element is eve
     assert.equal('newerButton' in controls, false);
     const snapshot = { initialized: true, canOlder: true, canNewer: true,
         olderExhausted: false, loading: '', error: null };
-    assert.deepEqual(controls.render(snapshot, []), { complete: false, truncated_by: [] });
+    assert.equal(controls.render(snapshot).complete, false);
+    assert.equal(controls.olderButton.textContent, 'Load more history');
     assert.deepEqual(messages.children.map((node) => node.className), ['chat-load-older']);
     assert.equal(messages.querySelector('.chat-load-newer'), null);
-    // A cache with no newer page is the only thing that ever made one appear.
     const exhausted = { ...snapshot, canOlder: false, canNewer: false, olderExhausted: true };
-    assert.deepEqual(controls.render(exhausted, []), { complete: true, truncated_by: [] });
+    assert.equal(controls.render(exhausted, { complete: false, gaps: true }).complete, false,
+        'EOF cannot certify physical coverage');
+    assert.equal(controls.render(exhausted, { complete: true, gaps: false }).complete, true);
     assert.deepEqual(messages.children.map((node) => node.className), ['chat-load-older']);
     assert.equal(messages.querySelector('.chat-load-older')
         .querySelector('.chat-load-older-note').textContent, 'Beginning of saved history');
@@ -326,6 +358,64 @@ test('a reader inside Reviews stays anchored when content grows above the attemp
     assert.equal(anchor.node, review);
     assert.equal(anchors.restoreVisibleTimelineAnchor(anchor), true);
     assert.equal(messages.scrollTop, 1120);
+});
+
+test('adopted live line bookmark serializes its row and restores the cold line with a different DOM key', () => {
+    const box = (top, bottom) => ({ top, bottom, left: 0, right: 600, width: 600, height: bottom - top });
+    const makeNode = (bounds, classes = []) => {
+        const node = { bounds, dataset: {}, isConnected: true, parentElement: null };
+        node.classList = { contains: value => classes.includes(value) };
+        node.getBoundingClientRect = () => node.bounds;
+        node.getClientRects = () => [node.bounds];
+        node.matches = selector => classes.some(value => selector === `.${value}`);
+        node.contains = candidate => {
+            for (let current = candidate; current; current = current.parentElement) if (current === node) return true;
+            return false;
+        };
+        node.closest = selector => {
+            for (let current = node; current; current = current.parentElement) {
+                if (selector === '.chat-live-card' && current.classList.contains('chat-live-card')) return current;
+            }
+            return null;
+        };
+        node.querySelectorAll = selector => selector.includes('.chat-live-line') && node.line ? [node.line] : [];
+        return node;
+    };
+    const messages = makeNode(box(0, 400));
+    messages.scrollTop = 200;
+    const card = makeNode(box(-100, 500), ['chat-live-card']);
+    card.dataset.taskId = 'owner'; card.parentElement = messages;
+    const line = makeNode(box(20, 100), ['chat-live-line']);
+    line.dataset.liveLineKey = 'line-random'; line.dataset.expanded = '1';
+    line.parentElement = card; card.line = line; messages.children = [card];
+    messages.contains = candidate => candidate === card || card.contains(candidate);
+    const records = new Map([['owner', { root: card, items: [{
+        lineKey: 'line-random', historyId: 'progress:41',
+    }] }]]);
+    const anchors = createTimelineAnchors({ messagesDiv: messages, liveCardRecords: records });
+    const saved = anchors.serializeTimelineAnchor();
+    assert.equal(saved.lineKey, 'line-random');
+    assert.equal(saved.lineHistoryId, 'progress:41');
+    assert.equal(saved.lineExpanded, true);
+    assert.equal('node' in saved, false);
+    records.get('owner').items[0] = { lineKey: 'line-random',
+        dedupeKey: 'subagent-lifecycle:child' };
+    const liveLifecycle = anchors.serializeTimelineAnchor();
+    assert.equal(liveLifecycle.lineLifecycleKey, 'subagent-lifecycle:child');
+    assert.equal(liveLifecycle.lineHistoryId, '');
+
+    card.isConnected = line.isConnected = false;
+    const coldCard = makeNode(box(-20, 600), ['chat-live-card']);
+    coldCard.dataset.taskId = 'owner'; coldCard.parentElement = messages;
+    const coldLine = makeNode(box(120, 200), ['chat-live-line']);
+    coldLine.dataset.liveLineKey = 'history-progress-41';
+    coldLine.parentElement = coldCard; coldCard.line = coldLine; messages.children = [coldCard];
+    messages.contains = candidate => candidate === coldCard || coldCard.contains(candidate);
+    records.set('owner', { root: coldCard, groupId: 'owner', items: [{
+        lineKey: coldLine.dataset.liveLineKey, historyId: 'progress:41',
+    }] });
+    assert.equal(anchors.restoreVisibleTimelineAnchor(saved, { exact: true }), true);
+    assert.equal(messages.scrollTop, 300);
 });
 
 test('a card crossing the top with nothing anchorable inside keeps the reader on what follows it', () => {

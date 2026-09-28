@@ -121,7 +121,7 @@ def _task_exception_terminal(env: Any, task: Dict[str, Any], exc: Exception, dri
         loop_outcome = derive_loop_outcome(text, usage, llm_trace)
         write_task_result(
             env.drive_root, str(task.get("id") or ""), STATUS_FAILED,
-            result=text, reason_code="task_exception", loop_outcome=loop_outcome,
+            _terminal_observed=True, result=text, reason_code="task_exception", loop_outcome=loop_outcome,
             outcome_axes=loop_outcome.get("outcome_axes") or infra_failed_axes(
                 "task_exception", review_trigger="agent_exception"),
             trace_summary=build_trace_summary(llm_trace),
@@ -372,6 +372,7 @@ class OuroborosAgent:
                 self.env.drive_root,
                 str(task.get("id") or ""),
                 STATUS_RUNNING,
+                task_attempt=task.get("_attempt", 0),
                 **({"started_at": datetime.fromtimestamp(started, timezone.utc).isoformat()}
                    if isinstance(started, (int, float)) and started > 0 else {}),
                 **({"queued_at": task["queued_at"]} if task.get("queued_at") is not None else {}),
@@ -439,7 +440,7 @@ class OuroborosAgent:
                     canonical, str(task.get("id") or ""), STATUS_RUNNING,
                     child_drive_root=str(self.env.drive_root), budget_drive_root=str(canonical),
                     _is_direct_chat=bool(task.get("_is_direct_chat")),
-                    **{key: running[key] for key in ("started_at", "ts") if key in running},
+                    **{key: running[key] for key in ("started_at", "ts", "task_attempt") if key in running},
                 )
         except Exception:
             log.warning("Failed to persist running task status", exc_info=True)

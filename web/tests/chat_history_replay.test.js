@@ -101,6 +101,28 @@ test('narration and current terminal projection of one source have distinct DOM 
     assert.equal(record.items.filter(item => item.historyId).length, 1);
 });
 
+test('canonical adoption adds source identity without replacing a live expanded line key', () => {
+    const record = { items: [], expandedLineKeys: new Set() };
+    const summary = { visible: true, phase: 'working', headline: 'Result',
+        body: 'Preview', truncated: true, fullRef: 'child', dedupeKey: 'subagent-result:child' };
+    updateLiveTimelineItem(record, summary, {
+        syntheticKey: summary.dedupeKey, headline: summary.headline,
+        ts: '12:00', rawTs: '2026-09-12T12:00:00Z', inPlaceByKey: true,
+    });
+    const live = record.items[0];
+    const key = live.lineKey;
+    record.expandedLineKeys.add(key);
+    assert.equal(mergeHistoricalTimelineItem(record, summary, {
+        history_id: 'progress:41', history_position: { source: 'progress', offset: 41 },
+        ts: '2026-09-12T12:00:00Z',
+    }, '12:00'), true);
+    assert.equal(record.items[0], live);
+    assert.equal(live.lineKey, key);
+    assert.equal(live.historyId, 'progress:41');
+    assert.equal(record.expandedLineKeys.has(key), true);
+    assert.equal(live.fullRef, 'child');
+});
+
 test('reopening a deep window fetches its exact page and retains newer navigation without cached bodies', async () => {
     const response = index => ({ messages: [{ history_id: `chat:${index}` }], has_more: index < 4,
         next_cursor: index < 4 ? `older-${index + 1}` : null, page_cursor: `page-${index}` });

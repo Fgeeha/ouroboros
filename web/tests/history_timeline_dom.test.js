@@ -57,7 +57,7 @@ class Node {
 }
 
 const text = (value) => ['#text', {}, value];
-function rendererFixture() {
+function rendererFixture(options = {}) {
     const doc = { activeElement: null, createElement: (name) => new Node(doc, [name]) };
     const timelineEl = new Node(doc, ['DIV']);
     doc.root = timelineEl;
@@ -69,9 +69,56 @@ function rendererFixture() {
         ]],
         ['DIV', { class: 'body' }, [['P', {}, [text(item.body || 'Long narration')]]]],
     ]]);
-    const renderer = createLiveCardTimelineRenderer({ withStableViewport: (fn) => fn(), buildTimelineItemHtml: build });
+    const renderer = createLiveCardTimelineRenderer({ withStableViewport: (fn) => fn(), buildTimelineItemHtml: build, ...options });
     return { doc, record, ...renderer };
 }
+
+test('saved expanded line restores the renderer disclosure and requests full output once', () => {
+    const hydrated = [];
+    const f = rendererFixture({ initialAnchor: { lineKey: 'saved', lineExpanded: true },
+        hydrate: (item, record) => hydrated.push([item, record]) });
+    const item = { lineKey: 'saved', truncated: true, fullRef: 'child' };
+    f.record.items = [item];
+    f.renderLiveCardTimeline(f.record);
+    assert.equal(f.record.expandedLineKeys.has('saved'), true);
+    assert.equal(f.record.timelineEl.firstElementChild.firstElementChild.getAttribute('aria-expanded'), 'true');
+    assert.deepEqual(hydrated, [[item, f.record]]);
+    f.renderLiveCardTimeline(f.record);
+    assert.equal(hydrated.length, 1);
+});
+
+test('an adopted live line reopens expanded by its physical row, keeping its new DOM key and full hydration', () => {
+    const hydrated = [];
+    const f = rendererFixture({ initialAnchor: {
+        lineKey: 'line-live-random', lineHistoryId: 'progress:41', lineExpanded: true,
+        cardChain: [{ taskId: 'owner' }],
+    }, hydrate: (item) => hydrated.push(item) });
+    f.record.groupId = 'owner';
+    const other = { lineKey: 'history-progress-40', historyId: 'progress:40',
+        headline: 'Same result', ts: '12:00', truncated: true, fullRef: 'other' };
+    const item = { lineKey: 'history-progress-41', historyId: 'progress:41',
+        headline: 'Same result', ts: '12:00', truncated: true, fullRef: 'child' };
+    f.record.items = [other, item];
+    f.renderLiveCardTimeline(f.record);
+    assert.equal(f.record.expandedLineKeys.has(item.lineKey), true);
+    assert.equal(f.record.expandedLineKeys.has(other.lineKey), false);
+    assert.equal(f.record.expandedLineKeys.has('line-live-random'), false);
+    assert.equal(f.record.timelineEl.lastElementChild.dataset.liveLineKey, item.lineKey);
+    assert.deepEqual(hydrated, [item]);
+});
+
+test('an evolving lifecycle reopens by lifecycle identity as its source row changes', () => {
+    const f = rendererFixture({ initialAnchor: {
+        lineKey: 'line-live-random', lineLifecycleKey: 'subagent-lifecycle:child',
+        lineExpanded: true, cardChain: [{ taskId: 'owner' }],
+    } });
+    f.record.groupId = 'owner';
+    const item = { lineKey: 'terminal-subagent-lifecycle-child',
+        dedupeKey: 'subagent-lifecycle:child', sourceHistoryId: 'progress:99' };
+    f.record.items = [item];
+    f.renderLiveCardTimeline(f.record);
+    assert.equal(f.record.expandedLineKeys.has(item.lineKey), true);
+});
 
 test('older rows and timestamp patches preserve the mounted row, focused header and selected body', () => {
     const f = rendererFixture();
