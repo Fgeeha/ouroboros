@@ -190,7 +190,7 @@ def test_concurrent_publication_through_outbox_dedup_and_history(world, monkeypa
     assert rows and all("card_row_revision" in row for row in rows)
     assert max(rows, key=lambda row: row["card_row_revision"])["text"].find("merge: merged") >= 0
     fixture = world.root / "delivery-projection.json"
-    fixture.write_text(json.dumps({"live": chats, "history": rows}))
+    fixture.write_text(json.dumps({"live": chats, "history": rows}), encoding="utf-8")
     node = shutil.which("node")
     assert node, "node is required for the real live/replay projection qualification"
     result = subprocess.run([node, "--test", "--test-name-pattern=canonical receipt revisions",
@@ -211,9 +211,9 @@ def test_legacy_ambiguous_refusal_keeps_observation_custody(world):
     # Reproduce an old persisted receipt, bypassing today's canonical join.
     from ouroboros.task_results import task_result_path
     path = task_result_path(world.root, "merge-task")
-    record = json.loads(path.read_text())
+    record = json.loads(path.read_text(encoding="utf-8"))
     record["merge_receipts"] = [receipt]
-    path.write_text(json.dumps(record))
+    path.write_text(json.dumps(record), encoding="utf-8")
     assert "PR_MERGE_UNKNOWN" in registered_merge(world)
     assert sum(c[:2] == ["pr", "merge"] for c in world.gh.calls) == 1
 
@@ -264,7 +264,7 @@ def bounded_receipt_history(world, monkeypatch):
 
     test_concurrent_publication_through_outbox_dedup_and_history(world, monkeypatch, "delivered_first")
     progress_path = world.root / "logs/progress.jsonl"
-    raw = [json.loads(line) for line in progress_path.read_text().splitlines()]
+    raw = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
     receipt_events = [r for r in raw if r.get("card_row_id")]
     assert [r["card_row_revision"] for r in receipt_events] == [3, 2]
     for i in range(59):
@@ -303,13 +303,13 @@ def bounded_receipt_history(world, monkeypatch):
     assert all(projected[k] == stale[k] for k in ("history_id", "history_position", "ts", "card_row_id"))
     assert {path: path.read_bytes() for path in sources} == sources
     evidence = json.dumps({"payload": payload, "selected": selected[0]})
-    (world.root / "cold-history.json").write_text(evidence)
+    (world.root / "cold-history.json").write_text(evidence, encoding="utf-8")
     if output := os.environ.get("OUROBOROS_UI_EVIDENCE_DIR"):
         output = pathlib.Path(output)
         output.mkdir(parents=True, exist_ok=True)
-        (output / "cold-history.json").write_text(evidence)
+        (output / "cold-history.json").write_text(evidence, encoding="utf-8")
         (output / "cold-progress.jsonl").write_bytes(sources[progress_path])
-        (output / "canonical-receipts.json").write_text(json.dumps(_receipts(world)))
+        (output / "canonical-receipts.json").write_text(json.dumps(_receipts(world)), encoding="utf-8")
     return payload
 
 
@@ -334,11 +334,11 @@ def test_bounded_history_discloses_unavailable_canonical_receipt(world, monkeypa
 
     bounded_receipt_history(world, monkeypatch)
     result_path = task_result_path(world.root, "merge-task", create=False)
-    record = json.loads(result_path.read_text())
+    record = json.loads(result_path.read_text(encoding="utf-8"))
     if gap == "missing_result":
         result_path.unlink()
     elif gap == "unreadable_result":
-        result_path.write_text("{torn")
+        result_path.write_text("{torn", encoding="utf-8")
     else:
         if gap == "missing_receipt":
             record["merge_receipts"] = []
@@ -349,9 +349,9 @@ def test_bounded_history_discloses_unavailable_canonical_receipt(world, monkeypa
         else:
             # A same-id receipt from a different task must not supply truth.
             other_path = task_result_path(world.root, "other-task")
-            other_path.write_text(json.dumps(record))
+            other_path.write_text(json.dumps(record), encoding="utf-8")
             record["merge_receipts"] = []
-        result_path.write_text(json.dumps(record))
+        result_path.write_text(json.dumps(record), encoding="utf-8")
     source = world.root / "logs/progress.jsonl"
     before = source.read_bytes()
     response = asyncio.run(make_chat_history_endpoint(world.root)(SimpleNamespace(query_params={"chat_id": "7"})))
