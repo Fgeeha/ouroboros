@@ -169,6 +169,22 @@ def test_legacy_first_write_reaches_runtime_context(tmp_path, monkeypatch):
     assert seen == {"new-run", "legacy-run"}
 
 
+def test_first_write_same_actor_orders_mixed_utc_timestamp_spellings(tmp_path):
+    """A fractional +00:00 instant follows a whole-second legacy Z instant."""
+    path = tmp_path / "state" / "subagent_last_delegation.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"ts": "2026-09-17T12:00:00Z",
+                                "selected_subagent_id": "legacy-worker", "run_id": "legacy-run",
+                                "route": "api_model"}), encoding="utf-8")
+    record_last_delegation(route="api_model", requested_model="openai::new",
+                           applied_model="openai::new", run_id="new-run",
+                           selected_subagent_id="legacy-worker", drive_root=tmp_path,
+                           occurred_at="2026-09-17T12:00:00.999999+00:00", outcome="succeeded")
+    row = subagent_last_delegation(tmp_path)
+    assert row["run_id"] == "new-run"
+    assert row["latest_by_subagent"]["legacy-worker"]["run_id"] == "new-run"
+
+
 def test_old_corrupt_missing_and_unknown_time_are_not_health(tmp_path):
     assert subagent_last_delegation(tmp_path) == {}
     path = tmp_path / "state" / "subagent_last_delegation.json"
