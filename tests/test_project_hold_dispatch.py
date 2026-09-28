@@ -41,15 +41,15 @@ def test_failed_running_mirror_and_stale_pending_snapshot_cannot_replay(host, tm
     assert host.pending[0]['_project_admission_restore_hold']
 
 
-@pytest.mark.parametrize('boundary', ['snapshot', 'result_false', 'result_raise', 'readback'])
+@pytest.mark.parametrize('boundary', ['snapshot', 'snapshot_none', 'result_false', 'result_raise', 'readback'])
 def test_failed_pre_handoff_proof_never_sends(host, tmp_path, monkeypatch, boundary):  # noqa: F811
     from supervisor import task_admission
 
     accepted(host, tmp_path)
     sent = worker(host, monkeypatch)
     with monkeypatch.context() as patch:
-        if boundary == 'snapshot':
-            patch.setattr(queue, 'persist_queue_snapshot', lambda **_kw: False)
+        if boundary in {'snapshot', 'snapshot_none'}:
+            patch.setattr(queue, 'persist_queue_snapshot', lambda **_kw: False if boundary == 'snapshot' else None)
         elif boundary == 'result_false':
             patch.setattr(task_admission, 'write_task_result', lambda *_a, **_kw: False)
         else:

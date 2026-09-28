@@ -550,12 +550,18 @@ def _enqueue_through_supervisor(tmp_path, monkeypatch, *, parent_lane: str = "",
     event["depth"] = 0
     event["delegation_role"] = ""
 
-    enqueued = []
+    from supervisor import queue
+    enqueued, running = [], {}
+    for key, value in {"DRIVE_ROOT": tmp_path, "PENDING": enqueued, "RUNNING": running,
+                       "QUEUE_SNAPSHOT_PATH": tmp_path / "state/queue_snapshot.json",
+                       "QUEUE_SEQ_COUNTER_REF": {"value": 0}, "ADMISSION_RESERVATIONS": {},
+                       "ACCEPTANCE_FENCES": {}, "BUDGET_ROOT_FENCES": {}}.items():
+        monkeypatch.setattr(queue, key, value)
 
     class FakeCtx:
         DRIVE_ROOT = tmp_path
-        PENDING = []
-        RUNNING = {}
+        PENDING = enqueued
+        RUNNING = running
         WORKERS = {0: SimpleNamespace(busy_task_id=None)}
 
         def load_state(self):
@@ -564,14 +570,12 @@ def _enqueue_through_supervisor(tmp_path, monkeypatch, *, parent_lane: str = "",
         def send_with_budget(self, chat_id, text, **kwargs):
             pass
 
-        def enqueue_task(self, task):
-            enqueued.append(task)
-
-        def persist_queue_snapshot(self, reason=""):
-            pass
+        enqueue_task = staticmethod(queue.enqueue_task)
+        persist_queue_snapshot = staticmethod(queue.persist_queue_snapshot)
 
     ev_module._handle_schedule_task(event, FakeCtx())
-    assert enqueued, "supervisor did not enqueue the task"
+    assert enqueued and enqueued[0] is queue.PENDING[0], "supervisor did not admit the task"
+    assert enqueued[0]["admitted_dispatch"] == "none"
     return enqueued[0]
 
 

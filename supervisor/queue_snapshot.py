@@ -699,25 +699,24 @@ def restore_pending_from_snapshot(
     Returns the PENDING count revived; ``terminalized`` separately collects
     surviving RUNNING ids fenced with cancel intents for the caller to name.
     """
-    q = _queue()
-    if q.PENDING:
+    if _queue().PENDING:
         return 0
     try:
-        if not q.QUEUE_SNAPSHOT_PATH.exists():
+        if not _queue().QUEUE_SNAPSHOT_PATH.exists():
             return 0
-        snap = json.loads(q.QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        snap = json.loads(_queue().QUEUE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
         if not isinstance(snap, dict):
             return 0
         ts = str(snap.get("ts") or "")
-        ts_unix = q.parse_iso_to_ts(ts)
+        ts_unix = _queue().parse_iso_to_ts(ts)
         # Timestamp validity and freshness gate ORDINARY rows only (#1196): a
         # readable snapshot whose stamp is missing or malformed is treated as
         # stale, so an identifiable exact pause or an acknowledged owner-wait
         # handoff is still retained under its own durable authority instead of
         # vanishing (a Resume would then answer task_not_pending over an intact checkpoint).
         if ts_unix is None:
-            q.append_jsonl(
-                q.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            _queue().append_jsonl(
+                _queue().DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {"ts": utc_now_iso(), "type": "queue_restore_snapshot_timestamp_invalid",
                  "snapshot_ts": ts[:64], "action": "treated_as_stale"},
             )
@@ -743,7 +742,7 @@ def restore_pending_from_snapshot(
         # call gives them the one cancel-intent path custody settles — except a
         # direct root whose exact budget pause was complete on disk, which is
         # parked under its own id like a paused RUNNING row (#1196).
-        direct_roots = dict(q.PRIOR_DIRECT_ROOTS)
+        direct_roots = dict(_queue().PRIOR_DIRECT_ROOTS)
         # An in-process supervisor revival re-runs queue init while direct turns of THIS process are
         # alive: the roster then names live work, not what a stop caught.
         from supervisor.active_activity import get_direct_activity_registry
@@ -768,8 +767,8 @@ def restore_pending_from_snapshot(
                                   direct_roots_incomplete=direct_roots.get("incomplete", False))
             return 0
         snapshot_pending, pending_by_id, restored = restore_terminalization_retry_rows(
-            snapshot_pending, pending=q.PENDING, running=q.RUNNING,
-            queue_seq_counter_ref=q.QUEUE_SEQ_COUNTER_REF, sort_pending=q.sort_pending,
+            snapshot_pending, pending=_queue().PENDING, running=_queue().RUNNING,
+            queue_seq_counter_ref=_queue().QUEUE_SEQ_COUNTER_REF, sort_pending=_queue().sort_pending,
         )
         fenced_roots, malformed_fences, malformed_budget_fences = restore_queue_fences(raw_fences, raw_budget_fences)
         if not malformed_budget_fences:
@@ -779,7 +778,7 @@ def restore_pending_from_snapshot(
             _record_queue_restore(restored=restored, terminalized_running=fenced_running,
                                   direct_roots_incomplete=direct_roots.get("incomplete", False))
             if restored > 0:
-                q.persist_queue_snapshot(reason="queue_restored")
+                _queue().persist_queue_snapshot(reason="queue_restored")
             return restored
 
         skipped_terminal, invalid_depth_restore = 0, []
@@ -798,16 +797,16 @@ def restore_pending_from_snapshot(
                 from supervisor.events_budget import HOLD_ROOT_ACCEPTANCE_FENCED, hold_restored_budget_pause
 
                 task = hold_restored_budget_pause(
-                    dict(task), q.DRIVE_ROOT, reason=HOLD_ROOT_ACCEPTANCE_FENCED,
+                    dict(task), _queue().DRIVE_ROOT, reason=HOLD_ROOT_ACCEPTANCE_FENCED,
                     detail="the root entered acceptance review; the saved pause is retained, not cancelled")
                 acceptance_held.append(str(task.get("id") or ""))
             elif _descends_from(task, fenced_roots, pending_by_id):
                 task_id = str(task.get("id") or "")
                 skipped_fenced.append(task_id)
                 try:
-                    existing = load_task_result(q.DRIVE_ROOT, task_id) or {}
+                    existing = load_task_result(_queue().DRIVE_ROOT, task_id) or {}
                     stored = write_task_result(
-                        q.DRIVE_ROOT, task_id, STATUS_CANCELLED,
+                        _queue().DRIVE_ROOT, task_id, STATUS_CANCELLED,
                         **_cancel_result_fields(task, existing=existing,
                             result="Task was not restored after restart because its root had entered acceptance review.",
                         ),
@@ -822,16 +821,16 @@ def restore_pending_from_snapshot(
                             "reason": "The root entered acceptance review; cancellation is pending.",
                             "reconcile_delegate_custody": False,
                         }
-                        with q._queue_lock:
+                        with _queue()._queue_lock:
                             _append_held_pending_row(task)
                         restored += 1
                 continue
             # AR2-10 (§8-A1): restore and the intent check share the queue lock.
-            with q._queue_lock:
+            with _queue()._queue_lock:
                 skip_revival = False
                 cancel_authority_unreadable = False
                 try:
-                    existing = load_task_result(q.DRIVE_ROOT, str(task.get("id")), strict=True)
+                    existing = load_task_result(_queue().DRIVE_ROOT, str(task.get("id")), strict=True)
                     existing_status = str(existing.get("status") or "") if existing else ""
                 except Exception:
                     if _exact_pause_row(task):
@@ -846,7 +845,7 @@ def restore_pending_from_snapshot(
 
                         if budget_hold_fact(task) is None:
                             task = hold_restored_budget_pause(
-                                dict(task), q.DRIVE_ROOT,
+                                dict(task), _queue().DRIVE_ROOT,
                                 reason=HOLD_RESTORE_REFUSED_PREFIX + RESTORE_REFUSAL_RECORD_UNREADABLE)
                         acceptance_held.append(str(task.get("id") or ""))
                         log.warning("Snapshot restore retained paused row %s under a hold: its "
@@ -867,9 +866,9 @@ def restore_pending_from_snapshot(
                         "reconcile_delegate_custody": False,
                     }
                     restore_terminalization_retry(
-                        task, pending=q.PENDING, running=q.RUNNING,
-                        queue_seq_counter_ref=q.QUEUE_SEQ_COUNTER_REF,
-                        sort_pending=q.sort_pending,
+                        task, pending=_queue().PENDING, running=_queue().RUNNING,
+                        queue_seq_counter_ref=_queue().QUEUE_SEQ_COUNTER_REF,
+                        sort_pending=_queue().sort_pending,
                     )
                     skipped_terminal += 1
                     log.debug("Snapshot restore result-authority check failed for %s", task.get("id"), exc_info=True)
@@ -895,7 +894,7 @@ def restore_pending_from_snapshot(
                             from ouroboros.cancel_intents import has_active_intent
 
                             if has_active_intent(
-                                q.DRIVE_ROOT, str(task.get("id")), strict=True,
+                                _queue().DRIVE_ROOT, str(task.get("id")), strict=True,
                             ):
                                 # Cancellation custody owns it; never revive a pending row.
                                 skip_revival = True
@@ -936,9 +935,9 @@ def restore_pending_from_snapshot(
                         "reconcile_delegate_custody": True,
                     }
                     restore_terminalization_retry(
-                        task, pending=q.PENDING, running=q.RUNNING,
-                        queue_seq_counter_ref=q.QUEUE_SEQ_COUNTER_REF,
-                        sort_pending=q.sort_pending,
+                        task, pending=_queue().PENDING, running=_queue().RUNNING,
+                        queue_seq_counter_ref=_queue().QUEUE_SEQ_COUNTER_REF,
+                        sort_pending=_queue().sort_pending,
                     )
                     orphan_children.append(str(task.get("id") or ""))
                     skipped_terminal += 1
@@ -949,11 +948,11 @@ def restore_pending_from_snapshot(
                     _append_held_pending_row(task)
                     restored += 1
                     continue
-                admitted = q.enqueue_task(task, restoring_snapshot=True)
+                admitted = _queue().enqueue_task(task, restoring_snapshot=True)
                 if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
-                    q.restore_invalid_depth_admission(task, admitted, drive_root=q.DRIVE_ROOT, pending=q.PENDING, blocked=blocked_restore, terminalized=invalid_depth_restore, queue_seq_counter_ref=q.QUEUE_SEQ_COUNTER_REF)
+                    _queue().restore_invalid_depth_admission(task, admitted, drive_root=_queue().DRIVE_ROOT, pending=_queue().PENDING, blocked=blocked_restore, terminalized=invalid_depth_restore, queue_seq_counter_ref=_queue().QUEUE_SEQ_COUNTER_REF)
                     try:
-                        q.sort_pending()
+                        _queue().sort_pending()
                     except (TypeError, ValueError, OverflowError):
                         log.warning("Deferred snapshot sort failed; custody retained", exc_info=True)
                     continue
@@ -961,8 +960,8 @@ def restore_pending_from_snapshot(
                     cancel_authority_holds.append(str(task.get("id") or ""))
             restored += 1
         if skipped_fenced or acceptance_held:
-            q.append_jsonl(
-                q.DRIVE_ROOT / "logs" / "supervisor.jsonl",
+            _queue().append_jsonl(
+                _queue().DRIVE_ROOT / "logs" / "supervisor.jsonl",
                 {
                     "ts": utc_now_iso(),
                     "type": "queue_restore_skipped_acceptance_fence",
@@ -981,10 +980,10 @@ def restore_pending_from_snapshot(
         from supervisor.queue_transitions import sweep_orphaned_budget_fences
 
         sweep_orphaned_budget_fences(
-            q.PENDING, q.BUDGET_ROOT_FENCES, q.DRIVE_ROOT,
+            _queue().PENDING, _queue().BUDGET_ROOT_FENCES, _queue().DRIVE_ROOT,
         )
         if restored > 0 or skipped_terminal > 0 or invalid_depth_restore or blocked_restore:
-            q.persist_queue_snapshot(reason="queue_restored")
+            _queue().persist_queue_snapshot(reason="queue_restored")
         return restored
     except Exception:
         log.warning("Failed to restore pending queue from snapshot", exc_info=True)

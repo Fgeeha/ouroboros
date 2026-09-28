@@ -315,3 +315,74 @@ def test_api_acceptance_refusal_uses_the_same_exact_cleanup_boundary(room, monke
         assert response.status_code == 409 and not child.exists()
         assert tid not in room.queue.ADMISSION_RESERVATIONS
         assert load_task_result(room.root, tid)["reason_code"] == "task_acceptance_fence"
+
+
+def test_promote_post_stage_lookup_failure_cleans_attachment(host, tmp_path, monkeypatch):  # noqa: F811
+    """The producer settles an exact refusal before freeing the staged input."""
+    from ouroboros import artifacts
+    from supervisor import queue
+    from supervisor.events_project_routing import _handle_promote_chat_to_task
+
+    source = tmp_path / "input.txt"
+    source.write_text("input")
+    cleaned = []
+    remove = artifacts.remove_staged_attachments
+    def cleanup(manifest):
+        receipt = load_task_result(host.root, "attach-lookup-fail", strict=True)
+        assert receipt["admission_outcome"] == "never_admitted"
+        assert receipt["_admission_refusal_token"]
+        cleaned.extend(Path(row["abs_path"]) for row in manifest)
+        assert cleaned and all(path.read_text() == "input" for path in cleaned)
+        remove(manifest)
+    monkeypatch.setattr(artifacts, "remove_staged_attachments", cleanup)
+    monkeypatch.setattr(registry, "project_admission_view", lambda *a, **k:
+                        (_ for _ in ()).throw(OSError("registry unavailable")))
+    outcome = _handle_promote_chat_to_task({
+        "task_id": "attach-lookup-fail", "routing_token": "lookup-token", "chat_id": 1,
+        "objective": "use input", "project_id": "lookup-project",
+        "attachment_uploads": [{"path": str(source)}],
+    }, host.ctx)
+    assert outcome["reason"] == "project_routing_fence_lookup_failed"
+    assert not host.pending and "attach-lookup-fail" not in queue.ADMISSION_RESERVATIONS
+    assert cleaned and all(not path.exists() for path in cleaned)
+
+
+@pytest.mark.parametrize("failure", ["enqueue", "snapshot"])
+def test_promote_queue_failure_preserves_receipt_first_custody(host, tmp_path, monkeypatch, failure):  # noqa: F811
+    """Refusal is certain only before admission; uncertain persistence retains inputs."""
+    from supervisor import queue
+    from supervisor.events_project_routing import _handle_promote_chat_to_task
+
+    registry.create_project(host.root, "target")
+    source = tmp_path / "input.txt"
+    source.write_text("input")
+    captured = []
+    real_enqueue = host.ctx.enqueue_task
+    def enqueue(payload):
+        captured.append(payload)
+        if failure == "enqueue":
+            registry.begin_project_deletion(host.root, "target")
+        return real_enqueue(payload)
+    host.ctx.enqueue_task = enqueue
+    if failure == "snapshot":
+        host.ctx.persist_queue_snapshot = lambda **kwargs: False
+    outcome = _handle_promote_chat_to_task({
+        "task_id": "promoted", "routing_token": "ours", "chat_id": 1,
+        "objective": "use input", "project_id": "target", "workspace": "none",
+        "attachment_uploads": [{"path": str(source)}],
+    }, host.ctx)
+    assert captured
+    staged = Path(captured[0]["attachments"][0]["abs_path"])
+    receipt = load_task_result(host.root, "promoted") or {}
+    assert "promoted" not in queue.ADMISSION_RESERVATIONS
+    if failure == "enqueue":
+        assert outcome["reason"] == "project_routing_fence"
+        assert receipt["admission_outcome"] == "never_admitted" and receipt["_admission_refusal_token"]
+        assert not host.pending and not staged.exists()
+    else:
+        assert outcome["status"] == "unconfirmed"
+        assert outcome["reason"] == "queue_snapshot_persist_failed"
+        assert [row["id"] for row in host.pending] == ["promoted"]
+        assert staged.read_text() == "input"
+        assert receipt.get("admission_outcome") != "never_admitted"
+        assert receipt.get("status") != "failed"

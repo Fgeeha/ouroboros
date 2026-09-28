@@ -18,7 +18,7 @@ from tests._evolution_state_shared import (
 
 
 def _assignment_case(tmp_path, monkeypatch, task_id="assign-evo"):
-    from supervisor import evolution_lifecycle, queue, state, workers
+    from supervisor import evolution_lifecycle, state, workers
 
     state.init(tmp_path)
     state.save_state({})  # an initialized install: only explicit init creates state (#1307)
@@ -44,7 +44,6 @@ def _assignment_case(tmp_path, monkeypatch, task_id="assign-evo"):
     worker = SimpleNamespace(wid=1, busy_task_id=None, reaping=False, in_q=inbox)
     monkeypatch.setattr(workers, "WORKERS", {1: worker})
     monkeypatch.setattr(workers, "get_event_q", lambda: events)
-    monkeypatch.setattr(queue, "persist_queue_snapshot", lambda reason="": None)
     monkeypatch.setattr(evolution_lifecycle, "evolution_block_reason", lambda: "")
     return workers, task, tx, worker, inbox, events
 

@@ -120,12 +120,17 @@ def test_real_admission_hurry_and_pre_running_death_recover(pool, monkeypatch, o
     if phase == "assigned":
         workers.assign_tasks()
         assert task_id in queue.RUNNING
-        assert not results.task_result_path(pool.root, task_id, create=False).exists()
+        before_hurry = results.load_task_result(pool.root, task_id, strict=True)
+        assert before_hurry["status"] == "requested"
+        assert before_hurry["admitted_dispatch"] == "possible"
     response = _hurry(pool.root, task_id)
     assert response.status_code == 200, response.text
     row = results.load_task_result(pool.root, task_id, strict=True)
-    assert row["status"] == ("scheduled" if phase == "pending" else "running")
-    assert set(row) == {"task_id", "status", "_schema_version", "ts", "updated_at", "owner_hurry"}
+    if phase == "pending":
+        assert row["status"] == "scheduled"
+        assert set(row) == {"task_id", "status", "_schema_version", "ts", "updated_at", "owner_hurry"}
+    else:
+        assert {key: value for key, value in row.items() if key != "owner_hurry"} == before_hurry
     assert row["owner_hurry"]["attempt_key"] == 1
     assert [entry["kind"] for entry in drain_owner_entries(pool.root, task_id)] == [KIND_HURRY]
     assert not (pool.root / "logs/chat.jsonl").exists()
