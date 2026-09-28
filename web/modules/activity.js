@@ -96,10 +96,12 @@ export function initActivity({ mount, ws } = {}) {
             const paused = rowBudgetPaused(q, t, kind);
             const kindLabel = paused ? 'paused (budget)' : kind;
             const meta = `${esc(kindLabel)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
+            const hold = t._project_admission_restore_hold;
+            const projectWait = hold ? ` · Waiting for Project verification: ${esc(hold.detail || hold.reason)}` : '';
             return `<div class="activity-row">
                 <div class="activity-row-main">
                     <span class="activity-name">${label}</span>
-                    <span class="activity-sub">${meta}</span>
+                    <span class="activity-sub">${meta}${projectWait}</span>
                 </div>
                 <div class="activity-row-actions">
                     <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${paused ? ' data-budget-paused="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>

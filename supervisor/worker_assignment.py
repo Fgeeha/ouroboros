@@ -197,13 +197,13 @@ def assign_tasks() -> None:
         # queue.  Then quarantine every malformed depth before budget, lease, or
         # capacity filters can leave it waiting indefinitely.
         if not _pool()._drop_cancelled_pending():
-            log.error(
-                "Task assignment blocked: cancellation authority or custody "
-                "state is indeterminate",
-            )
+            log.error("Task assignment blocked: cancellation authority or custody state is indeterminate")
             queue.persist_queue_snapshot(reason="cancellation_authority_indeterminate")
             return
         _pool()._retry_terminalization_pending_for_assignment(queue)
+        from supervisor.task_admission import revalidate_project_holds, record_project_dispatch_possible
+
+        revalidate_project_holds()
         invalid_ids, unresolved_invalid_ids = _pool()._quarantine_invalid_pending_depths()
         unresolved_invalid_id_set = set(unresolved_invalid_ids)
 
@@ -356,7 +356,7 @@ def assign_tasks() -> None:
                 # and project-leased candidates)
                 chosen_idx = None
                 for i, candidate in enumerate(_pool().PENDING):
-                    if candidate.get("_owner_hold"):
+                    if candidate.get("_owner_hold") or candidate.get("_project_admission_restore_hold"):
                         continue
                     if remaining <= 0 and not candidate.get("_owner_wait_resume"):
                         continue
@@ -433,29 +433,29 @@ def assign_tasks() -> None:
                         if dropped_ids:
                             queue.persist_queue_snapshot(reason="evolution_dropped_budget")
                     continue
-                task = _pool().PENDING.pop(chosen_idx)
+                task = _pool().PENDING[chosen_idx]
                 depth_error = _pool()._normalize_pending_task_depth(task)
-                if depth_error:
-                    if _pool()._terminalize_invalid_pending_depth(task, depth_error):
-                        queue.persist_queue_snapshot(reason="invalid_task_depth")
-                        continue
-                    # Keep failed terminalization in queue custody for retry.
-                    _pool().PENDING.insert(chosen_idx, task)
-                    log.error(
-                        "Assignment blocked: invalid task depth could not be terminalized for %s",
-                        task.get("id"),
-                    )
-                    break
-                evolution_error = _pool()._evolution_assignment_error(task)
-                if evolution_error:
-                    if _pool()._cancel_unauthorized_evolution(task, evolution_error):
-                        queue.persist_queue_snapshot(reason="evolution_authority_rejected")
-                    else:
-                        _pool().PENDING.insert(chosen_idx, task)
+                evolution_error = "" if depth_error else _pool()._evolution_assignment_error(task)
+                if depth_error or evolution_error:
+                    terminalized = (_pool()._terminalize_invalid_pending_depth(task, depth_error) if depth_error
+                                    else _pool()._cancel_unauthorized_evolution(task, evolution_error))
+                    if terminalized:
+                        _pool().PENDING.pop(chosen_idx)
+                        queue.persist_queue_snapshot(reason="invalid_task_depth" if depth_error else "evolution_authority_rejected")
+                    elif depth_error:  # Keep failed terminalization in queue custody for retry.
+                        log.error("Assignment blocked: invalid task depth could not be terminalized for %s", task.get("id"))
+                        break
+                    continue
+                # Keep the row in PENDING until durable pre-handoff evidence is
+                # visible. A failed write never permits the worker queue effect.
+                task["admitted_dispatch"] = "possible"
+                if queue.persist_queue_snapshot(reason="worker_launch_claimed") is not True:
+                    continue
+                if not record_project_dispatch_possible(task):
                     continue
                 if not record_dispatch_possible(task):  # its receipt must first say it MAY run (#1315)
-                    _pool().PENDING.insert(chosen_idx, task)
                     continue
+                _pool().PENDING.pop(chosen_idx)
                 _mirror_assigned_running_status(task)
                 w.busy_task_id = task["id"]
                 w.in_q.put(task)

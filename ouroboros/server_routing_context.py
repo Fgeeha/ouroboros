@@ -671,16 +671,11 @@ def _project_id_for_registered_chat(ctx: Any, chat_id: int) -> str:
 
 
 def _reserved_project_for_chat(ctx: Any, chat_id: int) -> Dict[str, Any]:
-    try:
-        from ouroboros.projects_registry import list_reserved_projects
+    """Execution routing requires positive absence, not an unavailable display lens."""
+    from ouroboros.projects_registry import list_reserved_projects
 
-        cid = int(chat_id or 0)
-        for project in list_reserved_projects(ctx.DRIVE_ROOT):
-            try:
-                if int(project.get("chat_id") or 0) == cid:
-                    return dict(project)
-            except (TypeError, ValueError):
-                continue
-    except Exception:
-        log.debug("Reserved Project chat lookup failed", exc_info=True)
+    cid = int(chat_id or 0)
+    for project in list_reserved_projects(ctx.DRIVE_ROOT, strict=True):
+        if project["chat_id"] == cid:
+            return dict(project)
     return {}

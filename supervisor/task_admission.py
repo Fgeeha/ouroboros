@@ -240,6 +240,42 @@ def restore_invalid_depth_admission(
     """
     task_id = str(task.get("id") or "")
     blocked.append(task_id)
+    reason = str(admitted.get("_admission_blocked") or "")
+    if reason == "project_routing_fence_lookup_failed":
+        # Same-ID custody: assignment revalidates only the original evidence.
+        # Preserve the exact invalid carrier and any pre-existing independent hold.
+        if task_id and not any(row.get("id") == task_id for row in pending):
+            retained = {**task, "_project_admission_restore_hold": {
+                "reason": reason, "detail": str(admitted.get("_admission_detail") or ""),
+            }}
+            pending.append(retained)
+        return
+    if reason in {"project_routing_fence", "project_routing_fence_changed"}:
+        # An accepted snapshot row never disappears merely because a sibling Main
+        # row restored. A semantic refusal owns a durable terminal or the existing
+        # non-dispatchable terminalization retry. Unknown authority stays held.
+        detail = str(admitted.get("_admission_detail") or "The Project no longer accepts this task.")
+        try:
+            stored = write_task_result(
+                pathlib.Path(task.get("budget_drive_root") or drive_root), task_id,
+                STATUS_FAILED, strict_existing_dict=True, reason_code=reason, result=detail,
+                **{key: task.get(key) for key in ("project_id", "chat_id", "root_task_id",
+                                                 "parent_task_id", "delegation_role", "metadata")})
+            if isinstance(stored, dict) and stored.get("status") == STATUS_FAILED:
+                return
+        except Exception:
+            log.warning("Project restore terminalization deferred for %s", task_id, exc_info=True)
+        retained = {**task, "_terminalization_retry": {
+            "status": STATUS_FAILED, "reason": detail, "trigger": reason,
+            "reconcile_delegate_custody": False,
+        }}
+        from supervisor import queue
+
+        restore_terminalization_retry(
+            retained, pending=pending, running=queue.RUNNING,
+            queue_seq_counter_ref=queue_seq_counter_ref or queue.QUEUE_SEQ_COUNTER_REF,
+            sort_pending=queue.sort_pending)
+        return
     if str(admitted.get("_admission_blocked") or "") != "invalid_task_depth":
         return
     detail = str(
@@ -287,6 +323,196 @@ def restore_invalid_depth_admission(
         pending.append(pending_task)
 
 
+def record_project_dispatch_possible(task: dict) -> bool:
+    """Persist possible Project handoff beside the queue's admitted_dispatch.
+
+    Assignment reads back 'possible' before handoff, so even an older PENDING
+    snapshot cannot overrule it if the best-effort RUNNING mirror fails. This
+    result fact never becomes 'none'; fresh admission's positive 'none' lives
+    on the queue row. No early result may preempt the admission receipt owner.
+    """
+    if not task.get("project_id"):
+        return True
+    from supervisor import queue
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED
+
+    def project(current, _incoming):
+        if (current.get("status") in _TRULY_TERMINAL_STATUSES | {STATUS_CANCEL_REQUESTED}
+                or current.get("_owner_hold")):
+            if current.get("_owner_hold"):
+                task["_owner_hold"] = current["_owner_hold"]
+            return None
+        return {"admitted_dispatch": "possible", "status": current.get("status") or STATUS_REQUESTED}
+
+    try:
+        written = write_task_result(queue.DRIVE_ROOT, task["id"], STATUS_REQUESTED,
+                                    _field_projector=project, strict_existing_dict=True)
+        if written is False:
+            return False
+        stored = load_task_result(queue.DRIVE_ROOT, task["id"], strict=True) or {}
+        return (stored.get("admitted_dispatch") == "possible"
+                and stored.get("status") not in _TRULY_TERMINAL_STATUSES | {STATUS_CANCEL_REQUESTED}
+                and not stored.get("_owner_hold"))
+    except Exception:
+        log.warning("Project dispatch evidence unavailable for %s", task.get("id"), exc_info=True)
+        return False
+
+
+def revalidate_project_holds() -> None:
+    """Revalidate accepted unstarted work once per Q-held assignment transaction.
+
+    A hold never grants a replay. The original carrier and prepared directory,
+    a positive scheduled result and schedule's own no-dispatch receipt must all
+    agree. Unknown facts retain the same row. Semantic refusals use the existing
+    terminalization owner; clearing this hold changes no independent control.
+    """
+    import os
+    import time
+    import copy
+    from collections import Counter
+
+    from ouroboros.project_admission import (
+        ProjectAdmissionError, _strict_admission_snapshot,
+        project_admission_guard, validate_project_admission,
+    )
+    from supervisor import queue
+    from supervisor.schedule_occurrence import restore_allowed
+    from ouroboros.projects_registry import project_binding_for_task
+
+    held = [task for task in queue.PENDING if task.get("_project_admission_restore_hold")]
+    if not held:
+        return
+    effects = ("_project_admission_restore_hold", "_terminalization_retry", "_owner_hold")
+    before = [copy.deepcopy({key: task[key] for key in effects if key in task}) for task in held]
+    counts = Counter(row.get("id") for row in queue.PENDING)
+    snapshot, read_error = None, None
+    try:
+        data, present = _strict_admission_snapshot(queue.DRIVE_ROOT, allow_missing=True)
+        snapshot = ({row["id"]: row for row in data["projects"]}, present)
+    except (OSError, ValueError, TypeError, RuntimeError) as exc:
+        read_error = exc
+    released = []
+    for task in held:
+        if task.get("_terminalization_retry"):
+            continue
+        tid = str(task.get("id") or "")
+        hold = task["_project_admission_restore_hold"]
+        try:
+            # Status and missing started_at alone cannot prove no handoff: the
+            # old RUNNING mirror was best-effort. Fresh queue admission supplies
+            # positive 'none'; canonical possible handoff always vetoes that row.
+            stored = load_task_result(queue.DRIVE_ROOT, tid, strict=True) or {}
+            if (stored.get("status") != STATUS_SCHEDULED or stored.get("started_at")
+                    or stored.get("admission_outcome") == "never_admitted"
+                    or task.get("admitted_dispatch") != "none"
+                    or "admitted_dispatch" in stored and stored["admitted_dispatch"] != "none"
+                    or tid in queue.RUNNING or tid in queue.ADMISSION_RESERVATIONS
+                    or counts[tid] != 1):
+                raise ValueError("The original task's no-dispatch evidence is unconfirmed; automatic recovery is not authorized.")
+            owner_hold = task.get("_owner_hold")
+            schedule_allowed = restore_allowed(task)
+            if owner_hold:
+                task["_owner_hold"] = owner_hold
+            if not schedule_allowed:
+                raise ValueError("The schedule's original no-dispatch receipt is unconfirmed.")
+            if stored.get("_owner_hold"):
+                task["_owner_hold"] = stored["_owner_hold"]
+            deadline = queue._task_deadline_ts(task)
+            if deadline and time.time() >= deadline:
+                task["_terminalization_retry"] = {
+                    "status": STATUS_FAILED, "trigger": "deadline",
+                    "reason": "The task deadline elapsed while waiting for its Project.",
+                    "reconcile_delegate_custody": False,
+                }
+                continue
+            fence = queue.ACCEPTANCE_FENCES.get(str(task.get("root_task_id") or ""))
+            if isinstance(fence, dict) and fence.get("status") in {"active", "sealed"}:
+                raise ValueError("The task's root is in acceptance review; dispatch remains closed.")
+            basis = task.get("_project_admission")
+            if (not isinstance(basis, dict) or basis.get("legacy_basis")
+                    or isinstance(basis.get("project"), dict) and not {
+                        "id", "chat_id", "lifecycle", "routing_generation", "working_dir",
+                        "routing_incarnation", "created_at"} <= basis["project"].keys()):
+                raise ValueError("The original Project identity is missing or invalid; automatic recovery is not authorized.")
+            validate_project_admission(basis)
+            if basis["project_id"] != str(task.get("project_id") or ""):
+                raise ProjectAdmissionError("project_routing_fence_changed", "The original Project scope changed.")
+            binding = project_binding_for_task(queue.DRIVE_ROOT, tid, strict=True)
+            if binding and basis["project"] is None:
+                raise ValueError("The original registered Project identity is missing; automatic recovery is not authorized.")
+            if binding and binding["project_id"] != basis["project_id"]:
+                raise ProjectAdmissionError("project_routing_fence_changed", "The task's original Project binding changed.")
+            if (stored.get("project_id") and stored["project_id"] != basis["project_id"]
+                    or stored.get("workspace_root") and stored["workspace_root"] != task.get("workspace_root")):
+                raise ProjectAdmissionError("project_routing_fence_changed", "The saved task assignment changed.")
+            if read_error is not None:
+                raise ValueError("Project information is unreadable; recovery will be checked automatically when it is readable.") from read_error
+            # Automatic hold release requires the FULL original registered tuple.
+            # Explicit/inherited frozen-resource admission elsewhere is unchanged.
+            with project_admission_guard(queue.DRIVE_ROOT, {**basis, "frozen": False}, snapshot=snapshot):
+                workspace = str(task.get("workspace_root") or "")
+                if workspace:
+                    path = pathlib.Path(workspace)
+                    if not path.is_dir() or os.path.normcase(str(path.resolve(strict=True))) != os.path.normcase(workspace):
+                        raise ValueError("The original prepared folder is unavailable or resolves elsewhere.")
+                for key in ("drive_root", "child_drive_root"):
+                    if task.get(key) and not pathlib.Path(task[key]).is_dir():
+                        raise ValueError("The original prepared task drive is unavailable.")
+                # Preserve independent Pause/budget/restart holds in the row.
+                task.pop("_project_admission_restore_hold")
+                released.append((task, hold))
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            reason = getattr(exc, "reason", "project_routing_fence_lookup_failed")
+            if reason in {"project_routing_fence", "project_routing_fence_changed"}:
+                task["_terminalization_retry"] = {
+                    "status": STATUS_FAILED, "trigger": reason, "reason": str(exc),
+                    "reconcile_delegate_custody": False,
+                }
+            task["_project_admission_restore_hold"] = {"reason": reason, "detail": str(exc)}
+    # No worker sees a released row before its restart-visible removal is saved.
+    # Unknown persistence puts the exact original hold back; later passes recheck.
+    changed = any(prior != {key: task[key] for key in effects if key in task}
+                  for prior, task in zip(before, held))
+    if changed and queue.persist_queue_snapshot(reason="project_hold_revalidated") is not True:
+        for task, hold in released:
+            task["_project_admission_restore_hold"] = hold
+
+
+def persist_never_admitted_refusal(
+    drive_root: Any, task_id: str, *, admission_token: str = "", **fields: Any,
+) -> Dict[str, Any]:
+    """Publish a proved refusal before cleanup, without taking another id owner.
+
+    Queue refusal can release its reservation before the producer resumes. Check
+    custody again under Q and establish a durable id owner before freeing drives.
+    A strict exact receipt is required even if a writer raises after replacement.
+    """
+    from supervisor import queue
+    from ouroboros.routing_wait import is_own_admission_stub
+
+    receipt = uuid.uuid4().hex
+    with queue._queue_lock:
+        reservation = queue.ADMISSION_RESERVATIONS.get(task_id)
+        if ((reservation and reservation != admission_token) or task_id in queue.RUNNING
+                or any(row.get("id") == task_id for row in queue.PENDING if isinstance(row, dict))):
+            raise RuntimeError("Refusal settlement lost task-id ownership; resources retained")
+        current = load_task_result(pathlib.Path(drive_root), task_id, strict=True) or {}
+        own_stub = bool(admission_token and is_own_admission_stub(current, admission_token))
+        if current and not own_stub and not (not admission_token and current.get("status") == STATUS_REQUESTED):
+            raise RuntimeError("Refusal settlement found an existing result owner; resources retained")
+        try:
+            write_task_result(pathlib.Path(drive_root), task_id, STATUS_FAILED,
+                              **{**fields, "admission_outcome": "never_admitted",
+                                 "_admission_refusal_token": receipt, "strict_existing_dict": True})
+        except Exception:
+            log.warning("Refusal write raised for %s; checking its exact receipt", task_id, exc_info=True)
+        stored = load_task_result(pathlib.Path(drive_root), task_id, strict=True) or {}
+        if stored.get("_admission_refusal_token") != receipt or stored.get("status") != STATUS_FAILED:
+            raise RuntimeError("Refusal persistence unconfirmed; resources retained")
+        queue.release_task_admission(task_id, admission_token)
+        return stored
+
+
 def scheduled_admission_rejection(
     admitted: Dict[str, Any], *, project_id: str, root_task_id: str,
 ) -> Dict[str, Any]:
@@ -304,12 +530,16 @@ def scheduled_admission_rejection(
             "lifecycle custody; the existing authority was preserved."
         )
         extra = {}
+    elif reason in {"admission_reservation_owned", "admission_reservation_lost"}:
+        detail = "Task not scheduled: another admission owns this task id; its resources were preserved."
+        extra = {}
     elif reason.startswith("project_routing_fence"):
         lifecycle = str(admitted.get("_project_lifecycle") or "unavailable")
-        detail = (
-            "Subagent not scheduled: the target Project has closed its "
-            f"routing/admission fence ({lifecycle}) and cannot accept new work."
-        )
+        from ouroboros.project_dialogue import routing_refusal_cause
+
+        detail = routing_refusal_cause("promote_chat_to_task", "failed", reason) + "."
+        if admitted.get("_admission_detail"):
+            detail += " " + str(admitted["_admission_detail"])
         extra = {
             "project_id": str(admitted.get("_project_id") or project_id),
             "project_lifecycle": lifecycle,
@@ -349,8 +579,10 @@ def scheduled_admission_rejection(
     return {
         "detail": detail,
         "reason_code": reason,
-        "extra_fields": extra,
-        "persist_result": reason not in {"task_id_lookup_failed", "duplicate_task_id"},
+        "extra_fields": {**extra, **({"admission_outcome": "never_admitted"}
+                                    if admitted.get("_admission_never_admitted") else {})},
+        "persist_result": reason not in {"task_id_lookup_failed", "duplicate_task_id",
+                                         "admission_reservation_owned", "admission_reservation_lost"},
     }
 
 
@@ -487,6 +719,8 @@ def enqueue_subagent_with_scheduled_result(
                     "unreadable during admission and was preserved.", False,
                 )
             return admitted, "", "", False
+        if "_project_admission" in admitted:
+            result_fields["_project_admission"] = admitted["_project_admission"]
         result_fields["task_contract"] = admitted_task_contract
         result_fields["depth_provenance"] = admitted_depth_provenance
         result_fields["delegation_admission"] = {
@@ -495,42 +729,25 @@ def enqueue_subagent_with_scheduled_result(
             "transition_id": transition_id,
         }
         try:
-            stored = write_task_result(
-                ctx.DRIVE_ROOT,
-                tid,
-                STATUS_SCHEDULED,
-                **result_fields,
-                result="Subagent accepted and scheduled.",
-            )
+            write_task_result(ctx.DRIVE_ROOT, tid, STATUS_SCHEDULED, **result_fields,
+                              result="Subagent accepted and scheduled.")
         except Exception:
-            committed = load_task_result(ctx.DRIVE_ROOT, tid) or {}
-            if _committed(committed):
-                log.warning(
-                    "Scheduled subagent write for %s raised after its accepted "
-                    "receipt committed; keeping admission",
-                    tid,
-                    exc_info=True,
-                )
-                return admitted, "", "", False
-            log.warning(
-                "Failed to persist scheduled subagent status for %s; rolled back "
-                "its exact queue admission",
-                tid,
-                exc_info=True,
-            )
-        else:
-            if _committed(stored):
-                return admitted, "", "", False
-            log.warning(
-                "Scheduled subagent status for %s did not commit this admission; "
-                "rolling back its exact queue row",
-                tid,
-            )
+            log.warning("Scheduled subagent receipt write raised for %s; reading its token", tid, exc_info=True)
+        try:
+            current = load_task_result(ctx.DRIVE_ROOT, tid, strict=True) or {}
+        except (OSError, ValueError):
+            # A committed receipt may exist. Preserve queue/resource custody and
+            # never quarantine unreadable bytes or infer permission to resend.
+            admitted["_admission_uncertain"] = "Subagent admission receipt could not be checked; resources retained."
+            return admitted, "", "", False
+        if _committed(current):
+            return admitted, "", "", False
+        # Q has remained held since append: no worker observed this refused
+        # scheduled-result transition, and strict readback established absence.
         for index, row in enumerate(pending_ref):
             if row is admitted:
                 pending_ref.pop(index)
                 break
-        current = load_task_result(ctx.DRIVE_ROOT, tid) or {}
         prior_status = str(previous.get("status") or "")
         current_status = str(current.get("status") or "")
         if any(

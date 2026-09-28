@@ -170,9 +170,9 @@ def test_task_api_admission_refusal_is_terminal_not_scheduled_phantom(tmp_path, 
     assert not (data / "state" / "headless_tasks" / "blocked-root").exists()
 
 
-def test_task_api_refuses_when_durable_queue_snapshot_fails(tmp_path, monkeypatch):
+def test_task_api_retains_possible_admission_when_snapshot_is_unconfirmed(tmp_path, monkeypatch):
     import supervisor.queue as queue
-    from ouroboros.task_results import STATUS_FAILED, load_task_result
+    from ouroboros.task_results import load_task_result
 
     repo = tmp_path / "repo"
     repo.mkdir()
@@ -194,15 +194,16 @@ def test_task_api_refuses_when_durable_queue_snapshot_fails(tmp_path, monkeypatc
     app.state.repo_dir = repo
     response = TestClient(app).post(
         "/api/tasks",
-        json={"description": "must be durable", "task_id": "snapshot-fail"},
+        json={"description": "must be durable", "task_id": "snapshot-fail", "memory_mode": "empty"},
     )
 
     assert response.status_code == 503
-    assert response.json()["admission"]["reason_code"] == "queue_snapshot_persist_failed"
-    assert pending == []
-    assert calls == ["api_task_create", "api_task_create_rollback"]
-    assert load_task_result(data, "snapshot-fail")["status"] == STATUS_FAILED
-    assert not (data / "state" / "headless_tasks" / "snapshot-fail").exists()
+    assert response.json()["status"] == "unconfirmed"
+    assert [row["id"] for row in pending] == ["snapshot-fail"]
+    assert calls == ["api_task_create"]
+    assert load_task_result(data, "snapshot-fail") is None
+    assert (data / "state" / "headless_tasks" / "snapshot-fail").exists()
+    assert queue.reserve_task_admission("snapshot-fail", "other", drive_root=data)["reason"] == "duplicate_task_id"
 
 
 def test_task_api_releases_reservation_when_payload_composition_fails(

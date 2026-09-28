@@ -232,15 +232,9 @@ def prepare(claimed: Dict[str, Any]) -> Dict[str, Any]:
     """Build the occurrence's task and resolve its resource, off every lock."""
     if claimed.get("stored_task"):
         task = copy.deepcopy(claimed["stored_task"])
-        project_view = None
-        if task.get("project_id"):
-            from ouroboros.projects_registry import project_admission_view
-
-            try:
-                project_view = project_admission_view(_queue().DRIVE_ROOT, str(task["project_id"]))
-            except Exception as exc:
-                return {**claimed, "task": task, "hold": ("registry_unreadable", str(exc))}
-        return {**claimed, "task": task, "project_admission": project_view}
+        # Already accepted recovery freezes its resource and original incarnation.
+        # The final queue read still checks lifecycle; no new preparation launders it.
+        return {**claimed, "task": task, "project_admission": task.get("_project_admission")}
     from supervisor.queue_schedules import _task_from_schedule
 
     record, occ = claimed["record"], claimed["occurrence"]
@@ -252,17 +246,8 @@ def prepare(claimed: Dict[str, Any]) -> Dict[str, Any]:
         hold, basis = resolve_resource(task, record)
     except Exception as exc:
         hold, basis = ("resource_resolution_failed", f"{type(exc).__name__}: {exc}"), None
-    project_view = None
-    if task.get("project_id"):
-        try:
-            from ouroboros.projects_registry import project_admission_view
-
-            project_view = project_admission_view(_queue().DRIVE_ROOT, str(task["project_id"]))
-            if basis is not None and str((project_view.get("project") or {}).get("working_dir") or "").strip() != basis:
-                hold = ("project_routing_fence_changed", "room changed during preparation")
-        except Exception as exc:
-            hold = ("registry_unreadable", str(exc))
-    return {**claimed, "task": task, "hold": hold, "binding_basis": basis, "project_admission": project_view}
+    return {**claimed, "task": task, "hold": hold, "binding_basis": basis,
+            "project_admission": task.get("_project_admission")}
 
 
 
@@ -327,21 +312,26 @@ def resolve_resource(task: Dict[str, Any], record: Dict[str, Any]) -> tuple[Opti
                 "origin record does not prove one; reschedule it from the work it continues"), None
     meta["resource_intent"] = intent
     kind = str(intent.get("kind") or "")
-    project_id = str(task.get("project_id") or intent.get("project_id") or "").strip()
+    from ouroboros.projects_registry import project_admission_view, task_project_membership
+
+    try:
+        project_id, known_room = task_project_membership(_queue().DRIVE_ROOT, task)
+        if project_id:
+            task["project_id"] = project_id
+            task["_project_admission"] = project_admission_view(
+                _queue().DRIVE_ROOT, project_id, allow_unregistered=not known_room,
+                frozen=kind != "room_default")
+    except Exception as exc:
+        return (getattr(exc, "reason", "registry_unreadable"), str(exc)), None
     if kind == "room_default":
         if not project_id:
             return ("resource_intent_unknown", "room_default intent names no project"), None
-        try:  # strict: an unreadable registry is NOT a folderless room
-            from ouroboros.projects_registry import get_reserved_project
-
-            room = get_reserved_project(_queue().DRIVE_ROOT, project_id, strict=True) or {}
-        except Exception as exc:
-            return ("registry_unreadable", f"{type(exc).__name__}: {exc}"), None
+        room = task["_project_admission"]["project"]
         basis = str(room.get("working_dir") or "").strip()
         if not basis or str(room.get("lifecycle") or "active") != "active":
             return None, ""  # folderless (task scratch as default cwd); a closed room meets the admission fence
         root, error = resolve_room_workspace(drive_root=_queue().DRIVE_ROOT, system_repo_dir=_queue().REPO_DIR,
-                                             project_id=project_id)
+                                             project_id=project_id, project_admission=task["_project_admission"])
         return (("workspace_unusable", error), basis) if error else (_bind(task, root), basis)
     if kind == "explicit_resource":
         root, error = resolve_room_workspace(drive_root=_queue().DRIVE_ROOT, system_repo_dir=_queue().REPO_DIR,
@@ -356,13 +346,15 @@ def _bind(task: Dict[str, Any], root: str) -> None:
     if not root:
         return None
     from ouroboros.headless import prepare_task_drive
-    from ouroboros.project_facts import resolve_project_id
     from ouroboros.workspace_admission import bounded_workspace_preflight, compose_workspace_block
 
     q = _queue()
     task.update(workspace_root=root, workspace_mode="external", memory_mode="forked")
     if not str(task.get("project_id") or "").strip():
-        task["project_id"] = resolve_project_id({"workspace_root": root}) or ""
+        from ouroboros.projects_registry import project_scope_admission
+
+        task["_project_admission"] = project_scope_admission(q.DRIVE_ROOT, workspace_root=root)
+        task["project_id"] = task["_project_admission"]["project_id"]
     child = prepare_task_drive(q.DRIVE_ROOT, str(task["id"]), "forked", project_id=str(task.get("project_id") or ""))
     if child is not None:
         task.update(drive_root=str(child), budget_drive_root=str(q.DRIVE_ROOT))

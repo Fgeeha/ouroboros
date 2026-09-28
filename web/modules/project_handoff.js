@@ -24,6 +24,7 @@ export function handoffPhase(activity, detail, connected = true) {
         return { text: view.headline, className: view.phase };
     }
     if (!connected || !activity) return { text: 'Activity unconfirmed', className: 'neutral' };
+    if (activity.project_admission_hold?.label) return { text: activity.project_admission_hold.label, className: 'warn' };
     if (activity.required_question || activeModelWaits(activity.model_waits || {}, false, activity.task_attempt || 0).length) {
         return { text: 'Waiting', className: 'warn' };
     }

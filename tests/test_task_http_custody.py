@@ -130,17 +130,21 @@ def test_cancelled_create_settles_original_admission(tmp_path, monkeypatch, mode
         assert len(manifest) == 28
         assert pending[0]["attachment_manifest_ref"]
         assert all(pathlib.Path(item["abs_path"]).read_text(encoding="utf-8") == "complete input" for item in manifest)
+    elif outcome == "snapshot_failure":
+        # Cancellation cannot turn unknown persistence into a safe rollback.
+        assert [item["id"] for item in pending] == ["custody"] and child.is_dir()
+        assert row is None
+        assert [reason for reason, _ in snapshots] == ["api_task_create"]
+        assert all(pathlib.Path(item["abs_path"]).read_text() == "complete input"
+                   for item in captured if item.get("status") == "staged")
+        assert queue.reserve_task_admission("custody", "other", drive_root=data)["reason"] == "duplicate_task_id"
     else:
         assert not pending and not child.exists()
         assert not artifacts.task_artifacts_dir(data, "custody", create=False).exists()
         staged = [item for item in captured if item.get("status") == "staged"]
         assert staged
         assert all(not pathlib.Path(item["abs_path"]).exists() for item in staged)
-        if outcome == "snapshot_failure":
-            assert row["status"] == "failed"
-            assert [reason for reason, _ in snapshots] == ["api_task_create", "api_task_create_rollback"]
-        else:
-            assert row is None and not snapshots
+        assert row is None and not snapshots
 
 
 @pytest.mark.parametrize("mode", ["asyncio", "anyio"])

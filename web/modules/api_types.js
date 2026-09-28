@@ -85,6 +85,7 @@
 
 /**
  * @typedef {Object} ActiveChatActivity
+ * @property {Object=} project_admission_hold  // accepted unstarted work waiting for original Project authority
  * @property {Object=} required_question  // read-only pointer to the current required Project quiz
  * @property {boolean=} required_question_unavailable  // a recorded owner-question wait whose detail could not be read: possibly blocked, never "no question"
  * @property {Object.<string,Object>=} model_waits

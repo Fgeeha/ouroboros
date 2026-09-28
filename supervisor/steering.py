@@ -190,11 +190,11 @@ def _owner_lane_allows(ctx: Any, task: Dict[str, Any], target: str, chat_id: int
     # but belong to a project thread — match via the durable binding.
     try:
         from ouroboros.projects_registry import project_chat_for_task
-        from ouroboros.server_routing_context import _project_id_for_registered_chat
+        from ouroboros.server_routing_context import _reserved_project_for_chat
 
         if int(project_chat_for_task(ctx.DRIVE_ROOT, target) or 0) == chat_id:
             return True
-        return not _project_id_for_registered_chat(ctx, chat_id)
+        return not _reserved_project_for_chat(ctx, chat_id)
     except Exception:
         return False
 

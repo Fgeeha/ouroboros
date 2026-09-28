@@ -203,14 +203,11 @@ def enqueue_task(
 
         consciousness_window = allowance_window(DRIVE_ROOT)
     project_id = str(t.get("project_id") or "").strip()
-    project_error = ""
-    if project_id and project_admission is None:
-        try:
-            from ouroboros.projects_registry import project_admission_view
-
-            project_admission = project_admission_view(DRIVE_ROOT, project_id)
-        except Exception:
-            project_error = "project_routing_fence_lookup_failed"
+    # The host preparation basis survives queue snapshots and retries. Legacy
+    # tasks lacking one are checked against current authority without claiming
+    # that their historical preparation generation is known.
+    has_project_admission = project_admission is not None or "_project_admission" in t
+    project_admission = t.get("_project_admission") if project_admission is None else project_admission
     with _queue_lock:
         require_unique_id = bool(t.pop("_require_unique_task_id", False))
         require_worker_pool = bool(t.pop("_require_worker_pool", False))
@@ -277,15 +274,6 @@ def enqueue_task(
         if admission_token and reserved_token != admission_token:
             t["_admission_blocked"] = "admission_reservation_lost"
             return t
-        if project_id:
-            project = (project_admission or {}).get("project")
-            lifecycle = str((project or {}).get("lifecycle") or "active")
-            if project_error or (project is not None and lifecycle != "active"):
-                t.update(_admission_blocked=project_error or "project_routing_fence",
-                         _project_lifecycle=lifecycle, _project_id=project_id)
-                if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
-                    ADMISSION_RESERVATIONS.pop(task_id, None)
-                return t
         root_id = str(t.get("root_task_id") or "").strip()
         if root_id and not restoring_snapshot and apply_budget_root_admission_fence(t, root_id):
             if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
@@ -308,18 +296,54 @@ def enqueue_task(
         t["queued_at"] = utc_now_iso()
         if admission_token:
             t["_admission_owner_token"] = admission_token
-        if project_id:
-            from ouroboros.projects_registry import project_admission_guard
+        from ouroboros.projects_registry import (
+            ProjectAdmissionError, project_admission_guard, project_admission_view,
+            task_project_membership, validate_project_admission,
+        )
 
-            try:
+        try:
+            if has_project_admission:
+                validate_project_admission(project_admission)
+            if project_admission is None or project_admission["project"] is None:
+                project_id, known_room = task_project_membership(DRIVE_ROOT, t)
+                if project_id:
+                    t["project_id"] = project_id
+                    if project_admission is None:
+                        project_admission = project_admission_view(
+                            DRIVE_ROOT, project_id, allow_unregistered=not known_room, frozen=True)
+                        project_admission["legacy_basis"] = True
+                    elif known_room:
+                        raise ProjectAdmissionError("project_routing_fence_changed", "The registered Project is missing.")
+            if project_admission is not None and project_admission["project_id"] != project_id:
+                raise ProjectAdmissionError("project_routing_fence_changed", "The prepared Project scope changed.")
+            if project_id:
                 with project_admission_guard(DRIVE_ROOT, project_admission):
+                    # Recovery keeps the resource actually admitted, without a
+                    # transient derived-selection census or current-folder substitution.
+                    t["_project_admission"] = {key: value for key, value in project_admission.items()
+                                               if key != "workspace_claims"}
+                    t["_project_admission"]["frozen"] = True
                     PENDING.append(t)
-            except (OSError, RuntimeError, TimeoutError):
-                t["_admission_blocked"] = "project_routing_fence_changed"
-                return t
-        else:
-            PENDING.append(t)
+            else:
+                PENDING.append(t)
+        except (OSError, ValueError, TypeError, RuntimeError) as exc:
+            t.update(_admission_blocked=getattr(exc, "reason", "project_routing_fence_lookup_failed"),
+                     _admission_detail=str(exc), _project_id=project_id,
+                     _project_lifecycle=getattr(exc, "lifecycle", ""),
+                     _admission_never_admitted=True)
+            if admission_token and ADMISSION_RESERVATIONS.get(task_id) == admission_token:
+                ADMISSION_RESERVATIONS.pop(task_id, None)
+            return t
         sort_pending()
+        if not restoring_snapshot:
+            # A live fresh admission is positive host evidence. Retry/resume
+            # authority belongs to its existing owner; restore never backfills.
+            t["admitted_dispatch"] = "possible" if (
+                int(t.get("_attempt") or 1) > 1 or t.get("original_task_id")
+                or t.get("timeout_retry_from") or t.get("_owner_wait_resume")
+                or t.get("_budget_pause_resume")
+                or t.get("admitted_dispatch") == "possible"
+            ) else "none"
         if ADMISSION_RESERVATIONS.get(task_id) == admission_token:
             ADMISSION_RESERVATIONS.pop(task_id, None)
     return t

@@ -123,22 +123,31 @@ def _cleanup_api_admission_attempt(
     admission_token: str,
     child_drive: Optional[pathlib.Path] = None,
 ) -> None:
-    """Release one token and remove only its pre-admission task-local state."""
-    from supervisor.queue import release_task_admission
+    """Clean a known pre-enqueue failure while its reservation excludes rivals."""
+    from supervisor import queue
 
-    release_task_admission(task_id, admission_token)
-    if child_drive is not None:
+    with queue._queue_lock:
+        if (queue.ADMISSION_RESERVATIONS.get(task_id) != admission_token
+                or task_id in queue.RUNNING or any(row.get("id") == task_id for row in queue.PENDING)):
+            return
         try:
-            from ouroboros.headless import remove_subagent_task_drive
-            from supervisor.queue import task_settlement_interlock, task_settlement_liveness
-            remove_subagent_task_drive(drive_root, task_id, live=task_settlement_liveness,
-                                       guard=task_settlement_interlock, admission_rollback=True)
+            if load_task_result(drive_root, task_id, strict=True) is not None:
+                return
         except Exception:
-            log.warning("Failed to clean child drive for rejected task %s", task_id, exc_info=True)
+            return  # unreadable identity is not proof of our preparation ownership
+    # Keep the reservation through cleanup, but not Q through drive preparation.
+    # Even a raising prepare_task_drive may have created a partial owned drive.
+    from ouroboros.headless import remove_subagent_task_drive
+    try:
+        remove_subagent_task_drive(drive_root, task_id, live=queue.task_settlement_liveness,
+                                   guard=queue.task_settlement_interlock, admission_rollback=True)
+    except Exception:
+        log.warning("Failed to clean child drive for rejected task %s", task_id, exc_info=True)
     try:
         shutil.rmtree(task_artifacts_dir(drive_root, task_id, create=False), ignore_errors=True)
     except Exception:
         log.warning("Failed to clean admission artifacts for task %s", task_id, exc_info=True)
+    queue.release_task_admission(task_id, admission_token)
 
 
 def _external_subagent_label(body: Dict[str, Any], metadata: Dict[str, Any]) -> bool:
@@ -206,6 +215,10 @@ def _admission_rejection_response(
     if not (isinstance(admitted, dict) and admitted.get("_admission_blocked")):
         return None
     reason_code = str(admitted.get("_admission_blocked") or "admission_fence")
+    if reason_code.startswith("project_routing_fence"):
+        from ouroboros.project_dialogue import routing_refusal_cause
+
+        detail = routing_refusal_cause("promote_chat_to_task", "failed", reason_code) + "."
     if reason_code == "invalid_task_depth":
         detail, status_code = str(admitted.get("_admission_detail") or "Task was not scheduled: depth must be a non-negative integer."), 400
     if reason_code == "task_id_lookup_failed":
@@ -218,7 +231,7 @@ def _admission_rejection_response(
             },
             status_code=409,
         )
-    if reason_code in {"duplicate_task_id", "admission_reservation_lost"}:
+    if reason_code in {"duplicate_task_id", "admission_reservation_lost", "admission_reservation_owned"}:
         return JSONResponse(
             {
                 "error": "Task id is already owned by another admission attempt.",
@@ -230,17 +243,23 @@ def _admission_rejection_response(
         )
     admission = {
         "reason_code": reason_code,
+        "detail": str(admitted.get("_admission_detail") or ""),
         "project_id": str(admitted.get("_project_id") or project_id),
         "project_lifecycle": str(admitted.get("_project_lifecycle") or ""),
         "acceptance_fence_token": str(admitted.get("_acceptance_fence_token") or ""),
         "acceptance_fence_status": str(admitted.get("_acceptance_fence_status") or ""),
     }
-    write_task_result(
+    from supervisor.task_admission import persist_never_admitted_refusal
+
+    write_refusal = persist_never_admitted_refusal if admitted.get("_admission_never_admitted") else write_task_result
+    write_refusal(
         drive_root,
         task_id,
-        STATUS_FAILED,
+        **({"admission_token": str(admitted.get("_admission_owner_token") or "")}
+           if admitted.get("_admission_never_admitted") else {"status": STATUS_FAILED}),
         reason_code=reason_code,
         admission=admission,
+        **({"admission_outcome": "never_admitted"} if admitted.get("_admission_never_admitted") else {}),
         artifact_status=ARTIFACT_STATUS_FAILED if workspace_root else "",
         result=detail,
         accounted_upper_bound_usd=0.0,
@@ -285,23 +304,24 @@ def _enqueue_api_task_durably(
     with queue._queue_lock:
         admitted = queue.enqueue_task(task)
         if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+            admitted.update(_admission_never_admitted=True, _admission_owner_token=admission_token)
             return admitted
-        if queue.persist_queue_snapshot(reason="api_task_create") is not True:
-            queue.PENDING[:] = [
-                row for row in queue.PENDING
-                if not (
-                    isinstance(row, dict)
-                    and str(row.get("id") or "") == task_id
-                    and str(row.get("_admission_owner_token") or "") == admission_token
-                )
-            ]
-            queue.persist_queue_snapshot(reason="api_task_create_rollback")
-            return {
-                **task,
-                "_admission_blocked": "queue_snapshot_persist_failed",
-                "_admission_status_code": 503,
-            }
-        write_task_result(drive_root, task_id, STATUS_SCHEDULED, **result_fields)
+        try:
+            if queue.persist_queue_snapshot(reason="api_task_create") is not True:
+                raise RuntimeError("Queue snapshot persistence was not confirmed")
+            write_task_result(drive_root, task_id, STATUS_SCHEDULED, **result_fields)
+            stored = load_task_result(drive_root, task_id, strict=True) or {}
+            if stored.get("api_admission") != result_fields["api_admission"]:
+                raise RuntimeError("The exact API admission receipt was not persisted")
+        except Exception as exc:
+            # An observer may raise AFTER atomic replacement. Read the exact
+            # token; unknown persistence retains the queue row and its resources.
+            try:
+                stored = load_task_result(drive_root, task_id, strict=True) or {}
+            except Exception:
+                stored = {}
+            if stored.get("api_admission") != result_fields["api_admission"]:
+                return {**admitted, "_admission_uncertain": str(exc)}
         queue.release_task_admission(task_id, admission_token)
         return admitted
 
@@ -323,7 +343,7 @@ def _complete_api_task_admission(
     artifacts: List[Dict[str, Any]],
     metadata: Dict[str, Any],
 ) -> JSONResponse:
-    """Publish one API admission or roll back only its token-owned queue row."""
+    """Publish one API admission; retain custody when persistence is unknown."""
     result_fields = {
         **({"created_at": task["created_at"]} if task.get("created_at") else {}),
         **{key: task.get(key) for key in (
@@ -332,6 +352,7 @@ def _complete_api_task_admission(
             "task_contract", "workspace_root",
         )},
         "project_id": project_id,
+        **{k: v for k, v in task.items() if k == "_project_admission"},
         "description": description,
         "allowed_resources": allowed_resources,
         "deadline_at": deadline_at,
@@ -343,6 +364,7 @@ def _complete_api_task_admission(
         "artifact_status": ARTIFACT_STATUS_PENDING if workspace_root else "",
         "metadata": metadata,
         **{key: task[key] for key in ("attachment_manifest", "attachment_manifest_ref") if key in task},
+        "api_admission": {"token": admission_token, "status": "accepted"},
         "result": "Task accepted and durably scheduled.",
     }
     try:
@@ -353,10 +375,10 @@ def _complete_api_task_admission(
             admission_token=admission_token,
             result_fields=result_fields,
         )
-        snapshot_failed = (
-            str(admitted.get("_admission_blocked") or "")
-            == "queue_snapshot_persist_failed"
-        )
+        if admitted.get("_admission_uncertain"):
+            return JSONResponse({"task_id": task_id, "status": "unconfirmed",
+                                 "error": "Task admission persistence is unconfirmed; its resources were retained.",
+                                 "detail": admitted["_admission_uncertain"]}, status_code=503)
         rejection = _admission_rejection_response(
             admitted,
             drive_root=drive_root,
@@ -364,52 +386,15 @@ def _complete_api_task_admission(
             project_id=project_id,
             workspace_root=workspace_root,
             child_drive=child_drive,
-            status_code=503 if snapshot_failed else 409,
-            detail=(
-                "Task was not scheduled because its durable queue snapshot could not be written."
-                if snapshot_failed
-                else "Task was not scheduled because its admission fence is closed."
-            ),
         )
         if rejection is not None:
             return rejection
     except Exception as exc:
-        try:
-            from supervisor import queue as supervisor_queue
-
-            with supervisor_queue._queue_lock:
-                supervisor_queue.PENDING[:] = [
-                    row for row in supervisor_queue.PENDING
-                    if not (
-                        isinstance(row, dict)
-                        and str(row.get("id") or "") == task_id
-                        and str(row.get("_admission_owner_token") or "")
-                        == admission_token
-                    )
-                ]
-            supervisor_queue.persist_queue_snapshot(
-                reason="api_task_create_failed_rollback"
-            )
-        except Exception:
-            log.warning(
-                "Failed to roll back API task %s after admission error",
-                task_id,
-                exc_info=True,
-            )
-        write_task_result(
-            drive_root,
-            task_id,
-            "failed",
-            **{
-                **result_fields,
-                "artifact_status": ARTIFACT_STATUS_FAILED if workspace_root else "",
-                "result": f"Failed to enqueue task: {exc}",
-            },
-        )
-        _cleanup_api_admission_attempt(
-            drive_root, task_id, admission_token, child_drive
-        )
-        return json_exception(exc, 503)
+        # The queue may already have been observed or persisted. No broad
+        # rollback can prove non-execution here, and unreadable is not refusal.
+        log.warning("API task admission settlement is unconfirmed for %s", task_id, exc_info=True)
+        return JSONResponse({"task_id": task_id, "status": "unconfirmed",
+                             "error": f"Task admission settlement is unconfirmed: {exc}"}, status_code=503)
     _broadcast_task_named(task_id, str(task.get("suggested_name") or ""))
     return JSONResponse({
         "ok": True,
@@ -504,24 +489,22 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         return json_error("memory_mode must be one of forked, empty, shared", 400)
     if workspace_root and memory_mode == "shared":
         return json_error("memory_mode=shared is not allowed for external workspaces; use forked or empty", 400)
-    from ouroboros.project_facts import explicit_project_id_ok, resolve_project_id as _resolve_pid
+    from ouroboros.project_facts import explicit_project_id_ok
+    from ouroboros.projects_registry import project_scope_admission
 
     raw_project_id = str(body.get("project_id") or "")
-    # Validate the UNSTRIPPED value so leading/trailing whitespace (which would
-    # collapse two inputs into one store) is rejected, not silently normalized.
+    # Reject unsanitized ids: normalization would alias different memory stores.
     if raw_project_id and not explicit_project_id_ok(raw_project_id):
-        # Fail closed: an explicit project_id must already be filesystem-clean.
-        # Reject (rather than silently normalize/empty -> canonical), so two
-        # inputs never collapse to one store and isolation is never defeated.
-        return json_error(
-            "project_id must be filesystem-safe (alphanumeric/_/-/., no spaces or slashes)", 400)
-    _task_project_id = _resolve_pid({"project_id": raw_project_id, "workspace_root": str(workspace_root or "")})
-    # D5 (Option A): keep the RECORDED memory_mode exactly as requested — shared/forked/
-    # empty semantics are unchanged. Isolation for a project-scoped `shared` task comes
-    # from MATERIALIZING an isolated child drive (data-root isolation), NOT from mutating
-    # the recorded mode. The worker uses task['drive_root'] (the child), and a pure
-    # --project-id task never shows the memory_mode line, so the recorded mode stays
-    # purely informational while post-task writes still land on the isolated child.
+        return json_error("project_id must be filesystem-safe (alphanumeric/_/-/., no spaces or slashes)", 400)
+    try:
+        project_basis = project_scope_admission(
+            drive_root, project_id=raw_project_id, workspace_root=str(workspace_root or ""))
+    except (OSError, ValueError, RuntimeError) as exc:
+        return json_error(f"Project state could not be checked: {exc}", 409,
+                          reason_code="project_routing_fence_lookup_failed")
+    _task_project_id = project_basis["project_id"]
+    # Keep requested memory_mode; project-scoped shared memory runs on a forked
+    # child data root, so post-task writes stay isolated even without a workspace.
     effective_drive_mode = "forked" if (_task_project_id and memory_mode == "shared") else memory_mode
     task_type = str(body.get("type") or "task")
     if task_type in {"evolution", "review", "deep_self_review"}:
@@ -637,11 +620,15 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     # task['drive_root'] set at the end of this handler). The returned manifest renders
     # READY read_file(root='artifact_store', ...) lines and feeds native image blocks.
     effective_drive = child_drive or drive_root
-    attachment_manifest, attachment_error = stage_initial_task_attachments(
-        effective_drive, task_id, _normalize_attachments(body.get("attachments")),
-        # Partial staging is the DEFAULT (В25c); explicit false = atomic admission.
-        allow_partial=body.get("allow_partial_attachments") is not False,
-    )
+    try:
+        attachment_manifest, attachment_error = stage_initial_task_attachments(
+            effective_drive, task_id, _normalize_attachments(body.get("attachments")),
+            # Partial staging is the DEFAULT (В25c); explicit false = atomic admission.
+            allow_partial=body.get("allow_partial_attachments") is not False,
+        )
+    except Exception as exc:
+        _cleanup_api_admission_attempt(drive_root, task_id, admission_token, child_drive)
+        return json_exception(exc, 503)
     if attachment_error is not None:
         _cleanup_api_admission_attempt(drive_root, task_id, admission_token, child_drive)
         return attachment_error
@@ -720,6 +707,7 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         "workspace_mode": workspace_mode,
         "memory_mode": memory_mode,
         "project_id": _task_project_id,
+        "_project_admission": project_basis,
         "metadata": metadata,
         # v6.52.0 (P1): the STAGED manifest (root/relpath/mime/is_image), not raw
         # host paths — relpaths resolve against task['drive_root'] at read time.
@@ -738,12 +726,9 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     try:
         task = attach_task_contract(task)
     except Exception as exc:
-        _cleanup_api_admission_attempt(
-            drive_root, task_id, admission_token, child_drive
-        )
+        _cleanup_api_admission_attempt(drive_root, task_id, admission_token, child_drive)
         return json_exception(exc, 503)
     if child_drive is not None:
-        task["drive_root"] = str(child_drive)
         task["child_drive_root"] = str(child_drive)
         task["budget_drive_root"] = str(drive_root)
         metadata["child_drive_root"] = str(child_drive)

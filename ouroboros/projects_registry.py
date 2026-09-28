@@ -17,9 +17,10 @@ one agent (BIBLE P1).
 from __future__ import annotations
 
 import logging
+import uuid
 import pathlib
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterator, List, Optional
 
 from ouroboros.contracts.chat_id_policy import project_chat_id
@@ -87,40 +88,25 @@ def _bindings_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / "state" / _BINDINGS_NAME
 
 
+# Keep the registry facade stable; execution reads have their own strict contract.
+from ouroboros.project_admission import (  # noqa: E402, F401
+    ProjectAdmissionError, _strict_admission_snapshot, display_registry_snapshot,
+    project_admission_basis, project_admission_guard, project_admission_view,
+    project_scope_admission, task_project_membership, validate_project_admission,
+)
+
+
 def _load(drive_root: Any, *, strict: bool = False) -> Dict[str, Any]:
-    if strict:
-        import json
+    # Writers reject malformed authority; display never normalizes it into active.
+    data = (_strict_admission_snapshot(drive_root, allow_missing=True)[0] if strict
+            else display_registry_snapshot(drive_root))
+    for row in data["projects"]:
         try:
-            data = json.loads(_registry_path(drive_root).read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {"projects": []}
-        if (not isinstance(data, dict) or not isinstance(data.get("projects"), list)
-                or any(not isinstance(row, dict) or not row.get("id") for row in data["projects"])):
-            raise ValueError("Project registry is unavailable")
-    else:
-        data = read_json_dict(_registry_path(drive_root))
-    if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
-        return {"projects": []}
-    data["projects"] = [
-        _normalize_project_row(p)
-        for p in data["projects"]
-        if isinstance(p, dict) and p.get("id")
-    ]
-    return data
-
-
-def _normalize_project_row(value: Dict[str, Any]) -> Dict[str, Any]:
-    """Add safe lifecycle/read-cursor defaults without rewriting on read."""
-    row = dict(value)
-    lifecycle = str(row.get("lifecycle") or PROJECT_ACTIVE).strip().lower()
-    row["lifecycle"] = lifecycle if lifecycle in PROJECT_LIFECYCLES else PROJECT_ACTIVE
-    for field in ("routing_generation", "visible_revision"):
-        try:
-            row[field] = max(0, int(row.get(field) or 0))
+            row["visible_revision"] = max(0, int(row.get("visible_revision") or 0))
         except (TypeError, ValueError):
-            row[field] = 0
-    row["delete_error"] = str(row.get("delete_error") or "")
-    return row
+            row["visible_revision"] = 0
+        row["delete_error"] = str(row.get("delete_error") or "")
+    return data
 
 
 def _validated_name(value: Any, fallback: str = "") -> str:
@@ -230,6 +216,7 @@ def bind_task_to_project(
     chat_id: Any = None,
     *,
     origin: Dict[str, Any],
+    admission_basis: Optional[dict] = None,
 ) -> Dict[str, Any]:
     """Durably bind an existing task/live card to a project thread.
 
@@ -249,14 +236,15 @@ def bind_task_to_project(
         raise ValueError("task_id is required")
     if not pid:
         raise ValueError(f"unusable project id: {project_id!r}")
-    if get_reserved_project(drive_root, pid) is None:
+    if admission_basis is None and get_reserved_project(drive_root, pid) is None:
         create_project(drive_root, pid)
     # Linearize admission with the lifecycle fence. Holding the registry lock
     # through the short bindings append means begin_project_deletion either lands
     # before this bind (which is refused) or after it (which cancellation sees).
-    with _file_write_lock(_registry_path(drive_root)):
+    with _file_write_lock(_registry_path(drive_root)), \
+            project_admission_guard(drive_root, admission_basis) if admission_basis is not None else nullcontext():
         project = next(
-            (row for row in _load(drive_root)["projects"] if row.get("id") == pid),
+            (row for row in _load(drive_root, strict=True)["projects"] if row.get("id") == pid),
             None,
         )
         if not isinstance(project, dict) or project.get("lifecycle") != PROJECT_ACTIVE:
@@ -365,7 +353,8 @@ def project_binding_for_task(drive_root: Any, task_id: str, *, strict: bool = Fa
     # always sees a complete (old or new) bindings file, never a torn one.
     bindings = _load_bindings(drive_root, strict=strict)["bindings"]
     row = bindings.get(tid)
-    if strict and tid in bindings and (not isinstance(row, dict) or not row.get("project_id")):
+    if strict and tid in bindings and (not isinstance(row, dict) or not isinstance(row.get("project_id"), str)
+            or not row["project_id"] or sanitize_project_id(row["project_id"]) != row["project_id"]):
         raise ValueError("Project binding is unavailable")
     return dict(row) if isinstance(row, dict) else None
 
@@ -504,7 +493,7 @@ def live_origin_lanes() -> list:
     return [(tid, ref) for tid, ref in lanes if tid]
 
 
-def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = False) -> str:
+def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = False, include_inactive: bool = False) -> str:
     """Project bound to ANY task whose binding names this owner-message origin, else "".
 
     One owner message can spawn several task ids (the direct turn that received
@@ -518,7 +507,8 @@ def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = Fa
     Reads the same mtime/size-cached lens ``project_id_for_task`` uses;
     ``strict=True`` re-reads and RAISES on an unreadable store, for the callers
     that authorize creating a project. A binding whose project is no longer
-    ACTIVE does not count (``bind_task_to_project`` would refuse it anyway).
+    ACTIVE does not count, unless admission requests ``include_inactive`` to
+    preserve positive membership evidence even after a room closes/disappears.
     LEGACY state can name SEVERAL active projects for one origin (the measured
     incident left exactly that): prefer the one whose task is still LIVE, else the
     LATEST binding — where the work actually continued — and disclose the choice
@@ -540,8 +530,11 @@ def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = Fa
     )
     if not candidates:
         return ""  # the common case: no binding names this message, so no registry read
-    active = {str(project.get("id") or "") for project in list_projects(drive_root)}
-    candidates = [row for row in candidates if row[2] in active]
+    if strict and any(sanitize_project_id(row[2]) != row[2] for row in candidates):
+        raise ValueError("Project origin binding is unavailable")
+    if not include_inactive:
+        active = {str(project.get("id") or "") for project in list_projects(drive_root, strict=strict)}
+        candidates = [row for row in candidates if row[2] in active]
     if not candidates:
         return ""
     chosen = candidates[-1][2]
@@ -658,10 +651,10 @@ def list_reserved_projects(drive_root: Any, *, strict: bool = False) -> List[Dic
     )
 
 
-def list_projects(drive_root: Any) -> List[Dict[str, Any]]:
+def list_projects(drive_root: Any, *, strict: bool = False) -> List[Dict[str, Any]]:
     """Active, routable Projects (most recently active first)."""
     return [
-        project for project in list_reserved_projects(drive_root)
+        project for project in list_reserved_projects(drive_root, strict=strict)
         if project.get("lifecycle") == PROJECT_ACTIVE
     ]
 
@@ -765,11 +758,11 @@ def registered_project_chat_ids(drive_root: Any) -> set:
     return reserved_project_chat_ids(drive_root)
 
 
-def get_project(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
+def get_project(drive_root: Any, project_id: str, *, strict: bool = False) -> Optional[Dict[str, Any]]:
     pid = sanitize_project_id(project_id)
     if not pid:
         return None
-    for project in list_projects(drive_root):
+    for project in list_projects(drive_root, strict=strict):
         if project.get("id") == pid:
             return dict(project)
     return None
@@ -785,36 +778,6 @@ def get_reserved_project(drive_root: Any, project_id: str, *, strict: bool = Fal
             return dict(project)
     return None
 
-
-def _registry_revision(drive_root: Any) -> tuple:
-    try:
-        st = _registry_path(drive_root).stat()
-        return st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size
-    except FileNotFoundError:
-        return ()
-
-
-def project_admission_view(drive_root: Any, project_id: str) -> Dict[str, Any]:
-    """Read the registry off the queue lock and bind its exact atomic-file revision."""
-    before = _registry_revision(drive_root)
-    project = get_reserved_project(drive_root, project_id, strict=True)
-    if before != _registry_revision(drive_root):
-        raise RuntimeError("project registry changed during admission preparation")
-    return {"project_id": project_id, "project": project, "revision": before}
-
-
-@contextmanager
-def project_admission_guard(drive_root: Any, view: Dict[str, Any]):
-    """Short existing-writer fence; never wait for registry writers under queue lock.
-
-    The expensive JSON read is in project_admission_view. Stat of the atomic-file
-    identity detects every replacement, including rebind-away-and-back. The same
-    writer lock prevents replacement until the queue publishes this admission.
-    """
-    with _file_write_lock(_registry_path(drive_root), timeout_sec=0.0):
-        if view.get("revision") != _registry_revision(drive_root):
-            raise RuntimeError("project registry changed before admission")
-        yield view.get("project")
 
 
 def _bounded_presentation_name(value: Any, *, fallback: str = "") -> str:
@@ -921,24 +884,20 @@ def create_project(
     name: str = "",
     working_dir: str = "",
     origin: str = "owner",
+    admission_basis: Optional[dict] = None,
 ) -> Dict[str, Any]:
-    """Register (or idempotently return) a project entry.
+    """Register or return an active room; its optional folder may stay empty.
 
-    ``working_dir`` is optional — file-less projects (research, presentations
-    drafted in chat) are first-class. The per-project chat id is derived
-    deterministically from the id (one allocator-free SSOT).
-
-    The returned dict carries an additive ``created`` key — ``True`` only when
-    THIS call registered the row, ``False`` on the idempotent replay of an
-    existing project. Callers that need "did a project actually come into
-    existence" (e.g. the agent-initiated ``project_started`` announcement)
-    branch on it; the key is never persisted into the registry file.
+    Chat identity derives deterministically from the id. The returned, unpersisted
+    ``created`` flag is true only for THIS registration, so announcements can
+    distinguish a newly created room from an idempotent replay.
     """
     pid = sanitize_project_id(project_id)
     if not pid:
         raise ValueError(f"unusable project id: {project_id!r}")
-    with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root)
+    with _file_write_lock(_registry_path(drive_root)), \
+            project_admission_guard(drive_root, admission_basis) if admission_basis is not None else nullcontext():
+        data = _load(drive_root, strict=True)
         for existing in data["projects"]:
             if existing.get("id") == pid:
                 if existing.get("lifecycle") != PROJECT_ACTIVE:
@@ -957,6 +916,7 @@ def create_project(
             "last_active_at": utc_now_iso(),
             "lifecycle": PROJECT_ACTIVE,
             "routing_generation": 0,
+            "routing_incarnation": uuid.uuid4().hex,
             "visible_revision": 0,
             "delete_error": "",
         }
@@ -967,7 +927,8 @@ def create_project(
 
 
 def update_project(
-    drive_root: Any, project_id: str, *, only_if_empty: tuple = (), **updates: Any,
+    drive_root: Any, project_id: str, *, only_if_empty: tuple = (),
+    admission_basis: Optional[dict] = None, **updates: Any,
 ) -> Optional[Dict[str, Any]]:
     """Update mutable fields. v6.59.0 adds the additive source-provenance facts:
     ``provenance`` (attached|cloned|genesis|none — how the working_dir came to be),
@@ -990,7 +951,10 @@ def update_project(
         "last_task_result_id",
     }
     with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root)
+        if admission_basis is not None:
+            with project_admission_guard(drive_root, admission_basis):
+                pass  # the writer lock keeps this comparison valid through _save
+        data = _load(drive_root, strict=True)
         for entry in data["projects"]:
             if entry.get("id") != pid or entry.get("lifecycle") != PROJECT_ACTIVE:
                 continue
@@ -1013,7 +977,7 @@ def begin_project_deletion(drive_root: Any, project_id: str) -> Optional[Dict[st
     if not pid:
         return None
     with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root)
+        data = _load(drive_root, strict=True)
         for entry in data["projects"]:
             if entry.get("id") != pid:
                 continue
@@ -1037,7 +1001,7 @@ def fail_project_deletion(
     if not pid:
         return None
     with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root)
+        data = _load(drive_root, strict=True)
         for entry in data["projects"]:
             if entry.get("id") == pid and entry.get("lifecycle") == PROJECT_DELETING:
                 entry["delete_error"] = str(error or "deletion did not quiesce")[:2000]
@@ -1052,7 +1016,7 @@ def complete_project_deletion(drive_root: Any, project_id: str) -> Optional[Dict
     if not pid:
         return None
     with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root)
+        data = _load(drive_root, strict=True)
         for entry in data["projects"]:
             if entry.get("id") != pid:
                 continue
@@ -1109,7 +1073,7 @@ def increment_project_visible_revision(
     if not pid and not cid:
         return None
     with _file_write_lock(_registry_path(drive_root)):
-        data = _load(drive_root)
+        data = _load(drive_root, strict=True)
         for entry in data["projects"]:
             if entry.get("lifecycle") != PROJECT_ACTIVE:
                 continue
@@ -1160,7 +1124,7 @@ def reconcile_projects(drive_root: Any) -> int:
         projects_root = pathlib.Path(drive_root) / "projects"
         if projects_root.is_dir():
             with _file_write_lock(_registry_path(drive_root)):
-                data = _load(drive_root)
+                data = _load(drive_root, strict=True)
                 known = {p.get("id") for p in data["projects"]}
                 # Keep the store-side marker current for every ACTIVE owner-originated
                 # row whose store already exists. Maintained HERE — by the same organ
@@ -1247,6 +1211,7 @@ def reconcile_projects(drive_root: Any) -> int:
                         "last_active_at": utc_now_iso(),
                         "lifecycle": PROJECT_ACTIVE,
                         "routing_generation": 0,
+                        "routing_incarnation": uuid.uuid4().hex,
                         "visible_revision": 0,
                         "delete_error": "",
                     })
@@ -1356,36 +1321,31 @@ def _backfill_thread_activity(drive_root: Any) -> int:
     return flagged
 
 
-def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any) -> str:
-    """Provision (once) an invisible-git working folder for a project.
+def ensure_project_workspace(drive_root: Any, project_id: str, repo_dir: Any,
+                             *, return_project: bool = False, admission_basis: Optional[dict] = None) -> Any:
+    """Choose the existing folder or provision only while the folder is empty.
 
-    Reuses the genesis-project machinery: a standalone git repo under the
-    durable projects root (never GC-pruned, isolated from repo/ and data/).
-    Returns the absolute path ("" when provisioning failed). File-less
-    projects simply never call this.
+    Preparation callers can consume the exact chosen row with return_project;
+    reading again after provisioning would lose an intervening rebind/ABA.
     """
-    entry = get_project(drive_root, project_id)
-    if entry is None:
-        entry = create_project(drive_root, project_id)
-    existing = str(entry.get("working_dir") or "").strip()
-    if existing and pathlib.Path(existing).is_dir():
-        return existing
-    try:
-        from ouroboros.subagent_worktrees import provision_genesis_project
+    entry = create_project(drive_root, project_id, admission_basis=admission_basis)
+    if not str(entry.get("working_dir") or "").strip():
+        try:
+            from ouroboros.subagent_worktrees import provision_genesis_project
 
-        handle = provision_genesis_project(
-            repo_dir=repo_dir,
-            task_id=f"project_{entry['id']}",
-            data_dir=drive_root,
-            # Name the genesis folder after the project so sibling builders land in a
-            # recognizable shared root (binding identity stays the task_id). (I, v6.39)
-            dir_name=str(entry.get("name") or ""),
-        )
-        update_project(drive_root, entry["id"], working_dir=str(handle.path))
-        return str(handle.path)
-    except Exception:
-        log.warning("Project workspace provisioning failed for %s", project_id, exc_info=True)
-        return ""
+            handle = provision_genesis_project(
+                repo_dir=repo_dir, task_id=f"project_{entry['id']}", data_dir=drive_root,
+                dir_name=str(entry.get("name") or ""),
+            )
+            entry = update_project(drive_root, entry["id"], working_dir=str(handle.path),
+                                   only_if_empty=("working_dir",),
+                                   admission_basis=project_admission_basis(entry["id"], entry))
+        except Exception:
+            log.warning("Project workspace provisioning failed for %s", project_id, exc_info=True)
+            entry = None
+    if return_project:
+        return entry
+    return str((entry or {}).get("working_dir") or "")
 
 
 def projects_summary(drive_root: Any, *, limit: int = 50) -> List[Dict[str, Any]]:

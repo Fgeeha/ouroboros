@@ -906,6 +906,9 @@ def effective_task_result(
         queue_status, queue_task = _queue_task_status(queue_snapshot, task_id)
         if queue_status and queue_status != "unknown":
             merged["status"] = _merge_queue_status(parent_status, queue_status, queue_task)
+            from ouroboros.project_admission import project_hold_fact
+
+            merged["project_admission_hold"] = project_hold_fact(queue_task)
             for key in (
                 "parent_task_id",
                 "root_task_id",

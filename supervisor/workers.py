@@ -540,15 +540,14 @@ def _stage_promoted_initial_attachments(
 def _reject_promoted_after_attachment_stage(
     outcome: dict, manifest: list[dict],
 ) -> dict:
-    """Central idempotent cleanup for every non-scheduled post-stage exit."""
+    """Carry cleanup ownership to the producer's exact refusal settlement."""
 
-    if manifest:
-        try:
-            from ouroboros.artifacts import remove_staged_attachments
-
-            remove_staged_attachments(manifest)
-        except Exception:
-            log.debug("promote: staged attachment cleanup failed", exc_info=True)
+    if outcome.get("admission_started"):
+        return outcome
+    outcome["never_admitted"] = True
+    # Keep the staging list itself: its private owned-path set is not serialized.
+    # Queue refusal may already have released this id's reservation.
+    outcome["_admission_cleanup_manifest"] = manifest
     return outcome
 
 
@@ -629,6 +628,7 @@ def _promoted_scheduled_outcome(task: dict, admitted: Any, tid: str) -> dict:
         "status": "scheduled",
         "task_id": tid,
         "_admitted_task_contract": dict(admitted_contract or {}),
+        **{k: v for k, v in (admitted if isinstance(admitted, dict) else task).items() if k == "_project_admission"},
     }
 
 
@@ -1839,6 +1839,11 @@ def _drop_cancelled_pending() -> bool:
             except Exception:
                 authority_error = True
         if authority_error:
+            if t.get("_project_admission_restore_hold"):
+                # Project conservation is independent of result readability;
+                # an unknown old dispatch is retained, never replayed or failed.
+                survivors.append(t)
+                continue
             if authority_hold:
                 assignment["safe"] = False
                 log.error(
