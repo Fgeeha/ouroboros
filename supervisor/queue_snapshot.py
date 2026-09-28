@@ -134,6 +134,7 @@ def persist_queue_snapshot(reason: str = "") -> bool:
                 **({"_project_admission": t["_project_admission"]} if "_project_admission" in t else {}),
                 "_project_admission_restore_hold": t.get("_project_admission_restore_hold"),
                 **({"admitted_dispatch": t["admitted_dispatch"]} if "admitted_dispatch" in t else {}),
+                **({"_project_scope_none": t["_project_scope_none"]} if "_project_scope_none" in t else {}),
                 "focus": t.get("focus"),
                 "allowed_resources": t.get("allowed_resources"), "deadline_at": t.get("deadline_at"),
                 "task_contract": t.get("task_contract"),

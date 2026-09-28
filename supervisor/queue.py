@@ -190,6 +190,7 @@ def enqueue_task(
     outside the consciousness concurrency cap; money (the allowance) still applies."""
     t = dict(task)
     if not restoring_snapshot:
+        t.pop("_project_scope_none", None)  # Only this host admission can attest absence.
         t.pop("_consciousness_continuation", None)  # never a caller-supplied marker
         if continuation:
             t["_consciousness_continuation"] = True
@@ -325,6 +326,8 @@ def enqueue_task(
                     t["_project_admission"]["frozen"] = True
                     PENDING.append(t)
             else:
+                if not restoring_snapshot and not has_project_admission:
+                    t["_project_scope_none"] = True
                 PENDING.append(t)
         except (OSError, ValueError, TypeError, RuntimeError) as exc:
             t.update(_admission_blocked=getattr(exc, "reason", "project_routing_fence_lookup_failed"),

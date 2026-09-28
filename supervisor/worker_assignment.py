@@ -344,10 +344,9 @@ def assign_tasks() -> None:
 
         from ouroboros.project_lease import candidate_is_leasable, running_project_ids
         from ouroboros.config import get_max_active_subagents_per_root
-
-
+        deferred_proofs = set()  # one attempt per row per Q-held pass; retry next tick
         for w in _pool().WORKERS.values():
-            if (w.busy_task_id is None and not getattr(w, "reaping", False)
+            while (w.busy_task_id is None and not getattr(w, "reaping", False)
                     and getattr(w, "active_capacity", True) and _pool().PENDING):
                 # One-writer-per-project lease: recompute per assignment so a
                 # task assigned in THIS loop pass immediately occupies its lane.
@@ -356,7 +355,8 @@ def assign_tasks() -> None:
                 # and project-leased candidates)
                 chosen_idx = None
                 for i, candidate in enumerate(_pool().PENDING):
-                    if candidate.get("_owner_hold") or candidate.get("_project_admission_restore_hold"):
+                    if (id(candidate) in deferred_proofs or candidate.get("_owner_hold")
+                            or candidate.get("_project_admission_restore_hold")):
                         continue
                     if remaining <= 0 and not candidate.get("_owner_wait_resume"):
                         continue
@@ -432,7 +432,7 @@ def assign_tasks() -> None:
                         dropped_ids = _pool()._drop_assignable_evolution_tasks(unresolved_invalid_id_set)
                         if dropped_ids:
                             queue.persist_queue_snapshot(reason="evolution_dropped_budget")
-                    continue
+                    break
                 task = _pool().PENDING[chosen_idx]
                 depth_error = _pool()._normalize_pending_task_depth(task)
                 evolution_error = "" if depth_error else _pool()._evolution_assignment_error(task)
@@ -444,16 +444,15 @@ def assign_tasks() -> None:
                         queue.persist_queue_snapshot(reason="invalid_task_depth" if depth_error else "evolution_authority_rejected")
                     elif depth_error:  # Keep failed terminalization in queue custody for retry.
                         log.error("Assignment blocked: invalid task depth could not be terminalized for %s", task.get("id"))
-                        break
-                    continue
+                        return
+                    break
                 # Keep the row in PENDING until durable pre-handoff evidence is
                 # visible. A failed write never permits the worker queue effect.
                 task["admitted_dispatch"] = "possible"
-                if queue.persist_queue_snapshot(reason="worker_launch_claimed") is not True:
-                    continue
-                if not record_project_dispatch_possible(task):
-                    continue
-                if not record_dispatch_possible(task):  # its receipt must first say it MAY run (#1315)
+                if (queue.persist_queue_snapshot(reason="worker_launch_claimed") is not True
+                        or not record_project_dispatch_possible(task)
+                        or not record_dispatch_possible(task)):  # schedule receipt must say it MAY run (#1315)
+                    deferred_proofs.add(id(task))
                     continue
                 _pool().PENDING.pop(chosen_idx)
                 _mirror_assigned_running_status(task)
@@ -485,3 +484,4 @@ def assign_tasks() -> None:
                             f"{emoji} {task_type.capitalize()} task {task['id']} started.",
                             role="system", system_type="task_started")
                 queue.persist_queue_snapshot(reason="assign_task")
+                break

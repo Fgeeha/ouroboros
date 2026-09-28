@@ -324,14 +324,14 @@ def restore_invalid_depth_admission(
 
 
 def record_project_dispatch_possible(task: dict) -> bool:
-    """Persist possible Project handoff beside the queue's admitted_dispatch.
+    """Persist possible handoff for scope-verifiable work beside admitted_dispatch.
 
     Assignment reads back 'possible' before handoff, so even an older PENDING
     snapshot cannot overrule it if the best-effort RUNNING mirror fails. This
     result fact never becomes 'none'; fresh admission's positive 'none' lives
     on the queue row. No early result may preempt the admission receipt owner.
     """
-    if not task.get("project_id"):
+    if not task.get("project_id") and task.get("_project_scope_none") is not True:
         return True
     from supervisor import queue
     from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED
@@ -370,14 +370,15 @@ def revalidate_project_holds() -> None:
     import time
     import copy
     from collections import Counter
+    from contextlib import nullcontext
 
     from ouroboros.project_admission import (
         ProjectAdmissionError, _strict_admission_snapshot,
-        project_admission_guard, validate_project_admission,
+        project_admission_guard, task_project_membership, validate_project_admission,
     )
     from supervisor import queue
     from supervisor.schedule_occurrence import restore_allowed
-    from ouroboros.projects_registry import project_binding_for_task
+    from ouroboros.projects_registry import _load_bindings, project_binding_for_task
 
     held = [task for task in queue.PENDING if task.get("_project_admission_restore_hold")]
     if not held:
@@ -392,6 +393,7 @@ def revalidate_project_holds() -> None:
     except (OSError, ValueError, TypeError, RuntimeError) as exc:
         read_error = exc
     released = []
+    bindings, bindings_error = None, None
     for task in held:
         if task.get("_terminalization_retry"):
             continue
@@ -429,27 +431,46 @@ def revalidate_project_holds() -> None:
             if isinstance(fence, dict) and fence.get("status") in {"active", "sealed"}:
                 raise ValueError("The task's root is in acceptance review; dispatch remains closed.")
             basis = task.get("_project_admission")
-            if (not isinstance(basis, dict) or basis.get("legacy_basis")
+            unscoped = (task.get("_project_scope_none") is True
+                        and "_project_admission" not in task and not task.get("project_id"))
+            if not unscoped and (not isinstance(basis, dict) or basis.get("legacy_basis")
                     or isinstance(basis.get("project"), dict) and not {
                         "id", "chat_id", "lifecycle", "routing_generation", "working_dir",
                         "routing_incarnation", "created_at"} <= basis["project"].keys()):
                 raise ValueError("The original Project identity is missing or invalid; automatic recovery is not authorized.")
-            validate_project_admission(basis)
-            if basis["project_id"] != str(task.get("project_id") or ""):
-                raise ProjectAdmissionError("project_routing_fence_changed", "The original Project scope changed.")
-            binding = project_binding_for_task(queue.DRIVE_ROOT, tid, strict=True)
-            if binding and basis["project"] is None:
-                raise ValueError("The original registered Project identity is missing; automatic recovery is not authorized.")
-            if binding and binding["project_id"] != basis["project_id"]:
-                raise ProjectAdmissionError("project_routing_fence_changed", "The task's original Project binding changed.")
-            if (stored.get("project_id") and stored["project_id"] != basis["project_id"]
+            if not unscoped:
+                validate_project_admission(basis)
+                if basis["project_id"] != str(task.get("project_id") or ""):
+                    raise ProjectAdmissionError("project_routing_fence_changed", "The original Project scope changed.")
+            if (stored.get("project_id") and stored["project_id"] != task.get("project_id")
+                    or unscoped and "_project_admission" in stored
+                    or unscoped and str(stored.get("workspace_root") or "") != str(task.get("workspace_root") or "")
                     or stored.get("workspace_root") and stored["workspace_root"] != task.get("workspace_root")):
                 raise ProjectAdmissionError("project_routing_fence_changed", "The saved task assignment changed.")
-            if read_error is not None:
+            if not unscoped and read_error is not None:
                 raise ValueError("Project information is unreadable; recovery will be checked automatically when it is readable.") from read_error
+            if bindings is None and bindings_error is None:
+                try:
+                    bindings = _load_bindings(queue.DRIVE_ROOT, strict=True)["bindings"]
+                except (OSError, ValueError, TypeError, RuntimeError) as exc:
+                    bindings_error = exc
+            if bindings_error is not None:
+                raise ValueError("Task scope information is unreadable; recovery will be checked automatically when it is readable.") from bindings_error
+            if unscoped:
+                pid, known = task_project_membership(queue.DRIVE_ROOT, task, bindings_snapshot=bindings)
+                if pid or known:
+                    raise ProjectAdmissionError("project_routing_fence_changed", "The task's original unscoped assignment changed.")
+                guard = nullcontext()
+            else:
+                binding = project_binding_for_task(queue.DRIVE_ROOT, tid, strict=True, bindings_snapshot=bindings)
+                if binding and basis["project"] is None:
+                    raise ValueError("The original registered Project identity is missing; automatic recovery is not authorized.")
+                if binding and binding["project_id"] != basis["project_id"]:
+                    raise ProjectAdmissionError("project_routing_fence_changed", "The task's original Project binding changed.")
+                guard = project_admission_guard(queue.DRIVE_ROOT, {**basis, "frozen": False}, snapshot=snapshot)
             # Automatic hold release requires the FULL original registered tuple.
             # Explicit/inherited frozen-resource admission elsewhere is unchanged.
-            with project_admission_guard(queue.DRIVE_ROOT, {**basis, "frozen": False}, snapshot=snapshot):
+            with guard:
                 workspace = str(task.get("workspace_root") or "")
                 if workspace:
                     path = pathlib.Path(workspace)

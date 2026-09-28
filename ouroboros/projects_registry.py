@@ -345,13 +345,15 @@ def all_task_project_bindings(drive_root: Any, *, strict: bool = False) -> Dict[
     return out
 
 
-def project_binding_for_task(drive_root: Any, task_id: str, *, strict: bool = False) -> Optional[Dict[str, Any]]:
+def project_binding_for_task(drive_root: Any, task_id: str, *, strict: bool = False,
+                             bindings_snapshot: Optional[dict] = None) -> Optional[Dict[str, Any]]:
     tid = str(task_id or "").strip()
     if not tid:
         return None
     # Read needs no lock: atomic_write_json renames into place, so a reader
     # always sees a complete (old or new) bindings file, never a torn one.
-    bindings = _load_bindings(drive_root, strict=strict)["bindings"]
+    bindings = (_load_bindings(drive_root, strict=strict)["bindings"]
+                if bindings_snapshot is None else bindings_snapshot)
     row = bindings.get(tid)
     if strict and tid in bindings and (not isinstance(row, dict) or not isinstance(row.get("project_id"), str)
             or not row["project_id"] or sanitize_project_id(row["project_id"]) != row["project_id"]):
@@ -493,7 +495,8 @@ def live_origin_lanes() -> list:
     return [(tid, ref) for tid, ref in lanes if tid]
 
 
-def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = False, include_inactive: bool = False) -> str:
+def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = False,
+                          include_inactive: bool = False, bindings_snapshot: Optional[dict] = None) -> str:
     """Project bound to ANY task whose binding names this owner-message origin, else "".
 
     One owner message can spawn several task ids (the direct turn that received
@@ -518,20 +521,24 @@ def project_id_for_origin(drive_root: Any, origin_ref: Any, *, strict: bool = Fa
     key = origin_key(origin_ref)
     if key is None:
         return ""
-    bindings = (
-        _load_bindings(drive_root, strict=True)["bindings"] if strict else _bindings_lens(drive_root)
-    )
-    candidates = sorted(
-        (str(row.get("bound_at") or ""), str(task_id), str(row.get("project_id") or "").strip())
-        for task_id, row in bindings.items()
-        if isinstance(row, dict)
-        and str(row.get("project_id") or "").strip()
-        and origin_key(row.get("source_ref")) == key
-    )
+    bindings = bindings_snapshot
+    if bindings is None:
+        bindings = _load_bindings(drive_root, strict=True)["bindings"] if strict else _bindings_lens(drive_root)
+    candidates = []
+    for task_id, row in bindings.items():
+        if not isinstance(row, dict) or origin_key(row.get("source_ref")) != key:
+            continue
+        pid = row.get("project_id")
+        # Validate matching evidence before display coercion can alias an ID or
+        # turn corrupt positive membership into an apparently unbound origin.
+        if strict and (not isinstance(pid, str) or not pid or sanitize_project_id(pid) != pid):
+            raise ValueError("Project origin binding is unavailable")
+        pid = str(pid or "").strip()
+        if pid:
+            candidates.append((str(row.get("bound_at") or ""), str(task_id), pid))
+    candidates.sort()
     if not candidates:
         return ""  # the common case: no binding names this message, so no registry read
-    if strict and any(sanitize_project_id(row[2]) != row[2] for row in candidates):
-        raise ValueError("Project origin binding is unavailable")
     if not include_inactive:
         active = {str(project.get("id") or "") for project in list_projects(drive_root, strict=strict)}
         candidates = [row for row in candidates if row[2] in active]

@@ -440,6 +440,8 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
                 "task_id": task_id,
                 "reservation_owned": False,
             }
+            if blocked["reason"] in {"worker_pool_unavailable", "worker_pool_state_unavailable"}:
+                blocked["never_admitted"] = True
             if blocked["reason"] != "duplicate_task_id" or _own_emitted_stub(ctx, task_id, routing_token):
                 _persist_promote_rejection(ctx, evt, blocked)
             _emit_routing_receipt(
@@ -477,6 +479,7 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
             outcome = {
                 "status": "needs_manual_target",
                 "reason": "project_source_error",
+                "never_admitted": True,
                 "detail": source_error,
                 "task_id": task_id,
                 "reservation_owned": True,
@@ -488,6 +491,7 @@ def _promote_chat_to_task_outcome(evt: Dict[str, Any], ctx: Any) -> Dict[str, An
             outcome = {
                 "status": "needs_manual_target",
                 "reason": "worker_pool_unavailable",
+                "never_admitted": True,
                 "worker_pool_disabled_reason": str(pool_state.get("disabled_reason") or ""),
                 "task_id": task_id,
             }

@@ -24,7 +24,10 @@ class ProjectAdmissionError(RuntimeError):
 def project_hold_fact(task: dict) -> dict:
     """Read-only waiting fact; no new task phase or owner-action claim."""
     hold = task.get("_project_admission_restore_hold")
-    return ({**hold, "label": "Waiting for Project verification"}
+    unscoped = (task.get("_project_scope_none") is True
+                and not task.get("project_id") and "_project_admission" not in task)
+    label = "Waiting for task scope verification" if unscoped else "Waiting for Project verification"
+    return ({**hold, "label": label}
             if isinstance(hold, dict) and hold else {})
 
 
@@ -159,10 +162,10 @@ def validate_project_admission(view: Any) -> dict:
     return view
 
 
-def task_project_membership(drive_root: Any, task: dict) -> tuple[str, bool]:
+def task_project_membership(drive_root: Any, task: dict, *, bindings_snapshot: Optional[dict] = None) -> tuple[str, bool]:
     """Recover positive room evidence from host lineage before any scope-only permit.
 
-    A bindings snapshot (plus origin lookup when present), no registry lock.
+    One strict bindings snapshot, including origin lookup; no registry lock.
     Exact/predecessor membership precedes origin
     and ancestor evidence; explicit scopes remain valid without any room binding.
     """
@@ -172,7 +175,8 @@ def task_project_membership(drive_root: Any, task: dict) -> tuple[str, bool]:
     intent = metadata.get("resource_intent")
     intent = intent if isinstance(intent, dict) else {}
     pid = str(task.get("project_id") or intent.get("project_id") or "").strip()
-    bindings = _load_bindings(drive_root, strict=True)["bindings"]
+    bindings = (_load_bindings(drive_root, strict=True)["bindings"]
+                if bindings_snapshot is None else bindings_snapshot)
     identities = [task.get(k) for k in ("id", "original_task_id", "timeout_retry_from", "root_task_id", "parent_task_id")]
     identities += [metadata.get(k) for k in ("origin_task_id", "origin_root_task_id")]
     known = intent.get("kind") == "room_default"
@@ -190,7 +194,8 @@ def task_project_membership(drive_root: Any, task: dict) -> tuple[str, bool]:
     # after the room closes or disappears. Active-only display lookup loses that fact.
     key = origin_key(task.get("origin_message_ref"))
     if key is not None:
-        bound = project_id_for_origin(drive_root, task["origin_message_ref"], strict=True, include_inactive=True)
+        bound = project_id_for_origin(drive_root, task["origin_message_ref"], strict=True,
+                                      include_inactive=True, bindings_snapshot=bindings)
         if not pid:
             pid = bound
         known = known or bool(bound and bound == pid)

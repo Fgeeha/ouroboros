@@ -673,8 +673,11 @@ def _project_id_for_registered_chat(ctx: Any, chat_id: int) -> str:
 def _reserved_project_for_chat(ctx: Any, chat_id: int) -> Dict[str, Any]:
     """Execution routing requires positive absence, not an unavailable display lens."""
     from ouroboros.projects_registry import list_reserved_projects
+    from ouroboros.contracts.chat_id_policy import is_project_chat_id
 
     cid = int(chat_id or 0)
+    if not is_project_chat_id(cid):
+        return {}  # These host-reserved ids cannot belong to a Project room.
     for project in list_reserved_projects(ctx.DRIVE_ROOT, strict=True):
         if project["chat_id"] == cid:
             return dict(project)

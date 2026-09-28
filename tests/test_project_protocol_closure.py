@@ -171,10 +171,13 @@ def test_strict_incoming_and_global_steering_cannot_use_display_fallback(room): 
     from supervisor.steering import _owner_lane_allows
 
     ctx = SimpleNamespace(DRIVE_ROOT=room.root)
+    project_chat = registry.get_project(room.root, "target")["chat_id"]
     change_row(room.root, "other", lifecycle=[])
     with pytest.raises(ValueError):
-        _reserved_project_for_chat(ctx, 1)
-    assert not _owner_lane_allows(ctx, {"chat_id": 7}, "foreign", 1)
+        _reserved_project_for_chat(ctx, project_chat)
+    assert not _owner_lane_allows(ctx, {"chat_id": 7}, "foreign", project_chat)
+    assert _reserved_project_for_chat(ctx, 1) == {}
+    assert _owner_lane_allows(ctx, {"chat_id": 7}, "foreign", 1)
 
 
 def test_real_api_derived_scope_survives_other_room_creation(room, tmp_path, monkeypatch):  # noqa: F811

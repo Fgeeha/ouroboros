@@ -7,6 +7,14 @@ import { handoffPhase } from '../modules/project_handoff.js';
 const hold = { label: 'Waiting for Project verification', reason: 'project_routing_fence_lookup_failed', detail: 'Authority is unreadable.' };
 const held = { activity_id: 'same-id', chat_id: 7, kind: 'managed_task', phase: 'queued', project_admission_hold: hold };
 
+test('known non-Project wait keeps the scope label in Chat and Main handoff', () => {
+    const scopeHold = { ...hold, label: 'Waiting for task scope verification' };
+    const row = { ...held, chat_id: 1, project_admission_hold: scopeHold };
+    const activities = computeHydratedDirectActivities(new Map(), [row], 1);
+    assert.equal(computeDerivedChatStatus(chatStatusCounts(activities, [])).text, scopeHold.label);
+    assert.equal(handoffPhase(row, null).text, scopeHold.label);
+});
+
 test('held task is stationary across hydrated Chat, Project and Main receipt', () => {
     const activities = computeHydratedDirectActivities(new Map(), [held], 7);
     const card = { root: { isConnected: true }, groupId: 'same-id', finished: false };

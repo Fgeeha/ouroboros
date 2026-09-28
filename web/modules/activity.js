@@ -97,7 +97,9 @@ export function initActivity({ mount, ws } = {}) {
             const kindLabel = paused ? 'paused (budget)' : kind;
             const meta = `${esc(kindLabel)}${q.type ? ` · ${esc(q.type)}` : ''}${rt}`;
             const hold = t._project_admission_restore_hold;
-            const projectWait = hold ? ` · Waiting for Project verification: ${esc(hold.detail || hold.reason)}` : '';
+            const unscoped = t._project_scope_none === true && !t.project_id && !('_project_admission' in t);
+            const waitLabel = unscoped ? 'Waiting for task scope verification' : 'Waiting for Project verification';
+            const projectWait = hold ? ` · ${waitLabel}: ${esc(hold.detail || hold.reason)}` : '';
             return `<div class="activity-row">
                 <div class="activity-row-main">
                     <span class="activity-name">${label}</span>

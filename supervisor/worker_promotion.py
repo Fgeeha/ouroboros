@@ -502,7 +502,7 @@ def promote_chat_to_task(evt: dict, ctx: Any) -> dict:
         evt, task, tid, inherited_manifest=inherited_attachment_manifest,
     )
     if attachment_rejection is not None:
-        return attachment_rejection
+        return _pool()._reject_promoted_after_attachment_stage(attachment_rejection, attachment_manifest)
     if repair_constraint is not None:
         # X3: bind the admission hash to the REAL task id, durably, before the
         # task exists anywhere else — every payload write CAS-checks this chain.
@@ -788,10 +788,15 @@ def _admit_promoted_workspace(evt: dict, ctx: Any, task: dict, *, pid: str, tid:
             # registry lock), so a set value is never overwritten and the room's
             # later direct turns are not blind to where the work went.
             try:
-                from ouroboros.projects_registry import update_project
+                from ouroboros.projects_registry import update_project, project_admission_basis
 
-                update_project(_pool().DRIVE_ROOT, pid, working_dir=resolved_ws,
-                               only_if_empty=("working_dir",), admission_basis=task["_project_admission"])
+                # Only our confirmed CAS may advance the original identity used
+                # by hold recovery. Frozen resource choice cannot bless a foreign
+                # rebind (including away-and-back) at this preparation write.
+                chosen = update_project(_pool().DRIVE_ROOT, pid, working_dir=resolved_ws,
+                    only_if_empty=("working_dir",), admission_basis={**task["_project_admission"], "frozen": False})
+                if chosen:
+                    task["_project_admission"] = project_admission_basis(pid, chosen, frozen=True)
             except Exception:
                 log.warning("promote: could not record working_dir for project %s", pid, exc_info=True)
         # The lease lane keys off task["project_id"]: for a project room it is already

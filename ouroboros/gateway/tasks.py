@@ -451,6 +451,37 @@ async def api_tasks_create(request: Request) -> JSONResponse:
     return await run_sync_to_completion(_create_task_from_body, request, body)
 
 
+def _api_executor_metadata(body: dict, raw_metadata: dict, workspace_root: Optional[pathlib.Path],
+                           repo_dir: pathlib.Path, drive_root: pathlib.Path) -> dict:
+    """Validate executor scope before reservation or preparation effects."""
+    if "executor_ref" in raw_metadata or "workspace_executor" in raw_metadata:
+        raise ValueError("metadata.executor_ref/workspace_executor is reserved; pass executor_ref as a top-level task field")
+    if "executor_ref" not in body:
+        return {}
+    raw = body["executor_ref"]
+    if not isinstance(raw, dict) or not raw:
+        raise ValueError("executor_ref must be a JSON object")
+    if workspace_root is None:
+        raise ValueError("executor_ref requires an external workspace_root")
+    executor = normalize_executor_ref(raw)
+    if executor is None:
+        return {}
+    for mapping in executor.mappings:
+        for protected_root, label in ((repo_dir, "Ouroboros system repo"), (drive_root, "Ouroboros data drive")):
+            if paths_overlap_casefold(mapping.host_path, protected_root):
+                raise ValueError(f"executor_ref mapping must not overlap the {label}")
+    if not any(path_is_relative_to(workspace_root, mapping.host_path) for mapping in executor.mappings):
+        raise ValueError("executor_ref mappings must cover workspace_root")
+    return {"executor_ref": {
+        "type": executor.kind, "id": executor.executor_id, "network": executor.network,
+        "workspace_host_path": str(executor.mappings[0].host_path),
+        "workspace_backend_path": executor.mappings[0].backend_path,
+        "container_name": executor.container_name,
+        "path_mappings": [{"host_path": str(mapping.host_path), "backend_path": mapping.backend_path}
+                          for mapping in executor.mappings],
+    }}
+
+
 def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     """Settle the existing reservation, staging and durable admission as one unit."""
     if not isinstance(body, dict):
@@ -549,37 +580,10 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
     )
     if policy_error:
         return json_error(policy_error, 400)
-    if "executor_ref" in raw_metadata or "workspace_executor" in raw_metadata:
-        return json_error("metadata.executor_ref/workspace_executor is reserved; pass executor_ref as a top-level task field", 400)
-    if "executor_ref" in body:
-        raw_executor_ref = body.get("executor_ref")
-        if not isinstance(raw_executor_ref, dict) or not raw_executor_ref:
-            return json_error("executor_ref must be a JSON object", 400)
-        if workspace_root is None:
-            return json_error("executor_ref requires an external workspace_root", 400)
-        try:
-            normalized_executor = normalize_executor_ref(raw_executor_ref)
-        except ValueError as exc:
-            return json_error(str(exc), 400)
-        if normalized_executor is not None:
-            for mapping in normalized_executor.mappings:
-                for protected_root, label in ((repo_dir, "Ouroboros system repo"), (drive_root, "Ouroboros data drive")):
-                    if paths_overlap_casefold(mapping.host_path, protected_root):
-                        return json_error(f"executor_ref mapping must not overlap the {label}", 400)
-            if not any(path_is_relative_to(workspace_root, mapping.host_path) for mapping in normalized_executor.mappings):
-                return json_error("executor_ref mappings must cover workspace_root", 400)
-            metadata["executor_ref"] = {
-                "type": normalized_executor.kind,
-                "id": normalized_executor.executor_id,
-                "network": normalized_executor.network,
-                "workspace_host_path": str(normalized_executor.mappings[0].host_path),
-                "workspace_backend_path": normalized_executor.mappings[0].backend_path,
-                "container_name": normalized_executor.container_name,
-                "path_mappings": [
-                    {"host_path": str(mapping.host_path), "backend_path": mapping.backend_path}
-                    for mapping in normalized_executor.mappings
-                ],
-            }
+    try:
+        metadata.update(_api_executor_metadata(body, raw_metadata, workspace_root, repo_dir, drive_root))
+    except ValueError as exc:
+        return json_error(str(exc), 400)
     try:
         deadline_at = _normalize_deadline_at(body.get("deadline_at") or raw_metadata.get("deadline_at") or "")
     except ValueError as exc:
@@ -712,7 +716,7 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         "workspace_mode": workspace_mode,
         "memory_mode": memory_mode,
         "project_id": _task_project_id,
-        "_project_admission": project_basis,
+        **({"_project_admission": project_basis} if _task_project_id else {}),
         "metadata": metadata,
         # v6.52.0 (P1): the STAGED manifest (root/relpath/mime/is_image), not raw
         # host paths — relpaths resolve against task['drive_root'] at read time.

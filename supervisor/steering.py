@@ -181,6 +181,10 @@ def _owner_lane_allows(ctx: Any, task: Dict[str, Any], target: str, chat_id: int
     Project room, and -- from the Main lane, which sees the global manifest --
     every root. The lane is the host registry's answer for the issuing chat, so
     a Swarm root (no routing contract) and a picker click read the same rule."""
+    from ouroboros.contracts.chat_id_policy import is_project_chat_id
+
+    if not is_project_chat_id(chat_id):
+        return True
     try:
         if int(task.get("chat_id") or 0) == chat_id:
             return True
