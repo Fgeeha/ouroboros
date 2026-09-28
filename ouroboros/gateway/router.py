@@ -125,10 +125,8 @@ def collect_routes(
         api_tasks_create,
         api_tasks_list,
     )
-    from ouroboros.gateway.ui_preferences import (
-        api_ui_preferences_get,
-        api_ui_preferences_post,
-    )
+    from ouroboros.gateway.ui_preferences import api_ui_preferences_get, api_ui_preferences_post
+    from ouroboros.gateway.desktop_autostart import api_desktop_autostart_get, api_desktop_autostart_post
     from ouroboros.gateway.onboarding_host import onboarding_page
     from ouroboros.gateway.settings import (
         api_acknowledge_capability,
@@ -222,6 +220,8 @@ def collect_routes(
         Route("/api/settings", endpoint=settings_post, methods=["POST"]),
         Route("/api/ui/preferences", endpoint=api_ui_preferences_get, methods=["GET"]),
         Route("/api/ui/preferences", endpoint=api_ui_preferences_post, methods=["POST"]),
+        Route("/api/desktop/autostart", endpoint=api_desktop_autostart_get, methods=["GET"]),
+        Route("/api/desktop/autostart", endpoint=api_desktop_autostart_post, methods=["POST"]),
         Route("/api/owner/runtime-mode", endpoint=api_owner_runtime_mode, methods=["POST"]),
         Route("/api/owner/auto-grant", endpoint=api_owner_auto_grant, methods=["POST"]),
         Route("/api/owner/context-mode", endpoint=api_owner_context_mode, methods=["POST"]),

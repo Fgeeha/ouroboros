@@ -800,6 +800,22 @@ export function renderSettingsPage() {
                             <div class="settings-inline-note" data-notify-attention-status role="status" aria-live="polite"></div>
                         </div>
                     </div>
+
+                    <div class="form-section" data-autostart-settings hidden>
+                        <h3>Start with Windows</h3>
+                        <div class="settings-section-copy">
+                            Applies right away to the Windows account Ouroboros runs under. Windows lists the
+                            entry under Settings → Apps → Startup, where it can be turned off as well. After
+                            Panic, a sign-in does not start Ouroboros; opening it yourself does.
+                        </div>
+                        <div class="settings-effort-card">
+                            <label class="local-toggle ui-field ui-field-inline">
+                                <input type="checkbox" class="ui-checkbox" data-autostart-toggle>
+                                Start Ouroboros when I sign in to Windows
+                            </label>
+                            <div class="settings-inline-status" data-autostart-status role="status" aria-live="polite"></div>
+                        </div>
+                    </div>
                 </section>
 
                 <section class="settings-panel" data-settings-panel="advanced">

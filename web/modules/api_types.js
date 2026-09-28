@@ -1429,6 +1429,11 @@
  */
 
 /**
+ * @typedef {Object} DesktopAutostartResponse
+ * @property {'unavailable'|'off'|'on'|'other_copy'|'disabled_in_windows'} state  // Windows sign-in entry of THIS packaged copy
+ */
+
+/**
  * @typedef {Object} UpdateMergePlan
  * @property {boolean=} available
  * @property {boolean=} auto_mergeable

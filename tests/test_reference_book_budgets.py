@@ -47,7 +47,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 166450 -> 167000 (merge of the moved target into the plan-review branch, measured 166885): both
     # sides' replaced paragraphs land together; no text was appended by the merge itself.
     # 167000 -> 167300 (merge of the moved target into the plan-review branch, measured 167032): both sides' paragraphs land together.
-    "docs/architecture/01-high-level-architecture.md": 167300,
+    # 167300 -> 167700 (Start with Windows, measured 167693): module-map rows for the two new owners
+    # (windows_autostart.py, gateway/desktop_autostart.py) and settings_autostart.js on the Settings row.
+    "docs/architecture/01-high-level-architecture.md": 167700,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.
@@ -92,7 +94,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 107300 -> 107500 (merge of the moved target into the plan-review branch, measured 107392): both
     # sides' replaced paragraphs land together; no text was appended by the merge itself.
     "docs/architecture/03-web-ui-pages-and-buttons.md": 107500,
-    "docs/architecture/04-server-api-endpoints.md": 26833,
+    # 26833 -> 26900 (measured 26883): the endpoint table mirrors the route registry, so the two
+    # /api/desktop/autostart routes are two new rows; nothing older describes them.
+    "docs/architecture/04-server-api-endpoints.md": 26900,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
     # store read's three refusal cases, intent-then-outcome audit with its

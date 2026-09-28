@@ -18,17 +18,17 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D08 | Supervisor: queue, workers, events & runtime control | 50 | 0 |
 | D09 | Cancellation, owner control & process custody | 14 | 0 |
 | D10 | Git, update & release machinery | 29 | 0 |
-| D11 | Gateway, server & Web UI | 58 | 0 |
+| D11 | Gateway, server & Web UI | 59 | 0 |
 | D12 | Settings & configuration | 15 | 0 |
 | D13 | Safety, guards & runtime mode | 9 | 0 |
 | D14 | Skills & extensions | 56 | 0 |
 | D15 | Memory, knowledge, consciousness & self-evolution | 23 | 0 |
 | D16 | Observability, usage accounting & cost | 14 | 0 |
 | D17 | Projects, workspaces & task results | 25 | 0 |
-| D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
+| D18 | Launcher, packaging, platform & shared substrate | 16 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **597** | **0** |
+| **total** | | **599** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -588,6 +588,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/gateway/control.py`
 - `ouroboros/gateway/cost_breakdown.py`
 - `ouroboros/gateway/decision_contracts.py`
+- `ouroboros/gateway/desktop_autostart.py`
 - `ouroboros/gateway/endpoint_index.py`
 - `ouroboros/gateway/extension_receipts.py`
 - `ouroboros/gateway/extensions.py`
@@ -815,6 +816,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/reference_books.py`
 - `ouroboros/utils.py`
 - `ouroboros/verified_download.py`
+- `ouroboros/windows_autostart.py`
 
 ### D19 — Frozen contracts (ABI)
 

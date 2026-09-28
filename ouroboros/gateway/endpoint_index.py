@@ -15,6 +15,8 @@ HTTP_ENDPOINTS: tuple[str, ...] = (
     "POST /api/settings",
     "GET /api/ui/preferences",
     "POST /api/ui/preferences",
+    "GET /api/desktop/autostart",
+    "POST /api/desktop/autostart",
     "POST /api/owner/runtime-mode",
     "POST /api/owner/auto-grant",
     "POST /api/owner/context-mode",
