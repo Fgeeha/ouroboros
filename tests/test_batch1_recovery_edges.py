@@ -132,7 +132,9 @@ def test_wait_end_and_late_accounting_failure_settle_once(tmp_path):
     _, logs = _call(registry, tmp_path, timeout=0.05)
     release.set()
     deadline = time.monotonic() + 3
-    while time.monotonic() < deadline and len(tool_rows(logs / "tools.jsonl")) < 3:
+    # The settlement callback appends the durable row, THEN publishes its live frame: await both.
+    while time.monotonic() < deadline and (len(tool_rows(logs / "tools.jsonl")) < 3
+                                           or not any(frame.get("type") == "tool_call" for frame in registry.frames)):
         time.sleep(0.01)
     rows = tool_rows(logs / "tools.jsonl")
     assert [row["type"] for row in rows] == ["tool_call_started", "tool_call_timeout", "tool_call"]
