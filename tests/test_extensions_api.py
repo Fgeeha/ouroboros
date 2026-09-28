@@ -157,6 +157,46 @@ def test_testclient_lifespan_reload_all_uses_app_state_drive_root(tmp_path, monk
     assert calls == [(drive_root, str(repo_root))]
 
 
+def test_provider_boot_attaches_notification_subscriber_before_supervisor_starts(tmp_path, monkeypatch):
+    """An overdue reminder may fire on the first supervisor tick, without replay.
+
+    Exercise the real lifespan ordering, not a scheduler helper whose test bus
+    was subscribed by hand before the server started.
+    """
+    from starlette.testclient import TestClient
+    import server as srv
+    from ouroboros import event_bus, extension_loader
+
+    drive_root = tmp_path / "drive"
+    drive_root.mkdir()
+    monkeypatch.setattr(srv.app.app.state, "drive_root", drive_root, raising=False)
+    monkeypatch.setattr(srv.app.app.state, "repo_dir", tmp_path / "repo", raising=False)
+    _patch_lifespan_for_drive_root_test(monkeypatch, srv, {})
+    monkeypatch.setattr(srv, "has_startup_ready_provider", lambda _settings: True)
+    monkeypatch.setattr(srv, "_boot_managed_update_tasks", lambda: None)
+    observed = []
+
+    def reload_extensions(_root, _reader, *, repo_path=None):
+        event_bus.get_global_event_bus().subscribe(
+            "telegram", event_bus.OWNER_NOTIFICATION, observed.append,
+        )
+        return {}
+
+    def start_supervisor(_settings):
+        # Stand in for the first tick: a due notice must see the subscription
+        # installed by reload_all, not merely an initialized empty bus.
+        event_bus.publish_event(event_bus.OWNER_NOTIFICATION, {"text": "due"})
+        return True
+
+    monkeypatch.setattr(extension_loader, "reload_all", reload_extensions)
+    monkeypatch.setattr(srv, "_start_supervisor_if_needed", start_supervisor)
+    try:
+        with TestClient(srv.app):
+            assert [row["text"] for row in observed] == ["due"]
+    finally:
+        event_bus.init_global_event_bus()
+
+
 def test_testclient_settings_hot_reload_uses_app_state_drive_root(tmp_path, monkeypatch):
     from starlette.testclient import TestClient
     import server as srv

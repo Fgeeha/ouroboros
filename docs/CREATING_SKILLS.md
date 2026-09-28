@@ -888,7 +888,15 @@ stores a `kind: "notify"` row in the one schedule table (visible under Activity
 fires it at its instant without a model — a reminder whose instant passed while
 Ouroboros was off fires on the next tick, like any one-shot. The table consumes
 the occurrence before the outbound append: a crash can lose one alert, but
-cannot replay it automatically. Inspect the row and events before re-arming. With a `key`
+cannot replay it automatically. Inspect the row and events before re-arming.
+If no task-capable provider is configured, the Host Service can still accept
+deferred rows, but the supervisor does not start: they remain pending until a
+provider is configured and the supervisor starts. No model call is needed at
+firing time; that is distinct from the supervisor's startup prerequisite.
+On a configured boot, the supervisor starts after extension subscribers load;
+a failed extension load or an absent browser client still cannot guarantee a
+Telegram push or a desktop banner. Browser banners are live-only, not replayed
+when a tab reconnects. With a `key`
 the row is yours to move: the same key posted again replaces its time and
 text (a one-shot that already fired needs a new `at` — the same instant answers
 `400 consumed_not_rearmed`); `{"key": ..., "cancel": true}` removes it (`404` when there is no such

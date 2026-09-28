@@ -1319,9 +1319,8 @@ async def lifespan(app):
 
     if not _exit_signalled.is_set():
         _supervisor_stop.clear()  # a fresh lifespan owns a fresh generation (symmetric with the teardown set)
-    if has_startup_ready_provider(settings):
-        _start_supervisor_if_needed(settings)
-    else:
+    startup_provider_ready = has_startup_ready_provider(settings)
+    if not startup_provider_ready:
         _supervisor_ready.set()
         _supervisor_init_done.set()
         log.info("No supported provider or local routing configured. Supervisor not started.")
@@ -1397,10 +1396,9 @@ async def lifespan(app):
     except Exception:
         log.warning("Stale skill-review reconciliation at startup failed", exc_info=True)
 
-    # Startup-only: after the prior process generation is gone, finalize orphaned
-    # RUNNING results and resolve an indeterminate post-task synthesis phase.
+    # Startup-only: finalize orphaned RUNNING results and indeterminate post-task synthesis.
     # The periodic zombie sweep intentionally does not perform this recovery.
-    if not has_startup_ready_provider(settings):
+    if not startup_provider_ready:
         _run_startup_task_recovery(
             lifespan_drive_root, REPO_DIR, skip_live_data=pytest_default_real_data_dir,
             prior_worker_pids=None if pytest_default_real_data_dir else _startup_worker_pids(lifespan_drive_root),
@@ -1422,7 +1420,9 @@ async def lifespan(app):
             _reload_extensions(lifespan_drive_root, _load_settings, repo_path=repo_path or None)
     except Exception:
         log.error("Extension reload_all at startup failed", exc_info=True)
-
+    # The first scheduler tick can consume an overdue notice; subscribers have no replay.
+    if startup_provider_ready:
+        _start_supervisor_if_needed(settings)
     try:
         from ouroboros.mcp_client import (
             reconfigure_from_settings as _mcp_reconfigure_startup,
