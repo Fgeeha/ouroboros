@@ -27,6 +27,9 @@ _BINDING_CAPS = ("billing_group_limit_usd", "root_limit_usd")
 BINDING_AUTHORITY_FIELD, BINDING_CARRIED = "binding_authority", "carried"  # baseline header stamp
 CARRIED_ROOT_BINDING, CARRIED_GROUP_BINDING = "original_root_binding", "original_group_binding"
 UNKNOWN_BINDING = "unknown"
+# Carried value for an identity the SOURCE had not bound yet: it stays unbound,
+# so a later original row still binds it exactly as it would have uncompacted.
+NO_ORIGINAL_BINDING = "unbound"
 
 
 class LedgerBindingUnknown(ValueError):
@@ -51,14 +54,16 @@ class BindingIndex:
 
     A baseline aggregate never binds: its cap is a minimum and its position a
     sort order. A carried block restores the source's bindings verbatim from
-    the first group row of each root/group; an older block cannot, so its
-    members' original binding is UNKNOWN rather than a later row's cap.
-    Equality compares the two indexes only.
+    the first group row of each root/group; an explicit ``NO_ORIGINAL_BINDING``
+    there leaves that member unbound for a later original row. Missing,
+    invalid or unstamped carriage fixes that member's binding as UNKNOWN,
+    never a later row's cap. Equality compares the two indexes only.
     """
 
     roots: Dict[str, Any] = field(default_factory=dict)
     groups: Dict[str, Any] = field(default_factory=dict)
     carried: bool = field(default=False, compare=False)
+    unbound: set = field(default_factory=set, compare=False)  # (carrier, key) the block left open
 
     def fold(self, row: Dict[str, Any]) -> None:
         kind = str(row.get("kind") or "")
@@ -69,10 +74,14 @@ class BindingIndex:
         if kind == "usage_baseline_group":
             for index, key, name, owner in ((self.roots, root, CARRIED_ROOT_BINDING, monetary_scope_key),
                                             (self.groups, group, CARRIED_GROUP_BINDING, billing_group_key)):
-                if key and not self.carried:
-                    index.setdefault(key, UNKNOWN_BINDING)
-                elif key and name in row:
-                    index.setdefault(key, _carried(row[name], key, owner))
+                if not key or key in index or (name, key) in self.unbound:
+                    continue  # only the first block row of each member decides it
+                if not self.carried:
+                    index[key] = UNKNOWN_BINDING
+                elif row.get(name) == NO_ORIGINAL_BINDING:
+                    self.unbound.add((name, key))
+                else:
+                    index[key] = _carried(row.get(name), key, owner)
             return
         if ((root and root not in self.roots) or (group and group not in self.groups)) and any(
                 cap in row for cap in _BINDING_CAPS):

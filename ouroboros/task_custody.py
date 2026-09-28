@@ -77,13 +77,14 @@ from typing import Any, Callable, ContextManager, Dict, Iterator, List, Optional
 
 from ouroboros.task_results import load_task_result, validate_task_id, write_task_result
 from ouroboros.utils import utc_now_iso
+from ouroboros.owner_mailbox import _mailbox_path, _MAILBOX_DIR as _OWNER_MAILBOX_DIR
 
 log = logging.getLogger(__name__)
 
 HEADLESS_TASKS_DIR = pathlib.Path("state") / "headless_tasks"
 TASK_DRIVES_DIR = pathlib.Path("task_drives")
 _ARTIFACTS_DIR = pathlib.Path("task_results") / "artifacts"
-_MAILBOX_DIR = pathlib.Path("memory") / "owner_mailbox"
+_MAILBOX_DIR = pathlib.Path(_OWNER_MAILBOX_DIR)
 _STAGING_DIR = pathlib.Path("state") / "custody_staging"
 _TRASH_DIR = pathlib.Path("state") / "custody_trash"
 # The addressed words a sender is owed; controls (hurry, finalize_now, ...) are not mail.
@@ -222,10 +223,6 @@ def store_relpath(store: pathlib.Path, raw_path: Any) -> str:
 
 
 # ----------------------------------------------------------------- unread mail
-
-
-def _mailbox_path(drive_root: Any, task_id: str) -> pathlib.Path:
-    return pathlib.Path(drive_root) / _MAILBOX_DIR / f"{validate_task_id(task_id)}.jsonl"
 
 
 def _row_key(row: str) -> str:

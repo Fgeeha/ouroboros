@@ -643,7 +643,7 @@ def test_continue_after_a_crash_rejoins_a_lost_answer_and_survives_reload(direct
                 button.click()
                 expect(button).to_have_text("Continued", timeout=15_000)
                 expect(button).to_have_attribute("data-continue-successor", successor)
-                expect(page.locator(".toast").last).to_contain_text(successor)
+                expect(page.locator(".toast").last).to_contain_text("Continue accepted.")
                 nonce = page.evaluate(f"localStorage.getItem('ouro_continue_nonce:{DELTA}')")
                 assert nonce
                 shot("03-continue-retry-same-successor")

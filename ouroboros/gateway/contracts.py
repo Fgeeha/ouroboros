@@ -1278,6 +1278,7 @@ class TaskPauseResponse(TypedDict, total=False):
     duplicate: bool
     members: List[str]
     snapshot_persisted: bool
+    latch_pending: bool
     error: str
     reason_code: str
 

@@ -421,8 +421,10 @@ def test_fresh_owner_pause_and_zero_ledger_do_not_prove_legacy_dispatch(tmp_path
     assert request_owner_pause("legacy", request_id="p")["ok"]
     before = read_fence(tmp_path, "legacy")
     result = resume_budget_paused_task("legacy")
-    if dispatch == "none":
+    if dispatch is not None:
+        # Recorded evidence decides the path; a Resume never rewrites it.
         assert result["ok"] and result["owner_pause_released"]
+        assert result["never_started"] is (dispatch == "none")
         assert read_fence(tmp_path, "legacy")["state"] == "released"
     else:
         assert result["error"] == "dispatch_outcome_unknown"

@@ -32,13 +32,15 @@ from tests.test_billing_group import _scope, _spend
 from tests.test_billing_group import data_root as data_root
 
 OLD_TS = "2026-01-01T00:00:00+00:00"
+UNCAPPED = object()  # no cap field at all: unlike an explicit unlimited None, this row binds nothing
 
 
 def _legacy_attempt(root, attempt_id, *, model, cap, rid="P", **extra):
     """A pre-group attempt chain: no ``billing_group_*`` fields, only its root cap."""
     base = {"kind": "attempt", "attempt_id": attempt_id, "model": model, "provider": "openai", "task_id": rid,
             "root_task_id": rid, "parent_task_id": "", "category": "task", "source": "old", "ts": OLD_TS,
-            "reservation_upper_bound_usd": 1.0, "pricing_known": True, "root_limit_usd": cap, **extra}
+            "reservation_upper_bound_usd": 1.0, "pricing_known": True,
+            **({} if cap is UNCAPPED else {"root_limit_usd": cap}), **extra}
     with ua._locked(root):
         records = ua._read_records_locked(root)
         ua._append_rows_locked(root, records, [{**base, "state": "reserved"}, {**base, "state": "dispatched"},
@@ -226,6 +228,8 @@ def test_older_block_is_unknown_never_an_invented_allowance(data_root, monkeypat
 
 @pytest.mark.parametrize("field", ["original_root_binding", "original_group_binding"])
 @pytest.mark.parametrize("tamper", [
+    "missing",
+    None,
     ["not", "a", "binding"],
     "unknown",
     {"root_task_id": "P"},
@@ -242,18 +246,25 @@ def test_unreadable_or_foreign_carried_binding_is_unknown(data_root, monkeypatch
     _legacy_attempt(root, "later", model="a-model", cap=100.0)
     _legacy_attempt(root, "foreign", model="m", cap=1000.0, rid="F")
     _compact(root, monkeypatch)
+    assert original_group_limit(root, "P")["limit_usd"] == 20.0  # warm the replaced generation
+    assert ledger_billing_binding(root, "P")["billing_group_limit_usd"] == 20.0
     rows = _rows(root)
     carrier = next(row for row in rows if row.get("root_task_id") == "P" and field in row)
-    carrier[field] = tamper
-    _rewrite(root, rows)
-    _cold(root)
-    if field == "original_group_binding":
-        assert original_group_limit(root, "P") == {"limit_usd": None, "source": "ledger_binding_unknown"}
-        assert ledger_billing_binding(root, "P")["billing_group_limit_usd"] == 20.0
+    if tamper == "missing":
+        carrier.pop(field)
     else:
-        assert original_group_limit(root, "P") == {"limit_usd": 20.0, "source": "ledger_first_row"}
-        with pytest.raises(LedgerBindingUnknown):
-            ledger_billing_binding(root, "P")
+        carrier[field] = tamper
+    _rewrite(root, rows)
+    for cold in (False, True):
+        if cold:
+            _cold(root)
+        if field == "original_group_binding":
+            assert original_group_limit(root, "P") == {"limit_usd": None, "source": "ledger_binding_unknown"}
+            assert ledger_billing_binding(root, "P")["billing_group_limit_usd"] == 20.0
+        else:
+            assert original_group_limit(root, "P") == {"limit_usd": 20.0, "source": "ledger_first_row"}
+            with pytest.raises(LedgerBindingUnknown):
+                ledger_billing_binding(root, "P")
     assert original_group_limit(root, "F") == {"limit_usd": 1000.0, "source": "ledger_first_row"}
     assert ledger_billing_binding(root, "F")["billing_group_limit_usd"] == 1000.0
     assert ua.usage_projection(root, billing_group_id="P")["accounted_usd"] == 1.0
@@ -288,3 +299,202 @@ def test_pass_that_cannot_carry_the_original_binding_aborts_byte_identical(data_
     events = (root / "logs" / "events.jsonl").read_text()
     assert "original binding authority mismatch" in events
     assert original_group_limit(root, "P") == {"limit_usd": 20.0, "source": "ledger_first_row"}
+
+
+@pytest.mark.serial
+@pytest.mark.parametrize("carriage,cap", [("missing", 20.0), ("present", 20.0), ("present", None)])
+def test_first_aggregate_authority_survives_tail_and_recompaction_into_continue(data_root, monkeypatch, carriage, cap):
+    """A stamped aggregate missing its payload cannot adopt a later original $100."""
+    from ouroboros._usage_rows import LedgerBindingUnknown
+    from ouroboros.task_results import load_task_result
+    from supervisor.continuation_admission import admit_continuation
+    from tests._budget_pause_exact_helpers import _install_queue
+    from tests.test_owner_continue import _interrupted, NONCE
+
+    root = ua._drive_root(data_root)
+    _queue, _state, workers = _install_queue(root, monkeypatch)
+    _legacy_attempt(root, "first", model="m", cap=cap)
+    _interrupted(root, "P", reason_code="task_exception")
+    assert not load_task_result(root, "P").get("billing_group"), "exercise the actual ledger fallback"
+    _legacy_attempt(root, "foreign", model="m", cap=7.0, rid="F")
+    _compact(root, monkeypatch)
+    assert original_group_limit(root, "P")["limit_usd"] == cap
+    assert ledger_billing_binding(root, "P")["billing_group_limit_usd"] == cap
+    if carriage == "missing":
+        rows = _rows(root)
+        assert rows[0]["binding_authority"] == "carried"
+        for row in rows:
+            if row.get("root_task_id") == "P":
+                row.pop("original_root_binding", None)
+                row.pop("original_group_binding", None)
+        _rewrite(root, rows)
+    _legacy_attempt(root, "later", model="m", cap=100.0)
+    for epoch in range(3):
+        for cold in (False, True):
+            if cold:
+                _cold(root)
+            if carriage == "missing":
+                assert original_group_limit(root, "P") == {"limit_usd": None, "source": "ledger_binding_unknown"}
+                with pytest.raises(LedgerBindingUnknown):
+                    ledger_billing_binding(root, "P")
+                assert admit_continuation("P", action_nonce=NONCE) == {
+                    "ok": False, "error": "billing_authority_unavailable"}
+                assert not load_task_result(root, "P").get("continued_by")
+                assert not workers.PENDING
+            else:
+                assert original_group_limit(root, "P") == {"limit_usd": cap, "source": "ledger_first_row"}
+                assert ledger_billing_binding(root, "P")["billing_group_limit_usd"] == cap
+            assert original_group_limit(root, "F") == {"limit_usd": 7.0, "source": "ledger_first_row"}
+        if epoch < 2:
+            for index in range(4):
+                _legacy_attempt(root, f"n-{epoch}-{index}", model="m", cap=5.0, rid="N")
+            sums = _sums(root, "P", "F", "N")
+            _compact(root, monkeypatch)
+            assert _sums(root, "P", "F", "N") == sums
+    if carriage == "present":
+        first = admit_continuation("P", action_nonce=NONCE)
+        assert first["ok"] and not first["held"]
+        second = admit_continuation("P", action_nonce=NONCE)
+        assert second["successor_task_id"] == first["successor_task_id"]
+        assert len(workers.PENDING) == 1
+        binding = workers.PENDING[0]["metadata"]["continuation"]
+        assert binding["billing_group_id"] == "P" and binding["billing_group_limit_usd"] == cap
+
+
+def _answers(root, rid):
+    """Every binding consumer's answer, a refusal recorded as its typed reason."""
+    def answer(call):
+        try:
+            return call()
+        except ValueError as exc:  # LedgerBindingUnknown and billing_authority_unavailable
+            return type(exc).__name__, str(exc)
+    return (original_group_limit(root, rid), answer(lambda: ledger_billing_binding(root, rid)),
+            answer(lambda: _billing_group(SimpleNamespace(DRIVE_ROOT=root), rid, {"task_id": rid})))
+
+
+def _carrier(rows, rid, field):
+    return next(row for row in rows if row.get("kind") == "usage_baseline_group"
+                and row.get("root_task_id") == rid and field in row)
+
+
+def _uncapped_history(root):
+    """U spends before any row names a cap (two models: two aggregates); F is capped."""
+    for index, model in enumerate(("z-model", "a-model", "a-model")):
+        _legacy_attempt(root, f"u-{index}", model=model, cap=UNCAPPED, rid="U")
+    _legacy_attempt(root, "foreign", model="m", cap=7.0, rid="F")
+
+
+UNBOUND = ({"limit_usd": None, "source": "no_attempt_recorded"}, {},
+           ("ValueError", "billing_authority_unavailable"))
+
+
+def test_no_binding_survives_recompaction_and_a_later_original_cap_still_binds(data_root, monkeypatch):
+    """Compacting an identity nothing has bound yet must not decide its cap for it."""
+    root = ua._drive_root(data_root)
+    _uncapped_history(root)
+    assert _answers(root, "U") == UNBOUND
+    foreign = _answers(root, "F")
+    for epoch in range(2):  # the block keeps U open across repeated passes
+        _legacy_attempt(root, f"u-more-{epoch}", model="a-model", cap=UNCAPPED, rid="U")
+        sums = _sums(root, "U", "F")
+        _compact(root, monkeypatch)
+        rows = _rows(root)
+        assert rows[0]["binding_authority"] == "carried"
+        for field in ("original_root_binding", "original_group_binding"):
+            assert _carrier(rows, "U", field)[field] == "unbound"
+            assert sum(field in row for row in rows if row.get("root_task_id") == "U") == 1
+        for cold in (False, True):
+            if cold:
+                _cold(root)
+            assert _answers(root, "U") == UNBOUND
+            assert _answers(root, "F") == foreign
+            assert _sums(root, "U", "F") == sums
+    # The first ORIGINAL cap after the block binds, exactly as it would uncompacted.
+    _legacy_attempt(root, "late", model="m", cap=30.0, rid="U")
+    _legacy_attempt(root, "later", model="m", cap=100.0, rid="U")
+    bound = ({"limit_usd": 30.0, "source": "ledger_first_row"},
+             {"billing_group_id": "U", "billing_group_limit_usd": 30.0,
+              "billing_group_limit_source": "ledger_first_row", "billing_group_limit_revision": None},
+             {"billing_group_id": "U", "billing_group_limit_usd": 30.0, "billing_group_limit_source": "ledger_first_row"})
+    for cold in (False, True):
+        if cold:
+            _cold(root)
+        assert _answers(root, "U") == bound
+    sums = _sums(root, "U", "F")
+    _compact(root, monkeypatch)  # the late binding's own row folds now: the block carries it
+    rows = _rows(root)
+    assert not any(row.get("attempt_id") in {"late", "later"} for row in rows)
+    for field in ("original_root_binding", "original_group_binding"):
+        assert float(_carrier(rows, "U", field)[field]["root_limit_usd"]) == 30.0
+    for cold in (False, True):
+        if cold:
+            _cold(root)
+        assert _answers(root, "U") == bound
+        assert _answers(root, "F") == foreign
+        assert _sums(root, "U", "F") == sums
+
+
+@pytest.mark.parametrize("field", ["original_root_binding", "original_group_binding"])
+@pytest.mark.parametrize("tamper", [
+    "missing", "moved", "unstamped", None, "unknown", "Unbound", " unbound", ["unbound"], {},
+    {"root_task_id": "U"}, {"root_task_id": "F", "root_limit_usd": 1000.0},
+])
+def test_absent_or_untrusted_no_binding_carriage_stays_unknown(data_root, monkeypatch, field, tamper):
+    """Only the exact stamped sentinel on the FIRST aggregate leaves a member open."""
+    from ouroboros._usage_rows import LedgerBindingUnknown
+
+    root = ua._drive_root(data_root)
+    _uncapped_history(root)
+    _compact(root, monkeypatch)
+    assert _answers(root, "U") == UNBOUND  # warm the replaced generation
+    rows = _rows(root)
+    carrier = _carrier(rows, "U", field)
+    if tamper == "unstamped":
+        rows[0].pop("binding_authority")
+    elif tamper == "moved":  # the sentinel on a later aggregate cannot speak for the first
+        later = next(row for row in rows if row.get("kind") == "usage_baseline_group"
+                     and row.get("root_task_id") == "U" and row is not carrier)
+        later[field] = carrier.pop(field)
+    elif tamper == "missing":
+        carrier.pop(field)
+    else:
+        carrier[field] = tamper
+    _rewrite(root, rows)
+    _legacy_attempt(root, "late", model="m", cap=1000.0, rid="U")  # would be the cap if U were open
+    unknown_group = {"limit_usd": None, "source": "ledger_binding_unknown"}
+    for epoch in range(2):  # a newer pass carries UNKNOWN forward, never heals or reopens it
+        for cold in (False, True):
+            if cold:
+                _cold(root)
+            if tamper == "unstamped" or field == "original_group_binding":
+                assert original_group_limit(root, "U") == unknown_group
+                with pytest.raises(ValueError, match="billing_authority_unavailable"):
+                    _billing_group(SimpleNamespace(DRIVE_ROOT=root), "U", {"task_id": "U"})
+            else:
+                assert original_group_limit(root, "U") == {"limit_usd": 1000.0, "source": "ledger_first_row"}
+            if tamper == "unstamped" or field == "original_root_binding":
+                with pytest.raises(LedgerBindingUnknown):
+                    ledger_billing_binding(root, "U")
+            else:
+                assert ledger_billing_binding(root, "U")["billing_group_limit_usd"] == 1000.0
+            assert original_group_limit(root, "F") == (  # an unstamped block vouches for no member
+                unknown_group if tamper == "unstamped" else {"limit_usd": 7.0, "source": "ledger_first_row"})
+        if epoch == 0:
+            sums = _sums(root, "U", "F")
+            _compact(root, monkeypatch)
+            assert _sums(root, "U", "F") == sums
+
+
+def test_pass_that_cannot_carry_no_binding_aborts_byte_identical(data_root, monkeypatch):
+    """Publication compares unbound members too: an unreadable sentinel cannot commit."""
+    root = ua._drive_root(data_root)
+    _uncapped_history(root)
+    before = (root / ua.LEDGER_REL).read_bytes()
+    monkeypatch.setattr(compact, "NO_ORIGINAL_BINDING", "unrecognized")
+    monkeypatch.setattr(compact, "_fold_clock", lambda: time.time() + 1_000_000)
+    with ua._locked(root) as lock:
+        assert compact.compact_usage_ledger_locked(root, heartbeat=lock) is None
+    assert (root / ua.LEDGER_REL).read_bytes() == before
+    assert "original binding authority mismatch" in (root / "logs" / "events.jsonl").read_text()
+    _cold(root)
+    assert _answers(root, "U") == UNBOUND

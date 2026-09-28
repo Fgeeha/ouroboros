@@ -563,6 +563,10 @@ def _run_child(
         out_thread.join(timeout=EXTENSION_CHILD_CLEANUP_GRACE_SEC)
         err_thread.join(timeout=EXTENSION_CHILD_CLEANUP_GRACE_SEC)
         _publish_child_facts(proc, child_started_ts)
+        if out_thread.is_alive() or err_thread.is_alive():
+            raise ExtensionProcessError("extension child output drain did not finish")
+        if overflow["stdout"] or overflow["stderr"]:
+            raise ExtensionProcessError("extension child output exceeded safety cap")
         if proc.returncode != 0:
             stderr_text = stderr.decode("utf-8", errors="replace").strip()
             safe_stderr = sanitize_tool_result_for_log(stderr_text)[-2000:] if stderr_text else ""
@@ -577,9 +581,11 @@ def _run_child(
             result = json.loads(result_path.read_text(encoding="utf-8") or "{}")
         except json.JSONDecodeError as exc:
             raise ExtensionProcessError(f"extension child returned invalid JSON: {exc}") from exc
+        if not isinstance(result, dict):
+            raise ExtensionProcessError("extension child returned invalid protocol shape")
         _publish_child_facts(proc, child_started_ts, ws_relay_failures=result.get("ws_relay_failures"),
                              skill_name=str(payload.get("skill_name") or ""))
-        if not result.get("ok", False):
+        if result.get("ok") is not True:
             raise ExtensionProcessError(str(result.get("error") or "extension child failed"))
         return dict(result)
 
@@ -781,7 +787,9 @@ def dispatch_extension_tool_subprocess(ext_tool: Dict[str, Any], ctx: ToolContex
             )
         ) if model_capable else None),
     )
-    return str(result.get("result") or "")
+    if "result" not in result:
+        raise _mark_child_spawned(ExtensionProcessError("extension child omitted tool result"))
+    return str(result["result"] or "")
 
 
 def dispatch_extension_route_subprocess(spec: Dict[str, Any], request_payload: Dict[str, Any], *, drive_root: pathlib.Path, repo_dir: pathlib.Path) -> Response:

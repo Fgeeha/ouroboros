@@ -112,20 +112,40 @@ function pauseRequestId(taskId) {
     return pauseRequestIds.get(id);
 }
 
+// A durable Pause whose queue latch waited on a busy launch lock (202
+// `latch_pending`): the SAME id completes it. Bounded; never a new action.
+const PAUSE_LATCH_RETRY_MS = [250, 500, 1000, 2000];
+const sleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
 /**
  * The shared "Pause" flow: one typed request, a local toast naming the
  * truthful tree state, a typed refusal shown verbatim. Never a chat message.
  * @param {string} taskId
- * @param {{pause?: Function, toast?: Function}} [deps]
+ * @param {{pause?: Function, toast?: Function, wait?: Function}} [deps]
  * @returns {Promise<boolean>} whether the pause was accepted
  */
-export async function pauseTaskAction(taskId, { pause = pauseTask, toast = showToast } = {}) {
+export async function pauseTaskAction(taskId, { pause = pauseTask, toast = showToast, wait = sleep } = {}) {
     const id = String(taskId || '').trim();
     if (!id || inFlight.has(id)) return false;
     inFlight.add(id);
     try {
-        const ack = await pause(id, pauseRequestId(id));
+        const requestId = pauseRequestId(id);
+        let ack = await pause(id, requestId);
         if (ack?.ok !== true) throw new Error('Pause acknowledgement is unknown; retry this action.');
+        // From here the fence is durable: a failed completion is never a refusal.
+        for (const delay of PAUSE_LATCH_RETRY_MS) {
+            if (!ack.latch_pending) break;
+            await wait(delay);
+            try {
+                const next = await pause(id, requestId);
+                if (next?.ok === true) ack = next;
+            } catch { /* keep the durable acknowledgement and its id */ }
+        }
+        if (ack.latch_pending) {
+            toast('Pausing: new work is stopped. The queue part of this Pause is not confirmed yet; '
+                + 'press Pause again to finish the same action.', 'info');
+            return true;
+        }
         pauseRequestIds.delete(id);
         if (ack.state === 'released') {
             toast('This Pause was already resumed.', 'info');

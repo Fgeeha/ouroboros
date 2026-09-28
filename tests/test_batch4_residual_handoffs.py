@@ -1,4 +1,5 @@
 """Residual Pause replay, pending recovery, and atomic validation consumers."""
+import json
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
@@ -184,11 +185,15 @@ def test_patch_validation_cannot_retire_an_independent_unknown_handoff(tmp_path,
         assert any(row["kind"] == "tool_handoff" for row in conflicting_writers(q, "root"))
 
 
-def test_pause_latch_recheck_contention_keeps_fence_and_retries_same_action(tmp_path, monkeypatch):
+@pytest.mark.parametrize("surface", ["accept_step", "http"])
+def test_pause_latch_contention_acknowledges_the_durable_fence_and_the_same_id_completes_it(
+        tmp_path, monkeypatch, surface):
+    import asyncio
+
     from ouroboros import owner_pause
     from ouroboros.task_results import write_task_result
     from supervisor.owner_pause_control import request_owner_pause
-    from tests.test_owner_controls_http_custody import _Holder
+    from tests.test_owner_controls_http_custody import _Holder, _request
 
     q, _, workers = _install_queue(tmp_path, monkeypatch)
     write_task_result(tmp_path, "root", "scheduled", root_task_id="root")
@@ -201,17 +206,171 @@ def test_pause_latch_recheck_contention_keeps_fence_and_retries_same_action(tmp_
         holders.append(_Holder(lambda: owner_pause.launch_lock(tmp_path, "root"), 3))
         return result
     monkeypatch.setattr(owner_pause, "install_fence", install_then_contend)
+
+    def press():
+        if surface == "accept_step":
+            return 200, request_owner_pause("root", request_id="P")
+        from ouroboros.gateway.task_pause import api_task_pause
+
+        response = asyncio.run(api_task_pause(_request("/api/tasks/root/pause", "root", {"request_id": "P"})))
+        return response.status_code, json.loads(response.body)
     try:
-        refused = request_owner_pause("root", request_id="P")
-        assert refused == {"ok": False, "error": "owner_launch_authority_unavailable"}
+        status, pending = press()
         assert not holders[0].timed_out.is_set(), "queue must not wait for this root's launch lock"
         fence = owner_pause.read_fence(tmp_path, "root")
         assert fence["request_id"] == "P" and owner_pause.fence_closed(fence)
+        # Truthful: the Pause is durable and every launch gate refuses; only its
+        # queue latch waits. Never "refused" (it was once a 503 over a closed fence).
+        assert status == (202 if surface == "http" else 200)
+        assert pending["ok"] is True and pending["latch_pending"] is True, pending
+        assert (pending["fence_id"], pending["state"], pending["duplicate"]) == (fence["fence_id"], "requested", False)
         assert "root" not in q.BUDGET_ROOT_FENCES
     finally:
         for holder in holders:
             holder.finish()
     monkeypatch.setattr(owner_pause, "install_fence", real_install)
-    replay = request_owner_pause("root", request_id="P")
-    assert replay["ok"] and replay["duplicate"] and replay["fence_id"] == fence["fence_id"]
+    status, replay = press()
+    assert status == 200 and replay["ok"] and replay["duplicate"] and not replay.get("latch_pending")
+    assert replay["fence_id"] == fence["fence_id"]
+    assert owner_pause.read_fence(tmp_path, "root")["generation"] == fence["generation"]
     assert q.BUDGET_ROOT_FENCES["root"]["fence_id"] == fence["fence_id"]
+
+
+def _queued_retry_root(tmp_path, monkeypatch):
+    """A crash-requeued root: attempt 2 of the same id, its launch claim carried."""
+    from ouroboros.task_results import write_task_result
+
+    q, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_kw: 5.0)
+    write_task_result(tmp_path, "root", "interrupted", root_task_id="root")
+    row = {"id": "root", "type": "task", "chat_id": 0, "_attempt": 2, "root_task_id": "root",
+           "admitted_dispatch": "possible"}
+    workers.PENDING.append(row)
+    return q, workers, row
+
+
+def test_queued_retry_root_settles_paused_and_resume_releases_its_one_admitted_dispatch(tmp_path, monkeypatch):
+    from ouroboros.owner_pause import read_fence
+    from supervisor.continuation_admission import conflicting_writers
+    from supervisor.owner_pause_control import request_owner_pause
+    from tests.test_budget_pause_holds import _idle_worker
+
+    q, workers, row = _queued_retry_root(tmp_path, monkeypatch)
+    sent = []
+    _idle_worker(workers, sent)
+    ack = request_owner_pause("root", request_id="P")
+    assert ack["ok"] and ack["state"] == "paused", ack
+    assert read_fence(tmp_path, "root")["state"] == "paused"
+    # Continue's census is not the Pause's: a latched possible row still counts there.
+    assert [b["kind"] for b in conflicting_writers(q, "root")] == ["dispatchable_member"]
+    workers.assign_tasks()
+    assert sent == [] and workers.PENDING == [row]
+    resumed = q.resume_budget_paused_task("root")
+    assert resumed["ok"] and resumed["owner_pause_released"] and not resumed["never_started"], resumed
+    assert read_fence(tmp_path, "root")["state"] == "released"
+    assert "root" not in q.BUDGET_ROOT_FENCES
+    # Same row, same attempt, same dispatch evidence: never re-classified as unrun.
+    assert workers.PENDING == [row] and "_budget_pause_hold" not in row
+    assert (row["_attempt"], row["admitted_dispatch"]) == (2, "possible")
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert [(task["id"], task["_attempt"]) for task in sent] == [("root", 2)]
+
+
+def test_queued_retry_resume_waits_for_its_earlier_attempts_handed_work(tmp_path, monkeypatch):
+    from ouroboros.owner_pause import operation_start, read_fence, tool_handoff
+    from ouroboros.task_results import load_task_result, write_task_result
+    from supervisor import owner_pause_control
+    from supervisor.owner_pause_control import request_owner_pause, settle_requested_owner_pauses
+
+    q, workers, row = _queued_retry_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(owner_pause_control, "_LAST_SETTLE_CHECK", {})
+    source = SimpleNamespace(task_id="root", root_task_id="root", drive_root=tmp_path)
+    with pytest.raises(TimeoutError):  # attempt 1 handed an operation whose outcome is unknown
+        with tool_handoff(source, "external_write"):
+            with operation_start(source):
+                raise TimeoutError("request sent, response unknown")
+    assert load_task_result(tmp_path, "root")["launch_handoffs"]
+    ack = request_owner_pause("root", request_id="P")
+    assert ack["ok"] and ack["state"] == "requested"
+    refused = q.resume_budget_paused_task("root")
+    assert refused["error"] == "owner_pause_effects_unsettled", refused
+    assert [b["kind"] for b in refused["blockers"]] == ["tool_handoff"]
+    assert read_fence(tmp_path, "root")["state"] == "requested"
+    assert q.BUDGET_ROOT_FENCES["root"]["cause"] == "owner_pause"
+    assert workers.PENDING == [row] and "_budget_pause_hold" not in row
+    assert settle_requested_owner_pauses(q, now=100.0) == []
+    write_task_result(tmp_path, "root", "interrupted", launch_handoffs={})  # positively settled
+    assert settle_requested_owner_pauses(q, now=110.0) == ["root"]
+    assert read_fence(tmp_path, "root")["state"] == "paused"
+    assert q.resume_budget_paused_task("root")["ok"]
+    assert (row["_attempt"], row["admitted_dispatch"]) == (2, "possible")
+
+
+def test_a_latched_member_with_unknown_dispatch_still_holds_the_pause(tmp_path, monkeypatch):
+    from supervisor.events_budget import hold_budget_row
+    from supervisor.owner_pause_control import refresh_owner_pause_tree, request_owner_pause
+
+    q, workers, row = _queued_retry_root(tmp_path, monkeypatch)
+    child = {"id": "child", "type": "task", "chat_id": 0, "_attempt": 1, "root_task_id": "root",
+             "parent_task_id": "root", "admitted_dispatch": "possible"}
+    hold_budget_row(child, reason="dispatch_outcome_unknown", result_root=tmp_path)
+    workers.PENDING.append(child)
+    assert request_owner_pause("root", request_id="P")["state"] == "requested"
+    workers.PENDING.remove(child)
+    assert refresh_owner_pause_tree("root") == "paused"
+
+
+def test_exact_root_resume_counts_a_latched_retry_child_like_the_settlement(tmp_path, monkeypatch):
+    from ouroboros import budget_pause
+    from ouroboros.owner_pause import read_fence
+    from ouroboros.task_results import write_task_result
+    from supervisor.events_budget import HOLD_ROOT_FENCE_LIFTED, budget_hold_fact, install_exact_budget_pause
+    from supervisor.owner_pause_control import request_owner_pause
+    from tests.test_owner_pause import _owner_park
+
+    q, state, workers = _install_queue(tmp_path, monkeypatch)
+    monkeypatch.setattr(state, "budget_remaining", lambda *_a, **_kw: 5.0)
+    write_task_result(tmp_path, "solo", "running", chat_id=0, root_task_id="solo")
+    write_task_result(tmp_path, "retry-child", "interrupted", chat_id=0, root_task_id="solo")
+    workers.RUNNING["solo"] = {"task": {"id": "solo", "type": "task", "chat_id": 0, "root_task_id": "solo"},
+                               "worker_id": 0, "attempt": 1}
+    child = {"id": "retry-child", "type": "task", "chat_id": 0, "_attempt": 2, "root_task_id": "solo",
+             "parent_task_id": "solo", "delegation_role": "subagent", "admitted_dispatch": "possible"}
+    workers.PENDING.append(child)
+    assert request_owner_pause("solo", request_id="P")["state"] == "requested"
+    row = _owner_park(tmp_path, monkeypatch, "solo", [], root="solo")
+    ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, RUNNING=workers.RUNNING, PENDING=workers.PENDING,
+                          WORKERS=workers.WORKERS, sort_pending=lambda: None,
+                          persist_queue_snapshot=q.persist_queue_snapshot, bridge=None)
+    install_exact_budget_pause(ctx, "solo", budget_pause.exact_pause_marker(row)["checkpoint"])
+    assert read_fence(tmp_path, "solo")["state"] == "paused"
+    granted = q.resume_budget_paused_task("solo")
+    assert granted["ok"] and granted["exact_continuation"], granted
+    # Root Resume selects the root alone: the child waits for its own selection (Q9).
+    assert budget_hold_fact(child)["reason"] == HOLD_ROOT_FENCE_LIFTED
+    assert (child["_attempt"], child["admitted_dispatch"]) == (2, "possible")
+
+
+def test_queued_retry_root_resume_leaves_its_queued_members_to_explicit_selection(tmp_path, monkeypatch):
+    from ouroboros.task_results import write_task_result
+    from supervisor.events_budget import HOLD_ROOT_FENCE_LIFTED, budget_hold_fact
+    from supervisor.owner_pause_control import request_owner_pause
+
+    q, workers, row = _queued_retry_root(tmp_path, monkeypatch)
+    write_task_result(tmp_path, "child", "scheduled", root_task_id="root")
+    child = {"id": "child", "type": "task", "chat_id": 0, "_attempt": 1, "root_task_id": "root",
+             "parent_task_id": "root", "delegation_role": "subagent", "admitted_dispatch": "none"}
+    workers.PENDING.append(child)
+    sent = []
+    for wid in (0, 1):
+        workers.WORKERS[wid] = SimpleNamespace(wid=wid, busy_task_id=None, reaping=False,
+                                               in_q=SimpleNamespace(put=lambda t: sent.append(dict(t))))
+    assert request_owner_pause("root", request_id="P")["state"] == "paused"
+    assert q.resume_budget_paused_task("root")["ok"]
+    assert budget_hold_fact(child)["reason"] == HOLD_ROOT_FENCE_LIFTED
+    workers.assign_tasks()
+    assert [task["id"] for task in sent] == ["root"]
+    assert q.resume_budget_paused_task("child")["ok"]  # the owner's own selection
+    workers.assign_tasks()
+    assert [task["id"] for task in sent] == ["root", "child"]

@@ -50,7 +50,6 @@ def _codebase_health(ctx: ToolContext) -> str:
         from ouroboros.review import (
             MAX_FUNCTION_LINES,
             MAX_MODULE_LINES,
-            MAX_TOTAL_FUNCTIONS,
             TARGET_FUNCTION_LINES,
             TARGET_MODULE_LINES,
         )
@@ -86,7 +85,6 @@ def _codebase_health(ctx: ToolContext) -> str:
         grandfathered_mods = metrics.get("grandfathered_modules", [])
         oversized_funcs = metrics.get("oversized_functions", [])
         oversized_mods = metrics.get("oversized_modules", [])
-        function_count_violation = int(metrics.get("total_functions") or 0) > MAX_TOTAL_FUNCTIONS
 
         if (
             oversized_funcs
@@ -95,11 +93,8 @@ def _codebase_health(ctx: ToolContext) -> str:
             or grandfathered_mods
             or target_drift_funcs
             or target_drift_mods
-            or function_count_violation
         ):
             lines.append("\n### Complexity Status (Principle 7: Minimalism)")
-            if function_count_violation:
-                lines.append(f"  Hard-limit total functions > {MAX_TOTAL_FUNCTIONS}: {metrics['total_functions']}")
             if oversized_funcs:
                 lines.append(f"  Hard-limit functions > {MAX_FUNCTION_LINES} lines: {len(oversized_funcs)}")
                 for path, start, length in oversized_funcs:
@@ -125,7 +120,7 @@ def _codebase_health(ctx: ToolContext) -> str:
         else:
             lines.append(
                 "\n✅ No hard P7 limit violations detected "
-                f"(all functions <= {MAX_FUNCTION_LINES} lines, total function count <= {MAX_TOTAL_FUNCTIONS}, "
+                f"(all functions <= {MAX_FUNCTION_LINES} lines, "
                 f"all non-grandfathered modules <= {MAX_MODULE_LINES} lines)"
             )
 

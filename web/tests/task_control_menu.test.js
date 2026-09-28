@@ -99,6 +99,32 @@ test('a null Pause acknowledgement keeps its id; a released replay never claims 
     assert.notEqual(ids[1], ids[2]);
 });
 
+test('a durable Pause with a pending queue latch is never reported refused; the same id completes it', async () => {
+    const toasts = [];
+    const toast = (...args) => toasts.push(args);
+    const wait = async () => {};
+    const pending = { ok: true, state: 'requested', latch_pending: true, duplicate: false };
+    const ids = [];
+    const completes = async (_id, requestId) => {
+        ids.push(requestId);
+        if (ids.length === 2) throw new Error('response lost');
+        return ids.length < 3 ? pending : { ok: true, state: 'requested', duplicate: true };
+    };
+    assert.equal(await pauseTaskAction('latch-1', { pause: completes, toast, wait }), true);
+    assert.equal(ids.length, 3);
+    assert.equal(new Set(ids).size, 1, 'every completion retry reuses the SAME request id');
+    assert.match(toasts.at(-1)[0], /^Pausing: .*work already sent finishes/);
+    assert.equal(toasts.length, 1);
+    // Never confirmed within the bound: still accepted and truthful; the id is kept.
+    const stuck = [];
+    const always = async (_id, requestId) => { stuck.push(requestId); return pending; };
+    assert.equal(await pauseTaskAction('latch-2', { pause: always, toast, wait }), true);
+    assert.match(toasts.at(-1)[0], /^Pausing: new work is stopped\. The queue part .* not confirmed yet/);
+    assert.doesNotMatch(toasts.at(-1)[0], /refused/i);
+    await pauseTaskAction('latch-2', { pause: always, toast, wait });
+    assert.equal(new Set(stuck).size, 1, 'the owner\'s next press finishes the SAME action');
+});
+
 test('a pending cancel offers ONLY the hard escalation — hurry is never shown then', () => {
     // Q1: the hard stop stays reachable DURING the soft-stop wait as the
     // monotonic escalation of the SAME intent; HQ1: a pending cancel refuses

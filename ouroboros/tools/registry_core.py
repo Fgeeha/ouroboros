@@ -1113,12 +1113,15 @@ class ToolRegistry:
                 # settles its local call; owned processes/runs keep their own
                 # custody. Errors/timeouts and opaque remote acknowledgements
                 # prove neither settlement nor the absence of remote effects.
+                # A local extension's joined return comes through a separate
+                # host-owned sidechannel; its body/metadata never attest custody.
                 # Explicit unknown completion also overrides an OK client exit.
                 handoff["settled"] = (
+                    handoff.get("local_extension_returned") is True or (
                     handoff.get("builtin_returned") is True and not typed.meta.get("dynamic_provider")
                     and (typed.meta.get("operation_outcome") in {"completed", "completed_no_effect"} or (
                         "operation_outcome" not in typed.meta and typed.status == "ok"
-                        and typed.code not in {"LEGACY_UNTYPED", "LEGACY_WARNING", "GIT_ERROR"})))
+                        and typed.code not in {"LEGACY_UNTYPED", "LEGACY_WARNING", "GIT_ERROR"}))))
                 return typed
         except OwnerPauseRefused as exc:
             from ouroboros.tools.tool_result import launch_refusal_result
@@ -1251,7 +1254,7 @@ class ToolRegistry:
             return extension_dispatch._dispatch_mcp_tool_result(self._ctx, name, args)
         if entry is None:
             if ext_tool and callable(ext_tool.get("handler")):
-                return extension_dispatch._dispatch_extension_tool_result(self._ctx, name, ext_tool, args)
+                return extension_dispatch._dispatch_extension_tool_result(self._ctx, name, ext_tool, args, handoff=handoff)
             return self._name_miss_result(name, extension_unavailable=extension_unavailable)
         args, interpreter_resolution, interpreter_block = tool_resolution._resolve_python_predispatch(
             self, name, args, _runtime_mode, effective_constraint, resolved_binding,

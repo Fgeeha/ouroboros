@@ -45,7 +45,6 @@ from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.workspace_executor import executor_ref_from_ctx
 from ouroboros.workspace_executor import overlay_env, resolve_process_env, service_env, validate_process_env
 from ouroboros.workspace_executor import kill_all_services as executor_kill_all_services
-from ouroboros.workspace_executor import map_host_path as executor_map_host_path
 from ouroboros.workspace_executor import _read_local_service_marker
 from ouroboros.workspace_executor import service_logs as executor_service_logs
 from ouroboros.workspace_executor import service_status as executor_service_status
@@ -132,14 +131,10 @@ def _service_output_binding(
 
 
 def _executor_can_run_cwd(ctx: ToolContext, workdir: pathlib.Path) -> bool:
-    executor_ref = executor_ref_from_ctx(ctx)
-    if executor_ref is None:
-        return False
-    try:
-        executor_map_host_path(executor_ref, pathlib.Path(workdir).resolve(strict=False))
-        return True
-    except Exception:
-        return False
+    # Keep the service keyword spelling while sharing shell's reachability rule.
+    from ouroboros.tools.shell_process import _executor_can_run_cwd as reachable
+
+    return reachable(ctx, workdir)
 
 
 def _tail(path: pathlib.Path, chars: int) -> str:

@@ -39,7 +39,7 @@ from ouroboros.config import get_finalization_grace_sec
 from ouroboros.deadline_utils import caller_deadline_arguments, owner_deadline_exhausted, review_transport_timeout
 from ouroboros.review_dispatch import bind_api_review_paid_stamp, invoke_review_paid_stamp
 from ouroboros.review_verdict_extraction import canonicalize_session_verdict
-from ouroboros.triad_review import default_output_contract, review_output_shape
+from ouroboros.triad_review import review_output_shape
 from ouroboros.usage_accounting import (
     POSITIVE_PHYSICAL_ATTEMPT_STATES,
     BudgetExceeded,
@@ -596,10 +596,6 @@ class NativeToolRoundReviewExecutor(ReviewSlotExecutor):
         return transcript_chars, transcript_chars if transcript_chars > self._transcript_bound else 0, changed
 
     # -- prompt (route-owned; never the api pack) ------------------------------
-
-    def _output_contract(self) -> str:
-        contract = str((self.assignment.request.policy or {}).get("output_contract") or "")
-        return contract or default_output_contract(review_output_shape(self.assignment.request.surface))
 
     def prompt_payload(self) -> Dict[str, Any]:
         return {

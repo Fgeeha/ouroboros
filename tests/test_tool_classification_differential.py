@@ -401,6 +401,10 @@ CURRENT_PRODUCER_CONTRACTS = {
     "SCOPE_UNCONFIRMED": (True, "tool_reported_failure"),
     "TOOL_ERROR": (True, "error"),
     "native:TOOL_REPORTED_FAILURE:TOOL_ERROR": (True, "tool_reported_failure"),
+    # extension_dispatch's async runner that ended without a result is the first
+    # EXTENSION_ERROR producer with a literal first line, so the harvest now sees
+    # the pair. Its code answers as the shape:extension_handler_error row does (A.17).
+    "native:EXTENSION_ERROR:TOOL_ERROR": (True, "extension_error"),
     # Release admission split its one PREFLIGHT_BLOCKED text in two: a source it
     # could not read is unavailable evidence, not a candidate defect. The new
     # identifier reaches its text through the `code` variable, so it is declared

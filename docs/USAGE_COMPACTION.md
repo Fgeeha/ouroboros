@@ -248,6 +248,21 @@ The group key (§4) makes each group homogeneous in every branch predicate
 `pricing_known is False`, `bound is None`, state), so the per-group branch is
 exactly the per-row branch taken `weight` times with the sums pre-added.
 
+Original cap authority is separate from aggregate minima. `BindingIndex`
+folds every original row, preserving the first root/group binding and explicit
+unlimited `None`. Compaction stamps `binding_authority=carried` on the header
+and puts `original_root_binding` / `original_group_binding` on the first
+aggregate for each respective identity. An identity no source row had bound
+yet carries the exact string `unbound` there: under the stamp it leaves that
+axis open, so the first later original row binds it exactly as it would have
+uncompacted. That first occurrence fixes each axis independently: missing,
+malformed, foreign or unstamped payload means UNKNOWN, never authority from a
+later aggregate or original row. Repeated compaction
+carries UNKNOWN forward; publication compares source/candidate bindings as
+well as money. Warm and cold readers share this index. Continue refuses an
+unknown original binding; valid durable bindings and owner amendments remain
+separate authorities. Readers never reconstruct authority from archives.
+
 ## 8. Concurrency, crash-safety, caches
 
 - Compaction runs **only under the same monetary lock** (`_locked(root)`) as

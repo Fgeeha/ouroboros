@@ -14,6 +14,10 @@
    and a Resume grant minted but not yet dispatched returns to its pause. The
    census of RUNNING members is taken inside that same lock, so no member can
    be assigned between the census and the latch. The snapshot is persisted.
+   The queue lock never waits for the root's launch lock: while that one is
+   busy the answer acknowledges the durable fence as it stands, marked
+   ``latch_pending``; the same ``request_id`` completes the latch, never a
+   second Pause.
 4. One ``owner_pause`` mailbox control per live member: a WAKE signal for a
    warm wait; every member's own launch gate and safe boundary read the fence.
 
@@ -102,26 +106,32 @@ def request_owner_pause(task_id: str, *, request_id: str) -> Dict[str, Any]:
     except Exception as exc:
         log.warning("Owner pause fence for %s was not written", task_id, exc_info=True)
         return {"ok": False, "error": "pause_record_unwritable", "detail": str(exc)[:200]}
+    answer = {"ok": True, "task_id": task_id, "root_task_id": task_id, "fence_id": fence["fence_id"],
+              "duplicate": not created, "state": str(fence.get("state") or ""), "members": []}
+    released = {**answer, "duplicate": True, "state": "released"}
+    if not fence_closed(fence):
+        return released  # a replay of an action already resumed: no queue effect
     with q._queue_lock:
         try:
             # Resume consumption can run outside the queue lock. Revalidate
             # the exact accepted generation before publishing its queue latch.
-            # Contention here returns a retryable refusal with the fence kept;
-            # one root's held launch lock must not stall unrelated controls.
+            # One root's held launch lock must not stall unrelated controls.
             with launch_lock(root_drive, task_id, wait=False):
                 current = read_fence(root_drive, task_id)
-                if (not fence_closed(fence) or not fence_closed(current)
-                        or fence.get("fence_id") != current.get("fence_id")):
-                    return {"ok": True, "task_id": task_id, "root_task_id": task_id,
-                            "fence_id": fence["fence_id"], "duplicate": True,
-                            "state": "released", "members": []}
+                if not fence_closed(current) or fence.get("fence_id") != current.get("fence_id"):
+                    return released
                 latch = _set_root_budget_pause_locked(task_id, {
                     "fence_id": str(fence["fence_id"]), "cause": "owner_pause",
                     "paused_at": str(fence.get("requested_at") or utc_now_iso())})
                 members = _running_members_locked(q, task_id)
                 persisted = q.persist_queue_snapshot(reason="owner_pause_requested")
-        except OwnerPauseRefused as exc:
-            return {"ok": False, "error": str(exc) or "pause_refused"}
+        except OwnerPauseRefused:
+            # Only the busy launch lock refuses here, after the fence landed:
+            # every launch gate already reads it. Not a refusal of the Pause.
+            if (q.BUDGET_ROOT_FENCES.get(task_id) or {}).get("fence_id") == fence["fence_id"]:
+                return answer  # this generation's latch already stands
+            log.info("Owner pause of %s is durable; its queue latch waits for the launch lock", task_id)
+            return {**answer, "latch_pending": True}
         except Exception as exc:
             log.warning("Owner pause fence for %s was not written", task_id, exc_info=True)
             return {"ok": False, "error": "pause_record_unwritable", "detail": str(exc)[:200]}
@@ -136,9 +146,7 @@ def request_owner_pause(task_id: str, *, request_id: str) -> Dict[str, Any]:
              "owner_visible": True, "toast_once": f"{task_id}:owner-pause:{fence['fence_id']}"}
     append_jsonl(q.DRIVE_ROOT / "logs" / "events.jsonl", event)
     state = refresh_owner_pause_tree(task_id)
-    return {"ok": True, "task_id": task_id, "root_task_id": task_id, "fence_id": fence["fence_id"],
-            "duplicate": not created, "state": state or fence.get("state"), "members": woken,
-            "snapshot_persisted": bool(persisted)}
+    return {**answer, "state": state or answer["state"], "members": woken, "snapshot_persisted": bool(persisted)}
 
 
 def _wake_members(q: Any, root_task_id: str, fence: Dict[str, Any], members: list, *, direct: bool) -> List[str]:
@@ -205,7 +213,8 @@ def refresh_owner_pause_tree(root_task_id: str) -> str:
             return FENCE_REQUESTED
     from supervisor.continuation_admission import conflicting_writers
 
-    if conflicting_writers(q, root_task_id, drive_root=root_drive):
+    if conflicting_writers(q, root_task_id, drive_root=root_drive,
+                           owner_pause_fence_id=str(fence.get("fence_id") or "")):
         return FENCE_REQUESTED
     try:
         set_fence_state(root_drive, root_task_id, fence_id=str(fence.get("fence_id") or ""),

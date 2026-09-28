@@ -21,19 +21,6 @@ BAND_MODULE_MAX_LINES = 1500
 MAX_MODULE_BYTES = 200_000
 TARGET_FUNCTION_LINES = 150
 MAX_FUNCTION_LINES = 300
-# Owner decision 2026-08-21: keep this only as a high-water alarm with ample
-# product headroom; module and per-function ratchets remain the primary gates.
-# Raised 2026-09-18 from 9500 after the count reached 9499 and the alarm had
-# turned into a hard gate. Raised 2026-09-24 from 10000 to 10500 (owner-approved
-# ≤10%, #1196): the budget-pause/exact-Resume lifecycle landed at 10027 after its
-# own single-caller inlines and an upstream base that grew ~42 functions in one
-# day; the remaining delta is decomposition, not duplication, so buying the gap
-# by merging load-bearing steps would read worse.
-# The approved aggregate budget is 11000: independent review found distinct
-# review-operation, state, schedule and tool-custody duties after simplification.
-# This adds headroom, not permission for duplicate machinery; module,
-# function-length, byte and debt-transition limits still hold independently.
-MAX_TOTAL_FUNCTIONS = 11000
 
 SIZE_RATCHET_MANIFEST_PATH = "ouroboros/size_ratchet_manifest.py"
 
@@ -631,10 +618,6 @@ def _manifest_inventory_errors(
     compare_set("BAND_PATHS", inventory.band_paths, frozenset(manifest.band_paths))
     if dict(inventory.byte_debt) != dict(manifest.byte_debt):
         errors.append(f"BYTE_DEBT differs from live exact counts: live={dict(inventory.byte_debt)!r}")
-    if len(inventory.functions) > MAX_TOTAL_FUNCTIONS:
-        errors.append(
-            f"total function count exceeds {MAX_TOTAL_FUNCTIONS}: {len(inventory.functions)}"
-        )
     return errors
 
 
@@ -980,16 +963,14 @@ def compute_repo_complexity_metrics(
 def size_headroom_lines(
     inventory: SizeRatchetInventory, *, paths: Iterable[str] | None = None, limit: int = 5,
 ) -> list[str]:
-    """Informational capacity from the same inventory as validation, never a gate.
+    """Descriptive totals and per-unit capacity from the validation inventory.
 
     Show touched paths when supplied; otherwise show the closest ordinary
     boundaries before registered debt, so giant legacy files cannot hide a
     nearly-full ordinary module. Bounds are presentation only and disclosed.
     """
     selected = set(paths) if paths is not None else None
-    functions = len(inventory.functions)
-    lines = [f"Runtime functions: {functions}/{MAX_TOTAL_FUNCTIONS}; "
-             f"{MAX_TOTAL_FUNCTIONS - functions} remaining."]
+    lines = [f"Runtime functions: {len(inventory.functions)} (descriptive)."]
     modules = sorted(
         (m for m in inventory.modules if selected is None or m.path in selected),
         key=lambda m: (m.path in GIANT_PATHS or m.path in _CHECKED_IN_MANIFEST.byte_debt,

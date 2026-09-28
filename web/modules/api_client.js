@@ -175,7 +175,9 @@ export function hurryTask(taskId, requestId) {
  * ONLY the stable request_id (the same id on retry is idempotent). The answer
  * arrives after the root's durable fence landed; its `state` is `requested`
  * while members still settle, `paused` once saved, or `released` on replay
- * after that action was resumed. An intentional new Pause uses a fresh id.
+ * after that action was resumed. A 202 `latch_pending` answer is accepted
+ * (the fence is durable) and the SAME id completes its queue latch. An
+ * intentional new Pause uses a fresh id.
  * @param {string} taskId
  * @param {string} requestId
  */

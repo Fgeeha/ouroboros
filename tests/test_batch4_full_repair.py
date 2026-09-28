@@ -153,8 +153,8 @@ def test_unretired_model_consumer_blocks_resume_but_retirement_keeps_unknown_mon
     assert load_task_result(tmp_path, "root")["retired_model_consumers"][owner.answer_consumer_id]["task_attempt"] == 1
 
 
-def test_local_extension_return_remains_opaque_without_effect_contract(tmp_path, monkeypatch):
-    """Characterize the qualified unresolved finding, never certify arbitrary OK."""
+def test_host_observed_local_extension_return_releases_only_its_invocation(tmp_path, monkeypatch):
+    """Local return is observable without claiming completion of arbitrary effects."""
     from ouroboros import extension_loader
     from ouroboros.extension_surface_names import extension_surface_name
     from ouroboros.tools.registry import ToolRegistry
@@ -174,9 +174,9 @@ def test_local_extension_return_remains_opaque_without_effect_contract(tmp_path,
         assert result.status == "ok" and result.text == "ok"
         assert result.meta["physical_dispatch"] and result.meta["dynamic_provider"]
         claims = load_task_result(root, "root")["launch_handoffs"]
-        assert len(claims) == 1
+        assert claims == {}
         _park(root, monkeypatch, queue, workers)
-        assert queue.resume_budget_paused_task("root")["error"] == "owner_pause_effects_unsettled"
+        assert queue.resume_budget_paused_task("root")["ok"]
         assert load_task_result(root, "root")["launch_handoffs"] == claims
     finally:
         extension_loader.unload_extension(name)

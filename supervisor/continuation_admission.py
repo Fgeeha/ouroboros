@@ -102,15 +102,20 @@ def _replay(q: Any, predecessor: str, nonce: str, successor: str) -> Optional[Di
                 "successor_task_id": successor, "unconfirmed": True, "detail": str(exc)[:200]}
 
 
-def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None) -> List[Dict[str, Any]]:
+def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None,
+                        owner_pause_fence_id: str = "") -> List[Dict[str, Any]]:
     """Observe all retained tree custody, regardless of the member's lifecycle.
 
     Queue authority is copied briefly; custody observations never cancel runs.
     Unknown files or unbound starts keep the same Continue action held.
+    ``owner_pause_fence_id`` is the owner Pause's own census: a queued admitted
+    dispatch that only that exact accepted Pause's latch holds is not running
+    work (its earlier effects are still observed below). Continue never passes
+    it: that row would dispatch again once the Pause is resumed.
     """
     from ouroboros.budget_pause import observe_task_runs
     from ouroboros.owner_pause import tree_member_results
-    from supervisor.queue_transitions import budget_pause_fact
+    from supervisor.queue_transitions import budget_pause_fact, queued_admitted_dispatch
 
     custody_root = pathlib.Path(drive_root or q.DRIVE_ROOT)
     blockers: List[Dict[str, Any]] = []
@@ -120,6 +125,10 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None) -> 
         running = [(str(tid), dict(meta.get("task") or {})) for tid, meta in q.RUNNING.items()
                    if isinstance(meta, dict)]
         pending = [dict(task) for task in q.PENDING if isinstance(task, dict)]
+        latch = dict(q.BUDGET_ROOT_FENCES.get(predecessor) or {})
+    owner_latched = bool(owner_pause_fence_id and latch.get("cause") == "owner_pause"
+                         and str(latch.get("status") or "") in {"active", "paused"}
+                         and str(latch.get("fence_id") or "") == str(owner_pause_fence_id))
     for task_id, task in running:
         if str(task.get("root_task_id") or task_id) == predecessor:
             members.add(task_id)
@@ -128,6 +137,8 @@ def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None) -> 
         tid = str(task.get("id") or "")
         if str(task.get("root_task_id") or tid) == predecessor:
             members.add(tid)
+            if owner_latched and queued_admitted_dispatch(task):
+                continue
             if budget_pause_fact(task) is None or (task.get("admitted_dispatch") == "possible"
                                                    and not task.get("_budget_pause")):
                 blockers.append({"kind": "dispatchable_member", "task_id": tid})

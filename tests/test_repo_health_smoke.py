@@ -11,9 +11,9 @@ from types import SimpleNamespace
 import pytest
 
 from ouroboros.review import (
+    MAX_FUNCTION_LINES,
     MAX_MODULE_BYTES,
     MAX_MODULE_LINES,
-    MAX_TOTAL_FUNCTIONS,
     TARGET_MODULE_LINES,
     SizeRatchetManifest,
     candidate_repo_paths,
@@ -32,6 +32,7 @@ from ouroboros.review import (
     validate_size_ratchet_transition_against_base,
 )
 from ouroboros.tools.health import _codebase_health
+from ouroboros.tools.review_helpers import check_worktree_readiness
 from scripts import regenerate_size_ratchet as regenerate
 
 
@@ -369,40 +370,84 @@ def test_tree_validation_reads_staged_bytes_not_unstaged_worktree_bytes(tmp_path
     assert not any(error.startswith("staged:") for error in errors)
 
 
-def test_total_function_cap_checks_staged_and_live_projections(tmp_path: Path) -> None:
+@pytest.mark.parametrize("projection", ["staged", "live"])
+def test_function_totals_are_descriptive_in_staged_and_live_trees(tmp_path: Path, projection: str) -> None:
     repo = tmp_path / "repo"
     baseline = _bootstrap_repo(repo)
     _write_manifest(repo, _manifest(sha=baseline))
     _git(repo, "add", ".")
     _git(repo, "commit", "-qm", "bootstrap ratchet")
-    functions_per_path = MAX_MODULE_LINES
-    paths = [
-        f"batch_{index}.py"
-        for index in range((MAX_TOTAL_FUNCTIONS // functions_per_path) + 1)
-    ]
-    source = "".join(
-        f"def f{index}(): pass\n" for index in range(functions_per_path)
-    )
-    total = len(paths) * functions_per_path
-    assert total > MAX_TOTAL_FUNCTIONS
-
+    # Exceed the retired 11,000 aggregate ceiling without per-unit size debt.
+    paths = [f"batch_{index}.py" for index in range(12)]
+    source = "".join(f"def f{index}(): pass\n" for index in range(1000))
     for rel in paths:
         (repo / rel).write_text(source, encoding="utf-8")
-    _git(repo, "add", *paths)
-    for rel in paths:
-        (repo / rel).unlink()
+    if projection == "staged":
+        _git(repo, "add", *paths)
+        for rel in paths:
+            (repo / rel).unlink()
+        inventory = collect_size_ratchet_inventory_at_ref(repo, _git(repo, "write-tree"))
+    else:
+        inventory = collect_size_ratchet_inventory(repo)
+
+    assert len(inventory.functions) == 12000
+    assert validate_size_ratchet(repo) == []
+    information: list[str] = []
+    # Scope the diff readout; readiness still validates the whole inventory.
+    assert check_worktree_readiness(repo, paths=[paths[0]], information=information) == []
+    live_total = 0 if projection == "staged" else 12000
+    assert compute_repo_complexity_metrics(repo)["total_functions"] == live_total
+    count_line = f"Runtime functions: {live_total} (descriptive)."
+    assert information[0] == count_line
+    report = _codebase_health(SimpleNamespace(repo_dir=repo))
+    assert f"**Functions:** {live_total}" in report
+    assert count_line in report.splitlines()
+    assert "No hard P7 limit violations detected" in report
+    assert "manifest is exact" in report
+    assert "Complexity Status" not in report
+    assert "Size-Ratchet Findings" not in report
+    assert "total function count" not in report
+    assert "Hard-limit total functions" not in report
+
+
+@pytest.mark.parametrize(("source", "finding"), [
+    ("x\n" * (MAX_MODULE_LINES + 1), "GIANT_PATHS missing live entry: 'oversized.py'"),
+    ("def large():\n" + "    pass\n" * MAX_FUNCTION_LINES,
+     "FUNCTION_DEBT missing live entry: ('oversized.py', 'large')"),
+    ("#" + "é" * (MAX_MODULE_BYTES // 2) + "\n", "BYTE_DEBT differs from live exact counts:"),
+])
+def test_public_validator_keeps_per_unit_limits(tmp_path: Path, source: str, finding: str) -> None:
+    repo = tmp_path / "repo"
+    baseline = _bootstrap_repo(repo)
+    _write_manifest(repo, _manifest(sha=baseline))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap ratchet")
+    (repo / "oversized.py").write_text(source, encoding="utf-8")
+    _git(repo, "add", "oversized.py")
 
     errors = validate_size_ratchet(repo)
-    expected = f"total function count exceeds {MAX_TOTAL_FUNCTIONS}: {total}"
-    assert f"staged: {expected}" in errors
-    assert expected not in {error for error in errors if not error.startswith("staged:")}
 
-    _git(repo, "reset", "-q", "HEAD", "--", *paths)
-    for rel in paths:
-        (repo / rel).write_text(source, encoding="utf-8")
+    assert any(error.startswith(finding) for error in errors)
+    assert any(error.startswith(f"staged: {finding}") for error in errors)
+
+
+def test_public_validator_keeps_byte_debt_shrink_only(tmp_path: Path) -> None:
+    repo = tmp_path / "repo"
+    source = "#" + "x" * MAX_MODULE_BYTES + "\n"
+    baseline = _bootstrap_repo(repo, files={"large.py": source})
+    byte_baseline = {"large.py": len(source.encode("utf-8"))}
+    _write_manifest(repo, _manifest(sha=baseline, byte_baseline_debt=byte_baseline, byte_debt=byte_baseline))
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "bootstrap ratchet")
+    (repo / "large.py").write_text(source + "#\n", encoding="utf-8")
+    _write_manifest(repo, _manifest(sha=baseline, byte_baseline_debt=byte_baseline,
+                                    byte_debt={"large.py": byte_baseline["large.py"] + 2}))
+    _git(repo, "add", ".")
+
     errors = validate_size_ratchet(repo)
-    assert expected in errors
-    assert not any(error.startswith("staged:") for error in errors)
+
+    expected = f"byte debt grew: large.py {byte_baseline['large.py']} -> {byte_baseline['large.py'] + 2}"
+    assert errors == [expected, f"staged: {expected}"]
 
 
 def test_staged_manifest_cannot_self_authorize_staged_new_debt(tmp_path: Path) -> None:

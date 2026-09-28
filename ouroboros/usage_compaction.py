@@ -42,7 +42,7 @@ from typing import Any, Callable, Dict, Optional, Tuple
 
 from ouroboros._usage_rows import _breakdown_bucket, _summary, _processing_summary, _merge_processing_summary, row_ts_epoch
 from ouroboros._usage_rows import (BINDING_AUTHORITY_FIELD, BINDING_CARRIED, CARRIED_GROUP_BINDING,
-                                   CARRIED_ROOT_BINDING, BindingIndex)
+                                   CARRIED_ROOT_BINDING, NO_ORIGINAL_BINDING, BindingIndex)
 from ouroboros.runtime_limits import USAGE_LEDGER_FOLD_MIN_AGE_SEC
 from ouroboros.usage_ledger import (
     ARCHIVE_SEGMENT_DIR_REL,
@@ -717,9 +717,9 @@ def _build_candidate(
         for bound, carry, carrier_field, keys in (
                 (bindings.roots, root_task_id, CARRIED_ROOT_BINDING, carried_keys[0]),
                 (bindings.groups, billing_group_id or root_task_id, CARRIED_GROUP_BINDING, carried_keys[1])):
-            if carry in bound and carry not in keys:  # the first block row of each root/group carries it
+            if carry and carry not in keys:  # the first block row of each root/group carries it
                 keys.add(carry)
-                row[carrier_field] = bound[carry]
+                row[carrier_field] = bound.get(carry, NO_ORIGINAL_BINDING)
         group_rows.append(row)
 
     retained_lines: list = []

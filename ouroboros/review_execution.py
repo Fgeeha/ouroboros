@@ -373,6 +373,10 @@ class ReviewSlotExecutor:
         self.llm = llm
         self.usage_observer: Optional[Callable[[Dict[str, Any]], None]] = None
 
+    def _output_contract(self) -> str:
+        contract = str((self.assignment.request.policy or {}).get("output_contract") or "")
+        return contract or default_output_contract(review_output_shape(self.assignment.request.surface))
+
     def _observe_usage(self, usage: Optional[Dict[str, Any]]) -> None:
         observe_review_usage(self.usage_observer, usage)
 
@@ -1198,10 +1202,6 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
         self._settled_failure: Optional[BaseException] = None
 
     # -- prompt (route-owned; never the api pack) ------------------------------
-
-    def _output_contract(self) -> str:
-        contract = str((self.assignment.request.policy or {}).get("output_contract") or "")
-        return contract or default_output_contract(review_output_shape(self.assignment.request.surface))
 
     def prompt_payload(self) -> Dict[str, Any]:
         return {"session_prompt": self.session_prompt}

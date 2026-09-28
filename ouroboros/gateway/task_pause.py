@@ -6,6 +6,9 @@ no text and no chat side effect. The response is sent only after the root's
 durable fence landed (``supervisor/owner_pause_control.py``); ``state`` is the
 accepted action state — ``requested`` while members settle, ``paused`` once
 saved, ``released`` on a retry after Resume. A new Pause needs a fresh ID.
+``202`` with ``latch_pending`` answers a fence that is durable (every launch
+gate refuses) while its queue latch waited on the root's busy launch lock: the
+Pause is accepted, not refused, and the same ``request_id`` completes it.
 Resume is the existing ``/resume`` endpoint.
 
 The accept step takes the queue lock and writes durable records, so it runs
@@ -46,7 +49,7 @@ async def api_task_pause(request: Request) -> JSONResponse:
     except Exception as exc:
         return json_exception(exc, 503)
     if result.get("ok"):
-        return JSONResponse(result)
+        return JSONResponse(result, status_code=202 if result.get("latch_pending") else 200)
     error = str(result.get("error") or "pause_refused")
     status = 404 if error == "task_not_live" else 409 if error in _CONFLICTS else 503
     return json_error(f"pause refused: {error}", status, task_id=task_id, reason_code=error,
