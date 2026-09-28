@@ -49,10 +49,8 @@ def accepted_chat_message(drive_root, chat_id: int, client_message_id: str) -> O
 
 def accept_local_message(bridge, drive_root, text: str, *, retain_inputs=None, dispatch=None, **message) -> tuple[dict, bool]:
     """Accept a named skill delivery once, then schedule/queue its exact source.
-
-    The canonical receipt precedes dispatch under the single ingress lock, including
-    simultaneous requests. A crash after acceptance permits no redispatch; operation
-    reads disclose a lost host session instead.
+    The ingress lock serializes receipt-before-dispatch. After an acceptance crash,
+    reads disclose a lost host session; they never redispatch.
     """
     from ouroboros.project_dialogue import _text_sha256, build_owner_message_ref
 
@@ -89,8 +87,7 @@ def accept_local_message(bridge, drive_root, text: str, *, retain_inputs=None, d
             if retain_inputs is not None:
                 retain_inputs()
         ref = build_owner_message_ref(chat_id=chat_id, client_message_id=message_id, ts=ts, text=logged)
-        # The row rides the item as its in-process witness (``record_inbound_message``); its
-        # acceptance time is this message's receipt stamp.
+        # record_inbound_message gets the row witness and receipt time.
         # Dispatch only schedules/queues; slow work must not hold the ingress lock.
         (dispatch or bridge.enqueue_local_message)(text, **message, accepted_source_ref=ref, accepted_source_row=row, received_at=ts)
         return row, False
@@ -1465,6 +1462,9 @@ def log_chat(
             card_row_id = str(meta.get("card_row_id") or "")
             if card_row_id and len(card_row_id) <= 200:
                 record["card_row_id"] = card_row_id
+                revision = meta.get("card_row_revision")
+                if type(revision) is int and revision >= 0:
+                    record["card_row_revision"] = revision
         if record_type == "acceptance_late_settlement" and isinstance(meta.get("late_evidence"), dict):
             record["late_evidence"] = dict(meta["late_evidence"])
         if filename:

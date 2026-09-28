@@ -267,6 +267,7 @@ def _worker_exception_operation_state(
             "unknown_review_route", "review_route_not_implemented",
             # Native tool-round refusals raised BEFORE the first provider send.
             "native_inspection_unavailable", "native_bound_below_first_send",
+            "degraded_source_unreachable",
         }:
             return "not_dispatched"
         return "settled"

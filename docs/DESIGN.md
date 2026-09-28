@@ -556,6 +556,8 @@ explains the approximation until explicit navigation clears it.
 Selection, focus and expanded Reviews keep their actual nodes during reconciliation.
 Reopening a card reads its supplying physical page and restores expanded activity
 lines, including their full-output hydration.
+Revisioned receipt rows keep their reading identity even when replay adds no new
+content, so returning to a receipt restores that row within the expanded card.
 
 ### Project work pointer
 

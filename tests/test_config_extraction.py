@@ -23,6 +23,9 @@ _LEAVES = (settings_defaults, settings_scales, model_slots, review_model_routes,
 # New subscription capabilities belong to the same leaves, but did not exist on
 # the historical extraction's facade and need not add compatibility re-exports.
 _ADDED_OWNERS = {
+    # Compatible-only review routing belongs to the existing model-route leaf.
+    "compatible_only_review_model": review_model_routes,
+    "_compatible_only_models": review_model_routes,
     "WORKER_READY_CEILING_SEC": runtime_limits,
     # The supervisor loop's bounded events pass and the budget-projection retry interval.
     "SUPERVISOR_EVENT_BATCH_MAX_EVENTS": runtime_limits,

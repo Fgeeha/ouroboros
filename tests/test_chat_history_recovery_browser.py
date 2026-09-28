@@ -202,7 +202,7 @@ def test_project_panel_shows_a_slow_first_read_as_loading_and_a_failed_one_as_re
             feed = _click_project(page, failing)
             failed = _wait_recent_state(page, feed, "!s.busy && s.button === 'Retry loading messages'")
             assert not failed["disabled"] and failed["messages"] == 0, failed
-            assert failed["note"].startswith("Could not load messages: "), failed
+            assert failed["note"] == "Some saved history could not be loaded.", failed
             assert failing["id"] not in acked, "a failed read is never acknowledged"
             _screenshot(page, tmp_path, f"project-first-read-failed-{browser_engine}")
 
@@ -217,7 +217,7 @@ def test_project_panel_shows_a_slow_first_read_as_loading_and_a_failed_one_as_re
             assert retried[0]["cursor"] is None and retried[0]["status"] == 200
             recovered = page.evaluate(_RECENT_STATE, feed)
             assert recovered["button"] != "Retry loading messages", recovered
-            assert "Could not load" not in recovered["note"], recovered
+            assert "could not be loaded" not in recovered["note"], recovered
             assert page.locator(f"{feed} .message").filter(has_text="history-human-0015").count() == 1
             _assert_unique_rows(page, feed)
             _screenshot(page, tmp_path, f"project-first-read-recovered-{browser_engine}")

@@ -163,8 +163,7 @@ def _open_project(page, project):
     feed = f'#pchat-{project["id"]}-messages'
     page.locator(feed).wait_for(state="visible", timeout=30_000)
     _idle(page, feed)
-    # Project show/reopen owns a bounded restoration lease before edge scrolling
-    # is admitted. Use the existing viewport suite's frame settlement contract.
+    # Settle completed rendering before the first deliberate edge gesture.
     page.evaluate(_SETTLE_RESTORE_FRAMES)
     return feed
 
@@ -184,13 +183,19 @@ def _assert_main_beginning_visible(page):
         const note = root.parentElement.querySelector('.chat-load-older-note');
         const header = document.querySelector('#page-chat .chat-page-header');
         const box = root.getBoundingClientRect();
-        return {top: first?.getBoundingClientRect().top, noteTop: note?.getBoundingClientRect().top,
+        const noteBox = note?.getBoundingClientRect(), headerBox = header?.getBoundingClientRect();
+        return {top: first?.getBoundingClientRect().top, noteTop: noteBox?.top, noteBottom: noteBox?.bottom,
+            noteInHeader: header?.contains(note), headerTop: headerBox?.top, headerBottom: headerBox?.bottom,
             floor: Math.max(box.top, header?.getBoundingClientRect().bottom || 0),
             bottom: box.bottom, scrollTop: root.scrollTop, note: note?.textContent};
     }""")
     assert bounds["scrollTop"] <= 1, bounds
     assert bounds["floor"] - 2 <= bounds["top"] < bounds["bottom"], bounds
-    assert bounds["floor"] - 2 <= bounds["noteTop"] < bounds["bottom"], bounds
+    # Uncertain coverage stays in persistent chrome; a complete beginning note
+    # belongs at the feed edge. Both must remain visible in their actual owner.
+    note_floor = bounds["headerTop"] if bounds["noteInHeader"] else bounds["floor"]
+    note_ceiling = bounds["headerBottom"] if bounds["noteInHeader"] else bounds["bottom"]
+    assert note_floor - 2 <= bounds["noteTop"] < bounds["noteBottom"] <= note_ceiling + 2, bounds
     assert bounds["note"] in {"Beginning of saved history", "Some saved history is not loaded. Shown messages may have gaps."}, bounds
 
 

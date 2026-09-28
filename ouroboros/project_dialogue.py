@@ -355,7 +355,7 @@ def _entry_source_identities(entry: Dict[str, Any]) -> set:
     if str(entry.get("direction") or "") != "in":
         return set()
     try:
-        chat_id = int(entry.get("chat_id", 1) or 1)
+        chat_id = int(entry.get("chat_id", 1))
     except (TypeError, ValueError):
         chat_id = 1
     client_id = str(entry.get("client_message_id") or "")

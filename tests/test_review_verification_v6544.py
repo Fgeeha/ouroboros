@@ -972,7 +972,8 @@ def test_agent_tool_payload_carries_dissent_noted(monkeypatch, tmp_path):
         ],
         parsed_findings=[], aggregate_signal="PASS",
     )
-    monkeypatch.setattr(rs, "triad_delivery_slots", lambda **k: [object(), object(), object()])
+    monkeypatch.setattr(rs, "triad_delivery_slots",
+                        lambda **k: [rs.ReviewSlot(slot_id=f"s{i}", model="m") for i in (1, 2, 3)])
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: result)
     monkeypatch.setattr(
         "ouroboros.review_evidence.build_task_acceptance_evidence",
@@ -983,7 +984,8 @@ def test_agent_tool_payload_carries_dissent_noted(monkeypatch, tmp_path):
         task_metadata={"root_task_id": "root", "parent_task_id": "root"},
         task_contract={},
     )
-    out = _handle_task_acceptance_review(ctx, claim="done", goal="g")
+    # A child names its one reviewer row when several are configured (#1334).
+    out = _handle_task_acceptance_review(ctx, claim="done", goal="g", reviewer_slot_id="s3")
     assert '"dissent_noted": true' in out
 
 

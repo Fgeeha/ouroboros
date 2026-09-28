@@ -104,6 +104,7 @@ _PROGRESS_META_FIELDS = (
     # The frame's voice: a replayed host note must stay a host note, or a reload
     # would hand the card title back to the very line live rendering refused it.
     "narration",
+    "card_row", "card_row_id", "card_row_revision",
     "checkpoint_kind", "episode_id", "phase", "elapsed_sec",
 )
 
@@ -328,8 +329,9 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
     """Copy terminal chat facts for task summaries."""
     if entry.get("type") != "task_summary":
         return
-    if isinstance(entry.get("model_execution"), dict):
-        rec["model_execution"] = dict(entry["model_execution"])
+    for key in ("model_execution", "review_projection", "history_retention"):
+        if isinstance(entry.get(key), dict):
+            rec[key] = dict(entry[key])
     if entry.get("suggested_name"):
         rec["suggested_name"] = str(entry["suggested_name"])
     for key in ("tool_calls", "rounds", "tool_errors", "routing_tool_calls"):
@@ -346,17 +348,12 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
     rec["outcome_axes"] = normalize_outcome_axes(entry)
     if "reason_code" in entry:
         rec["reason_code"] = str(entry.get("reason_code") or "")
-    if isinstance(entry.get("review_projection"), dict):
-        rec["review_projection"] = dict(entry.get("review_projection") or {})
-    if isinstance(entry.get("history_retention"), dict):
-        rec["history_retention"] = dict(entry["history_retention"])
     # The row's flat task-scope cost snapshot; _annotate_terminal_task_truth
     # later OVERRIDES it with the persisted task_results values when the result
     # file survives (row = fallback only). ABI-3: CONVERTED, not copied — a
     # stored legacy pair resolves deprecated-wins under the honest names only.
     rec.update(carry_cost_meta(entry))
-    # Live-card outcome axes and the origin label ride the summary row too (the
-    # pruned-result fallback); persisted task_results values still override them below.
+    # Live-card axes/origin are row fallbacks; persisted task_results override them.
     rec.update({key: entry[key] for key in ("outcome_phase", "outcome_final", "initiator") if key in entry})
 
 
@@ -367,7 +364,7 @@ def _load_terminal_result(
 ) -> Dict[str, Any]:
     """Effective task result for history projection, cached per request.
 
-    Status/cost and compact child-identity projection only — a history GET must never copy artifacts or
+    Status/cost, merge receipts and child identity — a history GET must never copy artifacts or
     claim disposition hashes (materialize contract). The cache is shared
     between the pre-floor lineage terminal-truth pass (perf2 P3 variant A) and
     ``_annotate_terminal_task_truth``, so each task_results file is read at
@@ -492,24 +489,17 @@ def _annotate_terminal_task_truth(
                     "outcome_axes": normalize_outcome_axes(result), "_is_direct_chat": bool(result.get("_is_direct_chat")),
                     "outcome_phase": outcome_phase(result, {}), "outcome_final": task_id not in finalizing_tasks,
                     **initiator_meta(result)}  # + the origin label, from the persisted metadata
-                if isinstance(result.get("model_execution"), dict):
-                    terminal_truth["model_execution"] = dict(result["model_execution"])
+                for key in ("model_execution", "cancel_origin", "review_projection"):
+                    if isinstance(result.get(key), dict):
+                        terminal_truth[key] = dict(result[key])
                 retention = retention_summary(result)
                 if retention:
                     terminal_truth["history_retention"] = retention
                 if result.get("reason_code"):
                     terminal_truth["reason_code"] = str(result.get("reason_code") or "")
-                if isinstance(result.get("cancel_origin"), dict):
-                    terminal_truth["cancel_origin"] = dict(result["cancel_origin"])
-                review_projection = result.get("review_projection")
-                if isinstance(review_projection, dict):
-                    terminal_truth["review_projection"] = dict(review_projection)
-                # v6.82 P1: attach the persisted terminal cost truth. Applied via
-                # message.update() below, so it OVERRIDES any row-embedded
-                # task_summary snapshot values (the result file is authoritative;
-                # the row snapshot is the pruned-result fallback). ABI-3:
-                # CONVERTED, not copied — a stored legacy result's pair
-                # resolves deprecated-wins and leaves under the honest names.
+                # Persisted cost truth overrides the row fallback via message.update().
+                # ABI-3 conversion resolves legacy pairs deprecated-wins and emits
+                # only honest names.
                 terminal_truth.update(carry_cost_meta(result))
                 terminal_truth_by_task[task_id] = terminal_truth
                 envelope = result.get("subagent_envelope")
@@ -557,6 +547,19 @@ def _annotate_terminal_task_truth(
             task_id = str(message.get("task_id") or "")
             if not task_id or message.get("system_type") == "project_question_pointer":
                 continue
+            # Selected receipt events keep their physical identity, but show current task-result truth.
+            row_id = str(message.get("card_row_id") or "")
+            if message.get("card_row") == "reviews" and row_id.startswith("merge-receipt:"):
+                from ouroboros.merge_receipts import card_row_text
+                try:
+                    receipt = next(r for r in cache.get(task_id, {}).get("merge_receipts", [])
+                                   if isinstance(r, dict) and row_id == f"merge-receipt:{r.get('receipt_id')}")
+                    revision = receipt.get("revision", 0)
+                    if type(revision) is not int or revision < int(message.get("card_row_revision") or 0):
+                        raise ValueError("canonical receipt revision unavailable")
+                    message.update(text=card_row_text(receipt), card_row_revision=revision)
+                except (StopIteration, KeyError, TypeError, ValueError, AttributeError):
+                    message["text"] += "\nCurrent merge receipt unavailable; showing recorded event."
             if cache.get(task_id, {}).get("_history_result_absent"):
                 historical = (historical_terminals or {}).get(task_id)
                 if historical:
@@ -913,7 +916,7 @@ def _collect_chat_rows(
             _copy_task_summary_metadata(rec, entry)
             # Lineage, the origin label, and the host's card placement (card_row /
             # card_row_id) — a stored key is replayed verbatim, an absent one is omitted.
-            for field in (*SUBAGENT_MESSAGE_FIELDS, "initiator", "card_row", "card_row_id", "narration"):
+            for field in (*SUBAGENT_MESSAGE_FIELDS, "initiator", "card_row", "card_row_id", "card_row_revision", "narration"):
                 if field in entry:
                     rec[field] = entry[field]
             combined.append(rec)
@@ -1521,12 +1524,10 @@ def _assemble_history_response(
         before[source] = max([before[source], *(entry["_history_end"] for entry in selections[source][0] or ()
                                                if entry.get("history_id") in deferred_lineage)])
 
-    # A wake-up is an ordinary direct turn with its own task id and its own
-    # durable result, so it needs no replay hack. The retired loop's progress
-    # rows (the pseudo task id "bg-consciousness") carry no task_result at all:
-    # they replay as any other row whose task result is gone, and the client's
-    # durable task-detail read settles that card as "Outcome unavailable". They
-    # are never stamped terminal here — a row with no result is not a Done.
+    # Wake-ups have their own task/result and need no replay special case.
+    # Retired "bg-consciousness" progress has no task_result: replay treats it
+    # like any missing-result row; the client's durable task-detail read shows
+    # "Outcome unavailable". Never stamp it terminal here: no result is not Done.
 
     # Hidden source evidence shares ordinary keyed replay. It carries no new
     # review/cost authority and never consumes the conversation quota.

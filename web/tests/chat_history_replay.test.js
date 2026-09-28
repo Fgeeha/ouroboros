@@ -123,6 +123,43 @@ test('canonical adoption adds source identity without replacing a live expanded 
     assert.equal(live.fullRef, 'child');
 });
 
+test('receipt revision ordering preserves its live identity and disclosure across stale and newer replay', () => {
+    const record = { items: [], expandedLineKeys: new Set() };
+    const summary = (revision, headline) => ({ dedupeKey: 'cardrow|receipt',
+        cardRowRevision: revision, headline, body: `${headline} evidence`, phase: 'done' });
+    const row = (offset, minute) => ({ history_id: `chat:${offset}`,
+        history_position: { source: 'chat', offset }, ts: `2026-09-12T12:0${minute}:00Z` });
+    const live = (revision, headline) => updateLiveTimelineItem(record, summary(revision, headline), {
+        syntheticKey: 'cardrow|receipt', headline, ts: '12:02', rawTs: row(2, 2).ts, inPlaceByKey: true,
+    });
+    live(3, 'Merged');
+    const item = record.items[0], key = item.lineKey;
+    record.expandedLineKeys.add(key);
+    const original = JSON.stringify(item);
+    for (const revision of [undefined, 2, 3]) {
+        assert.equal(mergeHistoricalTimelineItem(record, summary(revision, 'Queued'), row(90, 9), '12:09'), false);
+        assert.equal(JSON.stringify(item), original, 'a later delivery or physical row cannot override revision order');
+        assert.equal(live(revision, 'Queued').timelineUpdate, 'duplicate-skip');
+        assert.equal(JSON.stringify(item), original);
+    }
+    assert.equal(mergeHistoricalTimelineItem(record, summary(4, 'Merged with evidence'), row(1, 0), '12:00'), true);
+    assert.equal(record.items[0], item);
+    assert.equal(item.sourceHistoryId, 'chat:1');
+    assert.equal(item.cardRowRevision, 4);
+    assert.equal(item.headline, 'Merged with evidence', 'a newer revision wins despite an earlier delivery time/offset');
+    assert.equal(item.lineKey, key);
+    assert.equal(record.expandedLineKeys.has(key), true);
+    const updated = JSON.stringify(item);
+    assert.equal(mergeHistoricalTimelineItem(record, summary(3, 'Merged'), row(90, 9), '12:09'), false);
+    assert.equal(JSON.stringify(item), updated);
+    assert.equal(live(5, 'Verified merge').timelineUpdate, 'patch-at');
+    assert.equal(item.cardRowRevision, 5);
+    assert.equal(item.headline, 'Verified merge');
+    assert.equal(item.lineKey, key);
+    assert.equal(record.expandedLineKeys.has(key), true);
+    assert.equal(record.items.length, 1);
+});
+
 test('reopening a deep window fetches its exact page and retains newer navigation without cached bodies', async () => {
     const response = index => ({ messages: [{ history_id: `chat:${index}` }], has_more: index < 4,
         next_cursor: index < 4 ? `older-${index + 1}` : null, page_cursor: `page-${index}` });

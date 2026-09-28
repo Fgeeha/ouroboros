@@ -154,7 +154,7 @@ def _claim_for_paid_identity(claims: Any, paid_identity: str) -> Optional[Dict[s
 
 
 def project_task_acceptance_review_capacity(
-    ctx: Any, *, binding_hash: str = "", task_id: str = "", paid_identity: str = "",
+    ctx: Any, *, binding_hash: str = "", task_id: str = "", paid_identity: str = "", purpose: str = "",
 ) -> Dict[str, Any]:
     """Read the canonical root's paid acceptance-wallet projection.
 
@@ -199,7 +199,7 @@ def project_task_acceptance_review_capacity(
         "binding_seen": False,
         "dedupe": "task_acceptance_binding_sha256",
     }
-    if config.get_task_review_mode() == "off":
+    if config.get_task_review_mode() == "off" and purpose != "owner_historical_acceptance":
         return {
             **base,
             "state": "unavailable",
@@ -882,6 +882,8 @@ def write_task_result(
         if create_only and existing:
             return None
         prepared_fields = dict(fields)
+        from ouroboros.acceptance_history import preserve_acceptance_history
+        prepared_fields = preserve_acceptance_history(existing, prepared_fields)
         if "review_projection" in prepared_fields:
             prepared_fields["review_projection"] = merge_review_projection(
                 existing.get("review_projection"), prepared_fields["review_projection"],
@@ -922,8 +924,7 @@ def write_task_result(
         now = utc_now_iso()
         projected_fields.update(terminal_time_patch(existing, projected_fields, status=projected_status,
             task_id=task_id, observed_at=now if _terminal_observed else None, replica=_terminal_time_source))
-        # ABI-3: normalize base and incoming cost aliases; fresh values win.
-        # Both passes share the deep normalizer, including nested cost planes.
+        # ABI-3: shared deep cost normalization handles both rows/nested planes; incoming values win.
         return stamp_task_result_schema(normalize_task_result_cost_planes({
             **normalize_task_result_cost_planes(existing),
             **projected_fields,

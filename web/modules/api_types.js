@@ -473,6 +473,7 @@
  *   carries the fact (the row is still attached to the card); absent = an
  *   ordinary row.
  * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
+ * @property {number=} card_row_revision  // canonical source order, independent of delivery timestamp
  * @property {string=} target_label
  * @property {string=} project_id
  * @property {string=} project_name

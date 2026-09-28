@@ -348,6 +348,7 @@ _GITHUB_TOKEN_TOOLS = frozenset({
     "list_github_prs",
     "get_github_pr",
     "comment_on_pr",
+    "pr_merge",
     "list_github_issues",
     "get_github_issue",
     "comment_on_issue",

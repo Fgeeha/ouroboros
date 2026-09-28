@@ -24,7 +24,8 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
     if (!identity) return false;
     // A child's lifecycle is one evolving status, just as it is live. Its
     // authored progress keeps every source record, even when text and time match.
-    const evolving = summary.terminal || String(summary.dedupeKey || '').startsWith('subagent-lifecycle:');
+    const evolving = summary.terminal || String(summary.dedupeKey || '').startsWith('subagent-lifecycle:')
+        || String(summary.dedupeKey || '').startsWith('cardrow|');
     const key = evolving ? summary.dedupeKey : `history:${identity}`;
     let item = record.items.find((entry) => entry.dedupeKey === key);
     if (!item && !evolving) {
@@ -33,9 +34,12 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
     }
     if (item && evolving) {
         const incomingTime = Date.parse(row.ts), existingTime = Date.parse(item.sourceTs || '');
-        if (incomingTime < existingTime || incomingTime === existingTime
-                && compareHistoryPosition(row.history_position, item.historyPosition) < 0) return false;
+        if (Number.isSafeInteger(item.cardRowRevision)) {
+            if (!Number.isSafeInteger(summary.cardRowRevision) || summary.cardRowRevision <= item.cardRowRevision) return false;
+        } else if (!Number.isSafeInteger(summary.cardRowRevision) && (incomingTime < existingTime || incomingTime === existingTime
+                && compareHistoryPosition(row.history_position, item.historyPosition) < 0)) return false;
         const update = { headline: summary.headline || item.headline,
+            cardRowRevision: summary.cardRowRevision,
             fullHeadline: summary.fullHeadline || summary.headline || item.fullHeadline,
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
             phase: summary.phase || item.phase, sourceTs: row.ts || item.sourceTs,
@@ -53,6 +57,7 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
         item.count = 1;
     } else {
         record.items.push({
+            cardRowRevision: summary.cardRowRevision,
             phase: summary.phase || 'working', headline: summary.headline || 'Update',
             fullHeadline: summary.fullHeadline || summary.headline || 'Update',
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
@@ -60,7 +65,7 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
             ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key,
             ...(evolving ? { sourceHistoryId: identity } : { historyId: identity }),
             historyPosition: row.history_position,
-            lineKey: evolving ? `terminal-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`
+            lineKey: evolving && !String(key).startsWith('cardrow|') ? `terminal-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`
                 : `history-${identity.replace(/[^A-Za-z0-9_-]/g, '-')}`,
         });
     }

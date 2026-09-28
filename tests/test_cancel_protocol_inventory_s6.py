@@ -52,6 +52,9 @@ _TERMINAL_TOKENS = (
 # constant from the sticky set; "dynamic" is a variable or expression that can
 # carry one, which counts because the reducer, not the caller, decides.
 TERMINAL_WRITERS = {
+    # A source-bound cap amendment preserves CURRENT lifecycle in its locked
+    # projector; it changes money authority only and never revives the task.
+    ('ouroboros/acceptance_history.py::prepare_owner_historical_review', 'accounting["status"]'): 'dynamic',
     ('ouroboros/agent.py::_task_exception_terminal', 'STATUS_FAILED'): 'terminal',
     ('ouroboros/agent_task_pipeline.py::_store_task_result', 'status'): 'dynamic',
     ('ouroboros/delegate_terminal.py::record_terminal_reconciliation', 'str(existing.get("status") or STATUS_RUNNING)'): 'dynamic',

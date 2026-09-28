@@ -502,6 +502,7 @@ _PUBLISHED_CHILD_REF_FIELDS = frozenset(
         "review_evidence",
         "review_projection",
         "completion_observations",
+        "acceptance_debt",
         "owner_wait",
         "verification_ledger",
         "root_phase_checkpoint",
@@ -514,6 +515,10 @@ _PUBLISHED_CHILD_REF_FIELDS = frozenset(
 _SOURCE_HANDLES_SUBDIR = "source_handles"
 _TASK_SOURCE_MARKERS = ("FULL_RESULT_SOURCE_JSON=", "PRODUCER_RESULT_SOURCE_JSON=")
 _SERVICE_REF_TOOLS = frozenset({"service_logs", "stop_service"})
+# Host carriers written by process_tool_results and persist_call. Payloads and
+# tool arguments are data, even when they contain a valid reference shape.
+TOOL_SOURCE_REF_FIELDS = ("result_source_ref", "producer_source_ref")
+CALL_SOURCE_REF_FIELDS = ("manifest_ref", "redacted_projection_ref")
 
 
 def _promotion_fact(ref: Any, reason: str = "") -> Dict[str, Any]:
@@ -632,9 +637,16 @@ def _rewrite_service_result(
         parsed = json.loads(encoded)
     except (TypeError, ValueError):
         return text
-    rewritten = _rewrite_child_ref_tree(parsed, parent_root, child_root, task_id, state)
+    if not isinstance(parsed, dict):
+        return text
+    # services.py owns only these log carriers; tail/error text is process data.
+    for carrier in (parsed, parsed.get("log_finalization")):
+        if isinstance(carrier, dict) and _is_blob_ref(carrier.get("full_log_ref")):
+            carrier["full_log_ref"] = _promote_known_observability_ref(
+                parent_root, child_root, task_id, carrier["full_log_ref"], state, carrier="response_ref")
     from ouroboros.source_retention import active_walk
-    return text if active_walk() and active_walk().discovering else prefix + json.dumps(rewritten, ensure_ascii=False, indent=2)
+    walk = active_walk()
+    return text if walk is not None and walk.discovering else prefix + json.dumps(parsed, ensure_ascii=False, indent=2)
 
 
 def _rewrite_task_source_markers(

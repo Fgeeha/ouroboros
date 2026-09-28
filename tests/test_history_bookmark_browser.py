@@ -608,3 +608,102 @@ def test_review_bookmark_waits_for_necessary_task_detail(direct_server_with_data
             (tmp_path / f'composed-review-reads-{browser_engine}.json').write_text(json.dumps(page.evaluate('() => window.__detailReads.map(({release,...read}) => read)'), indent=2))
         finally:
             browser.close()
+
+
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+def test_live_revisioned_receipt_bookmark_survives_equal_replay(direct_server_with_data, browser_engine, tmp_path):
+    import os
+    from pathlib import Path
+    from ouroboros.merge_receipts import card_row_text
+    from ouroboros.projects_registry import create_project
+    from tests.ui_chat_viewport_smoke import _emit_ws_frame
+    from playwright.sync_api import sync_playwright
+
+    root = direct_server_with_data['data_dir']
+    project = create_project(root, 'receipt-bookmark', name='Receipt reading place')
+    cid, task_id = project['chat_id'], 'receipt-owner'
+    _write(root / 'logs/chat.jsonl', [
+        {'direction': 'in', 'chat_id': cid, 'ts': f'2026-09-01T10:{index:02d}:00Z',
+         'client_message_id': f'receipt-context-{index}', 'text': f'Receipt context {index:02d}'} for index in range(60)])
+    progress = root / 'logs/progress.jsonl'
+    _write(progress, [{'chat_id': cid, 'task_id': task_id, 'ts': '2026-09-01T10:30:00Z',
+                      'content': 'Reading the retained pull request.'}])
+    receipts = [{'receipt_id': name, 'number': 7, 'revision': 3,
+                 'outcome': {'status': 'merged', 'merge_sha': 'c' * 40},
+                 'coverage': {'status': 'covers_head', 'gaps': ['Retained receipt detail ' * 14]}}
+                for name in ('neighbour', 'reading')]
+    _result(root, task_id, chat_id=cid, project_id=project['id'], result='Completed.', merge_receipts=receipts)
+    rows = [{'chat_id': cid, 'task_id': task_id, 'ts': '2026-09-01T10:30:01Z',
+             'system_type': 'pr_merge_receipt', 'card_row': 'reviews',
+             'card_row_id': f"merge-receipt:{receipt['receipt_id']}", 'card_row_revision': 3,
+             'narration': False, 'text': card_row_text(receipt)} for receipt in receipts]
+    with sync_playwright() as pw:
+        browser = getattr(pw, browser_engine).launch(headless=True)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 850})
+            _open(page, direct_server_with_data['url'])
+            feed = _open_project(page, project)
+            for row in rows:
+                _emit_ws_frame(page, {**row, 'type': 'chat', 'role': 'system', 'is_progress': True, 'content': row['text']})
+            card = page.locator(f'{feed} .chat-live-card[data-task-id="{task_id}"]')
+            if card.get_attribute('data-expanded') != '1':
+                card.locator(':scope > [data-live-summary-button]').click()
+            lines = card.locator(':scope > [data-live-timeline] > .chat-live-line.result')
+            assert lines.count() == 2, 'same text and time must not merge different receipts'
+            line = lines.nth(1)
+            # Receipt rows have no individual disclosure; their owning card does.
+            assert line.locator('[data-live-line-toggle]').count() == 0
+            live_key = line.get_attribute('data-live-line-key')
+            assert not live_key.startswith('history-')
+            line.evaluate('n => { window.__readingReceipt = n; }')
+            _bookmark_place(page, line, 1)
+            with progress.open('a') as stream:
+                for row in rows:
+                    stream.write(json.dumps(row) + '\n')
+            before = page.evaluate('() => window.__historyReads.length')
+            _bookmark_reconnect(page)
+            page.wait_for_function('n => window.__historyReads.length > n && window.__historyReads.slice(n).every(r => r.done)', arg=before)
+            _idle(page, feed)
+            replay = page.evaluate('id => window.__historyReads.filter(r => r.chatId === id).at(-1).body', cid)
+            assert [r['card_row_revision'] for r in replay['messages'] if r.get('card_row_id')] == [3, 3]
+            assert line.evaluate('n => n === window.__readingReceipt')
+            assert line.get_attribute('data-live-line-key') == live_key
+            assert card.get_attribute('data-expanded') == '1'
+            offset = _bookmark_place(page, line, 1)
+            _screenshot(page, tmp_path, f'receipt-bookmark-before-{browser_engine}')
+            page.locator('#project-panel-close').click()
+            # Reflow the preceding receipt: restoring only the card offset is
+            # observably different from restoring this exact typed row.
+            page.set_viewport_size({'width': 900, 'height': 850})
+            _click_project(page, project)
+            _idle(page, feed)
+            assert lines.count() == 2
+            assert line.get_attribute('data-live-line-key') != live_key
+            _screenshot(page, tmp_path, f'receipt-bookmark-after-{browser_engine}')
+            restored_offset = line.evaluate(_OFFSET)
+            evidence = Path(os.environ.get('HISTORY_UI_EVIDENCE_DIR') or tmp_path)
+            (evidence / f'receipt-bookmark-{browser_engine}.json').write_text(json.dumps({
+                'saved_offset': offset, 'restored_offset': restored_offset, 'live_key': live_key,
+                'cold_key': line.get_attribute('data-live-line-key'), 'card_expanded': card.get_attribute('data-expanded'),
+                'receipt_rows': [r for r in replay['messages'] if r.get('card_row_id')],
+            }, indent=2))
+            assert card.get_attribute('data-expanded') == '1'
+            assert abs(restored_offset - offset) <= 8
+            assert 'could not be restored exactly' not in page.locator(feed).locator('..').inner_text()
+            text = line.inner_text()
+            line.evaluate('n => { window.__coldReceipt = n; }')
+            for revision in (2, 3):
+                _emit_ws_frame(page, {**rows[1], 'type': 'chat', 'role': 'system', 'is_progress': True,
+                    'card_row_revision': revision, 'ts': '2026-09-02T00:00:00Z', 'text': 'Stale queued receipt',
+                    'content': 'Stale queued receipt'})
+                assert line.inner_text() == text
+            _emit_ws_frame(page, {**rows[1], 'type': 'chat', 'role': 'system', 'is_progress': True,
+                'card_row_revision': 4, 'ts': '2026-08-01T00:00:00Z',
+                'text': rows[1]['text'] + ' Current review evidence.', 'content': rows[1]['text'] + ' Current review evidence.'})
+            assert 'Current review evidence.' in line.inner_text()
+            assert line.evaluate('n => n === window.__coldReceipt')
+            assert card.get_attribute('data-expanded') == '1'
+            assert lines.count() == 2
+            _screenshot(page, tmp_path, f'receipt-bookmark-newer-{browser_engine}')
+        finally:
+            browser.close()

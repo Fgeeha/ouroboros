@@ -136,6 +136,10 @@ def test_o200k_is_never_downloaded(tmp_path, monkeypatch):
 
 
 def test_headroom_is_derived_from_the_zero_diff_message(synthetic_repo, isolated_roots, monkeypatch):
+    # This arithmetic test measures an explicit packet recipient; shipped
+    # defaults retrieve natively and correctly have no packet headroom.
+    monkeypatch.setattr('ouroboros.reviewer_slot_config.commit_triad_delivery',
+                        lambda: _plan([('openai/packet', 'api_chat', '')]))
     from ouroboros.tools import review
     from ouroboros.tools import review_multi_model as mm
     from ouroboros.tools.review_helpers import build_goal_section
@@ -191,6 +195,26 @@ def _plan(rows):
         "routes": [ReviewRouteKind(route) for _model, route, _actor in rows],
         "subagent_ids": [actor for _model, _route, actor in rows],
     }
+
+
+def test_direct_native_rows_use_the_resolved_delivery_vector():
+    plan = _plan([('openai/native', 'api_chat', ''), ('openai/packet', 'api_chat', ''),
+                  ('claude=opus', 'agent_session', '')])
+    plan['retrieves'] = [True, False, True]
+    assert [row['receives_pack'] for row in mrp._panel_rows(plan)] == [False, True, False]
+
+
+def test_saved_direct_native_panel_has_no_packet_headroom(synthetic_repo, isolated_roots, monkeypatch):
+    monkeypatch.setenv('OUROBOROS_REVIEWER_SLOTS', json.dumps({
+        'triad': [{'slot_id': 'reader', 'route': {'kind': 'api_chat', 'target_id': 'openai/native'},
+                   'delivery': 'native'}],
+        'scope': [{'slot_id': 'scope', 'route': {'kind': 'api_chat', 'target_id': 'openai/scope'}}]}))
+    monkeypatch.setattr(mrp, '_quorum_limit', lambda _models: pytest.fail('native rows cannot constrain a packet'))
+    monkeypatch.setattr(mrp, '_o200k', _no_bpe)
+    report = mrp.measure(synthetic_repo)
+    assert report['fit']['no_api_pack'].startswith('no API pack is assembled')
+    assert report['fit']['api_pack_models'] == []
+    assert report['fit']['panel_rows'][0]['receives_pack'] is False
 
 
 def test_only_the_rows_that_receive_the_api_pack_bound_the_headroom(synthetic_repo, isolated_roots, monkeypatch):
@@ -354,6 +378,8 @@ def test_a_staged_deletion_is_parsed_like_the_host_parses_name_status(
 
 def test_main_prints_the_triad_packet_parts_and_the_advisory_manifest(
         synthetic_repo, isolated_roots, monkeypatch, capsys):
+    monkeypatch.setattr('ouroboros.reviewer_slot_config.commit_triad_delivery',
+                        lambda: _plan([('openai/packet', 'api_chat', '')]))
     monkeypatch.setattr(mrp, "_quorum_limit", lambda models: (10_000, {}))
     monkeypatch.setattr(mrp, "_o200k", _no_bpe)
     assert mrp.main(["--repo", str(synthetic_repo)]) == 0
