@@ -25,7 +25,7 @@ def late(tmp_path, monkeypatch, fresh_sends):
         {'slot_id': str(i), 'route': {'kind': 'api_chat', 'target_id': 'openai/gpt-4.1-nano'}} for i in range(3)],
         'scope': [{'slot_id': 'unused-scope', 'route': {'kind': 'api_chat', 'target_id': 'openai/gpt-4.1-nano'}}]}))
     calls, gates = [], []
-    config = SimpleNamespace(fail=False, verdict='PASS')
+    config = SimpleNamespace(fail=False, verdict='PASS', slot_gates={}, slot_verdicts={})
 
     def transport(_self, **kwargs):
         from ouroboros.usage_accounting import AttemptRequest, current_usage_scope, execute_physical_attempt
@@ -34,9 +34,12 @@ def late(tmp_path, monkeypatch, fresh_sends):
             calls.append((scope, kwargs))
             for gate in gates:
                 assert gate.wait(10)
+            if scope.review_slot_id in config.slot_gates:
+                assert config.slot_gates[scope.review_slot_id].wait(10)
             if config.fail:
                 raise TimeoutError('unknown after physical dispatch')
-            return {'content': json.dumps({'verdict': config.verdict, 'findings': [], 'summary': 'Frozen answer checked.',
+            return {'content': json.dumps({'verdict': config.slot_verdicts.get(scope.review_slot_id, config.verdict),
+                'findings': [], 'summary': 'Frozen answer checked.',
                 'outcome_tier': 'best_effort', 'completion_coach': 'Retain the historical source gaps.',
                 'criteria_used': [{'criterion': 'Original criterion', 'status': 'partial'}]})}, {'prompt_tokens': 1, 'completion_tokens': 1}
         return execute_physical_attempt(AttemptRequest(model=kwargs['model'], provider='openai', reservation_usd=0.01),
@@ -44,7 +47,7 @@ def late(tmp_path, monkeypatch, fresh_sends):
 
     monkeypatch.setattr('ouroboros.llm.LLMClient.chat', transport)
     yield SimpleNamespace(calls=calls, gates=gates, config=config)
-    for gate in gates:
+    for gate in [*gates, *config.slot_gates.values()]:
         gate.set()
     from ouroboros.review_operation import _LIVE
     until(lambda: not _LIVE)
@@ -124,6 +127,88 @@ def test_explicit_owner_runs_full_panel_on_delivered_root_and_retry(late, tmp_pa
     notices = [row for row in list(ctx.event_queue.queue) if row.get('system_type') == 'acceptance_late_settlement']
     assert len(notices) == 1 and notices[0]['chat_id'] == 7
     again = _request(f, ctx, _source(ctx, text='Review this delivered historical answer.'))
+    assert again['reason'] == 'existing_paid_operation' and len(late.calls) == 3
+
+
+@pytest.mark.parametrize('first_callback', ['quorum', 'complete'])
+@pytest.mark.parametrize('last_verdict', ['PASS', 'FAIL'])
+def test_delayed_quorum_callback_keeps_one_final_historical_notice(
+        late, tmp_path, monkeypatch, first_callback, last_verdict):
+    """A quorum snapshot may reach publication after the last producer settles."""
+    from ouroboros import acceptance_settlement as settlement
+    from ouroboros import review_operation
+    from ouroboros.artifacts import read_actor_source_bytes
+    from supervisor.terminal_delivery import pending_deliveries
+
+    f = delivered(tmp_path, monkeypatch)
+    ctx = _caller(f)
+    ctx.event_queue = queue.Queue()
+    before = copy.deepcopy(load_task_result(f.root, f.tid))
+    late.config.slot_gates = {slot: threading.Event() for slot in ('0', '1', '2')}
+    late.config.slot_verdicts['2'] = last_verdict
+    entered = {kind: threading.Event() for kind in ('quorum', 'complete')}
+    release = {kind: threading.Event() for kind in entered}
+    returned = {kind: threading.Event() for kind in entered}
+    announce = settlement.announce_acceptance_settlement
+    waves = {}
+
+    def held_announcement(usage_ctx, request, wave):
+        kind = 'complete' if all(wave['slots'].values()) else 'quorum'
+        waves[kind] = copy.deepcopy(wave)
+        entered[kind].set()
+        try:
+            assert release[kind].wait(10)
+            return announce(usage_ctx, request, wave)
+        finally:
+            returned[kind].set()
+
+    monkeypatch.setattr(settlement, 'announce_acceptance_settlement', held_announcement)
+    try:
+        result = _request(f, ctx, _source(ctx, text='Review this delivered historical answer.'))
+        assert result['status'] == 'pending', result
+        late.config.slot_gates['0'].set()
+        late.config.slot_gates['1'].set()
+        assert entered['quorum'].wait(10)
+        late.config.slot_gates['2'].set()
+        assert entered['complete'].wait(10)  # All producer facts are now collectable.
+        release[first_callback].set()
+        assert returned[first_callback].wait(10)
+        other = 'complete' if first_callback == 'quorum' else 'quorum'
+        release[other].set()
+        assert returned[other].wait(10)
+    finally:
+        for gate in [*late.config.slot_gates.values(), *release.values()]:
+            gate.set()
+        until(lambda: not review_operation._LIVE)
+
+    assert waves['quorum']['slots']['2'] == ''
+    assert waves['complete']['verdicts']['2']['verdict'] == last_verdict
+    after = load_task_result(f.root, f.tid)
+    panel, = after['review_projection']['panels']
+    source = json.loads(read_actor_source_bytes(f.root, f.tid, panel['applied_source_ref']))
+    assert {actor['slot_id']: actor['parsed']['verdict'] for actor in source['actors']} == {
+        '0': 'PASS', '1': 'PASS', '2': last_verdict}
+    assert source['request']['subject'] == before['result']
+    for key in ('result', 'status', 'review_status', 'outcome_axes', 'acceptance_debt'):
+        assert after.get(key) == before.get(key), key
+    assert len(late.calls) == 3
+    assert all(scope.task_id == f.tid and scope.root_task_id == f.accounting and scope.root_limit_usd == 4
+               for scope, _ in late.calls)
+    assert all(row['state'] == 'collected' for row in after['review_operations'].values())
+    assert not settlement.late_publication_owed(f.tid, source['request']['retry_key'])
+    notices = [row for row in list(ctx.event_queue.queue) if row.get('system_type') == 'acceptance_late_settlement']
+    owed, = pending_deliveries(f.root)
+    sends = []
+    sender = _send_ctx(f.root, sends)
+    for notice in [*notices, owed]:  # The real consumer also sees an outbox replay.
+        chat._handle_send_message(notice, sender)
+    assert len(sends) == 1 and sends[0][0] == 7, sends
+    assert 'pending' not in sends[0][1] and f'- 2: {last_verdict}' in sends[0][1], {
+        'notices': len(notices), 'sent': sends, 'retained': panel['late_settlement']['note']}
+    assert len(notices) == 1, notices
+    assert sends[0][1] == owed['text'] == panel['late_settlement']['note'] == source['late_settlement']['note']
+    assert not pending_deliveries(f.root)
+    again = _request(f, ctx, _source(ctx, text='Review this delivered historical answer again.'))
     assert again['reason'] == 'existing_paid_operation' and len(late.calls) == 3
 
 
