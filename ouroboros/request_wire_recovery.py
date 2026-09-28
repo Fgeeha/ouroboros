@@ -653,19 +653,33 @@ def _wire_rejection(error: Any) -> _WireRejection:
                 param = next((name for name in reversed(named) if name in fields), "")
             # Consume the list itself, stopping at prose (including a negative
             # clause). This accepts quoted JSON/Zod enums and plain comma lists.
-            # A conjunction ("a, b, or c") joins only a literal quoted like its
-            # predecessor: a quoted 'or' stays a value and bare prose ends the list.
+            # Each item is quoted like its predecessor: a quoted 'or' stays a
+            # value and bare prose ends the list. A conjunction ("a, b, or c")
+            # joins only the last item of a comma list; what follows is prose.
             tail = message[clause.end():].lstrip(" :[=({")
             tail = re.sub(r"^(?:are|is)\b", "", tail).lstrip(" :[=({")
-            tokens = []
-            while match := re.match(r"([\"']?)([a-z][a-z0-9_-]*)[\"']?", tail):
-                tokens.append(match.group(2))
-                tail = tail[match.end():]
-                lead = match.group(1) or "[\"']?"
-                separator = (re.match(rf"\s*,?\s*\b(?:or|and)\b\s*(?={lead}[a-z])", tail)
-                             or re.match(r"\s*[,|]\s*", tail))
-                if not separator:
+            tokens, lead, final, piped, comma_list = [], "[\"']?", False, False, False
+            while match := re.match(rf"({lead})([a-z][a-z0-9_-]*)[\"']?", tail):
+                rest = tail[match.end():]
+                # A token named in an explicit refusal after the positive list
+                # is not itself an advertised option, even after a comma or
+                # the first conjunction ("low, high and xhigh is unsupported").
+                if re.match(
+                    r"\s*\(?\s*(?:(?:is|are)\s+not\s+(?:supported|allowed|available|permitted)\b"
+                    r"|(?:isn't|aren't)\s+(?:supported|allowed|available|permitted)\b"
+                    r"|not\s+(?:supported|allowed|available|permitted)\b"
+                    r"|(?:unsupported|disallowed|unavailable|requires?)\b)", rest,
+                ):
                     break
+                tokens.append(match.group(2))
+                tail = rest
+                lead = match.group(1) or lead
+                conjunction = not piped and re.match(rf"\s*,?\s*\b(?:or|and)\b\s*(?={lead}[a-z])", tail)
+                separator = conjunction or re.match(r"\s*[,|]\s*", tail)
+                if final or not separator:
+                    break
+                comma_list = comma_list or "," in separator.group()
+                final, piped = bool(conjunction and comma_list), piped or "|" in separator.group()
                 tail = tail[separator.end():]
             if param and tokens:
                 allowed = tuple(tokens)

@@ -68,6 +68,27 @@ def _exception(error):
     pytest.param("ultra", _error("reasoning.effort: Input should be 'low', 'medium' or 'high' "
                                  "and xhigh requires a pro plan"),
         "high", id="conjunction-stops-at-prose"),
+    pytest.param("ultra", _error("reasoning.effort value 'ultra' is not supported. Supported values are "
+                                 "low, medium, or high and xhigh requires a pro plan"),
+        "high", id="bare-second-conjunction-is-prose"),
+    pytest.param("ultra", _error("reasoning.effort value 'ultra' is not supported. Supported values are "
+                                 "'low', 'medium', or 'high' and 'xhigh' is not supported"),
+        "high", id="quoted-second-conjunction-is-prose"),
+    pytest.param("ultra", _error("reasoning.effort value 'ultra' is not supported. Supported values are "
+                                 "low, medium, high and xhigh is not supported"),
+        "high", id="first-conjunction-negative-prose"),
+    pytest.param("xhigh", _error("reasoning.effort value 'xhigh' is not supported. Supported values are "
+                                 "low, medium, high and xhigh is not supported"),
+        "high", id="negative-prose-does-not-suppress-retry"),
+    pytest.param("ultra", _error("reasoning.effort value 'ultra' is not supported. Supported values are "
+                                 "low, medium, high, xhigh requires a pro plan"),
+        "high", id="bare-comma-negative-prose"),
+    pytest.param("ultra", _error("reasoning.effort value 'ultra' is not supported. Supported values are "
+                                 "low or medium or high"),
+        "high", id="chained-conjunctions"),
+    pytest.param("xhigh", _error("reasoning.effort value 'xhigh' is not supported. Supported values are "
+                                 "low, medium, or high and xhigh requires a pro plan"),
+        "high", id="prose-tier-does-not-suppress-resend"),
 ])
 def test_enum_without_scalar_echo_reaches_driver_and_learns_only_after_success(
     evidence_root, tmp_path, asynchronous, body_error, requested, error, applied,
@@ -205,6 +226,8 @@ def test_minimum_recovery_preserves_legacy_aliases_and_requires_positive_evidenc
     ("; 'max' is not supported. Supported values are: 'low', 'medium', 'high', 'xhigh'.", "xhigh"),
     # The old parser read the serial conjunction as a value 'or' and lost 'high'.
     (". Supported values are: 'low', 'medium', or 'high'.", "high"),
+    # The old parser read a clause after the serial conjunction as one more value.
+    (". Supported values are low, medium, or high and xhigh requires a pro plan", "high"),
 ])
 def test_positive_constraints_are_bound_to_field_and_ignore_negative_quotes(evidence_root, carrier, body_error, supported, applied):
     target = _target("anthropic" if carrier == "anthropic" else "openrouter")
@@ -301,6 +324,30 @@ def test_structured_enum_and_parameter_survive_sdk_exception_projection(evidence
     ("reasoning_effort: allowed values are 'low', 'or', or 'high'", ("low", "or", "high")),
     ("reasoning_effort: allowed values are low, medium, or high", ("low", "medium", "high")),
     ("reasoning_effort: allowed values are 'low' or higher", ("low",)),
+    ("reasoning_effort: allowed values are 'or' and 'and'", ("or", "and")),
+    ("reasoning_effort: allowed values are low, medium, or high and xhigh requires a pro plan",
+     ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are 'low', 'medium', or 'high' and 'xhigh' is not supported",
+     ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are 'low', 'medium', 'high', xhigh requires a pro plan",
+     ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are low, medium, high and xhigh is not supported",
+     ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are 'low', 'medium', 'high', and 'xhigh' isn't supported",
+     ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are 'low', 'medium', 'high', 'xhigh' (unsupported on this plan)",
+     ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are low, medium, high, xhigh requires a pro plan",
+     ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are low or medium or high",
+     ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are 'high' (not recommended)", ("high",)),
+    ("reasoning_effort: allowed values are low, medium, or high",
+     ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are 'low', 'medium', or 'high' and 'xhigh' is not supported",
+     ("low", "medium", "high")),
+    ('reasoning_effort: expected one of "low"|"medium"|"high" and "xhigh" requires a pro plan',
+     ("low", "medium", "high")),
 ])
 def test_enum_conjunction_keeps_quoted_literals_and_stops_at_prose(body_error, message, allowed):
     from ouroboros.request_wire_recovery import _wire_rejection
