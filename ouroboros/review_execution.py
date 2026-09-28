@@ -50,6 +50,7 @@ from ouroboros.review_session_custody import (
     owned_started_review_custody,
     review_recovery_facts,
 )
+from ouroboros.review_session_preparation import prepare_review_session_request, render_review_session_prompt
 from ouroboros.review_session_usage import (
     session_custody_attribution,
     session_invocation_fields,
@@ -147,7 +148,7 @@ def panel_delivery_class(slots: Any) -> str:
 # Policy keys a retrieving executor consumes itself (`review_native_episode`,
 # `AgentSessionReviewExecutor`); the rendered Policy JSON omits them so the api
 # pack states the review contract once, in its governance segment.
-ROUTE_OWNED_POLICY_KEYS = frozenset({"output_contract", "native_data_root"})
+ROUTE_OWNED_POLICY_KEYS = frozenset({"output_contract", "native_data_root", "review_source_closure"})
 
 
 def review_output_contract(request: ReviewRequest) -> str:
@@ -736,6 +737,7 @@ class SessionInvocation:
     operation_id: str = ""
     pending_invocation_checkpoint: Optional[Callable[[str], None]] = None
     owner_deadline_at: str = ""
+    source_delivery: Optional[Dict[str, Any]] = None
 
 def run_delegated_review_session(
     *,
@@ -827,6 +829,8 @@ def run_delegated_review_session(
                 raise ReviewRouteUnavailable(
                     f"delegated review route unavailable: {unavailable}", code=unavailable)
         if not recovering:
+            from ouroboros.acceptance_retrieving import prepare_session_source
+            prepare_session_source(invocation.source_delivery, task_id=task_id)
             existing_project = gateway.find_project_id(root)
             project_id = existing_project or gateway.register_project(root)
             schema_asked = bool(output_schema) and _effective_route_carries_schema(
@@ -845,29 +849,9 @@ def run_delegated_review_session(
             seconds = bounded_seconds(
                 timeout_sec, default=300, maximum=_CLAUDEXOR_MAX_SECONDS,
             )
-            run_request = {
-                "prompt": prompt,
-                "instructions": instructions,
-                "authPreference": "subscription",
-                "mode": shape.mode,
-                "access": shape.access,
-                "scope": {"kind": "project", "root": root},
-                # A one-element explicit pool is the pin; primaryHarness is only preference.
-                "harnesses": [route.route_id],
-                "primaryHarness": route.route_id,
-                "maxSeconds": seconds,
-            }
-            if use_thread:
-                run_request["_use_thread"] = True
-                run_request["_thread_id"] = thread_id
-            if route.model:
-                run_request["model"] = route.model
-            if route.effort:
-                run_request["effort"] = route.effort
-            if use_thread or getattr(route, "profile_id", ""):
-                run_request["credentialProfileId"] = getattr(route, "profile_id", "") or None
-            if schema_asked:
-                run_request["outputSchema"] = output_schema
+            run_request = prepare_review_session_request(
+                invocation, route, prompt=prompt, root=root,
+                thread_id=thread_id, schema_asked=schema_asked)
         if not run_id:
             from ouroboros.budget_pause import dispatch_fenced
 
@@ -897,6 +881,7 @@ def run_delegated_review_session(
                 surface=surface, slot_id=slot_id,
                 # #112: pending recovery replays the request row's lineage.
                 root_task_id=root_task_id, parent_task_id=parent_task_id,
+                review_source_delivery=dict(invocation.source_delivery or {}),
                 **usage_custody,
             )
             if not requested:
@@ -1243,19 +1228,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                     "agent_session slot has no session task: the surface must supply "
                     "the route-owned task text (request.session_task) — the assembled "
                     "api pack is deliberately not sendable to a session", code="session_task_missing")
-            parts = [
-                "You are an independent Ouroboros reviewer slot running as a "
-                "read-only agent session.",
-                f"Surface: {request.surface}",
-                f"Role hint: {slot.role_hint or 'general reviewer'}",
-                "",
-                task,
-                "",
-                "OUTPUT CONTRACT (your host parses this structurally):",
-                self._output_contract() + "\nThis contract governs the unwrapped substantive deliverable; emit any host-required transport metadata outside it exactly as separately instructed.",
-                f"Slot: {slot.slot_id}",
-            ]
-            self._session_prompt = "\n".join(parts)
+            self._session_prompt = render_review_session_prompt(request, slot, task)
         return self._session_prompt
     # -- delivery --------------------------------------------------------------
 
@@ -1381,6 +1354,7 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
                 operation_id=self.assignment.call_id,
                 pending_invocation_checkpoint=self._pending_invocation_checkpoint,
                 owner_deadline_at=str(getattr(request, "deadline_at", "") or ""),
+                source_delivery=(getattr(request, "slot_source_delivery", None) or {}).get(slot.slot_id),
             ),
         )
         self._run_id = facts["run_id"]

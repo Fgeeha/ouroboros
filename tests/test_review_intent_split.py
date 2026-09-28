@@ -17,6 +17,15 @@ v4.33.0 separates the two:
 
 from __future__ import annotations
 
+import pytest
+
+
+@pytest.fixture(autouse=True)
+def _packet_default_panel(monkeypatch):
+    """This module pins the PACKET assembly of the default panel; the shipped
+    default triad reads the work itself since #1334, so pin packet explicitly."""
+    monkeypatch.setattr("ouroboros.reviewer_slot_config.DEFAULT_TRIAD_DELIVERY", "")
+
 
 class TestResolveIntentSubjectOnly:
     def test_subject_only_from_multiline_commit_message(self):

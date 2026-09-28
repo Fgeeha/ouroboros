@@ -174,23 +174,23 @@ class ChatOutbound(TypedDict):
     model_lane: NotRequired[str]
     requested_model_lane: NotRequired[str]
     effective_model_lane: NotRequired[str]
-    # Phase 6: the OPAQUE harness route RESOLVED AT DISPATCH for this bubble/subagent (`resolve_subagent_dispatch`,
-    # stamped once) — a delegated route only; absent/empty means the ordinary native path and the UI draws no chip.
-    # It is the route the run was sent to, not a receipt from the engine saying where it landed: a landing below the
-    # ask is disclosed on `capability_delta`, not by rewriting this field.
+    # Opaque delegated route stamped once by resolve_subagent_dispatch; absent/empty = native/no chip.
+    # Dispatch intent is not a landing receipt: a reduction belongs in capability_delta, never rewrites this route.
     executor_route: NotRequired[str]
-    # Latest observed progress actor, NOT terminal evidence or current liveness. Own
-    # task_id/task_attempt/run_id/attempt_id, harness_id, phase, revision; optional model has explicit model_source
-    # (requested or observed).
+    # Latest observed progress actor, NOT terminal evidence or current liveness. Own task_id/task_attempt/run_id/
+    # attempt_id, harness_id, phase, revision; optional model has explicit model_source (requested or observed).
     executor_observation: NotRequired[Dict[str, Any]]
-    # The completion-seam EVIDENCE the route decision is reconciled against (subagents.envelope_from_task):
-    # delegated runs started/settled/succeeded, terminal failure states, disclosed subscription spend (+estimated
-    # flag), engine-reported models, the additive `nanny_nudge_recorded` flag (a non-empty finalization nudge was
-    # durably stamped), and the additive `delegate_start_attempted` flag (any durable delegate_start attempt,
-    # refused or started). Terminal frames only; its absence means "no evidence yet", never "ran natively".
+    # Host observation: v/task_id/run_id/after_seq/through_seq, source (run_events|timeline_window,
+    # read_through/ref/provisional), typed parts/technical/gaps/omitted/latest_message. Part cuts count
+    # Unicode code points. (run_id, seq) is identity; cuts_truncated/seqs_truncated disclose its preview loss.
+    # source.ref = redacted JSONL via confined task-file ?source= (503 if unsupported). Never narration,
+    # terminal evidence or a complete-journal claim; full shape is mirrored in web/modules/api_types.js.
+    delegated_activity: NotRequired[Dict[str, Any]]
+    # Terminal evidence from subagents.envelope_from_task: run started/settled/succeeded counts, failure states,
+    # disclosed spend/estimated flag, engine models, nanny_nudge_recorded (durable nonempty finalization nudge),
+    # delegate_start_attempted (durable start or refusal). Absence = no evidence yet, never native execution.
     execution_evidence: NotRequired[Dict[str, Any]]
-    # The FACT beside the executor_route plan, from the same custody evidence:
-    # "harness_used" | "harness_attempted" | "native_only". Terminal frames only; absent =
+    # Custody fact beside executor_route: "harness_used" | "harness_attempted" | "native_only". Terminal only; absent =
     # no substrate claim.
     actual_substrate: NotRequired[str]
     model: NotRequired[str]
@@ -248,10 +248,10 @@ class ChatOutbound(TypedDict):
     transport: NotRequired[TransportMetadata]
     # Typed message kind; role alone selects authorship (DESIGN: Chat authorship and System rows).
     system_type: NotRequired[str]
-    # Host-stamped placement of a task-keyed System row: "timeline" = a timeline item of the task's card, "reviews" =
-    # the card's Reviews group carries it (still attached); absent = ordinary. ``card_row_id`` is its stable identity.
+    # Host placement of a task's System row: timeline or Reviews; absent = ordinary. card_row_id is stable.
     card_row: NotRequired[Literal["timeline", "reviews"]]
     card_row_id: NotRequired[str]
+    card_row_revision: NotRequired[int]  # canonical source order, independent of delivery timestamp
     # Event-time human presentation; raw task/project ids remain machine keys.
     target_label: NotRequired[str]
     project_id: NotRequired[str]

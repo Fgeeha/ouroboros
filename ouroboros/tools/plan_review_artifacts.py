@@ -480,7 +480,76 @@ def slot_row(slot: Any) -> dict:
         "route": str(getattr(route, "value", route) or "api_chat"),
         "session_target": str(getattr(slot, "session_target", "") or ""),
         "session_profile": str(getattr(slot, "session_profile", "") or ""),
+        "delivery": "native" if getattr(slot, "native_retrieval", False) else (
+            "session" if str(getattr(route, "value", route)) == "agent_session" else "packet"),
+        "subagent_id": str(getattr(slot, "subagent_id", "") or ""),
+        "use_local": bool(getattr(slot, "use_local", False)),
+        "processing_preference": str(getattr(slot, "processing_preference", "") or ""),
     }
+
+
+def recorded_slot_rows(wave: dict) -> list[dict]:
+    """Interpret legacy delivery from its saved output, never today's Settings."""
+    outputs = {str(r.get("slot_id") or ""): r for r in wave.get("reviewer_outputs") or [] if isinstance(r, dict)}
+    actors = {str(r.get("slot_id") or ""): r for r in wave.get("actors") or [] if isinstance(r, dict)}
+    rows = []
+    for raw in wave.get("slots") or []:
+        row = dict(raw)
+        sid = str(row.get("slot_id") or "")
+        actor, output = actors.get(sid, {}), outputs.get(sid, {})
+        row.setdefault("subagent_id", str(actor.get("subagent_id") or ""))
+        row.setdefault("use_local", bool(actor.get("use_local", False)))
+        row.setdefault("processing_preference", str(actor.get("processing_preference") or ""))
+        row.setdefault("delivery", "session" if row.get("route") == "agent_session" else (
+            "native" if output.get("delivery_class") == "native_retrieving" or row["subagent_id"] else "packet"))
+        rows.append(row)
+    return rows
+
+
+def _legacy_paid_slot(row: dict, wave: dict, state_root: pathlib.Path, task_id: str) -> dict:
+    """Recover fields older wave projections omitted from their exact saved request."""
+    from ouroboros.observability import read_blob_ref, read_call_manifest_ref
+    from ouroboros.review_records import ReviewSlot
+    from ouroboros.review_execution import ReviewRouteKind
+
+    sid = row["slot_id"]
+    output = next((r for r in wave.get("reviewer_outputs") or [] if r.get("slot_id") == sid), {})
+    ref = (output.get("prompt_ref") or {}).get("manifest_ref")
+    if not ref:
+        return row  # Legacy bare packet interpretation; the recorded fingerprint still fences custody.
+    try:
+        manifest = read_call_manifest_ref(state_root, ref, task_id=task_id)
+        saved = read_blob_ref(state_root, manifest["full_payload_ref"])["slot"]
+        saved = {**saved, "route": ReviewRouteKind(saved["route"])}
+        exact = slot_row(ReviewSlot(**saved))
+        if any(exact[key] != row[key] for key in (
+                "slot_id", "model", "effort", "route", "session_target", "session_profile")):
+            raise ValueError("saved request differs from frozen roster")
+        return exact
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        raise PlanReviewSourceUnavailable(
+            f"PLAN_REVIEW_SOURCE_UNAVAILABLE: legacy paid slot {sid}: {exc}") from exc
+
+
+def frozen_plan_slots(wave: dict, *, state_root: Optional[pathlib.Path] = None, task_id: str = "") -> list:
+    """Reconstruct an already-paid roster without consulting mutable configuration."""
+    from ouroboros.review_records import ReviewSlot
+    from ouroboros.review_execution import ReviewRouteKind
+    from ouroboros.tools.plan_review_runtime import PLAN_REVIEW_MAX_TOKENS
+
+    rows = recorded_slot_rows(wave)
+    if not rows:
+        raise PlanReviewSourceUnavailable("PLAN_REVIEW_SOURCE_UNAVAILABLE: frozen reviewer roster missing")
+    if state_root is not None:
+        rows = [_legacy_paid_slot(row, wave, state_root, task_id) if "delivery" not in raw else row
+                for raw, row in zip(wave["slots"], rows)]
+    return [ReviewSlot(
+        slot_id=r["slot_id"], model=r["model"], effort=r["effort"], route=ReviewRouteKind(r["route"]),
+        session_target=r["session_target"], session_profile=r["session_profile"], subagent_id=r["subagent_id"],
+        use_local=r["use_local"], processing_preference=r["processing_preference"],
+        native_retrieval_override=r["delivery"] == "native", max_tokens=PLAN_REVIEW_MAX_TOKENS,
+        role_hint="plan reviewer", default_temperature=0.2,
+    ) for r in rows]
 
 
 def continuation_restart_delta(cause: str) -> dict:
@@ -545,7 +614,7 @@ def continuation_inputs(
     except (OSError, ValueError, json.JSONDecodeError) as exc:
         return fresh(f"prior_exact_wave_unreadable:{type(exc).__name__}")
     current_rows = [slot_row(slot) for slot in slots]
-    if current_rows != [r for r in exact.get("slots") or [] if isinstance(r, dict)]:
+    if current_rows != recorded_slot_rows(exact):
         return fresh("prior_reviewer_assignment_set_changed")
     outputs = {str(r.get("slot_id") or ""): r for r in exact.get("reviewer_outputs") or [] if isinstance(r, dict)}
     slot_messages: Dict[str, List[Dict[str, Any]]] = {}
@@ -593,6 +662,7 @@ def frozen_delivery_inputs(wave: dict, slots: list) -> dict:
             "current values cannot stand in for the paid request")
     outputs = {str(row.get("slot_id") or ""): row for row in wave.get("reviewer_outputs") or []}
     actors = {str(row.get("slot_id") or ""): row for row in wave.get("actors") or []}
+    roster = {row["slot_id"]: row for row in recorded_slot_rows(wave)}
     messages, tasks = {}, {}
     for slot in slots:
         sid = str(slot.slot_id)
@@ -601,7 +671,10 @@ def frozen_delivery_inputs(wave: dict, slots: list) -> dict:
         row = outputs.get(sid)
         if not isinstance(row, dict) or sid not in sizes:
             raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_SOURCE_UNAVAILABLE: recorded slot inputs missing: {sid}")
-        if bool(getattr(slot, "retrieves", False)):
+        recorded = roster.get(sid)
+        if not recorded:
+            raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_SOURCE_UNAVAILABLE: frozen reviewer missing: {sid}")
+        if recorded["delivery"] in ("native", "session"):
             if not row.get("session_task"):
                 raise PlanReviewSourceUnavailable(f"PLAN_REVIEW_SOURCE_UNAVAILABLE: recorded retrieving task missing: {sid}")
             tasks[sid] = str(row["session_task"])

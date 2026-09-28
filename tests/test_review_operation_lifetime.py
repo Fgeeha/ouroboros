@@ -110,6 +110,16 @@ def _rows(root, state="waiting"):
     return [row for row in waits.values() if row.get("state") == state and row.get("review_operation")]
 
 
+def _settled_rows(root):
+    """Waiting rows past their last waiting publication.
+
+    A parked reviewer publishes its row, then republishes it at the next revision
+    once its credential-harness lookup lands; a copy taken earlier is a stale
+    event its live operation has already superseded.
+    """
+    return [row for row in _rows(root) if row.get("credential_harness")]
+
+
 def _parent(f, **task):
     return model_wait.task_model_wait_scope(task={"id": TASK, "chat_id": 7, "_attempt": 1, **task},
                                             drive_root=f.root, event_queue=f.events, worker_slot_held=False)
@@ -236,9 +246,9 @@ def test_owner_controls_reach_the_exact_live_operation_after_author_end(env, mon
                            usage_ctx=f.ctx, llm=f.model)
         run_review_request(_request("answer B", "wave-b"), slots=[_slot()], drive_root=f.root,
                            usage_ctx=f.ctx, llm=f.model)
-        until(lambda: len(_rows(f.root)) == 2)
+        until(lambda: len(_settled_rows(f.root)) == 2)
     write_task_result(f.root, TASK, "completed", result="answer B")
-    rows = {row["review_operation"]["retry_key"]: row for row in _rows(f.root)}
+    rows = {row["review_operation"]["retry_key"]: row for row in _settled_rows(f.root)}
     op_a = review_operation._LIVE[rows["wave-a"]["review_operation"]["owner_id"]]
     op_b = review_operation._LIVE[rows["wave-b"]["review_operation"]["owner_id"]]
     # The supervisor publishes a live operation's waiting row although the author ended.
@@ -268,11 +278,46 @@ def test_owner_controls_reach_the_exact_live_operation_after_author_end(env, mon
     assert [c["model"] for c in f.model.calls if "answer B" in c["subject"]] == [MODEL, MODEL]
 
 
+def test_a_waiting_row_superseded_by_its_live_operation_is_not_forwarded(env):
+    """The first visible waiting row is not the settled one, and its copy stays refused."""
+    from supervisor.task_model_wait import handle_task_model_wait
+
+    f = env
+    parked, gate = threading.Event(), threading.Event()
+    lookup = f.model.claudexor_model_sources
+
+    def held_lookup():
+        parked.set()
+        gate.wait(10)
+        return lookup()
+
+    f.model.claudexor_model_sources = held_lookup
+    try:
+        with _parent(f):
+            run_review_request(_request(), slots=[_slot()], drive_root=f.root, usage_ctx=f.ctx, llm=f.model)
+            assert parked.wait(10), "the reviewer published its first waiting row, then looked up its harness"
+        early = _rows(f.root)[0]
+    finally:
+        gate.set()
+    assert not early["credential_harness"]
+    settled = until(lambda: _settled_rows(f.root))[0]
+    assert settled["wait_id"] == early["wait_id"] and settled["revision"] > early["revision"]
+    write_task_result(f.root, TASK, "completed")
+    forwarded = []
+    sup = _supervisor_ctx(f.root, forwarded)
+    handle_task_model_wait({"type": "task_model_wait", "task_id": TASK, **early}, sup)
+    assert forwarded == [], "a revision the live operation already republished is never forwarded"
+    handle_task_model_wait({"type": "task_model_wait", "task_id": TASK, **settled}, sup)
+    assert len(forwarded) == 1 and forwarded[0]["revision"] == settled["revision"] and forwarded[0]["chat_id"] == 7
+
+
 # A REAL review operation in another process: the author scope ends, the reviewer
 # parks on a quota refusal inside its operation, and the process stays alive after
-# the operation closes until the test closes its stdin.
+# the operation closes until the test closes its stdin. Its first line names the
+# process actually executing it (on Windows a venv ``python.exe`` is a launcher
+# whose CHILD is the interpreter, so ``Popen.pid`` is not that process).
 _REMOTE_OPERATION = r"""
-import json, sys, threading, time
+import json, os, sys, threading, time
 from types import SimpleNamespace
 root, session, task, surface = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 from ouroboros import config, model_wait, process_custody, review_operation
@@ -317,7 +362,8 @@ with model_wait.task_model_wait_scope(task={"id": task, "chat_id": 7, "_attempt"
                                      drain_deadline=time.monotonic()),
                        slots=[ReviewSlot(slot_id="one", model="claudexor::codex=exact-model", timeout_sec=60)],
                        drive_root=root, usage_ctx=ctx, llm=model)
-print(json.dumps({"author_scope": "closed"}), flush=True)
+print(json.dumps({"author_scope": "closed", "pid": os.getpid(), "ppid": os.getppid(), "executable": sys.executable,
+                  "base_executable": getattr(sys, "_base_executable", "")}), flush=True)
 while any(op.task_id == task for op in list(review_operation._LIVE.values())):
     time.sleep(0.01)
 print(json.dumps({"operation": "closed", "calls": model.calls}), flush=True)
@@ -332,12 +378,104 @@ def _lines(stream):
     return lines, reader
 
 
+def _exited(pid, birth, within):
+    """Whether the process ``pid`` born at ``birth`` is gone (or was never known) within ``within`` seconds."""
+    from ouroboros.platform_layer import pid_is_alive, process_start_time
+
+    deadline = time.monotonic() + within
+    while pid and birth and pid_is_alive(pid):
+        observed_birth = process_start_time(pid)
+        if observed_birth and observed_birth != birth:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+    return True
+
+
+@pytest.mark.parametrize("alive,observed_birth,expected", [
+    (True, "", False),
+    (True, "original", False),
+    (True, "replacement", True),
+    (False, "", True),
+])
+def test_remote_exit_observation_does_not_turn_unknown_birth_into_death(monkeypatch, alive, observed_birth, expected):
+    from ouroboros import platform_layer
+
+    monkeypatch.setattr(platform_layer, "pid_is_alive", lambda _pid: alive)
+    monkeypatch.setattr(platform_layer, "process_start_time", lambda _pid: observed_birth)
+    assert _exited(123, "original", 0) is expected
+
+
+def _stop_remote(child, reader, executing):
+    """EOF on stdin ends the operation's interpreter (also behind a launcher); reap both, then the reader.
+
+    A stuck child is killed as its own PID tree, never ``killpg``: it shares the
+    test runner's process group. The interpreter is awaited by its own pid and
+    birth, since a launcher's exit alone does not prove it gone.
+    """
+    from ouroboros.platform_layer import force_kill_pid, kill_pid_tree, process_start_time
+
+    child.stdin.close()
+    try:
+        child.wait(timeout=30)
+    except subprocess.TimeoutExpired:
+        kill_pid_tree(child.pid)
+        child.kill()
+        child.wait()
+    pid, birth = executing.get("pid"), executing.get("birth")
+    exited = _exited(pid, birth, 10)
+    if not exited and pid and birth and process_start_time(pid) == birth:
+        force_kill_pid(pid)
+        _exited(pid, birth, 10)
+    reader.join(10)
+    return {"launcher_returncode": child.returncode, "interpreter_exited": exited, "reader_running": reader.is_alive()}
+
+
+@pytest.mark.parametrize("observed_birth,should_kill", [("", False), ("replacement", False), ("original", True)])
+def test_remote_cleanup_requires_positive_birth_match(monkeypatch, observed_birth, should_kill):
+    from types import SimpleNamespace
+    from ouroboros import platform_layer
+
+    killed = []
+    joined = []
+    child = SimpleNamespace(stdin=SimpleNamespace(close=lambda: None), wait=lambda timeout: None, returncode=0)
+    reader = SimpleNamespace(join=joined.append, is_alive=lambda: False)
+    monkeypatch.setitem(globals(), "_exited", lambda *_args: False)
+    monkeypatch.setattr(platform_layer, "process_start_time", lambda _pid: observed_birth)
+    monkeypatch.setattr(platform_layer, "force_kill_pid", killed.append)
+    result = _stop_remote(child, reader, {"pid": 123, "birth": "original"})
+    assert killed == ([123] if should_kill else [])
+    assert joined == [10]
+    assert result["interpreter_exited"] is False  # Emergency cleanup never launders a failed teardown.
+
+
+def _forge(root, wait_id, row, pointer=None, *, remove=False):
+    """Write (or ``remove``) one forged wait row and, when given, its own open pointer, in one locked write."""
+    from ouroboros.task_results import task_result_path
+    from ouroboros.utils import update_json_locked
+
+    owner_id = row["review_operation"]["owner_id"]
+
+    def change(current):
+        waits = {key: value for key, value in current["model_waits"].items() if key != wait_id}
+        pointers = {key: value for key, value in current["review_operations"].items()
+                    if pointer is None or key != owner_id}
+        if not remove:
+            waits[wait_id] = row
+            pointers.update({owner_id: pointer} if pointer is not None else {})
+        return {**current, "model_waits": waits, "review_operations": pointers}
+
+    update_json_locked(task_result_path(root, TASK), change, strict_existing_dict=True)
+
+
+@pytest.mark.serial
 @pytest.mark.parametrize("surface", ["task_acceptance", "plan_review"])
-def test_a_real_remote_operation_consumes_its_exact_decision_and_a_closed_one_is_never_told_202(env, monkeypatch,
-                                                                                               surface):
+def test_a_real_remote_operation_consumes_its_exact_decision_and_a_closed_one_is_never_told_202(
+        env, monkeypatch, record_property, capsys, surface):
     from ouroboros.gateway import task_model_wait as gateway
     from ouroboros.owner_mailbox import KIND_MODEL_WAIT, drain_owner_entries
-    from ouroboros.platform_layer import process_start_time
+    from ouroboros.platform_layer import collect_descendant_pids, process_start_time
     from ouroboros.process_custody import current_custody_session_id
     from supervisor import queue as task_queue
     from supervisor.task_model_wait import handle_task_model_wait
@@ -348,15 +486,24 @@ def test_a_real_remote_operation_consumes_its_exact_decision_and_a_closed_one_is
                               surface],
                              stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, cwd=os.getcwd())
     out, reader = _lines(child.stdout)
+    executing = {}
+    topology = {"launched": {"pid": child.pid, "birth": process_start_time(child.pid), "argv0": sys.executable},
+                "executing": executing}
     try:
-        assert json.loads(out.get(timeout=60)) == {"author_scope": "closed"}
+        banner = json.loads(out.get(timeout=60))
+        assert banner.pop("author_scope") == "closed"
+        executing.update(banner, birth=process_start_time(banner["pid"]))
+        # The controller is the process executing the operation: the one we launched or its
+        # descendant, with the birth measured here and this server generation's custody session.
+        assert executing["pid"] == child.pid or executing["pid"] in collect_descendant_pids(child.pid), topology
+        assert executing["birth"], topology
         # The live row once the operation published its credential harness (its last
         # revision while it waits for the owner).
         row = until(lambda: [r for r in _rows(f.root) if r.get("credential_harness")], timeout=30)[0]
         write_task_result(f.root, TASK, "completed", result="answer")  # the author ended
         block = row["review_operation"]
-        assert block["controller"] == {"pid": child.pid, "birth": process_start_time(child.pid),
-                                       "session": current_custody_session_id()}
+        assert block["controller"] == {"pid": executing["pid"], "birth": executing["birth"],
+                                       "session": current_custody_session_id()}, topology
         # Its open pointer is part of the proof; only task acceptance also retains a checkpoint source.
         pointer = load_task_result(f.root, TASK)["review_operations"][block["owner_id"]]
         assert pointer["state"] == "dispatched" and pointer["controller"] == block["controller"]
@@ -368,14 +515,31 @@ def test_a_real_remote_operation_consumes_its_exact_decision_and_a_closed_one_is
         stale = gateway._decide(f.root, {**_decision(row, "stale"), "revision": row["revision"] + 5})
         assert stale.status_code == 409 and json.loads(stale.body)["reason_code"] == "stale_model_wait"
         # Rows naming the same process but another birth (a reused pid) or another server
-        # generation are refused, and a refused claim leaves no pending action behind.
-        for wait_id, controller in (("reused-pid", {**block["controller"], "birth": "another process"}),
-                                    ("other-generation", {**block["controller"], "session": "previous-server"})):
-            forged = {**row, "wait_id": wait_id, "review_operation": {**block, "controller": controller}}
-            model_wait.mutate_wait(f.root, TASK, wait_id, lambda _previous, value=forged: value)
-            refused = gateway._decide(f.root, _decision(forged, f"forged-{wait_id}"))
-            assert refused.status_code == 409 and json.loads(refused.body)["reason_code"] == "task_not_live"
-            assert "pending_action" not in load_task_result(f.root, TASK)["model_waits"][wait_id]
+        # generation are refused, and a refused claim leaves no pending action behind. A
+        # row alone disagrees with its operation's pointer; a forged row with its own
+        # matching pointer passes that check and meets the birth and session checks.
+        before = load_task_result(f.root, TASK)
+        for wait_id, controller, state in (
+                ("reused-pid", {**block["controller"], "birth": "another process"}, "dead"),
+                ("other-generation", {**block["controller"], "session": "previous-server"}, "alive")):
+            assert review_operation.controller_state(controller) == state
+            for owner_id in (block["owner_id"], f"forged-{wait_id}"):
+                forged = {**row, "wait_id": wait_id, "model_wait_owner_id": owner_id,
+                          "review_operation": {**block, "owner_id": owner_id, "controller": controller}}
+                own_pointer = None if owner_id == block["owner_id"] else {**pointer, "controller": controller}
+                _forge(f.root, wait_id, forged, own_pointer)
+                try:
+                    stored = load_task_result(f.root, TASK)
+                    opened = review_operation._open_pointer(stored, stored["model_waits"][wait_id])
+                    assert (opened is not None) is (own_pointer is not None)
+                    refused = gateway._decide(f.root, _decision(forged, f"forged-{wait_id}"))
+                    assert refused.status_code == 409 and json.loads(refused.body)["reason_code"] == "task_not_live"
+                    assert "pending_action" not in load_task_result(f.root, TASK)["model_waits"][wait_id]
+                finally:
+                    _forge(f.root, wait_id, forged, own_pointer, remove=True)
+        restored = load_task_result(f.root, TASK)
+        assert restored["model_waits"].keys() == before["model_waits"].keys()
+        assert restored["review_operations"] == before["review_operations"]
         switch = _decision(row, "switch-remote", action="switch", model=OTHER_MODEL,
                            credential_profile_id="", use_local=False, persist_role=False)
         response = gateway._decide(f.root, switch)
@@ -406,13 +570,12 @@ def test_a_real_remote_operation_consumes_its_exact_decision_and_a_closed_one_is
         assert adopted.status_code == 409 and json.loads(adopted.body)["reason_code"] == "task_not_live"
         assert drain_owner_entries(f.root, TASK, set(), kinds={KIND_MODEL_WAIT}) == []
     finally:
-        child.stdin.close()
-        try:
-            child.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            child.kill()
-            child.wait()
-        reader.join(10)
+        topology["teardown"] = _stop_remote(child, reader, executing)
+        # The actual process topology, readable in the CI log even when the test passes.
+        record_property("remote_controller_topology", json.dumps(topology))
+        with capsys.disabled():
+            print(f"\nREMOTE_CONTROLLER_TOPOLOGY {surface} {json.dumps(topology)}", flush=True)
+    assert topology["teardown"]["interpreter_exited"] and not topology["teardown"]["reader_running"], topology
     # A dead controller is refused as well.
     dead = gateway._decide(f.root, _decision({**row, "wait_id": "after-close"}, "after-death"))
     assert dead.status_code == 409

@@ -80,16 +80,20 @@ def evolution_stop_reason(campaign: Optional[Dict[str, Any]] = None) -> str:
     """Why no new evolution may be admitted regardless of state.json: a received
     Stop (latch or durable intent) or an unconsumed Panic flag. "" when none."""
     from supervisor import queue
+    from supervisor.state_initialization import confirm_absent
 
     if _STOP_LATCH["stopped"]:
         return "stop_latched"
     if isinstance((campaign if campaign is not None else _read_evolution_campaign()).get("stop_intent"), dict):
         return "stop_intent"
+    path = pathlib.Path(queue.DRIVE_ROOT) / "state" / "panic_stop.flag"
     try:
-        os.lstat(pathlib.Path(queue.DRIVE_ROOT) / "state" / "panic_stop.flag")
+        try:
+            os.lstat(path)
+        except FileNotFoundError:
+            confirm_absent(path)
+            return ""
         return "panic_flag"
-    except FileNotFoundError:
-        return ""
     except OSError:
         return "panic_flag_unknown"
 

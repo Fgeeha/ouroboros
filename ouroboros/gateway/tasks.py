@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse
 
 from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, request_drive_root, request_json_or, request_repo_dir, run_sync_to_completion, stage_initial_task_attachments
 from ouroboros.gateway.cost_breakdown import _task_cost_breakdown_view  # noqa: F401
@@ -38,7 +38,7 @@ from ouroboros.gateway.task_hurry import api_task_hurry  # noqa: F401
 from ouroboros.gateway.task_decision import api_decision_answer  # noqa: F401
 from ouroboros.gateway.task_archive import (
     chat_media_identity, directory_archives, plain_segments, serve_directory_archive, serve_task_file,
-    task_artifact_location, recorded_identity,
+    task_artifact_location, recorded_identity, serve_task_source,
 )
 from ouroboros.task_custody import task_artifact_stores
 from ouroboros.headless import (
@@ -105,6 +105,7 @@ _RESERVED_METADATA_KEYS = frozenset({
     "budget_drive_root",
     "task_constraint",
     "task_contract",
+    "input_sources",
     "allowed_resources",
     "deadline_at",
     "executor_ref",
@@ -529,6 +530,10 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         )
 
     raw_metadata = dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}
+    if "input_sources" in raw_metadata:
+        return json_error(
+            "metadata.input_sources is reserved; source selection is only supported by schedule_subagent",
+            400, reason_code="input_source_selection_unsupported")
     if _external_subagent_label(body, raw_metadata):
         return json_error("delegation_role=subagent is only allowed through the internal schedule_subagent tool", 400)
     if str(body.get("parent_task_id") or "").strip() or str(body.get("root_task_id") or "").strip():
@@ -955,10 +960,7 @@ def api_task_artifact(request: Request):
     if not result and not registered:
         return json_error("task not found", 404)
     if source:
-        try:
-            return Response(artifact_store.read_task_result_source_bytes(drive_root, result, name, source), media_type="application/json")
-        except (OSError, ValueError, RuntimeError):
-            return json_error("task source is unavailable or does not match its recorded identity", 404)
+        return serve_task_source(drive_root, stores, result, task_id, name, source)
     rows = [] if fast else [row for row in result.get("artifacts") or [] if isinstance(row, dict) and (
         relpath is not None or str(row.get("name") or pathlib.Path(str(row.get("path") or "")).name) == name)]
     located = [(at, order, row) for order, row in enumerate(rows + ([registered] if registered else []))

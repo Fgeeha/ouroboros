@@ -276,6 +276,9 @@ class ReviewRequest:
     session_root: str = ""
     session_task: str = ""
     slot_session_tasks: Dict[str, str] = field(default_factory=dict)  # per-slot work order over session_task
+    # Per-slot source delivery of a retrieving row (``acceptance_retrieving``):
+    # inline, paged through an exact source this row can open, or unavailable.
+    slot_source_delivery: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     session_threads: Dict[str, str] = field(default_factory=dict)
     usage_attribution: Dict[str, str] = field(default_factory=dict)
     deadline_at: str = ""

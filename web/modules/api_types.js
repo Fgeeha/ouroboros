@@ -359,6 +359,17 @@
  * @property {Object=} executor_observation
  *   Latest observed progress actor, bound to own task/attempt/run/revision.
  *   model_source distinguishes requested and observed; not a terminal receipt.
+ * @property {Object=} delegated_activity
+ *   One host progress observation: {v, task_id, run_id, after_seq,
+ *   through_seq, source{kind: run_events|timeline_window, read_through?, ref?,
+ *   provisional?}, parts[{kind: message|thinking|problem, actor, text, seq?,
+ *   last_seq?, cuts?[[seq, Unicode code-point offset]], cuts_truncated?, chars?,
+ *   truncated?}], technical?{count, labels, recent, seqs?, seqs_truncated?},
+ *   gaps?[{after_seq, through_seq, reason, final?}],
+ *   omitted?, latest_message?}. Identity is (run_id, seq); host progress about
+ *   the executor, never narration or execution evidence; `source.ref` names
+ *   retained redacted JSONL (confined task-file `?source=`, 503 where unsupported).
+ *   Incomplete preview identity is disclosed; a preview is not the whole journal.
  * @property {Object=} execution_evidence
  *   The completion-seam EVIDENCE the route decision is reconciled against:
  *   {delegated_runs_started, delegated_runs_settled, delegated_runs_succeeded,
@@ -474,6 +485,7 @@
  *   carries the fact (the row is still attached to the card); absent = an
  *   ordinary row.
  * @property {string=} card_row_id  // the row's stable identity across live delivery, outbox replay and history
+ * @property {number=} card_row_revision  // canonical source order, independent of delivery timestamp
  * @property {string=} target_label
  * @property {string=} project_id
  * @property {string=} project_name

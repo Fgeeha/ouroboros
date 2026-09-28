@@ -248,6 +248,15 @@ def commit_review_contract_fingerprint() -> str:
         if any(triad_actor_ids):
             for row, actor in zip(triad_rows, triad_actor_ids):
                 row.append(actor)
+        # A direct api row saved as native delivery (#1334) is the same kind of
+        # contract change with no actor id to carry it; the column appears only
+        # when such a row exists, so every other panel keeps its exact bytes.
+        native_direct = [bool(flag) and not actor and str(getattr(route, "value", route) or "") == "api_chat"
+                         for flag, actor, route in zip(row_plan.get("retrieves") or [], triad_actor_ids
+                                                       or [""] * len(triad_rows), row_plan["routes"])]
+        if any(native_direct):
+            for row, native in zip(triad_rows, native_direct):
+                row.append("native_retrieval" if native else "")
         scope_slots = list(scope_reviewer_slots())
         scope_rows = [
             [

@@ -8,7 +8,12 @@ optional advisory reviewer, and the one optional deep self-reviewer
 
     {"slot_id": "t_9f3a", "route": {"kind": "api_chat" | "agent_session",
                                     "target_id": "<model id | harness[=model]>"},
-     "effort": "high"}
+     "effort": "high", "delivery": "native" | "packet"}
+
+``delivery`` belongs only to a direct ``api_chat`` TRIAD row (#1334): ``native``
+reads the subject in bounded native tool rounds on the row's own route,
+``packet`` receives the assembled packet (for a model without tool calling);
+absent keeps the packet meaning a row saved before the field had.
 
 or, mutually exclusively, a reference to a configured subagent
 (``OUROBOROS_SUBAGENTS`` row)::
@@ -93,6 +98,12 @@ SCOPE_SLOT_LIMIT = 4
 
 _SLOT_ID_MAX_CHARS = 64
 
+# The saved delivery of a direct api_chat triad row (``ConfiguredReviewerSlot.delivery``).
+DELIVERY_NATIVE = "native"
+DELIVERY_PACKET = "packet"
+# The shipped default panel's triad delivery (#1334): the rows read the work themselves.
+DEFAULT_TRIAD_DELIVERY = DELIVERY_NATIVE
+
 # The deep self-review row is a singleton like the advisory: its identity is
 # fixed (the UI reads «Выполняется как» under this id), never owner-minted.
 DEEP_REVIEW_SLOT_ID = "deep_review_slot_1"
@@ -121,6 +132,11 @@ class ConfiguredReviewerSlot:
     subagent_id: str = ""
     use_local: Optional[bool] = None  # Runtime task override only; never a second settings policy.
     processing_preference: str = ""  # Effective preference captured when the row is loaded.
+    # A direct api_chat TRIAD row's saved delivery (#1334): "native" reads the
+    # subject in bounded native tool rounds, "packet" receives the assembled
+    # packet (the fallback for a model without tool calling). '' is a row saved
+    # before the field existed and keeps its packet meaning (never migrated).
+    delivery: str = ""
 
     @property
     def is_session(self) -> bool:
@@ -128,24 +144,24 @@ class ConfiguredReviewerSlot:
 
     @property
     def native_retrieval(self) -> bool:
-        """An ``api_model`` configured-subagent row: bounded native tool rounds.
+        """An ``api_chat`` row that reads the subject itself in bounded native
+        tool rounds: a configured-subagent api row, or a direct row whose saved
+        delivery is ``native``.
 
         Kept OFF the closed public route vocabulary (``api_chat`` stays the
         wire kind); executor selection and admission read this derived fact.
         """
-        return bool(self.subagent_id) and self.kind == ROUTE_KIND_API
+        return self.kind == ROUTE_KIND_API and (bool(self.subagent_id) or self.delivery == DELIVERY_NATIVE)
 
     @property
     def retrieves(self) -> bool:
         """Delivery class: the reviewer reads the subject with its own tools.
 
         THE predicate admission/fit/authority callers must use instead of
-        route-name comparisons — a session row and a native-retrieval actor
-        row are one class here, and neither receives an assembled packet.
+        route-name comparisons — a session row and a native-retrieval api row
+        are one class here, and neither receives an assembled packet.
         """
-        from ouroboros.review_execution import delivery_retrieves
-
-        return delivery_retrieves(self.kind, self.subagent_id)
+        return self.is_session or self.native_retrieval
 
 
 @dataclass(frozen=True)
@@ -329,10 +345,25 @@ def _resolve_actor_slot(
     )
 
 
-def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
+def _parse_delivery(row: Dict[str, Any], where: str, *, allowed: bool) -> str:
+    """A direct api_chat triad row's saved delivery; refused wherever it means nothing."""
+    if "delivery" not in row:
+        return ""
+    if not allowed:
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} delivery applies only to a direct api_chat triad row "
+            "(sessions, subagent references, scope, advisory and deep review rows always read)")
+    value = row["delivery"]
+    if value not in (DELIVERY_NATIVE, DELIVERY_PACKET):
+        raise ValueError(
+            f"{REVIEWER_SLOTS_ENV}: {where} delivery must be {DELIVERY_NATIVE!r} or {DELIVERY_PACKET!r}")
+    return value
+
+
+def _parse_slot(row: Any, where: str, seen_ids: set, *, delivery_allowed: bool = False) -> ConfiguredReviewerSlot:
     if not isinstance(row, dict):
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: {where} is not an object")
-    unknown = sorted(set(row) - {"slot_id", "route", "subagent_id", "effort", "processing_preference"})
+    unknown = sorted(set(row) - {"slot_id", "route", "subagent_id", "effort", "processing_preference", "delivery"})
     if unknown:
         raise ValueError(
             f"{REVIEWER_SLOTS_ENV}: {where} has unknown keys: {unknown}"
@@ -372,6 +403,7 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
     if actor_ref:
         if "processing_preference" in row:
             raise ValueError(f"{REVIEWER_SLOTS_ENV}: {where} inherits Processing from its subagent")
+        _parse_delivery(row, where, allowed=False)
         return _resolve_actor_slot(
             slot_id, actor_ref, _valid_effort(row.get("effort"), where), where,
         )
@@ -398,6 +430,7 @@ def _parse_slot(row: Any, where: str, seen_ids: set) -> ConfiguredReviewerSlot:
         session_target=route.target_id if kind == ROUTE_KIND_SESSION else "",
         profile_id=route.credential_profile_id,
         processing_preference=_row_processing(row.get("processing_preference")),
+        delivery=_parse_delivery(row, where, allowed=delivery_allowed and kind == ROUTE_KIND_API),
     )
 
 
@@ -573,7 +606,8 @@ def parse_reviewer_slots(raw: str) -> ReviewerSlotConfig:
                 f"limit is {limit} (shown in the UI, not negotiable here)"
             )
         groups[group] = [
-            _parse_slot(row, f"{group}[{idx}]", seen_ids) for idx, row in enumerate(rows)
+            _parse_slot(row, f"{group}[{idx}]", seen_ids, delivery_allowed=group == "triad")
+            for idx, row in enumerate(rows)
         ]
     if not groups["triad"]:
         raise ValueError(f"{REVIEWER_SLOTS_ENV}: triad needs at least one slot")
@@ -626,29 +660,35 @@ def _default_config() -> ReviewerSlotConfig:
     ids reuse the deterministic per-row spelling so receipts keep lining up.
     """
     from ouroboros.config import get_review_models, get_scope_review_models
+    from ouroboros.review_model_routes import compatible_only_review_model
     from ouroboros.review_substrate import (
         SCOPE_SLOT_ID_PREFIX,
         SLOT_ID_PREFIX,
         slot_id_for_row,
     )
 
-    def _rows(models, prefix):
+    def _rows(models, prefix, delivery=""):
         return tuple(
             ConfiguredReviewerSlot(
                 slot_id=slot_id_for_row(idx + 1, prefix=prefix),
                 kind=ROUTE_KIND_API,
                 target_id=str(model),
                 processing_preference=_row_processing(),
+                delivery=delivery,
             )
             for idx, model in enumerate(
                 str(m) for m in (models or []) if str(m or "").strip()
             )
         )
 
+    # #1334: the shipped triad reads the work itself on the same models (scope
+    # rows always read); a model without tool calling is switched to Packet by
+    # the owner, never silently at dispatch.
     return ReviewerSlotConfig(
-        triad=_rows(get_review_models(), SLOT_ID_PREFIX),
+        triad=_rows(get_review_models(), SLOT_ID_PREFIX, DEFAULT_TRIAD_DELIVERY),
         scope=_rows(get_scope_review_models(), SCOPE_SLOT_ID_PREFIX),
-        advisory=AdvisorySlotConfig(processing_preference=_row_processing()),
+        # An OpenAI-compatible-only install's advisory is Main's route too, shown as such.
+        advisory=AdvisorySlotConfig(target_id=compatible_only_review_model(), processing_preference=_row_processing()),
         source="default",
     )
 
@@ -695,7 +735,8 @@ def deep_review_slot(config: Optional[ReviewerSlotConfig] = None) -> ConfiguredR
     api row synthesized from the legacy model key.
 
     ``OUROBOROS_MODEL_DEEP_SELF_REVIEW`` stays the invisible migration source
-    and fallback: an install that never saved a row keeps its model (a native
+    and fallback: nonempty choices stay pinned; an empty fresh compatible-only
+    default uses Main. A saved panel keeps its legacy default (a native
     inspection episode on that model), and the row's own
     effort — resolved by ``row_effort(row, "deep_self_review")`` — outranks the
     surface key ``OUROBOROS_EFFORT_DEEP_SELF_REVIEW`` only when set (R6). A
@@ -703,11 +744,12 @@ def deep_review_slot(config: Optional[ReviewerSlotConfig] = None) -> ConfiguredR
     consumer of this parser; the surface turns it into its typed refusal.
     ``config`` lets a caller that already parsed the setting avoid a second parse.
     """
-    row = (config if config is not None else load_reviewer_slot_config()).deep_review
-    return row if row is not None else synthesized_deep_review_slot()
+    selected = config if config is not None else load_reviewer_slot_config()
+    row = selected.deep_review
+    return row if row is not None else synthesized_deep_review_slot(authored_panel=selected.source == "structured")
 
 
-def synthesized_deep_review_slot() -> ConfiguredReviewerSlot:
+def synthesized_deep_review_slot(*, authored_panel: bool = False) -> ConfiguredReviewerSlot:
     """The api row the legacy model key stands for — the ONE synthesis
     rule, shared by ``deep_review_slot`` and the settings endpoint (which shows
     it beside a malformed structured value as the legacy-derived REPAIR
@@ -717,7 +759,7 @@ def synthesized_deep_review_slot() -> ConfiguredReviewerSlot:
 
     return ConfiguredReviewerSlot(
         slot_id=DEEP_REVIEW_SLOT_ID, kind=ROUTE_KIND_API,
-        target_id=get_deep_self_review_model(),
+        target_id=get_deep_self_review_model(authored_panel=authored_panel),
         processing_preference=_row_processing(role="deep_review"),
     )
 
@@ -763,6 +805,8 @@ def _delivery_slot(
         session_profile=row.profile_id,
         subagent_id=row.subagent_id,
         processing_preference=row.processing_preference,
+        # The row's saved delivery is its own fact, never inferred from an actor id.
+        **({"native_retrieval_override": True} if row.native_retrieval and not row.subagent_id else {}),
         **slot_fields,
     )
 
@@ -802,6 +846,38 @@ def triad_delivery_slots(
         )
         for row in rows
     ]
+
+
+def child_acceptance_slots(slots: Sequence[Any], reviewer_slot_id: str = "") -> Tuple[List[Any], Dict[str, Any]]:
+    """At most ONE configured triad row for a child task's acceptance (#1334).
+
+    One reviewer is panel BREADTH, not a reading or round cap: the row keeps its
+    own delivery. The only configured row needs no name; otherwise the caller
+    names a member and the host checks membership. Returns ``(slots, refusal)``;
+    a refusal is a typed ``not_dispatched`` payload, never a review run.
+    """
+    rows = list(slots or [])
+    wanted = str(reviewer_slot_id or "").strip()
+    if wanted:
+        chosen = [slot for slot in rows if slot.slot_id == wanted]
+        if chosen:
+            return chosen, {}
+        reason = "reviewer_slot_unknown"
+    elif len(rows) <= 1:
+        return rows, {}
+    else:
+        reason = "reviewer_selection_required"
+    return [], {
+        "status": "not_dispatched", "reason": reason,
+        "detail": ("a child task's acceptance uses at most one configured reviewer row; name one "
+                   "with reviewer_slot_id — no reviewer was called"),
+        "reviewer_rows": [{"slot_id": str(getattr(slot, "slot_id", "") or ""),
+                           "model": str(getattr(slot, "model", "") or ""),
+                           "route": str(getattr(getattr(slot, "route", ""), "value", getattr(slot, "route", "")) or ""),
+                           "delivery": ("native" if getattr(slot, "native_retrieval", False)
+                                        else "agent_session" if getattr(slot, "retrieves", False) else "packet")}
+                          for slot in rows],
+    }
 
 
 def reviewer_slots(
@@ -867,16 +943,29 @@ def commit_triad_delivery() -> Dict[str, Any]:
         "session_profiles": [slot.session_profile for slot in slots],
         "slot_ids": [slot.slot_id for slot in slots],
         "subagent_ids": [slot.subagent_id for slot in slots],
+        # Per-row delivery class (#1334): a direct api row saved as ``native``
+        # retrieves without an actor id, so no consumer may infer it from one.
+        "retrieves": [bool(slot.retrieves) for slot in slots],
         "use_local": [slot.use_local for slot in slots],
-        # The historical fingerprint identity survives for the UNCONFIGURED
-        # panel (source="default", all api rows): a 7.0 upgrade must not lapse
-        # every install's skill-review replay authority. ABI-10 retired the
-        # legacy comma-list source, so "not structured" IS the default panel.
+        # Only an unconfigured all-packet panel keeps the legacy identity.
+        # Native defaults change the contract: a later requested review may
+        # buy a new cycle; changing defaults itself dispatches nothing.
         "legacy_skill_fingerprint": (
             config.source != "structured"
-            and all(slot.route is ReviewRouteKind.API_CHAT for slot in slots)
+            and all(slot.route is ReviewRouteKind.API_CHAT and not slot.retrieves for slot in slots)
         ),
     }
+
+
+def row_plan_retrieves(row_plan: Dict[str, Any], index: int) -> bool:
+    """Read the aligned delivery vector, with legacy route/actor interpretation."""
+    flags = list(row_plan.get("retrieves") or [])
+    if index < len(flags):
+        return bool(flags[index])
+    from ouroboros.review_execution import delivery_retrieves
+
+    routes, actors = list(row_plan.get("routes") or []), list(row_plan.get("subagent_ids") or [])
+    return index < len(routes) and delivery_retrieves(routes[index], actors[index] if index < len(actors) else "")
 
 
 def _compound_effort(row: ConfiguredReviewerSlot) -> str:
@@ -979,7 +1068,10 @@ def reviewer_slot_save_check(
         if not retrieving:
             return ""
         try:
-            if previous_raw and any(row.retrieves for row in parse_reviewer_slots(previous_raw).triad):
+            # No stored value ran the shipped default panel, whose triad already
+            # reads natively (#1334; the startup notice disclosed it).
+            previous = parse_reviewer_slots(previous_raw) if previous_raw else _default_config()
+            if any(row.retrieves for row in previous.triad):
                 return ""  # already disclosed when that value was saved
         except ValueError:
             pass  # a malformed previous value never ran a retrieving panel: disclose
@@ -1198,6 +1290,7 @@ __all__ = [
     "ConfiguredReviewerSlot",
     "ReviewerSlotConfig",
     "advisory_slot_config",
+    "child_acceptance_slots",
     "commit_scope_rows",
     "commit_triad_rows",
     "deep_review_slot",
@@ -1212,6 +1305,7 @@ __all__ = [
     "acceptance_delivery_disclosure",
     "reviewer_slot_save_check",
     "row_effort",
+    "row_plan_retrieves",
     "structured_reviewer_slots_present",
     "structured_scope_review_slots",
     "structured_reviewer_slots_raw",

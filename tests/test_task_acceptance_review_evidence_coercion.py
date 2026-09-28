@@ -47,7 +47,8 @@ def _stub_review(monkeypatch):
         captured.update(kwargs)
         return {"claim": "x"}
 
-    monkeypatch.setattr(rs, "reviewer_slots", lambda **k: [object()])
+    # One configured packet row: a child reviews with it (no selection needed).
+    monkeypatch.setattr(rs, "triad_delivery_slots", lambda **k: [rs.ReviewSlot(slot_id="s1", model="m")])
     monkeypatch.setattr(rs, "run_review_request", lambda *a, **k: result)
     monkeypatch.setattr(
         "ouroboros.review_evidence.build_task_acceptance_evidence", _build,

@@ -515,36 +515,75 @@ def test_evicted_trace_falls_back_to_the_canonical_published_source(tmp_path, mo
     assert ctx.event_queue.empty() and model.calls == 1
 
 
-def test_maintenance_collects_a_dead_controllers_operation_once(tmp_path, monkeypatch):
+@pytest.mark.parametrize("retry_root", [False, True])
+@pytest.mark.parametrize("checkpoint_format", ["current", "landed_bb27"])
+def test_maintenance_collects_a_dead_controllers_operation_once(tmp_path, monkeypatch, retry_root, checkpoint_format):
     """The controller died after dispatch and before any publication: the existing
     maintenance pass finds the retained checkpoint and settles it at $0, once."""
     from ouroboros import model_wait
+    from ouroboros.artifacts import read_actor_source_bytes
+
+    if checkpoint_format == "landed_bb27":
+        # bb27's actual _write_operation_pointer source is this exact asdict
+        # envelope without paid_authority. Produce it BEFORE the paid stamp;
+        # never retrofit a new field into immutable legacy checkpoint bytes.
+        writer = review_operation._write_operation_pointer
+        def legacy_writer(*a, **kw):
+            kw.pop("paid_authority", None)
+            return writer(*a, **kw)
+        monkeypatch.setattr(review_operation, "_write_operation_pointer", legacy_writer)
 
     delivered = queue.Queue()
     monkeypatch.setattr("supervisor.workers.get_event_q", lambda: delivered)
-    model = _HeldModel()
+    class StampedModel(_HeldModel):
+        def chat(self, **kwargs):
+            from ouroboros.review_dispatch import invoke_bound_api_review_paid_stamp
+            invoke_bound_api_review_paid_stamp()
+            return super().chat(**kwargs)
+
+    model = StampedModel()
     paid = hashlib.sha256(b"paid material").hexdigest()
     retry_key = f"task_acceptance:{paid}"
-    # The root wallet's existing claim is what makes this the host's paid panel.
-    write_task_result(tmp_path, TASK, "running", chat_id=3, task_acceptance_review_accounting={
-        "schema_version": 1, "root_task_id": TASK, "claims_by_binding": {"b" * 64: {
-            "binding_hash": "b" * 64, "candidate_hash": "c" * 64, "evidence_revision": "e" * 64,
-            "fence_hash": "f" * 64, "paid_identity": paid, "claimed_at": "2026-09-26T00:00:00+00:00",
-            "claimed_by_task_id": TASK}}})
+    from ouroboros.review_projection import build_review_binding
+    from ouroboros.review_dispatch import bind_task_acceptance_paid_dispatch
+
+    accounting = "original-root" if retry_root else TASK
+    metadata = ({"root_task_id": accounting, "delegation_role": "root", "parent_task_id": "",
+                 "original_task_id": accounting, "timeout_retry_from": accounting} if retry_root else {
+                     "root_task_id": TASK, "delegation_role": "root", "parent_task_id": ""})
+    binding = {**build_review_binding(candidate="reviewed answer A", evidence={"requirement": "exact"},
+                                      fence_token_or_state="original"), "paid_identity": paid}
+    write_task_result(tmp_path, accounting, "running", chat_id=3, task_contract={
+        "schema_version": 1, "deadline_at": "", "budget_profile": {"improvement_policy": "fixed", "max_improvement_passes": None}})
+    write_task_result(tmp_path, TASK, "running", chat_id=3, **metadata)
     ctx = _ctx(tmp_path)
-    with model_wait.task_model_wait_scope(task={"id": TASK, "chat_id": 3, "_attempt": 1}, drive_root=tmp_path,
-                                          event_queue=None, worker_slot_held=False):
-        run = _released_panel(tmp_path, ctx, model, retry_key=retry_key)
+    ctx.task_metadata = metadata
+    admission = SimpleNamespace(tools=SimpleNamespace(_ctx=ctx), task_id=TASK, drive_root=tmp_path,
+                                review_binding=binding)
+    # Inject controller death at the identity source; pointer and retained bytes
+    # keep the exact same identity, as after a real process exit.
+    dead = {"pid": _dead_pid(), "birth": "gone", "session": "gone"}
+    monkeypatch.setattr(review_operation, "controller_identity", lambda: dead)
+    with model_wait.task_model_wait_scope(task={"id": TASK, "chat_id": 3, "_attempt": 1, "metadata": metadata},
+                                          drive_root=tmp_path, event_queue=None, worker_slot_held=False):
+        with bind_task_acceptance_paid_dispatch(admission):
+            run = _released_panel(tmp_path, ctx, model, retry_key=retry_key)
         # An advisory child/off-mode review through the same seam: no wallet claim.
         advisory = _released_panel(tmp_path, ctx, model, retry_key="task_acceptance:advisory-evidence")
     operations = load_task_result(tmp_path, TASK)["review_operations"]
     owner_id = next(key for key, row in operations.items() if row["retry_key"] == retry_key)
     advisory_id = next(key for key, row in operations.items() if row["retry_key"] != retry_key)
+    legacy_bytes = read_actor_source_bytes(tmp_path, TASK, operations[owner_id]['source_ref'])
+    if checkpoint_format == "landed_bb27":
+        assert set(json.loads(legacy_bytes)) == {"schema_version", "owner_id", "task_id", "surface",
+            "retry_key", "task_attempt", "controller", "operations", "recorded_at", "request", "slot_roster"}
     _settle(model, run)
     _settle(model, advisory)
+    # A worker leaves _ACTIVE before its operation closes its own pointer; a death
+    # simulated before that close lands would be overwritten by the live controller.
+    _until(lambda: all(load_task_result(tmp_path, TASK)["review_operations"][key]["state"]
+                       not in {"retained", "dispatched"} for key in (owner_id, advisory_id)))
     # Death after dispatch: nothing published, the pointer still says dispatched, the pid is gone.
-    dead = {"pid": _dead_pid(), "session": "gone"}
-
     def died(rows):
         return {**rows, **{key: {**rows[key], "state": "dispatched", "controller": dead}
                            for key in (owner_id, advisory_id)}}
@@ -553,6 +592,14 @@ def test_maintenance_collects_a_dead_controllers_operation_once(tmp_path, monkey
     write_task_result(tmp_path, TASK, "failed", chat_id=3, result="")
     monkeypatch.setattr("ouroboros.review_substrate.run_review_request", lambda *a, **k: pytest.fail("runner"))
     report = review_operation.recover_orphaned_acceptance_operations(tmp_path)
+    assert read_actor_source_bytes(tmp_path, TASK, operations[owner_id]['source_ref']) == legacy_bytes
+    if checkpoint_format == "landed_bb27" and retry_root:
+        assert not report['settled'] and not report['errors']
+        assert {row['owner_id']: row['status'] for row in report['pending']} == {
+            owner_id: 'unavailable', advisory_id: 'unavailable'}
+        assert not load_task_result(tmp_path, TASK).get('review_projection')
+        assert delivered.empty() and model.calls == 2
+        return
     assert {row["owner_id"]: row["status"] for row in report["settled"]} == {owner_id: "announced"}, report
     assert {row["owner_id"]: row["status"] for row in report["pending"]} == {advisory_id: "unavailable"}
     stored = load_task_result(tmp_path, TASK)
@@ -562,7 +609,7 @@ def test_maintenance_collects_a_dead_controllers_operation_once(tmp_path, monkey
     panels = [p for p in stored["review_projection"]["panels"] if p.get("late_settlement")]
     assert len(panels) == 1 and panels[0]["aggregate_signal"] == "PASS"
     assert panels[0]["actors"][0]["semantic_verdict"] == "PASS"
-    assert panels[0]["late_settlement"]["reviewed_subject"]["binding_hash"] == "b" * 64
+    assert panels[0]["late_settlement"]["reviewed_subject"]["binding_hash"] == binding["binding_hash"]
     rows = [delivered.get_nowait() for _ in range(delivered.qsize())]
     assert [row["delivery_id"] for row in rows] == [f"acceptance-late:{retry_key}"]
     again = review_operation.recover_orphaned_acceptance_operations(tmp_path)
@@ -817,30 +864,47 @@ def test_a_late_settlement_that_did_not_land_is_never_announced_and_maintenance_
     assert model.calls == 1
 
 
-def _checkpointed_operation(root, *, binding="b" * 64):
+def _checkpointed_operation(root, *, legacy=False):
     from ouroboros.artifacts import store_actor_source_bytes
+    from ouroboros.review_projection import build_review_binding
+    from ouroboros.task_results import claim_task_acceptance_review_cycle, resolve_task_lineage
 
     paid = hashlib.sha256(b"paid material").hexdigest()
     retry_key = f"task_acceptance:{paid}"
-    request = ReviewRequest(surface="task_acceptance", task_id=TASK, goal="goal", subject="answer",
+    request = ReviewRequest(surface="task_acceptance", task_id=TASK, task_attempt=1, goal="goal", subject="answer",
                             evidence={"requirement": "exact"}, retry_key=retry_key)
-    source = {"request": dataclasses.asdict(request), "operations": {"a": "op-a"}, "task_attempt": 1,
+    binding = {**build_review_binding(candidate=request.subject, evidence=request.evidence,
+                                      fence_token_or_state="original"), "paid_identity": paid}
+    source = {"schema_version": 1, "task_id": TASK, "owner_id": "review-operation-" + "e" * 32,
+              "surface": "task_acceptance", "retry_key": retry_key,
+              "recorded_at": "2026-09-26T10:00:00+00:00",
+              "request": dataclasses.asdict(request), "operations": {"a": "op-a"}, "task_attempt": 1,
               "slot_roster": [dataclasses.asdict(ReviewSlot(slot_id="a", model="model/a"))],
-              "controller": {"pid": _dead_pid(), "birth": "gone", "session": "gone"}}
+              "controller": {"pid": _dead_pid(), "birth": "gone", "session": "gone"},
+              "paid_authority": {"schema_version": 1, "authority": "host_root",
+                                 "lineage": resolve_task_lineage(TASK), "binding": binding}}
+    if legacy:
+        source.pop('paid_authority')  # old producer shape, before immutable storage
     ref = store_actor_source_bytes(root, TASK, category="context_checkpoints", source_id="acceptance-operation",
                                    data=json.dumps(source, default=str).encode("utf-8"), extension="json")
-    claims = {binding: {"binding_hash": binding, "candidate_hash": "c" * 64, "paid_identity": paid}}
-    return retry_key, ref, {"task_acceptance_review_accounting": {"claims_by_binding": claims}}
+    write_task_result(root, TASK, "completed", result="answer", root_task_id=TASK,
+                      delegation_role="root", parent_task_id="", task_contract={
+        "schema_version": 1, "deadline_at": "", "budget_profile": {"improvement_policy": "fixed", "max_improvement_passes": None}})
+    claim_task_acceptance_review_cycle(root, TASK, binding, claimed_by_task_id=TASK)
+    checkpoint = {**{key: source[key] for key in ("retry_key", "owner_id", "controller", "operations", "task_attempt")},
+                  "source_ref": ref}
+    return checkpoint, binding
 
 
 def test_an_unreadable_published_source_is_never_duplicated_from_the_checkpoint(tmp_path):
     from ouroboros.acceptance_settlement import canonical_acceptance_trace, settle_acceptance_operation
 
-    retry_key, ref, result = _checkpointed_operation(tmp_path)
+    checkpoint, binding = _checkpointed_operation(tmp_path)
+    retry_key, ref = checkpoint["retry_key"], checkpoint["source_ref"]
+    result = load_task_result(tmp_path, TASK)
     missing = {**ref, "path": ref["path"].replace("acceptance-operation", "acceptance-missing"), "sha256": "0" * 64}
-    checkpoint = {"retry_key": retry_key, "source_ref": ref, "owner_id": "review-operation-" + "e" * 32}
     ours = {**result, "review_projection": {"panels": [
-        {"surface": "task_acceptance", "panel_id": "panel_pub", "binding_hash": "b" * 64, "applied_source_ref": missing}]}}
+        {"surface": "task_acceptance", "panel_id": "panel_pub", "binding_hash": binding["binding_hash"], "applied_source_ref": missing}]}}
     assert canonical_acceptance_trace(tmp_path, TASK, retry_key, result=ours, checkpoint=checkpoint) == {
         "review_runs": [], "source_status": "unreadable", "unreadable_panels": ["panel_pub"]}
     ctx = SimpleNamespace(task_id=TASK, drive_root=tmp_path, budget_drive_root=tmp_path, task_metadata={},
@@ -852,7 +916,7 @@ def test_an_unreadable_published_source_is_never_duplicated_from_the_checkpoint(
     theirs = {**ours, "review_projection": {"panels": [{**ours["review_projection"]["panels"][0],
                                                          "binding_hash": "d" * 64}]}}
     trace = canonical_acceptance_trace(tmp_path, TASK, retry_key, result=theirs, checkpoint=checkpoint)
-    assert [run["panel_id"] for run in trace["review_runs"]] == ["panel_" + "e" * 16]
+    assert [run["panel_id"] for run in trace["review_runs"]] == ["panel_" + trace["review_runs"][0]["binding_hash"][:16]]
 
 
 def test_recovery_defers_an_unverifiable_controller_without_marking_it(tmp_path):

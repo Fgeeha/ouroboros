@@ -312,7 +312,8 @@ def test_the_human_keeps_the_live_stream_while_the_model_waits(tmp_path, monkeyp
 
     emitted = []
     ctx = _nanny_ctx(tmp_path)
-    ctx.emit_progress_fn = lambda text: emitted.append((text, time.monotonic()))
+    # Shaped like the real Agent binder: the owned wait adds typed keyword metadata.
+    ctx.emit_progress_fn = lambda text, **_meta: emitted.append((text, time.monotonic()))
 
     started = time.monotonic()
     out, _ = _wait_against_a_streaming_run(ctx, tmp_path, monkeypatch, wait_sec=4)

@@ -678,6 +678,9 @@ def _supervisor_harness(monkeypatch, tmp_path, steps):
     monkeypatch.setattr(server, "ensure_legacy_imported", noop)
     monkeypatch.setattr(server, "_bootstrap_supervisor_repo", lambda _s: (True, "ok"))
     monkeypatch.setattr(server, "_runtime_branch_defaults", lambda: ("dev", "stable"))
+    # Startup notices have their own real delivery/state consumer tests. This
+    # harness records supervisor crash alerts and stubs other boot side effects.
+    monkeypatch.setattr("ouroboros.upgrade_notices.startup_upgrade_notices", noop)
     for name in (
         "_resume_interrupted_project_deletions", "_startup_prune_sweeps", "_startup_custody_sweep",
         "_startup_worktree_prune", "_prune_delegated_snapshots", "_periodic_supervisor_maintenance",

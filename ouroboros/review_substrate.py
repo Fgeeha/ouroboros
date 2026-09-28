@@ -133,6 +133,7 @@ from ouroboros.review_dispatch import (  # noqa: E402,F401 — re-exports
     SLOT_ID_PREFIX,
     slot_id_for_row,
     stamp_review_paid_on_dispatch,
+    task_acceptance_row_refusal,
     task_acceptance_zero_physical_refusal,
 )
 
@@ -305,7 +306,7 @@ class ReviewCoordinator:
                 global_limit = resolve_total_budget_usd()
             except Exception:
                 global_limit = None
-        if base_scope.root_limit_usd is not None:
+        if base_scope.root_limit_source or base_scope.root_limit_usd is not None:
             root_limit = base_scope.root_limit_usd
         else:
             try:
@@ -329,6 +330,7 @@ class ReviewCoordinator:
                                  else "settings_budget_resolver"),
             global_limit_revision=(base_scope.global_limit_revision if base_scope.global_limit_usd is not None else None),
             root_limit_usd=root_limit,
+            root_limit_source=base_scope.root_limit_source,
         )
 
         from ouroboros.review_custody import run_custodied_review_slots
@@ -388,12 +390,15 @@ class ReviewCoordinator:
         if request.surface == 'task_acceptance' and request.policy.get('native_data_root') and not request.reconcile_only:
             try:
                 from ouroboros.review_source_closure import retain_review_request_sources
-                from ouroboros.acceptance_retrieving import acceptance_retrieving_work_order
+                from ouroboros.acceptance_retrieving import acceptance_retrieving_work_order, retain_review_source
 
                 retain_review_request_sources(request, source_root=request.policy['native_data_root'],
                                               custody_root=self._custody_drive_root())
                 acceptance_retrieving_work_order(request, [slot for slot in slots if slot.retrieves],
                     session_root=request.session_root, data_root=pathlib.Path(request.policy['native_data_root']))
+                for slot in slots:
+                    if slot.retrieves:
+                        retain_review_source(request, slot.slot_id, self._custody_drive_root())
             except Exception as exc:
                 source_error = f'review_source_closure_unavailable: {type(exc).__name__}: {exc}'
         actors = [self._error_actor(request, slot, source_error, operation_state='not_dispatched')
@@ -529,6 +534,8 @@ class ReviewCoordinator:
         base_call_type = request.call_type or f"{request.surface}_review"
         from ouroboros.review_dispatch import review_operation_binding
         binding = review_operation_binding(request, slot, str(operation_id or call_id))
+        from ouroboros.acceptance_retrieving import retain_review_source
+        retain_review_source(request, slot.slot_id, self._custody_drive_root())
         assignment = ReviewAssignment(
             request=request, slot=slot, call_id=call_id, call_type=base_call_type,
             custody_root=self._custody_drive_root(),
@@ -566,9 +573,13 @@ class ReviewCoordinator:
                           "review_operation_binding": binding},
             )
         except Exception:
+            if request.slot_source_delivery.get(slot.slot_id):
+                # A sourced review must retain its canonical identity before
+                # dispatch, not only in a post-run result or a worker buffer.
+                raise
             prompt_ref = {}
         free_refusal = (
-            task_acceptance_zero_physical_refusal(request.evidence, retrieving=bool(slot.retrieves))
+            task_acceptance_row_refusal(request, slot)
             if request.surface == "task_acceptance"
             else {}
         )

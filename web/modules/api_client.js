@@ -133,12 +133,12 @@ export function taskArtifactArchiveUrl(taskId, directory) {
     return `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeSegment(name)}?archive=${encodeURIComponent(directory)}`;
 }
 
-/** URL for one published immutable source handle. */
+/** URL for one published immutable source handle (a delegated run's journal range included). */
 export function taskSourceDownloadUrl(taskId, ref) {
     const path = typeof ref?.path === 'string' ? ref.path : '';
     if (!taskId || ref?.root !== 'artifact_store' || ref?.kind !== 'task_source'
         || !/^[0-9a-f]{64}$/.test(ref?.sha256 || '')
-        || !/^source_handles\/(tool_results|context_checkpoints)\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path)
+        || !/^source_handles\/(tool_results|context_checkpoints|delegated_activity)\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path)
         || !Number.isSafeInteger(ref?.size) || ref.size < 0) return '';
     const name = path.split('/').at(-1);
     const url = taskArtifactDownloadUrl(taskId, name);

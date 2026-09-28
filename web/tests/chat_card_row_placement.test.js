@@ -275,3 +275,56 @@ test('a second history sync redraws a child System row whose old bubble it relea
         assert.match(bubbles[0].innerHTML, /model-provider outage/);
     } finally { instance?.destroy(); restoreDom(prior); }
 });
+
+// Optional stdin fixture comes from the real Python outbox/dedup/history test.
+// The standalone node lane uses the same adversarial revision/timestamp shape.
+test('canonical receipt revisions keep one merged row through live and history replay', async () => {
+    const supplied = process.env.MERGE_RECEIPT_PROJECTION
+        ? JSON.parse((await import('node:fs')).readFileSync(process.env.MERGE_RECEIPT_PROJECTION, 'utf8')) : null;
+    const base = { chat_id: 7, task_id: 'merge-task', role: 'system', system_type: 'host_progress',
+        is_progress: true, narration: false, card_row: 'reviews', card_row_id: 'merge-receipt:r' };
+    const merged = { ...base, card_row_revision: 3, content: 'PR #7 merge: merged', ts: '2026-09-16T00:01:00Z' };
+    const queued = { ...base, card_row_revision: 2, content: 'PR #7 merge: queued', ts: '2026-09-16T00:02:00Z' };
+    const live = supplied?.live || [merged, queued, merged];
+    const history = supplied?.history || [merged, queued].map((row, i) => ({ ...row, text: row.content,
+        history_id: `h-receipt-${i}`, history_position: { source: 'progress', offset: i } }));
+    const opened = openCardChat();
+    try {
+        opened.working('merge-task');
+        const markup = captureRenderedLines();
+        for (const row of live) opened.handlers.get('chat')({ ...row, chat_id: 2 });
+        // Older unversioned rows (e.g. an old outbox) cannot overwrite a revision either.
+        opened.handlers.get('chat')({ ...live[0], card_row_revision: undefined, chat_id: 2,
+            content: 'PR #7 merge: queued', ts: '2099-01-01T00:00:00Z' });
+        assert.match(markup().at(-1), /merge: merged/);
+        assert.equal(phasedLines(walkCard(opened.messages(), 'merge-task'), 'result').length, 1);
+    } finally { opened.instance.destroy(); restoreDom(opened.prior); }
+    for (const rows of [history, [...history].reverse()]) {
+        const replay = await replayChat([{ task_id: 'merge-task', is_progress: true,
+            text: 'Reading the PR.', ts: '2026-09-16T00:00:00Z' }, ...rows.map(row => ({ ...row, chat_id: 1 }))]);
+        try {
+            const markup = captureRenderedLines();
+            await replay.instance.refreshHistory({ revision: 1 });
+            assert.match(markup().at(-1), /merge: merged/);
+            assert.equal(phasedLines(walkCard(replay.messages(), 'merge-task'), 'result').length, 1);
+        } finally { replay.instance.destroy(); restoreDom(replay.prior); }
+    }
+});
+
+// This test needs the real endpoint's bounded selection, not hand-reordered frames.
+test('cold bounded receipt history renders canonical truth in a new Chat', {
+    skip: !process.env.COLD_RECEIPT_PROJECTION,
+}, async () => {
+    const { payload, selected } = JSON.parse((await import('node:fs'))
+        .readFileSync(process.env.COLD_RECEIPT_PROJECTION, 'utf8'));
+    assert.equal(selected.length, 60);
+    assert.deepEqual(selected.filter(row => row.card_row_id).map(row => row.card_row_revision), [2]);
+    const replay = await replayChat(payload.messages);
+    try {
+        const markup = captureRenderedLines();
+        await replay.instance.refreshHistory({ revision: 1 });
+        assert.match(markup().join('\n'), /merge: merged/);
+        assert.doesNotMatch(markup().join('\n'), /merge: queued/);
+        assert.equal(phasedLines(walkCard(replay.messages(), 'merge-task'), 'result').length, 1);
+    } finally { replay.instance.destroy(); restoreDom(replay.prior); }
+});

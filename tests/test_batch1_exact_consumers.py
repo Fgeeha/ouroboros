@@ -14,6 +14,7 @@ import pytest
 from supervisor import state, state_initialization
 from tests import test_schedule_occurrence as schedule_fixtures
 from tests import test_state_authority as state_fixtures
+from tests._shared import stop_socket_sharer
 
 root, _prior, _write = state_fixtures.root, state_fixtures._prior, state_fixtures._write
 q, _rows = schedule_fixtures.q, schedule_fixtures._rows
@@ -287,12 +288,40 @@ def test_osworld_readers_count_unfinished_calls_once_and_keep_legacy(tmp_path):
     assert trace[0]["is_error"] is None and not trace[0]["settled"]
 
 
+# The command child writes its own pid and parent pid atomically before sleeping.
+_COMMAND_CHILD = ('import os,time,pathlib; t=pathlib.Path("child.pid.tmp"); '
+                  't.write_text(f"{os.getpid()} {os.getppid()}"); t.replace("child.pid"); time.sleep(60)')
+_PUBLISHED, _HELD = "batch1-fixture:command-child-published", "batch1-fixture:command-child-held"
+
+
+def _is_command_child(popen):
+    return isinstance(popen.args, (list, tuple)) and _COMMAND_CHILD in popen.args
+
+
 def _pooled_test_entry(*args):
-    """Real worker_main and registry, with only model/extension setup replaced."""
+    """Real worker_main and registry, with only model/extension setup replaced.
+
+    The exact command's real communicate() first reports on this worker's own out_q
+    whether its Popen is in shell_process._active_subprocesses: the published-child ACK.
+    """
+    import subprocess
+
     from ouroboros import agent, extension_loader
     from ouroboros.tools import shell_process
     from ouroboros.tools.registry import ToolContext, ToolRegistry
     from supervisor.worker_process import worker_main
+
+    communicate = subprocess.Popen.communicate
+
+    def acknowledged_communicate(popen, *a, **kw):
+        if _is_command_child(popen):
+            try:
+                args[2].put((_PUBLISHED, popen.pid, popen in shell_process._active_subprocesses))
+            except Exception:
+                pass  # no ACK: the parent fails on its own deadline and never requests a stop
+        return communicate(popen, *a, **kw)
+
+    subprocess.Popen.communicate = acknowledged_communicate
 
     class CommandAgent:
         def handle_task(self, task):
@@ -312,8 +341,7 @@ def _pooled_test_entry(*args):
             handler.acquire()  # persistence/logging must not gate the worker's own exit
             process_custody.log.addHandler(handler)
             process_custody.log.setLevel(logging.WARNING)
-            result = registry.execute('run_command', {'cmd': [sys.executable, '-c',
-                'import os,time,pathlib; pathlib.Path("child.pid").write_text(str(os.getpid())); time.sleep(60)']})
+            result = registry.execute('run_command', {'cmd': [sys.executable, '-c', _COMMAND_CHILD]})
             (root / 'command-result.txt').write_text(str(result))
             return []
 
@@ -322,6 +350,64 @@ def _pooled_test_entry(*args):
     import ouroboros.safety
     ouroboros.safety.check_safety = lambda *_a, **_k: (True, '')
     worker_main(*args)
+
+
+def _held_publication_entry(*args):
+    """Hold the exact command's real Popen() return, so the child runs before publication."""
+    import subprocess
+
+    from ouroboros.tools import shell_process
+
+    release, init = pathlib.Path(args[4]) / 'release-publication', subprocess.Popen.__init__
+
+    def held_init(popen, *a, **kw):
+        init(popen, *a, **kw)
+        if _is_command_child(popen):
+            args[2].put((_HELD, popen.pid, popen in shell_process._active_subprocesses,
+                         shell_process._spawning_subprocesses))
+            deadline = time.monotonic() + 30  # bounded if the parent never releases
+            while not release.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
+
+    subprocess.Popen.__init__ = held_init
+    _pooled_test_entry(*args)
+
+
+def _observe_command_child(proc, outgoing, workspace, seen, need, timeout=20.0):
+    """Record the child's own marker and the worker's tagged fixture events until `need` is seen."""
+    import queue
+
+    from ouroboros import platform_layer as platform
+
+    marker, result, deadline = workspace / 'child.pid', workspace.parent / 'command-result.txt', \
+        time.monotonic() + timeout
+    while not need <= seen.keys():
+        assert time.monotonic() < deadline, ('no published command child', sorted(need - seen.keys()), seen,
+                                             result.read_text() if result.exists() else '')
+        assert proc.is_alive(), (proc.exitcode, seen)
+        if 'pid' not in seen and marker.exists():
+            seen['pid'], seen['launcher'] = map(int, marker.read_text().split())
+            seen['birth'] = platform.process_start_time(seen['pid'])
+        try:
+            event = outgoing.get(timeout=.01)
+        except queue.Empty:
+            continue
+        if isinstance(event, tuple) and event[:1] in ((_PUBLISHED,), (_HELD,)):  # skip worker events
+            seen['ack' if event[0] == _PUBLISHED else 'held'] = event[1:]
+    return seen
+
+
+def _is_marker_child(pid, seen):
+    # Direct child, or the Windows venv python.exe redirector that runs the interpreter as its child.
+    return pid == seen['pid'] or (os.name == 'nt' and pid == seen['launcher'])
+
+
+def _await_published_command_child(proc, outgoing, workspace, seen, timeout=20.0):
+    """The child's marker AND its registry ACK: the marker alone can precede publication."""
+    _observe_command_child(proc, outgoing, workspace, seen, {'pid', 'ack'}, timeout)
+    pid, registered = seen['ack']
+    assert registered and _is_marker_child(pid, seen), ('exact command not published', seen)
+    return seen['pid']
 
 
 def test_actual_pooled_worker_requests_separate_session_command_before_owner_exit(tmp_path, monkeypatch):
@@ -336,15 +422,10 @@ def test_actual_pooled_worker_requests_separate_session_command_before_owner_exi
     ctx = multiprocessing.get_context('spawn')
     incoming, outgoing = ctx.Queue(), ctx.Queue()
     proc = worker_process.spawn_worker_process(ctx, 0, incoming, outgoing, tmp_path, tmp_path)
-    child_pid = 0
+    seen = {}
     try:
         incoming.put({'id': 'pooled', 'type': 'task'})
-        deadline = time.monotonic() + 20
-        while not (tmp_path / 'workspace/child.pid').exists() and time.monotonic() < deadline:
-            assert proc.is_alive(), proc.exitcode
-            time.sleep(.03)
-        assert (tmp_path / 'workspace/child.pid').exists(), (tmp_path / 'command-result.txt').read_text()
-        child_pid = int((tmp_path / 'workspace/child.pid').read_text())
+        child_pid = _await_published_command_child(proc, outgoing, tmp_path / 'workspace', seen)
         if os.name != 'nt':
             assert os.getpgid(child_pid) == child_pid != os.getpgid(proc.pid)
         started = time.monotonic()
@@ -356,18 +437,80 @@ def test_actual_pooled_worker_requests_separate_session_command_before_owner_exi
         deadline = time.monotonic() + 3
         while pid_is_alive(child_pid) and not pid_is_zombie(child_pid) and time.monotonic() < deadline:
             time.sleep(.01)
-        assert not pid_is_alive(child_pid) or pid_is_zombie(child_pid)
+        assert not pid_is_alive(child_pid) or pid_is_zombie(child_pid), (receipt, proc.exitcode, seen)
     finally:
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=5)
-        if child_pid and pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
-            # This test created and continuously observed the child; no unrelated PID search.
-            os.kill(child_pid, 9)
-        proc._ouroboros_stop_socket.close()
-        for channel in (incoming, outgoing):
-            channel.close()
-            channel.cancel_join_thread()
+        try:
+            if proc.is_alive():
+                proc.terminate()
+                proc.join(timeout=5)
+            child_pid = seen.get('pid', 0)  # the marker's own pid, even when its ACK never came
+            if child_pid and pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
+                # This test created and continuously observed the child; no unrelated PID search.
+                try:
+                    os.kill(child_pid, 9)
+                except OSError:  # exited after the probe: ESRCH on POSIX, WinError 87/5 on Windows
+                    if pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
+                        raise  # a refused kill of a still-running child is a real failure
+        finally:  # release channels and the socket sharer even when a cleanup step above failed
+            proc._ouroboros_stop_socket.close()
+            for channel in (incoming, outgoing):
+                channel.close()
+                channel.cancel_join_thread()
+            stop_socket_sharer()
+
+
+def test_publication_ack_waits_for_the_registry_not_the_child_marker(tmp_path, monkeypatch):
+    """The child's own marker can precede publication; only the registry ACK proves it.
+
+    Characterizes, never repairs, the declared unpublished-spawn window: no stop is
+    requested here, and an unpublished child is not claimed stoppable.
+    """
+    import multiprocessing
+
+    from ouroboros import platform_layer as platform
+    from ouroboros.process_containment import pid_is_zombie
+    from supervisor import worker_process
+
+    monkeypatch.setenv('OUROBOROS_RUNTIME_MODE', 'advanced')
+    monkeypatch.setattr(worker_process, 'worker_main', _held_publication_entry)
+    ctx = multiprocessing.get_context('spawn')
+    incoming, outgoing = ctx.Queue(), ctx.Queue()
+    proc = worker_process.spawn_worker_process(ctx, 0, incoming, outgoing, tmp_path, tmp_path)
+    workspace, seen = tmp_path / 'workspace', {}
+    try:
+        incoming.put({'id': 'pooled', 'type': 'task'})
+        _observe_command_child(proc, outgoing, workspace, seen, {'pid', 'held'})
+        pid, registered, spawning = seen['held']
+        assert _is_marker_child(pid, seen) and platform.pid_is_alive(seen['pid'])
+        assert not registered and spawning == 1  # running, marked, yet only a spawn count
+        with pytest.raises(AssertionError, match='no published command child'):
+            _await_published_command_child(proc, outgoing, workspace, seen, timeout=1)
+        assert 'ack' not in seen
+        (tmp_path / 'release-publication').touch()
+        assert _await_published_command_child(proc, outgoing, workspace, seen) == seen['pid']
+        assert seen['ack'][0] == pid
+    finally:
+        try:
+            if proc.is_alive():
+                proc.kill()
+                proc.join(timeout=5)
+            child_pid, birth = seen.get('pid', 0), seen.get('birth', '')
+            if (birth and platform.pid_is_alive(child_pid) and not pid_is_zombie(child_pid)
+                    and platform.process_start_time(child_pid) == birth):
+                platform.force_kill_pid(child_pid)  # the marker's own pid AND its birth
+            # Identity authorizes the signal, never a claim that cleanup succeeded.
+            # Unknown/mismatched birth must still fail if the observed child survives.
+            deadline = time.monotonic() + 3
+            while (platform.pid_is_alive(child_pid) and not pid_is_zombie(child_pid)
+                   and time.monotonic() < deadline):
+                time.sleep(.01)
+            assert not platform.pid_is_alive(child_pid) or pid_is_zombie(child_pid), seen
+        finally:  # a failed death proof must not leak the stop channel, queues or socket sharer
+            worker_process.close_worker_stop_channel(proc)
+            for channel in (incoming, outgoing):
+                channel.close()
+                channel.cancel_join_thread()
+            stop_socket_sharer()
 
 
 @pytest.mark.parametrize("platform_name", ["linux", "darwin"])
@@ -376,9 +519,13 @@ def test_attached_request_never_turns_held_identity_into_numeric_group(monkeypat
     calls = []
     monkeypatch.setattr(platform, "IS_WINDOWS", False)
     monkeypatch.setattr(platform, "IS_MACOS", platform_name == "darwin")
-    monkeypatch.setattr(platform.os, "getpgid", lambda *_: pytest.fail("numeric group lookup loses identity"))
+    # The whole mocked POSIX surface, present on every host (Windows has no getpgid/killpg/SIGKILL).
+    monkeypatch.setattr(platform.os, "getpgid", lambda *_: pytest.fail("numeric group lookup loses identity"),
+                        raising=False)
     monkeypatch.setattr(platform.os, "kill", lambda *_: pytest.fail("numeric PID cannot signal an attachment"))
-    monkeypatch.setattr(platform.os, "killpg", lambda *_: pytest.fail("numeric group cannot signal an attachment"))
+    monkeypatch.setattr(platform.os, "killpg", lambda *_: pytest.fail("numeric group cannot signal an attachment"),
+                        raising=False)
+    monkeypatch.setattr(platform.signal, "SIGKILL", getattr(platform.signal, "SIGKILL", 9), raising=False)
     monkeypatch.setattr(platform.signal, "pidfd_send_signal", lambda *a: calls.append(a), raising=False)
     target = {"pid": 123, "handle": SimpleNamespace(fileno=lambda: 987, close=lambda: None), "pgid": 123}
     receipt = platform.request_process_tree_kill(target)
