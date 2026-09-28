@@ -24,6 +24,13 @@ from ouroboros.tools.review_subject import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _packet_default_panel(monkeypatch):
+    """This module pins the PACKET assembly of the default panel; the shipped
+    default triad reads the work itself since #1334, so pin packet explicitly."""
+    monkeypatch.setattr("ouroboros.reviewer_slot_config.DEFAULT_TRIAD_DELIVERY", "")
+
+
 def _git(repo, *args):
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
 
@@ -51,7 +58,7 @@ def _managed_resolution_repo(tmp_path, monkeypatch, official_binary=False):
     _git(repo, "config", "user.name", "t")
     _git(repo, "config", "commit.gpgsign", "false")
     (repo / "conflict.txt").write_text("base\n")
-    (repo / "keep.txt").write_text("k1\nk2\nk3\nk4\nk5\n")
+    (repo / "keep.txt").write_bytes(b"k1\nk2\nk3\nk4\nk5\n")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "base")
     head = _git(repo, "symbolic-ref", "--short", "HEAD").stdout.strip()
@@ -129,7 +136,7 @@ def test_managed_capture_returns_resolution_delta_only(tmp_path, monkeypatch):
 def test_managed_capture_supports_zero_context_rung(tmp_path, monkeypatch):
     repo, ctx, _tx = _managed_resolution_repo(tmp_path, monkeypatch)
     # A mid-file resolver edit gives the ladder real context lines to drop.
-    (repo / "keep.txt").write_text("k1\nk2\nk3-resolved\nk4\nk5\n")
+    (repo / "keep.txt").write_bytes(b"k1\nk2\nk3-resolved\nk4\nk5\n")
     _git(repo, "add", "-A")
 
     full = capture_review_diff(ctx, repo)
@@ -922,9 +929,10 @@ def test_guidance_open_debt_by_enforcement():
     assert "will be blocked" not in advisory
     assert "recorded durably" in advisory
     assert "commit_reviewed is available" in advisory
-    # The regroup methodology survives in BOTH branches (it is advice, not a lie).
+    # Both branches state the same outcome duty; the procedure is the author's.
     for msg in (blocking, advisory):
-        assert "group obligations by root cause" in msg.lower()
+        assert adv.REVIEW_REPAIR_JUDGMENT in msg
+        assert "group obligations by root cause" not in msg.lower()
 
 
 def test_skipped_guidance_is_managed_aware():

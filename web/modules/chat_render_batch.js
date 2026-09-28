@@ -1,6 +1,7 @@
 // Chat timeline ordering, keyed item reconciliation and reading anchors.
 // These helpers own no history source, navigation or task authority.
 import { compareHistoryPosition } from './chat_history_replay.js';
+import { appendDelegatedItem, reconcileDelegatedItems } from './delegated_activity.js';
 
 const nodePosition = node => node?.dataset?.historySource
     ? { source: node.dataset.historySource, offset: Number(node.dataset.historyOffset) } : null;
@@ -24,23 +25,48 @@ export function createHistoryControls(messagesDiv) {
     const note = doc.createElement('span');
     note.className = 'chat-load-older-note';
     root.append(button, note);
+    // The recent-window read is the chat's own request, not a pager page, so its
+    // in-flight and failed states are carried here and drawn by the same control
+    // (issue #1102: an empty feed under a green header read as a dead app, and a
+    // failed read looked identical to a slow one).
+    let recent = null;
+    const feedIsEmpty = () => Array.from(messagesDiv.children)
+        .every(node => node === root || node.classList.contains('typing-bubble'));
     return {
         olderButton: button,
+        // Only an EMPTY feed (or a failure already on screen) gets the loading
+        // state: an ordinary refresh never puts chrome over a painted transcript.
+        // Returns whether there is a state to draw, so a painted feed costs nothing.
+        beginRecent() {
+            if (recent?.error || feedIsEmpty()) recent = { loading: true };
+            return Boolean(recent);
+        },
+        // A failure is shown where the loading state was; elsewhere the reader
+        // keeps the transcript they have and the next sync reconciles it.
+        endRecent(error = null) { recent = error && recent ? { error } : null; },
+        recentFailed: () => Boolean(recent?.error),
         render(snapshot, windows) {
-            const error = snapshot.error;
+            const error = recent?.error || snapshot.error;
+            const hydrating = Boolean(recent?.loading);
+            const loading = hydrating || Boolean(snapshot.loading);
             const changedView = error?.body?.reason_code === 'history_view_changed';
-            const noteText = error ? String(error.message || error)
+            const noteText = hydrating ? ''
+                : recent?.error ? `Could not load messages: ${recent.error.message || recent.error}`
+                : error ? String(error.message || error)
                 : snapshot.olderExhausted ? 'Beginning of saved history' : '';
+            const buttonHidden = !error && !snapshot.canOlder && !hydrating;
             const fields = [
-                [button, { textContent: snapshot.loading ? 'Loading…'
+                [button, { textContent: loading ? 'Loading…'
                     : changedView ? 'Refresh history' : error ? 'Retry loading messages' : 'Load older messages',
-                    disabled: Boolean(snapshot.loading), hidden: !error && !snapshot.canOlder }],
+                    disabled: loading, hidden: buttonHidden }],
                 [note, { textContent: noteText, hidden: !noteText }],
+                [root, { hidden: buttonHidden && !noteText }],
             ];
             for (const [node, values] of fields) {
                 for (const [key, value] of Object.entries(values)) if (node[key] !== value) node[key] = value;
             }
-            if ((snapshot.initialized || error) && !root.isConnected) messagesDiv.prepend(root);
+            if (hydrating) root.setAttribute('aria-busy', 'true'); else root.removeAttribute('aria-busy');
+            if ((snapshot.initialized || error || hydrating) && !root.isConnected) messagesDiv.prepend(root);
             const hasGaps = [...windows].some(value => (value?.truncated_by || [])
                 .some(cause => !['quota', 'archive_floor', 'lineage_cap', 'page'].includes(cause)));
             return { complete: Boolean(snapshot.initialized && snapshot.olderExhausted
@@ -315,6 +341,7 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
     const render = (record) => {
         if (defer(record)) return false;
         record._timelineDirty = false;
+        reconcileDelegatedItems(record); // replay, page release and reorders re-project per seq
         return withStableViewport(() => {
             const el = record.timelineEl;
             const pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
@@ -579,13 +606,20 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
  * lifecycle notes keep their existing in-place semantics and disclosure key.
  */
 export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKey, headline, inPlaceByKey }) {
+    // A delegated observation is its own source record; its projection is per seq.
+    if (summary.activity) return appendDelegatedItem(record, summary, { ts, rawTs, syntheticKey, headline });
     let timelineUpdate = 'none', patchIndex = -1;
     const lastIdx = record.items.length - 1;
     // Full-array dedup keeps routine history syncs from growing Notes.
     const existingIdx = record.items.findIndex((it) => it.dedupeKey === syntheticKey);
     if (existingIdx !== -1 && inPlaceByKey) {
         const it = record.items[existingIdx];
+        if (Number.isSafeInteger(it.cardRowRevision)
+            && (!Number.isSafeInteger(summary.cardRowRevision) || summary.cardRowRevision <= it.cardRowRevision)) {
+            return { timelineUpdate: 'duplicate-skip', patchIndex };
+        }
         const patch = {
+            cardRowRevision: summary.cardRowRevision,
             phase: summary.phase || it.phase,
             headline: headline || it.headline,
             fullHeadline: summary.fullHeadline || headline || it.fullHeadline,
@@ -632,6 +666,7 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
     } else {
         const lineKey = `line-${Date.now()}-${Math.random().toString(16).slice(2)}`;
         record.items.push({
+            cardRowRevision: summary.cardRowRevision,
             phase: summary.phase || 'working',
             headline: headline || 'Update',
             fullHeadline: summary.fullHeadline || headline || 'Update',

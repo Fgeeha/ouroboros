@@ -434,8 +434,9 @@ def test_render_skill_review_block_keeps_same_item_fail_reasons_in_retry_coachin
         ),
         attempt_idx=2,
     )
-    assert "plugin.py::run can overflow the retry buffer" in rendered
-    assert "api_client.py::parse_response assumes choices[0]" in rendered
+    retry_note = rendered.split("Before the next skill_review:", 1)[1]
+    assert "plugin.py::run can overflow the retry buffer" in retry_note
+    assert "api_client.py::parse_response assumes choices[0]" in retry_note
 
 
 def test_review_skill_returns_advisory_for_soft_only_fail(tmp_path, monkeypatch):

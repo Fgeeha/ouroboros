@@ -125,18 +125,17 @@ def _supplied_budget_profile(ctx: Any) -> Any:
 
 
 def observe_budget_profile(ctx: Any) -> Dict[str, Any]:
-    """The task's normalized budget_profile resolved SIDE-EFFECT FREE (R49): the
-    reader the coordination poll (``delegate_supervision._time_fact``) uses."""
+    """The task's normalized budget_profile, with defaults and no side effects.
+
+    Coordination observation (``delegate_supervision._time_fact``, R49) and
+    ordinary resolution share this reader. The retired ``until_deadline`` /
+    ``stall_rounds_threshold`` aliases require no migration write or event.
+    """
     return normalize_budget_profile(_supplied_budget_profile(ctx))
 
 
-def resolve_budget_profile(ctx: Any) -> Dict[str, Any]:
-    """The task's normalized budget_profile (from task_contract; absent ->
-    defaults). The deprecated ``until_deadline`` / ``stall_rounds_threshold``
-    aliases and their deprecation row are gone (7.0 ABI window), so this is
-    the same side-effect-free read as ``observe_budget_profile``; both names
-    stay so the observer contract remains explicit at its call sites."""
-    return normalize_budget_profile(_supplied_budget_profile(ctx))
+# Both public names retain their caller contracts over the same pure read.
+resolve_budget_profile = observe_budget_profile
 
 
 def _acceptance_floor_sec() -> float:
@@ -602,28 +601,76 @@ def tree_spend_line(tree_info: Any, ceiling: Optional[CostCeiling] = None) -> st
     )
 
 
+def _wrapup_stop_facts(
+    deciding_usd: Optional[float], ceiling: CostCeiling, global_remaining_usd: Optional[float],
+) -> Tuple[str, str]:
+    """The stop's money facts with the BINDING bound first, and the owner's way out when there is one.
+
+    The old sentence opened with the tree cap whatever had stopped the task, so an
+    owner whose shared wallet ran dry at $125 of a $400 cap read it as a broken
+    per-task cap. The bound that binds is the one with less room; the wallet is
+    also the only one the owner can lift while the task is still running."""
+    cap = ceiling.root_cap_usd
+    room = None if cap is None or deciding_usd is None else float(cap) - float(deciding_usd)
+    if deciding_usd is None:
+        spent = "This task's tree spend is unavailable"
+    elif cap is not None:
+        spent = f"This task's tree spent ${deciding_usd:.2f} of its own ${cap:.2f} cap"
+    else:
+        spent = f"This task's tree spent ${deciding_usd:.2f}"
+    if global_remaining_usd is not None and (room is None or float(global_remaining_usd) <= room):
+        cleared = ", so the task cap is not what stopped it" if room is not None else ""
+        return (
+            f"The shared Total budget is nearly used up: ${global_remaining_usd:.2f} left across all "
+            f"tasks. {spent}{cleared}.",
+            " Raise Total budget in Settings for more room.",
+        )
+    wallet = (
+        f"; the shared Total budget still has ${global_remaining_usd:.2f}"
+        if global_remaining_usd is not None else ""
+    )
+    return f"{spent}{wallet}.", ""
+
+
 def wrapup_unaffordable_text(deciding_usd: Optional[float], ceiling: CostCeiling, global_remaining_usd: Optional[float] = None) -> str:
     """The owner-facing reason a task ends without even one affordable wrap-up send."""
-    cap = ceiling.root_cap_usd
-    cap_text = f" of the ${cap:.2f} hard tree cap" if cap is not None else ""
-    spent = f"Task tree spent ${deciding_usd:.3f}{cap_text}" if deciding_usd is not None else "Task-tree spend is unavailable"
-    wallet = f"; global model budget remaining is ${global_remaining_usd:.3f}" if global_remaining_usd is not None else ""
+    facts, way_out = _wrapup_stop_facts(deciding_usd, ceiling, global_remaining_usd)
     return (
-        f"{spent}{wallet}; not even one wrap-up call can "
-        "be reserved, so the host delivers the retained evidence without a model synthesis."
+        f"{facts} Not even one wrap-up call can be reserved, so the host delivers the "
+        f"retained evidence without a model synthesis.{way_out}"
     )
 
 
 def wrapup_last_fit_text(deciding_usd: Optional[float], ceiling: CostCeiling, global_remaining_usd: Optional[float] = None) -> str:
     """The owner-facing reason a task claims the last affordable wrap-up send."""
-    cap = ceiling.root_cap_usd
-    cap_text = f" of the ${cap:.2f} hard tree cap" if cap is not None else ""
-    spent = f"Task tree spent ${deciding_usd:.3f}{cap_text}" if deciding_usd is not None else "Task-tree spend is unavailable"
-    wallet = f"; global model budget remaining is ${global_remaining_usd:.3f}" if global_remaining_usd is not None else ""
+    facts, way_out = _wrapup_stop_facts(deciding_usd, ceiling, global_remaining_usd)
     return (
-        f"{spent}{wallet}; one wrap-up call is still "
-        "admissible, but another similarly reserved work call would consume that room."
+        f"{facts} One wrap-up call still fits and another work call of this size would not, "
+        f"so the task is finishing now with its best current answer.{way_out}"
     )
+
+
+def main_loop_wire_options(
+    model: str, *, allow_server_web_search: bool, bypass_response_cache: bool = False,
+) -> Dict[str, Any]:
+    """The payload-shaping options EVERY main-loop send declares — one owner for the send and for its pricing.
+
+    The budget wrap-up is admitted against a candidate built BEFORE the send (below)
+    that must equal it byte for byte. Each option the send grew on its own — cache
+    affinity, then ``stream`` — made the two payloads differ, and the admitted
+    answer was refused at dispatch. ``loop_llm_call.call_llm_with_retry`` spreads
+    this dict into its send and the prospective builder below spreads the same
+    one, so an option added here reaches both and one added elsewhere reaches one."""
+    from ouroboros.llm_claudexor import cache_key_for_model
+    from ouroboros.provider_models import provider_for_model
+
+    remote = provider_for_model(model) != "claudexor"
+    return {
+        "stream": True,
+        "cache_affinity": cache_key_for_model(model),
+        "allow_server_web_search": bool(allow_server_web_search) and remote,
+        "bypass_response_cache": bool(bypass_response_cache) and remote,
+    }
 
 
 def prospective_wrapup_attempt_request(
@@ -639,11 +686,15 @@ def prospective_wrapup_attempt_request(
 
     ``model_turn_state`` is the caller's active-turn transport slot. A candidate
     that a forced send is admitted against must be priced from the SAME slot
-    value the send will carry, or the two payloads differ by that field alone."""
+    value the send will carry, or the two payloads differ by that field alone.
+    Under a bound Main clock (``send_clock``) the copy carries a line of its own
+    sample, so its price is advice: the send seals a fresh line and is admitted
+    again at its own price (``loop_forced_finalization._forced_admission_predicate``)."""
     from ouroboros.llm import _attempt_request, _finalized_physical_candidate
     from ouroboros.loop_llm_call import MAIN_LOOP_MAX_TOKENS
     from ouroboros.request_wire_recovery import request_wire_call_scope
     from ouroboros.pricing import infer_provider_from_model
+    from ouroboros.send_clock import stamp_clock_note
     from ouroboros.usage_accounting import AttemptRequest, _merge_scope
     from ouroboros.model_slots import resolve_processing_preference
 
@@ -663,22 +714,26 @@ def prospective_wrapup_attempt_request(
         from ouroboros.llm_claudexor import _request, prepare_processing_target
 
         target = prepare_processing_target(target)
-        candidate = _request(target, messages, tools, {"reasoning_effort": reasoning_effort,
+        candidate = stamp_clock_note(_request(target, messages, tools, {"reasoning_effort": reasoning_effort,
             "model_role": model_role, "model_account_override": model_account_override,
             "model_turn_state": model_turn_state,
             "processing_preference": processing_preference,
-            "cache_affinity": cache_affinity, "prospective": True})
+            "cache_affinity": cache_affinity, "prospective": True}))
         return _merge_scope(replace(_attempt_request(target, candidate),
             force_unknown_reservation=True, max_completion_tokens=MAIN_LOOP_MAX_TOKENS))[0]
     with request_wire_call_scope():
+        # The send's own options, from their one owner: a key the send carries and
+        # this copy does not is a different payload, and the admitted answer is refused.
         candidate = llm._build_remote_candidate(
             target, messages, reasoning_effort, MAIN_LOOP_MAX_TOKENS, "auto", None, tools,
-            skip_capability_fetch=True, allow_server_web_search=allow_server_web_search,
+            skip_capability_fetch=True,
+            **main_loop_wire_options(model, allow_server_web_search=allow_server_web_search),
         )
         llm._normalize_payload_cache_ttl(target, candidate)
+        anthropic = target.get("provider") == "anthropic"
         candidate = _finalized_physical_candidate(
-            target, candidate,
-            "messages" if target.get("provider") == "anthropic" else "chat.completions",
+            target, stamp_clock_note(candidate, blocks=anthropic),
+            "messages" if anthropic else "chat.completions",
         )
         llm._pop_thread_disclosure("_cache_breakpoint_tls")
     return _merge_scope(_attempt_request(target, candidate))[0]
@@ -695,6 +750,7 @@ def prepared_wrapup_candidate(
     from ouroboros.loop_llm_call import _prepare_main_messages
     from ouroboros.model_slots import task_model_binding, task_processing_preference
     from ouroboros.model_wait import current_model_wait
+    from ouroboros.send_clock import MainSendClock, main_clock_policy
 
     owner_ctx = getattr(getattr(ctx, "tools", None), "_ctx", None)
     waiter = current_model_wait()
@@ -714,21 +770,24 @@ def prepared_wrapup_candidate(
         model_role=role,
         model_account_override=account,
     )
-    request = prospective_wrapup_attempt_request(
-        llm=ctx.llm, messages=send_messages, model=ctx.active_model,
-        reasoning_effort=ctx.active_effort, tools=ctx.tool_schemas,
-        allow_server_web_search=allow_server_web_search,
-        prompt_tokens=int(ctx.accumulated_usage.get("_context_prompt_estimate") or 0),
-        model_role=role,
-        model_account_override=account,
-        model_turn_state=getattr(owner_ctx, "model_turn_state", None),
-        # The admitted candidate must be the payload the send will produce: the
-        # main loop declares the same install-scoped cache affinity, so this
-        # prepared copy binds the same key as that dispatch does.
-        cache_affinity="" if getattr(ctx, "active_use_local", False) else cache_key_for_model(ctx.active_model),
-        processing_preference=task_processing_preference(
-            {"task_metadata": getattr(owner_ctx, "task_metadata", {})}, model_role=role),
-    )
+    # The forced send seals Main's clock line; its priced copy carries one too.
+    with MainSendClock(main_clock_policy(getattr(owner_ctx, "task_metadata", {}),
+                                         task_type=str(getattr(ctx, "task_type", "") or ""))).bound():
+        request = prospective_wrapup_attempt_request(
+            llm=ctx.llm, messages=send_messages, model=ctx.active_model,
+            reasoning_effort=ctx.active_effort, tools=ctx.tool_schemas,
+            allow_server_web_search=allow_server_web_search,
+            prompt_tokens=int(ctx.accumulated_usage.get("_context_prompt_estimate") or 0),
+            model_role=role,
+            model_account_override=account,
+            model_turn_state=getattr(owner_ctx, "model_turn_state", None),
+            # The admitted candidate must be the payload the send will produce: the
+            # main loop declares the same install-scoped cache affinity, so this
+            # prepared copy binds the same key as that dispatch does.
+            cache_affinity="" if getattr(ctx, "active_use_local", False) else cache_key_for_model(ctx.active_model),
+            processing_preference=task_processing_preference(
+                {"task_metadata": getattr(owner_ctx, "task_metadata", {})}, model_role=role),
+        )
     return request, send_messages
 
 

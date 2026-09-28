@@ -4,6 +4,12 @@ The existing task owns its worker, writer lane, mailbox and durable result.
 This module keeps only the live call's wait and role overrides. It neither
 schedules work nor records physical attempts: every resumed call still goes
 through LLMClient and the ordinary physical-attempt ledger.
+
+Quota recovery order: the transport's Auto account rotation, then every
+configured route of the round, and only then the owner. A round whose later
+route exists returns its refusal instead of waiting (``ResourceDeferral``); the
+owner question is then opened from that retained refusal, never from another
+generation. An inline Presence turn never waits for quota or for the owner.
 """
 
 from __future__ import annotations
@@ -127,6 +133,31 @@ def quota_waited_seconds(meta: dict, now: float) -> float:
     return max(0.0, elapsed) + (max(0.0, now - observed) if clock.get("active") is True else 0.0)
 
 
+def budget_paused_seconds(meta: dict) -> float:
+    """The ONE budget-paused carrier (#1196), read from a RUNNING row, a resume
+    handoff or a pause row alike: wall time a task spent PAUSED, which is not
+    execution and is NOT part of the quota union (that clock stays its own)."""
+    try:
+        paused = float(meta.get("budget_paused_sec") or meta.get("paused_duration_sec") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, paused) if math.isfinite(paused) else 0.0
+
+
+def execution_elapsed_seconds(meta: dict, now: float) -> float:
+    """Execution time of one task: wall clock minus the quota-wait union minus
+    the separate budget-paused interval. ``started_at`` is never moved, so every
+    finite-lifetime consumer (supervisor timeouts, owner stop, the exact-pause
+    grant, the live wait controls) subtracts the same two carriers."""
+    try:
+        started = float(meta.get("started_at") or 0.0)
+    except (TypeError, ValueError):
+        return 0.0
+    if started <= 0 or not math.isfinite(started):
+        return 0.0
+    return max(0.0, now - started - quota_waited_seconds(meta, now) - budget_paused_seconds(meta))
+
+
 _CURRENT: contextvars.ContextVar[TaskModelWait | None] = contextvars.ContextVar(
     "ouroboros_model_wait", default=None)
 _REPREPARE: contextvars.ContextVar[dict[str, Callable] | None] = contextvars.ContextVar(
@@ -135,6 +166,9 @@ _CALENDAR: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "ouroboros_model_wait_calendar", default=())
 _LOGICAL: contextvars.ContextVar[tuple[tuple[float, str], ...]] = contextvars.ContextVar(
     "ouroboros_model_wait_logical", default=())
+# One call's own scope, like its physical capture: never copied into a helper's context.
+_DEFERRED: contextvars.ContextVar[tuple["ResourceDeferral", ...]] = contextvars.ContextVar(
+    "ouroboros_model_wait_deferred", default=())
 
 
 def copy_wait_context() -> contextvars.Context:
@@ -183,6 +217,38 @@ def dispatch_deadline_remaining_sec() -> float | None:
     remaining.extend(max(0.0, deadline - monotonic_now(slot))
                      for deadline, slot in _LOGICAL.get())
     return min(remaining) if remaining else None
+
+
+class ResourceDeferral:
+    """One round's resource refusal, returned to the round instead of waited in its call.
+
+    The round tries its configured routes first. The owner question is then this
+    refusal's own wait, opened from the retained call: catalog checks only, so no
+    generation precedes the owner's answer. A turn that may not wait keeps the fact.
+    """
+
+    def __init__(self, role: str):
+        self.role = role
+        self.fact: dict = {}
+        self._retained: tuple | None = None
+
+    def retain(self, receiver: Any, error: Exception, values: dict) -> None:
+        self._retained = (receiver, error, values)
+        self.fact = {"reason": model_wait_reason(error), "role": self.role, "model": str(values.get("model") or ""),
+                     "reset_at": str(getattr(error, "reset_at", "") or ""),
+                     "account_rotation": copy.deepcopy(getattr(error, "account_rotation", None))}
+
+    def ask_owner(self, context: "TaskModelWait") -> dict:
+        receiver, error, values = self._retained
+        return context.wait(receiver, error, values)
+
+    def terminal(self, *, fallbacks_tried: list, owner_wait: str) -> dict:
+        """The typed temporary non-success when no route recovered it and no owner wait follows."""
+        return {**self.fact, "fallbacks_tried": list(fallbacks_tried), "owner_wait": owner_wait, "temporary": True}
+
+
+def _deferral(role: str) -> ResourceDeferral | None:
+    return next((item for item in reversed(_DEFERRED.get()) if item.role == role), None)
 
 
 def mutate_wait(root: Any, task_id: str, wait_id: str, transform: Callable) -> dict:
@@ -246,10 +312,24 @@ class TaskModelWait:
         self.waits: dict[str, dict] = {}
         self.clocks: dict[str, _QuotaClock] = {"": _QuotaClock()}
         self.started_monotonic = time.monotonic()
+        # The SAME budget-paused carrier the queue puts on the RUNNING row
+        # (#1196): a resumed task's finite lifetime excludes the paused wall
+        # time while its original start stays where it was.
+        self.budget_paused_sec = budget_paused_seconds(
+            task.get("_budget_pause_resume") if isinstance(task.get("_budget_pause_resume"), dict) else {})
         self.revision = 0
         self.auto_continue: dict[str, bool] = {}
         self.seen_controls: set[str] = set()
         self.mailbox_stamp = None
+        # Public facts every new row of this owner carries (a review operation
+        # names its exact controller); the waiting slot is stamped per row.
+        self.row_facts: dict[str, dict] = {}
+
+    @property
+    def waits_allowed(self) -> bool:
+        """An inline Presence turn holds its conversation slot with no owner at the
+        computer: rotation and fallback still run, then a typed temporary refusal."""
+        return not self.task.get("_presence_turn")
 
     def mutate_row(self, wait_id: str, transform: Callable) -> dict:
         if self.row_mutator is not None:
@@ -270,12 +350,22 @@ class TaskModelWait:
                 key: {k: copy.deepcopy(v) for k, v in row.items() if not k.startswith("_")}
                 for key, row in self.waits.items()}}
 
+    def executed_seconds(self, *, now: float | None = None) -> float:
+        """Live execution time: elapsed minus the quota union minus budget pause."""
+        stamp = time.monotonic() if now is None else now
+        return max(0.0, stamp - self.started_monotonic
+                   - self.paused_seconds(now=stamp) - self.budget_paused_sec)
+
     def execution_window_remaining(self) -> float | None:
-        """A custom live owner supplies its own clock; None invents no deadline."""
+        """A custom live owner supplies its own clock and a task without an absolute
+        lifetime has none; None invents no deadline, and 0.0 means the window is spent."""
         if self.owner_control is not None:
             return None
         from ouroboros.config import get_task_abs_ceiling_sec
-        return max(0.0, get_task_abs_ceiling_sec() - (time.monotonic() - self.started_monotonic - self.paused_seconds()))
+        ceiling = get_task_abs_ceiling_sec()
+        if ceiling is None:
+            return None
+        return max(0.0, ceiling - self.executed_seconds())
 
     def quota_clock_snapshot(self) -> dict:
         """The same task-wide clock fact for live publication and continuation."""
@@ -285,14 +375,29 @@ class TaskModelWait:
                     "observed_at": time.time(), "active": bool(clock.active)}
 
     def continuation_state(self) -> dict:
-        """Keep completed-call choices and accrued quota time, never live waiters."""
+        """Keep completed-call choices, accrued quota time and the paused carrier.
+
+        The budget-paused interval (#1196) rides EVERY same-ID continuation, not
+        only a budget one: a task that was paused and later parks in an owner
+        wait must resume on the same execution clock, or its planned restart
+        would count the paused wall time as execution and shrink the finite
+        lifetime it already spent (F5). Live waiters are never carried.
+        """
         with self.lock:
             return {"overrides": copy.deepcopy(self.overrides),
                     "auto_continue": dict(self.auto_continue),
+                    "budget_paused_sec": self.budget_paused_sec,
                     "quota_clock": {**self.quota_clock_snapshot(), "active": False}}
 
-    def restore_continuation(self, saved: dict, *, started_at: float | None) -> None:
-        """Rebind one fresh task owner before Runtime context or new model work."""
+    def restore_continuation(self, saved: dict, *, started_at: float | None,
+                             budget_paused_sec: float | None = None) -> None:
+        """Rebind one fresh task owner before Runtime context or new model work.
+
+        ``started_at`` is the ORIGINAL start, so the restored wall clock also
+        spans any budget pause; ``budget_paused_sec`` carries that interval
+        separately (#1196) and is subtracted by every finite-lifetime read.
+        ``None`` keeps whatever the task row already supplied.
+        """
         with self.lock:
             self.overrides = copy.deepcopy(saved.get("overrides") or {})
             self.auto_continue = dict(saved.get("auto_continue") or {})
@@ -300,6 +405,14 @@ class TaskModelWait:
             self.revision = int(clock.get("revision") or 0)
             elapsed = quota_waited_seconds({"model_wait_quota_clock": clock}, time.time())
             self.clocks = {"": _QuotaClock(elapsed=elapsed)}
+            if budget_paused_sec is None:
+                # The carrier the serializer saved: an owner-wait continuation of
+                # a task that had been budget-paused keeps the SAME paused
+                # interval across its planned restart (#1196, F5).
+                budget_paused_sec = saved.get("budget_paused_sec")
+            if budget_paused_sec is not None:
+                self.budget_paused_sec = budget_paused_seconds(
+                    {"budget_paused_sec": budget_paused_sec})
             if started_at:
                 self.started_monotonic = time.monotonic() - max(0.0, time.time() - float(started_at))
 
@@ -313,6 +426,16 @@ class TaskModelWait:
             yield
         finally:
             _REPREPARE.reset(token)
+
+    @contextlib.contextmanager
+    def defer_resource_wait(self, role: str) -> Iterator[ResourceDeferral]:
+        """A later route of this round, or a turn that may not wait, owns this role's refusal."""
+        deferral = ResourceDeferral(role)
+        token = _DEFERRED.set((*_DEFERRED.get(), deferral))
+        try:
+            yield deferral
+        finally:
+            _DEFERRED.reset(token)
 
     def paused_seconds(self, slot_id: str = "", *, now: float | None = None) -> float:
         with self.lock:
@@ -368,8 +491,8 @@ class TaskModelWait:
             return "execution_deadline"
         if self.owner_control is not None:
             return self.owner_control()
-        elapsed = time.monotonic() - self.started_monotonic - self.paused_seconds()
-        if elapsed >= get_task_abs_ceiling_sec():
+        ceiling = get_task_abs_ceiling_sec()  # None = unlimited; 0 = exhausted, never unlimited
+        if ceiling is not None and self.executed_seconds() >= ceiling:
             return "absolute_ceiling"
         # The loop owns delivery. A private seen copy leaves that ownership
         # intact and excludes an already-drained or superseded stop control.
@@ -497,6 +620,15 @@ class TaskModelWait:
                "worker_slot_held": self.worker_slot_held, "started_at": utc_now_iso()}
         if self.owner_id:
             row["model_wait_owner_id"] = self.owner_id
+        row.update({key: {**copy.deepcopy(value), "slot_id": slot_id} for key, value in self.row_facts.items()})
+        if getattr(error, "account_rotation", None):
+            row["account_rotation"] = copy.deepcopy(error.account_rotation)
+        # A vendor refusal with no reset evidence gives the engine no cooldown for that
+        # Auto account, so its catalog choosing the same account again proves nothing.
+        unproven = str(route.get("credentialProfileId") or "") if (
+            reason == "quota" and not account_intent and getattr(error, "status_code", 0)
+            and getattr(getattr(error, "physical_attempt_capture", None), "state", None) == "settled"
+            and not (problem_context.get("resetsAt") or problem_context.get("retryAfterMs"))) else ""
         with self.lock:
             self.waits[wait_id] = row
         if quota_wait:
@@ -547,6 +679,7 @@ class TaskModelWait:
                                                                  requested_model=native_model)
                             if (catalog.get("source") == source
                                     and (not account or catalog.get("credentialProfileId") == account)
+                                    and not (unproven and not account and catalog.get("credentialProfileId") == unproven)
                                     and any(item.get("id") == native_model for item in catalog.get("models", []))):
                                 resolution = "resource_available"
                                 return kwargs
@@ -589,11 +722,29 @@ def current_model_wait() -> TaskModelWait | None:
     return _CURRENT.get()
 
 
+@contextlib.contextmanager
+def operation_wait_scope(owner: TaskModelWait) -> Iterator[TaskModelWait]:
+    """Bind an already-paid operation's own wait owner for its caller and workers.
+
+    The author's execution-lifetime scopes (a tool or call execution deadline,
+    Main's re-preparation callbacks) are not the operation's and are cleared
+    explicitly; explicit calendar deadlines stay. Clocks read under this scope
+    are the operation's own union and per-slot quota clocks.
+    """
+    tokens = ((_CURRENT, _CURRENT.set(owner)), (_REPREPARE, _REPREPARE.set(None)), (_LOGICAL, _LOGICAL.set(())))
+    try:
+        yield owner
+    finally:
+        for variable, token in reversed(tokens):
+            variable.reset(token)
+
+
 def model_waitable(function: Callable | None = None, *, client_parameter: str = "self") -> Callable:
     """Catch resource refusals before helper catches; callers may decline waiting.
 
     ``wait_for_resources`` is call-local, leaving the shared task's overrides,
-    controls and custody intact even when a refusal returns immediately.
+    controls and custody intact even when a refusal returns immediately; so is a
+    round's ``defer_resource_wait``, which retains the refusal for that round.
     """
     if function is None:
         return functools.partial(model_waitable, client_parameter=client_parameter)
@@ -635,15 +786,23 @@ def model_waitable(function: Callable | None = None, *, client_parameter: str = 
         poll._model_wait_original = original
         return {**values, "model_poll_control": poll}
 
-    def can_wait(context, error, values):
+    def can_wait(context, receiver, error, values):
+        """Wait here, or raise; a deferring round first retains a quota refusal for its later routes."""
         from ouroboros.llm_claudexor import ClaudexorModelError
 
         capture = getattr(error, "physical_attempt_capture", None)
-        return bool(context and not context.closed and values.get("model_role")
-                    and values.get("wait_for_resources", True)
-                    and isinstance(error, ClaudexorModelError)
-                    and model_wait_reason(error)
-                    and getattr(capture, "state", None) in {"released", "settled"})
+        reason = model_wait_reason(error)
+        if not (context and not context.closed and values.get("model_role") and reason
+                and isinstance(error, ClaudexorModelError)
+                and getattr(capture, "state", None) in {"released", "settled"}):
+            return False
+        deferral = _deferral(values["model_role"])
+        # Quota: account rotation, then every configured route, then the owner. Sign-in
+        # keeps its own owner wait wherever waiting is possible.
+        if deferral is not None and (reason != "auth" or not context.waits_allowed):
+            deferral.retain(receiver, error, values)
+            return False
+        return bool(context.waits_allowed and values.get("wait_for_resources", True))
 
     def merged(result, attempts):
         result[1]["ledger_attempt_ids"] = list(dict.fromkeys([*attempts, *result[1].get("ledger_attempt_ids", [])]))
@@ -688,7 +847,7 @@ def model_waitable(function: Callable | None = None, *, client_parameter: str = 
                 except Exception as error:
                     error.model_role_route = route_projection(values)
                     propagate_model_control(error)
-                    if not can_wait(context, error, values):
+                    if not can_wait(context, receiver, error, values):
                         raise
                     record_attempts(attempts, error)
                     cancelled = threading.Event()
@@ -724,7 +883,7 @@ def model_waitable(function: Callable | None = None, *, client_parameter: str = 
             except Exception as error:
                 error.model_role_route = route_projection(values)
                 propagate_model_control(error)
-                if not can_wait(context, error, values):
+                if not can_wait(context, receiver, error, values):
                     raise
                 record_attempts(attempts, error)
                 values = context.wait(receiver, error, values)

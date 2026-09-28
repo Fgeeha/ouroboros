@@ -62,6 +62,7 @@ from devtools.benchmarks.common.server_runner import (  # noqa: E402
     seed_owner_state,
 )
 from ouroboros.config import SETTINGS_DEFAULTS  # noqa: E402
+from ouroboros.tool_call_log import CALL_SETTLED, CALL_STARTED, CALL_WAIT_ENDED, logical_calls  # noqa: E402
 from checker import grade_generic  # noqa: E402
 from make_fixtures_v2 import T3_NEW_CMDSTR, T3_NEW_STRIP, T3_NEW_SUDO  # noqa: E402
 
@@ -399,19 +400,26 @@ def _mine_metrics(data_root: pathlib.Path, task_id: str) -> dict:
 
     tool_calls: Counter[str] = Counter()
     tool_errors: Counter[str] = Counter()
-    seen_tool_rows: set[tuple] = set()
+    call_rows: list[dict] = []
+    seen_legacy_rows: set[tuple] = set()
     for tools_file in sorted(set(data_root.rglob("tools.jsonl"))):
         for row in _iter_jsonl(tools_file):
-            if row.get("type") != "tool_call" or not _matches_task(row, task_id):
+            if not _matches_task(row, task_id) or row.get("type") not in (CALL_STARTED, CALL_SETTLED, CALL_WAIT_ENDED):
                 continue
-            key = (row.get("ts"), row.get("tool"), row.get("tool_call_id"))
-            if key in seen_tool_rows:
-                continue  # the same row is mirrored into the budget drive root
-            seen_tool_rows.add(key)
-            tool = str(row.get("tool") or "?")
-            tool_calls[tool] += 1
-            if row.get("is_error"):
-                tool_errors[tool] += 1
+            if not row.get("invocation_id"):  # a legacy row stands alone (its type was always tool_call)
+                key = (row.get("ts"), row.get("tool"), row.get("tool_call_id"))
+                if row.get("type") != CALL_SETTLED or key in seen_legacy_rows:
+                    continue  # the same row is mirrored into the budget drive root
+                seen_legacy_rows.add(key)
+            call_rows.append(row)
+    # One count per LOGICAL call (#1316): its rows, mirrored ones included, share one
+    # invocation_id. A call with no recorded outcome still counts; a call whose wait
+    # ended is an error (the model saw the timeout), whatever the worker settled later.
+    for call in logical_calls(call_rows):
+        tool = str(call.get("tool") or "?")
+        tool_calls[tool] += 1
+        if "wait_ended" in call or (call.get("settled") or {}).get("is_error"):
+            tool_errors[tool] += 1
 
     edit_calls = {t: tool_calls.get(t, 0) for t in EDIT_TOOLS if tool_calls.get(t, 0)}
     edit_errors = {t: tool_errors.get(t, 0) for t in EDIT_TOOLS if tool_errors.get(t, 0)}

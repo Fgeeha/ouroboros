@@ -387,3 +387,56 @@ def test_native_progress_keeps_its_wait_card_and_settles_only_its_controls(waiti
     assert card.locator('.model-wait-row').count() == 0
     assert page.locator(f'.chat-live-card[data-task-id="{TASK}"] .model-wait-row').count() == 2
     capture(page, "native-settled-sibling-waits-retained")
+
+
+@pytest.mark.parametrize('action', ['switch', 'retry'])
+def test_paid_review_controls_survive_author_terminal_and_reload(waiting_ui, tmp_path, monkeypatch, action):
+    ui, page = waiting_ui, waiting_ui['page']
+    monkeypatch.setenv('OUROBOROS_UI_EVIDENCE_DIR', str(tmp_path))
+    print(f'PAID_REVIEW_UI_EVIDENCE {tmp_path}')
+    row = ui['rows']['light-wait']
+    row.update(revision=2, role='reviewer:one', worker_slot_held=False,
+               model_wait_owner_id='review-operation-one',
+               review_operation={'owner_id': 'review-operation-one', 'surface': 'task_acceptance',
+                                 'retry_key': 'paid-panel', 'slot_id': 'one'})
+    ui['emit'](row)
+    waiter = page.locator('[data-wait-id="light-wait"]')
+    waiter.locator('[data-wait-role]').filter(has_text='Reviewer').wait_for()
+    capture(page, 'paid-review-before-author-terminal')
+    terminal = {'type': 'task_done', 'task_id': TASK, 'status': 'completed',
+                'artifact_status': 'ready', 'ts': '2026-09-06T22:02:00Z'}
+    ui['wait_status']['terminal'] = True
+    ui['history'].append(terminal)
+    ui['sockets'][-1].send(json.dumps({'type': 'log', 'chat_id': 1, 'data': terminal}))
+    card = page.locator(f'.chat-live-card[data-task-id="{TASK}"][data-finished="1"]')
+    card.wait_for()
+    assert waiter.is_visible(), 'paid review outlives the terminal author'
+    assert page.locator('[data-wait-id="main-wait"]').count() == 0
+    assert not card.locator('[data-live-typing]').is_visible()
+    waiter.locator('[data-wait-auto]').uncheck()
+    waiter.locator('[data-wait-notice]').filter(has_text='Request accepted').wait_for()
+    assert ui['controls'][-1]['decision_id'] == f'model_wait:{TASK}:light-wait'
+    ui['apply']('light-wait')
+    page.reload()
+    card.wait_for()
+    waiter.wait_for()
+    assert not waiter.locator('[data-wait-auto]').is_checked()
+    assert card.locator('[data-live-phase]').inner_text() == 'Done'
+    capture(page, 'paid-review-after-author-terminal-reload')
+    if action == 'switch':
+        waiter.locator('[data-wait-change]').click()
+        waiter.locator('[data-model-role-source]').select_option(API_LANE)
+        waiter.locator('[data-model-role-model]').fill('replacement-reviewer')
+        waiter.locator('[data-wait-apply]').click()
+    else:
+        waiter.locator('[data-wait-retry]').click()
+    waiter.locator('[data-wait-notice]').filter(has_text='Request accepted').wait_for()
+    assert ui['controls'][-1]['action'] == action
+    assert ui['controls'][-1]['decision_id'] == f'model_wait:{TASK}:light-wait'
+    if action == 'switch':
+        assert ui['controls'][-1]['model'] == 'openai::replacement-reviewer'
+    ui['apply']('light-wait')
+    waiter.wait_for(state='detached')
+    ui['emit']({**row, 'revision': 99, 'state': 'waiting'})
+    assert waiter.count() == 0, 'resolved operation cannot be revived by a stale waiting row'
+    assert card.get_attribute('data-finished') == '1'

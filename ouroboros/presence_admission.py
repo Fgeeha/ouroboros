@@ -100,11 +100,15 @@ def _required_selection_ready(root: Path, profile: Any, resolution: Any) -> None
                 and is_extension_live(target.provider, root)
             )
         elif isinstance(target, PresenceToolTarget):
-            from ouroboros.mcp_client import ensure_configured_from_settings, get_manager
+            from ouroboros.mcp_client import canonical_server_id, ensure_configured_from_settings, get_manager
 
             ensure_configured_from_settings(refresh=False)
             tool = get_manager().get_tool(target.name)
-            ready = bool(tool and str(tool.get("server_id") or "") == target.provider)
+            server = str(tool.get("server_id") or "") if tool else ""
+            # The same wire tool on the one server its stored provider names —
+            # exactly, or through the fixed-point id a pre-#1328 grant stored
+            # unconverged. An ambiguous id serves no tools, so it never matches.
+            ready = bool(server) and server in {target.provider, canonical_server_id(target.provider)}
         elif isinstance(target, PresenceScriptTarget):
             script_skill = find_skill(root, target.skill)
             scripts = {
@@ -124,7 +128,7 @@ def admit_presence_turn(
     drive_root: Path,
     authenticated_transport_skill: str,
     binding_id: str,
-    global_max_rounds: int,
+    global_max_rounds: int | None,  # None = no task round limit; the inline cap stays finite
     repo_path: str | None = None,
 ) -> PresenceAdmission:
     """Resolve one opaque binding into a frozen, reviewed admission snapshot."""

@@ -172,7 +172,7 @@ def _notify_chat_progress(job: LifecycleJob, phase: str) -> None:
             is_progress=True,
             task_id=_chat_task_id(job),
             progress_meta={"lifecycle": lifecycle},
-        )
+            role="system", system_type="skill_lifecycle")
     except Exception:
         return
 
@@ -214,7 +214,7 @@ def _notify_duplicate_pointer(requested: LifecycleJob, existing: LifecycleJob) -
                 "presentation_owner_task_id": existing.presentation_owner_task_id,
                 "source": existing.source,
             }},
-        )
+            role="system", system_type="skill_lifecycle_pointer")
     except Exception:
         return
 

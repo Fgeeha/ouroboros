@@ -462,6 +462,25 @@ def test_every_focus_visible_selector_gets_the_canonical_ring() -> None:
 # ---------------------------------------------------------------------------
 
 
+def test_quiz_question_reads_as_text_with_its_own_emphasis() -> None:
+    """Pins the owner-visible defect "the whole question is one bold block": a
+    real question is a marked title plus several lines, so the question itself
+    is regular weight and only what it marks is semibold (DESIGN "Quiz card")."""
+    css = _decommented(_read("web/style.css"))
+
+    def weights(wanted: str) -> list[str]:
+        return [
+            part.split(":", 1)[1].strip()
+            for selector, body in RULE.findall(css)
+            if selector.strip() == wanted
+            for part in body.split(";")
+            if part.strip() and part.split(":", 1)[0].strip() == "font-weight"
+        ]
+
+    assert weights(".chat-quiz-question") == ["400"]
+    assert weights(".chat-quiz-question strong") == ["600"]
+
+
 def test_select_control_clips_its_value() -> None:
     """Pins the owner-visible defect "Settings -> Advanced paints a horizontal
     scrollbar in the desktop app": WebKit computes `overflow: visible` on a

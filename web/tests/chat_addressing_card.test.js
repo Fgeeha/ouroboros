@@ -58,7 +58,7 @@ function fixture(history = [], chatId = 1) {
     const instance = createChatInstance({ ws,
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
         updateUnreadBadge() {}, chatId, idPrefix: 'chat', mountEl: mount,
-        stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
+        stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
     });
     const messages = document.byId.get('chat-messages');
@@ -85,7 +85,8 @@ const final = { task_id: TASK, role: 'assistant', content: 'The task is schedule
     outcome_axes: { execution: { status: 'ok' } }, reason_code: 'final_message',
     accounted_upper_bound_usd: 0.75, cost_final: true, cost_accounting_status: 'available' };
 // The host stamps every frame of an addressing call with the action it represents.
-const stamped = (tool, row = {}) => ({ tool, routing_action: tool, ...row });
+const stamped = (tool, row = {}) => ({ tool, routing_action: tool,
+    invocation_id: row.tool_call_id || `host-${tool}`, ...row });
 
 for (const [room, chatId, destination, visible] of [
     ['Main', 1, 42, true], ['destination Project', 42, 42, false],

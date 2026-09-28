@@ -59,7 +59,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     })),
     "supervisor/queue_schedules.py": ("supervisor/queue.py", "_queue", frozenset({
         "DRIVE_ROOT", "PENDING", "RUNNING", "SCHEDULED_TASKS_FILE", "_queue_lock",
-        "enqueue_task", "load_state", "persist_queue_snapshot",
+        "load_state", "persist_queue_snapshot",  # admission enqueues in schedule_occurrence
     })),
     "supervisor/worker_chat_lane.py": ("supervisor/workers.py", "_pool", frozenset({
         "DRIVE_ROOT", "REPO_DIR", "_repo_writer_gate_lock", "chat_turn_liveness",
@@ -91,7 +91,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     # tree did not bear it out, so the three invariants below were not running on
     # them. Sets are the tool-derived exact read sets on these bytes.
     "supervisor/queue_snapshot.py": ("supervisor/queue.py", "_queue", frozenset({
-        "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES", "DRIVE_ROOT", "PENDING",
+        "ACCEPTANCE_FENCES", "BUDGET_ROOT_FENCES", "DRIVE_ROOT", "PENDING", "PRIOR_DIRECT_ROOTS",
         "QUEUE_SEQ_COUNTER_REF", "QUEUE_SNAPSHOT_PATH", "RUNNING", "_queue_lock",
         "append_jsonl", "atomic_write_text", "enqueue_task", "parse_iso_to_ts",
         "persist_queue_snapshot", "restore_invalid_depth_admission", "sort_pending",
@@ -122,6 +122,9 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         # Runtime707: health hands off recovery; the reaper owns storm/respawn.
         "DRIVE_ROOT", "QUEUE_MAX_RETRIES", "RUNNING", "WORKERS",
         "_LAST_SPAWN_TIME", "_SPAWN_GRACE_SEC", "_emit_task_done_terminal",
+        # #1196: completing a saved exact budget pause after a worker death re-parks
+        # the row into the pool's PENDING through the same handle.
+        "PENDING",
         "_ensure_workers_healthy_locked", "_reconcile_confirmed_dead_review_owner",
         "_worker_crash_storm_detected", "append_jsonl", "coerce_chat_identity",
         "disable_exhausted_worker_pool", "get_event_q", "load_state", "reconstruct_task_cost",
@@ -214,8 +217,8 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_preserve_branch_for_official_reset", "_read_managed_repo_meta",
         "_read_update_intent", "_ref_points_at_ref", "_rescue_untracked_incomplete",
         "_run_git_resilient", "_update_source", "append_jsonl", "git_capture",
-        "checkout_and_reset", "current_drive_root", "import_test", "load_state",
-        "preserve_local_ref_branch", "rescue_git_capture", "save_state",
+        "checkout_and_reset", "current_drive_root", "import_test",
+        "preserve_local_ref_branch", "rescue_git_capture", "update_state",
         "sync_runtime_dependencies", "utc_now_iso",
     })),
     "supervisor/git_ops_updates.py": ("supervisor/git_ops.py", "_go", frozenset({
@@ -264,7 +267,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
     # call time goes through `_delegate()` (the reference cut this leaf with
     # plain preamble imports and declared only _emit).
     "ouroboros/tools/delegate_terminal_evidence.py": ("ouroboros/tools/delegate.py", "_delegate", frozenset({
-        "_Breach", "_PAYLOAD_ENVELOPE_HEADROOM", "_emit", "_home_isolation_breach",
+        "_Breach", "_PAYLOAD_ENVELOPE_HEADROOM", "_capture_terminal_patch", "_emit", "_home_isolation_breach",
         "_preview_payload", "_resolve_full_primary_output", "_stage_full_output",
         "_widened_access", "add_terminal_source_verification", "custody",
         "home_nested_under_operator_home", "tool_result_limit",
@@ -334,7 +337,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_project_child_result_dispositions", "_publish_delivery_candidate",
         "_replace_delivery_candidate", "_resolve_delivery_control",
         "_run_task_acceptance_review_once", "_service_finalization_evidence",
-        "_supersede_delivery_acceptance_binding",
+        "_set_acceptance_decision", "_supersede_delivery_acceptance_binding",
         "_supersede_task_acceptance_for_evidence_change",
         "_supersede_task_acceptance_for_owner_followup",
         "_task_acceptance_owner_generation_changed",
@@ -347,6 +350,7 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_degrade_retained_delivery_candidate", "_delivery_evidence_state",
         "_delivery_replace_required", "_direct_child_results",
         "_drain_forced_owner_directives", "_drain_incoming_messages",
+        "_emit_checkpoint_event",
         "_end_task_acceptance_fence", "_finalize_forced_services",
         "_finalize_task_services", "_force_plan_decision",
         "_force_plan_disclosure", "_force_plan_reminder",
@@ -465,6 +469,9 @@ LEAVES: dict[str, tuple[str, str, frozenset[str]]] = {
         "_provider_unavailable_result", "_record_owner_directive",
         "_soft_land_exhausted_ceiling", "_task_deadline_epoch", "compact_tool_history_llm",
         "provider_no_call_source", "utc_now",
+        # #1196: a budget-pause HOLD ended by control rejoins the model-wait rails and
+        # merges its forced trace like every other controlled exit.
+        "_merge_finalization_trace",
     })),
 }
 

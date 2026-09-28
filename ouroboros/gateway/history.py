@@ -24,9 +24,10 @@ from ouroboros.gateway.history_paging import (
 )
 from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection
 from ouroboros.outcomes import normalize_outcome_axes
+from ouroboros.history_retention import retention_summary
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.project_dialogue import historical_terminal_projection
-from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, executor_observation_meta, initiator_meta, subagent_message_meta
+from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, delegated_activity_meta, executor_observation_meta, initiator_meta, subagent_message_meta
 from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
 from ouroboros.utils import JsonlChainUnreadable, strip_markdown, utc_now_iso
 
@@ -88,7 +89,7 @@ _PROGRESS_META_FIELDS = (
     # Phase 6: the resolved delegated route (a harness id), so a replayed
     # bubble keeps its executor chip instead of losing it on reload.
     "executor_route",
-    "executor_observation",
+    "executor_observation", "delegated_activity",  # the executor's typed words/technical events (#1350)
     # The completion-seam evidence block (delegated runs started/settled,
     # subscription spend, harness models) — the chip's layered truth on replay.
     "execution_evidence",
@@ -103,6 +104,8 @@ _PROGRESS_META_FIELDS = (
     # The frame's voice: a replayed host note must stay a host note, or a reload
     # would hand the card title back to the very line live rendering refused it.
     "narration",
+    "card_row", "card_row_id", "card_row_revision",
+    "checkpoint_kind", "episode_id", "phase", "elapsed_sec",
 )
 
 _SKILL_REVIEW_STRING_FIELDS = (
@@ -330,8 +333,9 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
     """Copy terminal chat facts for task summaries."""
     if entry.get("type") != "task_summary":
         return
-    if isinstance(entry.get("model_execution"), dict):
-        rec["model_execution"] = dict(entry["model_execution"])
+    for key in ("model_execution", "review_projection", "history_retention"):
+        if isinstance(entry.get(key), dict):
+            rec[key] = dict(entry[key])
     if entry.get("suggested_name"):
         rec["suggested_name"] = str(entry["suggested_name"])
     for key in ("tool_calls", "rounds", "tool_errors", "routing_tool_calls"):
@@ -348,15 +352,12 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
     rec["outcome_axes"] = normalize_outcome_axes(entry)
     if "reason_code" in entry:
         rec["reason_code"] = str(entry.get("reason_code") or "")
-    if isinstance(entry.get("review_projection"), dict):
-        rec["review_projection"] = dict(entry.get("review_projection") or {})
     # The row's flat task-scope cost snapshot; _annotate_terminal_task_truth
     # later OVERRIDES it with the persisted task_results values when the result
     # file survives (row = fallback only). ABI-3: CONVERTED, not copied — a
     # stored legacy pair resolves deprecated-wins under the honest names only.
     rec.update(carry_cost_meta(entry))
-    # Live-card outcome axes and the origin label ride the summary row too (the
-    # pruned-result fallback); persisted task_results values still override them below.
+    # Live-card axes/origin are row fallbacks; persisted task_results override them.
     rec.update({key: entry[key] for key in ("outcome_phase", "outcome_final", "initiator") if key in entry})
 
 
@@ -367,7 +368,7 @@ def _load_terminal_result(
 ) -> Dict[str, Any]:
     """Effective task result for history projection, cached per request.
 
-    Status/cost and compact child-identity projection only — a history GET must never copy artifacts or
+    Status/cost, merge receipts and child identity — a history GET must never copy artifacts or
     claim disposition hashes (materialize contract). The cache is shared
     between the pre-floor lineage terminal-truth pass (perf2 P3 variant A) and
     ``_annotate_terminal_task_truth``, so each task_results file is read at
@@ -453,6 +454,9 @@ def _annotate_terminal_task_truth(
             and str(message.get("role") or "") in {"assistant", "system"}
             and str(message.get("task_id") or "") not in progress_task_ids
         }
+        from ouroboros.tool_call_log import replay_evidence
+
+        tool_evidence_by_task = {}
         terminal_status_by_task: Dict[str, str] = {}
         terminal_truth_by_task: Dict[str, Dict[str, Any]] = {}
         terminal_receipt_by_task: Dict[str, Dict[str, Any]] = {}
@@ -461,6 +465,7 @@ def _annotate_terminal_task_truth(
         live_cost_by_task: Dict[str, Dict[str, Any]] = {}
         finalizing_tasks: set = set()
         for task_id in progress_task_ids | summary_task_ids | legacy_final_task_ids:
+            tool_evidence_by_task[task_id] = replay_evidence(data_dir, task_id)
             result = _load_terminal_result(data_dir, task_id, cache)
             child_meta = subagent_message_meta(result, task_id=task_id)
             if child_meta:
@@ -488,21 +493,17 @@ def _annotate_terminal_task_truth(
                     "outcome_axes": normalize_outcome_axes(result), "_is_direct_chat": bool(result.get("_is_direct_chat")),
                     "outcome_phase": outcome_phase(result, {}), "outcome_final": task_id not in finalizing_tasks,
                     **initiator_meta(result)}  # + the origin label, from the persisted metadata
-                if isinstance(result.get("model_execution"), dict):
-                    terminal_truth["model_execution"] = dict(result["model_execution"])
+                for key in ("model_execution", "cancel_origin", "review_projection"):
+                    if isinstance(result.get(key), dict):
+                        terminal_truth[key] = dict(result[key])
+                retention = retention_summary(result)
+                if retention:
+                    terminal_truth["history_retention"] = retention
                 if result.get("reason_code"):
                     terminal_truth["reason_code"] = str(result.get("reason_code") or "")
-                if isinstance(result.get("cancel_origin"), dict):
-                    terminal_truth["cancel_origin"] = dict(result["cancel_origin"])
-                review_projection = result.get("review_projection")
-                if isinstance(review_projection, dict):
-                    terminal_truth["review_projection"] = dict(review_projection)
-                # v6.82 P1: attach the persisted terminal cost truth. Applied via
-                # message.update() below, so it OVERRIDES any row-embedded
-                # task_summary snapshot values (the result file is authoritative;
-                # the row snapshot is the pruned-result fallback). ABI-3:
-                # CONVERTED, not copied — a stored legacy result's pair
-                # resolves deprecated-wins and leaves under the honest names.
+                # Persisted cost truth overrides the row fallback via message.update().
+                # ABI-3 conversion resolves legacy pairs deprecated-wins and emits
+                # only honest names.
                 terminal_truth.update(carry_cost_meta(result))
                 terminal_truth_by_task[task_id] = terminal_truth
                 envelope = result.get("subagent_envelope")
@@ -550,6 +551,19 @@ def _annotate_terminal_task_truth(
             task_id = str(message.get("task_id") or "")
             if not task_id or message.get("system_type") == "project_question_pointer":
                 continue
+            # Selected receipt events keep their physical identity, but show current task-result truth.
+            row_id = str(message.get("card_row_id") or "")
+            if message.get("card_row") == "reviews" and row_id.startswith("merge-receipt:"):
+                from ouroboros.merge_receipts import card_row_text
+                try:
+                    receipt = next(r for r in cache.get(task_id, {}).get("merge_receipts", [])
+                                   if isinstance(r, dict) and row_id == f"merge-receipt:{r.get('receipt_id')}")
+                    revision = receipt.get("revision", 0)
+                    if type(revision) is not int or revision < int(message.get("card_row_revision") or 0):
+                        raise ValueError("canonical receipt revision unavailable")
+                    message.update(text=card_row_text(receipt), card_row_revision=revision)
+                except (StopIteration, KeyError, TypeError, ValueError, AttributeError):
+                    message["text"] += "\nCurrent merge receipt unavailable; showing recorded event."
             if cache.get(task_id, {}).get("_history_result_absent"):
                 historical = (historical_terminals or {}).get(task_id)
                 if historical:
@@ -581,11 +595,12 @@ def _annotate_terminal_task_truth(
                 # window still holds, so its harness chip needs no "Load older".
                 message.update(terminal_receipt_by_task.get(task_id) or {})
             is_summary = str(message.get("system_type") or "") == "task_summary"
-            if is_summary or (
+            if is_summary or (not message.get("is_progress") and message.get("task_terminal_status")) or (
                 task_id not in summary_task_ids
                 and latest_progress_by_task.get(task_id) is message
             ):
                 message.update(terminal_truth_by_task.get(task_id) or {})
+                message["tool_evidence"] = tool_evidence_by_task.get(task_id)
             if (message.get("is_progress") or is_summary) and task_id in suggested_name_by_task:
                 message["suggested_name"] = suggested_name_by_task[task_id]
             # Floor-symmetric closed lineage window for chat FINALS: strip runs
@@ -680,7 +695,7 @@ def _make_thread_filter(
             return True
         if (thread_id not in project_chat_ids and isinstance(entry, dict)
                 and entry.get("summary_kind") in {"terminal_result_projection", "terminal_root_projection"}
-                and entry.get("type") not in {"project_started", "project_completion_summary"}):
+                and entry.get("type") not in {"project_started", "project_handoff", "project_completion_summary"}):
             return False
         return belongs(entry_chat, entry)
 
@@ -823,12 +838,14 @@ def _collect_chat_rows(
                 # (the key is simply ignored), and ``transport`` is the
                 # provenance surface.
             }
-            if rec["system_type"] in {"project_started", "project_completion_summary"}:
+            if role == "user" and entry.get("ingress_accepted") is True:
+                rec["ingress_accepted"] = True
+            if rec["system_type"] in {"project_started", "project_handoff", "project_completion_summary"}:
                 # Read-side plain normalization for lifecycle rows persisted
                 # before the producer stripped markdown; a no-op on new rows.
                 # The durable chat.jsonl is never rewritten.
                 rec["text"] = strip_markdown(rec["text"])
-                for key in ("project_id", "project_name", "target_label", "status"):
+                for key in ("project_id", "project_name", "target_label", "status", "completion_answer", "handoff_id"):
                     if key in entry:
                         rec[key] = str(entry.get(key) or "")
             annotation = _user_annotation(role, rec["client_message_id"], chat_annotations)
@@ -881,6 +898,8 @@ def _collect_chat_rows(
                         for key in ("answered_index", "comment", "wait_ended_at"):  # the answer, the closed bound
                             if key in _live:
                                 quiz[key] = _live[key]
+                        if _live.get("host_facts") and not quiz.get("host_facts"):
+                            quiz["host_facts"] = str(_live["host_facts"])  # the ask-time sentence the block holds
                         if "wait_for_answer" not in _live:
                             quiz.pop("wait_for_answer", None)  # the bound closed: the card no longer waits
                     if quiz.get("wait_for_answer") or quiz.get("wait_ended_at"):
@@ -896,7 +915,7 @@ def _collect_chat_rows(
             _copy_task_summary_metadata(rec, entry)
             # Lineage, the origin label, and the host's card placement (card_row /
             # card_row_id) — a stored key is replayed verbatim, an absent one is omitted.
-            for field in (*SUBAGENT_MESSAGE_FIELDS, "initiator", "card_row", "card_row_id"):
+            for field in (*SUBAGENT_MESSAGE_FIELDS, "initiator", "card_row", "card_row_id", "card_row_revision", "narration"):
                 if field in entry:
                     rec[field] = entry[field]
             combined.append(rec)
@@ -964,7 +983,8 @@ def _collect_progress_rows(
                 continue
             rec = {
                 "text": text,
-                "role": "assistant",
+                "role": str(entry.get("role") or "assistant"),
+                "system_type": str(entry.get("system_type") or ""),
                 "ts": str(entry.get("ts", "")),
                 "is_progress": True,
                 "markdown": str(entry.get("format", "")).lower() == "markdown",
@@ -984,12 +1004,11 @@ def _collect_progress_rows(
             for field in _PROGRESS_META_FIELDS:
                 if field in entry:
                     rec[field] = entry[field]
-            if "executor_observation" in rec:
-                observation = executor_observation_meta(
-                    rec.pop("executor_observation"), task_id=rec["task_id"],
-                )
-                if observation:
-                    rec["executor_observation"] = observation
+            # Replay re-checks task-bound progress facts with the emitter's own validators.
+            for key, validate in (("executor_observation", executor_observation_meta),
+                                  ("delegated_activity", delegated_activity_meta)):
+                if key in rec and (value := validate(rec.pop(key), task_id=rec["task_id"])):
+                    rec[key] = value
             # ABI-3: the whitelist passes only the honest cost names; a stored
             # legacy row's pair is CONVERTED here (deprecated-wins) instead of
             # being replayed under the retired spelling or silently dropped.
@@ -1117,7 +1136,7 @@ def _active_lifecycle_row(row_matches_thread) -> Optional[Dict[str, Any]]:
             chat_id = int(route if route is not None else 0)
             row = {
                 "text": text,
-                "role": "assistant",
+                "role": "system", "system_type": "skill_lifecycle",
                 "ts": utc_now_iso(),
                 "is_progress": True,
                 "markdown": False,

@@ -1070,7 +1070,8 @@ def _openai_compatible_metadata_window(
             from ouroboros.config import runtime_settings
             api_key = str((runtime_settings() or {}).get("OPENAI_COMPATIBLE_API_KEY") or "")
         headers = {"Authorization": f"Bearer {api_key}"} if api_key else {}
-        resp = httpx.get(str(base_url).rstrip("/") + "/models", headers=headers, timeout=5.0)
+        from ouroboros.net_transport import verify_kwargs
+        resp = httpx.get(str(base_url).rstrip("/") + "/models", headers=headers, timeout=5.0, **verify_kwargs())
         resp.raise_for_status()
         payload = resp.json()
         items = payload.get("data") if isinstance(payload, dict) else payload
@@ -1340,7 +1341,7 @@ def probe(
 # excluding it would starve the route of density witnesses entirely.
 _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS = frozenset({
     "openrouter", "openai", "openai-compatible", "cloudru", "local", "anthropic",
-    "deepseek",
+    "deepseek", "zai",
 })
 
 
@@ -1352,6 +1353,12 @@ def observe_token_density(request: Any, usage: Optional[Dict[str, Any]], *, driv
         cache_bearing = bool(cached or int(normalized.get("cache_write_tokens") or 0))
         provider = str(request.provider or "").strip().lower()
         if cache_bearing and provider not in _CACHE_INCLUSIVE_PROMPT_TOKEN_PROVIDERS:
+            return
+        # A route may answer with ANOTHER model. Its tokenizer is not the
+        # requested model's, so the row would teach one model a stranger's
+        # density. The witness belongs to the model that produced it, and this
+        # store is keyed by the requested one, so there is nothing to learn.
+        if (normalized.get("claudexor") or {}).get("served_other_model"):
             return
         real = int(normalized.get("prompt_tokens") or normalized.get("input_tokens") or 0)
         # A cache-inclusive total landing on 2 x cached_tokens (+-1) is a gateway

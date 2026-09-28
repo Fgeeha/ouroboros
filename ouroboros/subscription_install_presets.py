@@ -649,11 +649,15 @@ def preview_api_reviewer_slots(settings: Mapping[str, Any]) -> str:
     The existing provider-normalization helpers own model policy. This is only
     the structured editor representation of the same defaults, not a new panel.
     """
+    from ouroboros.model_slots import get_deep_self_review_model
+    from ouroboros.provider_models import compatible_only_main_model
     from ouroboros.server_runtime import (
-        _exclusive_direct_remote_provider, _normalize_direct_review_models,
-        _normalize_direct_scope_review_models, has_remote_provider,
+        _exclusive_direct_remote_provider,
+        _normalize_direct_review_models,
+        _normalize_direct_scope_review_models,
+        has_remote_provider,
     )
-    from ouroboros.settings_defaults import OPENROUTER_REVIEW_DEFAULTS, SETTINGS_DEFAULTS
+    from ouroboros.settings_defaults import OPENROUTER_REVIEW_DEFAULTS
 
     authored = str(settings.get(REVIEWER_SLOTS_KEY) or "")
     if authored:
@@ -661,36 +665,42 @@ def preview_api_reviewer_slots(settings: Mapping[str, Any]) -> str:
     provider = _exclusive_direct_remote_provider(dict(settings))
     triad = list(OPENROUTER_REVIEW_DEFAULTS["triad"])
     scope = list(OPENROUTER_REVIEW_DEFAULTS["scope"])
+    advisory_target = ""
     if provider:
         triad = _normalize_direct_review_models(dict(settings), provider).split(",")
         scope = _normalize_direct_scope_review_models(dict(settings), provider).split(",")
+    elif compatible := compatible_only_main_model(settings):  # #1116: the one reachable route
+        triad, scope, advisory_target = [compatible] * len(triad), [compatible] * len(scope), compatible
     if not has_remote_provider(dict(settings)) and str(settings.get("USE_LOCAL_MAIN")).lower() in {"true", "1"}:
         triad = [str(settings.get("OUROBOROS_MODEL") or "")] * len(triad)
         scope = [str(settings.get("OUROBOROS_MODEL") or "")] * len(scope)
     def rows(models, surface):
+        # #1334: fresh triad rows read the work themselves; scope rows always read.
+        delivery = {"delivery": "native"} if surface == SURFACE_TRIAD else {}
         return [{"slot_id": _slot_id(surface, i + 1),
-                 "route": {"kind": "api_chat", "target_id": model}, "effort": ""}
+                 "route": {"kind": "api_chat", "target_id": model}, "effort": "", **delivery}
                 for i, model in enumerate(models) if model]
     return json.dumps({
         "triad": rows(triad, SURFACE_TRIAD), "scope": rows(scope, SURFACE_SCOPE),
-        "advisory": {"enabled": True, "route": {"kind": "api_chat", "target_id": ""}, "effort": "low"},
-        "deep_review": {"route": {"kind": "api_chat", "target_id": str(settings.get("OUROBOROS_MODEL_DEEP_SELF_REVIEW")
-            or SETTINGS_DEFAULTS["OUROBOROS_MODEL_DEEP_SELF_REVIEW"])}, "effort": ""},
+        "advisory": {"enabled": True, "route": {"kind": "api_chat", "target_id": advisory_target}, "effort": "low"},
+        "deep_review": {"route": {"kind": "api_chat", "target_id": get_deep_self_review_model(dict(settings))}, "effort": ""},
     }, ensure_ascii=False)
 
 
 def preview_main_reviewer_slots(settings: Mapping[str, Any]) -> Tuple[str, str]:
     """Rebind a visible review draft to Main, preserving effort and inspection.
 
-    Original task actors stay unchanged. Retrieving triad rows share one Main
-    API actor; their effective efforts remain independent row overrides. Other
-    review surfaces already retrieve by their surface contract. The returned
-    reviewer and actor drafts are shown together before the completion write.
+    Original task actors stay unchanged. A retrieving triad row becomes a direct
+    Main API row saved with ``delivery: native`` (#1334) — it keeps reading the
+    work itself with no roster actor minted for it; its effective effort stays
+    an independent row override. Other review surfaces already retrieve by
+    their surface contract. The returned reviewer and actor drafts are shown
+    together before the completion write.
     """
     from ouroboros.configured_subagents import normalize_configured_subagents
     from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option, resolve_processing_preference
     from ouroboros.provider_models import provider_for_model
-    from ouroboros.reviewer_slot_config import parse_reviewer_slots, roster_env_override
+    from ouroboros.reviewer_slot_config import DELIVERY_NATIVE, parse_reviewer_slots, roster_env_override
     from ouroboros.route_spec import compound_session_effort
 
     main, _light = _effective_api_models(settings)
@@ -707,22 +717,6 @@ def preview_main_reviewer_slots(settings: Mapping[str, Any]) -> Tuple[str, str]:
     payload = json.loads(raw)
     payload["advisory"] = payload.get("advisory") or {"enabled": True}
     payload["deep_review"] = payload.get("deep_review") or {}
-    actor_id = ""
-    if any(row.retrieves for row in resolved.triad):
-        # Empty actor effort leaves each reviewer's captured effort authoritative.
-        destination = RouteSpec(ROUTE_KIND_API_MODEL, main, profile)
-        actor_id = next((row.subagent_id for row in roster.items
-                         if row.route == destination and not row.effort
-                         and row.processing_preference == processing), "")
-        if not actor_id:
-            used = {row.subagent_id for row in roster.items}
-            actor_id, suffix = "main-reviewer", 2
-            while actor_id in used:
-                actor_id, suffix = f"main-reviewer-{suffix}", suffix + 1
-            roster = make_configured_subagents([*roster.items, ConfiguredSubagent(
-                subagent_id=actor_id, recommended_use=_REVIEW_SEAT_RECOMMENDATION,
-                route=destination, processing_preference=processing,
-            )], enabled=roster.enabled)
     pairs = [*((row, slot, slot.retrieves) for row, slot in zip(payload["triad"], resolved.triad)),
              *((row, slot, False) for row, slot in zip(payload["scope"], resolved.scope)),
              (payload["advisory"], resolved.advisory, False),
@@ -731,18 +725,16 @@ def preview_main_reviewer_slots(settings: Mapping[str, Any]) -> Tuple[str, str]:
         effort = original.effort if original else ""
         if original and not effort and original.kind == "agent_session":
             effort = compound_session_effort(RouteSpec(ROUTE_KIND_AGENT_SESSION, original.target_id))
-        row.pop("subagent_id", None)
-        row.pop("route", None)
-        row.pop("processing_preference", None)
+        for key in ("subagent_id", "route", "processing_preference", "delivery"):
+            row.pop(key, None)
         row["effort"] = effort
+        row["route"] = {"kind": "api_chat", "target_id": main}
+        if profile:
+            row["route"]["profile_id"] = profile
+        if processing:
+            row["processing_preference"] = processing
         if retrieving:
-            row["subagent_id"] = actor_id
-        else:
-            row["route"] = {"kind": "api_chat", "target_id": main}
-            if profile:
-                row["route"]["profile_id"] = profile
-            if processing:
-                row["processing_preference"] = processing
+            row["delivery"] = DELIVERY_NATIVE
     raw, roster_raw = json.dumps(payload, ensure_ascii=False), serialize_configured_subagents(roster)
     refusal = _validate_against_parser(raw, roster_raw)
     if refusal:

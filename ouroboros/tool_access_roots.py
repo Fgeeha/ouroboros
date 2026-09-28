@@ -124,6 +124,34 @@ def project_room_lens_dir(ctx: Any) -> Optional[pathlib.Path]:
     return pathlib.Path(raw).resolve(strict=False)
 
 
+def folderless_scratch_dir(ctx: Any) -> Optional[pathlib.Path]:
+    """Project work WITHOUT a folder: the task's OWN scratch is its default cwd (#1315).
+
+    Project-scoped work with no workspace and no room folder (or an explicit
+    "no folder" intent) no longer defaults to the Ouroboros repository. This is a
+    default location only — never a workspace: no external-workspace or delegated
+    write authority, no change to what the profile may reach (the system repo stays
+    one explicit ``root``/``cwd`` away). Main self-work, Presence and an explicit
+    ``system_repo`` intent keep today's default."""
+    if getattr(ctx, "workspace_root", None):
+        return None
+    meta = getattr(ctx, "task_metadata", None)
+    meta = meta if isinstance(meta, dict) else {}
+    intent = meta.get("resource_intent") if isinstance(meta.get("resource_intent"), dict) else {}
+    kind = str(intent.get("kind") or "")
+    project = str(getattr(ctx, "project_id", "") or meta.get("project_id") or "").strip()
+    if (kind == "system_repo" or (not project and kind != "explicit_none")
+            or meta.get("_project_room_dir") or meta.get("_project_room_note")):
+        return None
+    from ouroboros.dialogue_provenance import presence_metadata_binding
+
+    if presence_metadata_binding(meta) is not None:
+        return None
+    scratch = resource_root_path(ctx, "task_drive")
+    scratch.mkdir(parents=True, exist_ok=True)
+    return scratch
+
+
 def load_bound_skill(binding: ResolvedResourceBinding) -> Any:
     """Load the frozen payload target while preserving lifecycle provenance."""
     from ouroboros.skill_loader import _classify_skill_source, load_skill
@@ -170,7 +198,7 @@ def resource_root_path(
 ) -> pathlib.Path:
     if root == "active_workspace":
         active = getattr(ctx, "active_repo_dir", None)
-        candidate = active() if callable(active) else project_room_lens_dir(ctx)
+        candidate = active() if callable(active) else (project_room_lens_dir(ctx) or folderless_scratch_dir(ctx))
         if candidate is None or candidate.__class__.__module__.startswith("unittest.mock"):
             candidate = getattr(ctx, "repo_dir")
         return pathlib.Path(candidate).resolve(strict=False)

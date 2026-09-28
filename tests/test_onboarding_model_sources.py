@@ -228,15 +228,16 @@ def test_recovery_endpoint_preserves_visible_panel_and_inherited_inspection(onbo
     response = onboarding.client.post("/api/onboarding/subagents/preview", json=settings)
     assert response.status_code == 200, response.text
     result = response.json()
-    assert result["available_subagents"]["items"][:len(roster["items"])] == roster["items"]
-    assert len(result["available_subagents"]["items"]) == len(roster["items"]) + 1 <= 10
+    # #1334: retrieving triad rows become direct Main rows saved as native delivery;
+    # no roster actor is minted for them.
+    assert result["available_subagents"]["items"] == roster["items"]
     with roster_env_override(json.dumps(result["available_subagents"]), environ=settings):
         resolved = parse_reviewer_slots(result["reviewer_slots"])
     before = [*original.triad, *original.scope, original.advisory, original.deep_review]
     after = [*resolved.triad, *resolved.scope, resolved.advisory, resolved.deep_review]
     assert [(r.slot_id, r.effort) for r in after] == [(r.slot_id, r.effort) for r in before]
     assert resolved.advisory.enabled is False
-    assert all(r.retrieves for r in resolved.triad)
+    assert all(r.retrieves and r.native_retrieval and not r.subagent_id for r in resolved.triad)
     assert all(r.target_id == settings["OUROBOROS_MODEL"] and r.profile_id == "account"
                and r.processing_preference == "standard" for r in after)
     assert not onboarding.settings_path.exists() and onboarding.calls["snapshot"] == 0
@@ -258,3 +259,38 @@ def test_recovery_endpoint_keeps_authored_counts_ids_effort_and_disabled_advisor
     assert [(r["slot_id"], r["effort"]) for r in result["triad"]] == [("own-triad", "xhigh")]
     assert [(r["slot_id"], r["effort"]) for r in result["scope"]] == [("own-scope", "high")]
     assert result["advisory"]["enabled"] is False and result["advisory"]["effort"] == "high"
+
+
+def test_main_review_recovery_never_proposes_an_owner_disabled_roster_row():
+    """A switched-off row is not a reviewer seat, and the recovery needs no
+    roster actor at all (#1334): a retrieving triad row becomes a direct Main
+    row saved with ``delivery: native``. The owner's disabled row is preserved
+    untouched and nothing is minted."""
+    from ouroboros.subscription_install_presets import preview_main_reviewer_slots
+
+    main = "claudexor::source=main-model"
+    disabled_match = {
+        "subagent_id": "paused-main", "recommended_use": "Paused reviewer seat",
+        "route": {"kind": "api_model", "target_id": main, "credential_profile_id": ""},
+        "enabled": False,
+    }
+    raw, roster_raw = preview_main_reviewer_slots({
+        "OUROBOROS_MODEL": main,
+        "OUROBOROS_SUBAGENTS": {"enabled": True, "items": [disabled_match]},
+        "OUROBOROS_REVIEWER_SLOTS": json.dumps({
+            "triad": [{"slot_id": "t1", "route": {"kind": "agent_session", "target_id": "codex"}}],
+            "scope": [{"slot_id": "s1", "route": {"kind": "api_chat", "target_id": "old"}}],
+        }),
+    })
+    roster = json.loads(roster_raw)
+    row = json.loads(raw)["triad"][0]
+    assert "subagent_id" not in row
+    assert row["route"] == {"kind": "api_chat", "target_id": main} and row["delivery"] == "native"
+    assert roster["items"] == [disabled_match]
+
+    # The compiled draft survives the reviewer-slot parser it must be saved through.
+    from ouroboros.reviewer_slot_config import parse_reviewer_slots, roster_env_override
+
+    with roster_env_override(roster_raw, environ={}):
+        triad = parse_reviewer_slots(raw).triad[0]
+    assert triad.native_retrieval and triad.retrieves and not triad.subagent_id

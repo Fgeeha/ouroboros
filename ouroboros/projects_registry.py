@@ -49,7 +49,7 @@ _DEPRECATED_CHAT_IDS_EVENTS: set[str] = set()
 
 
 @contextmanager
-def _file_write_lock(target_path: pathlib.Path) -> Iterator[None]:
+def _file_write_lock(target_path: pathlib.Path, *, timeout_sec: float = 4.0) -> Iterator[None]:
     """Cross-process exclusive lock for a registry/bindings read-modify-write.
 
     The registry is written from BOTH the server process (project create/bind,
@@ -65,12 +65,16 @@ def _file_write_lock(target_path: pathlib.Path) -> Iterator[None]:
 
     target_path.parent.mkdir(parents=True, exist_ok=True)
     lock_path = target_path.with_name(target_path.name + ".lock")
-    fd = acquire_exclusive_file_lock(lock_path, timeout_sec=4.0)
+    fd = acquire_exclusive_file_lock(lock_path, timeout_sec=timeout_sec)
     if fd is None:
         raise TimeoutError(f"projects_registry: could not lock {lock_path} in time")
     try:
-        with _LOCK:
+        if not _LOCK.acquire(timeout=timeout_sec):
+            raise TimeoutError("projects_registry: thread lock busy")
+        try:
             yield
+        finally:
+            _LOCK.release()
     finally:
         release_exclusive_file_lock(lock_path, fd)
 
@@ -83,8 +87,18 @@ def _bindings_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / "state" / _BINDINGS_NAME
 
 
-def _load(drive_root: Any) -> Dict[str, Any]:
-    data = read_json_dict(_registry_path(drive_root))
+def _load(drive_root: Any, *, strict: bool = False) -> Dict[str, Any]:
+    if strict:
+        import json
+        try:
+            data = json.loads(_registry_path(drive_root).read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {"projects": []}
+        if (not isinstance(data, dict) or not isinstance(data.get("projects"), list)
+                or any(not isinstance(row, dict) or not row.get("id") for row in data["projects"])):
+            raise ValueError("Project registry is unavailable")
+    else:
+        data = read_json_dict(_registry_path(drive_root))
     if not isinstance(data, dict) or not isinstance(data.get("projects"), list):
         return {"projects": []}
     data["projects"] = [
@@ -343,13 +357,16 @@ def all_task_project_bindings(drive_root: Any, *, strict: bool = False) -> Dict[
     return out
 
 
-def project_binding_for_task(drive_root: Any, task_id: str) -> Optional[Dict[str, Any]]:
+def project_binding_for_task(drive_root: Any, task_id: str, *, strict: bool = False) -> Optional[Dict[str, Any]]:
     tid = str(task_id or "").strip()
     if not tid:
         return None
     # Read needs no lock: atomic_write_json renames into place, so a reader
     # always sees a complete (old or new) bindings file, never a torn one.
-    row = _load_bindings(drive_root)["bindings"].get(tid)
+    bindings = _load_bindings(drive_root, strict=strict)["bindings"]
+    row = bindings.get(tid)
+    if strict and tid in bindings and (not isinstance(row, dict) or not row.get("project_id")):
+        raise ValueError("Project binding is unavailable")
     return dict(row) if isinstance(row, dict) else None
 
 
@@ -630,10 +647,10 @@ def project_chat_for_task_tree(
     return 0
 
 
-def list_reserved_projects(drive_root: Any) -> List[Dict[str, Any]]:
+def list_reserved_projects(drive_root: Any, *, strict: bool = False) -> List[Dict[str, Any]]:
     """All Project ids, including deleting/tombstoned history reservations."""
     with _LOCK:
-        projects = _load(drive_root)["projects"]
+        projects = _load(drive_root, strict=strict)["projects"]
     return sorted(
         projects,
         key=lambda p: str(p.get("last_active_at") or p.get("updated_at") or p.get("created_at") or ""),
@@ -758,15 +775,46 @@ def get_project(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
     return None
 
 
-def get_reserved_project(drive_root: Any, project_id: str) -> Optional[Dict[str, Any]]:
+def get_reserved_project(drive_root: Any, project_id: str, *, strict: bool = False) -> Optional[Dict[str, Any]]:
     """Lookup irrespective of lifecycle (history/recovery only)."""
     pid = sanitize_project_id(project_id)
     if not pid:
         return None
-    for project in list_reserved_projects(drive_root):
+    for project in list_reserved_projects(drive_root, strict=strict):
         if project.get("id") == pid:
             return dict(project)
     return None
+
+
+def _registry_revision(drive_root: Any) -> tuple:
+    try:
+        st = _registry_path(drive_root).stat()
+        return st.st_dev, st.st_ino, st.st_mtime_ns, st.st_size
+    except FileNotFoundError:
+        return ()
+
+
+def project_admission_view(drive_root: Any, project_id: str) -> Dict[str, Any]:
+    """Read the registry off the queue lock and bind its exact atomic-file revision."""
+    before = _registry_revision(drive_root)
+    project = get_reserved_project(drive_root, project_id, strict=True)
+    if before != _registry_revision(drive_root):
+        raise RuntimeError("project registry changed during admission preparation")
+    return {"project_id": project_id, "project": project, "revision": before}
+
+
+@contextmanager
+def project_admission_guard(drive_root: Any, view: Dict[str, Any]):
+    """Short existing-writer fence; never wait for registry writers under queue lock.
+
+    The expensive JSON read is in project_admission_view. Stat of the atomic-file
+    identity detects every replacement, including rebind-away-and-back. The same
+    writer lock prevents replacement until the queue publishes this admission.
+    """
+    with _file_write_lock(_registry_path(drive_root), timeout_sec=0.0):
+        if view.get("revision") != _registry_revision(drive_root):
+            raise RuntimeError("project registry changed before admission")
+        yield view.get("project")
 
 
 def _bounded_presentation_name(value: Any, *, fallback: str = "") -> str:
@@ -775,10 +823,10 @@ def _bounded_presentation_name(value: Any, *, fallback: str = "") -> str:
 
 
 def task_presentation_snapshot(drive_root: Any, task_id: str, *, task: Any = None,
-                               result: Any = None, project_id: str = "") -> Dict[str, Any]:
+                               result: Any = None, project_id: str = "", strict: bool = False) -> Dict[str, Any]:
     tid = str(task_id or "").strip()
     sources = [row for row in (task, result) if isinstance(row, dict)]
-    if tid:
+    if tid and not strict:
         try:
             from ouroboros.task_status import load_effective_task_result
             stored = load_effective_task_result(
@@ -800,7 +848,7 @@ def task_presentation_snapshot(drive_root: Any, task_id: str, *, task: Any = Non
             if pid:
                 break
     if not pid and tid:
-        binding = project_binding_for_task(drive_root, tid) or {}
+        binding = project_binding_for_task(drive_root, tid, strict=strict) or {}
         pid = str(binding.get("project_id") or "").strip()
     pname = ""
     registered = False
@@ -809,7 +857,7 @@ def task_presentation_snapshot(drive_root: Any, task_id: str, *, task: Any = Non
         # ``project_routable`` fact: a workspace-derived proj_<hash> is
         # project-SCOPED without having a room, and a producer that announces it
         # would point the owner at a project that does not exist.
-        project = get_reserved_project(drive_root, pid) or {}
+        project = get_reserved_project(drive_root, pid, strict=strict) or {}
         # ROUTABLE, not merely reserved: list_reserved_projects deliberately
         # includes deleting/tombstoned history reservations, and those have no
         # room left to open.
@@ -839,6 +887,31 @@ def task_presentation_snapshot(drive_root: Any, task_id: str, *, task: Any = Non
     return {"project_id": pid, "project_name": pname, "task_id": tid,
             "project_routable": registered, "task_name": task_name,
             "target_label": label}
+
+
+# A Project root's final answer rides Main's completion row so Main can show it as
+# an ordinary Ouroboros message (DESIGN "Project completion mirror"). Above this
+# size the row stays a pointer: nothing is ever cut host-side (BIBLE P1).
+MIRRORED_ANSWER_MAX_CHARS = 32000
+_TERMINAL_MIRROR_PHASES = frozenset({"done", "warn", "error", "cancelled"})
+
+
+def mirrored_answer(result: Any, phase: str) -> Dict[str, str]:
+    """The typed key Main's completion row carries, or nothing.
+
+    Present only for a MODEL-AUTHORED final answer of a settled task: host
+    salvage and host notices are not Ouroboros's words, and a row sent while the
+    task still reads ``working`` is frozen by the outbox and must stay a pointer.
+    """
+    from ouroboros.task_finalization import TERMINAL_ORIGIN_MODEL_FINAL
+
+    row = result if isinstance(result, dict) else {}
+    answer = row["result"].strip() if isinstance(row.get("result"), str) else ""
+    if (str(row.get("terminal_origin") or "") != TERMINAL_ORIGIN_MODEL_FINAL
+            or str(phase or "") not in _TERMINAL_MIRROR_PHASES
+            or not answer or len(answer) > MIRRORED_ANSWER_MAX_CHARS):
+        return {}
+    return {"completion_answer": answer}
 
 
 def create_project(
@@ -893,12 +966,16 @@ def create_project(
         return {**entry, "created": True}
 
 
-def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional[Dict[str, Any]]:
+def update_project(
+    drive_root: Any, project_id: str, *, only_if_empty: tuple = (), **updates: Any,
+) -> Optional[Dict[str, Any]]:
     """Update mutable fields. v6.59.0 adds the additive source-provenance facts:
     ``provenance`` (attached|cloned|genesis|none — how the working_dir came to be),
     ``clone_url`` (historical fact; live git data is always read from .git), and
     ``trusted_at`` (stamped automatically on attach/clone — the notification trust
-    model: attaching IS the owner's explicit grant, no second confirmation gate)."""
+    model: attaching IS the owner's explicit grant, no second confirmation gate).
+    A field named in ``only_if_empty`` is written only while still empty — a
+    compare-and-set under the registry lock; the caller reads the winner back."""
     pid = sanitize_project_id(project_id)
     if not pid:
         return None
@@ -918,10 +995,12 @@ def update_project(drive_root: Any, project_id: str, **updates: Any) -> Optional
             if entry.get("id") != pid or entry.get("lifecycle") != PROJECT_ACTIVE:
                 continue
             for key, value in updates.items():
-                if key not in allowed:
+                if key not in allowed or (key in only_if_empty and str(entry.get(key) or "").strip()):
                     continue
                 if key == "name":
                     value = _validated_name(value, str(entry.get("id") or ""))
+                if key == "working_dir" and value != entry.get(key):
+                    entry["routing_generation"] = int(entry.get("routing_generation") or 0) + 1
                 entry[key] = value
             _save(drive_root, data)
             return dict(entry)

@@ -64,6 +64,14 @@ def _addressable_root_tasks(ctx: Any, chat_id: Optional[int] = None) -> list:
             return
         if chat_id is not None and not _task_belongs_to_chat(ctx, tid, task_obj, int(chat_id or 0)):
             return
+        # RUNNING can mean only paid post-work remains. A terminal result
+        # cannot drain a new owner/peer message; don't suggest it as steerable.
+        from ouroboros.task_results import load_task_result
+        from ouroboros.task_status import SETTLED_STATUSES
+        from supervisor.queue import _task_drive_for_task
+
+        if (load_task_result(_task_drive_for_task(task_obj, tid), tid) or {}).get("status") in SETTLED_STATUSES:
+            return
         objective = str(
             task_obj.get("objective") or task_obj.get("description") or task_obj.get("text") or ""
         ).strip()
@@ -157,11 +165,131 @@ def _task_result_ground_truth(row: Dict[str, Any]) -> Dict[str, Any]:
             "branch": str(git.get("branch") or ""),
             "dirty": bool(git.get("dirty")),
         }
+    origin = row.get("cancel_origin") if isinstance(row.get("cancel_origin"), dict) else {}
+    if origin:
+        # WHY this result stopped, in the three scalars a continuation decision
+        # needs; the full origin (actor, request id, observation) stays in the row.
+        out["cancel_origin"] = {
+            key: str(origin.get(key) or "")
+            for key in ("reason", "source", "requested_at") if origin.get(key)
+        }
     return out
 
 
+def _is_child_result(facts: Dict[str, Any]) -> bool:
+    """A result that is NOT an owner root: it has a parent, or the subagent role.
+
+    ONE predicate for every reader of that fact - the manifest window that skips
+    children (owner decision batch 3, answer 6b=A), the pointer stamp that only a
+    root moves, and the promote receipt, which continues a named child with its
+    root disclosed. Reads a memoized fact row or a full result row.
+    """
+    return bool(str(facts.get("parent_task_id") or "").strip()) or str(
+        facts.get("delegation_role") or "") == "subagent"
+
+
+def _recent_root_results(ctx: Any, project_id: str = "") -> tuple:
+    """``(rows, omissions)``: the newest ROOT results a routing turn may continue,
+    optionally narrowed to ONE project.
+
+    The one producer behind both routing manifests - Main offers every lane's
+    roots, a project room offers its own. Only the owner's ROOT results are
+    offered (owner decision batch 3, answer 6b=A): a swarm wave's children are the
+    newest results of ANY kind, so they evicted the owner's own roots from this
+    window - which is how a root the same actor had just read stopped being
+    offerable. The facts are already memoized, so both the filter and the count
+    cost no extra read. The count runs over the WHOLE candidate list, not inside
+    the capped loop: children older than the last shown root are skipped just the
+    same, and counting them only until the cap reported zero while folding them
+    into the cap's own number.
+    """
+    from ouroboros.gateway.task_list_scan import raw_result_facts
+    from ouroboros.runtime_limits import get_routing_manifest_result_rows
+    from ouroboros.task_results import load_task_result, task_results_dir
+
+    results_error = ""
+    try:
+        facts, unreadable = raw_result_facts(task_results_dir(ctx.DRIVE_ROOT, create=False))
+    except OSError as exc:
+        facts, unreadable = {}, ["result_directory_unreadable"]
+        results_error = f"result_directory_unreadable: {exc}"
+    ordered = sorted(
+        facts, key=lambda name: facts[name]["ts"] or facts[name]["updated_at"], reverse=True,
+    )
+    pool = [name for name in ordered if not project_id or facts[name]["project_id"] == project_id]
+    children = sum(
+        1 for name in pool if not facts[name]["schema_refusal"] and _is_child_result(facts[name])
+    )
+    cap = get_routing_manifest_result_rows()
+    finals: list = []
+    for name in pool:
+        if facts[name]["schema_refusal"] or _is_child_result(facts[name]):
+            continue
+        row = load_task_result(ctx.DRIVE_ROOT, pathlib.Path(name).stem)
+        if row is not None:
+            finals.append(_task_result_ground_truth(row))
+        if len(finals) == cap:
+            break
+    return finals, {
+        # Kept meaning: results cut by the row cap. The children skipped above are
+        # a DIFFERENT omission and are counted as such, never folded in here.
+        "final_results": None if unreadable else max(0, len(pool) - children - len(finals)),
+        "final_results_error": results_error,
+        "children": None if unreadable else children,
+    }
+
+
+def _cancel_state_facts(ctx: Any, task_id: str) -> Dict[str, Any]:
+    """The durable cancel intent standing over one LIVE root, or ``{}``: the typed
+    public projection (``cancel_state``/``cancel_reason``/``stop_policy``), never a
+    body. A settled result carries its own ``cancel_origin`` instead."""
+    if not task_id:
+        return {}
+    try:
+        from ouroboros.cancel_intents import cancel_state_fields
+
+        return cancel_state_fields(ctx.DRIVE_ROOT, task_id)
+    except Exception:
+        log.debug("cancel state unreadable for %s", task_id, exc_info=True)
+        return {}
+
+
+def _project_routing_manifest(ctx: Any, project_id: str) -> Dict[str, Any]:
+    """The room's bounded HINT for a "continue this work" decision: the project's
+    recent ROOT results and the roots still live in it, each with the small typed
+    facts that separate the two choices - a settled root is promote's predecessor,
+    a live one is ``steer_task``.
+
+    A hint, never the door: promote's predicate admits any settled result, listed
+    or not, of any project (ch. 10), so this window may be bounded without
+    deciding what the room can continue. Until it existed a room saw exactly ONE
+    candidate, the registry pointer, so a room whose pointer had moved could not
+    name its own interrupted root at all.
+    """
+    finals, omissions = _recent_root_results(ctx, project_id)
+    active = [
+        {**row, **_cancel_state_facts(ctx, str(row.get("task_id") or ""))}
+        for row in _addressable_root_tasks(ctx, None)
+        if str(row.get("project_id") or "") == project_id
+    ]
+    return {
+        "final_results": finals,
+        "active_roots": active[:40],
+        "omissions": {**omissions, "active_roots": max(0, len(active) - 40)},
+    }
+
+
+def _not_a_root_result(row: Dict[str, Any]) -> bool:
+    """A row that is never "the project's last result": a child's result, or a
+    promote's emitted stub (an admission still pending, no result at all)."""
+    from ouroboros.routing_wait import is_emitted_admission_stub
+
+    return _is_child_result(row) or is_emitted_admission_stub(row)
+
+
 def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str, Any]]:
-    """Newest task result bound to ``project_id`` WITHOUT replaying the whole
+    """Newest ROOT task result bound to ``project_id`` (a child's is never the room's
+    last-result pointer: the hint offers roots only, ``_is_child_result``) WITHOUT replaying the whole
     store (DEVELOPMENT "Projection over replay"). The registry row's durable
     ``last_task_result_id`` pointer (stamped at project-task finalization) is
     read FIRST — one direct file fetch, immune to how many newer foreign
@@ -198,7 +326,9 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
     if pointer:
         pointed = load_task_result(ctx.DRIVE_ROOT, pointer)
         if isinstance(pointed, dict) and str(pointed.get("project_id") or "") == project_id:
-            return pointed
+            if not _not_a_root_result(pointed):
+                return pointed
+            pointer = ""  # a child-stamped pointer is provably wrong, not in flight: heal it
         log.debug(
             "project last-task-result pointer for %r is stale (%s); "
             "falling back to the bounded scan", project_id, pointer,
@@ -235,7 +365,7 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
         if candidate is None:
             uncertain = True
             continue
-        if str(candidate.get("project_id") or "") != project_id:
+        if str(candidate.get("project_id") or "") != project_id or _not_a_root_result(candidate):
             continue
         row = candidate
         # The match's whole equal-mtime group is read to its end — across the
@@ -247,7 +377,8 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
             other = read_json_dict(tied)
             if other is None:
                 uncertain = True
-            elif str(other.get("project_id") or "") == project_id and _order(other) > _order(row):
+            elif (str(other.get("project_id") or "") == project_id and not _not_a_root_result(other)
+                  and _order(other) > _order(row)):
                 row = other
         break
     if row is not None and not pointer and not uncertain:
@@ -262,9 +393,7 @@ def _latest_project_task_result(ctx: Any, project_id: str) -> Optional[Dict[str,
 def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
     """Bounded canonical facts for one Main-chat LLM routing decision."""
     from ouroboros.gateway._helpers import read_rotated_jsonl_entries
-    from ouroboros.gateway.task_list_scan import raw_result_facts
     from ouroboros.projects_registry import list_projects
-    from ouroboros.task_results import load_task_result, task_results_dir
 
     projects = [{
         "project_id": str(row.get("id") or ""),
@@ -276,35 +405,7 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
         "working_dir": str(row.get("working_dir") or ""),
     } for row in list_projects(ctx.DRIVE_ROOT)]
     roots = _addressable_root_tasks(ctx, None)
-
-    results_error = ""
-    try:
-        facts, unreadable = raw_result_facts(task_results_dir(ctx.DRIVE_ROOT, create=False))
-    except OSError as exc:
-        facts, unreadable = {}, ["result_directory_unreadable"]
-        results_error = f"result_directory_unreadable: {exc}"
-    ordered = sorted(facts, key=lambda name: facts[name]["ts"] or facts[name]["updated_at"], reverse=True)
-    # Only the owner's ROOT results are addressable predecessors (owner decision batch
-    # 3, answer 6b=A): a swarm wave's children are the newest results of ANY kind, so
-    # they evicted the owner's own roots from this window - which is how a root the
-    # same actor had just read stopped being offerable. The facts are already
-    # memoized, so both the filter and this count cost no extra read. The count runs
-    # over the WHOLE candidate list, not inside the capped loop: children older than
-    # the 16th root are skipped just the same, and counting them only until the cap
-    # reported zero while folding them into the cap's own number.
-    def _is_child(name: str) -> bool:
-        return bool(facts[name]["parent_task_id"]) or facts[name]["delegation_role"] == "subagent"
-
-    children = sum(1 for name in ordered if not facts[name]["schema_refusal"] and _is_child(name))
-    finals = []
-    for name in ordered:
-        if facts[name]["schema_refusal"] or _is_child(name):
-            continue
-        row = load_task_result(ctx.DRIVE_ROOT, pathlib.Path(name).stem)
-        if row is not None:
-            finals.append(_task_result_ground_truth(row))
-        if len(finals) == 16:
-            break
+    finals, result_omissions = _recent_root_results(ctx)
 
     dialogue_rows: list = []
     root = pathlib.Path(ctx.DRIVE_ROOT)
@@ -333,11 +434,7 @@ def _main_routing_manifest(ctx: Any) -> Dict[str, Any]:
         "omissions": {
             "projects": max(0, len(projects) - 40),
             "root_tasks": max(0, len(roots) - 40),
-            # Kept meaning: results cut by the 16 cap. The children skipped above are
-            # a DIFFERENT omission and are counted as such, never folded in here.
-            "final_results": None if unreadable else max(0, len(facts) - children - len(finals)),
-            "final_results_error": results_error,
-            "children": None if unreadable else children,
+            **result_omissions,
             # A bounded read cannot count bytes/rows it deliberately did not
             # visit. The exact historical messages remain available by id.
             "dialogue_rows": None,
@@ -393,6 +490,10 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
                 md["project_last_task_result"] = _task_result_ground_truth(row)
         except Exception:
             log.debug("project last-task-result projection failed", exc_info=True)
+        try:
+            md["project_routing_manifest"] = _project_routing_manifest(ctx, project_id)
+        except Exception:
+            log.warning("Unable to build the project routing manifest", exc_info=True)
     if client_message_id:
         md["client_message_id"] = client_message_id
     option_roots = (
@@ -442,6 +543,14 @@ def _decision_turn_metadata(ctx: Any, chat_id: int, client_message_id: str, task
         # review wave, because the deciding turn was never told a receipt already
         # existed. The choice stays with the model - no host ban on a second root.
         routing_contract["message_routing_receipt"] = receipt
+        acts = _message_routing_acts(ctx, client_message_id)
+        if len(acts) > 1:
+            # The latest row hides earlier acts on the same message (a promote, then
+            # a steer): each act keeps its own receipt, read, never inferred.
+            routing_contract["message_routing_acts"] = acts
+            routing_contract["message_routing_acts_note"] = (
+                "Recorded routing acts already taken for THIS owner message, oldest first. "
+                "Facts, not a ban: another act stays your choice.")
     md["routing_contract"] = routing_contract
     return md
 
@@ -452,8 +561,8 @@ def main_lane_routing_metadata(ctx: Any, chat_id: int) -> Dict[str, Any]:
     Exactly what an owner turn in the same chat is handed — the Main routing manifest
     and this chat's addressable roots — minus what is bound to an owner message (there
     is none). One seam over the owner path, so a wake can never drift from what the
-    host says is addressable: without the manifest every predecessor the wake names is
-    refused as "not addressable" and it cannot continue prior work at all.
+    host shows an owner turn: the manifest is the hint both decide from, while the
+    door judges the named result itself, listed or not.
     """
     facts = _decision_turn_metadata(ctx, int(chat_id or 0), "", {})
     return dict(facts) if isinstance(facts, dict) else {}
@@ -476,8 +585,10 @@ def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]
     except Exception:
         log.debug("message routing receipt lookup failed", exc_info=True)
         return {}
-    if not row:
-        return {}
+    return _receipt_fields(row) if row else {}
+
+
+def _receipt_fields(row: Dict[str, Any]) -> Dict[str, Any]:
     return {
         "action": str(row.get("action") or ""),
         "target": str(row.get("target") or ""),
@@ -486,6 +597,25 @@ def _message_routing_receipt(ctx: Any, client_message_id: str) -> Dict[str, Any]
         "ts": str(row.get("ts") or ""),
         "project_id": str(row.get("project_id") or ""),
     }
+
+
+def _message_routing_acts(ctx: Any, client_message_id: str) -> list:
+    """Every routing act recorded for THIS owner message (latest row per act), oldest first.
+
+    The routing rail already keeps one receipt per (message, routing token); this
+    only reads it. Acts keyed to a synthetic ``agent-steer:*`` id or to another
+    task's id carry no link to this message and stay unlisted (a producer gap).
+    """
+    try:
+        from ouroboros.project_dialogue import _ANNOTATIONS_NAME, _latest_annotations_by_token
+
+        rows = [row for (message_id, _token), row in _latest_annotations_by_token(
+            pathlib.Path(ctx.DRIVE_ROOT) / "logs" / _ANNOTATIONS_NAME).items()
+            if message_id == str(client_message_id)]
+    except Exception:
+        log.debug("message routing acts lookup failed", exc_info=True)
+        return []
+    return [_receipt_fields(row) for row in sorted(rows, key=lambda row: str(row.get("ts") or ""))]
 
 
 def _scoped_task_metadata(project_id: str, task_metadata: Any) -> Any:

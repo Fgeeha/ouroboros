@@ -134,7 +134,7 @@ def _reject_schedule_task(
                     detail=detail,
                 )
             elif fallback_message:
-                ctx.send_with_budget(chat_id, fallback_message)
+                ctx.send_with_budget(chat_id, fallback_message, role="system", system_type="task_admission_notice")
     except Exception:
         log.warning("Failed to notify schedule rejection for %s", tid, exc_info=True)
 
@@ -525,6 +525,8 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
             "parent_cognitive_route": parent_cognitive_route,
             "parent_id": parent_id,
             "origin_metadata": evt.get("origin_metadata"),
+            **({"presence_binding_authority": evt["presence_binding_authority"]}
+               if "presence_binding_authority" in evt else {}),
         })
         scheduled_failure_reason = ""
         scheduled_failure_detail = ""
@@ -653,5 +655,5 @@ def _handle_schedule_task(evt: Dict[str, Any], ctx: Any) -> None:
                 _notice_chat,
                 f"🗓️ Scheduled subagent {tid} ({role}): {desc}{suffix}" if delegation_role == "subagent" else f"🗓️ Scheduled task {tid}: {desc}",
                 is_progress=True, task_id=tid, progress_meta=progress_meta,
-            )
+                role="system", system_type="task_scheduled")
         ctx.persist_queue_snapshot(reason="schedule_subagent_event")

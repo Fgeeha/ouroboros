@@ -3,8 +3,8 @@
 Owns what happens to the actors' answers: flattening parseable per-item
 findings and naming the responsive model slots, the JSON-array read, the
 aggregate verdict delegated to the skill-review status SSOT, and the
-owner-facing review block Chat renders — including the self-verification
-template, the rebuttal affordance, and the retry coaching a pending review
+owner-facing review block Chat renders — including the shared round-two
+retry note, the rebuttal affordance, and the retry coaching a pending review
 earns. The items an actor is asked about come from the prompt owner, so the
 parser can never validate against a different list than the one demanded.
 """

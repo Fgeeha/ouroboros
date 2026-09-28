@@ -2,7 +2,8 @@
 
 Extracted whole from ``context.py`` at its module ceiling (v7 leaf) so the
 facts the runtime section renders keep one home: the project room a task sits in,
-the budget rails it runs under, and the
+the budget rails it runs under, how the run learns the time (its capture instant
+labels the Recent/Drive snapshots), and the
 configured delegation route with its honestly-labeled historical observations.
 Each returns a plain projection and reads no context state, so nothing here can
 change what the section MEANS — only what it reports. ``context`` re-exports every
@@ -19,6 +20,67 @@ from ouroboros.task_pacing import in_task_cost_ceiling_disclosure as _in_task_co
 from ouroboros.config import runtime_setting
 
 log = logging.getLogger(__name__)
+
+
+def task_execution_clock_fact(task: Dict[str, Any], ctx: Any) -> Dict[str, Any]:
+    """Current finite execution-ceiling estimate, not a calendar deadline.
+
+    Quota/budget pauses can move the estimate after this context is assembled;
+    an unknown start or unlimited ceiling yields null instead of a false date.
+    """
+    import datetime
+    import math
+    import time
+    from ouroboros.config import get_task_abs_ceiling_sec
+    from ouroboros.deadline_utils import parse_deadline_ts
+    from ouroboros.model_wait import current_model_wait, execution_elapsed_seconds
+
+    raw = getattr(ctx, "task_started_at", None) or task.get("started_at")
+    try:
+        start = float(raw)
+    except (TypeError, ValueError):
+        parsed = parse_deadline_ts(raw)
+        start = parsed.timestamp() if parsed is not None else 0.0
+    ceiling = get_task_abs_ceiling_sec()
+    started = datetime.datetime.fromtimestamp(start, datetime.timezone.utc).isoformat() if start > 0 and math.isfinite(start) else None
+    projected = None
+    if started and ceiling is not None:
+        now = time.time()
+        owner = current_model_wait()
+        elapsed = (owner.executed_seconds() if owner is not None and owner.task_id == str(task.get("id") or "")
+                   else execution_elapsed_seconds({**task, "started_at": start}, now))
+        projected = datetime.datetime.fromtimestamp(now + max(0.0, ceiling - elapsed),
+                                                    datetime.timezone.utc).isoformat()
+    return {"started_at": started, "absolute_ceiling_at": projected,
+            "absolute_ceiling_at_basis": "current estimate; quota or budget pauses may move it" if projected else "not_set"}
+
+
+def _context_clock_note(task: Dict[str, Any]) -> str:
+    """How this run learns the time: Main gets a clock line per request (``send_clock``)."""
+    from ouroboros.send_clock import main_clock_policy
+
+    meta = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
+    if task.get("delegation_role") and "delegation_role" not in meta:
+        meta = {**meta, "delegation_role": task.get("delegation_role")}
+    if main_clock_policy(meta, task_type=str(task.get("type") or "")) is None:
+        return ("context_captured_at is when this context was built; it does not advance "
+                "during this run.")
+    return ("context_captured_at is when this context was built, not the current time. "
+            "Each of your model requests ends with a host clock line sampled for that request.")
+
+
+def snapshot_labelled(section: str, captured_at: str) -> str:
+    """Label a captured Recent/Drive section with its capture time, below its heading.
+
+    These sections are rendered once per run and stay byte-stable in the cached
+    prefix; the label says so instead of refreshing them every round.
+    """
+    heading, sep, body = str(section or "").partition("\n")
+    if not heading.startswith(("## Recent ", "## Drive state")) or not captured_at:
+        return section
+    label = (f"_Snapshot captured at {captured_at} when this context was built; "
+             "not refreshed during this run._")
+    return heading + "\n" + label + ((sep + body) if body else "")
 
 
 def _queue_context_fact(task: Dict[str, Any]) -> Dict[str, Any]:
@@ -161,6 +223,7 @@ def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
     """
     try:
         from ouroboros.reviewer_slot_config import reviewer_slot_last_executions
+        from ouroboros.subagent_history import recorded_handle
         from ouroboros.subagents import subagent_last_delegation
 
         def _observed_label(ts: Any) -> str:
@@ -215,15 +278,20 @@ def _delegation_capability_fact() -> Optional[Dict[str, Any]]:
                 last_fact["requested_profile"] = str(last["requested_profile"])
             if last.get("applied_profile"):
                 last_fact["applied_profile"] = str(last["applied_profile"])
+            # Model-facing actor names are handles computed from each record's
+            # OWN facts; the stored key stays in the durable receipt file.
             if last.get("selected_subagent_id"):
-                last_fact["selected_subagent_id"] = str(last["selected_subagent_id"])
+                last_fact["selected_subagent_id"] = recorded_handle(last)
             for key in ("outcome", "failure_code", "reset_at", "occurred_at", "observed_at"):
                 if key in last:
                     last_fact[key] = last[key]
             delegation["subagent_last_delegation"] = last_fact
             rows = last.get("latest_by_subagent")
             if isinstance(rows, dict) and rows:
-                delegation["subagents_last_executions"] = list(rows.values())
+                delegation["subagents_last_executions"] = [
+                    {**row, "selected_subagent_id": recorded_handle(row)}
+                    for row in rows.values() if isinstance(row, dict)
+                ]
         if len(delegation) == 1:
             return None
         return delegation

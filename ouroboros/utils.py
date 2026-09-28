@@ -352,7 +352,8 @@ def atomic_write_json(path: pathlib.Path, payload: Any, *, trailing_newline: boo
     write_text_atomic(pathlib.Path(path), content, fsync=fsync)
 
 
-def sweep_stale_temp_files(root: pathlib.Path, *, min_age_sec: float = 3600.0) -> int:
+def sweep_stale_temp_files(root: pathlib.Path, *, min_age_sec: float = 3600.0,
+                           atomic_temps: bool = True, scripts: bool = True) -> int:
     """Remove orphaned atomic-write temp files left behind by a hard kill.
 
     ``atomic_write_json`` writes to a unique ``.{name}.tmp.<pid>.<tid>.<uuid>``
@@ -370,7 +371,9 @@ def sweep_stale_temp_files(root: pathlib.Path, *, min_age_sec: float = 3600.0) -
     ``tools/shell.py`` unlinks its ``script_<uuid>.<ext>`` files in a
     ``finally``, so one that survived is a hard-kill orphan. Only the
     TOP-LEVEL fallback dir is swept here — task-drive copies die with their
-    drive's own GC prune — and only at startup, when no script can be live.
+    drive's own GC prune — and only at startup, when no script can be live
+    (``scripts``); the whole-tree walk for atomic temps (``atomic_temps``) is the
+    expensive half and runs off the loop thread, in the first reconcile pass.
     """
     root = pathlib.Path(root)
     if not root.is_dir():
@@ -379,8 +382,9 @@ def sweep_stale_temp_files(root: pathlib.Path, *, min_age_sec: float = 3600.0) -
     removed = 0
     now = time.time()
     try:
-        candidates = list(root.rglob(".*.tmp.*"))
-        candidates.extend(root.glob("tmp_scripts/script_*"))
+        candidates = list(root.rglob(".*.tmp.*")) if atomic_temps else []
+        if scripts:
+            candidates.extend(root.glob("tmp_scripts/script_*"))
     except OSError:
         return 0
     fallback_scripts = root / "tmp_scripts"
@@ -580,16 +584,25 @@ def append_jsonl(
             # separator. Preserve those bytes while keeping this append a new
             # record. Ordinary high-volume logs retain their existing fast path.
             try:
-                if path.stat().st_size > 0:
+                size = path.stat().st_size
+            except FileNotFoundError:
+                size = 0  # First append; there is no previous record to separate.
+            except OSError:
+                log.warning("append_jsonl: record boundary unavailable for %s", path, exc_info=True)
+                return False
+            if size:
+                try:
                     with path.open("rb") as existing:
                         existing.seek(-1, os.SEEK_END)
-                        if existing.read(1) != b"\n":
-                            append_data = b"\n" + data
-            except FileNotFoundError:
-                pass
-            except OSError:
-                # Preserve historical behavior for unusual write-only files.
-                append_data = data
+                        last_byte = existing.read(1)
+                except OSError:
+                    log.warning("append_jsonl: record boundary unreadable for %s", path, exc_info=True)
+                    return False
+                if len(last_byte) != 1:
+                    log.warning("append_jsonl: record boundary changed while reading %s", path)
+                    return False
+                if last_byte != b"\n":
+                    append_data = b"\n" + data
 
         for attempt in range(write_retries):
             try:

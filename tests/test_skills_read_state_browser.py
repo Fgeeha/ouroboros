@@ -365,6 +365,58 @@ def test_skills_late_enrichment_preserves_presence_and_portalled_menu(skills_bro
 
 
 @pytest.mark.parametrize("browser_name", ["chromium", "webkit"])
+@pytest.mark.parametrize("menu_open", [False, True], ids=["menu-closed", "menu-open"])
+def test_skills_list_never_waits_for_the_hub_and_late_hub_facts_patch_in_place(skills_browser, browser_name, menu_open):
+    """The list paints from the local read alone; hub facts unknown at that moment
+    (null) arrive with ONE re-read after the catalog lands — same card, same menu."""
+    browser = getattr(skills_browser, browser_name).launch(headless=True)
+    try:
+        page = browser.new_page(viewport={"width": 1280, "height": 900})
+        state, installed = _open_skills(page)
+        hub = {**installed, "source": "ouroboroshub", "payload_root": "skills/ouroboroshub/weather",
+               "review_gate": {"executable_review": False}, "review_stale": False, "review_profile": "",
+               "grants": {}, "permissions": [], "content_hash": "c" * 64, "published": None}
+        state["extensions"] = [{**hub, "official_hub_verified": None, "owner_attestable": None}]
+        state["hold_paths"] = {"/api/marketplace/ouroboroshub/catalog"}
+        page.goto("http://skills.test/", wait_until="domcontentloaded")
+        card = page.locator('.skills-card[data-skill="weather"]')
+        card.wait_for()
+        assert state["requests"].count(("GET", "/api/extensions")) == 1
+        assert card.locator('.skills-attest-review').count() == 0
+        assert "Published" not in card.inner_text()
+        page.evaluate("window.keptCard = document.querySelector('.skills-card[data-skill=weather]')")
+        menu = '.skills-card[data-skill="weather"] .skills-card-menu-dialog'
+        if menu_open:
+            card.locator('[data-skill-menu-trigger]').click()
+            menu = 'body > .skills-card-menu-dialog'
+            page.evaluate("window.keptMenu = document.querySelector('body > .skills-card-menu-dialog')")
+        state["extensions"] = [{**hub, "official_hub_verified": True, "owner_attestable": True}]
+        catalog = {"slug": "weather", "sanitized_name": "weather", "display_name": "Weather",
+                   "latest_version": "1.0", "summary": "Local forecast", "official": True}
+        _release_read(state, "/api/marketplace/ouroboroshub/catalog", {"results": [catalog]})
+        page.wait_for_selector(f'{menu} .skills-attest-review', state="attached")
+        page.wait_for_function("document.querySelector('.skills-card[data-skill=weather]').textContent.includes('Published')")
+        assert state["requests"].count(("GET", "/api/extensions")) == 2
+        assert page.evaluate("keptCard === document.querySelector('.skills-card[data-skill=weather]')")
+        order = page.evaluate(f"[...document.querySelector('{menu}').children].map(el => el.className)")
+        assert sum("skills-attest-review" in name for name in order) == 1
+        assert next(i for i, name in enumerate(order) if "skills-attest-review" in name) \
+            < next(i for i, name in enumerate(order) if "skills-update" in name)
+        if menu_open:
+            assert page.evaluate("keptMenu === document.querySelector('body > .skills-card-menu-dialog')")
+            page.keyboard.press("Escape")
+        page.wait_for_function("() => !document.querySelector('#skills-refresh').disabled")
+        _capture(page, browser_name, 1280, f"late-hub-facts-{'open' if menu_open else 'closed'}")
+        # A settled view has nothing pending: Refresh reads the listing once.
+        state["hold_paths"].clear()
+        before = state["requests"].count(("GET", "/api/extensions"))
+        _refresh(page)
+        assert state["requests"].count(("GET", "/api/extensions")) == before + 1
+    finally:
+        _close_pending_browser(browser, state)
+
+
+@pytest.mark.parametrize("browser_name", ["chromium", "webkit"])
 def test_skills_late_enrichment_keeps_local_toggle_and_publish_pending(skills_browser, browser_name):
     browser = getattr(skills_browser, browser_name).launch(headless=True)
     try:

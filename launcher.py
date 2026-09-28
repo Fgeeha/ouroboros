@@ -32,6 +32,7 @@ os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
 from ouroboros.config import (
     AGENT_SERVER_PORT,
     DATA_DIR,
+    LAUNCHER_STOP_GRACE_SEC,
     PANIC_EXIT_CODE,
     PORT_FILE,
     REPO_DIR,
@@ -95,15 +96,13 @@ from ouroboros.platform_layer import (
     subprocess_new_group_kwargs,
     terminate_job,
     terminate_process_group_id,
-    terminate_process_tree,
+    request_native_attention,
 )
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
 MAX_CRASH_RESTARTS = 5
 CRASH_WINDOW_SEC = 120
-# One bounded, visible retry when a restart's dependency install fails (XG-7B.3):
-# long enough to ride out a transient index/network hiccup, short enough not to
-# stall an offline restart whose requirements are already satisfied.
+# One bounded visible retry when dependency installation fails.
 _DEPS_RETRY_DELAY_SEC = 5
 _CREATE_SUSPENDED = getattr(subprocess, "CREATE_SUSPENDED", 0x4) if IS_WINDOWS else 0
 _CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0) if IS_WINDOWS else 0
@@ -396,8 +395,8 @@ def start_agent(port: int = AGENT_SERVER_PORT) -> subprocess.Popen:
     env["OUROBOROS_REPO_DIR"] = str(REPO_DIR)
     env["OUROBOROS_APP_VERSION"] = str(APP_VERSION)
     env["OUROBOROS_MANAGED_BY_LAUNCHER"] = "1"
-    # Owner Surface Fact: the launcher is the only actor that knows HOW this
-    # server will be presented. `_headless` is decided in main() before the
+    env["OUROBOROS_MANAGED_REPO_DIR"] = str(REPO_DIR.resolve())
+    # Owner Surface Fact: the launcher alone knows presentation; `_headless` is decided in main() before the
     # lifecycle loop ever calls start_agent(), and every managed restart funnels
     # back through here, so the export is re-stamped fresh each time. Absence of
     # the var (source mode, Docker, Colab, CLI server) truthfully means "web".
@@ -534,11 +533,9 @@ def stop_agent() -> None:
 
     log.info("Stopping agent (pid=%s)...", proc.pid)
     try:
-        if IS_WINDOWS:
-            proc.terminate()
-        else:
-            terminate_process_tree(proc)
-        proc.wait(timeout=10)
+        # Graceful phase signals only the server: it owns its Manager and workers (#1142).
+        proc.terminate()
+        proc.wait(timeout=LAUNCHER_STOP_GRACE_SEC)
     except subprocess.TimeoutExpired:
         if IS_WINDOWS and job is not None:
             terminate_job(job)
@@ -1514,6 +1511,8 @@ def main(argv=()):
 
         def open_external_url(self, url: str) -> dict:
             return _open_external_url(url)
+        def request_attention(self, sound: bool = True) -> dict:
+            return request_native_attention(_webview_window.show if _webview_window else None, sound=bool(sound))
 
         def save_bytes_to_downloads(self, filename: str, b64: str) -> dict:
             try:

@@ -92,7 +92,13 @@ def test_appearance_is_a_named_destination_that_never_reaches_the_server():
     # An id starting with s- would be swept into the /api/settings payload.
     assert not re.search(r'\bid="s-[\w-]*"', panel.replace('id="s-appearance-theme-label"', '')), \
         "a settings-collected input would POST the client-local appearance choice"
-    assert "<input" not in panel and "<select" not in panel
+    # Appearance now owns a second client-local block (notifications), so the
+    # guard is stated as its own intent instead of "no control at all": every
+    # control here must lack the ONE handle the collector reads.
+    for control in re.finditer(r"<(?:input|select)\b[^>]*>", panel):
+        assert not re.search(r'\bid="s-', control.group(0)), (
+            f"{control.group(0)} would be swept into the /api/settings payload"
+        )
     collector = _read("web/modules/settings.js")
     assert 'input[id^="s-"]' in collector, "the collector moved; re-check this guard"
 

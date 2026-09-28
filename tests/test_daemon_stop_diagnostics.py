@@ -202,7 +202,7 @@ def test_panic_reports_missing_marker_and_preserves_live_process(tmp_path, monke
     try:
         before = custody.ledger_path(tmp_path).read_bytes()
         with caplog.at_level(logging.CRITICAL):
-            assert _run_panic(monkeypatch, tmp_path, daemon_stop=manager.stop)
+            assert _run_panic(monkeypatch, tmp_path, daemon_stop=manager.stop) == []
         assert proc.poll() is None
         assert custody.ledger_path(tmp_path).read_bytes() == before
         assert "stop unconfirmed" in caplog.text
@@ -308,7 +308,7 @@ def test_panic_records_stop_exception_and_continues(tmp_path, monkeypatch):
     from tests.test_server_control_panic_daemon import _run_panic
     def fail():
         raise RuntimeError("fixture stop failed")
-    assert _run_panic(monkeypatch, tmp_path, daemon_stop=fail)
+    assert _run_panic(monkeypatch, tmp_path, daemon_stop=fail) == []
     assert _rows(tmp_path)[-1] == {
         "ts": _rows(tmp_path)[-1]["ts"], "type": "process_stop_unconfirmed",
         "purpose": daemon.CUSTODY_PURPOSE, "reason": "stop raised RuntimeError",
@@ -425,7 +425,7 @@ def test_panic_stops_unreachable_owned_legacy_daemon(stop_endpoint, tmp_path, mo
     proc, manager = stop_endpoint
     assert manager._proc is None
     assert custody.live_daemon_root_pids(tmp_path, retained_purposes={daemon.CUSTODY_PURPOSE}) == {proc.pid}
-    assert _run_panic(monkeypatch, tmp_path, daemon_stop=manager.stop)
+    assert _run_panic(monkeypatch, tmp_path, daemon_stop=manager.stop) == []
     proc.wait(timeout=5)
     assert custody._read_ledger(tmp_path) == []
     assert [row["type"] for row in _rows(tmp_path)] == ["process_stopped"]

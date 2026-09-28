@@ -278,6 +278,13 @@ export function renderChatMarkdown(text) {
     }
 }
 
+/** Mount blocks with their CSS contract. Enhancement stays with the owning
+ * bubble/card so replacing content does not create another resource owner. */
+export function mountChatMarkdown(host, text) {
+    host.classList.add('ui-rich-content');
+    host.innerHTML = renderChatMarkdown(text);
+}
+
 function highlightCodeIn(root) {
     root.querySelectorAll?.('.md-code-block pre > code').forEach((code) => {
         const source = code.textContent || '';

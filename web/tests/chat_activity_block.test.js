@@ -8,6 +8,7 @@
 // block leaves with its wait and its resolved episode cannot reopen it; the
 // header keeps the census verdict beside a block.
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import test, { after } from 'node:test';
 import { createChatInstance } from '../modules/chat.js';
 import {
@@ -23,7 +24,9 @@ const fold = (...observations) => {
     for (const observation of observations) noteToolCall(record, observation);
     return toolEvidenceView(record.toolFold);
 };
-const frame = (type, task, row) => summarizeChatLiveEvent({ type, task_id: task, ...row });
+// Modern host fixtures carry invocation identity; legacy independence is tested separately.
+const invocation = row => row.tool_call_id ? { invocation_id: `host-${row.tool_call_id}` } : {};
+const frame = (type, task, row) => summarizeChatLiveEvent({ type, task_id: task, _live_tool_frame: true, ...invocation(row), ...row });
 
 // The flat fixture's querySelector does not descend; the status badge and
 // card internals need a real descendant lookup.
@@ -58,11 +61,15 @@ Object.defineProperty(ElementStub.prototype, 'innerHTML', {
 const TS = '2026-09-15T12:00:00Z';
 const TASK = 'turn-a';
 
-function fixture(history = []) {
-    const env = installDom(async (url) => ({ ok: true, json: async () =>
-        String(url).startsWith('/api/chat/history')
+function fixture(history = [], detail = { active_direct_turns: [] }) {
+    let historyReads = 0;
+    const env = installDom(async (url) => {
+        const isHistory = String(url).startsWith('/api/chat/history');
+        if (isHistory) historyReads++;
+        return { ok: true, json: async () => isHistory
             ? { messages: history, window: { complete: true } }
-            : { active_direct_turns: [] } }));
+            : detail };
+    });
     const handlers = new Map();
     let generation = 0;
     const instance = createChatInstance({
@@ -70,13 +77,13 @@ function fixture(history = []) {
             isConnected: () => true, send() {} },
         state: { activePage: 'chat', projectChatIds: new Set(), unreadCount: 0 },
         updateUnreadBadge() {}, chatId: 1, idPrefix: 'chat', mountEl: env.mount,
-        stateSnapshots: { begin: () => ({ generation: ++generation, requestedAt: Date.now() }),
+        stateSnapshots: { begin: () => ({ generation: ++generation, requestedAt: Date.now() }), gate() { return Promise.resolve(this.begin()); },
             isCurrent: () => true, apply() {} },
     });
     const messages = document.byId.get('chat-messages');
     const nodes = (node) => [node, ...(node?.children || []).flatMap(nodes)];
     return {
-        instance, messages,
+        instance, messages, historyReads: () => historyReads,
         card: (id = TASK) => walkCard(messages, id),
         rows: (id = TASK) => nodes(walkCard(messages, id)).filter((n) => n.classList?.contains('chat-live-line')),
         meta: (id = TASK) => walkCard(messages, id)?.querySelector('[data-live-meta]')?.innerHTML || '',
@@ -84,7 +91,7 @@ function fixture(history = []) {
         typingHidden: () => messages.children
             .find((node) => String(node.className || '').includes('typing-bubble'))?.style.display === 'none',
         emit: (type, row) => handlers.get(type)({ chat_id: 1, ts: TS, ...row }),
-        log: (row) => handlers.get('log')({ chat_id: 1, data: { task_id: TASK, ts: TS, ...row } }),
+        log: (row) => handlers.get('log')({ chat_id: 1, data: { task_id: TASK, ts: TS, ...invocation(row), ...row } }),
         census: (rows) => instance.hydrateStateSnapshot({
             active_chat_activities: rows, active_chat_activities_complete: true, supervisor_ready: true,
         }, Infinity, ++generation),
@@ -404,7 +411,7 @@ const ownerRow = { role: 'user', content: 'Turn this into a project', text: 'Tur
     client_message_id: 'owner-1', ts: TS, chat_id: 1 };
 const receipt = { annotation_type: 'routing_ack', client_message_id: 'owner-1', action: 'promote_chat_to_task',
     status: 'scheduled', target: 'managed-root', target_title: 'Requested work' };
-const promote = (row = {}) => ({ tool: 'promote_chat_to_task', routing_action: 'promote_chat_to_task', tool_call_id: 'p1', ...row });
+const promote = (row = {}) => ({ tool: 'promote_chat_to_task', routing_action: 'promote_chat_to_task', tool_call_id: 'p1', invocation_id: 'p1', ...row });
 
 test('an addressing-only turn keeps no block live or on reload; the owner message carries the receipt', async () => {
     const f = fixture();
@@ -743,10 +750,9 @@ test('a host note inside a child leaves the child\'s collapsed line and title al
     } finally { f.close(); }
 });
 
-// The disclosed residual: a child folds its calls while they happen, and the
-// host's at-rest metrics stay the owner's (`noteToolMetrics` skips children),
-// so a reloaded child card carries no evidence row.
-test('a child card folds its own tool calls live and takes no at-rest evidence row', () => {
+// Child cards fold their own live calls and host counters. Canonical child
+// history is exercised separately below.
+test('a child folds its own live calls and host counters', () => {
     const f = fixture();
     try {
         f.census(managed());
@@ -762,7 +768,212 @@ test('a child card folds its own tool calls live and takes no at-rest evidence r
         assert.match(folded()[0].innerHTML, /2 tool calls/);
         f.log({ type: 'task_metrics_event', task_id: CHILD, tool_calls: 5, tool_errors: 0,
             tool_call_counts: { read_file: 5 } });
-        assert.equal(folded().length, 1, 'the at-rest fact belongs to the owning turn: a child takes no row from it');
-        assert.doesNotMatch(folded()[0].innerHTML, /5 tool calls/);
+        assert.equal(folded().length, 1, 'host counters update the same folded row');
+        assert.match(f.meta(CHILD), /5 tool calls/);
+    } finally { f.close(); }
+});
+
+test('#931 a typed checkpoint is a real expanded row without stealing narration', () => {
+    const f = fixture();
+    try {
+        f.census(managed());
+        f.emit('chat', { task_id: TASK, role: 'assistant', is_progress: true,
+            narration: true, content: 'Reading the source' });
+        const card = f.card();
+        const title = card.querySelector('[data-live-title]').textContent;
+        f.log({ type: 'task_checkpoint', checkpoint_kind: 'context_view', round: 3 });
+        if (card.dataset.expanded !== '1') {
+            card.querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        }
+        assert.ok(f.rows().some((row) => row.innerHTML.includes('Context inspected')));
+        assert.equal(card.querySelector('[data-live-title]').textContent, title);
+        f.log({ type: 'task_checkpoint', checkpoint_kind: 'context_view', round: 3 });
+        assert.equal(f.rows().filter((row) => row.innerHTML.includes('Context inspected')).length, 1);
+        const count = f.rows().length;
+        f.log({ type: 'worker_starting', worker_id: 0 });
+        assert.equal(f.rows().length, count);
+    } finally { f.close(); }
+});
+
+
+test('real Chat clears a provisional wait notice after durable successful settlement', async () => {
+    const f = fixture();
+    try {
+        const identity = { tool: 'read_file', tool_call_id: 'call_0', invocation_id: 'real-i' };
+        f.log({ type: 'tool_call_started', ...identity });
+        f.log({ type: 'tool_call_timeout', ...identity });
+        f.log({ ...final, type: 'task_done', status: 'completed', tool_calls: 1, tool_errors: 1, _is_direct_chat: true });
+        f.log({ type: 'tool_call', ...identity, status: 'ok', is_error: false });
+        const rows = f.rows().map(row => row.innerHTML).join(' ');
+        assert.doesNotMatch(rows, /operation may still settle|One of the steps failed/);
+        assert.match(rows, /1 tool call/);
+    } finally { f.close(); }
+});
+
+
+for (const order of ['wait-first', 'settlement-first']) for (const failed of [false, true]) {
+    test(`terminal child keeps independent tool facts: ${order}, error=${failed}`, () => {
+        const f = fixture();
+        try {
+            f.emit('chat', { role: 'assistant', is_progress: true, content: 'Child working', task_id: TASK,
+                subagent_event: 'scheduled', subagent_task_id: 'kid', parent_task_id: TASK,
+                root_task_id: TASK, delegation_role: 'subagent', subagent_role: 'researcher' });
+            const identity = { task_id: 'kid', tool: 'read_file', invocation_id: 'kid-call' };
+            f.log({ type: 'tool_call_started', ...identity });
+            f.emit('chat', { role: 'assistant', is_progress: true, content: 'Child finished', task_id: TASK,
+                subagent_event: 'completed', subagent_task_id: 'kid', parent_task_id: TASK,
+                root_task_id: TASK, delegation_role: 'subagent', subagent_role: 'researcher' });
+            const wait = { type: 'tool_call_timeout', ...identity };
+            const result = { type: 'tool_call', ...identity, status: failed ? 'error' : 'ok', is_error: failed };
+            for (const row of order === 'wait-first' ? [wait, result] : [result, wait]) f.log(row);
+            f.card('kid').querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+            const rows = f.rows('kid').map(row => row.innerHTML).join(' ');
+            assert.match(rows, /1 tool call/);
+            assert.match(rows, /wait ended/);
+            assert.doesNotMatch(rows, /operation may still settle/);
+            assert.equal(/1 error/.test(rows), failed);
+            assert.equal(f.card('kid').dataset.finished, '1');
+            assert.equal(Boolean(f.card('kid').querySelector('[data-cancel-run]')), false);
+        } finally { f.close(); }
+    });
+}
+
+test('a terminal child drops a late non-tool frame while its late tool fact still lands', () => {
+    const f = fixture();
+    const lineage = { task_id: TASK, subagent_task_id: 'kid', parent_task_id: TASK, root_task_id: TASK,
+        delegation_role: 'subagent', subagent_role: 'researcher' };
+    try {
+        f.emit('chat', { role: 'assistant', is_progress: true, content: 'Child working', subagent_event: 'scheduled', ...lineage });
+        f.emit('chat', { role: 'assistant', is_progress: true, content: 'Child finished', subagent_event: 'completed', ...lineage });
+        f.log({ type: 'llm_round_error', task_id: 'kid', error: 'late child noise' });
+        f.log({ type: 'tool_call_timeout', task_id: 'kid', tool: 'read_file', invocation_id: 'kid-late' });
+        f.card('kid').querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        const rows = f.rows('kid').map(row => row.innerHTML).join(' ');
+        assert.doesNotMatch(rows, /late child noise|Thinking step failed/);
+        assert.match(rows, /wait ended/);
+    } finally { f.close(); }
+});
+
+for (const child of [false, true]) test(`cold Chat merges canonical settlement with persisted metrics: child=${child}`, async () => {
+    const id = child ? CHILD : TASK;
+    const base = { key: `tool:${id}:real-i`, tool: 'read_file', receipt: false, live: false };
+    const lineage = child ? { delegation_role: 'subagent', parent_task_id: TASK, root_task_id: TASK,
+        subagent_task_id: CHILD, subagent_role: 'scout' } : {};
+    const f = fixture([{ ...final, ...lineage, task_id: id, role: 'system', system_type: 'task_summary', text: 'Done',
+        ts: TS, chat_id: 1, tool_calls: 1, tool_errors: 1, tool_call_counts: { read_file: 1 },
+        tool_evidence: { observations: [
+            { ...base, fact: 'started', status: 'unknown' },
+            { ...base, fact: 'wait_ended', status: 'unknown' },
+            { ...base, fact: 'settled', status: 'ok' },
+        ] } }]);
+    try {
+        await f.instance.refreshHistory({ revision: 1 });
+        if (child) f.card(id).querySelector('[data-live-summary-button]').listeners.get('click')[0]({ detail: 0 });
+        const rows = f.rows(id).map(row => row.innerHTML).join(' ');
+        assert.match(rows, /1 tool call.*wait ended/);
+        assert.doesNotMatch(rows, /1 error|operation may still settle/);
+        assert.doesNotMatch(f.meta(id), /1 error/);
+    } finally { f.close(); }
+});
+
+for (const legacy of [false, true]) test(`Chat history keeps a known error when ${legacy ? 'legacy start' : 'partial replay'} lacks settlement`, async () => {
+    const id = TASK;
+    const evidence = legacy
+        ? { observations: [], legacy: { calls: 1, errors: 0, unknown: true }, coverage: { complete: false } }
+        : { observations: [{ key: `tool:${id}:partial`, tool: 'read_file', fact: 'started', status: 'unknown' }],
+            legacy: { calls: 0, errors: 0 }, coverage: { complete: false } };
+    const f = fixture([{ ...final, task_id: id, role: 'system', system_type: 'task_summary',
+        content: '', text: '', ts: TS, chat_id: 1, _is_direct_chat: true,
+        tool_calls: legacy ? 1 : 2, tool_errors: 1, routing_tool_calls: legacy ? 1 : 2,
+        tool_evidence: evidence }]);
+    try {
+        await f.instance.refreshHistory({ revision: 1 });
+        assert.equal(f.historyReads(), 1);
+        for (const reconnect of [false, true]) {
+            if (reconnect) {
+                f.emit('open', { previouslyConnected: true });
+                await new Promise(setImmediate);
+                assert.ok(f.historyReads() >= 2, 'the actual reconnect handler fetched history');
+            }
+            assert.ok(f.card(), 'an addressing-only row with a known error stays visible');
+            assert.match(f.rows().map(row => row.innerHTML).join(' '), /1 error/);
+            assert.match(f.meta(), /1 error/);
+        }
+    } finally { f.close(); }
+});
+
+test('terminal projection retires live calling without inventing settlement', () => {
+    const record = {};
+    noteToolCall(record, { key: 'interrupted', tool: 'read_file', fact: 'started', live: true });
+    record.finished = true;
+    const view = noteToolHostMetrics(record, {});
+    assert.match(view.headline, /outcome unknown/);
+    assert.equal(view.phase, 'result');
+    assert.equal(record.toolFold.calls.get('interrupted').settlement, undefined);
+});
+
+test('replayed tool evidence on a latest accounting-wait checkpoint row still reaches the fold', async () => {
+    const base = { key: `tool:${TASK}:before-wait`, tool: 'read_file', receipt: false, live: false };
+    const f = fixture([
+        { task_id: TASK, role: 'assistant', is_progress: true, content: 'Reading the file', ts: TS, chat_id: 1 },
+        { task_id: TASK, role: 'system', is_progress: true, system_type: 'task_checkpoint', checkpoint_kind: 'usage_lock_wait',
+            phase: 'entered', episode_id: 'wait-1', content: 'Waiting for accounting access', ts: '2026-09-15T12:00:05Z', chat_id: 1,
+            tool_evidence: { observations: [{ ...base, fact: 'started', status: 'unknown' }, { ...base, fact: 'settled', status: 'ok' }] } },
+    ]);
+    try {
+        await f.instance.refreshHistory({ revision: 1 });
+        const rows = f.rows().map(row => row.innerHTML).join(' ');
+        assert.match(rows, /Waiting for accounting access/);
+        assert.match(rows, /1 tool call/);
+    } finally { f.close(); }
+});
+
+for (const kind of ['review', 'model-wait', 'model-wait-outcome', 'nested-review', 'lifecycle']) test(`reference carriers retain invocation evidence: ${kind}`, async () => {
+    const base = { key: `tool:${TASK}:before-review`, tool: 'read_file', receipt: false, live: false };
+    const produced = process.env.OURO_TEST_TOOL_HISTORY;
+    const history = produced ? JSON.parse(readFileSync(produced, 'utf8')).messages : [
+        { task_id: TASK, role: 'assistant', is_progress: true, content: 'Reading the file', ts: TS, chat_id: 1 },
+        { task_id: TASK, role: 'system', is_progress: true, system_type: 'review_reference',
+            surface: 'plan_review', presentation_owner_task_id: TASK, state_revision: 'plan-1',
+            ts: '2026-09-15T12:00:05Z', chat_id: 1, tool_evidence: { observations: [
+                { ...base, fact: 'started', status: 'unknown' }, { ...base, fact: 'wait_ended', status: 'unknown' },
+                { ...base, fact: 'settled', status: 'ok' },
+                { ...base, key: `tool:${TASK}:next`, fact: 'started', status: 'unknown' },
+            ] } },
+    ];
+    const carrier = history.at(-1);
+    const owner = kind === 'nested-review' ? 'review-owner' : TASK;
+    if (kind.startsWith('model-wait')) Object.assign(carrier, wait({ is_progress: true }));
+    if (kind === 'model-wait-outcome') carrier.outcome_axes = { execution: { status: 'ok' } };
+    if (kind === 'lifecycle') {
+        carrier.system_type = 'progress';
+        carrier.progress_meta = { lifecycle: { kind: 'review', status: 'running', target: 'skill', job_id: 'job' } };
+    }
+    if (kind === 'nested-review') {
+        carrier.system_type = 'progress';
+        carrier.progress_meta = { review_reference: { surface: 'plan_review',
+            presentation_owner_task_id: owner, state_revision: 'nested-plan' } };
+    }
+    const f = fixture(history, { task_id: owner, status: 'running', plan_review_state: {
+        current_attempt: { fingerprint: 'plan-1', status: 'closed' }, waves_omitted: 0,
+        waves: [{ request_fingerprint: 'plan-1', aggregate: 'GREEN', closed: true }],
+    } });
+    try {
+        await f.instance.refreshHistory({ revision: 1 });
+        await new Promise(setImmediate);
+        for (const reconnect of [false, true]) {
+            if (reconnect) { f.emit('open', { previouslyConnected: true }); await new Promise(setImmediate); }
+            const rows = f.rows().map(row => row.innerHTML).join(' ');
+            assert.match(rows, /2 tool calls.*wait ended.*outcome unknown/);
+            assert.doesNotMatch(rows, /1 error|operation may still settle/);
+            assert.equal(f.rows().filter(row => row.innerHTML.includes('2 tool calls')).length, 1);
+            if (kind.startsWith('model-wait')) assert.equal(f.card().dataset.modelWaiting, '1');
+            else if (kind !== 'lifecycle') assert.equal(f.card(owner).querySelector('[data-live-review-summary]')?.textContent, 'Reviews 1');
+            if (owner !== TASK) assert.doesNotMatch(f.rows(owner).map(row => row.innerHTML).join(' '), /tool calls/);
+        }
+        assert.ok(f.historyReads() >= 2, 'the real reconnect handler refetched history');
+        f.emit('chat', carrier);
+        f.log({ ...carrier, type: carrier.system_type });
+        assert.equal(f.rows().filter(row => row.innerHTML.includes('2 tool calls')).length, 1);
     } finally { f.close(); }
 });

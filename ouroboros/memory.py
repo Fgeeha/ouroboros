@@ -440,8 +440,25 @@ class Memory:
             return []
 
     @staticmethod
+    def era_host_note(block: Dict[str, Any]) -> str:
+        """Host-authored framing for an era block: what it is, and its known coverage."""
+        return (
+            "Host note: compression of older dialogue blocks; an interpretation, not a grant "
+            f"or a standing rule. Range: {block.get('range') or 'unknown'}; "
+            f"source messages: {block.get('message_count') or 'unknown'}."
+        )
+
+    @staticmethod
     def format_blocks_as_markdown(blocks: List[Dict[str, Any]]) -> str:
-        return "\n\n".join(b.get("content", "") for b in blocks)
+        """Render dialogue blocks for the task context (``context.py`` is the only caller).
+
+        An era block gets the host note on its own line first; other blocks are unchanged.
+        """
+        return "\n\n".join(
+            Memory.era_host_note(b) + "\n" + str(b.get("content", ""))
+            if b.get("type") == "era" else b.get("content", "")
+            for b in blocks
+        )
 
     def load_identity(self) -> str:
         path = self.identity_path()
@@ -878,6 +895,62 @@ class Memory:
     def read_jsonl_tail(self, log_name: str, max_entries: int = 100) -> List[Dict[str, Any]]:
         return self._read_jsonl_entries(log_name, max_entries=max_entries)
 
+    def read_task_recent(
+        self, log_name: str, task_id: str, want: int,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """The newest ``want`` rows of ONE task (or of the log when ``task_id`` is
+        empty) through the bounded rotation-aware reader (razzant/ouroboros#131);
+        for ``tools.jsonl`` the rows of the newest ``want`` logical calls (#1316).
+
+        The window is a doubling byte tail of the live file plus at most the
+        three newest archives, so a busy neighbour cannot push this task's own
+        rows out of a shared global suffix, and the whole file is never parsed
+        for its tail. ``coverage`` states what the window was and whether the
+        quota went unmet while older archives stayed unopened (BIBLE P1: the
+        section discloses it; ``read_file`` on the log pages the rest).
+        """
+        from ouroboros.jsonl_tail import read_rotated_jsonl_entries
+        from ouroboros.tool_call_log import counts_as_call, logical_calls
+
+        wanted = str(task_id or "").strip()
+        calls_log = log_name == "tools.jsonl"
+
+        def matches(entry: Dict[str, Any]) -> bool:
+            return not wanted or str(entry.get("task_id", "")).strip() == wanted
+
+        def counts(entry: Dict[str, Any]) -> bool:
+            # tools.jsonl quota is LOGICAL calls (#1316). The window is sized by starts and
+            # legacy rows (a lower bound: an orphan settlement only widens the read); the
+            # shown/matched counts below are exact logical calls over the rows read.
+            return matches(entry) and (not calls_log or counts_as_call(entry))
+
+        stem = log_name[:-len(".jsonl")] if log_name.endswith(".jsonl") else log_name
+        coverage: Dict[str, Any] = {"task_id": wanted, "source": f"logs/{log_name}"}
+        try:
+            rows = read_rotated_jsonl_entries(
+                self.logs_path(log_name), self.drive_root / "archive", stem,
+                max(1, int(want)), counts, coverage=coverage,
+            )
+        except Exception:
+            log.warning("Failed to read recent %s rows", log_name, exc_info=True)
+            return [], {**coverage, "shown": 0, "matched": 0, "quota_met": False, "gaps": ["read_failed"]}
+        matching = [row for row in rows if matches(row)]
+        if not calls_log:
+            shown = matching[-max(1, int(want)):]
+            coverage["shown"] = len(shown)
+        else:
+            # ONE unit for both counts: each call once (a start with its later rows, an
+            # orphan settlement or wait end, a legacy row), all rows of the newest `want`.
+            calls = logical_calls(matching)
+            kept = calls[-max(1, int(want)):]
+            ids = {call["invocation_id"] for call in kept if call.get("invocation_id")}
+            legacy = {id(call["settled"]) for call in kept if call["state"] == "legacy"}
+            shown = [row for row in matching if str(row.get("invocation_id") or "") in ids or id(row) in legacy]
+            coverage.update({"shown": len(kept), "matched": len(calls), "unit": "calls",
+                             "archives_bounded": bool(coverage.get("archives_bounded")) and len(calls) < int(want)})
+        coverage["quota_met"] = int(coverage.get("matched") or 0) >= int(want)
+        return shown, coverage
+
     def read_jsonl_tail_after_offset(
         self,
         log_name: str,
@@ -909,7 +982,10 @@ class Memory:
 
         return jsonl_generation_signature(self.logs_path(log_name))
 
-    def summarize_chat(self, entries: List[Dict[str, Any]], limit: int = 1000) -> str:
+    def summarize_chat(
+        self, entries: List[Dict[str, Any]], limit: int = 1000, *,
+        include_room_labels: bool = False, room_resolver: Any = None,
+    ) -> str:
         """Render recent chat entries; never hide a horizon cut silently (P1).
 
         Callers that want the FULL window (e.g. low-context mode passes a huge
@@ -923,11 +999,32 @@ class Memory:
         prefix = ""
         if len(entries) > len(shown):
             prefix = f"[{len(entries) - len(shown)} older unconsolidated messages omitted]\n"
-        return prefix + "\n".join(self._format_chat_line(e, compact=True) for e in shown)
+        if include_room_labels and room_resolver is None:
+            from ouroboros.dialogue_provenance import RoomLabelResolver
+
+            room_resolver = RoomLabelResolver(self.drive_root)
+        return prefix + "\n".join(
+            self._format_chat_line(
+                e, compact=True, include_room_label=include_room_labels,
+                room_resolver=room_resolver,
+            )
+            for e in shown
+        )
 
     @staticmethod
-    def _format_chat_line(e: Dict[str, Any], *, compact: bool) -> str:
+    def _format_chat_line(
+        e: Dict[str, Any], *, compact: bool, include_room_label: bool = False,
+        room_resolver: Any = None,
+    ) -> str:
         from ouroboros.dialogue_provenance import dialogue_text
+
+        room_prefix = ""
+        if include_room_label:
+            if room_resolver is None:
+                from ouroboros.dialogue_provenance import RoomLabelResolver
+
+                room_resolver = RoomLabelResolver()
+            room_prefix = f"[room={room_resolver.label(e)}] "
 
         dir_raw = str(e.get("direction", "")).lower()
         ts_full = str(e.get("ts", ""))
@@ -939,18 +1036,62 @@ class Memory:
             provenance = dialogue_provenance(e) if e.get("transport") else ""
             if provenance:
                 raw_text = f"[{provenance}] {raw_text}"
-            return f"→ {ts} {raw_text}" if compact else f"→ [{ts}] {raw_text}"
+            return f"→ {ts} {room_prefix}{raw_text}" if compact else f"→ [{ts}] {room_prefix}{raw_text}"
         if dir_raw == "system":
             entry_type = str(e.get("type", "")).strip() or "system"
             if isinstance(e.get("transport"), dict) and e["transport"].get("delivery"):
                 from ouroboros.dialogue_provenance import dialogue_provenance
 
                 raw_text = f"[{dialogue_provenance(e)}] {raw_text}"
-            return f"📋 {ts} [{entry_type}] {raw_text}" if compact else f"📋 [{ts}] [{entry_type}] {raw_text}"
+            return f"📋 {ts} {room_prefix}[{entry_type}] {raw_text}" if compact else f"📋 [{ts}] {room_prefix}[{entry_type}] {raw_text}"
         from ouroboros.dialogue_provenance import dialogue_author
 
         username = dialogue_author(e)
-        return f"← {ts} [{username}] {raw_text}" if compact else f"← [{ts}] [{username}] {raw_text}"
+        return f"← {ts} {room_prefix}[{username}] {raw_text}" if compact else f"← [{ts}] {room_prefix}[{username}] {raw_text}"
+
+    def recent_activity_sections(
+        self, task_id: str, *, own_drive: Optional["Memory"] = None,
+    ) -> List[str]:
+        """The `## Recent progress/tools/events` sections of ONE task (razzant/ouroboros#131).
+
+        Each is the task's own newest rows through the bounded reader
+        (progress 50 rendered; tools 20 selected, 10 rendered and 20 scanned for
+        review markers; events 200 counted by type), never a global tail
+        filtered afterwards. ``own_drive`` is a task's execution-drive Memory:
+        its ``tools.jsonl``/``events.jsonl`` hold exactly that task's worker
+        rows (the tools rows are mirrored to the canonical log; host-side event
+        rows such as waits and supervision live only on the canonical log, and
+        the header says so), while progress is always canonical. The header
+        discloses the window (BIBLE P1); a window that met gaps or left older
+        archives unopened without a row is disclosed even when nothing rendered.
+        """
+        from ouroboros.jsonl_tail import coverage_line
+
+        sections: List[str] = []
+        # (log, header, formatter, quota, note): the note names what the formatter really
+        # does with more rows than it renders (progress renders its newest 50; tools renders
+        # 10 and scans 20 for review markers; events counts every row it is given).
+        for log_name, header, formatter, want, note in (
+            ("progress.jsonl", "## Recent progress", lambda rows: self.summarize_progress(rows, limit=50), 50,
+             lambda n: f"newest 50 rendered of {n} loaded" if n > 50 else ""),
+            ("tools.jsonl", "## Recent tools", self.summarize_tools, 20,
+             lambda n: f"10 rendered, {min(n, 20)} scanned for review markers" if n > 10 else ""),
+            ("events.jsonl", "## Recent events", self.summarize_events, 200, lambda n: ""),
+        ):
+            source = own_drive if own_drive is not None and log_name != "progress.jsonl" else self
+            entries, coverage = source.read_task_recent(log_name, task_id, want if task_id else 200)
+            if own_drive is not None:  # a child's header says which drive each window came from
+                coverage["source"] = "canonical logs/progress.jsonl" if source is self else (
+                    f"task drive logs/{log_name}" + (
+                        " (worker rows; host-side rows such as waits stay in the canonical log)"
+                        if log_name == "events.jsonl" else ""))
+            shown = int(coverage.get("shown") or 0)  # tools: logical calls, never rows (#1316)
+            if note(shown):
+                coverage["rendered"] = note(shown)
+            summary = formatter(entries)
+            if summary or coverage.get("gaps") or coverage.get("archives_bounded"):
+                sections.append(f"{header} ({coverage_line(coverage)})" + (f"\n\n{summary}" if summary else ""))
+        return sections
 
     def summarize_progress(self, entries: List[Dict[str, Any]], limit: int = 15) -> str:
         if not entries:
@@ -961,12 +1102,18 @@ class Memory:
         )
 
     def summarize_tools(self, entries: List[Dict[str, Any]]) -> str:
+        """One line per LOGICAL call (#1316): a start with no later row is an
+        unknown outcome, a caller whose wait ended is not a failed handler."""
+        from ouroboros.tool_call_log import logical_calls
+
         if not entries:
             return ""
+        calls = logical_calls(entries)
         lines = []
-        for e in entries[-10:]:
-            tool = e.get("tool") or e.get("tool_name") or "?"
-            args = e.get("args", {})
+        for call in calls[-10:]:
+            e = call.get("settled") or call.get("wait_ended") or call.get("started") or {}
+            tool = call.get("tool") or e.get("tool_name") or "?"
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
             hints = []
             for key in ("path", "dir", "commit_message", "query"):
                 if key in args:
@@ -974,12 +1121,25 @@ class Memory:
             if "cmd" in args:
                 hints.append(f"cmd={short(str(args['cmd']), 80)}")
             hint_str = ", ".join(hints) if hints else ""
-            status = "✓" if ("result_preview" in e and not str(e.get("result_preview", "")).lstrip().startswith("⚠️")) else "·"
-            lines.append(f"{status} {tool} {hint_str}".strip())
+            settled = call.get("settled")
+            status, note = "?", ""
+            if settled is None:
+                note = (" (wait ended; no result recorded)" if "wait_ended" in call else
+                        " (started; no outcome recorded)")
+            elif isinstance(settled.get("is_error"), bool):
+                status = "·" if settled["is_error"] else "✓"
+            elif settled.get("status"):
+                if settled["status"] == "ok":
+                    status = "✓"
+                elif settled["status"] in {"error", "host_error", "blocked", "timeout", "unavailable"}:
+                    status = "·"
+            elif "result_preview" in settled:  # Only untyped legacy settlements infer from text.
+                status = "·" if str(settled["result_preview"]).lstrip().startswith("⚠️") else "✓"
+            lines.append(f"{status} {tool} {hint_str}".strip() + note)
 
         _REVIEW_MARKERS = ("REVIEW_BLOCKED", "TESTS_FAILED", "REVIEW_MAX_ITERATIONS", "COMMIT_BLOCKED")
         seen_failures: set = set()
-        for e in entries[-20:]:
+        for e in [call["settled"] for call in calls[-20:] if call.get("settled")]:
             result = str(e.get("result_preview", ""))
             if any(marker in result for marker in _REVIEW_MARKERS):
                 sig = (e.get("tool", ""), result[:80])

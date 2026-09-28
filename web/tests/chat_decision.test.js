@@ -193,10 +193,32 @@ test('an accepted answer marks the chosen option; degenerate cards refuse to ren
         assert.ok(buttons[1].classList.contains('chosen'));
         assert.ok(buttons.every((btn) => btn.disabled));
 
-        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, options: [{ label: 'only' }] }), null);
+        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'one', options: [{ label: 'only' }] })
+            .querySelectorAll('.chat-quiz-option').length, 1);
         assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: '' }), null);
         // An anonymous quiz has no answer address: refuse to render buttons.
         assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, task_id: '' }), null);
+    } finally { fx.restore(); }
+});
+
+test('an open question offers a free-text answer without fabricated options', async () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'open', options: [] });
+        assert.ok(card);
+        assert.equal(card.querySelectorAll('.chat-quiz-option').length, 0);
+        const answer = card.querySelector('.chat-quiz-comment');
+        assert.ok(answer);
+        answer.value = 'I would take a different route.';
+        answer.listeners.get('input')();
+        card.querySelector('.chat-quiz-send').click();
+        await new Promise((resolve) => setTimeout(resolve, 0));
+        const body = JSON.parse(fx.calls[0].init.body);
+        assert.equal(body.comment, 'I would take a different route.');
+        assert.equal(Object.hasOwn(body, 'option_index'), false);
+        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'absent', options: undefined }), null);
+        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'too-many',
+            options: Array.from({ length: 7 }, (_, i) => ({ label: `Choice ${i}` })) }), null);
     } finally { fx.restore(); }
 });
 
@@ -452,6 +474,69 @@ test('an over-long answer is refused client-side, not truncated', async () => {
         assert.equal(fx.calls.length, 0);
         assert.match(fx.toasts[0].text, /under 2000 characters/);
         assert.equal(card.dataset.state, 'open');
+    } finally { fx.restore(); }
+});
+
+const pressEnter = (field, init = {}) => {
+    const event = { key: 'Enter', preventDefault() { event.defaultPrevented = true; }, ...init };
+    field.listeners.get('keydown')(event);
+    return event;
+};
+
+test('Enter sends an optionless answer through Send; Shift+Enter, composition and an empty field do not', async () => {
+    const fx = fixture();
+    try {
+        const card = fx.decision.buildQuizCard({ ...WS_MSG, options: [] });
+        const { field } = commentParts(card);
+        assert.equal(field.enterKeyHint, 'send');
+        assert.equal(pressEnter(field).defaultPrevented, true, 'an empty answer neither sends nor becomes a line');
+        field.value = 'Friday';
+        field.listeners.get('input')();
+        assert.equal(pressEnter(field, { shiftKey: true }).defaultPrevented, undefined, 'Shift+Enter is the line break');
+        field.value = 'Friday\nand say it is provisional';
+        field.listeners.get('input')();
+        assert.equal(pressEnter(field, { isComposing: true }).defaultPrevented, undefined);
+        assert.equal(pressEnter(field, { keyCode: 229 }).defaultPrevented, undefined, 'WebKit commits IME this way');
+        await turn();
+        assert.equal(fx.calls.length, 0);
+        pressEnter(field);
+        await turn();
+        const body = JSON.parse(fx.calls[0].init.body);
+        assert.deepEqual([fx.calls.length, body.comment, 'option_index' in body], [1, 'Friday\nand say it is provisional', false]);
+        assert.equal(card.dataset.state, 'answered');
+        assert.equal(card.querySelector('.chat-quiz-comment-box'), null);
+        assert.equal(pressEnter(field).defaultPrevented, undefined, 'the settled card takes no key');
+        await turn();
+        assert.equal(fx.calls.length, 1);
+    } finally { fx.restore(); }
+});
+
+test('held Enter and an Enter/click race record one answer; a refusal keeps the draft for the same retry', async () => {
+    const replies = [];
+    const fx = fixture({ fetchImpl: () => new Promise((resolve) => replies.push(resolve)) });
+    try {
+        const card = fx.decision.buildQuizCard(WS_MSG);
+        const { field, send } = commentParts(card);
+        field.value = 'wait for CI, then merge';
+        field.listeners.get('input')();
+        pressEnter(field);
+        assert.equal(pressEnter(field, { repeat: true }).defaultPrevented, true);
+        pressEnter(field);
+        send.click();
+        await turn();
+        assert.equal(fx.calls.length, 1, "the card's pending answer is the one gate");
+        replies.shift()({ ok: false, status: 503, json: async () => ({}) });
+        await turn();
+        assert.deepEqual([card.dataset.state, fx.toasts.at(-1).text], ['open', 'Could not record the answer (503).']);
+        assert.equal(card.querySelector('.chat-quiz-comment'), field);
+        assert.equal(field.value, 'wait for CI, then merge', 'the draft survives the refusal');
+        pressEnter(field);
+        await turn();
+        const [first, retry] = fx.calls.map((call) => JSON.parse(call.init.body));
+        assert.deepEqual([fx.calls.length, retry.request_id], [2, first.request_id], 'the retry replays the same request');
+        replies.shift()({ ok: true, status: 200, json: async () => ({ ok: true, state: 'answered', comment: retry.comment }) });
+        await turn();
+        assert.equal(card.dataset.state, 'answered');
     } finally { fx.restore(); }
 });
 
@@ -804,4 +889,50 @@ test('a late answer says where it went', async () => {
             assert.match(fx.toasts[0].text, forwarded ? /delivered to its chat as your message/ : /nothing is waiting on it/);
         } finally { fx.restore(); }
     }
+});
+
+test('the host facts line sits under the question when the card carries it and is absent otherwise', () => {
+    const fx = fixture();
+    const facts = 'Asked by task t-1, started by your message of 2026-09-25 00:21 UTC; '
+        + 'your last message in this chat: 2026-09-25 00:21 UTC (47 minutes before this question).';
+    try {
+        const card = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-facts', host_facts: facts });
+        const line = card.querySelector('.chat-quiz-host-facts');
+        assert.equal(line.textContent, facts);
+        // Plain text directly under the question, never through the markdown pipeline.
+        assert.equal(line.innerHTML, undefined);
+        const question = card.querySelector('.chat-quiz-question');
+        assert.equal(question.nextElementSibling, line);
+        // A stored history row nests the quiz; the sentence rides the nested block.
+        const replay = fx.decision.buildQuizCard({ task_id: 't-1', text: WS_MSG.question,
+            quiz: { ...WS_MSG, quiz_id: 'qz-facts-replay', host_facts: facts } });
+        assert.equal(replay.querySelector('.chat-quiz-host-facts').textContent, facts);
+        const bare = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-bare' });
+        assert.equal(bare.querySelector('.chat-quiz-host-facts'), null);
+        const empty = fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-empty', host_facts: '' });
+        assert.equal(empty.querySelector('.chat-quiz-host-facts'), null);
+        // A later, richer delivery of an already rendered card adds the line once.
+        assert.equal(fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-bare', host_facts: facts }), null);
+        assert.equal(bare.querySelectorAll('.chat-quiz-host-facts').length, 1);
+        assert.equal(bare.querySelector('.chat-quiz-question').nextElementSibling.textContent, facts);
+        fx.decision.buildQuizCard({ ...WS_MSG, quiz_id: 'qz-bare', host_facts: facts });
+        assert.equal(bare.querySelectorAll('.chat-quiz-host-facts').length, 1);
+    } finally { fx.restore(); }
+});
+
+test('a Main mirror of a Project question carries the host facts line from its pointer row', () => {
+    const column = new NodeStub();
+    const fx = fixture({ isMain: true,
+        frameNode: (_msg, card) => { const bubble = new NodeStub(); bubble.append(card); return bubble; },
+        insertMessageNode: (node) => { column.append(node); return true; } });
+    const row = { role: 'system', system_type: 'project_question_pointer', task_id: 't-9', quiz_id: 'qz-9',
+        project_id: 'p1', project_chat_id: 23, project_name: 'Storage', ts: '2026-09-25T00:00:00+00:00',
+        quiz_state: 'open', question: 'Merge now?', options: ['Yes', 'No'] };
+    try {
+        assert.ok(fx.decision.appendQuestionPointer({ ...row, host_facts: 'Asked by task t-9, origin unknown.' }));
+        const card = column.children[0].children[0];
+        assert.equal(card.querySelector('.chat-quiz-host-facts').textContent, 'Asked by task t-9, origin unknown.');
+        assert.ok(fx.decision.appendQuestionPointer({ ...row, task_id: 't-10' }));
+        assert.equal(column.children[1].children[0].querySelector('.chat-quiz-host-facts'), null);
+    } finally { fx.restore(); }
 });

@@ -16,20 +16,48 @@ import {
     startLifecyclePoller,
 } from './lifecycle_card.js';
 import { openConfirmDialog } from './confirm_dialog.js';
-import { hubListingRowFor, hubSyncVerdict } from './hub_sync.js';
+import { hubFactsPending, hubListingRowFor, hubSyncVerdict } from './hub_sync.js';
 import {
     emitSkillLifecycle,
     escapeHtmlAttr as escapeHtml,
     fetchJson,
     renderHubCard,
-    safeExternalHrefAttr,
+    renderSubmissionHistory,
 } from './utils.js';
 
 
-function adoptHint(facts) {
-    if (facts.edited_since_submission && facts.receipt_pr !== null) {
-        return `Local files were edited since submission (PR #${facts.receipt_pr}).`;
-    }
+// What a Hub replacement keeps and what it does not carry over, for both
+// Update and Adopt: the state dir (saved data), enablement and the
+// append-only review history stay, while review verdicts and grants are
+// bound to the content hash, so new bytes need a fresh review and may need
+// access granted again. No new copy is promised to be pinned or kept.
+const HUB_REPLACEMENT_KEEPS = 'Its saved data, enablement and review history stay; '
+    + 'the new files are reviewed again and may need access granted again.';
+
+
+/**
+ * A version as Hub copy shows it: `v<version>`, or "unknown version" when the
+ * manifest or catalog row names none — never a bare "v". Display only: no
+ * parsing, ordering or eligibility. My skills' Update confirmation uses it too.
+ */
+export function hubVersionText(version) {
+    const text = String(version || '');
+    return text ? `v${text}` : 'unknown version';
+}
+
+
+/** The same fact after a button, badge or state label: ` v<version>`, or nothing when unknown. */
+function hubVersionSuffix(version) {
+    return version ? ` ${hubVersionText(version)}` : '';
+}
+
+
+function hubHasHint(version) {
+    return version ? `Hub has ${hubVersionText(version)}.` : 'Hub version unknown.';
+}
+
+
+function receiptWarning(facts) {
     if (facts.receipt_unreadable) return 'Local publish record is unreadable.';
     if (facts.no_receipt) {
         return 'No local publish record for this name - the hub skill may belong to someone else.';
@@ -38,13 +66,43 @@ function adoptHint(facts) {
 }
 
 
+/**
+ * The one Update confirmation, shared by the hub card and the My skills menu.
+ * `hubVersion` is the last catalog observation, not a pinned package: the
+ * server installs whatever the Hub serves when the update runs.
+ */
+export function confirmHubUpdate(name, { localVersion = '', hubVersion = '' } = {}) {
+    return openConfirmDialog({
+        title: `Update ${name}`,
+        body: `Replace the local files of ${name}, including any local edits, with the current OuroborosHub copy? `
+            + HUB_REPLACEMENT_KEEPS,
+        details: {
+            summary: 'Show details',
+            rows: [
+                { label: 'Installed version', value: hubVersionText(localVersion) },
+                { label: 'Last seen in Hub', value: hubVersion || 'not checked' },
+            ],
+        },
+        confirmLabel: 'Update',
+        danger: true,
+    });
+}
+
+
 /** State line (tone/label/hint) for one card, from the verdict or pending job. */
-function lifecycleForVerdict(verdict, pending, listingRow) {
+function lifecycleForVerdict(verdict, pending, listingRow, listingOnly) {
     if (pending) {
         if (pending.failed === true) {
             return { tone: pending.tone || 'danger', label: pending.label || 'Failed', hint: pending.message || '' };
         }
         return { tone: pending.tone || 'warn', label: pending.label || 'Working', hint: pending.message || '' };
+    }
+    if (listingOnly) {
+        // A receipt-bearing local skill whose name the whole catalog lacks;
+        // without a catalog read that absence is unknown, not a fact.
+        return verdict.badges.includes('catalog_unavailable')
+            ? { tone: 'warn', label: 'Catalog unavailable', hint: '' }
+            : { tone: 'muted', label: 'Not in the Hub catalog', hint: '' };
     }
     const facts = verdict.copy_facts;
     switch (verdict.action) {
@@ -53,22 +111,20 @@ function lifecycleForVerdict(verdict, pending, listingRow) {
         case 'installed':
             return {
                 tone: listingRow?.review_stale ? 'warn' : 'ok',
-                label: `Installed v${facts.local_version}`,
+                label: `Installed${hubVersionSuffix(facts.local_version)}`,
                 hint: listingRow?.review_stale ? 'Review is stale; re-review from My skills before enabling.' : '',
             };
         case 'update':
-            return { tone: 'warn', label: `Installed v${facts.local_version}`, hint: `Hub has v${facts.catalog_version}.` };
+            return {
+                tone: 'warn',
+                label: `Installed${hubVersionSuffix(facts.local_version)}`,
+                hint: hubHasHint(facts.catalog_version),
+            };
         case 'adopt':
             return {
                 tone: 'warn',
-                label: `Name taken by a local skill (${facts.occupying_bucket})`,
-                hint: adoptHint(facts),
-            };
-        case 'wait_pr':
-            return {
-                tone: 'ok',
-                label: `Submitted PR #${facts.receipt_pr ?? ''}`,
-                hint: 'Waiting for the hub to publish the submitted version.',
+                label: `Local copy${hubVersionSuffix(facts.local_version)}`,
+                hint: [hubHasHint(facts.catalog_version), receiptWarning(facts)].filter(Boolean).join(' '),
             };
         default: {
             if (verdict.badges.includes('conflict')) {
@@ -76,6 +132,10 @@ function lifecycleForVerdict(verdict, pending, listingRow) {
             }
             if (verdict.badges.includes('listing_unavailable')) {
                 return { tone: 'warn', label: 'Hub facts unavailable', hint: '' };
+            }
+            if (facts.occupying_bucket === 'external') {
+                // Only reachable while the catalog is unavailable.
+                return { tone: 'warn', label: `Local copy${hubVersionSuffix(facts.local_version)}`, hint: '' };
             }
             if (facts.occupying_bucket) {
                 return {
@@ -102,12 +162,10 @@ function badgesHtmlFor(verdict) {
     const facts = verdict.copy_facts;
     const out = [];
     for (const badge of verdict.badges) {
-        if (badge === 'submitted_pr' && facts.receipt_pr !== null) {
-            out.push(`<span class="skills-badge skills-badge-warn">Submitted PR #${escapeHtml(String(facts.receipt_pr))}</span>`);
-        } else if (badge === 'published') {
-            out.push(`<span class="skills-badge skills-badge-ok">Published v${escapeHtml(facts.local_version)}</span>`);
+        if (badge === 'published') {
+            out.push(`<span class="skills-badge skills-badge-ok">Published${escapeHtml(hubVersionSuffix(facts.local_version))}</span>`);
         } else if (badge === 'update_available') {
-            out.push(`<span class="skills-badge skills-badge-warn">Update v${escapeHtml(facts.catalog_version)}</span>`);
+            out.push(`<span class="skills-badge skills-badge-warn">Update${escapeHtml(hubVersionSuffix(facts.catalog_version))}</span>`);
         } else if (badge === 'catalog_unavailable') {
             out.push('<span class="skills-badge skills-badge-warn">Catalog unavailable</span>');
         } else if (badge === 'listing_unavailable') {
@@ -135,29 +193,36 @@ function primaryHtmlFor(slug, verdict, pending) {
         case 'install':
             return `<button class="btn btn-primary" data-oh-action="install" data-oh-slug="${slugAttr}">Install</button>`;
         case 'update':
-            return `<button class="btn btn-primary" data-oh-action="update" data-oh-slug="${slugAttr}">Update v${escapeHtml(facts.catalog_version)}</button>`;
+            return `<button class="btn btn-primary" data-oh-action="update" data-oh-slug="${slugAttr}">Update${escapeHtml(hubVersionSuffix(facts.catalog_version))}</button>`;
         case 'adopt':
-            return `<button class="btn btn-primary" data-oh-action="adopt" data-oh-slug="${slugAttr}">Adopt hub version v${escapeHtml(facts.catalog_version)}</button>`;
+            return `<button class="btn btn-primary" data-oh-action="adopt" data-oh-slug="${slugAttr}">Use Hub version${escapeHtml(hubVersionSuffix(facts.catalog_version))}</button>`;
         case 'installed':
-            return `<button class="btn btn-default" disabled>Installed v${escapeHtml(facts.local_version)}</button>`;
-        case 'wait_pr':
-            return `<button class="btn btn-default" disabled>Submitted PR #${escapeHtml(String(facts.receipt_pr ?? ''))}</button>`;
+            return `<button class="btn btn-default" disabled>Installed${escapeHtml(hubVersionSuffix(facts.local_version))}</button>`;
         default:
             return '';
     }
 }
 
 
-function secondaryHtmlFor(verdict, rawSkill, pending) {
-    if (verdict.badges.includes('conflict')
-        || (!verdict.badges.includes('submitted_pr') && !verdict.copy_facts.edited_since_submission)) return '';
+/**
+ * Quiet submission history under the card: what this installation submitted
+ * and the explicit local Clear. Neither gates the primary action.
+ */
+function historyHtmlFor(slug, verdict, rawSkill, pending) {
+    const submission = verdict.copy_facts.submission;
+    if (!submission) return '';
     const published = rawSkill?.published && typeof rawSkill.published === 'object' ? rawSkill.published : {};
-    const href = safeExternalHrefAttr(published.pr_url);
-    if (!href) return '';
-    return `<a class="btn btn-default" href="${href}" target="_blank" rel="noopener noreferrer">PR #${escapeHtml(String(verdict.copy_facts.receipt_pr ?? ''))}</a>
-        <button class="btn btn-ghost" data-oh-clear-publication="${escapeHtml(rawSkill.name)}"
-                data-oh-receipt="${escapeHtml(JSON.stringify(published))}" ${pending ? 'disabled' : ''}>Clear local submission</button>
-        <span class="muted">Local record only; the PR remains on GitHub.</span>`;
+    // Clearing forgets only the local receipt; a conflicted identity offers no mutation.
+    const clear = verdict.badges.includes('conflict') ? '' : `<div class="marketplace-secondary-actions">
+            <button class="btn btn-ghost" data-oh-clear-publication="${escapeHtml(rawSkill.name)}"
+                    data-oh-receipt="${escapeHtml(JSON.stringify(published))}" ${pending ? 'disabled' : ''}>Clear local submission</button>
+            <span class="muted">Local record only; the PR remains on GitHub.</span>
+        </div>`;
+    return `<details class="skills-details marketplace-card-history" data-oh-history="${escapeHtml(slug)}">
+            <summary>Submission history</summary>
+            <div class="skills-detail-row">${renderSubmissionHistory(submission)}</div>
+            ${clear}
+        </details>`;
 }
 
 
@@ -237,8 +302,8 @@ export function initOuroborosHub(pane, controlsHost = null) {
         const verdict = hubSyncVerdict(
             listingRow,
             // A listing-only synthetic row has NO catalog entry: the verdict
-            // must see catalogRow=null (slug absent) for the frozen wait_pr/
-            // pending semantics, never a fabricated catalog fact.
+            // must see catalogRow=null (slug absent), never a fabricated
+            // catalog fact.
             item.listing_only === true ? null : catalogRow,
             { listingUnavailable: state.listingUnavailable, catalogUnavailable: state.catalogUnavailable },
         );
@@ -248,24 +313,34 @@ export function initOuroborosHub(pane, controlsHost = null) {
     function card(item) {
         const slug = String(item.slug || '');
         const pending = getPending(slug);
+        const listingOnly = item.listing_only === true;
         const { verdict, rawSkill, listingRow } = verdictFor(item);
-        const lifecycle = lifecycleForVerdict(verdict, pending, listingRow);
+        const lifecycle = lifecycleForVerdict(verdict, pending, listingRow, listingOnly);
         const installed = ['installed', 'update'].includes(verdict.action) ? rawSkill : null;
         return renderHubCard(item, {
             pending,
             installed,
             lifecycle,
             primaryHtml: primaryHtmlFor(slug, verdict, pending),
-            secondaryHtml: secondaryHtmlFor(verdict, rawSkill, pending),
+            secondaryHtml: historyHtmlFor(slug, verdict, rawSkill, pending),
             badgesHtml: badgesHtmlFor(verdict),
-            official: true,
+            // A listing-only row is a local submission, not a catalog entry.
+            official: !listingOnly,
         });
     }
 
     function renderCards() {
         if (destroyed || !state.catalogLoaded) return;
+        // Lifecycle ticks and refreshes re-render every card; an owner-opened
+        // history disclosure stays open across them.
+        const open = new Set(Array.from(results.querySelectorAll('details[data-oh-history][open]'),
+            (node) => node.dataset.ohHistory));
         results.innerHTML = state.results.map((item) => card(item)).join('')
             || '<div class="muted">No official skills found.</div>';
+        if (!open.size) return;
+        for (const node of results.querySelectorAll('details[data-oh-history]')) {
+            if (open.has(node.dataset.ohHistory)) node.open = true;
+        }
     }
 
     let refreshGeneration = 0;
@@ -278,14 +353,19 @@ export function initOuroborosHub(pane, controlsHost = null) {
         const generation = ++refreshGeneration;
         show('Loading OuroborosHub…', 'muted');
         try {
-            const params = new URLSearchParams();
-            if (state.query.trim()) params.set('q', state.query.trim());
-            // Global listing beside the catalog — a listing fetch failure is an
-            // honest "Hub facts unavailable" state, never "Not installed".
-            const [catalog, listingData] = await Promise.all([
-                fetchJson(`/api/marketplace/ouroboroshub/catalog?${params}`).then(data => ({ data }), error => ({ error })),
+            // The WHOLE catalog, filtered below: a name missing from a search
+            // result is not missing from the catalog. Global listing beside it —
+            // a listing fetch failure is an honest "Hub facts unavailable"
+            // state, never "Not installed".
+            let [catalog, listingData] = await Promise.all([
+                fetchJson('/api/marketplace/ouroboroshub/catalog').then(data => ({ data }), error => ({ error })),
                 fetchJson('/api/extensions').catch(() => null),
             ]);
+            // The listing is a local read that never waits for the hub; facts it
+            // could not know before this catalog read landed need one re-read.
+            if (!catalog.error && hubFactsPending(listingData?.skills)) {
+                listingData = await fetchJson('/api/extensions').catch(() => listingData);
+            }
             if (destroyed || generation !== refreshGeneration) return;
             state.listingUnavailable = !Array.isArray(listingData?.skills);
             if (!state.listingUnavailable) {
@@ -298,20 +378,23 @@ export function initOuroborosHub(pane, controlsHost = null) {
             }
             if (catalog.error) throw catalog.error;
             if (!Array.isArray(catalog.data?.results)) throw new Error('Hub catalog response is unavailable.');
-            state.results = catalog.data.results;
+            const query = state.query.trim().toLowerCase();
+            // The server search's fields (slug, name, description), applied to
+            // catalog rows and local submissions alike.
+            const matches = (...texts) => !query || texts.some((text) => String(text || '').toLowerCase().includes(query));
+            const catalogNames = new Set(catalog.data.results.map((row) => String(row.sanitized_name || row.slug || '')));
+            state.results = catalog.data.results.filter((row) => matches(row.slug, row.display_name, row.description));
+            const officialCount = state.results.length;
             state.catalogLoaded = true;
             state.catalogUnavailable = false;
             // A first-time submission is ABSENT from the catalog until its PR
-            // merges: synthesize a card row from the receipt-bearing listing
-            // entry so the frozen wait_pr/"Submitted PR #N" state is reachable
-            // (final-gate finding). Client-side query filter mirrors the
-            // server-side catalog search.
-            const catalogNames = new Set(state.results.map((row) => String(row.sanitized_name || row.slug || '')));
-            const query = state.query.trim().toLowerCase();
+            // merges: a card row synthesized from the receipt-bearing listing
+            // entry keeps its submission history reachable. It is not official
+            // and not counted as a catalog skill.
             for (const [name, skill] of state.listingByName) {
                 if (catalogNames.has(name)) continue;
                 if (!skill.published || typeof skill.published !== 'object') continue;
-                if (query && !name.toLowerCase().includes(query)) continue;
+                if (!matches(name, skill.description)) continue;
                 state.results.push({
                     slug: name,
                     sanitized_name: name,
@@ -321,10 +404,14 @@ export function initOuroborosHub(pane, controlsHost = null) {
                     listing_only: true,
                 });
             }
+            const localOnly = state.results.length - officialCount;
             renderCards();
             show(state.listingUnavailable
                 ? 'Installed skills could not be read. Previous details are retained where available; Refresh to retry.'
-                : `${state.results.length} official skill${state.results.length === 1 ? '' : 's'}`,
+                : [
+                    `${officialCount} official skill${officialCount === 1 ? '' : 's'}`,
+                    localOnly ? `${localOnly} local submission${localOnly === 1 ? '' : 's'} not in the catalog` : '',
+                ].filter(Boolean).join(' · '),
                 state.listingUnavailable ? 'warn' : 'muted');
         } catch (err) {
             if (destroyed || generation !== refreshGeneration) return;
@@ -339,33 +426,30 @@ export function initOuroborosHub(pane, controlsHost = null) {
         const name = String(item.sanitized_name || item.slug || '');
         const bucket = facts.occupying_bucket || 'external';
         const lines = [
-            `Replace the local copy (${bucket}, v${facts.local_version}) with hub v${facts.catalog_version}? `
-            + 'Local files will be replaced; skill settings, grants and review history are kept.',
+            `Replace the local copy (${bucket}, ${hubVersionText(facts.local_version)}), including any local edits, `
+            + `with the current OuroborosHub copy? ${HUB_REPLACEMENT_KEEPS}`,
         ];
-        if (facts.edited_since_submission && facts.receipt_pr !== null) {
-            lines.push(`Local files were edited since submission (PR #${facts.receipt_pr}).`);
-        }
-        if (facts.no_receipt) {
-            lines.push('No local publish record for this name - the hub skill may belong to someone else.');
-        }
-        if (facts.receipt_unreadable) {
-            lines.push('Local publish record is unreadable.');
-        }
+        const warning = receiptWarning(facts);
+        if (warning) lines.push(warning);
         const payloadRoot = String(rawSkill?.payload_root || '');
+        const submission = facts.submission;
+        const submitted = submission ? [
+            hubVersionText(submission.version),
+            submission.pr_number !== null ? `PR #${submission.pr_number}` : '',
+            submission.local_differs ? 'local files differ from it' : '',
+        ].filter(Boolean).join(' · ') : '';
         const rows = [
             { label: 'Occupying bucket', value: bucket },
             ...(payloadRoot ? [{ label: 'Local folder', value: `data/${payloadRoot}/` }] : []),
-            { label: 'Local version', value: `v${facts.local_version}` },
-            { label: 'Hub version', value: `v${facts.catalog_version}` },
-            ...(facts.edited_since_submission && facts.receipt_pr !== null
-                ? [{ label: 'Local edits', value: `Edited since submission (PR #${facts.receipt_pr})` }]
-                : []),
+            { label: 'Local version', value: hubVersionText(facts.local_version) },
+            { label: 'Last seen in Hub', value: hubVersionText(facts.catalog_version) },
+            ...(submitted ? [{ label: 'Submitted', value: submitted }] : []),
         ];
         return openConfirmDialog({
-            title: `Adopt ${name}`,
+            title: `Use Hub version of ${name}`,
             body: lines.join('\n'),
             details: { summary: 'Show details', rows },
-            confirmLabel: 'Adopt',
+            confirmLabel: 'Use Hub version',
             danger: true,
         });
     }
@@ -393,8 +477,8 @@ export function initOuroborosHub(pane, controlsHost = null) {
         const target = String(item.sanitized_name || item.slug || '');
         if (verdict.action !== action) {
             // A stale Retry (or any stale affordance) must never act against a
-            // state the fresh verdict forbids — frozen no-action states
-            // (conflict, listing_unavailable, wait_pr) included.
+            // state the fresh verdict forbids — no-action states (conflict,
+            // listing_unavailable, catalog absence) included.
             show(`${slug}: local state changed; refresh before retrying`, 'warn');
             return;
         }
@@ -411,10 +495,16 @@ export function initOuroborosHub(pane, controlsHost = null) {
             const ok = await confirmAdopt(item, verdict, rawSkill);
             if (!ok) return;
             body = { slug, adopt: true, expected_content_hash: expected, auto_review: true };
-            pendingLabel = 'Adopting';
-            pendingMessage = 'Replacing the local copy with the hub version…';
-            doneWord = 'adopted hub version';
+            pendingLabel = 'Replacing';
+            pendingMessage = 'Replacing the local copy with the Hub version…';
+            doneWord = 'now uses the Hub version';
         } else if (action === 'update') {
+            const facts = verdict.copy_facts;
+            const ok = await confirmHubUpdate(target, {
+                localVersion: facts.local_version,
+                hubVersion: hubVersionText(facts.catalog_version),
+            });
+            if (!ok) return;
             body = null; // update rides its own endpoint (unload/reload + rollback).
             pendingLabel = 'Updating';
             pendingMessage = 'Updating official skill…';

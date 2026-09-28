@@ -598,7 +598,9 @@ def test_start_service_local_branch_uses_case_aware_overlay(tmp_path, monkeypatc
 
     def fake_spawn(cmd, **kwargs):
         captured["env"] = kwargs["env"]
-        return SimpleNamespace(pid=4242, poll=lambda: None)
+        proc = SimpleNamespace(pid=4242, poll=lambda: None)
+        kwargs["on_spawn"](proc)
+        return proc
 
     monkeypatch.setattr("ouroboros.process_custody.spawn_supervised", fake_spawn)
     monkeypatch.setattr(wx, "IS_WINDOWS", True)

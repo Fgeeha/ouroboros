@@ -236,6 +236,7 @@ def test_new_campaign_is_stamped_for_same_generation_worker_respawns(tmp_path, m
 
     monkeypatch.setattr(process_custody, "current_custody_session_id", lambda: "same-server")
     state.init(tmp_path)
+    state.save_state({})  # an initialized install: only explicit init creates state (#1307)
     queue.init(tmp_path)
     queue.init_queue_refs([], {}, {"value": 0})
     campaign = evolution_lifecycle.start_evolution_campaign("Improve", source="test")
@@ -512,7 +513,7 @@ def test_supervisor_rechecks_evolution_claim_immediately_before_restart(tmp_path
         DRIVE_ROOT=tmp_path,
         load_state=state.load_state,
         safe_restart=lambda **k: restarted.append(k) or (True, "ok"),
-        send_with_budget=lambda *a: messages.append(a),
+        send_with_budget=lambda *a, **kw: messages.append(a),
     )
 
     server._perform_supervisor_restart(
@@ -532,7 +533,7 @@ def test_supervisor_blocks_evolution_restart_if_marker_disappears_during_drain(t
         DRIVE_ROOT=tmp_path,
         load_state=lambda: {"owner_chat_id": 1},
         safe_restart=lambda **k: restarted.append(k) or (True, "ok"),
-        send_with_budget=lambda *a: messages.append(a),
+        send_with_budget=lambda *a, **kw: messages.append(a),
     )
 
     server._perform_supervisor_restart(
@@ -609,7 +610,7 @@ def test_supervisor_blocks_restart_when_head_moved_after_receipt(tmp_path):
         REPO_DIR=repo,
         load_state=lambda: {"owner_chat_id": 1},
         safe_restart=lambda **k: restarted.append(k) or (True, "ok"),
-        send_with_budget=lambda *a: messages.append(a),
+        send_with_budget=lambda *a, **kw: messages.append(a),
     )
 
     server._perform_supervisor_restart(

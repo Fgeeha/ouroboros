@@ -32,6 +32,18 @@ def reap_test_process_group(proc, *, timeout_sec: float = 5.0) -> None:
         time.sleep(0.05)
 
 
+def stop_socket_sharer() -> None:
+    """Stop multiprocessing's socket-transfer server once a test's spawned children are gone.
+
+    On Windows a spawn child receives a socket argument (the worker stop channel) through the
+    stdlib ``resource_sharer``, whose process-global ``_serve`` thread starts with the first such
+    spawn and never ends by itself: it belongs to the test that spawned the child. Elsewhere
+    nothing started it and this is a no-op; a later spawn starts a fresh one."""
+    from multiprocessing import resource_sharer
+
+    resource_sharer.stop(timeout=5)
+
+
 # Every function in the tree that persists a settings document, as (repo-relative POSIX
 # path, function name). Three route through `config.prepare_settings_for_persist`; the
 # context-pair migration and the Colab generator are exempt from it by design and carry

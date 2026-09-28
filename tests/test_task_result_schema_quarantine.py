@@ -258,6 +258,7 @@ def test_state_save_stamps_and_an_unstamped_state_loads_unchanged(tmp_path, monk
     monkeypatch.setattr(state, "STATE_PATH", tmp_path / "state" / "state.json")
     monkeypatch.setattr(state, "STATE_LAST_GOOD_PATH", tmp_path / "state" / "state.last_good.json")
     monkeypatch.setattr(state, "STATE_LOCK_PATH", tmp_path / "locks" / "state.lock")
+    monkeypatch.setattr(state, "DRIVE_ROOT", tmp_path)  # a fresh root: the first whole-state write may mint
 
     state.save_state({"spent_usd": 1.25})
     for path in (state.STATE_PATH, state.STATE_LAST_GOOD_PATH):
