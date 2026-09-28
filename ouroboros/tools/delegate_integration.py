@@ -518,7 +518,15 @@ def _capture_terminal_patch(ctx: ToolContext, entry: Optional[_RunCustody], *, g
     """
     if entry is None:
         return None
-    return capture_terminal_patch_for_drive(custody.custody_root(ctx), entry, gateway=gateway)
+    block = capture_terminal_patch_for_drive(custody.custody_root(ctx), entry, gateway=gateway)
+    if block and entry.task_id != str(getattr(ctx, "task_id", "") or ""):
+        # Relative handles name the starter's prefix, not the successor's.
+        # The capture reader validates this exact canonical product, also after
+        # disposition and from a split execution drive.
+        for kind in ("patch", "manifest"):
+            if block.get(f"{kind}_read") and block.get(f"{kind}_artifact"):
+                block[f"{kind}_read"] = {"root": "artifact_store", "path": block[f"{kind}_artifact"]}
+    return block
 
 
 def capture_terminal_patch_for_drive(drive: Any, entry: _RunCustody, *, gateway=None) -> Optional[Dict[str, Any]]:

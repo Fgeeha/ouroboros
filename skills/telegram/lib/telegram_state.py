@@ -271,8 +271,21 @@ def _subagent_card_text(event: Dict[str, Any], sub_event: str, lang: str) -> str
         cost = 0.0
     if sub_event in _SUBAGENT_TERMINAL and cost > 0:
         header += f" · ${cost:.2f}"
-    # Live work commentary: the in-flight note, or the result/summary on finish.
+    # Live work commentary: the in-flight note, or the result/summary on finish. A
+    # delegated run's observation carries its typed parts: the card then leads with the
+    # executor's attributed latest words (an earlier one when this batch had none), then
+    # problems and the technical-event count, instead of the frame's joined labels.
+    activity = event.get("delegated_activity")
     note = str(event.get("text") or event.get("result") or event.get("trace_summary") or "").strip()
+    if isinstance(activity, dict) and activity.get("parts") is not None:
+        from ouroboros.delegate_activity import card_text
+
+        body = card_text(activity, 650).strip()
+        if body:
+            # The shared renderer already bounds speech around its diagnostic
+            # tail. Never cut that tail again or lose the complete-source cue.
+            full_ref = child_ref or str(activity.get("task_id") or "").strip()
+            return f"{header}\n{body}" + (f"\nFull ref: task {full_ref}" if full_ref else "")
     if note:
         preview = truncate_review_artifact(note, 700)
         if preview != note and child_ref:
