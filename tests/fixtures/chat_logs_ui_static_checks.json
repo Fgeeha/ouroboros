@@ -1059,7 +1059,7 @@
     "id": "test_sync_history_merges_offline_bootstrap_user_rows",
     "path": "web/modules/chat.js",
     "kind": "contains",
-    "value": "applyHistoryMessages(messages, { fromReconnect, includeUser: true });"
+    "value": "if (result.status !== 'applied') applyHistoryMessages(messages, { fromReconnect });"
   },
   {
     "id": "test_cancel_run_confirm_and_cascade",

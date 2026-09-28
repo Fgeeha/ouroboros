@@ -100,7 +100,9 @@ def test_reconnect_merges_user_rows_without_clearing_visible_history():
     # Reconnect still fetches the canonical source and includes owner dialogue.
     assert "await fetchHistory(null)" in sync
     assert "apiClient.chatHistory({ chatId, cursor, ...options })" in src
-    assert "applyHistoryMessages(messages, { fromReconnect, includeUser: true });" in sync
+    assert "historyPager.acceptRecent(data)" in sync
+    assert "if (result.status !== 'applied') applyHistoryMessages(messages, { fromReconnect });" in sync
+    assert "includeUser = true, archived = false" in replay
     assert "if (!includeUser && msg.role === 'user') continue;" in replay
     # Keyed reconciliation replaces the former clear-and-rebuild requirement:
     # physical rows dedupe and an offline/local echo is adopted in place.
