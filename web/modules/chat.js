@@ -2052,14 +2052,12 @@ export function createChatInstance({
             status: preserveTerminal ? '' : (msg?.status || ''),
         }, rawTs);
         if (!summary) return false;
-        summary.dedupeKey = `subagent-progress:${childId}`;
+        if (!summary.activity) summary.dedupeKey = `subagent-progress:${childId}`;
         if (preserveTerminal && !_historyReplayActive) {
             summary.phase = String(record.phaseEl?.dataset?.phase || 'done');
             summary.terminal = true;
         }
-        return queueTaskLiveUpdate(
-            summary, childId, normalizeLogTs(rawTs), summary.dedupeKey, rawTs,
-        );
+        return queueTaskLiveUpdate(summary, childId, normalizeLogTs(rawTs), summary.dedupeKey, rawTs);
     }
 
     function routeSubagentFinalMessageToCard(taskId, msg) {
@@ -2717,11 +2715,8 @@ export function createChatInstance({
                 }
                 if (data.recentVersion < recentApplied) return lastHistorySyncSucceeded;
                 const messages = Array.isArray(data.messages) ? data.messages : [];
-                if (!restoredPageReady && initialScrollState?.history && !historyPager.getState().initialized) {
-                    const restored = await historyPager.restore(initialScrollState.history);
-                    if (destroyed) return false;
-                    restoredPageReady = restored.status === 'applied';
-                }
+                const restoring = !restoredPageReady && !historyPager.getState().initialized
+                    ? historyPager.restore(initialScrollState.history) : null;
                 recentReady = !data.reason_code;
                 const oldRecentIds = recentHistoryIds;
                 const admitted = acceptRecentWindow(data, messages);
@@ -2729,7 +2724,12 @@ export function createChatInstance({
                 const rechainRecent = admitted && !data.reason_code && pagerBeforeRecent.initialized && !pagerBeforeRecent.canNewer
                     && [...oldRecentIds].some(id => !recentHistoryIds.has(id));
                 const result = historyPager.acceptRecent(data);
-                if (result.status !== 'applied') applyHistoryMessages(messages, { fromReconnect, includeUser: true });
+                if (result.status !== 'applied') applyHistoryMessages(messages, { fromReconnect });
+                // Recent owners exist before the saved page attaches content-only rows.
+                if (restoring) {
+                    restoredPageReady = (await restoring).status === 'applied';
+                    if (destroyed) return false;
+                }
                 const recentState = historyPager.getState();
                 const releasableRecentIds = !admitted || rechainRecent || recentState.canNewer ? [] : oldRecentIds;
                 withStableViewport(() => releaseHistoryIds(releasableRecentIds));

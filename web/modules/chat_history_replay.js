@@ -23,29 +23,40 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
     const identity = String(row?.history_id || '');
     if (!identity) return false;
     // A child's lifecycle is one evolving status, just as it is live. Its
-    // authored progress keeps every source record, even when text and time match.
+    // authored progress keeps every source record, even when text and time match;
+    // so does each delegated observation (`activity`), projected per seq at render.
     const evolving = summary.terminal || String(summary.dedupeKey || '').startsWith('subagent-lifecycle:')
         || String(summary.dedupeKey || '').startsWith('cardrow|');
+    const activity = summary.activity ? { activity: summary.activity } : {};
     const key = evolving ? summary.dedupeKey : `history:${identity}`;
+    const source = { sourceHistoryId: identity, sourceHistoryRevision: summary.cardRowRevision,
+        historyPosition: row.history_position };
     let item = record.items.find((entry) => entry.dedupeKey === key);
     if (!item && !evolving) {
         item = record.items.find((entry) => !entry.historyId
             && entry.dedupeKey === summary.dedupeKey && entry.sourceTs === row.ts);
     }
     if (item && evolving) {
+        // Source revision advances independently of live content: an older
+        // fallback can yield to its canonical current row without rolling back
+        // content, while stale sources cannot redirect an already newer locator.
+        const existingPosition = item.historyPosition;
+        const adoptedSource = !item.sourceHistoryId || Number.isSafeInteger(summary.cardRowRevision)
+            && (!Number.isSafeInteger(item.sourceHistoryRevision) || summary.cardRowRevision > item.sourceHistoryRevision);
+        if (adoptedSource) Object.assign(item, source);
         const incomingTime = Date.parse(row.ts), existingTime = Date.parse(item.sourceTs || '');
         if (Number.isSafeInteger(item.cardRowRevision)) {
-            if (!Number.isSafeInteger(summary.cardRowRevision) || summary.cardRowRevision <= item.cardRowRevision) return false;
+            if (!Number.isSafeInteger(summary.cardRowRevision) || summary.cardRowRevision <= item.cardRowRevision) return adoptedSource;
         } else if (!Number.isSafeInteger(summary.cardRowRevision) && (incomingTime < existingTime || incomingTime === existingTime
-                && compareHistoryPosition(row.history_position, item.historyPosition) < 0)) return false;
+                && compareHistoryPosition(row.history_position, existingPosition) < 0)) return adoptedSource;
         const update = { headline: summary.headline || item.headline,
             cardRowRevision: summary.cardRowRevision,
             fullHeadline: summary.fullHeadline || summary.headline || item.fullHeadline,
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
             phase: summary.phase || item.phase, sourceTs: row.ts || item.sourceTs,
-            ts, sourceHistoryId: identity, historyPosition: row.history_position };
+            ts, ...source };
         if (Object.entries(update).every(([key, value]) => key === 'historyPosition'
-            ? JSON.stringify(item[key]) === JSON.stringify(value) : item[key] === value)) return false;
+            ? JSON.stringify(item[key]) === JSON.stringify(value) : item[key] === value)) return adoptedSource;
         Object.assign(item, update);
         return true;
     }
@@ -62,9 +73,8 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
             fullHeadline: summary.fullHeadline || summary.headline || 'Update',
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
             fullRef: summary.fullRef || '', truncated: summary.truncated || false,
-            ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key,
-            ...(evolving ? { sourceHistoryId: identity } : { historyId: identity }),
-            historyPosition: row.history_position,
+            ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key, ...activity,
+            ...(evolving ? source : { historyId: identity, historyPosition: row.history_position }),
             lineKey: evolving && !String(key).startsWith('cardrow|') ? `terminal-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`
                 : `history-${identity.replace(/[^A-Za-z0-9_-]/g, '-')}`,
         });

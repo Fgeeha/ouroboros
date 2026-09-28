@@ -341,6 +341,10 @@ def _golden() -> dict[str, dict]:
 # unavailable. Keep the historical corpus intact and assert the new observed
 # outcome explicitly rather than manufacture old evidence (04-AGENCY S1/S3).
 CURRENT_PRODUCER_CONTRACTS = {
+    # Declared-source admission is a new native argument refusal. The retired
+    # text adapter never recognized this marker; do not fabricate its golden.
+    "INPUT_SOURCE_SELECTION_UNSUPPORTED": (False, "ok"),
+    "native:TOOL_ARG_ERROR:INPUT_SOURCE_SELECTION_UNSUPPORTED": (True, "argument_error"),
     # New merge producers are absent from the historical oracle. The partial
     # f-string harvest is a legacy warning; the real tool carries TOOL_ERROR
     # (and argument refusals TOOL_ARG_ERROR) through its typed sidecar.

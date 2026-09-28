@@ -122,9 +122,13 @@ test('an evolving lifecycle reopens by lifecycle identity as its source row chan
     assert.equal(f.record.expandedLineKeys.has(item.lineKey), true);
 });
 
-test('a live revisioned receipt survives equal replay and cold reopen at its exact row', () => {
+for (const kind of ['receipt', 'lifecycle', 'terminal', 'activity']) {
+test(`a live ${kind} retains its physical page and exact row through canonical adoption`, () => {
+    const evolving = kind !== 'activity';
+    const prefix = { receipt: 'cardrow|', lifecycle: 'subagent-lifecycle:', terminal: 'task_done|', activity: 'progress:' }[kind];
     const summary = id => ({ headline: 'PR #7 merge: merged', body: 'Exact merge evidence. '.repeat(20),
-        phase: 'done', dedupeKey: `cardrow|${id}`, cardRowRevision: 3 });
+        phase: 'done', dedupeKey: `${prefix}${id}`,
+        ...(kind === 'receipt' ? { cardRowRevision: 3 } : {}), terminal: kind === 'terminal' });
     const row = offset => ({ history_id: `chat:${offset}`,
         history_position: { source: 'chat', offset }, ts: '2026-09-12T12:00:00Z' });
     const live = rendererFixture();
@@ -174,14 +178,22 @@ test('a live revisioned receipt survives equal replay and cold reopen at its exa
     const mounted = mount(live, [100, 220]);
     const beforeReplay = mounted.anchors.serializeTimelineAnchor();
 
-    assert.equal(mergeHistoricalTimelineItem(live.record, summary('receipt'), row(41), '12:00'), false);
+    const mountedLine = live.record.timelineEl.lastElementChild;
+    const mountedHeader = mountedLine.firstElementChild;
+    mountedHeader.focus();
+    assert.equal(mergeHistoricalTimelineItem(live.record, summary('receipt'), row(41), '12:00'), true);
+    live.renderLiveCardTimeline(live.record);
     assert.equal(live.record.items[1], item);
     assert.equal(item.lineKey, liveKey);
-    assert.equal(item.sourceHistoryId, undefined, 'equal replay need not take physical source authority');
+    assert.equal(item[evolving ? 'sourceHistoryId' : 'historyId'], 'chat:41');
+    assert.equal(item[evolving ? 'historyId' : 'sourceHistoryId'], undefined, 'immutable and evolving source identities remain distinct');
+    assert.equal(live.record.timelineEl.lastElementChild, mountedLine);
+    assert.equal(live.doc.activeElement, mountedHeader);
     const saved = mounted.anchors.serializeTimelineAnchor();
     assert.equal(saved.lineExpanded, true);
     assert.equal(saved.offset, 20);
-    assert.equal(saved.lineHistoryId, '');
+    assert.equal(saved.lineHistoryId, evolving ? '' : 'chat:41');
+    assert.equal(saved.historyId, 'chat:41', 'the nested line must supply its own physical page, not a card-wide source');
     mounted.card.remove();
 
     const cold = rendererFixture({ initialAnchor: saved });
@@ -192,7 +204,7 @@ test('a live revisioned receipt survives equal replay and cold reopen at its exa
     cold.renderLiveCardTimeline(cold.record);
     const coldItem = cold.record.items[1];
     assert.notEqual(coldItem.lineKey, liveKey);
-    assert.equal(coldItem.sourceHistoryId, 'chat:41');
+    assert.equal(coldItem[evolving ? 'sourceHistoryId' : 'historyId'], 'chat:41');
     const reopened = mount(cold, [280, 320]);
     assert.equal(reopened.anchors.restoreVisibleTimelineAnchor(saved, { exact: true }), true);
     assert.equal(reopened.messages.scrollTop, 300);
@@ -200,10 +212,12 @@ test('a live revisioned receipt survives equal replay and cold reopen at its exa
     assert.equal(cold.record.expandedLineKeys.has(coldItem.lineKey), true);
     assert.equal(cold.record.expandedLineKeys.has(cold.record.items[0].lineKey), false);
     assert.equal(cold.record.timelineEl.lastElementChild.firstElementChild.getAttribute('aria-expanded'), 'true');
-    assert.equal(reopened.anchors.serializeTimelineAnchor().lineLifecycleKey, 'cardrow|receipt');
-    assert.equal(beforeReplay.lineLifecycleKey, 'cardrow|receipt', 'live receipts need an identity before history adoption');
-    assert.equal(saved.lineLifecycleKey, 'cardrow|receipt');
+    assert.equal(reopened.anchors.serializeTimelineAnchor().historyId, 'chat:41');
+    assert.equal(reopened.anchors.serializeTimelineAnchor().lineLifecycleKey, evolving ? `${prefix}receipt` : '');
+    assert.equal(beforeReplay.lineLifecycleKey, evolving ? `${prefix}receipt` : '');
+    assert.equal(saved.lineLifecycleKey, evolving ? `${prefix}receipt` : '');
 });
+}
 
 test('older rows and timestamp patches preserve the mounted row, focused header and selected body', () => {
     const f = rendererFixture();

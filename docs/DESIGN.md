@@ -554,10 +554,10 @@ coverage. A missing exact bookmark falls back to its card, then a row on the
 same loaded page, then the previous clamped position. The same persistent note
 explains the approximation until explicit navigation clears it.
 Selection, focus and expanded Reviews keep their actual nodes during reconciliation.
-Reopening a card reads its supplying physical page and restores expanded activity
-lines, including their full-output hydration.
-Revisioned receipt rows keep their reading identity even when replay adds no new
-content, so returning to a receipt restores that row within the expanded card.
+Reopening a nested line reads that line's supplying physical page before using a
+card-wide fallback, and restores expansion and full-output hydration. Its logical
+reading identity and physical source survive replay even when equal or older
+content is rejected; neither source adoption nor reopening rolls back revisions.
 
 ### Project work pointer
 
@@ -834,6 +834,17 @@ presence is consistent across reload and reconnect. A turn moved into a Project
 with `ensure_project_scope` lives there; Main retains its Started annotation.
 `N notes` in the collapsed header counts timeline items, the evidence row
 among them.
+
+Delegated executor activity keeps its own attributed voice in the root or child
+timeline. Messages lead; thinking stays folded in its own details, and routine
+technical events collapse into counts with per-event detail under Expand.
+Problems, unread ranges and omitted previews stay visible with a full-source
+reference. Preview limits include serialized size; they never erase the carrier
+or its source. Overlapping reads deduplicate by sequence identity, retaining any
+unseen tail's omission notice; equal words alone are not duplicates. A stream end
+before the observed cursor states unresolved coverage. Live, reconnect and replay
+use the same projection. Telegram reserves room for problems and incompleteness
+beside its disclosed speech preview and keeps the complete task reference.
 
 The block's chrome follows the work it stands on
 (`web/modules/chat.js::blockHasWork`, the presence facts minus open attention

@@ -3,6 +3,49 @@ import test from 'node:test';
 import { mergeHistoricalTimelineItem, compareHistoryPosition } from '../modules/chat_history_replay.js';
 import { createChatHistoryPager } from '../modules/chat_history.js';
 import { updateLiveTimelineItem } from '../modules/chat_render_batch.js';
+import { delegatedActivityView, reconcileDelegatedItems } from '../modules/delegated_activity.js';
+
+test('revisioned merge rows coexist with distinct delegated speech through live-to-history replay', () => {
+    const record = { items: [] }, ts = '2026-09-28T00:00:00Z';
+    const key = 'cardrow|merge-receipt:receipt-1';
+    const merge = (headline, revision) => ({ headline, phase: 'result', dedupeKey: key, cardRowRevision: revision });
+    const speech = (seq) => delegatedActivityView({ is_progress: true, task_id: 'task', delegated_activity: {
+        v: 1, task_id: 'task', run_id: 'run-1', after_seq: seq - 1, through_seq: seq,
+        source: { kind: 'run_events', read_through: seq },
+        parts: [{ kind: 'message', actor: 'executor', text: 'Same words 🙂', seq }],
+    } });
+    const row = (id, offset) => ({ history_id: id, ts,
+        history_position: { source: 'progress', offset } });
+    const live = (summary) => updateLiveTimelineItem(record, summary, {
+        ts, rawTs: ts, syntheticKey: summary.dedupeKey, headline: summary.headline, inPlaceByKey: true,
+    });
+    live(merge('PR queued', 1));
+    live(speech(1));
+    live(merge('PR merged', 3));
+    const receipt = record.items.find(item => item.dedupeKey === key);
+    for (const seq of [2, 1, 2]) {
+        mergeHistoricalTimelineItem(record, speech(seq), row(`speech-${seq}`, seq), ts);
+    }
+    assert.equal(mergeHistoricalTimelineItem(record, merge('PR queued', 2), row('receipt-old', 50), ts), true);
+    assert.equal(receipt.sourceHistoryId, 'receipt-old', 'a rejected revision still supplies a missing durable locator');
+    assert.equal(receipt.cardRowRevision, 3);
+    assert.equal(receipt.headline, 'PR merged');
+    assert.equal(record.items.filter(item => item.activity).length, 2);
+    assert.deepEqual(record.items.filter(item => item.activity).map(item => item.activity.parts[0].seq), [1, 2]);
+
+    // A cold page has no prior live revision: canonical source revision still
+    // wins over page arrival/timestamp, without coalescing equal executor words.
+    const cold = { items: [] };
+    for (const [summary, source] of [[merge('PR merged', 3), row('receipt-new', 3)],
+        [speech(2), row('speech-2', 2)], [merge('PR queued', 1), row('receipt-old', 50)],
+        [speech(1), row('speech-1', 1)]]) {
+        mergeHistoricalTimelineItem(cold, summary, source, ts);
+    }
+    reconcileDelegatedItems(cold);
+    assert.equal(cold.items.length, 3);
+    assert.equal(cold.items.find(item => item.dedupeKey === key).headline, 'PR merged');
+    assert.deepEqual(cold.items.filter(item => item.activity).map(item => item.activity.parts[0].seq), [1, 2]);
+});
 
 test('one child lifecycle survives chronological replay and older pages without losing narration', () => {
     const narration = 'Searching evidence. '.repeat(60) + 'COMPLETE_NARRATION_END';
@@ -47,9 +90,16 @@ test('an older lifecycle page cannot regress a status already updated live', () 
     const old = { history_id: 'progress:1', history_position: { source: 'progress', offset: 1 },
         ts: '2026-09-12T12:00:01Z' };
     assert.equal(mergeHistoricalTimelineItem(record,
-        { headline: 'Scheduled', phase: 'queued', dedupeKey: key }, old, '12:00:01'), false);
+        { headline: 'Scheduled', phase: 'queued', dedupeKey: key }, old, '12:00:01'), true);
     assert.equal(record.items[0], item);
     assert.equal(item.headline, 'Running');
+    assert.equal(item.sourceTs, '2026-09-12T12:00:03Z');
+    assert.equal(item.sourceHistoryId, 'progress:1');
+    assert.equal(item.historyId, undefined);
+    assert.equal(mergeHistoricalTimelineItem(record,
+        { headline: 'Scheduled', phase: 'queued', dedupeKey: key },
+        { ...old, history_id: 'progress:0', ts: '2026-09-12T12:00:00Z' }, '12:00:00'), false);
+    assert.equal(item.sourceHistoryId, 'progress:1', 'a rejected older source cannot redirect an existing locator');
     assert.equal(record.items.length, 1);
 });
 
@@ -135,6 +185,16 @@ test('receipt revision ordering preserves its live identity and disclosure acros
     live(3, 'Merged');
     const item = record.items[0], key = item.lineKey;
     record.expandedLineKeys.add(key);
+    const { sourceHistoryId: _source, sourceHistoryRevision: _revision, historyPosition: _position, ...content } = item;
+    assert.equal(mergeHistoricalTimelineItem(record, summary(2, 'Queued'), row(20, 9), '12:09'), true);
+    assert.equal(item.sourceHistoryId, 'chat:20');
+    assert.equal(item.cardRowRevision, 3);
+    assert.equal(mergeHistoricalTimelineItem(record, summary(3, 'Conflicting equal revision'), row(2, 2), '12:02'), true);
+    const { sourceHistoryId, sourceHistoryRevision, historyPosition, ...adoptedContent } = item;
+    assert.deepEqual(adoptedContent, content, 'equal revision adopts only physical provenance');
+    assert.equal(sourceHistoryId, 'chat:2', 'canonical current source supersedes the older fallback despite earlier delivery time');
+    assert.equal(sourceHistoryRevision, 3);
+    assert.deepEqual(historyPosition, row(2, 2).history_position);
     const original = JSON.stringify(item);
     for (const revision of [undefined, 2, 3]) {
         assert.equal(mergeHistoricalTimelineItem(record, summary(revision, 'Queued'), row(90, 9), '12:09'), false);
@@ -155,9 +215,26 @@ test('receipt revision ordering preserves its live identity and disclosure acros
     assert.equal(live(5, 'Verified merge').timelineUpdate, 'patch-at');
     assert.equal(item.cardRowRevision, 5);
     assert.equal(item.headline, 'Verified merge');
+    assert.equal(item.sourceHistoryRevision, 4, 'live content does not pretend its archived source advanced');
+    assert.equal(mergeHistoricalTimelineItem(record, summary(5, 'Conflicting canonical words'), row(3, 0), '12:00'), true);
+    assert.equal(item.sourceHistoryId, 'chat:3');
+    assert.equal(item.sourceHistoryRevision, 5);
+    assert.equal(item.headline, 'Verified merge');
     assert.equal(item.lineKey, key);
     assert.equal(record.expandedLineKeys.has(key), true);
     assert.equal(record.items.length, 1);
+});
+
+test('adopting a missing locator preserves the timestamp tie ordering witness', () => {
+    const summary = { dedupeKey: 'subagent-lifecycle:child', headline: 'Running' };
+    const record = { items: [{ ...summary, sourceTs: '2026-09-12T12:00:00Z',
+        historyPosition: { source: 'progress', offset: 9 } }] };
+    assert.equal(mergeHistoricalTimelineItem(record, { ...summary, headline: 'Queued' }, {
+        history_id: 'progress:1', history_position: { source: 'progress', offset: 1 },
+        ts: record.items[0].sourceTs,
+    }, '12:00'), true);
+    assert.equal(record.items[0].headline, 'Running');
+    assert.equal(record.items[0].sourceHistoryId, 'progress:1');
 });
 
 test('reopening a deep window fetches its exact page and retains newer navigation without cached bodies', async () => {

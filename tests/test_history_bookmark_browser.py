@@ -332,6 +332,114 @@ def _bookmark_reconnect(page):
 
 
 @pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+@pytest.mark.parametrize('line_kind', ['receipt', 'narration'])
+def test_nested_line_bookmark_uses_its_source_page(direct_server_with_data, browser_engine, line_kind, tmp_path):
+    """A card's recent progress must not choose the page for its older line."""
+    from datetime import datetime, timedelta, timezone
+    from ouroboros.merge_receipts import card_row_text
+    from ouroboros.projects_registry import create_project
+    from tests.ui_chat_viewport_smoke import _emit_ws_frame
+    from playwright.sync_api import sync_playwright
+
+    root = direct_server_with_data['data_dir']
+    project = create_project(root, 'source-page', name='Nested reading position')
+    cid = project['chat_id']
+    start = datetime(2026, 9, 1, 10, tzinfo=timezone.utc)
+    stamp = lambda minute: (start + timedelta(minutes=minute)).isoformat()
+    receipt = {'receipt_id': 'source', 'number': 1347, 'revision': 3,
+               'outcome': {'status': 'merged', 'merge_sha': 'a' * 40},
+               'coverage': {'status': 'covers_head', 'gaps': []}}
+    marker = 'PR #1347 merge:' if line_kind == 'receipt' else 'SOURCE_PAGE_NARRATION'
+    text = card_row_text(receipt) if line_kind == 'receipt' else (
+        'SOURCE_PAGE_NARRATION. ' + 'The original expanded activity remains readable. ' * 12)
+    old = {'chat_id': cid, 'task_id': 'source-owner', 'ts': stamp(1), 'content': text}
+    if line_kind == 'receipt':
+        old.update(role='system', system_type='host_progress', narration=False,
+                   card_row='reviews', card_row_id='merge-receipt:source', card_row_revision=3)
+    _write(root / 'logs/progress.jsonl', [old, *[
+        {'chat_id': cid, 'task_id': 'source-filler', 'ts': stamp(index + 2),
+         'content': f'Archive activity {index:03d}'} for index in range(80)],
+        {'chat_id': cid, 'task_id': 'source-owner', 'ts': stamp(83), 'content': 'RECENT_OWNER_PROGRESS'}])
+    _write(root / 'logs/chat.jsonl', [
+        {'chat_id': cid, 'direction': 'in', 'ts': stamp(index),
+         'client_message_id': f'source-{index}', 'text': f'Reading context {index:03d}'} for index in range(100)])
+    for task in ('source-owner', 'source-filler'):
+        _result(root, task, chat_id=cid, project_id=project['id'], result='Completed retained task.',
+                merge_receipts=[receipt] if task == 'source-owner' and line_kind == 'receipt' else [])
+    with sync_playwright() as pw:
+        browser = getattr(pw, browser_engine).launch(headless=True)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 850})
+            _open(page, direct_server_with_data['url'])
+            feed = _open_project(page, project)
+            recent = page.evaluate('id => window.__historyReads.find(r => r.chatId === id).body', cid)
+            assert any(row.get('text') == 'RECENT_OWNER_PROGRESS' for row in recent['messages'])
+            assert not any(marker in row.get('text', '') for row in recent['messages'])
+            card = page.locator(f'{feed} .chat-live-card[data-task-id="source-owner"]')
+            if card.get_attribute('data-expanded') != '1':
+                card.locator(':scope > [data-live-summary-button]').click()
+            line = card.locator(':scope > [data-live-timeline] > .chat-live-line').filter(has_text=marker)
+            if line_kind == 'receipt':
+                # A late live receipt already has the same revision as its archive row.
+                _emit_ws_frame(page, {**old, 'type': 'chat', 'is_progress': True})
+                line.wait_for(state='visible')
+                line.evaluate('''n => {
+                    window.__sourceLine = n;
+                    const range = document.createRange();
+                    range.selectNodeContents(n.querySelector('.chat-live-line-title'));
+                    getSelection().removeAllRanges(); getSelection().addRange(range);
+                    window.__sourceSelection = getSelection().toString();
+                }''')
+                live_key = line.get_attribute('data-live-line-key')
+            _step(page, feed)
+            line.wait_for(state='attached')
+            supplying = page.evaluate('''({id, marker}) => window.__historyReads.filter(r => r.chatId === id)
+                .find(r => r.cursor && r.body?.messages.some(m => m.text?.includes(marker))).body''', {'id': cid, 'marker': marker})
+            assert supplying['page_cursor'] != recent['page_cursor']
+            source_row = next(row for row in supplying['messages'] if marker in row.get('text', ''))
+            source = source_row['history_id']
+            if line_kind == 'receipt':
+                assert source_row['card_row_revision'] == 3 and source_row['text'] == text
+            if line_kind == 'receipt':
+                assert line.evaluate('n => n === window.__sourceLine'), 'equal revision adoption keeps the mounted node'
+                assert line.get_attribute('data-live-line-key') == live_key
+                assert page.evaluate('() => getSelection().toString() === window.__sourceSelection')
+                page.evaluate('() => getSelection().removeAllRanges()')
+                # A late, lower revision cannot roll back the visible receipt.
+                _emit_ws_frame(page, {**old, 'type': 'chat', 'is_progress': True,
+                                     'card_row_revision': 2, 'ts': stamp(99), 'content': 'Stale queued receipt'})
+                assert all(part in line.inner_text() for part in text.splitlines())
+            else:
+                line.locator('[data-live-line-toggle]').click()
+                assert line.get_attribute('data-expanded') == '1'
+            offset = _bookmark_place(page, line, 1)
+            anchor = page.evaluate('''async feed => {
+                const {createTimelineAnchors} = await import('/static/modules/chat_render_batch.js');
+                return createTimelineAnchors({messagesDiv:document.querySelector(feed), liveCardRecords:new Map()}).serializeTimelineAnchor();
+            }''', feed)
+            assert anchor['lineKey'] == line.get_attribute('data-live-line-key'), anchor
+            _screenshot(page, tmp_path, f'source-page-{line_kind}-before-{browser_engine}')
+            page.locator('#project-panel-close').click()
+            before = page.evaluate('() => window.__historyReads.length')
+            _click_project(page, project)
+            _idle(page, feed)
+            reads = page.evaluate('n => window.__historyReads.slice(n)', before)
+            (tmp_path / f'source-page-{line_kind}-{browser_engine}.json').write_text(json.dumps({
+                'source': source, 'anchor': anchor, 'recent': recent, 'supplying': supplying, 'reopen': reads}, indent=2))
+            assert [read['cursor'] for read in reads if read['cursor']] == [supplying['page_cursor']]
+            assert card.get_attribute('data-expanded') == '1'
+            line.wait_for(state='visible')
+            assert all(part.strip() in line.inner_text() for part in text.splitlines())
+            if line_kind == 'narration':
+                assert line.get_attribute('data-expanded') == '1'
+            assert abs(line.evaluate(_OFFSET) - offset) <= 8
+            assert 'could not be restored exactly' not in page.locator(feed).locator('..').inner_text()
+            _screenshot(page, tmp_path, f'source-page-{line_kind}-after-{browser_engine}')
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
 def test_protected_page_bookmark_survives_latest_rebase(direct_server_with_data, browser_engine, tmp_path):
     from datetime import datetime, timedelta, timezone
     from ouroboros.projects_registry import create_project

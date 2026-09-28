@@ -2525,6 +2525,58 @@ body.resizing-panels { user-select: none; }
     overflow-y: auto;
 }
 
+/* A delegated run's observation (#1350): the executor's words are the row's reading
+   text in primary ink; thinking, counts, gaps and notes stay in the row's quieter ink.
+   Problems use the warn pair — a failed step is not a failed task. */
+.chat-delegated-activity > * + * {
+    margin-top: var(--space-1);
+}
+
+.chat-delegated-message {
+    color: var(--text-primary);
+}
+
+.chat-delegated-actor {
+    display: block;
+    color: var(--text-muted);
+}
+
+.chat-delegated-problem {
+    color: var(--status-warn-fg);
+}
+
+/* A disclosure among quieter notes reads as a control: control ink, native marker. */
+.chat-delegated-thinking > summary {
+    cursor: pointer;
+    color: var(--text-primary);
+}
+
+.chat-delegated-thought + .chat-delegated-thought {
+    margin-top: var(--space-1);
+}
+
+.chat-delegated-gap,
+.chat-delegated-note,
+.chat-delegated-seq {
+    color: var(--text-meta);
+}
+
+/* A range the wait could not read before returning stays in the warn pair. */
+.chat-delegated-final {
+    color: var(--status-warn-fg);
+}
+
+.chat-delegated-source {
+    overflow-wrap: anywhere;
+}
+
+/* Ordered by the journal; each entry already carries its seq, so no list numbers. */
+.chat-delegated-events {
+    margin: 0;
+    padding-inline-start: 0;
+    list-style: none;
+}
+
 .chat-live-line-loading {
     margin-top: 6px;
     font-size: var(--type-meta);

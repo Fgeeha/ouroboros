@@ -1170,6 +1170,7 @@ class OuroborosAgent:
 
     def _emit_progress(self, text: str, *, incident: Optional[Dict[str, str]] = None,
                        executor_observation: Optional[Dict[str, Any]] = None,
+                       delegated_activity: Optional[Dict[str, Any]] = None,
                        narration: bool = False, card_row: str = "", card_row_id: str = "",
                        _task_id_override: Any = _PROGRESS_ID_UNSET,
                        _chat_id_override: Any = _PROGRESS_ID_UNSET,
@@ -1230,6 +1231,14 @@ class OuroborosAgent:
                 )
                 if observation:
                     progress_meta["executor_observation"] = observation
+            if delegated_activity is not None:
+                # The executor's typed words and technical events (``delegate_activity``):
+                # host progress about the delegated run, never this turn's own narration.
+                from ouroboros.subagent_messages import delegated_activity_meta
+
+                activity = delegated_activity_meta(delegated_activity, task_id=event["task_id"])
+                if activity:
+                    progress_meta["delegated_activity"] = activity
             # Stamped on EVERY frame, never inferred from the absence of other
             # metadata: a reader that sees no key is reading an older worker or a
             # row written before the fact existed, and keeps the legacy reading.
