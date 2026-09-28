@@ -710,6 +710,9 @@ def test_review_bookmark_waits_for_necessary_task_detail(direct_server_with_data
             _click_project(page, project)
             _idle(page, feed)
             detail.wait_for(state='visible')
+            # Another task-detail consumer can render this Review while its own
+            # hydration still holds the bookmark. Await that owner's completion.
+            card.locator('[data-review-hydrate-status]').wait_for(state='detached')
             page.evaluate(_FRAMES)
             assert abs(detail.evaluate(_OFFSET) - offset) <= 8
             _screenshot(page, tmp_path, f'composed-review-switch-{browser_engine}')
