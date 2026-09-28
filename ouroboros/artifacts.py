@@ -65,7 +65,7 @@ _MAX_SCRATCH_PATHS = 1000
 _ATTACHMENTS_SUBDIR = "attachments"
 _CHAT_MEDIA_SUBDIR = "chat_media"
 _SOURCE_HANDLES_SUBDIR = "source_handles"
-_SOURCE_HANDLE_CATEGORIES = frozenset({"tool_results", "context_checkpoints"})
+_SOURCE_HANDLE_CATEGORIES = frozenset({"tool_results", "context_checkpoints", "delegated_activity"})
 _LEGACY_TOOL_RESULT_TRUNCATION_RE = re.compile(
     r"\n\.\.\. \(truncated from (?P<original>[1-9][0-9]*) chars, "
     r"limit=(?P<limit>[1-9][0-9]*)\)"
@@ -1085,24 +1085,19 @@ DELEGATED_CAPTURE_PREFIX = "delegated_runs"
 def delegated_capture_read_target(
     canonical_root: Any, task_id: str, rel_text: str, resolved_base: pathlib.Path,
 ) -> Optional[pathlib.Path]:
-    """Canonical-drive anchor for READS of delegated-run capture artifacts (CR1-2).
+    """Canonical-drive anchor for READS of own delegated captures and activity.
 
-    The capture writer always writes under the CANONICAL (budget) drive
-    (`delegate_custody.custody_root` — the capture must survive child-drive
-    pruning), while a child task's ``artifact_store`` base resolves from the
-    CHILD's drive_root — so a split-drive nanny that owns the run got NOT_FOUND
-    for its own patch/manifest and could only dispose blindly. Reads of exactly
-    the capture prefix (the owning task's own capture dir, never a broader
-    surface) re-anchor here. Returns None when the path is not a capture path
-    or the base already IS canonical (ordinary single-drive tasks).
+    Writers retain captures and activity under ``delegate_custody.custody_root``
+    (the canonical budget drive) so they survive child-drive pruning. The child's
+    ``artifact_store`` otherwise resolves on its execution drive and misses them.
+    Only these two prefixes in the caller's OWN task store re-anchor here; other
+    paths and already-canonical bases return None. Writes keep their original base.
 
-    This anchor is deliberately OWNER-ONLY: it rebinds the caller's own
-    ``<task_id>`` prefix. A capture the ORPHAN disposition rule authorizes
-    lives under ANOTHER task's prefix and is resolved by the sibling
-    ``delegate_shared.orphan_capture_read_target``, which asks
-    ``orphan_disposition_status`` before returning a path.
+    Another task's capture requires ``delegate_shared.orphan_capture_read_target``
+    and its ``orphan_disposition_status`` proof; this binding grants no orphan access.
     """
-    prefix = DELEGATED_CAPTURE_PREFIX
+    activity_prefix = f"{_SOURCE_HANDLES_SUBDIR}/delegated_activity"
+    prefix = activity_prefix if rel_text == activity_prefix or rel_text.startswith(activity_prefix + "/") else DELEGATED_CAPTURE_PREFIX
     if rel_text != prefix and not rel_text.startswith(prefix + "/"):
         return None
     canonical_base = task_artifact_dir_path(
@@ -1111,10 +1106,13 @@ def delegated_capture_read_target(
     if canonical_base == pathlib.Path(resolved_base):
         return None
     anchored = (canonical_base / rel_text).resolve(strict=False)
+    # The new source binding grants only this subtree, including after symlink
+    # resolution; it cannot expose sibling source categories on the canonical drive.
+    allowed_base = canonical_base / prefix if prefix == activity_prefix else canonical_base
     try:
-        anchored.relative_to(canonical_base)
+        anchored.relative_to(allowed_base)
     except ValueError as exc:
-        raise ValueError(f"path escapes {canonical_base}") from exc
+        raise ValueError(f"path escapes {allowed_base}") from exc
     return anchored
 
 

@@ -64,14 +64,15 @@ from ouroboros.utils import append_jsonl, utc_now_iso
 from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
 
 
-def _publish_scheduling_refusal(ctx: Any, status: str, code: str, text: str) -> str:
+def _publish_scheduling_refusal(ctx: Any, status: str, code: str, text: str, *, reason: str = "") -> str:
     """Publish one scheduling refusal at the branch that composed it (D02).
 
     The validator helpers stay pure functions with no invocation to publish
     into; the single caller that turns a refusal into the result of a call
     publishes it here, with the code the one adapter already assigns.
     """
-    return _publish_tool_result(ctx, ToolResult(status=status, code=code, text=text))
+    return _publish_tool_result(ctx, ToolResult(
+        status=status, code=code, text=text, meta={"reason": reason} if reason else {}))
 
 log = logging.getLogger(__name__)
 
@@ -524,6 +525,31 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
     from _schedule_task to keep it under the method size gate; one dict param to stay
     within the parameter-count discipline; pure construction)."""
     parent_contract = spec.get("parent_contract")
+    input_source_fields = {}
+    if isinstance(parent_contract, dict) and "input_sources" in parent_contract:
+        input_source_fields["input_sources"] = parent_contract["input_sources"]
+    if "input_sources" in spec:
+        input_source_fields["input_sources"] = spec["input_sources"]
+    if (isinstance(parent_contract, dict) and parent_contract.get("input_sources") == "declared"
+            and input_source_fields.get("input_sources") != "declared"):
+        raise ValueError("input_sources=shared cannot widen an inherited declared selection")
+    if input_source_fields.get("input_sources") == "declared":
+        # Omit whole prior-case narrative carriers; keep the predecessor source
+        # that grants lineage reads. Input selection must not alter that access.
+        predecessor = (parent_contract or {}).get("predecessor_authority")
+        parent_contract = {
+            key: value for key, value in (parent_contract or {}).items()
+            if key not in {"notes", "review_notes", "predecessor_authority"}
+        }
+        if isinstance(predecessor, dict) and predecessor:
+            reference_keys = {"source", "task_id", "authority_sha256", "authority_chars", "digest_semantics"}
+            reference = {key: value for key, value in predecessor.items() if key in reference_keys}
+            omitted = predecessor.get("omitted_fields")
+            reference["omitted_fields"] = sorted(set(
+                [str(key) for key in predecessor if key not in reference_keys | {"omitted_fields"}]
+                + (list(omitted) if isinstance(omitted, list) else [])))
+            parent_contract["predecessor_authority"] = reference
+        input_source_fields["context"] = str(spec.get("context") or "")
     objective = spec.get("objective", "")
     expected_output = spec.get("expected_output", "")
     constraints = spec.get("constraints", "")
@@ -581,12 +607,14 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
                 # child verify receipts would "support" claims the child never owned.
                 "acceptance_claims": child_claims,
                 "success_criteria": [],
+                **input_source_fields,
             } if isinstance(parent_contract, dict) else {
                 "delegation_budget": delegation_budget,
                 "resource_policy": spec.get("resource_policy", {}),
                 "acceptance_claims": child_claims,
                 "attachment_manifest": spec.get("attachment_manifest") or [],
                 "attachment_manifest_ref": spec.get("attachment_manifest_ref"),
+                **input_source_fields,
             },
         },
     })
@@ -644,7 +672,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
                         f"{sorted(set(internal) - _INTERNAL_SCHEDULE_OPTIONS)}")
     fields, arg_error = _validated_schedule_fields(params, ctx=ctx)
     if arg_error:
-        return _publish_scheduling_refusal(ctx, "error", "TOOL_ARG_ERROR", arg_error)
+        return _publish_scheduling_refusal(
+            ctx, "error", "TOOL_ARG_ERROR", arg_error, reason=fields.get("reason", ""))
     deadline_at = fields["deadline_at"]
     objective = fields["objective"]
     expected_output = fields["expected_output"]
@@ -666,6 +695,12 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
     except SubagentSelectionError as exc:
         return _publish_scheduling_refusal(ctx, "error", "TOOL_ARG_ERROR", f"⚠️ {exc.code}: {exc.detail}")
     route = configured_subagent.get("route") if isinstance(configured_subagent.get("route"), dict) else {}
+    if fields.get("input_sources") == "declared" and route.get("kind") != "api_model":
+        return _publish_scheduling_refusal(
+            ctx, "error", "TOOL_ARG_ERROR",
+            "⚠️ INPUT_SOURCE_SELECTION_UNSUPPORTED (schedule_subagent): input_sources=declared "
+            "requires an api_model actor; agent_session composition is not qualified.",
+            reason="INPUT_SOURCE_SELECTION_UNSUPPORTED")
     if fields.get("directory_strategy") == "copy" and route.get("kind") != "agent_session":
         return _publish_scheduling_refusal(
             ctx, "error", "TOOL_ARG_ERROR",
@@ -773,10 +808,12 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         tid, status_drive_root, memory_mode, parent_project_id)
     if _drive_err:
         return _publish_scheduling_refusal(ctx, "error", "TOOL_ERROR", _drive_err)
-    child_attachment_authority, attachment_error = _materialize_child_attachment_manifest(
-        parent_contract, child_drive or status_drive_root, tid,
-        owner_drive=Path(ctx.drive_root), owner_task_id=parent_task_id,
-    )
+    child_attachment_authority, attachment_error = ({"attachment_manifest": []}, "")
+    if fields.get("input_sources") != "declared":
+        child_attachment_authority, attachment_error = _materialize_child_attachment_manifest(
+            parent_contract, child_drive or status_drive_root, tid,
+            owner_drive=Path(ctx.drive_root), owner_task_id=parent_task_id,
+        )
     if attachment_error:
         shutil.rmtree(task_state_dir(status_drive_root, tid), ignore_errors=True)
         return f"⚠️ SUBTASK_ATTACHMENT_ERROR: {attachment_error}"
@@ -798,6 +835,8 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "parent_task_id": parent_task_id, "root_task_id": root_task_id, "session_id": session_id,
         "child_delegation_budget": child_delegation_budget, "deadline_at": str(deadline_at or ""),
         "acceptance_claims": fields["acceptance_claims"], "resource_policy": fields["resource_policy"],
+        "context": context,
+        **({"input_sources": fields["input_sources"]} if "input_sources" in fields else {}),
         **child_attachment_authority,
     })
     # The requested-status envelope carries the REQUEST. Its derived half stays

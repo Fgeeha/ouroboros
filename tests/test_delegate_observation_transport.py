@@ -45,6 +45,10 @@ def test_public_wait_reads_response_slower_than_five_seconds(tmp_path, monkeypat
             if self.path == "/v2/agent-capabilities":
                 self.answer({"harnesses": [{"id": "fixture", "liveInput": "mid_turn"}]})
                 return
+            if self.path == "/v2/operations":
+                # This engine lists no run event stream: the drained tail keeps its window view.
+                self.answer({"operations": []})
+                return
             assert self.path == "/v2/runs/run-slow"
             # Deliberate network-latency reproduction: the previous five-second
             # HTTP timeout fails before this real socket sends its headers.
@@ -76,10 +80,12 @@ def test_public_wait_reads_response_slower_than_five_seconds(tmp_path, monkeypat
         assert result["state"] == "succeeded"
         # The route's live-input capability is read ONCE at entry on the same transport
         # and stamped on the wake; then one handshake per supervision loop, one GET per
-        # tick (S2): the loop holds the transport across quiet ticks.
+        # tick (S2): the loop holds the transport across quiet ticks. The terminal tick's
+        # new journal tail is drained to the owner before settlement, which negotiates
+        # the run event route once per engine identity (#1350).
         assert result["leaf_live_input"] == "mid_turn"
         assert requests == [("GET", "/v2/agent-capabilities"), ("POST", "/v2/handshake")] + [
-            ("GET", "/v2/runs/run-slow")] * (2 if initially_queued else 1)
+            ("GET", "/v2/runs/run-slow")] * (2 if initially_queued else 1) + [("GET", "/v2/operations")]
     finally:
         server.shutdown()
         server.server_close()

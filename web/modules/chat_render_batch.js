@@ -1,6 +1,7 @@
 // Chat timeline ordering, keyed item reconciliation and reading anchors.
 // These helpers own no history source, navigation or task authority.
 import { compareHistoryPosition } from './chat_history_replay.js';
+import { appendDelegatedItem, reconcileDelegatedItems } from './delegated_activity.js';
 
 const nodePosition = node => node?.dataset?.historySource
     ? { source: node.dataset.historySource, offset: Number(node.dataset.historyOffset) } : null;
@@ -340,6 +341,7 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
     const render = (record) => {
         if (defer(record)) return false;
         record._timelineDirty = false;
+        reconcileDelegatedItems(record); // replay, page release and reorders re-project per seq
         return withStableViewport(() => {
             const el = record.timelineEl;
             const pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
@@ -604,6 +606,8 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
  * lifecycle notes keep their existing in-place semantics and disclosure key.
  */
 export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKey, headline, inPlaceByKey }) {
+    // A delegated observation is its own source record; its projection is per seq.
+    if (summary.activity) return appendDelegatedItem(record, summary, { ts, rawTs, syntheticKey, headline });
     let timelineUpdate = 'none', patchIndex = -1;
     const lastIdx = record.items.length - 1;
     // Full-array dedup keeps routine history syncs from growing Notes.

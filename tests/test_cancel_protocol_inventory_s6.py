@@ -62,6 +62,9 @@ TERMINAL_WRITERS = {
     # disclosure without changing the task's terminal status (same preserved
     # read as its record_terminal_reconciliation sibling).
     ('ouroboros/delegate_terminal.py::_rewrite_execution_evidence', 'str(existing.get("status") or STATUS_RUNNING)'): 'dynamic',
+    # Disposition removes only this run's resolved debt. The locked projector
+    # preserves the current lifecycle; "running" is the writer's placeholder.
+    ('ouroboros/delegate_terminal.py::refresh_disposed_reconciliation', '"running"'): 'dynamic',
     ('ouroboros/gateway/tasks.py::_admission_rejection_response', 'STATUS_FAILED'): 'terminal',
     ('ouroboros/gateway/tasks.py::_complete_api_task_admission', '"failed"'): 'terminal',
     # The scanner treats a variable status as dynamic. This create-only site

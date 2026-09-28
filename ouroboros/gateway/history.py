@@ -27,7 +27,7 @@ from ouroboros.outcomes import normalize_outcome_axes
 from ouroboros.history_retention import retention_summary
 from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
 from ouroboros.project_dialogue import historical_terminal_projection
-from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, executor_observation_meta, initiator_meta, subagent_message_meta
+from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS, delegated_activity_meta, executor_observation_meta, initiator_meta, subagent_message_meta
 from ouroboros.task_results import TASK_COST_META_FIELDS as _TASK_COST_META_FIELDS
 from ouroboros.utils import JsonlChainUnreadable, strip_markdown, utc_now_iso
 
@@ -89,7 +89,7 @@ _PROGRESS_META_FIELDS = (
     # Phase 6: the resolved delegated route (a harness id), so a replayed
     # bubble keeps its executor chip instead of losing it on reload.
     "executor_route",
-    "executor_observation",
+    "executor_observation", "delegated_activity",  # the executor's typed words/technical events (#1350)
     # The completion-seam evidence block (delegated runs started/settled,
     # subscription spend, harness models) — the chip's layered truth on replay.
     "execution_evidence",
@@ -1004,12 +1004,11 @@ def _collect_progress_rows(
             for field in _PROGRESS_META_FIELDS:
                 if field in entry:
                     rec[field] = entry[field]
-            if "executor_observation" in rec:
-                observation = executor_observation_meta(
-                    rec.pop("executor_observation"), task_id=rec["task_id"],
-                )
-                if observation:
-                    rec["executor_observation"] = observation
+            # Replay re-checks task-bound progress facts with the emitter's own validators.
+            for key, validate in (("executor_observation", executor_observation_meta),
+                                  ("delegated_activity", delegated_activity_meta)):
+                if key in rec and (value := validate(rec.pop(key), task_id=rec["task_id"])):
+                    rec[key] = value
             # ABI-3: the whitelist passes only the honest cost names; a stored
             # legacy row's pair is CONVERTED here (deprecated-wins) instead of
             # being replayed under the retired spelling or silently dropped.
