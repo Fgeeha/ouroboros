@@ -1,10 +1,15 @@
 """Real disposable pooled children; never invoke the installation's Panic."""
 from __future__ import annotations
 
+import functools
+import itertools
+import json
 import multiprocessing
 import os
+import pathlib
 import signal
 import socket
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -60,6 +65,110 @@ def _owner_fault_entry(mode, *args):
     claudexor_daemon.get_owned_daemon = unavailable_owner
     # Actual worker_main -> actual registry -> supported run_command Popen.
     _pooled_test_entry(mode, *args)
+
+
+def _observed_owner_fault_entry(mode, *args, evidence):
+    """Trace the actual request path without holding it for logging or a Queue.
+
+    The socket is fixture-owned; a missing datagram is an evidence gap, not proof
+    that the corresponding call never ran. All wrapped operations still execute.
+    """
+    from ouroboros import process_custody
+    from ouroboros.tools import shell_process
+
+    sequence = itertools.count(1)
+    evidence.setblocking(False)
+
+    def emit(event, **facts):
+        try:
+            evidence.send(json.dumps({"seq": next(sequence), "event": event,
+                                      "t_ns": time.monotonic_ns(), **facts}).encode())
+        except OSError:
+            pass  # observer failure cannot veto an emergency request
+
+    start_lifeline = process_custody.start_parent_lifeline
+    request_child = shell_process.request_process_tree_kill
+    kill_group = os.killpg
+
+    def traced_lifeline(*, before_exit=None, **kwargs):
+        def callback():
+            emit("callback_enter")
+            try:
+                return before_exit()
+            finally:
+                emit("callback_exit")
+        return start_lifeline(before_exit=callback if before_exit else None, **kwargs)
+
+    def traced_child(proc, **kwargs):
+        emit("child_request_enter", pid=proc.pid,
+             registered=proc in shell_process._active_subprocesses)
+        try:
+            result = request_child(proc, **kwargs)
+        except BaseException as exc:
+            emit("child_request_error", error=type(exc).__name__)
+            raise
+        emit("child_request_return", result=result)
+        return result
+
+    def traced_kill_group(pgid, sig):
+        emit("killpg_enter", pgid=pgid, signal=int(sig))
+        try:
+            result = kill_group(pgid, sig)
+        except BaseException as exc:
+            emit("killpg_error", pgid=pgid, error=type(exc).__name__, errno=getattr(exc, "errno", None))
+            raise
+        emit("killpg_return", pgid=pgid)
+        return result
+
+    process_custody.start_parent_lifeline = traced_lifeline
+    shell_process.request_process_tree_kill = traced_child
+    os.killpg = traced_kill_group
+    emit("observer_ready", pid=os.getpid())
+    _owner_fault_entry(mode, *args)
+
+
+def _received_events(events):
+    """Report received prefix, not completion: senders may exit before a datagram lands."""
+    sequences = sorted(row["seq"] for row in events)
+    contiguous = bool(sequences) and sequences == list(range(1, len(sequences) + 1))
+    return {"events": events, "received_seq_prefix_contiguous": contiguous,
+            "last_received_seq": sequences[-1] if sequences else 0, "events_after_last_received": "unknown"}
+
+
+def _stop_trace(sock, child_pid):
+    """Drain worker events after the frozen verdict, before fixture cleanup."""
+    events = []
+    while True:
+        try:
+            events.append(json.loads(sock.recv(16384)))
+        except (BlockingIOError, ConnectionResetError):
+            break
+    child = {"pid": child_pid, "t_ns": time.monotonic_ns(), "alive": platform.pid_is_alive(child_pid),
+             "zombie": pid_is_zombie(child_pid), "birth": platform.process_start_time(child_pid),
+             "pgid": platform.process_group_id(child_pid)}
+    if sys.platform.startswith("linux"):
+        try:
+            child["wchan"] = pathlib.Path(f"/proc/{child_pid}/wchan").read_text()
+        except OSError as exc:
+            child["wchan_error"] = type(exc).__name__
+    return _received_events(events) | {"child_after_verdict": child}
+
+
+def _assert_frozen_child_stop(child_pid, diagnose, **context):
+    """Keep the original death predicate before any slower diagnostic observation."""
+    stopped = not platform.pid_is_alive(child_pid) or pid_is_zombie(child_pid)
+    verdict = {"child_stopped": stopped, "t_ns": time.monotonic_ns()}
+    trace = dict(context)
+    try:
+        trace |= diagnose()
+    except Exception as exc:
+        trace["diagnostic_error"] = f"{type(exc).__name__}: {exc}"
+    trace["verdict"] = verdict
+    try:
+        print("REGISTERED_STOP_TRACE " + json.dumps(trace, sort_keys=True, default=repr), flush=True)
+    except Exception as exc:
+        trace["print_error"] = f"{type(exc).__name__}: {exc}"
+    assert stopped, trace
 
 
 def _ordinary_close_entry(wid, incoming, outgoing, repo_dir, drive_root, session_id, stop_socket):
@@ -121,10 +230,36 @@ def test_supported_command_is_stopped_even_when_another_owner_fails(tmp_path, mo
     from tests.test_batch1_exact_consumers import _await_published_command_child
 
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", "advanced")
-    monkeypatch.setattr(worker_process, "worker_main", _owner_fault_entry)
+    trace_parent = trace_child = None
+    target = _owner_fault_entry
+    if os.name != "nt":
+        trace_parent, trace_child = socket.socketpair(type=socket.SOCK_DGRAM)
+        trace_parent.setblocking(False)
+        target = functools.partial(_observed_owner_fault_entry, evidence=trace_child)
+    monkeypatch.setattr(worker_process, "worker_main", target)
     ctx = multiprocessing.get_context("spawn")
     incoming, outgoing = ctx.Queue(), ctx.Queue()
-    proc = worker_process.spawn_worker_process(ctx, mode, incoming, outgoing, tmp_path, tmp_path)
+    try:
+        proc = worker_process.spawn_worker_process(ctx, mode, incoming, outgoing, tmp_path, tmp_path)
+    except BaseException:
+        if trace_parent is not None:
+            trace_parent.close()
+            trace_child.close()
+        for queue in (incoming, outgoing):
+            queue.close()
+            queue.cancel_join_thread()
+        raise
+    if trace_child is not None:
+        trace_child.close()
+    parent_events = []
+    if trace_parent is not None:
+        native_kill = proc._popen.kill
+
+        def observed_native_kill():
+            parent_events.append({"event": "parent_native_kill", "t_ns": time.monotonic_ns()})
+            return native_kill()
+
+        monkeypatch.setattr(proc._popen, "kill", observed_native_kill)
     seen = {}
     try:
         incoming.put({"id": "pooled", "type": "task"})
@@ -132,13 +267,17 @@ def test_supported_command_is_stopped_even_when_another_owner_fails(tmp_path, mo
         child_pid = _await_published_command_child(proc, outgoing, tmp_path / "workspace", seen)
         if os.name != "nt":
             assert os.getpgid(child_pid) == child_pid != os.getpgid(proc.pid)
+        parent_events.append({"event": "parent_request", "t_ns": time.monotonic_ns()})
         receipt = platform.request_process_tree_kill(proc)
         proc.join(timeout=3)
         assert not proc.is_alive(), receipt
         deadline = time.monotonic() + 3
         while platform.pid_is_alive(child_pid) and not pid_is_zombie(child_pid) and time.monotonic() < deadline:
             time.sleep(.01)
-        assert not platform.pid_is_alive(child_pid) or pid_is_zombie(child_pid), (receipt, proc.exitcode, seen)
+        _assert_frozen_child_stop(
+            child_pid, lambda: (_stop_trace(trace_parent, child_pid) | {"parent_events": parent_events}
+                                if trace_parent is not None else {"platform": "windows"}),
+            mode=mode, receipt=receipt, worker_exit=proc.exitcode, published=seen)
     finally:
         if proc.is_alive():
             proc.kill()
@@ -147,10 +286,53 @@ def test_supported_command_is_stopped_even_when_another_owner_fails(tmp_path, mo
         if child_pid and platform.pid_is_alive(child_pid) and not pid_is_zombie(child_pid):
             platform.force_kill_pid(child_pid)  # only the continuously observed fixture child
         worker_process.close_worker_stop_channel(proc)
+        if trace_parent is not None:
+            trace_parent.close()
         for queue in (incoming, outgoing):
             queue.close()
             queue.cancel_join_thread()
         stop_socket_sharer()
+
+
+def test_child_death_during_diagnostics_cannot_pass_the_frozen_verdict(capsys):
+    import subprocess
+
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
+    late = {}
+
+    def broken_observer():
+        raise RuntimeError("observer defect")
+
+    def child_dies_while_tracing():
+        child.kill()
+        child.wait(timeout=10)
+        late["stopped"] = not platform.pid_is_alive(child.pid) or pid_is_zombie(child.pid)
+        return {}
+
+    try:
+        with pytest.raises(AssertionError, match="RuntimeError: observer defect"):
+            _assert_frozen_child_stop(child.pid, broken_observer, mode="observer_defect")
+        with pytest.raises(AssertionError, match="'child_stopped': False"):
+            _assert_frozen_child_stop(child.pid, child_dies_while_tracing, mode="late_death")
+        assert late == {"stopped": True}
+        _assert_frozen_child_stop(child.pid, broken_observer, mode="stopped_before_trace")
+    finally:
+        if child.poll() is None:
+            child.kill()
+        child.wait(timeout=10)
+    printed = [json.loads(line.partition(" ")[2]) for line in capsys.readouterr().out.splitlines()
+               if line.startswith("REGISTERED_STOP_TRACE ")]
+    assert [(row["mode"], row["verdict"]["child_stopped"], "diagnostic_error" in row) for row in printed] == [
+        ("observer_defect", False, True), ("late_death", False, False), ("stopped_before_trace", True, True)]
+
+
+def test_trace_discloses_received_prefix_never_absent_execution():
+    racing = [{"seq": 2, "event": "callback_enter"}, {"seq": 1, "event": "observer_ready"}]
+    assert _received_events(racing) == {"events": racing, "received_seq_prefix_contiguous": True,
+                                        "last_received_seq": 2, "events_after_last_received": "unknown"}
+    gapped = _received_events([{"seq": 1, "event": "observer_ready"}, {"seq": 3, "event": "killpg_enter"}])
+    assert not gapped["received_seq_prefix_contiguous"] and gapped["events_after_last_received"] == "unknown"
+    assert not _received_events([])["received_seq_prefix_contiguous"]
 
 
 @pytest.mark.parametrize("broken_channel", [False, True])
