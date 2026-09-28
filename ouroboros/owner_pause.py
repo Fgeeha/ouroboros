@@ -311,7 +311,7 @@ def launch_admission(source: Any, *, root_resume: Optional[Dict[str, Any]] = Non
                 row = budget_pause_row(pathlib.Path(root_drive), task_id)
                 grant = row.get("grant") or {}
                 allowed = bool(row.get("state") == STATE_RESUME_GRANTED
-                    and row.get("owner_fence_id") == fence.get("fence_id")
+                    and (grant.get("owner_pause_fence_id") or row.get("owner_fence_id")) == fence.get("fence_id")
                     and row.get("pause_id") == root_resume.get("pause_id")
                     and grant.get("grant_id") == root_resume.get("grant_id")
                     and grant.get("authority") == "explicit_resume"

@@ -102,7 +102,7 @@ def _replay(q: Any, predecessor: str, nonce: str, successor: str) -> Optional[Di
                 "successor_task_id": successor, "unconfirmed": True, "detail": str(exc)[:200]}
 
 
-def conflicting_writers(q: Any, predecessor: str) -> List[Dict[str, Any]]:
+def conflicting_writers(q: Any, predecessor: str, *, drive_root: Any = None) -> List[Dict[str, Any]]:
     """Observe all retained tree custody, regardless of the member's lifecycle.
 
     Queue authority is copied briefly; custody observations never cancel runs.
@@ -112,6 +112,7 @@ def conflicting_writers(q: Any, predecessor: str) -> List[Dict[str, Any]]:
     from ouroboros.owner_pause import tree_member_results
     from supervisor.queue_transitions import budget_pause_fact
 
+    custody_root = pathlib.Path(drive_root or q.DRIVE_ROOT)
     blockers: List[Dict[str, Any]] = []
     members = {predecessor}
     member_results = {}
@@ -131,14 +132,14 @@ def conflicting_writers(q: Any, predecessor: str) -> List[Dict[str, Any]]:
                                                    and not task.get("_budget_pause")):
                 blockers.append({"kind": "dispatchable_member", "task_id": tid})
     try:
-        member_results = tree_member_results(q.DRIVE_ROOT, predecessor)
+        member_results = tree_member_results(custody_root, predecessor)
         for task_id, row in member_results.items():
             members.add(task_id)
             for op in (row.get("launch_handoffs") or {}).values():
                 blockers.append({"kind": "tool_handoff", "task_id": task_id, "operation": op})
         # A member whose result has been collected can still own a remote start.
         from ouroboros.delegate_custody_memo import custody_rows_with_integrity
-        rows, malformed = custody_rows_with_integrity(pathlib.Path(q.DRIVE_ROOT), predecessor)
+        rows, malformed = custody_rows_with_integrity(custody_root, predecessor)
         if malformed is None or malformed:
             raise OSError("tree_custody_unreadable")
         for row in rows:
@@ -147,7 +148,7 @@ def conflicting_writers(q: Any, predecessor: str) -> List[Dict[str, Any]]:
     except Exception as exc:
         blockers.append({"kind": "tree_census_unreadable", "detail": str(exc)[:200]})
     for member in sorted(members):
-        observed = observe_task_runs(q.DRIVE_ROOT, member, reason="continuation_writer_check", request_stop=False)
+        observed = observe_task_runs(custody_root, member, reason="continuation_writer_check", request_stop=False)
         if observed.get("custody_read") != "ok":
             blockers.append({"kind": "custody_unreadable", "task_id": member})
         else:
@@ -158,7 +159,7 @@ def conflicting_writers(q: Any, predecessor: str) -> List[Dict[str, Any]]:
     try:
         from ouroboros import process_custody as pc
         from ouroboros.platform_layer import pid_is_alive
-        complete, records = pc._read_ledger_strict(pathlib.Path(q.DRIVE_ROOT))
+        complete, records = pc._read_ledger_strict(custody_root)
         if not complete:
             raise OSError("process_custody_unreadable")
         for row in records:
@@ -170,7 +171,7 @@ def conflicting_writers(q: Any, predecessor: str) -> List[Dict[str, Any]]:
         blockers.append({"kind": "process_custody_unreadable", "detail": str(exc)[:200]})
     try:
         from ouroboros import usage_accounting as ua
-        attempts, integrity, _memo, _generation = ua._memoized_final_rows(pathlib.Path(q.DRIVE_ROOT))
+        attempts, integrity, _memo, _generation = ua._memoized_final_rows(custody_root)
         if not integrity:
             raise OSError("attempt_custody_unreadable")
         for attempt in attempts:

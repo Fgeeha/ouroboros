@@ -80,6 +80,25 @@ def _resume_custody_refusal(result_root, task_id, row, external):
     return None
 
 
+def _owner_resume_fence(result_root, task_id, external):
+    """Bind the fresh whole-tree observation to the still-closed owner fence."""
+    from ouroboros.owner_pause import fence_closed, read_fence
+
+    observed = (external or {}).get("owner_pause_tree")
+    if not isinstance(observed, dict) or observed.get("error"):
+        return "", {"ok": False, "error": "owner_pause_custody_unreadable"}
+    try:
+        current_fence = read_fence(result_root, task_id)
+    except Exception:
+        return "", {"ok": False, "error": "owner_pause_custody_unreadable"}
+    if not fence_closed(current_fence) or current_fence != observed.get("fence"):
+        return "", {"ok": False, "error": "selection_authority_changed"}
+    if observed.get("blockers"):
+        return "", {"ok": False, "error": "owner_pause_effects_unsettled",
+                    "blockers": observed["blockers"], "action": "wait_for_effect_settlement"}
+    return str(current_fence.get("fence_id") or ""), None
+
+
 def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected_by: str = "",
                         external: Optional[Dict[str, Any]] = None,
                         sleep_wake: bool = False) -> Dict[str, Any]:
@@ -137,6 +156,14 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
     if (not row or row.get("pause_id") != pause_id or row.get("state") not in LIVE_PAUSE_STATES
             or not row.get("source_ref")):
         return {"ok": False, "error": "pause_record_missing", "action": "cancel_or_new_run"}
+    from ouroboros.owner_pause import fence_closed
+
+    owner_fence_id = ""
+    if ((row.get("reason") == "owner" or fence_closed(result_row.get("owner_pause")))
+            and str(task.get("root_task_id") or task_id) == task_id):
+        owner_fence_id, refusal = _owner_resume_fence(result_root, task_id, external)
+        if refusal:
+            return refusal
     if int(row.get("task_attempt") or 0) != int(task.get("_attempt") or 1):
         # Another attempt than the checkpoint's: the loop would refuse the grant on arrival.
         return {"ok": False, "error": "pause_attempt_mismatch", "action": "cancel_or_new_run",
@@ -249,6 +276,7 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
     generation = int(row.get("resume_generation") or 0) + 1
     pause_generation = int(row.get("pause_generation") or 0)
     grant = {
+        **({"owner_pause_fence_id": owner_fence_id} if owner_fence_id else {}),
         "grant_id": uuid.uuid4().hex, "granted_at": utc_now_iso(), "granted_at_ts": now,
         "single_use": True, "paused_duration_sec": prior_paused + max(0.0, now - paused_at),
         "executed_sec_before_pause": round(executed_sec, 3),
@@ -294,7 +322,7 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
     released_markers: Dict[str, Dict[str, Any]] = {}
     rebound_holds: Dict[str, Dict[str, Any]] = {}
     if (task_id == root_task_id and isinstance(fence, dict) and str(fence.get("fence_id") or "")
-            == str(prior_pause.get("fence_id") or fence.get("fence_id"))):
+            == str(owner_fence_id or prior_pause.get("fence_id") or fence.get("fence_id"))):
         # The root's own Resume lifts its admission latch: exact descendants keep
         # their OWN `_budget_pause` rows and are only ELIGIBLE; the model selects each (Q9).
         q.BUDGET_ROOT_FENCES.pop(root_task_id, None)

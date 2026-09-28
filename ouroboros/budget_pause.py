@@ -1217,7 +1217,7 @@ def _refresh_planning_threshold(ctx: Any, budget_remaining_usd: Optional[float],
             "root_cap_usd": root_cap, "root_cap_basis": root_cap_basis}
 
 
-def _reopen_owner_fence(ctx: Any, usage: Dict[str, Any]) -> None:
+def _reopen_owner_fence(ctx: Any, usage: Dict[str, Any], *, fence_id: str = "") -> None:
     """The resumed ROOT reopens its tree's owner fence where it actually starts.
 
     Only the root does: a member the model selects later runs under a fence
@@ -1225,7 +1225,7 @@ def _reopen_owner_fence(ctx: Any, usage: Dict[str, Any]) -> None:
     and retries — a root running under its own closed fence would only be
     refused at every launch.
     """
-    from ouroboros.owner_pause import release_fence
+    from ouroboros.owner_pause import launch_lock, read_fence, release_fence
 
     root_id = str(getattr(ctx, "root_task_id", "") or ctx.task_id)
     if root_id != str(ctx.task_id):
@@ -1234,7 +1234,10 @@ def _reopen_owner_fence(ctx: Any, usage: Dict[str, Any]) -> None:
     published = ""
     while True:
         try:
-            release_fence(root, root_id, reason="owner_resume_consumed")
+            with launch_lock(root, root_id):
+                if fence_id and read_fence(root, root_id).get("fence_id") != fence_id:
+                    raise ValueError("owner_pause_fence_changed")
+                release_fence(root, root_id, reason="owner_resume_consumed")
             usage.pop("budget_pause_hold", None)
             return
         except Exception as exc:
@@ -1321,8 +1324,8 @@ def resume_paused_loop(tools: Any, state: Dict[str, Any], messages: list, trace:
                 raise ModelWaitInterrupted(control) from exc
             time.sleep(_HOLD_POLL_SEC)
     usage.pop("budget_pause_hold", None)
-    if str(row.get("reason") or "") == REASON_OWNER:
-        _reopen_owner_fence(ctx, usage)
+    if str(row.get("reason") or "") == REASON_OWNER or grant.get("owner_pause_fence_id"):
+        _reopen_owner_fence(ctx, usage, fence_id=str(grant.get("owner_pause_fence_id") or ""))
     ctx._budget_paused_sec = consumed["paused_duration_sec"]
     waiter = getattr(ctx, "model_wait_context", None)
     if waiter is not None:

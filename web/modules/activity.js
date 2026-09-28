@@ -104,6 +104,7 @@ export function initActivity({ mount, ws } = {}) {
                 || ownerFencedRoots.has(String(t.root_task_id || t.id || q.id || ''));
             const phase = (census?.active_chat_activities || []).find((entry) =>
                 entry.activity_id === String(t.root_task_id || t.id || q.id || ''))?.phase;
+            const resumable = paused && (!ownerPaused || phase === 'budget_paused');
             const kindLabel = phase === 'unknown' ? 'pause status unknown'
                 : phase === 'budget_pausing' ? 'pausing' : restartHeld ? 'held after Restart'
                 : (paused ? (ownerPaused ? 'paused' : 'paused (budget)') : kind);
@@ -114,7 +115,7 @@ export function initActivity({ mount, ws } = {}) {
                     <span class="activity-sub">${meta}</span>
                 </div>
                 <div class="activity-row-actions">
-                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${paused ? ' data-budget-paused="1"' : ''}${isRootTaskRow(t, q.id || t.id) ? ' data-root="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
+                    <button type="button" class="btn btn-xs btn-danger" data-act="task-control" data-id="${id}"${resumable ? ' data-budget-paused="1"' : ''}${isRootTaskRow(t, q.id || t.id) ? ' data-root="1"' : ''}>${esc(TASK_CONTROL_TRIGGER_LABEL)}</button>
                 </div>
             </div>`;
         };

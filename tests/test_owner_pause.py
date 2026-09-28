@@ -271,7 +271,7 @@ def test_resume_observes_without_stop_and_the_fence_reopens_where_the_root_start
                         lambda root, task_id, **kw: stops.append(kw.get("request_stop")) or real(root, task_id, **kw))
 
     granted = queue.resume_budget_paused_task("solo")
-    assert granted["ok"] is True and stops == [False]
+    assert granted["ok"] is True and stops and all(stop is False for stop in stops)
     assert owner_pause.read_fence(tmp_path, "solo")["state"] == owner_pause.FENCE_PAUSED, \
         "the grant alone reopens nothing"
 

@@ -949,6 +949,8 @@ def test_late_complete_stream_settles_original_attempt(isolated, monkeypatch):
 
 
 def test_cancelled_control_during_recovery_keeps_paid_custody(isolated):
+    from ouroboros.task_results import write_task_result
+    write_task_result(isolated, "stream-task", "running", root_task_id="stream-task")
     reason = [None]
     calls = []
     def send(**kw):

@@ -371,9 +371,29 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
         # row and decides on this observation. A budget pause requests stops of
         # uncovered runs; the owner's Pause only observes sent work (Batch4 5A).
         from ouroboros.budget_pause import observe_task_runs
+        from ouroboros.owner_pause import fence_closed, read_fence
+
+        root_task_id = str(located_state.get("root_task_id") or task_id)
+        try:
+            owner_fence = read_fence(result_root, root_task_id)
+        except Exception:
+            return {"ok": False, "error": "owner_pause_custody_unreadable"}
+        # Owner Pause may overlay an already saved budget/sleep checkpoint.
+        owner_paused = owner_paused or fence_closed(owner_fence)
 
         external = observe_task_runs(result_root, task_id, reason="budget_resume_uncovered_cost",
                                      request_stop=not owner_paused)
+        if owner_paused and root_task_id == task_id:
+            from supervisor.continuation_admission import conflicting_writers
+
+            # A saved loop is not proof that its handed tools/processes ended.
+            # Observe the existing whole-tree custody owner off the queue lock.
+            try:
+                external["owner_pause_tree"] = {
+                    "fence": owner_fence, "blockers": conflicting_writers(q, task_id, drive_root=result_root),
+                }
+            except Exception as exc:
+                external["owner_pause_tree"] = {"error": str(exc)}
     elif needs_selection:
         observation = observe_held_budget_selection(q, task_id)
     with q._queue_lock:

@@ -483,7 +483,8 @@ def _merge_scope(request: AttemptRequest) -> Tuple[AttemptRequest, UsageScope]:
         from ouroboros.usage_admission import effective_billing_fields
         scope = replace(scope, **effective_billing_fields(scope.drive_root, scope.root_task_id, {
             key: getattr(scope, key) for key in ("root_limit_usd", "root_limit_source", "root_limit_revision", "billing_group_id",
-                "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")}))
+                "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")},
+            non_task_operation=scope.non_task_operation))
     if request.root_limit_usd is not None and (scope.root_limit_usd is None or request.root_limit_usd < scope.root_limit_usd):
         scope = replace(scope, root_limit_usd=request.root_limit_usd, root_limit_source="attempt_request", root_limit_revision=None)
     if request.global_limit_usd is None and scope.global_limit_usd is not None:
@@ -1082,7 +1083,8 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
             from ouroboros.usage_admission import effective_billing_fields
             effective = effective_billing_fields(reservation.drive_root, scope.root_task_id, {
                 key: getattr(scope, key) for key in ("root_limit_usd", "root_limit_source", "root_limit_revision",
-                    "billing_group_id", "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")})
+                    "billing_group_id", "billing_group_limit_usd", "billing_group_limit_source", "billing_group_limit_revision")},
+                non_task_operation=scope.non_task_operation)
             if scope.root_limit_source == "attempt_request":
                 effective.update(root_limit_usd=scope.root_limit_usd, root_limit_source=scope.root_limit_source,
                                  root_limit_revision=scope.root_limit_revision)

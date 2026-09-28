@@ -703,9 +703,29 @@ test('saved Pause with unreadable tree authority remains unknown in Activity and
     await initActivity({ mount, ws }).refresh();
     assert.match(section(mount, 'queue').textContent, /pause status unknown/);
     assert.doesNotMatch(section(mount, 'queue').textContent, /paused/);
+    assert.equal(section(mount, 'queue').querySelector('[data-act="task-control"]').dataset.budgetPaused, undefined);
     let body = '';
     const result = await confirmAndSendRestart({ ws,
         openConfirmDialog: async (options) => { body = options.body; return false; } });
     assert.equal(result, 'cancelled');
     assert.match(body, /Pause status could not be read/);
+});
+
+test('Activity Resume follows the root census while owner Pause is settling', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    routes.set(queueUrl, response({ queue: { running: [], pending: ['root', 'child'].map((id) => ({ id, task: {
+        id, root_task_id: 'root', type: 'task', title: id, _budget_pause: { reason: 'owner' },
+    } })) } }));
+    const activity = initActivity({ mount, ws });
+    for (const phase of ['budget_pausing', 'unknown', undefined, 'budget_paused']) {
+        routes.set(backgroundUrl, response({ bg_consciousness_enabled: false,
+            active_chat_activities: phase ? [{ activity_id: 'root', phase }] : [],
+            active_chat_activities_complete: phase !== undefined }));
+        await activity.refresh();
+        for (const id of ['root', 'child']) {
+            const button = section(mount, 'queue').querySelector(`[data-id="${id}"]`);
+            assert.equal(button.dataset.budgetPaused, phase === 'budget_paused' ? '1' : undefined, `${id}: ${phase}`);
+        }
+    }
 });

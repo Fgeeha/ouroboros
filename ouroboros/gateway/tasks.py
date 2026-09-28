@@ -1417,6 +1417,7 @@ async def api_task_resume(request: Request) -> JSONResponse:
         # fresh custody at grant (#1196, owner Q8): a delegated run not proven
         # terminal keeps the task paused; a marker/attempt drift is typed too
         "external_runs_unsettled", "pause_attempt_mismatch",
+        "owner_pause_effects_unsettled", "owner_pause_custody_unreadable", "selection_authority_changed",
     } else 404
     return json_error(error, status, task_id=task_id, **({"action": result["action"]} if result.get("action") else {}))
 

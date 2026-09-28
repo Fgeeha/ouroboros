@@ -331,8 +331,10 @@ def test_subscription_tool_envelope_uses_existing_task_ceiling(monkeypatch):
 
 def test_real_parent_quota_controller_polls_metadata_then_rejoins_image_call(child_fixture, monkeypatch):
     from ouroboros.model_wait import task_model_wait_scope
+    from ouroboros.task_results import write_task_result
 
     state, events, root = child_fixture
+    write_task_result(root, "image-task", "running", root_task_id="image-task")
     state["mode"] = "quota"
     catalog_calls = []
 

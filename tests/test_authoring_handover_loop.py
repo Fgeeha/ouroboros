@@ -78,6 +78,8 @@ def episode(tmp_path, monkeypatch):
     monkeypatch.setattr(loop, "call_llm_with_retry", scripted)
 
     def run(steps, *, task_id=TASK):
+        from ouroboros.task_results import write_task_result
+        write_task_result(tmp_path, task_id, "running", root_task_id=task_id, _attempt=1)
         state.steps = list(steps)
         state.task_id = task_id
         state.result = loop.run_llm_loop(

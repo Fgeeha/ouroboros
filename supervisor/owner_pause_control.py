@@ -186,7 +186,7 @@ def refresh_owner_pause_tree(root_task_id: str) -> str:
             return FENCE_REQUESTED
     from supervisor.continuation_admission import conflicting_writers
 
-    if conflicting_writers(q, root_task_id):
+    if conflicting_writers(q, root_task_id, drive_root=root_drive):
         return FENCE_REQUESTED
     try:
         set_fence_state(root_drive, root_task_id, fence_id=str(fence.get("fence_id") or ""),

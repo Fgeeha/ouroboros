@@ -25,6 +25,10 @@ def _ctx(tmp_path, workspace, governance, *, child=True, expired=False):
     task_id = "child" if child else "root"
     metadata = {"root_task_id": "root", "deadline_at": deadline,
                 **({"parent_task_id": "root", "delegation_role": "subagent"} if child else {})}
+    if child:
+        # Real child admission starts under canonical root authority. A child
+        # row alone cannot authorize inherited money or tree controls.
+        write_task_result(tmp_path, "root", STATUS_RUNNING, root_task_id="root", deadline_at=deadline)
     write_task_result(tmp_path, task_id, STATUS_RUNNING, **metadata)
     return SimpleNamespace(task_id=task_id, drive_root=tmp_path, budget_drive_root=str(tmp_path),
                            task_metadata=metadata, task_contract={"objective": "read greeting"},

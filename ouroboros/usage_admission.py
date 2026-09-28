@@ -59,7 +59,8 @@ def scope_group(scope: Any) -> tuple:
 UNAVAILABLE_GROUP_PREFIX = "unavailable:"
 
 
-def effective_billing_fields(budget_root: Any, root_id: str, fields: Dict[str, Any]) -> Dict[str, Any]:
+def effective_billing_fields(budget_root: Any, root_id: str, fields: Dict[str, Any],
+                             *, non_task_operation: bool = False) -> Dict[str, Any]:
     """Overlay canonical owner amendments on the original binding, never spend.
 
     Only the group's own root can amend its total allowance. A successor's
@@ -70,6 +71,11 @@ def effective_billing_fields(budget_root: Any, root_id: str, fields: Dict[str, A
 
     result = dict(fields)
     group = str(fields.get("billing_group_id") or root_id)
+    # Host operations explicitly bind a non-task scope. They still pay through
+    # the same ledger/global cap, but have no task-result amendment authority.
+    # A task or a carried foreign group never gains this exemption from its ID.
+    if non_task_operation and group == root_id:
+        return result
     if not budget_root or not group or group.startswith(UNAVAILABLE_GROUP_PREFIX):
         return result
     try:
