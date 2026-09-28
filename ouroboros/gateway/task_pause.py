@@ -4,8 +4,9 @@ Owner Batch4 5A. The body carries ONLY a client-generated stable
 ``request_id`` (reused on retry: the acknowledgement is idempotent); there is
 no text and no chat side effect. The response is sent only after the root's
 durable fence landed (``supervisor/owner_pause_control.py``); ``state`` is the
-truthful tree state — ``requested`` while members still settle, ``paused``
-once the whole tree is saved. Resume is the existing ``/resume`` endpoint.
+accepted action state — ``requested`` while members settle, ``paused`` once
+saved, ``released`` on a retry after Resume. A new Pause needs a fresh ID.
+Resume is the existing ``/resume`` endpoint.
 
 The accept step takes the queue lock and writes durable records, so it runs
 off the event loop (``run_sync_to_completion``): a held lock or a slow disk

@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
 from starlette.requests import Request
-from starlette.responses import JSONResponse, Response
+from starlette.responses import JSONResponse
 
 from ouroboros.gateway._helpers import coerce_int, json_error, json_exception, request_drive_root, request_json_or, request_repo_dir, run_sync_to_completion, stage_initial_task_attachments
 from ouroboros.gateway.cost_breakdown import _task_cost_breakdown_view  # noqa: F401
@@ -39,7 +39,7 @@ from ouroboros.gateway.task_pause import api_task_pause, owner_tree_control_rout
 from ouroboros.gateway.task_decision import api_decision_answer  # noqa: F401
 from ouroboros.gateway.task_archive import (
     chat_media_identity, directory_archives, plain_segments, serve_directory_archive, serve_task_file,
-    task_artifact_location, recorded_identity,
+    task_artifact_location, recorded_identity, serve_task_source,
 )
 from ouroboros.task_custody import task_artifact_stores
 from ouroboros.headless import (
@@ -106,6 +106,7 @@ _RESERVED_METADATA_KEYS = frozenset({
     "budget_drive_root",
     "task_constraint",
     "task_contract",
+    "input_sources",
     "allowed_resources",
     "deadline_at",
     "executor_ref",
@@ -517,12 +518,9 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         return json_error(
             "project_id must be filesystem-safe (alphanumeric/_/-/., no spaces or slashes)", 400)
     _task_project_id = _resolve_pid({"project_id": raw_project_id, "workspace_root": str(workspace_root or "")})
-    # D5 (Option A): keep the RECORDED memory_mode exactly as requested — shared/forked/
-    # empty semantics are unchanged. Isolation for a project-scoped `shared` task comes
-    # from MATERIALIZING an isolated child drive (data-root isolation), NOT from mutating
-    # the recorded mode. The worker uses task['drive_root'] (the child), and a pure
-    # --project-id task never shows the memory_mode line, so the recorded mode stays
-    # purely informational while post-task writes still land on the isolated child.
+    # D5: preserve requested shared/forked/empty semantics in recorded memory_mode.
+    # Project-scoped shared tasks materialize a child drive: worker and post-task I/O
+    # use task['drive_root']; pure --project-id tasks don't render memory_mode.
     effective_drive_mode = "forked" if (_task_project_id and memory_mode == "shared") else memory_mode
     task_type = str(body.get("type") or "task")
     if task_type in {"evolution", "review", "deep_self_review"}:
@@ -547,6 +545,10 @@ def _create_task_from_body(request: Request, body: Any) -> JSONResponse:
         )
 
     raw_metadata = dict(body.get("metadata") or {}) if isinstance(body.get("metadata"), dict) else {}
+    if "input_sources" in raw_metadata:
+        return json_error(
+            "metadata.input_sources is reserved; source selection is only supported by schedule_subagent",
+            400, reason_code="input_source_selection_unsupported")
     if _external_subagent_label(body, raw_metadata):
         return json_error("delegation_role=subagent is only allowed through the internal schedule_subagent tool", 400)
     if str(body.get("parent_task_id") or "").strip() or str(body.get("root_task_id") or "").strip():
@@ -973,10 +975,7 @@ def api_task_artifact(request: Request):
     if not result and not registered:
         return json_error("task not found", 404)
     if source:
-        try:
-            return Response(artifact_store.read_task_result_source_bytes(drive_root, result, name, source), media_type="application/json")
-        except (OSError, ValueError, RuntimeError):
-            return json_error("task source is unavailable or does not match its recorded identity", 404)
+        return serve_task_source(drive_root, stores, result, task_id, name, source)
     rows = [] if fast else [row for row in result.get("artifacts") or [] if isinstance(row, dict) and (
         relpath is not None or str(row.get("name") or pathlib.Path(str(row.get("path") or "")).name) == name)]
     located = [(at, order, row) for order, row in enumerate(rows + ([registered] if registered else []))

@@ -151,7 +151,7 @@ def wake_reason(ctx: Any, chosen: Dict[str, Any]) -> str:
     return ""
 
 
-def cold_blockers(ctx: Any) -> List[Dict[str, str]]:
+def cold_blockers(ctx: Any, *, chosen: Dict[str, Any] | None = None) -> List[Dict[str, str]]:
     """What this task still runs that a COLD sleep would leave unwatched.
 
     A cold sleep ends the process: its own delegated runs and live services
@@ -186,6 +186,8 @@ def cold_blockers(ctx: Any) -> List[Dict[str, str]]:
 
     root = _canonical_root(ctx)
     tree_id = str(getattr(ctx, "root_task_id", "") or ctx.task_id)
+    chosen = chosen if chosen is not None else (getattr(ctx, "_model_sleep", None) or {})
+    dependencies = set(chosen.get("tasks", []) + chosen.get("senders", []))
     members = {str(ctx.task_id)}
     try:
         rows, malformed = custody_rows_with_integrity(root, tree_id)
@@ -199,6 +201,10 @@ def cold_blockers(ctx: Any) -> List[Dict[str, str]]:
             own = task_id == str(ctx.task_id)
             if not own and row.get("status") == "running":
                 blockers.append({"kind": "running_member", "detail": task_id})
+            if not own and task_id in dependencies and row.get("status") in {"requested", "scheduled"}:
+                # The root sleep fence would prevent this member from starting,
+                # including a child whose terminal/mail was selected as our wake.
+                blockers.append({"kind": "queued_member", "detail": task_id})
             own_sleep = current_tool_operation(ctx, "await_messages") if own else ""
             if any(op != own_sleep for op in (row.get("launch_handoffs") or {})):
                 blockers.append({"kind": "member_custody", "detail": task_id})
@@ -241,7 +247,7 @@ def request_sleep(ctx: Any, chosen: Dict[str, Any], mode: str) -> Dict[str, Any]
                     and row.get("status") in {"requested", "scheduled"}):
                 raise ValueError("warm sleep keeps the project lease needed by the selected queued root; choose cold sleep")
     if mode == MODE_COLD:
-        blockers = cold_blockers(ctx)
+        blockers = cold_blockers(ctx, chosen=chosen)
         if blockers:
             raise ValueError("a cold sleep would leave this task's own work unwatched: "
                              + "; ".join(f"{b['kind']} {b.get('run_id') or b.get('name') or b.get('detail') or ''}"

@@ -126,7 +126,8 @@ def test_failed_admission_reload_retry_and_tree_pause_consumers(tmp_path, monkey
                 page.screenshot(path=str(evidence / 'bound-retry.png'))
                 monkeypatch.setattr(q, 'persist_queue_snapshot', persist)
                 retry.click()
-                expect(page.locator('[data-continue-successor]')).to_have_text('Continued as ' + claim['successor_task_id'])
+                expect(page.locator('[data-continue-successor]')).to_have_text('Continued')
+                expect(page.locator('[data-continue-successor]')).to_have_attribute('data-continue-successor', claim['successor_task_id'])
                 assert [r['action_nonce'] for r in requests] == [claim['action_nonce']] * 2
                 assert sum(t['id'] == claim['successor_task_id'] for t in workers.PENDING) == 1
                 workers.RUNNING.clear()

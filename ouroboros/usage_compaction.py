@@ -8,8 +8,10 @@ the raw pre-compaction bytes move verbatim into an append-only
 Nothing is deleted, in-flight rows never fold, idempotency-bearing kinds
 (subscription/external/legacy) never fold, and the pass commits ONLY after
 proving, on the candidate bytes, that the production aggregation renders an
-identical NON-MONEY view and that the money itself is decimal-identical —
-otherwise it aborts and the ledger stays byte-identical.
+identical NON-MONEY view, that the money itself is decimal-identical and that
+every earliest root/group cap binding survives verbatim (group rows carry the
+source's; an aggregate never binds) — otherwise it aborts and the ledger stays
+byte-identical.
 
 Monetary exactness rule (fixed by the design note): group sums are computed as
 exact ``Decimal``s of the literals stored in the file and carried on group
@@ -39,6 +41,8 @@ from decimal import Decimal, DecimalException
 from typing import Any, Callable, Dict, Optional, Tuple
 
 from ouroboros._usage_rows import _breakdown_bucket, _summary, _processing_summary, _merge_processing_summary, row_ts_epoch
+from ouroboros._usage_rows import (BINDING_AUTHORITY_FIELD, BINDING_CARRIED, CARRIED_GROUP_BINDING,
+                                   CARRIED_ROOT_BINDING, BindingIndex)
 from ouroboros.runtime_limits import USAGE_LEDGER_FOLD_MIN_AGE_SEC
 from ouroboros.usage_ledger import (
     ARCHIVE_SEGMENT_DIR_REL,
@@ -641,6 +645,14 @@ def _build_candidate(
             folded_row_count += 1
     if folded_row_count == 0 or not groups:
         raise _Abort("nothing foldable")
+    # An aggregate's cap is a minimum and its position a sort order, so the
+    # block carries every source binding verbatim (usage_admission readers).
+    bindings = BindingIndex()
+    for index, row in enumerate(records):
+        if index % 4096 == 0:
+            beat()
+        bindings.fold(row)
+    carried_keys: tuple = (set(), set())
 
     baseline_id = f"baseline-{uuid.uuid4().hex[:12]}"
     epoch = 1
@@ -702,6 +714,12 @@ def _build_candidate(
                 name: format(value, "f") if isinstance(value, Decimal) else value
                 for name, value in group.processing_summary.items()
             }
+        for bound, carry, carrier_field, keys in (
+                (bindings.roots, root_task_id, CARRIED_ROOT_BINDING, carried_keys[0]),
+                (bindings.groups, billing_group_id or root_task_id, CARRIED_GROUP_BINDING, carried_keys[1])):
+            if carry in bound and carry not in keys:  # the first block row of each root/group carries it
+                keys.add(carry)
+                row[carrier_field] = bound[carry]
         group_rows.append(row)
 
     retained_lines: list = []
@@ -747,6 +765,7 @@ def _build_candidate(
         "folded_attempt_count": folded_attempt_count,
         "group_count": len(group_rows),
         "retained_row_count": retained_count,
+        BINDING_AUTHORITY_FIELD: BINDING_CARRIED,
     }
     for offset, row in enumerate(group_rows, start=2):
         row["seq"] = offset
@@ -830,6 +849,15 @@ def compact_usage_ledger_locked(
             beat()
             candidate_records, candidate_decimals = _parse_ledger_lines(candidate)
             _validate_records(candidate_records)
+            beat()
+            # Exact decimals: an original cap is carried, never approximated.
+            source_bindings, candidate_bindings = BindingIndex(), BindingIndex()
+            for row in decimal_rows:
+                source_bindings.fold(row)
+            for row in candidate_decimals:
+                candidate_bindings.fold(row)
+            if source_bindings != candidate_bindings:
+                raise _Abort("original binding authority mismatch")
             beat()
             finals_before = list(_final_rows(float_rows).values())
             finals_after = list(_final_rows(candidate_records).values())

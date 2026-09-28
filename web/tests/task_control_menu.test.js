@@ -17,6 +17,7 @@ import {
     hurryRequestId,
     isRootTaskRow,
     pauseTaskAction,
+    resumeTaskAction,
     stopPolicyFor,
     taskControlActions,
 } from '../modules/task_control_menu.js';
@@ -41,22 +42,61 @@ test('the dropdown offers exactly the owner-decided actions, in order', () => {
     assert.equal(stopPolicyFor(ACTION_PAUSE), '', 'Pause is not a stop');
 });
 
-test('Pause sends one text-free request with a stable id and reports the truthful tree state', async () => {
+test('Pause retries an unknown answer with the same id, then a new action gets a fresh id', async () => {
     const calls = [];
     const toasts = [];
-    const pause = async (id, requestId) => { calls.push([id, requestId]); return calls.length === 1
-        ? { ok: true, state: 'requested' } : { ok: true, state: 'paused' }; };
+    const pause = async (id, requestId) => {
+        calls.push([id, requestId]);
+        if (calls.length === 1) throw new Error('response lost');
+        return { ok: true, state: calls.length === 2 ? 'requested' : 'paused' };
+    };
     const toast = (text, kind) => toasts.push([text, kind]);
+    assert.equal(await pauseTaskAction('root-1', { pause, toast }), false);
     assert.equal(await pauseTaskAction('root-1', { pause, toast }), true);
+    await resumeTaskAction('root-1', { resume: async () => ({ ok: true }), toast });
     assert.equal(await pauseTaskAction('root-1', { pause, toast }), true);
     assert.equal(calls[0][1], calls[1][1], 'a retry reuses the SAME request id');
+    assert.notEqual(calls[1][1], calls[2][1], 'a new owner Pause after Resume is a NEW action');
     assert.match(calls[0][1], /^pause-/);
-    assert.match(toasts[0][0], /^Pausing: .*work already sent finishes/);
-    assert.match(toasts[1][0], /^Paused: the whole task tree is saved/);
+    assert.match(toasts[1][0], /^Pausing: .*work already sent finishes/);
+    assert.match(toasts[3][0], /^Paused: the whole task tree is saved/);
     assert.equal(await pauseTaskAction('root-2', { pause: async () => { throw new Error('cancel_pending'); }, toast }), false);
     assert.match(toasts.at(-1)[0], /^Pause refused: cancel_pending/);
     // Both surfaces reach it through the shared menu, resolved from the anchor.
     assert.match(menuSrc, /anchor\.dataset\?\.id \|\| anchor\.closest\?\.\('\[data-task-id\]'\)/);
+});
+
+test('Resume retires an unconfirmed Pause id, but a refused Resume leaves it retryable', async () => {
+    const ids = [];
+    const pause = async (_id, requestId) => { ids.push(requestId); throw new Error('response lost'); };
+    const toast = () => {};
+    await pauseTaskAction('uncertain-pause', { pause, toast });
+    await resumeTaskAction('uncertain-pause', { resume: async () => { throw new Error('still pausing'); }, toast });
+    await pauseTaskAction('uncertain-pause', { pause, toast });
+    assert.equal(ids[1], ids[0]);
+    await resumeTaskAction('uncertain-pause', { resume: async () => null, toast });
+    await pauseTaskAction('uncertain-pause', { pause, toast });
+    assert.equal(ids[2], ids[0], 'an unknown Resume response cannot retire the pending Pause');
+    await resumeTaskAction('uncertain-pause', { resume: async () => ({ ok: true }), toast });
+    await pauseTaskAction('uncertain-pause', { pause, toast });
+    assert.notEqual(ids[3], ids[0]);
+});
+
+test('a null Pause acknowledgement keeps its id; a released replay never claims Pausing', async () => {
+    const ids = [];
+    const toasts = [];
+    const pause = async (_id, requestId) => {
+        ids.push(requestId);
+        return ids.length === 1 ? null : { ok: true, duplicate: true, state: 'released' };
+    };
+    const toast = (...args) => toasts.push(args);
+    assert.equal(await pauseTaskAction('late-pause', { pause, toast }), false);
+    assert.equal(await pauseTaskAction('late-pause', { pause, toast }), true);
+    assert.equal(ids[0], ids[1]);
+    assert.match(toasts.at(-1)[0], /already resumed/i);
+    assert.equal(toasts.at(-1)[1], 'info');
+    assert.equal(await pauseTaskAction('late-pause', { pause, toast }), true);
+    assert.notEqual(ids[1], ids[2]);
 });
 
 test('a pending cancel offers ONLY the hard escalation — hurry is never shown then', () => {

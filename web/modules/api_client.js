@@ -135,12 +135,12 @@ export function taskArtifactArchiveUrl(taskId, directory) {
     return `/api/tasks/${encodeURIComponent(taskId)}/artifacts/${encodeSegment(name)}?archive=${encodeURIComponent(directory)}`;
 }
 
-/** URL for one published immutable source handle. */
+/** URL for one published immutable source handle (a delegated run's journal range included). */
 export function taskSourceDownloadUrl(taskId, ref) {
     const path = typeof ref?.path === 'string' ? ref.path : '';
     if (!taskId || ref?.root !== 'artifact_store' || ref?.kind !== 'task_source'
         || !/^[0-9a-f]{64}$/.test(ref?.sha256 || '')
-        || !/^source_handles\/(tool_results|context_checkpoints)\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path)
+        || !/^source_handles\/(tool_results|context_checkpoints|delegated_activity)\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(path)
         || !Number.isSafeInteger(ref?.size) || ref.size < 0) return '';
     const name = path.split('/').at(-1);
     const url = taskArtifactDownloadUrl(taskId, name);
@@ -174,7 +174,8 @@ export function hurryTask(taskId, requestId) {
  * Owner Pause of a whole task tree (Batch4): text-free like hurry — the body is
  * ONLY the stable request_id (the same id on retry is idempotent). The answer
  * arrives after the root's durable fence landed; its `state` is `requested`
- * while members still settle and `paused` once the tree is saved.
+ * while members still settle, `paused` once saved, or `released` on replay
+ * after that action was resumed. An intentional new Pause uses a fresh id.
  * @param {string} taskId
  * @param {string} requestId
  */

@@ -7,8 +7,8 @@ Neither enabled nor a timestamp releases a control. The lifecycle writer alone
 records an audited release of the exact observed hold.
 
 Final starts use queue -> schedule -> cancellation -> origin launch locks. Pause
-installation releases its launch lock before touching the queue; cancellation
-never acquires the schedule lock. No new occurrence or receipt protocol lives here.
+waits outside queue, then rechecks launch authority without waiting under queue;
+cancellation never acquires schedule. No new occurrence or receipt protocol lives here.
 """
 from __future__ import annotations
 
@@ -120,7 +120,7 @@ def policy_view(root, data, record):
     """Pure current projection; callers that authorize starts hold control locks."""
     from ouroboros.cancel_intents import active_intent, _validated_single_cancel_target
     from ouroboros.owner_pause import read_fence, fence_closed
-    from ouroboros.task_results import load_task_result
+    from ouroboros.task_results import load_task_result, _TRULY_TERMINAL_STATUSES
     from ouroboros.deadline_utils import parse_deadline_ts
     import datetime
 
@@ -152,8 +152,18 @@ def policy_view(root, data, record):
             if stop:
                 controls["stop:" + tid] = stop["control_id"]
         root_id = str(origin.get("root_task_id") or "")
-        if root_id and fence_closed(read_fence(root, root_id)):
-            wait = "origin_owner_paused"
+        fence = read_fence(root, root_id) if root_id else {}
+        if fence_closed(fence):
+            root_row = load_task_result(pathlib.Path(root), root_id, strict=True) or {}
+            pause_key = "pause:" + root_id
+            if root_row.get("status") in _TRULY_TERMINAL_STATUSES:
+                # The old tree stays closed. Restore selects this schedule's
+                # exact hold through the existing release carrier only.
+                controls[pause_key] = fence["fence_id"]
+                if released.get(pause_key) != fence["fence_id"]:
+                    wait = "origin_owner_paused"
+            else:
+                wait = "origin_owner_paused"
         if kind == "related":
             relation = record["followup_relation"]
             binding = relation.get("billing_group") or {}
@@ -172,7 +182,9 @@ def policy_view(root, data, record):
     except Exception:
         wait = "followup_authority_unavailable"
     controls = {key: value for key, value in controls.items() if released.get(key) != value}
-    reason = "relationship_unknown" if kind == "unknown" else ("origin_stopped" if controls else "")
+    reason = ("relationship_unknown" if kind == "unknown" else
+              "origin_stopped" if any(not key.startswith("pause:") for key in controls) else
+              "origin_owner_paused" if controls else "")
     hold = None
     if reason:
         identity = {"schedule_id": record.get("id"), "controls": controls, "relation": kind,

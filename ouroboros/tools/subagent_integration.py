@@ -1106,6 +1106,8 @@ def get_tools() -> List[ToolEntry]:
                 "name": "integrate_delegated_patch",
                 "description": (
                     "EXPLICITLY apply or reject the captured result of ONE terminal delegated run. "
+                    "Its starter or host-confirmed retry successor may decide it; terminal-owner "
+                    "orphan recovery remains available to top-level tasks. Current target authority still applies. "
                     "Git runs edit a private execution snapshot; apply verifies its complete result "
                     "against the recorded baseline under the repository lock, applies and stages "
                     "changed files into your active root, and never commits. Skill-payload runs "

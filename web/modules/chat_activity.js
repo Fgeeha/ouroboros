@@ -6,6 +6,7 @@ import { resultFilesItemHtml } from './result_files.js';
 import { compactModel, formatLogDuration, modelExecutionLabel } from './log_events.js';
 import { createSystemMessageActions } from './ui_helpers.js';
 import { projectReference } from './project_reference.js';
+import { delegatedActivityBodyHtml, delegatedHeadline, delegatedLineView } from './delegated_activity.js';
 import { joinMarkdownHeadings } from './utils.js';
 import { REUSABLE_TASK_IDS } from './task_control_menu.js';
 import { apiFetch } from './api_client.js';
@@ -74,9 +75,14 @@ export function isLiveLineExpandable(item) {
 
 export function buildTimelineItemHtml(item, record) {
     if (item.resultArtifacts) return resultFilesItemHtml(item);
-    const expandable = isLiveLineExpandable(item);
+    // A delegated observation renders its per-seq projection; one wholly shown by
+    // an earlier row, or folded into a silent stretch, keeps only its keyed slot.
+    const delegated = item.activity ? delegatedLineView(item) : null;
+    if (delegated?.hidden) return `<div class="chat-live-line" data-live-line-key="${escapeHtmlAttr(item.lineKey || '')}" data-delegated-folded hidden></div>`;
+    const expandable = Boolean(delegated) || isLiveLineExpandable(item);
     const expanded = expandable && record.expandedLineKeys.has(item.lineKey);
-    const displayHeadline = expanded && item.fullHeadline ? item.fullHeadline : item.headline;
+    const displayHeadline = delegated ? delegatedHeadline(delegated)
+        : expanded && item.fullHeadline ? item.fullHeadline : item.headline;
     // P3: when expanded, prefer the genuinely-full fetched output, then the capped
     // fullBody, then the preview body. A server-truncated line shows the fetched full
     // text in a bounded-scroll box so a huge research output never grows the chat.
@@ -86,7 +92,7 @@ export function buildTimelineItemHtml(item, record) {
     const isProgressLine = item.phase === 'working' || item.phase === 'thinking';
     const bodyId = `chat-live-line-body-${String(record.groupId || 'task').replace(/[^A-Za-z0-9_-]/g, '-')}-${String(item.lineKey || '').replace(/[^A-Za-z0-9_-]/g, '-')}`;
     const headContent = `
-        <span class="chat-live-line-title"${isProgressLine ? ' data-chat-markdown-enhanced' : ''}>${isProgressLine ? renderMarkdown(displayHeadline, { inlineHeadingBreaks: true }) : escapeHtml(displayHeadline)}</span>
+        <span class="chat-live-line-title"${isProgressLine && !delegated ? ' data-chat-markdown-enhanced' : ''}>${isProgressLine && !delegated ? renderMarkdown(displayHeadline, { inlineHeadingBreaks: true }) : escapeHtml(displayHeadline)}</span>
         <span class="chat-live-line-repeat" ${item.count > 1 ? '' : 'hidden'}>${item.count > 1 ? `${item.count}x` : ''}</span>
         ${item.ts ? `<span class="chat-live-line-time">${escapeHtml(item.ts)}</span>` : ''}
     `;
@@ -112,7 +118,8 @@ export function buildTimelineItemHtml(item, record) {
             data-expanded="${expanded ? '1' : '0'}"
         >
             ${headHtml}
-            ${displayBody ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${renderMarkdown(displayBody, { inlineHeadingBreaks: true })}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
+            ${delegated ? `<div class="chat-live-line-body chat-delegated-activity" id="${escapeHtmlAttr(bodyId)}">${delegatedActivityBodyHtml(delegated, { expanded })}</div>`
+        : displayBody ? `<div class="chat-live-line-body${showingFetched ? ' chat-live-line-body-full' : ''}" id="${escapeHtmlAttr(bodyId)}">${renderMarkdown(displayBody, { inlineHeadingBreaks: true })}${loadingFull ? '<div class="chat-live-line-loading">Loading full output…</div>' : ''}</div>` : ''}
         </div>
     `;
 }
@@ -1078,10 +1085,10 @@ export function chatStatusCounts(activities, records, isWaiting = () => false) {
         pausedManagedCount: 0, hasActiveLiveCard: false, waitingModelCount: 0 };
     for (const [id, entry] of activities) {
         if (isWaiting(id)) continue;
-        if (String(entry?.kind || '') !== 'managed_task') counts.activeDirectCount += 1;
-        else if (String(entry?.phase || '') === 'queued') counts.queuedManagedCount += 1;
-        else if (entry?.phase === 'budget_pausing') counts.pausingManagedCount += 1;
+        if (entry?.phase === 'budget_pausing') counts.pausingManagedCount += 1;
         else if (entry?.phase === 'budget_paused') counts.pausedManagedCount += 1;
+        else if (String(entry?.kind || '') !== 'managed_task') counts.activeDirectCount += 1;
+        else if (String(entry?.phase || '') === 'queued') counts.queuedManagedCount += 1;
         else counts.activeManagedCount += 1;
     }
     for (const record of records) {
@@ -1459,6 +1466,7 @@ export function costMetaKeys(src) {
 const CARD_META_KEYS = [
     ...COST_META_KEYS, 'executor_route', 'execution_evidence', 'actual_substrate',
     'executor_observation', 'model_execution', 'tool_calls', 'model', 'ts', 'initiator', 'cancel_origin',
+    'delegated_activity',
 ];
 export function cardMetaKeys(src) {
     return Object.fromEntries(CARD_META_KEYS.map((key) => [key, src?.[key]]));

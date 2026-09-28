@@ -62,7 +62,9 @@ def _running_members_locked(q: Any, root_task_id: str) -> List[Tuple[str, Dict[s
 
 def request_owner_pause(task_id: str, *, request_id: str) -> Dict[str, Any]:
     """Accept the owner's Pause of ``task_id``'s tree (see module docstring)."""
-    from ouroboros.owner_pause import OwnerPauseRefused, install_fence
+    from ouroboros.owner_pause import (
+        OwnerPauseRefused, fence_closed, install_fence, launch_lock, read_fence,
+    )
     from ouroboros.task_results import resolve_task_lineage
 
     from supervisor import queue as q
@@ -91,6 +93,8 @@ def request_owner_pause(task_id: str, *, request_id: str) -> Dict[str, Any]:
             except Exception:
                 log.warning("Owner pause lifecycle authority unavailable for %s", task_id, exc_info=True)
                 return {"ok": False, "error": "pause_record_unwritable"}
+    from supervisor.events_budget import _set_root_budget_pause_locked
+
     try:
         fence, created = install_fence(root_drive, task_id, request_id=request_id)
     except OwnerPauseRefused as exc:
@@ -98,14 +102,29 @@ def request_owner_pause(task_id: str, *, request_id: str) -> Dict[str, Any]:
     except Exception as exc:
         log.warning("Owner pause fence for %s was not written", task_id, exc_info=True)
         return {"ok": False, "error": "pause_record_unwritable", "detail": str(exc)[:200]}
-    from supervisor.events_budget import _set_root_budget_pause_locked
-
     with q._queue_lock:
-        latch = _set_root_budget_pause_locked(task_id, {
-            "fence_id": str(fence["fence_id"]), "cause": "owner_pause",
-            "paused_at": str(fence.get("requested_at") or utc_now_iso())})
-        members = _running_members_locked(q, task_id)
-        persisted = q.persist_queue_snapshot(reason="owner_pause_requested")
+        try:
+            # Resume consumption can run outside the queue lock. Revalidate
+            # the exact accepted generation before publishing its queue latch.
+            # Contention here returns a retryable refusal with the fence kept;
+            # one root's held launch lock must not stall unrelated controls.
+            with launch_lock(root_drive, task_id, wait=False):
+                current = read_fence(root_drive, task_id)
+                if (not fence_closed(fence) or not fence_closed(current)
+                        or fence.get("fence_id") != current.get("fence_id")):
+                    return {"ok": True, "task_id": task_id, "root_task_id": task_id,
+                            "fence_id": fence["fence_id"], "duplicate": True,
+                            "state": "released", "members": []}
+                latch = _set_root_budget_pause_locked(task_id, {
+                    "fence_id": str(fence["fence_id"]), "cause": "owner_pause",
+                    "paused_at": str(fence.get("requested_at") or utc_now_iso())})
+                members = _running_members_locked(q, task_id)
+                persisted = q.persist_queue_snapshot(reason="owner_pause_requested")
+        except OwnerPauseRefused as exc:
+            return {"ok": False, "error": str(exc) or "pause_refused"}
+        except Exception as exc:
+            log.warning("Owner pause fence for %s was not written", task_id, exc_info=True)
+            return {"ok": False, "error": "pause_record_unwritable", "detail": str(exc)[:200]}
     if not persisted:
         # The durable fence already holds every launch; the queue latch lives
         # in memory until the next persisted snapshot. Disclosed, not hidden.

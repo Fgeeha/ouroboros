@@ -10,13 +10,76 @@ so historical import and monkeypatch sites keep working unchanged.
 from __future__ import annotations
 
 import datetime as _dt
+import math
+from dataclasses import dataclass, field
 from typing import Any, Dict, Optional, Sequence
 from decimal import Decimal, InvalidOperation
 
 from ouroboros.usage_ledger import _number
-from ouroboros._usage_money import monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exact_money, decimal_of
+from ouroboros._usage_money import billing_group_key, monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exact_money, decimal_of
 
 REVIEW_ATTRIBUTION_KEYS = ("review_skill", "review_wave_id", "review_slot_id")
+
+# Earliest cap/attribution binding per root and billing group (usage_admission).
+BINDING_KEYS = ("root_task_id", "billing_group_id", "billing_group_limit_usd", "billing_group_limit_source",
+                "billing_group_limit_revision", "root_limit_usd", "root_limit_source", "root_limit_revision")
+_BINDING_CAPS = ("billing_group_limit_usd", "root_limit_usd")
+BINDING_AUTHORITY_FIELD, BINDING_CARRIED = "binding_authority", "carried"  # baseline header stamp
+CARRIED_ROOT_BINDING, CARRIED_GROUP_BINDING = "original_root_binding", "original_group_binding"
+UNKNOWN_BINDING = "unknown"
+
+
+class LedgerBindingUnknown(ValueError):
+    """A compacted aggregate hid the original binding: unknown, never a cap."""
+
+
+def _carried(value: Any, key: str, owner) -> Any:
+    """A carried binding that is well formed and belongs to ``key``; else UNKNOWN."""
+    if (not isinstance(value, dict) or not set(value) <= set(BINDING_KEYS) or owner(value) != key
+            or not any(cap in value for cap in _BINDING_CAPS)):
+        return UNKNOWN_BINDING
+    for cap in _BINDING_CAPS:
+        item = value.get(cap)
+        if item is not None and (_number(item) is None or not math.isfinite(_number(item))):
+            return UNKNOWN_BINDING
+    return dict(value)
+
+
+@dataclass
+class BindingIndex:
+    """Earliest binding per root and billing group: the first ORIGINAL row wins.
+
+    A baseline aggregate never binds: its cap is a minimum and its position a
+    sort order. A carried block restores the source's bindings verbatim from
+    the first group row of each root/group; an older block cannot, so its
+    members' original binding is UNKNOWN rather than a later row's cap.
+    Equality compares the two indexes only.
+    """
+
+    roots: Dict[str, Any] = field(default_factory=dict)
+    groups: Dict[str, Any] = field(default_factory=dict)
+    carried: bool = field(default=False, compare=False)
+
+    def fold(self, row: Dict[str, Any]) -> None:
+        kind = str(row.get("kind") or "")
+        if kind == "usage_baseline":
+            self.carried = row.get(BINDING_AUTHORITY_FIELD) == BINDING_CARRIED
+            return
+        root, group = monetary_scope_key(row), billing_group_key(row)
+        if kind == "usage_baseline_group":
+            for index, key, name, owner in ((self.roots, root, CARRIED_ROOT_BINDING, monetary_scope_key),
+                                            (self.groups, group, CARRIED_GROUP_BINDING, billing_group_key)):
+                if key and not self.carried:
+                    index.setdefault(key, UNKNOWN_BINDING)
+                elif key and name in row:
+                    index.setdefault(key, _carried(row[name], key, owner))
+            return
+        if ((root and root not in self.roots) or (group and group not in self.groups)) and any(
+                cap in row for cap in _BINDING_CAPS):
+            binding = {key: row[key] for key in BINDING_KEYS if key in row}  # verbatim, key presence kept
+            for index, key in ((self.roots, root), (self.groups, group)):
+                if key:
+                    index.setdefault(key, binding)
 
 
 def row_ts_epoch(row: Any) -> Optional[float]:

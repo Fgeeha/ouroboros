@@ -57,13 +57,13 @@ export async function continueTaskAction(taskId, { request = continueTask, stora
         const ack = await request(id, continueNonce(id, storage, actionNonce));
         const successor = String(ack?.successor_task_id || '');
         toast(ack?.held
-            ? `Continue accepted as ${successor}; it waits until the interrupted task's own work has settled.`
-            : `Continue accepted as ${successor}.`, 'ok');
+            ? 'Continue accepted. Waiting for earlier work to settle; use Resume in Activity to recheck.'
+            : 'Continue accepted.', 'ok');
         return successor;
     } catch (exc) {
         const body = exc?.body || {};
         if (body.reason_code === 'already_continued' && body.successor_task_id && body.state !== 'bound') {
-            toast(`Already continued as ${body.successor_task_id}.`, 'info');
+            toast('Already continued.', 'info');
             return String(body.successor_task_id);
         }
         if (body.state === 'bound' && body.action_nonce) continueNonce(id, storage, body.action_nonce);
@@ -76,7 +76,7 @@ export async function continueTaskAction(taskId, { request = continueTask, stora
 }
 
 function renderSuccessor(button, successorId) {
-    button.textContent = `Continued as ${successorId}`;
+    button.textContent = 'Continued';
     button.disabled = true;
     button.dataset.continueSuccessor = successorId;
 }
@@ -98,9 +98,13 @@ export function syncContinueAction(record, detail, { read = fetchTaskDetail } = 
         const clean = ['completed', 'done'].includes(status) && detail.outcome_axes?.execution?.status !== 'best_effort';
         if (record?.root && !record.isSubagent && !offerReads.has(record) && taskDoneIsTerminal(detail) && !clean) {
             offerReads.add(record);
-            Promise.resolve(read(record.groupId))
-                .then((full) => (full && typeof full === 'object' && 'continuation_offer' in full
-                    && record.root?.isConnected ? syncContinueAction(record, full, { read }) : false))
+            Promise.resolve().then(() => read(record.groupId))
+                .then((full) => {
+                    const offer = full?.continuation_offer;
+                    if (!offer || typeof offer !== 'object' || Array.isArray(offer)) {
+                        offerReads.delete(record);  // null is the production reader's failure result
+                    } else if (record.root?.isConnected) syncContinueAction(record, full, { read });
+                })
                 .catch(() => { offerReads.delete(record); });  // a later terminal row retries
         }
         return false;

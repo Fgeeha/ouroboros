@@ -1,6 +1,6 @@
 # 4. Server API Endpoints
 
-This test-checked registry mirrors mounted browser, CLI and Host Service routes and their handlers, authentication, file confinement and WebSocket protocol. Route changes must update the map.
+Endpoint registry for browser, CLI and Host Service routes, their handlers, non-loopback authentication, file confinement and WebSocket protocol. Tests check mounted routes; optional progress sources retain identity and platform limits.
 
 If `OUROBOROS_NETWORK_PASSWORD` is configured, non-loopback HTTP and WebSocket access requires authentication; loopback clients bypass the gate, and `/api/health` plus the middleware-owned login/logout paths stay reachable. Browser sessions use a server-keyed, expiring HttpOnly HMAC cookie; `Secure` is set only under TLS so a plain-HTTP LAN session does not enter a login loop. An unauthenticated WebSocket is closed with code 4401 before `ws_endpoint` accepts it. With no configured password, non-loopback access remains open by explicit operator choice.
 
@@ -85,10 +85,10 @@ Every `/api/files/*` operation resolves its requested path and refuses the opera
 | GET | `/api/tasks/{task_id}` | `gateway.tasks.api_task_get` |
 | GET | `/api/tasks/{task_id}/events` | `gateway.tasks.api_task_events` (legacy integer rank) |
 | POST | `/api/tasks/{task_id}/events` | `gateway.tasks.api_task_events` (read-only v2 cursor) |
-| GET | `/api/tasks/{task_id}/artifacts/{name}` | `gateway.tasks.api_task_artifact` (the task's own stores via `task_archive`: a bare name is a top-level file, `?relpath=` a nested one, `?archive=<dir>` a directory ZIP; the detail's `artifact_archives` says what each ZIP holds. A row that records a digest is served only when its bytes still match it — a changed mutable file is 409 `artifact_identity_changed` naming the recorded digest, a failed capture 404 `artifact_unverified` — and the response says `x-ouroboros-artifact-identity: verified` or `unmeasured`; a ZIP member follows the same rule. Windows ordinary file/chat-media/ZIP downloads return HTTP 503 pending confined opens (issue #1297); bound `?source=` review downloads remain available) |
+| GET | `/api/tasks/{task_id}/artifacts/{name}` | `gateway.tasks.api_task_artifact` via task_archive and task-owned stores: bare name = top-level file, `?relpath=` = nested file, `?archive=<dir>` = ZIP described by artifact_archives. Recorded digests bind files and ZIP members: drift is 409 artifact_identity_changed with digest, failed capture 404 artifact_unverified; x-ouroboros-artifact-identity says verified/unmeasured. Delegated JSONL `?source=` requires source_handles/delegated_activity content-addressed name, matching basename, confined descent and digest. Ordinary file/chat-media/ZIP and delegated JSONL reads return 503 where confined opens are unsupported, including Windows (issue #1297); result-published review sources retain read_task_result_source_bytes. |
 | POST | `/api/tasks/{task_id}/cancel` | `gateway.tasks.api_task_cancel` |
 | POST | `/api/tasks/{task_id}/hurry` | `gateway.tasks.api_task_hurry` |
-| POST | `/api/tasks/{task_id}/pause` | `gateway.task_pause.api_task_pause`: text-free `TaskPauseRequest` `{request_id}`; `TaskPauseResponse.state`: requested=Pausing, paused=settled (§6) |
+| POST | `/api/tasks/{task_id}/pause` | `gateway.task_pause.api_task_pause`: text-free `TaskPauseRequest` `{request_id}`; `TaskPauseResponse.state`: requested=Pausing, paused=settled, released=resumed replay (§6) |
 | POST | `/api/tasks/{task_id}/continue` | `gateway.task_continue.api_task_continue`: `TaskContinueRequest` `{action_nonce}` / `TaskContinueResponse`. Detail/history `ContinuationOffer`: bound carries retry nonce; admitted confirms successor (§6) |
 | POST | `/api/tasks/{task_id}/resume` | `gateway.tasks.api_task_resume` |
 | POST | `/api/decisions` | `gateway.tasks.api_decision_answer` |

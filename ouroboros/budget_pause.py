@@ -599,6 +599,10 @@ class ColdSleepWritersUnsettled(ValueError):
     """A fresh cold-sleep census still has writers; no source write failed."""
 
 
+class ColdSleepDependencyBlocked(ValueError):
+    """The proposed sleep fence prevents a selected queued dependency running."""
+
+
 def _hold_row(reason: str, *, exc: Optional[BaseException] = None,
               detail: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """One typed hold fact: WHY this task is still fenced and nonterminal."""
@@ -688,6 +692,8 @@ def _exact_continuation_row(limit_ctx: Any, ctx: Any, *, pause_id: str, rail: st
         from ouroboros.model_sleep import cold_blockers
 
         blockers = cold_blockers(ctx)
+        if any(blocker.get("kind") == "queued_member" for blocker in blockers):
+            raise ColdSleepDependencyBlocked(f"selected queued dependency: {blockers}")
         if blockers:
             raise ColdSleepWritersUnsettled(f"{HOLD_COLD_WRITERS_UNSETTLED}: {blockers}")
     usage = limit_ctx.accumulated_usage
@@ -790,7 +796,8 @@ def request_pause(limit_ctx: Any, *, rail: str, scope: str, reason_text: str,
     typed ``hold_reason`` to the owner, and buying no wrap-up call. A failed
     write is a visible retained hold, never a claimed durable pause. The task's
     existing Stop/Panic/deadline/cancel controls stay responsive throughout and
-    are the only thing that ends a hold without a pause.
+    end a hold without a pause. A cold sleep discovered to block its selected
+    queued dependency instead withdraws its exact sleep seed and stays awake.
     """
     tools = getattr(limit_ctx, "tools", None)
     ctx = getattr(tools, "_ctx", None)
@@ -923,6 +930,21 @@ def request_pause(limit_ctx: Any, *, rail: str, scope: str, reason_text: str,
                     set_budget_pause(root, task_id, prepared, expected_pause_id=pause_id)
                     row = prepared
                     break
+                except ColdSleepDependencyBlocked as exc:
+                    try:
+                        set_budget_pause(root, task_id, {**seed, "state": STATE_ABANDONED,
+                            "abandon_reason": "cold_sleep_dependency_blocked", "abandoned_at": time.time()},
+                            expected_pause_id=pause_id, expected_state=STATE_PAUSING)
+                    except Exception as write_error:
+                        hold = _hold_row(HOLD_PAUSE_RECORD_UNWRITABLE, exc=write_error)
+                    else:
+                        end_dispatch_fence(task_id)
+                        ctx._budget_pausing, ctx._model_sleep = False, None
+                        usage.pop("budget_pause_hold", None)
+                        limit_ctx.messages.append({"role": "user", "content": (
+                            "[SYSTEM NOTICE]\nCold sleep was not taken: " + str(exc)
+                            + ". Sleep warm to let the selected child run; no child was cancelled.")})
+                        return
                 except ColdSleepWritersUnsettled as exc:
                     hold = _hold_row(HOLD_COLD_WRITERS_UNSETTLED, exc=exc)
                 except Exception as exc:
@@ -1217,18 +1239,17 @@ def _refresh_planning_threshold(ctx: Any, budget_remaining_usd: Optional[float],
             "root_cap_usd": root_cap, "root_cap_basis": root_cap_basis}
 
 
-def _reopen_owner_fence(ctx: Any, usage: Dict[str, Any], *, fence_id: str = "") -> None:
-    """The resumed ROOT reopens its tree's owner fence where it actually starts.
+def _reopen_owner_fence(ctx: Any, usage: Dict[str, Any], *, fence_id: str = "", grant_id: str = "") -> None:
+    """Consume an explicit Resume's owner-fence authority where work starts.
 
-    Only the root does: a member the model selects later runs under a fence
-    its root already reopened. A write that fails HOLDS (typed, nonterminal)
-    and retries — a root running under its own closed fence would only be
-    refused at every launch.
+    A root reopens its tree; an owner-selected child of a terminal root opens
+    only its own member under that exact fence. Failed publication HOLDS and
+    retries; it never starts effects under missing authority.
     """
-    from ouroboros.owner_pause import launch_lock, read_fence, release_fence
+    from ouroboros.owner_pause import launch_lock, read_fence, release_fence, select_member_resume
 
     root_id = str(getattr(ctx, "root_task_id", "") or ctx.task_id)
-    if root_id != str(ctx.task_id):
+    if root_id != str(ctx.task_id) and not fence_id:
         return
     root = pathlib.Path(ctx.budget_drive_root or ctx.drive_root)
     published = ""
@@ -1237,7 +1258,10 @@ def _reopen_owner_fence(ctx: Any, usage: Dict[str, Any], *, fence_id: str = "") 
             with launch_lock(root, root_id):
                 if fence_id and read_fence(root, root_id).get("fence_id") != fence_id:
                     raise ValueError("owner_pause_fence_changed")
-                release_fence(root, root_id, reason="owner_resume_consumed")
+                if root_id == str(ctx.task_id):
+                    release_fence(root, root_id, reason="owner_resume_consumed")
+                else:
+                    select_member_resume(root, root_id, str(ctx.task_id), fence_id=fence_id, grant_id=grant_id)
             usage.pop("budget_pause_hold", None)
             return
         except Exception as exc:
@@ -1325,7 +1349,8 @@ def resume_paused_loop(tools: Any, state: Dict[str, Any], messages: list, trace:
             time.sleep(_HOLD_POLL_SEC)
     usage.pop("budget_pause_hold", None)
     if str(row.get("reason") or "") == REASON_OWNER or grant.get("owner_pause_fence_id"):
-        _reopen_owner_fence(ctx, usage, fence_id=str(grant.get("owner_pause_fence_id") or ""))
+        _reopen_owner_fence(ctx, usage, fence_id=str(grant.get("owner_pause_fence_id") or ""),
+                            grant_id=str(grant.get("grant_id") or ""))
     ctx._budget_paused_sec = consumed["paused_duration_sec"]
     waiter = getattr(ctx, "model_wait_context", None)
     if waiter is not None:

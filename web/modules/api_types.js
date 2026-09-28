@@ -347,6 +347,17 @@
  * @property {Object=} executor_observation
  *   Latest observed progress actor, bound to own task/attempt/run/revision.
  *   model_source distinguishes requested and observed; not a terminal receipt.
+ * @property {Object=} delegated_activity
+ *   One host progress observation: {v, task_id, run_id, after_seq,
+ *   through_seq, source{kind: run_events|timeline_window, read_through?, ref?,
+ *   provisional?}, parts[{kind: message|thinking|problem, actor, text, seq?,
+ *   last_seq?, cuts?[[seq, Unicode code-point offset]], cuts_truncated?, chars?,
+ *   truncated?}], technical?{count, labels, recent, seqs?, seqs_truncated?},
+ *   gaps?[{after_seq, through_seq, reason, final?}],
+ *   omitted?, latest_message?}. Identity is (run_id, seq); host progress about
+ *   the executor, never narration or execution evidence; `source.ref` names
+ *   retained redacted JSONL (confined task-file `?source=`, 503 where unsupported).
+ *   Incomplete preview identity is disclosed; a preview is not the whole journal.
  * @property {Object=} execution_evidence
  *   The completion-seam EVIDENCE the route decision is reconciled against:
  *   {delegated_runs_started, delegated_runs_settled, delegated_runs_succeeded,
@@ -1305,8 +1316,7 @@
  */
 
 /**
- * Legacy name for the DELETE response: the subset every previous caller read of
- * what that endpoint now answers as a ScheduleActionResponse.
+ * Legacy DELETE response: the ScheduleActionResponse subset read by previous callers.
  * @typedef {Object} ScheduleDeleteResponse
  * @property {boolean} ok
  */
@@ -1322,7 +1332,7 @@
  * @property {string=} task_id
  * @property {string=} root_task_id
  * @property {string=} fence_id
- * @property {'requested'|'paused'=} state
+ * @property {'requested'|'paused'|'released'=} state
  * @property {boolean=} duplicate
  * @property {Array<string>=} members
  * @property {boolean=} snapshot_persisted
@@ -1366,9 +1376,8 @@
  */
 
 /**
- * Optional cancel body. Reuse stop_action_id (at most 200 characters) for this
- * exact action; a later Stop uses a new ID. It is distinct from the server's
- * cancellation request_id. Absent identity has no exact-retry guarantee.
+ * Reuse stop_action_id (at most 200 characters) for this exact action; a later
+ * Stop needs a new ID, distinct from server request_id. No ID means no exact retry.
  * @typedef {Object} TaskCancelRequest
  * @property {boolean=} cascade
  * @property {string=} stop_policy
@@ -1380,25 +1389,17 @@
  * @property {boolean} ok
  * @property {string} task_id
  * @property {boolean=} cascade
- *   v6.82 (P5): echoed only when the request body {"cascade": true} asked for the
- *   subtree cancel, which is complete by the time this answer is sent; the plain
- *   single-task envelope is unchanged.
+ *   Echoed only for {"cascade": true}, after subtree cancel completes; single-task envelope unchanged.
  * @property {string=} cancel_state
- *   S3 (Q1/Q2): "pending" on the 202 acknowledgement of a
- *   {"stop_policy": "finalize_then_cancel"} request — the durable intent is
- *   open while the bounded finalization attempt runs. Absent on the legacy
- *   immediate path.
+ *   "pending" on graceful 202 ACK: durable intent stays open during bounded finalization; absent for immediate.
  * @property {string=} stop_policy
- *   The EFFECTIVE policy of the durable intent ("immediate" |
- *   "finalize_then_cancel"): a graceful request over an already-hard intent
- *   never softens it, and the answer says so.
+ *   Effective durable "immediate" | "finalize_then_cancel"; a graceful request never softens a hard intent.
  * @property {string=} error
  */
 
 /**
- * POST /api/tasks/{task_id}/hurry — the text-free owner hurry control (HQ1:
- * no chat message, ever). The body carries ONLY a client-generated stable
- * request_id (reused on retry); any other field is refused.
+ * POST /api/tasks/{task_id}/hurry: no chat message. Only client request_id is
+ * accepted, stable across retries; every other body field is refused.
  * @typedef {Object} TaskHurryRequest
  * @property {string} request_id
  */
@@ -1573,9 +1574,8 @@
 
 export const MAX_LINK_ACTIONS = 12;
 export const MAX_QUIZ_OPTIONS = 6;
-// Mirror of ouroboros/gateway/task_decision.py::_COMMENT_MAX — the ingress
-// REFUSES a longer comment (it is delivered verbatim, never truncated), so
-// the card must not offer to send one.
+// Mirror task_decision._COMMENT_MAX: ingress refuses longer comments, never
+// truncates; cards must offer only comments the ingress can deliver verbatim.
 export const MAX_DECISION_COMMENT = 2000;
 export const GATEWAY_CONTRACT_VERSION = '7.5.1';
 

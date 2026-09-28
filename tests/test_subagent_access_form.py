@@ -37,6 +37,7 @@ def test_api_all_fields_form_queues_without_changing_write_surface(registry, acc
         "subagent_id": "api-scout", "access": access,
         "objective": "Inspect the assigned source.", "expected_output": "Findings.",
         "role": "", "context": "", "constraints": "", "memory_mode": "forked",
+        "input_sources": "shared",
         "write_surface": surface, "write_root": "", "directory_strategy": "direct",
         "scope_paths": [], "protected_paths_grant": False, "external_tool_grants": [],
         "allowed_origins": [], "delegation_intent": "", "may_mutate": False,

@@ -729,3 +729,24 @@ test('Activity Resume follows the root census while owner Pause is settling', as
         }
     }
 });
+
+test('Activity names saved sleep without claiming a budget pause and preserves owner Pause precedence', async (t) => {
+    const { mount, routes, ws } = setup(t);
+    emptyActivity(routes);
+    const queue = { running: [], pending: [{ id: 'sleeping-root', task: {
+        id: 'sleeping-root', root_task_id: 'sleeping-root', type: 'task', title: 'Saved sleep',
+        _budget_pause: { reason: 'sleep' },
+    } }] };
+    routes.set(queueUrl, response({ queue }));
+    const activity = initActivity({ mount, ws });
+    await activity.refresh();
+    assert.match(section(mount, 'queue').textContent, /sleeping/);
+    assert.doesNotMatch(section(mount, 'queue').textContent, /paused \(budget\)/);
+    assert.equal(section(mount, 'queue').querySelector('[data-act="task-control"]').dataset.budgetPaused, '1');
+    queue.budget_root_fences = [{ root_task_id: 'sleeping-root', status: 'paused', cause: 'owner_pause' }];
+    routes.set(backgroundUrl, response({ bg_consciousness_enabled: false,
+        active_chat_activities: [{ activity_id: 'sleeping-root', phase: 'budget_paused' }] }));
+    await activity.refresh();
+    assert.match(section(mount, 'queue').textContent, /paused/);
+    assert.doesNotMatch(section(mount, 'queue').textContent, /sleeping|budget/);
+});

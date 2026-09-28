@@ -83,7 +83,8 @@ test('a lost answer is retried under the SAME nonce; an already accepted press n
     assert.match(toasts[0][0], /^Continue not confirmed: network timeout/);
     assert.equal(await continueTaskAction('root-1', { request, storage, toast }), 'root-1-cabc');
     assert.equal(seen[0][1], seen[1][1], 'the retry carries the same action nonce');
-    assert.match(toasts[1][0], /waits until the interrupted task's own work has settled/);
+    assert.match(toasts[1][0], /use Resume in Activity to recheck/);
+    assert.ok(!toasts[1][0].includes('root-1-cabc'), 'compact acknowledgement hides opaque identity');
     const refused = async () => { throw Object.assign(new Error('continue refused: already_continued'), {
         body: { reason_code: 'already_continued', successor_task_id: 'root-1-cabc' } }); };
     assert.equal(await continueTaskAction('root-9', { request: refused, storage, toast }), 'root-1-cabc');
@@ -138,7 +139,8 @@ test('an event row never erases the offer; a root that ended without an answer r
         assert.equal(card.root.querySelector('[data-continue-task]'), button);
         // The full detail still decides: the accepted successor replaces the offer.
         syncContinueAction(card, { continuation_offer: { eligible: false, successor_task_id: 'crashed-root-c1' } });
-        assert.equal(button.textContent, 'Continued as crashed-root-c1');
+        assert.equal(button.textContent, 'Continued');
+        assert.equal(button.dataset.continueSuccessor, 'crashed-root-c1');
         assert.equal(button.disabled, true);
 
         // A finished answer, a live row and a child card never read the detail.
@@ -154,26 +156,64 @@ test('an event row never erases the offer; a root that ended without an answer r
     }
 });
 
-test('a failed detail read lets the next terminal row retry', async () => {
+for (const failure of ['reject', 'null', 'missing-offer', 'null-offer']) {
+test(`an unusable detail read (${failure}) lets the next terminal row retry without polling`, async () => {
     const { prior } = installDom();
     try {
         let calls = 0;
         const read = async () => {
             calls += 1;
-            if (calls === 1) throw new Error('offline');
+            if (calls === 1) {
+                if (failure === 'reject') throw new Error('offline');
+                return failure === 'null' ? null : failure === 'null-offer' ? { continuation_offer: null } : {};
+            }
             return { status: 'failed', continuation_offer: { eligible: true, cause: 'provider_unavailable' } };
         };
         const card = settledRootCard('flaky-root');
         syncContinueAction(card, { type: 'task_done', status: 'failed' }, { read });
         await flush();
+        await flush();
+        assert.equal(calls, 1, 'a failed read does not start a retry loop');
         assert.equal(card.root.querySelector('[data-continue-task]'), null);
         syncContinueAction(card, { type: 'task_done', status: 'failed' }, { read });
         await flush();
         assert.equal(calls, 2);
         assert.equal(card.root.querySelector('[data-continue-task]')?.textContent, 'Continue');
+        syncContinueAction(card, { type: 'task_eval', status: 'failed' }, { read });
+        await flush();
+        assert.equal(calls, 2, 'usable detail is cached for later terminal rows');
     } finally {
         restoreDom(prior);
     }
+});
+}
+
+test('production 503/null detail recovers on the next terminal row with one read in flight', async () => {
+    let reads = 0;
+    let finishRead;
+    const { prior } = installDom(async () => {
+        reads += 1;
+        if (reads === 1) return { ok: false, status: 503 };
+        return new Promise((resolve) => { finishRead = () => resolve({ ok: true,
+            json: async () => ({ continuation_offer: { eligible: false, refusal: 'stopped_by_owner' } }) }); });
+    });
+    try {
+        const card = settledRootCard('production-flaky-root');
+        const terminal = { type: 'task_done', status: 'failed' };
+        syncContinueAction(card, terminal);
+        await flush();
+        assert.equal(reads, 1);
+        syncContinueAction(card, terminal);
+        syncContinueAction(card, terminal);
+        await flush();
+        assert.equal(reads, 2, 'the production null reader can retry, but not concurrently');
+        finishRead();
+        await flush();
+        syncContinueAction(card, terminal);
+        await flush();
+        assert.equal(reads, 2, 'a valid ineligible offer is also a completed read');
+        assert.equal(card.root.querySelector('[data-continue-task]'), null);
+    } finally { restoreDom(prior); }
 });
 
 test('a replayed history row states the offer: shown after a reload without opening, never read', async () => {
@@ -191,7 +231,8 @@ test('a replayed history row states the offer: shown after a reload without open
             continuation_offer: { eligible: false, refusal: 'already_continued', successor_task_id: 'continued-root-c9' } },
         { read });
         const pointer = claimed.root.querySelector('[data-continue-task]');
-        assert.equal(pointer?.textContent, 'Continued as continued-root-c9');
+        assert.equal(pointer?.textContent, 'Continued');
+        assert.equal(pointer?.dataset.continueSuccessor, 'continued-root-c9');
         assert.equal(pointer?.disabled, true);
         // An ineligible root's rows say so too: no button and no detail read.
         const stopped = settledRootCard('stopped-root');

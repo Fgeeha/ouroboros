@@ -5,6 +5,7 @@ export { taskCheckpointLabel } from './task_checkpoints.js';
 import { harnessPresentation } from './harness_presentation.js';
 import { acceptanceIncidentClauses } from './acceptance_incident_presentation.js';
 import { historyRetentionView } from './history_retention.js';
+import { delegatedActivityView } from './delegated_activity.js';
 import {
     classifyReviewLifecycle,
     classifyReviewLifecyclePointer,
@@ -1257,6 +1258,8 @@ function summarizeChatLiveEventView(evt) {
         });
     }
 
+    const delegated = delegatedActivityView(evt); // a delegated run's typed observation, root or child
+    if (delegated) return Object.assign(chatView({ ...delegated, chip: executorChip(evt), model: evt.model }), { activity: delegated.activity });
     if ((evt.is_progress || t === 'send_message') && isSubagentEvent(evt)) {
         const sid = subagentId(evt);
         const rawEvent = String(evt.subagent_event || '').toLowerCase();

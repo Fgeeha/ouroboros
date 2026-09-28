@@ -233,11 +233,16 @@ def _claim_worker_launch(queue, candidate, worker):
         with scheduled_start(queue.DRIVE_ROOT, candidate) as allowed:
             if not allowed:
                 return False
+            root_id = str(candidate.get("root_task_id") or candidate.get("id"))
+            latch = queue.BUDGET_ROOT_FENCES.get(root_id) or {}
+            resume = candidate.get("_budget_pause_resume")
+            selected_child = bool(candidate.get("id") != root_id and isinstance(resume, dict)
+                                  and latch.get("cause") == "owner_pause"
+                                  and resume.get("root_fence_id") == latch.get("fence_id"))
             with launch_admission(SimpleNamespace(
                     task_id=candidate.get("id"), root_task_id=candidate.get("root_task_id"),
                     budget_drive_root=candidate.get("budget_drive_root") or queue.DRIVE_ROOT),
-                    root_resume=candidate.get("_budget_pause_resume") if not
-                        queue.BUDGET_ROOT_FENCES.get(str(candidate.get("root_task_id") or candidate.get("id"))) else None):
+                    root_resume=resume if not latch or selected_child else None):
                 prior = candidate.get("admitted_dispatch")
                 candidate["admitted_dispatch"] = "possible"
                 if not queue.persist_queue_snapshot(reason="worker_launch_claimed"):

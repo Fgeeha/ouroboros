@@ -192,7 +192,7 @@ def _cold_park(tmp_path, monkeypatch, workers, task_id="sleeper", **selected):
     ctx, limit_ctx = _loop_ctx(tmp_path, task_id)
     _fast_hold(monkeypatch, budget_pause)
     _quiet_external(monkeypatch, budget_pause)
-    monkeypatch.setattr(model_sleep, "cold_blockers", lambda _ctx: [])
+    monkeypatch.setattr(model_sleep, "cold_blockers", lambda _ctx, **_kw: [])
     ctx._model_sleep = {"sleep_id": "s1", "mode": "cold", **model_sleep.selectors(ctx, **selected)}
     with pytest.raises(budget_pause.BudgetPauseRequested) as raised:
         budget_pause.enter_cold_sleep(limit_ctx)

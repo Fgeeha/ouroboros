@@ -669,6 +669,10 @@ def _handle_model_wait_control(
                 return None
             except OwnerPauseRefused as exc:
                 if str(exc) == reason:
+                    import time
+                    from ouroboros.budget_pause import _HOLD_POLL_SEC
+
+                    time.sleep(_HOLD_POLL_SEC)
                     continue
                 error = ModelWaitInterrupted(str(exc), role=error.model_role, cause=error)
             except Exception as exc:

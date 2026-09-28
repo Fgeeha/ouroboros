@@ -35,6 +35,7 @@ from ouroboros.runtime_limits import (
 )
 from ouroboros.usage_ledger import QUARANTINE_REL, LedgerResumeState, UsageLockUnavailable, is_abandoned_settlement
 from ouroboros._usage_money import billing_group_key, monetary_scope_key, ZERO_CASH, cash_contribution, change_cash, render_cash, exceeds_limit
+from ouroboros._usage_rows import BindingIndex
 
 log = logging.getLogger(__name__)
 
@@ -198,8 +199,7 @@ class _LedgerWriterView:
     cash: tuple = ZERO_CASH
     roots: dict = field(default_factory=dict)
     groups: dict = field(default_factory=dict)
-    root_bindings: dict = field(default_factory=dict)
-    group_bindings: dict = field(default_factory=dict)
+    bindings: BindingIndex = field(default_factory=BindingIndex)
     fold_times: list = field(default_factory=list)
 
     def fold(self, rows: list) -> None:
@@ -220,9 +220,7 @@ class _LedgerWriterView:
             self.roots[root] = change_cash(self.roots.get(root, ZERO_CASH), new=new)
             group = billing_group_key(row)
             self.groups[group] = change_cash(self.groups.get(group, ZERO_CASH), new=new)
-            if "billing_group_limit_usd" in row or "root_limit_usd" in row:
-                self.root_bindings.setdefault(root, row)
-                self.group_bindings.setdefault(group, row)
+            self.bindings.fold(row)
             self.finals[identity] = row
             eligible = fold_eligible_at(row)
             if eligible is not None:

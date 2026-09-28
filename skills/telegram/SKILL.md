@@ -1,7 +1,7 @@
 ---
 name: telegram
 description: Owner-only Telegram text bridge and Mini App gateway for the existing Ouroboros interface.
-version: 1.2.7
+version: 1.2.8
 type: extension
 entry: plugin.py
 plugin_api: "2.0"
@@ -70,6 +70,11 @@ stopping the text bridge. Disabling the skill destroys process-memory Mini App
 sessions, stops public exposure, and best-effort restores the prior Telegram
 menu button. Rotate the bot token only while the skill is disabled, then
 re-enable it.
+
+Delegated task cards lead with the executor's latest words (marked earlier
+when retained), followed by problems and compact activity counts. These are
+attributed observations, not the supervising task's narration or a completion
+receipt; journal gaps and preview omissions remain visible.
 
 Set `TELEGRAM_BOT_TOKEN` in Settings, grant it to this skill, enable the skill,
 and send the bot a private message to bind the owner. No legacy Telegram skill

@@ -3,6 +3,47 @@ import test from 'node:test';
 import { mergeHistoricalTimelineItem, compareHistoryPosition } from '../modules/chat_history_replay.js';
 import { createChatHistoryPager } from '../modules/chat_history.js';
 import { updateLiveTimelineItem } from '../modules/chat_render_batch.js';
+import { delegatedActivityView, reconcileDelegatedItems } from '../modules/delegated_activity.js';
+
+test('revisioned merge rows coexist with distinct delegated speech through live-to-history replay', () => {
+    const record = { items: [] }, ts = '2026-09-28T00:00:00Z';
+    const key = 'cardrow|merge-receipt:receipt-1';
+    const merge = (headline, revision) => ({ headline, phase: 'result', dedupeKey: key, cardRowRevision: revision });
+    const speech = (seq) => delegatedActivityView({ is_progress: true, task_id: 'task', delegated_activity: {
+        v: 1, task_id: 'task', run_id: 'run-1', after_seq: seq - 1, through_seq: seq,
+        source: { kind: 'run_events', read_through: seq },
+        parts: [{ kind: 'message', actor: 'executor', text: 'Same words 🙂', seq }],
+    } });
+    const row = (id, offset) => ({ history_id: id, ts,
+        history_position: { source: 'progress', offset } });
+    const live = (summary) => updateLiveTimelineItem(record, summary, {
+        ts, rawTs: ts, syntheticKey: summary.dedupeKey, headline: summary.headline, inPlaceByKey: true,
+    });
+    live(merge('PR queued', 1));
+    live(speech(1));
+    live(merge('PR merged', 3));
+    const receipt = record.items.find(item => item.dedupeKey === key);
+    for (const seq of [2, 1, 2]) {
+        mergeHistoricalTimelineItem(record, speech(seq), row(`speech-${seq}`, seq), ts);
+    }
+    assert.equal(mergeHistoricalTimelineItem(record, merge('PR queued', 2), row('receipt-old', 50), ts), false);
+    assert.equal(receipt.headline, 'PR merged');
+    assert.equal(record.items.filter(item => item.activity).length, 2);
+    assert.deepEqual(record.items.filter(item => item.activity).map(item => item.activity.parts[0].seq), [1, 2]);
+
+    // A cold page has no prior live revision: canonical source revision still
+    // wins over page arrival/timestamp, without coalescing equal executor words.
+    const cold = { items: [] };
+    for (const [summary, source] of [[merge('PR merged', 3), row('receipt-new', 3)],
+        [speech(2), row('speech-2', 2)], [merge('PR queued', 1), row('receipt-old', 50)],
+        [speech(1), row('speech-1', 1)]]) {
+        mergeHistoricalTimelineItem(cold, summary, source, ts);
+    }
+    reconcileDelegatedItems(cold);
+    assert.equal(cold.items.length, 3);
+    assert.equal(cold.items.find(item => item.dedupeKey === key).headline, 'PR merged');
+    assert.deepEqual(cold.items.filter(item => item.activity).map(item => item.activity.parts[0].seq), [1, 2]);
+});
 
 test('one child lifecycle survives chronological replay and older pages without losing narration', () => {
     const narration = 'Searching evidence. '.repeat(60) + 'COMPLETE_NARRATION_END';

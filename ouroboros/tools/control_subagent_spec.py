@@ -45,6 +45,20 @@ def schedule_subagent_properties() -> Dict[str, Any]:
         "expected_output": {"type": "string", "description": "Concrete handoff expected from the child."},
         "role": {"type": "string", "description": "Optional freeform role label for lineage/UI, e.g. architecture-reviewer."},
         "context": {"type": "string", "description": "Optional parent reference material. It is injected as context, not instructions; for a harness-dispatched child it becomes the WORK ORDER for its delegated run's prompt, so put the recipe/details here rather than in the objective."},
+        "input_sources": {
+            "type": "string", "enum": ["shared", "declared"],
+            "description": (
+                "Omit or shared for ordinary shared context. declared selects only the authored "
+                "objective/context/constraints and full governance/task authority as automatic inputs; "
+                "it excludes automatic shared memory, dialogue, project knowledge, inherited parent "
+                "context and attachments. Put common evidence explicitly in context. API-model "
+                "children only; inherited declared cannot be widened by descendants. Selection lasts "
+                "for the task; the assignment defines first-position retention and collaboration. "
+                "Tool results and messages can broaden the input. This selector prescribes no "
+                "exchange sequence or transport and is not access isolation or a claim about "
+                "provider context or learned priors."
+            ),
+        },
         "constraints": {"type": "string", "description": "Optional constraints/non-goals for the child."},
         "memory_mode": {
             "type": "string",
@@ -52,9 +66,10 @@ def schedule_subagent_properties() -> Dict[str, Any]:
             "description": (
                 "Seed of the child's OWN execution drive. Default forked copies stable memory files there "
                 "(identity, WORLD, registry and knowledge; a Project child gets only the shared patterns); "
-                "empty seeds that drive with nothing. Either way the child's context is still built from the "
+                "empty seeds that drive with nothing. In ordinary mode the child's context is still built from the "
                 "canonical governance (BIBLE, SYSTEM, reference books) and the canonical data root's shared "
-                "memory, so empty is a blank drive, not a blank context. shared is disabled for live local subagents."),
+                "memory, so empty is a blank drive, not a blank context. shared is disabled for live local subagents. "
+                "input_sources=declared independently selects automatic inputs."),
         },
         "write_surface": {
             "type": "string",
@@ -135,7 +150,7 @@ _INTERNAL_SCHEDULE_OPTIONS: frozenset = frozenset()
 def _validated_schedule_fields(params: Dict[str, Any], *, ctx: Any = None) -> tuple[Dict[str, Any], str]:
     """Normalize and validate the public schedule_subagent fields.
 
-    Returns ``(fields, "")`` or ``({}, refusal)``. Extracted from ``_schedule_task`` so
+    Returns ``(fields, "")`` or ``({optional reason}, refusal)``. Extracted from ``_schedule_task`` so
     the handler stays inside the method-size gate — argument validation is a coherent
     phase with one job, not a slice taken to shed lines.
     """
@@ -232,6 +247,20 @@ def _validated_schedule_fields(params: Dict[str, Any], *, ctx: Any = None) -> tu
     parent = metadata.get("task_contract") if isinstance(metadata.get("task_contract"), dict) else {}
     if not parent and isinstance(getattr(ctx, "task_contract", None), dict):
         parent = ctx.task_contract
+    from ouroboros.contracts.task_contract import normalize_input_sources
+
+    input_source_fields = {}
+    try:
+        if "input_sources" in parent:
+            input_source_fields["input_sources"] = normalize_input_sources(parent["input_sources"])
+        if "input_sources" in params:
+            selected = normalize_input_sources(params["input_sources"])
+            if input_source_fields.get("input_sources") == "declared" and selected != "declared":
+                return {"reason": "INPUT_SOURCE_SELECTION_WIDENING"}, (
+                    "⚠️ TOOL_ARG_ERROR (schedule_subagent): input_sources=shared cannot widen an inherited declared selection.")
+            input_source_fields["input_sources"] = selected
+    except ValueError as exc:
+        return {"reason": "INPUT_SOURCE_SELECTION_INVALID"}, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}."
     resource_policy = normalize_resource_policy(parent.get("resource_policy") or metadata.get("resource_policy"))
     if "allowed_origins" in params:
         requested = params["allowed_origins"]
@@ -254,6 +283,7 @@ def _validated_schedule_fields(params: Dict[str, Any], *, ctx: Any = None) -> tu
         "acceptance_claims": acceptance_claims,
         "resource_policy": resource_policy,
         "parent_contract": parent,
+        **input_source_fields,
         **directory_options,
     }, ""
 

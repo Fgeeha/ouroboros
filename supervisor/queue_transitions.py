@@ -267,6 +267,7 @@ def _resume_unstarted_owner_paused_root(q: Any, task: Dict[str, Any], fence: Dic
         # Publish queue eligibility first, while durable launch authority is still
         # closed. A crash or failed second write cannot start the unrun root.
         q.BUDGET_ROOT_FENCES.pop(task_id, None)
+        task.pop("_budget_pause", None)
         task.pop(BUDGET_HOLD_KEY, None)
         if not q.persist_queue_snapshot(reason="owner_pause_root_resumed"):
             task.clear()
@@ -383,14 +384,14 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
 
         external = observe_task_runs(result_root, task_id, reason="budget_resume_uncovered_cost",
                                      request_stop=not owner_paused)
-        if owner_paused and root_task_id == task_id:
+        if owner_paused:
             from supervisor.continuation_admission import conflicting_writers
 
             # A saved loop is not proof that its handed tools/processes ended.
             # Observe the existing whole-tree custody owner off the queue lock.
             try:
                 external["owner_pause_tree"] = {
-                    "fence": owner_fence, "blockers": conflicting_writers(q, task_id, drive_root=result_root),
+                    "fence": owner_fence, "blockers": conflicting_writers(q, root_task_id, drive_root=result_root),
                 }
             except Exception as exc:
                 external["owner_pause_tree"] = {"error": str(exc)}
@@ -421,7 +422,7 @@ def resume_budget_paused_task(task_id: str, *, selected_by: str = "") -> Dict[st
 
         candidate_root = str(task.get("root_task_id") or task_id)
         candidate_fence = q.BUDGET_ROOT_FENCES.get(candidate_root)
-        if (not pause and not selected_by and task_id == candidate_root
+        if (not selected_by and task_id == candidate_root
                 and isinstance(candidate_fence, dict) and candidate_fence.get("cause") == "owner_pause"):
             return _resume_unstarted_owner_paused_root(q, task, candidate_fence, observation)
         hold = budget_hold_fact(task)

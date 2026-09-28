@@ -97,8 +97,8 @@ export function taskControlActions({ cancelPending = false, budgetPaused = false
         : [ACTION_FINALIZE, ACTION_HURRY, ACTION_STOP_NOW];
 }
 
-// Stable per-task pause request id (the same click retried is idempotent);
-// page-session scoped like hurry — a reload is a new owner intent.
+// Retain an uncertain Pause's id for retries; acknowledgement or Resume
+// retires it, so a later intentional Pause is a new action.
 const pauseRequestIds = new Map();
 
 function pauseRequestId(taskId) {
@@ -125,7 +125,13 @@ export async function pauseTaskAction(taskId, { pause = pauseTask, toast = showT
     inFlight.add(id);
     try {
         const ack = await pause(id, pauseRequestId(id));
-        toast(ack?.state === 'paused'
+        if (ack?.ok !== true) throw new Error('Pause acknowledgement is unknown; retry this action.');
+        pauseRequestIds.delete(id);
+        if (ack.state === 'released') {
+            toast('This Pause was already resumed.', 'info');
+            return true;
+        }
+        toast(ack.state === 'paused'
             ? 'Paused: the whole task tree is saved until you resume it.'
             : 'Pausing: new work is stopped; work already sent finishes, then the tree is saved.', 'ok');
         return true;
@@ -137,18 +143,20 @@ export async function pauseTaskAction(taskId, { pause = pauseTask, toast = showT
     }
 }
 
-export async function resumeTaskAction(taskId) {
-    const id = String(taskId || '');
+export async function resumeTaskAction(taskId, { resume = resumeTask, toast = showToast } = {}) {
+    const id = String(taskId || '').trim();
     if (!id || inFlight.has(id)) return;
     inFlight.add(id);
     try {
-        await resumeTask(id);
-        showToast('Resuming: the task returns to the queue.', 'info');
+        const ack = await resume(id);
+        if (ack?.ok !== true) throw new Error('Resume acknowledgement is unknown; retry this action.');
+        pauseRequestIds.delete(id);
+        toast('Resuming: the task returns to the queue.', 'info');
     } catch (exc) {
         // The server names the refusal (replay_unsafe / fence missing /
         // not budget-paused): show it verbatim instead of a generic failure.
         // Handled here, never rethrown: the menu callback is fire-and-forget.
-        showToast(`Resume refused: ${exc?.message || exc}`, 'error');
+        toast(`Resume refused: ${exc?.message || exc}`, 'error');
     } finally {
         inFlight.delete(id);
     }

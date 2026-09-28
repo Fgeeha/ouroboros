@@ -80,15 +80,21 @@ def _resume_custody_refusal(result_root, task_id, row, external):
     return None
 
 
-def _owner_resume_fence(result_root, task_id, external):
+def _owner_resume_fence(result_root, task_id, external, *, root_task_id="", selected_by=""):
     """Bind the fresh whole-tree observation to the still-closed owner fence."""
     from ouroboros.owner_pause import fence_closed, read_fence
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
 
+    root_task_id = root_task_id or task_id
     observed = (external or {}).get("owner_pause_tree")
     if not isinstance(observed, dict) or observed.get("error"):
         return "", {"ok": False, "error": "owner_pause_custody_unreadable"}
     try:
-        current_fence = read_fence(result_root, task_id)
+        if root_task_id != task_id:
+            origin = load_task_result(result_root, root_task_id, strict=True) or {}
+            if selected_by or origin.get("status") not in _TRULY_TERMINAL_STATUSES:
+                return "", {"ok": False, "error": "root_still_paused", "root_task_id": root_task_id}
+        current_fence = read_fence(result_root, root_task_id)
     except Exception:
         return "", {"ok": False, "error": "owner_pause_custody_unreadable"}
     if not fence_closed(current_fence) or current_fence != observed.get("fence"):
@@ -159,9 +165,12 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
     from ouroboros.owner_pause import fence_closed
 
     owner_fence_id = ""
-    if ((row.get("reason") == "owner" or fence_closed(result_row.get("owner_pause")))
-            and str(task.get("root_task_id") or task_id) == task_id):
-        owner_fence_id, refusal = _owner_resume_fence(result_root, task_id, external)
+    root_task_id = str(task.get("root_task_id") or task_id)
+    observed_fence = ((external or {}).get("owner_pause_tree") or {}).get("fence") or {}
+    if (fence_closed(observed_fence) or root_task_id == task_id
+            and (row.get("reason") == "owner" or fence_closed(result_row.get("owner_pause")))):
+        owner_fence_id, refusal = _owner_resume_fence(result_root, task_id, external,
+                                                     root_task_id=root_task_id, selected_by=selected_by)
         if refusal:
             return refusal
     if int(row.get("task_attempt") or 0) != int(task.get("_attempt") or 1):

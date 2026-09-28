@@ -524,7 +524,8 @@ def test_continue_is_offered_after_an_owner_restart(direct_server_with_data, mon
                 offer = _task(page, url, BRAVO).get("continuation_offer") or {}
                 successor = offer.get("successor_task_id")
                 assert successor and offer.get("refusal") == "already_continued", offer
-                expect(button).to_have_text(f"Continued as {successor}", timeout=15_000)
+                expect(button).to_have_text("Continued", timeout=15_000)
+                expect(button).to_have_attribute("data-continue-successor", successor)
                 admitted = [row for row in _events(data_dir, "owner_continue_admitted")
                             if row.get("predecessor_task_id") == BRAVO]
                 record["admitted"] = admitted
@@ -556,7 +557,8 @@ def test_continue_is_offered_after_an_owner_restart(direct_server_with_data, mon
                 page.reload(wait_until="domcontentloaded")
                 page.wait_for_selector("#page-chat", timeout=30_000)
                 pointer = _card(page, BRAVO).locator("[data-continue-task]")
-                expect(pointer).to_have_text(f"Continued as {successor}", timeout=30_000)
+                expect(pointer).to_have_text("Continued", timeout=30_000)
+                expect(pointer).to_have_attribute("data-continue-successor", successor)
                 expect(pointer).to_be_disabled()
                 assert _card(page, BRAVO).locator(":scope > [data-live-summary-button]").get_attribute(
                     "aria-expanded") != "true", "the pointer is shown on the collapsed card"
@@ -639,7 +641,8 @@ def test_continue_after_a_crash_rejoins_a_lost_answer_and_survives_reload(direct
                 assert successor and offer.get("refusal") == "already_continued", offer
                 shot("02-continue-answer-lost")
                 button.click()
-                expect(button).to_have_text(f"Continued as {successor}", timeout=15_000)
+                expect(button).to_have_text("Continued", timeout=15_000)
+                expect(button).to_have_attribute("data-continue-successor", successor)
                 expect(page.locator(".toast").last).to_contain_text(successor)
                 nonce = page.evaluate(f"localStorage.getItem('ouro_continue_nonce:{DELTA}')")
                 assert nonce
@@ -652,7 +655,8 @@ def test_continue_after_a_crash_rejoins_a_lost_answer_and_survives_reload(direct
                 button = card.locator("[data-continue-task]")
                 # The replayed history rows carry the offer: the collapsed card
                 # points to its successor without being opened.
-                expect(button).to_have_text(f"Continued as {successor}", timeout=30_000)
+                expect(button).to_have_text("Continued", timeout=30_000)
+                expect(button).to_have_attribute("data-continue-successor", successor)
                 expect(button).to_be_disabled()
                 assert card.locator(":scope > [data-live-summary-button]").get_attribute("aria-expanded") != "true"
                 assert page.evaluate(f"localStorage.getItem('ouro_continue_nonce:{DELTA}')") == nonce

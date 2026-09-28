@@ -126,8 +126,9 @@ def fence_closed(fence: Dict[str, Any]) -> bool:
 def install_fence(root_drive: Any, root_task_id: str, *, request_id: str) -> Tuple[Dict[str, Any], bool]:
     """Close the root's fence durably; ``(fence, created)``.
 
-    Idempotent by ``request_id`` (a retried press returns the same fence) and
-    by state (a second press while a fence is closed returns that fence). A
+    Idempotent by ``request_id`` across Resume and later Pause generations;
+    every acknowledged action stays on this same root projection. A
+    second press while closed names that fence, never an additional Pause. A
     terminal root refuses: a finished tree has nothing to pause. Raises
     ``OwnerPauseRefused`` without any write on refusal; any write failure
     propagates, so the caller never acknowledges an undurable Pause.
@@ -144,18 +145,33 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str) -> Tup
         if not current:
             raise OwnerPauseRefused("root_result_missing")
         require_writable_task_result_schema(current)
+        old = current.get("owner_pause") if isinstance(current.get("owner_pause"), dict) else {}
+        requests = dict(old.get("requests") or {})
+        if old.get("request_id"):
+            requests.setdefault(old["request_id"], {
+                "fence_id": old.get("fence_id"), "generation": old.get("generation")})
+        prior = requests.get(request_id)
+        if prior:
+            replay = dict(old) if prior.get("fence_id") == old.get("fence_id") else {
+                **prior, "request_id": request_id, "root_task_id": str(root_task_id),
+                "state": FENCE_RELEASED}
+            outcome.update(fence=replay, created=False)
+            return None
         if current.get("status") in _TRULY_TERMINAL_STATUSES:
             raise OwnerPauseRefused("task_terminal")
-        old = current.get("owner_pause") if isinstance(current.get("owner_pause"), dict) else {}
         if fence_closed(old):
-            outcome.update(fence=dict(old), created=False)
-            return None
+            requests[request_id] = {"fence_id": old["fence_id"], "generation": old.get("generation")}
+            fence = {**old, "requests": requests}
+            outcome.update(fence=fence, created=False)
+            return stamp_task_result_schema({**current, "owner_pause": fence})
         fence = {
             "fence_id": uuid.uuid4().hex, "request_id": str(request_id or ""),
             "state": FENCE_REQUESTED, "requested_by": "owner", "requested_at": utc_now_iso(),
             "requested_at_ts": time.time(), "root_task_id": str(root_task_id),
             "generation": int(old.get("generation") or 0) + 1,
         }
+        requests[request_id] = {"fence_id": fence["fence_id"], "generation": fence["generation"]}
+        fence["requests"] = requests
         outcome.update(fence=fence, created=True)
         return stamp_task_result_schema({**current, "owner_pause": fence})
 
@@ -204,6 +220,39 @@ def release_fence(root_drive: Any, root_task_id: str, *, reason: str) -> Dict[st
         return fence
     return set_fence_state(root_drive, root_task_id, fence_id=str(fence.get("fence_id") or ""),
                            state=FENCE_RELEASED, release_reason=str(reason or "owner_resume"))
+
+
+def select_member_resume(root_drive: Any, root_task_id: str, task_id: str, *,
+                         fence_id: str, grant_id: str) -> None:
+    """Consume one child Resume under a terminal root; keep its siblings fenced.
+
+    Caller holds ``launch_lock``. The consumed explicit grant, root terminality
+    and exact fence are checked again here; neither lineage nor a terminal
+    transition grants this exception. A new Pause has no selected members.
+    """
+    from ouroboros.budget_pause import budget_pause_row, STATE_RESUMED
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
+    from ouroboros.utils import utc_now_iso
+
+    root = load_task_result(root_drive, root_task_id, strict=True) or {}
+    member = load_task_result(root_drive, task_id, strict=True) or {}
+    row = budget_pause_row(pathlib.Path(root_drive), task_id)
+    grant = row.get("grant") or {}
+    if (task_id == root_task_id or root.get("status") not in _TRULY_TERMINAL_STATUSES
+            or str(member.get("root_task_id") or (member.get("metadata") or {}).get("root_task_id") or "") != root_task_id
+            or row.get("state") != STATE_RESUMED or not grant_id
+            or grant.get("grant_id") != grant_id or not grant.get("consumed_at")
+            or grant.get("revoked_at") or grant.get("authority") != "explicit_resume"
+            or grant.get("selected_by") != "owner"
+            or grant.get("owner_pause_fence_id") != fence_id):
+        raise OwnerPauseRefused("member_resume_authority_changed")
+    fence = read_fence(root_drive, root_task_id)
+    if fence.get("fence_id") != fence_id or not fence_closed(fence):
+        raise OwnerPauseRefused("owner_pause_fence_changed")
+    selected = dict(fence.get("selected_members") or {})
+    selected[task_id] = {"grant_id": grant_id, "selected_at": utc_now_iso()}
+    set_fence_state(root_drive, root_task_id, fence_id=fence_id, state=fence["state"],
+                    selected_members=selected)
 
 
 # --- member side: the gate every launch family shares ----------------------------------
@@ -255,6 +304,8 @@ def member_fence(source: Any) -> Dict[str, Any]:
     except Exception:
         log.warning("Owner pause authority unreadable for %s", root_task_id, exc_info=True)
         return {"state": "unknown", "reason": "owner_pause_authority_unreadable"}
+    if fence_closed(fence) and _task_id in (fence.get("selected_members") or {}):
+        return {}  # One consumed owner Resume, bound to this fence generation.
     return fence if fence_closed(fence) else {}
 
 
@@ -272,15 +323,16 @@ def scope_fence() -> Dict[str, Any]:
 
 
 @contextmanager
-def launch_lock(root_drive: Any, root_task_id: str):
-    """Serialize only local authority/registration with Pause; never transport."""
+def launch_lock(root_drive: Any, root_task_id: str, *, wait: bool = True):
+    """Serialize local admission; ``wait=False`` never waits under a queue lock."""
     from ouroboros.platform_layer import acquire_exclusive_file_lock, release_exclusive_file_lock
 
     if not root_drive or not root_task_id:
         yield
         return
     path = _result_path(root_drive, root_task_id).with_suffix(".launch.lock")
-    fd = acquire_exclusive_file_lock(path, owner_aware_stale=True)
+    fd = acquire_exclusive_file_lock(path, owner_aware_stale=True,
+                                     **({} if wait else {"timeout_sec": 0.0}))
     if fd is None:
         raise OwnerPauseRefused("owner_launch_authority_unavailable")
     try:
@@ -291,9 +343,10 @@ def launch_lock(root_drive: Any, root_task_id: str):
 
 @contextmanager
 def launch_admission(source: Any, *, root_resume: Optional[Dict[str, Any]] = None):
-    """Register under the fence, or hand the root its exact explicit Resume.
+    """Register under the fence, or hand a member its exact explicit Resume.
 
-    A resumed worker must start to consume its grant and reopen the fence.
+    A resumed worker must start to consume its grant. A root reopens the tree;
+    an owner-selected child of a terminal root reopens only that member.
     This exception authorizes that handoff only, never its tools or sends.
     """
     root_drive, root_id, task_id = _member_coordinates(source)
@@ -303,14 +356,20 @@ def launch_admission(source: Any, *, root_resume: Optional[Dict[str, Any]] = Non
         raise OwnerPauseRefused("operation_already_returned")
     with launch_lock(root_drive, root_id):
         fence = member_fence(source)
+        selected_resume_start = False
         if fence:
             from ouroboros.budget_pause import budget_pause_row, STATE_RESUME_GRANTED
 
             allowed = False
-            if task_id == root_id and root_resume and fence_closed(fence):
+            if root_resume and fence_closed(fence):
                 row = budget_pause_row(pathlib.Path(root_drive), task_id)
                 grant = row.get("grant") or {}
+                root_allowed = task_id == root_id
+                if not root_allowed and grant.get("selected_by") == "owner":
+                    from ouroboros.task_results import load_task_result, _TRULY_TERMINAL_STATUSES
+                    root_allowed = (load_task_result(root_drive, root_id, strict=True) or {}).get("status") in _TRULY_TERMINAL_STATUSES
                 allowed = bool(row.get("state") == STATE_RESUME_GRANTED
+                    and root_allowed
                     and (grant.get("owner_pause_fence_id") or row.get("owner_fence_id")) == fence.get("fence_id")
                     and row.get("pause_id") == root_resume.get("pause_id")
                     and grant.get("grant_id") == root_resume.get("grant_id")
@@ -318,6 +377,7 @@ def launch_admission(source: Any, *, root_resume: Optional[Dict[str, Any]] = Non
                     and not grant.get("revoked_at") and not grant.get("consumed_at"))
             if not allowed:
                 raise OwnerPauseRefused(str(fence.get("reason") or "owner_pause"))
+            selected_resume_start = task_id != root_id
         from ouroboros.budget_pause import budget_pause_row, STATE_PAUSING, STATE_PAUSED, STATE_RESUME_GRANTED
 
         if root_drive and task_id:
@@ -329,6 +389,12 @@ def launch_admission(source: Any, *, root_resume: Optional[Dict[str, Any]] = Non
                 if row.get("reason") != "sleep" or row.get("state") not in {
                         STATE_PAUSING, STATE_PAUSED, STATE_RESUME_GRANTED}:
                     continue
+                if member_id == root_id and task_id != root_id:
+                    selected = read_fence(root_drive, root_id).get("selected_members") or {}
+                    if selected_resume_start or task_id in selected:
+                        # Explicit member Resume outlives its terminal root's
+                        # saved sleep. It does not release any sibling or root.
+                        continue
                 grant = row.get("grant") or {}
                 resume_start = bool(root_resume and member_id == task_id
                     and row.get("state") == STATE_RESUME_GRANTED

@@ -102,12 +102,19 @@ def effective_billing_fields(budget_root: Any, root_id: str, fields: Dict[str, A
 
 
 def ledger_billing_binding(budget_root: Any, root_task_id: str) -> Dict[str, Any]:
-    """Recover attribution from existing ledger authority, never current settings."""
+    """Recover attribution from existing ledger authority, never current settings.
+
+    A binding an older compaction folded into an aggregate is unknown and
+    raises ``LedgerBindingUnknown``: callers refuse it as unavailable authority.
+    """
     from ouroboros import usage_accounting as ua
+    from ouroboros._usage_rows import UNKNOWN_BINDING, LedgerBindingUnknown
 
     root = ua._drive_root(budget_root)
     with ua._writer_locked(root) as view:
-        row = view.root_bindings.get(root_task_id)
+        row = view.bindings.roots.get(root_task_id)
+    if row == UNKNOWN_BINDING:
+        raise LedgerBindingUnknown(f"original ledger binding unknown for root {root_task_id}")
     if row is not None:
         return {"billing_group_id": str(row.get("billing_group_id") or root_task_id),
                 "billing_group_limit_usd": row.get("billing_group_limit_usd", row.get("root_limit_usd")),
@@ -259,14 +266,18 @@ def original_group_limit(drive_root: Any, group_id: str) -> Dict[str, Any]:
     """The cap group ``group_id`` started under, from its own earliest ledger row.
 
     ``{"limit_usd": float|None, "source": str}``; ``source`` is
-    ``ledger_first_row`` or ``no_attempt_recorded`` (the caller then decides,
-    and discloses, what applies to work that never spent anything).
+    ``ledger_first_row``, ``no_attempt_recorded`` (the caller then decides,
+    and discloses, what applies to work that never spent anything) or
+    ``ledger_binding_unknown`` (an older compaction folded it: never a cap).
     """
     from ouroboros import usage_accounting as ua
+    from ouroboros._usage_rows import UNKNOWN_BINDING
 
     root = ua._drive_root(drive_root)
     with ua._writer_locked(root) as view:
-        row = view.group_bindings.get(group_id)
+        row = view.bindings.groups.get(group_id)
+    if row == UNKNOWN_BINDING:
+        return {"limit_usd": None, "source": "ledger_binding_unknown"}
     if row is not None:
         carried = row.get("billing_group_limit_usd", row.get("root_limit_usd"))
         return {"limit_usd": ua._number(carried), "source": "ledger_first_row"}
@@ -495,12 +506,16 @@ def task_money_snapshot(root, task, root_id, *, root_limit=None):
     group = str(fields.get("billing_group_id") or root_id)
     if group.startswith(UNAVAILABLE_GROUP_PREFIX):
         return None
+    from ouroboros._usage_rows import UNKNOWN_BINDING
     with ua._writer_locked(ua._drive_root(root)) as view:
         own, shared = view.summary(root_id), view.summary(billing_group_id=group)
-        initial = view.root_bindings.get(root_id) or {}
+        initial = view.bindings.roots.get(root_id) or {}
         cap = fields.get("root_limit_usd")
         if cap is None and not fields.get("root_limit_source"):
+            if initial == UNKNOWN_BINDING:
+                return None  # the root's original cap is unknown, never unlimited
             cap = initial.get("root_limit_usd")
+        initial = {} if initial == UNKNOWN_BINDING else initial
         axes = {"root": {"accounted_usd": own["accounted_usd"], "limit_usd": cap,
                          "source": fields.get("root_limit_source") or initial.get("root_limit_source"),
                          "revision": fields.get("root_limit_revision")},
