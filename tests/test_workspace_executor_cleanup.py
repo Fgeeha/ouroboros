@@ -82,6 +82,8 @@ def test_executor_panic_cleanup_wait_false_uses_bounded_docker_stop(tmp_path, mo
 
     def fake_docker_wait(cmd, **kwargs):
         docker_run_calls.append([str(part) for part in cmd])
+        if "printf completed" in str(cmd[-1]):
+            return subprocess.CompletedProcess(cmd, 0, stdout="completed", stderr="")
         if "kill -0" in str(cmd[-1]):
             return subprocess.CompletedProcess(cmd, 0, stdout="exited\n", stderr="")
         return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")

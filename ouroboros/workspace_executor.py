@@ -3,6 +3,14 @@
 The task contract stays semantic. This module consumes an operator/runtime
 ``executor_ref`` from task metadata and routes process execution into the
 declared backend when present.
+
+Completion belongs to the backend, not its host CLI. The Docker foreground
+wrapper retains its wait fact as ``completed`` in the existing unique pidfile;
+a bounded readback consumes it. Missing/malformed files or failed probes keep
+both the durable executor record and the tool's launch claim. Stop cleanup
+also requires its explicit backend receipt. These are foreground facts, not
+proof against escaped descendants. Popen failures settle only with the
+producer's positive no-start marker; a later exception is unknown.
 """
 
 from __future__ import annotations
@@ -57,6 +65,7 @@ class ExecutorResult:
     stderr: str = ""
     backend_trace: dict[str, Any] = field(default_factory=dict)
     args: list[str] = field(default_factory=list)
+    operation_outcome: str = "unknown"
 
 @dataclass
 class _ExecutorService:
@@ -356,6 +365,7 @@ def _execute_local(
             stderr or "",
             _trace(executor, str(cwd), cmd, proc.returncode, started),
             [str(part) for part in cmd],
+            operation_outcome="completed",
         )
     except subprocess.TimeoutExpired:
         kill_process_tree(proc)
@@ -394,7 +404,9 @@ def _execute_docker(
         "fi; "
         f"pid=$!; echo $pid > {quoted_pidfile}; "
         "wait $pid; rc=$?; "
-        f"rm -f {quoted_pidfile}; "
+        # The same owned pidfile retains the wrapper's positive wait evidence.
+        # Absence (including a CLI that died before launch) proves nothing.
+        f"echo completed > {quoted_pidfile}; "
         "exit $rc"
     )
     docker_cmd = [
@@ -443,9 +455,10 @@ def _execute_docker(
         },
     )
     _FOREGROUND[proc] = (record_path, executor.kind)
-    cleanup_confirmed = True
+    cleanup_confirmed = False
     try:
         stdout, stderr = proc.communicate(timeout=timeout_sec)
+        cleanup_confirmed = _docker_exec_completed(executor.container_name, pidfile)
     except subprocess.TimeoutExpired:
         cleanup_confirmed = _cleanup_docker_exec_timeout(executor.container_name, pidfile)
         kill_process_tree(proc)
@@ -458,7 +471,22 @@ def _execute_docker(
         _FOREGROUND.pop(proc, None)
         if cleanup_confirmed:
             _forget_process(record_path)
-    return ExecutorResult(proc.returncode, stdout or "", stderr or "", _trace(executor, backend_cwd, cmd, proc.returncode, started), [str(part) for part in cmd])
+    return ExecutorResult(proc.returncode, stdout or "", stderr or "", _trace(executor, backend_cwd, cmd, proc.returncode, started), [str(part) for part in cmd],
+                          operation_outcome="completed" if cleanup_confirmed else "unknown")
+
+
+def _docker_exec_completed(container_name: str, pidfile: str) -> bool:
+    """Read the backend wrapper's wait fact, never infer it from CLI exit."""
+    quoted = shlex.quote(pidfile)
+    try:
+        proc = subprocess.run(
+            ["docker", "exec", container_name, "sh", "-lc",
+             f'[ "$(cat {quoted})" = completed ] && rm -f {quoted} && printf completed'],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5,
+        )
+        return proc.returncode == 0 and proc.stdout == "completed"
+    except Exception:
+        return False
 
 
 def _cleanup_docker_exec_timeout(container_name: str, pidfile: str) -> bool:
@@ -473,7 +501,7 @@ def _cleanup_docker_exec_timeout(container_name: str, pidfile: str) -> bool:
             errors="replace",
             timeout=5,
         )
-        return proc.returncode == 0
+        return proc.returncode == 0 and proc.stdout == "completed"
     except Exception:
         return False
 
@@ -481,12 +509,13 @@ def _docker_exec_pidfile_stop_shell(pidfile: str) -> str:
     quoted_pidfile = shlex.quote(pidfile)
     return (
         f"pid=$(cat {quoted_pidfile} 2>/dev/null || true); "
-        "case \"$pid\" in ''|*[!0-9]*) exit 0;; esac; "
+        f'case "$pid" in completed) rm -f {quoted_pidfile} && printf completed; exit $?;; '
+        "''|*[!0-9]*) exit 1;; esac; "
         "kill -TERM -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null || true; "
         "sleep 0.5; "
         "kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null || true; "
         "if kill -0 -$pid 2>/dev/null || kill -0 $pid 2>/dev/null; then exit 1; fi; "
-        f"rm -f {quoted_pidfile}"
+        f"rm -f {quoted_pidfile} && printf completed"
     )
 
 def _docker_record_stop_shell(record: dict[str, Any]) -> str:
@@ -519,7 +548,7 @@ def _dispatch_docker_record_cleanup(record: dict[str, Any]) -> bool:
         backend_pid = str(record.get("backend_pid") or "").strip()
         if backend_pid:
             return _docker_pid_state(container, backend_pid) == "exited"
-        return True
+        return proc.stdout == "completed"
     except Exception:
         return False
 
@@ -999,7 +1028,11 @@ def _submit_service_command(cmd: list[str], **kwargs) -> subprocess.CompletedPro
     from ouroboros.owner_pause import operation_start
 
     with operation_start():
-        proc = subprocess.Popen(cmd, **kwargs)
+        try:
+            proc = subprocess.Popen(cmd, **kwargs)
+        except (OSError, ValueError) as exc:
+            exc.process_not_started = True
+            raise
     try:
         stdout, stderr = proc.communicate(timeout=20)
     except subprocess.TimeoutExpired:

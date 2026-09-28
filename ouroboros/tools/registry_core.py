@@ -1114,10 +1114,11 @@ class ToolRegistry:
                 # settles its local call; owned processes/runs keep their own
                 # custody. Errors/timeouts and opaque remote acknowledgements
                 # prove neither settlement nor the absence of remote effects.
+                # Explicit unknown completion also overrides an OK client exit.
                 handoff["settled"] = (
                     handoff.get("builtin_returned") is True and not typed.meta.get("dynamic_provider")
                     and (typed.meta.get("operation_outcome") in {"completed", "completed_no_effect"} or (
-                        typed.status == "ok"
+                        "operation_outcome" not in typed.meta and typed.status == "ok"
                         and typed.code not in {"LEGACY_UNTYPED", "LEGACY_WARNING", "GIT_ERROR"})))
                 return typed
         except OwnerPauseRefused as exc:

@@ -420,6 +420,7 @@ def _run_shell(
             res = executor_execute(ctx, cmd, pathlib.Path(work_dir), timeout_sec,
                                    env_overlay=interpreter_path_overlay(node_resolution),
                                    **({"target_env": selected_env} if selected_env else {}))
+            process_meta = {"operation_outcome": getattr(res, "operation_outcome", "unknown")}
         else:
             res = _tracked_subprocess_run(
                 cmd, cwd=str(work_dir),
@@ -427,6 +428,7 @@ def _run_shell(
                 text=True, timeout=timeout_sec,
                 **({"env": run_env} if run_env is not None else {}),
             )
+            process_meta = {"operation_outcome": "completed"}
         _lived_ms = _publish_finished_process_facts(ctx, res, _command_start_ts)
         # Post-run hashes exclude scratch only while its exact bytes still match.
         _record_scratch_fingerprints(ctx, scratch_abs)
@@ -440,9 +442,9 @@ def _run_shell(
                     f"{_format_process_output(res.stdout or '', '')}"
                     f"{executor_note}"
                 )
-                return _publish_process_result(ctx, "SHELL_NO_MATCH", text, exit_code=res.returncode, shell_regex_auto_corrected=regex_autocorrected)
+                return _publish_process_result(ctx, "SHELL_NO_MATCH", text, exit_code=res.returncode, shell_regex_auto_corrected=regex_autocorrected, meta=process_meta)
             text = autocorrect_note + f"⚠️ SHELL_EXIT_ERROR: command exited with {_describe_returncode(res.returncode, cwd=work_dir, binding=binding, lived_ms=_lived_ms, resolved_runtime=_active_resolved_runtime(ctx))}.\n\n{_format_process_output(res.stdout or '', res.stderr or '')}{executor_note}"
-            return _publish_process_result(ctx, "SHELL_EXIT_ERROR", text, exit_code=res.returncode, shell_regex_auto_corrected=regex_autocorrected)
+            return _publish_process_result(ctx, "SHELL_EXIT_ERROR", text, exit_code=res.returncode, shell_regex_auto_corrected=regex_autocorrected, meta=process_meta)
         after_changed = _status_snapshot(repo_root)
         if after_changed != before_changed:
             # This resolved cwd may be outside the live-repo dispatcher snapshot.
@@ -473,7 +475,7 @@ def _run_shell(
                 + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n"
                 + _format_process_output(res.stdout or "", res.stderr or "")
             )
-            return _masked_green_disclosure(ctx, _publish_process_result(ctx, "ARTIFACT_OUTPUT_UNDECLARED", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected), cmd)
+            return _masked_green_disclosure(ctx, _publish_process_result(ctx, "ARTIFACT_OUTPUT_UNDECLARED", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected, meta=process_meta), cmd)
         artifact_note, artifact_failed, artifact_registered = _register_process_outputs(
             ctx,
             outputs,
@@ -519,13 +521,13 @@ def _run_shell(
                 + f"{_format_process_output(res.stdout or '', res.stderr or '')}"
                 + artifact_note
             )
-            result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "ARTIFACT_OUTPUT_ERROR", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected), cmd)
+            result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "ARTIFACT_OUTPUT_ERROR", text, exit_code=0, shell_regex_auto_corrected=regex_autocorrected, meta=process_meta), cmd)
             return _disclose_output_audit_failure(ctx, result, audit_error)
         executor_note = ""
         if getattr(res, "backend_trace", None):
             executor_note = "\n\nEXECUTOR_TRACE:\n" + json.dumps(res.backend_trace, ensure_ascii=False, indent=2)
         text = autocorrect_note + f"{_describe_returncode(0, cwd=work_dir, binding=binding)}\n{_format_process_output(res.stdout or '', res.stderr or '')}{artifact_note}{audit_note}{scratch_note}{executor_note}"
-        result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "SHELL_REGEX_AUTO_CORRECTED" if regex_autocorrected else "OK", text, exit_code=0, artifact_registered=bool(artifact_registered and not artifact_failed), shell_regex_auto_corrected=regex_autocorrected), cmd)
+        result = _masked_green_disclosure(ctx, _publish_process_result(ctx, "SHELL_REGEX_AUTO_CORRECTED" if regex_autocorrected else "OK", text, exit_code=0, artifact_registered=bool(artifact_registered and not artifact_failed), shell_regex_auto_corrected=regex_autocorrected, meta=process_meta), cmd)
         return _disclose_output_audit_failure(ctx, result, audit_error)
     except OwnerPauseRefused as exc:
         return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))

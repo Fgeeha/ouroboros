@@ -703,12 +703,11 @@ def _publish_process_result(
     shell_regex_auto_corrected: bool = False,
     meta: Mapping[str, Any] | None = None,
 ) -> str:
-    """Publish trusted process facts through the transient string-bound sidecar."""
+    """Publish process facts; only the executor producer can certify completion."""
 
     facts = dict(meta or {})
     if exit_code is not None:
         facts["exit_code"] = int(exit_code)
-        facts["operation_outcome"] = "completed"
         if int(exit_code) < 0 and not signal_name:
             signal_name = posix_signal_name(abs(int(exit_code)))
     if signal_name:

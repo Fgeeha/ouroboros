@@ -472,7 +472,11 @@ def _start_service(
         except OwnerPauseRefused as exc:
             return _publish_tool_result(ctx, launch_refusal_result(str(exc), completed_no_effect=True))
         except Exception as exc:
-            return redact_known_values(f"⚠️ SERVICE_START_ERROR: executor backend failed: {type(exc).__name__}: {exc}", secret_values)
+            text = redact_known_values(f"⚠️ SERVICE_START_ERROR: executor backend failed: {type(exc).__name__}: {exc}", secret_values)
+            if getattr(exc, "process_not_started", False) is True:
+                return _publish_tool_result(ctx, ToolResult(status="error", code="LEGACY_TOOL_ERROR",
+                    text=text, meta={"operation_outcome": "completed_no_effect"}))
+            return text
     task_id = str(getattr(ctx, "task_id", "") or "manual")
     log_dir = pathlib.Path(ctx.drive_root) / "services" / task_id
     log_dir.mkdir(parents=True, exist_ok=True)
