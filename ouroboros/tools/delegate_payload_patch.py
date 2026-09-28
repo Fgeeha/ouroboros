@@ -629,6 +629,10 @@ def integrate_payload_patch(
         return (f"⚠️ INTEGRATE_DELEGATED_BASELINE_UNVERIFIABLE: the live payload "
                 f"could not be hashed ({type(exc).__name__}: {exc}). Nothing was "
                 "changed; the snapshot and the patch are preserved.")
+    from ouroboros.tools.subagent_integration_delegated import _current_disposition_refusal
+
+    if refusal := _current_disposition_refusal(ctx, rid):
+        return refusal
     if live_hash != baseline_hash:
         if result_hash and live_hash == result_hash:
             # Already applied (a crashed prior attempt landed the patch before its
@@ -655,6 +659,9 @@ def integrate_payload_patch(
         return (f"⚠️ INTEGRATE_INTENT_UNWRITTEN: the durable apply-intent row for run "
                 f"{rid} could not be written. Refusing to mutate; fix the drive/event "
                 "log and retry. Nothing was changed.")
+    if refusal := _current_disposition_refusal(ctx, rid):
+        custody.record_patch_apply_resolved(drive, entry, reason="authority_changed")
+        return refusal
     # Index-free apply with cwd = the LIVE payload (R1 item 3, probed): no .git,
     # no index, no staging is created in the live payload. Atomic on failure.
     # Config-isolated and repository-free (see the git_env comment above).

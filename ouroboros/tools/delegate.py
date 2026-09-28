@@ -337,6 +337,21 @@ def _start_argument_refusal(ctx: ToolContext, text: str, selector_root: str, ret
     continuation selector shapes one call cannot combine: a retry replays an old
     key byte-identically while a continuation is a NEW intention over a settled
     run, and a skill-payload selector run keeps its own target semantics."""
+    from ouroboros.contracts.task_contract import task_input_sources
+
+    # Retry replay bypasses assignment composition, so reject the unsupported
+    # source selection before either start path can prepare or replay a request.
+    if task_input_sources({
+        "task_contract": getattr(ctx, "task_contract", {}),
+        "metadata": getattr(ctx, "task_metadata", {}),
+    }) == "declared":
+        return "", _fail(
+            "delegate_start", "INPUT_SOURCE_SELECTION_UNSUPPORTED",
+            "Declared input selection supports scheduled API-model children only; "
+            "native-session composition is not qualified.",
+            definitely_unrun=True, host_fallback=False,
+        )
+
     if not text.strip():
         return "", _fail("delegate_start", "empty_prompt", "prompt is required")
     refusal = _payload_selector_refusal(selector_root, retry_of, bucket, skill_name)
@@ -1004,19 +1019,13 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     HOLDS the window it was given. It returns early only on a terminal state or a
     containment fault; a journal-cursor advance past ``since_seq`` is RECORDED and
     streamed to the human live, and the model is woken once, at expiry, with the whole
-    sequence in ``advances``. Returning on the first advance made the caller's window
-    meaningless against a healthy run — the only path that ever consulted it was the
-    SILENT one, so a streaming run cost a full-context round per event batch (measured:
-    18 rounds, 861k prompt tokens, for a run that was doing fine). Progress is the
-    JOURNAL cursor, so SSE ``: ping`` keepalives cannot masquerade as it.
+    sequence in ``advances``. Returning on first advance would buy a model round per
+    streaming batch. Only the journal cursor proves progress, never SSE ``: ping``.
 
     NARROW-ONLY, like ``bounded_max_seconds``: the wait may not outlive the nanny's own
-    deadline, minus the finalization grace it needs to answer at all. This tool is absent
-    from ``_DEADLINE_CLAMPED_TOOLS`` (its ToolEntry value IS its outer bound), so nothing
-    upstream cuts it — measured, a 2100s window against ten seconds of remaining deadline
-    ran the full 2100s and slid the task past its deadline mid-tool, the defect that set
-    built for ``web_search``. Clamping HERE keeps the graceful typed ``no_progress``
-    return where the outer clamp delivers a thread-kill. Only "no deadline set" is left
+    deadline minus finalization grace. This tool owns its ToolEntry outer bound and is
+    absent from ``_DEADLINE_CLAMPED_TOOLS``: clamping here preserves typed ``no_progress``
+    instead of an outer thread-kill. Only "no deadline set" is left
     unclamped; a SPENT deadline clamps to the floor, the window is measured from before
     the connection, and every call is BOUNDED by what it has left (``progress.poll_bound``)
     so no read can outrun it as the 60s default could. The internal supervision
@@ -1039,6 +1048,9 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
     if not rid:
         return _fail("delegate_wait", "missing_run_id", "run_id is required").text
     not_mine, entry = _owned_run(ctx, "delegate_wait", rid)
+    if not_mine:
+        from ouroboros.tools.delegate_terminal_evidence import retry_terminal_result
+        return retry_terminal_result(ctx, rid, gateway=gateway).text
     if not_mine or entry is None:
         return (not_mine or _fail("delegate_wait", "run_ownership_unknown",
                                   "custody unresolved", run_id=rid)).text
@@ -1051,10 +1063,7 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
 
     window = window_within_deadline(ctx, max(1, min(window, ceiling)))
 
-    # The clock starts HERE, before the connection: the window is a promise about how
-    # long this CALL holds, and the opening handshake plus first poll are part of it.
-    # Started after them, an unbounded connection could spend the whole deadline before
-    # the window it was clamped into had begun.
+    # Handshake and first poll spend this call's window too; start its clock before connecting.
     started = time.monotonic()
     deadline = started + window
     from ouroboros.gateways.claudexor import _READ_TIMEOUT_SEC
@@ -1116,6 +1125,15 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
             breach = _containment_breach(detail, authority)
             if breach:
                 return _halt_breached_run(ctx, gateway, entry, breach)
+            if last_seq > baseline or state in _TERMINAL_STATES:
+                # The STREAM is not collapsed — the TIMER is: every advance reaches the live
+                # progress surface the instant this loop sees it (also the frame the idle enforcer
+                # reads); only waking the MODEL per batch stops. At the end it drains the unread
+                # tail within this wait's read allowance before settlement returns.
+                progress.emit(ctx, rid, seen.record(detail, last_seq, int(time.monotonic() - started)), detail=detail,
+                              entry=entry, gateway=gateway, after_seq=baseline, read_remaining=read_window,
+                              drain_sec=read_window() if state in _TERMINAL_STATES else None)
+                baseline = last_seq          # so the NEXT advance is counted once
             if state in _TERMINAL_STATES:
                 settlement = custody.settle_run(custody.custody_root(ctx), gateway, entry, detail)
                 payload = _delivered_terminal_payload(ctx, rid, detail, authority, entry, gateway)
@@ -1147,15 +1165,6 @@ def _delegate_wait(ctx: ToolContext, run_id: str, wait_sec: Optional[int] = None
                 # containment block a reader is least likely to reach.
                 _record_containment(ctx, entry, payload)
                 return json.dumps(payload, ensure_ascii=False, indent=2)
-            if last_seq > baseline:
-                # The STREAM is not collapsed — the TIMER is. Every advance reaches the
-                # live progress surface the instant this loop sees it, so the human's
-                # view stays as rich; what stops is waking the MODEL per event batch.
-                # The emit is also the frame the supervisor's idle enforcer reads, which
-                # a silently blocking wait would starve.
-                progress.emit(ctx, rid, seen.record(detail, last_seq, int(time.monotonic() - started)),
-                              detail=detail, entry=entry)
-                baseline = last_seq          # so the NEXT advance is counted once
             pending = _cx_pending(detail)
             if pending and _interactions_are_news(rid, pending):
                 # A NEW question returns IMMEDIATELY: the old wait kept only the
@@ -1418,6 +1427,7 @@ def get_tools() -> List[ToolEntry]:
         ToolEntry("delegate_wait", {
             "name": "delegate_wait",
             "description": (
+                "A host-confirmed retry successor may retrieve a predecessor's proven terminal result; live control stays with its starter. "
                 "Sleep on a delegated run until a meaningful event. Quiet transport windows "
                 "are renewed by the host with zero model calls; journal progress still streams "
                 "to the human but does not wake you. A daemon that cannot be reached is the "

@@ -695,7 +695,7 @@ def _resolve_target_in_selected_base(
                 f"{operation_roots(active_tool_profile(ctx), operation)}."
             )
     if root == "artifact_store" and operation in _READ_OPS:
-        # C1 delegated captures (CR1-2): written on the CANONICAL drive, read from
+        # Delegated captures and activity: written on the CANONICAL drive, read from
         # a CHILD drive_root — re-anchor (see `delegated_capture_read_target`).
         anchored = delegated_capture_read_target(
             canonical_data_root(ctx), task_id_for_artifacts(ctx),

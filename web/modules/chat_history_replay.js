@@ -23,9 +23,11 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
     const identity = String(row?.history_id || '');
     if (!identity) return false;
     // A child's lifecycle is one evolving status, just as it is live. Its
-    // authored progress keeps every source record, even when text and time match.
+    // authored progress keeps every source record, even when text and time match;
+    // so does each delegated observation (`activity`), projected per seq at render.
     const evolving = summary.terminal || String(summary.dedupeKey || '').startsWith('subagent-lifecycle:')
         || String(summary.dedupeKey || '').startsWith('cardrow|');
+    const activity = summary.activity ? { activity: summary.activity } : {};
     const key = evolving ? summary.dedupeKey : `history:${identity}`;
     let item = record.items.find((entry) => entry.dedupeKey === key);
     if (!item && !evolving) {
@@ -62,7 +64,7 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
             fullHeadline: summary.fullHeadline || summary.headline || 'Update',
             body: summary.body || '', fullBody: summary.fullBody || summary.body || '',
             fullRef: summary.fullRef || '', truncated: summary.truncated || false,
-            ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key,
+            ts: ts || '', sourceTs: row.ts || '', count: 1, dedupeKey: key, ...activity,
             ...(evolving ? { sourceHistoryId: identity } : { historyId: identity }),
             historyPosition: row.history_position,
             lineKey: evolving && !String(key).startsWith('cardrow|') ? `terminal-${String(key).replace(/[^A-Za-z0-9_-]/g, '-')}`
