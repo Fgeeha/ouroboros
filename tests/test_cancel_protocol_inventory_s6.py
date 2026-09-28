@@ -55,6 +55,9 @@ TERMINAL_WRITERS = {
     # Continue replay restores the exact stored status, or seeds scheduled;
     # its recovered admission cannot originate a new terminal transition.
     ('supervisor/continuation_admission.py::_replay', 'stored.get("status") or "scheduled"'): 'dynamic',
+    # A source-bound cap amendment preserves CURRENT lifecycle in its locked
+    # projector; it changes money authority only and never revives the task.
+    ('ouroboros/acceptance_history.py::prepare_owner_historical_review', 'accounting["status"]'): 'dynamic',
     ('ouroboros/agent.py::_task_exception_terminal', 'STATUS_FAILED'): 'terminal',
     ('ouroboros/agent_task_pipeline.py::_store_task_result', 'status'): 'dynamic',
     ('ouroboros/delegate_terminal.py::record_terminal_reconciliation', 'str(existing.get("status") or STATUS_RUNNING)'): 'dynamic',

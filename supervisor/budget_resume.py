@@ -219,21 +219,26 @@ def _grant_exact_resume(task: Dict[str, Any], pause: Dict[str, Any], *, selected
         # ONE fresh strict ledger read is this grant's monetary authority (a Continue's
         # successor: its whole-work GROUP under the original cap), never the display cache.
         tree = refresh_root_accounting(result_root, task_accounting_key(result_root, task, root_task_id), strict=True)
-        if not isinstance(tree, dict):
-            # Unknown tree spend is not room: an unreadable ledger refuses typed.
-            return {"ok": False, "error": "root_accounting_unavailable",
-                    "action": "retry_or_cancel"}
-        if tree.get("integrity_degraded"):
-            return {"ok": False, "error": "root_accounting_degraded",
-                    "action": "retry_or_cancel"}
-        limit, accounted = tree.get("root_limit_usd"), tree.get("accounted_usd")
-        if limit is not None:
-            if accounted is None:
+        trees = [tree]
+        if isinstance(tree, dict):
+            from ouroboros.usage_admission import task_money_snapshot
+            trees.append(task_money_snapshot(result_root, task, root_task_id))
+        for tree in trees:
+            if not isinstance(tree, dict):
+                # Unknown tree spend is not room: an unreadable ledger refuses typed.
+                return {"ok": False, "error": "root_accounting_unavailable",
+                        "action": "retry_or_cancel"}
+            if tree.get("integrity_degraded"):
                 return {"ok": False, "error": "root_accounting_degraded",
                         "action": "retry_or_cancel"}
-            if float(accounted) >= float(limit) - 1e-9:
-                return {"ok": False, "error": "root_hard_cap_exhausted",
-                        "action": "increase_budget_then_resume"}
+            limit, accounted = tree.get("root_limit_usd"), tree.get("accounted_usd")
+            if limit is not None:
+                if accounted is None:
+                    return {"ok": False, "error": "root_accounting_degraded",
+                            "action": "retry_or_cancel"}
+                if float(accounted) >= float(limit) - 1e-9:
+                    return {"ok": False, "error": "root_hard_cap_exhausted",
+                            "action": "increase_budget_then_resume"}
     # Owner Q9: a descendant cannot be resumed under a root that is itself still paused.
     if root_task_id != task_id and any(
             str(item.get("id") or "") == root_task_id and isinstance(item.get("_budget_pause"), dict)

@@ -1,7 +1,7 @@
 """The owner's Pause of a whole task tree: its durable fence and launch gate.
 
 Owner Batch4 (5A/7A): Pause fences NEW effects of every member of one root's
-tree, lets operations already sent finish (no cancellation — unlike the budget
+tree, lets operations already handed to an executor finish (no cancellation — unlike the budget
 pause, which requests stops of delegated runs), then saves each member as the
 exact same-ID pause the budget rail already writes (``budget_pause``, reason
 ``owner``). Nothing here is a scheduler, a ledger or a second pause store:
@@ -13,7 +13,7 @@ exact same-ID pause the budget rail already writes (``budget_pause``, reason
   fence keeps new descendants from being admitted or assigned, and this
   durable projection is what a member that is ALREADY running consults at
   each launch handoff.
-- Preparation and durable claims precede a final operation-start point,
+- Preparation and durable claims precede confirmed executor submission,
   serialized with Pause by a short per-root lock. No lock spans body/network
   completion. Claims and started operations are custody, not wire receipts;
   a crash never proves success. Nested/queued transports take their final gate
@@ -32,7 +32,7 @@ from __future__ import annotations
 
 import logging
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import ContextVar, copy_context
 import os
 import pathlib
 import threading
@@ -43,6 +43,8 @@ from typing import Any, Dict, Optional, Tuple
 log = logging.getLogger(__name__)
 
 _TOOL_OPERATION = ContextVar("owner_pause_tool_operation", default=None)
+_HANDED_TOOL = ContextVar("owner_pause_handed_tool", default=None)
+_HANDED_MODEL = ContextVar("owner_pause_handed_model", default="")
 
 RAIL_OWNER_PAUSE = "owner_pause"
 REASON_OWNER = "owner"
@@ -396,7 +398,18 @@ def tool_handoff(source: Any, name: str):
         return stamp_task_result_schema({**current, "launch_handoffs": outstanding})
     claimed = False
     try:
-        with launch_admission(source):
+        # Stateful tools were submitted to their sticky executor by the loop.
+        # This ticket belongs only to that invocation, not its nested launches.
+        handed = _HANDED_TOOL.get()
+        with _CACHE_LOCK:
+            outcome["handed"] = bool(handed and handed["invocation"] == (id(source), name) and not handed["claimed"])
+            if outcome["handed"]:
+                handed["claimed"] = True  # Shared by copied contexts: exactly one consumer.
+        from ouroboros.model_wait import current_model_wait
+        owner = current_model_wait()
+        if owner is not None and owner.task_id == task_id and owner.closed:
+            raise OwnerPauseRefused("operation_already_returned")
+        with (launch_lock(root_drive, root_id) if outcome["handed"] else launch_admission(source)):
             # A standalone tool context is not a lifecycle producer. Never
             # manufacture a status-less result that the next strict read must
             # refuse. A not-yet-published member uses its existing root owner.
@@ -452,7 +465,69 @@ def operation_start(source: Any = None):
         yield
 
 
-def start_tool_operation(source: Any = None) -> None:
-    """Enter an opaque handler/transport; split submissions use operation_start."""
+def submit_tool(source: Any, name: str, submit: Any, function: Any, *args: Any):
+    """Hand one invocation to its existing sticky executor under Pause exclusion."""
+    with launch_admission(source):
+        context = copy_context()
+        context.run(_HANDED_TOOL.set, {"invocation": (id(source), name), "claimed": False})
+        return submit(context.run, function, *args)
+
+
+def run_operation(source: Any, function: Any, *args: Any, **kwargs: Any):
+    """Submit an opaque synchronous call; join outside the short launch lock.
+
+    The worker owns only this call. Its copied context does not authorize any
+    nested process, model or delegated submission after a subsequent Pause.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=1, thread_name_prefix="operation") as executor:
+        with operation_start(source):
+            context = copy_context()
+            future = executor.submit(context.run, function, *args, **kwargs)
+        return future.result()
+
+
+def run_tool_handler(source: Any, function: Any, *args: Any, **kwargs: Any):
+    active = _TOOL_OPERATION.get()
+    if active and active[0] is source and active[2].get("handed"):
+        if active[2].get("closed"):
+            raise OwnerPauseRefused("operation_already_returned")
+        active[2]["not_started"] = False
+        return function(*args, **kwargs)  # Keep browser/greenlet thread affinity.
+    from ouroboros.tools.process_facts import process_facts_handoff
+    with process_facts_handoff(function) as invoke:
+        return run_operation(source, invoke, *args, **kwargs)
+
+
+def submit_async_operation(source: Any, function: Any, *args: Any, **kwargs: Any):
+    """Submit to the current event loop without executing the body under a lock."""
+    import asyncio
+
+    async def invoke():
+        return await function(*args, **kwargs)
+
     with operation_start(source):
-        pass
+        return asyncio.create_task(invoke())
+
+
+def model_handed_off(attempt_id: str = "") -> bool:
+    """Only this physical attempt may finish despite a later owner Pause."""
+    if not attempt_id:
+        from ouroboros.usage_accounting import last_physical_attempt_capture
+        attempt_id = getattr(last_physical_attempt_capture(), "attempt_id", "")
+    return bool(attempt_id and _HANDED_MODEL.get() == attempt_id)
+
+
+def submit_model(reservation: Any, submit: Any, function: Any):
+    """Transfer the exact sender to an executor, mutually exclusive with Pause."""
+    from ouroboros.llm_attempt import _PhysicalSendNotStarted, require_physical_dispatch_window
+
+    try:
+        with launch_admission(reservation.scope):
+            require_physical_dispatch_window()
+            context = copy_context()
+            context.run(_HANDED_MODEL.set, reservation.attempt_id)
+            return submit(context.run, function)
+    except OwnerPauseRefused as exc:
+        raise _PhysicalSendNotStarted(str(exc)) from exc

@@ -431,7 +431,7 @@ def test_fresh_owner_pause_and_zero_ledger_do_not_prove_legacy_dispatch(tmp_path
 
 
 def test_escaping_tool_exception_keeps_unknown_effects_after_owner_terminal(tmp_path, monkeypatch):
-    from ouroboros.owner_pause import start_tool_operation, tool_handoff
+    from ouroboros.owner_pause import operation_start, tool_handoff
     from ouroboros.task_results import load_task_result, write_task_result
     from supervisor.continuation_admission import conflicting_writers
 
@@ -440,8 +440,8 @@ def test_escaping_tool_exception_keeps_unknown_effects_after_owner_terminal(tmp_
     source = SimpleNamespace(task_id="root", root_task_id="root", drive_root=tmp_path)
     with pytest.raises(TimeoutError):
         with tool_handoff(source, "external_write"):
-            start_tool_operation(source)
-            raise TimeoutError("request sent, response unknown")
+            with operation_start(source):
+                raise TimeoutError("request sent, response unknown")
     claim = load_task_result(tmp_path, "root")["launch_handoffs"]
     assert claim
     write_task_result(tmp_path, "root", "cancelled")

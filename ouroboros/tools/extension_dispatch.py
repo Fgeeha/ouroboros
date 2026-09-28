@@ -315,14 +315,10 @@ def _dispatch_extension_tool_untagged(
     except Exception as exc:
         text = f"⚠️ TOOL_ERROR ({name}): extension tool failed: {type(exc).__name__}: {exc}"
         return _extension_result("error", "EXTENSION_ERROR", text)
-    from ouroboros.owner_pause import start_tool_operation, OwnerPauseRefused
+    from ouroboros.owner_pause import run_operation, submit_async_operation, OwnerPauseRefused
 
     try:
-        start_tool_operation(ctx)
-        if _wants:
-            result = handler(ctx, **call_args)
-        else:
-            result = handler(**call_args)
+        result = run_operation(ctx, handler, *((ctx,) if _wants else ()), **call_args)
     except OwnerPauseRefused:
         raise
     except Exception as exc:
@@ -337,11 +333,10 @@ def _dispatch_extension_tool_untagged(
             try:
                 async def _bounded():
                     try:
-                        start_tool_operation(ctx)
+                        task = submit_async_operation(ctx, lambda: result)
                     except OwnerPauseRefused:
                         result.close()
                         raise
-                    task = asyncio.create_task(result)
                     done, _pending = await asyncio.wait({task}, timeout=timeout)
                     if task not in done:
                         task.cancel()

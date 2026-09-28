@@ -400,6 +400,8 @@ class OuroborosAgent:
                 workspace_mode=task.get("workspace_mode"),
                 task_constraint=task.get("task_constraint"),
                 task_contract=task.get("task_contract"),
+                **({"acceptance_original_root_cap": task["_acceptance_original_root_cap"]}
+                   if "_acceptance_original_root_cap" in task else {}),
                 model_lane=task.get("model_lane"),
                 requested_model_lane=task.get("requested_model_lane"),
                 parent_model_lane=task.get("parent_model_lane"),
@@ -439,7 +441,7 @@ class OuroborosAgent:
                     canonical, str(task.get("id") or ""), STATUS_RUNNING,
                     child_drive_root=str(self.env.drive_root), budget_drive_root=str(canonical),
                     _is_direct_chat=bool(task.get("_is_direct_chat")),
-                    **{key: running[key] for key in ("started_at", "ts") if key in running},
+                    **{key: running[key] for key in ("started_at", "ts", "acceptance_original_root_cap") if key in running},
                 )
         except Exception:
             log.warning("Failed to persist running task status", exc_info=True)
@@ -839,12 +841,22 @@ class OuroborosAgent:
             root_task_id = str(task.get("root_task_id") or metadata.get("root_task_id") or task_id)
             parent_task_id = str(task.get("parent_task_id") or metadata.get("parent_task_id") or "")
             budget_root = task.get("budget_drive_root") or metadata.get("budget_drive_root") or self.env.drive_root
+            root_limit_known = True
             try:
                 root_limit = float(runtime_setting("OUROBOROS_PER_TASK_COST_USD", "0") or 0)
             except (TypeError, ValueError):
                 root_limit = 0.0
+                root_limit_known = False
+            if task_id == root_task_id and not parent_task_id:
+                import math
+                task = dict(task)
+                task["_acceptance_original_root_cap"] = (
+                    {"state": "finite", "usd": root_limit, "source": "task_admission"}
+                    if root_limit_known and math.isfinite(root_limit) and root_limit > 0 else
+                    {"state": "unlimited", "source": "task_admission"}
+                    if root_limit_known and math.isfinite(root_limit) else
+                    {"state": "unknown", "source": "invalid_admission_setting"})
             from ouroboros.usage_admission import task_billing_fields
-
             scope = UsageScope(
                 drive_root=budget_root,
                 task_id=task_id,

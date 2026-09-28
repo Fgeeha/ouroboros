@@ -346,8 +346,7 @@ def test_cleanup_lock_failure_retains_custody_without_claiming_no_send(tmp_path,
         raise owner_pause.OwnerPauseRefused('owner_launch_authority_unavailable')
         yield
     def operation(_name, _args, handoff=None):
-        owner_pause.start_tool_operation(registry._ctx)
-        entered.append(True)
+        owner_pause.run_operation(registry._ctx, entered.append, True)
         handoff['builtin_returned'] = True
         monkeypatch.setattr(owner_pause, 'launch_lock', unavailable)
         return ToolResult(status='ok', code='OK', text='completed', meta={'operation_outcome': 'completed'})

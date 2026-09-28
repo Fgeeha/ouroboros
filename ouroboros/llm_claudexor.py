@@ -1,5 +1,4 @@
-"""Caller-owned Claudexor model transport over physical-attempt accounting.
-One engine operation rejoins after lost control; private CAS precedes ACK.
+"""Caller-owned physical accounting; one engine operation rejoins lost control, private CAS precedes ACK.
 Only durable dispatched results update the caller's live turn slot; unknown/no-start/legacy outcomes preserve it.
 Pre-dispatch pricing reads that slot; route changes clear it. Deadlines/Stop stay unchanged (ARCHITECTURE §6).
 """
@@ -32,7 +31,7 @@ from ouroboros.llm_substitution import (
 from ouroboros.model_slots import MODEL_ACCOUNTS_KEY, model_role_option
 from ouroboros.model_wait import ModelWaitInterrupted, current_model_wait, prepared_call_scope
 from ouroboros.observability import persist_call
-from ouroboros.owner_pause import launch_admission, OwnerPauseRefused
+from ouroboros.owner_pause import launch_admission, OwnerPauseRefused, model_handed_off
 from ouroboros.transport_custody import ProviderNotDispatched
 from ouroboros.usage_accounting import (
     PhysicalAttemptPreparationFailed, current_physical_attempt_context, current_usage_scope,
@@ -400,8 +399,11 @@ class _ModelInvocation:
             reason = waiter.control_reason() if waiter is not None else None
         if not reason and starting:
             try:
-                with launch_admission(current_usage_scope()):
+                if model_handed_off(self.invocation_id):
                     self.create_attempted = True
+                else:
+                    with launch_admission(current_usage_scope()):
+                        self.create_attempted = True
             except OwnerPauseRefused as exc:
                 reason = str(exc)  # prior create_attempted remains unknown, never unsent
         if not reason:
@@ -818,8 +820,7 @@ def chat_claudexor(target: dict, messages: list, tools: list | None, **parameter
                 all_operations_not_started = False  # even a discarded substituted response ran
                 invocation.capture = last_physical_attempt_capture()
                 if substitution.admit(invocation, result):
-                    # The same round, asked again naming no account, on this
-                    # call's every later request: the engine alone picks.
+                    # Every later request in this round leaves account selection to the engine.
                     retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
                     payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
                     continue
@@ -953,8 +954,7 @@ async def chat_claudexor_async(target: dict, messages: list, tools: list | None,
                 all_operations_not_started = False
                 invocation.capture = last_physical_attempt_capture()
                 if await invocation.offload(substitution.admit, invocation, result):
-                    # The same round, asked again naming no account, on this
-                    # call's every later request: the engine alone picks.
+                    # Every later request in this round leaves account selection to the engine.
                     retry_preparation, parameters = None, {**parameters, "_no_account_preference": True}
                     payload = _request(target, payload["messages"], payload["tools"], {**(prepared or parameters), "_no_account_preference": True})
                     continue

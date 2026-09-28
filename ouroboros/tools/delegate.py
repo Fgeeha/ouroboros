@@ -28,7 +28,7 @@ a dict this process happens to still hold.
 
 from __future__ import annotations
 
-from ouroboros.owner_pause import start_tool_operation, OwnerPauseRefused
+from ouroboros.owner_pause import run_operation, OwnerPauseRefused
 
 import datetime as _dt
 import functools
@@ -597,8 +597,7 @@ def _delegate_start(ctx: ToolContext, prompt: str, max_seconds: Optional[int] = 
                     reason=reason, invocation_id=invocation_id, snapshot_id=("" if recovering else snapshot_id),
                 ),
             )
-        start_tool_operation(ctx)
-        handle = gateway.start_run(request_body, idempotency_key=invocation_id)
+        handle = run_operation(ctx, gateway.start_run, request_body, idempotency_key=invocation_id)
         run_id = str(handle.get("runId") or handle.get("jobId") or "")
         if not run_id:
             return _fail("delegate_start", "queued_without_run_id",

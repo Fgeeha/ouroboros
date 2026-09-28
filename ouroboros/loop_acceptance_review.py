@@ -1210,6 +1210,8 @@ def _skip_task_acceptance_for_launch_reason(
         ),
     })
     emit_progress("Task acceptance skipped: spendable at or below floor.")
+    from ouroboros.acceptance_history import seed_acceptance_history
+    seed_acceptance_history(tools_ctx, llm_trace, launch_reason)
     return False
 
 

@@ -1,4 +1,5 @@
 """Producer evidence through registry → shell/VCS → Pause, Sleep and Continue."""
+import os
 import subprocess
 import sys
 
@@ -116,7 +117,7 @@ def test_docker_client_exit_requires_backend_evidence(tmp_path, monkeypatch, cod
     held = backend != "completed"
     assert result.meta["exit_code"] == code
     assert result.meta.get("operation_outcome") == ("unknown" if held else "completed")
-    assert [kind for kind, _ in calls] == ["start", "probe"]
+    assert [kind for kind, _ in calls] == ["start", "probe"] + ([] if held else ["probe"])
     records = list(executor._iter_process_records(tmp_path))
     assert len(records) == int(held)
     if held:
@@ -230,6 +231,7 @@ def test_docker_timeout_with_unreadable_backend_keeps_launch_custody(tmp_path, m
 
 
 @pytest.mark.parametrize("code", [0, 7])
+@pytest.mark.skipif(os.name != "posix", reason="Exercises the POSIX backend wrapper through local sh")
 def test_backend_wrapper_wait_fact_is_read_through_local_shell(tmp_path, monkeypatch, code):
     """Run the real wrapper/probe scripts locally; no daemon or Docker CLI."""
     from ouroboros import workspace_executor as executor
@@ -245,13 +247,14 @@ def test_backend_wrapper_wait_fact_is_read_through_local_shell(tmp_path, monkeyp
     monkeypatch.setattr(subprocess, "Popen", docker_as_shell)
     result = registry.execute_result("run_command", {"cmd": ["/bin/sh", "-c", f"exit {code}"]})
     assert result.meta.get("operation_outcome") == "completed", result
-    assert result.meta["exit_code"] == code and len(calls) == 2
-    assert not list(tmp_path.glob("owned-*.pid"))
+    assert result.meta["exit_code"] == code and len(calls) == 3
+    assert list(tmp_path.glob("owned-*.pid")) == []
     assert not executor._iter_process_records(tmp_path)
     _consumers(tmp_path, registry, queue, workers, False)
 
 
 @pytest.mark.parametrize("content", [None, "4321", "completed\nextra", "", "completed"])
+@pytest.mark.skipif(os.name != "posix", reason="Exercises the POSIX backend probe through local sh")
 def test_backend_completion_probe_requires_exact_owned_wait_fact(tmp_path, monkeypatch, content):
     from ouroboros import workspace_executor as executor
 
@@ -285,3 +288,67 @@ def test_backend_cleanup_requires_receipt_even_with_zero_cli_exit(monkeypatch, r
     assert executor._cleanup_docker_exec_timeout("simulated", "/tmp/owned.pid") is bool(receipt)
     record = {"container_name": "simulated", "backend_pidfile": "/tmp/owned.pid"}
     assert executor._dispatch_docker_record_cleanup(record) is bool(receipt)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Exercises backend receipt script through local sh")
+@pytest.mark.parametrize("cleanup", [False, True])
+def test_lost_completion_probe_reply_preserves_retry_receipt(tmp_path, monkeypatch, cleanup):
+    from ouroboros import workspace_executor as executor
+    pidfile = tmp_path / "owned.pid"
+    pidfile.write_text("completed")
+    real_run = subprocess.run
+    dropped = []
+    def run(argv, **kw):
+        observed = real_run(["/bin/sh", "-c", argv[-1]], **kw)
+        if not dropped:
+            dropped.append(True)
+            raise subprocess.TimeoutExpired(argv, 5)
+        return observed
+    monkeypatch.setattr(subprocess, "run", run)
+    probe = executor._cleanup_docker_exec_timeout if cleanup else executor._docker_exec_completed
+    assert not probe("simulated", str(pidfile))
+    assert pidfile.read_text() == "completed"
+    assert probe("simulated", str(pidfile))
+
+
+def test_timeout_cleanup_receipt_does_not_blanket_settle_generic_operation(tmp_path, monkeypatch):
+    from ouroboros import workspace_executor as executor
+    registry, queue, workers = _registry(tmp_path, monkeypatch, "docker_exec")
+    _docker(monkeypatch, timeout=True, backend="completed")
+    monkeypatch.setattr(executor, "kill_process_tree", lambda _proc: None)
+    result = registry.execute_result("run_command", {"cmd": ["backend-writer"]})
+    assert result.status == "timeout" and not result.meta.get("operation_outcome")
+    assert not executor._iter_process_records(tmp_path)
+    _consumers(tmp_path, registry, queue, workers, True)
+
+
+@pytest.mark.skipif(os.name != "posix", reason="Runs the backend receipt cleanup in POSIX sh")
+@pytest.mark.parametrize("failure", ["persist", "lost_delete_reply"])
+def test_docker_completion_gc_keeps_recoverable_fact(tmp_path, monkeypatch, failure):
+    from ouroboros import workspace_executor as executor
+    marker = tmp_path / "owned.pid"
+    marker.write_text("completed")
+    path = executor._register_process(tmp_path, {"record_type": "foreground", "executor_type": "docker_exec",
+        "container_name": "simulated", "backend_pidfile": "/tmp/ouroboros-exec-fixture.pid", "host_pid": 987654321})
+    real_write, real_run = executor.atomic_write_json, subprocess.run
+    calls = []
+    def run(argv, **kwargs):
+        result = real_run(["/bin/sh", "-c", argv[-1].replace("/tmp/ouroboros-exec-fixture.pid", str(marker))], **kwargs)
+        calls.append(argv)
+        if failure == "lost_delete_reply" and len(calls) == 1:
+            raise subprocess.TimeoutExpired(argv, 5)
+        return result
+    monkeypatch.setattr(subprocess, "run", run)
+    if failure == "persist":
+        monkeypatch.setattr(executor, "atomic_write_json", lambda *_a, **_kw: (_ for _ in ()).throw(OSError("disk")))
+    assert not executor._retire_docker_completion(path)
+    assert path.exists()
+    if failure == "persist":
+        assert marker.read_text() == "completed" and not calls
+        monkeypatch.setattr(executor, "atomic_write_json", real_write)
+        assert executor._retire_docker_completion(path)
+    else:
+        assert not marker.exists() and executor._load_process_record(path)["backend_completed"]
+        monkeypatch.setattr(executor, "_kill_host_pid", lambda *_a: pytest.fail("completed CLI PID must not be signaled"))
+        assert executor.kill_all_foreground(tmp_path)[0]["cleanup_dispatched"]
+    assert not marker.exists() and not path.exists()

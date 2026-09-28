@@ -1018,7 +1018,7 @@ class ToolRegistry:
     ) -> tuple[str | None, Any]:
         """Run one builtin handler under the scoped attestation."""
         from ouroboros.process_interpreters import interpreter_attestation
-        from ouroboros.owner_pause import OwnerPauseRefused, start_tool_operation
+        from ouroboros.owner_pause import OwnerPauseRefused, run_tool_handler
 
         observed_skill = None
         missing = object()
@@ -1057,8 +1057,7 @@ class ToolRegistry:
                         if refusal:
                             return refusal, None
                         observed_skill = (state_root, constraint)
-                    start_tool_operation(self._ctx)
-                    result = entry.handler(self._ctx, **handler_args)
+                    result = run_tool_handler(self._ctx, entry.handler, self._ctx, **handler_args)
                     if handoff is not None:
                         handoff["builtin_returned"] = True
                     published = _published_tool_result(

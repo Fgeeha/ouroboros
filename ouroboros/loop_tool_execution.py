@@ -1106,9 +1106,9 @@ def _await_stateful_tool(tools: ToolRegistry, tc: Dict[str, Any], drive_logs: pa
     # abandoned call build a session in the NEXT command's state.
     submit_generation = getattr(tool_ctx, "browser_state", None)
     with execution_deadline_scope(monotonic_now() + timeout_sec):
-        future = stateful_executor.submit(
-            _execute_browser_tool_bound, tools, tc, drive_logs, task_id, submit_generation, invocation,
-        )
+        from ouroboros.owner_pause import submit_tool
+        future = submit_tool(tool_ctx, fn_name, stateful_executor.submit,
+            _execute_browser_tool_bound, tools, tc, drive_logs, task_id, submit_generation, invocation)
     # The registration PINS settlement ownership until this call's own
     # handling is over (result in time, or the late hold claimed below):
     # released in the finally, after either branch (#1196).

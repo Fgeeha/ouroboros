@@ -503,8 +503,8 @@ def review_source_projection(drive_root: Any, task_id: str, digest: str,
                              start_char: Any = None, end_char: Any = None) -> Dict[str, Any]:
     """Read a physical author's exact acceptance source, including historical panels.
 
-    Only the host's digest-named acceptance sources qualify; there is no caller
-    path, successor substitution or arbitrary artifact-store search.
+    Only host acceptance panels and the canonical debt's exact pinned subject
+    qualify; no caller path, successor substitution or artifact-store search.
     """
     from ouroboros.artifacts import read_actor_source_bytes, task_artifact_dir_path, text_source_range_projection
 
@@ -513,26 +513,37 @@ def review_source_projection(drive_root: Any, task_id: str, digest: str,
         return {**unavailable, "reason": "source_ref_invalid"}
     path = f"source_handles/context_checkpoints/acceptance-{digest}.json"
     try:
-        from ouroboros.source_retention import retained_task_roots
+        from ouroboros.task_results import load_task_result
 
-        # The selector addresses exact bytes, not their current placement. Only
-        # this author's known retained drives can supply a not-yet-canonical file.
-        roots = [drive_root, *retained_task_roots(drive_root, task_id)]
-        stored = next((candidate for root in roots
-                       if (candidate := task_artifact_dir_path(root, task_id, create=False) / path).exists()), None)
-        if stored is None:
-            raise FileNotFoundError(path)
-        ref = {"kind": "task_source", "root": "artifact_store", "path": path,
-               "size": stored.stat().st_size, "sha256": digest}
-        raw = read_actor_source_bytes(drive_root, task_id, ref)
-        panel = json.loads(raw)
-        request = panel.get("request") or {}
-        if panel.get("authority") != "host_root" or request.get("surface") != "task_acceptance" or request.get("task_id") != task_id:
-            raise ValueError("review source identity verification failed")
+        debt = (load_task_result(drive_root, task_id, strict=True) or {}).get("acceptance_debt") or {}
+        historical_ref = debt.get("source_ref") or {}
+        if historical_ref.get("sha256") == digest:
+            from ouroboros.acceptance_history import read_acceptance_history
+
+            read_acceptance_history(drive_root, task_id, debt)
+            ref = historical_ref
+            raw = read_actor_source_bytes(drive_root, task_id, ref)
+        else:
+            from ouroboros.source_retention import retained_task_roots
+
+            # The selector addresses exact bytes, not their current placement. Only
+            # this author's known retained drives can supply a not-yet-canonical file.
+            roots = [drive_root, *retained_task_roots(drive_root, task_id)]
+            stored = next((candidate for root in roots
+                           if (candidate := task_artifact_dir_path(root, task_id, create=False) / path).exists()), None)
+            if stored is None:
+                raise FileNotFoundError(path)
+            ref = {"kind": "task_source", "root": "artifact_store", "path": path,
+                   "size": stored.stat().st_size, "sha256": digest}
+            raw = read_actor_source_bytes(drive_root, task_id, ref)
+            panel = json.loads(raw)
+            request = panel.get("request") or {}
+            if panel.get("authority") != "host_root" or request.get("surface") != "task_acceptance" or request.get("task_id") != task_id:
+                raise ValueError("review source identity verification failed")
         projection, reason = text_source_range_projection(raw.decode("utf-8"), unavailable["kind"], start_char, end_char)
         return {**(projection or unavailable), "task_id": task_id, "source_ref": ref,
                 **({"reason": reason} if reason else {})}
-    except (ValueError, TypeError, AttributeError, UnicodeError):
+    except (ValueError, TypeError, AttributeError, KeyError, UnicodeError):
         return {**unavailable, "reason": "source_identity_mismatch"}
     except (OSError, RuntimeError):
         return {**unavailable, "reason": "source_unavailable"}

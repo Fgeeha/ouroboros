@@ -523,6 +523,12 @@ def resolve_task_cost_ceiling(ctx: Any, budget_remaining_usd: Optional[float]) -
             root_cap = getattr(scope, "root_limit_usd", None)
             if root_cap is None:  # a Continue's successor: the original root's carried group cap
                 root_cap = getattr(scope, "billing_group_limit_usd", None)
+            if scope.billing_group_id:
+                from ouroboros.usage_admission import task_money_snapshot
+                snapshot = task_money_snapshot(scope.drive_root, {"id": scope.task_id}, scope.root_task_id,
+                                               root_limit=scope.root_limit_usd)
+                if snapshot is not None:
+                    root_cap = snapshot["root_limit_usd"]
             root_ceiling = getattr(scope, "root_cost_ceiling_usd", None)
             non_root_member = bool(
                 scope.root_task_id and scope.task_id and scope.root_task_id != scope.task_id

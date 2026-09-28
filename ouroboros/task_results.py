@@ -10,12 +10,10 @@ import re
 from typing import Any, Callable, Dict, List, Optional
 
 from ouroboros.cost_projection import (
-    COST_ALIAS_PAIRS, COST_OPENNESS_FIELDS,
-    normalize_task_result_cost_planes,
+    COST_ALIAS_PAIRS, COST_OPENNESS_FIELDS, normalize_task_result_cost_planes,
 )
 from ouroboros.utils import read_json_dict, update_json_locked, utc_now_iso
-# Read-side custody of a published review projection belongs with the projection
-# owner; the historical name stays resolvable through this module.
+# Projection owner retains read custody; this historical import remains compatible.
 from ouroboros.review_projection import merge_review_projection as merge_review_projection
 from ouroboros.review_records import validate_author_disposition
 
@@ -153,7 +151,7 @@ def _claim_for_paid_identity(claims: Any, paid_identity: str) -> Optional[Dict[s
 
 
 def project_task_acceptance_review_capacity(
-    ctx: Any, *, binding_hash: str = "", task_id: str = "", paid_identity: str = "",
+    ctx: Any, *, binding_hash: str = "", task_id: str = "", paid_identity: str = "", purpose: str = "",
 ) -> Dict[str, Any]:
     """Read the canonical root's paid acceptance-wallet projection.
 
@@ -198,7 +196,7 @@ def project_task_acceptance_review_capacity(
         "binding_seen": False,
         "dedupe": "task_acceptance_binding_sha256",
     }
-    if config.get_task_review_mode() == "off":
+    if config.get_task_review_mode() == "off" and purpose != "owner_historical_acceptance":
         return {
             **base,
             "state": "unavailable",
@@ -882,6 +880,8 @@ def write_task_result(
         if create_only and existing:
             return None
         prepared_fields = dict(fields)
+        from ouroboros.acceptance_history import preserve_acceptance_history
+        prepared_fields = preserve_acceptance_history(existing, prepared_fields)
         if "review_projection" in prepared_fields:
             prepared_fields["review_projection"] = merge_review_projection(
                 existing.get("review_projection"), prepared_fields["review_projection"],

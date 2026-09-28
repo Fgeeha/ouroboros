@@ -24,6 +24,13 @@ from ouroboros.tools.review_subject import (
 )
 
 
+@pytest.fixture(autouse=True)
+def _packet_default_panel(monkeypatch):
+    """This module pins the PACKET assembly of the default panel; the shipped
+    default triad reads the work itself since #1334, so pin packet explicitly."""
+    monkeypatch.setattr("ouroboros.reviewer_slot_config.DEFAULT_TRIAD_DELIVERY", "")
+
+
 def _git(repo, *args):
     return subprocess.run(["git", "-C", str(repo), *args], capture_output=True, text=True)
 

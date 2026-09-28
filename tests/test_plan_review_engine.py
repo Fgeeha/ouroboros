@@ -35,6 +35,7 @@ def _slots(*specs):
     """``specs`` = (slot_id, model[, "session"]) tuples → ReviewSlot list."""
     from ouroboros.review_execution import ReviewRouteKind
     from ouroboros.review_substrate import ReviewSlot
+    from ouroboros.tools.plan_review_runtime import PLAN_REVIEW_MAX_TOKENS
 
     out = []
     for spec in specs:
@@ -44,6 +45,9 @@ def _slots(*specs):
             slot_id=sid, model=model, effort="high", role_hint="plan reviewer",
             route=ReviewRouteKind.AGENT_SESSION if session else ReviewRouteKind.API_CHAT,
             session_target="cursor=grok" if session else "",
+            # Match the real plan builder's sampling shape: frozen collection
+            # validates the exact paid request, including these fields.
+            max_tokens=PLAN_REVIEW_MAX_TOKENS, default_temperature=0.2,
         ))
     return out
 

@@ -166,8 +166,22 @@ def _slugify(value: str, *, max_len: int, injective: bool = False) -> str:
 
 
 def canonical_server_id(value: str) -> str:
-    """Canonicalize the id shared by settings, UI routes, and MCPManager."""
-    return _slugify(value, max_len=_MAX_SERVER_SLUG)
+    """Canonicalize the id shared by settings, UI routes, Presence and MCPManager.
+
+    A fixed point (#1328): one ``_slugify`` pass can join a cut stem ending in
+    ``_`` to its digest as ``__``, which ``parse_tool_name`` then splits early.
+    The second pass collapses that join; it is exactly the slug every advertised
+    ``mcp_<server>__<tool>`` name already carried, so wire names are unchanged
+    and ``parse_tool_name(make_tool_name(cfg.id, t))["server_slug"] == cfg.id``.
+    """
+    return _slugify(_slugify(value, max_len=_MAX_SERVER_SLUG), max_len=_MAX_SERVER_SLUG)
+
+
+def raw_server_id(entry: Any) -> str:
+    """The canonical identity one raw ``MCP_SERVERS`` entry claims (loader expression)."""
+    if not isinstance(entry, dict):
+        return ""
+    return canonical_server_id(entry.get("id") or entry.get("slug") or entry.get("name"))
 
 
 def make_tool_name(server_id: str, tool_name: str) -> str:
@@ -387,8 +401,7 @@ def normalize_server_config(
         return invalid("server must be an object")
     raw = {key: value for key, value in raw.items() if key not in MCP_RESPONSE_ONLY_FIELDS}
 
-    raw_id = raw.get("id") or raw.get("slug") or raw.get("name")
-    server_slug = canonical_server_id(raw_id)
+    server_slug = raw_server_id(raw)
     if not server_slug:
         return invalid("server id or name is required")
 
@@ -461,26 +474,43 @@ def parse_servers(
     raw_list: Any, *, settings: Optional[Dict[str, Any]] = None,
     errors: Optional[List[Dict[str, Any]]] = None,
 ) -> List[MCPServerConfig]:
-    """Normalize a raw ``MCP_SERVERS`` list. Invalid entries are warned and skipped."""
+    """Normalize a raw ``MCP_SERVERS`` list. Invalid entries are warned and skipped.
+
+    Identity is judged on the FULL raw list before anything is dropped: when
+    several entries claim one canonical id, none of them is used — keeping the
+    first would silently retarget its tools, Presence grants and saved secrets
+    to whichever entry happens to come first. That id gets one typed
+    ``MCP_ID_AMBIGUOUS`` row; every other server keeps working.
+    """
     if not isinstance(raw_list, list):
         return []
-    out: List[MCPServerConfig] = []
-    seen: set = set()
+    claimants: Dict[str, List[Dict[str, Any]]] = {}
     for entry in raw_list:
+        server_id = raw_server_id(entry)
+        if server_id:
+            claimants.setdefault(server_id, []).append(entry)
+    ambiguous = {server_id: entries for server_id, entries in claimants.items() if len(entries) > 1}
+    out: List[MCPServerConfig] = []
+    for entry in raw_list:
+        if raw_server_id(entry) in ambiguous:
+            continue
         entry_errors: List[str] = []
         cfg = normalize_server_config(entry, settings=settings, errors=entry_errors)
         if cfg is None:
             if errors is not None:
                 source = entry if isinstance(entry, dict) else {}
-                errors.append({"id": canonical_server_id(source.get("id") or source.get("name")),
+                errors.append({"id": raw_server_id(source),
                                "enabled": source.get("enabled", False), "tool_count": 0,
                                "last_error": "; ".join(entry_errors), "code": "MCP_CONFIG_ERROR"})
             continue
-        if cfg.id in seen:
-            # Duplicate ids would share tool prefixes; keep the first config.
-            continue
-        seen.add(cfg.id)
         out.append(cfg)
+    for server_id, entries in ambiguous.items():
+        message = (f"MCP_ID_AMBIGUOUS: {len(entries)} configured servers resolve to server id "
+                   f"{server_id!r}; none of them is used until their ids are made distinct.")
+        log.warning("Invalid MCP server config: %s", message)
+        if errors is not None:
+            errors.append({"id": server_id, "enabled": any(e.get("enabled", False) for e in entries),
+                           "tool_count": 0, "last_error": message, "code": "MCP_ID_AMBIGUOUS"})
     return out
 
 
@@ -689,10 +719,9 @@ async def _call_tool_async(
                 read, write = streams.read, streams.write  # pragma: no cover
             async with ClientSession(read, write) as session:
                 await session.initialize()
-                from ouroboros.owner_pause import start_tool_operation
+                from ouroboros.owner_pause import submit_async_operation
 
-                start_tool_operation()
-                result = await session.call_tool(tool_name, arguments)
+                result = await submit_async_operation(None, session.call_tool, tool_name, arguments)
                 return _tool_result_from_call_result(result)
 
     return await asyncio.wait_for(_do(), timeout=timeout_sec)
@@ -1022,7 +1051,7 @@ class MCPManager:
             if runtime is None:
                 for error in self._configuration_errors:
                     if error["id"] == server_id:
-                        return {"ok": False, "code": "MCP_CONFIG_ERROR", "error": error["last_error"]}
+                        return {"ok": False, "code": error["code"], "error": error["last_error"]}
                 return {
                     "ok": False,
                     "error": f"unknown server id: {server_id!r}",

@@ -75,6 +75,27 @@ def test_partial_quorum_stays_open_while_one_paid_slot_is_in_flight(harness, mon
     assert _control(second) == {"outcome": "GREEN", "closed": True}
 
 
+def test_paid_plan_rejoins_frozen_delivery_after_settings_change(harness, monkeypatch):
+    import dataclasses
+    from ouroboros.tools.plan_review_artifacts import authority_wave
+
+    calls = []
+    _install_two_turn_substrate(monkeypatch, calls, pending_ids={"s3"})
+    harness.state["slots"][0] = dataclasses.replace(harness.state["slots"][0], native_retrieval_override=True)
+    ctx = harness.make_ctx()
+    assert _control(_call(ctx))["closed"] is False
+    before = authority_wave(harness.drive, ctx.task_id, _state(harness)["waves"][-1])
+    assert before["slots"][0]["delivery"] == "native"
+    harness.state["slots"] = [dataclasses.replace(s, model="changed/model", native_retrieval_override=False)
+                              for s in harness.state["slots"]]
+    monkeypatch.setenv("OUROBOROS_REVIEWER_SLOTS", "malformed current settings")
+    assert _control(_call(ctx)) == {"outcome": "GREEN", "closed": True}
+    after = authority_wave(harness.drive, ctx.task_id, _state(harness)["waves"][-1])
+    assert after["slots"] == before["slots"]
+    assert after["reviewer_outputs"][0]["session_task"] == before["reviewer_outputs"][0]["session_task"]
+    assert _state(harness)["cycles_paid"] == 1
+
+
 def test_expired_deadline_still_reconciles_existing_paid_wave(harness, monkeypatch):
     """An owner deadline must not strand a reviewer cycle already in flight."""
     monkeypatch.setenv("OUROBOROS_REVIEW_MAX_CYCLES", "1")

@@ -80,16 +80,16 @@ def physical_attempt_headroom() -> Optional[int]:
 def require_physical_dispatch_window() -> Optional[float]:
     """The model family's launch handoff: the reservation row already exists.
 
-    Checked immediately before the request bytes: task controls, an owner
-    Pause over this send's tree (``owner_pause``: refused as NOT STARTED, the
-    reservation settles as never dispatched) and the execution deadline.
+    Before executor handoff, Pause refuses this attempt as NOT STARTED. After
+    confirmed handoff only this exact attempt may proceed through later SDK
+    checks. Stop and execution deadlines remain effective; packet timing is opaque.
     """
     from ouroboros.model_wait import current_model_wait, dispatch_deadline_remaining_sec
-    from ouroboros.owner_pause import RAIL_OWNER_PAUSE, scope_fence
+    from ouroboros.owner_pause import RAIL_OWNER_PAUSE, scope_fence, model_handed_off
 
     owner = current_model_wait()
     reason = owner.control_reason() if owner is not None else None
-    if not reason and scope_fence():
+    if not reason and not model_handed_off() and scope_fence():
         reason = RAIL_OWNER_PAUSE
     if reason:
         raise _PhysicalSendNotStarted(reason)

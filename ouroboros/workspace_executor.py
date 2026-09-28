@@ -32,15 +32,11 @@ from ouroboros.observability import redact_projection
 from ouroboros.platform_layer import (
     IS_WINDOWS,
     bootstrap_process_path,
-    kill_pid_tree,
-    kill_process_group_id,
-    kill_process_tree,
+    kill_pid_tree, kill_process_group_id, kill_process_tree,
     pid_is_signalable,
-    process_command,
-    process_group_id,
+    process_command, process_group_id,
     request_process_tree_kill,
-    scrub_repo_from_pythonpath,
-    subprocess_new_group_kwargs,
+    scrub_repo_from_pythonpath, subprocess_new_group_kwargs,
 )
 from ouroboros.tool_access import path_is_relative_to
 from ouroboros.utils import atomic_write_json, utc_now_iso
@@ -470,7 +466,7 @@ def _execute_docker(
     finally:
         _FOREGROUND.pop(proc, None)
         if cleanup_confirmed:
-            _forget_process(record_path)
+            _retire_docker_completion(record_path)
     return ExecutorResult(proc.returncode, stdout or "", stderr or "", _trace(executor, backend_cwd, cmd, proc.returncode, started), [str(part) for part in cmd],
                           operation_outcome="completed" if cleanup_confirmed else "unknown")
 
@@ -481,10 +477,34 @@ def _docker_exec_completed(container_name: str, pidfile: str) -> bool:
     try:
         proc = subprocess.run(
             ["docker", "exec", container_name, "sh", "-lc",
-             f'[ "$(cat {quoted})" = completed ] && rm -f {quoted} && printf completed'],
+             f'[ "$(cat {quoted})" = completed ] && printf completed'],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5,
         )
         return proc.returncode == 0 and proc.stdout == "completed"
+    except Exception:
+        return False
+
+
+def _retire_docker_completion(record_path: pathlib.Path | None) -> bool:
+    """Persist the observed fact before deleting its backend receipt.
+
+    An ambiguous deletion is retried from this same record without signaling
+    a potentially reused host PID. Missing host authority retains the marker.
+    """
+    record = _load_process_record(record_path) if record_path else None
+    if not record:
+        return False
+    try:
+        if record.get("backend_completed") is not True:
+            record["backend_completed"] = True
+            atomic_write_json(record_path, record, trailing_newline=True)
+        proc = subprocess.run(["docker", "exec", record["container_name"], "sh", "-lc",
+            "rm -f -- " + shlex.quote(record["backend_pidfile"])],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=5)
+        if proc.returncode != 0:
+            return False
+        record_path.unlink(missing_ok=True)
+        return True
     except Exception:
         return False
 
@@ -509,13 +529,13 @@ def _docker_exec_pidfile_stop_shell(pidfile: str) -> str:
     quoted_pidfile = shlex.quote(pidfile)
     return (
         f"pid=$(cat {quoted_pidfile} 2>/dev/null || true); "
-        f'case "$pid" in completed) rm -f {quoted_pidfile} && printf completed; exit $?;; '
+        'case "$pid" in completed) printf completed; exit $?;; '
         "''|*[!0-9]*) exit 1;; esac; "
         "kill -TERM -$pid 2>/dev/null || kill -TERM $pid 2>/dev/null || true; "
         "sleep 0.5; "
         "kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null || true; "
         "if kill -0 -$pid 2>/dev/null || kill -0 $pid 2>/dev/null; then exit 1; fi; "
-        f"rm -f {quoted_pidfile} && printf completed"
+        f"printf completed > {quoted_pidfile} && printf completed"
     )
 
 def _docker_record_stop_shell(record: dict[str, Any]) -> str:
@@ -844,9 +864,14 @@ def kill_all_foreground(drive_root: pathlib.Path | None = None, *, wait: bool = 
         if record.get("record_type") != "foreground":
             continue
         cleanup_dispatched = True
-        if record.get("executor_type") == "docker_exec":
+        if record.get("executor_type") == "docker_exec" and record.get("backend_completed") is True:
+            cleanup_dispatched = _retire_docker_completion(path)
+        elif record.get("executor_type") == "docker_exec":
             cleanup_dispatched = _kill_docker_record(record, wait=wait)
-        _kill_host_pid(record.get("host_pid"))
+            if cleanup_dispatched and record.get("backend_pidfile"):
+                cleanup_dispatched = _retire_docker_completion(path)
+        else:
+            _kill_host_pid(record.get("host_pid"))
         if cleanup_dispatched:
             _forget_process(path)
         killed.append(

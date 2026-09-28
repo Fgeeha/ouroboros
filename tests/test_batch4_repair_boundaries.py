@@ -299,9 +299,8 @@ from tests.test_llm_claudexor import setup as model_setup  # noqa: F401 - pytest
 
 
 @pytest.mark.parametrize("prior_unknown", [False, True])
-def test_model_session_final_gate_preserves_prior_unknown(model_setup, monkeypatch, prior_unknown):  # noqa: F811 - pytest fixture
+def test_handed_model_session_finishes_after_pause_with_same_operation(model_setup, monkeypatch, prior_unknown):  # noqa: F811 - pytest fixture
     from tests.test_llm_claudexor import MODEL, ledger
-    from ouroboros import llm_claudexor
     from supervisor.owner_pause_control import request_owner_pause
     root, gateway, client = model_setup
     _, _, workers = _install_queue(root, monkeypatch)
@@ -312,11 +311,12 @@ def test_model_session_final_gate_preserves_prior_unknown(model_setup, monkeypat
         observations.append(value)
         if len(observations) == (2 if prior_unknown else 1):
             assert request_owner_pause("task-one", request_id="model-final")["ok"]
-    with pytest.raises(llm_claudexor.ClaudexorModelError):
-        client.chat([], MODEL, model_operation_observer=checkpoint)
-    assert len(gateway.creates) == int(prior_unknown)
+    answer, _usage = client.chat([], MODEL, model_operation_observer=checkpoint)
+    assert answer["content"] == "Ответ 🐍"
+    assert len(gateway.creates) == (2 if prior_unknown else 1)
+    assert len(gateway.accepted_operations) == 1, "lost create reply rejoins the exact original operation"
     assert len(gateway.uploads) == 1 and not gateway.cancels
-    assert ledger(root)[-1]["state"] == ("unresolved" if prior_unknown else "released")
+    assert ledger(root)[-1]["state"] == "settled"
 
 
 def test_delegated_start_pause_after_claim_prevents_post(tmp_path, monkeypatch):

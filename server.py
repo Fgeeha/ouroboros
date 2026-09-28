@@ -655,10 +655,8 @@ def _run_supervisor(settings: dict) -> None:
         set_log_sink(make_server_log_sink(bridge, pathlib.Path(DATA_DIR)))
 
         bus_init(
-            drive_root=DATA_DIR,
+            drive_root=DATA_DIR, budget_report_every=10, chat_bridge=bridge,
             total_budget_limit=float(settings.get("TOTAL_BUDGET", SETTINGS_DEFAULTS["TOTAL_BUDGET"])),
-            budget_report_every=10,
-            chat_bridge=bridge,
         )
 
         from supervisor.git_ops import safe_restart
@@ -737,6 +735,8 @@ def _run_supervisor(settings: dict) -> None:
                     )
                 send_with_budget(int(st_boot["owner_chat_id"]), " ".join(notice), role="system", system_type="startup_notice")
         _startup_retired_settings_notice(settings)
+        from ouroboros.upgrade_notices import startup_upgrade_notices
+        startup_upgrade_notices(settings)
 
         auto_resume_after_restart()
 

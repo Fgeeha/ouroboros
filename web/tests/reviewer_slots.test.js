@@ -1023,7 +1023,7 @@ test('an untouched deep self-review placeholder is omitted from the save; an edi
         { route: { kind: 'api_chat', target_id: '' } });
     assert.match(deepReviewMetaNotes(blanked).join(' '), /Model id required — an empty model id is refused at save/);
     assert.match(deepReviewMetaNotes(untouched).join(' '), /Not saved as a row yet — shown from OUROBOROS_MODEL_DEEP_SELF_REVIEW/);
-    assert.match(deepReviewMetaNotes(untouched).join(' '), /an untouched row is not written/);
+    assert.match(deepReviewMetaNotes(untouched).join(' '), /stored when edited or when the default panel is first saved/);
     assert.deepEqual(deepReviewMetaNotes(edited), []);
     assert.deepEqual(deepReviewMetaNotes({ ...blanked, subagent_id: 'deep' }), []);
     assert.deepEqual(deepReviewMetaNotes({ ...blanked, route: { kind: ROUTE_KIND_SESSION, target_id: 'codex' } }), []);

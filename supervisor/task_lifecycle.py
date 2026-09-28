@@ -668,6 +668,13 @@ def cancel_task_custody(task_id: str, *, deliver: bool = True) -> str:
                     break
 
     if captured_pending is None and captured_worker is None:
+        from ouroboros.review_operation import task_has_live_review_operation
+
+        if task_has_live_review_operation(q.DRIVE_ROOT, task_id):
+            # The operation reads this durable Stop. Keep it open until paid
+            # workers release custody; a terminal author is not proof of that.
+            _release_intent_claim(q, task_id, error="review operation still owns paid work", intent=intent)
+            return CANCEL_FAILED
         # A settled row does not prove the direct turn is done: the pipeline
         # persists the terminal BEFORE post-task cognition, whose in-process
         # synthesis thread outlives the turn's own liveness (the pooled twin:

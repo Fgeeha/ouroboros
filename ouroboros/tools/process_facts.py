@@ -209,6 +209,32 @@ def signal_name_for_returncode(returncode) -> str:
 
 _process_facts_tls = threading.local()
 
+
+@contextlib.contextmanager
+def process_facts_handoff(function):
+    """Bridge this invocation's channel to its joined handler executor.
+
+    The admitted environment is a snapshot, not a request to resolve Settings
+    again. Only the joined invocation returns its measured facts to the loop.
+    """
+    fields = ("environment", "runtime_provenance", "facts")
+    state = {key: getattr(_process_facts_tls, key, None) for key in fields}
+    def invoke(*args, **kwargs):
+        prior = {key: getattr(_process_facts_tls, key, None) for key in fields}
+        try:
+            for key, value in state.items():
+                setattr(_process_facts_tls, key, value)
+            return function(*args, **kwargs)
+        finally:
+            state.update({key: getattr(_process_facts_tls, key, None) for key in fields})
+            for key, value in prior.items():
+                setattr(_process_facts_tls, key, value)
+    try:
+        yield invoke
+    finally:
+        for key in ("facts", "runtime_provenance"):
+            setattr(_process_facts_tls, key, state[key])
+
 # The complete typed fact family this channel owns. When typed facts exist for
 # a call, they are authoritative for EVERY member — including the ABSENCE of a
 # member (a typed publication without ``signal`` means the child was not

@@ -45,6 +45,16 @@ def held_lock(root, timeout=5):
         assert not thread.is_alive()
 
 
+@pytest.fixture(autouse=True)
+def lifecycle_authority(root):
+    from ouroboros.task_results import write_task_result
+    # Managed model consumers require the same canonical lifecycle authority
+    # as production. A missing result tests unreadable authority, not contention.
+    # Prepare before each test installs its negative lock fault.
+    for tid in ("dominant", "child"):
+        write_task_result(root, tid, "running", root_task_id="dominant")
+
+
 @contextlib.contextmanager
 def owner(root, **values):
     events = queue.Queue()

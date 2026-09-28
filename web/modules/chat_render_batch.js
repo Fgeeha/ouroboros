@@ -610,7 +610,12 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
     const existingIdx = record.items.findIndex((it) => it.dedupeKey === syntheticKey);
     if (existingIdx !== -1 && inPlaceByKey) {
         const it = record.items[existingIdx];
+        if (Number.isSafeInteger(it.cardRowRevision)
+            && (!Number.isSafeInteger(summary.cardRowRevision) || summary.cardRowRevision <= it.cardRowRevision)) {
+            return { timelineUpdate: 'duplicate-skip', patchIndex };
+        }
         const patch = {
+            cardRowRevision: summary.cardRowRevision,
             phase: summary.phase || it.phase,
             headline: headline || it.headline,
             fullHeadline: summary.fullHeadline || headline || it.fullHeadline,
@@ -657,6 +662,7 @@ export function updateLiveTimelineItem(record, summary, { ts, rawTs, syntheticKe
     } else {
         const lineKey = `line-${Date.now()}-${Math.random().toString(16).slice(2)}`;
         record.items.push({
+            cardRowRevision: summary.cardRowRevision,
             phase: summary.phase || 'working',
             headline: headline || 'Update',
             fullHeadline: summary.fullHeadline || headline || 'Update',

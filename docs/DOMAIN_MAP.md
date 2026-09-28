@@ -8,17 +8,17 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 
 | domain | name | modules | proposed |
 |---|---|---:|---:|
-| D01 | Agent core & main loop | 41 | 0 |
+| D01 | Agent core & main loop | 43 | 0 |
 | D02 | LLM client, routing & providers | 39 | 0 |
 | D03 | Context assembly, fit & compaction | 11 | 0 |
 | D04 | Tool execution: registry, access & typed results | 21 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 29 | 0 |
-| D06 | Review stack | 70 | 0 |
+| D06 | Review stack | 71 | 0 |
 | D07 | Delegation, subagents & Claudexor | 55 | 0 |
 | D08 | Supervisor: queue, workers, events & runtime control | 55 | 0 |
-| D09 | Cancellation, owner control & process custody | 13 | 0 |
-| D10 | Git, update & release machinery | 28 | 0 |
-| D11 | Gateway, server & Web UI | 59 | 0 |
+| D09 | Cancellation, owner control & process custody | 14 | 0 |
+| D10 | Git, update & release machinery | 29 | 0 |
+| D11 | Gateway, server & Web UI | 60 | 0 |
 | D12 | Settings & configuration | 15 | 0 |
 | D13 | Safety, guards & runtime mode | 9 | 0 |
 | D14 | Skills & extensions | 56 | 0 |
@@ -28,7 +28,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **599** | **0** |
+| **total** | | **605** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -65,7 +65,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
 
 ## Hidden coupling (classified out of the strict graph)
 
-- lazy-only cross-domain pairs: **110**
+- lazy-only cross-domain pairs: **112**
   - D01->D08
   - D01->D10
   - D01->D11
@@ -107,6 +107,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
   - D08->D10
   - D08->D11
   - D09->D02
+  - D09->D04
   - D09->D05
   - D09->D07
   - D09->D11
@@ -115,6 +116,7 @@ Rows may import columns (`[graph].allowed`). `·` = forbidden direction.
   - D09->D15
   - D09->D17
   - D10->D01
+  - D10->D09
   - D10->D14
   - D10->D15
   - D10->D17
@@ -190,6 +192,8 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 
 - `ouroboros/_outcome_receipts.py`
 - `ouroboros/_outcome_tool_errors.py`
+- `ouroboros/acceptance_history.py`
+- `ouroboros/acceptance_late.py`
 - `ouroboros/acceptance_preparation.py`
 - `ouroboros/acceptance_retrieving.py`
 - `ouroboros/acceptance_settlement.py`
@@ -365,6 +369,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/review_projection.py`
 - `ouroboros/review_records.py`
 - `ouroboros/review_session_custody.py`
+- `ouroboros/review_session_preparation.py`
 - `ouroboros/review_session_reads.py`
 - `ouroboros/review_session_usage.py`
 - `ouroboros/review_slot_cancel.py`
@@ -537,6 +542,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/model_wait.py`
 - `ouroboros/owner_hurry.py`
 - `ouroboros/owner_quiz.py`
+- `ouroboros/owner_source.py`
 - `ouroboros/process_containment.py`
 - `ouroboros/process_custody.py`
 - `ouroboros/server_control.py`
@@ -549,6 +555,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 
 ### D10 — Git, update & release machinery
 
+- `ouroboros/merge_receipts.py`
 - `ouroboros/repo_remotes.py`
 - `ouroboros/size_ratchet_manifest.py`
 - `ouroboros/tools/ci.py`
@@ -638,6 +645,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/server_runtime.py`
 - `ouroboros/server_web.py`
 - `ouroboros/startup_historical_audit.py`
+- `ouroboros/upgrade_notices.py`
 - `server.py`
 
 ### D12 — Settings & configuration
