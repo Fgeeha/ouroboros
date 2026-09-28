@@ -13,8 +13,8 @@ from ouroboros import delegate_custody as custody
 from ouroboros import delegate_output
 from ouroboros.tool_capabilities import tool_result_limit
 from tests.test_delegate_retry_consumers import (
-    TerminalGateway, bind_gateway, call, durable_run, isolated_retry_state,
-    retry_context,
+    TerminalGateway, bind_gateway, call, durable_run, retry_context,
+    isolated_retry_state as isolated_retry_state,  # re-export the autouse pytest fixture
 )
 
 
