@@ -12,7 +12,6 @@ from __future__ import annotations
 import asyncio
 import json
 import queue
-import time
 from functools import partial
 from types import SimpleNamespace
 
