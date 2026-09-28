@@ -386,6 +386,7 @@ def _run_historical_acceptance(ctx: Any, *, task_id: str, debt_id: str,
 def supplement_chat(root: Any, event: dict) -> int | None:
     """A canonical historical supplement keeps its proven original recipient."""
     from ouroboros.task_results import load_task_result
+    from supervisor.terminal_delivery import pending_deliveries
 
     row = load_task_result(root, str(event.get('task_id') or ''), strict=True) or {}
     evidence = (event.get('progress_meta') or {}).get('late_evidence') or {}
@@ -393,8 +394,16 @@ def supplement_chat(root: Any, event: dict) -> int | None:
         late = panel.get('late_settlement') or {}
         delivery = late.get('historical_delivery') or {}
         if (delivery and panel.get('panel_id') == evidence.get('panel_id')
-                and panel.get('applied_source_ref') == evidence.get('source_ref')
                 and late.get('note') == event.get('text')
                 and event.get('delivery_id') == 'acceptance-late:' + str((late.get('reviewed_subject') or {}).get('retry_key'))):
-            return int(delivery['chat_id'])
+            if panel.get('applied_source_ref') == evidence.get('source_ref'):
+                return int(delivery['chat_id'])
+            # Concurrent collection can publish a newer source for this same
+            # settlement. The outbox retains its FIRST notice and exact source;
+            # that durable event still belongs to the proven historical room.
+            if any(owed.get('chat_id') == delivery.get('chat_id') and all(
+                    owed.get(key) == event.get(key) for key in
+                    ('task_id', 'delivery_id', 'chat_id', 'text', 'system_type', 'progress_meta'))
+                    for owed in pending_deliveries(root)):
+                return int(delivery['chat_id'])
     return None
