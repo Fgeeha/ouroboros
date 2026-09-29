@@ -1,7 +1,6 @@
 """Gateway HTTP/WebSocket contracts (v1): descriptive, not runtime validation.
 
-Keep discriminating ``type`` keys required; optional fields use ``NotRequired``.
-"""
+Keep discriminating ``type`` keys required; optional fields use ``NotRequired``."""
 
 from __future__ import annotations
 
@@ -1152,6 +1151,7 @@ class TaskDetailResponse(TypedDict, total=False):
     # Current hurry plus prior same-id attempts; detail-only, absent if never hurried (S3/HQ1).
     owner_hurry: OwnerHurryProjection
     owner_hurry_history: list[OwnerHurryProjection]
+    project_admission_hold: Dict[str, Any]  # While queued/running: {reason, detail, label} of a held row, else {}.
     error: str
 
 

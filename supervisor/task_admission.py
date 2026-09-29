@@ -9,6 +9,7 @@ from typing import Any, Dict, Optional
 
 from ouroboros.depth_evidence import parse_task_depth
 from ouroboros.task_results import (
+    STATUS_CANCELLED,
     STATUS_FAILED,
     STATUS_REQUESTED,
     STATUS_SCHEDULED,
@@ -245,10 +246,11 @@ def restore_invalid_depth_admission(
         # Same-ID custody: assignment revalidates only the original evidence.
         # Preserve the exact invalid carrier and any pre-existing independent hold.
         if task_id and not any(row.get("id") == task_id for row in pending):
-            retained = {**task, "_project_admission_restore_hold": {
+            # Keep the queue-order facts this refused admission already assigned.
+            order = {key: admitted[key] for key in ("priority", "_queue_seq", "queued_at") if key in admitted}
+            pending.append({**task, **order, "_project_admission_restore_hold": {
                 "reason": reason, "detail": str(admitted.get("_admission_detail") or ""),
-            }}
-            pending.append(retained)
+            }})
         return
     if reason in {"project_routing_fence", "project_routing_fence_changed"}:
         # An accepted snapshot row never disappears merely because a sibling Main
@@ -323,6 +325,68 @@ def restore_invalid_depth_admission(
         pending.append(pending_task)
 
 
+def restored_handoff_unproven(task: dict, existing: Optional[dict], *, ancestor_unknown: bool = False) -> bool:
+    """Whether a restored scope-verifiable row's result cannot rule out a handoff.
+
+    A Project row also needs its positive scheduled receipt. A host-verified
+    unscoped row is vetoed only by positive handoff evidence, so a producer
+    without such a receipt keeps its ordinary restore; other rows are unchanged.
+    An unreadable ancestor is neither interruption nor permission: both wait.
+    """
+    existing = existing or {}
+    possible = (bool(existing.get("started_at")) or existing.get("admitted_dispatch", "none") != "none"
+                or ancestor_unknown)
+    if task.get("project_id"):
+        return possible or existing.get("status") != STATUS_SCHEDULED
+    from ouroboros.project_admission import host_unscoped
+
+    return host_unscoped(task) and possible
+
+
+def enqueue_with_admission_receipt(task: Dict[str, Any], *, receipt_required: bool = True,
+                                   **enqueue_kwargs: Any) -> Any:
+    """Admit a host producer's row together with its positive scheduled receipt.
+
+    Append and receipt are ONE Q transaction, so no worker observes the row
+    first; hold release later reads this receipt, never an absent result. A
+    receipt proved missing rolls the unobserved row back as a typed refusal, or
+    keeps it receipt-less when not ``receipt_required``. An unreadable readback
+    retains custody with the receipt unconfirmed: that return proves no receipt,
+    so hold release still reads it and assignment still persists dispatch first.
+    A consciousness root's allowance is read before Q, as ``enqueue_task`` does.
+    """
+    from supervisor import queue
+
+    if enqueue_kwargs.get("consciousness_window") is None and not enqueue_kwargs.get("restoring_snapshot"):
+        window = queue.consciousness_admission_window(task)
+        if window is not None:
+            enqueue_kwargs["consciousness_window"] = window
+    with queue._queue_lock:
+        admitted = queue.enqueue_task(task, **enqueue_kwargs)
+        if not isinstance(admitted, dict) or admitted.get("_admission_blocked"):
+            return admitted
+        tid, token = str(admitted.get("id") or ""), uuid.uuid4().hex
+        try:
+            write_task_result(queue.DRIVE_ROOT, tid, STATUS_SCHEDULED, strict_existing_dict=True, create_only=True,
+                              chat_id=admitted.get("chat_id"), root_task_id=admitted.get("root_task_id") or tid,
+                              metadata=admitted.get("metadata") if isinstance(admitted.get("metadata"), dict) else {},
+                              host_admission={"token": token, "status": "accepted"},
+                              result="Task accepted and scheduled.")
+        except Exception:
+            log.warning("Host admission receipt write raised for %s; reading it back", tid, exc_info=True)
+        try:
+            stored = load_task_result(queue.DRIVE_ROOT, tid, strict=True) or {}
+        except Exception:
+            log.warning("Host admission receipt for %s is unreadable; custody retained", tid, exc_info=True)
+            return admitted
+        if (stored.get("status") == STATUS_SCHEDULED and (stored.get("host_admission") or {}).get("token") == token
+                or not receipt_required):
+            return admitted
+        queue.PENDING[:] = [row for row in queue.PENDING if row is not admitted]
+        return {**admitted, "_admission_blocked": "scheduled_result_persist_failed",
+                "_admission_detail": "its durable scheduled receipt could not be persisted"}
+
+
 def record_project_dispatch_possible(task: dict) -> bool:
     """Persist possible handoff for scope-verifiable work beside admitted_dispatch.
 
@@ -358,12 +422,40 @@ def record_project_dispatch_possible(task: dict) -> bool:
         return False
 
 
+def _exact_resume_granted(task: dict, drive_root: Any) -> bool:
+    """Whether the owner's single-use exact Resume grant is this row's handoff authority.
+
+    A mid-run pause was dispatched, so it never has first-dispatch 'none'. Its
+    durable pause row must still name the SAME unconsumed, unrevoked grant the
+    row carries; the grant continues that run and never authorizes a replay.
+    An unreadable pause row raises, keeping the hold.
+    """
+    from ouroboros.budget_pause import STATE_RESUME_GRANTED
+    from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, STATUS_CANCEL_REQUESTED
+
+    handoff = task.get("_budget_pause_resume")
+    if not isinstance(handoff, dict) or not str(handoff.get("grant_id") or ""):
+        return False
+    root = pathlib.Path(task.get("budget_drive_root") or drive_root)
+    stored = load_task_result(root, str(task.get("id") or ""), strict=True) or {}
+    pause = stored.get("budget_pause") if isinstance(stored.get("budget_pause"), dict) else {}
+    grant = pause.get("grant") if isinstance(pause.get("grant"), dict) else {}
+    return (pause.get("state") == STATE_RESUME_GRANTED
+            and str(pause.get("pause_id") or "") == str(handoff.get("pause_id") or "")
+            and grant.get("grant_id") == handoff["grant_id"]
+            and not grant.get("revoked_at") and not grant.get("consumed_at")
+            and stored.get("status") not in _TRULY_TERMINAL_STATUSES | {STATUS_CANCEL_REQUESTED})
+
+
 def revalidate_project_holds() -> None:
     """Revalidate accepted unstarted work once per Q-held assignment transaction.
 
     A hold never grants a replay. The original carrier and prepared directory,
     a positive scheduled result and schedule's own no-dispatch receipt must all
-    agree. Unknown facts retain the same row. Semantic refusals use the existing
+    agree; an exact budget continuation instead needs its live single-use
+    Resume grant. A child whose parent was proven interrupted takes the
+    restore's shutdown custody; an unreadable ancestor keeps it waiting.
+    Unknown facts retain the same row. Semantic refusals use the existing
     terminalization owner; clearing this hold changes no independent control.
     """
     import os
@@ -373,10 +465,11 @@ def revalidate_project_holds() -> None:
     from contextlib import nullcontext
 
     from ouroboros.project_admission import (
-        ProjectAdmissionError, _strict_admission_snapshot,
+        ProjectAdmissionError, _strict_admission_snapshot, host_unscoped,
         project_admission_guard, task_project_membership, validate_project_admission,
     )
     from supervisor import queue
+    from supervisor.queue_snapshot import _descends_from, _interrupted_ancestors
     from supervisor.schedule_occurrence import restore_allowed
     from ouroboros.projects_registry import _load_bindings, project_binding_for_task
 
@@ -386,6 +479,14 @@ def revalidate_project_holds() -> None:
     effects = ("_project_admission_restore_hold", "_terminalization_retry", "_owner_hold")
     before = [copy.deepcopy({key: task[key] for key in effects if key in task}) for task in held]
     counts = Counter(row.get("id") for row in queue.PENDING)
+    # Restore's parent rule, re-read at release: exact continuations are saved work.
+    children = [task for task in held if str(task.get("parent_task_id") or "")
+                and not task.get("_terminalization_retry") and not task.get("_budget_pause_resume")
+                and not (isinstance(task.get("_budget_pause"), dict)
+                         and task["_budget_pause"].get("exact_continuation") is True)]
+    pending_by_id = {str(row.get("id") or ""): row for row in queue.PENDING if row.get("id")}
+    lineage_unknown: set = set()
+    interrupted = _interrupted_ancestors([], children, unknown=lineage_unknown) if children else set()
     snapshot, read_error = None, None
     try:
         data, present = _strict_admission_snapshot(queue.DRIVE_ROOT, allow_missing=True)
@@ -400,19 +501,31 @@ def revalidate_project_holds() -> None:
         tid = str(task.get("id") or "")
         hold = task["_project_admission_restore_hold"]
         try:
+            if any(task is child for child in children):
+                if _descends_from(task, interrupted, pending_by_id):
+                    task["_terminalization_retry"] = {
+                        "status": STATUS_CANCELLED, "trigger": "pending_parent_interrupted",
+                        "reason": "Parent task was interrupted before this child started.",
+                        "reconcile_delegate_custody": True,
+                    }
+                    continue
+                if _descends_from(task, lineage_unknown, pending_by_id):
+                    raise ValueError("The parent task's state is unreadable; automatic recovery is not authorized.")
             # Status and missing started_at alone cannot prove no handoff: the
             # old RUNNING mirror was best-effort. Fresh queue admission supplies
             # positive 'none'; canonical possible handoff always vetoes that row.
             stored = load_task_result(queue.DRIVE_ROOT, tid, strict=True) or {}
-            if (stored.get("status") != STATUS_SCHEDULED or stored.get("started_at")
-                    or stored.get("admission_outcome") == "never_admitted"
-                    or task.get("admitted_dispatch") != "none"
-                    or "admitted_dispatch" in stored and stored["admitted_dispatch"] != "none"
-                    or tid in queue.RUNNING or tid in queue.ADMISSION_RESERVATIONS
-                    or counts[tid] != 1):
+            granted = _exact_resume_granted(task, queue.DRIVE_ROOT)
+            if (stored.get("admission_outcome") == "never_admitted"
+                    or tid in queue.RUNNING or tid in queue.ADMISSION_RESERVATIONS or counts[tid] != 1
+                    or not granted and (
+                        stored.get("status") != STATUS_SCHEDULED or stored.get("started_at")
+                        or task.get("admitted_dispatch") != "none"
+                        or "admitted_dispatch" in stored and stored["admitted_dispatch"] != "none")):
                 raise ValueError("The original task's no-dispatch evidence is unconfirmed; automatic recovery is not authorized.")
             owner_hold = task.get("_owner_hold")
-            schedule_allowed = restore_allowed(task)
+            # The schedule receipt proves no first dispatch; a grant continues one.
+            schedule_allowed = granted or restore_allowed(task)
             if owner_hold:
                 task["_owner_hold"] = owner_hold
             if not schedule_allowed:
@@ -431,8 +544,7 @@ def revalidate_project_holds() -> None:
             if isinstance(fence, dict) and fence.get("status") in {"active", "sealed"}:
                 raise ValueError("The task's root is in acceptance review; dispatch remains closed.")
             basis = task.get("_project_admission")
-            unscoped = (task.get("_project_scope_none") is True
-                        and "_project_admission" not in task and not task.get("project_id"))
+            unscoped = host_unscoped(task)
             if not unscoped and (not isinstance(basis, dict) or basis.get("legacy_basis")
                     or isinstance(basis.get("project"), dict) and not {
                         "id", "chat_id", "lifecycle", "routing_generation", "working_dir",

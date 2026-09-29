@@ -24,7 +24,12 @@ export function handoffPhase(activity, detail, connected = true) {
         return { text: view.headline, className: view.phase };
     }
     if (!connected || !activity) return { text: 'Activity unconfirmed', className: 'neutral' };
-    if (activity.project_admission_hold?.label) return { text: activity.project_admission_hold.label, className: 'warn' };
+    const held = activity.project_admission_hold?.label;
+    if (held) {
+        // An independent budget pause stays beside the Project wait, as in the sidebar.
+        const pause = { budget_paused: 'Paused', budget_pausing: 'Pausing…' }[activity.phase];
+        return { text: pause ? `${pause} · ${held}` : held, className: 'warn' };
+    }
     if (activity.required_question || activeModelWaits(activity.model_waits || {}, false, activity.task_attempt || 0).length) {
         return { text: 'Waiting', className: 'warn' };
     }

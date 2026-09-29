@@ -31,6 +31,9 @@ from ouroboros.utils import atomic_write_json, iter_jsonl_objects, read_json_dic
 log = logging.getLogger(__name__)
 
 _REGISTRY_NAME = "projects.json"
+# Empty witness touched after each registry save: beside it, a missing registry
+# is lost authority, not a fresh install that never had a Project room.
+_REGISTRY_WITNESS_NAME = "projects.json.committed"
 _BINDINGS_NAME = "project_task_bindings.json"
 # v6.58.0 (slice 0): projects.json carries an opt-in _schema_version so future
 # additive fields (git provenance, trusted_at) migrate deliberately. Old rows read
@@ -84,6 +87,19 @@ def _registry_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / "state" / _REGISTRY_NAME
 
 
+def _registry_witness_path(drive_root: Any) -> pathlib.Path:
+    return pathlib.Path(drive_root) / "state" / _REGISTRY_WITNESS_NAME
+
+
+def _mark_registry_committed(drive_root: Any) -> None:
+    """Touch the witness after a commit; a failure only defers it to the next save/reconcile,
+    and a registry lost inside that window reads as never committed (disclosed gap)."""
+    try:
+        _registry_witness_path(drive_root).touch()
+    except OSError:
+        log.warning("Project registry commit witness was not written", exc_info=True)
+
+
 def _bindings_path(drive_root: Any) -> pathlib.Path:
     return pathlib.Path(drive_root) / "state" / _BINDINGS_NAME
 
@@ -97,7 +113,8 @@ from ouroboros.project_admission import (  # noqa: E402, F401
 
 
 def _load(drive_root: Any, *, strict: bool = False) -> Dict[str, Any]:
-    # Writers reject malformed authority; display never normalizes it into active.
+    # Writers reject malformed authority and a registry lost after its commit witness
+    # (only an install without a witness starts empty); display never normalizes it into active.
     data = (_strict_admission_snapshot(drive_root, allow_missing=True)[0] if strict
             else display_registry_snapshot(drive_root))
     for row in data["projects"]:
@@ -122,6 +139,7 @@ def _save(drive_root: Any, data: Dict[str, Any]) -> None:
     # Stamp the current schema version on every write (idempotent; old files that
     # never had it are treated as version 0 by read_schema_version).
     atomic_write_json(path, with_schema_version(dict(data), _REGISTRY_SCHEMA_VERSION))
+    _mark_registry_committed(drive_root)  # after the commit it attests
 
 
 def _load_bindings(drive_root: Any, *, strict: bool = False) -> Dict[str, Any]:
@@ -1128,6 +1146,8 @@ def reconcile_projects(drive_root: Any) -> int:
     """
     added = 0
     try:
+        if _registry_path(drive_root).is_file():
+            _mark_registry_committed(drive_root)  # a registry saved before its witness existed
         projects_root = pathlib.Path(drive_root) / "projects"
         if projects_root.is_dir():
             with _file_write_lock(_registry_path(drive_root)):

@@ -270,7 +270,7 @@ def enqueue_evolution_task_if_needed() -> None:
         "metadata": {"evolution_transaction": transaction, **consciousness_origin_metadata(campaign)},
     }
     q.attach_task_contract(task)
-    admitted = q.enqueue_task(task)
+    admitted = q.enqueue_with_admission_receipt(task)  # the receipt hold release reads
     if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
         # The ONE admission door refused the cycle (a consciousness campaign out of its
         # allowance or concurrency, a closed pool): pause the campaign like the other

@@ -38,3 +38,12 @@ test('same-ID recovery clears the hold; independent work and budget remain truth
     const paused = computeHydratedDirectActivities(new Map(), [{ ...held, phase: 'budget_paused' }], 7);
     assert.equal(computeDerivedChatStatus(chatStatusCounts(paused, [])).text, 'Paused (budget)');
 });
+
+test('Main handoff keeps a budget pause beside the Project wait, as the sidebar does', () => {
+    const paused = { ...held, phase: 'budget_paused' };
+    assert.deepEqual(handoffPhase(paused, null), { text: `Paused · ${hold.label}`, className: 'warn' });
+    assert.equal(handoffPhase(paused, null).text, summarizeProjectActivities([paused]).label);
+    assert.deepEqual(handoffPhase({ ...held, phase: 'budget_pausing' }, null), { text: `Pausing… · ${hold.label}`, className: 'warn' });
+    assert.deepEqual(handoffPhase(held, null), { text: hold.label, className: 'warn' });
+    assert.equal(handoffPhase(paused, { status: 'cancelled' }).text, 'Cancelled');
+});

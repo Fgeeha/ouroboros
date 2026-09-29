@@ -19,6 +19,7 @@ from ouroboros.utils import utc_now_iso
 from supervisor.task_admission import (
     restore_terminalization_retry,
     restore_terminalization_retry_rows,
+    restored_handoff_unproven,
 )
 from supervisor.task_lifecycle import (
     _cancel_result_fields,
@@ -321,11 +322,13 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
     refused source becomes a typed, visible HOLD beside its marker, never a
     dropped or cancelled task. An owner-wait handoff needs its acknowledged
     restart transaction. Project admission holds retain custody through age and
-    schedule-receipt uncertainty, without acquiring dispatch permission.
+    schedule-receipt uncertainty, without acquiring dispatch permission; a fresh
+    host-unscoped row naming a possible handoff is held, never replayed.
     Returns ``(retained_rows, parked_rows, consumed_task_ids)``.
     """
     from ouroboros.budget_pause import budget_pause_restore_refusal, budget_pause_row
     from ouroboros.owner_wait import restore_owner_wait_allowed
+    from ouroboros.project_admission import host_unscoped
     from ouroboros.task_results import load_task_result
     from supervisor.budget_resume import revoke_exact_budget_resume
     from supervisor.events_budget import HOLD_RESTORE_REFUSED_PREFIX, hold_restored_budget_pause
@@ -384,6 +387,10 @@ def _retain_snapshot_pending(snapshot_pending: list, running_rows: list, *, stal
                            if isinstance(task.get("_project_admission"), dict) else
                            "The original Project basis has unknown historical identity; automatic recovery is not authorized."),
             }})
+        elif host_unscoped(task) and not stale and task.get("admitted_dispatch") != "none" and restore_allowed(task):
+            retained.append({**task, "_project_admission_restore_hold": {
+                "reason": "project_routing_fence_lookup_failed",
+                "detail": "The task may already have reached a worker; automatic recovery is not authorized."}})
         elif not restore_allowed(task):
             continue  # a schedule-born row that may have been dispatched, or is unprovable, is never replayed
         elif not stale:
@@ -613,18 +620,16 @@ def _descends_from(task: Any, roots: "set[str]", pending_by_id: dict) -> bool:
     return False
 
 
-def _interrupted_ancestors(
-    fenced_running: "list[str]", snapshot_pending: list, pending_by_id: dict,
-) -> "set[str]":
+def _interrupted_ancestors(fenced_running: "list[str]", snapshot_pending: list, *, unknown: set) -> "set[str]":
     """The ids whose interruption a restored PENDING child cannot survive.
 
     The rows this boot just fenced, plus the ancestors an EARLIER boot already
     handed to cancellation custody: a multi-boot stop settles the root first, so
     by the time the child is read again its parent is no longer a RUNNING row —
     only an active intent or a stored ``cancelled`` result with the shutdown
-    cause proves what happened to it. Ancestors the restore is reviving are
-    deliberately absent: an owner-wait handoff is a continuation, not an
-    interruption, and its children keep their place in the queue.
+    cause proves what happened to it. Queued ancestors are read alike. ``unknown``
+    collects unreadable, missing or never-admitted ones: a parent wrote its
+    running result before spawning a child, so absence is never permission.
     """
     from ouroboros.cancel_intents import has_active_intent
     from ouroboros.task_results import STATUS_CANCELLED, load_task_result
@@ -636,18 +641,19 @@ def _interrupted_ancestors(
             continue
         for key in ("parent_task_id", "root_task_id"):
             ancestor = str(task.get(key) or "")
-            if ancestor and ancestor not in interrupted and ancestor not in pending_by_id:
+            if ancestor and ancestor not in interrupted:
                 candidates.add(ancestor)
     for ancestor in candidates:
         try:
             if has_active_intent(_queue().DRIVE_ROOT, ancestor, strict=True):
                 interrupted.add(ancestor)
                 continue
-            stored = load_task_result(_queue().DRIVE_ROOT, ancestor, strict=True) or {}
+            stored = load_task_result(_queue().DRIVE_ROOT, ancestor, strict=True)
         except Exception:
-            # An unreadable ancestor is an UNKNOWN, never a proven interruption:
-            # the child keeps the dispatch authority the existing gates decide.
             log.warning("Snapshot restore could not read ancestor %s", ancestor, exc_info=True)
+            stored = None
+        if not stored or stored.get("admission_outcome") == "never_admitted":
+            unknown.add(ancestor)  # never a proven interruption: a scope-verifiable child waits
             continue
         origin = stored.get("cancel_origin")
         if (
@@ -783,9 +789,9 @@ def restore_pending_from_snapshot(
 
         skipped_terminal, invalid_depth_restore = 0, []
         cancel_authority_holds: list[str] = []
-        skipped_fenced, blocked_restore, orphan_children = [], [], []
+        skipped_fenced, blocked_restore, orphan_children, lineage_unknown = [], [], [], set()
         acceptance_held: list[str] = []
-        interrupted = _interrupted_ancestors(fenced_running, snapshot_pending, pending_by_id)
+        interrupted = _interrupted_ancestors(fenced_running, snapshot_pending, unknown=lineage_unknown)
         for task in snapshot_pending:
             chat_id = task.get("chat_id")
             if not task.get("id") or chat_id is None or chat_id == "":
@@ -850,9 +856,13 @@ def restore_pending_from_snapshot(
                         acceptance_held.append(str(task.get("id") or ""))
                         log.warning("Snapshot restore retained paused row %s under a hold: its "
                                     "result authority is unreadable", task.get("id"), exc_info=True)
+                    if not (_exact_pause_row(task) or task.get("_project_admission_restore_hold")
+                            or task.get("_owner_wait_resume")) and (task.get("project_id") or "_project_admission" in task):
+                        task["_project_admission_restore_hold"] = {"reason": "project_routing_fence_lookup_failed",
+                            "detail": "The task result is unreadable; the accepted task waits for it."}
                     if _exact_pause_row(task) or task.get("_project_admission_restore_hold"):
-                        # A receipt read failure cannot select a terminal policy
-                        # for conserved work. Keep its original pause/Project hold.
+                        # A receipt read failure cannot select a terminal policy for conserved
+                        # work: its pause, its Project hold, or accepted Project work held here.
                         _append_held_pending_row(task)
                         restored += 1
                         continue
@@ -874,15 +884,12 @@ def restore_pending_from_snapshot(
                     log.debug("Snapshot restore result-authority check failed for %s", task.get("id"), exc_info=True)
                     continue
                 else:
-                    if (task.get("project_id") and not _exact_pause_row(task)
-                            and not task.get("_owner_wait_resume")
-                            and (not existing or existing.get("status") != "scheduled"
-                                 or existing.get("started_at") or "admitted_dispatch" in existing
-                                 and existing["admitted_dispatch"] != "none")
-                            and not task.get("_project_admission_restore_hold")):
+                    if (not _exact_pause_row(task) and not task.get("_owner_wait_resume")
+                            and not task.get("_project_admission_restore_hold")
+                            and restored_handoff_unproven(task, existing, ancestor_unknown=_descends_from(task, lineage_unknown, pending_by_id))):
                         task["_project_admission_restore_hold"] = {
                             "reason": "project_routing_fence_lookup_failed",
-                            "detail": "Original no-dispatch evidence is unavailable; automatic recovery is not authorized.",
+                            "detail": "Original no-dispatch or parent evidence is unavailable; automatic recovery is not authorized.",
                         }
                     # Terminal OR cancel-intent — both must not be resurrected as
                     # pending. Intent lives in the durable projection (phase A);

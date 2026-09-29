@@ -1193,6 +1193,8 @@
  * @property {string=} stop_policy
  * @property {OwnerHurryProjection=} owner_hurry
  * @property {OwnerHurryProjection[]=} owner_hurry_history
+ * @property {{reason?:string, detail?:string, label?:string}=} project_admission_hold
+ *   While queued/running: the held row's wait for original Project/scope evidence, else {}.
  * @property {string=} error
  */
 

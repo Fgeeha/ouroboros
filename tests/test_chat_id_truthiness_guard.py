@@ -44,11 +44,6 @@ TRUTHY_ROUTE = re.compile(
 
 # (repo-relative path, exact stripped line) -> (occurrences, why it stays)
 ALLOWED = {
-    ("supervisor/steering.py", "if not is_project_chat_id(chat_id):"): (
-        1, "Semantic namespace predicate (Project IDs >= 1000), not ID truthiness. "
-        "Main, hidden 0 and A2A addresses remain values; ordinary Main steering "
-        "does not depend on Project registry availability.",
-    ),
     ("supervisor/terminal_delivery.py", "if not chat_id:"): (
         2,
         "lineage_chat_id() answers with the task's OWN chat: a project-homed run "

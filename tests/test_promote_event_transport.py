@@ -659,23 +659,17 @@ def test_snapshot_persistence_failure_preserves_pending_and_inputs(host, monkeyp
         },
         host.ctx,
     )
-    assert outcome["status"] == "unconfirmed"
-    assert outcome["task_id"] == "snapfail"
-    assert outcome["reason"] == "queue_snapshot_persist_failed"
-    assert not outcome.get("never_admitted")
-    assert [row["id"] for row in host.pending] == ["snapfail"]
-    admitted = host.pending[0]
-    assert admitted["root_task_id"] == "snapfail"
-    assert admitted["admitted_dispatch"] == "none"
+    assert (outcome["status"], outcome["task_id"], outcome["reason"], bool(outcome.get("never_admitted"))) == (
+        "unconfirmed", "snapfail", "queue_snapshot_persist_failed", False)
+    [admitted] = host.pending
+    assert (admitted["id"], admitted["root_task_id"], admitted["admitted_dispatch"]) == ("snapfail", "snapfail", "none")
     assert "snapfail" not in queue.ADMISSION_RESERVATIONS
     assert len(admitted["attachments"]) == 1
     staged = Path(admitted["attachments"][0]["abs_path"])
-    assert staged != source
+    assert staged != source and staged.read_bytes() == source.read_bytes()
     assert source.read_text(encoding="utf-8") == "retain this input after ambiguous admission"
-    assert staged.read_bytes() == source.read_bytes()
     # No definite refusal receipt may be forged after the real queue accepted it.
-    stored = load_task_result(host.root, "snapfail")
-    assert stored is None
+    assert load_task_result(host.root, "snapfail") is None
 
 
 def test_missing_snapshot_persister_fails_closed(monkeypatch, tmp_path):
@@ -948,9 +942,7 @@ def test_source_resolution_runs_off_supervisor_loop_and_continues_once(
 
     seen_names = []
 
-    def slow_resolve(
-        _ctx, _source, project_id, *, project_name="", admission_basis_out=None,
-    ):
+    def slow_resolve(_ctx, _source, project_id, *, project_name="", admission_basis_out=None):
         seen_names.append(project_name)
         started.set()
         assert release.wait(2)

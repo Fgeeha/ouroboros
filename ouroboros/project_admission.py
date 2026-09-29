@@ -21,12 +21,16 @@ class ProjectAdmissionError(RuntimeError):
         self.reason, self.lifecycle = reason, lifecycle
 
 
+def host_unscoped(task: dict) -> bool:
+    """Fresh host admission proved no Project scope; restore never backfills it."""
+    return (task.get("_project_scope_none") is True
+            and not task.get("project_id") and "_project_admission" not in task)
+
+
 def project_hold_fact(task: dict) -> dict:
     """Read-only waiting fact; no new task phase or owner-action claim."""
     hold = task.get("_project_admission_restore_hold")
-    unscoped = (task.get("_project_scope_none") is True
-                and not task.get("project_id") and "_project_admission" not in task)
-    label = "Waiting for task scope verification" if unscoped else "Waiting for Project verification"
+    label = "Waiting for task scope verification" if host_unscoped(task) else "Waiting for Project verification"
     return ({**hold, "label": label}
             if isinstance(hold, dict) and hold else {})
 
@@ -76,7 +80,18 @@ def _routing_row(raw: Any) -> dict:
 
 
 def _strict_admission_snapshot(drive_root: Any, *, allow_missing: bool = False) -> tuple[dict, bool]:
-    """Lockless committed authority. Only absent legacy fields receive defaults."""
+    """Lockless committed authority. Only absent legacy fields receive defaults.
+
+    ``allow_missing`` admits absence only while no commit witness exists: beside
+    it a missing registry is unavailable, so no strict reader or registry writer
+    mistakes that loss for zero rooms. A registry lost before its first witness
+    stamp landed (never committed, or a failed stamp not yet retried) still reads
+    as a first boot.
+    """
+    if allow_missing:
+        from ouroboros.projects_registry import _registry_witness_path
+
+        allow_missing = not _registry_witness_path(drive_root).exists()
     data, present = _registry_snapshot(drive_root, allow_missing=allow_missing)
     rows, seen = [], set()
     for raw in data["projects"]:
@@ -86,6 +101,15 @@ def _strict_admission_snapshot(drive_root: Any, *, allow_missing: bool = False) 
         seen.add(row["id"])
         rows.append(row)
     return {**data, "projects": rows}, present
+
+
+def routing_reservations(drive_root: Any) -> list:
+    """Strict rows of every lifecycle for execution chat routing.
+
+    Absence is positive only without a commit witness; beside it a missing
+    registry is unavailable, never no rooms.
+    """
+    return _strict_admission_snapshot(drive_root, allow_missing=True)[0]["projects"]
 
 
 def display_registry_snapshot(drive_root: Any) -> dict:

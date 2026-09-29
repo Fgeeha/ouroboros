@@ -106,6 +106,23 @@ def test_no_scope_recovery_requires_original_positive_authority(host, monkeypatc
     assert not any(r.get("project_id") == "new-room" for r in host.pending)
 
 
+def test_restore_never_retargets_unscoped_row_to_a_later_origin_binding(host, monkeypatch):  # noqa: F811
+    row = admit_main(host)
+    row["origin_message_ref"] = {"chat_id": 1, "client_message_id": "origin"}
+    assert queue.persist_queue_snapshot()
+    registry.create_project(host.root, "new-room")
+    registry.bind_task_to_project(host.root, "sibling", "new-room", origin={"ref": {
+        "chat_id": 1, "client_message_id": "origin", "ts": "2026-09-28T00:00:00Z",
+        "text_sha256": hashlib.sha256(b"Owner work").hexdigest()}, "text": "Owner work"})
+    host.pending.clear()
+    queue.restore_pending_from_snapshot()
+    sent = worker(host, monkeypatch)
+    workers.assign_tasks()
+    assert not sent and not any(r.get("project_id") == "new-room" for r in host.pending)
+    stored = load_task_result(host.root, "main")  # a semantic change, visibly terminal, never rerouted
+    assert stored["status"] == "failed" and stored["reason_code"] == "project_routing_fence_changed"
+
+
 def test_old_main_snapshot_cannot_replay_after_handoff(host, monkeypatch):  # noqa: F811
     admit_main(host)
     assert queue.persist_queue_snapshot()
@@ -240,3 +257,217 @@ def test_admission_and_revalidation_read_bindings_once_per_operation(host, monke
         revalidate_project_holds()
     assert reads == [True]
     assert all(not row.get("_project_admission_restore_hold") for row in host.pending)
+
+
+def _crash_after_handoff(host, monkeypatch, snapshot):  # noqa: F811
+    """Hand the row to a worker, then lose RUNNING before its snapshot as a crash does."""
+    sent, claimed = worker(host, monkeypatch), []
+    put = workers.WORKERS[0].in_q.put
+    workers.WORKERS[0].in_q = SimpleNamespace(
+        put=lambda row: (claimed.append(queue.QUEUE_SNAPSHOT_PATH.read_bytes()), put(row)))
+    monkeypatch.setattr("supervisor.worker_assignment._mirror_assigned_running_status", lambda _t: None)
+    workers.assign_tasks()
+    assert len(sent) == 1
+    queue.RUNNING.clear()
+    workers.WORKERS[0].busy_task_id = None
+    queue.QUEUE_SNAPSHOT_PATH.write_bytes(claimed[0] if snapshot is None else snapshot)
+    host.pending.clear()
+    queue.restore_pending_from_snapshot()
+    return sent
+
+
+@pytest.mark.parametrize("producer", ["promotion", "api"])
+@pytest.mark.parametrize("window", ["claimed_snapshot", "older_snapshot"])
+def test_unscoped_possible_handoff_never_replays_with_healthy_bindings(host, monkeypatch, producer, window):  # noqa: F811
+    from ouroboros.project_admission import project_hold_fact
+
+    admit_main(host, producer)
+    assert queue.persist_queue_snapshot()
+    older = queue.QUEUE_SNAPSHOT_PATH.read_bytes() if window == "older_snapshot" else None
+    sent = _crash_after_handoff(host, monkeypatch, older)
+    assert load_task_result(host.root, "main")["admitted_dispatch"] == "possible"
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert len(sent) == 1 and not host.attempts
+    assert project_hold_fact(host.pending[0])["label"] == "Waiting for task scope verification"
+
+
+@pytest.mark.parametrize("producer", ["promotion", "api"])
+def test_never_dispatched_main_restores_once_and_live_retry_still_assigns(host, monkeypatch, producer):  # noqa: F811
+    admit_main(host, producer)
+    assert queue.persist_queue_snapshot()
+    host.pending.clear()
+    queue.restore_pending_from_snapshot()
+    sent = worker(host, monkeypatch)
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert [row["id"] for row in sent] == ["main"]
+    queue.RUNNING.clear()
+    workers.WORKERS[0].busy_task_id = None
+    retry = queue.enqueue_task({**sent[0], "_attempt": 2}, front=True)
+    assert retry["admitted_dispatch"] == "possible" and retry["_project_scope_none"] is True
+    workers.assign_tasks()
+    assert [row["_attempt"] for row in sent] == [1, 2]
+
+
+def _deep_review(host, monkeypatch):  # noqa: F811
+    monkeypatch.setattr(queue, "send_with_budget", lambda *_a, **_k: None)
+    return queue.queue_deep_self_review_task("owner:/review", force=True, chat_id=1)
+
+
+def _evolution(host, monkeypatch):  # noqa: F811
+    from supervisor import evolution_lifecycle, state
+
+    state.save_state({"owner_chat_id": 1, "evolution_mode_enabled": True, "evolution_owner_stopped": False})
+    evolution_lifecycle.start_evolution_campaign("Improve", source="test")
+    monkeypatch.setattr(queue, "send_with_budget", lambda *_a, **_k: None)
+    monkeypatch.setattr(queue, "budget_remaining", lambda *_a, **_k: 100.0)
+    monkeypatch.setattr(evolution_lifecycle, "evolution_block_reason", lambda: "")
+    queue.enqueue_evolution_task_if_needed()
+    return host.pending[0]["id"]
+
+
+@pytest.mark.parametrize("producer", [_deep_review, _evolution], ids=["deep_review", "evolution"])
+@pytest.mark.parametrize("veto", [None, "unreadable", "possible", "legacy"])
+def test_host_producer_row_recovers_once_after_bindings_fault(host, monkeypatch, producer, veto):  # noqa: F811
+    tid = producer(host, monkeypatch)
+    [row] = host.pending
+    assert row["id"] == tid and row["_project_scope_none"] is True and row["admitted_dispatch"] == "none"
+    receipt = load_task_result(host.root, tid)
+    assert receipt["status"] == "scheduled" and receipt["host_admission"]["status"] == "accepted"
+    assert "admitted_dispatch" not in receipt
+    assert queue.persist_queue_snapshot()
+    path = registry._bindings_path(host.root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("{torn")
+    host.pending.clear()
+    queue.restore_pending_from_snapshot()
+    sent = worker(host, monkeypatch)
+    workers.assign_tasks()
+    assert not sent and host.pending[0]["_project_admission_restore_hold"]
+    assert host.pending[0]["_queue_seq"] > 0 and host.pending[0]["queued_at"]  # order survives the hold
+    if veto == "unreadable":
+        (host.root / "task_results" / f"{tid}.json").write_text("{torn")
+    elif veto == "possible":
+        write_task_result(host.root, tid, "scheduled", admitted_dispatch="possible")
+    elif veto == "legacy":
+        for key in ("_project_scope_none", "admitted_dispatch"):
+            host.pending[0].pop(key)
+    path.write_text('{"bindings": {}}')
+    workers.assign_tasks()
+    workers.assign_tasks()
+    assert [task["id"] for task in sent] == ([] if veto else [tid]) and not host.attempts
+    if veto:
+        assert host.pending[0]["_project_admission_restore_hold"]
+    else:
+        assert queue.persist_queue_snapshot()
+        queue.RUNNING.clear()
+        workers.WORKERS[0].busy_task_id = None
+        host.pending.clear()
+        queue.restore_pending_from_snapshot()
+        workers.assign_tasks()
+        assert len(sent) == 1
+
+
+def test_host_producer_refuses_when_its_admission_receipt_is_not_written(host, monkeypatch):  # noqa: F811
+    notices = []
+    monkeypatch.setattr(queue, "send_with_budget", lambda _chat, text, **_k: notices.append(text))
+    monkeypatch.setattr("supervisor.task_admission.write_task_result", lambda *_a, **_k: None)
+    assert queue.queue_deep_self_review_task("owner:/review", force=True, chat_id=1) is None
+    assert not host.pending and "could not be queued" in notices[-1]
+
+
+EXTERNAL_CHAT = 95576155
+
+
+def _bind_external_owner():
+    from supervisor import state
+
+    state.save_state({"owner_id": 1, "owner_chat_id": 1, "owner_external_id": 4242,
+                      "owner_external_chat_id": EXTERNAL_CHAT})
+
+
+def _committed_room(root, fault):
+    """The target room's chat id; a fresh install never committed any registry."""
+    if fault == "fresh":
+        from ouroboros.contracts.chat_id_policy import project_chat_id
+
+        return project_chat_id("target")
+    return registry.create_project(root, "target")["chat_id"]
+
+
+def _registry_fault(root, fault):
+    """After its first commit the registry becomes unreadable (torn) or absent (missing)."""
+    path = registry._registry_path(root)
+    if fault == "torn":
+        path.write_text("{torn")
+    elif fault == "missing":
+        path.unlink()
+
+
+def _sender_chat(sender, room_chat):
+    return {"project_room": room_chat, "external_owner": EXTERNAL_CHAT}.get(sender, EXTERNAL_CHAT + 1)
+
+
+def owner_turn(root, monkeypatch, chat_id, source):
+    """One owner message through the real bridge ingress: (direct Main turns, routing receipts)."""
+    import server
+    from tests.test_project_routing_v664 import _ctx, _ImmediateThread
+
+    direct, receipts = [], []
+    ctx = _ctx(root, direct=lambda *_a, **_k: direct.append(True))
+    monkeypatch.setattr("ouroboros.server_owner_routing.threading", SimpleNamespace(Thread=_ImmediateThread))
+
+    class Bridge:
+        def get_updates(self, **_kwargs):
+            return [{"update_id": 1, "message": {"chat": {"id": chat_id}, "from": {"id": 4242},
+                "text": "Continue with Main", "source": source, "client_message_id": "external"}}]
+
+        def send_routing_ack(self, *_args, **kwargs):
+            receipts.append(kwargs)
+
+        def broadcast(self, _payload):
+            pass
+    monkeypatch.setattr("supervisor.message_bus.log_chat", lambda *_a, **_k: None)
+    server._process_bridge_updates(Bridge(), 0, ctx)
+    return direct, receipts
+
+
+@pytest.mark.parametrize("fault", ["torn", "missing", "fresh"])
+@pytest.mark.parametrize("sender", ["external_owner", "unbound_external", "project_room"])
+def test_external_owner_main_dialogue_survives_registry_fault(tmp_path, monkeypatch, sender, fault):
+    from supervisor import state
+
+    state.init(tmp_path)
+    chat_id = _sender_chat(sender, _committed_room(tmp_path, fault))
+    _bind_external_owner()
+    _registry_fault(tmp_path, fault)
+    direct, receipts = owner_turn(tmp_path, monkeypatch, chat_id,
+                                  "web" if sender == "project_room" else "skill:telegram")
+    # Only a fresh install's absence is positive: no Project room was ever committed.
+    main = sender == "external_owner" or fault == "fresh"
+    assert direct == ([True] if main else [])
+    if not main:
+        assert receipts[-1]["status"] == "project_unavailable"
+
+
+@pytest.mark.parametrize("fault", ["torn", "missing", "fresh"])
+@pytest.mark.parametrize("sender", ["external_owner", "unbound_external", "project_room"])
+def test_external_owner_steers_despite_registry_fault(host, monkeypatch, sender, fault):  # noqa: F811
+    from ouroboros.owner_mailbox import drain_owner_messages
+    from ouroboros.tools.control import _steer_task
+    from tests.test_steer_relay import _live_tool_ctx, _supervisor_ctx
+
+    chat_id = _sender_chat(sender, _committed_room(host.root, fault))
+    _bind_external_owner()
+    ctx = _supervisor_ctx(host.root, [])
+    ctx.RUNNING["t-target"]["task"]["chat_id"] = 7
+    issuer = _live_tool_ctx(host.root, ctx, [], task_id="owner-turn", metadata={
+        "client_message_id": "steer", "origin_message_text": "Continue original task"})
+    issuer.current_chat_id = chat_id
+    issuer.task_metadata["origin_message_ref"]["chat_id"] = chat_id
+    _registry_fault(host.root, fault)
+    _steer_task(issuer, "t-target", "Continue original task")
+    delivered = drain_owner_messages(host.root, "t-target")
+    allowed = sender == "external_owner" or fault == "fresh"
+    assert delivered == (["Continue original task"] if allowed else [])

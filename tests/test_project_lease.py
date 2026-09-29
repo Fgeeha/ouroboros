@@ -3,6 +3,8 @@
 from __future__ import annotations
 import pathlib
 
+import pytest
+
 from ouroboros.contracts.chat_id_policy import (
     PROJECT_CHAT_ID_MIN,
     WEB_UI_CHAT_ID,
@@ -264,15 +266,20 @@ def test_reconcile_leaves_a_tombstoned_workspace_store_tombstoned(tmp_path):
     assert reserved == {_TOMB_ID: PROJECT_TOMBSTONED}
 
 
-def test_reconcile_recovers_a_marked_real_room_with_its_name(tmp_path):
+@pytest.mark.parametrize("witnessed", [False, True])
+def test_reconcile_recovers_a_marked_real_room_with_its_name(tmp_path, witnessed):
     """The recovery case the binding gate alone cannot cover: a REAL room named in
     Cyrillic hashes into the same proj_<hash> namespace as workspace stores (its id
     carries no binding when the owner created it by name). Once a reconcile tick has
     stamped the store's `.project.json`, losing the registry row is recoverable WITH
     the room's display name — better than the pre-guard behavior, which resurrected
-    it under the machine name."""
+    it under the machine name. Beside its commit witness the lost registry is
+    unavailable authority instead: reconcile rebuilds nothing, and the marker waits
+    for the committed file to return."""
     from ouroboros.project_facts import project_id_from_display_name
-    from ouroboros.projects_registry import create_project, list_projects, reconcile_projects
+    from ouroboros.projects_registry import (
+        _registry_witness_path, create_project, list_projects, reconcile_projects,
+    )
 
     pid = project_id_from_display_name("динозавры")
     assert pid.startswith("proj_")
@@ -283,7 +290,16 @@ def test_reconcile_recovers_a_marked_real_room_with_its_name(tmp_path):
     assert (tmp_path / "projects" / pid / ".project.json").is_file()
 
     # Registry catastrophe: the rows are lost wholesale.
+    committed = (tmp_path / "state" / "projects.json").read_bytes()
     (tmp_path / "state" / "projects.json").unlink()
+    if witnessed:
+        assert reconcile_projects(tmp_path) == 0
+        assert not (tmp_path / "state" / "projects.json").exists()
+        assert (tmp_path / "projects" / pid / ".project.json").is_file()
+        (tmp_path / "state" / "projects.json").write_bytes(committed)
+        assert [p["name"] for p in list_projects(tmp_path)] == ["динозавры"]
+        return
+    _registry_witness_path(tmp_path).unlink()  # a loss before any witness stamp
 
     assert reconcile_projects(tmp_path) == 1
     rows = list_projects(tmp_path)

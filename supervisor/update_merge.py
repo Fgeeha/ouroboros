@@ -575,33 +575,45 @@ def ensure_assisted_resolver_ready(expected_sha: str, timeout_sec: float = 90.0)
 def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
     """Enqueue (front) the single authorized resolution task for an assisted merge and start a
     worker for it. Used by both the apply orchestration and boot recovery so the objective +
-    structured metadata stay in one place. Returns the task id."""
+    structured metadata stay in one place. Returns the task id only while a queue row or the
+    running resolver holds it; ``""`` is a logged typed refusal, never a claimed start.
+
+    A first admission (scheduled receipt, dispatch ``none``) needs positive proof: no durable
+    result AND a transaction whose ``resolver_submitted_id`` (``""`` from the apply, written
+    ahead of every first admission, reset when that admission is provably refused) never named
+    this id. A READABLE non-terminal result is the managed resume of the same id as possibly
+    dispatched. A result unreadable, or missing after that submission (deleted, or quarantined
+    by a fail-soft reader) or on a transaction too old to say, is unknown dispatch: never
+    replayed, whether a queue row already holds the id (it keeps the existing restore hold) or
+    not; the transaction waits for the next boot."""
     from supervisor import workers
-    from supervisor.queue import _queue_lock, enqueue_task
+    from supervisor.queue import _queue_lock, enqueue_task, enqueue_with_admission_receipt
     from supervisor.update_merge_policy import assisted_objective
 
     task_id = str(tx.get("task_id") or "")
     prior_terminal_status = ""
+    never_scheduled = False  # proven first admission of this id
+    unknown = ""  # why this id may already have run: no receipt, no replay
     if task_id and task_id not in workers.RUNNING:
         try:
             from ouroboros.task_results import _TRULY_TERMINAL_STATUSES, load_task_result
 
-            prior = load_task_result(_g.DRIVE_ROOT, task_id) or {}
+            # Strict: a fail-soft read quarantines a malformed prior, then reports absence.
+            prior = load_task_result(_g.DRIVE_ROOT, task_id, strict=True) or {}
+            submitted = tx.get("resolver_submitted_id")  # None: a transaction too old to say
+            never_scheduled = not prior and submitted is not None and str(submitted) != task_id
+            unknown = "task_result_missing" if not prior and not never_scheduled else ""
             if str(prior.get("status") or "") in _TRULY_TERMINAL_STATUSES:
                 prior_terminal_status = str(prior.get("status") or "")
         except Exception:
-            # Fail-open to the historical behavior: an unreadable ledger must
-            # not block the resume that used to work without this check.
-            prior_terminal_status = ""
+            _g.log.warning("assisted resolver %s: prior result unreadable", task_id, exc_info=True)
+            unknown = "task_result_unreadable"
     if prior_terminal_status:
-        # Boot-resume after a shutdown that already settled the recorded
-        # resolver terminally (e.g. SIGTERM wrote a durable "cancelled"):
-        # re-enqueueing the OLD id is silently dropped pre-assignment by
-        # ``_drop_cancelled_pending`` (its durable result is terminal), leaving
-        # the tx wedged in assisted_resolution with no resolver task and no
-        # orphan watchdog (which only arms on task_done). Mint a FRESH task id
-        # and move the tx's recorded id to it. Paid-review-cycle ceiling
-        # continuity: the ORIGINAL resolver id — the root the ledger already
+        # Boot-resume after a shutdown that already settled the recorded resolver
+        # terminally (e.g. SIGTERM wrote a durable "cancelled"): re-enqueueing the OLD
+        # id is dropped pre-assignment by ``_drop_cancelled_pending``, wedging the tx
+        # with no resolver and no orphan watchdog (which only arms on task_done). Mint
+        # a FRESH id; the ORIGINAL id — the root the paid-review-cycle ledger already
         # charged — is pinned once and threaded into the task metadata below.
         import uuid
 
@@ -609,12 +621,9 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
         tx.setdefault("original_root_task_id", task_id)
         tx["task_id"] = fresh_id
         write_update_tx(tx)
-        _log_supervisor({
-            "type": "managed_update_assisted_reenqueued_fresh",
-            "task_old": task_id,
-            "task_new": fresh_id,
-            "prior_status": prior_terminal_status,
-        })
+        never_scheduled = True
+        _log_supervisor({"type": "managed_update_assisted_reenqueued_fresh", "task_old": task_id,
+                         "task_new": fresh_id, "prior_status": prior_terminal_status})
         task_id = fresh_id
     task = {
         "id": task_id,
@@ -622,11 +631,9 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
         "type": "task",
         "chat_id": int(tx.get("owner_chat_id") or 0),
         "metadata": {
-            # Root continuity for the paid-review-cycle ceiling
-            # (``commit_gate.resolve_root_task_id`` honors this key first): the
-            # first enqueue pins the resolver's own id (same value the gate
-            # would derive), a fresh-id re-enqueue pins the ORIGINAL id so the
-            # money ceiling never resets across resume chains of one update.
+            # Root continuity for the paid-review-cycle ceiling (``commit_gate.resolve_root_task_id``
+            # honors this key first): the resolver's own id, or after a fresh-id re-enqueue the
+            # ORIGINAL id, so the money ceiling never resets across resume chains of one update.
             "root_task_id": str(tx.get("original_root_task_id") or task_id),
             "managed_update": {
                 "target_sha": str(tx.get("target_sha") or ""),
@@ -645,22 +652,47 @@ def enqueue_assisted_resolution_task(tx: Dict[str, Any]) -> str:
     except Exception:
         _g.log.warning("enqueue_assisted_resolution_task: worker pool start failed", exc_info=True)
         return ""
+    refusal = ""
     with _queue_lock:
-        pending = next(
-            (
-                candidate
-                for candidate in workers.PENDING
-                if str(candidate.get("id") or "") == task_id
-            ),
-            None,
-        )
+        pending = next((row for row in workers.PENDING if str(row.get("id") or "") == task_id), None)
         if pending is not None:
             # Older updater versions could persist this task without the host-bound
             # authorization metadata. Refresh the durable queue row from the active
-            # transaction instead of leaving boot recovery permanently gated.
+            # transaction instead of leaving boot recovery permanently gated. A restored
+            # row whose dispatch is unknown keeps (or takes) the restore hold: no replay.
             pending.update(task)
+            if unknown:
+                if not pending.get("_project_admission_restore_hold"):  # a snapshot row carries None
+                    pending["_project_admission_restore_hold"] = {
+                        "reason": "project_routing_fence_lookup_failed",
+                        "detail": "The resolver may already have run; automatic recovery is not authorized."}
+                refusal = unknown
         elif task_id not in workers.RUNNING:
-            enqueue_task(task, front=True)
+            # A first admission records its submission ahead in the transaction, then takes
+            # the receipt hold release reads (a failed write keeps it receipt-less); a
+            # readable existing result is resumed as possibly dispatched with no receipt.
+            admitted: Any = {"_admission_blocked": unknown} if unknown else None
+            if admitted is None and never_scheduled:
+                try:
+                    write_update_tx({**tx, "resolver_submitted_id": task_id})
+                    tx["resolver_submitted_id"] = task_id
+                except Exception:
+                    _g.log.warning("assisted resolver %s: submission unrecorded", task_id, exc_info=True)
+                    admitted = {"_admission_blocked": "update_tx_unwritable"}
+                else:
+                    admitted = enqueue_with_admission_receipt(task, receipt_required=False, front=True)
+                    if isinstance(admitted, dict) and admitted.get("_admission_blocked"):
+                        try:  # a proven refusal appended nothing: the id stays unsubmitted
+                            write_update_tx({**tx, "resolver_submitted_id": ""})
+                            tx["resolver_submitted_id"] = ""
+                        except Exception:  # kept: the next attempt refuses it as unknown
+                            _g.log.warning("assisted resolver %s: refusal unrecorded", task_id, exc_info=True)
+            elif admitted is None:
+                admitted = enqueue_task({**task, "admitted_dispatch": "possible"}, front=True)
+            refusal = str(admitted.get("_admission_blocked") or "") if isinstance(admitted, dict) else "refused"
+    if refusal:
+        _log_supervisor({"type": "managed_update_assisted_resolver_unadmitted", "task_id": task_id, "reason": refusal})
+        return ""
     return task_id
 
 
@@ -944,11 +976,11 @@ def _recover_assisted_on_boot(tx: Dict[str, Any], supervisor_ready: bool) -> Dic
         tx["phase"] = "assisted_resolution"
         tx["resolution_attempts"] = attempts
         write_update_tx(tx)
-        enqueue_assisted_resolution_task(tx)
-        _log_supervisor({"type": "managed_update_assisted_resumed",
+        resumed = bool(enqueue_assisted_resolution_task(tx))  # unadmitted: tx waits for the next boot
+        _log_supervisor({"type": "managed_update_assisted_resumed" if resumed else "managed_update_assisted_resume_unadmitted",
                          "resolution_attempts": attempts, "preserved_progress": has_progress,
                          **({"progress_rescue_error": rescue_info["error"]} if rescue_info.get("error") else {})})
-        return {"finalized": False, "resumed": True, "resolution_attempts": attempts}
+        return {"finalized": False, "resumed": resumed, "resolution_attempts": attempts}
     # unknown: do not touch the tree; leave the tx for the owner / a later boot.
     _log_supervisor({"type": "managed_update_assisted_unknown_state"})
     return {"finalized": False, "reason": "unknown_assisted_state"}

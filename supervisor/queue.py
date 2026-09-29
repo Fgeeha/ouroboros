@@ -121,7 +121,7 @@ ADMISSION_RESERVATIONS: Dict[str, str] = {}
 # Guards PENDING/RUNNING mutations across main loop, direct chat, watchdog.
 _queue_lock = threading.RLock()
 from supervisor.task_admission import (  # noqa: E402,F401 - public queue API
-    coerce_queue_order, prefer_terminalization_retry_rows,
+    coerce_queue_order, enqueue_with_admission_receipt, prefer_terminalization_retry_rows,
     reject_invalid_task_depth, release_task_admission, restore_invalid_depth_admission,
     restore_terminalization_retry, restore_terminalization_retry_rows,
     reserve_task_admission,
@@ -199,10 +199,8 @@ def enqueue_task(
     # lock so a contended ledger never stalls every queue reader; only the live-root
     # count and the append must be one transaction with the lock (the window gates
     # starts — a window stale by milliseconds changes nothing).
-    if consciousness_window is None and not restoring_snapshot and _consciousness_root(t):
-        from ouroboros.consciousness_allowance import allowance_window
-
-        consciousness_window = allowance_window(DRIVE_ROOT)
+    if consciousness_window is None and not restoring_snapshot:
+        consciousness_window = consciousness_admission_window(t)
     project_id = str(t.get("project_id") or "").strip()
     # The host preparation basis survives queue snapshots and retries. Legacy
     # tasks lacking one are checked against current authority without claiming
@@ -297,6 +295,7 @@ def enqueue_task(
         t["queued_at"] = utc_now_iso()
         if admission_token:
             t["_admission_owner_token"] = admission_token
+        from ouroboros.project_admission import host_unscoped
         from ouroboros.projects_registry import (
             ProjectAdmissionError, project_admission_guard, project_admission_view,
             task_project_membership, validate_project_admission,
@@ -306,7 +305,13 @@ def enqueue_task(
             if has_project_admission:
                 validate_project_admission(project_admission)
             if project_admission is None or project_admission["project"] is None:
+                unscoped = restoring_snapshot and host_unscoped(t)
                 project_id, known_room = task_project_membership(DRIVE_ROOT, t)
+                if project_id and unscoped:
+                    # Host-attested absence is the admitted scope: a later binding
+                    # never retargets it (hold release applies the same rule).
+                    raise ProjectAdmissionError("project_routing_fence_changed",
+                                                "The task's original unscoped assignment changed.")
                 if project_id:
                     t["project_id"] = project_id
                     if project_admission is None:
@@ -372,6 +377,15 @@ def live_consciousness_root_count() -> int:
 def _consciousness_root(task: Dict[str, Any]) -> bool:
     return (is_consciousness_origin(task.get("metadata"))
             and str(task.get("delegation_role") or "root") == "root")
+
+
+def consciousness_admission_window(task: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """The allowance a consciousness-started root's admission reads BEFORE Q; None otherwise."""
+    if not _consciousness_root(task):
+        return None
+    from ouroboros.consciousness_allowance import allowance_window
+
+    return allowance_window(DRIVE_ROOT)
 
 
 def _consciousness_admission_block(task: Dict[str, Any], window: Optional[Dict[str, Any]] = None) -> Optional[Tuple[str, str]]:
@@ -539,7 +553,7 @@ def queue_deep_self_review_task(reason: str, model: str = "", force: bool = Fals
     if (not force) and queue_has_task_type("deep_self_review"):
         return None
     tid = uuid.uuid4().hex[:8]
-    admitted = enqueue_task({
+    admitted = enqueue_with_admission_receipt({
         "id": tid,
         "type": "deep_self_review",
         "chat_id": int(target_chat_id),
