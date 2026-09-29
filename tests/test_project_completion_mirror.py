@@ -106,10 +106,12 @@ def test_the_answer_survives_live_frame_durable_row_and_history_replay(monkeypat
         task_id="root-project", role="system", system_type="project_completion_summary",
         progress_meta={"project_id": "launch", "project_name": "Launch",
                        "target_label": "Launch › Ship release", "status": "completed",
-                       "completion_answer": ANSWER},
+                       "completion_answer": ANSWER,
+                       "terminal_time": {"v": 1, "source": "executor_terminal", "occurred_at": "2026-09-24T18:18:27Z"}},
     )
 
     live = next(frame for frame in frames if frame.get("type") == "chat")
+    assert live["terminal_time"]["occurred_at"] == "2026-09-24T18:18:27Z"
     assert live["completion_answer"] == ANSWER
     assert live["role"] == "system"   # the wire voice is unchanged: one ending, one ring
 
@@ -129,6 +131,7 @@ def test_the_answer_survives_live_frame_durable_row_and_history_replay(monkeypat
     # normalisation of lifecycle rows applies to `text` only.
     assert replayed["completion_answer"] == ANSWER
     assert replayed["text"] == stored["text"]
+    assert replayed["terminal_time"] == stored["terminal_time"] == live["terminal_time"]
 
 
 def test_a_row_without_the_key_replays_without_it(monkeypatch, tmp_path):

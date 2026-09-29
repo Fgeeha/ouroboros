@@ -1278,11 +1278,25 @@ body.resizing-panels { user-select: none; }
     outline: 2px solid var(--focus-accent-border);
     outline-offset: 2px;
 }
+.msg-provenance {
+    font-size: var(--type-meta);
+    color: var(--text-meta);
+    margin-top: var(--space-2);
+}
 .chat-load-older-note {
     font-size: var(--type-meta);
     color: var(--text-meta);
     text-align: center;
     max-width: 460px;
+}
+.chat-history-status {
+    grid-column: 1 / -1;
+    flex: 0 0 100%;
+    order: 1;
+    max-width: none;
+    text-align: left;
+    overflow-wrap: anywhere;
+    background: var(--bg-primary);
 }
 
 .typing-bubble { opacity: 0.7; }
@@ -7469,7 +7483,6 @@ textarea.chat-input {
     white-space: nowrap;
     text-overflow: ellipsis;
 }
-.project-work-coverage { font-size: var(--type-meta); color: var(--text-meta); }
 /* Compact horizontal spacing leaves room for wider native system-font metrics. */
 .chat-panel-statusbar { flex-wrap: wrap; gap: var(--space-2) var(--space-1); }
 .chat-live-executor-chip { max-width: 100%; white-space: normal; }

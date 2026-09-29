@@ -521,19 +521,67 @@ contract remains a documented exception, not a pattern for new notices.
   facts, not a claim that their union is the current actor. Missing identity
   stays unconfirmed; marks and configured routes never manufacture execution.
 
+A completion notice distinguishes the task's recorded end from the time the
+notification was added. Both dates are absolute local dates outside the answer's
+copyable body. Unknown historical end time says so explicitly. Inside the room,
+the task card's saved end line keeps its notification time and adds the same
+note whenever the recorded end falls in another minute or is unknown; minutes
+are compared as instants, and two that read alike on the local clock (a repeated
+daylight-saving hour) carry zone names. Lines saved before the host recorded end
+times stay as they were. Delivery keeps its present place in Main; an older
+Failed remains that task's result even after a different task succeeds.
+
 ### History edges
 
-A paged transcript loads older portions automatically at the reading edge and
-keeps a keyboard-reachable `Load older messages` button that retries the same
-portion when reading fails. A short or empty portion never claims the beginning
-of the archive; only the source reader establishes that boundary, and an empty
-portion is never a reading position. Distant portions may leave the rendered
-window and return quietly as the reader nears the live edge. There is no
-`load newer` control: the one explicit return to the present is the floating
-`Scroll to latest message` button. An edge control states a fact about the
-rendered transcript, never about an internal cache or cursor. The visible
-passage, selected text, focused control and expanded Reviews retain their
-actual nodes.
+Within one app session a room reopens at the passage being read after its data
+arrives, even on a slow connection; the place is kept in page memory, so a reload
+opens the room at the present. The passage includes how far a bounded full output,
+Review detail or card timeline around it was scrolled. A failed history read
+keeps that destination and offers Retry; a failed read of the present by ↓
+leaves the view in place with the same Retry. A room kept for an unsent file
+reopens where it was left without another read, even after a partial one. A
+failed full-output read keeps the line's capped preview and offers no Retry of
+its own; collapsing and expanding the line asks again. Scrolling, revealing a
+question, sending a message or choosing the existing ↓ supersedes the saved
+destination; a Send that fails keeps it with the draft and files. Reading on,
+even inside a bounded box, supersedes a ↓ or question still loading. A wheel,
+swipe or key over a bounded box moves that box, not the conversation, until the
+box reaches its edge.
+A scrollbar drag follows new replies only when released at the live edge.
+Expanding a line or receiving its full output leaves it in place; only a newer
+line moves a card timeline to its end.
+New replies remain below in the same live conversation without moving the passage.
+
+The common `Load more history` control retries a failed read, fills a known
+missing continuation toward the present, then reads older portions. A positive
+scroll gesture at an unambiguous reading edge may load a bounded continuation;
+a short portion, resize or media layout alone starts no archive read. Empty
+physical pages are traversable and never mean EOF. The existing floating
+`Scroll to latest message` remains the explicit return to the present; when the
+present is already loaded it moves there and follows without a read, and a gap
+note stays. A clean read of the present supersedes an earlier failed one and its
+note.
+
+When loaded fragments are disconnected or their coverage is uncertain, the
+same readable note stays in Main and Project header chrome: `Some saved history
+is not loaded. Shown messages may have gaps.` A failed read says so distinctly.
+Bytes written after a read found a source empty count as missing until a
+later read delivers them from its start.
+Mixed task cards
+keep one node and use this general note: dates, common
+row IDs and an exhausted cursor cannot establish a separator or full coverage.
+`Beginning of saved history` requires complete delivered physical coverage.
+Retained origins say `Saved project context`; a matching canonical source row
+adopts that node and removes the label. The context itself certifies no archive
+coverage. A missing exact bookmark falls back to its card, then a row on the
+same loaded page, then the previous clamped position. The same persistent note
+explains the approximation until explicit navigation clears it.
+Visible rows and card lines, selection, focus and expanded Reviews keep their
+actual nodes during reconciliation.
+Reopening a nested line reads that line's supplying physical page before using a
+card-wide fallback, and restores expansion and full-output hydration. Its logical
+reading identity and physical source survive replay even when equal or older
+content is rejected; neither source adoption nor reopening rolls back revisions.
 
 ### Project work pointer
 
@@ -542,12 +590,10 @@ leads to an unfinished represented root, or the latest represented root when all
 are finished. It occupies one line: it names the card (its coined name, else its
 title) and ellipsizes rather than restating a status headline in full, so the status bar
 never grows into the reading area; the complete text stays on the card itself,
-one click away, not in a mouse-only tooltip. A default desktop panel keeps the
-pointer, the coverage note and the status pill on one row while the pill is
-short (Online, Working, Thinking, Sending, Queued); a longer pill, a narrower
-panel or a phone wraps the bar to a second row, never a third. It states `Loaded messages only`
-unless history coverage is complete; without a represented card the pointer and
-that note are hidden, which is not a claim that the Project has no work.
+one click away, not in a mouse-only tooltip. The pointer and status pill share the
+bar; the common history note wraps below them when needed, readable on touch
+screens. Without a represented card the pointer is hidden; uncertainty, failure
+and approximation remain visible through the shared history status.
 Navigation moves the conversation to the existing card without changing the next
 message's recipient, opening another work pane or manufacturing activity.
 
