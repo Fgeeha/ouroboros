@@ -187,7 +187,7 @@ class TestAliasProducerFanOutSweep:
         ("ouroboros/usage_accounting.py", "cost_usd", "record_subscription_session"): ("ledger subscription session row", 1),
         ("ouroboros/usage_accounting.py", "cost_usd", "terminalize_abandoned_attempt"): ("ledger settlement transition", 1),
         ("ouroboros/usage_accounting.py", "cost_usd", "_settlement_fields"): ("ledger settlement fields shared by received and abandoned attempts", 1),
-        ("ouroboros/server_maintenance.py", "cost_usd", "_reconcile_abandoned_usage"): ("existing ledger settlement call for the original recovered model operation", 1),
+        ("ouroboros/terminal_cost_reconciliation.py", "cost_usd", "reconcile_abandoned_usage"): ("existing ledger settlement call for the original recovered model operation", 1),
         ("ouroboros/usage_accounting.py", "cost_usd", "_terminalize_failed_attempt"): ("ledger settlement transitions + settle call for a rejected stream whose usage frame was read", 3),
         ("ouroboros/usage_accounting.py", "cost_usd", "_account_response"): ("ledger settlement call shared by sync and async received responses", 1),
         ("ouroboros/usage_legacy_import.py", "cost_usd", "_ensure_legacy_imported_locked"): ("legacy usage.json ledger import rows", 2),
