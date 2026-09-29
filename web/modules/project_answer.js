@@ -9,6 +9,7 @@
  */
 import { createSystemMessageActions } from './ui_helpers.js';
 import { projectReference } from './project_reference.js';
+import { terminalTimeNote } from './utils.js';
 
 // The fade says "there is more": it appears only when the fold really hides text. The clamp
 // itself is unconditional CSS, so toggling the class never moves layout. A row mounted while
@@ -42,7 +43,7 @@ function watchFolds() {
     window.addEventListener('resize', refreshFoldsSoon);
 }
 
-export function decorateProjectRow(bubble, { role = 'system', projectId = '', projectName = '' } = {}) {
+export function decorateProjectRow(bubble, { role = 'system', projectId = '', projectName = '', terminalTime, addedAt, completion = false } = {}) {
     if (!bubble || !projectId) return null;
     if (role === 'assistant') {
         bubble.classList.add('project-answer');
@@ -51,5 +52,30 @@ export function decorateProjectRow(bubble, { role = 'system', projectId = '', pr
     }
     const actions = createSystemMessageActions(projectReference({ id: projectId, name: projectName }));
     bubble.querySelector('.message')?.after(actions);
+    if (completion) {
+        const note = bubble.ownerDocument.createElement('div');
+        note.className = 'msg-provenance';
+        note.textContent = terminalTimeNote(terminalTime, addedAt);
+        bubble.insertBefore(note, actions);
+    }
     return actions;
+}
+
+/** Kept beside the authored body; adoption never replaces the selected text. */
+export function syncSavedProjectContext(bubble, projected, originId = '') {
+    if (bubble && originId) bubble.dataset.originId = originId;
+    if (!bubble || (projected && bubble.dataset.historyId)) return false;
+    const prior = bubble.querySelector('.saved-project-context');
+    if (!projected) {
+        if (!prior) return false;
+        prior.remove(); delete bubble.dataset.originProjected;
+        return true;
+    }
+    if (prior) return false;
+    const note = bubble.ownerDocument.createElement('div');
+    note.className = 'msg-provenance saved-project-context';
+    note.textContent = 'Saved project context — original request retained here; surrounding history may still need loading.';
+    bubble.insertBefore(note, bubble.querySelector('.message')?.nextSibling || null);
+    bubble.dataset.originProjected = '1';
+    return true;
 }

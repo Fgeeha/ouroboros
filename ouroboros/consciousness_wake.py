@@ -425,8 +425,8 @@ def _transition_facts(row: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
     quizzes = row.get("owner_quiz") if isinstance(row.get("owner_quiz"), dict) else {}
     if status in SETTLED_STATUSES:
         attempt = hashlib.sha256(json.dumps(_attempt(row), sort_keys=True, default=str).encode("utf-8")).hexdigest()
-        proven = [_parse_iso(record[key]) for holder, key in (("canonical_terminal_projection_ready", "task_done_ts"),
-                                                               ("canonical_terminal_projection", "written_at"))
+        proven = [_parse_iso(record[key]) for holder, key in (("canonical_terminal_projection", "written_at"),
+                                                               ("canonical_terminal_projection_ready", "task_done_ts"))
                   if isinstance(record := row.get(holder), dict) and record.get(key)]
         proven = [stamp for stamp in proven if stamp is not None]
         facts[f"terminal:{task_id}:{status}:{attempt[:16]}"] = {

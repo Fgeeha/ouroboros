@@ -249,7 +249,9 @@ def test_reassignment_after_preparation_serves_no_prepared_bytes_or_rows(tmp_pat
 
     def plan_then_new_attempt(*args, **kwargs):
         plan = real_plan(*args, **kwargs)
-        write_task_result(data, TASK, "cancelled", started_at="2099-01-01T00:00:00+00:00")  # a new attempt basis
+        # Reassignment changes custody's drive witness; ordinary terminal
+        # enrichment cannot invent a new attempt by replacing started_at.
+        write_task_result(data, TASK, "cancelled", child_drive_root=str(tmp_path / "reassigned"))
         return plan
 
     monkeypatch.setattr(task_custody, "_child_store_plan", plan_then_new_attempt)

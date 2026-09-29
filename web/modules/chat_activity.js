@@ -113,7 +113,8 @@ export function buildTimelineItemHtml(item, record) {
         <div
             class="chat-live-line ${item.phase || 'working'}${expandable ? ' expandable' : ''}"
             data-live-line-key="${escapeHtmlAttr(item.lineKey || '')}"
-            ${item.historyId ? `data-history-id="${escapeHtmlAttr(item.historyId)}"` : ''}
+            ${item.historyId ? `data-history-id="${escapeHtmlAttr(item.historyId)}"`
+        : item.sourceHistoryId ? `data-source-history-id="${escapeHtmlAttr(item.sourceHistoryId)}"` : ''}
             data-expanded="${expanded ? '1' : '0'}"
         >
             ${headHtml}
