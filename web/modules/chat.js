@@ -2698,6 +2698,8 @@ export function createChatInstance({
             const armedAtStart = liveCardBound.begin();
             const cardsAtStart = new Set(liveCardRecords.keys());
             try {
+                // No welcome until this read lands.
+                emptyWelcome?.historyPending();
                 // An empty feed shows the read in flight (#1102); a painted one is left alone.
                 if (historyControls.beginRecent()) syncLoadOlderControl();
                 const data = await fetchHistory(null);

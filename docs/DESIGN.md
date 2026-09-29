@@ -467,9 +467,12 @@ Main's empty-chat greeting speaks in neither voice: it is host copy in a quiet
 `.chat-empty-welcome` placeholder (a `Welcome` label over one sentence), never a
 bubble, a history row or a model reply (`web/modules/welcome_preference.js`). It
 appears only after a successful recent history read whose own window reports
-complete coverage, over a feed with no message or task card; a failed or partial
-read retracts it, history loading and failure chrome still show over it, and it
-leaves with the first message or task card. Project rooms never show it.
+complete coverage, over a feed with no message or task card (the typing indicator
+and the ephemeral reconnect notice are chrome, by the same rule that gives an empty
+feed its history loading state). Every later read withdraws it while in flight, so
+that loading state, then any failure, shows instead; only a complete answer brings
+it back, and it leaves with the first message or task card. Project rooms never
+show it.
 
 The sentence is a hidden install-wide preference with no Settings control: the
 `welcome` key of `state/ui_preferences.json` under the data root

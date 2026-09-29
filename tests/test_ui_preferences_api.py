@@ -175,6 +175,41 @@ def test_hand_edited_welcome_is_read_without_disturbing_other_keys(tmp_path):
         assert stored["welcome"] == {"mode": "default", "text": ""} and stored["nested_subagents_expanded"] is True
 
 
+def test_welcome_text_with_a_lone_surrogate_is_refused_and_read_as_default(tmp_path):
+    """JSON's "\\ud800" escape parses to a str UTF-8 cannot encode; it never reaches a response or the file."""
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    path = tmp_path / "state" / "ui_preferences.json"
+    path.parent.mkdir(parents=True)
+    lone = {"mode": "custom", "text": "Hello \ud800 there"}
+    # json.dumps escapes non-ASCII, so the file carries the astral emoji as a "🌅" pair.
+    normal = {"mode": "custom", "text": "Доброе утро 🌅 中文"}
+    with TestClient(app) as client:
+        path.write_text(json.dumps({"sidebar_width": 300, "welcome": normal}), encoding="utf-8")
+        assert client.get("/api/ui/preferences").json()["welcome"] == normal
+        response = client.post("/api/ui/preferences", json={"welcome": normal})
+        assert response.status_code == 200 and response.json()["welcome"] == normal
+        stored = path.read_bytes()
+        response = client.post("/api/ui/preferences", content=json.dumps({"welcome": lone}),
+                               headers={"Content-Type": "application/json"})
+        assert response.status_code == 400
+        assert response.json()["error"] == "welcome text must be valid Unicode"
+        assert path.read_bytes() == stored
+        # A hand edit carrying one reads as the default without costing the other keys,
+        # and an unrelated write succeeds and stores the default.
+        path.write_text(json.dumps({"sidebar_width": 300, "welcome": lone}), encoding="utf-8")
+        prefs = client.get("/api/ui/preferences").json()
+        assert prefs["welcome"] == {"mode": "default", "text": ""} and prefs["sidebar_width"] == 300
+        response = client.post("/api/ui/preferences", json={"nested_subagents_expanded": True})
+        assert response.status_code == 200, response.text
+        assert response.json()["sidebar_width"] == 300
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert stored["welcome"] == {"mode": "default", "text": ""}
+        assert stored["sidebar_width"] == 300 and stored["nested_subagents_expanded"] is True
+
+
 def test_ui_preferences_concurrent_paint_acks_are_monotonic(tmp_path):
     from ouroboros.gateway.ui_preferences import api_ui_preferences_post
     from ouroboros.projects_registry import create_project, increment_project_visible_revision

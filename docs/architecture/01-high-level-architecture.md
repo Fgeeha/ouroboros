@@ -662,7 +662,7 @@ Bundled resources use the CLI / Headless Boundary lookup order rather than assum
 │   │   ├── update_letter.json     ← the last update letter (key = base/target/channel/ref, state, text, `last_good`); kept after apply and projected against the live HEAD (update_letter.py)
 │   │   ├── projects.json          ← Project registry: immutable id/chat identity, working folder, lifecycle/routing fence, revision; tombstones are durable and never age-pruned
 │   │   ├── project_task_bindings.json ← schema v1 root↔Project bindings with REQUIRED typed origin; one-way enrichment; tombstoning never removes a binding
-│   │   ├── ui_preferences.json    ← owner-local layout preferences + monotonic project_seen_revision ACKs
+│   │   ├── ui_preferences.json    ← owner-local layout/`welcome` prefs + monotonic project_seen_revision ACKs
 │   │   ├── cancel_intents.json    ← compact locked projection of ACTIVE cancel intents; the forensic trail is typed cancel_intent rows in logs/supervisor.jsonl, never read back (cancel_intents.py)
 │   │   ├── terminal_deliveries.json ← delivery-id dedupe, emitted-byte receipts, pending outbox (terminal_delivery.py)
 │   │   ├── extension_companions.json ← runtime snapshot of live companion processes

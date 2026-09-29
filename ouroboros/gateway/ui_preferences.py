@@ -151,8 +151,16 @@ def _normalize_preferences(
         mode, text = value["mode"], value["text"]
         if mode not in ("default", "hidden", "custom") or not isinstance(text, str):
             raise ValueError("welcome mode or text is invalid")
-        if len(text) > _MAX_WELCOME_CHARS or (mode == "custom" and not text.strip()):
-            raise ValueError("welcome custom text must be nonblank and at most 500 characters")
+        if len(text) > _MAX_WELCOME_CHARS:
+            raise ValueError("welcome text must be at most 500 characters")
+        if mode == "custom" and not text.strip():
+            raise ValueError("welcome custom text must be nonblank")
+        try:
+            # A parsed lone surrogate ("\ud800") is a str but not UTF-8: refused here,
+            # the response and the save would fail only after the merge.
+            text.encode("utf-8")
+        except UnicodeEncodeError:
+            raise ValueError("welcome text must be valid Unicode") from None
         prefs["welcome"] = {"mode": mode, "text": text}
     return prefs
 

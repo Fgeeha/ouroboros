@@ -1494,7 +1494,7 @@ body.resizing-panels { user-select: none; }
     align-self: flex-start;
     max-width: min(80%, 520px);
     min-width: 0;
-    padding: 14px 16px;
+    padding: var(--space-3) var(--space-4);
     border: 1px solid var(--surface-border);
     border-radius: var(--radius-lg);
     background: var(--bg-hover);
@@ -1506,7 +1506,7 @@ body.resizing-panels { user-select: none; }
     font-weight: 600;
 }
 .chat-empty-welcome p {
-    margin: 6px 0 0;
+    margin: var(--space-1) 0 0;
     color: var(--text-primary);
     font-size: var(--type-section);
     white-space: pre-wrap;

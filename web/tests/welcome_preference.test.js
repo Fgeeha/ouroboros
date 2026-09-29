@@ -54,6 +54,12 @@ test('the Main empty state needs a complete successful read and an empty feed', 
         assert.equal(shown().lastElementChild.innerHTML, '&lt;b&gt;x&lt;/b&gt;\nnext', 'owner copy stays text');
         messages.appendChild(node('chat-bubble system', { ephemeral: '1' })); mutated();
         assert.ok(shown(), 'the reconnect notice is chrome, not conversation');
+        welcome.historyPending();
+        assert.equal(shown(), undefined, 'a read in flight vouches for nothing, over a reconnect notice too');
+        welcome.setPreference({ mode: 'custom', text: '<b>x</b>\nnext' });
+        assert.equal(shown(), undefined, 'a preference read does not stand in for the history read');
+        welcome.historyRead(true);
+        assert.ok(shown());
         const card = node('chat-live-card');
         messages.appendChild(card); mutated();
         assert.equal(shown(), undefined, 'a visible task card is content');

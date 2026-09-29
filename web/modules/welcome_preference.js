@@ -1,3 +1,5 @@
+import { feedIsEmpty } from './chat_render_batch.js';
+
 export const DEFAULT_WELCOME_TEXT = 'Ouroboros has awakened';
 
 export function welcomeText(value) {
@@ -10,21 +12,17 @@ export function welcomeText(value) {
 // Main's empty state. Its copy is the hidden `welcome` UI preference (no Settings
 // control: docs/DESIGN.md "Chat authorship and System rows"), read when Main connects.
 // Only a successful recent read whose own window reports complete coverage can
-// confirm emptiness; a failed or partial read retracts it, and any insertion into
-// the feed or later read decides again.
+// confirm emptiness; every read in flight, failed or partial withdraws it, and any
+// insertion into the feed decides again. Chrome (the typing indicator, the reconnect
+// notice) is not content: the history loading state counts the same nodes.
 export function mountEmptyChatWelcome(messages) {
     const doc = messages.ownerDocument;
     let preference = null;
     let confirmedEmpty = false;
     let node = null;
-    // Content is a top-level bubble or visible task card; the typing indicator and
-    // the ephemeral reconnect notice are chrome, like this empty state itself.
-    const hasContent = () => Array.from(messages.children).some((child) => child !== node
-        && (child.classList.contains('chat-live-card') || (child.classList.contains('chat-bubble')
-            && !child.classList.contains('typing-bubble') && !child.dataset.ephemeral)));
     const render = () => {
         const copy = welcomeText(preference);
-        if (!confirmedEmpty || !copy || hasContent()) {
+        if (!confirmedEmpty || !copy || !feedIsEmpty(messages)) {
             node?.remove();
             node = null;
             return;
@@ -45,6 +43,8 @@ export function mountEmptyChatWelcome(messages) {
         // Called only with a successful read: before one nothing shows, and a failed
         // re-read keeps the choice already observed.
         setPreference(value) { preference = value || null; render(); },
+        // An earlier confirmation cannot vouch for a read still in flight.
+        historyPending() { confirmedEmpty = false; render(); },
         historyRead(complete) { confirmedEmpty = complete === true; render(); },
         dispose() { observer?.disconnect(); },
     };

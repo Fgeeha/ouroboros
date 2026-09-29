@@ -6,6 +6,13 @@ import { appendDelegatedItem, reconcileDelegatedItems } from './delegated_activi
 const nodePosition = node => node?.dataset?.historySource
     ? { source: node.dataset.historySource, offset: Number(node.dataset.historyOffset) } : null;
 
+// A feed holding only chrome has no conversation: the history control, the typing
+// indicator, Main's empty-state greeting and an ephemeral notice (the reconnect
+// banner). The loading state and the greeting share this one rule.
+export const feedIsEmpty = messages => Array.from(messages.children).every(node =>
+    node.classList.contains('chat-load-older') || node.classList.contains('typing-bubble')
+    || node.classList.contains('chat-empty-welcome') || node.dataset.ephemeral === '1');
+
 /**
  * History chrome only; the chat instance retains navigation and reading state.
  *
@@ -30,16 +37,13 @@ export function createHistoryControls(messagesDiv, statusHost = null) {
     // (issue #1102: an empty feed under a green header read as a dead app, and a
     // failed read looked identical to a slow one).
     let recent = null;
-    // The empty-Main greeting is chrome: a read over it still shows its state.
-    const feedIsEmpty = () => Array.from(messagesDiv.children).every(node => node === root
-        || node.classList.contains('typing-bubble') || node.classList.contains('chat-empty-welcome'));
     return {
         olderButton: button,
         // Only an EMPTY feed (or a failure already on screen) gets the loading
         // state: an ordinary refresh never puts chrome over a painted transcript.
         // Returns whether there is a state to draw, so a painted feed costs nothing.
         beginRecent() {
-            if (recent?.error || feedIsEmpty()) recent = { loading: true };
+            if (recent?.error || feedIsEmpty(messagesDiv)) recent = { loading: true };
             return Boolean(recent);
         },
         // A failure is shown where the loading state was; elsewhere the reader
@@ -53,7 +57,7 @@ export function createHistoryControls(messagesDiv, statusHost = null) {
             const changedView = error?.body?.reason_code === 'history_view_changed';
             const incomplete = coverage.gaps === true;
             let noteText = error ? 'Some saved history could not be loaded.'
-                : hydrating && feedIsEmpty() ? 'Loading saved history…'
+                : hydrating && feedIsEmpty(messagesDiv) ? 'Loading saved history…'
                 : incomplete ? 'Some saved history is not loaded. Shown messages may have gaps.'
                 : !hydrating && coverage.complete ? 'Beginning of saved history' : '';
             if (approximate) noteText += `${noteText ? ' ' : ''}Saved position could not be restored exactly.`;
