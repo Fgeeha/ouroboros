@@ -13,7 +13,7 @@ from ouroboros.cost_projection import (
     COST_ALIAS_PAIRS, COST_OPENNESS_FIELDS,
     normalize_task_result_cost_planes,
 )
-from ouroboros.utils import read_json_dict, update_json_locked, utc_now_iso
+from ouroboros.utils import read_json_dict, read_text_across_replace, update_json_locked, utc_now_iso
 # Read-side custody of a published review projection belongs with the projection
 # owner; the historical name stays resolvable through this module.
 from ouroboros.review_projection import merge_review_projection as merge_review_projection
@@ -791,7 +791,8 @@ def load_task_result(
             raise
         return None
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        # A writer's atomic replace can deny a Windows open for an instant: not unreadable.
+        data = json.loads(read_text_across_replace(path))
     except FileNotFoundError:
         return None  # This read saw absence even if a writer publishes immediately after it.
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
