@@ -80,7 +80,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── version.py           ← Version string from the VERSION file with importlib.metadata fallback
       ├── secret_masking.py    ← Exact Settings/MCP wire-placeholder emitters/recognizers + top-level secret repair before env overlay and persistence (§7)
       ├── settings_integrity.py ← Task-local in-memory settings read view and strict settings-snapshot integrity pin; `OUROBOROS_SETTINGS_SHA256` enables the trust root (§7)
-      ├── credential_shapes.py ← Credential leaf names plus physical owner credential locations (§6 Credential fence and byte masking)
+      ├── credential_shapes.py ← Credential leaf names plus physical owner credential locations (§6 Credential mutation and diagnostic redaction)
       ├── update_channels.py   ← Closed Stable/QA/Development channel mapping and update-network defaults (§8)
       ├── update_letter.py     ← The update letter: `base..target` commit material plus README history rows (only bodies and the oldest row texts are bounded, and disclosed), one accounted LIGHT-slot call, `state/update_letter.json`, one projection shared by the Updates payload and the Runtime-context `official_update` fact (§7; §3 Updates)
       ├── colab_bootstrap.py   ← Google Colab source-mode bootstrap: official update source, stable local `ouroboros` branch, Drive-backed settings/data, personal origin, no-UI server command, native Telegram setup
@@ -429,7 +429,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── tools/               ← Auto-discovered tool plugins (registry.py owns discovery; frozen module list for packaged builds)
       │   ├── registry.py      ← Tool registry SSOT: loads tool modules, exposes schemas, executes safely; owns the shell-guard/process-tool membership sets
       │   ├── core.py          ← File/data tools (read_file, write_file, list_files) + code search and digest helpers
-      │   ├── core_file_tools.py, core_secret_paths.py, core_artifacts.py ← Core-tool leaves: the read/list file tools with the shared resource-access helpers; the restricted-subagent physical read-denial policy (owner secrets/control state, data roots, repository credential locations, listing redaction); the verbs that put something in front of a human (§6 Credential fence and byte masking)
+      │   ├── core_file_tools.py, core_secret_paths.py, core_artifacts.py ← Core-tool leaves: the read/list file tools with the shared resource-access helpers; the retained delegated action-profile and runtime-control helpers; the verbs that put something in front of a human (§6 Credential mutation and diagnostic redaction)
       │   ├── shell.py         ← Process tools `run_command`/`run_script` (in-process `_active_subprocesses` tracking; §9)
       │   ├── shell_guards.py  ← Shared process-path inspection helpers and retained target extractors; process admission is owned by registry_guard_process (§6)
       │   ├── registry_core.py, registry_guards.py, registry_guard_process.py, tool_context.py ← The registry's leaves: the execution authority (load, schemas, safe dispatch); the host-owned pre-dispatch guards (capability/resource, managed-update and skill-payload constraints); process admission over the prepared target with post-execution observations (§6 Safety and runtime mode); and `ouroboros/tools/tool_context.py`, the concrete `ToolContext` + `BrowserState` (its protocol is `contracts/tool_context.py`)

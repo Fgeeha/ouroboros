@@ -99,7 +99,7 @@ Run roots are append-only outside `repo/` and live `data/`; the focused contract
   and declared process `outputs` register/copy the canonical artifact; a
   rewrite keeps the previous copy in non-manifest history with last-5
   retention — recovery, never a second deliverable list. `root=deliverables`
-  stays read/list/search-only and is never granted to children.
+  stays read/list/search-only for every actor, including children.
 - Large task files stream (`artifacts.stream_artifact_file`, atomic
   `copy_artifact_file`): never a whole dataset in a bytes object, and a read is
   rejected as soon as it exceeds the source's initial regular-file size rather
@@ -307,6 +307,10 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   `tests/test_browser_isolation.py`, `tests/test_browser_redirect_chain.py`).
 - Acting children return `workspace.patch`; only the parent commits the live body,
   applying via `integrate_subagent_patch` then its own `commit_reviewed`.
+  An isolated Git child copies the selected source's current eligible contents,
+  including uncommitted inputs; isolation alone does not make a project part of
+  the Ouroboros body. Preserve the source binding through capture, cleanup and
+  integration, and apply only the child's delta back to its source.
   `external_workspace` verifies and records without re-applying. Edit/capture text preserves external Git authority and patch-only `self_worktree`. Capture bases prove no authorship; compare via explicit `vcs_diff`. A genesis project's directory is its durable deliverable
   (until it declares a `.gitignore`, small
   text build output rides `workspace.patch`, bounded by the
