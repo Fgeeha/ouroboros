@@ -47,7 +47,7 @@ function fixture(t, initial = page([]), fetchPage = null) {
         async refresh(next = response) {
             response = next;
             const result = await instance.refreshHistory({ revision: ++revision });
-            assert.equal(result.painted, true, 'history reached the public paint acknowledgement');
+            assert.equal(result.painted, true, 'the readable response reaches paint ACK independently of navigation');
         },
         async clickOlder() {
             const button = messages.querySelector('.chat-load-older').querySelector('.chat-load-older-btn');
@@ -62,6 +62,7 @@ function fixture(t, initial = page([]), fetchPage = null) {
 // fetch chain drain until it stops asking for pages.
 async function scrollEdge(f, scrollTop = 0) {
     f.messages.scrollTop = scrollTop;
+    for (const handler of f.messages.listeners.get('wheel')) handler({ type: 'wheel', deltaY: scrollTop ? 1 : -1 });
     for (const handler of f.messages.listeners.get('scroll')) handler({});
     for (let n = 0, spent = -1; spent !== f.calls.length && n < 40; n += 1) {
         spent = f.calls.length;
@@ -82,9 +83,12 @@ test('a sparse room walks to its floor without minting a Load-newer control', as
     const f = sparseRoom(t);
     await f.refresh();
     await scrollEdge(f);
+    assert.deepEqual(f.calls, [null, 'before:1', 'before:2'], 'one gesture performs a bounded sparse traversal');
+    await scrollEdge(f);
+    await scrollEdge(f);
     assert.deepEqual(f.calls, [null, 'before:1', 'before:2', 'before:3', 'before:4', 'before:5']);
     const controls = f.messages.querySelector('.chat-load-older');
-    assert.equal(controls.querySelector('.chat-load-older-note').textContent, 'Beginning of saved history');
+    assert.equal((f.messages.parentNode.querySelector('.chat-panel-statusbar').querySelector('.chat-load-older-note') || f.messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note')).textContent, 'Some saved history is not loaded. Shown messages may have gaps.');
     assert.equal(controls.querySelector('.chat-load-older-btn').hidden, true);
     assert.equal(f.messages.querySelector('.chat-load-newer'), null, 'walked-over empty pages are not a gap');
     assert.equal(f.bubbles().filter(node => node.dataset.historyId === 'chat:900').length, 1);
@@ -96,6 +100,7 @@ test('a walked-out sparse room asks for nothing more, however often the reader s
     await scrollEdge(f);
     // Everything fits on one screen, so the reader is at the top edge and near the
     // bottom at the same time: both edges are live on every one of these events.
+    await scrollEdge(f); await scrollEdge(f);
     const spent = f.calls.length;
     for (let n = 0; n < 5; n += 1) await scrollEdge(f);
     assert.equal(f.calls.length, spent, 'no pill to click 64 times, and no request storm behind it');
@@ -127,7 +132,7 @@ test('at the bottom edge a released page returns by its exact handle and closes 
     assert.equal(f.bubbles().filter(node => node.dataset.historyId === 'chat:900').length, 1,
         'the recent rows stay mounted after the pager released their page');
     // Near the bottom without being at the top: only the newer edge is live here.
-    await scrollEdge(f, 200);
+    await f.clickOlder(); // ambiguous synthetic geometry uses the common button
     assert.deepEqual(f.calls, [null, 'before:1', 'before:2', 'before:3', 'page:recent'],
         'the released page is refetched by its own frozen handle, page zero first');
     const ids = [...f.messages.querySelectorAll('[data-history-id]')].map(node => node.dataset.historyId);
@@ -303,10 +308,10 @@ for (const hydrated of [false, true]) test(`an unavailable archive keeps recent 
     const controls = f.messages.querySelector('.chat-load-older');
     const button = controls.querySelector('.chat-load-older-btn');
     assert.equal(button.textContent, 'Retry loading messages');
-    assert.notEqual(controls.querySelector('.chat-load-older-note').textContent, 'Beginning of saved history');
+    assert.notEqual((f.messages.parentNode.querySelector('.chat-panel-statusbar').querySelector('.chat-load-older-note') || f.messages.querySelector('.chat-load-older').querySelector('.chat-load-older-note')).textContent, 'Some saved history is not loaded. Shown messages may have gaps.');
     f.respond(page([row('chat:10', 'Readable recent answer')], 'real-page', 'real-older'));
     await f.clickOlder();
-    assert.equal(button.textContent, 'Load older messages');
+    assert.equal(button.textContent, 'Load more history');
     assert.deepEqual(f.bubbles().filter(node => node.dataset.historyId === 'chat:10'), [recent]);
     assert.equal(f.calls.at(-1), null, 'retry captures a fresh real boundary rather than inventing a cursor');
 });

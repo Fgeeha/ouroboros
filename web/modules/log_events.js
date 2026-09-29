@@ -1,4 +1,4 @@
-import { accountedUpperBound, accountedUpperBoundWithChildren, formatUsd4, joinMarkdownHeadings } from './utils.js';
+import { accountedUpperBound, accountedUpperBoundWithChildren, formatUsd4, joinMarkdownHeadings, savedTerminalRowNote } from './utils.js';
 import { cancelCauseClauses } from './cancel_presentation.js';
 import { taskCheckpointLabel, checkpointHasProgressRow } from './task_checkpoints.js';
 export { taskCheckpointLabel } from './task_checkpoints.js';
@@ -1162,8 +1162,8 @@ export function taskTerminalSummary(evt = {}) {
     const knownStatus = String(record?.status || record?.outcome_axes?.lifecycle?.status || '').toLowerCase();
     const observedOutcome = OBSERVED_OUTCOME_STATUSES.has(knownStatus) ? outcome : '';
     const presentation = taskPresentation(terminal ? outcome : 'working');
-    const body = [taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : '', taskReasonDetail(evt)]
-        .filter(Boolean).join('\n');
+    const body = [taskStoppedWithSummary(evt) ? OWNER_STOP_DETAIL_MARKER : '', taskReasonDetail(evt),
+        terminal ? savedTerminalRowNote(evt) : ''].filter(Boolean).join('\n');
     const cause = terminal ? taskReasonDetail(evt) : '';
     return {
         ...chatView({

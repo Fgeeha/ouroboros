@@ -1442,7 +1442,7 @@ def log_chat(
         if "narration" in meta:
             record["narration"] = bool(meta["narration"])
         if record_type in ("project_started", "project_handoff", "project_completion_summary"):
-            for key in ("project_id", "project_name", "target_label", "status", "completion_answer", "handoff_id"):
+            for key in ("project_id", "project_name", "target_label", "status", "completion_answer", "handoff_id", "terminal_time"):
                 if key in meta:
                     record[key] = meta[key]
         if "task_terminal_status" in meta:

@@ -425,7 +425,7 @@ def _copy_child_task_result_locked(parent_drive_root: pathlib.Path, task: Dict[s
         child_result["child_status"] = child_status
 
     return _retry_child_task_refs_locked(parent_drive_root, child_drive, task_id,
-                                         replica={**child_result, "status": child_status})
+                                         replica={**child_result, "task_id": task_id, "status": child_status})
 
 
 class _GenerationClosed(Exception):
@@ -494,7 +494,8 @@ def _retry_child_task_refs_locked(parent: pathlib.Path, child: pathlib.Path, tas
             try:
                 return write_task_result(parent, task_id, source["status"],
                                          _field_projector=project, strict_existing_dict=True,
-                                         **{key: value for key, value in (replica or {}).items() if key != "status"})
+                                         _terminal_time_source=replica,
+                                         **{key: value for key, value in (replica or {}).items() if key not in {"status", "task_id"}})
             except _RefPublicationChanged:
                 continue
             except _GenerationClosed:
