@@ -325,3 +325,26 @@ def test_llm_usage_serializer_carries_web_search_sources():
     src = (pathlib.Path(__file__).resolve().parent.parent
            / "supervisor" / "events_budget.py").read_text(encoding="utf-8")
     assert "web_search_sources" in src
+
+
+def test_effort_facts_with_legacy_option_status_survive_logs_without_notices(tmp_path):
+    """An old option_status stays in both logs without creating a notice."""
+    from types import SimpleNamespace
+    from supervisor import events
+
+    (tmp_path / "logs").mkdir()
+    frames = []
+    facts = {
+        "effort": {"requested": "ultra", "sent": {"reasoning_effort": "max"},
+                   "sent_state": "explicit", "reported": None, "report_source": None},
+        "request_wire": {"requested_effort": "ultra", "applied_effort": "max",
+                         "applied_effort_source": "sent_candidate"},
+        "claudexor": {"requested_options": {"reasoningEffort": "ultra"},
+                      "applied_options": {}, "option_status": {"reasoningEffort": "unknown"}},
+    }
+    ctx = SimpleNamespace(DRIVE_ROOT=tmp_path, bridge=SimpleNamespace(push_log=frames.append))
+    events._handle_llm_usage({"type": "llm_usage", "task_id": "t", "usage": facts}, ctx)
+    written = json.loads((tmp_path / "logs/events.jsonl").read_text())
+    assert {key: written[key] for key in facts} == facts
+    assert frames == [written]
+    assert "toast_once" not in written and "task_incident" not in written

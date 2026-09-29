@@ -71,6 +71,16 @@
           "usage": {
             "prompt_tokens": 200,
             "completion_tokens": 10,
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "reasoning_effort": "medium"
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "provider": "openai",
             "resolved_model": "openai/gpt-5.5",
@@ -80,6 +90,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -282,6 +297,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -290,6 +318,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "provider_unsupported_field",
@@ -497,6 +530,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "none",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "low",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -505,6 +551,11 @@
             "request_wire": {
               "requested_effort": "none",
               "applied_effort": "low",
+              "original_requested_effort": "none",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "provider_required_reasoning",
@@ -720,6 +771,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -728,6 +792,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -1044,6 +1113,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -1052,6 +1134,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -1287,6 +1374,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -1295,6 +1395,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -1490,6 +1595,19 @@
             "response_id": "gen-fixture-429"
           },
           "usage": {
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "provider_error": {
               "code": 429,
               "type": null,
@@ -1717,6 +1835,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -1725,6 +1856,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -1942,6 +2078,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -1950,6 +2099,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "provider_unsupported_field",
@@ -2159,6 +2313,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -2167,6 +2334,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "provider_unsupported_field",
@@ -2389,6 +2561,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -2397,6 +2582,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -2593,6 +2783,19 @@
           "usage": {
             "prompt_tokens": 200,
             "completion_tokens": 10,
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "provider": "openrouter",
             "resolved_model": "x-ai/grok-4.5",
@@ -2602,6 +2805,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",
@@ -2806,6 +3014,19 @@
             "prompt_tokens": 120,
             "completion_tokens": 8,
             "cost": 0.0031,
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "tool_calls",
             "provider": "openrouter",
             "resolved_model": "x-ai/grok-4.5",
@@ -2813,6 +3034,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "function",
               "applied_tool_dialect": "function",
               "reason_code": "requested_wire_form",
@@ -3005,6 +3231,19 @@
             "prompt_tokens_details": {
               "cached_tokens": 40
             },
+            "effort": {
+              "requested": "medium",
+              "sent": {
+                "extra_body.reasoning": {
+                  "effort": "medium",
+                  "exclude": false
+                }
+              },
+              "sent_state": "explicit",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "cached_tokens": 40,
             "provider": "openrouter",
@@ -3013,6 +3252,11 @@
             "request_wire": {
               "requested_effort": "medium",
               "applied_effort": "medium",
+              "original_requested_effort": "medium",
+              "requested_effort_source": "provider_projection",
+              "applied_effort_source": "sent_candidate",
+              "reported_effort": null,
+              "reported_effort_source": null,
               "requested_tool_dialect": "none",
               "applied_tool_dialect": "none",
               "reason_code": "requested_wire_form",

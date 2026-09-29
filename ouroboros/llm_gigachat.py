@@ -17,6 +17,7 @@ from ouroboros.llm_attempt import (
     _candidate_before_dispatch,
     _execute_candidate,
     _physical_candidate,
+    attach_processing_receipt,
 )
 
 
@@ -233,6 +234,7 @@ class _GigaChatLaneMixin:
         # no_proxy (a macOS fork-safety flag for the OpenAI/requests paths) does
         # not apply here.
         del no_proxy
+        target["requested_reasoning_effort"] = reasoning_effort
 
         client = self._get_gigachat_client(target, timeout=timeout)
 
@@ -333,4 +335,5 @@ class _GigaChatLaneMixin:
 
             usage["processing"] = processing_receipt(
                 "gigachat", usage, requested=target["processing_preference"])
+        attach_processing_receipt(target, usage)
         return message, usage

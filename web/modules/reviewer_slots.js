@@ -331,10 +331,9 @@ export function subagentOptionsFor(roster, savedId, { rosterKnown = true, proces
     return options;
 }
 
-export function describeSubagentReference(subagentId, roster, { rosterKnown = true, processingPreference = '' } = {}) {
-    // The DERIVED facts, disclosed read-only (never editable knobs): the
-    // roster row is the SSOT for a referenced reviewer's route/model/effort/
-    // account, so this line only reports what that row says.
+export function describeSubagentReference(subagentId, roster, { rosterKnown = true, processingPreference = '', effort = '' } = {}) {
+    // Route/model/account come from the roster; the reviewer row may override
+    // the separate effort preference. Compound slugs retain their identity.
     const row = (roster || []).find(
         (item) => String(item.subagent_id || '') === String(subagentId || ''));
     if (!row) {
@@ -354,12 +353,14 @@ export function describeSubagentReference(subagentId, roster, { rosterKnown = tr
             : (route.target_id ? `API model ${route.target_id}` : 'API model (unset)'));
     }
     if (routeEditor.routeSupportsAccount(route) && route.credential_profile_id) parts.push(`account ${route.credential_profile_id}`);
-    if (row.effort) parts.push(`effort ${row.effort}`);
+    const preferredEffort = (route.kind === ROUTE_KIND_SESSION
+        ? routeEditor.compoundSessionEffort(route.target_id) : '') || effort || row.effort;
+    if (preferredEffort) parts.push(`preferred effort ${preferredEffort}`);
     parts.push(`processing ${routeEditor.processingIntentLabel(row.processing_preference, processingPreference)}`);
     const off = row.enabled === false
         ? '. That row is switched off, so this reference is refused at save rather than rerouted — choose another reviewer or turn the row back on'
         : '';
-    return `Runs as ${parts.join(' · ')} — from its roster row under Available subagents${off}`;
+    return `Runs as ${parts.join(' · ')} — route from its roster row under Available subagents${off}`;
 }
 
 export function describeLastExecution(entry) {
@@ -382,7 +383,7 @@ export function describeLastExecution(entry) {
     }
     if (effective.profile_id) parts.push(`account ${effective.profile_id}`);
     if (effective.access) parts.push(`access ${effective.access}`);
-    // No applied effort is rendered: none exists upstream, so the key is not emitted.
+    // Effort reports stay structured and in Logs; prepared options are not applied facts.
     if (effective.verdict_method && effective.verdict_method !== 'structured'
         && effective.verdict_method !== 'strict_parse') {
         parts.push(`verdict via ${effective.verdict_method.replace(/_/g, ' ')}`);
@@ -935,7 +936,7 @@ function rowHtml(row, group) {
     if (row.subagent_id) {
         const last = state.lastExecutions[row.slot_id];
         const metaParts = [
-            describeSubagentReference(row.subagent_id, state.roster, { rosterKnown: state.rosterKnown, processingPreference: state.processingPreference }),
+            describeSubagentReference(row.subagent_id, state.roster, { rosterKnown: state.rosterKnown, processingPreference: state.processingPreference, effort: row.effort }),
         ];
         return `
         <div class="reviewer-slot-row" data-slot-group="${group}" data-slot-id="${escapeHtml(row.slot_id)}">
@@ -999,7 +1000,7 @@ function singletonHtml(spec) {
     const meta = (parts) => metaLineHtml(parts, row, last);
     if (row.subagent_id) {
         const metaParts = [
-            describeSubagentReference(row.subagent_id, state.roster, { rosterKnown: state.rosterKnown, processingPreference: state.processingPreference }),
+            describeSubagentReference(row.subagent_id, state.roster, { rosterKnown: state.rosterKnown, processingPreference: state.processingPreference, effort: row.effort }),
             ...(spec.badgeOnReference ? [spec.badge(row)] : []),
             ...spec.extraMeta(row),
         ];
@@ -1255,6 +1256,7 @@ function bindRowEvents() {
         });
         rowEl.querySelector('[data-slot-effort]')?.addEventListener('change', (event) => {
             row.effort = String(event.target.value || '');
+            renderRows({ discoveryOnly: true });
             state.onChange();
         });
         // Only an explicit switch writes delivery; a model or account change never does.
@@ -1348,6 +1350,7 @@ function bindSingletonEvents(section, spec) {
         // route/roster-row default on a session or subagent reference.
         row.effort = selected
             || (row.subagent_id || row.route?.kind === ROUTE_KIND_SESSION ? '' : spec.apiEffortDefault);
+        renderRows({ discoveryOnly: true });
         edited();
     });
     el.querySelector(`[data-${a}-processing]`)?.addEventListener('change', (event) => {
