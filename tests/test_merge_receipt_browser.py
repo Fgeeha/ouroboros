@@ -1,7 +1,9 @@
 """Render the real outbox consumer's receipt frames and its history projection."""
+import asyncio
 import json
 import os
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,17 +20,24 @@ pytestmark = [pytest.mark.ui_browser, pytest.mark.serial]
 
 
 def test_merge_card_stays_current_after_outbox_delivery_and_reload(request, world, monkeypatch, tmp_path):
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros.utils import append_jsonl
+
+    append_jsonl(world.root / "logs/progress.jsonl", {
+        "type": "task_progress", "chat_id": 7, "task_id": "merge-task",
+        "text": "Reading the PR.", "ts": "2026-09-16T00:00:00Z",
+    })
     exercise_publication(world, monkeypatch, "buffered")
+    history = json.loads(asyncio.run(make_chat_history_endpoint(world.root)(
+        SimpleNamespace(query_params={"chat_id": "7"}))).body)
     fixture = json.loads((world.root / "delivery-projection.json").read_text())
     ui = request.getfixturevalue("subscription_ui")
     page, url = ui["page"], ui["url"]
-    rows = [{"task_id": "merge-task", "is_progress": True, "text": "Reading the PR.",
-             "ts": "2026-09-16T00:00:00Z"}, *fixture["history"]]
     page.route("**/receipt-projection", lambda route: route.fulfill(content_type="text/html", body='''
         <!doctype html><html><head><link rel="stylesheet" href="/static/ui.css">
         <link rel="stylesheet" href="/static/style.css"></head><body><main id="content"></main></body></html>'''))
     page.route("**/api/chat/history?*", lambda route: route.fulfill(
-        content_type="application/json", body=json.dumps({"messages": rows})))
+        content_type="application/json", body=json.dumps(history)))
     page.goto(url + "/receipt-projection")
     page.evaluate('''async () => {
         const { createChatInstance } = await import('/static/modules/chat.js');
@@ -56,11 +65,13 @@ def test_merge_card_stays_current_after_outbox_delivery_and_reload(request, worl
         page.screenshot(path=str(output / "merge-receipt-live.png"), full_page=True)
         line = card.locator('.chat-live-line.result')
         assert line.count() == 1 and "merge: merged" in line.inner_text()
-        page.evaluate("() => receiptChat.refreshHistory({revision: 1})")
+        replay = page.evaluate("() => receiptChat.refreshHistory({revision: 1})")
+        assert replay["painted"], "receipt history must paint successfully"
         card = page.locator('.chat-live-card[data-task-id="merge-task"]')
         if card.get_attribute("data-expanded") != "1":
             card.locator('[data-live-summary-button]').click()
         page.screenshot(path=str(output / "merge-receipt-replay.png"), full_page=True)
+        assert not page.get_by_role("button", name="Retry loading messages").is_visible()
         line = card.locator('.chat-live-line.result')
         assert line.count() == 1 and "merge: merged" in line.inner_text()
         assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")

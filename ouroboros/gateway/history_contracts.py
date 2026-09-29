@@ -17,5 +17,6 @@ class ChatHistoryResponse(TypedDict, total=False):
     next_cursor: Optional[str]
     page_cursor: Optional[str]
     window: Dict[str, Any]
+    coverage: Dict[str, Any]  # v1 delivered physical spans after quota/lineage deferrals
     error: str
     reason_code: str

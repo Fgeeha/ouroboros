@@ -18,6 +18,7 @@ _SOURCES = ("chat", "progress")
 _READ_BYTES = 64 * 1024
 _PAGE_SCAN_BYTES = 512 * 1024
 _PAGE_SCAN_ROWS = 1000
+_CHAIN_WITNESSES = 16
 
 
 def progress_quota_predicate(row_matches_thread, stored_chat_id):
@@ -199,6 +200,28 @@ class HistorySource(JsonlChainSnapshot):
         return rows, lower, gaps
 
 
+def chain_witness(reader):
+    """Rolling prefix witnesses through the trailing retained segments below ``upper``.
+
+    Physical byte coordinates survive append and rotation: the live file keeps
+    its inode and base when renamed into the archive. Every witness rolls each
+    earlier nonempty segment's identity and base, so replacing, removing or
+    resizing ANY earlier segment changes it. A span stays comparable while its
+    own last witness is still listed by a newer read, i.e. within
+    ``_CHAIN_WITNESSES`` rotations; older spans are disclosed as gaps. Metadata
+    only: no archive is read to establish it. Empty sources have no prefix.
+    """
+    witnesses, digest = [], b""
+    for index, (_, stat, _) in enumerate(reader.entries):
+        base = reader.ends[index - 1] if index else 0
+        if base >= reader.upper:
+            break
+        if stat.st_size:
+            digest = hashlib.sha256(digest + f"{stat.st_dev}:{stat.st_ino}@{base}".encode()).digest()
+            witnesses.append(digest.hex()[:16])
+    return ".".join(witnesses[-_CHAIN_WITNESSES:]) or "empty"
+
+
 def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, caps):
     continuation = decode_cursor(cursor, thread_id, view) if cursor else None
     if continuation:
@@ -206,13 +229,14 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
         if any(quotas[key] > caps[key] for key in quotas):
             raise HistoryCursorError("history_cursor_invalid", 400)
     recent = not continuation or (continuation["kind"] == "page" and continuation["recent"])
-    selections, upper, before, page_ends = {}, {}, {}, {}
+    selections, upper, before, page_ends, chains = {}, {}, {}, {}, {}
     paths = {"chat": data_dir / "logs" / "chat.jsonl", "progress": data_dir / "logs" / "progress.jsonl"}
     for source, quota in (("chat", "human"), ("progress", "progress")):
         try:
             reader = HistorySource(paths[source], source,
                                    continuation["upper"][source] if continuation else None)
             upper[source] = reader.upper
+            chains[source] = chain_witness(reader)
             page_ends[source] = continuation["before"][source] if continuation else reader.upper
             if continuation and continuation["kind"] == "page":
                 selections[source] = reader.replay(continuation["lower"][source], page_ends[source])
@@ -228,7 +252,23 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
             selections[source] = (None, 0, {"source_unavailable"})
         before[source] = selections[source][1]
     return {"v": 1, "chat_id": thread_id, "view": view, "upper": upper, "quotas": quotas,
-            "recent": recent, "selections": selections, "before": before, "page_ends": page_ends}
+            "recent": recent, "selections": selections, "before": before, "page_ends": page_ends,
+            "chains": chains}
+
+
+def history_page_coverage(page, stream_gaps):
+    """Delivered physical spans, called AFTER quota/lineage deferrals.
+
+    A projected origin, detail overlay or shared row ID proves no scanned span.
+    Quota-disabled and unreadable streams are unknown, even when they emit []
+    and no continuation. Parse gaps remain part of the coverage evidence.
+    """
+    return {"v": 1, "view": page["view"], "upper": dict(page["upper"]), "spans": {
+        source: ({"from": page["before"][source], "to": page["page_ends"][source],
+                  "chain": page["chains"][source], "gaps": sorted(stream_gaps[source])}
+                 if page["selections"][source][0] is not None
+                 and page["quotas"]["human" if source == "chat" else source] else None)
+        for source in _SOURCES}}
 
 
 def history_page_tokens(page):

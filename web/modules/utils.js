@@ -52,6 +52,36 @@ export function sinceLocalTime(value, now = Date.now()) {
     return ` · since ${at.toLocaleDateString([], { month: 'short', day: 'numeric' })} ${clock}`;
 }
 
+const absoluteTime = (value, zone = false) => {
+    const date = value ? new Date(value) : null;
+    return date && !Number.isNaN(date.getTime()) ? date.toLocaleString(undefined, {
+        year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
+        ...(zone ? { timeZoneName: 'short' } : {}),
+    }) : '';
+};
+// The instant's own minute: local clock text repeats across a DST fallback hour.
+const minuteOf = value => Math.floor(new Date(value).getTime() / 60000);
+
+/** A task's host-observed end and the time its notification was added are two
+ * facts (#1347); an unknown end says so rather than borrowing the second. Two
+ * different minutes that read alike locally carry their zone names. */
+export function terminalTimeNote(terminalTime, addedAt) {
+    const known = terminalTime?.source === 'executor_terminal' && absoluteTime(terminalTime.occurred_at);
+    const zone = Boolean(known) && known === absoluteTime(addedAt) && minuteOf(terminalTime.occurred_at) !== minuteOf(addedAt);
+    const occurred = known ? absoluteTime(terminalTime.occurred_at, zone) : '';
+    return `${occurred ? `Task ended ${occurred}` : 'Task end time not recorded'} · Notification added ${absoluteTime(addedAt, zone)}`;
+}
+
+/** A saved end row may be published long after its task ended. Its line keeps the
+ * row's own time and adds the note when the end falls in another minute or is
+ * unknown; live frames and rows saved before the host fact existed stay as they were. */
+export function savedTerminalRowNote(row) {
+    const fact = row?.system_type === 'task_summary' ? row.terminal_time : null;
+    if (!fact || typeof fact !== 'object' || !absoluteTime(row.ts)) return '';
+    const known = fact.source === 'executor_terminal' && absoluteTime(fact.occurred_at);
+    return known && minuteOf(fact.occurred_at) === minuteOf(row.ts) ? '' : terminalTimeNote(fact, row.ts);
+}
+
 /** Bound untrusted text with a visible marker before it reaches DOM surfaces. */
 export function boundedText(value, maxLen = 1200) {
     const text = String(value ?? '');
