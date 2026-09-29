@@ -982,6 +982,8 @@ def _attach_only_run(root: Any, request: Any, slot: Any, operation_id: str, run_
     usage = {"provider": "claudexor", "delegated_run_started": True, "delegated_run_id": run_id,
              "collection": "attach_only_observation", "cost": None, "run_state": state}
     observed = final_attempt_facts(detail, run_id)
+    if isinstance(observed.get("effort_resolution"), dict):
+        usage["effort_resolution"] = observed["effort_resolution"]
     # Requested identity comes only from this paid invocation, never live settings
     # or the summary's request echoes. Absent final-attempt facts stay unknown.
     routes = (invocation.get("request") or {}).get("harnesses") or []

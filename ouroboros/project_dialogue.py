@@ -264,7 +264,7 @@ def project_origin_rows(drive_root: Any, project_chat_id: int) -> List[Dict[str,
         if identity in seen:
             continue
         seen.add(identity)
-        rows.append({"ref": dict(ref), "text": text})
+        rows.append({"ref": dict(ref), "text": text, "origin_id": project_origin_identity(ref)})
     return rows
 
 
@@ -374,6 +374,16 @@ def entry_matches_source_ref(entry: Dict[str, Any], refs: Iterable[Dict[str, Any
         if (key := _source_ref_identity(ref)) is not None
     }
     return bool(_entry_source_identities(entry) & ref_keys)
+
+
+def project_origin_identity(ref: dict) -> str:
+    """Same binding identity on retained context and its eventual physical row."""
+    return _text_sha256(json.dumps(_source_ref_identity(ref), separators=(",", ":")))
+
+
+def matching_project_origin(entry: dict, refs: list) -> str:
+    keys = _entry_source_identities(entry)
+    return next((project_origin_identity(ref) for ref in refs if _source_ref_identity(ref) in keys), "")
 
 
 def resolve_owner_message_source(drive_root: Any, ref: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -1466,6 +1476,8 @@ def project_completion_delivery_outcome(
         lead = f"{verdict} " if verdict else ""
         if excerpt:
             excerpt = f"{excerpt} Open the Project for details."
+        from ouroboros.terminal_time import terminal_time_fact
+
         event = {
             "type": "send_message", "chat_id": 1, "task_id": tid,
             "text": (f"{snapshot['target_label']} · "
@@ -1477,6 +1489,7 @@ def project_completion_delivery_outcome(
                 "project_id": snapshot["project_id"],
                 "project_name": snapshot["project_name"],
                 "target_label": snapshot["target_label"], "status": status,
+                "terminal_time": terminal_time_fact(result),
                 **mirrored_answer(result, outcome_phase(result, task_done_event)),
             },
         }

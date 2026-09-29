@@ -114,7 +114,15 @@
             "cost_final": true,
             "provider": "local",
             "resolved_model": "local-model",
-            "response_finish_reason": "stop"
+            "response_finish_reason": "stop",
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            }
           },
           "ledger_attempt_count": 1
         },

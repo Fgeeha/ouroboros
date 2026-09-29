@@ -697,9 +697,11 @@ def reconcile_orphaned_running_tasks(
             with (write_guard(task_id) if write_guard else nullcontext(True)) as allowed:
                 if not allowed:
                     continue
+                # The projection is this write's replica: a child terminal lends the occurrence
+                # its canonical attempt matches, as copyback would; a recovery projection has none.
                 write_task_result(root, task_id, status=eff_status,
                                   _field_projector=partial(_still_orphan_at_write, task_id, observed, applied),
-                                  **persist_fields)
+                                  _terminal_time_source=effective, **persist_fields)
                 if not applied:
                     continue  # the row moved on between the effective read and this write: nothing was settled here
                 healed += 1

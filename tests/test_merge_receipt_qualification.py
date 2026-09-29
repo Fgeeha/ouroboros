@@ -36,6 +36,50 @@ def registered_merge(world):
                    reviewed_head_sha=HEAD, reviewed_base_sha=BASE, review_task_ids=["review-1"])
 
 
+@pytest.mark.parametrize("hostname", ["github.com", "github.example.test"])
+def test_body_patch_uses_selected_repo_scoped_identity_without_org_access(world, monkeypatch, hostname):
+    """The real gh binding needs no GraphQL organization metadata to edit a body."""
+    selected_env = {"GH_TOKEN": "synthetic-repo-token-without-read-org"}
+    repo = f"{hostname}/chosen/repository"
+    world.gh.pr["url"] = f"https://{repo}/pull/7"
+    prefix, suffix = 'Résumé "quoted" \\ path.\r\n\n', '\n\nOwner footer.  \n'
+    note = "\nAdded during merge: @literal-file-name.\n"
+    world.gh.pr["body"] = prefix + "<!-- ouroboros:merge-receipt ab -->\nold\n<!-- /ouroboros:merge-receipt -->" + suffix
+    writes = []
+
+    def process(argv, **kw):
+        assert kw["env"] == selected_env  # every call retains the same selected identity
+        args = argv[1:]
+        if args[:1] == ["pr"]:
+            assert args[-2:] == ["--repo", repo]
+        if args[:1] == ["api"] and "PATCH" in args:
+            assert args == ["api", "repos/chosen/repository/pulls/7", "--hostname", hostname,
+                            "--method", "PATCH", "--input", "-"]
+            assert kw["timeout"] == 60
+            assert _receipts(world)[0]["outcome"]["status"] == "merged"
+            writes.append(json.loads(kw["input"]))
+        result = world.gh(args, world.ctx, input_data=kw.get("input"))
+        if args[:2] == ["pr", "merge"]:
+            world.gh.pr["body"] += note
+        return SimpleNamespace(returncode=result.exit_code, stdout=result.text if result.ok else "",
+                               stderr="" if result.ok else result.text)
+
+    monkeypatch.setattr(github, "_gh_run", REAL_GH)
+    monkeypatch.setattr(github.subprocess, "run", process)
+    monkeypatch.setattr(github, "_gh_env", lambda ctx: selected_env)
+    monkeypatch.setattr(github, "github_token_from_env_or_settings", lambda: selected_env["GH_TOKEN"])
+    handler = next(entry.handler for entry in github.get_tools() if entry.name == "pr_merge")
+    text = handler(world.ctx, number=7, expected_head_sha=HEAD, method="squash", repo=repo)
+    (receipt,) = _receipts(world)
+    assert receipt["publication"]["body"] == {"status": "published"}, text
+    expected = prefix + merge_receipts.public_block(receipt) + suffix + note
+    assert writes == [{"body": expected}] and world.gh.pr["body"] == expected
+    assert world.gh.pr["title"] == "demo"
+    assert receipt["publication"]["card"]["status"] == "owed"
+    assert not any(c[:2] == ["pr", "edit"] or c[:2] == ["api", "graphql"] or c[0] == "auth"
+                   for c in world.gh.calls)
+
+
 @pytest.mark.parametrize("failure", ["EOF", "HTTP 502: Bad Gateway (https://api.github.com/graphql)",
                                      "HTTP 409: Conflict (https://api.github.com/graphql)",
                                      PRE_EFFECT + "HTTP 503: lost reply", "timeout"])
@@ -148,7 +192,7 @@ def test_concurrent_publication_through_outbox_dedup_and_history(world, monkeypa
     gh = world.gh
 
     def delayed(args, *a, **kw):
-        if args[:2] == ["pr", "edit"] and "**queued**" in str(kw.get("input_data")):
+        if args[:1] == ["api"] and "PATCH" in args and "**queued**" in str(kw.get("input_data")):
             blocked.set()
             assert release.wait(5)
         return gh(args, *a, **kw)
@@ -190,7 +234,7 @@ def test_concurrent_publication_through_outbox_dedup_and_history(world, monkeypa
     assert rows and all("card_row_revision" in row for row in rows)
     assert max(rows, key=lambda row: row["card_row_revision"])["text"].find("merge: merged") >= 0
     fixture = world.root / "delivery-projection.json"
-    fixture.write_text(json.dumps({"live": chats, "history": rows}))
+    fixture.write_text(json.dumps({"live": chats, "history": rows}), encoding="utf-8")
     node = shutil.which("node")
     assert node, "node is required for the real live/replay projection qualification"
     result = subprocess.run([node, "--test", "--test-name-pattern=canonical receipt revisions",
@@ -211,9 +255,9 @@ def test_legacy_ambiguous_refusal_keeps_observation_custody(world):
     # Reproduce an old persisted receipt, bypassing today's canonical join.
     from ouroboros.task_results import task_result_path
     path = task_result_path(world.root, "merge-task")
-    record = json.loads(path.read_text())
+    record = json.loads(path.read_text(encoding="utf-8"))
     record["merge_receipts"] = [receipt]
-    path.write_text(json.dumps(record))
+    path.write_text(json.dumps(record), encoding="utf-8")
     assert "PR_MERGE_UNKNOWN" in registered_merge(world)
     assert sum(c[:2] == ["pr", "merge"] for c in world.gh.calls) == 1
 
@@ -264,7 +308,7 @@ def bounded_receipt_history(world, monkeypatch):
 
     test_concurrent_publication_through_outbox_dedup_and_history(world, monkeypatch, "delivered_first")
     progress_path = world.root / "logs/progress.jsonl"
-    raw = [json.loads(line) for line in progress_path.read_text().splitlines()]
+    raw = [json.loads(line) for line in progress_path.read_text(encoding="utf-8").splitlines()]
     receipt_events = [r for r in raw if r.get("card_row_id")]
     assert [r["card_row_revision"] for r in receipt_events] == [3, 2]
     for i in range(59):
@@ -303,13 +347,13 @@ def bounded_receipt_history(world, monkeypatch):
     assert all(projected[k] == stale[k] for k in ("history_id", "history_position", "ts", "card_row_id"))
     assert {path: path.read_bytes() for path in sources} == sources
     evidence = json.dumps({"payload": payload, "selected": selected[0]})
-    (world.root / "cold-history.json").write_text(evidence)
+    (world.root / "cold-history.json").write_text(evidence, encoding="utf-8")
     if output := os.environ.get("OUROBOROS_UI_EVIDENCE_DIR"):
         output = pathlib.Path(output)
         output.mkdir(parents=True, exist_ok=True)
-        (output / "cold-history.json").write_text(evidence)
+        (output / "cold-history.json").write_text(evidence, encoding="utf-8")
         (output / "cold-progress.jsonl").write_bytes(sources[progress_path])
-        (output / "canonical-receipts.json").write_text(json.dumps(_receipts(world)))
+        (output / "canonical-receipts.json").write_text(json.dumps(_receipts(world)), encoding="utf-8")
     return payload
 
 
@@ -334,11 +378,11 @@ def test_bounded_history_discloses_unavailable_canonical_receipt(world, monkeypa
 
     bounded_receipt_history(world, monkeypatch)
     result_path = task_result_path(world.root, "merge-task", create=False)
-    record = json.loads(result_path.read_text())
+    record = json.loads(result_path.read_text(encoding="utf-8"))
     if gap == "missing_result":
         result_path.unlink()
     elif gap == "unreadable_result":
-        result_path.write_text("{torn")
+        result_path.write_text("{torn", encoding="utf-8")
     else:
         if gap == "missing_receipt":
             record["merge_receipts"] = []
@@ -349,9 +393,9 @@ def test_bounded_history_discloses_unavailable_canonical_receipt(world, monkeypa
         else:
             # A same-id receipt from a different task must not supply truth.
             other_path = task_result_path(world.root, "other-task")
-            other_path.write_text(json.dumps(record))
+            other_path.write_text(json.dumps(record), encoding="utf-8")
             record["merge_receipts"] = []
-        result_path.write_text(json.dumps(record))
+        result_path.write_text(json.dumps(record), encoding="utf-8")
     source = world.root / "logs/progress.jsonl"
     before = source.read_bytes()
     response = asyncio.run(make_chat_history_endpoint(world.root)(SimpleNamespace(query_params={"chat_id": "7"})))

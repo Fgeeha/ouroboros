@@ -290,6 +290,10 @@ def test_strict_child_schema_rejects_false_capture_and_wrong_receipt():
     vision_process._read_receipt(receipt, "ours")
     with pytest.raises(ValueError, match="another invocation"):
         vision_process._read_receipt(receipt, "theirs")
+    capture["effort"] = ["not", "an", "evidence", "object"]
+    with pytest.raises(Exception):
+        vision_process._read_receipt(receipt, "ours")
+    capture["effort"] = None
     capture["state"] = "free"
     with pytest.raises(Exception):
         vision_process._read_receipt(receipt, "ours")

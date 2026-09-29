@@ -337,7 +337,7 @@ def _outcome(pr: Optional[Dict[str, Any]], gh_api: Gh, *, own_effect_ok: bool, e
     return {"status": "unknown", "reason": f"pr_state_{state.lower() or 'unread'}_after_unconfirmed_effect"}
 
 
-def _publish(ctx: Any, gh: Gh, receipt: Dict[str, Any], drive_root: Any, task_id: str) -> Dict[str, Any]:
+def _publish(ctx: Any, gh: Gh, gh_api: Gh, receipt: Dict[str, Any], drive_root: Any, task_id: str) -> Dict[str, Any]:
     """PR body block (confirmed by readback) and the task-card row, each with its own gap."""
     block = public_block(receipt)
     body_status: Dict[str, Any] = {"status": "gap"}
@@ -345,15 +345,21 @@ def _publish(ctx: Any, gh: Gh, receipt: Dict[str, Any], drive_root: Any, task_id
     # is unnecessary when a lost reply already left the exact block in place.
     latest = _read_pr(gh, receipt["number"])
     res = None
-    if latest is not None and block not in str(latest.get("body") or ""):
-        res = gh(["pr", "edit", str(receipt["number"]), "--body-file", "-"], timeout=60,
-                 input_data=upsert_body(latest.get("body") or "", block))
+    target = _PR_URL_RE.fullmatch(str((receipt.get("repo") or {}).get("url") or ""))
+    if target is None or int(target.group(4)) != receipt["number"]:
+        target = None
+        body_status["reason"] = "target_unavailable"
+    if target is not None and latest is not None and block not in str(latest.get("body") or ""):
+        # REST edits only the body; gh pr edit also queries organization metadata.
+        res = gh_api(["api", f"repos/{target.group(2)}/{target.group(3)}/pulls/{receipt['number']}",
+                      "--hostname", target.group(1), "--method", "PATCH", "--input", "-"], timeout=60,
+                     input_data=json.dumps({"body": upsert_body(latest.get("body") or "", block)}))
     readback = _read_pr(gh, receipt["number"])
-    if readback is not None and block in str(readback.get("body") or ""):
+    if target is not None and readback is not None and block in str(readback.get("body") or ""):
         body_status = {"status": "published"}
     else:
-        body_status["reason"] = "readback_missing_block" if getattr(res, "ok", False) else str(
-            getattr(res, "failure", "") or "edit_failed")
+        body_status.setdefault("reason", "readback_missing_block" if getattr(res, "ok", False) else str(
+            getattr(res, "failure", "") or "edit_failed"))
     # The canonical receipt is the projection source. The existing outbox owns
     # terminal supplement delivery/replay, including after this worker exits.
     # A best-effort emitter returning None is never delivery evidence.
@@ -447,7 +453,7 @@ def _finish(ctx: Any, gh: Gh, gh_api: Gh, drive_root: Any, task_id: str,
             receipt = write_receipt(drive_root, task_id, receipt)
         while receipt["outcome"]["status"] in ("merged", "queued"):
             source = receipt
-            publication = _publish(ctx, gh, source, drive_root, task_id)
+            publication = _publish(ctx, gh, gh_api, source, drive_root, task_id)
             # Preserve observed publication facts even if their durable write fails.
             receipt = dict(source, publication=publication)
             receipt = write_receipt(drive_root, task_id, source, publication=publication)

@@ -345,9 +345,9 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
         if (!openOnly) closeProjectPanel();
         else if (taskId && quizId) {
             const inst = projectInstances.get(project.id);
+            const reveal = inst?.revealQuestion?.(taskId, quizId);
             await acknowledgeProjectAfterPaint(project, inst, { forcePaint: true });
-            if (navigation === projectNavigationGeneration && navState.activeProjectId === project.id)
-                await inst?.revealQuestion?.(taskId, quizId);
+            await reveal;
         }
         return;
     }
@@ -394,13 +394,16 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
         // Restore this thread's scroll instead of leaving it at the top (P7). Runs
         // after the panel is shown so the column has real geometry to scroll.
         inst.restoreScrollPosition?.();
+        // The addressed question owns the viewport before either history or
+        // detail I/O; its chat-owned generation yields to later navigation.
+        // Every showing is one: a plain reopen addresses no question and so
+        // voids a reveal that a hidden pending-work survivor still awaits.
+        const reveal = inst.revealQuestion?.(taskId, quizId);
         // ACK only the exact revision whose history was fetched and painted. chat.js
         // owns the paint receipt; an already-painted instance skips the forced
         // refetch — the server clamps the ACK, so no repaint is needed.
         await acknowledgeProjectAfterPaint(project, inst, { forcePaint: Boolean(quizId) || !inst.hasPaintedHistory?.() });
-        if (taskId && quizId && navigation === projectNavigationGeneration
-            && navState.activeProjectId === project.id && projectInstances.get(project.id) === inst)
-            await inst.revealQuestion?.(taskId, quizId);
+        await reveal;
     } finally {
         projectPanelOpeningSince = 0;
     }

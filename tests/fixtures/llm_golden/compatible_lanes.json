@@ -172,6 +172,14 @@
           "usage": {
             "prompt_tokens": 200,
             "completion_tokens": 10,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "provider": "openai-compatible",
             "resolved_model": "openai-compatible/glm-5",
@@ -348,6 +356,14 @@
           "usage": {
             "prompt_tokens": 200,
             "completion_tokens": 10,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "provider": "cloudru",
             "resolved_model": "cloudru/GLM-5",
@@ -477,6 +493,14 @@
           "usage": {
             "prompt_tokens": 200,
             "completion_tokens": 10,
+            "effort": {
+              "requested": "medium",
+              "sent": {},
+              "sent_state": "omitted",
+              "sent_source": "host_candidate",
+              "reported": null,
+              "report_source": null
+            },
             "response_finish_reason": "stop",
             "provider": "minimax",
             "resolved_model": "minimax/MiniMax-M2",

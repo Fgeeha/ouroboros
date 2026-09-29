@@ -372,8 +372,6 @@ class _RecoveryLadderMixin:
 
         def _send(candidate: Dict[str, Any]) -> Any:
             nonlocal prior_capture
-            # Socket policy is not model input; seal only the provider payload.
-            candidate = {key: value for key, value in candidate.items() if key != "timeout"}
             candidate = _finalized_physical_candidate(
                 target, candidate, "messages" if target.get("provider") == "anthropic" else "chat.completions",
                 fresh_clock=True,
@@ -534,7 +532,6 @@ class _RecoveryLadderMixin:
 
         async def _send(candidate: Dict[str, Any]) -> Any:
             nonlocal prior_capture
-            candidate = {key: value for key, value in candidate.items() if key != "timeout"}
             candidate = _finalized_physical_candidate(target, candidate, "chat.completions", fresh_clock=True)
             request = _attempt_request(target, candidate)
 
