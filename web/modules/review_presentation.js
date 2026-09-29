@@ -1158,9 +1158,8 @@ function reviewRevision(value) {
 }
 
 // Revisions are opaque SHA-256 tokens; one distinct token may trail a live GET.
-export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {} } = {}) {
+export function createReviewHydrator({ fetchDetail, applyDetail, onState = () => {}, onSettled = () => {} } = {}) {
     const states = new Map();
-
     const start = (taskId, state, revision, onDomWrite) => {
         const generation = ++state.generation;
         state.inFlightRevision = revision;
@@ -1191,7 +1190,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 return false;
             })
             .finally(() => {
-                if (state.inFlight !== request || state.generation !== generation) return;
+                if (states.get(taskId) !== state || state.inFlight !== request || state.generation !== generation) return;
                 state.inFlight = null;
                 state.inFlightRevision = null;
                 const pending = state.pending;
@@ -1199,12 +1198,18 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (pending && pending.revision !== state.appliedRevision) {
                     start(taskId, state, pending.revision, pending.onDomWrite);
                 }
+                onSettled(taskId);
             });
         state.inFlight = request;
         return request;
     };
 
     return {
+        // Saved Review: errors await Retry; a successful empty/404 permits fallback.
+        ready(taskId) {
+            const state = states.get(taskId);
+            return !state || (!state.inFlight && state.lastStatus !== 'error');
+        },
         hydrate(taskIdValue, revisionValue = null, { onDomWrite = null } = {}) {
             const taskId = text(taskIdValue);
             if (!taskId) return Promise.resolve(false);
@@ -1229,10 +1234,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (revision !== null && revision === state.pending?.revision) {
                     return state.inFlight.then(() => state.inFlight || false);
                 }
-                if (
-                    revision !== null
-                    && revision !== state.inFlightRevision
-                ) {
+                if (revision !== null && revision !== state.inFlightRevision) {
                     state.pending = { revision, onDomWrite };
                     return state.inFlight.then(() => state.inFlight || false);
                 }
@@ -1247,9 +1249,7 @@ export function createReviewHydrator({ fetchDetail, applyDetail, onState = () =>
                 if (state) state.appliedRevision = null;
                 return;
             }
-            // A full DOM rebuild discards the projection that an applied
-            // revision hydrated, but it must retain and join any physical GET
-            // already in flight. Reset only the applied presentation receipt.
+            // Reset the presentation receipt after rebuild; keep joining any physical GET.
             for (const state of states.values()) state.appliedRevision = null;
         },
         clear() {
