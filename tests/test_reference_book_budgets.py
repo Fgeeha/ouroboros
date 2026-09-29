@@ -47,9 +47,7 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # 166450 -> 167000 (merge of the moved target into the plan-review branch, measured 166885): both
     # sides' replaced paragraphs land together; no text was appended by the merge itself.
     # 167000 -> 167300 (merge of the moved target into the plan-review branch, measured 167032): both sides' paragraphs land together.
-    # 167300 -> 167450 (#1374, measured 167398): the module-map row for the new
-    # terminal_cost_reconciliation.py leaf; the base sat 38 bytes under.
-    "docs/architecture/01-high-level-architecture.md": 167450,
+    "docs/architecture/01-high-level-architecture.md": 167300,
     # 15517 -> 16200 (#1195): the session-custodied startup historical audit is a
     # new node of the startup flow (readiness no longer waits for the historical
     # seal diagnostic); the chapter had no older description of that pass to replace.

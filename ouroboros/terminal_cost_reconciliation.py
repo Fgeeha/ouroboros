@@ -128,7 +128,7 @@ def reconcile_abandoned_usage(drive_root: pathlib.Path) -> None:
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.llm_claudexor import recover_model_attempt
     from ouroboros.post_task_checkpoint import post_task_synthesis_is_open
-    from ouroboros.task_results import load_task_result
+    from ouroboros.task_results import load_task_result, validate_task_id
     from ouroboros.task_status import SETTLED_STATUSES
     from ouroboros.transport_custody import ProviderNotDispatched, release_pre_dispatch_attempt
     from ouroboros.usage_ledger import is_abandoned_settlement
@@ -174,7 +174,12 @@ def reconcile_abandoned_usage(drive_root: pathlib.Path) -> None:
                 continue
             task_id = str(row.get("task_id") or "")
             # Settled/compacted attribution still owes projection after a failed write.
-            refresh.update(owner for owner in (task_id, str(row.get("root_task_id") or "")) if owner)
+            for owner in (task_id, str(row.get("root_task_id") or "")):
+                try:
+                    validate_task_id(owner)
+                except ValueError:
+                    continue  # Empty or system:* accounting scopes own no task result.
+                refresh.add(owner)
             remote = row.get("provider") == "claudexor"
             abandoned = is_abandoned_settlement(row)
             if (kind != "attempt"

@@ -1,4 +1,7 @@
 """Selection is a no-write proof, never an ownership or accounting authority."""
+import json
+import logging
+import time
 from collections import Counter
 from types import SimpleNamespace
 
@@ -357,6 +360,53 @@ def test_memo_is_root_scoped_and_pruned_by_current_attribution(env):
     reconciliation._refresh_costs(env.root, set(), {})
     assert key(env) not in reconciliation._EQUAL_PROJECTIONS
     assert key(other) in reconciliation._EQUAL_PROJECTIONS
+
+
+@pytest.mark.parametrize("compact", [False, True])
+def test_settled_system_scopes_own_no_result_but_their_real_root_still_does(env, monkeypatch, caplog, compact):
+    from ouroboros import usage_compaction
+
+    task(env)
+    attempt(env)
+    # Probe/test money settles under non-task ``system:*`` scopes; one such scope
+    # still rolls up into a real root that no row of its own names.
+    task(env, "owed")
+    attempt(env, "system:update_letter", logical="owed", cost=0.6)
+    for _ in range(20 if compact else 1):
+        for scope in ("system:capability_probe", "system:provider_test", "system:update_letter"):
+            attempt(env, scope, logical="owed" if scope == "system:update_letter" else None, cost=0.0)
+    task(env, "broken")
+    attempt(env, "broken")
+    broken = task_results.task_result_path(env.root, "broken")
+    broken.write_bytes(b"{broken")
+    if compact:
+        monkeypatch.setattr(usage_compaction, "_fold_clock", lambda: time.time() + 1_000_000)
+        with usage._locked(env.root) as heartbeat:
+            assert usage_compaction.compact_usage_ledger_locked(env.root, heartbeat=heartbeat)
+            rows = usage._read_records_locked_cached(env.root)
+        grouped = {(row.get("task_id"), row.get("root_task_id")) for row in rows
+                   if row.get("kind") == "usage_baseline_group"}
+        assert {("system:capability_probe", "system:capability_probe"),
+                ("system:update_letter", "owed")} <= grouped
+    ledger = (env.root / usage.LEDGER_REL).read_bytes()
+    caplog.set_level(logging.WARNING, logger=reconciliation.__name__)
+
+    for _ in range(3):
+        maintenance._reconcile_abandoned_usage(env.root)
+
+    # A malformed real task keeps its diagnostic; non-task scopes add none.
+    assert [record.getMessage() for record in caplog.records if record.levelno >= logging.WARNING] == [
+        "Reconciled task cost refresh failed for broken"] * 3
+    assert (env.root / usage.LEDGER_REL).read_bytes() == ledger
+    assert sorted(path.name for path in (env.root / "task_results").iterdir()) == [
+        "broken.json", "owed.json", "root.json"]
+    assert broken.read_bytes() == b"{broken"
+    events = (env.root / "logs" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    assert sorted(json.loads(line)["task_id"] for line in events
+                  if json.loads(line).get("type") == "task_cost_finalized") == ["owed", "root"]
+    assert task_results.load_task_result(env.root, "root")["accounted_upper_bound_usd"] == 0.4
+    assert task_results.load_task_result(env.root, "owed")["accounted_upper_bound_usd_with_children"] == 0.6
+    assert sorted(reconciliation._EQUAL_PROJECTIONS) == [key(env, "owed"), key(env)]
 
 
 @pytest.mark.parametrize("owner", ["running", "busy", "direct", "postwork", "retry", "malformed_retry", "review", "control_review"])
