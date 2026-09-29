@@ -247,6 +247,24 @@ def replace_atomic(
             delay = min(delay * 2, _REPLACE_RETRY_MAX_DELAY_SEC)
 
 
+def read_text_across_replace(path: pathlib.Path | str, *, encoding: str = "utf-8") -> str:
+    """The reader's side of ``replace_atomic``'s race, under the same bound.
+
+    Windows denies an open that meets another thread's replace of the same file
+    (PermissionError) although both versions are intact. POSIX has no such race:
+    its PermissionError is a real answer and propagates unchanged after the bound.
+    """
+    delay = _REPLACE_RETRY_INITIAL_DELAY_SEC
+    for attempt in range(_REPLACE_RETRY_ATTEMPTS):
+        try:
+            return pathlib.Path(path).read_text(encoding=encoding)
+        except PermissionError:
+            if attempt == _REPLACE_RETRY_ATTEMPTS - 1:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 2, _REPLACE_RETRY_MAX_DELAY_SEC)
+
+
 def _atomic_overwrite(path: pathlib.Path, write_temp: Callable[[pathlib.Path], None]) -> None:
     """Run ``write_temp`` against a sibling file, then atomically replace ``path``.
 
