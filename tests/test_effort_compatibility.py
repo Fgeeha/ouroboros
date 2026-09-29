@@ -80,6 +80,9 @@ def _exception(error):
     pytest.param("xhigh", _error("reasoning.effort value 'xhigh' is not supported. Supported values are "
                                  "low, medium, high and xhigh is not supported"),
         "high", id="negative-prose-does-not-suppress-retry"),
+    pytest.param("xhigh", _error("reasoning.effort value 'xhigh' is not supported. Supported values are "
+                                 "low, medium, high and xhigh is unsupported"),
+        "high", id="copula-negative-prose-does-not-suppress-retry"),
     pytest.param("ultra", _error("reasoning.effort value 'ultra' is not supported. Supported values are "
                                  "low, medium, high, xhigh requires a pro plan"),
         "high", id="bare-comma-negative-prose"),
@@ -332,6 +335,8 @@ def test_structured_enum_and_parameter_survive_sdk_exception_projection(evidence
     ("reasoning_effort: allowed values are 'low', 'medium', 'high', xhigh requires a pro plan",
      ("low", "medium", "high")),
     ("reasoning_effort: allowed values are low, medium, high and xhigh is not supported",
+     ("low", "medium", "high")),
+    ("reasoning_effort: allowed values are low, medium, high and xhigh is unsupported",
      ("low", "medium", "high")),
     ("reasoning_effort: allowed values are 'low', 'medium', 'high', and 'xhigh' isn't supported",
      ("low", "medium", "high")),

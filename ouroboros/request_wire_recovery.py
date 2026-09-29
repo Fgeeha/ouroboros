@@ -668,7 +668,7 @@ def _wire_rejection(error: Any) -> _WireRejection:
                     r"\s*\(?\s*(?:(?:is|are)\s+not\s+(?:supported|allowed|available|permitted)\b"
                     r"|(?:isn't|aren't)\s+(?:supported|allowed|available|permitted)\b"
                     r"|not\s+(?:supported|allowed|available|permitted)\b"
-                    r"|(?:unsupported|disallowed|unavailable|requires?)\b)", rest,
+                    r"|(?:(?:is|are)\s+)?(?:unsupported|disallowed|unavailable|requires?)\b)", rest,
                 ):
                     break
                 tokens.append(match.group(2))
