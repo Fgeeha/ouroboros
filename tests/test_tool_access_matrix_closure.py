@@ -56,7 +56,8 @@ def test_the_closure_added_no_write_like_operation_anywhere():
                 assert matrix[root] == {"read", "list", "search"}, (profile, root)
     acting = _POLICY["acting_subagent"]
     assert {root for root, ops in acting.items() if ops & _WRITE_LIKE_OPS} == {"active_workspace"}
-    assert "system_repo" not in acting and "user_files" not in acting and "skill_payload" not in acting
+    for root in ("system_repo", "user_files", "skill_payload"):
+        assert acting[root] == {"read", "list", "search"}
 
 
 def test_close_operations_adds_only_the_implied_read_family_and_edit():
@@ -83,11 +84,11 @@ def test_the_rows_the_closure_opened():
             for op in ("write", "edit", "shell", "service"):
                 if profile == "local_readonly_subagent":
                     assert not decide_tool_access(profile=profile, root=root, operation=op).allow, (root, op)
-    # What stays closed stays closed: a child never reaches the roots it never had.
+    # Parent-equivalent reading broadens roots without adding mutation operations.
     for profile in ("local_readonly_subagent", "acting_subagent"):
         for root in ("subagent_projects", "user_files"):
             for op in ("read", "list", "search"):
-                assert not decide_tool_access(profile=profile, root=root, operation=op).allow, (profile, root, op)
+                assert decide_tool_access(profile=profile, root=root, operation=op).allow, (profile, root, op)
     assert set(_POLICY["operator_control"]) == _ALL_ROOTS
 
 
@@ -165,21 +166,18 @@ def test_readonly_child_searches_runtime_data_through_its_read_guards(world):
     registry, _ctx = _readonly_child(world)
     result = registry.execute("search_code", {"root": "runtime_data", "path": ".", "query": "CLOSURE_"})
     assert "CLOSURE_LOG_MARKER" in result, result
-    assert "CLOSURE_SECRET_MARKER" not in result and "settings.json" not in result, result
+    assert "CLOSURE_SECRET_MARKER" in result and "settings.json" in result, result
     drive = registry.execute("search_code", {"root": "task_drive", "path": ".", "query": "CLOSURE_CHILD"})
     assert "task_drive:own.txt:1:" in drive and "CLOSURE_CHILD_DRIVE_MARKER" in drive, drive
     enum = registry.get_schema_by_name("search_code")["function"]["parameters"]["properties"]["root"]["enum"]
     assert {"runtime_data", "task_drive", "artifact_store"} <= set(enum), enum
-    assert "user_files" not in enum and "subagent_projects" not in enum, enum
+    assert "user_files" in enum and "subagent_projects" in enum, enum
 
 
-def test_readonly_child_refusal_still_names_the_roots_it_can_search(world):
+def test_readonly_child_reads_home_without_acquiring_write_tools(world):
     registry, _ctx = _readonly_child(world)
     result = registry.execute("search_code", {"root": "user_files", "path": ".", "query": "CLOSURE_"})
-    assert result.startswith("⚠️ TOOL_ACCESS_BLOCKED"), result
-    assert "Roots your profile can search:" in result
-    for root in ("active_workspace", "system_repo", "runtime_data", "task_drive", "artifact_store"):
-        assert root in result, (root, result)
+    assert "TOOL_ACCESS_BLOCKED" not in result, result
     for tool, args in (
         ("write_file", {"root": "runtime_data", "path": "logs/x.txt", "content": "x"}),
         ("edit_text", {"root": "task_drive", "path": "notes.txt", "old_str": "a", "new_str": "b"}),

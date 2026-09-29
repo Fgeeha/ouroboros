@@ -505,9 +505,9 @@ class ToolRegistry:
             elif entry.name in {"browse_page", "browser_action"}:
                 schema = copy.deepcopy(entry.schema)
                 if entry.name == "browse_page":
-                    schema["description"] = "Open an HTTP(S) URL (external, or localhost on non-Ouroboros ports) or a file:// path under your workspace in a headless browser. Returns page content as text, html, markdown, or screenshot (base64 PNG) — use it with analyze_screenshot to visually verify your own built apps. The Ouroboros API ports, private/link-local IPs, and other URL schemes are blocked for subagents. Use viewport to test mobile layouts (e.g. '375x812')."
+                    schema["description"] = "Open an HTTP(S) URL (external, or localhost on non-Ouroboros ports) or a parent-readable file:// path in a headless browser. Returns page content as text, html, markdown, or screenshot (base64 PNG) — use it with analyze_screenshot to visually verify your own built apps. The Ouroboros API ports, private/link-local IPs, and other URL schemes are blocked for subagents. Use viewport to test mobile layouts (e.g. '375x812')."
                 if entry.name == "browser_action":
-                    schema["description"] = "Perform action on the current browser page (external HTTP(S), localhost on non-Ouroboros ports, or a file:// page under your workspace). Actions: click (selector), fill (selector + value), select (selector + value), screenshot (base64 PNG), scroll (value: up/down/top/bottom). JavaScript evaluate is unavailable to local-readonly subagents."
+                    schema["description"] = "Perform action on the current browser page (external HTTP(S), localhost on non-Ouroboros ports, or a parent-readable file:// page). Actions: click (selector), fill (selector + value), select (selector + value), screenshot (base64 PNG), scroll (value: up/down/top/bottom). JavaScript evaluate is unavailable to local-readonly subagents."
                     props = schema.get("parameters", {}).get("properties", {})
                     action_schema = props.get("action", {})
                     if isinstance((action_enum := action_schema.get("enum")), list):
@@ -553,15 +553,14 @@ class ToolRegistry:
 
     def _schema_with_matrix_roots(self, entry: ToolEntry) -> Dict[str, Any]:
         """A copy of the schema whose ``root`` enum is what the matrix grants this
-        profile for the tool's operation; query_code stays repo-only by contract."""
+        profile for the tool's operation; tool-specific root enums remain intact."""
         schema = copy.deepcopy(entry.schema)
         root_schema = schema.get("parameters", {}).get("properties", {}).get("root", {})
         operation = _target_binding_operation(entry.name, {})
         if isinstance(root_schema.get("enum"), list) and operation:
             root_schema["enum"] = [root for root in root_schema["enum"]
                 if decide_tool_access(profile=active_tool_profile(self._ctx), root=root,
-                                      operation=operation).allow
-                and (entry.name != "query_code" or root in {"active_workspace", "system_repo"})]
+                                      operation=operation).allow]
         return schema
 
     def _schemas_for_entry(self, entry: ToolEntry) -> List[Dict[str, Any]]:

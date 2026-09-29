@@ -592,6 +592,9 @@ def _build_child_subagent_contract(spec: Dict[str, Any]) -> Dict[str, Any]:
                 "objective": objective,
                 "expected_output": expected_output,
                 "constraints": constraints,
+                "workspace": {"root": spec.get("workspace_root", ""), "mode": spec.get("workspace_mode", "")},
+                "workspace_root": spec.get("workspace_root", ""),
+                "workspace_mode": spec.get("workspace_mode", ""),
                 # The spread above hands the child EVERY parent field, and this merged
                 # mapping outranks the task-level keys in build_task_contract. Any field we
                 # deliberately narrow must therefore be re-stated after it, or the parent's
@@ -647,6 +650,25 @@ def _inherited_workspace_from_active_repo(
     except Exception:
         pass
     return workspace_root, workspace_mode
+
+
+def _child_workspace(ctx, metadata, params):
+    """Bind the parent's observed source before selecting the child's start."""
+    workspace_root = str(getattr(ctx, "workspace_root", "") or metadata.get("workspace_root") or "").strip()
+    workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
+    from ouroboros.tool_access_reads import capture_parent_workspace, readonly_start_folder
+    parent_workspace = capture_parent_workspace(ctx)
+    workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)
+    selected_folder = str(params.get("workspace_root") or "").strip()
+    if selected_folder:
+        try:
+            selected_path = Path(selected_folder).expanduser()
+            workspace_root = readonly_start_folder(
+                selected_path if selected_path.is_absolute() else Path(parent_workspace["root"]) / selected_path)
+            workspace_mode = "read_only"
+        except (OSError, ValueError, RuntimeError) as exc:
+            return workspace_root, workspace_mode, parent_workspace, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}"
+    return workspace_root, workspace_mode, parent_workspace, ""
 
 
 def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, **params: Any) -> str:
@@ -744,9 +766,9 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
                             if root_task_id_seed == current_task_id else metadata.get("root_cost_ceiling_usd"))
     if refusal := schedule_delegation_refusal(parent_contract, status_drive_root, parent_task_id):
         return refusal
-    workspace_root = str(getattr(ctx, "workspace_root", "") or metadata.get("workspace_root") or "").strip()
-    workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
-    workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)
+    workspace_root, workspace_mode, parent_workspace, folder_error = _child_workspace(ctx, metadata, params)
+    if folder_error:
+        return folder_error
     parent_project_id = str(getattr(ctx, "project_id", "") or "").strip()
     requested_surface = str(params.get("write_surface") or "").strip().lower()
     # `read_only` is a first-class, provider-safe alias for "omit write_surface" (NOT a
@@ -875,6 +897,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         "budget_drive_root": budget_drive_root,
         "root_cost_ceiling_usd": root_cost_ceiling_usd,
         "task_constraint": task_constraint,
+        "parent_workspace": parent_workspace,
         "task_contract": child_contract,
         "allowed_resources": allowed_resources,
         "required_capabilities": required_caps,

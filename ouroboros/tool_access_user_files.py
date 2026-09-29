@@ -133,7 +133,8 @@ def user_files_path_block_reason(
     from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
     from ouroboros.tool_access import active_tool_profile
 
-    if mode_has_unrestricted_agency(get_runtime_mode()) and active_tool_profile(ctx) != "local_readonly_subagent":
+    read_only = operation in _tool_access()._READ_OPS
+    if mode_has_unrestricted_agency(get_runtime_mode()) and (read_only or active_tool_profile(ctx) != "local_readonly_subagent"):
         return ""
     home = _tool_access()._user_files_root()
     outside_home = not _tool_access().path_is_relative_to(resolved, home) and not _tool_access()._path_is_relative_to_casefold(resolved, home)
@@ -141,7 +142,9 @@ def user_files_path_block_reason(
     # sibling checkouts). The runtime-overlap guard BELOW still runs on the full
     # path, so the Ouroboros repo/data drive stays protected even when home
     # confinement is lifted.
-    if outside_home and not _tool_access().is_external_workspace(ctx):
+    from ouroboros.tool_access_reads import read_allows_outside_home
+    outside_home_allowed = read_allows_outside_home(ctx) if read_only else _tool_access().is_external_workspace(ctx)
+    if outside_home and not outside_home_allowed:
         return f"path is outside user home {home}"
 
     # The Ouroboros runtime/control surface is the system repo PLUS every data
@@ -281,8 +284,11 @@ def resolve_user_file_path(
         from ouroboros.runtime_mode_policy import mode_has_unrestricted_agency
         from ouroboros.tool_access import active_tool_profile
 
-        cyber = mode_has_unrestricted_agency(get_runtime_mode()) and active_tool_profile(ctx) != "local_readonly_subagent"
-        if not allow_outside_home and not cyber and not _tool_access().is_external_workspace(ctx):
+        read_only = operation in _tool_access()._READ_OPS
+        cyber = mode_has_unrestricted_agency(get_runtime_mode()) and (read_only or active_tool_profile(ctx) != "local_readonly_subagent")
+        from ouroboros.tool_access_reads import read_allows_outside_home
+        outside_home_allowed = read_allows_outside_home(ctx) if read_only else _tool_access().is_external_workspace(ctx)
+        if not allow_outside_home and not cyber and not outside_home_allowed:
             home_resolved = home.resolve(strict=False)
             # Case-insensitive-platform parity with the user_files_path_block_reason
             # authority: a differently-cased safe home path must not be rejected

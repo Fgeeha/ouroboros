@@ -408,6 +408,12 @@ def _resolve_subagent_constraint(
     readonly = {"mode": LOCAL_READONLY_SUBAGENT_MODE, "allow_enable": False, "allow_review": False}
     req = requested_constraint if isinstance(requested_constraint, dict) else {}
     if str(req.get("mode") or "") != ACTING_SUBAGENT_MODE:
+        if workspace_root:
+            from ouroboros.tool_access_reads import readonly_start_folder
+            try:
+                workspace_root = readonly_start_folder(workspace_root)
+            except (OSError, ValueError, RuntimeError) as exc:
+                return readonly, workspace_root, workspace_mode, f"Subagent rejected: {exc}"
         return readonly, workspace_root, workspace_mode, ""
     surface = str(req.get("surface") or "").strip().lower()
     if surface not in VALID_WRITE_SURFACES:
