@@ -195,7 +195,7 @@ class TestAliasProducerFanOutSweep:
         ("ouroboros/tools/search.py", "cost_usd", "_web_search"): ("ledger settlement call (web search attempt)", 1),
         # usage/observability event streams (events.jsonl, live log frames;
         # /api/logs replay converts to the honest name at the boundary)
-        ("ouroboros/loop_llm_call.py", "cost_usd", "call_llm_with_retry"): ("llm_round usage event rows", 2),
+        ("ouroboros/loop_llm_call.py", "cost_usd", "call_llm_with_retry"): ("llm_round usage event rows", 1),
         ("ouroboros/post_task_synthesis.py", "cost_usd", "_run_chat_consolidation"): ("chat_block_consolidation event row", 1),
         ("ouroboros/post_task_synthesis.py", "cost_usd", "_run_reflection"): ("reflection generation gate args", 1),
         ("supervisor/events_evolution_done.py", "cost_usd", "_handle_evolution_task_done"): ("internal lifecycle/checkpoint call kwargs + supervisor.jsonl observability row", 3),

@@ -671,3 +671,22 @@ def test_the_terminal_hint_claims_every_account_only_from_the_pool_verdict():
     assert "every compatible account blocked" in proven and FALLBACK in proven
     assert "every compatible account" not in unproven and "unproven" in unproven
     assert "scheduled" not in proven + unproven and "nothing sleeps" in unproven
+
+
+def test_fallback_keeps_original_effort_instead_of_previous_sent_or_reported(main_call, one_fallback, monkeypatch):
+    ctx, _gateway, _owner, events, _decide, _observations = main_call
+    ctx.accumulated_usage["request_wire"] = {"original_requested_effort": "ultra", "applied_effort": "low"}
+    seen = []
+
+    def candidate(round_call):
+        seen.append(round_call.active_effort)
+        return {"role": "assistant", "content": "done"}, 0.0, "max"
+
+    monkeypatch.setattr(loop, "_call_round_model", candidate)
+    message, *_rest = loop._run_cross_model_fallback_chain(
+        llm=ctx.llm, ctx=ctx.tools._ctx, tools=ctx.tools, messages=ctx.messages, active_model=ctx.active_model,
+        active_use_local=False, tool_schemas=[], active_effort="ultra", max_retries=1, drive_logs=ctx.drive_logs,
+        task_id=ctx.task_id, round_idx=1, event_queue=events, accumulated_usage=ctx.accumulated_usage,
+        task_type="task", emit_progress=lambda *_a, **_kw: None, context_fit_plan=ctx.context_fit_plan,
+        active_context_mode="max")
+    assert message["content"] == "done" and seen == ["ultra"]

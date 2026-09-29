@@ -505,21 +505,36 @@ def test_the_open_wave_text_names_the_route_that_waits_for_the_settlement_frame(
 
     executor = _install_real_substrate(monkeypatch)
     ctx = harness.make_ctx()
+    before = set(threading.enumerate())
+    workers = []
     try:
-        first = _call(ctx)
-        assert _wait_until(lambda: executor.execute_calls == 3)
+        try:
+            first = _call(ctx)
+            assert _wait_until(lambda: executor.execute_calls == 3)
+            workers = [t for t in threading.enumerate()
+                       if t not in before and t.name.startswith("ouroboros-review-plan_review-")]
+            assert sorted(t.name for t in workers) == [f"ouroboros-review-plan_review-s{i}" for i in (1, 2, 3)]
+        finally:
+            executor.release.set()
+        wave = _state(harness)["waves"][-1]
+        fp = wave["request_fingerprint"]
+        for text in (first, _next_step(wave, enforcement="blocking", cap=2, cycles_paid=0)):
+            # "paid" is not claimed: a slot released at the barrier is $0 until its row proves the send.
+            assert "one or more reviewer operations are still in flight" in text and "paid reviewer" not in text
+            assert ("The host writes ONE message into this task's mailbox when every released slot "
+                    "settles: wait_task on this task's own id (wait_tasks while children run) "
+                    "returns on it") in text
+            assert f"plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}})" in text
+            assert "schedule_followup" not in text  # a new root task cannot collect this wave
+        assert _wait_until(lambda: len(_mailbox_entries(harness.drive, "task-1")) == 1)
     finally:
         executor.release.set()
-    wave = _state(harness)["waves"][-1]
-    fp = wave["request_fingerprint"]
-    for text in (first, _next_step(wave, enforcement="blocking", cap=2, cycles_paid=0)):
-        # "paid" is not claimed: a slot released at the barrier is $0 until its row proves the send.
-        assert "one or more reviewer operations are still in flight" in text and "paid reviewer" not in text
-        assert ("The host writes ONE message into this task's mailbox when every released slot "
-                "settles: wait_task on this task's own id (wait_tasks while children run) "
-                "returns on it") in text
-        assert f"plan_task(review_disposition={{review_fingerprint: '{fp}', items: []}})" in text
-        assert "schedule_followup" not in text  # a new root task cannot collect this wave
+        # Even a failed assertion must not leave this test's released reviewers alive.
+        # The positive path above still checks the exact settlement frame.
+        retired = _wait_until(lambda: not any(
+            t.is_alive() for t in threading.enumerate()
+            if t not in before and t.name.startswith("ouroboros-review-plan_review-")))
+    assert retired
 
 
 @pytest.mark.parametrize("effort", ["low", "high", "none", "default"])
