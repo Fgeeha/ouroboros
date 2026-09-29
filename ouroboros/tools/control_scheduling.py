@@ -364,11 +364,12 @@ def _build_acting_constraint(
             f"{allowed} (or omit it for a read-only subagent)."
         )
     from ouroboros.consciousness_authority import task_mode_capped_light
+    from ouroboros.workspace_copies import workspace_copy_source_is_system
 
-    # A per-task mode cap (a consciousness Act/Observe tree: light) keeps a self_worktree
-    # child off in EVERY install mode and toggle state — the tree may write, but never into
-    # its own repository, its children included (В21=A).
-    if write_surface == "self_worktree" and task_mode_capped_light(getattr(ctx, "task_metadata", None)):
+    system_copy = write_surface == "self_worktree" and (
+        not parent_workspace_root or workspace_copy_source_is_system(ctx, parent_workspace_root))
+    # The inherited light cap excludes own-body mutation, including through copies.
+    if system_copy and task_mode_capped_light(getattr(ctx, "task_metadata", None)):
         return _publish_tool_result(ctx, ToolResult(
             status="blocked", code="ACCESS_BLOCKED",
             text=(
@@ -378,7 +379,7 @@ def _build_acting_constraint(
                 "Schedule a read-only subagent (omit write_surface) or use an external surface."
             ),
         ))
-    if not get_allow_mutative_subagents(write_surface):
+    if not get_allow_mutative_subagents(write_surface, source_is_system_repo=system_copy):
         return _publish_tool_result(ctx, ToolResult(
             status="blocked", code="ACCESS_BLOCKED",
             text=(
@@ -388,8 +389,8 @@ def _build_acting_constraint(
             "true/false applies to every surface; when it is empty the runtime mode "
             "decides — advanced/pro allow every surface, light allows the external "
             "build surfaces (external_workspace, genesis — they write outside the "
-            "Ouroboros runtime) and keeps self_worktree (a checkout of the live body) "
-            "off. Schedule a read-only subagent (omit write_surface), use an external "
+            "Ouroboros runtime, including isolated copies of foreign projects) and keeps "
+            "own-body copies off. Schedule a read-only subagent (omit write_surface), use an external "
             "surface, or have the owner enable the toggle."
             ),
         ))
@@ -771,15 +772,19 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         return folder_error
     parent_project_id = str(getattr(ctx, "project_id", "") or "").strip()
     requested_surface = str(params.get("write_surface") or "").strip().lower()
-    # `read_only` is a first-class, provider-safe alias for "omit write_surface" (NOT a
-    # VALID_WRITE_SURFACES acting surface) — normalize it to the read-only path so
-    # constraint selection, mutating detection, and the event all treat it as read-only (P5).
+    # The explicit read-only alias selects the same authority as omission.
     if requested_surface == "read_only":
         requested_surface = ""
+    from ouroboros.delegate_directory import git_directory_options_refusal
+    if requested_surface and (error := git_directory_options_refusal(
+            params.get("write_root") or workspace_root or system_repo_dir_for(ctx),
+            fields.get("directory_strategy"), fields.get("scope_paths"),
+            git_workspace=requested_surface in {"self_worktree", "genesis"})):
+        return _publish_scheduling_refusal(ctx, "error", "TOOL_ARG_ERROR", f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {error}")
     if requested_surface:
         from ouroboros.presence_authority import presence_ceiling_allows_delegated_surface
 
-        if not presence_ceiling_allows_delegated_surface(ctx, requested_surface):
+        if not presence_ceiling_allows_delegated_surface(ctx, requested_surface, workspace_root):
             return (
                 "⚠️ PRESENCE_DELEGATION_BLOCKED: mutative delegation requires an exact "
                 "selected write root for this surface in the inherited capability ceiling."
@@ -813,11 +818,7 @@ def _schedule_task(ctx: ToolContext, internal: Dict[str, Any] | None = None, /, 
         or {}
     )
     executor_ref = _resolve_executor_ref(ctx)
-    # SCHEDULING STATES INTENT AND NOTHING ELSE. The lane, the model, the effort, the
-    # route, the profile and the effective executor are all resolved ONCE, at
-    # dispatch, by `subagents.resolve_subagent_dispatch` — see it for why. What is
-    # recorded here is what the parent ASKED for, plus the parent's own lane, which
-    # is the fact an omitted lane inherits and which only the parent knows.
+    # Dispatch resolves the exact actor later; scheduling records requested intent.
     tid = uuid.uuid4().hex[:8]
     created_at = utc_now_iso()
     root_task_id = root_task_id_seed or tid

@@ -361,15 +361,16 @@ def _target_is_system_repo(ctx: ToolContext) -> bool:
     project that happens to own files with those names is not covered by it, and
     gating there blocks ordinary work in an external workspace with advice about a
     runtime mode that has nothing to do with that project. The predicate mirrors
-    the registry's own write gate (`(not workspace_mode or acting_self_worktree)`):
-    no active workspace means the active root IS the live repo, and a
-    ``self_worktree`` surface is a checkout of it.
+    the registry's own write gate: absent workspace means the live body; an
+    isolated copy retains its admitted source identity. Legacy copies are
+    interpreted as the body, as their original contract required.
     """
     constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
-    if str(getattr(constraint, "surface", "") or "") == "self_worktree":
-        return True
-    if str(getattr(ctx, "workspace_mode", "") or "").strip().lower() == "self_worktree":
-        return True
+    if (str(getattr(constraint, "surface", "") or "") == "self_worktree"
+            or str(getattr(ctx, "workspace_mode", "") or "").strip().lower() == "self_worktree"):
+        from ouroboros.workspace_copies import is_system_copy
+
+        return is_system_copy(ctx)
     try:
         return not bool(ctx.is_workspace_mode())
     except Exception:
@@ -783,9 +784,7 @@ def _integrate_subagent_patch(
             )
     touched = sorted(set(touched) | {row["path"] for row in file_rows})
 
-    # Top-only routing for EVERY caller: integration always targets your OWN active
-    # repo/worktree. An explicit target_root must equal it (no foreign target, which
-    # could be the live repo or another worktree).
+    # An explicit target must equal the parent active root; descendants bubble up.
     constraint = normalize_task_constraint(getattr(ctx, "task_constraint", None))
     is_acting = bool(constraint and getattr(constraint, "mode", "") == ACTING_SUBAGENT_MODE)
     try:
@@ -821,30 +820,23 @@ def _integrate_subagent_patch(
             touched=touched, file_rows=file_rows,
         )
 
-    # Fail-closed category guard (v6.56.0): a self_worktree child's patch is a
-    # patch AGAINST THE OUROBOROS SYSTEM REPO. A parent running in EXTERNAL
-    # workspace mode has the external project as its active root — applying a
-    # system-repo patch there would target the wrong repository. Refuse instead
-    # of 3-way-applying into the task workspace. A nested acting parent whose
-    # own workspace IS a self_worktree checkout stays legitimate top-only
-    # routing and is not touched by this guard.
+    from ouroboros.workspace_copies import copy_binding
+
+    child_copy = copy_binding(child_result) or child_result.get("workspace_copy") or {}
     if child_surface == "self_worktree":
-        capped = _capped_self_repo_refusal(ctx, child_task_id)
-        if capped:
-            return capped
-        parent_ws_mode = str(getattr(ctx, "workspace_mode", "") or "").strip().lower()
-        # Fire STRUCTURALLY whenever the parent's active root is a non-system
-        # workspace (is_workspace_mode()), so an unrecognized external spelling
-        # cannot slip past a fixed allowlist. The one excluded mode is a parent
-        # whose OWN workspace is a self_worktree checkout — it legitimately routes
-        # a system-repo patch (nested acting), as the comment above notes.
-        if ctx.is_workspace_mode() and parent_ws_mode != "self_worktree":
-            return (
-                f"⚠️ INTEGRATE_SELF_WORKTREE_UNDER_WORKSPACE: child {child_task_id} produced a "
-                "self_worktree patch (against the Ouroboros system repo), but this task's active "
-                "root is an external workspace. Refusing to apply a system-repo patch into the "
-                "task workspace; integrate it from a non-workspace parent task instead."
-            )
+        if child_copy:
+            if (pathlib.Path(child_copy.get("source_root") or ".").resolve() != target
+                    or child_copy.get("baseline_sha") != manifest.get("base_head")
+                    or child_copy != manifest.get("workspace_copy")):
+                return "⚠️ INTEGRATE_COPY_BINDING_MISMATCH: the recorded copy source, baseline or capture does not match this parent."
+        elif ctx.is_workspace_mode() and str(getattr(ctx, "workspace_mode", "")) != "self_worktree":
+            # Legacy records always meant an Ouroboros-body copy. Missing
+            # provenance must never turn one into a foreign-project patch.
+            return "⚠️ INTEGRATE_SELF_WORKTREE_UNDER_WORKSPACE: legacy system-repo patch cannot be applied to an external workspace."
+        if (not child_copy or child_copy.get("source_is_system_repo") is not False):
+            capped = _capped_self_repo_refusal(ctx, child_task_id)
+            if capped:
+                return capped
 
     runtime_mode = _integration_runtime_mode(ctx)
     # Derive the changed-path set from the PATCH ITSELF (not the child-controlled
@@ -857,7 +849,7 @@ def _integrate_subagent_patch(
             f"protected-path check (git apply --numstat failed): {parse_error[:300]}"
         )
     touched = sorted(patch_touched | {row["path"] for row in file_rows})
-    protected = protected_paths_in(touched)
+    protected = protected_paths_in(touched) if _target_is_system_repo(ctx) else []
     if protected:
         grant_ok = (not is_acting) or bool(getattr(constraint, "protected_paths_grant", False))
         if not (mode_allows_protected_write(runtime_mode) and grant_ok):
@@ -872,57 +864,71 @@ def _integrate_subagent_patch(
                 action=f"integrate subagent patch {child_task_id} touching",
             )
 
-    # Serialize the index/worktree mutation with the SAME repo git lock that
-    # commit_reviewed uses, so a concurrent integration or a reviewed commit cannot
-    # race on the index.
-    from ouroboros.tools.git import _acquire_git_lock, _release_git_lock
+    if child_copy:
+        try:
+            outcome = _locked_apply(
+                ctx, target, patch_path, touched, child_copy["baseline_sha"],
+                file_changes=file_rows, file_baseline=child_copy.get("file_baseline", {}))
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError, zipfile.BadZipFile) as exc:
+            return f"⚠️ INTEGRATE_APPLY_UNKNOWN: {type(exc).__name__}: {exc}. Inspect the target before another apply; the captured result is retained."
+        detail = outcome.get("lock_error") or outcome.get("drift_error")
+        if outcome.get("drifted"):
+            detail = "source files changed since copy: " + ", ".join(outcome["drifted"])
+        proc = outcome["proc"]
+        apply_attempted = proc is not None
+        partial_applied = bool(outcome["staging_failure"] and not outcome["reverted"])
+        if detail or outcome["staging_failure"] or proc is None:
+            proc = subprocess.CompletedProcess([], 1, "", detail or outcome["staging_failure"] or "copy apply was not attempted")
+    else:
+        # Legacy --index apply shares the reviewed-commit Git lock.
+        from ouroboros.tools.git import _acquire_git_lock, _release_git_lock
 
-    try:
-        _git_lock = _acquire_git_lock(ctx)
-    except Exception as exc:
-        return f"⚠️ INTEGRATE_LOCK_TIMEOUT: could not acquire the repo git lock: {type(exc).__name__}: {exc}."
-    partial_applied = False
-    apply_attempted = False
-    try:
-        # Match --index semantics for file results too: never replace a parent's
-        # staged preimage merely because its working copy matches the child base.
-        index_tree = subprocess.run(
-            ["git", "write-tree"], cwd=str(target), capture_output=True, text=True, check=True,
-        ).stdout.strip() if file_rows else ""
-        with prepare_file_outputs(file_rows, target, baseline_sha=index_tree) as prepared:
-            apply_attempted = has_patch
-            proc = (subprocess.run(
-                ["git", "apply", "--3way", "--index", str(patch_path)],
-                cwd=str(target), capture_output=True, text=True,
-            ) if has_patch else subprocess.CompletedProcess([], 0, "", ""))
-            if proc.returncode == 0 and file_rows:
-                try:
-                    apply_attempted = True
-                    prepared.apply()
-                    if not prepared.verify_applied():
-                        raise OSError("file outputs changed before staging")
-                    paths = _stageable_paths(target, prepared.paths)
-                    if paths:
-                        stage = subprocess.run(
-                            ["git", "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
-                            cwd=str(target), capture_output=True,
-                            input=b"\0".join(p.encode("utf-8", errors="surrogateescape") for p in paths) + b"\0",
-                        )
-                        if stage.returncode:
-                            raise OSError((stage.stderr or stage.stdout).decode("utf-8", errors="replace"))
-                except Exception as exc:
-                    partial_applied = has_patch
+        try:
+            _git_lock = _acquire_git_lock(ctx)
+        except Exception as exc:
+            return f"⚠️ INTEGRATE_LOCK_TIMEOUT: could not acquire the repo git lock: {type(exc).__name__}: {exc}."
+        partial_applied = False
+        apply_attempted = False
+        try:
+            # Match --index semantics for file results too: never replace a parent's
+            # staged preimage merely because its working copy matches the child base.
+            index_tree = subprocess.run(
+                ["git", "write-tree"], cwd=str(target), capture_output=True, text=True, check=True,
+            ).stdout.strip() if file_rows else ""
+            with prepare_file_outputs(file_rows, target, baseline_sha=index_tree) as prepared:
+                apply_attempted = has_patch
+                proc = (subprocess.run(
+                    ["git", "apply", "--3way", "--index", str(patch_path)],
+                    cwd=str(target), capture_output=True, text=True,
+                ) if has_patch else subprocess.CompletedProcess([], 0, "", ""))
+                if proc.returncode == 0 and file_rows:
                     try:
-                        prepared.rollback()
-                        detail = "file output writes reverted; inspect any applied text patch before retrying"
-                    except Exception as rollback_exc:
-                        partial_applied = True
-                        detail = f"file output rollback incomplete: {rollback_exc}"
-                    proc = subprocess.CompletedProcess([], 1, "", f"{exc}; {detail}")
-    except (OSError, ValueError, KeyError, subprocess.SubprocessError, zipfile.BadZipFile) as exc:
-        proc = subprocess.CompletedProcess([], 1, "", str(exc))
-    finally:
-        _release_git_lock(_git_lock)
+                        apply_attempted = True
+                        prepared.apply()
+                        if not prepared.verify_applied():
+                            raise OSError("file outputs changed before staging")
+                        paths = _stageable_paths(target, prepared.paths)
+                        if paths:
+                            stage = subprocess.run(
+                                ["git", "add", "--pathspec-from-file=-", "--pathspec-file-nul"],
+                                cwd=str(target), capture_output=True,
+                                input=b"\0".join(p.encode("utf-8", errors="surrogateescape") for p in paths) + b"\0",
+                            )
+                            if stage.returncode:
+                                raise OSError((stage.stderr or stage.stdout).decode("utf-8", errors="replace"))
+                    except Exception as exc:
+                        partial_applied = has_patch
+                        try:
+                            prepared.rollback()
+                            detail = "file output writes reverted; inspect any applied text patch before retrying"
+                        except Exception as rollback_exc:
+                            partial_applied = True
+                            detail = f"file output rollback incomplete: {rollback_exc}"
+                        proc = subprocess.CompletedProcess([], 1, "", f"{exc}; {detail}")
+        except (OSError, ValueError, KeyError, subprocess.SubprocessError, zipfile.BadZipFile) as exc:
+            proc = subprocess.CompletedProcess([], 1, "", str(exc))
+        finally:
+            _release_git_lock(_git_lock)
     if proc.returncode != 0:
         stderr = (proc.stderr or proc.stdout or "").strip()
         conflicts = [ln.strip() for ln in stderr.splitlines() if "conflict" in ln.lower() or "patch failed" in ln.lower()]
@@ -1076,11 +1082,11 @@ def get_tools() -> List[ToolEntry]:
                 "name": "integrate_subagent_patch",
                 "description": (
                     "Integrate a mutative child's result or record a rejection: self_worktree uses "
-                    "manifest-first, sha256-verified 3-way apply into your active repo; native external_workspace "
+                    "a source-bound baseline check then apply/stage into your active repo (legacy copies keep 3-way apply); native external_workspace "
                     "verifies files already in the shared tree WITHOUT reapplying. Genesis is a standalone "
                     "directory, not a repo patch. This never commits; self-modification still requires your "
                     "commit_reviewed. For best-of-N pick a child "
-                    "and integrate it, or integrate several to synthesize. Protected-path changes require "
+                    "and integrate it, or integrate several to synthesize. Own-body protected-path changes require "
                     "pro runtime mode (and, for a nested acting parent, protected_paths_grant). Conflicts "
                     "are reported for you to resolve (vcs_diff) or abort (vcs_restore). Writes a "
                     "subagent_patch_verdict_<task_id>.json audit artifact."

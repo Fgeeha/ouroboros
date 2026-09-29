@@ -1103,6 +1103,9 @@ class ToolRegistry:
         local_readonly_subagent = self._is_local_readonly_subagent()
         acting_subagent = self._is_acting_subagent()
         acting_self_worktree = acting_subagent and str(getattr(task_constraint, "surface", "") or "") == "self_worktree"
+        from ouroboros.workspace_copies import is_system_copy
+
+        acting_system_worktree = acting_self_worktree and is_system_copy(self._ctx)
         acting_protected_grant = acting_subagent and bool(getattr(task_constraint, "protected_paths_grant", False))
         acting_tool_grants = self._acting_tool_grants() if acting_subagent else set()
         entry = self._entries.get(name)
@@ -1178,9 +1181,9 @@ class ToolRegistry:
                     name, str(args.get("root") or "active_workspace"), exc)
         # Asked three times below (light start_service, protected writes, the
         # light repo tripwire snapshot) and always with the same answer: an
-        # acting child's own worktree counts as the system repo.
+        # isolated child counts as the body only when its admitted source does.
         targets_system_repo = (
-            _binding_set_targets_system_repo(self._ctx, resolved_binding) or acting_self_worktree
+            _binding_set_targets_system_repo(self._ctx, resolved_binding) or acting_system_worktree
         )
         if not _presence_binding_allowed(self._ctx, resolved_binding):
             return (
@@ -1238,11 +1241,11 @@ class ToolRegistry:
             # resolves user_files to the whole host, so a repository path
             # reached under THAT root is still Ouroboros self-modification.
             light_targets_system = (
-                _binding_set_is_light_restricted(self._ctx, resolved_binding) or acting_self_worktree
+                _binding_set_is_light_restricted(self._ctx, resolved_binding) or acting_system_worktree
                 or _user_files_binding_reaches_repo(self._ctx, resolved_binding)
             )
         else:
-            light_targets_system = not workspace_mode or acting_self_worktree
+            light_targets_system = not workspace_mode or acting_system_worktree
         if (
             _runtime_mode == "light"
             and name in _REPO_MUTATION_TOOLS
@@ -1277,7 +1280,7 @@ class ToolRegistry:
             if resolved_binding is not None:
                 protected_target = targets_system_repo
             else:
-                protected_target = (not workspace_mode or acting_self_worktree) and (
+                protected_target = (not workspace_mode or acting_system_worktree) and (
                     root_name in {"active_workspace", "system_repo"}
                 )
             protected_matches = (
