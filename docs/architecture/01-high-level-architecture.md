@@ -22,7 +22,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
   │   ├── modules/project_handoff.js ← Main-only transfer anchors: every converted card stays visible, at most one receipt row per `handoff_id` folds under the first visible card, shadows restored on eviction, phase from the existing census/task detail; `receiptNotice` words the typed receipt (§3 Project handoff receipts)
   │   ├── modules/project_reference.js ← the one control that points at a Project, and the only raiser of `ouro:open-project` (DESIGN "References and actions")
   │   ├── modules/project_activity.js ← pure `active_chat_activities` census projection for Project navigation dots; complete supervisor-ready snapshots clear absences, while partial/unavailable/disconnected reads retain explicitly unknown rows (§3 Liveness census and the chat header)
-  │   ├── modules/project_work_pointer.js ← Project-room pointer to an already loaded root card; no execution or history authority (§3 Project rooms)
+  │   ├── modules/project_work_pointer.js, project_read_state.js ← Pointer to a loaded root card, no execution or history authority; the room's read receipt (§3 Project rooms)
   │   ├── modules/model_wait.js ← Model-wait views and owner actions inside existing chat cards, through the shared decision ingress (§6 Quota and auth waits)
   │   ├── modules/task_checkpoints.js, cancel_presentation.js ← Typed task checkpoints and recorded cancellation-cause text shared by Chat and Logs (§3)
   │   ├── modules/dashboard.js, logs.js, costs.js, files.js ← Dashboard tab host; Logs (backfill plus live-stream duplicate guard); Costs (an open zero is never shown as free); Files browser over `/api/files/*` (§3 Dashboard, Files)

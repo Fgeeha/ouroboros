@@ -94,7 +94,7 @@ def test_live_card_timeline_only_follows_when_pinned():
 
 def test_reconnect_merges_user_rows_without_clearing_visible_history():
     src = _read("web/modules/chat.js")
-    sync = src[src.index("async function syncHistory"):src.index("function cancelHistoryPaint")]
+    sync = src[src.index("async function syncHistory"):src.index("const readReceipt = createProjectReadReceipt(")]
     replay = src[src.index("function applyHistoryMessages"):src.index("async function syncHistory")]
     add = src[src.index("function addMessage"):src.index("function updateMessageAnnotation")]
     # Reconnect still fetches the canonical source and includes owner dialogue.

@@ -1557,7 +1557,13 @@ export const GATEWAY_CONTRACT_VERSION = '7.5.1';
  * @property {boolean} has_more Older bytes remain or a disclosed source gap prevents establishing EOF.
  * @property {string|null} next_cursor Opaque room-bound older continuation.
  * @property {string|null} page_cursor Replays a frozen page; null for an unavailable source boundary.
- * @property {{complete:boolean,truncated_by:Array<string>}} window Whole-history coverage.
+ * @property {{complete:boolean,truncated_by:Array<string>,latest_message?:({history_id:string,out_of_order:boolean}|null)}} window
+ *   Whole-history coverage. A recent Project read also names the standalone message that
+ *   arrived last (null: its arrival is unknown, as while the live chat's last line is
+ *   unfinished, and on a replayed page, frozen before later arrivals), which must itself be
+ *   on screen for the room's read receipt, in its ordinary place too;
+ *   out_of_order: the bottom is not where it is (it sorts above earlier arrivals, or lies
+ *   before the recent read).
  * @property {string} [next_before_ts] Legacy field retained for compatibility.
  * @property {string} [error]
  * @property {string} [reason_code]

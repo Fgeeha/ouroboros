@@ -19,7 +19,7 @@ from ouroboros.gateway._helpers import (
 )
 from ouroboros.gateway.cost_breakdown import make_cost_breakdown_endpoint  # noqa: F401 — historical import path (router)
 from ouroboros.gateway.history_paging import (
-    HistoryCursorError, deferred_before, history_page_tokens, progress_quota_predicate,
+    HistoryCursorError, deferred_before, history_page_tokens, latest_arrival, progress_quota_predicate,
     replay_evidence_rows, room_view_fingerprint, select_history_page,
 )
 from ouroboros.cost_projection import carry_cost_meta, live_root_cost_projection
@@ -1493,6 +1493,7 @@ def _assemble_history_response(
     lifecycle_row = _active_lifecycle_row(row_matches_thread) if not cursor else None
     if lifecycle_row is not None:
         combined.append(lifecycle_row)
+    arrival = latest_arrival(combined, page, data_dir, row_matches_thread, _stored_chat_id) if thread_id in project_chat_ids else {}  # before tail/annotation
     if recent:
         (
             messages, result_cache, human_rows_dropped, lineage_truncated,
@@ -1547,7 +1548,7 @@ def _assemble_history_response(
             window["truncated_by"].append("quota")
     payload = {
         "messages": messages,
-        "window": window,
+        "window": {**window, **arrival},
         **tokens,
     }
     # Same rendering options as starlette's JSONResponse — serialized here so

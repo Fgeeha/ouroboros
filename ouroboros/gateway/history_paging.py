@@ -13,6 +13,7 @@ from ouroboros.contracts.chat_id_policy import is_a2a_chat_id
 from ouroboros.gateway import _helpers
 from ouroboros.gateway._helpers import _TAIL_WINDOW_START_BYTES
 from ouroboros.jsonl_tail import JsonlChainSnapshot
+from ouroboros.subagent_messages import is_task_card_message
 
 _SOURCES = ("chat", "progress")
 _READ_BYTES = 64 * 1024
@@ -70,6 +71,9 @@ def decode_cursor(value, thread_id, view):
                 raise ValueError
         if any(cursor["before"][source] > cursor["upper"][source] for source in _SOURCES):
             raise ValueError
+        unfinished = cursor.setdefault("unfinished", [])
+        if not isinstance(unfinished, list) or unfinished != sorted(set(unfinished) & set(_SOURCES)):
+            raise ValueError
         if set(cursor["quotas"]) != {"human", "progress"} or any(
             type(value) is not int or value < 0 for value in cursor["quotas"].values()
         ):
@@ -90,19 +94,27 @@ def decode_cursor(value, thread_id, view):
 class HistorySource(JsonlChainSnapshot):
     """One metadata snapshot, with no handles retained across a read batch."""
 
-    def __init__(self, path: Path, source: str, upper=None):
+    def __init__(self, path: Path, source: str, upper=None, unfinished=False):
         super().__init__(path, upper=upper)
         self.source = source
+        # Bytes after the frozen boundary that a writer had not finished when it
+        # was frozen (a cursor carries the fact with ``upper``): every read that
+        # reaches the boundary discloses them (``incomplete_live_line``), a clean EOF has none.
+        self.unfinished_live_line = bool(unfinished)
         if upper is None and self.snapshot["entries"] and self.snapshot["entries"][-1][2]:
             base, end = self.segment(len(self.entries) - 1)
             # A writer owns an unfinished live line. Freeze only complete rows,
             # so completing/rotating that line later cannot alter this page.
+            eof = end
             while end > base and self._read(end - 1, end) != b"\n":
                 start = max(base, end - _READ_BYTES)
                 data = self._read(start, end)
                 newline = data.rfind(b"\n")
                 end = start + newline + 1 if newline >= 0 else start
-            self.upper = end
+            self.upper, self.unfinished_live_line = end, end < eof
+
+    def _boundary_gaps(self, end):
+        return {"incomplete_live_line"} if self.unfinished_live_line and end == self.upper else set()
 
     def _entries(self, start, end, gaps):
         data = self._read(start, end)
@@ -141,7 +153,8 @@ class HistorySource(JsonlChainSnapshot):
 
     def recent(self, want, counts):
         """The existing recent byte-window and three-archive selection, with ids."""
-        entries, gaps, before, archive_count = [], set(), self.upper, 0
+        entries, before, archive_count = [], self.upper, 0
+        gaps = self._boundary_gaps(self.upper)
         for index in reversed(range(len(self.snapshot["entries"]))):
             base, end = self.segment(index)
             if base >= self.upper:
@@ -166,7 +179,7 @@ class HistorySource(JsonlChainSnapshot):
         """Consume one backward page; foreign/invalid bytes advance the position."""
         if want <= 0:
             return [], before, set()
-        selected, gaps, counted, scanned, scanned_rows = [], set(), 0, 0, 0
+        selected, gaps, counted, scanned, scanned_rows = [], self._boundary_gaps(before), 0, 0, 0
         while before > 0 and scanned < _PAGE_SCAN_BYTES and scanned_rows < _PAGE_SCAN_ROWS:
             index = bisect_left(self.snapshot["ends"], before)
             base, _end = self.segment(index)
@@ -190,7 +203,7 @@ class HistorySource(JsonlChainSnapshot):
         return list(reversed(selected)), before, gaps
 
     def replay(self, lower, before):
-        gaps, rows = set(), []
+        gaps, rows = self._boundary_gaps(before), []
         for index in range(len(self.snapshot["entries"])):
             base, end = self.segment(index)
             start, end = max(base, lower), min(end, before)
@@ -206,13 +219,16 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
         if any(quotas[key] > caps[key] for key in quotas):
             raise HistoryCursorError("history_cursor_invalid", 400)
     recent = not continuation or (continuation["kind"] == "page" and continuation["recent"])
-    selections, upper, before, page_ends = {}, {}, {}, {}
+    selections, upper, before, page_ends, unfinished = {}, {}, {}, {}, []
     paths = {"chat": data_dir / "logs" / "chat.jsonl", "progress": data_dir / "logs" / "progress.jsonl"}
     for source, quota in (("chat", "human"), ("progress", "progress")):
         try:
             reader = HistorySource(paths[source], source,
-                                   continuation["upper"][source] if continuation else None)
+                                   continuation["upper"][source] if continuation else None,
+                                   bool(continuation) and source in continuation["unfinished"])
             upper[source] = reader.upper
+            if reader.unfinished_live_line:
+                unfinished.append(source)
             page_ends[source] = continuation["before"][source] if continuation else reader.upper
             if continuation and continuation["kind"] == "page":
                 selections[source] = reader.replay(continuation["lower"][source], page_ends[source])
@@ -227,15 +243,16 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
             # unknown chain prefix cannot establish global offsets or EOF.
             selections[source] = (None, 0, {"source_unavailable"})
         before[source] = selections[source][1]
-    return {"v": 1, "chat_id": thread_id, "view": view, "upper": upper, "quotas": quotas,
-            "recent": recent, "selections": selections, "before": before, "page_ends": page_ends}
+    return {"v": 1, "chat_id": thread_id, "view": view, "upper": upper, "unfinished": unfinished,
+            "quotas": quotas, "recent": recent, "replayed": bool(continuation),
+            "selections": selections, "before": before, "page_ends": page_ends}
 
 
 def history_page_tokens(page):
     if any(selection[0] is None for selection in page["selections"].values()):
         return {"has_more": True, "next_cursor": None, "page_cursor": None,
                 "reason_code": "history_source_unavailable"}
-    state = {key: page[key] for key in ("v", "chat_id", "view", "upper", "quotas")}
+    state = {key: page[key] for key in ("v", "chat_id", "view", "upper", "unfinished", "quotas")}
     before = {source: position if page["quotas"]["human" if source == "chat" else source] else 0
               for source, position in page["before"].items()}
     has_more = any(before.values())
@@ -276,6 +293,97 @@ def deferred_before(source, entries, candidates, messages, before):
     return max([before, *(entry["_history_end"] for entry in entries
                           if entry.get("history_id") in deferred
                           and entry["history_position"]["source"] == source)])
+
+
+def _feed_message(row):
+    """A standalone conversation row with a physical chat position.
+
+    Progress, a folded review, a task summary and task-card content (a host
+    placement or a child's own words) change a card, not the conversation; a
+    skill review is appended beside it and never counts as unread."""
+    position = row.get("history_position")
+    return (isinstance(position, dict) and position.get("source") == "chat"
+            and not row.get("is_progress") and not isinstance(row.get("review_group"), dict)
+            and str(row.get("system_type") or "") not in ("task_summary", "skill_review")
+            and not is_task_card_message(row))
+
+
+def _skipped_row_after(entries, after, upper):
+    """Whether the physical selection skipped a row at or after ``after``."""
+    position = after
+    for start, end in sorted((entry["history_position"]["offset"], entry["_history_end"])
+                             for entry in entries if entry["history_position"]["offset"] >= after):
+        if start != position:
+            return True
+        position = end
+    return position != upper
+
+
+def _stored_message(row_matches_thread, stored_chat_id):
+    """A stored chat row the history projection turns into a standalone message."""
+    def message(entry):
+        kind = str(entry.get("type") or "")
+        return (str(entry.get("direction") or "").lower() in ("out", "system")
+                and kind not in ("routing_options", "quiz_answer", "task_summary", "skill_review")
+                and not is_task_card_message(entry) and not is_a2a_chat_id(entry.get("chat_id", 1))
+                and (str(entry.get("text") or "").strip() not in ("", "\u200b")
+                     or kind in ("document", "links", "photo", "video", "quiz"))
+                and row_matches_thread(stored_chat_id(entry.get("chat_id"), 1), entry))
+    return message
+
+
+def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id):
+    """``window.latest_message`` of a recent Project read (DESIGN "Project unread dot").
+
+    The window is ordered and tailed by event time, but a Project message counts
+    as unread when it ARRIVES: an answer the terminal outbox delivers late keeps
+    its original ``ts``, so it can sort above messages that arrived before it
+    (``out_of_order``) or below the window's floor, where the first older page
+    (``deferred_before``) shows it. Reading the room means reading the standalone
+    message that arrived last, named from the persisted rows before the tail and
+    annotation rewrite them. ``None``: its arrival is unknown — the chat source
+    is unreadable, a row after the newest readable one is, or the live chat ends in
+    a line its writer has not finished (``incomplete_live_line``: this read froze
+    before it, so it may be the newest message) — and on a replayed recent page,
+    which cannot see what arrived after its frozen boundary. Older pages name nothing.
+
+    Card rows, a child's words and the owner's own messages can fill the recent
+    selection's quota. One bounded older read (``older``'s own byte and row bound)
+    then names the newest stored message before it — ``out_of_order``, since this
+    read cannot place it relative to the bottom — or proves the chat holds none
+    (absent); its bound or an unreadable row reached first leaves the arrival unknown.
+    """
+    if not page["recent"]:
+        return {}
+    if page["replayed"]:
+        return {"latest_message": None}
+    entries, start, gaps = page["selections"]["chat"]
+    upper = page["upper"].get("chat", 0)
+    feed = [row for row in rows if _feed_message(row)]
+    spoken = [row for row in feed if row.get("role") != "user" and (
+        str(row.get("text") or "").strip() not in ("", "\u200b") or row.get("msg_type"))]
+    offset = lambda row: row["history_position"]["offset"]  # noqa: E731
+    latest = max(spoken, key=offset, default=None)
+    if entries is None or "incomplete_live_line" in gaps or (
+            gaps and _skipped_row_after(entries, offset(latest) if latest else start, upper)):
+        return {"latest_message": None}
+    if latest is None and start > 0:
+        message = _stored_message(row_matches_thread, stored_chat_id)
+        try:
+            entries, before, gaps = HistorySource(data_dir / "logs" / "chat.jsonl", "chat", upper).older(
+                start, 1, message)
+        except OSError:
+            return {"latest_message": None}
+        found = next(filter(message, entries), None)  # ``older`` stops at the newest one
+        if (not found and before > 0) or (gaps and _skipped_row_after(
+                entries, offset(found) if found else before, start)):
+            return {"latest_message": None}
+        return {"latest_message": {"history_id": found["history_id"], "out_of_order": True}} if found else {}
+    if latest is None:
+        return {}
+    ts = str(latest.get("ts") or "")
+    return {"latest_message": {"history_id": latest["history_id"], "out_of_order": any(
+        offset(row) < offset(latest) and str(row.get("ts") or "") > ts for row in feed)}}
 
 
 def replay_evidence_rows(messages, evidence):

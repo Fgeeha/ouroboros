@@ -21,7 +21,7 @@ from ouroboros.tools.core import (
     validate_quiz_payload,
 )
 from ouroboros.utils import utc_now_iso
-from ouroboros.subagent_messages import SUBAGENT_MESSAGE_FIELDS
+from ouroboros.subagent_messages import CARD_ROW_PLACEMENTS, SUBAGENT_MESSAGE_FIELDS, is_task_card_message
 
 log = logging.getLogger(__name__)
 
@@ -249,7 +249,7 @@ def get_bridge() -> "LocalChatBridge":
 
 
 def _advance_project_visible_revision(chat_id: int) -> None:
-    """Advance unread only for a real owner-visible Project presentation row."""
+    """Advance unread for one new message in a Project's conversation feed."""
     if DATA_DIR is None:
         return
     try:
@@ -1457,7 +1457,7 @@ def log_chat(
         # to the task's card, not beside it. Only the two named placements are
         # persisted, and the row's stable identity rides with one of them or not
         # at all — a bare id without a placement names nothing on reload.
-        if meta.get("card_row") in ("timeline", "reviews"):
+        if meta.get("card_row") in CARD_ROW_PLACEMENTS:
             record["card_row"] = str(meta["card_row"])
             card_row_id = str(meta.get("card_row_id") or "")
             if card_row_id and len(card_row_id) <= 200:
@@ -1569,7 +1569,7 @@ def send_with_budget(chat_id: int, text: str, log_text: Optional[str] = None,
 
     if _text.strip() in ("", "\u200b"):
         return
-    if (not is_progress) or bool((progress_meta or {}).get("task_incident")):
+    if not is_progress and not is_task_card_message(progress_meta):  # card content changes a card
         _advance_project_visible_revision(chat_id)
     # Budget footers belong in dashboard/status flows, not every chat reply.
     full = _text
