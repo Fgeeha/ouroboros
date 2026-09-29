@@ -123,12 +123,28 @@ def fence_closed(fence: Dict[str, Any]) -> bool:
     return str((fence or {}).get("state") or "") in CLOSED_FENCE_STATES
 
 
+def _resume_outstanding(current: Dict[str, Any], fence: Dict[str, Any]) -> bool:
+    """The root's unrevoked Resume grant names this closed fence.
+
+    The fence stays closed from the grant until the resumed worker consumes it
+    (``reopen_for_resume``); that grant would release whatever shares its fence.
+    """
+    from ouroboros.budget_pause import STATE_RESUME_GRANTED, STATE_RESUMED
+
+    row = current.get("budget_pause") if isinstance(current.get("budget_pause"), dict) else {}
+    grant = row.get("grant") if isinstance(row.get("grant"), dict) else {}
+    return bool(fence.get("fence_id") and grant.get("owner_pause_fence_id") == fence["fence_id"]
+                and not grant.get("revoked_at") and row.get("state") in {STATE_RESUME_GRANTED, STATE_RESUMED})
+
+
 def install_fence(root_drive: Any, root_task_id: str, *, request_id: str) -> Tuple[Dict[str, Any], bool]:
     """Close the root's fence durably; ``(fence, created)``.
 
     Idempotent by ``request_id`` across Resume and later Pause generations;
     every acknowledged action stays on this same root projection. A
-    second press while closed names that fence, never an additional Pause. A
+    second press while closed names that fence, never an additional Pause,
+    unless outstanding Resume authority names it: then this fresh Pause gets
+    its own fence identity, which that grant cannot release. A
     terminal root refuses: a finished tree has nothing to pause. Raises
     ``OwnerPauseRefused`` without any write on refusal; any write failure
     propagates, so the caller never acknowledges an undurable Pause.
@@ -159,7 +175,7 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str) -> Tup
             return None
         if current.get("status") in _TRULY_TERMINAL_STATUSES:
             raise OwnerPauseRefused("task_terminal")
-        if fence_closed(old):
+        if fence_closed(old) and not _resume_outstanding(current, old):
             requests[request_id] = {"fence_id": old["fence_id"], "generation": old.get("generation")}
             fence = {**old, "requests": requests}
             outcome.update(fence=fence, created=False)
@@ -169,6 +185,8 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str) -> Tup
             "state": FENCE_REQUESTED, "requested_by": "owner", "requested_at": utc_now_iso(),
             "requested_at_ts": time.time(), "root_task_id": str(root_task_id),
             "generation": int(old.get("generation") or 0) + 1,
+            # Still closed here only under outstanding Resume authority: name it.
+            **({"supersedes_fence_id": old["fence_id"]} if fence_closed(old) else {}),
         }
         requests[request_id] = {"fence_id": fence["fence_id"], "generation": fence["generation"]}
         fence["requests"] = requests
@@ -182,8 +200,12 @@ def install_fence(root_drive: Any, root_task_id: str, *, request_id: str) -> Tup
 
 
 def set_fence_state(root_drive: Any, root_task_id: str, *, fence_id: str, state: str,
-                    **fields: Any) -> Dict[str, Any]:
-    """Compare-and-set the fence's state on its own ``fence_id`` (never another Pause's)."""
+                    expected_state: str = "", **fields: Any) -> Dict[str, Any]:
+    """Compare-and-set the fence's state on its own ``fence_id`` (never another Pause's).
+
+    ``expected_state`` also binds the state its caller read: a Resume that
+    released this same fence after that read refuses a stale write here.
+    """
     from ouroboros.task_results import (
         require_writable_task_result_schema, stamp_task_result_schema, task_result_path,
     )
@@ -196,6 +218,8 @@ def set_fence_state(root_drive: Any, root_task_id: str, *, fence_id: str, state:
         old = current.get("owner_pause") if isinstance(current.get("owner_pause"), dict) else {}
         if str(old.get("fence_id") or "") != str(fence_id or ""):
             raise ValueError("owner pause fence identity changed")
+        if expected_state and str(old.get("state") or "") != expected_state:
+            raise ValueError("owner pause fence state changed")
         if str(old.get("state") or "") == state and not fields:
             written.update(old)
             return None
@@ -220,6 +244,27 @@ def release_fence(root_drive: Any, root_task_id: str, *, reason: str) -> Dict[st
         return fence
     return set_fence_state(root_drive, root_task_id, fence_id=str(fence.get("fence_id") or ""),
                            state=FENCE_RELEASED, release_reason=str(reason or "owner_resume"))
+
+
+def reopen_for_resume(root_drive: Any, root_task_id: str, task_id: str, *,
+                      fence_id: str, grant_id: str) -> None:
+    """Consume one explicit Resume's fence authority where its work starts.
+
+    A root reopens its tree; an owner-selected child of a terminal root opens
+    only its own member. A closed fence that ``install_fence`` minted over this
+    outstanding Resume (``supersedes_fence_id``) is a newer owner Pause: the
+    Resume is superseded, releases nothing, and the member parks at its next
+    safe boundary. Any other identity change refuses.
+    """
+    with launch_lock(root_drive, root_task_id):
+        current = read_fence(root_drive, root_task_id) if fence_id else {}
+        if fence_id and current.get("fence_id") != fence_id:
+            if not fence_closed(current) or current.get("supersedes_fence_id") != fence_id:
+                raise ValueError("owner_pause_fence_changed")
+        elif root_task_id == task_id:
+            release_fence(root_drive, root_task_id, reason="owner_resume_consumed")
+        else:
+            select_member_resume(root_drive, root_task_id, task_id, fence_id=fence_id, grant_id=grant_id)
 
 
 def select_member_resume(root_drive: Any, root_task_id: str, task_id: str, *,
@@ -574,6 +619,27 @@ def submit_async_operation(source: Any, function: Any, *args: Any, **kwargs: Any
         return await function(*args, **kwargs)
 
     with operation_start(source):
+        return asyncio.create_task(invoke())
+
+
+def submit_async_preparation(function: Any, *args: Any, source: Any = None, **kwargs: Any):
+    """Admit a nested transport's local preparation before it opens anything.
+
+    Entering an MCP stdio transport starts the server process: that handoff
+    serializes with Pause here, so an accepted Pause refuses it. It is not the
+    operation start: ``submit_async_operation`` stays the final gate for the
+    call itself (and for a returned invocation). The body runs after the short
+    lock, never under it. ``source`` names the task outside a tool invocation
+    (a task's MCP discovery); otherwise the active invocation's task decides.
+    """
+    import asyncio
+
+    active = _TOOL_OPERATION.get()
+
+    async def invoke():
+        return await function(*args, **kwargs)
+
+    with launch_admission(source if source is not None else active[0] if active else None):
         return asyncio.create_task(invoke())
 
 

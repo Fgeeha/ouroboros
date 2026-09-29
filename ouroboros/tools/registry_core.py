@@ -651,7 +651,7 @@ class ToolRegistry:
         from ouroboros.mcp_client import ensure_configured_from_settings as _mcp_ensure_configured, get_manager as _mcp_get_manager
 
         if refresh:
-            _mcp_ensure_configured(refresh=True)
+            _mcp_ensure_configured(refresh=True, authority=self._ctx)
         manager = _mcp_get_manager()
         grants = self._acting_tool_grants() if self._is_acting_subagent() else None
         rows = [tool for tool in manager.list_tools_for_registry()

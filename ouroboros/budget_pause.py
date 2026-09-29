@@ -1243,10 +1243,11 @@ def _reopen_owner_fence(ctx: Any, usage: Dict[str, Any], *, fence_id: str = "", 
     """Consume an explicit Resume's owner-fence authority where work starts.
 
     A root reopens its tree; an owner-selected child of a terminal root opens
-    only its own member under that exact fence. Failed publication HOLDS and
-    retries; it never starts effects under missing authority.
+    only its own member under that exact fence; a newer owner Pause's fence stays
+    closed (``reopen_for_resume``). Failed publication HOLDS and retries; it
+    never starts effects under missing authority.
     """
-    from ouroboros.owner_pause import launch_lock, read_fence, release_fence, select_member_resume
+    from ouroboros.owner_pause import reopen_for_resume
 
     root_id = str(getattr(ctx, "root_task_id", "") or ctx.task_id)
     if root_id != str(ctx.task_id) and not fence_id:
@@ -1255,13 +1256,7 @@ def _reopen_owner_fence(ctx: Any, usage: Dict[str, Any], *, fence_id: str = "", 
     published = ""
     while True:
         try:
-            with launch_lock(root, root_id):
-                if fence_id and read_fence(root, root_id).get("fence_id") != fence_id:
-                    raise ValueError("owner_pause_fence_changed")
-                if root_id == str(ctx.task_id):
-                    release_fence(root, root_id, reason="owner_resume_consumed")
-                else:
-                    select_member_resume(root, root_id, str(ctx.task_id), fence_id=fence_id, grant_id=grant_id)
+            reopen_for_resume(root, root_id, str(ctx.task_id), fence_id=fence_id, grant_id=grant_id)
             usage.pop("budget_pause_hold", None)
             return
         except Exception as exc:

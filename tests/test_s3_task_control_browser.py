@@ -510,7 +510,11 @@ def test_s3_chat_card_dropdown_hurry_and_soft_stop(direct_server_with_data):
                 )
                 calls = page.evaluate("() => window.__s3Calls")
                 assert calls[-1]["kind"] == "cancel"
-                assert calls[-1]["body"] == {"cascade": True, "stop_policy": "finalize_then_cancel"}
+                # One retryable Stop action: its id rides beside the exact policy.
+                body = dict(calls[-1]["body"])
+                action_id = body.pop("stop_action_id", "")
+                assert body == {"cascade": True, "stop_policy": "finalize_then_cancel"}
+                assert action_id.startswith("stop-") and len(action_id) <= 200, action_id
                 trigger.wait_for(state="attached", timeout=10_000)
                 page.wait_for_function(
                     "() => !document.querySelector('.chat-live-card[data-task-id=\"live-root\"]"

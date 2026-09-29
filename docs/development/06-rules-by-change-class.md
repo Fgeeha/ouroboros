@@ -414,16 +414,15 @@ The imperatives:
   validates through the DURABLE result unconditionally (ARCHITECTURE §10 "Key
   Invariants" 15); only `interrupted` keeps its restore-path exemption, and
   the legacy `cancel_requested` status survives on a read path only.
-- `stop_policy` is an axis on the durable intent, and the owner hurry control
-  is a typed TASK-LOCAL owner-mailbox control — never a chat message, a global
-  settings mutation or a review-gate weakening. Every same-id requeue producer
+- `stop_policy` is an axis on the durable intent; the owner hurry control is a
+  typed TASK-LOCAL owner-mailbox control — never a chat message, global
+  settings mutation or review-gate weakening. Every same-id requeue producer
   calls the ONE shared `owner_hurry.retry_reset`; the durable hurry projection
-  writes only through `update_json_locked` on the `owner_hurry` keys, never
+  writes only via `update_json_locked` on `owner_hurry` keys, never
   `write_task_result`; UI surfaces share `web/modules/task_control_menu.js`;
-  queue-owned Pause/Hurry admission initializes only an absent pooled result
-  from exact admitted queue lineage/budget/source facts through the writer's
-  atomic `create_only` branch. Existing terminal rows win; direct turns and
-  billing stay outside it.
+  queue-owned Pause/Hurry admission atomically `create_only`-writes an absent
+  pooled result from exact admitted lineage/budget/source facts; terminal rows
+  win; direct turns/billing stay outside.
 - Code owners stay narrow behind one public queue/lifecycle surface:
   retry-aware target/subtree-liveness in `supervisor/queue_transitions.py`,
   capture-miss terminalization/publication in

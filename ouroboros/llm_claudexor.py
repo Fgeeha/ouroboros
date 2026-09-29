@@ -21,10 +21,10 @@ from ouroboros._usage_response import provider_cost_value
 from ouroboros.anthropic_native_custody import scrub_native_custody
 from ouroboros.claudexor_daemon import ensure_owned_gateway, owned_engine_version, read_owned_gateway
 from ouroboros.deadline_utils import llm_transport_timeout_sec
-from ouroboros.gateways.claudexor import (
-    ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported,
-    operation_query_supported, _READ_TIMEOUT_SEC)
-from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch
+from ouroboros.effort_evidence import model_effort_usage
+from ouroboros.gateways.claudexor import (ClaudexorUnavailable, engine_at_least, model_failure_evidence_supported,
+                                          operation_query_supported, _READ_TIMEOUT_SEC)
+from ouroboros.llm_attempt import _attempt_request, _candidate_before_dispatch, effort_request_facts
 from ouroboros.send_clock import stamp_clock_note
 from ouroboros.llm_substitution import (
     AccountRotation, SubstitutionBudget, substitution_fact, failed_account_preference,
@@ -172,8 +172,6 @@ def propagate_model_error(error: Exception) -> None:
 
 def _usage(result: dict, effort: dict | None = None) -> tuple[dict, float | None, bool]:
     """Normalize explicit model usage; never run the generic body-error/free branch."""
-    from ouroboros.effort_evidence import model_effort_usage
-
     counters = result.get("usage") or {}
     cost_evidence = result.get("cost") or {}
     cash = provider_cost_value(cost_evidence.get("cashUsd"))
@@ -624,8 +622,6 @@ class _ModelInvocation:
         return custody
 
     def extract_usage(self, result: dict) -> tuple[dict, float | None, bool]:
-        from ouroboros.llm_attempt import effort_request_facts
-
         usage, cost, final = _usage(result, effort_request_facts(self.target, self.payload))
         # Settlement reads this row before the caller decides anything, and the
         # density witness must know whose tokenizer it measured: a generation

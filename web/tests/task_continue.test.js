@@ -32,7 +32,7 @@ test('lost answers retain the page action when storage reads or writes throw', a
         const request = async (_id, nonce) => {
             seen.push(nonce);
             if (seen.length === 1) throw new Error('answer lost');
-            return { successor_task_id: 'accepted-root' };
+            return { ok: true, successor_task_id: 'accepted-root' };  // the server's success body
         };
         const id = `storage-failure-${failingMethod}`;
         assert.equal(await continueTaskAction(id, { request, storage, toast() {} }), '');
@@ -288,4 +288,31 @@ test('bound history restores the server nonce after reload; its ID is not admiss
     assert.equal(await reloaded.continueTaskAction('bound-root', { storage, request, toast() {}, actionNonce: offer.action_nonce }), 'bound-successor');
     assert.deepEqual(seen, [offer.action_nonce]);
     assert.equal(reloaded.continueNonce('bound-root', storage), offer.action_nonce);
+});
+
+test('a resolved malformed 200 is unconfirmed: no success toast, the same nonce retries', async () => {
+    // Real continueTask -> fetchJson: a truncated HTTP-200 body resolves (not rejects) as {error}.
+    const priorFetch = globalThis.fetch;
+    const storage = memoryStorage();
+    const toasts = [];
+    const toast = (text, kind) => toasts.push([text, kind]);
+    const nonces = [];
+    const replies = [
+        { ok: true, status: 200, json: async () => { throw new SyntaxError('Unexpected end of JSON input'); } },
+        { ok: true, status: 200, json: async () => ({ ok: true, held: false }) },
+        { ok: true, status: 200, json: async () => ({ ok: true, successor_task_id: 'malformed-root-c1' }) },
+    ];
+    globalThis.fetch = async (_url, init) => { nonces.push(JSON.parse(init.body).action_nonce); return replies.shift(); };
+    try {
+        assert.equal(await continueTaskAction('malformed-root', { storage, toast }), '');
+        assert.deepEqual(toasts, [['Continue not confirmed: non-json response (HTTP 200)', 'error']]);
+        assert.equal(storage.getItem('ouro_continue_nonce:malformed-root'), nonces[0], 'the unconfirmed action keeps its nonce');
+        assert.equal(await continueTaskAction('malformed-root', { storage, toast }), '', 'ok without a successor is not an acknowledgement');
+        assert.deepEqual(toasts[1], ['Continue not confirmed: no acknowledgement', 'error']);
+        assert.equal(await continueTaskAction('malformed-root', { storage, toast }), 'malformed-root-c1');
+        assert.deepEqual(toasts[2], ['Continue accepted.', 'ok']);
+        assert.deepEqual(nonces, [nonces[0], nonces[0], nonces[0]], 'every retry is the same admission');
+    } finally {
+        globalThis.fetch = priorFetch;
+    }
 });

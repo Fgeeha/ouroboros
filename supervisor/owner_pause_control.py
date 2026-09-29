@@ -217,9 +217,18 @@ def refresh_owner_pause_tree(root_task_id: str) -> str:
                            owner_pause_fence_id=str(fence.get("fence_id") or "")):
         return FENCE_REQUESTED
     try:
+        # CAS on the state this census read: a Resume that released the same
+        # fence meanwhile wins; a stale census never revives released authority.
         set_fence_state(root_drive, root_task_id, fence_id=str(fence.get("fence_id") or ""),
-                        state=FENCE_PAUSED, parked_members=[str(item.get("id") or "") for item in parked])
+                        state=FENCE_PAUSED, expected_state=FENCE_REQUESTED,
+                        parked_members=[str(item.get("id") or "") for item in parked])
     except Exception:
+        try:
+            moved = read_fence(root_drive, root_task_id)
+        except Exception:
+            moved = fence
+        if moved.get("fence_id") != fence.get("fence_id") or moved.get("state") != FENCE_REQUESTED:
+            return str(moved.get("state") or "")
         log.warning("Owner pause of %s is settled but its paused state was not recorded", root_task_id,
                     exc_info=True)
         return FENCE_REQUESTED

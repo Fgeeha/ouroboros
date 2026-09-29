@@ -8,17 +8,33 @@ import os
 import pathlib
 import re
 import subprocess
-from dataclasses import dataclass
+from contextvars import ContextVar
+from dataclasses import dataclass, replace
+from functools import wraps
 from typing import List, Optional
 
 from ouroboros.secret_masking import redact_known_values
 from ouroboros.tools.registry import ToolContext, ToolEntry
-from ouroboros.tools.tool_result import ToolResult, _publish_tool_result
+from ouroboros.tools.tool_result import LegacyTextResultAdapter, ToolResult, _publish_tool_result, _replace_tool_result
 from ouroboros.utils import truncate_within_limit
 from ouroboros.utils import truncate_review_artifact as _truncate_with_notice
 
 log = logging.getLogger(__name__)
 _GENERIC_TRANSPORT = object()
+# One public tool invocation's "a gh subprocess was already launched" fact.
+_SUBMITTED: ContextVar[Optional[List[bool]]] = ContextVar("github_invocation_submitted", default=None)
+
+
+def _one_invocation(handler):
+    """Scope ``_gh_run``'s first-submission fact to one public tool invocation."""
+    @wraps(handler)
+    def invoke(ctx, *args, **kwargs):
+        token = _SUBMITTED.set([False])
+        try:
+            return handler(ctx, *args, **kwargs)
+        finally:
+            _SUBMITTED.reset(token)
+    return invoke
 
 
 # gh's own HTTP status shapes (see ``_gh_run``); the first match in stderr order wins.
@@ -102,11 +118,22 @@ def _gh_run(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Op
     # The target refusals below publish a typed argument error into the calling
     # tool's sidecar; the publication transport omits `repo`, so it can never
     # reach them and its own final result is never shadowed from here.
+    # A refusal before this invocation's FIRST gh launch also attests that the
+    # invocation had no effect; after any launch it attests nothing.
+    submitted = _SUBMITTED.get()
+    first = submitted is not None and not submitted[0]
+
+    def refused(text: str, failure: str, typed: Optional[ToolResult] = None) -> GhResult:
+        if first:
+            typed = _replace_tool_result(typed or LegacyTextResultAdapter.from_text("", text),
+                                         meta_updates={"operation_outcome": "completed_no_effect"})
+        return GhResult(False, _publish_tool_result(ctx, typed) if typed else text, None, None, failure)
+
     if repo is not _GENERIC_TRANSPORT and not isinstance(repo, str):
-        return GhResult(False, _publish_tool_result(ctx, ToolResult(
+        return refused("", "target", ToolResult(
             status="error", code="TOOL_ARG_ERROR",
             text="⚠️ GH_TARGET_INVALID: repo must be a string; omit it to use the selected Project.",
-        )), None, None, "target")
+        ))
     try:
         cwd, env = pathlib.Path(ctx.repo_dir), _gh_env(ctx)
         cmd = ["gh", *args]
@@ -122,24 +149,25 @@ def _gh_run(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Op
                 note = str(metadata.get("_project_room_note") or "")
                 selected = workspace or room_dir
                 if note or (selected and not pathlib.Path(selected).is_dir()):
-                    return GhResult(False,
+                    return refused(
                         f"⚠️ GH_TARGET_UNAVAILABLE: {note or 'The selected Project directory is unavailable.'}",
-                        None, None, "target")
+                        "target")
                 if project and not selected:
-                    return GhResult(False, _publish_tool_result(ctx, ToolResult(
+                    return refused("", "target", ToolResult(
                         status="error", code="TOOL_ARG_ERROR",
                         text="⚠️ GH_TARGET_REQUIRED: this Project has no repository directory; pass repo='[HOST/]OWNER/REPO'.",
-                    )), None, None, "target")
+                    ))
             binding = build_resolved_resource_binding(ctx, operation="shell", process_cwd="")
             cwd = binding.target_path
             if workspace and cwd != pathlib.Path(workspace).resolve(strict=False):
-                return GhResult(False,
-                    "⚠️ GH_TARGET_UNAVAILABLE: the task's Project binding could not be resolved.",
-                    None, None, "target")
+                return refused("⚠️ GH_TARGET_UNAVAILABLE: the task's Project binding could not be resolved.",
+                               "target")
             if workspace or room_dir or project:
                 env.pop("GH_REPO", None)  # Ambient defaults cannot replace the selected Project.
             if repo:
                 cmd.extend(["--repo", repo])
+        if submitted is not None:
+            submitted[0] = True
         res = subprocess.run(
             cmd,
             cwd=str(cwd),
@@ -176,9 +204,9 @@ def _gh_run(args: List[str], ctx: ToolContext, timeout: int = 30, input_data: Op
     except FileNotFoundError as e:
         missing = str(getattr(e, "filename", "") or "")
         if not missing or pathlib.Path(missing).name == "gh":
-            return GhResult(False,
+            return refused(
                 "⚠️ GH_ERROR: `gh` CLI not found. Install GitHub CLI and ensure it is on PATH (https://cli.github.com/)",
-                None, None, "cli_missing")
+                "cli_missing")
         detail = truncate_within_limit(redact_known_values(str(e), [github_token_from_env_or_settings()]), 600)
         return GhResult(False, f"⚠️ GH_ERROR: {detail}", None, None, "exception")
     except subprocess.TimeoutExpired:
@@ -233,7 +261,7 @@ def _list_issues(ctx: ToolContext, state: str = "open", labels: str = "", limit:
 
 def _get_issue(ctx: ToolContext, number: int, repo: str = "") -> str:
     if number <= 0:
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive", no_effect=True)
 
     args = [
         "issue", "view", str(number),
@@ -277,10 +305,10 @@ def _get_issue(ctx: ToolContext, number: int, repo: str = "") -> str:
 
 def _comment_on_issue(ctx: ToolContext, number: int, body: str, repo: str = "") -> str:
     if number <= 0:
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive", no_effect=True)
 
     if not body or not body.strip():
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: comment body cannot be empty.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: comment body cannot be empty.", no_effect=True)
 
     args = ["issue", "comment", str(number), "--body-file", "-"]
     raw = _gh_cmd(args, ctx, input_data=body, repo=repo)
@@ -291,7 +319,7 @@ def _comment_on_issue(ctx: ToolContext, number: int, body: str, repo: str = "") 
 
 def _close_issue(ctx: ToolContext, number: int, comment: str = "", repo: str = "") -> str:
     if number <= 0:
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue number must be positive", no_effect=True)
 
     if comment and comment.strip():
         result = _comment_on_issue(ctx, number, comment, repo=repo)
@@ -342,7 +370,7 @@ def _list_prs(ctx: ToolContext, state: str = "open", limit: int = 20, repo: str 
 
 def _get_pr(ctx: ToolContext, number: int, repo: str = "") -> str:
     if number <= 0:
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: PR number must be positive.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: PR number must be positive.", no_effect=True)
 
     meta_args = [
         "pr", "view", str(number),
@@ -447,9 +475,9 @@ def _get_pr(ctx: ToolContext, number: int, repo: str = "") -> str:
 
 def _comment_on_pr(ctx: ToolContext, number: int, body: str, repo: str = "") -> str:
     if number <= 0:
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: PR number must be positive.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: PR number must be positive.", no_effect=True)
     if not (body or "").strip():
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: comment body cannot be empty.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: comment body cannot be empty.", no_effect=True)
 
     args = ["pr", "comment", str(number), "--body-file", "-"]
     raw = _gh_cmd(args, ctx, input_data=body, repo=repo)
@@ -511,7 +539,7 @@ def _pr_merge(ctx: ToolContext, number: int, expected_head_sha: str, method: str
 
 def _create_issue(ctx: ToolContext, title: str, body: str = "", labels: str = "", repo: str = "") -> str:
     if not title or not title.strip():
-        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue title cannot be empty.")
+        return _refuse(ctx, "⚠️ TOOL_ARG_ERROR: issue title cannot be empty.", no_effect=True)
 
     args = ["issue", "create", f"--title={title}"]
     if body:
@@ -647,6 +675,8 @@ def get_tools() -> List[ToolEntry]:
             }, "required": ["title"]},
         }, _create_issue),
     ]
+    # Wrapped here, not at definition: nested handler calls share one invocation.
+    tools = [replace(entry, handler=_one_invocation(entry.handler)) for entry in tools]
     for entry in tools:
         entry.schema["parameters"]["properties"]["repo"] = {
             "type": "string", "default": "",

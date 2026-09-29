@@ -355,6 +355,15 @@ def _readiness_marker_observed(record: ServiceRecord, marker: str) -> bool:
     return _read_local_service_marker(record, record.log_path, marker)
 
 
+def _refused_before_start(ctx: ToolContext, refusal: str) -> str:
+    """Producer fact: this start_service call refused during preparation, before
+    any process, service record or executor submission existed. Errors after
+    that point never carry it."""
+    from ouroboros.tools.shell import _pre_spawn_refusal
+
+    return _pre_spawn_refusal(ctx, refusal, tool="start_service")
+
+
 def _start_service(
     ctx: ToolContext,
     cmd: List[str],
@@ -368,7 +377,7 @@ def _start_service(
     _resolved_binding: ResolvedResourceBinding | None = None,
 ) -> str:
     if not isinstance(cmd, list) or not cmd or not all(str(x).strip() for x in cmd):
-        return "⚠️ TOOL_ARG_ERROR (start_service): cmd must be a non-empty array of strings."
+        return _refused_before_start(ctx, "⚠️ TOOL_ARG_ERROR (start_service): cmd must be a non-empty array of strings.")
     proposed_env = dict(env or {})
     try:
         refs = validate_process_env(env_from_settings)
@@ -379,23 +388,24 @@ def _start_service(
                 return _publish_tool_result(ctx, ToolResult(
                     status="blocked", code="ACCESS_BLOCKED",
                     text="⚠️ SERVICE_ENV_REFERENCE_BLOCKED: this task cannot select settings-backed service environment. A root task can start the service; existing literal environment and configured MCP access remain available.",
+                    meta={"operation_outcome": "completed_no_effect"},
                 ))
         env, secret_values = resolve_process_env(env, refs, settings=runtime_settings(settings_reader=load_settings) if refs else None)
     except ValueError as exc:
-        return f"⚠️ TOOL_ARG_ERROR (start_service): {exc}"
+        return _refused_before_start(ctx, f"⚠️ TOOL_ARG_ERROR (start_service): {exc}")
     service_name, name_error = _sanitize_service_name(name)
     if name_error:
-        return name_error
+        return _refused_before_start(ctx, name_error)
     readiness_timeout, readiness_error = _readiness_timeout(readiness)
     if readiness_error:
-        return readiness_error
+        return _refused_before_start(ctx, readiness_error)
     if _panic_requested:
-        return "⚠️ SERVICE_START_ERROR: Emergency Stop has retired service admission"
+        return _refused_before_start(ctx, "⚠️ SERVICE_START_ERROR: Emergency Stop has retired service admission")
     key = _service_key(ctx, service_name)
     with _LOCK:
         existing = _SERVICES.get(key)
         if existing and existing.proc.poll() is None:
-            return f"⚠️ SERVICE_ALREADY_RUNNING: {service_name} pid={existing.proc.pid}"
+            return _refused_before_start(ctx, f"⚠️ SERVICE_ALREADY_RUNNING: {service_name} pid={existing.proc.pid}")
     try:
         binding = _resolved_binding or build_resolved_resource_binding(
             ctx,
@@ -408,7 +418,7 @@ def _start_service(
         # One failure class, one message (v6.54.3 SSOT): the canonical cwd block
         # names every allowed root as label=path instead of a bare rootless
         # ValueError echo; the SHELL_CWD_BLOCKED status is a typed policy denial.
-        return shell_cwd_block_message(ctx, cwd, operation="service", error=exc)
+        return _refused_before_start(ctx, shell_cwd_block_message(ctx, cwd, operation="service", error=exc))
     if _resolved_binding is None:
         # Registry dispatch has already checked this exact prepared binding.
         # A direct handler caller uses the same Supervisor before the first
@@ -422,6 +432,7 @@ def _start_service(
         if not allowed:
             return _publish_tool_result(ctx, ToolResult(
                 status="blocked", code="SAFETY_VIOLATION", text=advice,
+                meta={"operation_outcome": "completed_no_effect"},
             ))
         if advice:
             ctx.emit_progress_fn(advice)

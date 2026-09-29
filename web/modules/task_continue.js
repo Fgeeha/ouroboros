@@ -55,7 +55,15 @@ export async function continueTaskAction(taskId, { request = continueTask, stora
     inFlight.add(id);
     try {
         const ack = await request(id, continueNonce(id, storage, actionNonce));
-        const successor = String(ack?.successor_task_id || '');
+        const successor = ack?.ok === true && typeof ack.successor_task_id === 'string'
+            ? ack.successor_task_id.trim() : '';
+        // A resolved body is not an acknowledgement (fetchJson resolves a
+        // malformed 200 as {error}): without the server's ok + successor the
+        // admission is unconfirmed, and the same nonce stays for the retry.
+        if (!successor) {
+            const reason = typeof ack?.error === 'string' && ack.error ? ack.error : 'no acknowledgement';
+            throw Object.assign(new Error(reason), { body: {} });
+        }
         toast(ack?.held
             ? 'Continue accepted. Waiting for earlier work to settle; use Resume in Activity to recheck.'
             : 'Continue accepted.', 'ok');
