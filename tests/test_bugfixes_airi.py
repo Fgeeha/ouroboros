@@ -85,8 +85,9 @@ def test_live_card_timeline_only_follows_when_pinned():
         src.index("export function createTimelineAnchors")
     ]
     assert renderer.count("const pinned =") == 2
-    assert "const prevTop = el.scrollTop;" in renderer
-    assert "el.scrollTop = pinned ? el.scrollHeight : prevTop;" in renderer
+    assert "const prevTop = el.scrollTop, newest = el.lastElementChild;" in renderer
+    # Only a new newest line follows; a disclosure or late full output keeps its place.
+    assert "el.scrollTop = pinned && el.lastElementChild !== newest ? el.scrollHeight : prevTop;" in renderer
     assert "record.root.dataset.expanded === '1' && pinned" in renderer
 
 

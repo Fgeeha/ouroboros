@@ -7,7 +7,7 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
     let mutationDepth = 0;
     let viewportAnchor = null, width = feed.clientWidth;
     let intent = initial && initial.stick === false ? { ...initial } : null;
-    let approximate = false;
+    let approximate = false, dragging = '', claimed = null;
     const state = {
         top: Math.max(0, Number(initial?.scrollTop) || 0),
         stick: initial ? initial.stick !== false : true,
@@ -20,6 +20,7 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
             width = feed.clientWidth; viewportAnchor = anchors.capture();
         },
         reflow() {
+            if (dragging === 'released') dragging = ''; // a resize is no part of a released drag
             if (intent) { state.position(); return; }
             if (!visible()) return;
             if (state.stick) feed.scrollTop = feed.scrollHeight;
@@ -29,6 +30,9 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
         scroll() {
             if (!visible()) return;
             if (!intent) {
+                // A feed scrollbar drag, and the scrolls it still owes after its
+                // release, follow exactly where it leaves the feed.
+                if (dragging) state.stick = feed.scrollHeight > feed.clientHeight && state.nearBottom();
                 state.top = feed.scrollTop;
                 state.remember();
             }
@@ -65,41 +69,88 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
             }
         },
         cancel() {
-            generation++; scheduled = false; intent = null;
+            generation++; scheduled = false; intent = null; dragging = '';
             const notify = approximate;
             approximate = false; state.remember(true);
             if (notify) changed();
         },
         export() { return intent ? { ...intent } : null; },
+        /** An explicit navigation (↓) that awaits history before it moves: the
+         * reader's own later gesture supersedes it, even one a bounded box absorbs. */
+        claim() {
+            state.cancel();
+            const token = claimed = generation;
+            return () => token === generation;
+        },
         bindGestures(navigate) {
-            let touchY = null, pressedInside = false;
+            let touchY = null, pressed = null, latched = null, wheelAt = -Infinity, boxScrolled = null;
             const doc = feed.ownerDocument;
             // Keys scroll the focused control's scroller or, with nothing focused,
             // the one last pressed; neither sends keydown to the feed itself.
-            const scrollsFeed = ({ target, key }) => feed.contains(target)
-                ? !(key === ' ' && target.closest?.('button, a[href], summary, [role="button"]'))
-                : pressedInside && (target === doc.body || target === doc.documentElement);
+            const keyOrigin = ({ target, key }) => feed.contains(target)
+                ? (key === ' ' && target.closest?.('button, a[href], summary, [role="button"]') ? null : target)
+                : (target === doc.body || target === doc.documentElement ? pressed : null);
+            // A bounded box (full output, Review detail, card timeline) that can
+            // still move absorbs the gesture; only at its edge does the feed move.
+            const nestedMoves = (node, direction) => {
+                for (let box = node; box && box !== feed; box = box.parentElement) {
+                    if (!(box.scrollHeight > box.clientHeight + 1)
+                        || !/auto|scroll|overlay/.test(doc.defaultView?.getComputedStyle?.(box)?.overflowY || '')) continue;
+                    if (direction < 0 ? box.scrollTop > 0 : box.scrollTop + box.clientHeight < box.scrollHeight - 1) return true;
+                }
+                return false;
+            };
             const gesture = event => {
+                if (event.type === 'pointerup' || event.type === 'pointercancel') {
+                    // Released, a drag decides by where it is. Engines report its last
+                    // scrolls after the release; they decide until the feed's scrollend.
+                    if (dragging) { state.stick = feed.scrollHeight > feed.clientHeight && state.nearBottom(); dragging = 'released'; }
+                    return;
+                }
                 if (event.type === 'pointerdown') {
-                    pressedInside = feed.contains(event.target);
+                    pressed = feed.contains(event.target) ? event.target : null;
                     if (event.target === feed) { state.cancel(); state.stick = false; }
+                    dragging = event.target === feed ? 'held' : '';
                     return; // a scrollbar drag owns position, not archive traversal
                 }
-                if (event.type === 'touchstart') { touchY = event.touches?.[0]?.clientY; return; }
+                if (event.type === 'touchstart') { touchY = event.touches?.[0]?.clientY; latched = null; return; }
+                const origin = event.type === 'keydown' ? keyOrigin(event) : event.target;
                 if (event.type === 'keydown' && (event.defaultPrevented
                         || event.target?.closest?.('input, textarea, select, [contenteditable="true"]')
                         || !['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(event.key)
-                        || !scrollsFeed(event))) return;
+                        || !origin)) return;
                 const y = event.touches?.[0]?.clientY;
                 const direction = event.type === 'wheel' ? Math.sign(event.deltaY)
                     : event.type === 'keydown' ? (['ArrowUp', 'PageUp', 'Home'].includes(event.key) || (event.key === ' ' && event.shiftKey) ? -1 : 1)
                     : Math.sign((touchY ?? y) - y);
                 if (event.type === 'touchmove') touchY = y;
                 if (!direction) return;
+                // A browser keeps one wheel burst or touch on the scroller it began on,
+                // even once that box reaches its edge; so does this reading.
+                const continuing = latched !== null && (event.type === 'touchmove'
+                    || (event.type === 'wheel' && event.timeStamp - wheelAt < 200));
+                if (event.type === 'wheel') wheelAt = event.timeStamp;
+                const nested = continuing ? latched : nestedMoves(origin, direction);
+                latched = event.type === 'keydown' ? null : nested;
+                // The reader's own box scrolling supersedes a saved place or a ↓
+                // still awaiting history, which must not override it later; other
+                // layout stays. The feed pages nothing, and following can only
+                // end: turning back or reading away from the live edge.
+                const follow = state.stick, absorb = () => { state.stick = follow && direction > 0 && state.nearBottom(); };
+                if (nested) {
+                    if (intent || approximate || claimed === generation) state.cancel();
+                    absorb();
+                    return;
+                }
                 state.cancel(); state.stick = false;
-                const token = generation;
+                const token = generation, since = event.timeStamp;
                 requestAnimationFrame(() => {
                     if (!alive() || !visible() || token !== generation) return;
+                    // A browser may move the box before it reports the gesture: when the
+                    // box under it scrolled, the gesture was that box's after all.
+                    for (let box = origin; boxScrolled?.at >= since - 50 && box && box !== feed; box = box.parentElement) {
+                        if (box === boxScrolled.box) { latched = true; absorb(); return; }
+                    }
                     state.stick = direction > 0 && feed.scrollHeight > feed.clientHeight && state.nearBottom();
                     state.top = feed.scrollTop;
                     navigate(direction);
@@ -107,15 +158,23 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
             };
             const types = ['wheel', 'touchstart', 'touchmove'];
             for (const type of types) feed.addEventListener(type, gesture, { passive: true });
+            const noteBoxScroll = event => { if (event.target && event.target !== feed) boxScrolled = { box: event.target, at: event.timeStamp }; };
+            feed.addEventListener('scroll', noteBoxScroll, { passive: true, capture: true });
+            const settle = () => { if (dragging === 'released') dragging = ''; };
+            feed.addEventListener('scrollend', settle, { passive: true });
+            const pointer = ['pointerdown', 'pointerup', 'pointercancel'];
             doc.addEventListener('keydown', gesture, { passive: true });
-            doc.addEventListener('pointerdown', gesture, { passive: true, capture: true });
+            for (const type of pointer) doc.addEventListener(type, gesture, { passive: true, capture: true });
             return () => {
                 for (const type of types) feed.removeEventListener(type, gesture);
+                feed.removeEventListener('scroll', noteBoxScroll, true);
+                feed.removeEventListener('scrollend', settle);
                 doc.removeEventListener('keydown', gesture);
-                doc.removeEventListener('pointerdown', gesture, true);
+                for (const type of pointer) doc.removeEventListener(type, gesture, true);
             };
         },
         request() {
+            dragging = '';
             if (!intent) intent = { scrollTop: state.top, stick: state.stick, historyAnchor: anchors.serialize() };
             state.position();
         },
@@ -127,6 +186,7 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
                 feed.scrollTop = feed.scrollHeight; state.top = feed.scrollTop;
                 state.stick = true; state.remember(); updateButton();
                 if (++passes < 2) requestAnimationFrame(apply);
+                else if (claimed === token) claimed = null; // the present is reached: box reading cancels no later layout
             };
             requestAnimationFrame(apply);
         },

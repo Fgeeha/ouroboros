@@ -369,7 +369,7 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
         return withStableViewport(() => {
             const el = record.timelineEl;
             const pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
-            const prevTop = el.scrollTop;
+            const prevTop = el.scrollTop, newest = el.lastElementChild;
             const byKey = new Map(Array.from(el.children).map((node) => [node.dataset.liveLineKey, node]));
             const active = el.ownerDocument?.activeElement;
             const caret = textControlCaret(active);
@@ -413,7 +413,9 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
                     }
                 }
             }
-            if (changed) el.scrollTop = pinned ? el.scrollHeight : prevTop;
+            // Only a new newest line keeps a pinned timeline at its end; a disclosure
+            // or late full output keeps the line being read where it is.
+            if (changed) el.scrollTop = pinned && el.lastElementChild !== newest ? el.scrollHeight : prevTop;
             return changed && Boolean(el.isConnected);
         });
     };
@@ -449,6 +451,27 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
             return replace(item, record, current);
         },
     };
+}
+
+// A live card's header chrome: a saved role inside its owner card.
+const CARD_HEADER = [
+    '[data-live-summary-button]',
+    '[data-live-title]',
+    '[data-live-activity]',
+    '[data-live-meta]',
+    '.chat-live-actions',
+    '.chat-live-project-card-btn',
+];
+
+// The feed's bounded, separately scrolling boxes: a card timeline, a fetched
+// full output, a Review attempt detail. Each clips what it holds.
+const BOUNDED_BOX = '[data-live-timeline], .chat-live-line-body-full, [data-review-attempt-detail]';
+
+// A node's own bounded reading box: an expanded line's fetched full output or
+// a Review attempt detail. The owner card timeline is found from the node.
+function innerBox(node) {
+    if (node?.matches?.('[data-review-attempt-detail]')) return node;
+    return node?.matches?.('.chat-live-line') ? node.querySelector?.(':scope > .chat-live-line-body-full') || null : null;
 }
 
 /**
@@ -523,6 +546,12 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 .filter(({ rect }) => rect.top <= messagesRect.top && rect.bottom > messagesRect.top)
                 .sort((a, b) => b.depth - a.depth);
             node = belowTop[0]?.node || crossing[0]?.node || topNode;
+            // Header chrome heads what it discloses: when it is all that precedes
+            // an expanded line, that line is being read, and anchoring it lets a
+            // reopen expand it again instead of saving the header alone.
+            const header = candidate => candidate.classList.contains('chat-live-card') || CARD_HEADER.some(role => candidate.matches(role));
+            const content = header(node) ? belowTop.find(({ node: candidate }) => !header(candidate))?.node : null;
+            if (content?.matches('.chat-live-line') && content.dataset?.expanded === '1') node = content;
             if (node === topNode && topNode.getBoundingClientRect().top < messagesRect.top) {
                 // The card's visible part holds nothing anchorable (a wait row, a
                 // block without work): keep the reader's view of what FOLLOWS the
@@ -535,6 +564,32 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 });
                 if (following) { topNode = following; node = following; }
             }
+        }
+
+        // A visible bounded full output or Review detail the reader entered
+        // (the top edge is inside it) or scrolled is the place being read; its
+        // line or detail anchors, so reopening expands and scrolls it again.
+        // Visible means one common part inside the feed and every bounded box
+        // around it: overlapping each clip at different places shows nothing.
+        const shown = (box, rect) => {
+            let top = Math.max(rect.top, messagesRect.top), bottom = Math.min(rect.bottom, messagesRect.bottom);
+            for (let clip = box.parentElement?.closest?.(BOUNDED_BOX); clip && messagesDiv.contains(clip);
+                clip = clip.parentElement?.closest?.(BOUNDED_BOX)) {
+                const edge = clip.getBoundingClientRect();
+                top = Math.max(top, edge.top); bottom = Math.min(bottom, edge.bottom);
+            }
+            return top < bottom;
+        };
+        const reading = Array.from(messagesDiv.querySelectorAll?.('.chat-live-line-body-full, [data-review-attempt-detail]') || [])
+            .map(box => ({ box, rect: box.getBoundingClientRect() }))
+            .filter(({ box, rect }) => box.getClientRects().length && shown(box, rect)
+                && (box.scrollTop > 0 || rect.top < messagesRect.top))
+            .sort((a, b) => a.rect.top - b.rect.top)
+            .map(({ box }) => (box.matches('[data-review-attempt-detail]') ? box : box.closest('.chat-live-line')))
+            .find(owner => owner && nodes.some(item => item.contains(owner)));
+        if (reading) {
+            node = reading;
+            topNode = nodes.find(item => item.contains(reading));
         }
 
         const cardChain = [];
@@ -551,14 +606,7 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
         }
 
         const ts = topNode.dataset?.ts || '';
-        const anchorRole = [
-            '[data-live-summary-button]',
-            '[data-live-title]',
-            '[data-live-activity]',
-            '[data-live-meta]',
-            '.chat-live-actions',
-            '.chat-live-project-card-btn',
-        ].find((candidate) => node.matches?.(candidate)) || '';
+        const anchorRole = CARD_HEADER.find((candidate) => node.matches?.(candidate)) || '';
         const lineKey = node.matches?.('.chat-live-line') ? (node.dataset?.liveLineKey || '') : '';
         const lineItem = lineKey ? (liveCardRecords.get(cardChain[0]?.taskId)?.items || [])
             .find(item => item.lineKey === lineKey) : null;
@@ -608,12 +656,35 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
         };
 
         if (restoreNode(anchor.node, anchor.offset)) return true;
+        // The saved node found: its owner timeline puts it back at its offset
+        // there (that scroll moves the node), then its own box scrolls. A box
+        // that is missing, or an own box that cannot reach its scroll, is not
+        // exact. A timeline at its scroll limit has done what it can: its node
+        // still takes the exact feed offset, and a reflowed earlier row only
+        // moves the box around it.
+        const restoreSaved = (node) => {
+            const timeline = node.closest?.('[data-live-timeline]'), inner = innerBox(node);
+            let settled = true;
+            if (Number.isFinite(anchor.timelineOffset)) {
+                const offset = () => node.getBoundingClientRect().top - timeline.getBoundingClientRect().top;
+                if (timeline) timeline.scrollTop += offset() - anchor.timelineOffset;
+                const miss = timeline ? offset() - anchor.timelineOffset : NaN;
+                settled = Boolean(timeline) && (Math.abs(miss) <= 1 || (miss > 0
+                    ? timeline.scrollTop >= timeline.scrollHeight - timeline.clientHeight - 1
+                    : timeline.scrollTop <= 0));
+            }
+            if (Number.isFinite(anchor.innerTop)) {
+                if (inner) inner.scrollTop = anchor.innerTop;
+                settled = settled && Boolean(inner) && Math.abs(inner.scrollTop - anchor.innerTop) <= 1;
+            }
+            return restoreNode(node, anchor.offset) && (settled || !exact);
+        };
 
         const historyId = anchor.historyId || anchor.id;
         if (historyId && !anchor.lineKey && !anchor.reviewKey && !anchor.anchorRole) {
             const node = Array.from(messagesDiv.querySelectorAll('[data-history-id]'))
                 .find(item => item.dataset.historyId === historyId);
-            if (restoreNode(node, anchor.offset)) return true;
+            if (isRendered(node)) return restoreSaved(node);
         }
 
         const cardChain = Array.isArray(anchor.cardChain) && anchor.cardChain.length
@@ -629,7 +700,7 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
         if (ownerCard && anchor.reviewKey) {
             const node = Array.from(ownerCard.querySelectorAll('[data-review-section], [data-review-group], [data-review-attempt], [data-review-attempt-detail]'))
                 .find(item => item.dataset?.[anchor.reviewKey] === anchor.reviewValue);
-            if (restoreNode(node, anchor.offset)) return true;
+            if (isRendered(node)) return restoreSaved(node);
         }
         if (ownerCard && anchor.lineKey) {
             const item = timelineItemForAnchor(liveCardRecords.get(cardChain[0]?.taskId) || { items: [] }, anchor);
@@ -637,12 +708,12 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
             const line = Array.from(ownerCard.querySelectorAll('.chat-live-line'))
                 .find((candidate) => candidate.dataset?.liveLineKey === lineKey
                     && candidate.closest('.chat-live-card') === ownerCard);
-            if (restoreNode(line, anchor.offset)) return true;
+            if (isRendered(line)) return restoreSaved(line);
         }
         if (ownerCard && anchor.anchorRole) {
             const roleNode = Array.from(ownerCard.querySelectorAll(anchor.anchorRole))
                 .find((candidate) => candidate.closest('.chat-live-card') === ownerCard);
-            if (restoreNode(roleNode, anchor.offset)) return true;
+            if (isRendered(roleNode)) return restoreSaved(roleNode);
         }
         if (exact && (anchor.lineKey || anchor.reviewKey || anchor.anchorRole)) return false;
         if (exact && cardChain.length && restoreNode(ownerCard, anchor.offset)) return true;
@@ -667,10 +738,25 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
 
     function serializeTimelineAnchor(anchor = captureVisibleTimelineAnchor()) {
         if (!anchor) return null;
-        const { node: _node, topNode: _topNode, cardChain, ...fields } = anchor;
-        return { ...fields, cardChain: (cardChain || []).map(({ taskId, offset }) => ({ taskId, offset })) };
+        const { node, topNode: _topNode, cardChain, ...fields } = anchor;
+        // A bounded box scrolls on its own: the node keeps its offset inside its
+        // owner timeline, and its own full output or Review detail its scroll.
+        const timeline = node?.closest?.('[data-live-timeline]'), inner = node && innerBox(node);
+        return { ...fields, cardChain: (cardChain || []).map(({ taskId, offset }) => ({ taskId, offset })),
+            ...(timeline && messagesDiv.contains(timeline) ? { timelineOffset:
+                node.getBoundingClientRect().top - timeline.getBoundingClientRect().top } : {}),
+            ...(inner ? { innerTop: inner.scrollTop } : {}) };
     }
-    return { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor, serializeTimelineAnchor };
+
+    /** Positioning waits for the data owners of the saved place: the Review
+     * detail it names and the full output an expanded line is still fetching. */
+    function anchorOwnersReady(anchor, reviewReady) {
+        const taskId = anchor?.cardChain?.[0]?.taskId;
+        if (anchor?.reviewKey && !reviewReady(taskId)) return false;
+        const record = anchor?.lineExpanded && liveCardRecords.get(taskId);
+        return !(record && timelineItemForAnchor(record, anchor)?._fetchingFull);
+    }
+    return { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor, serializeTimelineAnchor, anchorOwnersReady };
 }
 
 /** Update one live timeline item using the same keys the card's producer owns.

@@ -523,15 +523,27 @@ contract remains a documented exception, not a pattern for new notices.
 
 A completion notice distinguishes the task's recorded end from the time the
 notification was added. Both dates are absolute local dates outside the answer's
-copyable body. Unknown historical end time says so explicitly. Delivery keeps
-its present place in Main; an older Failed remains that task's result even after
-a different task succeeds.
+copyable body. Unknown historical end time says so explicitly. Inside the room,
+the task card's saved end line keeps its notification time and adds the same
+note whenever the recorded end falls in another minute or is unknown; minutes
+are compared as instants, and two that read alike on the local clock (a repeated
+daylight-saving hour) carry zone names. Lines saved before the host recorded end
+times stay as they were. Delivery keeps its present place in Main; an older
+Failed remains that task's result even after a different task succeeds.
 
 ### History edges
 
-A room reopens at the passage being read after its data arrives, even on a slow
-connection. A failed read keeps that destination and offers Retry. Scrolling,
-revealing a question or choosing the existing ↓ supersedes the saved destination.
+Within one app session a room reopens at the passage being read after its data
+arrives, even on a slow connection; the place is kept in page memory, so a reload
+opens the room at the present. The passage includes how far a bounded full output,
+Review detail or card timeline around it was scrolled. A failed read keeps that
+destination and offers Retry. Scrolling, revealing a question or choosing the
+existing ↓ supersedes the saved destination; reading on, even inside a bounded
+box, supersedes a ↓ or question still loading. A wheel, swipe or key over a
+bounded box moves that box, not the conversation, until the box reaches its edge.
+A scrollbar drag follows new replies only when released at the live edge.
+Expanding a line or receiving its full output leaves it in place; only a newer
+line moves a card timeline to its end.
 New replies remain below in the same live conversation without moving the passage.
 
 The common `Load more history` control retries a failed read, fills a known
@@ -539,7 +551,9 @@ missing continuation toward the present, then reads older portions. A positive
 scroll gesture at an unambiguous reading edge may load a bounded continuation;
 a short portion, resize or media layout alone starts no archive read. Empty
 physical pages are traversable and never mean EOF. The existing floating
-`Scroll to latest message` remains the explicit return to the present.
+`Scroll to latest message` remains the explicit return to the present; when the
+present is already loaded it moves there and follows without a read, and a gap
+note stays.
 
 When loaded fragments are disconnected or their coverage is uncertain, the
 same readable note stays in Main and Project header chrome: `Some saved history

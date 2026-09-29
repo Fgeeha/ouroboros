@@ -23,7 +23,12 @@ export function historyCoverage(recent, pages = []) {
         if (!Number.isSafeInteger(horizon) || !head) { complete = false; gaps = true; continue; }
         const delivered = [recent, ...pages].filter(value => value?.v === 1 && value.view === recent.view)
             .map(value => value.spans?.[source]);
-        const valid = span => span && span.chain === head.chain && Array.isArray(span.gaps)
+        // The newest read lists prefix witnesses through its trailing segments.
+        // A span keeps its coordinates while its own last witness is listed:
+        // rotation appends one, a replaced or removed earlier segment changes all.
+        const listed = new Set(String(head.chain).split('.'));
+        const sameChain = span => typeof span?.chain === 'string' && listed.has(span.chain.split('.').at(-1));
+        const valid = span => span && sameChain(span) && Array.isArray(span.gaps)
                 && Number.isSafeInteger(span.from) && Number.isSafeInteger(span.to)
                 && span.from >= 0 && span.from <= span.to;
         // A formerly empty source owns no retained bytes. Its first write
@@ -50,7 +55,7 @@ export function historyCoverage(recent, pages = []) {
         if (end !== horizon) gaps = true;
         if (start !== 0 || end !== horizon) complete = false;
         const oldEnds = pages.filter(value => value?.view === recent.view)
-            .map(value => value?.spans?.[source]).filter(span => span?.chain === head.chain)
+            .map(value => value?.spans?.[source]).filter(sameChain)
             .map(span => span.to);
         if (oldEnds.length && head.from > Math.max(...oldEnds)) horizonGap = true;
     }

@@ -9,6 +9,7 @@
  */
 import { createSystemMessageActions } from './ui_helpers.js';
 import { projectReference } from './project_reference.js';
+import { terminalTimeNote } from './utils.js';
 
 // The fade says "there is more": it appears only when the fold really hides text. The clamp
 // itself is unconditional CSS, so toggling the class never moves layout. A row mounted while
@@ -54,14 +55,7 @@ export function decorateProjectRow(bubble, { role = 'system', projectId = '', pr
     if (completion) {
         const note = bubble.ownerDocument.createElement('div');
         note.className = 'msg-provenance';
-        const absolute = value => {
-            const date = value ? new Date(value) : null;
-            return date && !Number.isNaN(date.getTime()) ? date.toLocaleString(undefined, {
-                year: 'numeric', month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit',
-            }) : '';
-        };
-        const occurred = terminalTime?.source === 'executor_terminal' ? absolute(terminalTime.occurred_at) : '';
-        note.textContent = `${occurred ? `Task ended ${occurred}` : 'Task end time not recorded'} · Notification added ${absolute(addedAt)}`;
+        note.textContent = terminalTimeNote(terminalTime, addedAt);
         bubble.insertBefore(note, actions);
     }
     return actions;

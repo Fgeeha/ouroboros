@@ -70,3 +70,19 @@ test('same-rowcount reread refreshes spans, empty saved descriptors have no load
     assert.equal(historyCoverage(current, restored.getState().coverage).complete, true);
     pager.destroy(); restored.destroy();
 });
+
+test('rotation keeps earlier prefix witnesses; a replaced later archive cannot complete coverage', () => {
+    // Each span lists rolling prefix witnesses through its trailing segments
+    // (symbolic here). A page is compatible when its own last witness is still
+    // listed by the newest recent read.
+    const at = (from, to, upper, chain) => coverage(from, to, upper, { chain });
+    const pages = [at(0, 40, 100, 'a.ab.abc'), at(40, 80, 100, 'a.ab.abc')];
+    assert.equal(historyCoverage(at(80, 100, 100, 'a.ab.abc'), pages).complete, true);
+    assert.deepEqual(historyCoverage(at(80, 140, 140, 'ab.abc.abcd'), pages),
+        { complete: true, gaps: false, horizonGap: false }, 'the live segment rotated and a new one began');
+    const replaced = historyCoverage(at(80, 140, 140, "ab'.ab'c.ab'cd"), pages);
+    assert.equal(replaced.complete, false);
+    assert.equal(replaced.gaps, true, 'bytes read before a later archive was replaced are disclosed');
+    assert.equal(historyCoverage(at(80, 140, 140, 'ab.abc.abcd'), [at(0, 80, 100, 'abc.x')]).gaps, true,
+        'only the span\'s own last witness proves its coordinates');
+});

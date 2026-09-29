@@ -2,7 +2,9 @@
 import json
 import pytest
 
-from tests.test_history_continuity_browser import _deep_gesture_history, _OFFSET
+from tests.test_history_continuity_browser import (
+    _bookmark_place, _deep_gesture_history, _nested_full_output_history, _open_nested_full_output, _OFFSET,
+)
 from tests.test_chat_history_paging_browser import _open, _open_project, _step, _idle, _screenshot, _FRAMES, _write, _result
 from tests.test_chat_history_recovery_browser import _click_project
 from tests.test_ui_smoke_playwright import direct_server_with_data as direct_server_with_data
@@ -311,16 +313,6 @@ def test_late_latest_cannot_erase_newer_physical_coverage(direct_server_with_dat
                 {'held': held, 'reads': page.evaluate('() => window.__historyReads')}, indent=2))
         finally:
             browser.close()
-
-
-def _bookmark_place(page, node, offset=30):
-    node.evaluate("""(node, offset) => {
-        const feed = node.closest('.chat-messages');
-        feed.dispatchEvent(new WheelEvent('wheel', {deltaY:-1}));
-        feed.scrollTop += node.getBoundingClientRect().top - feed.getBoundingClientRect().top - offset;
-    }""", offset)
-    page.evaluate(_FRAMES)
-    return node.evaluate(_OFFSET)
 
 
 def _bookmark_reconnect(page):
@@ -816,5 +808,49 @@ def test_live_revisioned_receipt_bookmark_survives_equal_replay(direct_server_wi
             assert card.get_attribute('data-expanded') == '1'
             assert lines.count() == 2
             _screenshot(page, tmp_path, f'receipt-bookmark-newer-{browser_engine}')
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+def test_latest_waiting_for_history_yields_to_reading_inside_a_box(direct_server_with_data, browser_engine, tmp_path):
+    """#1347 A: ↓ waits for an older read in flight; reading on inside a full output meanwhile keeps the place."""
+    from playwright.sync_api import sync_playwright
+
+    project = _nested_full_output_history(direct_server_with_data['data_dir'])
+    with sync_playwright() as pw:
+        browser = getattr(pw, browser_engine).launch(headless=True)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 850})
+            feed, _child, line, body = _open_nested_full_output(page, direct_server_with_data['url'], project)
+            root = page.locator(feed)
+            root.evaluate('feed => { feed.scrollTop = 0; }')
+            body.evaluate('n => { n.scrollTop = Math.round((n.scrollHeight - n.clientHeight) / 2); }')
+            page.evaluate(_FRAMES)
+            # Turning back at the top edge reads an older page; that read is held.
+            page.evaluate("() => { window.__historyFault = 'hold'; }")
+            root.evaluate("feed => feed.dispatchEvent(new WheelEvent('wheel', {deltaY: -1}))")
+            page.wait_for_function('() => Boolean(window.__heldHistory)')
+            page.locator('#project-panel-body .chat-scroll-bottom-btn').click()
+            rect, frame = body.bounding_box(), root.bounding_box()
+            page.mouse.move(rect['x'] + rect['width'] / 2, max(rect['y'], frame['y']) + 40)
+            page.wait_for_timeout(300)  # a new wheel burst, not the tail of the edge gesture
+            before = {'body': body.evaluate('n => n.scrollTop'), 'line': line.evaluate(_OFFSET)}
+            page.mouse.wheel(0, 240)
+            page.wait_for_timeout(300)
+            page.evaluate(_FRAMES)
+            read = {'body': body.evaluate('n => n.scrollTop'), 'line': line.evaluate(_OFFSET)}
+            assert read['body'] > before['body'] and abs(read['line'] - before['line']) <= 1, (before, read)
+            page.evaluate('() => window.__releaseHistory()')
+            _idle(page, feed)
+            page.wait_for_timeout(200)
+            page.evaluate(_FRAMES)
+            after = {'body': body.evaluate('n => n.scrollTop'), 'line': line.evaluate(_OFFSET),
+                     'gap': root.evaluate('n => n.scrollHeight - n.scrollTop - n.clientHeight')}
+            (tmp_path / f'latest-yields-{browser_engine}.json').write_text(
+                json.dumps({'before': before, 'read': read, 'after': after}, indent=2))
+            _screenshot(page, tmp_path, f'latest-yields-to-box-{browser_engine}')
+            assert after['gap'] > 200, ('the superseded ↓ must not pull the reader to the present', after)
+            assert abs(after['line'] - read['line']) <= 8 and abs(after['body'] - read['body']) <= 2, (read, after)
         finally:
             browser.close()

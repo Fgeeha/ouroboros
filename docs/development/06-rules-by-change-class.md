@@ -1037,8 +1037,10 @@ and what enforces each.
   and failures per operation; repeated edges cannot turn deduplicated failure into
   success. New operations retry durable sources. Capacity, publication order and
   paid identity stay separate.
-- Mirror actual split-root execution start/binding into the canonical result through
-  its terminal-preserving writer. Recover legacy bindings only from positive child
+- Mirror actual split-root or split-subagent execution start/attempt/binding into
+  the canonical result through its terminal-preserving writer; copyback transfers
+  a child's terminal occurrence only for the attempt the canonical row names, and a
+  start written without it stays unknown. Recover legacy bindings only from positive child
   start plus existing queue/worker orphan proof, never while pending/cancelled and
   never as permission to resume.
 - `headless.prepare_terminal_task_files` adopts answer, output files and receipt

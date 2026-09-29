@@ -163,6 +163,44 @@ def test_actual_child_copyback_cannot_authenticate_its_own_attempt(tmp_path, mon
     assert terminal_time_fact(final)['occurred_at'] == expected
 
 
+@pytest.mark.parametrize('worker_start', [True, False])
+def test_split_subagent_start_carries_the_witness_its_copyback_needs(tmp_path, monkeypatch, worker_start):
+    """The real subagent route: request receipt, assignment mirror, worker start, child end, copyback."""
+    import supervisor.workers as workers
+    from ouroboros.agent import OuroborosAgent
+    from ouroboros.headless import copy_child_task_result
+    from ouroboros.task_status import load_effective_task_result
+    from supervisor.worker_assignment import _mirror_assigned_running_status
+
+    host, child = tmp_path / 'host', tmp_path / 'child'
+    task = {'id': 'sub', 'delegation_role': 'subagent', 'parent_task_id': 'root', 'root_task_id': 'root',
+            'drive_root': str(child), 'child_drive_root': str(child), 'budget_drive_root': str(host),
+            'memory_mode': 'forked', '_attempt': 1, 'metadata': {}}
+    write_task_result(host, 'sub', 'requested', delegation_role='subagent', parent_task_id='root',
+                      drive_root=str(child), child_drive_root=str(child))
+    monkeypatch.setattr(workers, 'DRIVE_ROOT', host)
+    _mirror_assigned_running_status(task)
+    assert task_attempt_witness(load_task_result(host, 'sub'))['started_at'] is None
+    actor = SimpleNamespace(env=SimpleNamespace(drive_root=child, budget_drive_root=host),
+                            _task_started_ts=1790000000.0)
+    if worker_start:
+        OuroborosAgent._persist_running_record(actor, task)
+    else:  # an install that started the child before the canonical witness existed
+        write_task_result(child, 'sub', 'running', task_attempt=1, started_at=T1)
+    monkeypatch.setattr('ouroboros.task_results.utc_now_iso', lambda: T2)
+    source = write_task_result(child, 'sub', 'failed', _terminal_observed=True, result='Child failed')
+    monkeypatch.setattr('ouroboros.task_results.utc_now_iso', lambda: T3)
+    effective = load_effective_task_result(host, 'sub', materialize_artifacts=False)
+    copied = copy_child_task_result(host, task)
+    for row in (effective, copied, load_task_result(host, 'sub')):
+        assert row['status'] == 'failed'
+        # The canonical start now names the child's attempt; a legacy start
+        # without it stays unknown instead of trusting the replica's own clock.
+        assert terminal_time_fact(row)['occurred_at'] == (T2 if worker_start else None)
+        if worker_start:
+            assert task_attempt_witness(row) == task_attempt_witness(source)
+
+
 def test_create_only_compatibility_import_transfers_trusted_fact(tmp_path, monkeypatch):
     from ouroboros.terminal_projection import append_terminal_projection
 
@@ -194,6 +232,33 @@ def test_late_failure_publication_after_other_success_keeps_both_outcomes_and_ti
     assert rows[-1]['status'] == 'failed' and rows[0]['status'] == 'completed'
     assert _already_in_chat(tmp_path, rows[-1])['ts'] == T3
     assert load_task_result(tmp_path, 'old')['canonical_terminal_projection']['written_at'] == T3
+
+
+@pytest.mark.parametrize('observed', [True, False])
+def test_project_room_terminal_row_keeps_occurrence_beside_its_publication(tmp_path, monkeypatch, observed):
+    """A Project room's own terminal row carries the same end fact as its Main mirror."""
+    import asyncio
+
+    from ouroboros.gateway.history import make_chat_history_endpoint
+    from ouroboros.project_dialogue import append_terminal_task_projection
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+
+    project = create_project(tmp_path, 'room-times', name='Room times')
+    bind_task_to_project(tmp_path, 'late', project['id'], project['chat_id'], origin={'absent': 'system'})
+    write_task_result(tmp_path, 'late', 'running', task_attempt=0, started_at=T1,
+                      project_id=project['id'], chat_id=project['chat_id'])
+    monkeypatch.setattr('ouroboros.task_results.utc_now_iso', lambda: T1)
+    # A recovered or imported terminal has no executor observation: it stays unknown.
+    ended = write_task_result(tmp_path, 'late', 'failed', _terminal_observed=observed, result='Late failure')
+    monkeypatch.setattr('ouroboros.terminal_projection.utc_now_iso', lambda: T3)
+    assert append_terminal_task_projection(tmp_path, 'late', {'id': 'late'}, ended, {})
+    response = asyncio.run(make_chat_history_endpoint(tmp_path)(
+        SimpleNamespace(query_params={'chat_id': str(project['chat_id'])})))
+    rows = [row for row in json.loads(response.body)['messages'] if row.get('system_type') == 'task_summary']
+    assert [(row['task_id'], row['ts']) for row in rows] == [('late', T3)], 'publication keeps its own time'
+    assert rows[0]['terminal_time'] == ended['terminal_time'] == terminal_time_fact(ended)
+    assert rows[0]['terminal_time']['occurred_at'] == (T1 if observed else None)
+    assert rows[0]['terminal_time']['source'] == ('executor_terminal' if observed else 'unknown')
 
 
 def test_unknown_fact_cannot_be_upgraded_by_untyped_or_mismatched_metadata():

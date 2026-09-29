@@ -5,11 +5,12 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 
 import pytest
 
 from tests.test_chat_history_paging_browser import (
-    _open, _open_project, _step, _idle, _write, _screenshot, _FRAMES,
+    _open, _open_project, _step, _idle, _write, _result, _screenshot, _FRAMES,
 )
 from tests.ui_chat_viewport_smoke import _SETTLE_RESTORE_FRAMES
 from tests.test_chat_history_recovery_browser import _click_project
@@ -188,6 +189,68 @@ def test_terminal_publication_timing_and_answer_copy(direct_server_with_data, br
             page.evaluate(_FRAMES)
             assert check() == before
             _screenshot(page, tmp_path, f'terminal-times-narrow-{browser_engine}')
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
+def test_project_room_terminal_lines_separate_end_and_notification(direct_server_with_data, browser_engine, tmp_path, monkeypatch):
+    """Inside the Project room the task's own saved end row keeps both times (#1347 A)."""
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.project_dialogue import append_terminal_task_projection
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+    from ouroboros.task_results import write_task_result
+
+    root = direct_server_with_data['data_dir']
+    direct_server_with_data['stop_server']()
+    project = create_project(root, 'room-terminal-times', name='Room terminal times')
+    ended = {'late': '2026-09-24T18:18:27+00:00', 'prompt': '2026-09-25T15:19:01+00:00', 'unknown': None}
+    added = {'late': '2026-09-26T19:21:43+00:00', 'prompt': '2026-09-25T15:19:09+00:00', 'unknown': '2026-09-26T19:25:00+00:00'}
+    for task_id in ('prompt', 'late', 'unknown'):
+        bind_task_to_project(root, task_id, project['id'], project['chat_id'], origin={'absent': 'system'})
+        write_task_result(root, task_id, 'running', task_attempt=0, started_at='2026-09-24T17:00:00+00:00',
+                          project_id=project['id'], chat_id=project['chat_id'])
+        monkeypatch.setattr('ouroboros.task_results.utc_now_iso', lambda: ended[task_id] or added[task_id])
+        result = write_task_result(root, task_id, 'failed', _terminal_observed=bool(ended[task_id]),
+                                   result=f'{task_id.upper()}_ROOM_RESULT')
+        monkeypatch.setattr('ouroboros.terminal_projection.utc_now_iso', lambda: added[task_id])
+        assert append_terminal_task_projection(root, task_id, {'id': task_id}, result, {})
+    direct_server_with_data['start_server']()
+    with sync_playwright() as pw:
+        browser = getattr(pw, browser_engine).launch(headless=True)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 850}, timezone_id='UTC', locale='en-US')
+            _open(page, direct_server_with_data['url'])
+            feed = _open_project(page, project)
+
+            def notes():
+                found = {}
+                for task_id in ended:
+                    card = page.locator(f'{feed} .chat-live-card[data-task-id="{task_id}"]')
+                    card.wait_for(state='attached')
+                    if card.get_attribute('data-expanded') != '1':
+                        card.locator(':scope > [data-live-summary-button]').click()
+                    found[task_id] = card.locator(':scope > [data-live-timeline]').inner_text()
+                return found
+
+            found = notes()
+            # ICU spells the date/time joint differently per engine; the facts are fixed.
+            assert re.search(r'Task ended Sep 24, 2026\D+06:18 PM · Notification added Sep 26, 2026\D+07:21 PM', found['late']), found
+            assert re.search(r'Task end time not recorded · Notification added Sep 26, 2026\D+07:25 PM', found['unknown']), found
+            assert 'Notification added' not in found['prompt'] and 'Task end' not in found['prompt'], found
+            _screenshot(page, tmp_path, f'room-terminal-times-{browser_engine}')
+            page.reload(wait_until='domcontentloaded')
+            _idle(page, '#chat-messages')
+            feed = _open_project(page, project)
+            assert notes() == found
+            page.set_viewport_size({'width': 390, 'height': 844})
+            page.evaluate(_FRAMES)
+            late = page.locator(f'{feed} .chat-live-card[data-task-id="late"]')
+            late.scroll_into_view_if_needed()
+            box = late.bounding_box()
+            assert box['x'] >= 0 and box['x'] + box['width'] <= 391, box
+            _screenshot(page, tmp_path, f'room-terminal-times-narrow-{browser_engine}')
         finally:
             browser.close()
 
@@ -541,3 +604,381 @@ def test_deep_restoration_waits_for_data_and_actual_gestures_win(direct_server_w
             (out / f'gesture-phases-{browser_engine}.json').write_text(json.dumps(evidence, indent=2), encoding='utf-8')
             browser.close()
     assert not failures, (failures, evidence)
+
+
+def _bookmark_place(page, node, offset=30):
+    node.evaluate("""(node, offset) => {
+        const feed = node.closest('.chat-messages');
+        feed.dispatchEvent(new WheelEvent('wheel', {deltaY:-1}));
+        feed.scrollTop += node.getBoundingClientRect().top - feed.getBoundingClientRect().top - offset;
+    }""", offset)
+    page.evaluate(_FRAMES)
+    return node.evaluate(_OFFSET)
+
+
+def _nested_full_output_history(root, card_after=49, unrelated=False):
+    """A Project card whose child line holds a long fetched full output, between saved talk."""
+    from ouroboros.projects_registry import create_project
+
+    project = create_project(root, 'nested-scroll-room', name='Nested scroll history')
+    cid = project['chat_id']
+    full = ''.join(f'Retained paragraph {index:03d}. ' + 'The full output stays readable in place. ' * 3 + '\n\n'
+                   for index in range(120)) + 'UNIQUE_NESTED_TAIL'
+    lineage = {'subagent_task_id': 'nested-child', 'parent_task_id': 'nested-parent',
+               'root_task_id': 'nested-parent', 'delegation_role': 'subagent', 'subagent_role': 'Archive reader'}
+    # 150 recent human rows leave 50 on an older page; by default the card
+    # opens the recent window, right below its Load-older boundary.
+    def minute(index):
+        return f'2026-09-01T{10 + index // 60:02d}:{index % 60:02d}'
+    at = minute(card_after)
+    _write(root / 'logs/chat.jsonl', [
+        {'direction': 'in', 'chat_id': cid, 'ts': f'{minute(index)}:00Z',
+         'client_message_id': f'nested-{index}', 'text': f'Nested context {index:03d}'} for index in range(200)])
+    # An unrelated owner's saved Review hydrates on every reopen: its detail read
+    # is someone else's data and may never hold this reading place.
+    _write(root / 'logs/progress.jsonl', [
+        *([{'type': 'review_reference', 'chat_id': cid, 'task_id': 'unrelated-review',
+            'presentation_owner_task_id': 'unrelated-review', 'surface': 'task_acceptance',
+            'state_revision': 'a' * 64, 'ts': f'{at}:29Z'}] if unrelated else []),
+        {'chat_id': cid, 'ts': f'{at}:30Z', 'task_id': 'nested-parent', 'content': 'Parent narration'},
+        {'chat_id': cid, 'ts': f'{at}:31Z', 'task_id': 'nested-child', **lineage,
+         'subagent_event': 'completed', 'status': 'completed', 'content': 'Child finished',
+         'result': full[:4000], 'result_truncated': True}])
+    if unrelated:
+        _result(root, 'unrelated-review', chat_id=cid, project_id=project['id'], result='Unrelated task')
+    _result(root, 'nested-parent', chat_id=cid, project_id=project['id'], result='Parent finished.')
+    _result(root, 'nested-child', chat_id=cid, project_id=project['id'], result=full, **lineage)
+    return project
+
+
+def _open_nested_full_output(page, url, project):
+    _open(page, url)
+    feed = _open_project(page, project)
+    parent = page.locator(f'{feed} .chat-live-card[data-task-id="nested-parent"]')
+    child = page.locator(f'{feed} .chat-live-card[data-task-id="nested-child"]')
+    for card in (parent, child):
+        card.wait_for(state='attached')
+        if card.get_attribute('data-expanded') != '1':
+            card.locator(':scope > [data-live-summary-button]').click()
+    line = child.locator(':scope > [data-live-timeline] > .chat-live-line.expandable')
+    line.locator('[data-live-line-toggle]').click()
+    body = line.locator(':scope > .chat-live-line-body-full')
+    body.get_by_text('UNIQUE_NESTED_TAIL', exact=False).wait_for(state='attached')
+    page.evaluate(_FRAMES)
+    return feed, child, line, body
+
+
+_NESTED = """n => ({top: n.scrollTop, max: n.scrollHeight - n.clientHeight,
+    offset: n.getBoundingClientRect().top - n.closest('.chat-messages').getBoundingClientRect().top})"""
+
+
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+def test_expanded_full_output_reopens_at_its_own_scrolled_place(direct_server_with_data, browser_engine, tmp_path):
+    """#1347 A: the exact old place includes a bounded full output and card timeline scrolled inside."""
+    from playwright.sync_api import sync_playwright
+
+    project = _nested_full_output_history(direct_server_with_data['data_dir'], card_after=80)
+    with sync_playwright() as pw:
+        browser = getattr(pw, browser_engine).launch(headless=True)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 850})
+            feed, child, line, body = _open_nested_full_output(page, direct_server_with_data['url'], project)
+            timeline = child.locator(':scope > [data-live-timeline]')
+            # The line head just crosses the feed top: the reader is inside its output.
+            _bookmark_place(page, line, -20)
+            assert page.locator(feed).evaluate('n => n.scrollTop') > 80, 'placing the line must not page'
+            box = body.evaluate(_NESTED)
+            assert box['max'] > 600, box
+            timeline_range = timeline.evaluate(_NESTED)['max']
+            timeline.evaluate('(n, top) => { n.scrollTop = top; }', max(0, min(16, timeline_range - 30)))
+            body.evaluate('n => { n.scrollTop = Math.round((n.scrollHeight - n.clientHeight) / 2); }')
+            page.evaluate(_FRAMES)
+            before = {'body': body.evaluate(_NESTED), 'timeline': timeline.evaluate(_NESTED), 'line': line.evaluate(_OFFSET)}
+            assert before['body']['top'] > 300, before
+            _screenshot(page, tmp_path, f'nested-output-before-{browser_engine}')
+            page.locator('#project-panel-close').click()
+            _click_project(page, project)
+            _idle(page, feed)
+            body.get_by_text('UNIQUE_NESTED_TAIL', exact=False).wait_for(state='attached')
+            page.evaluate(_FRAMES)
+            page.evaluate(_FRAMES)
+            after = {'body': body.evaluate(_NESTED), 'timeline': timeline.evaluate(_NESTED), 'line': line.evaluate(_OFFSET)}
+            (tmp_path / f'nested-output-{browser_engine}.json').write_text(json.dumps({'before': before, 'after': after}, indent=2))
+            _screenshot(page, tmp_path, f'nested-output-after-{browser_engine}')
+            assert line.get_attribute('data-expanded') == '1'
+            assert abs(after['body']['top'] - before['body']['top']) <= 2, (before, after)
+            assert abs(after['timeline']['top'] - before['timeline']['top']) <= 2, (before, after)
+            assert abs(after['line'] - before['line']) <= 8, (before, after)
+            assert 'could not be restored exactly' not in page.locator(feed).locator('..').inner_text()
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+def test_wheel_inside_full_output_neither_pages_nor_follows_until_its_edge(direct_server_with_data, browser_engine, tmp_path):
+    """#1347 A: a real wheel scrolls the bounded output it is over; only at its edge does it move the feed."""
+    from playwright.sync_api import sync_playwright
+
+    project = _nested_full_output_history(direct_server_with_data['data_dir'])
+    with sync_playwright() as pw:
+        browser = getattr(pw, browser_engine).launch(headless=True)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 850})
+            feed, _child, _line, body = _open_nested_full_output(page, direct_server_with_data['url'], project)
+            root = page.locator(feed)
+            # Clicking the disclosures scrolled the card into view; settle at the
+            # feed top without a gesture, so no archive read has been asked for.
+            root.evaluate('feed => { feed.scrollTop = 0; }')
+            page.evaluate(_FRAMES)
+            body.evaluate('n => { n.scrollTop = Math.round((n.scrollHeight - n.clientHeight) / 2); }')
+            page.evaluate(_FRAMES)
+            rect = body.bounding_box()
+            frame = root.bounding_box()
+            assert rect['y'] + 40 < frame['y'] + frame['height'], (rect, frame)
+            assert root.evaluate('n => n.scrollTop') < 80
+            before = {'reads': page.evaluate('() => window.__historyReads.length'),
+                      'feed': root.evaluate('n => n.scrollTop'), 'body': body.evaluate('n => n.scrollTop')}
+            page.mouse.move(rect['x'] + rect['width'] / 2, max(rect['y'], frame['y']) + 40)
+            page.mouse.wheel(0, -240)
+            page.wait_for_timeout(400)
+            page.evaluate(_FRAMES)
+            after = {'reads': page.evaluate('() => window.__historyReads.length'),
+                     'feed': root.evaluate('n => n.scrollTop'), 'body': body.evaluate('n => n.scrollTop')}
+            (tmp_path / f'nested-wheel-{browser_engine}.json').write_text(json.dumps({'before': before, 'after': after}, indent=2))
+            _screenshot(page, tmp_path, f'nested-wheel-{browser_engine}')
+            assert after['body'] < before['body'], (before, after)
+            assert abs(after['feed'] - before['feed']) <= 1, (before, after)
+            assert after['reads'] == before['reads'], 'a wheel the full output consumed must not page the archive'
+
+            # At the output's top edge the wheel chains to its card timeline, the
+            # next bounded box that can still move: it scrolls; the feed still does not.
+            timeline = body.locator('xpath=ancestor::*[@data-live-timeline][1]')
+            timeline.evaluate('n => { n.scrollTop = n.scrollHeight; }')
+            body.evaluate('n => { n.scrollTop = 0; }')
+            page.evaluate(_FRAMES)
+            chained = {'timeline': timeline.evaluate('n => n.scrollTop'), 'feed': root.evaluate('n => n.scrollTop')}
+            assert chained['timeline'] > 0, chained
+            inner = body.bounding_box()
+            top, bottom = max(inner['y'], frame['y']), min(inner['y'] + inner['height'], frame['y'] + frame['height'])
+            assert bottom - top > 20, (inner, frame)
+            page.mouse.move(inner['x'] + inner['width'] / 2, (top + bottom) / 2)
+            page.mouse.wheel(0, -240)
+            page.wait_for_timeout(400)
+            page.evaluate(_FRAMES)
+            assert timeline.evaluate('n => n.scrollTop') < chained['timeline']
+            assert abs(root.evaluate('n => n.scrollTop') - chained['feed']) <= 1
+            assert page.evaluate('() => window.__historyReads.length') == before['reads'], 'the timeline absorbed it'
+
+            # With the output and its card timeline at their top edges, the same
+            # real wheel reaches the feed top.
+            body.evaluate('n => { n.scrollTop = 0; n.closest("[data-live-timeline]").scrollTop = 0; }')
+            page.evaluate(_FRAMES)
+            page.mouse.wheel(0, -240)
+            page.wait_for_function('n => window.__historyReads.length > n', arg=before['reads'], timeout=30_000)
+            _idle(page, feed)
+            assert page.locator(f'{feed} [data-client-message-id="nested-10"]').count() == 1
+            _screenshot(page, tmp_path, f'nested-wheel-edge-{browser_engine}')
+        finally:
+            browser.close()
+
+
+_HOLD_TASK_READS = """(() => {
+    const fetch = window.fetch.bind(window);
+    window.__childReads = []; window.__unrelatedReads = [];
+    window.fetch = async (input, init) => {
+        const url = new URL(typeof input === 'string' ? input : input.url, location.href);
+        if (url.pathname === '/api/tasks/unrelated-review' && window.__holdUnrelated) {
+            await new Promise(resolve => { window.__unrelatedReads.push(resolve); });
+        }
+        if (url.pathname === '/api/tasks/nested-child') {
+            const read = {mode: window.__childMode || 'ready', done: false}; window.__childReads.push(read);
+            if (read.mode === 'hold') await new Promise(resolve => { read.release = resolve; });
+            if (read.mode === 'error') { read.done = true; throw new TypeError('controlled full-output failure'); }
+            const response = await fetch(input, init); read.done = true; return response;
+        }
+        return fetch(input, init);
+    };
+})()"""
+
+
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+def test_full_output_bookmark_waits_for_its_own_fetch_not_unrelated_ones(direct_server_with_data, browser_engine, tmp_path):
+    """#1347 A: a held full output defers the exact place; a failure is disclosed; reader input wins."""
+    from playwright.sync_api import sync_playwright
+
+    project = _nested_full_output_history(direct_server_with_data['data_dir'], card_after=80, unrelated=True)
+    with sync_playwright() as pw:
+        browser = getattr(pw, browser_engine).launch(headless=True)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 850})
+            page.add_init_script(_HOLD_TASK_READS)
+            feed, child, line, body = _open_nested_full_output(page, direct_server_with_data['url'], project)
+            timeline = child.locator(':scope > [data-live-timeline]')
+            status = page.locator(feed).locator('..')
+            _bookmark_place(page, line, -20)
+            body.evaluate('n => { n.scrollTop = Math.round((n.scrollHeight - n.clientHeight) / 2); }')
+            page.evaluate(_FRAMES)
+            saved = {'body': body.evaluate(_NESTED)['top'], 'timeline': timeline.evaluate(_NESTED)['top'],
+                     'line': line.evaluate(_OFFSET)}
+            assert saved['body'] > 300, saved
+
+            def reopen(mode):
+                page.locator('#project-panel-close').click()
+                page.evaluate('mode => { window.__childMode = mode; window.__childReads = []; window.__holdUnrelated = true; }', mode)
+                _click_project(page, project)
+                _idle(page, feed)
+                page.wait_for_function('() => window.__childReads.length > 0')
+
+            def settle_unrelated():
+                page.evaluate('() => { window.__holdUnrelated = false; window.__unrelatedReads.splice(0).forEach(resolve => resolve()); }')
+
+            def release_child():
+                page.evaluate('() => { window.__childMode = null; window.__childReads.forEach(read => read.release?.()); }')
+                body.get_by_text('UNIQUE_NESTED_TAIL', exact=False).wait_for(state='attached')
+                page.wait_for_function('() => window.__childReads.every(read => read.done)')
+                page.evaluate(_FRAMES)
+
+            # Held: many paints, no network deadline, no premature or approximate place.
+            reopen('hold')
+            for _ in range(8):
+                page.evaluate(_FRAMES)
+            assert not body.count(), 'the full output is still being read'
+            assert 'could not be restored exactly' not in status.inner_text()
+            _screenshot(page, tmp_path, f'full-output-held-{browser_engine}')
+            release_child()
+            restored = {'body': body.evaluate(_NESTED)['top'], 'timeline': timeline.evaluate(_NESTED)['top'],
+                        'line': line.evaluate(_OFFSET)}
+            (tmp_path / f'full-output-held-{browser_engine}.json').write_text(json.dumps({'saved': saved, 'restored': restored}, indent=2))
+            assert page.evaluate('() => window.__unrelatedReads.length') > 0, 'an unrelated owner read is still held'
+            assert abs(restored['body'] - saved['body']) <= 2, (saved, restored)
+            assert abs(restored['timeline'] - saved['timeline']) <= 2, (saved, restored)
+            assert abs(restored['line'] - saved['line']) <= 8, (saved, restored)
+            assert 'could not be restored exactly' not in status.inner_text()
+            _screenshot(page, tmp_path, f'full-output-released-{browser_engine}')
+            settle_unrelated()
+
+            # Failed: the line returns, the missing output is disclosed rather than called exact.
+            reopen('error')
+            page.wait_for_function('() => window.__childReads.every(read => read.done)')
+            status.get_by_text('Saved position could not be restored exactly.', exact=False).wait_for(state='visible')
+            assert line.get_attribute('data-expanded') == '1'
+            assert abs(line.evaluate(_OFFSET) - saved['line']) <= 8
+            assert not body.count()
+            _screenshot(page, tmp_path, f'full-output-failed-{browser_engine}')
+            # Retry is the line's own disclosure: collapse, expand, read again.
+            page.evaluate('() => { window.__childMode = null; }')
+            for _ in range(2):
+                line.locator('[data-live-line-toggle]').click()
+            body.get_by_text('UNIQUE_NESTED_TAIL', exact=False).wait_for(state='attached')
+            _screenshot(page, tmp_path, f'full-output-retried-{browser_engine}')
+            settle_unrelated()
+            body.evaluate('n => { n.scrollTop = Math.round((n.scrollHeight - n.clientHeight) / 2); }')
+            page.evaluate(_FRAMES)
+
+            # Held again, the reader scrolls the card's own bounded timeline: that box
+            # moves, the old place yields for good, and nothing follows or pages.
+            reopen('hold')
+            page.evaluate(_FRAMES)
+            timeline.evaluate('n => n.scrollIntoView({block: "center"})')
+            page.evaluate(_FRAMES)
+            assert timeline.evaluate(_NESTED)['top'] > 40, 'the renderer keeps a fresh timeline at its latest line'
+            box = timeline.bounding_box()
+            page.mouse.move(box['x'] + box['width'] / 2, box['y'] + min(box['height'] / 2, 150))
+            reads = page.evaluate('() => window.__historyReads.length')
+            before = {'feed': page.locator(feed).evaluate('n => n.scrollTop'), 'timeline': timeline.evaluate(_NESTED)['top']}
+            page.mouse.wheel(0, -120)
+            page.wait_for_timeout(300)
+            page.evaluate(_FRAMES)
+            moved = {'feed': page.locator(feed).evaluate('n => n.scrollTop'), 'timeline': timeline.evaluate(_NESTED)['top']}
+            assert moved['timeline'] < before['timeline'] and abs(moved['feed'] - before['feed']) <= 1, (before, moved)
+            release_child()
+            for _ in range(3):
+                page.evaluate(_FRAMES)
+            after = {'feed': page.locator(feed).evaluate('n => n.scrollTop'), 'body': body.evaluate(_NESTED)['top'],
+                     'reads': page.evaluate('() => window.__historyReads.length')}
+            (tmp_path / f'full-output-superseded-{browser_engine}.json').write_text(json.dumps(
+                {'saved': saved, 'before': before, 'moved': moved, 'after': after}, indent=2))
+            assert abs(after['feed'] - moved['feed']) <= 1, 'a superseded restore cannot move the reader'
+            assert after['body'] == 0 and after['reads'] == reads, (moved, after)
+            assert 'could not be restored exactly' not in status.inner_text()
+            _screenshot(page, tmp_path, f'full-output-superseded-{browser_engine}')
+            settle_unrelated()
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+def test_feed_scrollbar_drag_to_the_live_edge_follows_new_replies(direct_server_with_data, browser_engine, tmp_path):
+    """#1347 A: dragging the feed's own scrollbar to the bottom leads to the present;
+    a drag released away from it stays there even when a resize later reaches the end."""
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.projects_registry import create_project
+    from tests.ui_chat_viewport_smoke import _emit_ws_frame
+
+    root = direct_server_with_data['data_dir']
+    project = create_project(root, 'scrollbar-room', name='Scrollbar drag')
+    cid = project['chat_id']
+    _write(root / 'logs/chat.jsonl', [
+        {'direction': 'in', 'chat_id': cid, 'ts': f'2026-09-01T10:{index:02d}:00Z',
+         'client_message_id': f'drag-{index}', 'text': f'Scrollbar context {index:02d}'} for index in range(60)])
+    with sync_playwright() as pw:
+        # Classic scrollbars: headless Chromium hides them by default.
+        options = {'ignore_default_args': ['--hide-scrollbars']} if browser_engine == 'chromium' else {}
+        browser = getattr(pw, browser_engine).launch(headless=True, **options)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 850})
+            _open(page, direct_server_with_data['url'])
+            feed = _open_project(page, project)
+            root_feed = page.locator(feed)
+            bar = root_feed.evaluate('n => n.offsetWidth - n.clientWidth')
+            assert bar > 0, 'a classic feed scrollbar is present'
+            _bookmark_place(page, page.locator(f'{feed} [data-client-message-id="drag-10"]'), 40)
+            box = root_feed.bounding_box()
+            x = box['x'] + box['width'] - bar / 2
+            thumb_js = """n => n.getBoundingClientRect().top
+                + (n.scrollTop + n.clientHeight / 2) / n.scrollHeight * n.clientHeight"""
+
+            def drag(to_y):
+                page.mouse.move(x, root_feed.evaluate(thumb_js))
+                page.mouse.down()
+                page.mouse.move(x, to_y, steps=12)
+                page.mouse.up()
+                page.evaluate(_FRAMES)
+
+            def reply(key):
+                _emit_ws_frame(page, {'type': 'chat', 'role': 'user', 'chat_id': cid, 'content': f'A new reply {key}',
+                                      'ts': '2026-09-01T11:30:00Z', 'client_message_id': key, 'sender_session_id': 'other-tab'})
+                page.locator(f'{feed} [data-client-message-id="{key}"]').wait_for(state='attached')
+                page.evaluate(_FRAMES)
+
+            drag(box['y'] + box['height'] - 2)
+            dragged = root_feed.evaluate('n => n.scrollHeight - n.scrollTop - n.clientHeight')
+            assert dragged <= 2, dragged
+            reply('drag-new')
+            gap = root_feed.evaluate('n => n.scrollHeight - n.scrollTop - n.clientHeight')
+            _screenshot(page, tmp_path, f'scrollbar-drag-follows-{browser_engine}')
+            assert gap <= 2, f'the dragged-to-bottom feed follows the new reply ({gap}px short)'
+
+            # Released a little above the end; a taller window then clamps the feed
+            # to its end. Only the release decided following: a new reply stays below.
+            ratio = root_feed.evaluate('n => n.scrollHeight / n.clientHeight')
+            drag(root_feed.evaluate(thumb_js) - 90 / ratio)
+            released = root_feed.evaluate('n => n.scrollHeight - n.scrollTop - n.clientHeight')
+            assert 48 < released < 150, released
+            page.set_viewport_size({'width': 1280, 'height': 1000})
+            page.wait_for_timeout(150)
+            page.evaluate(_FRAMES)
+            resized = root_feed.evaluate('n => n.scrollHeight - n.scrollTop - n.clientHeight')
+            first = root_feed.evaluate(_FIRST_VISIBLE)
+            reply('drag-away')
+            kept = page.locator(f'{feed} [data-history-id="{first["id"]}"]').evaluate(_OFFSET)
+            away = root_feed.evaluate('n => n.scrollHeight - n.scrollTop - n.clientHeight')
+            _screenshot(page, tmp_path, f'scrollbar-drag-released-away-{browser_engine}')
+            (tmp_path / f'scrollbar-drag-{browser_engine}.json').write_text(json.dumps({
+                'bar': bar, 'dragged': dragged, 'gap': gap, 'released': released, 'resized': resized,
+                'first': first, 'kept': kept, 'away': away}))
+            assert abs(kept - first['offset']) <= 2 and away > 20, ('a drag released away does not follow', first, kept, away)
+            assert page.evaluate('() => window.__historyReads.every(read => !read.cursor)'), 'a scrollbar drag pages nothing'
+        finally:
+            browser.close()

@@ -53,7 +53,7 @@ class Node {
     }
     querySelector(selector) {
         const key = selector.match(/data-live-line-key="([^"]+)"/)?.[1];
-        return this.children.find((child) => child.dataset.liveLineKey === key);
+        return key ? this.children.find((child) => child.dataset.liveLineKey === key) : null;
     }
 }
 
@@ -333,4 +333,21 @@ test('delegated header activation respects selection, nested controls and one ke
     handlers.click({ ...event, target: link });
     handlers.keydown({ ...event, target: link, key: 'Enter' });
     assert.equal(calls, 3);
+});
+
+test('a line disclosure or late full output keeps a pinned timeline where it is; a new newest line is followed', () => {
+    const f = rendererFixture();
+    f.record.items = [{ lineKey: 'one' }, { lineKey: 'two' }];
+    f.renderLiveCardTimeline(f.record);
+    assert.equal(f.record.timelineEl.scrollTop, 40, 'a fresh timeline opens at its newest line');
+    f.record.timelineEl.scrollTop = 10; // still within the pinned band
+    f.record.expandedLineKeys.add('one');
+    assert.equal(f.renderLiveCardTimeline(f.record), true);
+    assert.equal(f.record.timelineEl.scrollTop, 10, 'expanding the line being read does not scroll it away');
+    f.record.items[0].body = 'The fetched full output';
+    assert.equal(f.renderLiveCardTimeline(f.record), true);
+    assert.equal(f.record.timelineEl.scrollTop, 10);
+    f.record.items.push({ lineKey: 'three' });
+    f.renderLiveCardTimeline(f.record);
+    assert.equal(f.record.timelineEl.scrollTop, 60, 'a new newest line is followed');
 });

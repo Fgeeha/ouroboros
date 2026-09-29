@@ -649,7 +649,7 @@ export function createChatInstance({
 
     const isNearBottom = threshold => reading.nearBottom(threshold);
 
-    const { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor, serializeTimelineAnchor } =
+    const { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor, serializeTimelineAnchor, anchorOwnersReady } =
         createTimelineAnchors({ messagesDiv, liveCardRecords });
     const reading = createChatReadingPosition({
         initial: initialScrollState, feed: messagesDiv, alive: () => !destroyed,
@@ -657,8 +657,7 @@ export function createChatInstance({
         updateButton: updateScrollButton,
         visible: () => !destroyed && isInstanceVisible(),
         ready: () => historyLoaded && restoredPageReady && recentReady
-            && (!reading.target?.historyAnchor?.reviewKey
-                || reviewHydrator.ready(reading.target.historyAnchor.cardChain?.[0]?.taskId)),
+            && anchorOwnersReady(reading.target?.historyAnchor, reviewHydrator.ready),
         anchors: { serialize: serializeTimelineAnchor, restore: restoreVisibleTimelineAnchor, capture: captureVisibleTimelineAnchor },
         fallback: target => {
             const ids = pageHistoryIds.get(target.history?.pages?.[target.history?.focus]?.id);
@@ -1618,6 +1617,7 @@ export function createChatInstance({
             if (changed && !destroyed && record.expandedLineKeys.has(item.lineKey)) {
                 renderLiveCardTimeline(record);
             }
+            reading.position();
         }
     }
 
@@ -3098,15 +3098,14 @@ export function createChatInstance({
         scrollBottomBtn.classList.toggle('visible', isInstanceVisible() && (!isNearBottom() || (!reading.stick && historyWindow?.gaps)));
     }
     scrollBottomBtn?.addEventListener('click', async () => {
-        reading.cancel();
-        const intent = reading.generation;
+        const current = reading.claim();
         if (historySyncPromise) await historySyncPromise;
         await historyPager.whenIdle();
-        if (destroyed || intent !== reading.generation) return;
+        if (destroyed || !current()) return;
         if (historyPager.getState().canNewer || historyWindow?.horizonGap) {
             if ((await historyPager.latest()).status !== 'applied') return;
         }
-        if (destroyed || intent !== reading.generation) return;
+        if (destroyed || !current()) return;
         reading.stick = true;
         reading.followAfterLayout();
         updateScrollButton();
@@ -3894,8 +3893,7 @@ export function createChatInstance({
         refreshHistory,
         revealQuestion: (taskId, quizId) => chatDecision.revealQuestion(
             taskId, quizId, projectId, chatId, appendQuizMessage, isInstanceVisible,
-            () => { reading.cancel(); reading.stick = false;
-                const token = reading.generation; return () => token === reading.generation; }, reading.scroll),
+            () => { const current = reading.claim(); reading.stick = false; return current; }, reading.scroll),
         cancelHistoryPaint,
         // app.js fans its already-existing /api/state refresh to every open
         // thread; panels gain convergence without acquiring their own poll.

@@ -329,7 +329,7 @@ def _copy_task_summary_metadata(rec: Dict[str, Any], entry: Dict[str, Any]) -> N
     """Copy terminal chat facts for task summaries."""
     if entry.get("type") != "task_summary":
         return
-    for key in ("model_execution", "review_projection", "history_retention"):
+    for key in ("model_execution", "review_projection", "history_retention", "terminal_time"):
         if isinstance(entry.get(key), dict):
             rec[key] = dict(entry[key])
     if entry.get("suggested_name"):

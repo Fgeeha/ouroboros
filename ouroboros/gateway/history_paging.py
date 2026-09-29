@@ -18,6 +18,7 @@ _SOURCES = ("chat", "progress")
 _READ_BYTES = 64 * 1024
 _PAGE_SCAN_BYTES = 512 * 1024
 _PAGE_SCAN_ROWS = 1000
+_CHAIN_WITNESSES = 16
 
 
 def progress_quota_predicate(row_matches_thread, stored_chat_id):
@@ -199,6 +200,28 @@ class HistorySource(JsonlChainSnapshot):
         return rows, lower, gaps
 
 
+def chain_witness(reader):
+    """Rolling prefix witnesses through the trailing retained segments below ``upper``.
+
+    Physical byte coordinates survive append and rotation: the live file keeps
+    its inode and base when renamed into the archive. Every witness rolls each
+    earlier nonempty segment's identity and base, so replacing, removing or
+    resizing ANY earlier segment changes it. A span stays comparable while its
+    own last witness is still listed by a newer read, i.e. within
+    ``_CHAIN_WITNESSES`` rotations; older spans are disclosed as gaps. Metadata
+    only: no archive is read to establish it. Empty sources have no prefix.
+    """
+    witnesses, digest = [], b""
+    for index, (_, stat, _) in enumerate(reader.entries):
+        base = reader.ends[index - 1] if index else 0
+        if base >= reader.upper:
+            break
+        if stat.st_size:
+            digest = hashlib.sha256(digest + f"{stat.st_dev}:{stat.st_ino}@{base}".encode()).digest()
+            witnesses.append(digest.hex()[:16])
+    return ".".join(witnesses[-_CHAIN_WITNESSES:]) or "empty"
+
+
 def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, caps):
     continuation = decode_cursor(cursor, thread_id, view) if cursor else None
     if continuation:
@@ -213,11 +236,7 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
             reader = HistorySource(paths[source], source,
                                    continuation["upper"][source] if continuation else None)
             upper[source] = reader.upper
-            # Physical byte coordinates survive append/rotation, but not a
-            # replaced or removed prefix. Metadata only: do not read archives
-            # merely to establish this witness. Empty sources have no prefix.
-            first = next((stat for _, stat, _ in reader.entries if stat.st_size), None)
-            chains[source] = f"{first.st_dev}:{first.st_ino}" if first else "empty"
+            chains[source] = chain_witness(reader)
             page_ends[source] = continuation["before"][source] if continuation else reader.upper
             if continuation and continuation["kind"] == "page":
                 selections[source] = reader.replay(continuation["lower"][source], page_ends[source])

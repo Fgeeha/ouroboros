@@ -32,12 +32,36 @@ def test_root_witness_survives_rotation_but_not_prefix_replacement(tmp_path):
     archive.parent.mkdir(); live.rename(archive)
     write(live, [row(2)])
     _, second = request(tmp_path)
-    assert first['coverage']['spans']['chat']['chain'] == second['coverage']['spans']['chat']['chain']
+    assert _compatible(first, second), 'rotation keeps the renamed live segment and its base'
     replacement = archive.with_suffix('.replacement')
     write(replacement, [row(3)])
     replacement.replace(archive)
     _, third = request(tmp_path)
-    assert third['coverage']['spans']['chat']['chain'] != first['coverage']['spans']['chat']['chain']
+    assert not _compatible(first, third) and not _compatible(second, third)
+
+
+def _compatible(page, head):
+    # The client's rule: a span's own last prefix witness must still be listed
+    # by the newer read (web/modules/chat_history.js historyCoverage).
+    return page['coverage']['spans']['chat']['chain'].split('.')[-1] in head['coverage']['spans']['chat']['chain'].split('.')
+
+
+def test_replacing_a_later_archive_invalidates_every_page_read_before(tmp_path):
+    archives = [tmp_path / f'archive/chat_2026090{day}T000000.jsonl' for day in (1, 2)]
+    for index, path in enumerate(archives):
+        write(path, [row(index)])
+    write(tmp_path / 'logs/chat.jsonl', [row(2)])
+    loaded = list(pages(tmp_path, n_human='1'))
+    assert len(loaded) == 3 and all(_compatible(page, loaded[0]) for page in loaded)
+    # Same bytes and size under a new inode: offsets would still line up, but
+    # the rows read from the old file are no longer this chain's rows.
+    replacement = archives[1].with_suffix('.replacement')
+    write(replacement, [row(1)])
+    replacement.replace(archives[1])
+    _, head = request(tmp_path, n_human='1')
+    assert [_compatible(page, head) for page in loaded] == [False, False, False]
+    assert head['coverage']['spans']['chat']['chain'].split('.')[0] == loaded[0]['coverage']['spans']['chat']['chain'].split('.')[0], \
+        'the untouched first archive keeps its own prefix witness'
 
 
 def test_sparse_global_archives_empty_pages_and_retained_origin(tmp_path):

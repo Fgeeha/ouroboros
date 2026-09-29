@@ -346,7 +346,7 @@ class OuroborosAgent:
             return
 
     def _persist_running_record(self, task: Dict[str, Any]) -> None:
-        """Record actual start on the execution drive and bind split roots canonically.
+        """Record actual start on the execution drive and bind split tasks canonically.
 
         For a delegated child every derived field here was stamped onto ``task`` by
         `resolve_dispatch_axes` moments earlier, so model, effort, route, tool
@@ -432,12 +432,12 @@ class OuroborosAgent:
             )
             canonical = pathlib.Path(task.get("budget_drive_root") or getattr(self.env, "budget_drive_root", None)
                                      or self.env.drive_root)
-            if (str(task.get("delegation_role") or "") != "subagent"
-                    and canonical.resolve() != self.env.drive_root.resolve()
-                    and running.get("status") == STATUS_RUNNING):
-                # Queue snapshots are transient. A split root must retain its
-                # real start and child location after the worker/OS disappears.
-                # The existing writer refuses a late start over a terminal row.
+            if canonical.resolve() != self.env.drive_root.resolve() and running.get("status") == STATUS_RUNNING:
+                # Queue snapshots are transient. A split root or subagent must
+                # retain its real start, attempt and child location after the
+                # worker/OS disappears: copyback accepts the child's end time
+                # only for the attempt the canonical row already names. The
+                # existing writer refuses a late start over a terminal row.
                 write_task_result(
                     canonical, str(task.get("id") or ""), STATUS_RUNNING,
                     child_drive_root=str(self.env.drive_root), budget_drive_root=str(canonical),
