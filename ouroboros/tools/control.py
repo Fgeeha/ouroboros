@@ -361,6 +361,12 @@ def get_tools() -> List[ToolEntry]:
             "parameters": {"type": "object", "properties": {
                 "text": {"type": "string", "description": "Message text"},
                 "reason": {"type": "string", "description": "Why you're reaching out (logged, not sent)"},
+                "destination": {"type": "string", "enum": ["current", "main"], "default": "current",
+                                "description": "'current' (default): this conversation's room. 'main': the "
+                                               "owner's main chat, for a brief plain-text notice that belongs "
+                                               "there while this work lives in an owner-visible Project room. "
+                                               "It never appears in the Project thread and is not this task's "
+                                               "answer. Delegated, Presence and agent-to-agent work cannot use it."},
             }, "required": ["text"]},
         }, _send_user_message),
         ToolEntry("update_identity", {

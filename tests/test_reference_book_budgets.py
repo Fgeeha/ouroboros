@@ -91,7 +91,9 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # earlier-plan facts as read-side projections (one clause); the base sat 22 bytes under.
     # 107300 -> 107500 (merge of the moved target into the plan-review branch, measured 107392): both
     # sides' replaced paragraphs land together; no text was appended by the merge itself.
-    "docs/architecture/03-web-ui-pages-and-buttons.md": 107500,
+    # 107500 -> 107800 (#1412): Main's admission list gains a root's `main_notice` and the one
+    # MAIN_PINNED_ROW_TYPES set both delivery and replay read; the base sat 88 bytes under.
+    "docs/architecture/03-web-ui-pages-and-buttons.md": 107800,
     "docs/architecture/04-server-api-endpoints.md": 26833,
     # 27137 -> 30400: the schedule table gains a documented write contract the
     # chapter had no text for — one transaction owning the lock ORDER, the strict
@@ -328,7 +330,10 @@ CHAPTER_BYTE_BUDGETS: dict[str, int] = {
     # Dispatcher producer/annotation separation and its retained-source lifetime.
     "docs/architecture/13-external-skills-layer.md": 9500,
     "docs/development/01-role-and-authority.md": 2437,
-    "docs/development/02-naming-and-boundaries.md": 36372,
+    # 36372 -> 37100 (#1412): one new LLM-first rule (owner notification is judgment,
+    # not a threshold/timer/counter) plus its Main-notice capability; the base sat
+    # 53 bytes under the previous budget and no older text states it.
+    "docs/development/02-naming-and-boundaries.md": 37100,
     # 22873 -> 23100: one new invariant (notifications ring for live events
     # only). Its text was compressed to the load-bearing facts first; the
     # remainder is the cost of stating a rule that did not exist before.

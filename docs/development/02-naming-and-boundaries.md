@@ -87,6 +87,18 @@ Never freeze the model's reasoning, dialogue representation or collaboration
 strategy to make one incident testable — SYSTEM accretion trains around that
 incident, bloats the resident prefix and forks the authority.
 
+Whether, when and how often to tell or escalate to the owner is behavior, and so
+is the choice to retry, wait or substitute: it belongs to the prompt and the
+model's judgment. A threshold, timer or counter standing in for that judgment
+("after N failures", "after 30 minutes", "if several tasks are affected") is the
+if-else behavior selection BIBLE P5 forbids, whoever proposes it. Numbers
+still bound physical, safety, budget, transport and evidence expiry. A missing
+channel is a capability gap, not a rule:
+`send_user_message(destination="main")` lets a registered Project root or a
+host-attested owner-origin root reach Main from elsewhere; a Main root already
+speaks there. Hidden, A2A, Presence and delegated work cannot. No chat number,
+even Main's, is owner proof.
+
 `prompts/SYSTEM.md` is tier-0 for every Main/task profile in both context modes
 and competes with the task for context; the safety supervisor is the one caller
 with a prompt of its own, and Background Consciousness uses SYSTEM.md like any

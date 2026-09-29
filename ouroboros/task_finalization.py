@@ -256,7 +256,8 @@ def deliver_final_message_live(
 
     The buffer can also hold proactive ``send_user_message`` events that fell
     back to deferred delivery mid-task (live-first frames stamp ``task_id``
-    too), so the final answer is selected as the LAST send_message matching
+    too). Their typed rows (``proactive_message``, ``main_notice``) are never
+    candidates, and the final answer is selected as the LAST send_message matching
     the finalizing task's id — the host appends the terminal frame after all
     tool-time frames, so it wins the last-match scan — never the first match,
     which would ship a proactive text early while the answer stayed hostage
@@ -281,7 +282,9 @@ def deliver_final_message_live(
     tid = str(task_id or "")
     final = fallback = None
     for event in pending_events:
-        if isinstance(event, dict) and event.get("type") == "send_message":
+        # A mid-task reply or Main notice is never the answer, even with no final after it.
+        if (isinstance(event, dict) and event.get("type") == "send_message"
+                and event.get("system_type") not in ("proactive_message", "main_notice")):
             fallback = event
             if str(event.get("task_id") or "") == tid:
                 final = event

@@ -6409,6 +6409,8 @@ textarea.chat-input {
         width: 100%;
         z-index: 60;
         border-left: none;
+        /* A full-screen room must occlude Main, not show its text through glass. */
+        background: var(--bg-primary);
         transform: translateY(14px);
     }
 
