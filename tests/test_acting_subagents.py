@@ -1163,14 +1163,14 @@ def test_acting_structured_write_stays_inside_its_selected_surface(tmp_path):
     assert not (wt.parent / "outside.txt").exists()
 
 
-def test_acting_read_schema_excludes_system_repo(tmp_path):
+def test_acting_read_schema_includes_parent_read_roots(tmp_path):
     reg, _ctx, _wt = _acting_registry(tmp_path)
     schemas = {s["function"]["name"]: s["function"] for s in reg.schemas()}
     rf = schemas.get("read_file")
     if rf:
         root_enum = rf["parameters"]["properties"].get("root", {}).get("enum")
         if isinstance(root_enum, list):
-            assert "system_repo" not in root_enum  # matches acting _POLICY (no system_repo)
+            assert {"system_repo", "user_files", "deliverables", "subagent_projects"} <= set(root_enum)
 
 
 def test_integrate_counts_as_reviewable_effect():
