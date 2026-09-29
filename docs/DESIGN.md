@@ -465,10 +465,32 @@ contract remains a documented exception, not a pattern for new notices.
 
 Main's empty-chat greeting speaks in neither voice: it is host copy in a quiet
 `.chat-empty-welcome` placeholder (a `Welcome` label over one sentence), never a
-bubble, a history row or a model reply. The sentence is the install-wide `welcome`
-preference — the built-in "Ouroboros has awakened", hidden, or the owner's plain
-text, set as text and never as markup. It appears only in a Main whose history read
-confirmed it empty, and it leaves with the first message or task card.
+bubble, a history row or a model reply (`web/modules/welcome_preference.js`). It
+appears only after a successful recent history read whose own window reports
+complete coverage, over a feed with no message or task card; a failed or partial
+read retracts it, history loading and failure chrome still show over it, and it
+leaves with the first message or task card. Project rooms never show it.
+
+The sentence is a hidden install-wide preference with no Settings control: the
+`welcome` key of `state/ui_preferences.json` under the data root
+(`~/Ouroboros/data` by default). Change only that key and keep the file's others:
+
+```json
+"welcome": {"mode": "default", "text": ""}
+"welcome": {"mode": "hidden", "text": ""}
+"welcome": {"mode": "custom", "text": "Good morning."}
+```
+
+`default` shows the built-in "Ouroboros has awakened", `hidden` shows nothing, and
+`custom` shows `text` as plain text, never markup (nonblank, at most 500
+characters; the other modes keep `text` unused). The object has exactly these two
+keys. `POST /api/ui/preferences` with `{"welcome": {...}}` validates and merges it
+(a refused value answers 400 and writes nothing). A hand edit is best made while
+Ouroboros is stopped, because the UI rewrites the file whenever it saves another
+preference; a stored value the POST would refuse reads as `default` and the next
+write stores `default`. Main reads the preference when it opens and on every
+reconnect; nothing watches the file, so an open page keeps its greeting until it
+is reloaded or reconnects.
 
 ## 5. Card and section composition
 

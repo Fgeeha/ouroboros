@@ -147,6 +147,34 @@ def test_empty_chat_welcome_preference_round_trip_and_refusals(tmp_path):
         assert client.post("/api/ui/preferences", json={"welcome": default}).json()["welcome"] == default
 
 
+def test_hand_edited_welcome_is_read_without_disturbing_other_keys(tmp_path):
+    """`welcome` has no Settings control: the owner edits the file (docs/DESIGN.md)."""
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    path = tmp_path / "state" / "ui_preferences.json"
+    path.parent.mkdir(parents=True)
+    with TestClient(app) as client:
+        for welcome in ({"mode": "hidden", "text": ""}, {"mode": "custom", "text": "Доброе утро"},
+                        {"mode": "default", "text": ""}):
+            path.write_text(json.dumps({"sidebar_width": 300, "welcome": welcome}), encoding="utf-8")
+            prefs = client.get("/api/ui/preferences").json()
+            assert prefs["welcome"] == welcome and prefs["sidebar_width"] == 300
+        # A value the POST contract refuses reads as the default instead of resetting every
+        # other key, and cannot block their writes; the next write stores the default.
+        for invalid in ({"mode": "Hidden", "text": ""}, {"mode": "custom", "text": " "},
+                        {"mode": "custom", "text": "x" * 501}, {"mode": "custom"},
+                        {"mode": "hidden", "text": "", "extra": 1}, "hidden", None):
+            path.write_text(json.dumps({"sidebar_width": 300, "welcome": invalid}), encoding="utf-8")
+            prefs = client.get("/api/ui/preferences").json()
+            assert prefs["welcome"] == {"mode": "default", "text": ""} and prefs["sidebar_width"] == 300
+        response = client.post("/api/ui/preferences", json={"nested_subagents_expanded": True})
+        assert response.status_code == 200 and response.json()["sidebar_width"] == 300
+        stored = json.loads(path.read_text(encoding="utf-8"))
+        assert stored["welcome"] == {"mode": "default", "text": ""} and stored["nested_subagents_expanded"] is True
+
+
 def test_ui_preferences_concurrent_paint_acks_are_monotonic(tmp_path):
     from ouroboros.gateway.ui_preferences import api_ui_preferences_post
     from ouroboros.projects_registry import create_project, increment_project_visible_revision

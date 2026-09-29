@@ -58,10 +58,10 @@ test('provider actions use the shared status-first action row contract', () => {
     const html = renderSettingsPage();
     const rows = [...html.matchAll(/<div class="settings-action-row(?:"|\s)[\s\S]*?<\/div>/g)]
         .map(([row]) => row);
-    // Nine provider probes, the catalog action and the empty-chat greeting save.
-    // The Claude-runtime status/Repair panel is retired with its product surface
-    // (the advisory pre-review runs on a configured routed model or agent session now).
-    assert.equal(rows.length, 11, 'nine provider probes, the catalog action and the greeting save');
+    // Nine provider probes plus the catalog action. The Claude-runtime
+    // status/Repair panel is retired with its product surface (the advisory
+    // pre-review runs on a configured routed model or agent session now).
+    assert.equal(rows.length, 10, 'nine provider probes plus the catalog action');
     assert.doesNotMatch(html, /settings-claude-code/);
     assert.doesNotMatch(html, /settings-ghost-btn/);
     for (const row of rows) {

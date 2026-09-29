@@ -31,7 +31,8 @@ DEFAULT_UI_PREFERENCES: dict[str, Any] = {
     # unknown-key 400, a stored legacy key is ignored on read and dropped on
     # the next write (``project_seen_revision`` is the replacement).
     "project_seen_revision": {},
-    # Install-wide presentation only: never a model reply or a chat-history row.
+    # Main's empty-state copy, a hidden install-wide preference (no Settings control):
+    # never a model reply or a chat-history row.
     "welcome": {"mode": "default", "text": ""},
 }
 _KNOWN_KEYS = frozenset(DEFAULT_UI_PREFERENCES)
@@ -156,11 +157,24 @@ def _normalize_preferences(
     return prefs
 
 
+def _stored_preferences(path: pathlib.Path) -> dict[str, Any]:
+    """Saved preferences. ``welcome`` has no Settings control and is edited by hand, so
+    a value the POST contract would refuse reads as the default instead of taking every
+    other key down with it; the next write stores that default."""
+    stored = read_json_dict(path)
+    if stored is not None and "welcome" in stored:
+        try:
+            _normalize_preferences({"welcome": stored["welcome"]}, fill_defaults=False)
+        except ValueError:
+            stored = {key: value for key, value in stored.items() if key != "welcome"}
+    return _normalize_preferences(stored)
+
+
 async def api_ui_preferences_get(request: Request) -> JSONResponse:
     drive_root = request_drive_root(request)
     path = pathlib.Path(drive_root) / "state" / "ui_preferences.json"
     try:
-        prefs = _normalize_preferences(read_json_dict(path))
+        prefs = _stored_preferences(path)
         return JSONResponse(prefs)
     except Exception:
         return JSONResponse(dict(DEFAULT_UI_PREFERENCES))
@@ -177,7 +191,7 @@ async def api_ui_preferences_post(request: Request) -> JSONResponse:
     path = pathlib.Path(drive_root) / "state" / "ui_preferences.json"
     try:
         with _preferences_lock(path):
-            prefs = _normalize_preferences(read_json_dict(path))
+            prefs = _stored_preferences(path)
             incoming = _normalize_preferences(body, fill_defaults=False)
             if "project_seen_revision" in incoming:
                 from ouroboros.projects_registry import get_project

@@ -737,28 +737,6 @@ export function renderSettingsPage() {
                 </section>
 
                 <section class="settings-panel" data-settings-panel="appearance">
-                    <div class="form-section" data-welcome-settings>
-                        <h3>Empty chat greeting</h3>
-                        <div class="settings-section-copy">The sentence shown in an empty Main chat is a local display, not a message sent by Ouroboros. This installation shares it across its clients; it never enters chat history or calls a model.</div>
-                        <div class="form-grid two">
-                            <div class="form-field ui-field">
-                                <label for="welcome-mode">Show greeting</label>
-                                <select id="welcome-mode" class="ui-control" data-welcome-mode>
-                                    <option value="default">Default</option>
-                                    <option value="hidden">Hidden</option>
-                                    <option value="custom">Custom text</option>
-                                </select>
-                            </div>
-                            <div class="form-field ui-field">
-                                <label for="welcome-text">Custom text</label>
-                                <textarea id="welcome-text" class="ui-control" data-welcome-text maxlength="500" rows="2" disabled></textarea>
-                            </div>
-                        </div>
-                        <div class="settings-action-row">
-                            <span class="settings-inline-status" data-welcome-status role="status" aria-live="polite" aria-atomic="true">Reading welcome preference…</span>
-                            <button type="button" class="btn btn-default" data-welcome-save>Save greeting</button>
-                        </div>
-                    </div>
                     <div class="form-section">
                         <h3>Theme</h3>
                         <div class="settings-section-copy">

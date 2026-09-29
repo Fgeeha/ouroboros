@@ -1,5 +1,3 @@
-import { apiClient } from './api_client.js';
-
 export const DEFAULT_WELCOME_TEXT = 'Ouroboros has awakened';
 
 export function welcomeText(value) {
@@ -9,10 +7,12 @@ export function welcomeText(value) {
     return value?.mode === 'default' ? DEFAULT_WELCOME_TEXT : null;
 }
 
-// Main's empty state. Only a successful recent read whose own window reports complete
-// coverage can confirm emptiness; a failed or partial read retracts it, and any
-// insertion into the feed, later read or saved preference decides again.
-export function mountEmptyChatWelcome(messages, win = window) {
+// Main's empty state. Its copy is the hidden `welcome` UI preference (no Settings
+// control: docs/DESIGN.md "Chat authorship and System rows"), read when Main connects.
+// Only a successful recent read whose own window reports complete coverage can
+// confirm emptiness; a failed or partial read retracts it, and any insertion into
+// the feed or later read decides again.
+export function mountEmptyChatWelcome(messages) {
     const doc = messages.ownerDocument;
     let preference = null;
     let confirmedEmpty = false;
@@ -41,90 +41,11 @@ export function mountEmptyChatWelcome(messages, win = window) {
     };
     const observer = typeof MutationObserver === 'function' ? new MutationObserver(render) : null;
     observer?.observe(messages, { childList: true });
-    const onChanged = (event) => { preference = event.detail; render(); };
-    win.addEventListener('ouro:welcome-changed', onChanged);
     return {
-        // Called only with a successful read; a failed one keeps the observed choice.
+        // Called only with a successful read: before one nothing shows, and a failed
+        // re-read keeps the choice already observed.
         setPreference(value) { preference = value || null; render(); },
         historyRead(complete) { confirmedEmpty = complete === true; render(); },
-        dispose() {
-            observer?.disconnect();
-            win.removeEventListener('ouro:welcome-changed', onChanged);
-        },
-    };
-}
-
-// This control saves a presentation preference independently of /api/settings.
-// A failed read never paints the default as though it were the owner's saved choice.
-export function bindWelcomePreference(root, client = apiClient) {
-    const host = root.querySelector('[data-welcome-settings]');
-    if (!host) return () => {};
-    const mode = host.querySelector('[data-welcome-mode]');
-    const text = host.querySelector('[data-welcome-text]');
-    const save = host.querySelector('[data-welcome-save]');
-    const status = host.querySelector('[data-welcome-status]');
-    let alive = true;
-    let dirty = false;
-    let busy = false;
-    let loaded = false;
-    let editVersion = 0;
-    const show = (message, tone = 'muted') => {
-        status.textContent = message;
-        status.dataset.tone = tone;
-    };
-    const sync = () => {
-        text.disabled = mode.value !== 'custom';
-        save.disabled = busy || !loaded;
-    };
-    const changed = () => { dirty = true; editVersion++; sync(); };
-    mode.addEventListener('change', changed);
-    text.addEventListener('input', changed);
-    const load = async () => {
-        try {
-            const value = (await client.uiPreferences())?.welcome;
-            if (!alive || dirty) return;
-            if (!value || !['default', 'hidden', 'custom'].includes(value.mode)
-                || typeof value.text !== 'string') throw new Error('Welcome preference unavailable');
-            loaded = true;
-            mode.value = value.mode;
-            text.value = value.text;
-            show('Saved for this installation.');
-            sync();
-        } catch (error) {
-            if (alive) show(`Could not read the welcome preference: ${error.message}`, 'warn');
-        }
-    };
-    const onSave = async () => {
-        if (busy || !loaded) return;
-        if (mode.value === 'custom' && !text.value.trim()) {
-            show('Enter a message, or choose Hidden.', 'warn');
-            return;
-        }
-        busy = true;
-        sync();
-        const submitted = { mode: mode.value, text: text.value };
-        const submittedVersion = editVersion;
-        try {
-            const result = await client.saveUiPreferences({ welcome: submitted });
-            if (!alive) return;
-            if (!result?.ok || !result?.welcome) throw new Error('Save was not confirmed');
-            if (editVersion === submittedVersion) dirty = false;
-            show(dirty ? 'Saved; newer edits have not been saved.' : 'Welcome preference saved.');
-            window.dispatchEvent(new CustomEvent('ouro:welcome-changed', { detail: result.welcome }));
-        } catch (error) {
-            if (alive) show(`Welcome preference was not saved: ${error.message}`, 'warn');
-        } finally {
-            busy = false;
-            if (alive) sync();
-        }
-    };
-    save.addEventListener('click', onSave);
-    sync();
-    void load();
-    return () => {
-        alive = false;
-        mode.removeEventListener('change', changed);
-        text.removeEventListener('input', changed);
-        save.removeEventListener('click', onSave);
+        dispose() { observer?.disconnect(); },
     };
 }

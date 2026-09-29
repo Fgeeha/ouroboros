@@ -121,8 +121,10 @@ def test_project_panel_composer_and_welcome_contracts():
     )[0]
     # The empty-Main greeting is host copy: mounted for Main only, decided by the
     # successful recent read's own coverage (a failed read retracts it), set as text
-    # and never minted as a chat bubble.
+    # and never minted as a chat bubble. Its preference is hidden: Settings has no editor.
     welcome_js = _read("web/modules/welcome_preference.js")
+    assert "welcome" not in _read("web/modules/settings.js").lower()
+    assert "welcome" not in _read("web/modules/settings_ui.js").lower()
     assert "const emptyWelcome = isMain ? mountEmptyChatWelcome(messagesDiv) : null;" in chat_js
     assert "emptyWelcome?.historyRead(data.window?.complete === true);" in chat_js
     assert "lastHistorySyncSucceeded = false;\n                emptyWelcome?.historyRead(false);" in chat_js
