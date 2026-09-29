@@ -65,9 +65,11 @@ class FakeGh:
                 return github.GhResult(False, "⚠️ GH_TIMEOUT: exceeded 120s.", None, None, "timeout")
             return github.GhResult(False, "⚠️ GH_ERROR: pre-effect refusal", 1, None, "pre_effect")
         if args[:2] == ["pr", "edit"]:
+            return github.GhResult(False, "GraphQL: The 'login' field requires 'read:org' scope", 1, None, "exit")
+        if args[:1] == ["api"] and "PATCH" in args:
             if self.fail_edit:
                 return github.GhResult(False, "⚠️ GH_ERROR: forbidden", 1, 403, "exit")
-            self.pr["body"] = input_data
+            self.pr["body"] = json.loads(input_data)["body"]
             return github.GhResult(True, "", 0, None, "")
         if args[:1] == ["api"]:
             return github.GhResult(True, json.dumps({"commit": {"tree": {"sha": TREE}},
@@ -203,6 +205,55 @@ def test_a_failed_publication_is_a_gap_and_a_retry_never_merges_again(world):
     assert _receipts(world)[0]["outcome"] == receipt["outcome"]
 
 
+@pytest.mark.parametrize("failure", ["readback_unavailable", "missing_block"])
+def test_successful_body_patch_needs_readback_and_recovers_without_second_merge(world, monkeypatch, failure):
+    original = world.gh
+    description = world.gh.pr["body"]
+    patch_seen = False
+
+    def gh(args, *a, **kw):
+        nonlocal patch_seen
+        if patch_seen and args[:2] == ["pr", "view"] and failure == "readback_unavailable":
+            return github.GhResult(False, "readback unavailable", 1, 502, "exit")
+        result = original(args, *a, **kw)
+        if args[:1] == ["api"] and "PATCH" in args:
+            patch_seen = True
+            if failure == "missing_block":
+                world.gh.pr["body"] = description
+        return result
+
+    monkeypatch.setattr(github, "_gh_run", gh)
+    assert "not confirmed" in _merge(world)
+    (before,) = _receipts(world)
+    assert before["outcome"]["status"] == "merged"
+    assert before["publication"]["body"] == {"status": "gap", "reason": "readback_missing_block"}
+    assert before["publication"]["card"]["status"] == "owed"
+    monkeypatch.setattr(github, "_gh_run", original)
+    assert "sent no new merge request" in _merge(world)
+    (after,) = _receipts(world)
+    assert after["publication"]["body"] == {"status": "published"}
+    assert all(after[key] == before[key] for key in ("receipt_id", "revision", "outcome", "effect"))
+    assert after["publication"]["card"] == before["publication"]["card"]
+    assert world.gh.pr["body"] == description + "\n\n" + merge_receipts.public_block(after) + "\n"
+    assert sum(c[:2] == ["pr", "merge"] for c in original.calls) == 1
+    assert sum(c[:1] == ["api"] and "PATCH" in c for c in original.calls) == (2 if failure == "missing_block" else 1)
+    assert not any(c[:2] == ["pr", "edit"] for c in original.calls)
+
+
+@pytest.mark.parametrize("url", ["", "unknown", "https://github.com/octo/demo", URL + "junk",
+                                 "https://github.com/octo/demo/pull/8"])
+def test_unknown_body_target_is_an_explicit_gap_without_default_repo_write(world, url):
+    world.gh.pr["url"] = url
+    description = world.gh.pr["body"]
+    assert "not confirmed" in _merge(world)
+    (receipt,) = _receipts(world)
+    assert receipt["outcome"]["status"] == "merged"
+    assert receipt["publication"]["body"] == {"status": "gap", "reason": "target_unavailable"}
+    assert receipt["publication"]["card"]["status"] == "owed"
+    assert world.gh.pr["body"] == description
+    assert not any(c[:2] == ["pr", "edit"] or "PATCH" in c for c in world.gh.calls)
+
+
 def test_the_body_block_replaces_an_older_receipt_and_the_checklist_is_recognized(world):
     world.gh.pr["body"] = f"Intro.\n\n```json\n{CHECKLIST}\n```\n\nFooter."
     _merge(world, reviewed_head_sha=HEAD)
@@ -245,7 +296,7 @@ def test_base_and_tree_gaps_prevent_green_without_vetoing_merge(world, monkeypat
     original = world.gh
 
     def gh(args, *a, **kw):
-        if args[:1] == ["api"]:
+        if args[:1] == ["api"] and "/commits/" in args[1]:
             is_merge = args[1].endswith(MERGE)
             return github.GhResult(True, json.dumps({"commit": {"tree": {"sha": TREE if is_merge else "f" * 40}},
                                                       "parents": [{"sha": "e" * 40}]}), 0, None, "")
@@ -352,7 +403,7 @@ def test_delayed_queue_publication_catches_up_to_the_persisted_merge(world, monk
     world.gh.merge = "accepted_open"
 
     def delayed_edit(args, *a, **kw):
-        if args[:2] == ["pr", "edit"] and "Outcome: **queued**" in kw["input_data"]:
+        if args[:1] == ["api"] and "PATCH" in args and "Outcome: **queued**" in kw["input_data"]:
             queued_edit.set()
             assert merged_published.wait(timeout=5)
         return gh(args, *a, **kw)
@@ -381,7 +432,7 @@ def test_retry_enriches_merge_readback_without_erasing_attribution(world, monkey
     gh = world.gh
 
     def unavailable_commit(args, *a, **kw):
-        if args[:1] == ["api"]:
+        if args[:1] == ["api"] and "/commits/" in args[1]:
             return github.GhResult(False, "unavailable", 1, 502, "exit")
         return gh(args, *a, **kw)
 
@@ -441,7 +492,7 @@ def test_body_uses_fresh_publication_view_and_confirms_a_lost_edit_reply(world, 
         result = original(args, *a, **kw)
         if args[:2] == ["pr", "merge"]:
             world.gh.pr["body"] += concurrent_note
-        if args[:2] == ["pr", "edit"]:
+        if args[:1] == ["api"] and "PATCH" in args:
             return github.GhResult(False, "lost reply", None, None, "timeout")
         return result
 
@@ -450,4 +501,4 @@ def test_body_uses_fresh_publication_view_and_confirms_a_lost_edit_reply(world, 
     assert concurrent_note in world.gh.pr["body"]
     assert _receipts(world)[0]["publication"]["body"]["status"] == "published"
     _merge(world)
-    assert sum(c[:2] == ["pr", "edit"] for c in world.gh.calls) == 1
+    assert sum(c[:1] == ["api"] and "PATCH" in c for c in world.gh.calls) == 1

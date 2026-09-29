@@ -429,30 +429,44 @@ def test_operation_identity_mismatch_is_not_an_accepted_response(gateway_factory
     assert raised.value.code == "malformed_response"
 
 
-@pytest.mark.parametrize("capture", [False, True])
-def test_failure_evidence_opt_in_preserves_create_body(gateway_factory, capture):
+@pytest.mark.parametrize("capture_failure", [False, True])
+@pytest.mark.parametrize("capture_effort", [False, True])
+def test_evidence_opt_ins_preserve_create_body(gateway_factory, capture_failure, capture_effort):
     wire = ModelWire()
     gateway = gateway_factory(wire)
     ref = gateway.upload_model_request(_request(), idempotency_key="evidence")
-    gateway.create_model_operation(ref, idempotency_key="evidence", capture_failure_evidence=capture)
+    gateway.create_model_operation(ref, idempotency_key="evidence",
+        capture_failure_evidence=capture_failure, capture_effort_evidence=capture_effort)
     request = wire.calls[-1]
-    assert request.url.query == (b"captureFailureEvidence=true" if capture else b"")
+    expected = {}
+    if capture_failure:
+        expected["captureFailureEvidence"] = "true"
+    if capture_effort:
+        expected["captureEffortEvidence"] = "true"
+    assert dict(request.url.params) == expected
     assert json.loads(request.content) == {"request": ref}
+    assert request.headers["Idempotency-Key"] == "evidence"
     assert wire.payload == _bytes(_request())
     assert wire.generation_count == 1
 
 
-def test_query_negotiation_uses_exact_wire_descriptor():
-    parameter = {"name": "captureFailureEvidence", "location": "query", "enum": ["true", "false"]}
+@pytest.mark.parametrize("parameter_name", ["captureFailureEvidence", "captureEffortEvidence"])
+def test_query_negotiation_uses_exact_wire_descriptor(parameter_name):
+    def supported(operations):
+        return cx.operation_query_supported(operations, method="POST", path="/v2/model-operations",
+                                            name=parameter_name, value="true")
+
+    parameter = {"name": parameter_name, "location": "query", "enum": ["true", "false"]}
     operation = {"method": "POST", "path": "/v2/model-operations", "parameters": [parameter]}
-    assert cx.model_failure_evidence_supported([operation])
-    assert not cx.model_failure_evidence_supported([])
+    assert supported([operation])
+    assert cx.model_failure_evidence_supported([operation]) is (parameter_name == "captureFailureEvidence")
+    assert not supported([])
     for change in ({"method": "GET"}, {"path": "/v2/model-operations/:id"}, {"parameters": []}):
-        assert not cx.model_failure_evidence_supported([{**operation, **change}])
+        assert not supported([{**operation, **change}])
     for change in ({"name": "other"}, {"location": "header"}, {"enum": ["false"]}, {"enum": "true"}):
-        assert not cx.model_failure_evidence_supported([{**operation, "parameters": [{**parameter, **change}]}])
+        assert not supported([{**operation, "parameters": [{**parameter, **change}]}])
     accounts = {"method": "GET", "path": "/v2/model-sources", "parameters": [
         {"name": "view", "location": "query", "enum": ["accounts"]}]}
     assert cx.account_catalog_supported([accounts], accounts["path"])
     assert not cx.account_catalog_supported([operation], accounts["path"])
-    assert not cx.model_failure_evidence_supported([accounts])
+    assert not supported([accounts])

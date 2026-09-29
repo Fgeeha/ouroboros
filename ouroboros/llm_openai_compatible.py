@@ -120,6 +120,7 @@ class _OpenAICompatibleLaneMixin:
         bypass_response_cache: bool = False,
         stream: bool = False,
     ) -> Dict[str, Any]:
+        target["requested_reasoning_effort"] = normalize_reasoning_effort(reasoning_effort)
         messages = self._normalize_system_message_placement(messages)
         resolved_model = str(target.get("resolved_model") or "")
         provider = str(target.get("provider") or "")
