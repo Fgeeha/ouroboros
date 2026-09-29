@@ -17,7 +17,7 @@ import pathlib
 import re
 import subprocess
 from dataclasses import asdict, dataclass, field
-from typing import Any, Dict, Iterable, List
+from typing import Any, Callable, Dict, Iterable, List
 
 from ouroboros.utils import atomic_write_json, utc_now_iso
 
@@ -631,6 +631,7 @@ def build_code_inventory(
     drive_root: pathlib.Path | None = None,
     persist: bool = True,
     exclude_paths: Iterable[pathlib.Path] | None = None,
+    path_allowed: Callable[[pathlib.Path], bool] | None = None,
 ) -> CodeInventory:
     root = pathlib.Path(repo_root).resolve(strict=False)
     cached = load_cached_inventory(root, drive_root) if drive_root is not None else None
@@ -640,6 +641,7 @@ def build_code_inventory(
         for path in (exclude_paths or [])
     ]
     files = []
+    filtered = False
     for path in _tracked_files(root):
         try:
             rel_parts = path.relative_to(root).parts
@@ -648,6 +650,9 @@ def build_code_inventory(
         if any(part in _SKIP_DIRS for part in rel_parts):
             continue
         if _is_excluded_inventory_path(path, excluded_paths):
+            continue
+        if path_allowed is not None and not path_allowed(path):
+            filtered = True
             continue
         if path.is_file():
             rel = ""
@@ -675,7 +680,8 @@ def build_code_inventory(
         files=files,
         coverage=coverage,
     )
-    if persist and drive_root is not None:
+    # A caller-scoped view must not replace the shared full-source cache.
+    if persist and drive_root is not None and not filtered:
         path = inventory_cache_path(root, pathlib.Path(drive_root))
         atomic_write_json(path, inventory.to_json(), trailing_newline=True)
     return inventory

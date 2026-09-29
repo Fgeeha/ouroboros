@@ -116,7 +116,7 @@ def test_subagent_inherits_active_external_workspace_when_metadata_missing(tmp_p
 def test_root_config_mutations_preserve_enumerated_credentials_without_dotdir_default_deny(tmp_path):
     """Root configuration access is broad; named stores/leaves keep their fences.
 
-    Root reads remain location-authorized with secret-byte masking at egress.
+    Root reads remain location-authorized and preserve file content.
     Unlisted dotted directories are explicitly not a blanket credential fence.
     """
     home = tmp_path / "_home"
@@ -162,7 +162,7 @@ def test_block_reason_protects_runtime_and_credentials_even_in_external(tmp_path
     # A credential-shaped NAME outside a credential location no longer refuses
     # mutation either: the fence is the location (~/.ssh, ~/.aws, ...) and the
     # exact credential leaves, never the suffix. Root reads stay location-only
-    # (capinv-447 / В23=A — bytes are masked at egress instead).
+    # and admitted content is delivered unchanged.
     assert user_files_path_block_reason(ext, tmp_path / "scratch" / "id_rsa.pem") == ""
     assert user_files_path_block_reason(ext, tmp_path / "scratch" / "id_rsa.pem", operation="read") == ""
 
