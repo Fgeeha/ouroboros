@@ -379,7 +379,7 @@ def test_prescribed_lower_effort_tier_wins_over_the_one_rung_walk(evidence_root)
     assert upward is not None and payload_effort(upward) == "medium"
 
 
-def test_prescribed_jump_needs_a_quoted_tier_inside_the_retry_floor(evidence_root):
+def test_prose_and_unbound_quotes_keep_the_existing_one_rung_floor(evidence_root):
     target = _target(provider="openai")
 
     with request_wire_call_scope():

@@ -436,6 +436,7 @@ class TestWrapupAffordability:
     def test_wire_recovery_matches_physical_candidate(self, monkeypatch, tmp_path):
         from ouroboros import llm as llm_module
         from ouroboros.llm import LLMClient
+        from ouroboros.request_wire_contract import physical_candidate_bytes, physical_candidate_sha256
 
         monkeypatch.setenv("OPENAI_API_KEY", "unused")
         client = LLMClient(api_key="unused")
@@ -445,9 +446,13 @@ class TestWrapupAffordability:
         captured = {}
         real_prepare = llm_module.prepare_wire_payload_for_send
 
-        def prepare(target_, payload, *, api_surface):
-            prepared = real_prepare(target_, payload, api_surface=api_surface)
+        def prepare(target_, payload, *, api_surface, logical_payload=None):
+            prepared = real_prepare(
+                target_, payload, api_surface=api_surface, logical_payload=logical_payload,
+            )
             prepared["recovered_wire_field"] = True
+            captured.setdefault("prepared", []).append(prepared)
+            captured.setdefault("logical", []).append(logical_payload)
             return prepared
 
         def execute(request, _send, _before_dispatch):
@@ -472,10 +477,20 @@ class TestWrapupAffordability:
                 target, messages, "high", prospective.max_completion_tokens, "auto", None, None,
                 skip_capability_fetch=True, **_MAIN_LOOP_OPTIONS,
             )
+            candidate["timeout"] = 33.0
             client._normalize_payload_cache_ttl(target, candidate)
             client._create_chat_completion_with_retries(lambda **_kwargs: None, candidate, target)
 
         actual = captured["request"]
+        assert len(captured["prepared"]) == len(captured["logical"]) == 2
+        assert captured["logical"][-1] is candidate
+        assert captured["logical"][-1]["timeout"] == 33.0
+        assert all("timeout" not in payload for payload in captured["prepared"])
+        prepared = captured["prepared"][-1]
+        assert prepared["recovered_wire_field"] is True
+        assert actual.candidate_raw_size_bytes == len(physical_candidate_bytes(prepared))
+        assert actual.candidate_raw_sha256 == physical_candidate_sha256(prepared)
+        assert prospective.prompt_tokens_estimate == actual.prompt_tokens_estimate
         assert prospective.candidate_raw_size_bytes == actual.candidate_raw_size_bytes
         assert prospective.candidate_raw_sha256 == actual.candidate_raw_sha256
 

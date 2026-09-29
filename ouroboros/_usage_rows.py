@@ -432,7 +432,7 @@ _SKILL_ATTEMPT_FIELDS = (
     "cost_usd", "cost_final", "reservation_upper_bound_usd", "pricing_known",
     "prompt_tokens", "completion_tokens", "cached_tokens", "subscription_route",
     "subscription_reset_at", "credential_profile_id", "access_profile",
-    "processing", "processing_basis", "cost_evidence", "attempt_execution",
+    "effort", "effort_resolution", "processing", "processing_basis", "cost_evidence", "attempt_execution",
 )
 
 

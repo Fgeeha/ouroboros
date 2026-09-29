@@ -1100,6 +1100,7 @@ def settle_run(drive_root: Any, gateway: Any, custody: RunCustody, detail: Dict[
                 # and the ledger writer decides what is usable.
                 input_token_usage=summary.get("inputTokenUsage"),
                 attempt_execution=detail.get("attemptExecution"),
+                effort_resolution=observed.get("effort_resolution"),
                 spend_usd=spend,
                 spend_estimated=estimated,
                 credential_profile_id=applied_profile,

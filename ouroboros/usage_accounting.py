@@ -289,14 +289,8 @@ class AttemptRequest:
     physical_context: Optional[PhysicalAttemptContext] = None
     # Route-locality fact (additive): base_url host is localhost/127.0.0.1/::1 (loopback OpenAI-compatible installs — Ollama / LM Studio / vLLM).
     route_is_loopback: bool = False
-    # The fit estimator's own token count for this request
-    # (context_fit.estimate_context_prompt_tokens: full projected context, tool
-    # objects and schemas included, images at the billing proxy) — additive,
-    # LAST (frozen dataclass), 0 = producer predates the field. The density
-    # observer MUST calibrate on THIS, the exact quantity measure_main_fit
-    # multiplies, so density lands ≈1.0; `prompt_tokens_estimate` above keeps
-    # the raw base64 basis because budget reservation wants the conservative
-    # over-count (owner decision 3=A: the two consumers intentionally split).
+    # Density uses the fit estimator's count (0 = old producer), while budget
+    # reservation retains the conservative raw-base64 estimate above.
     prompt_tokens_bounded_estimate: int = 0
     global_limit_source: str = ""
     global_limit_revision: Optional[str] = None
@@ -306,6 +300,7 @@ class AttemptRequest:
     # The same canonical candidate without its Main clock line (``send_clock``);
     # None when the candidate carries none. An identity, never a row field.
     candidate_clock_free_sha256: Optional[str] = None
+    effort: Optional[Dict[str, Any]] = None
 @dataclass(frozen=True)
 class AttemptReservation:
     attempt_id: str
@@ -342,6 +337,7 @@ class PhysicalAttemptCapture:
     processing_preference: str = ""
     submitted_processing_mode: str = ""
     processing_basis: Optional[Dict[str, Any]] = None
+    effort: Optional[Dict[str, Any]] = None
 
 
 @contextlib.contextmanager
@@ -696,6 +692,7 @@ _CANDIDATE_ROW_FIELDS = (
     "candidate_context_size_bytes", "candidate_measurement_kind", "physical_context",
     "candidate_manifest_ref",
     "processing_preference", "submitted_processing_mode", "processing_basis",
+    "effort",
 )
 
 
@@ -836,6 +833,7 @@ def reserve_attempt(request: AttemptRequest) -> AttemptReservation:
                     "candidate_context_size_bytes": request.candidate_context_size_bytes,
                     "candidate_measurement_kind": request.candidate_measurement_kind,
                     "physical_context": asdict(request.physical_context) if request.physical_context else None,
+                    **({"effort": copy.deepcopy(request.effort)} if request.effort is not None else {}),
                     **({"processing_preference": request.processing_preference,
                         "submitted_processing_mode": request.submitted_processing_mode,
                         "processing_basis": copy.deepcopy(request.processing_basis)}
@@ -962,6 +960,7 @@ def record_subscription_session(
     input_token_usage: Dict[str, Any] | None = None,
     review_skill: str = "", review_wave_id: str = "", review_slot_id: str = "",
     attempt_execution: Optional[list[Dict[str, Any]]] = None,
+    effort_resolution: Optional[Dict[str, Any]] = None,
 ) -> str:
     """Record one idempotent session; model observation is not session identity.
 
@@ -1019,13 +1018,13 @@ def record_subscription_session(
         "credential_profile_id": str(credential_profile_id or ""),
         "access_profile": str(access_profile or ""),
         "session_id_sha256": identity,
+        **({"effort_resolution": copy.deepcopy(effort_resolution)} if isinstance(effort_resolution, dict) else {}),
         # Present only when the harness reported a complete, valid object.
         **({"input_token_usage": input_counters} if input_counters is not None else {}),
         **({"attempt_execution": copy.deepcopy(attempt_execution)}
            if isinstance(attempt_execution, list) else {}),
-        # CPL-5 lane-level disclosure: a delegated/harness session never hands
-        # the host the final wire bytes, so it carries this typed limit instead
-        # of a fake model_send seal (design note §4, provider_side_transform).
+        # CPL-5: sessions do not hand the host final wire bytes; disclose the
+        # limit (design note §4, provider_side_transform) without a fake seal.
         "model_send_seal": "unobserved",
     }
     return _append_single_settled_row(root, row, comparable=(
@@ -1104,11 +1103,11 @@ def _transition(reservation: AttemptReservation, state: str, **fields: Any) -> D
             from ouroboros.usage_admission import raise_group_refusal
 
             raise_group_refusal(view, scope, dispatch=True)
-        # Carry provenance, including future metadata; event-local reasons and
-        # receipt observations belong only to the transition that supplied them.
         replaced = {"seq", "ts", "pre_compaction_seq", "settle_reason", "reason"}
         if state == "settled":
-            replaced.update(("processing", "speed", "service_tier", "cost_basis", "cost_evidence"))
+            replaced.update(("effort", "effort_resolution", "processing", "speed", "service_tier", "cost_basis", "cost_evidence"))
+            if "effort" not in fields and isinstance(current.get("effort"), dict):  # Keep candidate facts, not older observations.
+                fields["effort"] = {**current["effort"], "reported": None, "report_source": None}
         row = {key: value for key, value in current.items() if key not in replaced}
         row.update(state=state, **fields)
         if state == "dispatched":
@@ -1265,7 +1264,7 @@ def _settlement_fields(reservation, usage, cost_usd, cost_final) -> Dict[str, An
         cached_tokens=cached_tokens,
         cache_write_tokens=cache_write_tokens,
         prompt_cache_ttl=str(normalized.get("prompt_cache_ttl") or ""),
-        **{key: copy.deepcopy(normalized[key]) for key in ("processing", "speed", "service_tier", "cost_basis", "cost_evidence")
+        **{key: copy.deepcopy(normalized[key]) for key in ("effort", "effort_resolution", "processing", "speed", "service_tier", "cost_basis", "cost_evidence")
            if key in normalized},
     )
 
@@ -1404,6 +1403,7 @@ def _record_attempt_capture(
         processing_preference=request.processing_preference,
         submitted_processing_mode=request.submitted_processing_mode,
         processing_basis=copy.deepcopy(request.processing_basis),
+        effort=copy.deepcopy(request.effort),
     )
     _LAST_PHYSICAL_ATTEMPT.set(capture)
     if exc is not None:

@@ -1388,6 +1388,8 @@ class AgentSessionReviewExecutor(ReviewSlotExecutor):
             "delegated_route": effective_routes[0] if len(effective_routes) == 1 else "",
             "requested_route": facts["route_id"],
             "observed_attempt": facts.get("observed_attempt") or {},
+            **({"effort_resolution": facts["observed_attempt"]["effort_resolution"]}
+               if isinstance((facts.get("observed_attempt") or {}).get("effort_resolution"), dict) else {}),
             "review_thread_id": str(facts.get("thread_id") or ""),
             "review_turn_id": str(facts.get("turn_id") or ""),
             "review_thread_receipt": facts.get("thread_receipt") or {},
