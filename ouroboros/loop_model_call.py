@@ -661,7 +661,7 @@ def _dispatch_round_model(
 ) -> Tuple[Any, float]:
     from ouroboros.model_wait import current_model_wait
     from ouroboros.loop_transport import (
-        emit_model_effort_mismatch, emit_model_substitution,
+        emit_model_substitution,
         managed_transport_continuation, transport_repeat_stop_requested,
     )
     from ouroboros.owner_mailbox import OwnerMailboxPeek
@@ -745,8 +745,6 @@ def _dispatch_round_model(
             use_local=ctx.active_use_local, preferred_mode=ctx.active_context_mode,
             tool_schemas=ctx.tool_schemas, model_role=role, model_route=observed,
             credential_profile_id=(waiter.overrides.get(role, {}).get("model_account_override") if waiter else None))
-    emit_model_effort_mismatch(ctx.accumulated_usage, task_id=ctx.task_id,
-                               emit_progress=getattr(ctx, "emit_progress", None))
     emit_model_substitution(ctx.accumulated_usage, task_id=ctx.task_id,
                             emit_progress=getattr(ctx, "emit_progress", None))
     call = ctx.accumulated_usage.get("_last_llm_call_meta")

@@ -296,6 +296,10 @@ def attach_processing_receipt(target: Dict[str, Any], usage: Dict[str, Any]) -> 
     model = str(target.get("usage_model") or target.get("resolved_model") or "")
     capture = last_physical_attempt_capture()
     matched = capture is not None and capture.provider == provider and capture.model == model
+    usage.pop("effort", None)  # Host evidence cannot be supplied by a provider usage echo.
+    usage.pop("effort_resolution", None)
+    if matched and capture.effort is not None:
+        usage["effort"] = copy.deepcopy(capture.effort)
     requested = (capture.processing_preference if matched
                  else str(target.get("processing_preference") or ""))
     submitted = capture.submitted_processing_mode if matched else ""
@@ -380,6 +384,31 @@ def processing_refusal(target: Dict[str, Any], payload: Dict[str, Any],
     return error
 
 
+def effort_request_facts(target: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Original preference and actual host-send fields, never provider execution.
+
+    Kept with every physical attempt, including refused/failed sends. Native
+    mappings are facts of the payload; an absent knob means vendor default.
+    """
+    fields = {key: copy.deepcopy(payload[key]) for key in
+              ("reasoning_effort", "reasoning", "thinking") if key in payload}
+    output = payload.get("output_config")
+    if isinstance(output, dict) and "effort" in output:
+        fields["output_config.effort"] = copy.deepcopy(output["effort"])
+    extra = payload.get("extra_body")
+    extra = extra if isinstance(extra, dict) else {}
+    for key in ("reasoning", "thinking"):
+        if key in extra:
+            fields[f"extra_body.{key}"] = copy.deepcopy(extra[key])
+    options = payload.get("options")
+    options = options if isinstance(options, dict) else {}
+    if "reasoningEffort" in options:
+        fields["options.reasoningEffort"] = options["reasoningEffort"]
+    return {"requested": target.get("requested_reasoning_effort"),
+            "sent": fields, "sent_state": "explicit" if fields else "omitted",
+            "sent_source": "host_candidate", "reported": None, "report_source": None}
+
+
 def _attempt_request(
     target: Dict[str, Any],
     payload: Dict[str, Any],
@@ -439,6 +468,7 @@ def _attempt_request(
         processing_preference=str(target.get("processing_preference") or ""),
         submitted_processing_mode=submitted_processing_mode(target, payload),
         processing_basis=copy.deepcopy(target.get("processing_basis")),
+        effort=effort_request_facts(target, payload),
         candidate_clock_free_sha256=(
             hashlib.sha256(_canonical_candidate_bytes(clock_free)).hexdigest()
             if clock_note is not None else None
@@ -469,14 +499,16 @@ def _finalized_physical_candidate(
 ) -> Dict[str, Any]:
     from ouroboros.request_wire_recovery import refresh_wire_clock
 
-    physical = _physical_candidate(payload)
+    # Bind the caller's exact logical input before removing host/socket metadata
+    # or sampling a fresh clock; recovery must not guess those transformations.
+    physical = _physical_candidate({key: value for key, value in payload.items() if key != "timeout"})
     if fresh_clock:
         physical = refresh_wire_clock(physical, api_surface=api_surface)
     if target.get("context_mode") == "nano":
         physical = _fit_output_payload(target, physical, api_surface)
     return prepare_wire_payload_for_send(
         {**target, "contract_headers": processing_contract_headers(target, physical)},
-        physical, api_surface=api_surface,
+        physical, api_surface=api_surface, logical_payload=payload,
     )
 
 

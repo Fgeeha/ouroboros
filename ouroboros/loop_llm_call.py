@@ -1431,7 +1431,9 @@ def call_llm_with_retry(
             )
             host_route = usage.get("model_role_route") or {}
             model, use_local = host_route.get("model", model), host_route.get("use_local", use_local)
-            accumulated_usage["_model_route"], accumulated_usage["_options"], accumulated_usage["_model_substitutions"] = dict((usage.get("claudexor") or {}).get("route") or {}), ({key: (usage.get("claudexor") or {}).get(key) for key in ("requested_options", "applied_options", "options_honored", "route")} if usage.get("claudexor") else {}), ((usage.get("claudexor") or {}).get("substituted") or [])
+            model_facts = usage.get("claudexor") or {}
+            accumulated_usage["_model_route"] = dict(model_facts.get("route") or {})
+            accumulated_usage["_model_substitutions"] = model_facts.get("substituted") or []
             context_fit_event_fields = _context_fit_event_fields(accumulated_usage) if physical_context is not None else {}
             _take_custom_receipts(usage, msg, accumulated_usage)
             for stale in ("_last_llm_error", "_last_llm_error_kind", "_last_llm_retry_same_request",
@@ -1517,10 +1519,7 @@ def call_llm_with_retry(
             for stale in ("execution_status", "result_status", "reason_code", RETRY_WALL_EXHAUSTED_KEY, TRANSPORT_DEATHS_KEY):
                 accumulated_usage.pop(stale, None)  # a USABLE response closes the round's repeat record
             accumulated_usage["rounds"] = accumulated_usage.get("rounds", 0) + 1
-            prompt_tokens = int(usage.get("prompt_tokens") or 0)
-            completion_tokens = int(usage.get("completion_tokens") or 0)
             cached_tokens = int(usage.get("cached_tokens") or 0)
-            cache_write_tokens = int(usage.get("cache_write_tokens") or 0)
             prompt_cache_ttl, cache_hit_rate, cache_cold_restart, gap_since_prev_round_sec = (
                 _record_round_cache_facts(accumulated_usage, usage, round_idx=round_idx))
             _round_event = {
@@ -1531,13 +1530,14 @@ def call_llm_with_retry(
                 "llm_call_id": llm_call_id,
                 "round": round_idx, "model": display_model,
                 "reasoning_effort": effort,
+                **{key: usage[key] for key in ("effort", "effort_resolution", "request_wire", "claudexor") if key in usage},
                 "provider": provider,
                 "source": "loop",
                 "model_category": infer_model_category(display_model),
-                "prompt_tokens": prompt_tokens,
-                "completion_tokens": completion_tokens,
+                "prompt_tokens": int(usage.get("prompt_tokens") or 0),
+                "completion_tokens": int(usage.get("completion_tokens") or 0),
                 "cached_tokens": (cached_tokens if usage.get("cached_tokens") is not None else None),
-                "cache_write_tokens": cache_write_tokens,
+                "cache_write_tokens": int(usage.get("cache_write_tokens") or 0),
                 "prompt_cache_ttl": prompt_cache_ttl,
                 "cache_hit_rate": cache_hit_rate,
                 "cache_cold_restart": cache_cold_restart,
@@ -1558,10 +1558,9 @@ def call_llm_with_retry(
                 "task_attempt": task_attempt,
                 "attempt": attempt + 1,
                 "model": display_model,
-                "reasoning_effort": effort,
                 **{key: _round_event[key] for key in (
-                    "prompt_tokens", "completion_tokens", "cached_tokens", "cache_write_tokens", "prompt_cache_ttl")},
-                "cost_usd": cost,
+                    "reasoning_effort", "cost_usd", "prompt_tokens", "completion_tokens", "cached_tokens",
+                    "cache_write_tokens", "prompt_cache_ttl", "effort", "effort_resolution", "request_wire", "claudexor") if key in _round_event},
                 "response_kind": "tool_calls" if tool_calls else "message",
                 "tool_call_count": len(tool_calls),
                 "has_text": bool(content and str(content).strip()),
