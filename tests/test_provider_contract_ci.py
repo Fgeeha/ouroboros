@@ -702,16 +702,28 @@ def test_reasoning_integrity_canary_rejects_explicit_none_and_clamp():
     assert_openai_canary_usage(neutral_repair, model)
 
 
-def test_normalized_calls_require_unique_schema_valid_delegate_start():
+def _normalized_call_violation(arguments, expected, *, calls=None):
+    with pytest.raises(AssertionError) as caught:
+        assert_normalized_canary_call(
+            {"tool_calls": calls or [_canonical_canary_call("call-violation", arguments)]},
+            full_registry_canary_tools(),
+            expected,
+        )
+    return caught.value.args[0]["provider_contract_violation"]
+
+
+def test_normalized_calls_require_exactly_the_requested_delegate_start():
     tools = full_registry_canary_tools()
     expected = delegate_start_canary_arguments("normalized-call")
-    required = {"prompt": expected["prompt"]}
+    assert set(expected) == {"prompt", "subagent_id"}
     assert assert_normalized_canary_call(
         {"tool_calls": [_canonical_canary_call("call-ok", expected)]},
         tools,
-        required,
+        expected,
     )[0]["id"] == "call-ok"
 
+    # Schema-valid neutral values the prompt never asked for are what a route that
+    # forces optional properties emits (issue #1411): RED, naming declared keys only.
     provider_defaults = {
         **expected,
         "root": "skill_payload",
@@ -720,38 +732,52 @@ def test_normalized_calls_require_unique_schema_valid_delegate_start():
         "retry_of": "",
         "max_seconds": 0,
     }
-    assert assert_normalized_canary_call(
-        {"tool_calls": [_canonical_canary_call("call-defaults", provider_defaults)]},
-        tools,
-        required,
-    )[0]["id"] == "call-defaults"
+    evidence = _normalized_call_violation(provider_defaults, expected)
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert evidence["extra_keys"] == ["bucket", "max_seconds", "retry_of", "root", "skill_name"]
+    assert evidence["missing_keys"] == []
 
     provider_selector = {
         "prompt": expected["prompt"],
-        "retry_of": "provider-contract-canary",
+        "retry_of": expected["subagent_id"],
         "root": "skill_payload",
         "bucket": "external",
     }
-    assert assert_normalized_canary_call(
-        {"tool_calls": [_canonical_canary_call("call-selector", provider_selector)]},
-        tools,
-        required,
-    )[0]["id"] == "call-selector"
+    evidence = _normalized_call_violation(provider_selector, expected)
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert evidence["extra_keys"] == ["bucket", "retry_of", "root"]
+    assert evidence["missing_keys"] == ["subagent_id"]
 
+    wrong_selector = dict(expected, subagent_id="another-subagent")
+    assert _normalized_call_violation(wrong_selector, expected)["violation"] == "arguments_subagent_id"
     wrong = dict(expected, prompt="different nonce-bearing prompt")
-    with pytest.raises(AssertionError):
-        assert_normalized_canary_call(
-            {"tool_calls": [_canonical_canary_call("call-wrong", wrong)]},
-            tools,
-            required,
-        )
+    assert _normalized_call_violation(wrong, expected)["violation"] == "arguments_prompt"
     duplicate = _canonical_canary_call("call-duplicate", expected)
-    with pytest.raises(AssertionError):
-        assert_normalized_canary_call(
-            {"tool_calls": [duplicate, copy.deepcopy(duplicate)]},
-            tools,
-            required,
+    assert _normalized_call_violation(
+        None, expected, calls=[duplicate, copy.deepcopy(duplicate)],
+    )["violation"] == "duplicate_tool_call_id"
+
+
+def test_canary_run_rejects_provider_filled_optional_keys_as_red():
+    canary = next(row for row in provider_canary_matrix() if row.canary_id == "openrouter_gpt")
+    nonce = "forced-optional"
+    forced = {**delegate_start_canary_arguments(nonce), "retry_of": "", "max_seconds": 0}
+
+    class ForcedOptionalClient:
+        def chat(self, **kwargs):
+            return {
+                "content": "",
+                "tool_calls": [_canonical_canary_call("forced-optional", forced)],
+            }, _fake_usage(canary, 1)
+
+    with pytest.raises(AssertionError) as caught:
+        run_provider_contract_canary(
+            ForcedOptionalClient(), canary=canary, tools=full_registry_canary_tools(), nonce=nonce,
         )
+    evidence = caught.value.args[0]["provider_contract_violation"]
+    assert evidence["violation"] == "arguments_exact_keys"
+    assert evidence["extra_keys"] == ["max_seconds", "retry_of"]
+    assert skip_on_provider_environmental_error(canary.canary_id, caught.value) is None
 
 
 def test_production_custom_none_text_is_semantic_success(monkeypatch):
