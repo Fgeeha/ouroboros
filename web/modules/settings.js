@@ -28,6 +28,7 @@ import { createModelRolesEditor, modelRoleMap } from './model_roles.js';
 import { PROCESSING_PREFERENCE_KEY, MODEL_PROCESSING_PREFERENCES_KEY } from './route_editor_primitives.js';
 import { collectSafeFieldValues, normalizeTone, renderSafeField, setInlineStatus, revealNewRow } from './ui_helpers.js';
 import { extensionActionStatus } from './extension_status_text.js';
+import { bindWelcomePreference } from './welcome_preference.js';
 
 let markSettingsDirty = () => {};
 const BASE_SECRET_KEYS = new Set(SECRET_KEYS.map(([key]) => key));
@@ -474,6 +475,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     // Notification preferences are client-local for the same reason; the module
     // owns delegated handlers, so mounting only paints current state.
     getNotifier().mountSettings(page);
+    const disposeWelcomePreference = bindWelcomePreference(page);
     const disposeLocalModel = bindLocalModelControls({ state,
         onApplication: (local) => syncRestartState({ ...restartState, local_model: local }) });
     // Best-effort About version from /api/health.
@@ -1130,12 +1132,10 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
         });
     }
 
-    // Client-local blocks (appearance, notifications) live on the Appearance
-    // tab but never enter the /api/settings payload, so their controls must not
-    // make the server draft dirty — otherwise toggling one would ask the owner
-    // to discard "unsaved settings" that do not exist.
+    // These Appearance controls save outside /api/settings (theme and notifications
+    // per client; greeting per installation). They cannot dirty that server draft.
     const onServerSettingEdited = (event) => {
-        if (event?.target?.closest?.('[data-notify-settings]')) return;
+        if (event?.target?.closest?.('[data-notify-settings], [data-welcome-settings]')) return;
         onSettingsEdited();
     };
     page.addEventListener('input', onServerSettingEdited);
@@ -1198,6 +1198,7 @@ export function initSettings({ state, setBeforePageLeave, ws } = {}) {
     window.addEventListener('pagehide', (event) => {
         if (event.persisted) return;
         disposeSettingsTabs();
+        disposeWelcomePreference();
         window.removeEventListener('beforeunload', beforeUnload);
         disposeLocalModel();
         disposeRestartReconnect?.();

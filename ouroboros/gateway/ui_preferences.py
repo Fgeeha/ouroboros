@@ -31,6 +31,8 @@ DEFAULT_UI_PREFERENCES: dict[str, Any] = {
     # unknown-key 400, a stored legacy key is ignored on read and dropped on
     # the next write (``project_seen_revision`` is the replacement).
     "project_seen_revision": {},
+    # Install-wide presentation only: never a model reply or a chat-history row.
+    "welcome": {"mode": "default", "text": ""},
 }
 _KNOWN_KEYS = frozenset(DEFAULT_UI_PREFERENCES)
 _MAX_WIDGET_ORDER_ITEMS = 200
@@ -40,6 +42,7 @@ _SIDEBAR_WIDTH_MIN, _SIDEBAR_WIDTH_MAX = 180, 560
 _PROJECT_PANEL_WIDTH_MIN, _PROJECT_PANEL_WIDTH_MAX = 320, 1100
 _MAX_PROJECT_CURSORS = 1000
 _MAX_PROJECT_ID_LENGTH = 64
+_MAX_WELCOME_CHARS = 500
 
 
 @contextmanager
@@ -140,6 +143,16 @@ def _normalize_preferences(
                 except (TypeError, ValueError):
                     raise ValueError("project_seen_revision values must be integers")
             prefs["project_seen_revision"] = cleaned
+    if "welcome" in raw:
+        value = raw["welcome"]
+        if not isinstance(value, dict) or set(value) != {"mode", "text"}:
+            raise ValueError("welcome must have exactly mode and text")
+        mode, text = value["mode"], value["text"]
+        if mode not in ("default", "hidden", "custom") or not isinstance(text, str):
+            raise ValueError("welcome mode or text is invalid")
+        if len(text) > _MAX_WELCOME_CHARS or (mode == "custom" and not text.strip()):
+            raise ValueError("welcome custom text must be nonblank and at most 500 characters")
+        prefs["welcome"] = {"mode": mode, "text": text}
     return prefs
 
 

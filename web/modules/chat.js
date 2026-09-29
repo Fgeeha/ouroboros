@@ -46,6 +46,7 @@ import {
 } from './task_control_menu.js';
 import { openConfirmDialog } from './confirm_dialog.js';
 import { bindEnterSubmit } from './ui_interactions.js';
+import { welcomeText } from './welcome_preference.js';
 import {
     captureLiveCardPhaseState,
     desiredLiveCardPhase,
@@ -329,8 +330,11 @@ export function createChatInstance({
             const prefs = await apiClient.uiPreferences();
             if (destroyed) return;
             nestedSubagentsExpanded = prefs?.nested_subagents_expanded === true;
+            welcomePreference = prefs?.welcome || null;
+            ensureWelcomeMessage();
         } catch {
             nestedSubagentsExpanded = false;
+            // Keep a previously observed choice; an unavailable read is not a reset.
         }
     }
 
@@ -428,7 +432,8 @@ export function createChatInstance({
     let hydrationGatePromise = null;
     // The server retains whole-history coverage independently of the DOM window.
     let historyWindow = null;
-    let welcomeShown = false;
+    let welcomePreference = null;
+    let welcomeNode = null;
     // Cross-instance hide/show position; visible mutations use live geometry.
     let _savedScrollTop = Math.max(0, Number(initialScrollState?.scrollTop) || 0);
     let _savedStick = initialScrollState ? initialScrollState.stick !== false : true;
@@ -2376,15 +2381,35 @@ export function createChatInstance({
     const markPendingDropped = (clientMessageId) => markPendingDelivered(clientMessageId, true);
 
     function ensureWelcomeMessage() {
-        if (!isMain) return;
-        if (welcomeShown) return;
+        if (destroyed) return;
         const hasRealBubbles = Array.from(messagesDiv.querySelectorAll('.chat-bubble')).some(
             bubble => !bubble.classList.contains('typing-bubble')
         );
-        if (hasRealBubbles) return;
-        welcomeShown = true;
-        addMessage('Ouroboros has awakened', 'assistant', false, null, false, { ephemeral: true });
+        const copy = welcomeText(welcomePreference);
+        // A failed or partial history read cannot establish that this is an empty chat.
+        if (!isMain || !lastHistorySyncSucceeded || historyWindow?.complete !== true
+                || hasRealBubbles || !copy) {
+            if (welcomeNode) { welcomeNode.remove(); welcomeNode = null; }
+            return;
+        }
+        if (!welcomeNode) {
+            welcomeNode = document.createElement('div');
+            welcomeNode.className = 'chat-empty-welcome';
+            welcomeNode.dataset.welcomeState = 'ready';
+            welcomeNode.innerHTML = '<span class="chat-empty-welcome-label">Welcome</span><p></p>';
+            messagesDiv.appendChild(welcomeNode);
+        }
+        welcomeNode.querySelector('p').textContent = copy;
     }
+    // Every kind of incoming content (including media and cards) has one DOM
+    // insertion seam; observing it removes the empty state without a type list.
+    const welcomeObserver = new MutationObserver(() => ensureWelcomeMessage());
+    if (isMain) welcomeObserver.observe(messagesDiv, { childList: true });
+    const onWelcomeChanged = (event) => {
+        welcomePreference = event.detail;
+        ensureWelcomeMessage();
+    };
+    if (isMain) window.addEventListener('ouro:welcome-changed', onWelcomeChanged);
 
     // Hydration triggers share one sticky request; reconnect/resync still refetch.
     function awaitInitialHydration({ includeUser = false } = {}) {
@@ -2808,6 +2833,8 @@ export function createChatInstance({
                 const wasFirstLoad = !historyLoaded;
                 historyLoaded = true;
                 lastHistorySyncSucceeded = true;
+                messagesDiv.dataset.historyHydrated = 'true';
+                ensureWelcomeMessage();
                 liveCardBound.settle({ rebuilt: wasFirstLoad || armedAtStart, size: liveCardRecords.size });
                 modelWaits.retainCards(liveCardRecords);
                 // ANY successful sync leaves the instance hydrated
@@ -3963,6 +3990,8 @@ export function createChatInstance({
         destroy() {
             if (destroyed) return;
             destroyed = true;
+            welcomeObserver.disconnect();
+            window.removeEventListener('ouro:welcome-changed', onWelcomeChanged);
             cancelHistoryPaint();
             for (const dispose of wsDisposers) {
                 try { dispose(); } catch {}

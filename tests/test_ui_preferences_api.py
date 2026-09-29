@@ -28,6 +28,7 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
             "sidebar_width": 0,
             "project_panel_width": 0,
             "project_seen_revision": {},
+            "welcome": {"mode": "default", "text": ""},
         }
 
         create_project(tmp_path, "racer", name="Racer")
@@ -121,6 +122,29 @@ def test_ui_preferences_round_trip_and_normalization(tmp_path):
         assert client.post("/api/ui/preferences", json={"widget_order": "bad"}).status_code == 400
         assert client.post("/api/ui/preferences", json={"project_seen_revision": {"racer": "bad"}}).status_code == 400
         assert client.post("/api/ui/preferences", json={"unknown": True}).status_code == 400
+
+
+def test_empty_chat_welcome_preference_round_trip_and_refusals(tmp_path):
+    from starlette.testclient import TestClient
+
+    app = Starlette(routes=collect_routes(data_dir=tmp_path))
+    app.state.drive_root = tmp_path
+    with TestClient(app) as client:
+        assert client.get("/api/ui/preferences").json()["welcome"] == {"mode": "default", "text": ""}
+        custom = {"mode": "custom", "text": "Привет <b>мир</b>\nagain"}
+        response = client.post("/api/ui/preferences", json={"welcome": custom})
+        assert response.status_code == 200
+        assert response.json()["welcome"] == custom
+        assert client.get("/api/ui/preferences").json()["welcome"] == custom
+        for invalid in ({"mode": "custom", "text": "  "}, {"mode": "custom", "text": "x" * 501},
+                        {"mode": "other", "text": "x"}, {"mode": "custom"}, None):
+            assert client.post("/api/ui/preferences", json={"welcome": invalid}).status_code == 400
+            assert client.get("/api/ui/preferences").json()["welcome"] == custom
+        hidden = {"mode": "hidden", "text": custom["text"]}
+        assert client.post("/api/ui/preferences", json={"welcome": hidden}).json()["welcome"] == hidden
+        assert client.post("/api/ui/preferences", json={"widget_order": ["skill:x"]}).json()["welcome"] == hidden
+        default = {"mode": "default", "text": custom["text"]}
+        assert client.post("/api/ui/preferences", json={"welcome": default}).json()["welcome"] == default
 
 
 def test_ui_preferences_concurrent_paint_acks_are_monotonic(tmp_path):
