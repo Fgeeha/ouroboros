@@ -32,6 +32,22 @@ test('the history chrome is one Load-older control; no Load-newer element is eve
     assert.equal(controls.olderButton.hidden, true);
 });
 
+test('the empty-Main greeting is chrome: a read over it still shows its loading and failure', () => {
+    const doc = { byId: new Map(), createElement: (tag) => new ElementStub(tag, doc) };
+    const messages = new ElementStub('div', doc);
+    messages.isConnected = true;
+    const controls = createHistoryControls(messages);
+    const node = (className) => { const element = doc.createElement('div'); element.className = className; return element; };
+    messages.appendChild(node('chat-bubble assistant typing-bubble'));
+    messages.appendChild(node('chat-empty-welcome'));
+    assert.equal(controls.beginRecent(), true);
+    controls.endRecent(new Error('offline'));
+    assert.equal(controls.recentFailed(), true);
+    controls.endRecent();
+    messages.appendChild(node('chat-bubble assistant'));
+    assert.equal(controls.beginRecent(), false, 'a painted transcript gets no loading chrome');
+});
+
 // ─────────────── sticky hydration / replay contracts ──────────────────────
 
 test('sticky single-flight never swallows the post-completion resync', () => {

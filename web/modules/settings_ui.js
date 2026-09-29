@@ -755,7 +755,7 @@ export function renderSettingsPage() {
                             </div>
                         </div>
                         <div class="settings-action-row">
-                            <div class="settings-inline-note" data-welcome-status role="status" aria-live="polite">Reading welcome preference…</div>
+                            <span class="settings-inline-status" data-welcome-status role="status" aria-live="polite" aria-atomic="true">Reading welcome preference…</span>
                             <button type="button" class="btn btn-default" data-welcome-save>Save greeting</button>
                         </div>
                     </div>

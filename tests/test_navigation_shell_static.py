@@ -119,7 +119,16 @@ def test_project_panel_composer_and_welcome_contracts():
     send_group_css = css.split(".chat-send-group {", 1)[1].split(
         ".chat-send-group[data-busy", 1
     )[0]
-    assert "if (!isMain) return;" in chat_js  # ensureWelcomeMessage is main-only
+    # The empty-Main greeting is host copy: mounted for Main only, decided by the
+    # successful recent read's own coverage (a failed read retracts it), set as text
+    # and never minted as a chat bubble.
+    welcome_js = _read("web/modules/welcome_preference.js")
+    assert "const emptyWelcome = isMain ? mountEmptyChatWelcome(messagesDiv) : null;" in chat_js
+    assert "emptyWelcome?.historyRead(data.window?.complete === true);" in chat_js
+    assert "lastHistorySyncSucceeded = false;\n                emptyWelcome?.historyRead(false);" in chat_js
+    assert "if (!confirmedEmpty || !copy || hasContent()) {" in welcome_js
+    assert "node.lastElementChild.textContent = copy;" in welcome_js
+    assert "Ouroboros has awakened" not in chat_js and "addMessage" not in welcome_js
     assert "padding: 10px 292px" not in css
     assert "right: 8px;\n    bottom: 6px" not in send_group_css
     assert ".chat-text-row:focus-within" in css

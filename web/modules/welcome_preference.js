@@ -9,6 +9,51 @@ export function welcomeText(value) {
     return value?.mode === 'default' ? DEFAULT_WELCOME_TEXT : null;
 }
 
+// Main's empty state. Only a successful recent read whose own window reports complete
+// coverage can confirm emptiness; a failed or partial read retracts it, and any
+// insertion into the feed, later read or saved preference decides again.
+export function mountEmptyChatWelcome(messages, win = window) {
+    const doc = messages.ownerDocument;
+    let preference = null;
+    let confirmedEmpty = false;
+    let node = null;
+    // Content is a top-level bubble or visible task card; the typing indicator and
+    // the ephemeral reconnect notice are chrome, like this empty state itself.
+    const hasContent = () => Array.from(messages.children).some((child) => child !== node
+        && (child.classList.contains('chat-live-card') || (child.classList.contains('chat-bubble')
+            && !child.classList.contains('typing-bubble') && !child.dataset.ephemeral)));
+    const render = () => {
+        const copy = welcomeText(preference);
+        if (!confirmedEmpty || !copy || hasContent()) {
+            node?.remove();
+            node = null;
+            return;
+        }
+        if (!node) {
+            node = doc.createElement('div');
+            node.className = 'chat-empty-welcome';
+            node.dataset.welcomeState = 'ready';
+            node.innerHTML = '<span class="chat-empty-welcome-label">Welcome</span>';
+            node.appendChild(doc.createElement('p'));
+            messages.insertBefore(node, messages.querySelector('.typing-bubble'));
+        }
+        node.lastElementChild.textContent = copy;  // owner copy is text, never markup
+    };
+    const observer = typeof MutationObserver === 'function' ? new MutationObserver(render) : null;
+    observer?.observe(messages, { childList: true });
+    const onChanged = (event) => { preference = event.detail; render(); };
+    win.addEventListener('ouro:welcome-changed', onChanged);
+    return {
+        // Called only with a successful read; a failed one keeps the observed choice.
+        setPreference(value) { preference = value || null; render(); },
+        historyRead(complete) { confirmedEmpty = complete === true; render(); },
+        dispose() {
+            observer?.disconnect();
+            win.removeEventListener('ouro:welcome-changed', onChanged);
+        },
+    };
+}
+
 // This control saves a presentation preference independently of /api/settings.
 // A failed read never paints the default as though it were the owner's saved choice.
 export function bindWelcomePreference(root, client = apiClient) {

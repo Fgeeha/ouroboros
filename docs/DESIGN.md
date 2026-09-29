@@ -463,6 +463,13 @@ renderer regardless of `markdown`; ordinary System text is escaped unless
 Voice does not confer task finality. The existing untyped terminal-host-notice
 contract remains a documented exception, not a pattern for new notices.
 
+Main's empty-chat greeting speaks in neither voice: it is host copy in a quiet
+`.chat-empty-welcome` placeholder (a `Welcome` label over one sentence), never a
+bubble, a history row or a model reply. The sentence is the install-wide `welcome`
+preference — the built-in "Ouroboros has awakened", hidden, or the owner's plain
+text, set as text and never as markup. It appears only in a Main whose history read
+confirmed it empty, and it leaves with the first message or task card.
+
 ## 5. Card and section composition
 
 - A panel is one `.ui-card`-family surface: `--ui-card-border`,

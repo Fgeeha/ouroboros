@@ -30,8 +30,9 @@ export function createHistoryControls(messagesDiv) {
     // (issue #1102: an empty feed under a green header read as a dead app, and a
     // failed read looked identical to a slow one).
     let recent = null;
-    const feedIsEmpty = () => Array.from(messagesDiv.children)
-        .every(node => node === root || node.classList.contains('typing-bubble'));
+    // The empty-Main greeting is chrome: a read over it still shows its state.
+    const feedIsEmpty = () => Array.from(messagesDiv.children).every(node => node === root
+        || node.classList.contains('typing-bubble') || node.classList.contains('chat-empty-welcome'));
     return {
         olderButton: button,
         // Only an EMPTY feed (or a failure already on screen) gets the loading

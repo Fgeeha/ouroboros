@@ -1,6 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { bindWelcomePreference, DEFAULT_WELCOME_TEXT, welcomeText } from '../modules/welcome_preference.js';
+import { bindWelcomePreference, DEFAULT_WELCOME_TEXT, mountEmptyChatWelcome, welcomeText } from '../modules/welcome_preference.js';
+import { installDom, restoreDom } from './chat_dom_fixture.js';
 
 test('welcome mode resolves exactly without treating custom text as markup', () => {
     assert.equal(welcomeText({ mode: 'default', text: 'ignored' }), DEFAULT_WELCOME_TEXT);
@@ -72,4 +73,63 @@ test('a failed preference read cannot authorize overwriting it and disposes hand
         assert.match(f.status.textContent, /offline/);
     } finally { f.dispose(); }
     assert.equal(f.save.listeners.size, 0);
+});
+
+test('the Main empty state needs a complete successful read and an empty feed', () => {
+    const { prior, mount } = installDom();
+    const previousObserver = globalThis.MutationObserver;
+    let mutated = null;
+    globalThis.MutationObserver = class {
+        constructor(callback) { mutated = callback; }
+        observe() {}
+        disconnect() { mutated = null; }
+    };
+    const listeners = new Map();
+    const win = { addEventListener: (type, fn) => listeners.set(type, fn), removeEventListener: (type) => listeners.delete(type) };
+    const doc = globalThis.document;
+    const node = (className, dataset = {}) => {
+        const element = doc.createElement('div');
+        element.className = className;
+        Object.assign(element.dataset, dataset);
+        return element;
+    };
+    try {
+        const messages = node('');
+        mount.appendChild(messages);
+        const typing = node('chat-bubble assistant typing-bubble');
+        messages.appendChild(typing);
+        const welcome = mountEmptyChatWelcome(messages, win);
+        const shown = () => messages.children.find((child) => child.classList.contains('chat-empty-welcome'));
+        welcome.setPreference({ mode: 'default', text: '' });
+        assert.equal(shown(), undefined, 'no history read has confirmed emptiness');
+        welcome.historyRead(false);
+        assert.equal(shown(), undefined, 'a partial or failed read confirms nothing');
+        welcome.historyRead(true);
+        assert.equal(shown().dataset.welcomeState, 'ready');
+        assert.equal(shown().lastElementChild.textContent, DEFAULT_WELCOME_TEXT);
+        assert.ok(messages.children.indexOf(shown()) < messages.children.indexOf(typing));
+        listeners.get('ouro:welcome-changed')({ detail: { mode: 'custom', text: '<b>x</b>\nnext' } });
+        assert.equal(shown().lastElementChild.innerHTML, '&lt;b&gt;x&lt;/b&gt;\nnext', 'owner copy stays text');
+        messages.appendChild(node('chat-bubble system', { ephemeral: '1' })); mutated();
+        assert.ok(shown(), 'the reconnect notice is chrome, not conversation');
+        const card = node('chat-live-card');
+        messages.appendChild(card); mutated();
+        assert.equal(shown(), undefined, 'a visible task card is content');
+        card.remove(); mutated();
+        assert.ok(shown());
+        const bubble = node('chat-bubble user');
+        messages.appendChild(bubble); mutated();
+        assert.equal(shown(), undefined, 'a late message removes the empty state');
+        bubble.remove(); welcome.historyRead(false);
+        assert.equal(shown(), undefined, 'a later failed read retracts it');
+        welcome.historyRead(true);
+        welcome.setPreference({ mode: 'hidden', text: 'kept' });
+        assert.equal(shown(), undefined);
+        welcome.dispose();
+        assert.equal(listeners.size, 0);
+        assert.equal(mutated, null);
+    } finally {
+        globalThis.MutationObserver = previousObserver;
+        restoreDom(prior);
+    }
 });
