@@ -810,8 +810,8 @@ def test_concurrent_collectors_of_one_wave_publish_one_verdict_and_owe_one_row(t
         thread.join(10)
     assert len(outcomes) == 2 and set(outcomes) <= {"announced", "published"}
     rows = [row for sink in queues for row in list(sink.queue) if row.get("system_type") == "acceptance_late_settlement"]
-    assert rows and {row["delivery_id"] for row in rows} == {"acceptance-late:wave-race"}, \
-        "duplicates carry one delivery id; the send handler delivers exactly one"
+    assert [row["delivery_id"] for row in rows] == ["acceptance-late:wave-race"], \
+        "the second collector finds the notice owed and queues no live copy"
     assert [row["delivery_id"] for row in pending_deliveries(tmp_path)] == ["acceptance-late:wave-race"]
     panels = load_task_result(tmp_path, TASK)["review_projection"]["panels"]
     assert len(panels) == 1 and panels[0]["aggregate_signal"] == "PASS" and panels[0]["late_settlement"]
