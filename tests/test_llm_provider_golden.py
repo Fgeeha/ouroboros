@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import contextvars
 import copy
 import hashlib
 import json
@@ -616,7 +617,10 @@ def _observe(spec: Dict[str, Any]) -> Dict[str, Any]:
         if spec.get("cancel_model_after_create"):
             call["kwargs"]["model_poll_control"] = lambda: "cancelled" if recorder.model_gateway.accepted_operations else None
         try:
-            result = _call_route(client, call)
+            # An empty call context, for the same reason as the env and class caches
+            # above: a per-call disclosure (effort clamp note, last physical attempt)
+            # another test staged on this worker must not ride into the projection.
+            result = contextvars.Context().run(_call_route, client, call)
         except BaseException as exc:  # noqa: BLE001 - the raise IS the projection
             observed["raised"] = {"type": type(exc).__name__, "message": str(exc)}
             if spec.get("model_operation"):
@@ -731,6 +735,22 @@ def test_processing_environment_isolated_but_explicit_case_options_apply(monkeyp
     explicit = _observe(spec)
     assert explicit["sends"][0]["payload"]["service_tier"] == "default"
     assert explicit["returned"]["usage"]["processing"]["requested"] == "standard"
+
+
+def test_call_context_left_by_an_earlier_test_does_not_reach_the_replay():
+    """A parallel worker runs other modules first; a per-call disclosure one of them
+    staged and never consumed (a native effort mapping built without a send) must not
+    be attributed to the recorded route."""
+    from ouroboros.llm_capability_policy import _EFFORT_CLAMP_CVAR
+
+    case = next(case for case in _CASES if case["id"] == "anthropic.dispatch.happy_path")
+    token = _EFFORT_CLAMP_CVAR.set({
+        "requested": "ultra", "applied": "max", "reason": "provider_wire_mapping", "model": "future",
+    })
+    try:
+        assert _observe(case["spec"]) == case["expected"]
+    finally:
+        _EFFORT_CLAMP_CVAR.reset(token)
 
 
 def test_golden_covers_every_declared_provider_lane():
