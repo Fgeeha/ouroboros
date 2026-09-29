@@ -657,15 +657,15 @@ def _child_workspace(ctx, metadata, params):
     """Bind the parent's observed source before selecting the child's start."""
     workspace_root = str(getattr(ctx, "workspace_root", "") or metadata.get("workspace_root") or "").strip()
     workspace_mode = str(getattr(ctx, "workspace_mode", "") or metadata.get("workspace_mode") or "").strip()
-    from ouroboros.tool_access_reads import capture_parent_workspace, readonly_start_folder
+    from ouroboros.tool_access_reads import admit_child_start_folder, capture_parent_workspace
     parent_workspace = capture_parent_workspace(ctx)
     workspace_root, workspace_mode = _inherited_workspace_from_active_repo(ctx, workspace_root, workspace_mode)
     selected_folder = str(params.get("workspace_root") or "").strip()
     if selected_folder:
         try:
             selected_path = Path(selected_folder).expanduser()
-            workspace_root = readonly_start_folder(
-                selected_path if selected_path.is_absolute() else Path(parent_workspace["root"]) / selected_path)
+            workspace_root = admit_child_start_folder(ctx,
+                selected_path if selected_path.is_absolute() else Path(parent_workspace["root"]) / selected_path, params)
             workspace_mode = "read_only"
         except (OSError, ValueError, RuntimeError) as exc:
             return workspace_root, workspace_mode, parent_workspace, f"⚠️ TOOL_ARG_ERROR (schedule_subagent): {exc}"

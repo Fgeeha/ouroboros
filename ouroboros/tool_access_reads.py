@@ -114,3 +114,22 @@ def readonly_start_folder(value: Any) -> str:
     if not path.is_dir():
         raise ValueError(f"workspace_root is not a directory: {value}")
     return str(path)
+
+
+def admit_child_start_folder(ctx: Any, value: Any, params: dict) -> str:
+    """Select an existing parent READ binding; the folder grants no authority."""
+    if str(params.get("write_surface") or "").strip().lower() == "genesis":
+        raise ValueError("workspace_root cannot select a starting folder for genesis, which creates its own empty project")
+    folder = readonly_start_folder(value)
+    write_root = str(params.get("write_root") or "").strip()
+    if write_root and pathlib.Path(write_root).expanduser().resolve(strict=False) != pathlib.Path(folder):
+        raise ValueError("workspace_root and write_root name different folders; select one acting workspace")
+    from ouroboros.tools.tool_resolution import _root_containing_absolute_path
+
+    root = _root_containing_absolute_path(ctx, "read_file", folder)
+    # External/Cyber parents can already READ off-home addresses through
+    # user_files even when no finite root contains the address. Its existing
+    # resolver decides that reach, including refusals for ordinary parents.
+    binding = _access().build_resolved_resource_binding(
+        ctx, root=root or "user_files", operation="read", path=folder)
+    return str(binding.target_path)
