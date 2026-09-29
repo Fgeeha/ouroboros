@@ -182,6 +182,10 @@ def test_notify_scheduling_validation(tmp_path: pathlib.Path) -> None:
     client, _app = _notify_client(tmp_path)
     headers = {"X-Skill-Token": "tok"}
     assert client.post("/notify", headers=headers, json={"text": "x", "at": "soon"}).status_code == 400
+    # An offsetless time is not an instant. In particular it must not become
+    # UTC merely because the caller omitted the optional cron timezone.
+    assert client.post("/notify", headers=headers, json={
+        "text": "x", "at": "2999-01-01T14:45:00"}).status_code == 400
     assert client.post("/notify", headers=headers, json={
         "text": "x", "at": "2999-01-01T14:45:00", "timezone": "Europe/Moscow"}).status_code == 400
     assert client.post("/notify", headers=headers, json={

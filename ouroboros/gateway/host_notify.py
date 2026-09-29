@@ -168,8 +168,8 @@ def _schedule_owner_notification(ctx: "HostServiceContext", skill_name: str, tex
         return _json_error("supply exactly one of at (ISO 8601 instant) or cron (5-field expression)", 400)
     timezone = str(timezone_raw or "").strip()
     if at_raw is not None:
-        if timezone and isinstance(at_raw, str) and _naive_instant(at_raw.strip()):
-            return _json_error("at without a UTC offset cannot be combined with timezone; put the offset in at", 400)
+        if isinstance(at_raw, str) and _naive_instant(at_raw.strip()):
+            return _json_error("at requires an explicit UTC offset; put the offset in at", 400)
         at_instant = parse_deadline_ts(at_raw.strip()) if isinstance(at_raw, str) else None
         if at_instant is None:
             return _json_error("at must be a parseable ISO 8601 instant", 400)

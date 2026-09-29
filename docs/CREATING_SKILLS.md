@@ -878,9 +878,13 @@ keyed row that belongs to another skill. A cancel whose delete landed but whose
 audit outcome was lost answers `200 {ok: false, cancelled: true, status: "changed_audit_incomplete"}` —
 the row is gone, do not retry.
 
-A deferred reminder adds `"at": "<ISO 8601 instant>"` (once) or `"cron":
-"<5-field>"` plus optional `"timezone"`. A naive `at` combined with
-`timezone` is refused; put the offset in `at`. Success answers
+A deferred reminder adds `"at": "<ISO 8601 instant with UTC offset>"` (once) or `"cron":
+"<5-field>"` plus optional `"timezone"`. An offsetless `at` is refused
+whether or not `timezone` is provided; put the offset in `at`. For a recurring
+local-time cron, provide an IANA timezone explicitly: the blank-zone fallback
+uses the server's zone, which on Windows or a Docker host without a discoverable
+IANA zone may be a fixed current UTC offset and drift at daylight-saving changes.
+Success answers
 `200 {ok, scheduled: true, id, next_run_at}` (`ok: false` there means the row is
 stored but its audit outcome could not be recorded — no retry needed). The host
 stores a `kind: "notify"` row in the one schedule table (visible under Activity

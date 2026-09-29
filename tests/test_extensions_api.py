@@ -166,6 +166,7 @@ def test_provider_boot_attaches_notification_subscriber_before_supervisor_starts
     from starlette.testclient import TestClient
     import server as srv
     from ouroboros import event_bus, extension_loader
+    from supervisor import queue
 
     drive_root = tmp_path / "drive"
     drive_root.mkdir()
@@ -174,6 +175,14 @@ def test_provider_boot_attaches_notification_subscriber_before_supervisor_starts
     _patch_lifespan_for_drive_root_test(monkeypatch, srv, {})
     monkeypatch.setattr(srv, "has_startup_ready_provider", lambda _settings: True)
     monkeypatch.setattr(srv, "_boot_managed_update_tasks", lambda: None)
+    queue.init(drive_root)
+    queue.init_queue_refs([], {}, {"value": 0})
+    queue.upsert_scheduled_task({
+        "id": "cold-boot-notice", "name": "Due before boot", "kind": "notify",
+        "enabled": True, "source": "task_followup",
+        "trigger": {"type": "once", "run_at": "2000-01-01T00:00:00+00:00"},
+        "notification": {"text": "due", "key": "cold-boot"},
+    })
     observed = []
 
     def reload_extensions(_root, _reader, *, repo_path=None):
@@ -183,9 +192,9 @@ def test_provider_boot_attaches_notification_subscriber_before_supervisor_starts
         return {}
 
     def start_supervisor(_settings):
-        # Stand in for the first tick: a due notice must see the subscription
-        # installed by reload_all, not merely an initialized empty bus.
-        event_bus.publish_event(event_bus.OWNER_NOTIFICATION, {"text": "due"})
+        # Exercise the real first scheduler pass: consumption precedes the
+        # topic publication, which has no replay for a late subscriber.
+        queue.check_scheduled_tasks()
         return True
 
     monkeypatch.setattr(extension_loader, "reload_all", reload_extensions)
@@ -193,6 +202,10 @@ def test_provider_boot_attaches_notification_subscriber_before_supervisor_starts
     try:
         with TestClient(srv.app):
             assert [row["text"] for row in observed] == ["due"]
+            assert queue.list_scheduled_tasks(drive_root)["tasks"][0]["completed_at"]
+            queue.check_scheduled_tasks()
+            assert len(observed) == 1
+            assert not (drive_root / "logs" / "chat.jsonl").exists()
     finally:
         event_bus.init_global_event_bus()
 
