@@ -1,9 +1,11 @@
 """What a tool says about an argument it did not obey (DEVELOPMENT "LLM-first affordances").
 
-Models fill every key of a tool schema. A value that asks for nothing takes the
-omitted path and the result says so in one line; a value that asks for something
-the call cannot serve is refused ONCE, typed, naming the field, the value received
-and the repair — a refusal that only restates the rule is retried unchanged.
+Models may fill optional keys (OpenAI's Responses API tries strict mode when a
+function tool leaves `strict` unset, so the OpenRouter lane sends `strict: false`). A value
+that asks for nothing takes the omitted path and the result says so in one line; a
+value that asks for something the call cannot serve is refused ONCE, typed, naming
+the field, the value received and the repair — a refusal that only restates the
+rule is retried unchanged.
 """
 
 from __future__ import annotations
