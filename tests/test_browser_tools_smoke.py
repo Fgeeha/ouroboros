@@ -98,6 +98,15 @@ def test_browser_tools_launch_real_chromium(tmp_path, static_page_url, monkeypat
                 pytest.skip(text)
             pytest.skip(text)
         assert "Browser smoke OK" in text
+
+        screenshot = _browser_action(ctx, action="screenshot")
+        if screenshot.startswith("⚠️ BROWSER_INFRA_ERROR"):
+            if expect_chromium:
+                pytest.fail(screenshot)
+            pytest.skip(screenshot)
+        raw = base64.b64decode(ctx.browser_state.last_screenshot_b64 or "")
+        assert raw.startswith(b"\x89PNG\r\n\x1a\n")
+        cleanup_browser(ctx)  # Independent Sync API contexts cannot nest on one thread.
         local = tmp_path / "outside-start" / "index.html"
         local.parent.mkdir()
         local.write_text("<h1>Parent-readable local artifact</h1>", encoding="utf-8")
@@ -107,13 +116,6 @@ def test_browser_tools_launch_real_chromium(tmp_path, static_page_url, monkeypat
         finally:
             cleanup_browser(subagent_ctx)
 
-        screenshot = _browser_action(ctx, action="screenshot")
-        if screenshot.startswith("⚠️ BROWSER_INFRA_ERROR"):
-            if expect_chromium:
-                pytest.fail(screenshot)
-            pytest.skip(screenshot)
-        raw = base64.b64decode(ctx.browser_state.last_screenshot_b64 or "")
-        assert raw.startswith(b"\x89PNG\r\n\x1a\n")
     finally:
         cleanup_browser(ctx)
 
