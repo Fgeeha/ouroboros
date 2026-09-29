@@ -510,7 +510,7 @@ def _responses_search_candidate(ctx, query: str, model: str, options: dict):
     )
     target = {"provider": "openai", "resolved_model": model, "base_url": options["base_url"],
               "usage_model": model if "/" in model else f"openai/{model}",
-              "processing_preference": options["preference"]}
+              "processing_preference": options["preference"], "requested_reasoning_effort": options["effort"]}
     payload = {"model": model,
                "tools": [{"type": "web_search", "search_context_size": options["search_context_size"]}],
                "reasoning": {"effort": options["effort"]}, "tool_choice": "auto", "input": query,

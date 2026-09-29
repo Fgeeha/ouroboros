@@ -29,6 +29,15 @@ PANEL = "#project-panel .chat-messages"
 LATE = "Late final answer"
 NEWEST = "Newest reply in its place"
 QUESTION = "Merge the release branch now?"
+DRAFT = "Yes, after the tag"
+_FOCUSED_DRAFT = """() => document.activeElement?.classList.contains('chat-quiz-comment')
+    ? document.activeElement.value : null"""
+# The browser's page visibility as a background/foreground switch reports it.
+_SET_HIDDEN = """hidden => {
+    Object.defineProperty(document, 'hidden', {configurable: true, get: () => hidden});
+    Object.defineProperty(document, 'visibilityState', {configurable: true, get: () => hidden ? 'hidden' : 'visible'});
+    document.dispatchEvent(new Event('visibilitychange'));
+}"""
 # Place the message's top `offset` px below the composer's top edge, and report
 # the geometry the reader actually has.
 _PLACE = """(messages, [text, offset]) => {
@@ -255,6 +264,9 @@ def test_a_question_delivered_live_is_read_where_its_card_is_shown(direct_server
             card = messages.locator(".chat-quiz-card").filter(has_text=QUESTION)
             card.wait_for(state="visible")
             assert card.evaluate("n => n.closest('[data-history-id]')") is None, "live, the card names no row yet"
+            # The owner starts answering before any read names the question.
+            card.evaluate("n => { n.__liveCard = true; }")
+            card.locator(".chat-quiz-comment").fill(DRAFT)
             with chat_log.open("a", encoding="utf-8") as stream:
                 stream.write(json.dumps({"ts": ts, "direction": "out", "chat_id": chat_id, "text": QUESTION,
                                          "type": "quiz", "task_id": "ask-task", "quiz": quiz}) + "\n")
@@ -274,6 +286,9 @@ def test_a_question_delivered_live_is_read_where_its_card_is_shown(direct_server
             assert geometry["card"]["top"] < geometry["composer"]["top"], ("the card is on screen", geometry)
             assert read, ("the question on screen is read", acks, stamped, geometry)
             assert str(stamped).startswith("chat:"), stamped
+            assert messages.locator(".chat-quiz-card").filter(has_text=QUESTION).count() == 1
+            assert card.evaluate("n => n.__liveCard === true"), "the read adopted the live card, not a copy"
+            assert page.evaluate(_FOCUSED_DRAFT) == DRAFT, "the draft and its focus survive the adoption"
             row.locator(".nav-unread-dot").wait_for(state="detached")
         finally:
             browser.close()
@@ -352,5 +367,153 @@ def test_a_room_read_on_one_client_clears_the_dot_on_another_at_its_next_state_r
             other.screenshot(path=str(evidence / f"read-band-{engine}-other-client.png"))
             assert [ack for ack in other_acks if ack.get("project_seen_revision")] == [], \
                 "the other client never read the room and acknowledges nothing"
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_a_question_revealed_from_main_is_not_reading_the_newer_messages_below_it(direct_server_with_data, engine):
+    """Main's question mirror opens the room at the question; the newer replies below it are read only
+    once the reader reaches them (DESIGN "Project unread dot")."""
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.projects_registry import bind_task_to_project, get_project
+    from ouroboros.task_results import write_task_result
+
+    data = direct_server_with_data["data_dir"]
+    at = lambda minute: f"2026-09-28T10:{minute:02d}:00Z"  # noqa: E731
+    quiz = {"quiz_id": "q-mirror", "question": QUESTION, "options": ["Yes", "No"], "state": "open", "asked_at": at(5)}
+    rows = [{"ts": at(minute), "direction": "out", "text": f"Reply {minute}"} for minute in range(3)]
+    rows.append({"ts": at(5), "direction": "out", "text": QUESTION, "type": "quiz", "task_id": "mirror-task",
+                 "quiz": {**quiz, "options": [{"label": "Yes"}, {"label": "No"}]}})
+    rows += [{"ts": at(10 + index), "direction": "out", "text": f"Later reply {index}\nline two\nline three"}
+             for index in range(25)]
+    chat_id, _chat_log, revision = _seed_room(data, "mirror-room", "Mirror room", rows)
+    project = get_project(data, "mirror-room")
+    bind_task_to_project(data, "mirror-task", project["id"], chat_id, origin={"absent": "system"})
+    write_task_result(data, "mirror-task", "running", project_id=project["id"], chat_id=chat_id,
+                      owner_quiz={"q-mirror": quiz})
+    evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", data.parent))
+    evidence.mkdir(parents=True, exist_ok=True)
+    acks = []
+    seen = lambda: [ack["project_seen_revision"]["mirror-room"] for ack in acks  # noqa: E731
+                    if "mirror-room" in (ack.get("project_seen_revision") or {})]
+    with sync_playwright() as pw:
+        browser = getattr(pw, engine).launch()
+        try:
+            page, row = _client(browser, direct_server_with_data["url"], "mirror-room", acks)
+            page.evaluate("""project => window.dispatchEvent(new CustomEvent('ouro:open-project', {
+                detail: {project, task_id: 'mirror-task', quiz_id: 'q-mirror'}}))""", project)
+            messages = page.locator(PANEL)
+            card = messages.locator('.chat-quiz-card[data-quiz-id="q-mirror"]')
+            card.wait_for(state="visible")
+            page.wait_for_function("() => Boolean(document.activeElement?.closest('[data-quiz-id=\"q-mirror\"]'))")
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.wait_for_timeout(500)
+            newest = messages.evaluate(_BOX_OF, "Later reply 24")
+            page.screenshot(path=str(evidence / f"read-band-{engine}-mirror-question.png"))
+            assert newest["top"] > messages.evaluate("n => n.getBoundingClientRect().bottom"), newest
+            assert seen() == [], "landing on the question is not reading the newer replies below it"
+            assert row.locator(".nav-unread-dot").count() == 1
+
+            messages.evaluate(_AT_BOTTOM)
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            assert _wait_for(page, lambda: seen() == [revision]), acks
+            page.screenshot(path=str(evidence / f"read-band-{engine}-mirror-latest.png"))
+            row.locator(".nav-unread-dot").wait_for(state="detached")
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_a_reply_arriving_while_the_window_is_hidden_is_read_when_it_is_shown_again(direct_server_with_data, engine):
+    from playwright.sync_api import sync_playwright
+
+    from ouroboros.projects_registry import increment_project_visible_revision
+
+    data = direct_server_with_data["data_dir"]
+    chat_id, chat_log, first = _seed_room(data, "away-room", "Away room", [
+        {"ts": f"2026-09-28T10:{minute:02d}:00Z", "direction": "out", "text": f"Reply {minute}"} for minute in range(4)])
+    evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", data.parent))
+    evidence.mkdir(parents=True, exist_ok=True)
+    acks = []
+    seen = lambda: [ack["project_seen_revision"]["away-room"] for ack in acks  # noqa: E731
+                    if "away-room" in (ack.get("project_seen_revision") or {})]
+    with sync_playwright() as pw:
+        browser, page, row = _open_room(pw, engine, direct_server_with_data["url"], "away-room", acks)
+        try:
+            messages = page.locator(PANEL)
+            messages.locator(".chat-bubble").filter(has_text="Reply 3").wait_for(state="attached")
+            assert _wait_for(page, lambda: seen() == [first]), acks
+            row.locator(".nav-unread-dot").wait_for(state="detached")
+
+            page.evaluate(_SET_HIDDEN, True)
+            with chat_log.open("a", encoding="utf-8") as stream:
+                stream.write(json.dumps({"ts": "2026-09-28T10:30:00Z", "direction": "out", "chat_id": chat_id,
+                                         "text": "Reply while away"}) + "\n")
+            second = increment_project_visible_revision(data, chat_id=chat_id)["visible_revision"]
+            _emit_ws_frame(page, {"type": "projects_changed"})
+            row.locator(".nav-unread-dot").wait_for(state="attached")
+            messages.locator(".chat-bubble").filter(has_text="Reply while away").wait_for(state="attached")
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.wait_for_timeout(500)
+            assert seen() == [first], "nobody can see a hidden window"
+
+            page.evaluate(_SET_HIDDEN, False)
+            assert _wait_for(page, lambda: seen() == [first, second]), acks
+            row.locator(".nav-unread-dot").wait_for(state="detached")
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.screenshot(path=str(evidence / f"read-band-{engine}-shown-again.png"))
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize("engine", ["chromium", "webkit"])
+def test_a_failed_read_receipt_is_retried_at_the_next_state_refresh(direct_server_with_data, engine):
+    """The reader stays at the newest message while every POST fails; once the server accepts it
+    again, the next state refresh, which changes nothing in the Projects list, retries it."""
+    from playwright.sync_api import sync_playwright
+
+    data = direct_server_with_data["data_dir"]
+    _chat_id, _chat_log, revision = _seed_room(data, "retry-room", "Retry room", [
+        {"ts": f"2026-09-28T10:{minute:02d}:00Z", "direction": "out", "text": f"Reply {minute}"} for minute in range(4)])
+    evidence = Path(os.environ.get("OUROBOROS_UI_EVIDENCE_DIR", data.parent))
+    evidence.mkdir(parents=True, exist_ok=True)
+    attempts, failing = [], [True]
+
+    def preferences(route):
+        body = route.request.post_data or ""
+        if route.request.method == "POST" and "retry-room" in body:
+            attempts.append((json.loads(body)["project_seen_revision"], failing[0]))
+            if failing[0]:
+                return route.abort()
+        return route.continue_()
+
+    with sync_playwright() as pw:
+        browser = getattr(pw, engine).launch()
+        try:
+            page = browser.new_page(viewport={"width": 1187, "height": 734})
+            page.route("**/api/ui/preferences", preferences)
+            page.add_init_script(f"({_CAPTURE_TEST_SOCKET})()")
+            page.goto(direct_server_with_data["url"], wait_until="domcontentloaded")
+            page.wait_for_function("() => window.__testSockets?.some(s => s.readyState === 1)")
+            row = page.locator('.nav-project-row[data-project-id="retry-room"]')
+            row.locator(".nav-unread-dot").wait_for(state="attached")
+            row.evaluate("el => el.click()")
+            page.locator(PANEL).locator(".chat-bubble").filter(has_text="Reply 3").wait_for(state="attached")
+            assert _wait_for(page, lambda: len(attempts) >= 1), attempts
+            page.evaluate(_SETTLE_RESTORE_FRAMES)
+            page.wait_for_timeout(1500)  # the app's own start-up snapshots settle
+            assert row.locator(".nav-unread-dot").count() == 1, ("a failed POST keeps the dot", attempts)
+            page.screenshot(path=str(evidence / f"read-band-{engine}-ack-failed.png"))
+
+            failed, failing[0] = len(attempts), False
+            _emit_ws_frame(page, {"type": "projects_changed"})
+            assert _wait_for(page, lambda: len(attempts) > failed), attempts
+            row.locator(".nav-unread-dot").wait_for(state="detached")
+            cursors = page.evaluate("() => fetch('/api/ui/preferences').then(r => r.json())")["project_seen_revision"]
+            assert {json.dumps(seen) for seen, _ in attempts} == {json.dumps({"retry-room": revision})}, attempts
+            assert attempts[-1][1] is False and cursors["retry-room"] == revision, (attempts, cursors)
+            page.screenshot(path=str(evidence / f"read-band-{engine}-ack-retried.png"))
         finally:
             browser.close()

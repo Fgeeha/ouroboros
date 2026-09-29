@@ -19,6 +19,10 @@ _SOURCES = ("chat", "progress")
 _READ_BYTES = 64 * 1024
 _PAGE_SCAN_BYTES = 512 * 1024
 _PAGE_SCAN_ROWS = 1000
+_CHAIN_WITNESSES = 16
+# A projection that failed part-way: the rows after the failing one are missing
+# from the response, so neither its coverage nor its newest arrival is known.
+PROJECTION_FAILED = "projection_failed"
 
 
 def progress_quota_predicate(row_matches_thread, stored_chat_id):
@@ -212,6 +216,28 @@ class HistorySource(JsonlChainSnapshot):
         return rows, lower, gaps
 
 
+def chain_witness(reader):
+    """Rolling prefix witnesses through the trailing retained segments below ``upper``.
+
+    Physical byte coordinates survive append and rotation: the live file keeps
+    its inode and base when renamed into the archive. Every witness rolls each
+    earlier nonempty segment's identity and base, so replacing, removing or
+    resizing ANY earlier segment changes it. A span stays comparable while its
+    own last witness is still listed by a newer read, i.e. within
+    ``_CHAIN_WITNESSES`` rotations; older spans are disclosed as gaps. Metadata
+    only: no archive is read to establish it. Empty sources have no prefix.
+    """
+    witnesses, digest = [], b""
+    for index, (_, stat, _) in enumerate(reader.entries):
+        base = reader.ends[index - 1] if index else 0
+        if base >= reader.upper:
+            break
+        if stat.st_size:
+            digest = hashlib.sha256(digest + f"{stat.st_dev}:{stat.st_ino}@{base}".encode()).digest()
+            witnesses.append(digest.hex()[:16])
+    return ".".join(witnesses[-_CHAIN_WITNESSES:]) or "empty"
+
+
 def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, caps):
     continuation = decode_cursor(cursor, thread_id, view) if cursor else None
     if continuation:
@@ -219,7 +245,7 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
         if any(quotas[key] > caps[key] for key in quotas):
             raise HistoryCursorError("history_cursor_invalid", 400)
     recent = not continuation or (continuation["kind"] == "page" and continuation["recent"])
-    selections, upper, before, page_ends, unfinished = {}, {}, {}, {}, []
+    selections, upper, before, page_ends, chains, unfinished = {}, {}, {}, {}, {}, []
     paths = {"chat": data_dir / "logs" / "chat.jsonl", "progress": data_dir / "logs" / "progress.jsonl"}
     for source, quota in (("chat", "human"), ("progress", "progress")):
         try:
@@ -227,6 +253,7 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
                                    continuation["upper"][source] if continuation else None,
                                    bool(continuation) and source in continuation["unfinished"])
             upper[source] = reader.upper
+            chains[source] = chain_witness(reader)
             if reader.unfinished_live_line:
                 unfinished.append(source)
             page_ends[source] = continuation["before"][source] if continuation else reader.upper
@@ -245,7 +272,25 @@ def select_history_page(data_dir, thread_id, view, cursor, quotas, predicates, c
         before[source] = selections[source][1]
     return {"v": 1, "chat_id": thread_id, "view": view, "upper": upper, "unfinished": unfinished,
             "quotas": quotas, "recent": recent, "replayed": bool(continuation),
-            "selections": selections, "before": before, "page_ends": page_ends}
+            "selections": selections, "before": before, "page_ends": page_ends, "chains": chains}
+
+
+def history_page_coverage(page, stream_gaps):
+    """Delivered physical spans, called AFTER quota/lineage deferrals.
+
+    A projected origin, detail overlay or shared row ID proves no scanned span.
+    Quota-disabled and unreadable streams are unknown, even when they emit []
+    and no continuation. Parse gaps remain part of the coverage evidence; the
+    unfinished live line a frozen boundary discloses lies after ``upper``, so
+    it is no gap in a span that ends there.
+    """
+    return {"v": 1, "view": page["view"], "upper": dict(page["upper"]), "spans": {
+        source: ({"from": page["before"][source], "to": page["page_ends"][source],
+                  "chain": page["chains"][source], "gaps": sorted(stream_gaps[source] - (
+                      {"incomplete_live_line"} if source in page["unfinished"] else set()))}
+                 if page["selections"][source][0] is not None
+                 and page["quotas"]["human" if source == "chat" else source] else None)
+        for source in _SOURCES}}
 
 
 def history_page_tokens(page):
@@ -332,7 +377,7 @@ def _stored_message(row_matches_thread, stored_chat_id):
     return message
 
 
-def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id):
+def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id, projected_gaps=frozenset()):
     """``window.latest_message`` of a recent Project read (DESIGN "Project unread dot").
 
     The window is ordered and tailed by event time, but a Project message counts
@@ -342,7 +387,9 @@ def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id):
     (``deferred_before``) shows it. Reading the room means reading the standalone
     message that arrived last, named from the persisted rows before the tail and
     annotation rewrite them. ``None``: its arrival is unknown — the chat source
-    is unreadable, a row after the newest readable one is, or the live chat ends in
+    is unreadable, its projection failed part-way (``projected_gaps`` holds
+    ``PROJECTION_FAILED``: any row after the fault may be the newest), a row
+    after the newest readable one is unreadable, or the live chat ends in
     a line its writer has not finished (``incomplete_live_line``: this read froze
     before it, so it may be the newest message) — and on a replayed recent page,
     which cannot see what arrived after its frozen boundary. Older pages name nothing.
@@ -364,7 +411,7 @@ def latest_arrival(rows, page, data_dir, row_matches_thread, stored_chat_id):
         str(row.get("text") or "").strip() not in ("", "\u200b") or row.get("msg_type"))]
     offset = lambda row: row["history_position"]["offset"]  # noqa: E731
     latest = max(spoken, key=offset, default=None)
-    if entries is None or "incomplete_live_line" in gaps or (
+    if entries is None or PROJECTION_FAILED in projected_gaps or "incomplete_live_line" in gaps or (
             gaps and _skipped_row_after(entries, offset(latest) if latest else start, upper)):
         return {"latest_message": None}
     if latest is None and start > 0:

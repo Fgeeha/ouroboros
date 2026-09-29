@@ -190,6 +190,29 @@ def test_an_unreadable_row_after_the_newest_readable_one_leaves_its_arrival_unkn
         "an unreadable row before the newest message does not hide it"
 
 
+def test_a_projection_that_fails_part_way_leaves_the_arrival_unknown_and_discloses_the_gap(room, monkeypatch):
+    """Every row after a projection fault is missing: the last one projected is not the newest arrival."""
+    room.deliver("reply 1", 1)
+    room.deliver("reply 2", 2)
+    copy = history._copy_task_summary_metadata
+
+    def fault(rec, entry):
+        if entry.get("text") == "reply 2":
+            raise RuntimeError("injected projection fault")
+        return copy(rec, entry)
+
+    monkeypatch.setattr(history, "_copy_task_summary_metadata", fault)
+    partial = room.read()
+    assert texts(partial) == ["reply 1"], "the rows after the fault are not in the response"
+    assert "chat_projection_failed" in partial["window"]["truncated_by"]
+    assert partial["coverage"]["spans"]["chat"]["gaps"] == ["projection_failed"], "the span is not clean"
+    assert partial["window"]["latest_message"] is None, "reply 1 is not the message that arrived last"
+    monkeypatch.setattr(history, "_copy_task_summary_metadata", copy)
+    healed = room.read()
+    assert "chat_projection_failed" not in healed["window"]["truncated_by"]
+    assert healed["window"]["latest_message"] == {"history_id": room.row_id("reply 2"), "out_of_order": False}
+
+
 def test_a_live_line_its_writer_has_not_finished_leaves_the_arrival_unknown_until_it_is(room):
     """The read freezes before the unfinished line, which may be the newest message."""
     room.deliver("reply 1", 1)
@@ -204,6 +227,10 @@ def test_a_live_line_its_writer_has_not_finished_leaves_the_arrival_unknown_unti
     assert texts(unfinished) == ["reply 1"], "the page holds only complete rows"
     assert "chat_incomplete_live_line" in unfinished["window"]["truncated_by"]
     assert unfinished["window"]["latest_message"] is None, "the previous message is not the one that arrived last"
+    frozen = room.chat_log.stat().st_size - len(line[:-6])
+    span = unfinished["coverage"]["spans"]["chat"]
+    assert span["to"] == unfinished["coverage"]["upper"]["chat"] == frozen and span["gaps"] == [], \
+        "History coverage: every byte up to the frozen boundary was delivered; the unfinished line lies after it"
 
     with room.chat_log.open("ab") as stream:
         stream.write(line[-6:])
@@ -227,6 +254,7 @@ def test_a_frozen_page_keeps_the_unfinished_line_it_froze_before_and_never_names
     replayed = room.read(cursor=unfinished["page_cursor"])
     assert texts(replayed) == ["reply 1"], "the frozen page is unchanged"
     assert "chat_incomplete_live_line" in replayed["window"]["truncated_by"], "the gap it froze before is kept"
+    assert replayed["coverage"]["spans"]["chat"]["gaps"] == [], "and its span stays clean"
     assert replayed["window"]["latest_message"] is None, "reply 1 is not the message that arrived last"
 
     clean = room.read()

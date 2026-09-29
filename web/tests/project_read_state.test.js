@@ -17,12 +17,16 @@ const row = (n) => ({
 // Arrived last (the highest offset) but keeps the older time it was written at.
 const late = (n) => ({ ...row(n), text: `late answer ${n}`, ts: '2026-09-28T11:00:00.000Z' });
 
-function room(t, { onReadingLatest } = {}) {
+function room(t, { onReadingLatest, initialScrollState = null } = {}) {
     // `rows` is the durable state; a read answers with the state it STARTED on.
-    // `older`, when set, is the one older page behind the recent window.
-    const server = { rows: [], older: null, window: { complete: true, truncated_by: [] }, gates: [] };
+    // `older`, when set, is the one older page behind the recent window;
+    // `pageFails` makes every page read (a saved place's too) fail.
+    const server = { rows: [], older: null, pageFails: false, window: { complete: true, truncated_by: [] }, gates: [] };
     const reads = [];
     const { prior, mount } = installDom(async (url) => {
+        if (String(url).includes('cursor=') && server.pageFails) {
+            return { ok: false, status: 503, json: async () => ({ error: 'unavailable' }) };
+        }
         if (String(url).includes('cursor=')) {
             return { ok: true, json: async () => ({ messages: [...server.older], page_cursor: 'page:older',
                 next_cursor: null, has_more: false, window: { complete: false, truncated_by: ['page'] } }) };
@@ -52,7 +56,7 @@ function room(t, { onReadingLatest } = {}) {
         updateUnreadBadge() {},
         stateSnapshots: { begin: () => ({ generation: 1, requestedAt: Date.now() }),
             gate() { return Promise.resolve(this.begin()); }, isCurrent: () => true, apply() {} },
-        chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true, onReadingLatest,
+        chatId: 2, idPrefix: 'chat', mountEl: mount, asPanel: true, onReadingLatest, initialScrollState,
     });
     t.after(() => { instance.destroy(); restoreDom(prior); globalThis.WebSocket = priorSocket; });
     const messages = globalThis.document.byId.get('chat-messages');
@@ -73,8 +77,14 @@ function room(t, { onReadingLatest } = {}) {
         messages.scrollTop = top;
         for (const handler of messages.listeners.get('scroll') || []) handler({});
     };
-    // A short viewport over the rows: scrollTop 0 is "reading further up".
-    const readUp = () => { messages.clientHeight = 10; scroll(0); };
+    // A short viewport over the rows: scrollTop 0 is "reading further up". The
+    // reader's own gesture (a wheel up) moved it there; only a gesture pages history.
+    const readUp = () => {
+        messages.clientHeight = 10; scroll(0);
+        for (const handler of messages.listeners.get('wheel') || []) {
+            handler({ type: 'wheel', deltaY: -1, target: messages, timeStamp: 0 });
+        }
+    };
     const readLatest = () => scroll(messages.scrollHeight);
     const setHidden = (hidden) => {
         globalThis.document.hidden = hidden;
@@ -154,7 +164,8 @@ test('a hidden document paints but does not read; showing it again reports the r
 test('a recent read that could not open the chat source reads nothing; an older gap does not block', async (t) => {
     const r = room(t);
     r.server.rows = [row(1)];
-    r.server.window = { complete: false, truncated_by: ['chat_source_unavailable'] };
+    // The server names no arrival it cannot read (test_an_unreadable_chat_source_leaves_the_arrival_unknown).
+    r.server.window = { complete: false, truncated_by: ['chat_source_unavailable'], latest_message: null };
     const gap = await r.instance.refreshHistory({ revision: 1 });
     assert.deepEqual([gap.painted, Boolean(gap.read)], [false, false]);
     r.server.window = { complete: false, truncated_by: ['archive_floor', 'progress_unreadable_source'] };
@@ -336,6 +347,31 @@ test('an older page that shows the late answer on screen is an arrival without a
     assert.equal((await r.instance.refreshHistory({ revision: 4 })).read, true);
 });
 
+// A reopened room first returns to its saved place. Until it is there, the rows
+// painted meanwhile are not where the reader is: a saved page that cannot be read
+// keeps the place pending, and the reader's own gesture then decides.
+test('a saved place still being restored is not reading; the reader\'s own gesture decides', async (t) => {
+    let arrivals = 0;
+    const r = room(t, { onReadingLatest: () => { arrivals += 1; }, initialScrollState: {
+        scrollTop: 0, stick: false, historyAnchor: null, history: { focus: 0, pages: [{
+            id: 'history-page-1-0', chain: 1, index: 0, requestCursor: 'saved:0', nextCursor: null,
+            hasMore: false, rows: 1 }] } } });
+    r.server.pageFails = true;
+    r.server.rows = [row(1)];
+    r.server.window = { complete: true, truncated_by: [], latest_message: { history_id: 'chat:1', out_of_order: false } };
+    const opened = await r.instance.refreshHistory({ revision: 1 });
+    assert.deepEqual(r.shown(), ['chat:1'], 'the newest message is painted, on screen');
+    assert.deepEqual([opened.painted, opened.read], [true, false], 'but the reader\'s place is not settled');
+    r.scroll(0);
+    assert.equal(arrivals, 0, 'a scroll while the saved place is pending is no arrival');
+    for (const handler of r.messages.listeners.get('wheel') || []) {
+        handler({ type: 'wheel', deltaY: 1, target: r.messages, timeStamp: 0 });
+    }
+    r.scroll(0);
+    assert.equal(arrivals, 1, 'the reader\'s own gesture ends the restoration: they are at the newest message');
+    assert.equal((await r.instance.refreshHistory({ revision: 1 })).read, true);
+});
+
 // The page is applied before the frame that draws it; the controls and the
 // viewport settle in that frame, without a scroll to report the reader.
 test('an older page takes the edge again once drawn', async (t) => {
@@ -357,6 +393,7 @@ test('an older page takes the edge again once drawn', async (t) => {
     globalThis.requestAnimationFrame = (fn) => { frames.push(fn); return frames.length; };
     try {
         r.readUp();
+        for (const fn of frames.splice(0)) fn(); // the gesture's own frame asks for the page
         await until(() => r.shown().includes('chat:9'));
         assert.equal(arrivals, 0, 'as applied, the late answer is still above the fold');
         top = 0;

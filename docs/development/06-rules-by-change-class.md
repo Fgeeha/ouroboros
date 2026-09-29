@@ -613,36 +613,35 @@ and what enforces each.
 
 #### Subscription transport
 
-- Claudexor model calls are a transport, not delegated reasoning: model content and
-  native continuation stay byte-faithful through the purpose-bound engine operation;
-  never inject its credentials, run its tools, compact inside the adapter or silently
-  repeat a generation. A lost connection rejoins the same operation ID, unknown stays
-  unknown, ACK only after the private CAS owns the exact result. Failed-response capture
-  uses the catalog's optional query, frozen before create and reused under the same
-  idempotency key (absence keeps the legacy shape); received bytes and exception chains
-  stay private, diagnostics compact. A known terminal with unusable output is a
-  settled provider result plus local rejection (`stream_rejected`), never unknown or
-  not-dispatched — keep both markers across sync, async and process boundaries; a
-  local rejection never rotates accounts. A round the ENGINE says another model answered
-  is not that class; the host matches no model strings.
-- Host hints are chosen by their caller from transport capability; an explicitly
-  unsupported option refuses rather than being silently dropped and retried. Submitted
-  options are recorded beside applied options on the usage row (absent report =
-  unknown), and that record covers every submitted option while the owner line speaks
-  only for the thinking horizon: the first changed reasoning effort of each model in a
-  task emits one typed owner line (keyed by task and model, never per round, naming
-  only the reporting route). A mismatch is disclosure, never a dispatch gate.
-- The engine's active-turn token is a transport fact: the CALLER owns the slot
-  (`llm_claudexor.ModelTurnState` on the loop context, also used by consciousness);
-  only the engine boundary writes it. Fresh slot per logical
-  turn, cleared when dispatch leaves this transport; never derived from message roles,
-  prose or the last stored assistant envelope (BIBLE P5); never checkpointed (a cold
-  restart starts empty); never forked by a reprepare, thread offload or kwargs copy;
-  a dispatched durable result updates it; released `invalid_continuation` repair clears
-  it with message envelopes. Other non-dispatched, unknown or legacy results preserve
-  it; never in usage, events, progress or task cards. Opt-in is gated on the last SUCCESSFUL handshake's version —
-  not the next-spawn pin, not a liveness projection a failed probe can blank (WHY:
-  ARCHITECTURE §6 "The live turn slot"; the `llm_claudexor.py` docstring).
+- Claudexor preserves model content/native continuation bytes: no credential
+  injection, tools, adapter compaction or silent regeneration. Lost control rejoins
+  the same operation ID; unknown stays unknown. ACK after private CAS owns exact
+  result bytes. Freeze catalog-advertised failure/effort queries before create for
+  same-key rejoin; absent flags keep legacy shape. Bytes/exception chains private; diagnostics compact. Unusable terminals settle with
+  `stream_rejected`, never unknown/not-dispatched; keep both across sync/async/process boundaries. Local rejection never rotates accounts.
+  Only the engine classifies substitution; no host model-string matching.
+- Caller hints use capabilities; explicitly unsupported options refuse. Record
+  submitted options and provider `appliedOptions` echoes; absent keys stay unknown.
+  Effort appears in usage/events/Logs, not automatic chat/toasts/incidents or a
+  mismatch gate. Keep substitution/terminal notices and weaker-reviewer plan facts.
+- `effort_evidence.py` validates model `effortResolution` (stored as
+  `effort_resolution`) and the unique final session `final/telemetry.yaml` attempt.
+  Live/late reads share `model_effort_usage`; missing/malformed clears stale reports.
+  `submitted` is preparation, not dispatch; null means omitted, not `none`.
+  Native `parameter` may be known when submitted is null and is required otherwise.
+  Paired `observed`/`observedSource` report provider evidence; `source` names
+  resolution authority. Preserve source-qualified `downward`/`floor` and future
+  tokens in engine-native order, never re-rank by host preference.
+- The engine's active-turn token is transport, owned by the caller's
+  `llm_claudexor.ModelTurnState` slot (including consciousness); only the engine
+  boundary writes it. Start empty per logical turn and cold restart; clear on
+  departure from this transport. Never derive it from messages (BIBLE P5), copy
+  it on reprepare/offload, checkpoint it or publish it in usage/events/cards.
+  A dispatched durable result updates it; released `invalid_continuation` clears
+  it with message envelopes. Other non-dispatched, unknown or legacy results
+  preserve it. Opt in by the last successful handshake version, not a next-spawn
+  pin or failed liveness probe (ARCHITECTURE §6 "The live turn slot";
+  `llm_claudexor.py` docstring).
 - Pass `model_role` and captured account at every helper/reviewer seam: shared model
   names do not share pins; account evidence remains source/profile/fingerprint-bound.
   Manual context sizing grants no scope authority; ACK binds the actual route.
@@ -679,8 +678,12 @@ and what enforces each.
   dialect, no Responses migration, owner `none` on direct Anthropic =
   `thinking.type=disabled` (`tests/test_request_wire_contract.py`,
   `tests/test_openai_chat_custom_contract.py`, `tests/test_anthropic_native_custody.py`).
-  `usage.request_wire` is one call's terminal candidate; nested aggregation keeps the
-  ordered `request_wire_history` with explicit omission accounting.
+  `usage.request_wire` is a call's terminal candidate; nested aggregation preserves
+  `request_wire_history` order/omissions. Legacy `applied_effort` is sent candidate,
+  never provider-applied. Capture preference before native projection; separate
+  request/sent/report. Positive field-bound enums need
+  no scalar echo; negative quotes prescribe nothing, value rejection cannot drop
+  the carrier. Existing attempt/pricing/Stop/deadline limits apply.
 - Every core-mediated physical provider send goes through
   `usage_accounting.execute_physical_attempt[_async]` (`tests/test_usage_accounting.py`);
   custody classifiers read the explicit `__cause__` chain, never `__context__`, and an
@@ -854,8 +857,7 @@ and what enforces each.
   the same incident pair naming both models, the account the send's own binding
   selects when the route has accounts (a task-local wait override included, never the
   configured value alone) and the typed failure reason when the round record has one;
-  the applied-option mismatch line rides the same callable, and the frozen
-  `ToolContext.emit_progress_fn` takes one argument, never the pair.
+  the frozen `ToolContext.emit_progress_fn` takes one argument, never the pair.
 - Timeout classes are separate axes. A transport timeout
   (`OUROBOROS_LLM_TRANSPORT_READ_TIMEOUT_SEC`) bounds only a dead socket — never a
   reasoning cutoff or evidence of a stall. API review uses it as a settlement fallback
@@ -1037,8 +1039,10 @@ and what enforces each.
   and failures per operation; repeated edges cannot turn deduplicated failure into
   success. New operations retry durable sources. Capacity, publication order and
   paid identity stay separate.
-- Mirror actual split-root execution start/binding into the canonical result through
-  its terminal-preserving writer. Recover legacy bindings only from positive child
+- Mirror actual split-root or split-subagent execution start/attempt/binding into
+  the canonical result through its terminal-preserving writer; copyback transfers
+  a child's terminal occurrence only for the attempt the canonical row names, and a
+  start written without it stays unknown. Recover legacy bindings only from positive child
   start plus existing queue/worker orphan proof, never while pending/cancelled and
   never as permission to resume.
 - `headless.prepare_terminal_task_files` adopts answer, output files and receipt

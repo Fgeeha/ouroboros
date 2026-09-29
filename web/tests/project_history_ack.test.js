@@ -169,8 +169,9 @@ test('only the Project room paint path posts a read cursor', () => {
 });
 
 // A question opened from Main (DESIGN "Project unread dot"): landing on it is not
-// reading the newer messages below it. The reveal is one transaction — its paint
-// never joins an acknowledging request, and nothing is acknowledged until it ends.
+// reading the newer messages below it. The reveal is one transaction — the question
+// owns the viewport before history I/O, its paint never joins an acknowledging
+// request, and nothing is acknowledged until it ends.
 function revealHarness() {
     const acked = [], calls = [], reveals = [];
     const pending = (list) => { let settle; const promise = new Promise((resolve) => { settle = resolve; }); list.push({ settle }); return promise; };
@@ -197,10 +198,10 @@ function revealHarness() {
         markProjectViewed: async (id, revision) => { acked.push([id, revision]); },
         console: { error() {} },
     });
-    vm.runInContext(`let projectNavigationGeneration = 1;\n${lift('freshProjectRow')}\n${ackSource}
+    vm.runInContext(`${lift('freshProjectRow')}\n${ackSource}
         ${lift('revealProjectQuestion')}
         globalThis.api = { ack: acknowledgeProjectAfterPaint,
-            reveal: (inst) => revealProjectQuestion(lastProjectRows[0], inst, projectNavigationGeneration, 't1', 'q1') };`, context);
+            reveal: (inst) => revealProjectQuestion(lastProjectRows[0], inst, 't1', 'q1') };`, context);
     return { acked, calls, reveals, inst, project, context, api: context.api };
 }
 
@@ -210,6 +211,7 @@ test('opening a question supersedes an acknowledgement in flight instead of join
     const h = revealHarness();
     const ordinary = h.api.ack(h.project, h.inst);
     const revealed = h.api.reveal(h.inst);
+    assert.equal(h.reveals.length, 1, 'the question owns the viewport before either history or detail I/O');
     await flush();
     assert.equal(h.calls.length, 2, 'the question paint is its own request, not the one in flight');
     h.calls[0].settle({ painted: true, read: true });
@@ -217,7 +219,7 @@ test('opening a question supersedes an acknowledgement in flight instead of join
     assert.deepEqual(h.acked, [], 'the superseded request acknowledges nothing');
     h.calls[1].settle({ painted: true, read: true });
     await flush();
-    assert.equal(h.reveals.length, 1, 'the question is revealed after its paint');
+    assert.equal(h.calls.length, 2, 'no read decision while the question is still being revealed');
     h.reveals[0].settle(true);
     await flush();
     h.calls[2].settle({ painted: true, read: false });
@@ -270,4 +272,61 @@ test('a reopened pending-work survivor never joins the paint cancelled when it w
     h.calls[1].settle({ painted: true, read: true });
     await reopened;
     assert.deepEqual(h.acked, [['p1', 5]]);
+});
+
+// A state snapshot that still shows the open room unread offers the read decision
+// again through the real renderProjectsNav → acknowledgeProjectAfterPaint path: a
+// failed POST is retried by the next poll even when the snapshot is unchanged, and
+// the retry still posts only a read (painted, shown, the reader at the newest message).
+function pollHarness({ read = true, hidden = false, failures = 1 } = {}) {
+    const posts = [], refreshes = [];
+    let failing = failures;
+    const inst = {
+        page: { hidden, isConnected: true }, cancelHistoryPaint() {},
+        refreshHistory: async ({ revision }) => { refreshes.push(revision); return { painted: true, read, revision }; },
+    };
+    const context = vm.createContext({
+        state: { projectSeenRevision: {} }, navState: { activeProjectId: 'p1' },
+        projectInstances: new Map([['p1', inst]]), projectPaintRequests: new Map(), projectReveals: new Map(),
+        projectActivityIndex: null, knownProjectsJson: '', lastProjectRows: [],
+        closeProjectPanel() {}, paintProjectsNav() {}, syncNavigationState() {}, patchProjectActivityMarkers() {},
+        refreshSharedProjectSeen() {},
+        fetchJson: async (_url, init = {}) => {
+            const body = JSON.parse(init.body);
+            posts.push(body.project_seen_revision);
+            if (failing-- > 0) throw new Error('offline');
+            return { ok: true, project_seen_revision: body.project_seen_revision };
+        },
+        console: { error() {} },
+    });
+    vm.runInContext(`${ackSource}\n${lift('markProjectViewed')}\n${lift('mergeProjectSeenRevisions')}
+        ${lift('renderProjectsNav')}
+        globalThis.poll = () => renderProjectsNav([{ id: 'p1', name: 'P', chat_id: 9, lifecycle: 'active',
+            visible_revision: 5 }], [9]);`, context);
+    const poll = async () => { context.poll(); for (let i = 0; i < 5; i++) await flush(); };
+    return { context, posts, refreshes, poll, unread: () => context.lastProjectRows[0]?._unread };
+}
+
+test('a failed read acknowledgement is retried by the next unchanged state poll', async () => {
+    const h = pollHarness();
+    await h.poll();
+    assert.deepEqual(h.posts, [{ p1: 5 }], 'the reader at the newest message is acknowledged');
+    assert.equal(h.unread(), true, 'the failed POST leaves the room unread');
+    await h.poll();
+    assert.deepEqual(h.posts, [{ p1: 5 }, { p1: 5 }], 'the same snapshot retries the same revision');
+    assert.equal(h.context.state.projectSeenRevision.p1, 5);
+    assert.equal(h.unread(), false, 'the confirmed cursor clears the dot');
+    await h.poll();
+    assert.equal(h.posts.length, 2, 'a read room posts nothing more');
+});
+
+for (const [name, options, refreshes] of [
+    ['whose reader is not at the newest message', { read: false }, 3],
+    ['that is hidden', { hidden: true }, 0],
+]) test(`state polls never acknowledge a room ${name}`, async () => {
+    const h = pollHarness({ ...options, failures: 0 });
+    for (let i = 0; i < 3; i++) await h.poll();
+    assert.deepEqual(h.posts, [], 'retrying the decision is not acknowledging');
+    assert.equal(h.refreshes.length, refreshes, 'a shown room re-reads through the existing receipt; a hidden one does nothing');
+    assert.equal(h.unread(), true);
 });

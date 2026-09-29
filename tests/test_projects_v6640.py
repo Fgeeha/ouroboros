@@ -524,7 +524,8 @@ def test_project_lifecycle_rows_render_design_system_action_static_contract():
     )
     # chat.js only delegates; the lifecycle-row module puts the one Project reference
     # (web/modules/project_reference.js) into the shared action composition.
-    assert "if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName });" in chat
+    assert "if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName," in chat
+    assert "terminalTime: opts.terminalTime, addedAt: ts, completion: systemType === 'project_completion_summary'" in chat
     render = (root / "web" / "modules" / "project_answer.js").read_text(encoding="utf-8")
     assert "createSystemMessageActions(projectReference(" in render
     assert "row.className = 'system-message-actions'" in helpers

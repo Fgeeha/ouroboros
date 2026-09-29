@@ -69,7 +69,7 @@ def test_history_never_fabricates_a_terminal_status_for_legacy_bg_rows(tmp_path)
 
 def test_live_card_disclosure_is_explicit_user_owned_state():
     src = _read("web/modules/chat.js")
-    assert "const explicitCardExpansion = new Map();" in src
+    assert "const explicitCardExpansion = new Map(initialScrollState?.disclosures?.cards || []);" in src
     assert "explicitCardExpansion.set(record.groupId, nowExpanded);" in src
     assert "explicitCardExpansion.has(normalizedGroupId)" in src
     assert "explicitCardExpansion.get(normalizedGroupId)" in src
@@ -85,8 +85,9 @@ def test_live_card_timeline_only_follows_when_pinned():
         src.index("export function createTimelineAnchors")
     ]
     assert renderer.count("const pinned =") == 2
-    assert "const prevTop = el.scrollTop;" in renderer
-    assert "el.scrollTop = pinned ? el.scrollHeight : prevTop;" in renderer
+    assert "const prevTop = el.scrollTop, newest = el.lastElementChild;" in renderer
+    # Only a new newest line follows; a disclosure or late full output keeps its place.
+    assert "el.scrollTop = pinned && el.lastElementChild !== newest ? el.scrollHeight : prevTop;" in renderer
     assert "record.root.dataset.expanded === '1' && pinned" in renderer
 
 
@@ -98,8 +99,11 @@ def test_reconnect_merges_user_rows_without_clearing_visible_history():
     replay = src[src.index("function applyHistoryMessages"):src.index("async function syncHistory")]
     add = src[src.index("function addMessage"):src.index("function updateMessageAnnotation")]
     # Reconnect still fetches the canonical source and includes owner dialogue.
-    assert "await apiClient.chatHistory({ chatId })" in sync
-    assert "applyHistoryMessages(messages, { fromReconnect, includeUser: true });" in sync
+    assert "await fetchHistory(null)" in sync
+    assert "apiClient.chatHistory({ chatId, cursor, ...options })" in src
+    assert "historyPager.acceptRecent(data)" in sync
+    assert "if (result.status !== 'applied') applyHistoryMessages(messages, { fromReconnect });" in sync
+    assert "includeUser = true, archived = false" in replay
     assert "if (!includeUser && msg.role === 'user') continue;" in replay
     # Keyed reconciliation replaces the former clear-and-rebuild requirement:
     # physical rows dedupe and an offline/local echo is adopted in place.

@@ -14,7 +14,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D04 | Tool execution: registry, access & typed results | 21 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 29 | 0 |
 | D06 | Review stack | 71 | 0 |
-| D07 | Delegation, subagents & Claudexor | 57 | 0 |
+| D07 | Delegation, subagents & Claudexor | 58 | 0 |
 | D08 | Supervisor: queue, workers, events & runtime control | 50 | 0 |
 | D09 | Cancellation, owner control & process custody | 14 | 0 |
 | D10 | Git, update & release machinery | 29 | 0 |
@@ -24,11 +24,11 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D14 | Skills & extensions | 56 | 0 |
 | D15 | Memory, knowledge, consciousness & self-evolution | 23 | 0 |
 | D16 | Observability, usage accounting & cost | 14 | 0 |
-| D17 | Projects, workspaces & task results | 25 | 0 |
+| D17 | Projects, workspaces & task results | 26 | 0 |
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **597** | **0** |
+| **total** | | **599** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -447,6 +447,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/delegate_target_drift.py`
 - `ouroboros/delegate_terminal.py`
 - `ouroboros/depth_evidence.py`
+- `ouroboros/effort_evidence.py`
 - `ouroboros/gateways/__init__.py`
 - `ouroboros/gateways/claudexor.py`
 - `ouroboros/gateways/claudexor_run_events.py`
@@ -790,6 +791,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/task_results.py`
 - `ouroboros/task_status.py`
 - `ouroboros/terminal_projection.py`
+- `ouroboros/terminal_time.py`
 - `ouroboros/tools/project_journal.py`
 - `ouroboros/workspace_admission.py`
 - `ouroboros/workspace_executor.py`

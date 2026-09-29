@@ -489,6 +489,7 @@
  * @property {string=} project_id
  * @property {string=} project_name
  * @property {string=} handoff_id  // immutable origin/destination receipt identity
+ * @property {Object=} terminal_time  // host-owned occurrence; ts remains publication time
  * @property {string=} completion_answer  // a Project root's model-authored final answer, mirrored into Main
  * @property {number=} chat_id
  * @property {boolean=} project_thread  // server-stamped: chat_id is a reserved Project thread; Main never adopts it even before projectChatIds learns the project
@@ -743,6 +744,7 @@
  * @property {boolean=} outcome_final  // true only after the canonical task outcome settles; false marks a pre-finalization narrative
  * @property {{status: string, phase: string, ts: string, provenance: string, model_execution?: Object}=} historical_terminal
  * @property {Object=} model_execution
+ * @property {{v: 1, occurred_at: ?string, source: "executor_terminal"|"unknown", attempt: Object}=} terminal_time  // a task_summary row's host end fact; `ts` stays its publication time
  */
 
 /**
@@ -1558,12 +1560,13 @@ export const GATEWAY_CONTRACT_VERSION = '7.5.1';
  * @property {string|null} next_cursor Opaque room-bound older continuation.
  * @property {string|null} page_cursor Replays a frozen page; null for an unavailable source boundary.
  * @property {{complete:boolean,truncated_by:Array<string>,latest_message?:({history_id:string,out_of_order:boolean}|null)}} window
- *   Whole-history coverage. A recent Project read also names the standalone message that
+ *   Bounds/gaps of this response. A recent Project read also names the standalone message that
  *   arrived last (null: its arrival is unknown, as while the live chat's last line is
  *   unfinished, and on a replayed page, frozen before later arrivals), which must itself be
  *   on screen for the room's read receipt, in its ordinary place too;
  *   out_of_order: the bottom is not where it is (it sorts above earlier arrivals, or lies
  *   before the recent read).
+ * @property {{v:1,view:string,upper:Object,spans:Object}=} coverage Delivered physical byte spans, after deferrals.
  * @property {string} [next_before_ts] Legacy field retained for compatibility.
  * @property {string} [error]
  * @property {string} [reason_code]

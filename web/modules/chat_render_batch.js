@@ -12,10 +12,10 @@ const nodePosition = node => node?.dataset?.historySource
  * There is no "Load newer" control. Whether a newer page is cached is a fact
  * about the bounded page cache, not about what the reader can see, so a button
  * driven by it appeared under a fully visible transcript and asked for one click
- * per cached page. Loading newer pages is automatic at the bottom edge; the
+ * per cached page. Loading missing pages uses a positive gesture at an unambiguous island edge; the
  * floating scroll-to-latest button remains the only return-to-present control.
  */
-export function createHistoryControls(messagesDiv) {
+export function createHistoryControls(messagesDiv, statusHost = null) {
     const doc = messagesDiv.ownerDocument;
     const root = doc.createElement('div');
     root.className = 'chat-load-older';
@@ -43,34 +43,40 @@ export function createHistoryControls(messagesDiv) {
         },
         // A failure is shown where the loading state was; elsewhere the reader
         // keeps the transcript they have and the next sync reconciles it.
-        endRecent(error = null) { recent = error && recent ? { error } : null; },
+        endRecent(error = null) { recent = error ? { error } : null; },
         recentFailed: () => Boolean(recent?.error),
-        render(snapshot, windows) {
+        render(snapshot, coverage = {}, approximate = false) {
             const error = recent?.error || snapshot.error;
             const hydrating = Boolean(recent?.loading);
             const loading = hydrating || Boolean(snapshot.loading);
             const changedView = error?.body?.reason_code === 'history_view_changed';
-            const noteText = hydrating ? ''
-                : recent?.error ? `Could not load messages: ${recent.error.message || recent.error}`
-                : error ? String(error.message || error)
-                : snapshot.olderExhausted ? 'Beginning of saved history' : '';
-            const buttonHidden = !error && !snapshot.canOlder && !hydrating;
+            const incomplete = coverage.gaps === true;
+            let noteText = error ? 'Some saved history could not be loaded.'
+                : hydrating && feedIsEmpty() ? 'Loading saved history…'
+                : incomplete ? 'Some saved history is not loaded. Shown messages may have gaps.'
+                : !hydrating && coverage.complete ? 'Beginning of saved history' : '';
+            if (approximate) noteText += `${noteText ? ' ' : ''}Saved position could not be restored exactly.`;
+            // One note moves into persistent chrome when it describes the reading
+            // window; the ordinary beginning marker belongs at the feed's start.
+            const host = statusHost && (error || incomplete || approximate || hydrating) ? statusHost : root;
+            if (note.parentNode !== host) host.appendChild(note);
+            note.classList.toggle('chat-history-status', host === statusHost);
+            const buttonHidden = !error && !snapshot.canOlder && !snapshot.canNewer && !coverage.horizonGap && !hydrating;
             const fields = [
                 [button, { textContent: loading ? 'Loading…'
-                    : changedView ? 'Refresh history' : error ? 'Retry loading messages' : 'Load older messages',
+                    : changedView ? 'Refresh history' : error ? 'Retry loading messages' : 'Load more history',
                     disabled: loading, hidden: buttonHidden }],
                 [note, { textContent: noteText, hidden: !noteText }],
-                [root, { hidden: buttonHidden && !noteText }],
+                [root, { hidden: buttonHidden && (host !== root || !noteText) }],
             ];
             for (const [node, values] of fields) {
                 for (const [key, value] of Object.entries(values)) if (node[key] !== value) node[key] = value;
             }
             if (hydrating) root.setAttribute('aria-busy', 'true'); else root.removeAttribute('aria-busy');
             if ((snapshot.initialized || error || hydrating) && !root.isConnected) messagesDiv.prepend(root);
-            const hasGaps = [...windows].some(value => (value?.truncated_by || [])
-                .some(cause => !['quota', 'archive_floor', 'lineage_cap', 'page'].includes(cause)));
-            return { complete: Boolean(snapshot.initialized && snapshot.olderExhausted
-                && !snapshot.canNewer && !hasGaps && !error), truncated_by: hasGaps ? ['read_gap'] : [] };
+            root.classList.toggle('has-gaps', incomplete || Boolean(error));
+            return { ...coverage, complete: Boolean(coverage.complete && !error),
+                error: Boolean(error), note: noteText, truncated_by: incomplete ? ['unloaded'] : [] };
         },
     };
 }
@@ -286,7 +292,18 @@ export function syncLiveCardToggle(record) {
 // Incremental timeline DOM writes share the Chat viewport boundary but own no
 // scroll state. Keeping them here also keeps the byte-capped instance factory
 // focused on event projection rather than HTML replacement mechanics.
-export function createLiveCardTimelineRenderer({ withStableViewport, buildTimelineItemHtml, isReplayActive = () => false }) {
+function timelineItemForAnchor(record, anchor) {
+    if (!anchor?.lineKey) return null;
+    const owner = anchor.cardChain?.[0]?.taskId;
+    if (owner && record.groupId && owner !== record.groupId) return null;
+    // Mounted keys preserve focus/selection in one session; the row or evolving
+    // lifecycle identity survives a fresh card built from saved history.
+    if (anchor.lineHistoryId) return record.items.find(item => item.historyId === anchor.lineHistoryId) || null;
+    if (anchor.lineLifecycleKey) return record.items.find(item => item.dedupeKey === anchor.lineLifecycleKey) || null;
+    return record.items.find(item => item.lineKey === anchor.lineKey) || null;
+}
+
+export function createLiveCardTimelineRenderer({ withStableViewport, buildTimelineItemHtml, isReplayActive = () => false, initialAnchor = null, hydrate = () => {} }) {
     // Remember generated markup, not the enhanced DOM: a timestamp update must
     // not undo markdown controls or replace a body the reader has selected.
     const rendered = new WeakMap();
@@ -333,6 +350,13 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
         return true;
     };
     const nodeFor = (item, record) => {
+        if (timelineItemForAnchor(record, initialAnchor) === item) {
+            if (initialAnchor.lineExpanded) {
+                record.expandedLineKeys.add(item.lineKey);
+                if (item.truncated && item.fullRef && !item.fetchedFull && !item._fetchingFull) hydrate(item, record);
+            } else record.expandedLineKeys.delete(item.lineKey);
+            initialAnchor = null;
+        }
         const doc = record.timelineEl?.ownerDocument || globalThis.document;
         const wrapper = doc.createElement('div');
         wrapper.innerHTML = buildTimelineItemHtml(item, record).trim();
@@ -345,7 +369,7 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
         return withStableViewport(() => {
             const el = record.timelineEl;
             const pinned = el.scrollHeight - el.scrollTop - el.clientHeight <= 24;
-            const prevTop = el.scrollTop;
+            const prevTop = el.scrollTop, newest = el.lastElementChild;
             const byKey = new Map(Array.from(el.children).map((node) => [node.dataset.liveLineKey, node]));
             const active = el.ownerDocument?.activeElement;
             const caret = textControlCaret(active);
@@ -389,7 +413,9 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
                     }
                 }
             }
-            if (changed) el.scrollTop = pinned ? el.scrollHeight : prevTop;
+            // Only a new newest line keeps a pinned timeline at its end; a disclosure
+            // or late full output keeps the line being read where it is.
+            if (changed) el.scrollTop = pinned && el.lastElementChild !== newest ? el.scrollHeight : prevTop;
             return changed && Boolean(el.isConnected);
         });
     };
@@ -427,6 +453,27 @@ export function createLiveCardTimelineRenderer({ withStableViewport, buildTimeli
     };
 }
 
+// A live card's header chrome: a saved role inside its owner card.
+const CARD_HEADER = [
+    '[data-live-summary-button]',
+    '[data-live-title]',
+    '[data-live-activity]',
+    '[data-live-meta]',
+    '.chat-live-actions',
+    '.chat-live-project-card-btn',
+];
+
+// The feed's bounded, separately scrolling boxes: a card timeline, a fetched
+// full output, a Review attempt detail. Each clips what it holds.
+const BOUNDED_BOX = '[data-live-timeline], .chat-live-line-body-full, [data-review-attempt-detail]';
+
+// A node's own bounded reading box: an expanded line's fetched full output or
+// a Review attempt detail. The owner card timeline is found from the node.
+function innerBox(node) {
+    if (node?.matches?.('[data-review-attempt-detail]')) return node;
+    return node?.matches?.('.chat-live-line') ? node.querySelector?.(':scope > .chat-live-line-body-full') || null : null;
+}
+
 /**
  * Timeline viewport anchors (extracted verbatim from chat.js at the byte
  * ratchet): capture the first visible timestamped node and restore its exact
@@ -454,6 +501,12 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
         // child summary or timeline line. Preserve that visible boundary, not
         // merely the root card whose own top may be far above the viewport.
         let node = topNode;
+        if (!topNode.dataset?.historyId && !topNode.classList.contains('chat-live-card')) {
+            // Media owns a layout wrapper around keyed bubbles. Save the
+            // physical child being read, not an unidentifiable wrapper.
+            node = [...topNode.querySelectorAll('[data-history-id]')]
+                .find(child => child.getBoundingClientRect().bottom > messagesRect.top) || topNode;
+        }
         if (topNode.classList.contains('chat-live-card')) {
             const selector = [
                 '.chat-live-card',
@@ -493,6 +546,12 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 .filter(({ rect }) => rect.top <= messagesRect.top && rect.bottom > messagesRect.top)
                 .sort((a, b) => b.depth - a.depth);
             node = belowTop[0]?.node || crossing[0]?.node || topNode;
+            // Header chrome heads what it discloses: when it is all that precedes
+            // an expanded line, that line is being read, and anchoring it lets a
+            // reopen expand it again instead of saving the header alone.
+            const header = candidate => candidate.classList.contains('chat-live-card') || CARD_HEADER.some(role => candidate.matches(role));
+            const content = header(node) ? belowTop.find(({ node: candidate }) => !header(candidate))?.node : null;
+            if (content?.matches('.chat-live-line') && content.dataset?.expanded === '1') node = content;
             if (node === topNode && topNode.getBoundingClientRect().top < messagesRect.top) {
                 // The card's visible part holds nothing anchorable (a wait row, a
                 // block without work): keep the reader's view of what FOLLOWS the
@@ -505,6 +564,32 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 });
                 if (following) { topNode = following; node = following; }
             }
+        }
+
+        // A visible bounded full output or Review detail the reader entered
+        // (the top edge is inside it) or scrolled is the place being read; its
+        // line or detail anchors, so reopening expands and scrolls it again.
+        // Visible means one common part inside the feed and every bounded box
+        // around it: overlapping each clip at different places shows nothing.
+        const shown = (box, rect) => {
+            let top = Math.max(rect.top, messagesRect.top), bottom = Math.min(rect.bottom, messagesRect.bottom);
+            for (let clip = box.parentElement?.closest?.(BOUNDED_BOX); clip && messagesDiv.contains(clip);
+                clip = clip.parentElement?.closest?.(BOUNDED_BOX)) {
+                const edge = clip.getBoundingClientRect();
+                top = Math.max(top, edge.top); bottom = Math.min(bottom, edge.bottom);
+            }
+            return top < bottom;
+        };
+        const reading = Array.from(messagesDiv.querySelectorAll?.('.chat-live-line-body-full, [data-review-attempt-detail]') || [])
+            .map(box => ({ box, rect: box.getBoundingClientRect() }))
+            .filter(({ box, rect }) => box.getClientRects().length && shown(box, rect)
+                && (box.scrollTop > 0 || rect.top < messagesRect.top))
+            .sort((a, b) => a.rect.top - b.rect.top)
+            .map(({ box }) => (box.matches('[data-review-attempt-detail]') ? box : box.closest('.chat-live-line')))
+            .find(owner => owner && nodes.some(item => item.contains(owner)));
+        if (reading) {
+            node = reading;
+            topNode = nodes.find(item => item.contains(reading));
         }
 
         const cardChain = [];
@@ -521,18 +606,30 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
         }
 
         const ts = topNode.dataset?.ts || '';
-        const anchorRole = [
-            '[data-live-summary-button]',
-            '[data-live-title]',
-            '[data-live-activity]',
-            '[data-live-meta]',
-            '.chat-live-actions',
-            '.chat-live-project-card-btn',
-        ].find((candidate) => node.matches?.(candidate)) || '';
+        const anchorRole = CARD_HEADER.find((candidate) => node.matches?.(candidate)) || '';
+        const lineKey = node.matches?.('.chat-live-line') ? (node.dataset?.liveLineKey || '') : '';
+        const lineItem = lineKey ? (liveCardRecords.get(cardChain[0]?.taskId)?.items || [])
+            .find(item => item.lineKey === lineKey) : null;
+        const lifecycleKey = String(lineItem?.dedupeKey || '');
         return {
             node,
+            // The line's physical source selects its page; its immutable row or
+            // lifecycle key below selects the line inside that page's mixed card.
+            historyId: lineItem?.historyId || lineItem?.sourceHistoryId
+                || node.closest?.('[data-history-id]')?.dataset?.historyId
+                || topNode.dataset?.historyId || '',
+            reviewKey: ['reviewAttemptDetail', 'reviewAttempt', 'reviewGroup', 'reviewSection']
+                .find(key => node.dataset?.[key]) || '',
+            reviewValue: node.dataset?.reviewAttemptDetail || node.dataset?.reviewAttempt
+                || node.dataset?.reviewGroup || node.dataset?.reviewSection || '',
             cardChain,
-            lineKey: node.matches?.('.chat-live-line') ? (node.dataset?.liveLineKey || '') : '',
+            lineKey,
+            lineHistoryId: lineItem?.historyId || '',
+            lineLifecycleKey: (lineItem?.sourceHistoryId
+                || lifecycleKey.startsWith('subagent-lifecycle:')
+                || lifecycleKey.startsWith('task_done|')
+                || lifecycleKey.startsWith('cardrow|')) ? lifecycleKey : '',
+            lineExpanded: node.matches?.('.chat-live-line') && node.dataset?.expanded === '1',
             anchorRole,
             topNode,
             clientMessageId: topNode.dataset?.clientMessageId || '',
@@ -543,7 +640,7 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
         };
     }
 
-    function restoreVisibleTimelineAnchor(anchor) {
+    function restoreVisibleTimelineAnchor(anchor, { exact = false, cardOnly = false } = {}) {
         if (!anchor) return false;
         const isRendered = (node) => {
             if (!node?.isConnected || !messagesDiv.contains(node)) return false;
@@ -559,6 +656,36 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
         };
 
         if (restoreNode(anchor.node, anchor.offset)) return true;
+        // The saved node found: its owner timeline puts it back at its offset
+        // there (that scroll moves the node), then its own box scrolls. A box
+        // that is missing, or an own box that cannot reach its scroll, is not
+        // exact. A timeline at its scroll limit has done what it can: its node
+        // still takes the exact feed offset, and a reflowed earlier row only
+        // moves the box around it.
+        const restoreSaved = (node) => {
+            const timeline = node.closest?.('[data-live-timeline]'), inner = innerBox(node);
+            let settled = true;
+            if (Number.isFinite(anchor.timelineOffset)) {
+                const offset = () => node.getBoundingClientRect().top - timeline.getBoundingClientRect().top;
+                if (timeline) timeline.scrollTop += offset() - anchor.timelineOffset;
+                const miss = timeline ? offset() - anchor.timelineOffset : NaN;
+                settled = Boolean(timeline) && (Math.abs(miss) <= 1 || (miss > 0
+                    ? timeline.scrollTop >= timeline.scrollHeight - timeline.clientHeight - 1
+                    : timeline.scrollTop <= 0));
+            }
+            if (Number.isFinite(anchor.innerTop)) {
+                if (inner) inner.scrollTop = anchor.innerTop;
+                settled = settled && Boolean(inner) && Math.abs(inner.scrollTop - anchor.innerTop) <= 1;
+            }
+            return restoreNode(node, anchor.offset) && (settled || !exact);
+        };
+
+        const historyId = anchor.historyId || anchor.id;
+        if (historyId && !anchor.lineKey && !anchor.reviewKey && !anchor.anchorRole) {
+            const node = Array.from(messagesDiv.querySelectorAll('[data-history-id]'))
+                .find(item => item.dataset.historyId === historyId);
+            if (isRendered(node)) return restoreSaved(node);
+        }
 
         const cardChain = Array.isArray(anchor.cardChain) && anchor.cardChain.length
             ? anchor.cardChain
@@ -570,20 +697,31 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
             return isRendered(record?.root) ? record.root : null;
         };
         const ownerCard = resolveCard(cardChain[0]);
+        if (ownerCard && anchor.reviewKey) {
+            const node = Array.from(ownerCard.querySelectorAll('[data-review-section], [data-review-group], [data-review-attempt], [data-review-attempt-detail]'))
+                .find(item => item.dataset?.[anchor.reviewKey] === anchor.reviewValue);
+            if (isRendered(node)) return restoreSaved(node);
+        }
         if (ownerCard && anchor.lineKey) {
+            const item = timelineItemForAnchor(liveCardRecords.get(cardChain[0]?.taskId) || { items: [] }, anchor);
+            const lineKey = item?.lineKey || (anchor.lineHistoryId || anchor.lineLifecycleKey ? '' : anchor.lineKey);
             const line = Array.from(ownerCard.querySelectorAll('.chat-live-line'))
-                .find((candidate) => candidate.dataset?.liveLineKey === anchor.lineKey
+                .find((candidate) => candidate.dataset?.liveLineKey === lineKey
                     && candidate.closest('.chat-live-card') === ownerCard);
-            if (restoreNode(line, anchor.offset)) return true;
+            if (isRendered(line)) return restoreSaved(line);
         }
         if (ownerCard && anchor.anchorRole) {
             const roleNode = Array.from(ownerCard.querySelectorAll(anchor.anchorRole))
                 .find((candidate) => candidate.closest('.chat-live-card') === ownerCard);
-            if (restoreNode(roleNode, anchor.offset)) return true;
+            if (isRendered(roleNode)) return restoreSaved(roleNode);
         }
+        if (exact && (anchor.lineKey || anchor.reviewKey || anchor.anchorRole)) return false;
+        if (exact && cardChain.length && restoreNode(ownerCard, anchor.offset)) return true;
+        if (exact && !anchor.clientMessageId) return false;
         for (const entry of cardChain) {
             if (restoreNode(resolveCard(entry), entry.offset)) return true;
         }
+        if (cardOnly) return false;
 
         let node = isRendered(anchor.topNode) ? anchor.topNode : null;
         if (!node && anchor.clientMessageId) {
@@ -591,14 +729,34 @@ export function createTimelineAnchors({ messagesDiv, liveCardRecords }) {
                 (item) => item.dataset?.clientMessageId === anchor.clientMessageId
             ) || null;
         }
-        if (!node && anchor.ts) {
+        if (!node && anchor.ts && !exact) {
             const matches = Array.from(messagesDiv.children).filter((item) => item.dataset?.ts === anchor.ts);
             node = matches[anchor.ordinal] || matches[0] || null;
         }
         return restoreNode(node, anchor.topOffset ?? anchor.offset);
     }
 
-    return { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor };
+    function serializeTimelineAnchor(anchor = captureVisibleTimelineAnchor()) {
+        if (!anchor) return null;
+        const { node, topNode: _topNode, cardChain, ...fields } = anchor;
+        // A bounded box scrolls on its own: the node keeps its offset inside its
+        // owner timeline, and its own full output or Review detail its scroll.
+        const timeline = node?.closest?.('[data-live-timeline]'), inner = node && innerBox(node);
+        return { ...fields, cardChain: (cardChain || []).map(({ taskId, offset }) => ({ taskId, offset })),
+            ...(timeline && messagesDiv.contains(timeline) ? { timelineOffset:
+                node.getBoundingClientRect().top - timeline.getBoundingClientRect().top } : {}),
+            ...(inner ? { innerTop: inner.scrollTop } : {}) };
+    }
+
+    /** Positioning waits for the data owners of the saved place: the Review
+     * detail it names and the full output an expanded line is still fetching. */
+    function anchorOwnersReady(anchor, reviewReady) {
+        const taskId = anchor?.cardChain?.[0]?.taskId;
+        if (anchor?.reviewKey && !reviewReady(taskId)) return false;
+        const record = anchor?.lineExpanded && liveCardRecords.get(taskId);
+        return !(record && timelineItemForAnchor(record, anchor)?._fetchingFull);
+    }
+    return { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor, serializeTimelineAnchor, anchorOwnersReady };
 }
 
 /** Update one live timeline item using the same keys the card's producer owns.

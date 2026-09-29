@@ -352,7 +352,7 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
     const navigation = ++projectNavigationGeneration;
     if (navState.activeProjectId === project.id) {
         if (!openOnly) closeProjectPanel();
-        else if (taskId && quizId) await revealProjectQuestion(project, projectInstances.get(project.id), navigation, taskId, quizId);
+        else if (taskId && quizId) await revealProjectQuestion(project, projectInstances.get(project.id), taskId, quizId);
         return;
     }
     // perf2 P4.2: signal chat.js that a panel open is in flight so Main's
@@ -402,8 +402,13 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
         // ACK only the exact revision whose history was fetched and painted. chat.js
         // owns the paint receipt; an already-painted instance skips the forced
         // refetch — the server clamps the ACK, so no repaint is needed.
-        if (taskId && quizId) await revealProjectQuestion(project, inst, navigation, taskId, quizId);
-        else await acknowledgeProjectAfterPaint(project, inst, { forcePaint: !inst.hasPaintedHistory?.() });
+        if (taskId && quizId) await revealProjectQuestion(project, inst, taskId, quizId);
+        else {
+            // Every showing is a navigation: a plain reopen addresses no question
+            // and so voids a reveal that a hidden pending-work survivor still awaits.
+            void inst.revealQuestion?.(taskId, quizId);
+            await acknowledgeProjectAfterPaint(project, inst, { forcePaint: !inst.hasPaintedHistory?.() });
+        }
     } finally {
         projectPanelOpeningSince = 0;
     }
@@ -414,17 +419,18 @@ function freshProjectRow(project) {
 }
 
 // A question opened from Main is revealed BEFORE the read decision: landing on it
-// is not reading the newer messages below it. The reveal is one transaction: its
-// paint supersedes any request in flight, and no acknowledgement decides until
-// the reveal has ended, when this one does (DESIGN "Project unread dot").
-async function revealProjectQuestion(project, inst, navigation, taskId, quizId) {
+// is not reading the newer messages below it. The reveal is one transaction: the
+// addressed question owns the viewport before either history or detail I/O (its
+// chat-owned generation yields to later navigation), its paint supersedes any
+// request in flight, and no acknowledgement decides until the reveal has ended,
+// when this one does (DESIGN "Project unread dot").
+async function revealProjectQuestion(project, inst, taskId, quizId) {
     const reveal = {};
     projectReveals.set(project.id, reveal);
     try {
+        const revealed = inst?.revealQuestion?.(taskId, quizId);
         await acknowledgeProjectAfterPaint(project, inst, { forcePaint: true, paintOnly: true });
-        if (navigation !== projectNavigationGeneration || navState.activeProjectId !== project.id
-            || projectInstances.get(project.id) !== inst) return;
-        await inst?.revealQuestion?.(taskId, quizId);
+        await revealed;
     } finally {
         if (projectReveals.get(project.id) === reveal) projectReveals.delete(project.id);
     }
@@ -526,12 +532,15 @@ function renderProjectsNav(projects, projectChatIds, activityIndex = projectActi
     // rename action or keyboard navigation. Patch marker attributes in place.
     if (json === knownProjectsJson) {
         patchProjectActivityMarkers(activityIndex);
-        return;
+    } else {
+        knownProjectsJson = json;
+        lastProjectRows = rows;
+        paintProjectsNav();
+        syncNavigationState();
     }
-    knownProjectsJson = json;
-    lastProjectRows = rows;
-    paintProjectsNav();
-    syncNavigationState();
+    // Every snapshot that still shows the open room unread offers the read decision
+    // again, so an acknowledgement whose POST failed is retried by the next poll
+    // while its reader stays at the newest message; the receipt still decides.
     const active = rows.find((project) => project.id === navState.activeProjectId);
     if (active?._unread && active.lifecycle === 'active') {
         acknowledgeProjectAfterPaint(active);
@@ -674,7 +683,7 @@ function paintProjectsNav() {
         if (project._unread && !deleting) {
             const dot = document.createElement('span');
             dot.className = 'nav-unread-dot';
-            dot.title = 'New activity';
+            dot.title = 'Unread messages';
             btn.appendChild(dot);
             btn.classList.add('has-unread');
         }

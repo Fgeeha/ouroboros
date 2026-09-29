@@ -3,7 +3,7 @@ import { destroyChatMarkdown, enhanceChatMarkdown, mountChatMarkdown, renderChat
 import { renderPageHeader } from './page_header.js';
 import { PAGE_ICONS } from './page_icons.js';
 import { showToast } from './toast.js';
-import { decorateProjectRow } from './project_answer.js';
+import { decorateProjectRow, syncSavedProjectContext } from './project_answer.js';
 import { createProjectHandoffs, receiptNotice } from './project_handoff.js';
 import { bindComposerFileTargets, cleanupUploadedAttachments, createChatMedia, showTaskIncidentToast } from './chat_media.js';
 import { createChatDecision } from './chat_decision.js';
@@ -11,9 +11,10 @@ import { bindProjectWorkPointer } from './project_work_pointer.js';
 import { createModelWaitController, isModelWaitReference } from './model_wait.js';
 import { clientSurfaceField } from './client_surface.js';
 import { syncResultFilesItem } from './result_files.js';
-import { createChatHistoryPager } from './chat_history.js';
+import { createChatReadingPosition } from './chat_reading_position.js';
+import { createChatHistoryPager, historyCoverage, historyIslandAtEdge } from './chat_history.js';
 import { createProjectReadReceipt, isAtNewestMessage } from './project_read_state.js';
-import { mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
+import { mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, historyStamps, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
 import { syncHistoryRetentionItem } from './history_retention.js';
 import {
@@ -191,7 +192,7 @@ export function createChatInstance({
     // defers its first hydration to it (bounded by an unconditional deadline).
     isProjectOpening = null,
     onHistoryRetry = null,
-    onReadingLatest = null,
+    onReadingLatest,
 }) {
     const container = mountEl || document.getElementById('content');
     const chatSessionId = getOrCreateChatSessionId(sessionStorage, globalThis.crypto);
@@ -416,9 +417,7 @@ export function createChatInstance({
     let inputHistorySeededFromServer = false; // set true only after a successful server-side recall seed
     let historySyncPromise = null;
     let lastHistorySyncSucceeded = false;
-    // The newest recent read could not open the chat source, so it cannot show every counted row.
-    let recentChatSourceGap = false;
-    let recentLatestMessage; // its window.latest_message (project_read_state.js)
+    let recentLatestMessage; // newest recent read's window.latest_message
     // STICKY single-flight hydration promise.
     // Unlike historySyncPromise it survives success, so hydration triggers
     // (bootstrap IIFE, first non-reconnect socket open, refreshHistory without
@@ -427,30 +426,26 @@ export function createChatInstance({
     let initialHydrationPromise = null;
     // one-shot idle gate for Main's deferred first hydration.
     let hydrationGatePromise = null;
-    // The server retains whole-history coverage independently of the DOM window.
+    // One derived physical coverage/status for the mounted reading window.
     let historyWindow = null;
     let welcomeShown = false;
-    // Cross-instance hide/show position; visible mutations use live geometry.
-    let _savedScrollTop = Math.max(0, Number(initialScrollState?.scrollTop) || 0);
-    let _savedStick = initialScrollState ? initialScrollState.stick !== false : true;
-    let _initialScrollPending = Boolean(initialScrollState) && !_savedStick;
-    let _resumeAnchor = initialScrollState?.historyAnchor || null;
+    // Saved page and whole recent read gate only the cross-instance place; reshow
+    // targets and visible mutations use live geometry.
+    let restoredPageReady = !initialScrollState?.history;
+    let recentReady = false;
     let _hasNewActivity = false;
-    let _restoring = false;
-    let restoreGeneration = 0;
-    let _viewportMutationDepth = 0;
     const isInstanceVisible = () =>
         Boolean(messagesDiv) && messagesDiv.offsetParent !== null && !document.hidden;
     const LIVE_CARD_CAP = 200;
     const liveCardBound = createLiveCardBound(LIVE_CARD_CAP);
     const liveCardRecords = new Map();
     const workPointer = asPanel ? bindProjectWorkPointer(page.querySelector('.chat-panel-statusbar'), {
-        records: liveCardRecords, getWindow: () => historyWindow,
+        records: liveCardRecords,
         onNavigate: (root) => {
+            reading.cancel();
             messagesDiv.scrollTop += root.getBoundingClientRect().top - messagesDiv.getBoundingClientRect().top;
-            _savedStick = false;
-            _savedScrollTop = messagesDiv.scrollTop;
-            updateScrollButton();
+            reading.stick = false;
+            reading.scroll();
         },
     }) : null;
     // A wait materializes the real task record; its open/closed state is one
@@ -468,11 +463,13 @@ export function createChatInstance({
         liveCardRecords.delete(id);
     }
     const markReviewAnchor = (r, on = false) => setReviewAnchor(r, on, setLiveCardPhase);
-    const explicitCardExpansion = new Map();
-    const reviewDisclosureByTask = new Map();
+    const explicitCardExpansion = new Map(initialScrollState?.disclosures?.cards || []);
+    const reviewDisclosureByTask = new Map((initialScrollState?.disclosures?.reviews || []).map(([id, value]) =>
+        [id, { ...value, expandedGroups: new Set(value.expandedGroups), expandedAttempts: new Set(value.expandedAttempts) }]));
     const skillReviewDetailStore = new Map();
     const reviewHydrator = createReviewHydrator({
         fetchDetail: fetchTaskDetailStrict,
+        onSettled: () => !destroyed && reading.position(),
         applyDetail: (id, detail) => !destroyed && attachTaskDetailReviews(id, detail),
         onState: (id, status) => !destroyed
             && (liveCardRecords.get(id)?.reviewController?.setHydrateStatus?.(status) ?? false),
@@ -648,67 +645,30 @@ export function createChatInstance({
         } catch {}
     }
 
-    const NEAR_BOTTOM_THRESHOLD_PX = 48;
     const ACTUAL_BOTTOM_TOLERANCE_PX = 6;
 
-    function isNearBottom(threshold = NEAR_BOTTOM_THRESHOLD_PX) {
-        const remaining = messagesDiv.scrollHeight - messagesDiv.scrollTop - messagesDiv.clientHeight;
-        return remaining <= threshold;
-    }
+    const isNearBottom = threshold => reading.nearBottom(threshold);
 
-    const { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor } =
+    const { captureVisibleTimelineAnchor, restoreVisibleTimelineAnchor, serializeTimelineAnchor, anchorOwnersReady } =
         createTimelineAnchors({ messagesDiv, liveCardRecords });
+    const reading = createChatReadingPosition({
+        initial: initialScrollState, feed: messagesDiv, alive: () => !destroyed,
+        afterWrite: () => workPointer?.update(), activity: () => { _hasNewActivity = true; },
+        updateButton: updateScrollButton,
+        visible: () => !destroyed && isInstanceVisible(),
+        ready: () => historyLoaded && (!reading.restoring || restoredPageReady && recentReady)
+            && anchorOwnersReady(reading.target?.historyAnchor, reviewHydrator.ready),
+        anchors: { serialize: serializeTimelineAnchor, restore: restoreVisibleTimelineAnchor, capture: captureVisibleTimelineAnchor },
+        fallback: target => {
+            const ids = pageHistoryIds.get(target.history?.pages?.[target.history?.focus]?.id);
+            const node = ids && [...ids].flatMap(historyNodes).find(node => node.getClientRects().length);
+            return node ? restoreVisibleTimelineAnchor({ node, offset: target.historyAnchor?.offset || 0 }) : false;
+        },
+        // A settled place is where the reader is (the read receipt).
+        changed: () => { syncLoadOlderControl(); updateScrollButton(); readReceipt.note({ discrete: true }); },
+    });
 
-    function withStableViewport(mutate, {
-        forceFollow = false,
-        remoteContent = false,
-        excludeAnchorNode = null,
-    } = {}) {
-        if (typeof mutate !== 'function') return undefined;
-        if (destroyed) return false;
-        if (_viewportMutationDepth > 0) return mutate();
-        if (_restoring || !isInstanceVisible()) {
-            const result = mutate();
-            workPointer?.update();
-            if (remoteContent && result && !_savedStick) _hasNewActivity = true;
-            return result;
-        }
-
-        const followBottom = forceFollow || isNearBottom();
-        const anchor = followBottom ? null : captureVisibleTimelineAnchor(excludeAnchorNode);
-        // Pre-mutation geometry, not the mutate() return, decides restore/
-        // follow (survives throws and lying change-flags); booleans keep only
-        // the activity-marker and write-idempotence duties.
-        const preScrollHeight = messagesDiv.scrollHeight;
-        const preScrollTop = messagesDiv.scrollTop;
-        let result;
-        _viewportMutationDepth = 1;
-        try {
-            result = mutate();
-            workPointer?.update();
-            return result;
-        } finally {
-            _viewportMutationDepth = 0;
-            if (isInstanceVisible()) {
-                if (followBottom) {
-                    if (forceFollow || messagesDiv.scrollHeight !== preScrollHeight) {
-                        messagesDiv.scrollTop = messagesDiv.scrollHeight;
-                    } else if (messagesDiv.scrollTop !== preScrollTop) {
-                        // Engine drift on a no-op frame: put the reader back.
-                        messagesDiv.scrollTop = preScrollTop;
-                    }
-                } else {
-                    // Restores the captured offset; a zero-delta frame re-lands
-                    // on the same position.
-                    restoreVisibleTimelineAnchor(anchor);
-                }
-                if (remoteContent && result && !followBottom) _hasNewActivity = true;
-                _savedScrollTop = messagesDiv.scrollTop;
-                _savedStick = isNearBottom();
-                updateScrollButton();
-            }
-        }
-    }
+    function withStableViewport(mutate, options) { return reading.mutate(mutate, options); }
 
     function withRemoteActivity(mutate) {
         _remoteActivityDepth += 1;
@@ -732,6 +692,7 @@ export function createChatInstance({
         patchTimelineItemAt,
     } = createLiveCardTimelineRenderer({
         withStableViewport, buildTimelineItemHtml, isReplayActive: () => _historyReplayActive,
+        initialAnchor: initialScrollState?.historyAnchor, hydrate: fetchFullLineOutput,
     });
 
     function insertMessageNode(node, options = {}) {
@@ -1401,9 +1362,7 @@ export function createChatInstance({
             if (nowExpanded) record.expandedLineKeys.add(lineKey);
             else record.expandedLineKeys.delete(lineKey);
             renderLiveCardTimeline(record);
-            // P3: on expand, lazily fetch the genuinely-full output for a server-truncated
-            // line (the WS preview was capped at 4000); cached on the item so a re-render
-            // keeps it. Best-effort — the capped preview stays on failure.
+            // Expand fetches full output once; failures retain the preview.
             if (nowExpanded) {
                 const item = record.items.find((it) => it.lineKey === lineKey);
                 if (item && item.truncated && item.fullRef && !item.fetchedFull && !item._fetchingFull) {
@@ -1622,14 +1581,12 @@ export function createChatInstance({
         if (record.countEl.textContent !== text) record.countEl.textContent = text;
     }
 
-    // Re-showing a hidden instance still restores its saved viewport. Live-card
-    // geometry itself has no deferred layout work; every real DOM mutation is
-    // stabilized at its write boundary.
+    // Re-show the same reading intent; data readiness controls positioning.
     const handlePageShown = (event) => {
         if (
             event?.detail?.page === 'chat'
             || (event?.type === 'visibilitychange' && !document.hidden)
-        ) { restoreScrollPosition(); readReceipt.note({ discrete: true }); }
+        ) reading.request();
     };
     window.addEventListener('ouro:page-shown', handlePageShown);
     document.addEventListener('visibilitychange', handlePageShown);
@@ -1661,6 +1618,7 @@ export function createChatInstance({
             if (changed && !destroyed && record.expandedLineKeys.has(item.lineKey)) {
                 renderLiveCardTimeline(record);
             }
+            reading.position();
         }
     }
 
@@ -2245,7 +2203,8 @@ export function createChatInstance({
                 : Array.from(messagesDiv.querySelectorAll('.chat-bubble')).find(node => node.dataset.messageKey === legacyKey);
             if (prior) {
                 rememberMessageKey(messageKey);
-                return chatDecision.renderRoutingDecision(prior, opts.chatAnnotation);
+                const originChanged = syncSavedProjectContext(prior, opts.originProjected, opts.originId);
+                return chatDecision.renderRoutingDecision(prior, opts.chatAnnotation) || originChanged;
             }
         }
         if (messageKey && seenMessageKeys.has(messageKey)) {
@@ -2254,12 +2213,16 @@ export function createChatInstance({
         if (opts.historyId) {
             const prior = Array.from(messagesDiv.querySelectorAll('.chat-bubble')).find(node =>
                 (clientMessageId && node.dataset.clientMessageId === clientMessageId)
+                || (opts.originId && node.dataset.originId === opts.originId)
                 || (!node.dataset.historyId && node.dataset.messageKey === legacyKey));
             if (prior) {
                 stampHistoryNode(prior, opts.historyId, opts.historyPosition);
                 rememberMessageKey(messageKey);
                 chatDecision.renderRoutingDecision(prior, opts.chatAnnotation);
-                return false;
+                const changed = syncSavedProjectContext(prior, opts.originProjected);
+                for (const row of persistedHistory) if (opts.originId && row.originId === opts.originId
+                    || clientMessageId && row.clientMessageId === clientMessageId) row.originProjected = false;
+                return changed;
             }
         }
 
@@ -2279,6 +2242,9 @@ export function createChatInstance({
                 projectId,
                 projectName,
                 handoffId: opts.handoffId || '',
+                originProjected: Boolean(opts.originProjected),
+                originId: opts.originId || '',
+                terminalTime: opts.terminalTime || null,
                 skillReview: opts.skillReview || null,
             });
             // Mirror the sessionStorage slice(-200): the in-memory copy exists
@@ -2323,7 +2289,9 @@ export function createChatInstance({
         `;
         if (!isProgress && text) chatMedia.attachCopyControl(bubble, String(text));
         if (systemType === 'project_handoff' && handoffs) handoffs.mount(bubble, { taskId, projectId, projectName, title: text, handoffId: opts.handoffId, kind: 'receipt' });
-        else if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName });
+        else if (PROJECT_ROW_TYPES.has(systemType)) decorateProjectRow(bubble, { role, projectId, projectName,
+            terminalTime: opts.terminalTime, addedAt: ts, completion: systemType === 'project_completion_summary' });
+        syncSavedProjectContext(bubble, opts.originProjected, opts.originId);
         wireSkillReviewDisclosure(bubble, { onDomWrite: withStableViewport });
         stampNodeTimestamp(bubble, ts);
         insertMessageNode(bubble, { forceStick: !!opts.forceStick });
@@ -2341,7 +2309,7 @@ export function createChatInstance({
         const a = msg.completion_answer;
         return addMessage(a || text, a ? 'assistant' : 'system', !!(a || msg.markdown), msg.ts || null, false, {
             ...opts, systemType: msg.system_type, projectId: msg.project_id || '',
-            projectName: msg.project_name || '', handoffId: msg.handoff_id || '',
+            projectName: msg.project_name || '', handoffId: msg.handoff_id || '', terminalTime: msg.terminal_time || null,
         });
     }
 
@@ -2615,6 +2583,8 @@ export function createChatInstance({
                         senderLabel: msg.sender_label || '',
                         senderSessionId: msg.sender_session_id || '',
                         clientMessageId: msg.client_message_id || '',
+                        originProjected: msg.origin_projected === true,
+                        originId: msg.origin_id || '',
                         taskId,
                         chatAnnotation: msg.chat_annotation || null,
                         skillReview: msg.system_type === 'skill_review' && msg.skill && msg.job_id
@@ -2737,45 +2707,31 @@ export function createChatInstance({
             try {
                 // An empty feed shows the read in flight (#1102); a painted one is left alone.
                 if (historyControls.beginRecent()) syncLoadOlderControl();
-                const data = await apiClient.chatHistory({ chatId });
+                const data = await fetchHistory(null);
                 // Closed rooms do not consume late responses.
                 if (destroyed) {
                     lastHistorySyncSucceeded = false;
                     initialHydrationPromise = null;
                     return false;
                 }
+                if (data.recentVersion < recentApplied) return lastHistorySyncSucceeded;
                 const messages = Array.isArray(data.messages) ? data.messages : [];
-                recentChatSourceGap = Boolean(data.window?.truncated_by?.includes('chat_source_unavailable'));
-                recentLatestMessage = data.window?.latest_message;
-                if (!historyLoaded && initialScrollState?.history && !historyPager.getState().initialized) {
-                    await historyPager.restore(initialScrollState.history);
+                const restoring = !restoredPageReady && !historyPager.getState().initialized
+                    ? historyPager.restore(initialScrollState.history) : null;
+                const oldRecentIds = recentHistoryIds;
+                const admitted = acceptRecentWindow(data, messages);
+                const pagerBeforeRecent = historyPager.getState();
+                const rechainRecent = admitted && !data.reason_code && pagerBeforeRecent.initialized && !pagerBeforeRecent.canNewer
+                    && [...oldRecentIds].some(id => !recentHistoryIds.has(id));
+                const result = historyPager.acceptRecent(data);
+                if (result.status !== 'applied') applyHistoryMessages(messages, { fromReconnect });
+                // Recent owners exist before the saved page attaches content-only rows.
+                if (restoring) {
+                    restoredPageReady = (await restoring).status === 'applied';
                     if (destroyed) return false;
                 }
-                historyWindow = (data && typeof data.window === 'object' && data.window)
-                    ? data.window
-                    : null;
-                const scrollBeforeSync = {
-                    top: messagesDiv.scrollTop,
-                    nearBottom: isNearBottom(),
-                    anchor: captureVisibleTimelineAnchor(),
-                };
-
-                const oldRecentIds = recentHistoryIds;
-                recentHistoryIds = new Set(messages.flatMap(historyRowIds));
-                const pagerBeforeRecent = historyPager.getState();
-                const rechainRecent = !data.reason_code && pagerBeforeRecent.initialized && !pagerBeforeRecent.canNewer
-                    && [...oldRecentIds].some(id => !recentHistoryIds.has(id));
-                for (const id of oldRecentIds) {
-                    if (data.window?.truncated_by?.includes(`${id.split(':')[0]}_source_unavailable`)) recentHistoryIds.add(id);
-                }
-                if ((!historyPager.getState().initialized && data.page_cursor)
-                        || data.reason_code === 'history_source_unavailable') {
-                    const result = historyPager.acceptRecent(data);
-                    if (result.status !== 'applied') applyHistoryMessages(messages, { fromReconnect, includeUser: true });
-                }
-                else applyHistoryMessages(messages, { fromReconnect, includeUser: true });
                 const recentState = historyPager.getState();
-                const releasableRecentIds = rechainRecent || recentState.canNewer ? [] : oldRecentIds;
+                const releasableRecentIds = !admitted || rechainRecent || recentState.canNewer ? [] : oldRecentIds;
                 withStableViewport(() => releaseHistoryIds(releasableRecentIds));
                 if (rechainRecent && !destroyed) void historyPager.latest();
                 if (armedAtStart) {
@@ -2816,28 +2772,15 @@ export function createChatInstance({
                 // ANY successful sync leaves the instance hydrated
                 // — later hydration triggers ride this sticky promise.
                 initialHydrationPromise = historySyncPromise;
-                historyControls.endRecent();
                 syncLoadOlderControl();
                 // A recreated project instance restores its predecessor's stashed
                 // mid-history position on first paint instead of pinning to newest.
-                if (wasFirstLoad && _initialScrollPending) {
-                    _initialScrollPending = false;
+                if (reading.pending) {
                     updateMessagesPadding(false);
-                    restoreScrollPosition();
-                } else
-                // First load jumps to latest; reconnect preserves older-message reading.
-                if (wasFirstLoad || (fromReconnect ? scrollBeforeSync.nearBottom : isNearBottom())) {
+                    reading.position();
+                } else if (wasFirstLoad && reading.stick) {
                     updateMessagesPadding();
-                    // Bootstrap pin: a fresh feed starts at scrollTop 0, where
-                    // the ordinary boundary would not land on the newest row.
-                    if (wasFirstLoad) scrollToBottomAfterLayout();
-                } else if (fromReconnect) {
-                    // Reconnect can add rows on either side. Restore the same
-                    // nested reading anchor after layout, never a height delta.
-                    await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-                    const restoredFromAnchor = restoreVisibleTimelineAnchor(scrollBeforeSync.anchor);
-                    if (!restoredFromAnchor) messagesDiv.scrollTop = scrollBeforeSync.top;
-                    updateScrollButton();
+                    reading.followAfterLayout();
                 }
                 readReceipt.settle(recentLatestMessage);
                 return messages.length > 0;
@@ -2863,9 +2806,8 @@ export function createChatInstance({
         return historySyncPromise;
     }
 
-    // The Project read receipt (project_read_state.js). A new revision needs a
-    // read that STARTS after it was observed, so a read already in flight is
-    // awaited, never joined; the sticky hydration answers an already-covered one.
+    // A new revision needs a read begun after it: one in flight is awaited, never
+    // joined; the sticky hydration answers a covered one (project_read_state.js).
     const readReceipt = createProjectReadReceipt({
         read: async (fresh) => {
             if (!fresh && initialHydrationPromise) await initialHydrationPromise;
@@ -2873,16 +2815,17 @@ export function createChatInstance({
                 if (historySyncPromise) await historySyncPromise;
                 await syncHistory({ includeUser: true });
             }
-            // An unknown last arrival (null) names nothing to read.
-            return lastHistorySyncSucceeded && !recentChatSourceGap && recentLatestMessage !== null;
+            // null: the last arrival is unknown (an unreadable chat source too).
+            return lastHistorySyncSucceeded && recentLatestMessage !== null;
         },
         // A destroyed page reports hidden===false, hence the lifecycle flag.
         isShown: () => !destroyed && !page.hidden,
-        isReadingLatest: () => !destroyed && isInstanceVisible() && isAtNewestMessage(recentLatestMessage, {
-            delivered: (id) => retainedHistoryIds().has(id), nodes: historyNodes, viewport: messagesDiv, header: pageHeader, composer: inputArea,
+        // A place still being restored is not where the reader is.
+        isReadingLatest: () => !destroyed && !reading.pending && isInstanceVisible() && isAtNewestMessage(recentLatestMessage, {
+            delivered: id => retainedHistoryIds().has(id), nodes: historyNodes, viewport: messagesDiv, header: pageHeader, composer: inputArea,
             atBottom: () => isNearBottom() && !historyPager.getState().canNewer,
         }),
-        onReadingLatest: () => onReadingLatest?.(),
+        onReadingLatest,
     });
 
     (async () => {
@@ -3026,6 +2969,7 @@ export function createChatInstance({
         input.value = '';
         clearInputDraft();
         const sentTs = new Date().toISOString();
+        reading.cancel(); // an accepted Send supersedes any saved place
         addMessage(text, 'user', false, sentTs, false, {
             pending: result?.status === 'queued',
             source: 'web',
@@ -3045,7 +2989,7 @@ export function createChatInstance({
         }
         syncChatStatus();
         resizeChatInput();
-        scrollToBottomAfterLayout();
+        reading.followAfterLayout();
     }
 
     // Send mode lives on DOM so CSS and click/Enter share one source.
@@ -3124,26 +3068,9 @@ export function createChatInstance({
         updateScrollButton();
     }
 
-    function scrollToBottomAfterLayout() {
-        requestAnimationFrame(() => {
-            if (destroyed) return;
-            scrollToBottom();
-            requestAnimationFrame(() => {
-                if (destroyed) return;
-                scrollToBottom();
-            });
-        });
-    }
-
-    // Ignore hidden/restoring scroll events so browser resets cannot corrupt saved intent.
-    messagesDiv?.addEventListener('scroll', () => {
-        readReceipt.note();
-        if (!isInstanceVisible()) return;
-        if (_restoring) { updateScrollButton(); return; }
-        _savedScrollTop = messagesDiv.scrollTop;
-        _savedStick = isNearBottom();
-        updateScrollButton();
-    }, { passive: true });
+    // Scroll events observe position; only positive navigation changes follow intent.
+    messagesDiv?.addEventListener('scroll', () => { reading.scroll(); settleHistoryViewport(); readReceipt.note(); }, { passive: true });
+    messagesDiv?.addEventListener('load', reading.reflow, true);
 
     // Navigation plus one coalesced, non-live-region remote-activity bit.
     function updateScrollButton() {
@@ -3157,38 +3084,21 @@ export function createChatInstance({
         scrollBottomBtn.setAttribute('aria-label', label);
         scrollBottomBtn.title = label;
         if (scrollActivityDot) scrollActivityDot.hidden = !_hasNewActivity;
-        scrollBottomBtn.classList.toggle('visible', isInstanceVisible() && !isNearBottom());
+        scrollBottomBtn.classList.toggle('visible', isInstanceVisible() && (!isNearBottom() || (!reading.stick && historyWindow?.gaps)));
     }
     scrollBottomBtn?.addEventListener('click', async () => {
-        if (historyPager.getState().canNewer) await historyPager.latest();
-        _savedStick = true;
-        scrollToBottomAfterLayout();
+        const current = reading.claim();
+        if (historySyncPromise) await historySyncPromise;
+        await historyPager.whenIdle();
+        if (destroyed || !current()) return;
+        if (historyPager.getState().canNewer || historyWindow?.horizonGap) {
+            if ((await historyPager.latest()).status !== 'applied') return;
+        }
+        if (destroyed || !current()) return;
+        reading.stick = true;
+        reading.followAfterLayout();
         updateScrollButton();
     });
-
-    function restoreScrollPosition() {
-        if (!isInstanceVisible()) return;  // hidden column has no geometry yet
-        // Reapply across relayout frames for pre-scroll-anchoring WKWebView.
-        _restoring = true;
-        const generation = ++restoreGeneration;
-        const targetStick = _savedStick;
-        const targetTop = _savedScrollTop;
-        const historicalAnchor = _resumeAnchor;
-        let frames = 0;
-        const apply = () => {
-            if (generation !== restoreGeneration) return;
-            if (destroyed || !isInstanceVisible()) { _restoring = false; return; }
-            const node = !targetStick && historicalAnchor
-                ? historyNodes(historicalAnchor.id)[0] : null;
-            if (node) messagesDiv.scrollTop += node.getBoundingClientRect().top
-                - messagesDiv.getBoundingClientRect().top - historicalAnchor.offset;
-            else messagesDiv.scrollTop = targetStick ? messagesDiv.scrollHeight : targetTop;
-            updateScrollButton();
-            if (++frames < 12) requestAnimationFrame(apply);
-            else { _restoring = false; _resumeAnchor = null; }
-        };
-        requestAnimationFrame(apply);
-    }
 
     function updateMessagesPadding(preserveStickiness = true) {
         const mutate = () => {
@@ -3229,10 +3139,12 @@ export function createChatInstance({
             requestAnimationFrame(() => {
                 queued = false;
                 if (destroyed) return;
+                reading.reflow();
                 updateMessagesPadding();
             });
         };
         chatResizeObserver = new ResizeObserver(schedule);
+        chatResizeObserver.observe(messagesDiv);
         if (pageHeader) chatResizeObserver.observe(pageHeader);
         if (inputArea) chatResizeObserver.observe(inputArea);
     }
@@ -3357,17 +3269,37 @@ export function createChatInstance({
     messagesDiv.appendChild(typingEl);
 
     const pageHistoryIds = new Map();
-    const pageWindows = new Map();
+    let recentCoverage = null;
+    let recentHasOrigins = false;
     let recentHistoryIds = new Set();
+    let recentRequest = 0, recentApplied = 0;
+    async function fetchHistory(cursor, options = {}) {
+        const recentVersion = cursor == null ? ++recentRequest : 0;
+        return { ...await apiClient.chatHistory({ chatId, cursor, ...options }), recentVersion };
+    }
+    function acceptRecentWindow(data, messages) {
+        if (data.recentVersion <= recentApplied) return false;
+        recentApplied = data.recentVersion;
+        // The newest admitted window (↓ too) owns readiness and the failure note.
+        recentReady = !data.reason_code;
+        historyControls.endRecent(data.reason_code ? new Error('Some saved history could not be loaded.') : null);
+        recentCoverage = data.coverage ?? null;
+        recentHasOrigins = messages.some(row => row.origin_projected);
+        recentLatestMessage = data.window?.latest_message;
+        const ids = new Set(messages.flatMap(historyRowIds));
+        for (const id of recentHistoryIds) if (data.window?.truncated_by?.includes(`${id.split(':')[0]}_source_unavailable`)) ids.add(id);
+        recentHistoryIds = ids;
+        return true;
+    }
     const pendingHistoryEvictions = new Set();
     const historyNodes = (id) => Array.from(messagesDiv.querySelectorAll('[data-history-id]'))
         .filter(node => node.dataset.historyId === id);
     const retainedHistoryIds = () => new Set([...recentHistoryIds,
         ...[...pageHistoryIds.values()].flatMap(ids => [...ids])]);
     function isHistoryPageProtected(descriptor) {
+        if (reading.pending && reading.target?.history?.pages?.[reading.target.history.focus]?.id === descriptor.id) return true;
         const ids = pageHistoryIds.get(descriptor.id) || new Set();
-        if (Array.from(messagesDiv.querySelectorAll('[data-history-id]'))
-            .some(node => ids.has(node.dataset.historyId) && historyNodeIsProtected(node, messagesDiv))) return true;
+        if (historyStamps(messagesDiv).some(([id, node]) => ids.has(id) && historyNodeIsProtected(node, messagesDiv))) return true;
         return [...liveCardRecords.values()].some(record =>
             [...(record.historyIds || [])].some(id => ids.has(id))
             && [record.summaryButtonEl, record.reviewsHostEl].some(node => historyNodeIsProtected(node, messagesDiv)));
@@ -3383,8 +3315,7 @@ export function createChatInstance({
         const retained = retainedHistoryIds();
         const released = new Set();
         const byId = new Map();
-        for (const node of messagesDiv.querySelectorAll('[data-history-id]')) {
-            const key = node.dataset.historyId;
+        for (const [key, node] of historyStamps(messagesDiv)) {
             if (!byId.has(key)) byId.set(key, []);
             byId.get(key).push(node);
         }
@@ -3427,27 +3358,26 @@ export function createChatInstance({
         }
     }
 
-    const historyControls = createHistoryControls(messagesDiv);
+    const historyControls = createHistoryControls(messagesDiv, pageHeader || page.querySelector('.chat-panel-statusbar'));
     const { olderButton: loadOlderBtn } = historyControls;
 
     const historyPager = createChatHistoryPager({
-        fetchPage: (cursor, { signal }) => apiClient.chatHistory({ chatId, cursor, signal }),
+        fetchPage: fetchHistory,
         isAlive: () => !destroyed,
         applyPage: (messages, descriptor) => {
             pageHistoryIds.set(descriptor.id, new Set(messages.flatMap(historyRowIds)));
-            pageWindows.set(descriptor.id, descriptor.window);
+            const oldRecentIds = recentHistoryIds;
+            const admitted = descriptor.direction === 'latest' && acceptRecentWindow(descriptor, messages);
             const archived = descriptor.direction !== 'recent' && descriptor.direction !== 'latest';
             applyHistoryMessages(messages, { archived });
-            // A page can bring the room's newest arrival on screen without a scroll,
-            // as can the layout that settles once it is drawn.
-            if (archived) {
-                readReceipt.note();
-                requestAnimationFrame(() => readReceipt.note());
-            }
+            if (admitted) withStableViewport(() => releaseHistoryIds(oldRecentIds));
+            // An older page drawn can show the newest arrival without a scroll.
+            if (admitted) readReceipt.settle(recentLatestMessage);
+            else if (archived) requestAnimationFrame(() => readReceipt.note());
         },
         releasePage: descriptor => {
             const ids = pageHistoryIds.get(descriptor.id) || [];
-            pageHistoryIds.delete(descriptor.id); pageWindows.delete(descriptor.id);
+            pageHistoryIds.delete(descriptor.id);
             withStableViewport(() => releaseHistoryIds(ids));
         },
         isPageProtected: isHistoryPageProtected,
@@ -3457,45 +3387,70 @@ export function createChatInstance({
     function syncLoadOlderControl(snapshot = historyPager.getState()) {
         if (destroyed) return;
         withStableViewport(() => {
-            historyWindow = historyControls.render(snapshot, pageWindows.values());
+            const coverage = historyCoverage(recentCoverage, snapshot.coverage);
+            if (recentHasOrigins && !coverage.complete) coverage.gaps = true;
+            historyWindow = historyControls.render(snapshot, coverage, reading.approximate);
             return true;
         });
     }
     async function loadOlderHistory() {
-        // A failed recent read retries as its owner's open transaction (fetch,
-        // paint, ACK). Retry must always read: no owner, or one that declined
-        // (it starts the fetch synchronously when it accepts), refetches here.
         if (historyControls.recentFailed()) {
             const owned = onHistoryRetry?.();
             return historySyncPromise ? owned : syncHistory({ includeUser: true });
         }
         const snapshot = historyPager.getState();
-        if (snapshot.error?.body?.reason_code === 'history_view_changed') return historyPager.latest();
-        return snapshot.error ? historyPager.retry() : loadOlderAtEdge();
+        if (snapshot.error?.body?.reason_code === 'history_view_changed') {
+            reading.cancel(); restoredPageReady = true;
+            return historyPager.latest();
+        }
+        if (snapshot.error) {
+            const result = await historyPager.retry();
+            if (snapshot.retryDirection === 'restore' && result.status === 'applied') {
+                restoredPageReady = true;
+                reading.position();
+                const owned = onHistoryRetry?.();
+                if (historySyncPromise) await owned;
+                else await syncHistory({ includeUser: true });
+            }
+            return result;
+        }
+        return loadHistoryAtEdge(snapshot.canNewer ? 'newer' : 'older');
     }
-    async function loadOlderAtEdge() {
+    async function loadHistoryAtEdge(direction) {
         let result;
-        do {
-            result = await historyPager.older();
-        } while (!destroyed && result.status === 'applied' && result.messageCount === 0
-            && isInstanceVisible() && messagesDiv.scrollTop < 80 && historyPager.getState().canOlder);
+        // Two bounded physical reads per gesture cross sparse pages without
+        // turning a short island or reflow into an automatic archive chase.
+        for (let reads = 0; reads < 2; reads++) {
+            if (direction === 'older' && historyWindow?.horizonGap && !historyPager.getState().canNewer) {
+                result = await historyPager.latest(); // rebase bytes, preserve the reading destination
+            } else result = await historyPager[direction]();
+            if (destroyed || result.status !== 'applied' || result.messageCount !== 0) break;
+        }
         return result;
     }
     loadOlderBtn.addEventListener('click', loadOlderHistory);
 
-    function navigateHistoryAtEdge() {
-        if (destroyed || _restoring || !historyLoaded || !isInstanceVisible()) return;
-        let snapshot = historyPager.getState();
-        if (snapshot.loading || snapshot.error || !snapshot.initialized) return;
+    function settleHistoryViewport() {
+        if (destroyed || reading.pending || !historyLoaded || !isInstanceVisible()) return;
         retryHistoricalUpserts();
         historyPager.trim();
         if (pendingLiveEvictions.size) withStableViewport(releaseLiveOverflow);
         if (pendingHistoryEvictions.size) withStableViewport(() => releaseHistoryIds([...pendingHistoryEvictions]));
-        snapshot = historyPager.getState();
-        if (messagesDiv.scrollTop < 80 && snapshot.canOlder) void loadOlderAtEdge();
-        else if (isNearBottom(80) && snapshot.canNewer) void historyPager.newer();
     }
-    messagesDiv.addEventListener('scroll', navigateHistoryAtEdge, { passive: true });
+    function navigateHistoryAtEdge(direction) {
+        if (destroyed || reading.pending || !historyLoaded || !isInstanceVisible()) return;
+        settleHistoryViewport();
+        const snapshot = historyPager.getState();
+        if (snapshot.loading || snapshot.error || !snapshot.initialized) return;
+        if (direction < 0 && messagesDiv.scrollTop < 80 && snapshot.canOlder) void loadHistoryAtEdge('older');
+        else if (direction > 0 && snapshot.canNewer) {
+            // Only an unambiguous page-owned island has a physical edge. A
+            // mixed card has no chronological boundary: use the same button.
+            const ids = pageHistoryIds.get(snapshot.firstPage?.id) || new Set();
+            if (historyIslandAtEdge(messagesDiv, ids, historyNodes)) void loadHistoryAtEdge('newer');
+        }
+    }
+    const disposeReadingGestures = reading.bindGestures(navigateHistoryAtEdge);
     function retryHistoricalUpserts() {
         const ready = [...pendingHistoryUpserts.values()].filter(row =>
             !historyNodes(row.history_id).some(node => historyNodeIsProtected(node, messagesDiv)));
@@ -3929,11 +3884,11 @@ export function createChatInstance({
         projectId,
         // Called by app.js when this instance's panel is (re)shown so a project
         // thread restores its scroll position instead of jumping to the top (P7).
-        restoreScrollPosition,
+        restoreScrollPosition: reading.request,
         refreshHistory: readReceipt.refresh,
         revealQuestion: (taskId, quizId) => chatDecision.revealQuestion(
-            taskId, quizId, projectId, chatId, appendQuizMessage, () => !page.hidden,
-            () => { restoreGeneration++; _restoring = false; }),
+            taskId, quizId, projectId, chatId, appendQuizMessage, isInstanceVisible,
+            () => { const current = reading.claim(); reading.stick = false; return current; }, reading.scroll),
         cancelHistoryPaint: readReceipt.cancel,
         // app.js fans its already-existing /api/state refresh to every open
         // thread; panels gain convergence without acquiring their own poll.
@@ -3946,15 +3901,18 @@ export function createChatInstance({
         hasPendingWork: () => pendingAttachments.length > 0 || attachmentsUploading,
         // Viewport intent stash source for the single-live-panel policy.
         getScrollState: () => {
-            const captured = captureVisibleTimelineAnchor();
-            const node = captured?.node?.closest?.('[data-history-id]')
-                || captured?.node?.querySelector?.('[data-history-id]') || captured?.topNode;
-            const id = node?.dataset?.historyId || '';
-            const pageId = [...pageHistoryIds].find(([, ids]) => ids.has(id))?.[0];
-            return { scrollTop: _savedScrollTop, stick: _savedStick,
-                history: historyPager.exportResume(pageId),
-                historyAnchor: id ? { id, offset: node.getBoundingClientRect().top
-                    - messagesDiv.getBoundingClientRect().top } : null };
+            if (reading.pending) return reading.export();
+            const anchor = serializeTimelineAnchor();
+            const tasks = new Set(anchor?.cardChain?.map(entry => entry.taskId) || []);
+            const sources = [anchor?.historyId, ...[...tasks].flatMap(id => [...(liveCardRecords.get(id)?.historyIds || [])])];
+            const pageId = sources.map(id => [...pageHistoryIds].find(([, ids]) => ids.has(id))?.[0]).find(Boolean);
+            return { scrollTop: reading.top, stick: reading.stick,
+                history: historyPager.exportResume(pageId), historyAnchor: anchor,
+                disclosures: {
+                    cards: [...tasks].map(id => [id, liveCardRecords.get(id)?.root.dataset.expanded === '1']),
+                    reviews: [...reviewDisclosureByTask].filter(([id]) => tasks.has(id)).map(([id, value]) =>
+                        [id, { ...value, expandedGroups: [...value.expandedGroups], expandedAttempts: [...value.expandedAttempts] }]),
+                } };
         },
         // Full teardown (P3): release every resource this instance acquired —
         // ws subscriptions, window/document listeners, the ResizeObserver, all
@@ -3970,7 +3928,7 @@ export function createChatInstance({
             wsDisposers.length = 0;
             historyControls.endRecent();
             historyPager.destroy();
-            messagesDiv.removeEventListener('scroll', navigateHistoryAtEdge);
+            disposeReadingGestures();
             document.removeEventListener('selectionchange', retryHistoricalUpserts);
             chatMedia.destroy();
             workPointer?.destroy();
@@ -4001,7 +3959,7 @@ export function createChatInstance({
             seenMessageKeys.clear();
             messageKeyOrder.length = 0;
             persistedHistory.length = 0;
-            pageHistoryIds.clear(); pageWindows.clear(); historicalTerminals.clear(); pendingHistoryEvictions.clear();
+            pageHistoryIds.clear(); recentCoverage = null; historicalTerminals.clear(); pendingHistoryEvictions.clear();
             pendingHistoryUpserts.clear();
             pendingLiveEvictions.clear();
             try { destroyChatMarkdown(page); page.remove(); } catch {}
