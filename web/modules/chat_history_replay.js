@@ -87,6 +87,11 @@ export function mergeHistoricalTimelineItem(record, summary, row, ts) {
     return true;
 }
 
+/** Each mounted node a released id removes, as [id, node]: the rows it renders
+ * and the evolving lines that only locate their page by it (never a row stamp). */
+export const historyStamps = root => [['[data-history-id]', 'historyId'], ['[data-source-history-id]', 'sourceHistoryId']]
+    .flatMap(([selector, key]) => Array.from(root.querySelectorAll(selector), node => [node.dataset[key], node]));
+
 /** A page can leave the rendered window only outside reading, focus and selection. */
 export function historyNodeIsProtected(node, viewport, selection = globalThis.getSelection?.()) {
     if (!node?.isConnected) return false;

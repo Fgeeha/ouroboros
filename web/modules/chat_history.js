@@ -32,11 +32,13 @@ export function historyCoverage(recent, pages = []) {
                 && Number.isSafeInteger(span.from) && Number.isSafeInteger(span.to)
                 && span.from >= 0 && span.from <= span.to;
         // A formerly empty source owns no retained bytes. Its first write
-        // changes the chain witness without invalidating an older fragment.
+        // changes the chain witness without invalidating an older fragment,
+        // and its frontier stays zero: a first read starting above it is a gap.
         const knownEmpty = span => span?.chain === 'empty' && span.from === 0 && span.to === 0
             && Array.isArray(span.gaps) && !span.gaps.length;
-        if (delivered.some(span => !valid(span) && !knownEmpty(span))) gaps = true;
-        const spans = delivered.filter(span => valid(span) && !span.gaps.length)
+        const known = span => valid(span) || knownEmpty(span);
+        if (delivered.some(span => !known(span))) gaps = true;
+        const spans = delivered.filter(span => known(span) && !span.gaps.length)
             .sort((a, b) => a.from - b.from);
         const clean = [];
         let end = null, start = null;
@@ -55,7 +57,7 @@ export function historyCoverage(recent, pages = []) {
         if (end !== horizon) gaps = true;
         if (start !== 0 || end !== horizon) complete = false;
         const oldEnds = pages.filter(value => value?.view === recent.view)
-            .map(value => value?.spans?.[source]).filter(sameChain)
+            .map(value => value?.spans?.[source]).filter(span => sameChain(span) || knownEmpty(span))
             .map(span => span.to);
         if (oldEnds.length && head.from > Math.max(...oldEnds)) horizonGap = true;
     }

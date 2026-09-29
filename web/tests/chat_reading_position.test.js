@@ -65,6 +65,16 @@ test('a failed or delayed read schedules no layout polling and exports the origi
     assert.equal(f.restored(), 2);
 });
 
+test('only the cross-instance saved place is restoring; a reshow of the live room is not', t => {
+    const f = fixture(t);
+    assert.equal(f.reading.restoring, true);
+    f.reading.request();
+    assert.equal(f.reading.restoring, true, 'a reshow while pending keeps the saved place');
+    f.reading.cancel();
+    f.reading.request();
+    assert.deepEqual([f.reading.pending, f.reading.restoring], [true, false]);
+});
+
 test('wheel/latest/question cancellation wins even between positioning frames', t => {
     const f = fixture(t); f.ready(); f.reading.position(); f.frame();
     f.reading.cancel(); f.feed.scrollTop = 210;

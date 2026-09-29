@@ -536,11 +536,17 @@ Failed remains that task's result even after a different task succeeds.
 Within one app session a room reopens at the passage being read after its data
 arrives, even on a slow connection; the place is kept in page memory, so a reload
 opens the room at the present. The passage includes how far a bounded full output,
-Review detail or card timeline around it was scrolled. A failed read keeps that
-destination and offers Retry. Scrolling, revealing a question or choosing the
-existing ↓ supersedes the saved destination; reading on, even inside a bounded
-box, supersedes a ↓ or question still loading. A wheel, swipe or key over a
-bounded box moves that box, not the conversation, until the box reaches its edge.
+Review detail or card timeline around it was scrolled. A failed history read
+keeps that destination and offers Retry; a failed read of the present by ↓
+leaves the view in place with the same Retry. A room kept for an unsent file
+reopens where it was left without another read, even after a partial one. A
+failed full-output read keeps the line's capped preview and offers no Retry of
+its own; collapsing and expanding the line asks again. Scrolling, revealing a
+question, sending a message or choosing the existing ↓ supersedes the saved
+destination; a Send that fails keeps it with the draft and files. Reading on,
+even inside a bounded box, supersedes a ↓ or question still loading. A wheel,
+swipe or key over a bounded box moves that box, not the conversation, until the
+box reaches its edge.
 A scrollbar drag follows new replies only when released at the live edge.
 Expanding a line or receiving its full output leaves it in place; only a newer
 line moves a card timeline to its end.
@@ -553,11 +559,14 @@ a short portion, resize or media layout alone starts no archive read. Empty
 physical pages are traversable and never mean EOF. The existing floating
 `Scroll to latest message` remains the explicit return to the present; when the
 present is already loaded it moves there and follows without a read, and a gap
-note stays.
+note stays. A clean read of the present supersedes an earlier failed one and its
+note.
 
 When loaded fragments are disconnected or their coverage is uncertain, the
 same readable note stays in Main and Project header chrome: `Some saved history
 is not loaded. Shown messages may have gaps.` A failed read says so distinctly.
+Bytes written after a read found a source empty count as missing until a
+later read delivers them from its start.
 Mixed task cards
 keep one node and use this general note: dates, common
 row IDs and an exhausted cursor cannot establish a separator or full coverage.
@@ -567,7 +576,8 @@ adopts that node and removes the label. The context itself certifies no archive
 coverage. A missing exact bookmark falls back to its card, then a row on the
 same loaded page, then the previous clamped position. The same persistent note
 explains the approximation until explicit navigation clears it.
-Selection, focus and expanded Reviews keep their actual nodes during reconciliation.
+Visible rows and card lines, selection, focus and expanded Reviews keep their
+actual nodes during reconciliation.
 Reopening a nested line reads that line's supplying physical page before using a
 card-wide fallback, and restores expansion and full-output hydration. Its logical
 reading identity and physical source survive replay even when equal or older

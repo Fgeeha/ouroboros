@@ -66,6 +66,15 @@ test('a late targeted question read cannot steal a newer navigation or a hidden 
         pending.get('hidden')(detail('hidden'));
         assert.equal(await hidden, false);
         assert.deepEqual(appended, ['new']);
+        // Hidden while its read is held, then shown again by a plain reopen (no question):
+        // that showing is the newer navigation, so the late detail cannot act.
+        visible = true;
+        const reopened = fx.decision.revealQuestion('reopened', 'qz-1', 'p1', 23, append, () => visible);
+        await Promise.resolve();
+        assert.equal(await fx.decision.revealQuestion('', '', 'p1', 23, append, () => visible), false);
+        pending.get('reopened')(detail('reopened'));
+        assert.equal(await reopened, false);
+        assert.deepEqual(appended, ['new']);
     } finally { fx.restore(); }
 });
 

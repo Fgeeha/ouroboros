@@ -113,7 +113,7 @@ export function createChatDecision({
     }
 
     async function revealQuestion(taskId, quizId, projectId, chatId, appendQuiz, isVisible, beginReveal = () => {}, didReveal = () => {}) {
-        const navigation = ++questionNavigation;
+        const navigation = ++questionNavigation; // one naming no question still voids older reveals
         let ownsPosition = () => true;
         const current = () => !disposed && isVisible() && navigation === questionNavigation && ownsPosition();
         if (!projectId || !taskId || !quizId || !current()) return false;

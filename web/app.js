@@ -396,7 +396,9 @@ async function openProjectPanel(project, { closeDrawer = true, openOnly = false,
         inst.restoreScrollPosition?.();
         // The addressed question owns the viewport before either history or
         // detail I/O; its chat-owned generation yields to later navigation.
-        const reveal = taskId && quizId ? inst.revealQuestion?.(taskId, quizId) : null;
+        // Every showing is one: a plain reopen addresses no question and so
+        // voids a reveal that a hidden pending-work survivor still awaits.
+        const reveal = inst.revealQuestion?.(taskId, quizId);
         // ACK only the exact revision whose history was fetched and painted. chat.js
         // owns the paint receipt; an already-painted instance skips the forced
         // refetch — the server clamps the ACK, so no repaint is needed.

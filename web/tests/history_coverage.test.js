@@ -51,6 +51,19 @@ test('the first write of a previously empty source does not invent a gap', () =>
     }
 });
 
+test('a retained empty source keeps its zero frontier when its first growth is read truncated', () => {
+    const empty = coverage(0, 0, 0, { chain: 'empty' });
+    const grown = (from, to) => coverage(from, to, 100, { chain: 'a' });
+    assert.deepEqual(historyCoverage(grown(40, 100), [empty]), { complete: false, gaps: true, horizonGap: true },
+        'bytes written below the truncated read and above the retained rows are an undelivered gap');
+    assert.deepEqual(historyCoverage(grown(0, 100), [empty]), { complete: true, gaps: false, horizonGap: false },
+        'a first growth read from zero is the whole source');
+    assert.deepEqual(historyCoverage(grown(40, 100), [empty, grown(0, 40)]), { complete: true, gaps: false, horizonGap: false },
+        'paging the new chain delivers those bytes');
+    assert.deepEqual(historyCoverage(grown(40, 100), [grown(40, 100)]), { complete: false, gaps: false, horizonGap: false },
+        'without a retained frontier the same tail is ordinary pagination');
+});
+
 test('same-rowcount reread refreshes spans, empty saved descriptors have no loaded authority', async () => {
     let current = coverage(0, 50, 100, { gaps: ['invalid_json'] });
     const make = () => createChatHistoryPager({

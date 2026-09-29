@@ -13,7 +13,7 @@ import { clientSurfaceField } from './client_surface.js';
 import { syncResultFilesItem } from './result_files.js';
 import { createChatReadingPosition } from './chat_reading_position.js';
 import { createChatHistoryPager, historyCoverage, historyIslandAtEdge } from './chat_history.js';
-import { mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
+import { mergeHistoricalTimelineItem, historyNodeIsProtected, historyRowIds, historyStamps, stampHistoryNode, compareHistoryPosition } from './chat_history_replay.js';
 import { apiClient, apiFetch, fetchTaskDetail, fetchTaskDetailStrict } from './api_client.js';
 import { syncHistoryRetentionItem } from './history_retention.js';
 import {
@@ -430,7 +430,8 @@ export function createChatInstance({
     // One derived physical coverage/status for the mounted reading window.
     let historyWindow = null;
     let welcomeShown = false;
-    // Cross-instance hide/show position; visible mutations use live geometry.
+    // Saved page and whole recent read gate only the cross-instance place; reshow
+    // targets and visible mutations use live geometry.
     let restoredPageReady = !initialScrollState?.history;
     let recentReady = false;
     let _hasNewActivity = false;
@@ -656,7 +657,7 @@ export function createChatInstance({
         afterWrite: () => workPointer?.update(), activity: () => { _hasNewActivity = true; },
         updateButton: updateScrollButton,
         visible: () => !destroyed && isInstanceVisible(),
-        ready: () => historyLoaded && restoredPageReady && recentReady
+        ready: () => historyLoaded && (!reading.restoring || restoredPageReady && recentReady)
             && anchorOwnersReady(reading.target?.historyAnchor, reviewHydrator.ready),
         anchors: { serialize: serializeTimelineAnchor, restore: restoreVisibleTimelineAnchor, capture: captureVisibleTimelineAnchor },
         fallback: target => {
@@ -2717,7 +2718,6 @@ export function createChatInstance({
                 const messages = Array.isArray(data.messages) ? data.messages : [];
                 const restoring = !restoredPageReady && !historyPager.getState().initialized
                     ? historyPager.restore(initialScrollState.history) : null;
-                recentReady = !data.reason_code;
                 const oldRecentIds = recentHistoryIds;
                 const admitted = acceptRecentWindow(data, messages);
                 const pagerBeforeRecent = historyPager.getState();
@@ -2772,7 +2772,6 @@ export function createChatInstance({
                 // ANY successful sync leaves the instance hydrated
                 // — later hydration triggers ride this sticky promise.
                 initialHydrationPromise = historySyncPromise;
-                historyControls.endRecent(data.reason_code ? new Error('Some saved history could not be loaded.') : null);
                 syncLoadOlderControl();
                 // A recreated project instance restores its predecessor's stashed
                 // mid-history position on first paint instead of pinning to newest.
@@ -2981,6 +2980,7 @@ export function createChatInstance({
         input.value = '';
         clearInputDraft();
         const sentTs = new Date().toISOString();
+        reading.cancel(); // an accepted Send supersedes any saved place
         addMessage(text, 'user', false, sentTs, false, {
             pending: result?.status === 'queued',
             source: 'web',
@@ -3291,6 +3291,9 @@ export function createChatInstance({
     function acceptRecentWindow(data, messages) {
         if (data.recentVersion <= recentApplied) return false;
         recentApplied = data.recentVersion;
+        // The newest admitted window (↓ too) owns readiness and the failure note.
+        recentReady = !data.reason_code;
+        historyControls.endRecent(data.reason_code ? new Error('Some saved history could not be loaded.') : null);
         recentCoverage = data.coverage ?? null;
         recentHasOrigins = messages.some(row => row.origin_projected);
         const ids = new Set(messages.flatMap(historyRowIds));
@@ -3306,8 +3309,7 @@ export function createChatInstance({
     function isHistoryPageProtected(descriptor) {
         if (reading.pending && reading.target?.history?.pages?.[reading.target.history.focus]?.id === descriptor.id) return true;
         const ids = pageHistoryIds.get(descriptor.id) || new Set();
-        if (Array.from(messagesDiv.querySelectorAll('[data-history-id]'))
-            .some(node => ids.has(node.dataset.historyId) && historyNodeIsProtected(node, messagesDiv))) return true;
+        if (historyStamps(messagesDiv).some(([id, node]) => ids.has(id) && historyNodeIsProtected(node, messagesDiv))) return true;
         return [...liveCardRecords.values()].some(record =>
             [...(record.historyIds || [])].some(id => ids.has(id))
             && [record.summaryButtonEl, record.reviewsHostEl].some(node => historyNodeIsProtected(node, messagesDiv)));
@@ -3323,8 +3325,7 @@ export function createChatInstance({
         const retained = retainedHistoryIds();
         const released = new Set();
         const byId = new Map();
-        for (const node of messagesDiv.querySelectorAll('[data-history-id]')) {
-            const key = node.dataset.historyId;
+        for (const [key, node] of historyStamps(messagesDiv)) {
             if (!byId.has(key)) byId.set(key, []);
             byId.get(key).push(node);
         }

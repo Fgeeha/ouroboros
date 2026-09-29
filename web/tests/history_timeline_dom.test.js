@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import { bindLiveCardTimeline, buildTimelineItemHtml, selectionInside } from '../modules/chat_activity.js';
 import { createLiveCardTimelineRenderer, createTimelineAnchors, updateLiveTimelineItem } from '../modules/chat_render_batch.js';
-import { mergeHistoricalTimelineItem } from '../modules/chat_history_replay.js';
+import { historyStamps, mergeHistoricalTimelineItem } from '../modules/chat_history_replay.js';
 
 // A real tree (including text nodes), with explicit removal effects on focus.
 // The injected renderer builds JSON trees so this fixture needs no HTML parser.
@@ -300,6 +300,20 @@ test('timeline markup uses a selectable accessible header and exact history attr
     assert.match(html, /aria-controls="chat-live-line-body-task-one"/);
     assert.match(html, /Title<\/strong><br>/);
     assert.match(html, /Body<\/strong><br>/);
+    // An evolving line is released with its current source row, so visibility
+    // protection must see it; that row may render elsewhere, so it is a locator.
+    const receipt = buildTimelineItemHtml({ lineKey: 'terminal-receipt', dedupeKey: 'cardrow|merge-receipt:r',
+        sourceHistoryId: 'progress:9', phase: 'result', headline: 'PR #7 merge: merged' }, { expandedLineKeys: new Set(), groupId: 'task' });
+    assert.match(receipt, /data-source-history-id="progress:9"/);
+    assert.doesNotMatch(receipt, /data-history-id/);
+    const live = buildTimelineItemHtml({ lineKey: 'live', phase: 'working', headline: 'Live only' }, { expandedLineKeys: new Set(), groupId: 'task' });
+    assert.doesNotMatch(live, /history-id/);
+});
+
+test('history stamps pair each row and source-only locator with its node', () => {
+    const row = { dataset: { historyId: 'progress:4' } }, terminal = { dataset: { sourceHistoryId: 'progress:4' } };
+    const root = { querySelectorAll: selector => ({ '[data-history-id]': [row], '[data-source-history-id]': [terminal] })[selector] };
+    assert.deepEqual(historyStamps(root), [['progress:4', row], ['progress:4', terminal]]);
 });
 
 test('selection crossing a header is protected even with both endpoints outside', () => {

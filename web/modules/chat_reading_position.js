@@ -7,6 +7,7 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
     let mutationDepth = 0;
     let viewportAnchor = null, width = feed.clientWidth;
     let intent = initial && initial.stick === false ? { ...initial } : null;
+    const saved = intent;
     let approximate = false, dragging = '', claimed = null;
     const state = {
         top: Math.max(0, Number(initial?.scrollTop) || 0),
@@ -14,6 +15,9 @@ export function createChatReadingPosition({ initial, visible, alive, ready, feed
         get generation() { return generation; },
         get pending() { return Boolean(intent); },
         get target() { return intent; },
+        /** The cross-instance saved place is still pending; a reshow of this
+         * live room is not one: its target was taken from the mounted rows. */
+        get restoring() { return Boolean(intent) && intent === saved; },
         get approximate() { return approximate; },
         remember(force = false) {
             if (intent || !visible() || (!force && width !== feed.clientWidth)) return;

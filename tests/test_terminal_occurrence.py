@@ -163,6 +163,39 @@ def test_actual_child_copyback_cannot_authenticate_its_own_attempt(tmp_path, mon
     assert terminal_time_fact(final)['occurred_at'] == expected
 
 
+@pytest.mark.parametrize('child_state', ['matching', 'stale_attempt', 'recovered'])
+def test_orphan_settlement_before_delayed_copyback_keeps_child_occurrence(tmp_path, monkeypatch, child_state):
+    """The sweep can settle a split row from its child terminal before copyback lands."""
+    import time
+    from ouroboros.headless import copy_child_task_result
+    from ouroboros.task_status import reconcile_orphaned_running_tasks
+    from ouroboros.utils import append_jsonl
+
+    host, child = tmp_path / 'host', tmp_path / 'child'
+    write_task_result(host, 'root', 'running', task_attempt=1, started_at=T1, ts=T1,
+                      child_drive_root=str(child), headless_child_drive_root=str(child))
+    write_task_result(child, 'root', 'running', task_attempt=2 if child_state == 'stale_attempt' else 1,
+                      started_at=T1, ts=T1)
+    monkeypatch.setattr('ouroboros.task_results.utc_now_iso', lambda: T2)
+    if child_state == 'recovered':  # no child terminal: only the queue/worker orphan proof ends it
+        monkeypatch.setattr(time, 'time', lambda: 1_800_000_000.0)
+        (host / 'state').mkdir()
+        (host / 'state/queue_snapshot.json').write_text(json.dumps({'ts': '2027-01-15T08:00:00+00:00', 'pending': [], 'running': []}))
+        append_jsonl(host / 'logs/events.jsonl', {'ts': T2, 'type': 'worker_boot'})
+    else:
+        write_task_result(child, 'root', 'completed', _terminal_observed=True, result='Child answer')
+    monkeypatch.setattr('ouroboros.task_results.utc_now_iso', lambda: T3)
+    assert load_task_result(host, 'root')['status'] == 'running'  # copyback has not delivered it yet
+    assert reconcile_orphaned_running_tasks(host) == 1
+    rows = [load_task_result(host, 'root')]
+    if child_state != 'recovered':
+        rows.append(copy_child_task_result(host, {'id': 'root', 'drive_root': str(child)}))
+    for row in rows:
+        assert row['status'] == ('failed' if child_state == 'recovered' else 'completed')
+        assert terminal_time_fact(row)['occurred_at'] == (T2 if child_state == 'matching' else None)
+    assert terminal_time_fact(load_task_result(host, 'root')) == terminal_time_fact(rows[0])
+
+
 @pytest.mark.parametrize('worker_start', [True, False])
 def test_split_subagent_start_carries_the_witness_its_copyback_needs(tmp_path, monkeypatch, worker_start):
     """The real subagent route: request receipt, assignment mirror, worker start, child end, copyback."""

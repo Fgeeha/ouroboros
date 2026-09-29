@@ -854,3 +854,119 @@ def test_latest_waiting_for_history_yields_to_reading_inside_a_box(direct_server
             assert abs(after['line'] - read['line']) <= 8 and abs(after['body'] - read['body']) <= 2, (read, after)
         finally:
             browser.close()
+
+
+def _retained_room(root, slug, count, **quiz):
+    """A deep Project whose composer will hold a staged file, so hiding keeps its instance."""
+    from datetime import datetime, timedelta, timezone
+    from ouroboros.projects_registry import bind_task_to_project, create_project
+    from ouroboros.task_results import write_task_result
+
+    project = create_project(root, slug, name=slug.replace('-', ' ').title())
+    start = datetime(2026, 9, 1, tzinfo=timezone.utc)
+    _write(root / 'logs/chat.jsonl', [{'direction': 'in', 'chat_id': project['chat_id'], 'client_message_id': f'{slug}-{index}',
+        'ts': (start + timedelta(minutes=index)).isoformat(), 'text': f'{slug} message {index:04d}. Reading an older discussion.'}
+        for index in range(count)])
+    if quiz:
+        bind_task_to_project(root, 'continuity-question', project['id'], project['chat_id'], origin={'absent': 'system'})
+        write_task_result(root, 'continuity-question', 'completed', project_id=project['id'], chat_id=project['chat_id'], owner_quiz=quiz)
+    return project
+
+
+def _stage_file(page):
+    panel = page.locator('#project-panel')
+    panel.locator('.chat-file-input-hidden').set_input_files([{'name': 'kept.txt', 'mimeType': 'text/plain', 'buffer': b'kept'}])
+    panel.locator('.attach-name').filter(has_text='kept.txt').wait_for()
+
+
+_GAP = 'n => n.scrollHeight - n.scrollTop - n.clientHeight'
+
+
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+def test_failed_restore_then_latest_keeps_a_retained_room_at_the_present(direct_server_with_data, browser_engine, tmp_path):
+    """Restore error → ↓ → hide/reopen of a room kept by its staged file still follows new replies."""
+    from playwright.sync_api import sync_playwright
+    from tests.test_history_continuity_browser import _FAULT
+    from tests.ui_chat_viewport_smoke import _emit_ws_frame
+
+    project = _retained_room(direct_server_with_data['data_dir'], 'restore-latest', 1200)
+    with sync_playwright() as pw:
+        browser = getattr(pw, browser_engine).launch(headless=True)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 850})
+            page.add_init_script(f'({_FAULT})()')
+            _open(page, direct_server_with_data['url'])
+            feed = _open_project(page, project)
+            for _ in range(3):
+                _step(page, feed, automatic=True)
+            _bookmark_place(page, page.locator(f'{feed} [data-client-message-id="restore-latest-650"]'), 80)
+            page.locator('#project-panel-close').click()
+            page.evaluate('fault => { window.__continuityFault = fault; }', {'chatId': project['chat_id'], 'fail': 'saved'})
+            _click_project(page, project)
+            page.wait_for_function("feed => document.querySelector(`${feed} .chat-load-older button`)?.textContent === 'Retry loading messages'", arg=feed)
+            page.evaluate('() => { window.__continuityFault = null; }')
+            _stage_file(page)
+            page.locator('#project-panel-body .chat-scroll-bottom-btn').click()
+            _idle(page, feed)
+            page.evaluate(_FRAMES)
+            assert page.locator(feed).evaluate(_GAP) <= 8
+            page.locator('#project-panel-close').click()
+            assert page.locator('.chat-instance-panel[data-pending-work="1"]').count() == 1
+            _click_project(page, project)
+            page.evaluate(_FRAMES)
+            _emit_ws_frame(page, {'type': 'chat', 'chat_id': project['chat_id'], 'role': 'assistant',
+                                  'content': 'LIVE_REPLY_AFTER_REOPEN', 'ts': '2026-09-27T22:00:00Z'})
+            page.evaluate(_FRAMES)
+            _screenshot(page, tmp_path, f'restore-error-latest-reopen-{browser_engine}')
+            assert page.locator(feed).get_by_text('LIVE_REPLY_AFTER_REOPEN', exact=True).count() == 1
+            assert page.locator(feed).evaluate(_GAP) <= 8, 'the reopened room keeps following the present'
+        finally:
+            browser.close()
+
+
+@pytest.mark.parametrize('browser_engine', ['chromium', 'webkit'])
+def test_plain_reopen_voids_a_hidden_rooms_held_question_reveal(direct_server_with_data, browser_engine, tmp_path):
+    """A reveal still awaiting detail when its retained room hid cannot move or focus a later plain reopen."""
+    from playwright.sync_api import sync_playwright
+    from tests.test_history_continuity_browser import _FAULT
+
+    project = _retained_room(direct_server_with_data['data_dir'], 'held-reveal', 400, addressed={
+        'quiz_id': 'addressed', 'state': 'expired_terminal', 'question': 'ADDRESSED_QUESTION',
+        'options': ['Yes', 'No'], 'option_details': ['Proceed', 'Wait'], 'asked_at': '2026-09-01T02:00:00Z'})
+    ask = """project => window.dispatchEvent(new CustomEvent('ouro:open-project', {
+        detail: {project, task_id: 'continuity-question', quiz_id: 'addressed'}}))"""
+    in_quiz = "() => Boolean(document.activeElement?.closest('[data-quiz-id=\"addressed\"]'))"
+    with sync_playwright() as pw:
+        browser = getattr(pw, browser_engine).launch(headless=True)
+        try:
+            page = browser.new_page(viewport={'width': 1280, 'height': 850})
+            page.add_init_script(f'({_FAULT})()')
+            _open(page, direct_server_with_data['url'])
+            feed = _open_project(page, project)
+            _stage_file(page)
+            ids = page.locator(f'{feed} [data-client-message-id]').evaluate_all('ns => ns.map(n => n.dataset.clientMessageId)')
+            target = page.locator(f'{feed} [data-client-message-id="{ids[len(ids) // 2]}"]')
+            _bookmark_place(page, target, 80)
+            page.locator('#project-panel-close').click()
+            page.evaluate('() => { window.__holdQuestion = true; }')
+            page.evaluate(ask, project)
+            page.wait_for_function('() => Boolean(window.__releaseQuestion)')
+            page.locator('#project-panel-close').click()
+            assert page.locator('.chat-instance-panel[data-pending-work="1"]').count() == 1
+            _click_project(page, project)
+            _idle(page, feed)
+            page.evaluate(_FRAMES)
+            before = target.evaluate(_OFFSET)
+            with page.expect_response(lambda response: '/api/tasks/continuity-question' in response.url):
+                page.evaluate('() => { window.__holdQuestion = false; window.__releaseQuestion(); }')
+            page.wait_for_timeout(150)
+            page.evaluate(_FRAMES)
+            _screenshot(page, tmp_path, f'held-reveal-after-plain-reopen-{browser_engine}')
+            assert page.locator(f'{feed} [data-quiz-id="addressed"]').count() == 0
+            assert abs(target.evaluate(_OFFSET) - before) <= 8 and not page.evaluate(in_quiz)
+            page.evaluate(ask, project)  # a new addressed navigation still owns the viewport
+            page.locator(f'{feed} [data-quiz-id="addressed"]').wait_for(state='visible')
+            page.wait_for_function(in_quiz)
+            _screenshot(page, tmp_path, f'held-reveal-new-reveal-{browser_engine}')
+        finally:
+            browser.close()
