@@ -791,7 +791,6 @@ def load_task_result(
             raise
         return None
     try:
-        # A writer's atomic replace can deny a Windows open for an instant: not unreadable.
         data = json.loads(read_text_across_replace(path))
     except FileNotFoundError:
         return None  # This read saw absence even if a writer publishes immediately after it.
