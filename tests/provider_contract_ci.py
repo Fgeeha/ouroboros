@@ -350,7 +350,8 @@ def _text_facts(value):
     return len(encoded), hashlib.sha256(encoded).hexdigest()
 
 
-def _canary_evidence(canary_or_model, message, usage, *, call=None, call_index=None, parse_error=None):
+def _canary_evidence(canary_or_model, message, usage, *, call=None, call_index=None, parse_error=None,
+                     key_diff=None):
     """Return bounded structural evidence; never copy provider payloads."""
     canary_id = canary_or_model.canary_id if isinstance(canary_or_model, ProviderCanary) else ""
     model = canary_or_model.model if isinstance(canary_or_model, ProviderCanary) else canary_or_model
@@ -405,6 +406,10 @@ def _canary_evidence(canary_or_model, message, usage, *, call=None, call_index=N
                 evidence["arguments_type"] = type(raw_arguments).__name__
         else:
             evidence["function_type"] = type(function).__name__
+    if key_diff is not None:
+        extra, missing = key_diff
+        evidence["extra_keys"] = [label for label in map(_bounded_diagnostic_label, extra) if label]
+        evidence["missing_keys"] = [label for label in map(_bounded_diagnostic_label, missing) if label]
     if parse_error is not None:
         evidence["parse_error"] = {"type": type(parse_error).__name__}
         for field in ("pos", "lineno", "colno"):
@@ -619,11 +624,16 @@ def _chat_canary_turn(client, *, canary: ProviderCanary, chat_kwargs):
 def assert_normalized_canary_call(
     message,
     tools,
-    required_arguments,
+    requested_arguments,
     *,
     canary=None,
     usage=None,
 ):
+    """Every native call must be schema-valid and carry EXACTLY the requested object.
+
+    An extra declared key is a RED contract fact, not tolerated noise: a route that
+    forces optional properties (issue #1411) fills keys the prompt never asked for.
+    """
     from jsonschema import validators
 
     calls = message.get("tool_calls") if isinstance(message, dict) else None
@@ -697,7 +707,16 @@ def assert_normalized_canary_call(
                 canary or "", message, usage, "arguments_unknown_keys",
                 call=call, call_index=call_index,
             )
-        for key, expected in required_arguments.items():
+        if set(arguments) != set(requested_arguments):
+            # Only declared property names reach here, so naming them is safe evidence.
+            raise _canary_failure(
+                canary or "", message, usage, "arguments_exact_keys",
+                call=call, call_index=call_index, key_diff=(
+                    sorted(set(arguments) - set(requested_arguments)),
+                    sorted(set(requested_arguments) - set(arguments)),
+                ),
+            )
+        for key, expected in requested_arguments.items():
             if arguments.get(key) != expected:
                 raise _canary_failure(
                     canary or "", message, usage, f"arguments_{key}",
@@ -715,7 +734,6 @@ def run_provider_contract_canary(
 ):
     """Exercise the public chat seam without executing the returned tool call."""
     requested_arguments = delegate_start_canary_arguments(nonce)
-    required_arguments = {"prompt": requested_arguments["prompt"]}
     arguments_json = json.dumps(requested_arguments, ensure_ascii=False, sort_keys=True)
     final_marker = f"FULL_REGISTRY_CONTINUED_{nonce}"
     continuation_instruction = (
@@ -755,15 +773,14 @@ def run_provider_contract_canary(
             "timeout": CANARY_TIMEOUT_SEC,
         },
     )
-    # This is a provider schema-admission canary, not a duplicate of the
-    # runtime selector gate. The provider must preserve the nonce-bearing prompt
-    # and return declared, schema-valid native calls. Valid assistant text beside
-    # those calls is tolerated and recorded as bounded warning telemetry;
-    # subagent_id versus retry_of is enforced by the existing typed runtime tests.
+    # The provider must return schema-valid native calls whose arguments are
+    # exactly the requested object: the nonce-bearing prompt and the subagent_id
+    # selector, no omitted, substituted or provider-filled optional key. Valid
+    # assistant text beside those calls is tolerated as bounded warning telemetry.
     calls = assert_normalized_canary_call(
         message,
         tools,
-        required_arguments,
+        requested_arguments,
         canary=canary,
         usage=usage,
     )
