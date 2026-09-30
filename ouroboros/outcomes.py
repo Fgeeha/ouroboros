@@ -803,7 +803,8 @@ def normalize_outcome_axes(result: Dict[str, Any]) -> Dict[str, Any]:
     plan_blocked = (objective_status == OBJECTIVE_FAIL and objective_source in {
         "plan_review_cycles_exhausted", "plan_review_quorum_unreachable", "plan_review_author_stop"}
         and objective.get("reason") in {REASON_REVIEW_CYCLES_EXHAUSTED, REASON_REVIEW_QUORUM_UNREACHABLE, "author_stop"})
-    if objective_status != OBJECTIVE_NOT_EVALUATED and objective_source != "task_acceptance_review" and not (author_current or plan_blocked):
+    stopped = objective_source == "task_completion" and (normalized["execution"].get("task_completion") or {}).get("action") == "stop"
+    if objective_status != OBJECTIVE_NOT_EVALUATED and objective_source != "task_acceptance_review" and not (author_current or plan_blocked or stopped):
         normalized["objective"] = {
             **objective,
             "status": OBJECTIVE_NOT_EVALUATED,
@@ -1196,13 +1197,8 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         })
     # Mutation attribution is evidence for the reviewing panels (attached to the
     # failure-evidence projection below), deliberately never a structural veto.
-    # Tool-call errors alone do not degrade a delivered answer's execution, so
-    # when the objective was never judged (default "auto" with no self-call ->
-    # objective not_evaluated) a real overclaim could read as clean. Surface a
-    # structural warning (not a failure) so the UI escalates it. Gating on the
-    # objective being genuinely unjudged is the honest condition: a review that
-    # ran (any verdict) already judged it. No review is auto-run, no env knob, no
-    # content inference (Bible P5).
+    # Unjudged objectives retain a structural tool-error warning, never an inferred
+    # failure or an automatic review. Any recorded critic already judged its subject.
     if (cosmetic_tool_errors or tool_errors) and objective.get("status") == OBJECTIVE_NOT_EVALUATED:
         _merge_objective_warning(objective, WARN_RESIDUAL_TOOL_ERRORS_WITHOUT_REVIEW)
     final_answer_payload = (
@@ -1226,11 +1222,15 @@ def derive_loop_outcome(final_text: str, usage: Dict[str, Any], llm_trace: Dict[
         # headline a completed answer-bearing task as a top-level tool failure.
         headline_reason = REASON_FINAL_MESSAGE
         headline_failure = None
+    completion = _trace_mapping(llm_trace, "task_completion")
+    if completion.get("action") == "stop" and objective.get("reason") not in {"author_stop", REASON_REVIEW_CYCLES_EXHAUSTED}:
+        objective.update(status=OBJECTIVE_FAIL, source="task_completion", reason="author_stop")
     outcome_axes = {
         "schema_version": 1,
         "lifecycle": {"status": "completed"},
         "execution": {
             "status": execution_status,
+            **({"task_completion": completion} if completion else {}),
             "reason_code": reason_code,
             "failure": failure,
             **({"resource_limit": resource_limit} if resource_limit else {}),

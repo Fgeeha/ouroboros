@@ -1281,16 +1281,9 @@ def _join_cause_clauses(clauses: List[str]) -> str:
 def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     """Every simultaneous cause this record holds, as ONE terminated host clause.
 
-    The primary cause is what ENDED the task. A deferred child, a plan review
-    still open at delivery and an unreconciled custody debt are standing
-    limitations of the SAME answer, so they are stated BESIDE it instead of
-    replacing it or being replaced by it: a card that can show one cause has to
-    choose, and choosing is why the host had to write the second fact as chat
-    prose. Nothing here ranks or folds; equivalent clauses state themselves once.
-    A held task (a blocking plan exit) speaks through its objective's own reason,
-    so it never reads "the work went on". The stored reviewer rationale never
-    reaches the row — it stays in the card, the task result and Logs. The Python
-    twin of ``taskReasonDetail``; callers add no punctuation.
+    Primary cause and standing limitations each appear once. Held tasks state
+    their objective's reason. Only the author's stop rationale reaches this line; reviewer
+    prose stays in review detail. Python twin of ``taskReasonDetail``.
     """
     from ouroboros.outcomes import (
         ACCEPTANCE_ACCEPTED, REASON_FINAL_MESSAGE, REASON_OWNER_REQUESTED_FINALIZATION, plan_review_awaiting,
@@ -1299,8 +1292,13 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
     decision: Dict[str, Any] = {}
     veto: Dict[str, Any] = {}
     objective: Dict[str, Any] = {}
+    completion: Dict[str, Any] = {}
     for source in (event, result):
         axes = source.get("outcome_axes") if isinstance(source.get("outcome_axes"), dict) else {}
+        execution = axes.get("execution") if isinstance(axes.get("execution"), dict) else {}
+        value = source.get("task_completion", execution.get("task_completion"))
+        if isinstance(value, dict):
+            completion = value
         objective = axes.get("objective") if isinstance(axes.get("objective"), dict) else objective
         if isinstance(objective.get("receipt_veto"), dict):
             veto = objective["receipt_veto"]
@@ -1333,8 +1331,8 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
         # A task HELD by a blocking plan review states the objective's own reason.
         clause = TASK_CAUSE_PHRASES.get(str(objective.get("reason") or ""), str(objective.get("reason") or ""))
     elif raw_reason in {REASON_FINAL_MESSAGE, ""}:
-        clause = (TASK_CAUSE_PHRASES["plan_review_awaiting"]
-                  if plan_review_awaiting(event, result) and phase == "done" else "")
+        clause = (TASK_CAUSE_PHRASES["author_stop"] if completion.get("action") == "stop" and phase != "cancelled"
+                  else TASK_CAUSE_PHRASES["plan_review_awaiting"] if plan_review_awaiting(event, result) and phase == "done" else "")
     else:
         # A healed debt is never restored here: naming the code again would
         # state a debt the same record shows as empty. The recorded open-review
@@ -1343,19 +1341,20 @@ def _completion_verdict(result: Dict[str, Any], event: Dict[str, Any]) -> str:
         key = _plan_review_key(result, event, reason) if reason == "plan_review_advisory" else reason
         clause = (" ".join(strip_markdown(str(detail)).split()) if detail
                   else TASK_CAUSE_PHRASES.get(key, key))
-    line = _join_cause_clauses([clause, _author_stop_rationale(decision),
+    line = _join_cause_clauses([clause, _author_stop_rationale(decision, completion),
                                 *incident_cause_clauses(decision, reason, TASK_CAUSE_PHRASES),
                                 *_terminal_limitations(result, event, reason, held=held),
                                 TASK_CAUSE_PHRASES.get(custody, custody) if custody else ""])
     return line if not line or line.endswith((".", "!", "?", "…", ")")) else line + "."
 
 
-def _author_stop_rationale(decision: Dict[str, Any]) -> str:
+def _author_stop_rationale(decision: Dict[str, Any], completion: Optional[Dict[str, Any]] = None) -> str:
     """The agent's own reason for an explicit stop, beside the typed sentence (TZ-2 C4).
 
     Only the AUTHOR's recorded rationale reaches the row: the reviewer rationale
     stays in the card; a finish carries none. The twin of ``authorStopRationale``."""
-    author = decision.get("author_disposition") if recorded_author_stop(decision) else None
+    author = completion if (completion or {}).get("action") == "stop" else (
+        decision.get("author_disposition") if recorded_author_stop(decision) else None)
     return " ".join(strip_markdown(str(author.get("rationale") or "")).split()) if isinstance(author, dict) else ""
 
 

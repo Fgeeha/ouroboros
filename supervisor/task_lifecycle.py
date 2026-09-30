@@ -195,7 +195,10 @@ def restore_queue_fences(
                 if not root_id:
                     malformed_acceptance = True
                     break
-                fenced_roots.add(root_id)
+                # A saved author stop closes its own admission, not its children.
+                # Pre-terminal shutdown and cancel custody are restored separately.
+                if status != "sealed" or fence.get("outcome") != "author_stop":
+                    fenced_roots.add(root_id)
     malformed_budget = not isinstance(raw_budget, list)
     restored: Dict[str, Dict[str, Any]] = {}
     if not malformed_budget:

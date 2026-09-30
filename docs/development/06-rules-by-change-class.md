@@ -340,10 +340,9 @@ and 23 (`delegated_transport`), both critical. The imperatives:
   `prune_orphans` and genesis excepted)
   (`tests/test_snapshot_file_inputs.py`, `tests/test_subagent_worktrees_lock_scope.py`).
 - Outcome honesty: a delegating parent must not produce a clean no-tool final
-  answer while direct children run undecided — one bounded absorption
-  reminder, then best-effort (`children_unabsorbed`); the delivery candidate
-  is HELD while that gate is open, and the delivery-control instruction never
-  rides the reminder round (`tests/test_v6570_swarm_honesty.py`). `wait_tasks`
+  answer while direct children run undecided. Hold finish until an exact disposition
+  or explicit unfinished stop; reminder counts never terminate the task. Keep selected
+  bytes and children intact (`tests/test_completion_selection.py`). `wait_tasks`
   stays batch-compact;
   `control_task_results._wait_for_tasks` owns its projection, documented under
   ARCHITECTURE's "Waiting on children"; full untruncated handoff belongs to `get_task_result` and a settled `wait_task`, and the
@@ -943,8 +942,8 @@ and what enforces each.
   final-answer path unless that invariant is explicitly tested and documented.
 - Keep a complete loop-local `DeliveryCandidate`; sticky host-control provenance survives
   replacement (`ouroboros/loop_delivery.py`; ARCHITECTURE §6 "Task lifecycle").
-  FORCED resolution: pure, no retry; honor valid keep/replace, preserve malformed controls'
-  candidate with a typed degraded reason; no protocol JSON in chat/durable results.
+  Forced resolution is pure, with no retry: the same action/answer/hash request selects
+  complete bytes; malformed or historical controls stay private and retain the candidate.
   Distinguish consumed owner source from changed requirements; effective criteria and
   material effects (nominated reads included) define the subject; ingress generations
   preserve unread order. Status/narration/working-view changes buy no review. Finalize
@@ -994,12 +993,11 @@ and what enforces each.
   ARCHITECTURE §6 Task acceptance owns waiting, fences, `previous_revision_accepted`
   and `late_settlement`. Freeze request/roster; collect pending paid panels at $0 before
   new evidence or `review_cycles_exhausted`. Reauthoring loses no verdict; settlement
-  wakes carry verdicts regardless of Main's draft. Re-offer only changed control bytes;
-  spent repair stays spent, typed host refusal spends none. Ready feedback skips parking
-  only. Complete prose is valid; optional keep/replace/finish defaults pending-review
-  choice to wait. Preserve effect/owner/child gates, source acknowledgement and forced
-  rails; context mail wakes without owner revision. Empty/malformed controls keep the
-  answer (`test_acceptance_optional_control.py`). Text-only rewrites reuse ready/pending
+  wakes carry verdicts regardless of Main's draft. Every held prose round appends
+  assistant+host rows; rich facts change only when their inputs do. Main selects complete
+  bytes or an offered hash through finish_task; pending-review defaults to wait. Preserve
+  effect/owner/child gates, source acknowledgement and forced rails; context mail grants
+  no owner revision. Refused selections preserve the answer (`test_completion_selection.py`). Text-only rewrites reuse ready/pending
   PASS; changed subject/owner source does not (`_deliver_under_running_panel`). Blocking
   waits; Cyber Pro does not; Advisory finish needs explicit `"pending_review":"finish"`.
   Bind operation wait before windows with original money/deadline/Stop; read back the
@@ -1012,8 +1010,9 @@ and what enforces each.
   Pass late evidence to an admissible cognition turn; settlement starts none. Workers
   never author Main's candidate/decision or make reviewers open delegations; subtree,
   status, findings and Cyber authority stay distinct (BIBLE P0).
-- Delivery-control JSON governs only tool-less final responses; retention leaves tools
-  available. Changed criteria/material evidence mean a new subject even with kept text,
+- One completion request serves native tools, legacy explicit review actions, Presence
+  and pure forced extraction. Retention leaves tools available. Changed criteria/material
+  evidence mean a new subject even with kept text,
   never old verdict authority. Source acknowledgement infers no semantic change from
   generation. File/diff requests impose no commit-or-revert rule; self-modification
   keeps reviewed commits (BIBLE P0/P3).

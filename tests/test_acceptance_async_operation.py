@@ -546,7 +546,7 @@ def test_a_late_settlement_for_another_task_is_never_published(tmp_path):
     assert json.dumps(load_task_result(tmp_path, "other-root"), sort_keys=True) == before
 
 
-def test_every_acceptance_wake_reoffers_a_changed_keep_contract(tmp_path, monkeypatch):
+def test_every_acceptance_wake_reoffers_the_changed_answer_selector(tmp_path, monkeypatch):
     """A replacement candidate inherits ``control_episode_seen``; the contract for
     the NEW candidate must still be shown, while identical bytes are not repeated."""
     from ouroboros.loop_acceptance_review import wait_for_acceptance_feedback
@@ -570,11 +570,8 @@ def test_every_acceptance_wake_reoffers_a_changed_keep_contract(tmp_path, monkey
     assert blocks() == 2 and second.content_sha256[:12] in str(ctx.messages)
 
 
-def test_the_acceptance_wake_keeps_the_one_repair_already_spent(tmp_path, monkeypatch):
-    """Scope review round 1: re-arming on every wake reset ``repair_attempted``,
-    so a candidate could burn one malformed-control repair per wake instead of
-    one per episode. The wake's re-offer preserves the spent repair; an ordinary
-    arm (something changed) still opens a fresh episode."""
+def test_acceptance_wakes_never_spend_a_counter_to_discard_the_answer(tmp_path, monkeypatch):
+    """Repeated wakes and interim replies retain the answer until an explicit selection."""
     from ouroboros.loop_acceptance_review import wait_for_acceptance_feedback
     from tests.test_delivery_forced_finalization import _forced_test_context
 
@@ -583,11 +580,18 @@ def test_the_acceptance_wake_keeps_the_one_repair_already_spent(tmp_path, monkey
     registry._ctx._task_acceptance_pending = "binding-one"
     candidate = loop._replace_delivery_candidate(registry, ctx, trace, "Complete answer.", control="candidate")
     wait_for_acceptance_feedback(registry, ctx, trace, [], set())
-    candidate.repair_attempted = True  # the one repair was spent on a malformed control
-    wait_for_acceptance_feedback(registry, ctx, trace, [], set())
-    assert candidate.repair_attempted is True, "the wake re-offer must not refund the repair"
-    loop._arm_delivery_control(registry, ctx, trace)
-    assert candidate.repair_attempted is False, "an ordinary arm opens a new episode"
+    for interim in ("Still waiting.", "The critic is working.", "No new review result yet."):
+        wait_for_acceptance_feedback(registry, ctx, trace, [], set())
+        status, text = loop._resolve_delivery_control(interim, registry, ctx, trace)
+        assert (status, text) == ("retry", "Complete answer.")
+        assert registry._ctx._delivery_candidate.full_text == "Complete answer."
+        assert registry._ctx._delivery_control_required
+        assert not registry._ctx._delivery_candidate.degraded
+        assert not getattr(registry._ctx, "_completion_selected", None)
+    from tests.test_delivery_forced_finalization import _select_completion
+    _select_completion(registry, ctx, trace, answer_sha256=candidate.content_sha256)
+    assert registry._ctx._completion_selected["action"] == "finish"
+    assert registry._ctx._delivery_candidate.full_text == "Complete answer."
 
 
 def test_the_rearmed_contract_never_rewrites_an_already_sent_row(tmp_path):
@@ -622,23 +626,29 @@ def test_pending_review_rides_beside_the_verb_and_is_recorded_on_every_answer(tm
     never an extra key that invalidates the body, and every control answer records
     it (an answer without the key means wait)."""
     from tests.test_delivery_control_lineage import _start_control_episode
+    from ouroboros.loop_delivery import completion_observation, consume_completion_request
+    from ouroboros.tools.control_runtime import stage_completion_request
 
     loop, registry, ctx, trace, candidate = _start_control_episode(tmp_path)
     loop._arm_delivery_control(registry, ctx, trace)
-    status, text = loop._resolve_delivery_control(
-        json.dumps({"delivery_control": "keep", "pending_review": choice}), registry, ctx, trace,
-    )
-    assert (status, text) == ("resolved", candidate.full_text)
+    registry._ctx._completion_observation = completion_observation(registry._ctx, trace)
+    assert json.loads(stage_completion_request(registry._ctx, {
+        "action": "finish", "answer_sha256": candidate.content_sha256, "pending_review": choice,
+    }))["status"] == "completion_requested"
+    assert consume_completion_request(registry, ctx, trace)
+    assert registry._ctx._delivery_candidate.full_text == candidate.full_text
     assert registry._ctx._acceptance_pending_review_choice == choice
     loop._arm_delivery_control(registry, ctx, trace)
-    status, _text = loop._resolve_delivery_control(
-        json.dumps({"delivery_control": "keep"}), registry, ctx, trace,
-    )
-    assert status == "resolved" and registry._ctx._acceptance_pending_review_choice == "wait"
+    registry._ctx._completion_observation = completion_observation(registry._ctx, trace)
+    assert json.loads(stage_completion_request(registry._ctx, {
+        "action": "finish", "answer_sha256": candidate.content_sha256,
+    }))["status"] == "completion_requested"
+    assert consume_completion_request(registry, ctx, trace)
+    assert registry._ctx._acceptance_pending_review_choice == "wait"
 
 
 @pytest.mark.parametrize("content", ["", [{"type": "thinking", "thinking": "reasoning only"}], "invalid control"])
-def test_delivery_repair_keeps_the_sent_control_prefix(tmp_path, content):
+def test_held_prose_keeps_the_sent_control_prefix(tmp_path, content):
     import copy
     from ouroboros.transcript_prefix import observe_send
     from tests.test_delivery_forced_finalization import _forced_test_context
@@ -652,9 +662,9 @@ def test_delivery_repair_keeps_the_sent_control_prefix(tmp_path, content):
 
     status, text = loop._resolve_delivery_control(content, registry, ctx, trace)
 
-    assert (status, text) == ("retry", "")
+    assert (status, text) == ("retry", "Complete retained answer.")
     assert ctx.messages[:len(sent)] == sent
-    assert "[DELIVERY_CONTROL_REPAIR]" in ctx.messages[-1]["content"]
+    assert "No completion selection was made" in ctx.messages[-1]["content"]
     assert ctx.messages[-1]["role"] == "user"
     assert observe_send(registry._ctx, ctx.messages, round_idx=2) is None
     assert candidate.full_text == "Complete retained answer."

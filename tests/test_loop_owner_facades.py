@@ -90,7 +90,7 @@ LOOP_LEAF_OWNERS: dict[str, str] = {
         "_load_direct_child_results _direct_child_results _child_disposition_state "
         "_project_child_result_dispositions _record_forced_finalization "
         "_forced_orphan_note _claimed_child_dispositions _undispositioned_children "
-        "_maybe_enforce_child_absorption_gate _run_forced_children_acceptance "
+        "_maybe_enforce_child_absorption_gate "
         "_enforce_swarm_actions _finalize_forced_services _drain_forced_owner_directives "
         "_call_forced_model_once _publish_model_forced_candidate "
         "_publish_stale_forced_candidate _forced_fallback_result "

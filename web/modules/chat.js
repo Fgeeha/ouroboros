@@ -771,16 +771,16 @@ export function createChatInstance({
     // host's lane fact (`_is_direct_chat`) keeps its host jobs and never chooses chrome.
     function blockHasWork(record) {
         const id = record.groupId;
-        // No lane is always shown: the retired bg-consciousness card kind is gone.
+        // Visibility depends on work, never the lane.
         return record.reviewController?.groups.size > 0
             || [...subagentChildParents.values()].some((info) => info.parentId === id)
             || record.items.some((item) => !item.receipt && !String(item.dedupeKey || '').startsWith('task_done|'))
             || record.toolErrors > 0;
     }
 
-    // Fold counters with canonical facts; absent fields stay absent.
+    // Fold host facts; absent counters stay absent.
     function noteToolMetrics(taskId, metrics, rawTs, { suppressDomInsert = false } = {}) {
-        const [calls, errors, routing] = ['tool_calls', 'tool_errors', 'routing_tool_calls']
+        const [calls, errors, routing, completion] = ['tool_calls', 'tool_errors', 'routing_tool_calls', 'completion_tool_calls']
             .map(key => Number.isInteger(metrics?.[key]) ? metrics[key] : null);
         if (!calls && !errors && !metrics.tool_evidence?.observations?.length && !metrics.tool_evidence?.legacy?.calls) return false;
         return withStableViewport(() => {
@@ -788,7 +788,7 @@ export function createChatInstance({
             const before = captureLiveCardProjection(record);
             const duration = Number(metrics.duration_sec);
             if (Number.isFinite(duration)) record.durationSec = duration;
-            const summary = noteToolHostMetrics(record, { calls, errors, routing, counts: metrics.tool_call_counts, evidence: metrics.tool_evidence });
+            const summary = noteToolHostMetrics(record, { calls, errors, routing, completion, counts: metrics.tool_call_counts, evidence: metrics.tool_evidence });
             record.toolCalls = summary.calls;
             record.toolErrors = summary.errors;
             const { timelineUpdate } = upsertToolFoldRow(record, summary, normalizeLogTs(rawTs), rawTs);

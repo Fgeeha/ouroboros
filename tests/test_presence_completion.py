@@ -64,14 +64,14 @@ def test_explicit_finish_uses_one_model_round_and_real_tool_batch(turn, outcome,
     response["tool_calls"].append({"id": "sibling", "type": "function", "function": {
         "name": "chat_history", "arguments": "{}",
     }})
-    text, usage, trace = run([response])
-    assert len(calls) == 1
+    text, usage, trace = run([response, _call(outcome, message)])
+    assert len(calls) == 2
     assert completed == ["sibling"]
     assert text == message
     assert registry._ctx._presence_completion_accepted is True
     assert usage["presence_completion_outcome"] == outcome
     assert usage["terminal_origin"] == "model_final"
-    assert len(trace["tool_calls"]) == 2
+    assert len(trace["tool_calls"]) == 3
     result = build_presence_result_event({"id": "parent1"}, text, registry._ctx, terminal_origin=usage.get("terminal_origin", ""))
     assert result["outcome"] == outcome
     assert result["text"] == (message if outcome in {"message", "deferred"} else "")
@@ -97,10 +97,10 @@ def test_review_hold_drops_old_outcome_and_uses_replacement(turn, monkeypatch):
         return len(reviews) == 1
 
     monkeypatch.setattr(loop, "_run_task_acceptance_review_once", review)
-    text, usage, _trace = run([_call("tool_delivered", "Old answer"), {"content": "Revised answer"}])
+    text, usage, _trace = run([_call("tool_delivered", "Old answer"), _call("message", "Revised answer")])
     assert len(calls) == 2 and reviews == ["Old answer", "Revised answer"]
-    assert registry._ctx._presence_completion is None
-    assert "presence_completion_outcome" not in usage
+    assert registry._ctx._presence_completion["message"] == "Revised answer"
+    assert usage["presence_completion_outcome"] == "message"
     result = build_presence_result_event({"id": "parent1"}, text, registry._ctx, terminal_origin=usage.get("terminal_origin", ""))
     assert (result["outcome"], result["text"]) == ("message", "Revised answer")
 
@@ -160,10 +160,10 @@ def test_owner_followup_invalidates_finish_before_or_during_final_gate(turn, tmp
             return result
 
         registry.override_handler("presence_finish", finish)
-    text, usage, _trace = run([_call("silent", "Old"), {"content": "With the new detail"}])
+    text, usage, _trace = run([_call("silent", "Old"), _call("message", "With the new detail")])
     assert len(calls) == 2 and text == "With the new detail"
     assert any("new detail" in str(row.get("content")) for row in calls[-1])
-    assert "presence_completion_outcome" not in usage
+    assert usage["presence_completion_outcome"] == "message"
     assert build_presence_result_event({"id": "parent1"}, text, registry._ctx, terminal_origin=usage.get("terminal_origin", ""))["outcome"] == "message"
 
 
@@ -196,7 +196,8 @@ def test_control_or_budget_tail_precedes_pending_finish(turn, tmp_path, monkeypa
     assert usage["execution_status"] == "failed"
     result = build_presence_result_event({"id": "parent1"}, text, registry._ctx, terminal_origin=usage.get("terminal_origin", ""))
     assert result["outcome"] == "silent" and result["text"] == ""
-    assert usage["terminal_origin"] == "host_notice"
+    assert text == "Old answer"  # retained authored bytes survive the real hard rail
+    assert usage["terminal_origin"] == "model_final"
     if reason == "budget":
         assert tail == ["budget"] and len(calls) == 1
     else:
@@ -210,35 +211,47 @@ def test_ordinary_empty_and_failed_silent_outcomes_remain_failed():
         assert outcome["outcome_axes"]["execution"]["status"] in {"failed", "infra_failed"}
 
 
-_DECLARED = json.dumps({"delivery_control": "replace", "full_answer": "Best available; child1 still running",
-                        "presence_finish": {"outcome": "message", "message": "Here is what I have so far."}})
-
-
-@pytest.mark.parametrize("forced,outcome,spoken", [
-    # Owner Q4: the forced answer is the internal record; undeclared prose never becomes speech.
-    ("Best available; child1 still running", "silent", ""),
-    (_DECLARED, "message", "Here is what I have so far."),
-])
-def test_pending_children_still_require_absorption(turn, tmp_path, forced, outcome, spoken):
+@pytest.mark.parametrize("outcome,spoken", [("silent", ""), ("message", "Here is what I have so far.")])
+def test_pending_children_hold_until_an_explicit_unfinished_stop(turn, tmp_path, outcome, spoken):
     from ouroboros.task_results import write_task_result, STATUS_RUNNING
-
-    _registry, calls, run = turn
-    # A real turn carries its Presence metadata; the ceiling alone does not arm the protocol.
-    _registry._ctx.task_metadata = {"presence": {"binding_id": "a" * 32, "event": {"conversation_key": "k"}}}
+    registry, calls, run = turn
+    registry._ctx.task_metadata = {"presence": {"binding_id": "a" * 32, "event": {"conversation_key": "k"}}}
     write_task_result(tmp_path, "child1", STATUS_RUNNING, parent_task_id="parent1",
                       root_task_id="parent1", delegation_role="subagent", role="reviewer", result="Still running")
-    text, usage, _trace = run([
-        _call("silent", "Premature"),
-        {"content": '{"delivery_control":"keep"}'},
-        {"content": "Best available"}, {"content": forced},
-    ])
-    assert len(calls) > 1
-    assert usage["reason_code"] == "children_unabsorbed"
-    assert "presence_completion_outcome" not in usage
-    assert text == "Best available; child1 still running"  # the internal record keeps the child facts
-    assert "[PRESENCE_DELIVERY]" in str(calls[-1][-1]["content"])
-    assert "name the unabsorbed" not in str(calls[-1][-1]["content"])
-    task = {"id": "parent1"}
-    result = build_presence_result_event(task, text, _registry._ctx, terminal_origin=usage.get("terminal_origin", ""))
+    stop = _call(outcome, spoken)
+    arguments = json.loads(stop["tool_calls"][0]["function"]["arguments"])
+    arguments.update(action="stop", rationale="Child1 is still running and remains unfinished.")
+    stop["tool_calls"][0]["function"]["arguments"] = json.dumps(arguments)
+    text, usage, trace = run([_call("silent", "Premature"), _call("silent", "Still premature"), stop])
+    assert len(calls) == 3 and trace["task_completion"]["action"] == "stop"
+    assert usage.get("reason_code") != "children_unabsorbed"
+    assert trace["child_result_dispositions"]["current"] == []
+    saved = json.loads((tmp_path / "task_results" / "child1.json").read_text(encoding="utf-8"))
+    assert saved["status"] == STATUS_RUNNING
+    result = build_presence_result_event({"id": "parent1"}, text, registry._ctx, terminal_origin=usage.get("terminal_origin", ""))
     assert (result["outcome"], result["text"]) == (outcome, spoken)
-    assert task["metadata"]["presence_declaration"]["status"] == ("declared" if spoken else "missing")
+
+
+@pytest.mark.parametrize('receipt_state,expected_calls', [('delivered', 1), ('uncertain', 2), ('failed', 2)])
+def test_same_batch_presence_send_needs_its_actual_host_receipt(turn, tmp_path, receipt_state, expected_calls):
+    from ouroboros.utils import append_jsonl
+    registry, calls, run = turn
+    registry._ctx.task_metadata = {'presence': {
+        'binding_id': 'a' * 32, 'delivery_reporting_version': 1,
+        'event': {'conversation_key': 'room'},
+    }}
+    def send(ctx, **kw):
+        append_jsonl(tmp_path / 'logs' / 'chat.jsonl', {
+            'task_id': 'parent1', 'type': 'presence_delivery', 'text': 'Actual send',
+            'transport': {'conversation_key': 'room', 'origin': {'kind': 'tool'},
+                'delivery': {'state': receipt_state, 'delivery_id': 'send-1', 'part_id': '0'}},
+        })
+        return 'Send returned'
+    registry.override_handler('chat_history', send)
+    response = _call('tool_delivered', '')
+    response['tool_calls'].insert(0, {'id': 'send', 'type': 'function', 'function': {
+        'name': 'chat_history', 'arguments': '{}'}})
+    text, usage, trace = run([response, _call('silent', '')])
+    assert len(calls) == expected_calls
+    assert bool(trace['tool_calls'][0].get('presence_delivery_confirmed')) == (receipt_state == 'delivered')
+    assert usage['presence_completion_outcome'] == ('tool_delivered' if expected_calls == 1 else 'silent')

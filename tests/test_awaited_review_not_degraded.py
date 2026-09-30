@@ -572,8 +572,7 @@ def test_a_real_answer_released_over_a_running_panel_is_not_a_degraded_review(fu
         if f.model_step == 1:
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "nominate")]}, 0.0
         assert f.entered.wait(5) and not f.release.is_set()
-        control = json.loads(keep(f)["content"])
-        return {"content": json.dumps({**control, "pending_review": "finish"})}, 0.0
+        return keep(f, pending_review="finish"), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, usage, trace = f.run()

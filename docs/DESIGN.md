@@ -954,7 +954,7 @@ calls, without error, is a receipt row too — live from the stamped frames, on
 reload from `routing_tool_calls`. So a turn that only
 addressed work («turn this into a project») draws no block, live or on reload:
 the annotation on the owner message and the managed root's own card are its
-whole record (owner decision 11.09). A failed addressing call is an error row
+whole record (owner decision 11.09). Successful local completion acts use the same receipt semantics through the host's `completion_control` fact and `completion_tool_calls` aggregate. They keep their actual call count without manufacturing work, and failed completion calls keep their error. A failed addressing call is an error row
 and therefore content, as is any recorded tool error. A REFUSED addressing act
 is told where the work lives and never in Ouroboros's voice (owner 16.09): the
 receipt line states the cause in the owner's words, the failed call stays the

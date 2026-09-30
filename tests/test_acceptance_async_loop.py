@@ -171,12 +171,20 @@ def full_loop(tmp_path, monkeypatch):
         assert fixture.settled.wait(10)
 
 
-def keep(f):
+def select_completion(f, answer=None, **options):
+    """Main explicitly selects complete bytes using the source it actually received."""
     observation = f.ctx._acceptance_observation
     assert observation["owner_source_sha256"] in str(f.model_inputs[-1])
-    return {"content": json.dumps({"delivery_control": "keep", "acceptance_subject": {
+    selected = ({"answer": answer} if answer is not None else
+                {"answer_sha256": f.ctx._delivery_candidate.content_sha256})
+    arguments = {"action": "finish", **selected, "acceptance_subject": {
         "owner_source_sha256": observation["owner_source_sha256"],
-    }})}
+    }, **options}
+    return {"content": None, "tool_calls": [call("finish_task", arguments, f"finish-{f.model_step}")]}
+
+
+def keep(f, **options):
+    return select_completion(f, **options)
 
 
 def test_full_loop_explicit_batch_owner_status_and_free_collection(full_loop, monkeypatch):
@@ -376,7 +384,7 @@ def _terminal_record(trace):
 def test_a_rewritten_answer_delivers_under_the_running_panel_instead_of_buying_one(full_loop, monkeypatch):
     """The live incident shape (task 4525349b, cap 1) under owner D4=A and fork 1=B:
     Main nominates, the reviewers are still reading when it rewrites the answer
-    through the delivery control (round 7 of the incident). The rewrite is a
+    through explicit completion selection (round 7 of the original incident). The rewrite is a
     DELIVERY, not a nomination: it buys nothing and is refused nothing; the host
     waits for the panel it already paid for, and when that panel PASSES the earlier
     revision the task is accepted on the reviewers' word and the row says so."""
@@ -393,9 +401,7 @@ def test_a_rewritten_answer_delivers_under_the_running_panel_instead_of_buying_o
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "first-review")]}, 0.0
         if f.model_step == 2:
             assert f.entered.wait(5) and not f.release.is_set(), "the panel must still be running"
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": reauthored,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, reauthored), 0.0
         assert f.model_step < 6, f.progress
         return keep(f), 0.0
 
@@ -442,9 +448,7 @@ def test_a_rejected_earlier_revision_is_not_a_verdict_on_the_rewrite(full_loop, 
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "first-review")]}, 0.0
         if f.model_step == 2:
             assert f.entered.wait(5) and not f.release.is_set()
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": reauthored,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, reauthored), 0.0
         assert f.model_step < 6, f.progress
         return keep(f), 0.0
 
@@ -466,7 +470,7 @@ def _advisory(monkeypatch):
 
 def test_a_conscious_finish_releases_the_answer_while_the_panel_runs(full_loop, monkeypatch):
     """Owner D4=A point 3: under advisory enforcement Main chooses explicitly.
-    ``"pending_review":"finish"`` on the delivery control delivers now, without a
+    ``pending_review="finish"`` on finish_task delivers now, without a
     park; the verdict reaches Main as advice when it settles."""
     f = full_loop
     _advisory(monkeypatch)
@@ -478,9 +482,8 @@ def test_a_conscious_finish_releases_the_answer_while_the_panel_runs(full_loop, 
         if f.model_step == 1:
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "nominate")]}, 0.0
         assert f.model_step == 2 and f.entered.wait(5) and not f.release.is_set()
-        control = json.loads(keep(f)["content"])
-        assert '"pending_review":"finish"' in str(messages), "the choice is offered while the panel runs"
-        return {"content": json.dumps({**control, "pending_review": "finish"})}, 0.0
+        assert "Pending critics: choose pending_review=wait" in str(messages), "the choice is offered while the panel runs"
+        return keep(f, pending_review="finish"), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, _usage, trace = f.run()
@@ -509,8 +512,7 @@ def test_a_panel_that_settles_after_the_loop_exited_is_attached_through_the_reme
         if f.model_step == 1:
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "nominate")]}, 0.0
         assert f.model_step == 2 and f.entered.wait(5) and not f.release.is_set()
-        control = json.loads(keep(f)["content"])
-        return {"content": json.dumps({**control, "pending_review": "finish"})}, 0.0
+        return keep(f, pending_review="finish"), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, _usage, trace = f.run()
@@ -563,9 +565,7 @@ def test_a_rejected_earlier_revision_buys_a_panel_on_the_rewrite_when_the_cap_al
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "first-review")]}, 0.0
         if f.model_step == 2:
             assert f.entered.wait(5) and not f.release.is_set()
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": reauthored,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, reauthored), 0.0
         # The park released panel 1 (FAIL) before this round; the rewrite addresses the notes.
         f.reviewer_verdict = "PASS"
         assert f.model_step < 8, f.progress
@@ -615,9 +615,7 @@ def test_an_older_fail_never_outvotes_the_pass_that_accepted_the_task(full_loop,
             # This scenario rewrites under B's settled PASS, not while B runs.
             with f.condition:
                 assert f.condition.wait_for(lambda: f.settled_count >= 2, timeout=10)
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": third,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, third), 0.0
         assert f.model_step < 8, f.progress
         return keep(f), 0.0
 
@@ -642,7 +640,7 @@ def test_an_older_fail_never_outvotes_the_pass_that_accepted_the_task(full_loop,
 
 def test_an_owner_followup_acknowledged_through_the_control_sets_the_panel_aside(full_loop, monkeypatch):
     """Astra review round 5: the owner changes the requirements while the panel
-    runs; Main reads the message, acknowledges its source on the delivery control
+    runs; Main reads the message, acknowledges its source on finish_task
     and rewrites. The rewrite is NOT a delivery under the old panel (it judged the
     old premises): the ordinary path buys a panel on the new answer and the old
     PASS never accepts it."""
@@ -661,9 +659,7 @@ def test_an_owner_followup_acknowledged_through_the_control_sets_the_panel_aside
             return {"content": "", "tool_calls": [call("send_user_message", {"text": "Adding the timeline."}, "ack")]}, 0.0
         if f.model_step == 3:
             assert followup in str(messages), "the owner follow-up reached the model"
-            observation = f.ctx._acceptance_observation
-            return {"content": json.dumps({"delivery_control": "replace", "full_answer": rewritten,
-                                           "acceptance_subject": {"owner_source_sha256": observation["owner_source_sha256"]}})}, 0.0
+            return select_completion(f, rewritten), 0.0
         assert f.model_step < 8, f.progress
         return keep(f), 0.0
 
@@ -698,17 +694,14 @@ def test_waiting_is_the_default_and_blocking_enforcement_never_offers_the_choice
             return {"content": "", "tool_calls": [call("task_acceptance_review", {"claim": ANSWER}, "nominate")]}, 0.0
         if f.model_step == 2:
             assert f.entered.wait(5)
-            control = json.loads(keep(f)["content"])
-            if install == "blocking_finish":
-                control["pending_review"] = "finish"
-            return {"content": json.dumps(control)}, 0.0
+            return keep(f, **({"pending_review": "finish"} if install == "blocking_finish" else {})), 0.0
         assert f.model_step < 6, f.progress
         return keep(f), 0.0
 
     monkeypatch.setattr(loop, "call_llm_with_retry", main)
     result, _usage, trace = f.run()
     assert result == ANSWER and len(f.review_sends) == 1
-    offered = any('"pending_review":"finish"' in str(inputs) for inputs in f.model_inputs)
+    offered = any("Pending critics: choose pending_review=wait" in str(inputs) for inputs in f.model_inputs)
     if install == "advisory_default":
         assert offered and f.waits and f.waits[0]["reason"] == "review"
         assert trace["acceptance_decision"]["status"] == "accepted"

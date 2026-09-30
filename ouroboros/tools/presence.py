@@ -13,20 +13,28 @@ from ouroboros.tools.registry import ToolContext, ToolEntry
 PRESENCE_OUTCOMES = ("message", "silent", "tool_delivered", "deferred")
 
 
-def _finish_presence(ctx: ToolContext, outcome: str, message: str = "") -> str:
+def _finish_presence(ctx: ToolContext, outcome: str, message: str = "", action: str = "finish",
+                     rationale: str = "", answer_sha256: str | None = None) -> str:
     contract = getattr(ctx, "task_contract", {})
     if not isinstance(contract, dict) or not isinstance(contract.get("capability_ceiling"), dict):
         return _publish_tool_result(ctx, ToolResult(status="unavailable", code="CAPABILITY_UNAVAILABLE", text=("ERROR: PRESENCE_COMPLETION_UNAVAILABLE: this is not a host-admitted presence turn.")))
     selected = str(outcome or "").strip()
     if selected not in PRESENCE_OUTCOMES:
         return _publish_tool_result(ctx, ToolResult(status="error", code="TOOL_ARG_ERROR", text=("ERROR: PRESENCE_OUTCOME_INVALID: choose message, silent, tool_delivered, or deferred.")))
+    from ouroboros.tools.control_runtime import stage_completion_request
+    reply_later = not message and answer_sha256 is None and selected in {"message", "deferred"}
+    result = stage_completion_request(ctx, {"action": action, "rationale": rationale,
+        **({"answer_sha256": answer_sha256} if answer_sha256 is not None else {"answer": message})},
+        source="presence_finish", allow_empty=selected in {"silent", "tool_delivered"}, reply_later=reply_later)
+    if not getattr(ctx, "_completion_request", None) or getattr(ctx, "_completion_conflict", False):
+        return result
     ctx._presence_completion = {
         "outcome": selected,
         "message": str(message or "").strip(),
     }
     ctx._presence_completion_accepted = False
     ctx._presence_completion_owner_revision = len(getattr(ctx, "_owner_directives", []) or [])
-    return f"PRESENCE_COMPLETION_RECORDED: {selected}. The host will apply the normal finalization checks after this tool batch."
+    return result
 
 
 def _configure_presence(ctx: ToolContext, action: str, **params: Any) -> str:
@@ -338,6 +346,9 @@ def get_tools() -> List[ToolEntry]:
                     "type": "object",
                     "properties": {
                         "outcome": {"type": "string", "enum": list(PRESENCE_OUTCOMES)},
+                        "action": {"type": "string", "enum": ["finish", "stop"], "default": "finish"},
+                        "rationale": {"type": "string", "description": "For stop, what remains unfinished. Delivery outcome is independent."},
+                        "answer_sha256": {"type": "string", "description": "Select an offered complete answer instead of message or reply-later."},
                         "message": {
                             "type": "string",
                             "description": "Reply text for message, or an immediate acknowledgement for deferred. Nonblank text enables immediate finalization; omitting it leaves the reply to a subsequent model round.",
