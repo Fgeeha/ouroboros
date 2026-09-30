@@ -1149,12 +1149,10 @@ def test_ui_smoke_collapsed_activity_line_named_vs_unnamed(
 @pytest.mark.ui_browser
 @pytest.mark.parametrize("browser_engine", ["chromium", "webkit"])
 def test_ui_smoke_live_card_mutations_preserve_viewport(
-    direct_server_with_data,
-    browser_engine,
+    direct_server_with_data, browser_engine, request,
 ):
-    from tests.ui_chat_viewport_smoke import run_chat_viewport_smoke
-
-    run_chat_viewport_smoke(direct_server_with_data, browser_engine)
+    from tests.ui_chat_viewport_smoke import run_chat_viewport_smoke as run
+    run(direct_server_with_data, browser_engine, request)
 
 @pytest.mark.ui_browser
 def test_ui_smoke_chat_chronology_reconnect_and_plain_answer_marker(direct_server_with_data):

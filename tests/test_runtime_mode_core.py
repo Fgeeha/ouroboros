@@ -1055,10 +1055,19 @@ def test_default_lane_allows_minusC_retarget_from_default_cwd(tmp_path, monkeypa
 
 
 @pytest.mark.parametrize("mode", ["advanced", "pro"])
-def test_shell_python_writer_reaches_the_selected_process(tmp_path, monkeypatch, mode):
+def test_shell_python_writer_reaches_the_selected_process(tmp_path, tmp_path_factory, monkeypatch, mode):
     """Source text is executed under selected supervision without guessed targets."""
     monkeypatch.setenv("OUROBOROS_RUNTIME_MODE", mode)
     monkeypatch.setenv("OUROBOROS_SAFETY_MODE", "off")
+    # Only an argv LIST is interpreter-resolved; this string form launches the bare
+    # `python` from PATH, which a host shipping only `python3` (stock macOS) lacks.
+    # Put the running interpreter there under that name, outside the repo root.
+    executable = pathlib.Path(sys.executable)
+    python_dir = executable.parent
+    if os.name != "nt" and executable.name != "python":
+        python_dir = tmp_path_factory.mktemp("bare-python")
+        (python_dir / "python").symlink_to(executable)
+    monkeypatch.setenv("PATH", str(python_dir) + os.pathsep + os.environ.get("PATH", ""))
     reg = _registry(tmp_path)
     result = reg.execute(
         "run_command",

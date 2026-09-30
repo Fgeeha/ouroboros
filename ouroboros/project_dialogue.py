@@ -293,7 +293,7 @@ def room_membership(chat_id: int, project_chat_ids: set, source_refs: list,
         # A routing refusal belongs to the issuing chat, even when the target
         # is bound to another Project. Its lineage must not move the notice.
         bound = 0 if row.get("type") in ORIGIN_ADDRESSED_NOTICE_TYPES else bound_room_chat(bindings, row)
-        lifecycle = row.get("type") in {"project_started", "project_handoff", "project_completion_summary"}
+        lifecycle = row.get("type") in MAIN_PINNED_ROW_TYPES
         if chat_id in project_chat_ids:
             return not lifecycle and (bound == chat_id or entry_chat == chat_id
                                       or entry_matches_source_ref(row, source_refs))
@@ -666,6 +666,13 @@ ROUTING_REFUSAL_CAUSES: Dict[str, str] = {
 # Host routing refusals stay in the issuing chat regardless of the target's
 # Project binding (room_membership); they are never terminal task facts.
 ORIGIN_ADDRESSED_NOTICE_TYPES = frozenset({"task_not_started", "task_start_unconfirmed", "steer_not_delivered"})
+
+# A root's deliberate plain-text notice to Main (send_user_message
+# destination="main"); never a task's final answer.
+MAIN_NOTICE_TYPE = "main_notice"
+# Rows pinned to Main whatever the sender's Project binding: the supervisor
+# send handler and room_membership replay read this one set.
+MAIN_PINNED_ROW_TYPES = frozenset({"project_started", "project_handoff", "project_completion_summary", MAIN_NOTICE_TYPE})
 
 # Statuses of an act that LANDED (or is still in flight): no cause sentence.
 _LANDED_ROUTING_STATUSES = frozenset({"scheduled", "delivered", "pending", "dispatch_pending", "accepted"})

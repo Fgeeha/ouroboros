@@ -400,7 +400,7 @@ def _rebind_context_fit_plan(
     from ouroboros.capability_evidence import is_known
     from ouroboros.context import _context_fit_route
     from ouroboros.context_budget import NANO_MIN_HEADROOM_TOKENS, OWNER_NANO_TARGET_TOKENS
-    from ouroboros.context_fit import _failed_route_evidence, _route_calibration_ratio
+    from ouroboros.context_fit import _failed_route_evidence, _route_calibration_ratio, main_output_reserve_tokens
     from ouroboros.provider_models import parse_claudexor_model
 
     metadata = getattr(tools._ctx, "task_metadata", {})
@@ -427,11 +427,12 @@ def _rebind_context_fit_plan(
     )
     known_window = is_known(evidence, require_fresh=True)
     window_tokens = int(getattr(evidence, "window_tokens", 0) or 0)
+    output_reserve = main_output_reserve_tokens(use_local=bool(route.get("use_local", use_local)))
 
     def project(projection: Any) -> Any:
         calibrated = int(int(projection.estimated_tokens or 0) * ratio)
         nano = projection.mode == "nano"
-        reserve = NANO_MIN_HEADROOM_TOKENS if nano else int(plan.output_reserve_tokens or 0)
+        reserve = NANO_MIN_HEADROOM_TOKENS if nano else output_reserve
         capacity = min(OWNER_NANO_TARGET_TOKENS, window_tokens) if nano else window_tokens
         fits = (
             calibrated + reserve <= capacity
@@ -462,6 +463,7 @@ def _rebind_context_fit_plan(
         status=str(getattr(evidence, "status", "") or ""),
         stale=bool(getattr(evidence, "stale", False)),
         window_tokens=window_tokens,
+        output_reserve_tokens=output_reserve,
         max_projection=max_projection,
         low_projection=low_projection,
         nano_projection=nano_projection,

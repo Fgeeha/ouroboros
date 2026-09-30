@@ -134,18 +134,14 @@ def _compact_local_text(text: str, mode: str) -> str:
 
 
 def local_context_limits(max_tokens: int) -> Tuple[int, int]:
-    """Current local window and effective output cap, shared with caller preflight."""
+    """Confirmed serving window (0 if unknown) and output cap for caller preflight."""
     ctx_len = 0
     local_max = min(max_tokens, 2048)
     try:
         from ouroboros.local_model import get_manager
-        manager = get_manager()
-        evidence_fn = getattr(manager, "serving_context_evidence", None)
-        if callable(evidence_fn):
-            evidence = evidence_fn() or {}
-            ctx_len = int(evidence.get("context_window") or 0)
-        if ctx_len <= 0:
-            ctx_len = int(manager.get_context_length() or 0)
+        evidence = get_manager().serving_context_evidence() or {}
+        if evidence.get("confirmed") is True:
+            ctx_len = max(0, int(evidence.get("context_window") or 0))
         if ctx_len > 0:
             local_max = min(max_tokens, max(256, ctx_len // 4))
     except Exception:
