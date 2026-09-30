@@ -25,7 +25,9 @@ def test_the_stand_panel_parses_with_the_product_parser_and_names_three_families
 
 
 def test_paid_lanes_carry_the_panel_unless_production_panel_or_stub(monkeypatch):
-    monkeypatch.setenv("TMPDIR", "/tmp")
+    # parse_args reads tempfile.gettempdir(), which caches the session's temp dir; a TMPDIR
+    # env change never reaches it (test_e2e_live_runner.py's _short_tmp patches the same seam).
+    monkeypatch.setattr(run_live_lanes.tempfile, "gettempdir", lambda: "/tmp")
     paid = run_live_lanes.effective_settings(run_live_lanes.parse_args(["--out", "/tmp/x"]), FAKE_KEY)
     assert json.loads(paid["OUROBOROS_REVIEWER_SLOTS"]) == scenarios.STAND_REVIEW_PANEL
     assert paid["OUROBOROS_EFFORT_REVIEW"] == "low" and paid["OUROBOROS_EFFORT_TASK"] == "medium"
