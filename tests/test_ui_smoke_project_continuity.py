@@ -49,7 +49,9 @@ def _wait_status(page, expected, timeout=10_000):
 def _goto_main_ready(page, url, expected="Online"):
     page.goto(url, wait_until="domcontentloaded", timeout=30_000)
     _wait_status(page, expected, timeout=30_000)
-    page.get_by_text("Ouroboros has awakened", exact=True).wait_for(timeout=30_000)
+    # Main's own history read has landed (stamped on every successful sync); the
+    # empty-chat greeting is owner-configurable copy, not a readiness signal.
+    page.wait_for_selector('#chat-messages[data-history-hydrated="true"]', timeout=30_000)
     # The socket-open census may still be reading (a forced refresh coalesced
     # behind an in-flight read starts after it settles); a card minted on the
     # test socket before that read lands would be concluded by its absence.

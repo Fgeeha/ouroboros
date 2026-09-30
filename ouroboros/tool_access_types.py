@@ -155,24 +155,10 @@ _TOP_LEVEL_PRINCIPAL_POLICY: dict[str, set[str]] = {
 
 _POLICY: dict[str, dict[str, set[str]]] = {
     "local_readonly_subagent": {
-        # Read-only child VCS names still need their target binding to resolve.
+        **{root: set(_READ_OPS) for root in _TOP_LEVEL_PRINCIPAL_POLICY},
+        # Read-only VCS names still need a binding; no mutating names are exposed.
         "active_workspace": set(_READ_OPS) | {"vcs"},
         "system_repo": set(_READ_OPS) | {"vcs"},
-        # Read⇒search closure: the search tool applies the same per-file secret /
-        # owner-state guards and match masking a child's read_file does.
-        "runtime_data": set(_READ_OPS),
-        "task_drive": set(_READ_OPS),
-        "artifact_store": set(_READ_OPS),
-        # v6.70.0 (owner-approved): read-only scouts sent to review a skill were
-        # structurally blind to its payload — a scout literally reported
-        # "reviewing blind", and a correct "skill does not exist" answer was
-        # indistinguishable from an access block. Payloads are skill CODE
-        # (data/skills/...); grants/secrets live in data/state/skills, which
-        # stays invisible to this profile.
-        "skill_payload": {"read", "list", "search"},
-        # Owner T4=A (#1105): the owner-visible Deliverables container is readable
-        # by a read-only child; `subagent_projects` stays top-level only.
-        "deliverables": {"read", "list", "search"},
     },
     # Top-level preset names remain observable, but workspace focus never narrows
     # the ordinary principal. Independent path/credential/child/runtime guards
@@ -185,13 +171,9 @@ _POLICY: dict[str, dict[str, set[str]]] = {
     # keeps protected-path discipline active in the registry (it is the system
     # repo). runtime_data stays read-only.
     "acting_subagent": {
-        # Acting children write ONLY inside their isolated surface (active_workspace =
-        # the self_worktree / external_workspace / genesis). task_drive / artifact_store
-        # are read-only here (no extra write surface); the deliverable is a workspace.patch.
+        **{root: set(_READ_OPS) for root in _TOP_LEVEL_PRINCIPAL_POLICY},
+        # Broader reads do not grant another write surface.
         "active_workspace": {"read", "list", "search", "write", "edit", "shell", "vcs", "service"},
-        "runtime_data": set(_READ_OPS),
-        "task_drive": set(_READ_OPS),
-        "artifact_store": set(_READ_OPS),
     },
     "self_modification": _TOP_LEVEL_PRINCIPAL_POLICY,
     # operator_control gets full authority on every mutable root, but the orchestrator

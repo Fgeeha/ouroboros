@@ -7,7 +7,7 @@ import pathlib
 from tests.test_delegated_skill_payload import _payload_ctx, _StartStub
 
 
-def test_readonly_source_permissions_do_not_prevent_masked_session_input(tmp_path, monkeypatch):
+def test_readonly_source_permissions_do_not_prevent_exact_session_input(tmp_path, monkeypatch):
     from ouroboros import claudexor_daemon, safety
     from ouroboros.tools.registry import ToolRegistry
 
@@ -19,6 +19,8 @@ def test_readonly_source_permissions_do_not_prevent_masked_session_input(tmp_pat
     token = "ghp_" + "a" * 32
     source.write_text("Parent input with " + token, encoding="utf-8")
     source.chmod(0o444)
+    binary = parent / "fixture.bin"
+    binary.write_bytes(b"\xff\x00" + token.encode() + b"\r\n")
     owner_secret = ctx.drive_root / "settings.json"
     owner_secret.write_text('{"owner": "control"}', encoding="utf-8")
     secret_alias = parent / "ordinary.txt"
@@ -34,23 +36,26 @@ def test_readonly_source_permissions_do_not_prevent_masked_session_input(tmp_pat
     reader.set_context(native)
     monkeypatch.setattr(safety, "check_safety", lambda *_a, **_k: (True, ""))
     readable = reader.execute("read_file", {"root": "task_drive", "path": str(source)})
-    assert "Parent input" in readable and token not in readable
-    assert "BLOCKED" in reader.execute("read_file", {"root": "task_drive", "path": str(secret_alias)})
+    assert "Parent input with " + token in readable
+    assert "control" in reader.execute("read_file", {"root": "task_drive", "path": str(secret_alias)})
     assert "BLOCKED" in reader.execute("read_file", {"root": "task_drive", "path": str(protected)})
     seen = {}
 
     class Gateway(_StartStub):
         def start_run(self, request, **kwargs):
             scope = pathlib.Path(request["scope"]["root"])
-            manifest_text = (scope / "inputs.json").read_text()
+            manifest_text = (scope / "inputs.json").read_text(encoding="utf-8")
             manifest = json.loads(manifest_text)
-            assert str(secret_alias) not in manifest_text and str(protected) not in manifest_text
+            assert str(secret_alias) in manifest_text and str(protected) not in manifest_text
             [note] = [row for row in manifest if row["source"] == str(source)]
             delivered = (scope / note["local"]).read_bytes()
-            assert b"Parent input" in delivered and token.encode() not in delivered
-            assert note["masked_spans"] == 1
+            assert delivered == source.read_bytes()
+            assert "masked_spans" not in note
             assert note["source_sha256"] == hashlib.sha256(source.read_bytes()).hexdigest()
             assert note["sha256"] == hashlib.sha256(delivered).hexdigest()
+            [binary_row] = [row for row in manifest if row["source"] == str(binary)]
+            assert (scope / binary_row["local"]).read_bytes() == binary.read_bytes()
+            assert binary_row["source_sha256"] == binary_row["sha256"]
             return super().start_run(request, **kwargs)
 
     monkeypatch.setattr(claudexor_daemon, "ensure_owned_gateway", lambda: Gateway(seen))
@@ -61,7 +66,7 @@ def test_readonly_source_permissions_do_not_prevent_masked_session_input(tmp_pat
             "subagent_id": "payload-session", "access": "readonly", "prompt": "Read the parent notes.",
         })
         assert json.loads(result).get("run_id") == "run-p1", result
-        assert source.read_text() == "Parent input with " + token
+        assert source.read_text(encoding="utf-8") == "Parent input with " + token
     finally:
         source.chmod(0o644)
 
@@ -90,7 +95,7 @@ def test_input_copy_failure_is_typed_unrun_without_pending_engine_custody(tmp_pa
     assert "request" not in seen and not delegate_custody.pending_invocations(ctx.drive_root)
 
 
-def test_unknown_start_replays_same_masked_inputs_and_durable_invocation(tmp_path, monkeypatch):
+def test_unknown_start_replays_same_exact_inputs_and_durable_invocation(tmp_path, monkeypatch):
     from ouroboros import claudexor_daemon, delegate_custody, safety
     from ouroboros.gateways.claudexor import ClaudexorUnavailable
     from ouroboros.tools.registry import ToolRegistry
@@ -107,9 +112,9 @@ def test_unknown_start_replays_same_masked_inputs_and_durable_invocation(tmp_pat
             if len(requests) == 1:
                 raise ClaudexorUnavailable("daemon_unreachable", "start response lost")
             scope = pathlib.Path(request["scope"]["root"])
-            [note] = [row for row in json.loads((scope / "inputs.json").read_text())
+            [note] = [row for row in json.loads((scope / "inputs.json").read_text(encoding="utf-8"))
                       if row["source"] == str(source)]
-            assert (scope / note["local"]).read_text() == "original input"
+            assert (scope / note["local"]).read_text(encoding="utf-8") == "original input"
             return super().start_run(request, **kwargs)
 
     monkeypatch.setattr(claudexor_daemon, "ensure_owned_gateway", lambda: Gateway({}))

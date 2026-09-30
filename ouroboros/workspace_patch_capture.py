@@ -98,7 +98,8 @@ def write_workspace_patch_artifacts(
         expected_base_sha=task_base_sha or preflight_head,
     )
     metadata = task.get("metadata") if isinstance(task.get("metadata"), dict) else {}
-    file_baseline = metadata.get("file_baseline") or {}
+    workspace_copy = metadata.get("workspace_copy") or task.get("workspace_copy") or {}
+    file_baseline = metadata.get("file_baseline") or workspace_copy.get("file_baseline") or {}
     file_input_paths: List[str] = []
     try:
         from ouroboros.workspace_file_outputs import changed_file_inputs
@@ -277,14 +278,9 @@ def write_workspace_patch_artifacts(
     digest = hasher.hexdigest()
     head_errors: List[Dict[str, Any]] = []
     current_head = _git_stdout(["git", "rev-parse", "--verify", "HEAD"], root, allow_rc={0}, errors=head_errors).strip()
-    # Q11: the moved-HEAD fail-closed tripwire applies ONLY to a child's private
-    # self_worktree, where a moved HEAD can only mean the worktree itself
-    # rewrote history under the patch (its base is always a real provisioned
-    # commit, never unborn). In a SHARED tree (external_workspace/genesis) the
-    # parent's own legitimate commits move HEAD too — enforcing it there failed
-    # every innocent in-flight sibling; shared-tree integrity is verified by the
-    # reverse-patch check in tools/subagent_integration (verified_shared_workspace),
-    # and base_sha stays the patch BASE so parent-committed work is still captured.
+    # Only isolated copies keep HEAD fixed to their provisioned baseline.
+    # Shared external/genesis trees may receive legitimate parent commits;
+    # integration verifies their postimages instead of calling that drift.
     if (task_base_sha and acting_constraint is not None
             and acting_constraint.surface == "self_worktree" and current_head != base_head):
         if not current_head:
@@ -314,6 +310,7 @@ def write_workspace_patch_artifacts(
         "created_at": utc_now_iso(),
         "status": status,
         "workspace_root": str(root),
+        **({"workspace_copy": workspace_copy} if workspace_copy else {}),
         "patch_name": "workspace.patch",
         "manifest_name": "workspace_patch.json",
         "base_provenance": ("task_constraint" if task_base_sha else "admission_head" if preflight_head

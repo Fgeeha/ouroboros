@@ -11,10 +11,10 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D01 | Agent core & main loop | 40 | 0 |
 | D02 | LLM client, routing & providers | 39 | 0 |
 | D03 | Context assembly, fit & compaction | 12 | 0 |
-| D04 | Tool execution: registry, access & typed results | 21 | 0 |
+| D04 | Tool execution: registry, access & typed results | 22 | 0 |
 | D05 | Tool surfaces: files, code, shell, media, external | 29 | 0 |
 | D06 | Review stack | 71 | 0 |
-| D07 | Delegation, subagents & Claudexor | 58 | 0 |
+| D07 | Delegation, subagents & Claudexor | 59 | 0 |
 | D08 | Supervisor: queue, workers, events & runtime control | 50 | 0 |
 | D09 | Cancellation, owner control & process custody | 14 | 0 |
 | D10 | Git, update & release machinery | 29 | 0 |
@@ -28,7 +28,7 @@ The manifest is the SSOT of the module→domain assignment (1:1, complete over t
 | D18 | Launcher, packaging, platform & shared substrate | 15 | 0 |
 | D19 | Frozen contracts (ABI) | 10 | 0 |
 | D20 | Presence | 10 | 0 |
-| **total** | | **600** | **0** |
+| **total** | | **602** | **0** |
 
 ## Dependency direction matrix (strict, pinned)
 
@@ -290,6 +290,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/protected_artifacts.py`
 - `ouroboros/tool_access.py`
 - `ouroboros/tool_access_paths.py`
+- `ouroboros/tool_access_reads.py`
 - `ouroboros/tool_access_roots.py`
 - `ouroboros/tool_access_types.py`
 - `ouroboros/tool_access_user_files.py`
@@ -475,6 +476,7 @@ No function body (≥ 10 normalized lines) is shared verbatim across domains. Ne
 - `ouroboros/tools/subagent_integration.py`
 - `ouroboros/tools/subagent_integration_delegated.py`
 - `ouroboros/tools/task_tree.py`
+- `ouroboros/workspace_copies.py`
 
 ### D08 — Supervisor: queue, workers, events & runtime control
 
