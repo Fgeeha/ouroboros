@@ -347,7 +347,7 @@ server.py (Starlette+uvicorn) ← HTTP + WebSocket on configurable host:port (de
       ├── server_control.py    ← `restart_current_process` + `execute_panic_stop`
       ├── server_entrypoint.py ← CLI parsing + port binding helpers
       ├── server_runtime.py    ← Startup/onboarding wiring + WS liveness
-      ├── server_web.py        ← `NoCacheStaticFiles`, web-dir resolver and fixed-source `read_author_kit_assets(repo_dir)` for optional author-owned routes; no endpoint or cache
+      ├── server_web.py        ← Static/web roots and fixed-source `read_author_kit_assets(repo_dir)`; no endpoint/cache
       ├── server_process.py, server_liveness.py, server_maintenance.py, server_restart.py, server_owner_routing.py, server_routing_context.py ← Server leaves the composition root calls: the facts one server process shares with every leaf, including applied startup settings; wedge detection for the supervisor generation; the upkeep a generation owes the drive; restart operations (shutdown, the checkout-first manual Restart, the planned restart's engine-pin daemon stop; §9); where one owner message goes; the bounded facts one owner turn may address
       ├── terminal_cost_reconciliation.py ← Usage recovery/projection (§6)
       ├── task_continuation.py ← Durable review continuation state
