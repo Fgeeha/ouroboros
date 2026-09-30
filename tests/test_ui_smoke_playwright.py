@@ -2153,10 +2153,10 @@ def test_ui_smoke_direct_mode_chat_scrolls_on_desktop(direct_server):
                 page.goto(direct_server, wait_until="domcontentloaded", timeout=30_000)
                 page.get_by_role("button", name="Chat").click()
                 page.wait_for_selector("#chat-messages", timeout=30_000)
-                # Wait for the initial history rebuild to finish before injecting
-                # synthetic rows; otherwise that authoritative rebuild may erase
-                # the probe immediately after insertion on slower startup paths.
-                page.wait_for_selector("#chat-messages .chat-bubble.assistant", timeout=30_000)
+                # Wait for the first history rebuild to land (the hydration stamp; empty
+                # Main has no bubble) before injecting synthetic rows, or that rebuild may
+                # erase the probe right after insertion on slower startups.
+                page.wait_for_selector('#chat-messages[data-history-hydrated="true"]', timeout=30_000)
                 # A viewport change can re-render the chat from the (empty) real
                 # history and drop injected probe nodes, so injection is a helper
                 # re-run before every measurement instead of a one-shot setup.
