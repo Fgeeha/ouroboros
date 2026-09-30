@@ -326,15 +326,15 @@ def get_evolution_persistent_objective() -> str:
     ) or "").strip()
 
 
-def get_allow_mutative_subagents(write_surface: str = "") -> bool:
+def get_allow_mutative_subagents(write_surface: str = "", *, source_is_system_repo: bool = True) -> bool:
     """Whether the parent may spawn mutative (acting) subagents.
 
     Owner-controlled. An explicit truthy/falsey value applies to EVERY surface.
     Empty/unset follows the runtime mode: advanced/pro allow every acting
     surface; light is SURFACE-AWARE (Q4 sandbox unwind, owner 2026-08-08) —
-    ``external_workspace``/``genesis`` children build OUTSIDE the Ouroboros
-    runtime and stay allowed (light is a self-modification boundary, not an OS
-    sandbox), while ``self_worktree`` (a checkout of the live body) stays off.
+    External work, including an isolated copy of a foreign Git project, stays
+    allowed. Light is a self-modification boundary: a self_worktree sourced
+    from the Ouroboros body stays off. Legacy callers default to that source.
     A bare call (no surface) answers "may ANY acting child be scheduled".
     Gates only SCHEDULING: light-mode self-repo writes stay blocked by the
     runtime sandbox regardless."""
@@ -352,10 +352,11 @@ def get_allow_mutative_subagents(write_surface: str = "") -> bool:
         return True
     surface = str(write_surface or "").strip().lower()
     # Unset + light (or unknown mode): allowed for the external build surfaces,
-    # off for self_worktree; an unknown surface string fails closed (the surface
+    # off for own-body copies; an unknown surface string fails closed (the surface
     # validity gate elsewhere rejects it with its own message). A bare query
     # reports True because SOME acting children are allowed.
-    return not surface or surface in {"external_workspace", "genesis"}
+    return (not surface or surface in {"external_workspace", "genesis"}
+            or (surface == "self_worktree" and not source_is_system_repo))
 
 
 def get_subagent_worktree_root() -> str:

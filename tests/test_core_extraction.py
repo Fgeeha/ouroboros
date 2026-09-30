@@ -27,7 +27,6 @@ _MOVED_NAMES = frozenset({
     "_MAX_VIDEO_FILE_BYTES",
     "_MEMORY_AT_DRIVE_MEMORY",
     "_SKILL_OWNER_STATE_FILENAMES",
-    "_SUBAGENT_SECRET_FILE_NAMES",
     "_access_or_block",
     "_annotate_reread",
     "_coerce_line_window",
@@ -38,17 +37,11 @@ _MOVED_NAMES = frozenset({
     "_detect_image_mime",
     "_detect_video_mime",
     "_direct_resource_binding",
-    "_filter_subagent_secret_listing",
-    "_filter_subagent_secret_repo_listing",
     "_is_cognitive_data_path",
     "_is_skill_owner_state_target",
-    "_is_subagent_secret_data_path",
-    "_is_subagent_secret_repo_path",
-    "_is_subagent_secret_repo_target",
     "_list_dir",
     "_list_files",
     "_list_user_files_dir",
-    "_local_readonly_resource_block",
     "_normalize_data_read_path",
     "_profile_roots_hint",
     "_read_file",
@@ -59,7 +52,6 @@ _MOVED_NAMES = frozenset({
     "_send_file",
     "_send_photo",
     "_send_video",
-    "is_restricted_subagent_profile",
 })
 
 

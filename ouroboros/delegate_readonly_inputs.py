@@ -19,7 +19,6 @@ import stat
 def prepare_folderless_inputs(ctx, invocation_id: str) -> tuple[str, str]:
     from ouroboros.artifacts import stream_artifact_file
     from ouroboros.protected_artifacts import block_reason_for_path
-    from ouroboros.secret_masking import mask_secret_bytes
     from ouroboros.task_custody import fence_publication
     from ouroboros.tool_access import (
         active_tool_profile,
@@ -28,8 +27,8 @@ def prepare_folderless_inputs(ctx, invocation_id: str) -> tuple[str, str]:
         folderless_scratch_dir,
         lineage_read_roots,
     )
-    from ouroboros.tools.core_file_tools import _local_readonly_resource_block
     from ouroboros.utils import write_bytes_atomic
+    from ouroboros.tools.core_file_tools import _runtime_data_read_check
 
     scratch = folderless_scratch_dir(ctx)
     if scratch is None:
@@ -44,6 +43,7 @@ def prepare_folderless_inputs(ctx, invocation_id: str) -> tuple[str, str]:
     root = container / invocation_id
     root.mkdir(parents=True, exist_ok=False)
     manifest = []
+    runtime_check = _runtime_data_read_check(reader)
     for label in ("task_drive", "artifact_store"):
         if not decide_tool_access(profile=active_tool_profile(reader), root=label, operation="read").allow:
             continue
@@ -58,32 +58,27 @@ def prepare_folderless_inputs(ctx, invocation_id: str) -> tuple[str, str]:
                 if source.is_symlink():
                     continue
                 binding = build_resolved_resource_binding(reader, root=label, operation="read", path=str(source))
+                if runtime_check(binding.target_path):
+                    continue
                 if block_reason_for_path(reader, binding.target_path, "read_bytes", binding):
                     continue
-                if _local_readonly_resource_block(reader, label, binding.target_path,
-                                                  binding.base_path, action="READ_FILE"):
-                    continue
                 local = pathlib.Path("inputs") / label / str(index) / relative
-                # Verify the original once, then publish only the permitted bytes.
-                # Source permissions describe the input, not this owned projection;
-                # copying a read-only mode first would make masking fail.
+                # Verify the original once, then copy its exact bytes. The owned
+                # copy does not inherit source permissions or workspace authority.
                 fence_publication()
                 contents = io.BytesIO()
                 measured = stream_artifact_file(binding.target_path, contents)
                 raw = contents.getvalue()
-                masked_text, masked = mask_secret_bytes(raw.decode("utf-8", "replace"), preserve_layout=True)
-                delivered = masked_text.encode("utf-8") if masked else raw
-                write_bytes_atomic(root / local, delivered)
+                write_bytes_atomic(root / local, raw)
                 manifest.append({"root": label, "source": str(source), "local": local.as_posix(),
                                  "source_sha256": measured["sha256"], "source_size": measured["size"],
-                                 "sha256": hashlib.sha256(delivered).hexdigest(), "size": len(delivered),
-                                 "masked_spans": masked})
+                                 "sha256": hashlib.sha256(raw).hexdigest(), "size": len(raw)})
     (root / "inputs.json").write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
     return str(root), (
         "\nREADONLY INPUTS: This invocation has its own scratch scope, not a workspace grant. "
-        "inputs.json maps permitted native lineage sources to verified local copies (masked_spans discloses the native secret mask). "
+        "inputs.json maps permitted native lineage sources to byte-identical verified local copies. "
         "Read those local paths when the work order names the original sources. "
-        "Unlisted operator/runtime data and sibling tasks are not inputs.\n"
+        "The manifest describes staged copies, not an additional filesystem-read boundary.\n"
     )
 
 

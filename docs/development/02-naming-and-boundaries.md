@@ -54,8 +54,8 @@ of core" step in `.github/workflows/ci.yml`); the rest is review-only.
   refuse owner input or output on a SUFFIX or WORD inside a file name; dotenv
   spellings are the one surviving tail rule. Owner locations are a physical list
   (`credential_shapes.owner_credential_locations`), so an unlisted store keeps
-  ordinary access; `make_subagent_secret_target_check` is prepared once per call
-  and never retained; `pem_capture_refusal` keeps effective Cyber's finding
+  ordinary access. Helpers inherit the parent's reads without file-name filters
+  or content masking; `pem_capture_refusal` keeps effective Cyber's finding
   advisory with the requested bytes while ordinary modes keep the exclusion; the
   SSH config exception permits no key writes under `.ssh`.
 - An unlaunchable sole cmd element gets an actionable argv/shell hint, never
